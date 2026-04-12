@@ -40,6 +40,12 @@
 - `PORTR_RS_CLEANUP_INTERVAL_SECS`
 - `PORTR_RS_LEASE_RETENTION_SECS`
 
+默认配置文件路径：
+
+- `$HOME/.config/portr-rs/.env`
+
+启动时如果这个文件不存在，`portr-rs` 会自动生成默认 `.env`，然后按该文件加载配置。进程环境变量优先级更高，会覆盖 `.env` 里的同名配置。
+
 启动：
 
 ```bash
@@ -103,6 +109,12 @@ BUILD_MODE=debug ./build.sh
 - `ARCHITECTURE.md`
 - `portr-rs.env.example`
 
+### GitHub Release
+
+GitHub Actions 会在 `main` 分支自动构建 Ubuntu AMD64 二进制，并更新 `latest` Release。Release 只附带单个二进制文件：
+
+- `portr-rs-linux-amd64`
+
 ### 2. 服务器解压
 
 示例：
@@ -133,15 +145,25 @@ mkdir -p /opt/portr-rs/data
 
 ### 4. 配置环境变量
 
+首次启动前不必手动创建配置文件。默认情况下，服务会自动生成：
+
+```text
+$HOME/.config/portr-rs/.env
+```
+
+如需预先编辑，可直接创建或修改这个文件。
+
 最小生产示例：
 
 ```bash
-export PORTR_RS_API_ADDR=0.0.0.0:8787
-export PORTR_RS_SSH_ADDR=0.0.0.0:2222
-export PORTR_RS_TUNNEL_DOMAIN=your-domain.example.com
-export PORTR_RS_USE_LOCALHOST=false
-export PORTR_RS_DB_PATH=$HOME/.config/portr-rs/portr-rs.db
-export PORTR_RS_ADMIN_TOKEN=change-me-admin-token
+cat > "$HOME/.config/portr-rs/.env" <<'EOF'
+PORTR_RS_API_ADDR=0.0.0.0:8787
+PORTR_RS_SSH_ADDR=0.0.0.0:2222
+PORTR_RS_TUNNEL_DOMAIN=your-domain.example.com
+PORTR_RS_USE_LOCALHOST=false
+PORTR_RS_DB_PATH=$HOME/.config/portr-rs/portr-rs.db
+PORTR_RS_ADMIN_TOKEN=change-me-admin-token
+EOF
 ```
 
 如果需要长期保留更少历史数据，可额外配置：
@@ -202,12 +224,8 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/portr-rs
-Environment=PORTR_RS_API_ADDR=0.0.0.0:8787
-Environment=PORTR_RS_SSH_ADDR=0.0.0.0:2222
-Environment=PORTR_RS_TUNNEL_DOMAIN=your-domain.example.com
-Environment=PORTR_RS_USE_LOCALHOST=false
-Environment=PORTR_RS_DB_PATH=/opt/portr-rs/data/portr-rs.db
-Environment=PORTR_RS_ADMIN_TOKEN=change-me-admin-token
+Environment=HOME=/root
+EnvironmentFile=%h/.config/portr-rs/.env
 ExecStart=/opt/portr-rs/portr-rs
 Restart=always
 RestartSec=3

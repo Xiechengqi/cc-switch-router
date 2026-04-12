@@ -3,7 +3,7 @@ name: Build and Release
 on:
   push:
     branches:
-      - master
+      - main
 
 permissions:
   contents: write
@@ -25,18 +25,17 @@ jobs:
         run: |
           VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "archive=portr-rs_${VERSION}_x86_64-unknown-linux-gnu.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "asset=portr-rs-linux-amd64" >> "$GITHUB_OUTPUT"
 
-      - name: Build release package
+      - name: Build release binary
         run: |
-          chmod +x ./build.sh
-          TARGET_TRIPLE=x86_64-unknown-linux-gnu ./build.sh
+          cargo build --release --target x86_64-unknown-linux-gnu
 
       - name: Prepare release assets
         run: |
           mkdir -p release-files
-          cp "dist/${{ steps.version.outputs.archive }}" release-files/
-          cp "dist/${{ steps.version.outputs.archive }}.sha256" release-files/
+          cp target/x86_64-unknown-linux-gnu/release/portr-rs "release-files/${{ steps.version.outputs.asset }}"
+          chmod +x "release-files/${{ steps.version.outputs.asset }}"
           ls -lh release-files/
 
       - name: Upload artifact
@@ -62,14 +61,13 @@ jobs:
         run: |
           VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
           echo "version=v${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "archive=portr-rs_${VERSION}_x86_64-unknown-linux-gnu.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "asset=portr-rs-linux-amd64" >> "$GITHUB_OUTPUT"
           echo "Current version: v${VERSION}"
 
       - name: Prepare release files
         run: |
           mkdir -p release-files
-          cp "artifacts/portr-rs-linux-amd64/${{ steps.version.outputs.archive }}" release-files/
-          cp "artifacts/portr-rs-linux-amd64/${{ steps.version.outputs.archive }}.sha256" release-files/
+          cp "artifacts/portr-rs-linux-amd64/${{ steps.version.outputs.asset }}" release-files/
           ls -lh release-files/
 
       - name: Delete existing latest release and tag
@@ -100,15 +98,13 @@ jobs:
 
             ### Assets
 
-            - Ubuntu AMD64 package: `${{ steps.version.outputs.archive }}`
-            - SHA256: `${{ steps.version.outputs.archive }}.sha256`
+            - Ubuntu AMD64 binary: `${{ steps.version.outputs.asset }}`
 
             ### Quick download
 
             ```bash
-            wget https://github.com/${{ github.repository }}/releases/download/latest/${{ steps.version.outputs.archive }}
-            wget https://github.com/${{ github.repository }}/releases/download/latest/${{ steps.version.outputs.archive }}.sha256
-            sha256sum -c ${{ steps.version.outputs.archive }}.sha256
+            wget https://github.com/${{ github.repository }}/releases/download/latest/${{ steps.version.outputs.asset }} -O portr-rs
+            chmod +x portr-rs
             ```
           files: release-files/*
           prerelease: false

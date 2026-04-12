@@ -1,6 +1,9 @@
 use std::env;
+use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+
+use anyhow::{Context, Result};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -57,9 +60,79 @@ impl Config {
     }
 }
 
+pub fn default_env_path() -> PathBuf {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".config/portr-rs/.env"))
+        .unwrap_or_else(|| PathBuf::from("./.env"))
+}
+
+pub fn ensure_default_env_file() -> Result<PathBuf> {
+    let env_path = default_env_path();
+    if let Some(parent) = env_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("create env dir failed: {}", parent.display())
+        })?;
+    }
+
+    if !env_path.exists() {
+        fs::write(&env_path, default_env_contents())
+            .with_context(|| format!("write default env failed: {}", env_path.display()))?;
+    }
+
+    Ok(env_path)
+}
+
+pub fn load_env_file(path: &PathBuf) -> Result<()> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("read env file failed: {}", path.display()))?;
+
+    for (index, raw_line) in content.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let Some((key, value)) = line.split_once('=') else {
+            anyhow::bail!("invalid env line {} in {}", index + 1, path.display());
+        };
+
+        let key = key.trim();
+        if key.is_empty() {
+            anyhow::bail!("empty env key on line {} in {}", index + 1, path.display());
+        }
+
+        if env::var_os(key).is_none() {
+            let value = value.trim().trim_matches('"').trim_matches('\'');
+            unsafe {
+                env::set_var(key, value);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn default_db_path() -> PathBuf {
     env::var_os("HOME")
         .map(PathBuf::from)
         .map(|home| home.join(".config/portr-rs/portr-rs.db"))
         .unwrap_or_else(|| PathBuf::from("./data/portr-rs.db"))
+}
+
+fn default_env_contents() -> String {
+    format!(
+        "\
+PORTR_RS_API_ADDR=0.0.0.0:8787
+PORTR_RS_SSH_ADDR=0.0.0.0:2222
+PORTR_RS_TUNNEL_DOMAIN=0.0.0.0:8787
+PORTR_RS_USE_LOCALHOST=true
+PORTR_RS_LEASE_TTL_SECS=60
+PORTR_RS_DB_PATH={}
+PORTR_RS_ADMIN_TOKEN=change-me-admin-token
+PORTR_RS_CLEANUP_INTERVAL_SECS=300
+PORTR_RS_LEASE_RETENTION_SECS=604800
+",
+        default_db_path().display()
+    )
 }

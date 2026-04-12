@@ -17,7 +17,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 
-use crate::config::Config;
+use crate::config::{Config, ensure_default_env_file, load_env_file};
 use crate::store::AppStore;
 
 #[derive(Clone)]
@@ -33,6 +33,9 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    let env_path = ensure_default_env_file()?;
+    load_env_file(&env_path)?;
+
     let env_filter = EnvFilter::builder()
         .with_default_directive(LevelFilter::INFO.into())
         .from_env_lossy();
@@ -46,6 +49,7 @@ async fn main() -> Result<()> {
         ssh_addr = %config.ssh_addr,
         tunnel_domain = %config.tunnel_domain,
         db_path = %config.db_path.display(),
+        env_path = %env_path.display(),
         use_localhost = config.use_localhost,
         cleanup_interval_secs = config.cleanup_interval_secs,
         lease_retention_secs = config.lease_retention_secs,
@@ -133,6 +137,10 @@ Environment:
   PORTR_RS_ADMIN_TOKEN           Admin login token
   PORTR_RS_CLEANUP_INTERVAL_SECS Cleanup interval, default 300
   PORTR_RS_LEASE_RETENTION_SECS  Lease retention period, default 604800
+
+Default env file:
+  $HOME/.config/portr-rs/.env
+  The file is auto-created on first start when missing.
 "
     );
 }
