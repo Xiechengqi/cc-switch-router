@@ -1,0 +1,115 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Get version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "archive=portr-rs_${VERSION}_x86_64-unknown-linux-gnu.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Build release package
+        run: |
+          chmod +x ./build.sh
+          TARGET_TRIPLE=x86_64-unknown-linux-gnu ./build.sh
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-files
+          cp "dist/${{ steps.version.outputs.archive }}" release-files/
+          cp "dist/${{ steps.version.outputs.archive }}.sha256" release-files/
+          ls -lh release-files/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: portr-rs-linux-amd64
+          path: release-files/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Get version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "version=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "archive=portr-rs_${VERSION}_x86_64-unknown-linux-gnu.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "Current version: v${VERSION}"
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release-files
+          cp "artifacts/portr-rs-linux-amd64/${{ steps.version.outputs.archive }}" release-files/
+          cp "artifacts/portr-rs-linux-amd64/${{ steps.version.outputs.archive }}.sha256" release-files/
+          ls -lh release-files/
+
+      - name: Delete existing latest release and tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes || true
+          git push origin :refs/tags/latest || true
+
+      - name: Create latest tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -f latest
+          git push -f origin latest
+
+      - name: Create or Update Latest Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "Latest Build (${{ steps.version.outputs.version }})"
+          body: |
+            ## Latest automated build
+
+            Version: ${{ steps.version.outputs.version }}
+            Commit: ${{ github.sha }}
+            Branch: ${{ github.ref_name }}
+
+            ### Assets
+
+            - Ubuntu AMD64 package: `${{ steps.version.outputs.archive }}`
+            - SHA256: `${{ steps.version.outputs.archive }}.sha256`
+
+            ### Quick download
+
+            ```bash
+            wget https://github.com/${{ github.repository }}/releases/download/latest/${{ steps.version.outputs.archive }}
+            wget https://github.com/${{ github.repository }}/releases/download/latest/${{ steps.version.outputs.archive }}.sha256
+            sha256sum -c ${{ steps.version.outputs.archive }}.sha256
+            ```
+          files: release-files/*
+          prerelease: false
+          draft: false

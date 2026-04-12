@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>portr-rs Console</title>
+    <style>
+      :root {
+        --background: #fafafa;
+        --foreground: #0f172a;
+        --muted: #f1f5f9;
+        --muted-foreground: #64748b;
+        --accent: #0052ff;
+        --accent-secondary: #4d7cff;
+        --border: #e2e8f0;
+        --card: #ffffff;
+        --shadow: 0 20px 60px rgba(15, 23, 42, 0.08);
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: Inter, system-ui, sans-serif;
+        background:
+          radial-gradient(circle at top right, rgba(77, 124, 255, 0.14), transparent 26rem),
+          radial-gradient(circle at bottom left, rgba(0, 82, 255, 0.08), transparent 22rem),
+          var(--background);
+        color: var(--foreground);
+      }
+      .page { max-width: 1200px; margin: 0 auto; padding: 32px 20px 80px; }
+      .topbar {
+        display:flex;
+        justify-content:space-between;
+        align-items:center;
+        gap:12px;
+        flex-wrap:wrap;
+      }
+      .eyebrow {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        border: 1px solid rgba(0, 82, 255, 0.18);
+        background: rgba(0, 82, 255, 0.06);
+        color: var(--accent);
+        border-radius: 999px;
+        padding: 10px 14px;
+        font: 12px/1 "JetBrains Mono", monospace;
+        letter-spacing: 0.15em;
+        text-transform: uppercase;
+      }
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: linear-gradient(135deg, var(--accent), var(--accent-secondary));
+        box-shadow: 0 0 0 8px rgba(0, 82, 255, 0.1);
+        animation: pulse 2.2s infinite;
+      }
+      @keyframes pulse {
+        0%, 100% { transform: scale(1); opacity: 1; }
+        50% { transform: scale(1.15); opacity: 0.7; }
+      }
+      h1, h2 {
+        font-family: Calistoga, Georgia, serif;
+        font-weight: 400;
+        margin: 0;
+      }
+      h1 {
+        font-size: clamp(3rem, 8vw, 5.25rem);
+        line-height: 1.03;
+        letter-spacing: -0.02em;
+        max-width: 8ch;
+        margin-top: 18px;
+      }
+      .gradient-text {
+        background: linear-gradient(135deg, var(--accent), var(--accent-secondary));
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+      .hero {
+        display: grid;
+        grid-template-columns: 1.1fr 0.9fr;
+        gap: 28px;
+        align-items: stretch;
+        margin-top: 24px;
+      }
+      .hero-copy p {
+        max-width: 56ch;
+        color: var(--muted-foreground);
+        font-size: 1.05rem;
+        line-height: 1.75;
+      }
+      .panel {
+        background: rgba(255,255,255,0.76);
+        backdrop-filter: blur(18px);
+        border: 1px solid rgba(255,255,255,0.7);
+        border-radius: 28px;
+        padding: 22px;
+        box-shadow: var(--shadow);
+      }
+      .hero-panel {
+        position: relative;
+        overflow: hidden;
+        min-height: 280px;
+        background:
+          radial-gradient(circle at top right, rgba(77, 124, 255, 0.22), transparent 11rem),
+          linear-gradient(180deg, rgba(255,255,255,0.94), rgba(241,245,249,0.78));
+      }
+      .hero-panel::before {
+        content: "";
+        position: absolute;
+        inset: 20px auto auto 20px;
+        width: 180px;
+        height: 180px;
+        border-radius: 999px;
+        border: 1px dashed rgba(0, 82, 255, 0.28);
+        animation: spin 60s linear infinite;
+      }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      .stack {
+        position: absolute;
+        right: 18px;
+        bottom: 18px;
+        width: min(360px, calc(100% - 36px));
+        display: grid;
+        gap: 14px;
+      }
+      .mini-card {
+        background: rgba(15, 23, 42, 0.9);
+        color: white;
+        border-radius: 22px;
+        padding: 18px;
+        box-shadow: 0 14px 40px rgba(15, 23, 42, 0.22);
+      }
+      .mini-card strong {
+        display: block;
+        font-size: 1.4rem;
+        margin-top: 6px;
+      }
+      .stats {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 18px;
+        margin-top: 28px;
+      }
+      .stat-card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 24px;
+        padding: 22px;
+        box-shadow: var(--shadow);
+      }
+      .stat-card small {
+        display: block;
+        color: var(--muted-foreground);
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        font-size: 11px;
+        font-family: "JetBrains Mono", monospace;
+      }
+      .stat-card strong {
+        font-size: 2rem;
+        display: block;
+        margin-top: 10px;
+      }
+      .section {
+        margin-top: 42px;
+      }
+      .section-head {
+        display: flex;
+        align-items: end;
+        justify-content: space-between;
+        gap: 20px;
+        margin-bottom: 18px;
+      }
+      .section-head p {
+        margin: 0;
+        color: var(--muted-foreground);
+        max-width: 56ch;
+      }
+      .client-grid {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 18px;
+      }
+      .client-card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 28px;
+        padding: 22px;
+        box-shadow: var(--shadow);
+      }
+      .client-top, .lease-row {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        align-items: start;
+      }
+      .muted { color: var(--muted-foreground); }
+      .refresh-note {
+        color: var(--muted-foreground);
+        font-size: 13px;
+      }
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
+        border-radius: 999px;
+        font-size: 12px;
+        border: 1px solid rgba(0, 82, 255, 0.15);
+        background: rgba(0, 82, 255, 0.06);
+        color: var(--accent);
+      }
+      .lease-list {
+        margin-top: 18px;
+        display: grid;
+        gap: 12px;
+      }
+      .lease-row {
+        background: var(--muted);
+        border-radius: 18px;
+        padding: 14px 16px;
+      }
+      .lease-row strong, .token-table td strong { font-size: 0.98rem; }
+      .lease-meta, .token-meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 8px;
+        color: var(--muted-foreground);
+        font-size: 13px;
+      }
+      .dark-band {
+        margin-top: 42px;
+        background:
+          radial-gradient(circle at 20% 20%, rgba(77, 124, 255, 0.18), transparent 18rem),
+          radial-gradient(circle at 80% 0%, rgba(0, 82, 255, 0.12), transparent 20rem),
+          #0f172a;
+        color: white;
+        border-radius: 36px;
+        padding: 28px;
+        position: relative;
+        overflow: hidden;
+      }
+      .dark-band::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background-image: radial-gradient(rgba(255,255,255,0.08) 1px, transparent 1px);
+        background-size: 18px 18px;
+        opacity: 0.24;
+        pointer-events: none;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        position: relative;
+        z-index: 1;
+      }
+      th, td {
+        padding: 16px 12px;
+        text-align: left;
+        border-bottom: 1px solid rgba(255,255,255,0.08);
+        vertical-align: top;
+      }
+      th {
+        font: 12px/1 "JetBrains Mono", monospace;
+        text-transform: uppercase;
+        letter-spacing: 0.13em;
+        color: rgba(255,255,255,0.72);
+      }
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 7px 10px;
+        border-radius: 999px;
+        background: rgba(255,255,255,0.08);
+      }
+      .token-value {
+        font-family: "JetBrains Mono", monospace;
+        font-size: 12px;
+        color: rgba(255,255,255,0.92);
+      }
+      .empty {
+        padding: 28px;
+        border-radius: 22px;
+        background: var(--muted);
+        color: var(--muted-foreground);
+      }
+      @media (max-width: 980px) {
+        .hero, .stats, .client-grid { grid-template-columns: 1fr; }
+        .section-head { align-items: start; flex-direction: column; }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="page">
+      <div class="topbar">
+        <span class="eyebrow"><span class="dot"></span>portr-rs console</span>
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <span class="refresh-note">Auto refresh every 5s · last sync <span id="last-sync">n/a</span></span>
+          <button id="logout-btn" style="border:1px solid var(--border);background:white;color:var(--foreground);padding:10px 14px;border-radius:999px;cursor:pointer">Logout</button>
+        </div>
+      </div>
+      <section class="hero">
+        <div class="hero-copy">
+          <h1>See every <span class="gradient-text">client</span> and share token.</h1>
+          <p>
+            A single console for installation presence, active tunnel leases, and the
+            cc-switch share tokens currently flowing through portr-rs.
+          </p>
+        </div>
+        <div class="panel hero-panel">
+          <div class="stack">
+            <div class="mini-card">
+              <span class="muted">Live installations</span>
+              <strong id="mini-installations">0</strong>
+            </div>
+            <div class="mini-card" style="transform: translateY(14px)">
+              <span class="muted">Tracked shares</span>
+              <strong id="mini-shares">0</strong>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="stats" id="stats"></section>
+
+      <section class="section">
+        <div class="section-head">
+          <div>
+            <span class="eyebrow"><span class="dot"></span>clients</span>
+            <h2>Connected installations</h2>
+          </div>
+          <p>Each card shows one registered client, its platform footprint, and the leases it has issued for active or historical share tunnels.</p>
+        </div>
+        <div class="client-grid" id="clients"></div>
+      </section>
+
+      <section class="dark-band">
+        <div class="section-head" style="position: relative; z-index: 1">
+          <div>
+            <span class="eyebrow" style="background: rgba(255,255,255,0.08); border-color: rgba(255,255,255,0.12); color: #dbeafe"><span class="dot"></span>shares</span>
+            <h2>Token intelligence</h2>
+          </div>
+          <p style="color: rgba(255,255,255,0.72)">Masked share tokens, quota usage, request volume, and the latest tunnel binding uploaded from cc-switch.</p>
+        </div>
+        <div class="token-table">
+          <table>
+            <thead>
+              <tr>
+                <th>Share</th>
+                <th>Token</th>
+                <th>Usage</th>
+                <th>Status</th>
+                <th>Route</th>
+              </tr>
+            </thead>
+            <tbody id="shares"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+    <script>
+      const formatTime = (value) => {
+        if (!value) return "n/a";
+        return new Date(value).toLocaleString();
+      };
+
+      const maskToken = (value) => {
+        if (!value) return "n/a";
+        if (value.length <= 8) return value;
+        return `${value.slice(0, 4)}••••${value.slice(-4)}`;
+      };
+
+      const statItems = [
+        ["Installations", "installations"],
+        ["Tracked Shares", "shares"],
+        ["Active Leases", "activeLeases"],
+        ["Active Shares", "activeShares"],
+      ];
+
+      async function boot() {
+        const response = await fetch("/v1/dashboard");
+        if (response.status === 401) {
+          window.location.href = "/admin/login";
+          return;
+        }
+        const data = await response.json();
+        document.getElementById("last-sync").textContent = formatTime(data.generatedAt);
+        document.getElementById("mini-installations").textContent = data.stats.installations;
+        document.getElementById("mini-shares").textContent = data.stats.shares;
+
+        document.getElementById("stats").innerHTML = statItems.map(([label, key]) => `
+          <article class="stat-card">
+            <small>${label}</small>
+            <strong>${data.stats[key]}</strong>
+          </article>
+        `).join("");
+
+        const clients = document.getElementById("clients");
+        clients.innerHTML = data.installations.length ? data.installations.map((item) => `
+          <article class="client-card">
+            <div class="client-top">
+              <div>
+                <h3 style="margin:0 0 6px;font-size:1.3rem">${item.platform}</h3>
+                <div class="muted">v${item.appVersion}</div>
+              </div>
+              <span class="pill">${item.activeLeaseCount} active leases</span>
+            </div>
+            <div class="lease-meta">
+              <span>ID ${item.id.slice(0, 8)}</span>
+              <span>Created ${formatTime(item.createdAt)}</span>
+              <span>Seen ${formatTime(item.lastSeenAt)}</span>
+            </div>
+            <div class="lease-list">
+              ${(item.leases || []).slice(0, 4).map((lease) => `
+                <div class="lease-row">
+                  <div>
+                    <strong>${lease.subdomain}</strong>
+                    <div class="lease-meta">
+                      <span>${lease.tunnelType}</span>
+                      <span>Issued ${formatTime(lease.issuedAt)}</span>
+                      <span>Expires ${formatTime(lease.expiresAt)}</span>
+                    </div>
+                  </div>
+                  <span class="pill">${lease.isActive ? "active" : "expired"}</span>
+                </div>
+              `).join("") || '<div class="empty">No leases yet.</div>'}
+            </div>
+          </article>
+        `).join("") : '<div class="empty">No installations have registered yet.</div>';
+
+        const shares = document.getElementById("shares");
+        shares.innerHTML = data.shares.length ? data.shares.map((share) => `
+          <tr>
+            <td>
+              <strong>${share.shareName}</strong>
+              <div class="token-meta">
+                <span>${share.appType}</span>
+                <span>${share.providerId || "no provider"}</span>
+              </div>
+            </td>
+            <td><span class="token-value">${maskToken(share.shareToken)}</span></td>
+            <td>
+              <strong>${share.tokensUsed} / ${share.tokenLimit}</strong>
+              <div class="token-meta">
+                <span>${share.requestsCount} requests</span>
+              </div>
+            </td>
+            <td>
+              <span class="badge">${share.shareStatus}</span>
+              <div class="token-meta">
+                <span>${share.activeLeaseCount} active leases</span>
+                <span>expires ${formatTime(share.expiresAt)}</span>
+              </div>
+            </td>
+            <td>
+              <strong>${share.latestSubdomain}</strong>
+              <div class="token-meta">
+                <span>installation ${share.installationId.slice(0, 8)}</span>
+              </div>
+            </td>
+          </tr>
+        `).join("") : '<tr><td colspan="5"><div class="empty">No share metadata uploaded yet.</div></td></tr>';
+      }
+
+      boot().catch((error) => {
+        document.body.innerHTML += `<pre style="padding:20px;color:#b91c1c">${String(error)}</pre>`;
+      });
+      setInterval(() => {
+        boot().catch((error) => console.error(error));
+      }, 5000);
+      document.getElementById("logout-btn").addEventListener("click", async () => {
+        await fetch("/v1/admin/logout", { method: "POST" });
+        window.location.href = "/admin/login";
+      });
+    </script>
+  </body>
+</html>

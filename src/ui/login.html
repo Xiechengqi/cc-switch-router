@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>portr-rs Admin Login</title>
+    <style>
+      :root {
+        --background: #fafafa;
+        --foreground: #0f172a;
+        --muted: #f1f5f9;
+        --muted-foreground: #64748b;
+        --accent: #0052ff;
+        --accent-secondary: #4d7cff;
+        --border: #e2e8f0;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        font-family: Inter, system-ui, sans-serif;
+        background:
+          radial-gradient(circle at top right, rgba(77,124,255,.16), transparent 24rem),
+          radial-gradient(circle at bottom left, rgba(0,82,255,.08), transparent 20rem),
+          var(--background);
+        color: var(--foreground);
+      }
+      .card {
+        width: min(460px, calc(100vw - 32px));
+        background: rgba(255,255,255,.82);
+        backdrop-filter: blur(18px);
+        border: 1px solid rgba(255,255,255,.72);
+        border-radius: 28px;
+        padding: 28px;
+        box-shadow: 0 20px 60px rgba(15,23,42,.08);
+      }
+      .eyebrow {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        border: 1px solid rgba(0,82,255,.18);
+        background: rgba(0,82,255,.06);
+        color: var(--accent);
+        border-radius: 999px;
+        padding: 10px 14px;
+        font: 12px/1 "JetBrains Mono", monospace;
+        letter-spacing: .15em;
+        text-transform: uppercase;
+      }
+      .dot {
+        width: 8px; height: 8px; border-radius: 999px;
+        background: linear-gradient(135deg, var(--accent), var(--accent-secondary));
+      }
+      h1 {
+        margin: 18px 0 10px;
+        font-family: Calistoga, Georgia, serif;
+        font-weight: 400;
+        font-size: clamp(2.2rem, 8vw, 3.4rem);
+        line-height: 1.05;
+      }
+      p { color: var(--muted-foreground); line-height: 1.7; }
+      label { display:block; margin: 18px 0 8px; font-weight: 600; }
+      input {
+        width: 100%;
+        padding: 14px 16px;
+        border-radius: 16px;
+        border: 1px solid var(--border);
+        background: white;
+        font: inherit;
+      }
+      button {
+        margin-top: 18px;
+        width: 100%;
+        border: 0;
+        border-radius: 18px;
+        padding: 14px 18px;
+        color: white;
+        background: linear-gradient(135deg, var(--accent), var(--accent-secondary));
+        font: inherit;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      .error { color: #b91c1c; min-height: 20px; margin-top: 10px; font-size: 14px; }
+    </style>
+  </head>
+  <body>
+    <form class="card" id="login-form">
+      <span class="eyebrow"><span class="dot"></span>admin auth</span>
+      <h1>Unlock the console.</h1>
+      <p>Use the admin token configured in <code>PORTR_RS_ADMIN_TOKEN</code> to access the dashboard.</p>
+      <label for="token">Admin token</label>
+      <input id="token" name="token" type="password" autocomplete="current-password" required />
+      <button type="submit">Enter Admin Console</button>
+      <div class="error" id="error"></div>
+    </form>
+    <script>
+      document.getElementById("login-form").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const token = document.getElementById("token").value;
+        const error = document.getElementById("error");
+        error.textContent = "";
+        const response = await fetch("/v1/admin/login", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ token }),
+        });
+        if (!response.ok) {
+          error.textContent = "Invalid admin token.";
+          return;
+        }
+        window.location.href = "/admin";
+      });
+    </script>
+  </body>
+</html>
