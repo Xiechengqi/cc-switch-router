@@ -10,6 +10,7 @@ pub struct Config {
     pub api_addr: SocketAddr,
     pub ssh_addr: SocketAddr,
     pub tunnel_domain: String,
+    pub ssh_public_addr: String,
     pub use_localhost: bool,
     pub lease_ttl_secs: i64,
     pub db_path: PathBuf,
@@ -30,6 +31,7 @@ impl Config {
                 .expect("invalid PORTR_RS_SSH_ADDR"),
             tunnel_domain: env::var("PORTR_RS_TUNNEL_DOMAIN")
                 .unwrap_or_else(|_| "0.0.0.0:8787".to_string()),
+            ssh_public_addr: env::var("PORTR_RS_SSH_PUBLIC_ADDR").unwrap_or_default(),
             use_localhost: env::var("PORTR_RS_USE_LOCALHOST")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(true),
@@ -54,6 +56,14 @@ impl Config {
     pub fn tunnel_url(&self, subdomain: &str) -> String {
         let scheme = if self.use_localhost { "http" } else { "https" };
         format!("{scheme}://{subdomain}.{}", self.tunnel_domain)
+    }
+
+    pub fn effective_ssh_public_addr(&self) -> String {
+        if !self.ssh_public_addr.is_empty() {
+            return self.ssh_public_addr.clone();
+        }
+        let port = self.ssh_addr.port();
+        format!("{}:{}", self.tunnel_domain, port)
     }
 }
 

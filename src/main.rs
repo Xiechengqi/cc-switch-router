@@ -48,6 +48,7 @@ async fn main() -> Result<()> {
         api_addr = %config.api_addr,
         ssh_addr = %config.ssh_addr,
         tunnel_domain = %config.tunnel_domain,
+        ssh_public_addr = %config.effective_ssh_public_addr(),
         db_path = %config.db_path.display(),
         env_path = %env_path.display(),
         use_localhost = config.use_localhost,
@@ -139,6 +140,7 @@ Environment:
   PORTR_RS_API_ADDR              HTTP listen address, default 0.0.0.0:8787
   PORTR_RS_SSH_ADDR              SSH listen address, default 0.0.0.0:2222
   PORTR_RS_TUNNEL_DOMAIN         Public tunnel domain, default 0.0.0.0:8787
+  PORTR_RS_SSH_PUBLIC_ADDR       SSH address sent to clients, default TUNNEL_DOMAIN:SSH_PORT
   PORTR_RS_USE_LOCALHOST         Use http for localhost-style domains, default true
   PORTR_RS_LEASE_TTL_SECS        Tunnel lease ttl, default 60
   PORTR_RS_DB_PATH               SQLite path, default $HOME/.config/portr-rs/portr-rs.db

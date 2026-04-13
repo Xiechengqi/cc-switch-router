@@ -188,6 +188,7 @@ impl AppStore {
             connection_id: lease.connection_id,
             ssh_username: lease.ssh_username,
             ssh_password,
+            ssh_addr: config.effective_ssh_public_addr(),
             expires_at,
             tunnel_url: config.tunnel_url(&subdomain),
             subdomain,

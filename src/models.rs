@@ -94,6 +94,7 @@ pub struct IssueLeaseResponse {
     pub connection_id: String,
     pub ssh_username: String,
     pub ssh_password: String,
+    pub ssh_addr: String,
     pub expires_at: DateTime<Utc>,
     pub tunnel_url: String,
     pub subdomain: String,

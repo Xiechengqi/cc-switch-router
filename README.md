@@ -2,11 +2,29 @@
 
 面向 `cc-switch` 的最小 Rust tunnel server。
 
-## 快速开始
+## 技术架构
 
-### 源码运行
+```
+                  ┌──────────────────────────────────┐
+                  │            portr-rs               │
+                  │                                   │
+  HTTPS ──────►  │  HTTP API + Subdomain Proxy (:80) │
+  (Cloudflare)   │                                   │
+                  │  SSH Reverse Forwarding  (:2222)  │
+  SSH ─────────► │                                   │
+                  │  SQLite (lease/share/install)      │
+                  └──────────────────────────────────┘
+```
 
-当前实现包含：
+单进程同时承载三个职责：
+
+- **HTTP 服务** — API 端点 + 基于 Host subdomain 的反向代理，共用同一端口
+- **SSH 服务** — 基于 `russh` 的 reverse forwarding，一次性密码认证
+- **数据存储** — SQLite，存储 installation、lease、share 等状态
+
+核心依赖：`axum`、`russh`、`rusqlite`、`tokio`
+
+当前实现的端点：
 
 - `POST /v1/installations/register`
 - `POST /v1/tunnels/lease`
@@ -16,183 +34,78 @@
 - `POST /v1/shares/batch-sync`
 - `POST /v1/shares/delete`
 - `GET /admin`
-- 基于 `russh` 的一次性 SSH 密码认证
-- 基于 Host subdomain 的最小 HTTP 反向代理
-
-默认监听：
-
-- HTTP API: `0.0.0.0:8787`
-- SSH: `0.0.0.0:2222`
-- Tunnel domain: `0.0.0.0:8787`
-
-可通过环境变量覆盖：
-
-- `PORTR_RS_API_ADDR`
-- `PORTR_RS_SSH_ADDR`
-- `PORTR_RS_TUNNEL_DOMAIN`
-- `PORTR_RS_USE_LOCALHOST`
-- `PORTR_RS_LEASE_TTL_SECS`
-- `PORTR_RS_DB_PATH`，默认 `$HOME/.config/portr-rs/portr-rs.db`
-- `PORTR_RS_CLEANUP_INTERVAL_SECS`
-- `PORTR_RS_LEASE_RETENTION_SECS`
-
-默认配置文件路径：
-
-- `$HOME/.config/portr-rs/.env`
-
-启动时如果这个文件不存在，`portr-rs` 会自动生成默认 `.env`，然后按该文件加载配置。进程环境变量优先级更高，会覆盖 `.env` 里的同名配置。
-
-`/admin` 和 `/v1/dashboard` 默认公开可读，不需要登录。
-
-启动：
-
-```bash
-cargo run
-```
-
-查看帮助：
-
-```bash
-cargo run -- help
-```
-
-默认日志级别是 `info`。如需查看更多细节，可显式指定：
-
-```bash
-RUST_LOG=debug cargo run
-```
-
-### 一键构建
-
-项目根目录已提供 [build.sh](/data/projects/portr-rs/build.sh)：
-
-```bash
-chmod +x ./build.sh
-./build.sh
-```
-
-默认行为：
-
-- 执行 `cargo build --release`
-- 将二进制和部署文件整理到 `dist/`
-- 生成 `.tar.gz` 发布包
-- 生成 `sha256` 校验文件（系统支持时）
-
-这里的 `.tar.gz` 仅用于本地构建验证，不是推荐部署方式。
-
-可选环境变量：
-
-```bash
-TARGET_TRIPLE=x86_64-unknown-linux-gnu ./build.sh
-BUILD_MODE=debug ./build.sh
-```
 
 ## 二进制部署
 
-### 1. 准备发布包
+### 准备发布包
 
 GitHub Actions 会在 `main` 分支自动构建 Ubuntu AMD64 二进制，并更新 `latest` Release。部署时直接下载 release binary：
 
 ```bash
-wget https://github.com/<owner>/<repo>/releases/download/latest/portr-rs-linux-amd64 -O portr-rs
-chmod +x portr-rs
+wget https://github.com/xiechengqi/portr-rs/releases/download/latest/portr-rs-linux-amd64 -O /usr/local/bin/portr-rs && chmod +x /usr/local/bin/portr-rs
 ```
 
-### GitHub Release
+### 环境变量
 
-GitHub Actions 会在 `main` 分支自动构建 Ubuntu AMD64 二进制，并更新 `latest` Release。GitHub Release 不上传 `.tar.gz`，只附带单个二进制文件：
+默认配置文件路径：`$HOME/.config/portr-rs/.env`
 
-- `portr-rs-linux-amd64`
+启动时如果这个文件不存在，`portr-rs` 会自动生成默认 `.env`，然后按该文件加载配置。进程环境变量优先级更高，会覆盖 `.env` 里的同名配置。
 
-### 2. 放置二进制
+可用环境变量：
 
-示例：
-
-```bash
-mkdir -p /opt/portr-rs
-mv portr-rs /opt/portr-rs/portr-rs
-```
-
-### 3. 准备运行目录
-
-建议目录结构：
-
-```text
-/opt/portr-rs/
-  portr-rs
-```
-
-### 4. 配置环境变量
-
-首次启动前不必手动创建配置文件。默认情况下，服务会自动生成：
-
-```text
-$HOME/.config/portr-rs/.env
-```
-
-如需预先编辑，可直接创建或修改这个文件。
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `PORTR_RS_API_ADDR` | `0.0.0.0:8787` | HTTP 监听地址 |
+| `PORTR_RS_SSH_ADDR` | `0.0.0.0:2222` | SSH 监听地址 |
+| `PORTR_RS_TUNNEL_DOMAIN` | `0.0.0.0:8787` | 公共 tunnel 域名 |
+| `PORTR_RS_SSH_PUBLIC_ADDR` | `{TUNNEL_DOMAIN}:{SSH_PORT}` | 下发给客户端的 SSH 地址（Cloudflare 代理时填源站 IP:端口） |
+| `PORTR_RS_USE_LOCALHOST` | `true` | 为 `false` 时 tunnel URL 使用 `https://` |
+| `PORTR_RS_LEASE_TTL_SECS` | `60` | Tunnel lease 有效期（秒） |
+| `PORTR_RS_DB_PATH` | `$HOME/.config/portr-rs/portr-rs.db` | SQLite 路径 |
+| `PORTR_RS_CLEANUP_INTERVAL_SECS` | `300` | 清理任务执行间隔（秒） |
+| `PORTR_RS_LEASE_RETENTION_SECS` | `604800` | 过期 lease 保留时长（秒） |
 
 最小生产示例：
 
 ```bash
 cat > "$HOME/.config/portr-rs/.env" <<'EOF'
-PORTR_RS_API_ADDR=0.0.0.0:8787
+PORTR_RS_API_ADDR=0.0.0.0:80
 PORTR_RS_SSH_ADDR=0.0.0.0:2222
-PORTR_RS_TUNNEL_DOMAIN=your-domain.example.com
+PORTR_RS_TUNNEL_DOMAIN=example.com
 PORTR_RS_USE_LOCALHOST=false
-PORTR_RS_DB_PATH=$HOME/.config/portr-rs/portr-rs.db
 EOF
 ```
 
-如果需要长期保留更少历史数据，可额外配置：
+### 启动
 
 ```bash
-export PORTR_RS_CLEANUP_INTERVAL_SECS=300
-export PORTR_RS_LEASE_RETENTION_SECS=604800
-```
-
-### 5. 启动二进制
-
-```bash
-cd /opt/portr-rs
-./portr-rs
+portr-rs
 ```
 
 查看帮助：
 
 ```bash
-./portr-rs help
+portr-rs help
 ```
 
-默认启动会打印 `info` 级别日志。生产环境如需调整日志详细程度，可追加：
+调整日志级别：
 
 ```bash
-RUST_LOG=debug ./portr-rs
+RUST_LOG=debug portr-rs
 ```
 
-### 6. 验证部署
-
-健康检查：
+### 验证部署
 
 ```bash
-curl http://127.0.0.1:8787/v1/healthz
+curl http://127.0.0.1/v1/healthz
+# {"ok":true}
 ```
 
-预期返回：
+控制台：`http://127.0.0.1/admin`
 
-```json
-{"ok":true}
-```
+`/admin` 和 `/v1/dashboard` 默认公开可读，不需要登录。
 
-控制台地址：
-
-```text
-http://127.0.0.1:8787/admin
-```
-
-### 7. systemd 部署示例
-
-示例服务文件：
+### systemd 部署示例
 
 ```ini
 [Unit]
@@ -212,8 +125,6 @@ RestartSec=3
 WantedBy=multi-user.target
 ```
 
-应用：
-
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable portr-rs
@@ -221,16 +132,10 @@ sudo systemctl start portr-rs
 sudo systemctl status portr-rs
 ```
 
-打开控制台：
-
-```text
-http://127.0.0.1:8787/admin
-```
-
-当前限制：
+## 当前限制
 
 - 仅实现 HTTP tunnel
 - 设备私钥仍由 `cc-switch` 以本地文件方式保存，未接入系统安全存储
-- share 用量同步为“事件驱动最终一致”，由 `cc-switch` 在创建、状态变更、用量变更、删除时异步上报
+- share 用量同步为"事件驱动最终一致"，由 `cc-switch` 在创建、状态变更、用量变更、删除时异步上报
 - `cc-switch` 端 share 同步已做短延迟批量聚合，降低高频请求噪音
 - `portr-rs` 会定时清理超过保留期的历史 lease，以及状态为 `expired` / `deleted` 的陈旧 share 记录
