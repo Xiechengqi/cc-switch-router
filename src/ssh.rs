@@ -7,7 +7,9 @@ use russh::keys::key::KeyPair;
 use russh::server::Msg;
 use russh::server::{Auth, Session};
 use russh::{Channel, ChannelId, server};
+use tokio::io;
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 use tracing::{error, info};
 
 use crate::proxy::ProxyRegistry;
@@ -25,6 +27,7 @@ struct ClientHandler {
     proxy: Arc<ProxyRegistry>,
     lease: Option<crate::models::TunnelLease>,
     backend: Option<String>,
+    forward_task: Option<Arc<JoinHandle<()>>>,
 }
 
 impl SshServer {
@@ -45,6 +48,7 @@ impl SshServer {
                 proxy: self.proxy.clone(),
                 lease: None,
                 backend: None,
+                forward_task: None,
             };
             tokio::spawn(async move {
                 if let Err(err) = server::run_stream(config, socket, handler).await {
@@ -94,20 +98,43 @@ impl server::Handler for ClientHandler {
         &mut self,
         address: &str,
         port: &mut u32,
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<bool, Self::Error> {
         let Some(lease) = self.lease.as_ref() else {
             return Ok(false);
         };
+        if let Some(task) = self.forward_task.take() {
+            task.abort();
+        }
+
         let host = normalize_backend_host(address);
+        let listener = match TcpListener::bind((host, *port as u16)).await {
+            Ok(listener) => listener,
+            Err(err) => {
+                error!("failed to bind forwarded port {}:{}: {}", host, *port, err);
+                return Ok(false);
+            }
+        };
+        let bound_port = listener.local_addr()?.port();
+        *port = bound_port as u32;
         let backend = format!("{host}:{port}");
         self.proxy
             .set_route(lease.subdomain.clone(), backend.clone())
             .await;
-        self.backend = Some(backend);
+        self.backend = Some(backend.clone());
+        let handle = session.handle();
+        let connected_address = address.to_string();
+        let task = tokio::spawn(async move {
+            if let Err(err) =
+                serve_forward_listener(listener, handle, connected_address, bound_port).await
+            {
+                error!("forward listener failed on port {}: {}", bound_port, err);
+            }
+        });
+        self.forward_task = Some(Arc::new(task));
         info!(
             "registered backend for subdomain={} connection_id={} backend={}",
-            lease.subdomain, lease.connection_id, host
+            lease.subdomain, lease.connection_id, backend
         );
         Ok(true)
     }
@@ -117,6 +144,9 @@ impl server::Handler for ClientHandler {
         _channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if let Some(task) = self.forward_task.take() {
+            task.abort();
+        }
         if let Some(lease) = self.lease.as_ref() {
             self.proxy.remove_route(&lease.subdomain).await;
         }
@@ -129,10 +159,50 @@ impl server::Handler for ClientHandler {
         _port: u32,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
+        if let Some(task) = self.forward_task.take() {
+            task.abort();
+        }
         if let Some(lease) = self.lease.as_ref() {
             self.proxy.remove_route(&lease.subdomain).await;
         }
         Ok(true)
+    }
+}
+
+async fn serve_forward_listener(
+    listener: TcpListener,
+    handle: russh::server::Handle,
+    connected_address: String,
+    connected_port: u16,
+) -> Result<()> {
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        let handle = handle.clone();
+        let connected_address = connected_address.clone();
+        tokio::spawn(async move {
+            let originator_address = peer.ip().to_string();
+            let originator_port = peer.port() as u32;
+            match handle
+                .channel_open_forwarded_tcpip(
+                    connected_address,
+                    connected_port as u32,
+                    originator_address,
+                    originator_port,
+                )
+                .await
+            {
+                Ok(channel) => {
+                    let mut ssh_stream = channel.into_stream();
+                    let mut stream = stream;
+                    if let Err(err) = io::copy_bidirectional(&mut stream, &mut ssh_stream).await {
+                        error!("forwarded tcp bridge failed: {}", err);
+                    }
+                }
+                Err(err) => {
+                    error!("failed to open forwarded tcp channel: {}", err);
+                }
+            }
+        });
     }
 }
 
