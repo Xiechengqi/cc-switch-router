@@ -121,12 +121,19 @@ pub async fn proxy_handler(State(state): State<ServerState>, req: Request) -> Re
     };
 
     let status = upstream.status();
-    let headers = upstream.headers().clone();
-    let body = upstream.bytes().await.unwrap_or_default();
-    let mut response = Response::new(Body::from(body));
+    let response_headers = upstream.headers().clone();
+
+    // Stream the response body instead of buffering it entirely.
+    // This is critical for SSE (text/event-stream) responses so that
+    // downstream clients receive chunks in real time and cc-switch's
+    // usage collector fires correctly when the stream ends.
+    let body_stream = upstream.bytes_stream();
+    let body = Body::from_stream(body_stream);
+
+    let mut response = Response::new(body);
     *response.status_mut() = status;
     response.headers_mut().clear();
-    for (name, value) in &headers {
+    for (name, value) in &response_headers {
         if is_hop_by_hop_header(name.as_str()) {
             continue;
         }
