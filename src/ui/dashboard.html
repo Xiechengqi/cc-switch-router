@@ -283,29 +283,21 @@
         font-size: 12px;
         color: rgba(255,255,255,0.92);
       }
-      .share-request-stack {
-        margin-top: 12px;
-        display: grid;
-        gap: 10px;
-      }
-      .share-request-item {
-        padding: 12px 14px;
+      .share-request-table {
+        margin-top: 14px;
+        width: 100%;
         border-radius: 16px;
-        background: rgba(255,255,255,0.06);
+        overflow: hidden;
+        background: rgba(255,255,255,0.04);
       }
-      .share-request-head {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 12px;
-      }
-      .share-request-meta {
-        margin-top: 8px;
-        display: flex;
-        flex-wrap: wrap;
-        gap: 10px;
-        color: rgba(255,255,255,0.72);
+      .share-request-table th,
+      .share-request-table td {
+        padding: 10px 12px;
         font-size: 12px;
+        border-bottom: 1px solid rgba(255,255,255,0.06);
+      }
+      .share-request-table th {
+        color: rgba(255,255,255,0.62);
       }
       .empty {
         padding: 28px;
@@ -491,23 +483,43 @@
               <div class="token-meta">
                 <span>installation ${share.installationId.slice(0, 8)}</span>
               </div>
-              <div class="share-request-stack">
-                ${share.recentRequests?.length ? share.recentRequests.map((log) => `
-                  <div class="share-request-item">
-                    <div class="share-request-head">
-                      <strong>${log.model || log.requestModel || "-"}</strong>
-                      <span class="badge">${log.statusCode}</span>
-                    </div>
-                    <div class="share-request-meta">
-                      <span>${formatTime((log.createdAt || 0) * 1000)}</span>
-                      <span>${log.providerName || log.providerId}</span>
-                      <span>${totalTokens(log)} tokens</span>
-                      <span>${log.latencyMs} ms</span>
-                      <span>${log.isStreaming ? "stream" : "request"}</span>
-                    </div>
-                  </div>
-                `).join("") : '<div class="share-request-item"><span class="muted">No request logs synced yet.</span></div>'}
-              </div>
+              ${share.recentRequests?.length ? `
+                <table class="share-request-table">
+                  <thead>
+                    <tr>
+                      <th>Time</th>
+                      <th>Model</th>
+                      <th>Input</th>
+                      <th>Output</th>
+                      <th>Cache Read</th>
+                      <th>Cache Create</th>
+                      <th>Total</th>
+                      <th>Status</th>
+                      <th>Latency</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    ${share.recentRequests.map((log) => `
+                      <tr>
+                        <td>${formatTime((log.createdAt || 0) * 1000)}</td>
+                        <td>
+                          <strong>${log.model || log.requestModel || "-"}</strong>
+                          <div class="token-meta" style="margin-top:4px">
+                            <span>${log.providerName || log.providerId}</span>
+                          </div>
+                        </td>
+                        <td>${log.inputTokens || 0}</td>
+                        <td>${log.outputTokens || 0}</td>
+                        <td>${log.cacheReadTokens || 0}</td>
+                        <td>${log.cacheCreationTokens || 0}</td>
+                        <td>${totalTokens(log)}</td>
+                        <td>${log.statusCode}</td>
+                        <td>${log.latencyMs} ms</td>
+                      </tr>
+                    `).join("")}
+                  </tbody>
+                </table>
+              ` : '<div class="empty" style="margin-top:14px">No request logs synced yet.</div>'}
             </td>
           </tr>
         `).join("") : '<tr><td colspan="5"><div class="empty">No share metadata uploaded yet.</div></td></tr>';
