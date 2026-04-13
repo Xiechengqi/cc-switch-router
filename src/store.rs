@@ -285,7 +285,11 @@ impl AppStore {
         Ok(())
     }
 
-    pub async fn dashboard_snapshot(&self) -> Result<DashboardResponse, AppError> {
+    pub async fn dashboard_snapshot(
+        &self,
+        proxy: &ProxyRegistry,
+    ) -> Result<DashboardResponse, AppError> {
+        let active_subdomains = proxy.active_subdomains().await.into_iter().collect::<HashSet<_>>();
         let conn = self.conn.lock().await;
         let now = Utc::now();
 
@@ -307,7 +311,7 @@ impl AppStore {
             let mut active_lease_count = 0usize;
             if let Some(items) = leases_by_installation.get(&installation.id) {
                 for lease in items {
-                    let is_active = lease.expires_at > now;
+                    let is_active = active_subdomains.contains(&lease.subdomain);
                     if is_active {
                         active_lease_count += 1;
                     }
@@ -340,7 +344,8 @@ impl AppStore {
         let share_views = shares
             .into_iter()
             .map(
-                |(installation_id, share, latest_subdomain, active_lease_count)| {
+                |(installation_id, share, latest_subdomain, _active_lease_count)| {
+                    let active_lease_count = usize::from(active_subdomains.contains(&latest_subdomain));
                     if active_lease_count > 0 {
                         active_share_ids.insert(share.share_id.clone());
                     }

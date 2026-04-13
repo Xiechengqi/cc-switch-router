@@ -66,7 +66,7 @@ async fn issue_lease(
 async fn dashboard(
     State(state): State<ServerState>,
 ) -> Result<Json<DashboardResponse>, AppError> {
-    Ok(Json(state.store.dashboard_snapshot().await?))
+    Ok(Json(state.store.dashboard_snapshot(&state.proxy).await?))
 }
 
 async fn admin_page() -> Html<&'static str> {
