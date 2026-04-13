@@ -99,19 +99,15 @@ impl server::Handler for ClientHandler {
         let Some(lease) = self.lease.as_ref() else {
             return Ok(false);
         };
-        let host = if address.is_empty() {
-            "127.0.0.1"
-        } else {
-            address
-        };
+        let host = normalize_backend_host(address);
         let backend = format!("{host}:{port}");
         self.proxy
             .set_route(lease.subdomain.clone(), backend.clone())
             .await;
         self.backend = Some(backend);
         info!(
-            "registered backend for subdomain={} connection_id={}",
-            lease.subdomain, lease.connection_id
+            "registered backend for subdomain={} connection_id={} backend={}",
+            lease.subdomain, lease.connection_id, host
         );
         Ok(true)
     }
@@ -137,5 +133,12 @@ impl server::Handler for ClientHandler {
             self.proxy.remove_route(&lease.subdomain).await;
         }
         Ok(true)
+    }
+}
+
+fn normalize_backend_host(address: &str) -> &str {
+    match address.trim() {
+        "" | "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
+        value => value,
     }
 }
