@@ -80,6 +80,21 @@ pub async fn proxy_handler(State(state): State<ServerState>, req: Request) -> Re
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
 
+    let host_without_port = host.split(':').next().unwrap_or(&host);
+    let tunnel_suffix = format!(".{}", state.config.tunnel_domain);
+    if host_without_port != state.config.tunnel_domain
+        && !host_without_port.ends_with(&tunnel_suffix)
+    {
+        tracing::debug!(
+            method = %method,
+            host = %host,
+            path = %path_and_query,
+            tunnel_domain = %state.config.tunnel_domain,
+            "proxy request ignored: host outside tunnel domain"
+        );
+        return simple_response(StatusCode::NOT_FOUND, "not-found");
+    }
+
     let Some((backend, route_share_token)) = state
         .proxy
         .backend_for_host(&host, &state.config.tunnel_domain)
