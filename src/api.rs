@@ -9,7 +9,7 @@ use axum::{
 use crate::ServerState;
 use crate::error::AppError;
 use crate::models::{
-    DashboardResponse, HealthResponse, IssueLeaseRequest, IssueLeaseResponse,
+    DashboardPresenceRequest, DashboardPresenceResponse, DashboardResponse, HealthResponse, IssueLeaseRequest, IssueLeaseResponse,
     RegisterInstallationRequest, RegisterInstallationResponse, ShareBatchSyncRequest,
     ShareClaimSubdomainRequest, ShareDeleteRequest, ShareHeartbeatRequest,
     ShareRequestLogBatchSyncRequest, ShareSyncRequest,
@@ -22,6 +22,7 @@ pub fn router(state: ServerState) -> Router {
         .route("/favicon.ico", get(favicon))
         .route("/v1/healthz", get(health))
         .route("/v1/dashboard", get(dashboard))
+        .route("/v1/dashboard/presence", post(dashboard_presence))
         .route("/v1/installations/register", post(register_installation))
         .route("/v1/tunnels/lease", post(issue_lease))
         .route("/v1/shares/claim-subdomain", post(claim_share_subdomain))
@@ -71,6 +72,14 @@ async fn dashboard(
     State(state): State<ServerState>,
 ) -> Result<Json<DashboardResponse>, AppError> {
     Ok(Json(state.store.dashboard_snapshot(&state.proxy).await?))
+}
+
+async fn dashboard_presence(
+    State(state): State<ServerState>,
+    Json(input): Json<DashboardPresenceRequest>,
+) -> Result<Json<DashboardPresenceResponse>, AppError> {
+    let online_count = state.store.record_dashboard_presence(input).await?;
+    Ok(Json(DashboardPresenceResponse { online_count }))
 }
 
 async fn admin_page() -> Html<&'static str> {

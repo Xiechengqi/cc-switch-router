@@ -78,6 +78,19 @@
         font-size: 12px;
         color: var(--muted-foreground);
       }
+      .page-footer {
+        margin-top: 28px;
+        display: flex;
+        justify-content: flex-end;
+        font: 11px/1 "JetBrains Mono", monospace;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        color: var(--muted-foreground);
+      }
+      .page-footer strong {
+        margin-left: 8px;
+        color: var(--foreground);
+      }
 
       /* ── Section labels ── */
       .section { margin-top: 0; }
@@ -476,6 +489,10 @@
           </table>
         </div>
       </section>
+      <footer class="page-footer">
+        <span>Page Online</span>
+        <strong id="page-online-count">0</strong>
+      </footer>
     </main>
 
     <!-- Universal drawer -->
@@ -496,6 +513,9 @@
       let _installations = [];
       let _shares = [];
       let _drawerOpen = false;
+      const _pagePresenceSession = (window.crypto && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : `session-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
       /* ── Helpers ── */
       function relTime(value) {
@@ -589,6 +609,18 @@
           dots.push(`<span class="health-dot ${cls}" title="${rel} — ${statusText}"></span>`);
         }
         return `<span class="health-dots">${dots.join("")}</span>`;
+      }
+
+      async function updatePagePresence() {
+        const res = await fetch("/v1/dashboard/presence", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId: _pagePresenceSession }),
+          keepalive: true,
+        });
+        if (!res.ok) throw new Error("Failed to update presence: " + res.status);
+        const data = await res.json();
+        document.getElementById("page-online-count").textContent = String(data.onlineCount ?? 0);
       }
 
       /* ── Drawer ── */
@@ -787,7 +819,9 @@
       boot().catch(err => {
         document.body.innerHTML += `<pre style="padding:20px;color:#b91c1c">${String(err)}</pre>`;
       });
+      updatePagePresence().catch(console.error);
       setInterval(() => boot().catch(console.error), 5000);
+      setInterval(() => updatePagePresence().catch(console.error), 15000);
     </script>
   </body>
 </html>

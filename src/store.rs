@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::error::AppError;
 use crate::models::{
-    DashboardResponse, DashboardStats, HealthCheckEntry, Installation, InstallationView,
+    DashboardPresenceRequest, DashboardResponse, DashboardStats, HealthCheckEntry, Installation, InstallationView,
     IssueLeaseRequest, IssueLeaseResponse, LeaseView, RegisterInstallationRequest,
     RegisterInstallationResponse, ShareBatchSyncRequest, ShareClaimSubdomainRequest,
     ShareDeleteRequest, ShareDescriptor, ShareHeartbeatRequest, ShareRequestLogBatchSyncRequest,
@@ -72,6 +72,40 @@ impl AppStore {
         Ok(RegisterInstallationResponse {
             installation_id: installation.id,
         })
+    }
+
+    pub async fn record_dashboard_presence(
+        &self,
+        input: DashboardPresenceRequest,
+    ) -> Result<usize, AppError> {
+        let session_id = input.session_id.trim();
+        if session_id.is_empty() {
+            return Err(AppError::BadRequest("session_id is required".into()));
+        }
+
+        let now = Utc::now().timestamp();
+        let cutoff = now - 30;
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO dashboard_presence (session_id, last_seen_at)
+             VALUES (?1, ?2)
+             ON CONFLICT(session_id) DO UPDATE SET last_seen_at = excluded.last_seen_at",
+            params![session_id, now],
+        )
+        .map_err(|e| AppError::Internal(format!("upsert dashboard presence failed: {e}")))?;
+        conn.execute(
+            "DELETE FROM dashboard_presence WHERE last_seen_at < ?1",
+            params![cutoff],
+        )
+        .map_err(|e| AppError::Internal(format!("prune dashboard presence failed: {e}")))?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dashboard_presence WHERE last_seen_at >= ?1",
+                params![cutoff],
+                |row| row.get(0),
+            )
+            .map_err(|e| AppError::Internal(format!("count dashboard presence failed: {e}")))?;
+        Ok(count as usize)
     }
 
     pub async fn issue_lease(
@@ -724,12 +758,18 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             is_healthy INTEGER NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS dashboard_presence (
+            session_id TEXT PRIMARY KEY,
+            last_seen_at INTEGER NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_leases_installation_id ON leases(installation_id);
         CREATE INDEX IF NOT EXISTS idx_leases_subdomain ON leases(subdomain);
         CREATE INDEX IF NOT EXISTS idx_shares_installation_id ON shares(installation_id);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_shares_subdomain_unique ON shares(subdomain) WHERE subdomain IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_share_request_logs_share_id ON share_request_logs(share_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_share_health_checks ON share_health_checks(share_id, checked_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_dashboard_presence_last_seen ON dashboard_presence(last_seen_at DESC);
         ",
     )
     .map_err(|e| AppError::Internal(format!("init schema failed: {e}")))?;
