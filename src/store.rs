@@ -20,6 +20,7 @@ use crate::models::{
     ShareDeleteRequest, ShareDescriptor, ShareHeartbeatRequest, ShareRequestLogBatchSyncRequest,
     ShareRequestLogEntry, ShareSyncRequest, ShareView, TunnelLease,
 };
+use crate::ServerGeo;
 use crate::proxy::ProxyRegistry;
 
 #[derive(Clone)]
@@ -504,7 +505,8 @@ impl AppStore {
 
     pub async fn dashboard_snapshot(
         &self,
-        config: &Config,
+        _config: &Config,
+        server_geo: &ServerGeo,
         proxy: &ProxyRegistry,
     ) -> Result<DashboardResponse, AppError> {
         let active_subdomains = proxy.active_subdomains().await.into_iter().collect::<HashSet<_>>();
@@ -641,9 +643,9 @@ impl AppStore {
                 active_shares: active_share_ids.len(),
             },
             map: DashboardMap {
-                server: config.server_lat.zip(config.server_lon).map(|(lat, lon)| DashboardMapPoint {
+                server: server_geo.lat.zip(server_geo.lon).map(|(lat, lon)| DashboardMapPoint {
                     id: "server".into(),
-                    label: config.server_label.clone(),
+                    label: "server".into(),
                     point_type: "server".into(),
                     platform: None,
                     country_code: None,

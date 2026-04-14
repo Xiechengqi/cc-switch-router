@@ -104,16 +104,7 @@
         border-right: 1px solid rgba(226, 232, 240, 0.9);
       }
       .map-stage-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        gap: 10px;
         margin-bottom: 10px;
-      }
-      .map-stage-header strong { font-size: 0.96rem; }
-      .map-stage-header span {
-        font-size: 12px;
-        color: var(--muted-foreground);
       }
       .map-shell {
         position: relative;
@@ -125,11 +116,25 @@
           #f8fbff;
         border: 1px solid rgba(226, 232, 240, 0.9);
         overflow: hidden;
+        cursor: default;
+        user-select: none;
       }
+      .map-shell.zoomed { cursor: grab; }
+      .map-shell.dragging { cursor: grabbing; }
       .map-controls {
+        position: absolute;
+        left: 16px;
+        bottom: 16px;
+        z-index: 4;
         display: inline-flex;
         align-items: center;
         gap: 8px;
+        padding: 8px 10px;
+        border: 1px solid rgba(226, 232, 240, 0.95);
+        border-radius: 14px;
+        background: rgba(255, 255, 255, 0.88);
+        box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
+        backdrop-filter: blur(8px);
       }
       .map-zoom-label {
         min-width: 48px;
@@ -691,20 +696,18 @@
         <div class="table-card map-card">
           <div class="map-layout">
             <div class="map-stage">
-              <div class="map-stage-header">
-                <strong>Client & Server Topology</strong>
-                <div class="map-controls">
-                  <button class="map-control-btn" id="map-zoom-out" type="button" aria-label="Zoom out">-</button>
-                  <span class="map-zoom-label" id="map-zoom-label">100%</span>
-                  <button class="map-control-btn" id="map-zoom-in" type="button" aria-label="Zoom in">+</button>
-                  <button class="map-control-btn" id="map-zoom-reset" type="button" aria-label="Reset zoom">0</button>
-                </div>
-              </div>
+              <div class="map-stage-header"></div>
               <div class="map-shell" id="map-shell">
                 <div class="map-canvas" id="map-canvas">
                   <img class="world-image" src="/assets/world-map.svg" alt="" />
                   <svg class="map-overlay" id="map-overlay" viewBox="0 0 1000 520" preserveAspectRatio="none"></svg>
                   <div id="map-points"></div>
+                </div>
+                <div class="map-controls">
+                  <button class="map-control-btn" id="map-zoom-out" type="button" aria-label="Zoom out">-</button>
+                  <span class="map-zoom-label" id="map-zoom-label">100%</span>
+                  <button class="map-control-btn" id="map-zoom-in" type="button" aria-label="Zoom in">+</button>
+                  <button class="map-control-btn" id="map-zoom-reset" type="button" aria-label="Reset map view">↺</button>
                 </div>
                 <div class="map-empty" id="map-empty">Waiting for server geo or client locations</div>
               </div>
@@ -791,6 +794,9 @@
       let _shares = [];
       let _drawerOpen = false;
       let _mapZoom = 1;
+      let _mapPanX = 0;
+      let _mapPanY = 0;
+      let _mapDragState = null;
       const _pagePresenceSession = (window.crypto && crypto.randomUUID)
         ? crypto.randomUUID()
         : `session-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
@@ -974,13 +980,27 @@
       function applyMapZoom() {
         const canvas = document.getElementById("map-canvas");
         const label = document.getElementById("map-zoom-label");
+        const shell = document.getElementById("map-shell");
         if (!canvas || !label) return;
-        canvas.style.transform = `scale(${_mapZoom})`;
+        canvas.style.transform = `translate(${_mapPanX}px, ${_mapPanY}px) scale(${_mapZoom})`;
         label.textContent = `${Math.round(_mapZoom * 100)}%`;
+        shell?.classList.toggle("zoomed", _mapZoom > 1.001);
       }
 
       function setMapZoom(nextZoom) {
-        _mapZoom = clampMapZoom(nextZoom);
+        const clamped = clampMapZoom(nextZoom);
+        if (clamped <= 1) {
+          _mapPanX = 0;
+          _mapPanY = 0;
+        }
+        _mapZoom = clamped;
+        applyMapZoom();
+      }
+
+      function resetMapView() {
+        _mapZoom = 1;
+        _mapPanX = 0;
+        _mapPanY = 0;
         applyMapZoom();
       }
 
@@ -991,12 +1011,35 @@
         const zoomReset = document.getElementById("map-zoom-reset");
         zoomIn?.addEventListener("click", () => setMapZoom(_mapZoom + 0.2));
         zoomOut?.addEventListener("click", () => setMapZoom(_mapZoom - 0.2));
-        zoomReset?.addEventListener("click", () => setMapZoom(1));
+        zoomReset?.addEventListener("click", resetMapView);
         shell?.addEventListener("wheel", (event) => {
           event.preventDefault();
           const delta = event.deltaY < 0 ? 0.15 : -0.15;
           setMapZoom(_mapZoom + delta);
         }, { passive: false });
+        shell?.addEventListener("mousedown", (event) => {
+          if (_mapZoom <= 1.001) return;
+          _mapDragState = {
+            startX: event.clientX,
+            startY: event.clientY,
+            panX: _mapPanX,
+            panY: _mapPanY,
+          };
+          shell.classList.add("dragging");
+        });
+        window.addEventListener("mousemove", (event) => {
+          if (!_mapDragState) return;
+          _mapPanX = _mapDragState.panX + (event.clientX - _mapDragState.startX);
+          _mapPanY = _mapDragState.panY + (event.clientY - _mapDragState.startY);
+          applyMapZoom();
+        });
+        window.addEventListener("mouseup", () => {
+          _mapDragState = null;
+          shell?.classList.remove("dragging");
+        });
+        shell?.addEventListener("mouseleave", () => {
+          if (!_mapDragState) shell.classList.remove("dragging");
+        });
       }
 
       function healthDots(checks) {

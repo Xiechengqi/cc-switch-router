@@ -23,8 +23,15 @@ use crate::store::AppStore;
 #[derive(Clone)]
 pub struct ServerState {
     pub config: Config,
+    pub server_geo: ServerGeo,
     pub store: AppStore,
     pub proxy: Arc<ProxyRegistry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServerGeo {
+    pub lat: Option<f64>,
+    pub lon: Option<f64>,
 }
 
 #[tokio::main]
@@ -43,16 +50,16 @@ async fn main() -> Result<()> {
         .with_env_filter(env_filter)
         .init();
 
-    let mut config = Config::from_env();
-    maybe_resolve_server_geo(&mut config).await;
+    let config = Config::from_env();
+    let server_geo = resolve_server_geo().await;
     info!(
         api_addr = %config.api_addr,
         ssh_addr = %config.ssh_addr,
         tunnel_domain = %config.tunnel_domain,
         ssh_public_addr = %config.effective_ssh_public_addr(),
-        server_label = %config.server_label,
-        server_lat = config.server_lat,
-        server_lon = config.server_lon,
+        server_label = "server",
+        server_lat = server_geo.lat,
+        server_lon = server_geo.lon,
         db_path = %config.db_path.display(),
         env_path = %env_path.display(),
         use_localhost = config.use_localhost,
@@ -62,6 +69,7 @@ async fn main() -> Result<()> {
     );
     let state = ServerState {
         config: config.clone(),
+        server_geo: server_geo.clone(),
         store: AppStore::new(&config)?,
         proxy: Arc::new(ProxyRegistry::default()),
     };
@@ -118,39 +126,70 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn maybe_resolve_server_geo(config: &mut Config) {
-    if config.server_lat.is_some() && config.server_lon.is_some() {
-        return;
-    }
+async fn resolve_server_geo() -> ServerGeo {
     let client = match reqwest::Client::builder()
         .user_agent("portr-rs/0.1")
         .timeout(Duration::from_secs(3))
         .build()
     {
         Ok(client) => client,
-        Err(_) => return,
+        Err(_) => {
+            return ServerGeo {
+                lat: None,
+                lon: None,
+            };
+        }
     };
-    let response = match client.get("https://ip.im/info").send().await {
-        Ok(response) if response.status().is_success() => response,
-        _ => return,
-    };
-    let body = match response.text().await {
-        Ok(body) => body,
-        Err(_) => return,
-    };
+
+    if let Some(geo) = resolve_server_geo_from_json(&client).await {
+        return geo;
+    }
+    if let Some(geo) = resolve_server_geo_from_ip_im(&client).await {
+        return geo;
+    }
+    ServerGeo {
+        lat: None,
+        lon: None,
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct JsonServerGeoResponse {
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+}
+
+async fn resolve_server_geo_from_json(client: &reqwest::Client) -> Option<ServerGeo> {
+    let response = client.get("http://3.0.3.0/ips").send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let payload: JsonServerGeoResponse = response.json().await.ok()?;
+    Some(ServerGeo {
+        lat: payload.latitude,
+        lon: payload.longitude,
+    })
+    .filter(|geo| geo.lat.is_some() && geo.lon.is_some())
+}
+
+async fn resolve_server_geo_from_ip_im(client: &reqwest::Client) -> Option<ServerGeo> {
+    let response = client.get("https://ip.im/info").send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body = response.text().await.ok()?;
     for raw_line in body.lines() {
         let line = raw_line.trim();
         if let Some(value) = line.strip_prefix("Loc:") {
             if let Some((lat, lon)) = value.trim().split_once(',') {
-                if config.server_lat.is_none() {
-                    config.server_lat = lat.trim().parse().ok();
-                }
-                if config.server_lon.is_none() {
-                    config.server_lon = lon.trim().parse().ok();
-                }
+                return Some(ServerGeo {
+                    lat: lat.trim().parse().ok(),
+                    lon: lon.trim().parse().ok(),
+                });
             }
         }
     }
+    None
 }
 
 fn try_handle_cli() -> Result<bool> {
@@ -184,9 +223,6 @@ Environment:
   PORTR_RS_SSH_ADDR              SSH listen address, default 0.0.0.0:2222
   PORTR_RS_TUNNEL_DOMAIN         Public tunnel domain, default 0.0.0.0:8787
   PORTR_RS_SSH_PUBLIC_ADDR       SSH address sent to clients, default TUNNEL_DOMAIN:SSH_PORT
-  PORTR_RS_SERVER_LABEL          Server label shown on dashboard map, default portr-rs
-  PORTR_RS_SERVER_LAT            Server latitude for dashboard map
-  PORTR_RS_SERVER_LON            Server longitude for dashboard map
   PORTR_RS_USE_LOCALHOST         Use http for localhost-style domains, default true
   PORTR_RS_LEASE_TTL_SECS        Tunnel lease ttl, default 60
   PORTR_RS_DB_PATH               SQLite path, default $HOME/.config/portr-rs/portr-rs.db

@@ -81,7 +81,11 @@ async fn dashboard(
     Ok(Json(
         state
             .store
-            .dashboard_snapshot(&state.config, &state.proxy)
+            .dashboard_snapshot(
+                &state.config,
+                &state.server_geo,
+                &state.proxy,
+            )
             .await?,
     ))
 }

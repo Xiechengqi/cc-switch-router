@@ -11,9 +11,6 @@ pub struct Config {
     pub ssh_addr: SocketAddr,
     pub tunnel_domain: String,
     pub ssh_public_addr: String,
-    pub server_label: String,
-    pub server_lat: Option<f64>,
-    pub server_lon: Option<f64>,
     pub use_localhost: bool,
     pub lease_ttl_secs: i64,
     pub db_path: PathBuf,
@@ -35,14 +32,6 @@ impl Config {
             tunnel_domain: env::var("PORTR_RS_TUNNEL_DOMAIN")
                 .unwrap_or_else(|_| "0.0.0.0:8787".to_string()),
             ssh_public_addr: env::var("PORTR_RS_SSH_PUBLIC_ADDR").unwrap_or_default(),
-            server_label: env::var("PORTR_RS_SERVER_LABEL")
-                .unwrap_or_else(|_| "portr-rs".to_string()),
-            server_lat: env::var("PORTR_RS_SERVER_LAT")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-            server_lon: env::var("PORTR_RS_SERVER_LON")
-                .ok()
-                .and_then(|v| v.parse().ok()),
             use_localhost: env::var("PORTR_RS_USE_LOCALHOST")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(true),
@@ -144,7 +133,6 @@ fn default_env_contents() -> String {
 PORTR_RS_API_ADDR=0.0.0.0:8787
 PORTR_RS_SSH_ADDR=0.0.0.0:2222
 PORTR_RS_TUNNEL_DOMAIN=0.0.0.0:8787
-PORTR_RS_SERVER_LABEL=portr-rs
 PORTR_RS_USE_LOCALHOST=true
 PORTR_RS_LEASE_TTL_SECS=60
 PORTR_RS_DB_PATH={}
