@@ -464,11 +464,10 @@
             <thead>
               <tr>
                 <th>Share</th>
-                <th>APIKEY</th>
+                <th>API URL&KEY</th>
                 <th>Usage</th>
                 <th>Status</th>
                 <th>Health</th>
-                <th>Route</th>
                 <th style="width:28px"></th>
               </tr>
             </thead>
@@ -542,6 +541,12 @@
         if (n >= 1_000_000) return (n / 1_000_000).toFixed(1).replace(/\.0$/, "") + "M";
         if (n >= 10_000) return (n / 1_000).toFixed(1).replace(/\.0$/, "") + "k";
         return String(n);
+      }
+
+      function shareApiUrl(subdomain) {
+        const host = window.location.hostname || "localhost";
+        const proto = window.location.protocol || "https:";
+        return `${proto}//${subdomain}.${host}`;
       }
 
       function healthDots(checks) {
@@ -741,7 +746,14 @@
                 <span>${share.providerId || "--"}</span>
               </div>
             </td>
-            <td><span class="token-value">${maskToken(share.shareToken)}</span></td>
+            <td>
+              <div>
+                <strong>${shareApiUrl(share.subdomain)}</strong>
+              </div>
+              <div class="item-card-meta" style="margin-top:4px">
+                <span class="token-value">[${maskToken(share.shareToken)}]</span>
+              </div>
+            </td>
             <td>
               <strong>${formatNum(share.tokensUsed)} / ${formatNum(share.tokenLimit)}</strong>
               <div class="usage-bar"><div class="${usageBarClass(pct)}" style="width:${pct}%"></div></div>
@@ -750,15 +762,9 @@
               <span class="badge ${share.shareStatus === 'active' ? 'badge--active' : ''}">${share.shareStatus}</span>
             </td>
             <td>${healthDots(share.healthChecks || [])}</td>
-            <td>
-              <strong>${share.subdomain}</strong>
-              <div class="item-card-meta" style="margin-top:4px">
-                <span>${share.installationId.slice(0, 8)}</span>
-              </div>
-            </td>
             <td><span class="row-arrow">&rsaquo;</span></td>
           </tr>`;
-        }).join("") : `<tr><td colspan="7"><div class="empty"><div class="empty-icon"></div>No shares yet</div></td></tr>`;
+        }).join("") : `<tr><td colspan="6"><div class="empty"><div class="empty-icon"></div>No shares yet</div></td></tr>`;
       }
 
       boot().catch(err => {
