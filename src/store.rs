@@ -40,9 +40,22 @@ struct GeoLookupResult {
 #[derive(Debug, Clone)]
 struct InstallationGeoState {
     last_seen_ip: Option<String>,
+    country_code: Option<String>,
     latitude: Option<f64>,
     longitude: Option<f64>,
+    geo_candidate_country_code: Option<String>,
+    geo_candidate_latitude: Option<f64>,
+    geo_candidate_longitude: Option<f64>,
+    geo_candidate_hits: i64,
+    geo_candidate_first_seen_at: Option<DateTime<Utc>>,
+    geo_last_changed_at: Option<DateTime<Utc>>,
 }
+
+const GEO_STABLE_DISTANCE_KM: f64 = 120.0;
+const GEO_CANDIDATE_DISTANCE_KM: f64 = 120.0;
+const GEO_CANDIDATE_CONFIRM_HITS: i64 = 3;
+const GEO_CANDIDATE_MIN_AGE_SECS: i64 = 10 * 60;
+const GEO_STABLE_MIN_SWITCH_SECS: i64 = 30 * 60;
 
 impl AppStore {
     pub fn new(config: &Config) -> Result<Self, AppError> {
@@ -80,6 +93,15 @@ impl AppStore {
             city: None,
             latitude: None,
             longitude: None,
+            geo_candidate_country_code: None,
+            geo_candidate_country: None,
+            geo_candidate_region: None,
+            geo_candidate_city: None,
+            geo_candidate_latitude: None,
+            geo_candidate_longitude: None,
+            geo_candidate_hits: 0,
+            geo_candidate_first_seen_at: None,
+            geo_last_changed_at: None,
             created_at: now,
             last_seen_at: now,
         };
@@ -87,8 +109,11 @@ impl AppStore {
         conn.execute(
             "INSERT INTO installations (
                 id, public_key, platform, app_version, last_seen_ip, country_code, country, region,
-                city, latitude, longitude, created_at, last_seen_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                city, latitude, longitude, geo_candidate_country_code, geo_candidate_country,
+                geo_candidate_region, geo_candidate_city, geo_candidate_latitude,
+                geo_candidate_longitude, geo_candidate_hits, geo_candidate_first_seen_at,
+                geo_last_changed_at, created_at, last_seen_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             params![
                 installation.id,
                 installation.public_key,
@@ -101,6 +126,17 @@ impl AppStore {
                 installation.city,
                 installation.latitude,
                 installation.longitude,
+                installation.geo_candidate_country_code,
+                installation.geo_candidate_country,
+                installation.geo_candidate_region,
+                installation.geo_candidate_city,
+                installation.geo_candidate_latitude,
+                installation.geo_candidate_longitude,
+                installation.geo_candidate_hits,
+                installation
+                    .geo_candidate_first_seen_at
+                    .map(|value| value.to_rfc3339()),
+                installation.geo_last_changed_at.map(|value| value.to_rfc3339()),
                 installation.created_at.to_rfc3339(),
                 installation.last_seen_at.to_rfc3339(),
             ],
@@ -726,43 +762,83 @@ impl AppStore {
         let Some(ip) = ip.as_deref().map(str::trim).filter(|v| !v.is_empty()) else {
             return Ok(());
         };
-        if !force {
+        let current_state = {
             let conn = self.conn.lock().await;
             let state = get_installation_geo_state(&conn, installation_id)?;
             let Some(state) = state else {
                 return Ok(());
             };
-            if state.last_seen_ip.as_deref() == Some(ip)
+            if !force
+                && state.last_seen_ip.as_deref() == Some(ip)
                 && state.latitude.is_some()
                 && state.longitude.is_some()
             {
                 return Ok(());
             }
-        }
+            state
+        };
         let Some(geo) = lookup_ip_im_geo(ip).await else {
             return Ok(());
         };
+        let now = Utc::now();
         let conn = self.conn.lock().await;
-        conn.execute(
-            "UPDATE installations
-             SET country_code = COALESCE(?2, country_code),
-                 country = COALESCE(?3, country),
-                 region = COALESCE(?4, region),
-                 city = COALESCE(?5, city),
-                 latitude = COALESCE(?6, latitude),
-                 longitude = COALESCE(?7, longitude)
-             WHERE id = ?1",
-            params![
-                installation_id,
-                geo.country_code,
-                geo.country,
-                geo.region,
-                geo.city,
-                geo.latitude,
-                geo.longitude,
-            ],
-        )
-        .map_err(|e| AppError::Internal(format!("update installation geo failed: {e}")))?;
+        let no_stable_position =
+            current_state.latitude.is_none() || current_state.longitude.is_none();
+        if no_stable_position {
+            persist_stable_geo(&conn, installation_id, &geo, now)?;
+            return Ok(());
+        }
+
+        let stable_distance_km = haversine_distance_km(
+            current_state.latitude,
+            current_state.longitude,
+            geo.latitude,
+            geo.longitude,
+        );
+        let crossed_country = current_state.country_code != geo.country_code
+            && current_state.country_code.is_some()
+            && geo.country_code.is_some();
+        let can_stay_stable = !crossed_country
+            && stable_distance_km
+                .map(|distance| distance <= GEO_STABLE_DISTANCE_KM)
+                .unwrap_or(false);
+
+        if can_stay_stable {
+            persist_stable_geo(&conn, installation_id, &geo, now)?;
+            return Ok(());
+        }
+
+        let candidate_matches = current_state
+            .geo_candidate_latitude
+            .zip(current_state.geo_candidate_longitude)
+            .and_then(|(lat, lon)| haversine_distance_km(Some(lat), Some(lon), geo.latitude, geo.longitude))
+            .map(|distance| distance <= GEO_CANDIDATE_DISTANCE_KM)
+            .unwrap_or(false)
+            && current_state.geo_candidate_country_code == geo.country_code;
+
+        let candidate_hits = if candidate_matches {
+            current_state.geo_candidate_hits + 1
+        } else {
+            1
+        };
+        let candidate_first_seen_at = if candidate_matches {
+            current_state.geo_candidate_first_seen_at.unwrap_or(now)
+        } else {
+            now
+        };
+        persist_candidate_geo(&conn, installation_id, &geo, candidate_hits, candidate_first_seen_at)?;
+
+        let candidate_age_secs = (now - candidate_first_seen_at).num_seconds();
+        let last_change_age_secs = current_state
+            .geo_last_changed_at
+            .map(|value| (now - value).num_seconds())
+            .unwrap_or(i64::MAX);
+        let promote_candidate = candidate_hits >= GEO_CANDIDATE_CONFIRM_HITS
+            && candidate_age_secs >= GEO_CANDIDATE_MIN_AGE_SECS
+            && last_change_age_secs >= GEO_STABLE_MIN_SWITCH_SECS;
+        if promote_candidate {
+            persist_stable_geo(&conn, installation_id, &geo, now)?;
+        }
         Ok(())
     }
 }
@@ -884,6 +960,15 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             city TEXT,
             latitude REAL,
             longitude REAL,
+            geo_candidate_country_code TEXT,
+            geo_candidate_country TEXT,
+            geo_candidate_region TEXT,
+            geo_candidate_city TEXT,
+            geo_candidate_latitude REAL,
+            geo_candidate_longitude REAL,
+            geo_candidate_hits INTEGER NOT NULL DEFAULT 0,
+            geo_candidate_first_seen_at TEXT,
+            geo_last_changed_at TEXT,
             created_at TEXT NOT NULL,
             last_seen_at TEXT NOT NULL
         );
@@ -998,6 +1083,42 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         conn.execute("ALTER TABLE installations ADD COLUMN longitude REAL", [])
             .map_err(|e| AppError::Internal(format!("add installations longitude failed: {e}")))?;
     }
+    if !columns.iter().any(|name| name == "geo_candidate_country_code") {
+        conn.execute("ALTER TABLE installations ADD COLUMN geo_candidate_country_code TEXT", [])
+            .map_err(|e| AppError::Internal(format!("add installations geo_candidate_country_code failed: {e}")))?;
+    }
+    if !columns.iter().any(|name| name == "geo_candidate_country") {
+        conn.execute("ALTER TABLE installations ADD COLUMN geo_candidate_country TEXT", [])
+            .map_err(|e| AppError::Internal(format!("add installations geo_candidate_country failed: {e}")))?;
+    }
+    if !columns.iter().any(|name| name == "geo_candidate_region") {
+        conn.execute("ALTER TABLE installations ADD COLUMN geo_candidate_region TEXT", [])
+            .map_err(|e| AppError::Internal(format!("add installations geo_candidate_region failed: {e}")))?;
+    }
+    if !columns.iter().any(|name| name == "geo_candidate_city") {
+        conn.execute("ALTER TABLE installations ADD COLUMN geo_candidate_city TEXT", [])
+            .map_err(|e| AppError::Internal(format!("add installations geo_candidate_city failed: {e}")))?;
+    }
+    if !columns.iter().any(|name| name == "geo_candidate_latitude") {
+        conn.execute("ALTER TABLE installations ADD COLUMN geo_candidate_latitude REAL", [])
+            .map_err(|e| AppError::Internal(format!("add installations geo_candidate_latitude failed: {e}")))?;
+    }
+    if !columns.iter().any(|name| name == "geo_candidate_longitude") {
+        conn.execute("ALTER TABLE installations ADD COLUMN geo_candidate_longitude REAL", [])
+            .map_err(|e| AppError::Internal(format!("add installations geo_candidate_longitude failed: {e}")))?;
+    }
+    if !columns.iter().any(|name| name == "geo_candidate_hits") {
+        conn.execute("ALTER TABLE installations ADD COLUMN geo_candidate_hits INTEGER NOT NULL DEFAULT 0", [])
+            .map_err(|e| AppError::Internal(format!("add installations geo_candidate_hits failed: {e}")))?;
+    }
+    if !columns.iter().any(|name| name == "geo_candidate_first_seen_at") {
+        conn.execute("ALTER TABLE installations ADD COLUMN geo_candidate_first_seen_at TEXT", [])
+            .map_err(|e| AppError::Internal(format!("add installations geo_candidate_first_seen_at failed: {e}")))?;
+    }
+    if !columns.iter().any(|name| name == "geo_last_changed_at") {
+        conn.execute("ALTER TABLE installations ADD COLUMN geo_last_changed_at TEXT", [])
+            .map_err(|e| AppError::Internal(format!("add installations geo_last_changed_at failed: {e}")))?;
+    }
     let columns = conn
         .prepare("PRAGMA table_info(shares)")
         .and_then(|mut stmt| {
@@ -1022,7 +1143,10 @@ fn get_installation(
     installation_id: &str,
 ) -> Result<Option<Installation>, AppError> {
     conn.query_row(
-        "SELECT id, public_key, platform, app_version, last_seen_ip, country_code, country, region, city, latitude, longitude, created_at, last_seen_at
+        "SELECT id, public_key, platform, app_version, last_seen_ip, country_code, country, region, city, latitude, longitude,
+                geo_candidate_country_code, geo_candidate_country, geo_candidate_region, geo_candidate_city,
+                geo_candidate_latitude, geo_candidate_longitude, geo_candidate_hits, geo_candidate_first_seen_at,
+                geo_last_changed_at, created_at, last_seen_at
          FROM installations WHERE id = ?1",
         params![installation_id],
         |row| {
@@ -1038,8 +1162,23 @@ fn get_installation(
                 city: row.get(8)?,
                 latitude: row.get(9)?,
                 longitude: row.get(10)?,
-                created_at: parse_dt_sql(&row.get::<_, String>(11)?)?,
-                last_seen_at: parse_dt_sql(&row.get::<_, String>(12)?)?,
+                geo_candidate_country_code: row.get(11)?,
+                geo_candidate_country: row.get(12)?,
+                geo_candidate_region: row.get(13)?,
+                geo_candidate_city: row.get(14)?,
+                geo_candidate_latitude: row.get(15)?,
+                geo_candidate_longitude: row.get(16)?,
+                geo_candidate_hits: row.get(17)?,
+                geo_candidate_first_seen_at: row
+                    .get::<_, Option<String>>(18)?
+                    .map(|value| parse_dt_sql(&value))
+                    .transpose()?,
+                geo_last_changed_at: row
+                    .get::<_, Option<String>>(19)?
+                    .map(|value| parse_dt_sql(&value))
+                    .transpose()?,
+                created_at: parse_dt_sql(&row.get::<_, String>(20)?)?,
+                last_seen_at: parse_dt_sql(&row.get::<_, String>(21)?)?,
             })
         },
     )
@@ -1065,7 +1204,10 @@ fn get_lease_by_connection_id(
 fn list_installations(conn: &Connection) -> Result<Vec<Installation>, AppError> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, public_key, platform, app_version, last_seen_ip, country_code, country, region, city, latitude, longitude, created_at, last_seen_at
+            "SELECT id, public_key, platform, app_version, last_seen_ip, country_code, country, region, city, latitude, longitude,
+                    geo_candidate_country_code, geo_candidate_country, geo_candidate_region, geo_candidate_city,
+                    geo_candidate_latitude, geo_candidate_longitude, geo_candidate_hits, geo_candidate_first_seen_at,
+                    geo_last_changed_at, created_at, last_seen_at
              FROM installations ORDER BY last_seen_at DESC",
         )
         .map_err(|e| AppError::Internal(format!("prepare installations failed: {e}")))?;
@@ -1083,8 +1225,23 @@ fn list_installations(conn: &Connection) -> Result<Vec<Installation>, AppError> 
                 city: row.get(8)?,
                 latitude: row.get(9)?,
                 longitude: row.get(10)?,
-                created_at: parse_dt_sql(&row.get::<_, String>(11)?)?,
-                last_seen_at: parse_dt_sql(&row.get::<_, String>(12)?)?,
+                geo_candidate_country_code: row.get(11)?,
+                geo_candidate_country: row.get(12)?,
+                geo_candidate_region: row.get(13)?,
+                geo_candidate_city: row.get(14)?,
+                geo_candidate_latitude: row.get(15)?,
+                geo_candidate_longitude: row.get(16)?,
+                geo_candidate_hits: row.get(17)?,
+                geo_candidate_first_seen_at: row
+                    .get::<_, Option<String>>(18)?
+                    .map(|value| parse_dt_sql(&value))
+                    .transpose()?,
+                geo_last_changed_at: row
+                    .get::<_, Option<String>>(19)?
+                    .map(|value| parse_dt_sql(&value))
+                    .transpose()?,
+                created_at: parse_dt_sql(&row.get::<_, String>(20)?)?,
+                last_seen_at: parse_dt_sql(&row.get::<_, String>(21)?)?,
             })
         })
         .map_err(|e| AppError::Internal(format!("query installations failed: {e}")))?;
@@ -1096,13 +1253,30 @@ fn get_installation_geo_state(
     installation_id: &str,
 ) -> Result<Option<InstallationGeoState>, AppError> {
     conn.query_row(
-        "SELECT last_seen_ip, latitude, longitude FROM installations WHERE id = ?1",
+        "SELECT last_seen_ip, country_code, latitude, longitude,
+                geo_candidate_country_code, geo_candidate_country, geo_candidate_region, geo_candidate_city,
+                geo_candidate_latitude, geo_candidate_longitude, geo_candidate_hits,
+                geo_candidate_first_seen_at, geo_last_changed_at
+         FROM installations WHERE id = ?1",
         params![installation_id],
         |row| {
             Ok(InstallationGeoState {
                 last_seen_ip: row.get(0)?,
-                latitude: row.get(1)?,
-                longitude: row.get(2)?,
+                country_code: row.get(1)?,
+                latitude: row.get(2)?,
+                longitude: row.get(3)?,
+                geo_candidate_country_code: row.get(4)?,
+                geo_candidate_latitude: row.get(8)?,
+                geo_candidate_longitude: row.get(9)?,
+                geo_candidate_hits: row.get(10)?,
+                geo_candidate_first_seen_at: row
+                    .get::<_, Option<String>>(11)?
+                    .map(|value| parse_dt_sql(&value))
+                    .transpose()?,
+                geo_last_changed_at: row
+                    .get::<_, Option<String>>(12)?
+                    .map(|value| parse_dt_sql(&value))
+                    .transpose()?,
             })
         },
     )
@@ -1143,6 +1317,97 @@ fn should_refresh_installation_geo(
     installation.last_seen_ip.as_deref() != Some(next_ip)
         || installation.latitude.is_none()
         || installation.longitude.is_none()
+}
+
+fn haversine_distance_km(
+    lat1: Option<f64>,
+    lon1: Option<f64>,
+    lat2: Option<f64>,
+    lon2: Option<f64>,
+) -> Option<f64> {
+    let (lat1, lon1, lat2, lon2) = (lat1?, lon1?, lat2?, lon2?);
+    let to_rad = |deg: f64| deg.to_radians();
+    let dlat = to_rad(lat2 - lat1);
+    let dlon = to_rad(lon2 - lon1);
+    let lat1 = to_rad(lat1);
+    let lat2 = to_rad(lat2);
+    let a = (dlat / 2.0).sin().powi(2)
+        + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
+    let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+    Some(6371.0 * c)
+}
+
+fn persist_candidate_geo(
+    conn: &Connection,
+    installation_id: &str,
+    geo: &GeoLookupResult,
+    hits: i64,
+    first_seen_at: DateTime<Utc>,
+) -> Result<(), AppError> {
+    conn.execute(
+        "UPDATE installations
+         SET geo_candidate_country_code = ?2,
+             geo_candidate_country = ?3,
+             geo_candidate_region = ?4,
+             geo_candidate_city = ?5,
+             geo_candidate_latitude = ?6,
+             geo_candidate_longitude = ?7,
+             geo_candidate_hits = ?8,
+             geo_candidate_first_seen_at = ?9
+         WHERE id = ?1",
+        params![
+            installation_id,
+            geo.country_code,
+            geo.country,
+            geo.region,
+            geo.city,
+            geo.latitude,
+            geo.longitude,
+            hits,
+            first_seen_at.to_rfc3339(),
+        ],
+    )
+    .map_err(|e| AppError::Internal(format!("update installation candidate geo failed: {e}")))?;
+    Ok(())
+}
+
+fn persist_stable_geo(
+    conn: &Connection,
+    installation_id: &str,
+    geo: &GeoLookupResult,
+    changed_at: DateTime<Utc>,
+) -> Result<(), AppError> {
+    conn.execute(
+        "UPDATE installations
+         SET country_code = COALESCE(?2, country_code),
+             country = COALESCE(?3, country),
+             region = COALESCE(?4, region),
+             city = COALESCE(?5, city),
+             latitude = COALESCE(?6, latitude),
+             longitude = COALESCE(?7, longitude),
+             geo_candidate_country_code = NULL,
+             geo_candidate_country = NULL,
+             geo_candidate_region = NULL,
+             geo_candidate_city = NULL,
+             geo_candidate_latitude = NULL,
+             geo_candidate_longitude = NULL,
+             geo_candidate_hits = 0,
+             geo_candidate_first_seen_at = NULL,
+             geo_last_changed_at = ?8
+         WHERE id = ?1",
+        params![
+            installation_id,
+            geo.country_code,
+            geo.country,
+            geo.region,
+            geo.city,
+            geo.latitude,
+            geo.longitude,
+            changed_at.to_rfc3339(),
+        ],
+    )
+    .map_err(|e| AppError::Internal(format!("update installation stable geo failed: {e}")))?;
+    Ok(())
 }
 
 async fn lookup_ip_im_geo(ip: &str) -> Option<GeoLookupResult> {
