@@ -11,7 +11,8 @@ use crate::error::AppError;
 use crate::models::{
     DashboardResponse, HealthResponse, IssueLeaseRequest, IssueLeaseResponse,
     RegisterInstallationRequest, RegisterInstallationResponse, ShareBatchSyncRequest,
-    ShareDeleteRequest, ShareRequestLogBatchSyncRequest, ShareSyncRequest,
+    ShareClaimSubdomainRequest, ShareDeleteRequest, ShareHeartbeatRequest,
+    ShareRequestLogBatchSyncRequest, ShareSyncRequest,
 };
 use crate::proxy::proxy_handler;
 
@@ -23,9 +24,11 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/dashboard", get(dashboard))
         .route("/v1/installations/register", post(register_installation))
         .route("/v1/tunnels/lease", post(issue_lease))
+        .route("/v1/shares/claim-subdomain", post(claim_share_subdomain))
         .route("/v1/shares/sync", post(sync_share))
         .route("/v1/shares/batch-sync", post(batch_sync_share))
         .route("/v1/share-request-logs/batch-sync", post(batch_sync_share_request_logs))
+        .route("/v1/shares/heartbeat", post(share_heartbeat))
         .route("/v1/shares/delete", post(delete_share))
         .route("/admin", get(admin_page))
         .route("/admin/login", get(root))
@@ -79,6 +82,22 @@ async fn sync_share(
     Json(input): Json<ShareSyncRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     state.store.sync_share(input).await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn claim_share_subdomain(
+    State(state): State<ServerState>,
+    Json(input): Json<ShareClaimSubdomainRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    state.store.claim_share_subdomain(input).await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn share_heartbeat(
+    State(state): State<ServerState>,
+    Json(input): Json<ShareHeartbeatRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    state.store.record_share_heartbeat(input).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 

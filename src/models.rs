@@ -65,6 +65,13 @@ pub struct ShareSyncRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ShareClaimSubdomainRequest {
+    pub installation_id: String,
+    pub share: ShareDescriptor,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ShareDeleteRequest {
     pub installation_id: String,
     pub share_id: String,
@@ -143,6 +150,7 @@ pub struct HealthResponse {
 pub struct ShareDescriptor {
     pub share_id: String,
     pub share_name: String,
+    pub subdomain: String,
     pub share_token: String,
     pub app_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -204,6 +212,7 @@ pub struct LeaseView {
 pub struct ShareView {
     pub share_id: String,
     pub share_name: String,
+    pub subdomain: String,
     pub share_token: String,
     pub app_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -214,8 +223,22 @@ pub struct ShareView {
     pub share_status: String,
     pub created_at: String,
     pub expires_at: String,
-    pub latest_subdomain: String,
     pub installation_id: String,
     pub active_lease_count: usize,
     pub recent_requests: Vec<ShareRequestLogEntry>,
+    pub health_checks: Vec<HealthCheckEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareHeartbeatRequest {
+    pub installation_id: String,
+    pub share_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthCheckEntry {
+    pub checked_at: i64,
+    pub is_healthy: bool,
 }

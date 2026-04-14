@@ -12,9 +12,10 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::error::AppError;
 use crate::models::{
-    DashboardResponse, DashboardStats, Installation, InstallationView, IssueLeaseRequest,
-    IssueLeaseResponse, LeaseView, RegisterInstallationRequest, RegisterInstallationResponse,
-    ShareBatchSyncRequest, ShareDeleteRequest, ShareDescriptor, ShareRequestLogBatchSyncRequest,
+    DashboardResponse, DashboardStats, HealthCheckEntry, Installation, InstallationView,
+    IssueLeaseRequest, IssueLeaseResponse, LeaseView, RegisterInstallationRequest,
+    RegisterInstallationResponse, ShareBatchSyncRequest, ShareClaimSubdomainRequest,
+    ShareDeleteRequest, ShareDescriptor, ShareHeartbeatRequest, ShareRequestLogBatchSyncRequest,
     ShareRequestLogEntry, ShareSyncRequest, ShareView, TunnelLease,
 };
 use crate::proxy::ProxyRegistry;
@@ -104,7 +105,21 @@ impl AppStore {
             ));
         }
 
-        let subdomain = normalize_subdomain(&input.requested_subdomain)?;
+        let requested_subdomain = normalize_subdomain(&input.requested_subdomain)?;
+        let subdomain = if let Some(share) = input.share.as_ref() {
+            let conn = self.conn.lock().await;
+            let owned_subdomain =
+                get_share_owned_subdomain(&conn, &input.installation_id, &share.share_id)?
+                    .ok_or_else(|| AppError::Conflict("share subdomain is not claimed".into()))?;
+            if owned_subdomain != requested_subdomain {
+                return Err(AppError::Conflict(
+                    "requested subdomain does not match claimed subdomain".into(),
+                ));
+            }
+            owned_subdomain
+        } else {
+            requested_subdomain
+        };
         {
             let conn = self.conn.lock().await;
             let live_lease_exists: bool = conn
@@ -233,6 +248,28 @@ impl AppStore {
         self.upsert_share(&input.installation_id, input.share).await
     }
 
+    pub async fn claim_share_subdomain(
+        &self,
+        input: ShareClaimSubdomainRequest,
+    ) -> Result<(), AppError> {
+        let subdomain = normalize_subdomain(&input.share.subdomain)?;
+        ensure_subdomain_allowed(&subdomain)?;
+        let conn = self.conn.lock().await;
+        let exists = get_installation(&conn, &input.installation_id)?.is_some();
+        if !exists {
+            return Err(AppError::Unauthorized("installation not found".into()));
+        }
+
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| AppError::Internal(format!("begin share claim tx failed: {e}")))?;
+        let mut share = input.share;
+        share.subdomain = subdomain;
+        upsert_share_tx(&tx, &input.installation_id, share)?;
+        tx.commit().map_err(map_share_constraint_error)?;
+        Ok(())
+    }
+
     pub async fn delete_share(&self, input: ShareDeleteRequest) -> Result<(), AppError> {
         let conn = self.conn.lock().await;
         conn.execute(
@@ -317,6 +354,7 @@ impl AppStore {
         let installations = list_installations(&conn)?;
         let leases = list_leases(&conn)?;
         let shares = list_shares(&conn)?;
+        let health_by_share = list_health_checks(&conn, 10)?;
         let recent_logs = list_recent_share_request_logs(&conn, 8)?;
         let logs_by_share = recent_logs
             .into_iter()
@@ -371,9 +409,9 @@ impl AppStore {
         let mut active_share_ids = HashSet::new();
         let share_views = shares
             .into_iter()
-            .map(
-                |(installation_id, share, latest_subdomain, _active_lease_count)| {
-                    let active_lease_count = usize::from(active_subdomains.contains(&latest_subdomain));
+            .map(|(installation_id, share, _active_lease_count)| {
+                    let active_lease_count =
+                        usize::from(active_subdomains.contains(&share.subdomain));
                     if active_lease_count > 0 {
                         active_share_ids.insert(share.share_id.clone());
                     }
@@ -381,9 +419,14 @@ impl AppStore {
                         .get(&share.share_id)
                         .cloned()
                         .unwrap_or_default();
+                    let health_checks = health_by_share
+                        .get(&share.share_id)
+                        .cloned()
+                        .unwrap_or_default();
                     ShareView {
                         share_id: share.share_id,
                         share_name: share.share_name,
+                        subdomain: share.subdomain,
                         share_token: share.share_token,
                         app_type: share.app_type,
                         provider_id: share.provider_id,
@@ -393,10 +436,10 @@ impl AppStore {
                         share_status: share.share_status,
                         created_at: share.created_at,
                         expires_at: share.expires_at,
-                        latest_subdomain,
                         installation_id,
                         active_lease_count,
                         recent_requests,
+                        health_checks,
                     }
                 },
             )
@@ -461,12 +504,40 @@ impl AppStore {
         Ok((deleted_leases, deleted_shares))
     }
 
+    /// Record a heartbeat reported by cc-switch for a share.
+    pub async fn record_share_heartbeat(
+        &self,
+        input: ShareHeartbeatRequest,
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().await;
+        let exists = get_installation(&conn, &input.installation_id)?.is_some();
+        if !exists {
+            return Err(AppError::Unauthorized("installation not found".into()));
+        }
+        let now = Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO share_health_checks (share_id, checked_at, is_healthy) VALUES (?1, ?2, 1)",
+            params![input.share_id, now],
+        )
+        .map_err(|e| AppError::Internal(format!("insert heartbeat failed: {e}")))?;
+        // Prune entries older than 15 minutes.
+        conn.execute(
+            "DELETE FROM share_health_checks WHERE checked_at < ?1",
+            params![now - 900],
+        )
+        .map_err(|e| AppError::Internal(format!("prune heartbeats failed: {e}")))?;
+        Ok(())
+    }
+
     async fn upsert_share(
         &self,
         installation_id: &str,
-        share: ShareDescriptor,
+        mut share: ShareDescriptor,
     ) -> Result<(), AppError> {
         let conn = self.conn.lock().await;
+        let existing_subdomain = get_share_owned_subdomain(&conn, installation_id, &share.share_id)?
+            .ok_or_else(|| AppError::Conflict("share subdomain is not claimed".into()))?;
+        share.subdomain = existing_subdomain;
         upsert_share_tx(&conn, installation_id, share)?;
         Ok(())
     }
@@ -479,12 +550,13 @@ fn upsert_share_tx(
 ) -> Result<(), AppError> {
     conn.execute(
         "INSERT INTO shares (
-            share_id, installation_id, share_name, share_token, app_type, provider_id,
+            share_id, installation_id, share_name, subdomain, share_token, app_type, provider_id,
             token_limit, tokens_used, requests_count, share_status, created_at, expires_at, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
         ON CONFLICT(share_id) DO UPDATE SET
             installation_id = excluded.installation_id,
             share_name = excluded.share_name,
+            subdomain = excluded.subdomain,
             share_token = excluded.share_token,
             app_type = excluded.app_type,
             provider_id = excluded.provider_id,
@@ -499,6 +571,7 @@ fn upsert_share_tx(
             share.share_id,
             installation_id,
             share.share_name,
+            share.subdomain,
             share.share_token,
             share.app_type,
             share.provider_id,
@@ -511,7 +584,7 @@ fn upsert_share_tx(
             Utc::now().to_rfc3339(),
         ],
     )
-    .map_err(|e| AppError::Internal(format!("upsert share failed: {e}")))?;
+    .map_err(map_share_constraint_error)?;
     Ok(())
 }
 
@@ -602,6 +675,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             share_id TEXT PRIMARY KEY,
             installation_id TEXT NOT NULL,
             share_name TEXT NOT NULL,
+            subdomain TEXT,
             share_token TEXT NOT NULL,
             app_type TEXT NOT NULL,
             provider_id TEXT,
@@ -636,13 +710,38 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             created_at INTEGER NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS share_health_checks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            share_id TEXT NOT NULL,
+            checked_at INTEGER NOT NULL,
+            is_healthy INTEGER NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_leases_installation_id ON leases(installation_id);
         CREATE INDEX IF NOT EXISTS idx_leases_subdomain ON leases(subdomain);
         CREATE INDEX IF NOT EXISTS idx_shares_installation_id ON shares(installation_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_shares_subdomain_unique ON shares(subdomain) WHERE subdomain IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_share_request_logs_share_id ON share_request_logs(share_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_share_health_checks ON share_health_checks(share_id, checked_at DESC);
         ",
     )
     .map_err(|e| AppError::Internal(format!("init schema failed: {e}")))?;
+    let columns = conn
+        .prepare("PRAGMA table_info(shares)")
+        .and_then(|mut stmt| {
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|e| AppError::Internal(format!("inspect shares schema failed: {e}")))?;
+    if !columns.iter().any(|name| name == "subdomain") {
+        conn.execute("ALTER TABLE shares ADD COLUMN subdomain TEXT", [])
+            .map_err(|e| AppError::Internal(format!("add shares subdomain failed: {e}")))?;
+    }
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_shares_subdomain_unique ON shares(subdomain) WHERE subdomain IS NOT NULL",
+        [],
+    )
+    .map_err(|e| AppError::Internal(format!("create subdomain unique index failed: {e}")))?;
     Ok(())
 }
 
@@ -720,19 +819,11 @@ fn list_leases(conn: &Connection) -> Result<Vec<TunnelLease>, AppError> {
     collect_rows(rows)
 }
 
-fn list_shares(
-    conn: &Connection,
-) -> Result<Vec<(String, ShareDescriptor, String, usize)>, AppError> {
+fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor, usize)>, AppError> {
     let mut stmt = conn
         .prepare(
-            "SELECT s.installation_id, s.share_id, s.share_name, s.share_token, s.app_type, s.provider_id,
+            "SELECT s.installation_id, s.share_id, s.share_name, COALESCE(s.subdomain, '-'), s.share_token, s.app_type, s.provider_id,
                     s.token_limit, s.tokens_used, s.requests_count, s.share_status, s.created_at, s.expires_at,
-                    COALESCE((
-                        SELECT l.subdomain FROM leases l
-                        WHERE json_extract(l.share_json, '$.shareId') = s.share_id
-                        ORDER BY l.issued_at DESC
-                        LIMIT 1
-                    ), '-') AS latest_subdomain,
                     (
                         SELECT COUNT(*) FROM leases l
                         WHERE json_extract(l.share_json, '$.shareId') = s.share_id
@@ -749,17 +840,17 @@ fn list_shares(
                 ShareDescriptor {
                     share_id: row.get(1)?,
                     share_name: row.get(2)?,
-                    share_token: row.get(3)?,
-                    app_type: row.get(4)?,
-                    provider_id: row.get(5)?,
-                    token_limit: row.get(6)?,
-                    tokens_used: row.get(7)?,
-                    requests_count: row.get(8)?,
-                    share_status: row.get(9)?,
-                    created_at: row.get(10)?,
-                    expires_at: row.get(11)?,
+                    subdomain: row.get(3)?,
+                    share_token: row.get(4)?,
+                    app_type: row.get(5)?,
+                    provider_id: row.get(6)?,
+                    token_limit: row.get(7)?,
+                    tokens_used: row.get(8)?,
+                    requests_count: row.get(9)?,
+                    share_status: row.get(10)?,
+                    created_at: row.get(11)?,
+                    expires_at: row.get(12)?,
                 },
-                row.get(12)?,
                 row.get::<_, i64>(13)? as usize,
             ))
         })
@@ -816,6 +907,38 @@ fn list_recent_share_request_logs(
     collect_rows(rows)
 }
 
+fn list_health_checks(conn: &Connection, limit: usize) -> Result<HashMap<String, Vec<HealthCheckEntry>>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT share_id, checked_at, is_healthy
+             FROM (
+                 SELECT share_id, checked_at, is_healthy,
+                        ROW_NUMBER() OVER (PARTITION BY share_id ORDER BY checked_at DESC) AS rn
+                 FROM share_health_checks
+             )
+             WHERE rn <= ?1
+             ORDER BY checked_at ASC",
+        )
+        .map_err(|e| AppError::Internal(format!("prepare health checks failed: {e}")))?;
+    let rows = stmt
+        .query_map(params![limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                HealthCheckEntry {
+                    checked_at: row.get(1)?,
+                    is_healthy: row.get::<_, i64>(2)? != 0,
+                },
+            ))
+        })
+        .map_err(|e| AppError::Internal(format!("query health checks failed: {e}")))?;
+    let mut map: HashMap<String, Vec<HealthCheckEntry>> = HashMap::new();
+    for row in rows {
+        let (share_id, entry) = row.map_err(|e| AppError::Internal(format!("read health check row failed: {e}")))?;
+        map.entry(share_id).or_default().push(entry);
+    }
+    Ok(map)
+}
+
 fn map_lease_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TunnelLease> {
     let share_json: Option<String> = row.get(10)?;
     Ok(TunnelLease {
@@ -865,6 +988,12 @@ fn normalize_subdomain(value: &str) -> Result<String, AppError> {
     if value.is_empty() {
         return Err(AppError::BadRequest("subdomain is required".into()));
     }
+    if value.len() < 3 || value.len() > 63 {
+        return Err(AppError::BadRequest("invalid subdomain".into()));
+    }
+    if value.starts_with('-') || value.ends_with('-') {
+        return Err(AppError::BadRequest("invalid subdomain".into()));
+    }
     if !value
         .chars()
         .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
@@ -872,6 +1001,39 @@ fn normalize_subdomain(value: &str) -> Result<String, AppError> {
         return Err(AppError::BadRequest("invalid subdomain".into()));
     }
     Ok(value)
+}
+
+fn ensure_subdomain_allowed(value: &str) -> Result<(), AppError> {
+    const RESERVED: &[&str] = &["admin", "api", "www", "cdn-cgi"];
+    if RESERVED.contains(&value) {
+        return Err(AppError::Conflict("subdomain is reserved".into()));
+    }
+    Ok(())
+}
+
+fn get_share_owned_subdomain(
+    conn: &Connection,
+    installation_id: &str,
+    share_id: &str,
+) -> Result<Option<String>, AppError> {
+    conn.query_row(
+        "SELECT subdomain FROM shares WHERE installation_id = ?1 AND share_id = ?2",
+        params![installation_id, share_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| AppError::Internal(format!("query owned subdomain failed: {e}")))
+}
+
+fn map_share_constraint_error(err: rusqlite::Error) -> AppError {
+    let text = err.to_string();
+    if text.contains("UNIQUE constraint failed: shares.subdomain")
+        || text.contains("idx_shares_subdomain_unique")
+    {
+        AppError::Conflict("subdomain already claimed".into())
+    } else {
+        AppError::Internal(format!("upsert share failed: {text}"))
+    }
 }
 
 fn verify_signature(public_key: &str, input: &IssueLeaseRequest) -> Result<(), AppError> {
