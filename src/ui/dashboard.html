@@ -517,7 +517,7 @@
       function maskToken(value) {
         if (!value) return "--";
         if (value.length <= 8) return value;
-        return value.slice(0, 4) + "\u2022\u2022\u2022\u2022" + value.slice(-4);
+        return value.slice(0, 1) + "***" + value.slice(-1);
       }
 
       function totalTokens(log) {
