@@ -489,6 +489,7 @@
                 <th>API URL&KEY</th>
                 <th>Usage</th>
                 <th>Status</th>
+                <th>Expires</th>
                 <th>Health</th>
                 <th>Online</th>
                 <th style="width:28px"></th>
@@ -540,7 +541,20 @@
 
       function fullTime(value) {
         if (!value) return "";
-        return new Date(value).toLocaleString();
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return "";
+        const parts = new Intl.DateTimeFormat(undefined, {
+          timeZone: "UTC",
+          year: "numeric",
+          month: "2-digit",
+          day: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+          hour12: false,
+        }).formatToParts(date);
+        const pick = (type) => parts.find((part) => part.type === type)?.value ?? "00";
+        return `${pick("year")}-${pick("month")}-${pick("day")} ${pick("hour")}:${pick("minute")}:${pick("second")} UTC`;
       }
 
       function relTimeFromDate(value) {
@@ -816,13 +830,16 @@
             <td>
               <span class="badge ${share.shareStatus === 'active' ? 'badge--active' : ''}">${share.shareStatus}</span>
             </td>
+            <td title="${fullTime(share.expiresAt)}">
+              <strong>${fullTime(share.expiresAt)}</strong>
+            </td>
             <td>${healthDots(share.healthChecks || [])}</td>
             <td title="${share.onlineMinutes24h || 0} / 1440 min online in last 24h">
               <strong>${formatPct(share.onlineRate24h || 0)}</strong>
             </td>
             <td><span class="row-arrow">&rsaquo;</span></td>
           </tr>`;
-        }).join("") : `<tr><td colspan="7"><div class="empty"><div class="empty-icon"></div>No shares yet</div></td></tr>`;
+        }).join("") : `<tr><td colspan="8"><div class="empty"><div class="empty-icon"></div>No shares yet</div></td></tr>`;
       }
 
       boot().catch(err => {
