@@ -918,7 +918,8 @@ fn list_health_checks(
     conn: &Connection,
     minutes: usize,
 ) -> Result<HashMap<String, Vec<HealthCheckEntry>>, AppError> {
-    let cutoff = Utc::now().timestamp() - (minutes as i64 - 1) * 60;
+    let current_bucket = Utc::now().timestamp().div_euclid(60);
+    let cutoff = (current_bucket - (minutes as i64 - 1)) * 60;
     let mut stmt = conn
         .prepare(
             "SELECT share_id, checked_at, is_healthy
