@@ -148,7 +148,8 @@
         width: 100%;
         height: 100%;
       }
-      .world-svg { opacity: 0.82; }
+      .world-svg { opacity: 0.82; z-index: 0; }
+      .map-overlay { z-index: 1; }
       .world-land {
         fill: rgba(0, 82, 255, 0.11);
         stroke: rgba(0, 82, 255, 0.14);
@@ -167,6 +168,7 @@
       #map-points {
         position: absolute;
         inset: 0;
+        z-index: 2;
       }
       .map-dot {
         position: absolute;
@@ -268,6 +270,7 @@
         justify-content: center;
         color: var(--muted-foreground);
         font-size: 13px;
+        z-index: 3;
       }
       .page-footer {
         margin-top: auto;
@@ -859,6 +862,8 @@
         return {
           x: ((lon + 180) / 360) * width,
           y: ((90 - lat) / 180) * height,
+          xPct: ((lon + 180) / 360) * 100,
+          yPct: ((90 - lat) / 180) * 100,
         };
       }
 
@@ -896,8 +901,8 @@
         const serverPoint = server ? projectPoint(server.lat, server.lon, width, height) : null;
         if (server && serverPoint) {
           points.push(
-            `<div class="map-dot map-dot--server" style="left:${serverPoint.x}px;top:${serverPoint.y}px" title="${escapeHtml(server.label)}"></div>`,
-            `<div class="map-label" style="left:${serverPoint.x}px;top:${serverPoint.y}px">${escapeHtml(server.label)}</div>`
+            `<div class="map-dot map-dot--server" style="left:${serverPoint.xPct}%;top:${serverPoint.yPct}%" title="${escapeHtml(server.label)}"></div>`,
+            `<div class="map-label" style="left:${serverPoint.xPct}%;top:${serverPoint.yPct}%">${escapeHtml(server.label)}</div>`
           );
         }
 
@@ -913,7 +918,7 @@
             client.lastSeenAt ? fullTime(client.lastSeenAt) : "",
           ].filter(Boolean).join(" · ");
           points.push(
-            `<div class="map-dot map-dot--client ${client.isActive ? "active" : ""}" style="left:${point.x}px;top:${point.y}px" title="${escapeHtml(title)}"></div>`
+            `<div class="map-dot map-dot--client ${client.isActive ? "active" : ""}" style="left:${point.xPct}%;top:${point.yPct}%" title="${escapeHtml(title)}"></div>`
           );
         }
 
