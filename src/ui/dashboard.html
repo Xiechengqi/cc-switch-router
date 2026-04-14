@@ -468,6 +468,7 @@
                 <th>Usage</th>
                 <th>Status</th>
                 <th>Health</th>
+                <th>Online</th>
                 <th style="width:28px"></th>
               </tr>
             </thead>
@@ -556,6 +557,11 @@
         const host = window.location.hostname || "localhost";
         const proto = window.location.protocol || "https:";
         return `${proto}//${subdomain}.${host}`;
+      }
+
+      function formatPct(value) {
+        if (value == null || Number.isNaN(value)) return "0.0%";
+        return `${value.toFixed(1)}%`;
       }
 
       function healthDots(checks) {
@@ -770,9 +776,12 @@
               <span class="badge ${share.shareStatus === 'active' ? 'badge--active' : ''}">${share.shareStatus}</span>
             </td>
             <td>${healthDots(share.healthChecks || [])}</td>
+            <td title="${share.onlineMinutes24h || 0} / 1440 min online in last 24h">
+              <strong>${formatPct(share.onlineRate24h || 0)}</strong>
+            </td>
             <td><span class="row-arrow">&rsaquo;</span></td>
           </tr>`;
-        }).join("") : `<tr><td colspan="6"><div class="empty"><div class="empty-icon"></div>No shares yet</div></td></tr>`;
+        }).join("") : `<tr><td colspan="7"><div class="empty"><div class="empty-icon"></div>No shares yet</div></td></tr>`;
       }
 
       boot().catch(err => {

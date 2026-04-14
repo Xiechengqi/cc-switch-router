@@ -225,6 +225,8 @@ pub struct ShareView {
     pub expires_at: String,
     pub installation_id: String,
     pub active_lease_count: usize,
+    pub online_minutes_24h: usize,
+    pub online_rate_24h: f64,
     pub recent_requests: Vec<ShareRequestLogEntry>,
     pub health_checks: Vec<HealthCheckEntry>,
 }

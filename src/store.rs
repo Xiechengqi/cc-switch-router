@@ -355,6 +355,7 @@ impl AppStore {
         let leases = list_leases(&conn)?;
         let shares = list_shares(&conn)?;
         let health_by_share = list_health_checks(&conn, 10)?;
+        let online_by_share = list_online_minutes_24h(&conn)?;
         let recent_logs = list_recent_share_request_logs(&conn, 8)?;
         let logs_by_share = recent_logs
             .into_iter()
@@ -423,6 +424,10 @@ impl AppStore {
                         .get(&share.share_id)
                         .cloned()
                         .unwrap_or_default();
+                    let online_minutes_24h = online_by_share
+                        .get(&share.share_id)
+                        .copied()
+                        .unwrap_or(0);
                     ShareView {
                         share_id: share.share_id,
                         share_name: share.share_name,
@@ -438,6 +443,8 @@ impl AppStore {
                         expires_at: share.expires_at,
                         installation_id,
                         active_lease_count,
+                        online_minutes_24h,
+                        online_rate_24h: (online_minutes_24h as f64 / 1440.0) * 100.0,
                         recent_requests,
                         health_checks,
                     }
@@ -935,6 +942,30 @@ fn list_health_checks(
     for row in rows {
         let (share_id, entry) = row.map_err(|e| AppError::Internal(format!("read health check row failed: {e}")))?;
         map.entry(share_id).or_default().push(entry);
+    }
+    Ok(map)
+}
+
+fn list_online_minutes_24h(conn: &Connection) -> Result<HashMap<String, usize>, AppError> {
+    let cutoff = Utc::now().timestamp() - 24 * 60 * 60;
+    let mut stmt = conn
+        .prepare(
+            "SELECT share_id, COUNT(DISTINCT checked_at / 60) AS online_minutes
+             FROM share_health_checks
+             WHERE checked_at >= ?1
+             GROUP BY share_id",
+        )
+        .map_err(|e| AppError::Internal(format!("prepare online minutes failed: {e}")))?;
+    let rows = stmt
+        .query_map(params![cutoff], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+        })
+        .map_err(|e| AppError::Internal(format!("query online minutes failed: {e}")))?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let (share_id, online_minutes) =
+            row.map_err(|e| AppError::Internal(format!("read online minute row failed: {e}")))?;
+        map.insert(share_id, online_minutes);
     }
     Ok(map)
 }
