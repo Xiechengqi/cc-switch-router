@@ -86,27 +86,9 @@
         font-size: 12px;
         color: var(--muted-foreground);
       }
-      .map-card {
-        position: relative;
-        overflow: hidden;
-        background:
-          radial-gradient(circle at top left, rgba(0, 82, 255, 0.16), transparent 28%),
-          linear-gradient(180deg, #ffffff 0%, #f7faff 100%);
-      }
-      .map-layout {
-        display: block;
-      }
-      .map-stage {
-        position: relative;
-        min-height: 360px;
-        padding: 18px 20px 12px;
-      }
-      .map-stage-header {
-        margin-bottom: 10px;
-      }
       .map-shell {
         position: relative;
-        min-height: 300px;
+        min-height: 360px;
         border-radius: 18px;
         background:
           linear-gradient(180deg, rgba(0, 82, 255, 0.035), rgba(0, 82, 255, 0.02)),
@@ -186,7 +168,8 @@
         height: 100%;
       }
       .world-image {
-        object-fit: cover;
+        object-fit: contain;
+        object-position: center center;
         opacity: 0.72;
         z-index: 0;
         filter: saturate(0.4) hue-rotate(180deg) brightness(1.02);
@@ -656,32 +639,24 @@
       </div>
 
       <section class="section">
-        <div class="section-label">GLOBAL MAP <span id="map-client-count">0</span></div>
-        <div class="table-card map-card">
-          <div class="map-layout">
-            <div class="map-stage">
-              <div class="map-stage-header"></div>
-              <div class="map-shell" id="map-shell">
-                <div class="map-canvas" id="map-canvas">
-                  <img class="world-image" src="/assets/world-map.svg" alt="" />
-                  <svg class="map-overlay" id="map-overlay" viewBox="0 0 1000 520" preserveAspectRatio="none"></svg>
-                  <div id="map-points"></div>
-                </div>
-                <div class="map-controls">
-                  <button class="map-control-btn" id="map-zoom-out" type="button" aria-label="Zoom out">-</button>
-                  <span class="map-zoom-label" id="map-zoom-label">100%</span>
-                  <button class="map-control-btn" id="map-zoom-in" type="button" aria-label="Zoom in">+</button>
-                  <button class="map-control-btn" id="map-zoom-reset" type="button" aria-label="Reset map view">↺</button>
-                </div>
-                <div class="map-legend">
-                  <span><i class="server"></i>server</span>
-                  <span><i class="active"></i>active client</span>
-                  <span><i class="inactive"></i>idle client</span>
-                </div>
-                <div class="map-empty" id="map-empty">Waiting for server geo or client locations</div>
-              </div>
-            </div>
+        <div class="map-shell" id="map-shell">
+          <div class="map-canvas" id="map-canvas">
+            <img class="world-image" src="/assets/world-map.svg" alt="" />
+            <svg class="map-overlay" id="map-overlay" viewBox="0 0 1000 520" preserveAspectRatio="none"></svg>
+            <div id="map-points"></div>
           </div>
+          <div class="map-controls">
+            <button class="map-control-btn" id="map-zoom-out" type="button" aria-label="Zoom out">-</button>
+            <span class="map-zoom-label" id="map-zoom-label">100%</span>
+            <button class="map-control-btn" id="map-zoom-in" type="button" aria-label="Zoom in">+</button>
+            <button class="map-control-btn" id="map-zoom-reset" type="button" aria-label="Reset map view">↺</button>
+          </div>
+          <div class="map-legend">
+            <span><i class="server"></i>server</span>
+            <span><i class="active"></i>active client</span>
+            <span><i class="inactive"></i>idle client</span>
+          </div>
+          <div class="map-empty" id="map-empty">Waiting for server geo or client locations</div>
         </div>
       </section>
 
