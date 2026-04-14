@@ -557,8 +557,8 @@
         for (const c of checks) {
           hitMinutes.add(Math.floor(c.checkedAt / 60));
         }
-        // Render 10 slots: oldest (now-10m) → newest (now-1m).
-        for (let i = total; i >= 1; i--) {
+        // Render 10 slots including the current minute: oldest (now-9m) → newest (now).
+        for (let i = total - 1; i >= 0; i--) {
           const bucket = Math.floor((now - i * 60) / 60);
           const hit = hitMinutes.has(bucket);
           const cls = hit ? "health-dot--ok" : "health-dot--fail";
