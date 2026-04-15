@@ -11,16 +11,17 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 use uuid::Uuid;
 
+use crate::ServerGeo;
 use crate::config::Config;
 use crate::error::AppError;
 use crate::models::{
-    ClientMetadata, DashboardMap, DashboardMapPoint, DashboardPresenceRequest, DashboardResponse, DashboardStats, HealthCheckEntry, Installation, InstallationView,
-    IssueLeaseRequest, IssueLeaseResponse, LeaseView, RegisterInstallationRequest,
-    RegisterInstallationResponse, ShareBatchSyncRequest, ShareClaimSubdomainRequest,
-    ShareDeleteRequest, ShareDescriptor, ShareHeartbeatRequest, ShareRequestLogBatchSyncRequest,
-    ShareRequestLogEntry, ShareSyncRequest, ShareView, TunnelLease,
+    ClientMetadata, DashboardMap, DashboardMapPoint, DashboardPresenceRequest, DashboardResponse,
+    DashboardStats, HealthCheckEntry, Installation, InstallationView, IssueLeaseRequest,
+    IssueLeaseResponse, LeaseView, RegisterInstallationRequest, RegisterInstallationResponse,
+    ShareBatchSyncRequest, ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptor,
+    ShareHeartbeatRequest, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareSyncRequest,
+    ShareView, TunnelLease,
 };
-use crate::ServerGeo;
 use crate::proxy::ProxyRegistry;
 
 #[derive(Clone)]
@@ -498,14 +499,15 @@ impl AppStore {
         }
 
         let conn = self.conn.lock().await;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| AppError::Internal(format!("begin request log batch sync tx failed: {e}")))?;
+        let tx = conn.unchecked_transaction().map_err(|e| {
+            AppError::Internal(format!("begin request log batch sync tx failed: {e}"))
+        })?;
         for log in input.logs {
             upsert_share_request_log_tx(&tx, &input.installation_id, log)?;
         }
-        tx.commit()
-            .map_err(|e| AppError::Internal(format!("commit request log batch sync failed: {e}")))?;
+        tx.commit().map_err(|e| {
+            AppError::Internal(format!("commit request log batch sync failed: {e}"))
+        })?;
         Ok(())
     }
 
@@ -515,7 +517,11 @@ impl AppStore {
         server_geo: &ServerGeo,
         proxy: &ProxyRegistry,
     ) -> Result<DashboardResponse, AppError> {
-        let active_subdomains = proxy.active_subdomains().await.into_iter().collect::<HashSet<_>>();
+        let active_subdomains = proxy
+            .active_subdomains()
+            .await
+            .into_iter()
+            .collect::<HashSet<_>>();
         let conn = self.conn.lock().await;
         let now = Utc::now();
 
@@ -525,12 +531,13 @@ impl AppStore {
         let health_by_share = list_health_checks(&conn, 10)?;
         let online_by_share = list_online_minutes_24h(&conn)?;
         let recent_logs = list_recent_share_request_logs(&conn, 8)?;
-        let logs_by_share = recent_logs
-            .into_iter()
-            .fold(HashMap::<String, Vec<ShareRequestLogEntry>>::new(), |mut acc, log| {
+        let logs_by_share = recent_logs.into_iter().fold(
+            HashMap::<String, Vec<ShareRequestLogEntry>>::new(),
+            |mut acc, log| {
                 acc.entry(log.share_id.clone()).or_default().push(log);
                 acc
-            });
+            },
+        );
 
         let mut leases_by_installation: HashMap<String, Vec<TunnelLease>> = HashMap::new();
         for lease in leases {
@@ -596,45 +603,40 @@ impl AppStore {
         let share_views = shares
             .into_iter()
             .map(|(installation_id, share, _active_lease_count)| {
-                    let active_lease_count =
-                        usize::from(active_subdomains.contains(&share.subdomain));
-                    if active_lease_count > 0 {
-                        active_share_ids.insert(share.share_id.clone());
-                    }
-                    let recent_requests = logs_by_share
-                        .get(&share.share_id)
-                        .cloned()
-                        .unwrap_or_default();
-                    let health_checks = health_by_share
-                        .get(&share.share_id)
-                        .cloned()
-                        .unwrap_or_default();
-                    let online_minutes_24h = online_by_share
-                        .get(&share.share_id)
-                        .copied()
-                        .unwrap_or(0);
-                    ShareView {
-                        share_id: share.share_id,
-                        share_name: share.share_name,
-                        subdomain: share.subdomain,
-                        share_token: share.share_token,
-                        app_type: share.app_type,
-                        provider_id: share.provider_id,
-                        token_limit: share.token_limit,
-                        tokens_used: share.tokens_used,
-                        requests_count: share.requests_count,
-                        share_status: share.share_status,
-                        created_at: share.created_at,
-                        expires_at: share.expires_at,
-                        installation_id,
-                        active_lease_count,
-                        online_minutes_24h,
-                        online_rate_24h: (online_minutes_24h as f64 / 1440.0) * 100.0,
-                        recent_requests,
-                        health_checks,
-                    }
-                },
-            )
+                let active_lease_count = usize::from(active_subdomains.contains(&share.subdomain));
+                if active_lease_count > 0 {
+                    active_share_ids.insert(share.share_id.clone());
+                }
+                let recent_requests = logs_by_share
+                    .get(&share.share_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let health_checks = health_by_share
+                    .get(&share.share_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let online_minutes_24h = online_by_share.get(&share.share_id).copied().unwrap_or(0);
+                ShareView {
+                    share_id: share.share_id,
+                    share_name: share.share_name,
+                    subdomain: share.subdomain,
+                    share_token: share.share_token,
+                    app_type: share.app_type,
+                    provider_id: share.provider_id,
+                    token_limit: share.token_limit,
+                    tokens_used: share.tokens_used,
+                    requests_count: share.requests_count,
+                    share_status: share.share_status,
+                    created_at: share.created_at,
+                    expires_at: share.expires_at,
+                    installation_id,
+                    active_lease_count,
+                    online_minutes_24h,
+                    online_rate_24h: (online_minutes_24h as f64 / 1440.0) * 100.0,
+                    recent_requests,
+                    health_checks,
+                }
+            })
             .collect::<Vec<_>>();
 
         Ok(DashboardResponse {
@@ -649,20 +651,23 @@ impl AppStore {
                 active_shares: active_share_ids.len(),
             },
             map: DashboardMap {
-                server: server_geo.lat.zip(server_geo.lon).map(|(lat, lon)| DashboardMapPoint {
-                    id: "server".into(),
-                    label: "server".into(),
-                    point_type: "server".into(),
-                    platform: None,
-                    country_code: None,
-                    country: None,
-                    region: None,
-                    city: None,
-                    lat: Some(lat),
-                    lon: Some(lon),
-                    last_seen_at: Some(now),
-                    is_active: true,
-                }),
+                server: server_geo
+                    .lat
+                    .zip(server_geo.lon)
+                    .map(|(lat, lon)| DashboardMapPoint {
+                        id: "server".into(),
+                        label: "server".into(),
+                        point_type: "server".into(),
+                        platform: None,
+                        country_code: None,
+                        country: None,
+                        region: None,
+                        city: None,
+                        lat: Some(lat),
+                        lon: Some(lon),
+                        last_seen_at: Some(now),
+                        is_active: true,
+                    }),
                 clients: client_map_points,
             },
             installations: installation_views,
@@ -701,9 +706,11 @@ impl AppStore {
             .execute(
                 "DELETE FROM share_request_logs
                  WHERE created_at < ?1",
-                params![DateTime::parse_from_rfc3339(&cutoff)
-                    .map(|dt| dt.timestamp())
-                    .unwrap_or_default()],
+                params![
+                    DateTime::parse_from_rfc3339(&cutoff)
+                        .map(|dt| dt.timestamp())
+                        .unwrap_or_default()
+                ],
             )
             .map_err(|e| AppError::Internal(format!("delete stale request logs failed: {e}")))?;
 
@@ -787,8 +794,9 @@ impl AppStore {
         mut share: ShareDescriptor,
     ) -> Result<(), AppError> {
         let conn = self.conn.lock().await;
-        let existing_subdomain = get_share_owned_subdomain(&conn, installation_id, &share.share_id)?
-            .ok_or_else(|| AppError::Conflict("share subdomain is not claimed".into()))?;
+        let existing_subdomain =
+            get_share_owned_subdomain(&conn, installation_id, &share.share_id)?
+                .ok_or_else(|| AppError::Conflict("share subdomain is not claimed".into()))?;
         share.subdomain = existing_subdomain;
         upsert_share_tx(&conn, installation_id, share)?;
         Ok(())
@@ -852,7 +860,9 @@ impl AppStore {
         let candidate_matches = current_state
             .geo_candidate_latitude
             .zip(current_state.geo_candidate_longitude)
-            .and_then(|(lat, lon)| haversine_distance_km(Some(lat), Some(lon), geo.latitude, geo.longitude))
+            .and_then(|(lat, lon)| {
+                haversine_distance_km(Some(lat), Some(lon), geo.latitude, geo.longitude)
+            })
             .map(|distance| distance <= GEO_CANDIDATE_DISTANCE_KM)
             .unwrap_or(false)
             && current_state.geo_candidate_country_code == geo.country_code;
@@ -867,7 +877,13 @@ impl AppStore {
         } else {
             now
         };
-        persist_candidate_geo(&conn, installation_id, &geo, candidate_hits, candidate_first_seen_at)?;
+        persist_candidate_geo(
+            &conn,
+            installation_id,
+            &geo,
+            candidate_hits,
+            candidate_first_seen_at,
+        )?;
 
         let candidate_age_secs = (now - candidate_first_seen_at).num_seconds();
         let last_change_age_secs = current_state
@@ -901,9 +917,9 @@ fn upsert_share_tx(
             share_token = excluded.share_token,
             app_type = excluded.app_type,
             provider_id = excluded.provider_id,
-            token_limit = excluded.token_limit,
-            tokens_used = excluded.tokens_used,
-            requests_count = excluded.requests_count,
+            token_limit = MAX(shares.token_limit, excluded.token_limit),
+            tokens_used = MAX(shares.tokens_used, excluded.tokens_used),
+            requests_count = MAX(shares.requests_count, excluded.requests_count),
             share_status = excluded.share_status,
             created_at = excluded.created_at,
             expires_at = excluded.expires_at,
@@ -929,11 +945,41 @@ fn upsert_share_tx(
     Ok(())
 }
 
+fn backfill_share_usage_from_logs_tx(conn: &Connection, share_id: &str) -> Result<(), AppError> {
+    conn.execute(
+        "UPDATE shares
+         SET tokens_used = MAX(
+                 tokens_used,
+                 COALESCE((
+                     SELECT SUM(
+                         input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens
+                     )
+                     FROM share_request_logs
+                     WHERE share_id = ?1
+                 ), 0)
+             ),
+             requests_count = MAX(
+                 requests_count,
+                 COALESCE((
+                     SELECT COUNT(*)
+                     FROM share_request_logs
+                     WHERE share_id = ?1
+                 ), 0)
+             ),
+             updated_at = ?2
+         WHERE share_id = ?1",
+        params![share_id, Utc::now().to_rfc3339()],
+    )
+    .map_err(|e| AppError::Internal(format!("backfill share usage from logs failed: {e}")))?;
+    Ok(())
+}
+
 fn upsert_share_request_log_tx(
     conn: &Connection,
     installation_id: &str,
     log: ShareRequestLogEntry,
 ) -> Result<(), AppError> {
+    let share_id = log.share_id.clone();
     conn.execute(
         "INSERT INTO share_request_logs (
             request_id, installation_id, share_id, share_name, provider_id, provider_name,
@@ -983,6 +1029,7 @@ fn upsert_share_request_log_tx(
         ],
     )
     .map_err(|e| AppError::Internal(format!("upsert share request log failed: {e}")))?;
+    backfill_share_usage_from_logs_tx(conn, &share_id)?;
     Ok(())
 }
 
@@ -1098,11 +1145,15 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         .map_err(|e| AppError::Internal(format!("inspect installations schema failed: {e}")))?;
     if !columns.iter().any(|name| name == "last_seen_ip") {
         conn.execute("ALTER TABLE installations ADD COLUMN last_seen_ip TEXT", [])
-            .map_err(|e| AppError::Internal(format!("add installations last_seen_ip failed: {e}")))?;
+            .map_err(|e| {
+                AppError::Internal(format!("add installations last_seen_ip failed: {e}"))
+            })?;
     }
     if !columns.iter().any(|name| name == "country_code") {
         conn.execute("ALTER TABLE installations ADD COLUMN country_code TEXT", [])
-            .map_err(|e| AppError::Internal(format!("add installations country_code failed: {e}")))?;
+            .map_err(|e| {
+                AppError::Internal(format!("add installations country_code failed: {e}"))
+            })?;
     }
     if !columns.iter().any(|name| name == "country") {
         conn.execute("ALTER TABLE installations ADD COLUMN country TEXT", [])
@@ -1124,41 +1175,104 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         conn.execute("ALTER TABLE installations ADD COLUMN longitude REAL", [])
             .map_err(|e| AppError::Internal(format!("add installations longitude failed: {e}")))?;
     }
-    if !columns.iter().any(|name| name == "geo_candidate_country_code") {
-        conn.execute("ALTER TABLE installations ADD COLUMN geo_candidate_country_code TEXT", [])
-            .map_err(|e| AppError::Internal(format!("add installations geo_candidate_country_code failed: {e}")))?;
+    if !columns
+        .iter()
+        .any(|name| name == "geo_candidate_country_code")
+    {
+        conn.execute(
+            "ALTER TABLE installations ADD COLUMN geo_candidate_country_code TEXT",
+            [],
+        )
+        .map_err(|e| {
+            AppError::Internal(format!(
+                "add installations geo_candidate_country_code failed: {e}"
+            ))
+        })?;
     }
     if !columns.iter().any(|name| name == "geo_candidate_country") {
-        conn.execute("ALTER TABLE installations ADD COLUMN geo_candidate_country TEXT", [])
-            .map_err(|e| AppError::Internal(format!("add installations geo_candidate_country failed: {e}")))?;
+        conn.execute(
+            "ALTER TABLE installations ADD COLUMN geo_candidate_country TEXT",
+            [],
+        )
+        .map_err(|e| {
+            AppError::Internal(format!(
+                "add installations geo_candidate_country failed: {e}"
+            ))
+        })?;
     }
     if !columns.iter().any(|name| name == "geo_candidate_region") {
-        conn.execute("ALTER TABLE installations ADD COLUMN geo_candidate_region TEXT", [])
-            .map_err(|e| AppError::Internal(format!("add installations geo_candidate_region failed: {e}")))?;
+        conn.execute(
+            "ALTER TABLE installations ADD COLUMN geo_candidate_region TEXT",
+            [],
+        )
+        .map_err(|e| {
+            AppError::Internal(format!(
+                "add installations geo_candidate_region failed: {e}"
+            ))
+        })?;
     }
     if !columns.iter().any(|name| name == "geo_candidate_city") {
-        conn.execute("ALTER TABLE installations ADD COLUMN geo_candidate_city TEXT", [])
-            .map_err(|e| AppError::Internal(format!("add installations geo_candidate_city failed: {e}")))?;
+        conn.execute(
+            "ALTER TABLE installations ADD COLUMN geo_candidate_city TEXT",
+            [],
+        )
+        .map_err(|e| {
+            AppError::Internal(format!("add installations geo_candidate_city failed: {e}"))
+        })?;
     }
     if !columns.iter().any(|name| name == "geo_candidate_latitude") {
-        conn.execute("ALTER TABLE installations ADD COLUMN geo_candidate_latitude REAL", [])
-            .map_err(|e| AppError::Internal(format!("add installations geo_candidate_latitude failed: {e}")))?;
+        conn.execute(
+            "ALTER TABLE installations ADD COLUMN geo_candidate_latitude REAL",
+            [],
+        )
+        .map_err(|e| {
+            AppError::Internal(format!(
+                "add installations geo_candidate_latitude failed: {e}"
+            ))
+        })?;
     }
     if !columns.iter().any(|name| name == "geo_candidate_longitude") {
-        conn.execute("ALTER TABLE installations ADD COLUMN geo_candidate_longitude REAL", [])
-            .map_err(|e| AppError::Internal(format!("add installations geo_candidate_longitude failed: {e}")))?;
+        conn.execute(
+            "ALTER TABLE installations ADD COLUMN geo_candidate_longitude REAL",
+            [],
+        )
+        .map_err(|e| {
+            AppError::Internal(format!(
+                "add installations geo_candidate_longitude failed: {e}"
+            ))
+        })?;
     }
     if !columns.iter().any(|name| name == "geo_candidate_hits") {
-        conn.execute("ALTER TABLE installations ADD COLUMN geo_candidate_hits INTEGER NOT NULL DEFAULT 0", [])
-            .map_err(|e| AppError::Internal(format!("add installations geo_candidate_hits failed: {e}")))?;
+        conn.execute(
+            "ALTER TABLE installations ADD COLUMN geo_candidate_hits INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| {
+            AppError::Internal(format!("add installations geo_candidate_hits failed: {e}"))
+        })?;
     }
-    if !columns.iter().any(|name| name == "geo_candidate_first_seen_at") {
-        conn.execute("ALTER TABLE installations ADD COLUMN geo_candidate_first_seen_at TEXT", [])
-            .map_err(|e| AppError::Internal(format!("add installations geo_candidate_first_seen_at failed: {e}")))?;
+    if !columns
+        .iter()
+        .any(|name| name == "geo_candidate_first_seen_at")
+    {
+        conn.execute(
+            "ALTER TABLE installations ADD COLUMN geo_candidate_first_seen_at TEXT",
+            [],
+        )
+        .map_err(|e| {
+            AppError::Internal(format!(
+                "add installations geo_candidate_first_seen_at failed: {e}"
+            ))
+        })?;
     }
     if !columns.iter().any(|name| name == "geo_last_changed_at") {
-        conn.execute("ALTER TABLE installations ADD COLUMN geo_last_changed_at TEXT", [])
-            .map_err(|e| AppError::Internal(format!("add installations geo_last_changed_at failed: {e}")))?;
+        conn.execute(
+            "ALTER TABLE installations ADD COLUMN geo_last_changed_at TEXT",
+            [],
+        )
+        .map_err(|e| {
+            AppError::Internal(format!("add installations geo_last_changed_at failed: {e}"))
+        })?;
     }
     let columns = conn
         .prepare("PRAGMA table_info(shares)")
@@ -1348,10 +1462,7 @@ fn touch_installation_presence(
     Ok(())
 }
 
-fn should_refresh_installation_geo(
-    installation: &Installation,
-    next_ip: Option<&str>,
-) -> bool {
+fn should_refresh_installation_geo(installation: &Installation, next_ip: Option<&str>) -> bool {
     let Some(next_ip) = next_ip.map(str::trim).filter(|v| !v.is_empty()) else {
         return false;
     };
@@ -1372,8 +1483,7 @@ fn haversine_distance_km(
     let dlon = to_rad(lon2 - lon1);
     let lat1 = to_rad(lat1);
     let lat2 = to_rad(lat2);
-    let a = (dlat / 2.0).sin().powi(2)
-        + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
+    let a = (dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
     let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
     Some(6371.0 * c)
 }
@@ -1642,7 +1752,8 @@ fn list_health_checks(
         .map_err(|e| AppError::Internal(format!("query health checks failed: {e}")))?;
     let mut map: HashMap<String, Vec<HealthCheckEntry>> = HashMap::new();
     for row in rows {
-        let (share_id, entry) = row.map_err(|e| AppError::Internal(format!("read health check row failed: {e}")))?;
+        let (share_id, entry) =
+            row.map_err(|e| AppError::Internal(format!("read health check row failed: {e}")))?;
         map.entry(share_id).or_default().push(entry);
     }
     Ok(map)
