@@ -19,10 +19,12 @@ use crate::models::{
     DashboardStats, HealthCheckEntry, Installation, InstallationView, IssueLeaseRequest,
     IssueLeaseResponse, LeaseView, RegisterInstallationRequest, RegisterInstallationResponse,
     ShareBatchSyncRequest, ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptor,
-    ShareHeartbeatRequest, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareSyncRequest,
-    ShareView, TunnelLease,
+    ShareHeartbeatRequest, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry,
+    ShareRequestLogFetchResponse, ShareSyncRequest, ShareView, TunnelLease,
 };
 use crate::proxy::ProxyRegistry;
+
+const SHARE_REQUEST_LOG_RECOVERY_LIMIT: usize = 10;
 
 #[derive(Clone)]
 pub struct AppStore {
@@ -513,7 +515,7 @@ impl AppStore {
 
     pub async fn dashboard_snapshot(
         &self,
-        _config: &Config,
+        config: &Config,
         server_geo: &ServerGeo,
         proxy: &ProxyRegistry,
     ) -> Result<DashboardResponse, AppError> {
@@ -522,15 +524,18 @@ impl AppStore {
             .await
             .into_iter()
             .collect::<HashSet<_>>();
-        let conn = self.conn.lock().await;
         let now = Utc::now();
-
-        let installations = list_installations(&conn)?;
-        let leases = list_leases(&conn)?;
-        let shares = list_shares(&conn)?;
-        let health_by_share = list_health_checks(&conn, 10)?;
-        let online_by_share = list_online_minutes_24h(&conn)?;
-        let recent_logs = list_recent_share_request_logs(&conn, 8)?;
+        let (installations, leases, shares, health_by_share, online_by_share, recent_logs) = {
+            let conn = self.conn.lock().await;
+            (
+                list_installations(&conn)?,
+                list_leases(&conn)?,
+                list_shares(&conn)?,
+                list_health_checks(&conn, 10)?,
+                list_online_minutes_24h(&conn)?,
+                list_recent_share_request_logs(&conn, SHARE_REQUEST_LOG_RECOVERY_LIMIT)?,
+            )
+        };
         let logs_by_share = recent_logs.into_iter().fold(
             HashMap::<String, Vec<ShareRequestLogEntry>>::new(),
             |mut acc, log| {
@@ -538,6 +543,9 @@ impl AppStore {
                 acc
             },
         );
+        let logs_by_share = self
+            .recover_missing_share_request_logs(config, &active_subdomains, &shares, logs_by_share)
+            .await?;
 
         let mut leases_by_installation: HashMap<String, Vec<TunnelLease>> = HashMap::new();
         for lease in leases {
@@ -551,12 +559,13 @@ impl AppStore {
         let mut client_map_points = Vec::new();
         for installation in installations {
             let mut lease_views = Vec::new();
-            let mut active_lease_count = 0usize;
+            let mut active_subdomains_for_installation = HashSet::new();
             if let Some(items) = leases_by_installation.get(&installation.id) {
                 for lease in items {
-                    let is_active = active_subdomains.contains(&lease.subdomain);
+                    let is_active =
+                        lease.expires_at > now && active_subdomains.contains(&lease.subdomain);
                     if is_active {
-                        active_lease_count += 1;
+                        active_subdomains_for_installation.insert(lease.subdomain.clone());
                     }
                     lease_views.push(LeaseView {
                         connection_id: lease.connection_id.clone(),
@@ -571,6 +580,7 @@ impl AppStore {
                 }
                 lease_views.sort_by(|a, b| b.issued_at.cmp(&a.issued_at));
             }
+            let active_lease_count = active_subdomains_for_installation.len();
             let is_active = active_lease_count > 0;
             client_map_points.push(DashboardMapPoint {
                 id: installation.id.clone(),
@@ -673,6 +683,100 @@ impl AppStore {
             installations: installation_views,
             shares: share_views,
         })
+    }
+
+    async fn recover_missing_share_request_logs(
+        &self,
+        config: &Config,
+        active_subdomains: &HashSet<String>,
+        shares: &[(String, ShareDescriptor, usize)],
+        mut logs_by_share: HashMap<String, Vec<ShareRequestLogEntry>>,
+    ) -> Result<HashMap<String, Vec<ShareRequestLogEntry>>, AppError> {
+        let missing_shares = shares
+            .iter()
+            .filter(|(_, share, _)| {
+                active_subdomains.contains(&share.subdomain)
+                    && logs_by_share
+                        .get(&share.share_id)
+                        .map(|logs| logs.is_empty())
+                        .unwrap_or(true)
+            })
+            .map(|(installation_id, share, _)| {
+                (
+                    installation_id.clone(),
+                    share.share_id.clone(),
+                    share.subdomain.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        if missing_shares.is_empty() {
+            return Ok(logs_by_share);
+        }
+
+        let client = reqwest::Client::builder()
+            .user_agent("portr-rs/0.1 share-log-recovery")
+            .timeout(StdDuration::from_secs(5))
+            .build()
+            .map_err(|e| {
+                AppError::Internal(format!("build share log recovery client failed: {e}"))
+            })?;
+
+        for (installation_id, share_id, subdomain) in missing_shares {
+            let response =
+                match fetch_share_request_logs_from_route(config, &client, &subdomain).await {
+                    Ok(response) => response,
+                    Err(err) => {
+                        tracing::debug!(
+                            share_id = %share_id,
+                            subdomain = %subdomain,
+                            "share request log recovery skipped: {err}"
+                        );
+                        continue;
+                    }
+                };
+
+            if response.logs.is_empty() {
+                continue;
+            }
+
+            if let Some(response_share_id) = response.share_id.as_deref() {
+                if response_share_id != share_id {
+                    tracing::debug!(
+                        share_id = %share_id,
+                        response_share_id = %response_share_id,
+                        subdomain = %subdomain,
+                        "share request log recovery returned mismatched share id"
+                    );
+                }
+            }
+
+            {
+                let mut recovered_logs = response.logs;
+                recovered_logs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                recovered_logs.truncate(SHARE_REQUEST_LOG_RECOVERY_LIMIT);
+                let conn = self.conn.lock().await;
+                let tx = conn.unchecked_transaction().map_err(|e| {
+                    AppError::Internal(format!("begin share request log recovery tx failed: {e}"))
+                })?;
+                for log in &recovered_logs {
+                    upsert_share_request_log_tx(&tx, &installation_id, log.clone())?;
+                }
+                tx.commit().map_err(|e| {
+                    AppError::Internal(format!("commit share request log recovery tx failed: {e}"))
+                })?;
+                logs_by_share.insert(share_id.clone(), recovered_logs);
+            }
+
+            tracing::info!(
+                share_id = %share_id,
+                subdomain = %subdomain,
+                recovered = logs_by_share.get(&share_id).map(|logs| logs.len()).unwrap_or(0),
+                "recovered share request logs from active route"
+            );
+        }
+
+        Ok(logs_by_share)
     }
 
     pub async fn cleanup_expired_data(&self, config: &Config) -> Result<(usize, usize), AppError> {
@@ -898,6 +1002,31 @@ impl AppStore {
         }
         Ok(())
     }
+}
+
+async fn fetch_share_request_logs_from_route(
+    config: &Config,
+    client: &reqwest::Client,
+    subdomain: &str,
+) -> Result<ShareRequestLogFetchResponse, AppError> {
+    let url = format!("{}/_portr/request-logs", config.tunnel_url(subdomain));
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("fetch share request logs failed: {e}")))?;
+
+    if !response.status().is_success() {
+        return Err(AppError::Internal(format!(
+            "fetch share request logs failed with status {}",
+            response.status()
+        )));
+    }
+
+    response
+        .json::<ShareRequestLogFetchResponse>()
+        .await
+        .map_err(|e| AppError::Internal(format!("decode share request logs failed: {e}")))
 }
 
 fn upsert_share_tx(
