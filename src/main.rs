@@ -18,7 +18,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 
 use crate::config::{Config, ensure_default_env_file, load_env_file};
-use crate::store::AppStore;
+use crate::store::{AppStore, ShareRouteTarget};
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -80,6 +80,8 @@ async fn main() -> Result<()> {
     };
     let cleanup_store = state.store.clone();
     let cleanup_config = config.clone();
+    let probe_store = state.store.clone();
+    let probe_config = config.clone();
 
     let http_listener = TcpListener::bind(config.api_addr).await?;
     let ssh_listener = TcpListener::bind(config.ssh_addr).await?;
@@ -102,6 +104,22 @@ async fn main() -> Result<()> {
             }
         }
     });
+    let probe_task = tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .user_agent("portr-rs/0.1 route-probe")
+            .timeout(Duration::from_secs(5))
+            .build()?;
+
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            if let Err(err) = run_route_health_probe_cycle(&probe_store, &probe_config, &client).await {
+                tracing::warn!("route health probe failed: {err}");
+            }
+        }
+        #[allow(unreachable_code)]
+        Ok::<_, anyhow::Error>(())
+    });
     let ssh_task = tokio::spawn(async move { ssh_server.run_with_listener(ssh_listener).await });
     let http_task = tokio::spawn(async move {
         axum::serve(
@@ -115,14 +133,48 @@ async fn main() -> Result<()> {
     tokio::select! {
         ssh_result = ssh_task => {
             cleanup_task.abort();
+            probe_task.abort();
             ssh_result??;
             Ok(())
         }
         http_result = http_task => {
             cleanup_task.abort();
+            probe_task.abort();
             http_result??;
             Ok(())
         }
+    }
+}
+
+async fn run_route_health_probe_cycle(
+    store: &AppStore,
+    config: &Config,
+    client: &reqwest::Client,
+) -> Result<()> {
+    let targets = store.list_share_route_targets().await?;
+    for target in targets {
+        let is_healthy = probe_share_route(config, client, &target).await;
+        if let Err(err) = store.record_share_route_health(&target.share_id, is_healthy).await {
+            tracing::warn!(share_id = %target.share_id, "record route health failed: {err}");
+        }
+    }
+    Ok(())
+}
+
+async fn probe_share_route(
+    config: &Config,
+    client: &reqwest::Client,
+    target: &ShareRouteTarget,
+) -> bool {
+    let url = format!("{}/_portr/health", config.tunnel_url(&target.subdomain));
+    match client
+        .get(&url)
+        .header("X-Portr-Probe", "1")
+        .send()
+        .await
+    {
+        Ok(response) => response.status().is_success(),
+        Err(_) => false,
     }
 }
 

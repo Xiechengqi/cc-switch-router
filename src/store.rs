@@ -58,6 +58,12 @@ const GEO_CANDIDATE_CONFIRM_HITS: i64 = 3;
 const GEO_CANDIDATE_MIN_AGE_SECS: i64 = 10 * 60;
 const GEO_STABLE_MIN_SWITCH_SECS: i64 = 30 * 60;
 
+#[derive(Debug, Clone)]
+pub struct ShareRouteTarget {
+    pub share_id: String,
+    pub subdomain: String,
+}
+
 impl AppStore {
     pub fn new(config: &Config) -> Result<Self, AppError> {
         if let Some(parent) = config.db_path.parent() {
@@ -707,7 +713,9 @@ impl AppStore {
         Ok((deleted_leases, deleted_shares))
     }
 
-    /// Record a heartbeat reported by cc-switch for a share.
+    /// Legacy heartbeat endpoint kept for compatibility with older cc-switch
+    /// clients. It updates installation presence only and no longer feeds
+    /// dashboard health state.
     pub async fn record_share_heartbeat(
         &self,
         input: ShareHeartbeatRequest,
@@ -718,7 +726,6 @@ impl AppStore {
         let Some(installation) = installation else {
             return Err(AppError::Unauthorized("installation not found".into()));
         };
-        let now = Utc::now().timestamp();
         let should_refresh_geo =
             should_refresh_installation_geo(&installation, metadata.ip.as_deref());
         touch_installation_presence(&conn, &input.installation_id, &metadata, Utc::now())?;
@@ -727,18 +734,50 @@ impl AppStore {
             self.refresh_installation_geo(&input.installation_id, &metadata.ip, false)
                 .await?;
         }
+        Ok(())
+    }
+
+    pub async fn list_share_route_targets(&self) -> Result<Vec<ShareRouteTarget>, AppError> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT share_id, subdomain
+                 FROM shares
+                 WHERE subdomain IS NOT NULL
+                   AND subdomain != ''
+                   AND subdomain != '-'
+                   AND share_status != 'deleted'
+                 ORDER BY share_name ASC",
+            )
+            .map_err(|e| AppError::Internal(format!("prepare route targets failed: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ShareRouteTarget {
+                    share_id: row.get(0)?,
+                    subdomain: row.get(1)?,
+                })
+            })
+            .map_err(|e| AppError::Internal(format!("query route targets failed: {e}")))?;
+        collect_rows(rows)
+    }
+
+    pub async fn record_share_route_health(
+        &self,
+        share_id: &str,
+        is_healthy: bool,
+    ) -> Result<(), AppError> {
+        let now = Utc::now().timestamp();
         let conn = self.conn.lock().await;
         conn.execute(
-            "INSERT INTO share_health_checks (share_id, checked_at, is_healthy) VALUES (?1, ?2, 1)",
-            params![input.share_id, now],
+            "INSERT INTO share_health_checks (share_id, checked_at, is_healthy) VALUES (?1, ?2, ?3)",
+            params![share_id, now, if is_healthy { 1 } else { 0 }],
         )
-        .map_err(|e| AppError::Internal(format!("insert heartbeat failed: {e}")))?;
-        // Prune entries older than 24 hours.
+        .map_err(|e| AppError::Internal(format!("insert route health failed: {e}")))?;
         conn.execute(
             "DELETE FROM share_health_checks WHERE checked_at < ?1",
             params![now - 86_400],
         )
-        .map_err(|e| AppError::Internal(format!("prune heartbeats failed: {e}")))?;
+        .map_err(|e| AppError::Internal(format!("prune route health failed: {e}")))?;
         Ok(())
     }
 

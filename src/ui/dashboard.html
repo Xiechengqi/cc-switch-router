@@ -89,10 +89,9 @@
       .map-shell {
         position: relative;
         min-height: 360px;
-        border-radius: 18px;
+        border-radius: 10px;
         background:
-          linear-gradient(180deg, rgba(0, 82, 255, 0.035), rgba(0, 82, 255, 0.02)),
-          radial-gradient(circle at 20% 20%, rgba(77, 124, 255, 0.12), transparent 28%),
+          linear-gradient(180deg, rgba(0, 82, 255, 0.025), rgba(0, 82, 255, 0.015)),
           #f8fbff;
         border: 1px solid rgba(226, 232, 240, 0.9);
         overflow: hidden;
@@ -138,8 +137,7 @@
         background: #ffffff;
         border-color: rgba(0, 82, 255, 0.22);
       }
-      .map-shell::before,
-      .map-shell::after {
+      .map-shell::before {
         content: "";
         position: absolute;
         inset: 0;
@@ -149,9 +147,6 @@
         background:
           linear-gradient(transparent 24.5%, rgba(15, 23, 42, 0.03) 25%, transparent 25.5%, transparent 49.5%, rgba(15, 23, 42, 0.03) 50%, transparent 50.5%, transparent 74.5%, rgba(15, 23, 42, 0.03) 75%, transparent 75.5%),
           linear-gradient(90deg, transparent 24.5%, rgba(15, 23, 42, 0.03) 25%, transparent 25.5%, transparent 49.5%, rgba(15, 23, 42, 0.03) 50%, transparent 50.5%, transparent 74.5%, rgba(15, 23, 42, 0.03) 75%, transparent 75.5%);
-      }
-      .map-shell::after {
-        background: radial-gradient(circle at center, transparent 55%, rgba(255, 255, 255, 0.55) 100%);
       }
       .map-canvas {
         position: absolute;
@@ -967,25 +962,26 @@
       function healthDots(checks) {
         const total = 10;
         if (!checks || checks.length === 0) {
-          // No heartbeat data yet — show all gray (unknown state).
+          // No route probe data yet — show all gray (unknown state).
           return `<span class="health-dots">${'<span class="health-dot"></span>'.repeat(total)}</span>`;
         }
         const now = Math.floor(Date.now() / 1000);
         const dots = [];
-        // Build a set of minute-buckets that had at least one heartbeat.
-        const hitMinutes = new Set();
+        const minuteStatus = new Map();
         for (const c of checks) {
-          hitMinutes.add(Math.floor(c.checkedAt / 60));
+          const bucket = Math.floor(c.checkedAt / 60);
+          const prev = minuteStatus.get(bucket);
+          minuteStatus.set(bucket, Boolean(prev) || Boolean(c.isHealthy));
         }
-        // Render 10 slots including the current minute: oldest (now-9m) → newest (now).
         for (let i = total - 1; i >= 0; i--) {
           const bucket = Math.floor((now - i * 60) / 60);
           const isCurrentBucket = i === 0;
-          const hit = hitMinutes.has(bucket) || isCurrentBucket;
+          const healthy = minuteStatus.get(bucket);
+          const hit = healthy === true || isCurrentBucket;
           const cls = hit ? "health-dot--ok" : "health-dot--fail";
           const bucketDate = new Date(bucket * 60 * 1000);
           const rel = relTimeFromDate(bucketDate);
-          const statusText = hitMinutes.has(bucket) || isCurrentBucket ? "ok" : "no heartbeat";
+          const statusText = healthy === true || isCurrentBucket ? "ok" : "route probe failed";
           dots.push(`<span class="health-dot ${cls}" title="${rel} — ${statusText}"></span>`);
         }
         return `<span class="health-dots">${dots.join("")}</span>`;
