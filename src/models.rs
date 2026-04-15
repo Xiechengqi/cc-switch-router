@@ -188,6 +188,14 @@ pub struct DashboardPresenceResponse {
     pub online_count: usize,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareSupport {
+    pub claude: bool,
+    pub codex: bool,
+    pub gemini: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareDescriptor {
@@ -204,6 +212,8 @@ pub struct ShareDescriptor {
     pub share_status: String,
     pub created_at: String,
     pub expires_at: String,
+    #[serde(default)]
+    pub support: ShareSupport,
 }
 
 #[derive(Debug, Serialize)]
@@ -302,6 +312,7 @@ pub struct ShareView {
     pub share_status: String,
     pub created_at: String,
     pub expires_at: String,
+    pub support: ShareSupport,
     pub installation_id: String,
     pub active_lease_count: usize,
     pub online_minutes_24h: usize,

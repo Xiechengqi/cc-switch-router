@@ -20,7 +20,7 @@ use crate::models::{
     IssueLeaseResponse, LeaseView, RegisterInstallationRequest, RegisterInstallationResponse,
     ShareBatchSyncRequest, ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptor,
     ShareHeartbeatRequest, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry,
-    ShareRequestLogFetchResponse, ShareSyncRequest, ShareView, TunnelLease,
+    ShareRequestLogFetchResponse, ShareSupport, ShareSyncRequest, ShareView, TunnelLease,
 };
 use crate::proxy::ProxyRegistry;
 
@@ -652,6 +652,7 @@ impl AppStore {
                     share_status: share.share_status,
                     created_at: share.created_at,
                     expires_at: share.expires_at,
+                    support: share.support,
                     installation_id,
                     active_lease_count,
                     online_minutes_24h,
@@ -1050,8 +1051,9 @@ fn upsert_share_tx(
     conn.execute(
         "INSERT INTO shares (
             share_id, installation_id, share_name, subdomain, share_token, app_type, provider_id,
+            enabled_claude, enabled_codex, enabled_gemini,
             token_limit, tokens_used, requests_count, share_status, created_at, expires_at, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
         ON CONFLICT(share_id) DO UPDATE SET
             installation_id = excluded.installation_id,
             share_name = excluded.share_name,
@@ -1059,6 +1061,9 @@ fn upsert_share_tx(
             share_token = excluded.share_token,
             app_type = excluded.app_type,
             provider_id = excluded.provider_id,
+            enabled_claude = excluded.enabled_claude,
+            enabled_codex = excluded.enabled_codex,
+            enabled_gemini = excluded.enabled_gemini,
             token_limit = MAX(shares.token_limit, excluded.token_limit),
             tokens_used = MAX(shares.tokens_used, excluded.tokens_used),
             requests_count = MAX(shares.requests_count, excluded.requests_count),
@@ -1074,6 +1079,9 @@ fn upsert_share_tx(
             share.share_token,
             share.app_type,
             share.provider_id,
+            i64::from(share.support.claude as u8),
+            i64::from(share.support.codex as u8),
+            i64::from(share.support.gemini as u8),
             share.token_limit,
             share.tokens_used,
             share.requests_count,
@@ -1225,6 +1233,9 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             share_token TEXT NOT NULL,
             app_type TEXT NOT NULL,
             provider_id TEXT,
+            enabled_claude INTEGER NOT NULL DEFAULT 0,
+            enabled_codex INTEGER NOT NULL DEFAULT 0,
+            enabled_gemini INTEGER NOT NULL DEFAULT 0,
             token_limit INTEGER NOT NULL,
             tokens_used INTEGER NOT NULL,
             requests_count INTEGER NOT NULL,
@@ -1426,6 +1437,27 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
     if !columns.iter().any(|name| name == "subdomain") {
         conn.execute("ALTER TABLE shares ADD COLUMN subdomain TEXT", [])
             .map_err(|e| AppError::Internal(format!("add shares subdomain failed: {e}")))?;
+    }
+    if !columns.iter().any(|name| name == "enabled_claude") {
+        conn.execute(
+            "ALTER TABLE shares ADD COLUMN enabled_claude INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| AppError::Internal(format!("add shares enabled_claude failed: {e}")))?;
+    }
+    if !columns.iter().any(|name| name == "enabled_codex") {
+        conn.execute(
+            "ALTER TABLE shares ADD COLUMN enabled_codex INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| AppError::Internal(format!("add shares enabled_codex failed: {e}")))?;
+    }
+    if !columns.iter().any(|name| name == "enabled_gemini") {
+        conn.execute(
+            "ALTER TABLE shares ADD COLUMN enabled_gemini INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| AppError::Internal(format!("add shares enabled_gemini failed: {e}")))?;
     }
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_shares_subdomain_unique ON shares(subdomain) WHERE subdomain IS NOT NULL",
@@ -1783,6 +1815,7 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor, usize)
     let mut stmt = conn
         .prepare(
             "SELECT s.installation_id, s.share_id, s.share_name, COALESCE(s.subdomain, '-'), s.share_token, s.app_type, s.provider_id,
+                    s.enabled_claude, s.enabled_codex, s.enabled_gemini,
                     s.token_limit, s.tokens_used, s.requests_count, s.share_status, s.created_at, s.expires_at,
                     (
                         SELECT COUNT(*) FROM leases l
@@ -1804,14 +1837,19 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor, usize)
                     share_token: row.get(4)?,
                     app_type: row.get(5)?,
                     provider_id: row.get(6)?,
-                    token_limit: row.get(7)?,
-                    tokens_used: row.get(8)?,
-                    requests_count: row.get(9)?,
-                    share_status: row.get(10)?,
-                    created_at: row.get(11)?,
-                    expires_at: row.get(12)?,
+                    support: ShareSupport {
+                        claude: row.get::<_, i64>(7)? != 0,
+                        codex: row.get::<_, i64>(8)? != 0,
+                        gemini: row.get::<_, i64>(9)? != 0,
+                    },
+                    token_limit: row.get(10)?,
+                    tokens_used: row.get(11)?,
+                    requests_count: row.get(12)?,
+                    share_status: row.get(13)?,
+                    created_at: row.get(14)?,
+                    expires_at: row.get(15)?,
                 },
-                row.get::<_, i64>(13)? as usize,
+                row.get::<_, i64>(16)? as usize,
             ))
         })
         .map_err(|e| AppError::Internal(format!("query shares failed: {e}")))?;

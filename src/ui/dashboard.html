@@ -380,6 +380,28 @@
         border-radius: 999px;
         background: var(--accent);
       }
+      .support-pills {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+      .support-pill {
+        display: inline-flex;
+        align-items: center;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        padding: 4px 8px;
+        font-size: 11px;
+        font-weight: 600;
+        line-height: 1;
+        background: rgba(15, 23, 42, 0.04);
+        color: var(--muted-foreground);
+      }
+      .support-pill--on {
+        border-color: rgba(22, 163, 74, 0.24);
+        background: rgba(22, 163, 74, 0.1);
+        color: #15803d;
+      }
 
       /* ── Token value ── */
       .token-value {
@@ -688,6 +710,7 @@
               <tr>
                 <th>Share</th>
                 <th>API URL&KEY</th>
+                <th>Support</th>
                 <th>Usage</th>
                 <th>Expires</th>
                 <th>Health</th>
@@ -820,6 +843,17 @@
       function formatPct(value) {
         if (value == null || Number.isNaN(value)) return "0.0%";
         return `${value.toFixed(1)}%`;
+      }
+
+      function supportPills(support) {
+        const apps = [
+          { key: "claude", label: "Claude" },
+          { key: "codex", label: "Codex" },
+          { key: "gemini", label: "Gemini" },
+        ];
+        return `<div class="support-pills">${apps.map((app) => `
+          <span class="support-pill ${support?.[app.key] ? "support-pill--on" : ""}">${app.label}</span>
+        `).join("")}</div>`;
       }
 
       const COUNTRY_CENTROIDS = {
@@ -1114,7 +1148,7 @@
           </div>
           <div class="drawer-summary-item">
             <small>Expires</small>
-            <strong title="${fullTime(share.expiresAt)}">${relTime(share.expiresAt)}</strong>
+            <strong title="${relTime(share.expiresAt)}">${fullTime(share.expiresAt)}</strong>
           </div>`;
 
         const logs = share.recentRequests || [];
@@ -1205,12 +1239,13 @@
                 <span class="token-value">[${maskToken(share.shareToken)}]</span>
               </div>
             </td>
+            <td>${supportPills(share.support)}</td>
             <td>
               <strong>${formatNum(share.tokensUsed)} / ${formatNum(share.tokenLimit)}</strong>
               <div class="usage-bar"><div class="${usageBarClass(pct)}" style="width:${pct}%"></div></div>
             </td>
             <td title="${fullTime(share.expiresAt)}">
-              <strong>${fullTime(share.expiresAt)}</strong>
+              <strong>${relTime(share.expiresAt)}</strong>
             </td>
             <td>${healthDots(share.healthChecks || [])}</td>
             <td title="${share.onlineMinutes24h || 0} / 1440 min online in last 24h">
@@ -1218,7 +1253,7 @@
             </td>
             <td><span class="row-arrow">&rsaquo;</span></td>
           </tr>`;
-        }).join("") : `<tr><td colspan="7"><div class="empty"><div class="empty-icon"></div>No shares yet</div></td></tr>`;
+        }).join("") : `<tr><td colspan="8"><div class="empty"><div class="empty-icon"></div>No shares yet</div></td></tr>`;
       }
 
       boot().catch(err => {
