@@ -46,9 +46,7 @@ async fn main() -> Result<()> {
     let env_filter = EnvFilter::builder()
         .with_default_directive(LevelFilter::INFO.into())
         .from_env_lossy();
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .init();
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     let config = Config::from_env();
     let server_geo = resolve_server_geo().await;
@@ -113,7 +111,9 @@ async fn main() -> Result<()> {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         loop {
             interval.tick().await;
-            if let Err(err) = run_route_health_probe_cycle(&probe_store, &probe_config, &client).await {
+            if let Err(err) =
+                run_route_health_probe_cycle(&probe_store, &probe_config, &client).await
+            {
                 tracing::warn!("route health probe failed: {err}");
             }
         }
@@ -154,7 +154,10 @@ async fn run_route_health_probe_cycle(
     let targets = store.list_share_route_targets().await?;
     for target in targets {
         let is_healthy = probe_share_route(config, client, &target).await;
-        if let Err(err) = store.record_share_route_health(&target.share_id, is_healthy).await {
+        if let Err(err) = store
+            .record_share_route_health(&target.share_id, is_healthy)
+            .await
+        {
             tracing::warn!(share_id = %target.share_id, "record route health failed: {err}");
         }
     }
@@ -167,12 +170,7 @@ async fn probe_share_route(
     target: &ShareRouteTarget,
 ) -> bool {
     let url = format!("{}/_portr/health", config.tunnel_url(&target.subdomain));
-    match client
-        .get(&url)
-        .header("X-Portr-Probe", "1")
-        .send()
-        .await
-    {
+    match client.get(&url).header("X-Portr-Probe", "1").send().await {
         Ok(response) => response.status().is_success(),
         Err(_) => false,
     }

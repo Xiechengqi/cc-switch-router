@@ -77,9 +77,8 @@ pub fn default_env_path() -> PathBuf {
 pub fn ensure_default_env_file() -> Result<PathBuf> {
     let env_path = default_env_path();
     if let Some(parent) = env_path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("create env dir failed: {}", parent.display())
-        })?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create env dir failed: {}", parent.display()))?;
     }
 
     if !env_path.exists() {
