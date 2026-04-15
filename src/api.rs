@@ -1,4 +1,3 @@
-use std::fs;
 use std::net::SocketAddr;
 
 use axum::extract::{ConnectInfo, State};
@@ -15,6 +14,8 @@ use crate::models::{
     ShareDeleteRequest, ShareHeartbeatRequest, ShareRequestLogBatchSyncRequest, ShareSyncRequest,
 };
 use crate::proxy::proxy_handler;
+
+const REGIONS: &str = include_str!("../regions");
 
 pub fn router(state: ServerState) -> Router {
     Router::new()
@@ -89,10 +90,7 @@ async fn dashboard(State(state): State<ServerState>) -> Result<Json<DashboardRes
 }
 
 async fn regions() -> Result<Json<Vec<String>>, AppError> {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/regions");
-    let content = fs::read_to_string(path)
-        .map_err(|e| AppError::Internal(format!("read regions failed: {e}")))?;
-    let regions = content
+    let regions = REGIONS
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
