@@ -646,6 +646,23 @@
       }
       .status-pill--ok { background: rgba(16,185,129,0.1); color: #059669; }
       .status-pill--err { background: rgba(239,68,68,0.1); color: #dc2626; }
+      .for-sale-pill {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 48px;
+        padding: 4px 10px;
+        border-radius: 999px;
+        font: 11px/1 "JetBrains Mono", monospace;
+      }
+      .for-sale-pill--yes {
+        background: rgba(16,185,129,0.12);
+        color: #059669;
+      }
+      .for-sale-pill--no {
+        background: rgba(148,163,184,0.14);
+        color: var(--muted-foreground);
+      }
       .pill-sm {
         display: inline-flex;
         align-items: center;
@@ -744,6 +761,8 @@
             <thead>
               <tr>
                 <th>Share</th>
+                <th>API URL&KEY</th>
+                <th>ForSale</th>
                 <th>Region</th>
                 <th>Usage</th>
                 <th>Expires</th>
@@ -1159,6 +1178,20 @@
         return `<span class="badge">${escapeHtml(formatShareStatus(share.shareStatus))}</span>`;
       }
 
+      function shareApiUrlKey(share) {
+        if (!share) return "—";
+        const baseHost = window.location.host || "";
+        const apiHost = share.subdomain && baseHost ? `${share.subdomain}.${baseHost}` : (share.subdomain || baseHost || "—");
+        return `${apiHost}[${share.shareToken || "***"}]`;
+      }
+
+      function forSalePill(share) {
+        if (!share) return '<span class="meta">—</span>';
+        const isYes = share.forSale === "Yes";
+        const label = isYes ? "Yes" : "No";
+        return `<span class="for-sale-pill ${isYes ? "for-sale-pill--yes" : "for-sale-pill--no"}">${label}</span>`;
+      }
+
       async function updatePagePresence() {
         const res = await fetch("/v1/dashboard/presence", {
           method: "POST",
@@ -1330,6 +1363,8 @@
           return `
           <tr onclick="openClient(${i})">
             <td>${share ? `<strong>${escapeHtml(share.shareName)}</strong>` : '<span class="meta">—</span>'}</td>
+            <td class="meta">${share ? `<strong>${escapeHtml(shareApiUrlKey(share))}</strong>` : '<span class="meta">—</span>'}</td>
+            <td>${forSalePill(share)}</td>
             <td class="meta">${escapeHtml(item.countryCode || "-")}</td>
             <td>
               ${share ? `
@@ -1344,7 +1379,7 @@
             <td><span class="row-arrow">&rsaquo;</span></td>
           </tr>
         `;
-        }).join("") : `<tr><td colspan="8"><div class="empty"><div class="empty-icon"></div>No clients yet</div></td></tr>`;
+        }).join("") : `<tr><td colspan="10"><div class="empty"><div class="empty-icon"></div>No clients yet</div></td></tr>`;
       }
 
       bootRegions().catch(console.error);

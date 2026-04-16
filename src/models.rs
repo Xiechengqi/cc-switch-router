@@ -1,6 +1,10 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+fn default_share_for_sale() -> String {
+    "No".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Installation {
@@ -218,6 +222,8 @@ pub struct ShareDescriptor {
     pub share_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default = "default_share_for_sale")]
+    pub for_sale: String,
     pub subdomain: String,
     pub share_token: String,
     pub app_type: String,
@@ -328,6 +334,7 @@ pub struct ShareView {
     pub share_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    pub for_sale: String,
     pub subdomain: String,
     pub share_token: String,
     pub app_type: String,
