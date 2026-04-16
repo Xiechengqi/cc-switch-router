@@ -141,18 +141,56 @@ impl AppStore {
         input: RegisterInstallationRequest,
         metadata: ClientMetadata,
     ) -> Result<RegisterInstallationResponse, AppError> {
-        if input.public_key.trim().is_empty() {
+        let public_key = input.public_key.trim();
+        if public_key.is_empty() {
             return Err(AppError::BadRequest("public_key is required".into()));
+        }
+        let platform = input.platform.trim();
+        if platform.is_empty() {
+            return Err(AppError::BadRequest("platform is required".into()));
         }
         let now = Utc::now();
         let ip = metadata.ip.clone();
+        let country_code = metadata.country_code.clone();
+        let conn = self.conn.lock().await;
+        if let Some(existing_installation_id) =
+            find_installation_id_by_public_key(&conn, public_key)?
+        {
+            conn.execute(
+                "UPDATE installations
+                 SET public_key = ?2,
+                     platform = ?3,
+                     app_version = ?4,
+                     last_seen_ip = COALESCE(?5, last_seen_ip),
+                     country_code = COALESCE(?6, country_code),
+                     last_seen_at = ?7
+                 WHERE id = ?1",
+                params![
+                    existing_installation_id,
+                    public_key,
+                    platform,
+                    input.app_version,
+                    ip,
+                    country_code,
+                    now.to_rfc3339(),
+                ],
+            )
+            .map_err(|e| AppError::Internal(format!("update installation failed: {e}")))?;
+            drop(conn);
+            self.refresh_installation_geo(&existing_installation_id, &ip, true)
+                .await?;
+            return Ok(RegisterInstallationResponse {
+                installation_id: existing_installation_id,
+            });
+        }
+
         let installation = Installation {
             id: Uuid::new_v4().to_string(),
-            public_key: input.public_key,
-            platform: input.platform,
+            public_key: public_key.to_string(),
+            platform: platform.to_string(),
             app_version: input.app_version,
             last_seen_ip: ip.clone(),
-            country_code: metadata.country_code,
+            country_code,
             country: None,
             region: None,
             city: None,
@@ -170,7 +208,6 @@ impl AppStore {
             created_at: now,
             last_seen_at: now,
         };
-        let conn = self.conn.lock().await;
         conn.execute(
             "INSERT INTO installations (
                 id, public_key, platform, app_version, last_seen_ip, country_code, country, region,
@@ -619,6 +656,11 @@ impl AppStore {
                     .insert(share.subdomain.clone());
             }
         }
+        let installations = deduplicate_dashboard_installations(
+            installations,
+            &leases_by_installation,
+            &active_share_subdomains_by_installation,
+        );
 
         let mut installation_views = Vec::new();
         let mut client_map_points = Vec::new();
@@ -1656,6 +1698,23 @@ fn get_installation(
     .map_err(|e| AppError::Internal(format!("query installation failed: {e}")))
 }
 
+fn find_installation_id_by_public_key(
+    conn: &Connection,
+    public_key: &str,
+) -> Result<Option<String>, AppError> {
+    conn.query_row(
+        "SELECT id
+         FROM installations
+         WHERE public_key = ?1
+         ORDER BY last_seen_at DESC, created_at DESC
+         LIMIT 1",
+        params![public_key],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| AppError::Internal(format!("query installation by public key failed: {e}")))
+}
+
 fn get_lease_by_connection_id(
     conn: &Connection,
     connection_id: &str,
@@ -1796,6 +1855,76 @@ fn prefer_dashboard_share(candidate: &ShareView, existing: &ShareView) -> bool {
         return candidate.created_at > existing.created_at;
     }
     candidate.share_id > existing.share_id
+}
+
+fn deduplicate_dashboard_installations(
+    installations: Vec<Installation>,
+    leases_by_installation: &HashMap<String, Vec<TunnelLease>>,
+    active_share_subdomains_by_installation: &HashMap<String, HashSet<String>>,
+) -> Vec<Installation> {
+    let mut deduped = Vec::with_capacity(installations.len());
+    let mut seen = HashMap::<String, usize>::new();
+
+    for installation in installations {
+        let key = installation.public_key.clone();
+        match seen.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert(deduped.len());
+                deduped.push(installation);
+            }
+            Entry::Occupied(entry) => {
+                let existing = &mut deduped[*entry.get()];
+                if prefer_dashboard_installation(
+                    &installation,
+                    existing,
+                    leases_by_installation,
+                    active_share_subdomains_by_installation,
+                ) {
+                    *existing = installation;
+                }
+            }
+        }
+    }
+
+    deduped.sort_by(|a, b| b.last_seen_at.cmp(&a.last_seen_at));
+    deduped
+}
+
+fn prefer_dashboard_installation(
+    candidate: &Installation,
+    existing: &Installation,
+    leases_by_installation: &HashMap<String, Vec<TunnelLease>>,
+    active_share_subdomains_by_installation: &HashMap<String, HashSet<String>>,
+) -> bool {
+    let candidate_has_share = active_share_subdomains_by_installation
+        .get(&candidate.id)
+        .map(|subdomains| !subdomains.is_empty())
+        .unwrap_or(false);
+    let existing_has_share = active_share_subdomains_by_installation
+        .get(&existing.id)
+        .map(|subdomains| !subdomains.is_empty())
+        .unwrap_or(false);
+    if candidate_has_share != existing_has_share {
+        return candidate_has_share;
+    }
+
+    let candidate_active_lease_count = leases_by_installation
+        .get(&candidate.id)
+        .map(|leases| leases.len())
+        .unwrap_or(0);
+    let existing_active_lease_count = leases_by_installation
+        .get(&existing.id)
+        .map(|leases| leases.len())
+        .unwrap_or(0);
+    if candidate_active_lease_count != existing_active_lease_count {
+        return candidate_active_lease_count > existing_active_lease_count;
+    }
+
+    if candidate.last_seen_at != existing.last_seen_at {
+        return candidate.last_seen_at > existing.last_seen_at;
+    }
+
+    candidate.created_at > existing.created_at
 }
 
 fn haversine_distance_km(
