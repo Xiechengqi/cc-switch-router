@@ -1287,7 +1287,7 @@
           return `
           <tr onclick="openClient(${i})">
             <td>${share ? `<strong>${escapeHtml(share.shareName)}</strong>` : '<span class="meta">—</span>'}</td>
-            <td class="meta">${escapeHtml(item.region || "—")}</td>
+            <td class="meta">${escapeHtml(item.countryCode || "-")}</td>
             <td>
               ${share ? `
                 <strong>${formatNum(share.tokensUsed)} / ${formatNum(share.tokenLimit)}</strong>

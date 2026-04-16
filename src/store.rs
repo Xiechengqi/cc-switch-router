@@ -28,6 +28,59 @@ use crate::proxy::ProxyRegistry;
 const SHARE_REQUEST_LOG_RECOVERY_LIMIT: usize = 10;
 const PUBLIC_MAP_CLIENT_ACTIVE_WINDOW_MINUTES: i64 = 5;
 
+fn country_centroid(country_code: &str) -> Option<(f64, f64)> {
+    match country_code {
+        "AR" => Some((-38.42, -63.62)),
+        "AT" => Some((47.52, 14.55)),
+        "AU" => Some((-25.27, 133.77)),
+        "BE" => Some((50.50, 4.47)),
+        "BR" => Some((-14.23, -51.92)),
+        "CA" => Some((56.13, -106.35)),
+        "CH" => Some((46.82, 8.23)),
+        "CL" => Some((-35.68, -71.54)),
+        "CN" => Some((35.86, 104.20)),
+        "CO" => Some((4.57, -74.30)),
+        "DE" => Some((51.17, 10.45)),
+        "DK" => Some((56.26, 9.50)),
+        "EG" => Some((26.82, 30.80)),
+        "ES" => Some((40.46, -3.75)),
+        "FI" => Some((61.92, 25.75)),
+        "FR" => Some((46.22, 2.21)),
+        "GB" => Some((55.38, -3.43)),
+        "GR" => Some((39.07, 21.82)),
+        "HK" => Some((22.32, 114.17)),
+        "ID" => Some((-0.79, 113.92)),
+        "IE" => Some((53.41, -8.24)),
+        "IL" => Some((31.05, 34.85)),
+        "IN" => Some((20.59, 78.96)),
+        "IT" => Some((41.87, 12.57)),
+        "JP" => Some((36.20, 138.25)),
+        "KR" => Some((35.91, 127.77)),
+        "MX" => Some((23.63, -102.55)),
+        "MY" => Some((4.21, 101.98)),
+        "NG" => Some((9.08, 8.67)),
+        "NL" => Some((52.13, 5.29)),
+        "NO" => Some((60.47, 8.47)),
+        "NZ" => Some((-40.90, 174.89)),
+        "PE" => Some((-9.19, -75.02)),
+        "PH" => Some((12.88, 121.77)),
+        "PL" => Some((51.92, 19.15)),
+        "PT" => Some((39.40, -8.22)),
+        "RU" => Some((61.52, 105.31)),
+        "SA" => Some((23.89, 45.08)),
+        "SE" => Some((60.13, 18.64)),
+        "SG" => Some((1.35, 103.82)),
+        "TH" => Some((15.87, 100.99)),
+        "TR" => Some((38.96, 35.24)),
+        "TW" => Some((23.70, 120.96)),
+        "UA" => Some((48.38, 31.17)),
+        "US" => Some((39.83, -98.58)),
+        "VN" => Some((14.06, 108.28)),
+        "ZA" => Some((-30.56, 22.94)),
+        _ => None,
+    }
+}
+
 #[derive(Clone)]
 pub struct AppStore {
     conn: Arc<Mutex<Connection>>,
@@ -916,29 +969,39 @@ impl AppStore {
         let conn = self.conn.lock().await;
         let mut stmt = conn
             .prepare(
-                "SELECT latitude, longitude
+                "SELECT latitude, longitude, country_code
                  FROM installations
-                 WHERE latitude IS NOT NULL
-                   AND longitude IS NOT NULL
-                   AND last_seen_at >= ?1
+                 WHERE last_seen_at >= ?1
                  ORDER BY last_seen_at DESC",
             )
             .map_err(|e| AppError::Internal(format!("prepare public map clients failed: {e}")))?;
         let rows = stmt
             .query_map(params![active_cutoff], |row| {
-                Ok(LatLonPoint {
-                    lat: row.get(0)?,
-                    lon: row.get(1)?,
-                })
+                let lat = row.get::<_, Option<f64>>(0)?;
+                let lon = row.get::<_, Option<f64>>(1)?;
+                let country_code = row.get::<_, Option<String>>(2)?;
+                Ok(lat
+                    .zip(lon)
+                    .map(|(lat, lon)| LatLonPoint { lat, lon })
+                    .or_else(|| {
+                        country_code
+                            .as_deref()
+                            .and_then(country_centroid)
+                            .map(|(lat, lon)| LatLonPoint { lat, lon })
+                    }))
             })
             .map_err(|e| AppError::Internal(format!("query public map clients failed: {e}")))?;
+        let clients = collect_rows(rows)?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
 
         Ok(PublicMapPointsResponse {
             server: server_geo
                 .lat
                 .zip(server_geo.lon)
                 .map(|(lat, lon)| LatLonPoint { lat, lon }),
-            clients: collect_rows(rows)?,
+            clients,
         })
     }
 
