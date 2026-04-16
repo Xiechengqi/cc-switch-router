@@ -718,14 +718,13 @@
           <table>
             <thead>
               <tr>
-                <th>Platform</th>
-                <th>Region</th>
-                <th>Version</th>
-                <th>Last seen</th>
                 <th>Share</th>
-                <th>Status</th>
+                <th>Region</th>
                 <th>Usage</th>
-                <th>Active leases</th>
+                <th>Expires</th>
+                <th>Online</th>
+                <th>Health</th>
+                <th>Support</th>
                 <th style="width:28px"></th>
               </tr>
             </thead>
@@ -1154,23 +1153,31 @@
 
         document.getElementById("drawer-title").textContent = item.platform;
         document.getElementById("drawer-meta").innerHTML =
-          `<span>v${item.appVersion}</span><span style="font-family:'JetBrains Mono',monospace;font-size:12px">${item.id.slice(0, 12)}</span>`;
+          `<span>${escapeHtml(item.region || "Unknown region")}</span><span style="font-family:'JetBrains Mono',monospace;font-size:12px">${item.id.slice(0, 12)}</span>`;
 
         document.getElementById("drawer-summary").innerHTML = `
           <div class="drawer-summary-item">
-            <small>Created</small>
-            <strong title="${fullTime(item.createdAt)}">${relTime(item.createdAt)}</strong>
+            <small>Platform</small>
+            <strong>${escapeHtml(item.platform)}</strong>
           </div>
           <div class="drawer-summary-item">
-            <small>Last seen</small>
+            <small>Version</small>
+            <strong>v${escapeHtml(item.appVersion)}</strong>
+          </div>
+          <div class="drawer-summary-item">
+            <small>Last Seen</small>
             <strong title="${fullTime(item.lastSeenAt)}">${relTime(item.lastSeenAt)}</strong>
           </div>
           <div class="drawer-summary-item">
-            <small>Active leases</small>
+            <small>Status</small>
+            <strong>${escapeHtml(formatShareStatus(share?.shareStatus || ""))}</strong>
+          </div>
+          <div class="drawer-summary-item">
+            <small>Active Leases</small>
             <strong>${item.activeLeaseCount}</strong>
           </div>`;
 
-        const leases = item.leases || [];
+        const leases = (item.leases || []).slice(0, 3);
         const pct = share ? usagePercent(share.tokensUsed, share.tokenLimit) : 0;
         const shareSection = share ? `
           <div class="drawer-section-label">Share</div>
@@ -1181,15 +1188,12 @@
             </div>
             <div class="item-card-meta">
               <span>${escapeHtml(share.subdomain)}</span>
-              <span title="${fullTime(share.expiresAt)}">expires ${relTime(share.expiresAt)}</span>
-              <span title="${share.onlineMinutes24h || 0} / 1440 min online in last 24h">${formatPct(share.onlineRate24h || 0)} online</span>
+              <span>${escapeHtml(item.region || "Unknown region")}</span>
             </div>
             <div class="item-card-grid">
               <div class="item-card-grid-cell">Usage<span>${formatNum(share.tokensUsed)} / ${formatNum(share.tokenLimit)}</span></div>
               <div class="item-card-grid-cell">Requests<span>${formatNum(share.requestsCount)}</span></div>
-              <div class="item-card-grid-cell">Health<span>${healthDots(share.healthChecks || [])}</span></div>
             </div>
-            <div style="margin-top:10px">${supportPills(share.support)}</div>
             <div class="usage-bar" style="margin-top:10px;width:100%"><div class="${usageBarClass(pct)}" style="width:${pct}%"></div></div>
           </div>
         ` : `
@@ -1199,21 +1203,6 @@
         const logs = share?.recentRequests || [];
         document.getElementById("drawer-body").innerHTML = `
           ${shareSection}
-          <div class="drawer-section-label">Leases</div>
-          ${leases.length ? leases.map(lease => `
-            <div class="item-card">
-              <div class="item-card-top">
-                <strong>${lease.subdomain}</strong>
-                <span class="pill-sm">${lease.isActive ? "active" : "expired"}</span>
-              </div>
-              <div class="item-card-meta">
-                <span>${lease.tunnelType}</span>
-                <span title="${fullTime(lease.issuedAt)}">issued ${relTime(lease.issuedAt)}</span>
-                <span title="${fullTime(lease.expiresAt)}">expires ${relTime(lease.expiresAt)}</span>
-                ${lease.share ? `<span>share: ${lease.share.shareName}</span>` : ""}
-              </div>
-            </div>
-          `).join("") : '<div class="empty"><div class="empty-icon"></div>No leases yet</div>'}
           <div class="drawer-section-label">Request logs</div>
           ${logs.length ? logs.map(log => `
             <div class="item-card">
@@ -1239,7 +1228,22 @@
                 <div class="item-card-grid-cell">Total<span>${totalTokens(log)}</span></div>
               </div>
             </div>
-          `).join("") : '<div class="empty"><div class="empty-icon"></div>No request logs yet</div>'}`;
+          `).join("") : '<div class="empty"><div class="empty-icon"></div>No request logs yet</div>'}
+          <div class="drawer-section-label">Recent leases</div>
+          ${leases.length ? leases.map(lease => `
+            <div class="item-card">
+              <div class="item-card-top">
+                <strong>${lease.subdomain}</strong>
+                <span class="pill-sm">${lease.isActive ? "active" : "expired"}</span>
+              </div>
+              <div class="item-card-meta">
+                <span>${lease.tunnelType}</span>
+                <span title="${fullTime(lease.issuedAt)}">issued ${relTime(lease.issuedAt)}</span>
+                <span title="${fullTime(lease.expiresAt)}">expires ${relTime(lease.expiresAt)}</span>
+                ${lease.share ? `<span>share: ${lease.share.shareName}</span>` : ""}
+              </div>
+            </div>
+          `).join("") : '<div class="empty"><div class="empty-icon"></div>No leases yet</div>'}`;
 
         openDrawer();
       }
@@ -1276,25 +1280,22 @@
           const pct = share ? usagePercent(share.tokensUsed, share.tokenLimit) : 0;
           return `
           <tr onclick="openClient(${i})">
-            <td><strong>${item.platform}</strong></td>
-            <td class="meta">${escapeHtml(item.region || "—")}</td>
-            <td class="meta">v${item.appVersion}</td>
-            <td class="meta" title="${fullTime(item.lastSeenAt)}">${relTime(item.lastSeenAt)}</td>
             <td>${share ? `<strong>${escapeHtml(share.shareName)}</strong>` : '<span class="meta">—</span>'}</td>
-            <td>${shareStatusBadge(share)}</td>
+            <td class="meta">${escapeHtml(item.region || "—")}</td>
             <td>
               ${share ? `
                 <strong>${formatNum(share.tokensUsed)} / ${formatNum(share.tokenLimit)}</strong>
                 <div class="usage-bar"><div class="${usageBarClass(pct)}" style="width:${pct}%"></div></div>
               ` : '<span class="meta">—</span>'}
             </td>
-            <td>${item.activeLeaseCount
-              ? `<span class="badge badge--active">${item.activeLeaseCount}</span>`
-              : '<span class="badge">0</span>'}</td>
+            <td>${share ? `<strong title="${fullTime(share.expiresAt)}">${relTime(share.expiresAt)}</strong>` : '<span class="meta">—</span>'}</td>
+            <td>${share ? `<strong title="${share.onlineMinutes24h || 0} / 1440 min online in last 24h">${formatPct(share.onlineRate24h || 0)}</strong>` : '<span class="meta">—</span>'}</td>
+            <td>${share ? healthDots(share.healthChecks || []) : '<span class="meta">—</span>'}</td>
+            <td>${share ? supportPills(share.support) : '<span class="meta">—</span>'}</td>
             <td><span class="row-arrow">&rsaquo;</span></td>
           </tr>
         `;
-        }).join("") : `<tr><td colspan="9"><div class="empty"><div class="empty-icon"></div>No clients yet</div></td></tr>`;
+        }).join("") : `<tr><td colspan="8"><div class="empty"><div class="empty-icon"></div>No clients yet</div></td></tr>`;
       }
 
       bootRegions().catch(console.error);
