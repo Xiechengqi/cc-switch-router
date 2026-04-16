@@ -71,6 +71,16 @@
         font-size: 13px;
         color: var(--muted-foreground);
       }
+      .topbar-stat {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        cursor: help;
+      }
+      .topbar-stat strong {
+        font-weight: 600;
+        color: var(--foreground);
+      }
       .topbar-region {
         display: inline-flex;
         align-items: center;
@@ -92,10 +102,6 @@
         font: inherit;
         outline: none;
         cursor: pointer;
-      }
-      .topbar-right strong {
-        font-weight: 600;
-        color: var(--foreground);
       }
       .topbar-sep {
         margin: 0 4px;
@@ -676,15 +682,17 @@
             <select id="region-select" aria-label="Router"></select>
           </div>
           <span class="topbar-sep">&middot;</span>
-          <strong id="stat-clients">0</strong> clients
+          <span class="topbar-stat" title="Total number of clients registered on this router.">
+            <strong id="stat-clients">0</strong> clients
+          </span>
           <span class="topbar-sep">&middot;</span>
-          <strong id="stat-clients-with-share">0</strong> with share
+          <span class="topbar-stat" title="Clients whose share status is currently active.">
+            <strong id="stat-active-shares">0</strong> active shares
+          </span>
           <span class="topbar-sep">&middot;</span>
-          <strong id="stat-active-clients">0</strong> active clients
-          <span class="topbar-sep">&middot;</span>
-          <strong id="stat-active-shared-clients">0</strong> active shared clients
-          <span class="topbar-sep">&middot;</span>
-          <strong id="stat-leases">0</strong> active leases
+          <span class="topbar-stat" title="Live tunnel leases currently active on this router.">
+            <strong id="stat-leases">0</strong> active leases
+          </span>
           <span class="topbar-sync">synced <span id="last-sync">--</span></span>
         </div>
       </div>
@@ -1258,9 +1266,7 @@
 
         /* topbar stats */
         document.getElementById("stat-clients").textContent = data.stats.clients;
-        document.getElementById("stat-clients-with-share").textContent = data.stats.clientsWithShare;
-        document.getElementById("stat-active-clients").textContent = data.stats.activeClients;
-        document.getElementById("stat-active-shared-clients").textContent = data.stats.activeSharedClients;
+        document.getElementById("stat-active-shares").textContent = data.stats.activeShares;
         document.getElementById("stat-leases").textContent = data.stats.activeLeases;
         document.getElementById("last-sync").textContent = relTime(data.generatedAt);
         document.getElementById("last-sync").title = fullTime(data.generatedAt);

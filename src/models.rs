@@ -244,9 +244,7 @@ pub struct DashboardResponse {
 #[serde(rename_all = "camelCase")]
 pub struct DashboardStats {
     pub clients: usize,
-    pub clients_with_share: usize,
-    pub active_clients: usize,
-    pub active_shared_clients: usize,
+    pub active_shares: usize,
     pub active_leases: usize,
 }
 

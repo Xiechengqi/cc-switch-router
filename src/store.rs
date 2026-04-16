@@ -27,7 +27,6 @@ use crate::proxy::ProxyRegistry;
 
 const SHARE_REQUEST_LOG_RECOVERY_LIMIT: usize = 10;
 const PUBLIC_MAP_CLIENT_ACTIVE_WINDOW_MINUTES: i64 = 5;
-const DASHBOARD_ACTIVE_CLIENT_WINDOW_MINUTES: i64 = 5;
 
 #[derive(Clone)]
 pub struct AppStore {
@@ -680,22 +679,10 @@ impl AppStore {
                 installation,
             })
             .collect::<Vec<_>>();
-        let active_client_cutoff =
-            Utc::now() - Duration::minutes(DASHBOARD_ACTIVE_CLIENT_WINDOW_MINUTES);
         let clients_count = client_views.len();
-        let clients_with_share_count = client_views
+        let active_shares_count = client_views
             .iter()
-            .filter(|client| client.share.is_some())
-            .count();
-        let active_clients_count = client_views
-            .iter()
-            .filter(|client| client.installation.last_seen_at >= active_client_cutoff)
-            .count();
-        let active_shared_clients_count = client_views
-            .iter()
-            .filter(|client| {
-                client.share.is_some() && client.installation.last_seen_at >= active_client_cutoff
-            })
+            .filter(|client| matches!(client.share.as_ref(), Some(share) if share.share_status == "active"))
             .count();
         let active_leases_count = client_views
             .iter()
@@ -706,9 +693,7 @@ impl AppStore {
             generated_at: now,
             stats: DashboardStats {
                 clients: clients_count,
-                clients_with_share: clients_with_share_count,
-                active_clients: active_clients_count,
-                active_shared_clients: active_shared_clients_count,
+                active_shares: active_shares_count,
                 active_leases: active_leases_count,
             },
             map: DashboardMap {
