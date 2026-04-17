@@ -694,20 +694,22 @@ impl AppStore {
                 .get(&installation.id)
                 .map(|subdomains| !subdomains.is_empty())
                 .unwrap_or(false);
-            client_map_points.push(DashboardMapPoint {
-                id: installation.id.clone(),
-                label: installation.platform.clone(),
-                point_type: "client".into(),
-                platform: Some(installation.platform.clone()),
-                country_code: installation.country_code.clone(),
-                country: installation.country.clone(),
-                region: installation.region.clone(),
-                city: installation.city.clone(),
-                lat: installation.latitude,
-                lon: installation.longitude,
-                last_seen_at: Some(installation.last_seen_at),
-                is_active,
-            });
+            if is_active {
+                client_map_points.push(DashboardMapPoint {
+                    id: installation.id.clone(),
+                    label: installation.platform.clone(),
+                    point_type: "client".into(),
+                    platform: Some(installation.platform.clone()),
+                    country_code: installation.country_code.clone(),
+                    country: installation.country.clone(),
+                    region: installation.region.clone(),
+                    city: installation.city.clone(),
+                    lat: installation.latitude,
+                    lon: installation.longitude,
+                    last_seen_at: Some(installation.last_seen_at),
+                    is_active,
+                });
+            }
             installation_views.push(InstallationView {
                 id: installation.id,
                 platform: installation.platform,
@@ -777,6 +779,7 @@ impl AppStore {
                 share: share_by_installation.remove(&installation.id),
                 installation,
             })
+            .filter(|client| client.share.is_some())
             .collect::<Vec<_>>();
         let clients_count = client_views.len();
         let active_shares_count = client_views
@@ -1028,10 +1031,12 @@ impl AppStore {
         let conn = self.conn.lock().await;
         let mut stmt = conn
             .prepare(
-                "SELECT latitude, longitude, country_code
-                 FROM installations
-                 WHERE last_seen_at >= ?1
-                 ORDER BY last_seen_at DESC",
+                "SELECT DISTINCT i.latitude, i.longitude, i.country_code
+                 FROM installations i
+                 INNER JOIN shares s ON s.installation_id = i.id
+                 WHERE i.last_seen_at >= ?1
+                   AND s.share_status = 'active'
+                 ORDER BY i.last_seen_at DESC",
             )
             .map_err(|e| AppError::Internal(format!("prepare public map clients failed: {e}")))?;
         let rows = stmt
