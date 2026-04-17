@@ -665,6 +665,10 @@
         background: rgba(16,185,129,0.12);
         color: #059669;
       }
+      .for-sale-pill--free {
+        background: rgba(59,130,246,0.12);
+        color: #2563eb;
+      }
       .for-sale-pill--no {
         background: rgba(148,163,184,0.14);
         color: var(--muted-foreground);
@@ -1193,9 +1197,11 @@
 
       function forSalePill(share) {
         if (!share) return '<span class="meta">—</span>';
-        const isYes = share.forSale === "Yes";
-        const label = isYes ? "Yes" : "No";
-        return `<span class="for-sale-pill ${isYes ? "for-sale-pill--yes" : "for-sale-pill--no"}">${label}</span>`;
+        const value = share.forSale === "Free" ? "Free" : (share.forSale === "Yes" ? "Yes" : "No");
+        const cls = value === "Yes"
+          ? "for-sale-pill--yes"
+          : (value === "Free" ? "for-sale-pill--free" : "for-sale-pill--no");
+        return `<span class="for-sale-pill ${cls}">${value}</span>`;
       }
 
       async function updatePagePresence() {

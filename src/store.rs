@@ -1233,7 +1233,11 @@ fn upsert_share_tx(
 ) -> Result<(), AppError> {
     let description = normalize_share_description(share.description.clone())?;
     let for_sale = normalize_share_for_sale(&share.for_sale)?;
-    let masked_share_token = mask_share_token(&share.share_token);
+    let stored_share_token = if for_sale == "Free" {
+        share.share_token.clone()
+    } else {
+        mask_share_token(&share.share_token)
+    };
     conn.execute(
         "INSERT INTO shares (
             share_id, installation_id, share_name, description, for_sale, subdomain, share_token, app_type, provider_id,
@@ -1266,7 +1270,7 @@ fn upsert_share_tx(
             description,
             for_sale,
             share.subdomain,
-            masked_share_token,
+            stored_share_token,
             share.app_type,
             share.provider_id,
             i64::from(share.support.claude as u8),
@@ -2180,8 +2184,9 @@ fn normalize_share_for_sale(value: &str) -> Result<String, AppError> {
     match value.trim() {
         "No" => Ok("No".to_string()),
         "Yes" => Ok("Yes".to_string()),
+        "Free" => Ok("Free".to_string()),
         _ => Err(AppError::BadRequest(
-            "share for_sale must be Yes or No".into(),
+            "share for_sale must be Yes, No, or Free".into(),
         )),
     }
 }
