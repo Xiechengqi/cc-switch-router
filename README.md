@@ -65,6 +65,7 @@ wget https://github.com/xiechengqi/portr-rs/releases/download/latest/portr-rs-li
 | `PORTR_RS_DB_PATH` | `$HOME/.config/portr-rs/portr-rs.db` | SQLite 路径 |
 | `PORTR_RS_CLEANUP_INTERVAL_SECS` | `300` | 清理任务执行间隔（秒） |
 | `PORTR_RS_LEASE_RETENTION_SECS` | `604800` | 过期 lease 保留时长（秒） |
+| `PORTR_RS_CLIENT_STALE_SECS` | `3600` | client 超过该时间未上报时清理其 share、lease 和 client 记录 |
 
 最小生产示例：
 

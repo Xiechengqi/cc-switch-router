@@ -16,6 +16,7 @@ pub struct Config {
     pub db_path: PathBuf,
     pub cleanup_interval_secs: u64,
     pub lease_retention_secs: i64,
+    pub client_stale_secs: i64,
 }
 
 impl Config {
@@ -50,6 +51,10 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(7 * 24 * 60 * 60),
+            client_stale_secs: env::var("PORTR_RS_CLIENT_STALE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60 * 60),
         }
     }
 
@@ -137,6 +142,7 @@ PORTR_RS_LEASE_TTL_SECS=60
 PORTR_RS_DB_PATH={}
 PORTR_RS_CLEANUP_INTERVAL_SECS=300
 PORTR_RS_LEASE_RETENTION_SECS=604800
+PORTR_RS_CLIENT_STALE_SECS=3600
 ",
         default_db_path().display()
     )

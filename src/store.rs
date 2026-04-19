@@ -123,6 +123,23 @@ pub struct ShareRouteTarget {
     pub subdomain: String,
 }
 
+#[derive(Debug, Default)]
+pub struct CleanupResult {
+    pub deleted_leases: usize,
+    pub deleted_shares: usize,
+    pub deleted_installations: usize,
+    pub removed_routes: usize,
+}
+
+impl CleanupResult {
+    pub fn has_changes(&self) -> bool {
+        self.deleted_leases > 0
+            || self.deleted_shares > 0
+            || self.deleted_installations > 0
+            || self.removed_routes > 0
+    }
+}
+
 impl AppStore {
     pub fn new(config: &Config) -> Result<Self, AppError> {
         if let Some(parent) = config.db_path.parent() {
@@ -651,7 +668,7 @@ impl AppStore {
         let mut active_share_subdomains_by_installation: HashMap<String, HashSet<String>> =
             HashMap::new();
         for (installation_id, share, _) in &shares {
-            if active_subdomains.contains(&share.subdomain) {
+            if share.share_status == "active" && active_subdomains.contains(&share.subdomain) {
                 active_share_subdomains_by_installation
                     .entry(installation_id.clone())
                     .or_default()
@@ -727,7 +744,9 @@ impl AppStore {
         let share_views = shares
             .into_iter()
             .map(|(installation_id, share, _active_lease_count)| {
-                let active_lease_count = usize::from(active_subdomains.contains(&share.subdomain));
+                let active_lease_count = usize::from(
+                    share.share_status == "active" && active_subdomains.contains(&share.subdomain),
+                );
                 let recent_requests = logs_by_share
                     .get(&share.share_id)
                     .cloned()
@@ -929,49 +948,140 @@ impl AppStore {
         Ok(logs_by_share)
     }
 
-    pub async fn cleanup_expired_data(&self, config: &Config) -> Result<(usize, usize), AppError> {
+    pub async fn cleanup_expired_data(
+        &self,
+        config: &Config,
+        proxy: &ProxyRegistry,
+    ) -> Result<CleanupResult, AppError> {
         let cutoff = (Utc::now() - Duration::seconds(config.lease_retention_secs)).to_rfc3339();
-        let conn = self.conn.lock().await;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| AppError::Internal(format!("begin cleanup tx failed: {e}")))?;
+        let stale_cutoff = (Utc::now() - Duration::seconds(config.client_stale_secs)).to_rfc3339();
+        let (mut result, stale_subdomains) = {
+            let conn = self.conn.lock().await;
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| AppError::Internal(format!("begin cleanup tx failed: {e}")))?;
 
-        let deleted_leases = tx
-            .execute(
-                "DELETE FROM leases
-                 WHERE expires_at < ?1
-                   AND (used_at IS NULL OR used_at < ?1)",
-                params![cutoff],
+            let stale_subdomains = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT DISTINCT subdomain
+                         FROM shares
+                         WHERE installation_id IN (
+                             SELECT id FROM installations WHERE last_seen_at < ?1
+                         )
+                           AND subdomain IS NOT NULL
+                           AND subdomain != ''
+                           AND subdomain != '-'",
+                    )
+                    .map_err(|e| AppError::Internal(format!("prepare stale routes failed: {e}")))?;
+                let rows = stmt
+                    .query_map(params![stale_cutoff], |row| row.get::<_, String>(0))
+                    .map_err(|e| AppError::Internal(format!("query stale routes failed: {e}")))?;
+                collect_rows(rows)?
+            };
+
+            let deleted_leases = tx
+                .execute(
+                    "DELETE FROM leases
+                     WHERE expires_at < ?1
+                       AND (used_at IS NULL OR used_at < ?1)",
+                    params![cutoff],
+                )
+                .map_err(|e| AppError::Internal(format!("delete expired leases failed: {e}")))?
+                as usize;
+
+            tx.execute(
+                "DELETE FROM share_health_checks
+                     WHERE share_id IN (
+                         SELECT share_id
+                         FROM shares
+                         WHERE installation_id IN (
+                             SELECT id FROM installations WHERE last_seen_at < ?1
+                         )
+                     )",
+                params![stale_cutoff],
             )
-            .map_err(|e| AppError::Internal(format!("delete expired leases failed: {e}")))?
-            as usize;
+            .map_err(|e| AppError::Internal(format!("delete stale share health failed: {e}")))?;
 
-        let deleted_shares = tx
-            .execute(
-                "DELETE FROM shares
-                 WHERE share_status IN ('expired', 'deleted')
-                   AND updated_at < ?1",
-                params![cutoff],
+            let deleted_stale_shares = tx
+                .execute(
+                    "DELETE FROM shares
+                     WHERE installation_id IN (
+                         SELECT id FROM installations WHERE last_seen_at < ?1
+                     )",
+                    params![stale_cutoff],
+                )
+                .map_err(|e| {
+                    AppError::Internal(format!("delete stale client shares failed: {e}"))
+                })? as usize;
+
+            let deleted_stale_leases = tx
+                .execute(
+                    "DELETE FROM leases
+                     WHERE installation_id IN (
+                         SELECT id FROM installations WHERE last_seen_at < ?1
+                     )",
+                    params![stale_cutoff],
+                )
+                .map_err(|e| {
+                    AppError::Internal(format!("delete stale client leases failed: {e}"))
+                })? as usize;
+
+            let deleted_installations = tx
+                .execute(
+                    "DELETE FROM installations WHERE last_seen_at < ?1",
+                    params![stale_cutoff],
+                )
+                .map_err(|e| {
+                    AppError::Internal(format!("delete stale installations failed: {e}"))
+                })? as usize;
+
+            let deleted_old_shares = tx
+                .execute(
+                    "DELETE FROM shares
+                     WHERE share_status IN ('expired', 'deleted')
+                       AND updated_at < ?1",
+                    params![cutoff],
+                )
+                .map_err(|e| AppError::Internal(format!("delete stale shares failed: {e}")))?
+                as usize;
+
+            let _deleted_request_logs = tx
+                .execute(
+                    "DELETE FROM share_request_logs
+                     WHERE created_at < ?1",
+                    params![
+                        DateTime::parse_from_rfc3339(&cutoff)
+                            .map(|dt| dt.timestamp())
+                            .unwrap_or_default()
+                    ],
+                )
+                .map_err(|e| {
+                    AppError::Internal(format!("delete stale request logs failed: {e}"))
+                })?;
+
+            tx.commit()
+                .map_err(|e| AppError::Internal(format!("commit cleanup tx failed: {e}")))?;
+
+            (
+                CleanupResult {
+                    deleted_leases: deleted_leases + deleted_stale_leases,
+                    deleted_shares: deleted_stale_shares + deleted_old_shares,
+                    deleted_installations,
+                    removed_routes: 0,
+                },
+                stale_subdomains,
             )
-            .map_err(|e| AppError::Internal(format!("delete stale shares failed: {e}")))?
-            as usize;
+        };
 
-        let _deleted_request_logs = tx
-            .execute(
-                "DELETE FROM share_request_logs
-                 WHERE created_at < ?1",
-                params![
-                    DateTime::parse_from_rfc3339(&cutoff)
-                        .map(|dt| dt.timestamp())
-                        .unwrap_or_default()
-                ],
-            )
-            .map_err(|e| AppError::Internal(format!("delete stale request logs failed: {e}")))?;
+        let mut removed_routes = 0;
+        for subdomain in stale_subdomains {
+            proxy.remove_route(&subdomain).await;
+            removed_routes += 1;
+        }
+        result.removed_routes = removed_routes;
 
-        tx.commit()
-            .map_err(|e| AppError::Internal(format!("commit cleanup tx failed: {e}")))?;
-
-        Ok((deleted_leases, deleted_shares))
+        Ok(result)
     }
 
     /// Legacy heartbeat endpoint kept for compatibility with older cc-switch
@@ -1007,7 +1117,7 @@ impl AppStore {
                  WHERE subdomain IS NOT NULL
                    AND subdomain != ''
                    AND subdomain != '-'
-                   AND share_status != 'deleted'
+                   AND share_status = 'active'
                  ORDER BY share_name ASC",
             )
             .map_err(|e| AppError::Internal(format!("prepare route targets failed: {e}")))?;
@@ -1839,8 +1949,8 @@ fn should_refresh_installation_geo(installation: &Installation, next_ip: Option<
 }
 
 fn prefer_dashboard_share(candidate: &ShareView, existing: &ShareView) -> bool {
-    let candidate_active = candidate.active_lease_count > 0 || candidate.share_status == "active";
-    let existing_active = existing.active_lease_count > 0 || existing.share_status == "active";
+    let candidate_active = candidate.share_status == "active";
+    let existing_active = existing.share_status == "active";
     if candidate_active != existing_active {
         return candidate_active;
     }
@@ -2485,4 +2595,209 @@ fn verify_signature(public_key: &str, input: &IssueLeaseRequest) -> Result<(), A
     verifying_key
         .verify(payload.as_bytes(), &signature)
         .map_err(|_| AppError::Unauthorized("signature verification failed".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::proxy::ProxyRegistry;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::path::PathBuf;
+
+    fn test_config(name: &str) -> Config {
+        let db_path = std::env::temp_dir().join(format!("portr-rs-{name}-{}.db", Uuid::new_v4()));
+        Config {
+            api_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8787),
+            ssh_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2222),
+            tunnel_domain: "127.0.0.1:8787".into(),
+            ssh_public_addr: String::new(),
+            use_localhost: true,
+            lease_ttl_secs: 60,
+            db_path,
+            cleanup_interval_secs: 300,
+            lease_retention_secs: 7 * 24 * 60 * 60,
+            client_stale_secs: 60 * 60,
+        }
+    }
+
+    async fn setup_store(name: &str) -> (AppStore, Config) {
+        let config = test_config(name);
+        let store = AppStore::new(&config).expect("create store");
+        (store, config)
+    }
+
+    async fn insert_installation(store: &AppStore, installation_id: &str) {
+        let now = Utc::now().to_rfc3339();
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "INSERT INTO installations (
+                id, public_key, platform, app_version, created_at, last_seen_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                installation_id,
+                format!("pk-{installation_id}"),
+                "macOS",
+                "1.0.0",
+                now,
+                now,
+            ],
+        )
+        .expect("insert installation");
+    }
+
+    async fn mark_installation_last_seen(
+        store: &AppStore,
+        installation_id: &str,
+        value: DateTime<Utc>,
+    ) {
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "UPDATE installations SET last_seen_at = ?2 WHERE id = ?1",
+            params![installation_id, value.to_rfc3339()],
+        )
+        .expect("update installation last_seen_at");
+    }
+
+    async fn insert_share(
+        store: &AppStore,
+        installation_id: &str,
+        share_id: &str,
+        subdomain: &str,
+        share_status: &str,
+    ) {
+        let now = Utc::now();
+        let expires = now + Duration::hours(1);
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "INSERT INTO shares (
+                share_id, installation_id, share_name, description, for_sale, subdomain, share_token,
+                app_type, provider_id, enabled_claude, enabled_codex, enabled_gemini, token_limit,
+                tokens_used, requests_count, share_status, created_at, expires_at, updated_at
+             ) VALUES (?1, ?2, ?3, NULL, 'No', ?4, 'token', 'proxy', NULL, 1, 1, 1, 1000, 0, 0, ?5, ?6, ?7, ?6)",
+            params![
+                share_id,
+                installation_id,
+                format!("share-{share_id}"),
+                subdomain,
+                share_status,
+                now.to_rfc3339(),
+                expires.to_rfc3339(),
+            ],
+        )
+        .expect("insert share");
+    }
+
+    #[tokio::test]
+    async fn list_share_route_targets_only_returns_active_shares() {
+        let (store, config) = setup_store("route-targets").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-active", "active-sub", "active").await;
+        insert_share(&store, "inst-1", "share-paused", "paused-sub", "paused").await;
+
+        let targets = store
+            .list_share_route_targets()
+            .await
+            .expect("list route targets");
+        let subdomains = targets
+            .into_iter()
+            .map(|target| target.subdomain)
+            .collect::<Vec<_>>();
+
+        assert_eq!(subdomains, vec!["active-sub".to_string()]);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn dashboard_snapshot_does_not_count_paused_share_as_active() {
+        let (store, config) = setup_store("dashboard-paused").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-paused", "paused-sub", "paused").await;
+
+        let server_geo = ServerGeo {
+            lat: None,
+            lon: None,
+        };
+        let proxy = ProxyRegistry::default();
+        let snapshot = store
+            .dashboard_snapshot(&config, &server_geo, &proxy)
+            .await
+            .expect("dashboard snapshot");
+
+        assert_eq!(snapshot.stats.clients, 1);
+        assert_eq!(snapshot.stats.active_shares, 0);
+        assert_eq!(snapshot.stats.active_leases, 0);
+        assert_eq!(snapshot.clients.len(), 1);
+        assert_eq!(
+            snapshot.clients[0]
+                .share
+                .as_ref()
+                .expect("share view")
+                .share_status,
+            "paused"
+        );
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_clients_and_shares_after_one_hour_without_report() {
+        let (store, config) = setup_store("cleanup-stale-client").await;
+        insert_installation(&store, "inst-stale").await;
+        insert_installation(&store, "inst-fresh").await;
+        insert_share(&store, "inst-stale", "share-stale", "stale-sub", "active").await;
+        insert_share(&store, "inst-fresh", "share-fresh", "fresh-sub", "active").await;
+        mark_installation_last_seen(&store, "inst-stale", Utc::now() - Duration::hours(2)).await;
+
+        let proxy = ProxyRegistry::default();
+        proxy
+            .set_route("stale-sub".into(), "127.0.0.1:1234".into(), None)
+            .await;
+        proxy
+            .set_route("fresh-sub".into(), "127.0.0.1:5678".into(), None)
+            .await;
+
+        let result = store
+            .cleanup_expired_data(&config, &proxy)
+            .await
+            .expect("cleanup stale client");
+
+        assert_eq!(result.deleted_installations, 1);
+        assert_eq!(result.deleted_shares, 1);
+        assert_eq!(result.removed_routes, 1);
+
+        let conn = store.conn.lock().await;
+        let stale_installations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM installations WHERE id = 'inst-stale'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count stale installations");
+        let stale_shares: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM shares WHERE share_id = 'share-stale'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count stale shares");
+        let fresh_shares: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM shares WHERE share_id = 'share-fresh'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count fresh shares");
+        drop(conn);
+
+        assert_eq!(stale_installations, 0);
+        assert_eq!(stale_shares, 0);
+        assert_eq!(fresh_shares, 1);
+        let active_subdomains = proxy.active_subdomains().await;
+        assert!(!active_subdomains.contains(&"stale-sub".to_string()));
+        assert!(active_subdomains.contains(&"fresh-sub".to_string()));
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
 }

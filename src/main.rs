@@ -63,6 +63,7 @@ async fn main() -> Result<()> {
         use_localhost = config.use_localhost,
         cleanup_interval_secs = config.cleanup_interval_secs,
         lease_retention_secs = config.lease_retention_secs,
+        client_stale_secs = config.client_stale_secs,
         "starting portr-rs"
     );
     let state = ServerState {
@@ -78,6 +79,7 @@ async fn main() -> Result<()> {
     };
     let cleanup_store = state.store.clone();
     let cleanup_config = config.clone();
+    let cleanup_proxy = state.proxy.clone();
     let probe_store = state.store.clone();
     let probe_config = config.clone();
 
@@ -91,9 +93,18 @@ async fn main() -> Result<()> {
             tokio::time::interval(Duration::from_secs(cleanup_config.cleanup_interval_secs));
         loop {
             interval.tick().await;
-            match cleanup_store.cleanup_expired_data(&cleanup_config).await {
-                Ok((leases, shares)) if leases > 0 || shares > 0 => {
-                    info!("cleanup removed {leases} leases and {shares} shares");
+            match cleanup_store
+                .cleanup_expired_data(&cleanup_config, &cleanup_proxy)
+                .await
+            {
+                Ok(result) if result.has_changes() => {
+                    info!(
+                        leases = result.deleted_leases,
+                        shares = result.deleted_shares,
+                        installations = result.deleted_installations,
+                        routes = result.removed_routes,
+                        "cleanup removed stale data"
+                    );
                 }
                 Ok(_) => {}
                 Err(err) => {
@@ -278,6 +289,7 @@ Environment:
   PORTR_RS_DB_PATH               SQLite path, default $HOME/.config/portr-rs/portr-rs.db
   PORTR_RS_CLEANUP_INTERVAL_SECS Cleanup interval, default 300
   PORTR_RS_LEASE_RETENTION_SECS  Lease retention period, default 604800
+  PORTR_RS_CLIENT_STALE_SECS     Delete clients and shares after no report, default 3600
 
 Default env file:
   $HOME/.config/portr-rs/.env
