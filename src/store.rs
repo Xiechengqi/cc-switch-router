@@ -21,7 +21,7 @@ use crate::models::{
     RegisterInstallationRequest, RegisterInstallationResponse, ShareBatchSyncRequest,
     ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptor, ShareHeartbeatRequest,
     ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRequestLogFetchResponse,
-    ShareSupport, ShareSyncRequest, ShareView, TunnelLease,
+    ShareSupport, ShareSyncRequest, ShareUpstreamProvider, ShareView, TunnelLease,
 };
 use crate::proxy::ProxyRegistry;
 
@@ -775,6 +775,7 @@ impl AppStore {
                     created_at: share.created_at,
                     expires_at: share.expires_at,
                     support: share.support,
+                    upstream_provider: share.upstream_provider,
                     installation_id,
                     active_lease_count,
                     online_minutes_24h,
@@ -1346,6 +1347,12 @@ fn upsert_share_tx(
 ) -> Result<(), AppError> {
     let description = normalize_share_description(share.description.clone())?;
     let for_sale = normalize_share_for_sale(&share.for_sale)?;
+    let upstream_provider_json = share
+        .upstream_provider
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| AppError::Internal(format!("serialize upstream provider failed: {e}")))?;
     let stored_share_token = if for_sale == "Free" {
         share.share_token.clone()
     } else {
@@ -1355,8 +1362,8 @@ fn upsert_share_tx(
         "INSERT INTO shares (
             share_id, installation_id, share_name, description, for_sale, subdomain, share_token, app_type, provider_id,
             enabled_claude, enabled_codex, enabled_gemini,
-            token_limit, tokens_used, requests_count, share_status, created_at, expires_at, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+            token_limit, tokens_used, requests_count, share_status, created_at, expires_at, upstream_provider_json, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
         ON CONFLICT(share_id) DO UPDATE SET
             installation_id = excluded.installation_id,
             share_name = excluded.share_name,
@@ -1375,6 +1382,7 @@ fn upsert_share_tx(
             share_status = excluded.share_status,
             created_at = excluded.created_at,
             expires_at = excluded.expires_at,
+            upstream_provider_json = excluded.upstream_provider_json,
             updated_at = excluded.updated_at",
         params![
             share.share_id,
@@ -1395,6 +1403,7 @@ fn upsert_share_tx(
             share.share_status,
             share.created_at,
             share.expires_at,
+            upstream_provider_json,
             Utc::now().to_rfc3339(),
         ],
     )
@@ -1520,6 +1529,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             share_status TEXT NOT NULL,
             created_at TEXT NOT NULL,
             expires_at TEXT NOT NULL,
+            upstream_provider_json TEXT,
             updated_at TEXT NOT NULL
         );
 
@@ -1747,6 +1757,15 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             [],
         )
         .map_err(|e| AppError::Internal(format!("add shares enabled_gemini failed: {e}")))?;
+    }
+    if !columns.iter().any(|name| name == "upstream_provider_json") {
+        conn.execute(
+            "ALTER TABLE shares ADD COLUMN upstream_provider_json TEXT",
+            [],
+        )
+        .map_err(|e| {
+            AppError::Internal(format!("add shares upstream_provider_json failed: {e}"))
+        })?;
     }
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_shares_subdomain_unique ON shares(subdomain) WHERE subdomain IS NOT NULL",
@@ -2204,7 +2223,7 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor, usize)
         .prepare(
             "SELECT s.installation_id, s.share_id, s.share_name, s.description, s.for_sale, COALESCE(s.subdomain, '-'), s.share_token, s.app_type, s.provider_id,
                     s.enabled_claude, s.enabled_codex, s.enabled_gemini,
-                    s.token_limit, s.tokens_used, s.requests_count, s.share_status, s.created_at, s.expires_at,
+                    s.token_limit, s.tokens_used, s.requests_count, s.share_status, s.created_at, s.expires_at, s.upstream_provider_json,
                     (
                         SELECT COUNT(*) FROM leases l
                         WHERE json_extract(l.share_json, '$.shareId') = s.share_id
@@ -2238,8 +2257,9 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor, usize)
                     share_status: row.get(15)?,
                     created_at: row.get(16)?,
                     expires_at: row.get(17)?,
+                    upstream_provider: parse_upstream_provider(row.get(18)?)?,
                 },
-                row.get::<_, i64>(18)? as usize,
+                row.get::<_, i64>(19)? as usize,
             ))
         })
         .map_err(|e| AppError::Internal(format!("query shares failed: {e}")))?;
@@ -2271,6 +2291,20 @@ fn normalize_share_for_sale(value: &str) -> Result<String, AppError> {
             "share for_sale must be Yes, No, or Free".into(),
         )),
     }
+}
+
+fn parse_upstream_provider(
+    value: Option<String>,
+) -> Result<Option<ShareUpstreamProvider>, rusqlite::Error> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_str(&value).map(Some).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+    })
 }
 
 fn mask_share_token(token: &str) -> String {

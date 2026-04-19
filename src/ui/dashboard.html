@@ -952,6 +952,69 @@
         `).join("")}</div>`;
       }
 
+      function titleApp(value) {
+        if (!value) return "Unknown";
+        return String(value).slice(0, 1).toUpperCase() + String(value).slice(1);
+      }
+
+      function upstreamKindLabel(upstream) {
+        if (!upstream || upstream.kind === "unknown") return "Upstream unknown";
+        if (upstream.kind === "official_oauth") return "Official Subscription";
+        if (upstream.kind === "custom_provider") return "Custom Provider";
+        return String(upstream.kind).replaceAll("_", " ");
+      }
+
+      function quotaSummary(upstream) {
+        if (!upstream) return "No official subscription quota";
+        if (upstream.kind !== "official_oauth") return "No official subscription quota";
+        const quota = upstream.quota;
+        if (!quota) return "Official quota unavailable";
+        if (quota.status && quota.status !== "ok") return "Official quota unavailable";
+        const tiers = (quota.tiers || []).filter((tier) => tier && tier.label);
+        if (!tiers.length) return "Official quota unavailable";
+        return tiers.map((tier) => `${tier.label} ${Math.round(tier.utilization || 0)}%`).join(" · ");
+      }
+
+      function upstreamSummary(share) {
+        const upstream = share?.upstreamProvider;
+        if (!upstream) return "Upstream unknown";
+        const parts = [upstreamKindLabel(upstream)];
+        if (upstream.kind === "official_oauth") {
+          parts.push(titleApp(upstream.app));
+        }
+        if (upstream.providerName && upstream.kind !== "official_oauth") {
+          parts.push(upstream.providerName);
+        }
+        if (upstream.providerName && upstream.kind === "official_oauth") {
+          parts.push(upstream.providerName);
+        }
+        if (upstream.accountEmail) {
+          parts.push(upstream.accountEmail);
+        }
+        return parts.filter(Boolean).join(" · ");
+      }
+
+      function upstreamDetails(share) {
+        const upstream = share?.upstreamProvider;
+        const provider = upstream?.providerName || "—";
+        const account = upstream?.accountEmail || "—";
+        const quota = quotaSummary(upstream);
+        return `
+          <div class="drawer-section-label">Upstream</div>
+          <div class="item-card">
+            <div class="item-card-top">
+              <strong>${escapeHtml(upstreamKindLabel(upstream))}</strong>
+              ${upstream?.app ? `<span class="badge">${escapeHtml(titleApp(upstream.app))}</span>` : ""}
+            </div>
+            <div class="item-card-grid">
+              <div class="item-card-grid-cell">Provider<span>${escapeHtml(provider)}</span></div>
+              <div class="item-card-grid-cell">Account<span>${escapeHtml(account)}</span></div>
+              <div class="item-card-grid-cell">Official Limit<span>${escapeHtml(quota)}</span></div>
+            </div>
+          </div>
+        `;
+      }
+
       const COUNTRY_CENTROIDS = {
         AR: [-38.42, -63.62], AT: [47.52, 14.55], AU: [-25.27, 133.77], BE: [50.50, 4.47],
         BR: [-14.23, -51.92], CA: [56.13, -106.35], CH: [46.82, 8.23], CL: [-35.68, -71.54],
@@ -1336,6 +1399,7 @@
             </div>
             <div class="usage-bar usage-bar--full" style="margin-top:10px;width:100%"><div class="${usageBarClass(pct)}" style="width:${pct}%"></div></div>
           </div>
+          ${upstreamDetails(share)}
         ` : `
           <div class="drawer-section-label">Share</div>
           <div class="empty"><div class="empty-icon"></div>No share linked to this client</div>
@@ -1418,7 +1482,7 @@
           const pct = share ? usagePercent(share.tokensUsed, share.tokenLimit) : 0;
           return `
           <tr onclick="openClient(${i})">
-            <td>${share ? `<strong>${escapeHtml(share.shareName)}</strong>` : '<span class="meta">—</span>'}</td>
+            <td>${share ? `<strong>${escapeHtml(share.shareName)}</strong><div class="meta">${escapeHtml(upstreamSummary(share))}</div><div class="meta">${escapeHtml(quotaSummary(share.upstreamProvider))}</div>` : '<span class="meta">—</span>'}</td>
             <td class="meta">${share ? `<strong>${escapeHtml(shareApiUrlKey(share))}</strong>` : '<span class="meta">—</span>'}</td>
             <td>${forSalePill(share)}</td>
             <td class="meta">${escapeHtml(item.countryCode || "-")}</td>

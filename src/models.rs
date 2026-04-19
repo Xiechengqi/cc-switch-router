@@ -217,6 +217,38 @@ pub struct ShareSupport {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ShareUpstreamQuotaTier {
+    pub label: String,
+    pub utilization: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareUpstreamQuota {
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queried_at: Option<i64>,
+    #[serde(default)]
+    pub tiers: Vec<ShareUpstreamQuotaTier>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareUpstreamProvider {
+    pub kind: String,
+    pub app: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota: Option<ShareUpstreamQuota>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ShareDescriptor {
     pub share_id: String,
     pub share_name: String,
@@ -237,6 +269,8 @@ pub struct ShareDescriptor {
     pub expires_at: String,
     #[serde(default)]
     pub support: ShareSupport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_provider: Option<ShareUpstreamProvider>,
 }
 
 #[derive(Debug, Serialize)]
@@ -347,6 +381,8 @@ pub struct ShareView {
     pub created_at: String,
     pub expires_at: String,
     pub support: ShareSupport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_provider: Option<ShareUpstreamProvider>,
     pub installation_id: String,
     pub active_lease_count: usize,
     pub online_minutes_24h: usize,
