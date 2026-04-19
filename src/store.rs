@@ -27,6 +27,7 @@ use crate::proxy::ProxyRegistry;
 
 const SHARE_REQUEST_LOG_RECOVERY_LIMIT: usize = 10;
 const PUBLIC_MAP_CLIENT_ACTIVE_WINDOW_MINUTES: i64 = 5;
+const ONLINE_WINDOW_MINUTES: usize = 24 * 60;
 
 fn country_centroid(country_code: &str) -> Option<(f64, f64)> {
     match country_code {
@@ -756,6 +757,8 @@ impl AppStore {
                     .cloned()
                     .unwrap_or_default();
                 let online_minutes_24h = online_by_share.get(&share.share_id).copied().unwrap_or(0);
+                let online_rate_24h =
+                    ((online_minutes_24h as f64 / ONLINE_WINDOW_MINUTES as f64) * 100.0).min(100.0);
                 ShareView {
                     share_id: share.share_id,
                     share_name: share.share_name,
@@ -775,7 +778,7 @@ impl AppStore {
                     installation_id,
                     active_lease_count,
                     online_minutes_24h,
-                    online_rate_24h: (online_minutes_24h as f64 / 1440.0) * 100.0,
+                    online_rate_24h,
                     recent_requests,
                     health_checks,
                 }
@@ -2464,7 +2467,7 @@ fn list_online_minutes_24h(conn: &Connection) -> Result<HashMap<String, usize>, 
     for row in rows {
         let (share_id, online_minutes) =
             row.map_err(|e| AppError::Internal(format!("read online minute row failed: {e}")))?;
-        map.insert(share_id, online_minutes);
+        map.insert(share_id, online_minutes.min(ONLINE_WINDOW_MINUTES));
     }
     Ok(map)
 }
@@ -2688,6 +2691,15 @@ mod tests {
         .expect("insert share");
     }
 
+    async fn insert_health_check(store: &AppStore, share_id: &str, checked_at: i64) {
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "INSERT INTO share_health_checks (share_id, checked_at, is_healthy) VALUES (?1, ?2, 1)",
+            params![share_id, checked_at],
+        )
+        .expect("insert health check");
+    }
+
     #[tokio::test]
     async fn list_share_route_targets_only_returns_active_shares() {
         let (store, config) = setup_store("route-targets").await;
@@ -2797,6 +2809,39 @@ mod tests {
         let active_subdomains = proxy.active_subdomains().await;
         assert!(!active_subdomains.contains(&"stale-sub".to_string()));
         assert!(active_subdomains.contains(&"fresh-sub".to_string()));
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn online_minutes_24h_is_capped_to_one_day() {
+        let (store, config) = setup_store("online-minutes-cap").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-1", "share-sub", "active").await;
+
+        let now = Utc::now().timestamp();
+        for minute_offset in 0..=ONLINE_WINDOW_MINUTES {
+            insert_health_check(&store, "share-1", now - (minute_offset as i64 * 60)).await;
+        }
+
+        let conn = store.conn.lock().await;
+        let online = list_online_minutes_24h(&conn).expect("list online minutes");
+        drop(conn);
+
+        assert_eq!(online.get("share-1"), Some(&ONLINE_WINDOW_MINUTES));
+
+        let server_geo = ServerGeo {
+            lat: None,
+            lon: None,
+        };
+        let proxy = ProxyRegistry::default();
+        let snapshot = store
+            .dashboard_snapshot(&config, &server_geo, &proxy)
+            .await
+            .expect("dashboard snapshot");
+        let share = snapshot.clients[0].share.as_ref().expect("share view");
+        assert_eq!(share.online_minutes_24h, ONLINE_WINDOW_MINUTES);
+        assert_eq!(share.online_rate_24h, 100.0);
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }

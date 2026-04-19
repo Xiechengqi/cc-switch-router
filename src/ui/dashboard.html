@@ -1197,6 +1197,52 @@
         return `${apiHost}[${share.shareToken || "***"}]`;
       }
 
+      function isUnlimitedExpiry(value) {
+        if (!value) return false;
+        const expiresAt = new Date(value).getTime();
+        if (Number.isNaN(expiresAt)) return false;
+        const fiftyYearsMs = 50 * 365 * 24 * 60 * 60 * 1000;
+        return expiresAt - Date.now() >= fiftyYearsMs;
+      }
+
+      function expiryLabel(value) {
+        return isUnlimitedExpiry(value) ? "Unlimited" : relTime(value);
+      }
+
+      function expiryTitle(value) {
+        return isUnlimitedExpiry(value) ? "Unlimited" : fullTime(value);
+      }
+
+      function expirySortValue(share) {
+        if (!share || !share.expiresAt) return 0;
+        if (isUnlimitedExpiry(share.expiresAt)) return Number.POSITIVE_INFINITY;
+        const expiresAt = new Date(share.expiresAt).getTime();
+        return Number.isNaN(expiresAt) ? 0 : expiresAt;
+      }
+
+      function compareNumberDesc(left, right) {
+        if (left === right) return 0;
+        return left > right ? -1 : 1;
+      }
+
+      function sortClients(clients) {
+        return [...clients].sort((left, right) => {
+          const leftShare = left.share;
+          const rightShare = right.share;
+
+          const onlineCmp = compareNumberDesc(leftShare?.onlineMinutes24h || 0, rightShare?.onlineMinutes24h || 0);
+          if (onlineCmp) return onlineCmp;
+
+          const limitCmp = compareNumberDesc(leftShare?.tokenLimit || 0, rightShare?.tokenLimit || 0);
+          if (limitCmp) return limitCmp;
+
+          const expiryCmp = compareNumberDesc(expirySortValue(leftShare), expirySortValue(rightShare));
+          if (expiryCmp) return expiryCmp;
+
+          return shareApiUrlKey(leftShare).localeCompare(shareApiUrlKey(rightShare), undefined, { sensitivity: "base" });
+        });
+      }
+
       function forSalePill(share) {
         if (!share) return '<span class="meta">—</span>';
         const value = share.forSale === "Free" ? "Free" : (share.forSale === "Yes" ? "Yes" : "No");
@@ -1348,7 +1394,7 @@
         if (!res.ok) throw new Error("Failed to fetch: " + res.status);
         const data = await res.json();
 
-        _clients = data.clients || [];
+        _clients = sortClients(data.clients || []);
 
         /* topbar stats */
         document.getElementById("stat-clients").textContent = data.stats.clients;
@@ -1382,7 +1428,7 @@
                 <div class="usage-bar"><div class="${usageBarClass(pct)}" style="width:${pct}%"></div></div>
               ` : '<span class="meta">—</span>'}
             </td>
-            <td>${share ? `<strong title="${fullTime(share.expiresAt)}">${relTime(share.expiresAt)}</strong>` : '<span class="meta">—</span>'}</td>
+            <td>${share ? `<strong title="${escapeHtml(expiryTitle(share.expiresAt))}">${escapeHtml(expiryLabel(share.expiresAt))}</strong>` : '<span class="meta">—</span>'}</td>
             <td>${share ? `<strong title="${share.onlineMinutes24h || 0} / 1440 min online in last 24h">${formatPct(share.onlineRate24h || 0)}</strong>` : '<span class="meta">—</span>'}</td>
             <td>${share ? healthDots(share.healthChecks || []) : '<span class="meta">—</span>'}</td>
             <td>${share ? supportPills(share.support) : '<span class="meta">—</span>'}</td>
