@@ -1,16 +1,18 @@
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use russh::keys::key::KeyPair;
+use russh::keys::{encode_pkcs8_pem, load_secret_key};
 use russh::server::Msg;
 use russh::server::{Auth, Session};
 use russh::{Channel, ChannelId, server};
 use tokio::io;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::proxy::ProxyRegistry;
 use crate::store::AppStore;
@@ -19,6 +21,59 @@ use crate::store::AppStore;
 pub struct SshServer {
     pub store: AppStore,
     pub proxy: Arc<ProxyRegistry>,
+    pub host_key: KeyPair,
+}
+
+/// 加载持久化的 SSH host key；不存在则生成并写入磁盘。
+///
+/// Why: 每次进程启动都 `generate_ed25519()` 会让所有客户端的 known_hosts / 指纹
+/// 绑定失效，中间人攻击无法被发现。持久化 host key 后客户端可通过 `ssh_host_fingerprint`
+/// 租约字段（P0-3b）进行首次 TOFU + 后续校验。
+pub fn load_or_generate_host_key(path: &Path) -> Result<KeyPair> {
+    if path.exists() {
+        match load_secret_key(path, None) {
+            Ok(key) => {
+                info!("loaded ssh host key from {}", path.display());
+                return Ok(key);
+            }
+            Err(err) => {
+                warn!(
+                    "failed to load ssh host key from {}: {}, will regenerate",
+                    path.display(),
+                    err
+                );
+            }
+        }
+    }
+
+    let keypair = KeyPair::generate_ed25519();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create host key dir failed: {}", parent.display()))?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("create host key file failed: {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        let _ = file.set_permissions(perms);
+    }
+    encode_pkcs8_pem(&keypair, &mut file)
+        .with_context(|| format!("write host key failed: {}", path.display()))?;
+    info!("generated new ssh host key at {}", path.display());
+    Ok(keypair)
+}
+
+/// 计算 KeyPair 对应 PublicKey 的 SHA256 指纹字符串（与 OpenSSH 输出一致：`SHA256:<base64-nopad>`）。
+pub fn host_key_fingerprint(key: &KeyPair) -> Result<String> {
+    let public = key
+        .clone_public_key()
+        .context("derive public key for fingerprint")?;
+    Ok(format!("SHA256:{}", public.fingerprint()))
 }
 
 #[derive(Clone)]
@@ -37,7 +92,7 @@ impl SshServer {
             auth_rejection_time: std::time::Duration::from_secs(1),
             ..Default::default()
         };
-        config.keys.push(KeyPair::generate_ed25519());
+        config.keys.push(self.host_key.clone());
         let config = Arc::new(config);
         info!("ssh listening on {}", listener.local_addr()?);
         loop {

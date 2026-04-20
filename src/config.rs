@@ -14,6 +14,7 @@ pub struct Config {
     pub use_localhost: bool,
     pub lease_ttl_secs: i64,
     pub db_path: PathBuf,
+    pub host_key_path: PathBuf,
     pub cleanup_interval_secs: u64,
     pub lease_retention_secs: i64,
     pub client_stale_secs: i64,
@@ -43,6 +44,9 @@ impl Config {
             db_path: env::var("PORTR_RS_DB_PATH")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| default_db_path()),
+            host_key_path: env::var("PORTR_RS_HOST_KEY_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| default_host_key_path()),
             cleanup_interval_secs: env::var("PORTR_RS_CLEANUP_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -129,6 +133,13 @@ fn default_db_path() -> PathBuf {
         .map(PathBuf::from)
         .map(|home| home.join(".config/portr-rs/portr-rs.db"))
         .unwrap_or_else(|| PathBuf::from("./data/portr-rs.db"))
+}
+
+fn default_host_key_path() -> PathBuf {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".config/portr-rs/ssh_host_ed25519_key"))
+        .unwrap_or_else(|| PathBuf::from("./data/ssh_host_ed25519_key"))
 }
 
 fn default_env_contents() -> String {

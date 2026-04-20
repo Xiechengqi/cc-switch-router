@@ -78,7 +78,7 @@ async fn issue_lease(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(input): Json<IssueLeaseRequest>,
 ) -> Result<Json<IssueLeaseResponse>, AppError> {
-    let response = state
+    let mut response = state
         .store
         .issue_lease(
             &state.config,
@@ -87,6 +87,7 @@ async fn issue_lease(
             extract_client_metadata(&headers, addr),
         )
         .await?;
+    response.ssh_host_fingerprint = state.ssh_host_fingerprint.clone();
     Ok(Json(response))
 }
 

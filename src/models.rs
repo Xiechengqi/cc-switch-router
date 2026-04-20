@@ -86,6 +86,9 @@ pub struct IssueLeaseRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ShareSyncRequest {
     pub installation_id: String,
+    pub timestamp_ms: i64,
+    pub nonce: String,
+    pub signature: String,
     pub share: ShareDescriptor,
 }
 
@@ -93,6 +96,9 @@ pub struct ShareSyncRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ShareClaimSubdomainRequest {
     pub installation_id: String,
+    pub timestamp_ms: i64,
+    pub nonce: String,
+    pub signature: String,
     pub share: ShareDescriptor,
 }
 
@@ -100,6 +106,9 @@ pub struct ShareClaimSubdomainRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ShareDeleteRequest {
     pub installation_id: String,
+    pub timestamp_ms: i64,
+    pub nonce: String,
+    pub signature: String,
     pub share_id: String,
 }
 
@@ -107,6 +116,9 @@ pub struct ShareDeleteRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ShareBatchSyncRequest {
     pub installation_id: String,
+    pub timestamp_ms: i64,
+    pub nonce: String,
+    pub signature: String,
     pub ops: Vec<ShareSyncOperation>,
 }
 
@@ -114,6 +126,9 @@ pub struct ShareBatchSyncRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ShareRequestLogBatchSyncRequest {
     pub installation_id: String,
+    pub timestamp_ms: i64,
+    pub nonce: String,
+    pub signature: String,
     pub logs: Vec<ShareRequestLogEntry>,
 }
 
@@ -172,6 +187,10 @@ pub struct IssueLeaseResponse {
     pub expires_at: DateTime<Utc>,
     pub tunnel_url: String,
     pub subdomain: String,
+    /// SSH host key 指纹（`SHA256:<base64-nopad>` 格式），由客户端用于校验远端身份，
+    /// 防止中间人攻击。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_host_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

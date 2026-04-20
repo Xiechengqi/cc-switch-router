@@ -7,6 +7,7 @@ use chrono::{DateTime, Duration, Utc};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rand::distributions::{Alphanumeric, DistString};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 use uuid::Uuid;
@@ -28,6 +29,8 @@ use crate::proxy::ProxyRegistry;
 const SHARE_REQUEST_LOG_RECOVERY_LIMIT: usize = 10;
 const PUBLIC_MAP_CLIENT_ACTIVE_WINDOW_MINUTES: i64 = 5;
 const ONLINE_WINDOW_MINUTES: usize = 24 * 60;
+const SIGNED_REQUEST_MAX_SKEW_MS: i64 = 60_000;
+const NONCE_RETENTION_SECS: i64 = 10 * 60;
 
 fn country_centroid(country_code: &str) -> Option<(f64, f64)> {
     match country_code {
@@ -315,7 +318,7 @@ impl AppStore {
     ) -> Result<IssueLeaseResponse, AppError> {
         let now = Utc::now();
         let skew = (now.timestamp_millis() - input.timestamp_ms).abs();
-        if skew > 60_000 {
+        if skew > SIGNED_REQUEST_MAX_SKEW_MS {
             return Err(AppError::Unauthorized("stale lease request".into()));
         }
 
@@ -443,6 +446,7 @@ impl AppStore {
             expires_at,
             tunnel_url: config.tunnel_url(&subdomain),
             subdomain,
+            ssh_host_fingerprint: None,
         })
     }
 
@@ -484,6 +488,16 @@ impl AppStore {
             let Some(installation) = installation else {
                 return Err(AppError::Unauthorized("installation not found".into()));
             };
+            verify_signed_share_request(
+                &conn,
+                &installation.public_key,
+                &input.installation_id,
+                "share_sync",
+                &input.share,
+                input.timestamp_ms,
+                &input.nonce,
+                &input.signature,
+            )?;
             let should_refresh_geo =
                 should_refresh_installation_geo(&installation, metadata.ip.as_deref());
             touch_installation_presence(&conn, &input.installation_id, &metadata, Utc::now())?;
@@ -508,6 +522,16 @@ impl AppStore {
         let Some(installation) = installation else {
             return Err(AppError::Unauthorized("installation not found".into()));
         };
+        verify_signed_share_request(
+            &conn,
+            &installation.public_key,
+            &input.installation_id,
+            "share_claim_subdomain",
+            &input.share,
+            input.timestamp_ms,
+            &input.nonce,
+            &input.signature,
+        )?;
         let should_refresh_geo =
             should_refresh_installation_geo(&installation, metadata.ip.as_deref());
         touch_installation_presence(&conn, &input.installation_id, &metadata, Utc::now())?;
@@ -530,6 +554,21 @@ impl AppStore {
 
     pub async fn delete_share(&self, input: ShareDeleteRequest) -> Result<(), AppError> {
         let conn = self.conn.lock().await;
+        let installation = get_installation(&conn, &input.installation_id)?;
+        let Some(installation) = installation else {
+            return Err(AppError::Unauthorized("installation not found".into()));
+        };
+        let delete_payload = serde_json::json!({ "shareId": &input.share_id });
+        verify_signed_share_request(
+            &conn,
+            &installation.public_key,
+            &input.installation_id,
+            "share_delete",
+            &delete_payload,
+            input.timestamp_ms,
+            &input.nonce,
+            &input.signature,
+        )?;
         conn.execute(
             "DELETE FROM shares WHERE share_id = ?1 AND installation_id = ?2",
             params![input.share_id, input.installation_id],
@@ -548,6 +587,16 @@ impl AppStore {
         let Some(installation) = installation else {
             return Err(AppError::Unauthorized("installation not found".into()));
         };
+        verify_signed_share_request(
+            &conn,
+            &installation.public_key,
+            &input.installation_id,
+            "share_batch_sync",
+            &input.ops,
+            input.timestamp_ms,
+            &input.nonce,
+            &input.signature,
+        )?;
         let should_refresh_geo =
             should_refresh_installation_geo(&installation, metadata.ip.as_deref());
         touch_installation_presence(&conn, &input.installation_id, &metadata, Utc::now())?;
@@ -603,6 +652,16 @@ impl AppStore {
         let Some(installation) = installation else {
             return Err(AppError::Unauthorized("installation not found".into()));
         };
+        verify_signed_share_request(
+            &conn,
+            &installation.public_key,
+            &input.installation_id,
+            "share_request_logs_batch_sync",
+            &input.logs,
+            input.timestamp_ms,
+            &input.nonce,
+            &input.signature,
+        )?;
         let should_refresh_geo =
             should_refresh_installation_geo(&installation, metadata.ip.as_deref());
         touch_installation_presence(&conn, &input.installation_id, &metadata, Utc::now())?;
@@ -1063,6 +1122,13 @@ impl AppStore {
                 .map_err(|e| {
                     AppError::Internal(format!("delete stale request logs failed: {e}"))
                 })?;
+
+            tx.execute(
+                "DELETE FROM request_nonces
+                 WHERE created_at < ?1",
+                params![(Utc::now() - Duration::seconds(NONCE_RETENTION_SECS)).to_rfc3339()],
+            )
+            .map_err(|e| AppError::Internal(format!("delete stale request nonces failed: {e}")))?;
 
             tx.commit()
                 .map_err(|e| AppError::Internal(format!("commit cleanup tx failed: {e}")))?;
@@ -1567,6 +1633,14 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             last_seen_at INTEGER NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS request_nonces (
+            installation_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            nonce TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (installation_id, action, nonce)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_leases_installation_id ON leases(installation_id);
         CREATE INDEX IF NOT EXISTS idx_leases_subdomain ON leases(subdomain);
         CREATE INDEX IF NOT EXISTS idx_shares_installation_id ON shares(installation_id);
@@ -1574,6 +1648,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         CREATE INDEX IF NOT EXISTS idx_share_request_logs_share_id ON share_request_logs(share_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_share_health_checks ON share_health_checks(share_id, checked_at DESC);
         CREATE INDEX IF NOT EXISTS idx_dashboard_presence_last_seen ON dashboard_presence(last_seen_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_request_nonces_created_at ON request_nonces(created_at DESC);
         ",
     )
     .map_err(|e| AppError::Internal(format!("init schema failed: {e}")))?;
@@ -2634,11 +2709,104 @@ fn verify_signature(public_key: &str, input: &IssueLeaseRequest) -> Result<(), A
         .map_err(|_| AppError::Unauthorized("signature verification failed".into()))
 }
 
+fn verify_signed_share_request<T: Serialize>(
+    conn: &Connection,
+    public_key: &str,
+    installation_id: &str,
+    action: &str,
+    payload: &T,
+    timestamp_ms: i64,
+    nonce: &str,
+    signature: &str,
+) -> Result<(), AppError> {
+    let now = Utc::now();
+    let skew = (now.timestamp_millis() - timestamp_ms).abs();
+    if skew > SIGNED_REQUEST_MAX_SKEW_MS {
+        return Err(AppError::Unauthorized("stale signed request".into()));
+    }
+
+    verify_signed_payload(
+        public_key,
+        installation_id,
+        action,
+        payload,
+        timestamp_ms,
+        nonce,
+        signature,
+    )?;
+    consume_request_nonce(conn, installation_id, action, nonce, now)
+}
+
+fn consume_request_nonce(
+    conn: &Connection,
+    installation_id: &str,
+    action: &str,
+    nonce: &str,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    conn.execute(
+        "INSERT INTO request_nonces (installation_id, action, nonce, created_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![installation_id, action, nonce, now.to_rfc3339()],
+    )
+    .map_err(|err| {
+        let text = err.to_string();
+        if text.contains("UNIQUE constraint failed")
+            || text.contains("request_nonces.installation_id")
+        {
+            AppError::Unauthorized("nonce already used".into())
+        } else {
+            AppError::Internal(format!("store request nonce failed: {text}"))
+        }
+    })?;
+    Ok(())
+}
+
+fn verify_signed_payload<T: Serialize>(
+    public_key: &str,
+    installation_id: &str,
+    action: &str,
+    payload: &T,
+    timestamp_ms: i64,
+    nonce: &str,
+    signature: &str,
+) -> Result<(), AppError> {
+    let key_bytes = base64::engine::general_purpose::STANDARD
+        .decode(public_key)
+        .map_err(|_| AppError::Unauthorized("invalid stored public key".into()))?;
+    let key_array: [u8; 32] = key_bytes
+        .try_into()
+        .map_err(|_| AppError::Unauthorized("invalid public key length".into()))?;
+    let verifying_key = VerifyingKey::from_bytes(&key_array)
+        .map_err(|_| AppError::Unauthorized("invalid public key".into()))?;
+
+    let sig_bytes = base64::engine::general_purpose::STANDARD
+        .decode(signature)
+        .map_err(|_| AppError::Unauthorized("invalid signature".into()))?;
+    let sig_array: [u8; 64] = sig_bytes
+        .try_into()
+        .map_err(|_| AppError::Unauthorized("invalid signature length".into()))?;
+    let signature = Signature::from_bytes(&sig_array);
+
+    let payload_json = serde_json::to_string(payload)
+        .map_err(|_| AppError::Unauthorized("invalid signed payload".into()))?;
+    let payload = format!(
+        "{}\n{}\n{}\n{}\n{}",
+        installation_id, action, payload_json, timestamp_ms, nonce
+    );
+    verifying_key
+        .verify(payload.as_bytes(), &signature)
+        .map_err(|_| AppError::Unauthorized("signature verification failed".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::models::ShareSyncOperation;
     use crate::proxy::ProxyRegistry;
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand::rngs::OsRng;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::path::PathBuf;
 
@@ -2652,6 +2820,8 @@ mod tests {
             use_localhost: true,
             lease_ttl_secs: 60,
             db_path,
+            host_key_path: std::env::temp_dir()
+                .join(format!("portr-rs-{name}-{}.key", Uuid::new_v4())),
             cleanup_interval_secs: 300,
             lease_retention_secs: 7 * 24 * 60 * 60,
             client_stale_secs: 60 * 60,
@@ -2734,6 +2904,36 @@ mod tests {
         .expect("insert health check");
     }
 
+    async fn insert_signed_installation(store: &AppStore, installation_id: &str) -> SigningKey {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = base64::engine::general_purpose::STANDARD
+            .encode(signing_key.verifying_key().to_bytes());
+        let now = Utc::now().to_rfc3339();
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "INSERT INTO installations (
+                id, public_key, platform, app_version, created_at, last_seen_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![installation_id, public_key, "macOS", "1.0.0", now, now],
+        )
+        .expect("insert signed installation");
+        signing_key
+    }
+
+    fn sign_test_payload<T: Serialize>(
+        signing_key: &SigningKey,
+        installation_id: &str,
+        action: &str,
+        payload: &T,
+        timestamp_ms: i64,
+        nonce: &str,
+    ) -> String {
+        let payload_json = serde_json::to_string(payload).expect("serialize test payload");
+        let body = format!("{installation_id}\n{action}\n{payload_json}\n{timestamp_ms}\n{nonce}");
+        let signature = signing_key.sign(body.as_bytes());
+        base64::engine::general_purpose::STANDARD.encode(signature.to_bytes())
+    }
+
     #[tokio::test]
     async fn list_share_route_targets_only_returns_active_shares() {
         let (store, config) = setup_store("route-targets").await;
@@ -2751,6 +2951,350 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(subdomains, vec!["active-sub".to_string()]);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn claim_share_subdomain_accepts_valid_signature_and_rejects_replay_and_tamper() {
+        let (store, config) = setup_store("signed-share-claim").await;
+        let signing_key = insert_signed_installation(&store, "inst-signed").await;
+
+        let share = ShareDescriptor {
+            share_id: "share-1".into(),
+            share_name: "Signed Share".into(),
+            description: None,
+            for_sale: "No".into(),
+            subdomain: "signed-sub".into(),
+            share_token: "token-12345678".into(),
+            app_type: "proxy".into(),
+            provider_id: None,
+            token_limit: 1000,
+            tokens_used: 0,
+            requests_count: 0,
+            share_status: "paused".into(),
+            created_at: Utc::now().to_rfc3339(),
+            expires_at: (Utc::now() + Duration::hours(1)).to_rfc3339(),
+            support: ShareSupport::default(),
+            upstream_provider: None,
+        };
+
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            "inst-signed",
+            "share_claim_subdomain",
+            &share,
+            timestamp_ms,
+            &nonce,
+        );
+
+        let request = ShareClaimSubdomainRequest {
+            installation_id: "inst-signed".into(),
+            timestamp_ms,
+            nonce: nonce.clone(),
+            signature: signature.clone(),
+            share: share.clone(),
+        };
+
+        store
+            .claim_share_subdomain(
+                request,
+                ClientMetadata {
+                    ip: Some("127.0.0.1".into()),
+                    country_code: None,
+                },
+            )
+            .await
+            .expect("valid signed share claim");
+
+        let replay_err = store
+            .claim_share_subdomain(
+                ShareClaimSubdomainRequest {
+                    installation_id: "inst-signed".into(),
+                    timestamp_ms,
+                    nonce: nonce.clone(),
+                    signature: signature.clone(),
+                    share: share.clone(),
+                },
+                ClientMetadata {
+                    ip: Some("127.0.0.1".into()),
+                    country_code: None,
+                },
+            )
+            .await
+            .expect_err("replay should fail");
+        assert!(replay_err.to_string().contains("nonce already used"));
+
+        let tampered_share = ShareDescriptor {
+            subdomain: "signed-sub-tampered".into(),
+            ..share
+        };
+        let tampered_err = store
+            .claim_share_subdomain(
+                ShareClaimSubdomainRequest {
+                    installation_id: "inst-signed".into(),
+                    timestamp_ms: Utc::now().timestamp_millis(),
+                    nonce: Uuid::new_v4().to_string(),
+                    signature,
+                    share: tampered_share,
+                },
+                ClientMetadata {
+                    ip: Some("127.0.0.1".into()),
+                    country_code: None,
+                },
+            )
+            .await
+            .expect_err("tampered payload should fail");
+        assert!(
+            tampered_err
+                .to_string()
+                .contains("signature verification failed")
+        );
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn batch_sync_shares_requires_valid_signature() {
+        let (store, config) = setup_store("signed-share-batch").await;
+        let signing_key = insert_signed_installation(&store, "inst-batch").await;
+
+        let share = ShareDescriptor {
+            share_id: "share-batch-1".into(),
+            share_name: "Batch Share".into(),
+            description: Some("signed batch sync".into()),
+            for_sale: "No".into(),
+            subdomain: "batch-sub".into(),
+            share_token: "token-batch-123".into(),
+            app_type: "proxy".into(),
+            provider_id: None,
+            token_limit: 2048,
+            tokens_used: 12,
+            requests_count: 3,
+            share_status: "active".into(),
+            created_at: Utc::now().to_rfc3339(),
+            expires_at: (Utc::now() + Duration::hours(2)).to_rfc3339(),
+            support: ShareSupport {
+                claude: true,
+                codex: true,
+                gemini: false,
+            },
+            upstream_provider: None,
+        };
+        let ops = vec![ShareSyncOperation {
+            kind: "upsert".into(),
+            share: Some(share.clone()),
+            share_id: None,
+        }];
+
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            "inst-batch",
+            "share_batch_sync",
+            &ops,
+            timestamp_ms,
+            &nonce,
+        );
+
+        store
+            .batch_sync_shares(
+                ShareBatchSyncRequest {
+                    installation_id: "inst-batch".into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    ops,
+                },
+                ClientMetadata {
+                    ip: Some("127.0.0.1".into()),
+                    country_code: None,
+                },
+            )
+            .await
+            .expect("valid signed batch sync");
+
+        let conn = store.conn.lock().await;
+        let synced: (String, String, i64) = conn
+            .query_row(
+                "SELECT share_name, subdomain, token_limit FROM shares
+                 WHERE installation_id = ?1 AND share_id = ?2",
+                params!["inst-batch", "share-batch-1"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("query synced share");
+        drop(conn);
+        assert_eq!(synced.0, "Batch Share");
+        assert_eq!(synced.1, "batch-sub");
+        assert_eq!(synced.2, 2048);
+
+        let tampered_ops = vec![ShareSyncOperation {
+            kind: "upsert".into(),
+            share: Some(ShareDescriptor {
+                share_name: "Batch Share Tampered".into(),
+                ..share
+            }),
+            share_id: None,
+        }];
+        let tampered_err = store
+            .batch_sync_shares(
+                ShareBatchSyncRequest {
+                    installation_id: "inst-batch".into(),
+                    timestamp_ms: Utc::now().timestamp_millis(),
+                    nonce: Uuid::new_v4().to_string(),
+                    signature: sign_test_payload(
+                        &signing_key,
+                        "inst-batch",
+                        "share_batch_sync",
+                        &vec![ShareSyncOperation {
+                            kind: "upsert".into(),
+                            share: Some(ShareDescriptor {
+                                share_name: "Different".into(),
+                                ..tampered_ops[0].share.clone().expect("share")
+                            }),
+                            share_id: None,
+                        }],
+                        Utc::now().timestamp_millis(),
+                        &Uuid::new_v4().to_string(),
+                    ),
+                    ops: tampered_ops,
+                },
+                ClientMetadata {
+                    ip: Some("127.0.0.1".into()),
+                    country_code: None,
+                },
+            )
+            .await
+            .expect_err("tampered batch sync should fail");
+        assert!(
+            tampered_err
+                .to_string()
+                .contains("signature verification failed")
+        );
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn batch_sync_share_request_logs_requires_valid_signature() {
+        let (store, config) = setup_store("signed-log-batch").await;
+        let signing_key = insert_signed_installation(&store, "inst-logs").await;
+
+        let logs = vec![ShareRequestLogEntry {
+            request_id: "req-1".into(),
+            share_id: "share-log-1".into(),
+            share_name: "Log Share".into(),
+            provider_id: "provider-1".into(),
+            provider_name: "Provider One".into(),
+            app_type: "codex".into(),
+            model: "gpt-5".into(),
+            request_model: "gpt-5".into(),
+            status_code: 200,
+            latency_ms: 1234,
+            first_token_ms: Some(222),
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            is_streaming: true,
+            session_id: Some("session-1".into()),
+            created_at: Utc::now().timestamp(),
+        }];
+
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            "inst-logs",
+            "share_request_logs_batch_sync",
+            &logs,
+            timestamp_ms,
+            &nonce,
+        );
+
+        store
+            .batch_sync_share_request_logs(
+                ShareRequestLogBatchSyncRequest {
+                    installation_id: "inst-logs".into(),
+                    timestamp_ms,
+                    nonce: nonce.clone(),
+                    signature: signature.clone(),
+                    logs: logs.clone(),
+                },
+                ClientMetadata {
+                    ip: Some("127.0.0.1".into()),
+                    country_code: None,
+                },
+            )
+            .await
+            .expect("valid signed request log batch sync");
+
+        let conn = store.conn.lock().await;
+        let stored_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM share_request_logs
+                 WHERE installation_id = ?1 AND request_id = ?2",
+                params!["inst-logs", "req-1"],
+                |row| row.get(0),
+            )
+            .expect("count synced request logs");
+        drop(conn);
+        assert_eq!(stored_count, 1);
+
+        let replay_err = store
+            .batch_sync_share_request_logs(
+                ShareRequestLogBatchSyncRequest {
+                    installation_id: "inst-logs".into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    logs: logs.clone(),
+                },
+                ClientMetadata {
+                    ip: Some("127.0.0.1".into()),
+                    country_code: None,
+                },
+            )
+            .await
+            .expect_err("replayed log sync should fail");
+        assert!(replay_err.to_string().contains("nonce already used"));
+
+        let tampered_logs = vec![ShareRequestLogEntry {
+            status_code: 500,
+            ..logs[0].clone()
+        }];
+        let bad_signature = sign_test_payload(
+            &signing_key,
+            "inst-logs",
+            "share_request_logs_batch_sync",
+            &logs,
+            Utc::now().timestamp_millis(),
+            &Uuid::new_v4().to_string(),
+        );
+        let tampered_err = store
+            .batch_sync_share_request_logs(
+                ShareRequestLogBatchSyncRequest {
+                    installation_id: "inst-logs".into(),
+                    timestamp_ms: Utc::now().timestamp_millis(),
+                    nonce: Uuid::new_v4().to_string(),
+                    signature: bad_signature,
+                    logs: tampered_logs,
+                },
+                ClientMetadata {
+                    ip: Some("127.0.0.1".into()),
+                    country_code: None,
+                },
+            )
+            .await
+            .expect_err("tampered log sync should fail");
+        assert!(
+            tampered_err
+                .to_string()
+                .contains("signature verification failed")
+        );
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }

@@ -26,6 +26,8 @@ pub struct ServerState {
     pub server_geo: ServerGeo,
     pub store: AppStore,
     pub proxy: Arc<ProxyRegistry>,
+    /// SSH host key 指纹（`SHA256:<base64-nopad>` 格式），在 /lease 响应中回传给客户端。
+    pub ssh_host_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -66,16 +68,25 @@ async fn main() -> Result<()> {
         client_stale_secs = config.client_stale_secs,
         "starting portr-rs"
     );
+    // 预加载 SSH host key 并计算指纹，提前失败在配置错误；也作为 lease 响应返回给客户端。
+    let ssh_host_key = ssh::load_or_generate_host_key(&config.host_key_path)?;
+    let ssh_host_fingerprint = ssh::host_key_fingerprint(&ssh_host_key).ok();
+    if let Some(ref fp) = ssh_host_fingerprint {
+        info!("ssh host key fingerprint: {}", fp);
+    }
+
     let state = ServerState {
         config: config.clone(),
         server_geo: server_geo.clone(),
         store: AppStore::new(&config)?,
         proxy: Arc::new(ProxyRegistry::default()),
+        ssh_host_fingerprint: ssh_host_fingerprint.clone(),
     };
 
     let ssh_server = ssh::SshServer {
         store: state.store.clone(),
         proxy: state.proxy.clone(),
+        host_key: ssh_host_key,
     };
     let cleanup_store = state.store.clone();
     let cleanup_config = config.clone();
