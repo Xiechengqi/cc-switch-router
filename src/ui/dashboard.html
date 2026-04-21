@@ -460,7 +460,7 @@
       .support-pill {
         display: grid;
         grid-template-columns: 56px minmax(0, 1fr);
-        align-items: center;
+        align-items: start;
         justify-content: stretch;
         gap: 10px;
         border-radius: 12px;
@@ -468,7 +468,7 @@
         padding: 6px 8px;
         font-size: 11px;
         font-weight: 600;
-        line-height: 1;
+        line-height: 1.2;
         background: rgba(15, 23, 42, 0.04);
         color: var(--muted-foreground);
       }
@@ -476,11 +476,26 @@
         font: 11px/1 "JetBrains Mono", monospace;
         text-transform: uppercase;
         letter-spacing: 0.08em;
+        padding-top: 2px;
+      }
+      .support-pill-meta {
+        display: grid;
+        gap: 3px;
+        min-width: 0;
       }
       .support-pill-quota {
         min-width: 0;
         text-align: right;
         color: var(--foreground);
+      }
+      .support-pill-account {
+        min-width: 0;
+        text-align: right;
+        color: var(--muted-foreground);
+        font-weight: 500;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
       }
       .support-pill--on {
         border-color: rgba(22, 163, 74, 0.24);
@@ -489,6 +504,9 @@
       }
       .support-pill--on .support-pill-quota {
         color: inherit;
+      }
+      .support-pill--on .support-pill-account {
+        color: rgba(21, 128, 61, 0.82);
       }
 
       /* ── Token value ── */
@@ -1020,7 +1038,10 @@
         return `<div class="support-pills">${apps.map((app) => `
           <span class="support-pill ${support?.[app.key] ? "support-pill--on" : ""}">
             <span class="support-pill-label">${app.label}</span>
-            <span class="support-pill-quota">${escapeHtml(support?.[app.key] ? quotaSummary(appRuntimeForApp(appRuntimes, app.key)) : "—")}</span>
+            <span class="support-pill-meta">
+              <span class="support-pill-quota">${escapeHtml(support?.[app.key] ? quotaSummary(appRuntimeForApp(appRuntimes, app.key)) : "—")}</span>
+              <span class="support-pill-account">${escapeHtml(support?.[app.key] ? accountSummary(appRuntimeForApp(appRuntimes, app.key)) : "—")}</span>
+            </span>
           </span>
         `).join("")}</div>`;
       }
@@ -1030,54 +1051,25 @@
         return String(value).slice(0, 1).toUpperCase() + String(value).slice(1);
       }
 
-      function upstreamKindLabel(upstream) {
-        if (!upstream || upstream.kind === "unknown") return "Upstream unknown";
-        if (upstream.kind === "official_oauth") return "Official Subscription";
-        if (upstream.kind === "custom_provider") return "Custom Provider";
-        return String(upstream.kind).replaceAll("_", " ");
-      }
-
       function quotaSummary(upstream) {
         if (!upstream) return "No official subscription quota";
         if (upstream.kind !== "official_oauth") return "No official subscription quota";
         const quota = upstream.quota;
         if (!quota) return "Official quota unavailable";
         if (quota.status && quota.status !== "ok") return "Official quota unavailable";
-        const tiers = (quota.tiers || []).filter((tier) => tier && tier.label);
+        let tiers = (quota.tiers || []).filter((tier) => tier && tier.label);
+        if (upstream.app === "claude") {
+          const preferredLabels = new Set(["5h", "1w"]);
+          const preferredTiers = tiers.filter((tier) => preferredLabels.has(String(tier.label).toLowerCase()));
+          if (preferredTiers.length) tiers = preferredTiers;
+        }
         if (!tiers.length) return "Official quota unavailable";
         return tiers.map((tier) => `${tier.label} ${Math.round(tier.utilization || 0)}%`).join(" · ");
       }
 
-      function appRuntimeDetails(share) {
-        const apps = [
-          { key: "claude", label: "Claude" },
-          { key: "codex", label: "Codex" },
-          { key: "gemini", label: "Gemini" },
-        ];
-        return `
-          <div class="drawer-section-label">Upstream</div>
-          ${apps.map((app) => {
-            const enabled = Boolean(share?.support?.[app.key]);
-            const runtime = appRuntimeForApp(share?.appRuntimes, app.key);
-            const provider = runtime?.providerName || "—";
-            const account = runtime?.accountEmail || "—";
-            const quota = enabled ? quotaSummary(runtime) : "—";
-            return `
-              <div class="item-card">
-                <div class="item-card-top">
-                  <strong>${escapeHtml(app.label)}</strong>
-                  <span class="badge ${enabled ? "badge--active" : ""}">${enabled ? "enabled" : "disabled"}</span>
-                </div>
-                <div class="item-card-grid">
-                  <div class="item-card-grid-cell">Kind<span>${escapeHtml(enabled ? upstreamKindLabel(runtime) : "—")}</span></div>
-                  <div class="item-card-grid-cell">Provider<span>${escapeHtml(provider)}</span></div>
-                  <div class="item-card-grid-cell">Account<span>${escapeHtml(account)}</span></div>
-                  <div class="item-card-grid-cell">Quota<span>${escapeHtml(quota)}</span></div>
-                </div>
-              </div>
-            `;
-          }).join("")}
-        `;
+      function accountSummary(upstream) {
+        if (!upstream) return "Account —";
+        return upstream.accountEmail ? `Account ${upstream.accountEmail}` : "Account —";
       }
 
       const COUNTRY_CENTROIDS = {
@@ -1519,7 +1511,6 @@
             </div>
             ${isUnlimitedTokenLimit(share.tokenLimit) ? "" : `<div class="usage-bar usage-bar--full" style="margin-top:10px;width:100%"><div class="${usageBarClass(pct)}" style="width:${pct}%"></div></div>`}
           </div>
-          ${appRuntimeDetails(share)}
         ` : `
           <div class="drawer-section-label">Share</div>
           <div class="empty"><div class="empty-icon"></div>No share linked to this client</div>
