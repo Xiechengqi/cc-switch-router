@@ -375,6 +375,19 @@
         font-size: 13px;
         color: var(--muted-foreground);
       }
+      .api-stack {
+        display: grid;
+        gap: 6px;
+        min-width: 180px;
+      }
+      .api-stack strong,
+      .api-stack .token-value {
+        display: block;
+      }
+      .api-stack .token-value {
+        color: var(--muted-foreground);
+        word-break: break-all;
+      }
       .status-stack {
         display: grid;
         gap: 8px;
@@ -440,26 +453,42 @@
         background: var(--accent);
       }
       .support-pills {
-        display: flex;
-        flex-wrap: wrap;
+        display: grid;
         gap: 6px;
+        min-width: 180px;
       }
       .support-pill {
-        display: inline-flex;
+        display: grid;
+        grid-template-columns: 56px minmax(0, 1fr);
         align-items: center;
-        border-radius: 999px;
+        justify-content: stretch;
+        gap: 10px;
+        border-radius: 12px;
         border: 1px solid var(--border);
-        padding: 4px 8px;
+        padding: 6px 8px;
         font-size: 11px;
         font-weight: 600;
         line-height: 1;
         background: rgba(15, 23, 42, 0.04);
         color: var(--muted-foreground);
       }
+      .support-pill-label {
+        font: 11px/1 "JetBrains Mono", monospace;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+      }
+      .support-pill-quota {
+        min-width: 0;
+        text-align: right;
+        color: var(--foreground);
+      }
       .support-pill--on {
         border-color: rgba(22, 163, 74, 0.24);
         background: rgba(22, 163, 74, 0.1);
         color: #15803d;
+      }
+      .support-pill--on .support-pill-quota {
+        color: inherit;
       }
 
       /* ── Token value ── */
@@ -978,14 +1007,21 @@
         return String(value).replaceAll("_", " ");
       }
 
-      function supportPills(support) {
+      function appRuntimeForApp(appRuntimes, key) {
+        return appRuntimes?.[key] || null;
+      }
+
+      function supportPills(support, appRuntimes) {
         const apps = [
           { key: "claude", label: "Claude" },
           { key: "codex", label: "Codex" },
           { key: "gemini", label: "Gemini" },
         ];
         return `<div class="support-pills">${apps.map((app) => `
-          <span class="support-pill ${support?.[app.key] ? "support-pill--on" : ""}">${app.label}</span>
+          <span class="support-pill ${support?.[app.key] ? "support-pill--on" : ""}">
+            <span class="support-pill-label">${app.label}</span>
+            <span class="support-pill-quota">${escapeHtml(support?.[app.key] ? quotaSummary(appRuntimeForApp(appRuntimes, app.key)) : "—")}</span>
+          </span>
         `).join("")}</div>`;
       }
 
@@ -1012,43 +1048,35 @@
         return tiers.map((tier) => `${tier.label} ${Math.round(tier.utilization || 0)}%`).join(" · ");
       }
 
-      function upstreamSummary(share) {
-        const upstream = share?.upstreamProvider;
-        if (!upstream) return "Upstream unknown";
-        const parts = [upstreamKindLabel(upstream)];
-        if (upstream.kind === "official_oauth") {
-          parts.push(titleApp(upstream.app));
-        }
-        if (upstream.providerName && upstream.kind !== "official_oauth") {
-          parts.push(upstream.providerName);
-        }
-        if (upstream.providerName && upstream.kind === "official_oauth") {
-          parts.push(upstream.providerName);
-        }
-        if (upstream.accountEmail) {
-          parts.push(upstream.accountEmail);
-        }
-        return parts.filter(Boolean).join(" · ");
-      }
-
-      function upstreamDetails(share) {
-        const upstream = share?.upstreamProvider;
-        const provider = upstream?.providerName || "—";
-        const account = upstream?.accountEmail || "—";
-        const quota = quotaSummary(upstream);
+      function appRuntimeDetails(share) {
+        const apps = [
+          { key: "claude", label: "Claude" },
+          { key: "codex", label: "Codex" },
+          { key: "gemini", label: "Gemini" },
+        ];
         return `
           <div class="drawer-section-label">Upstream</div>
-          <div class="item-card">
-            <div class="item-card-top">
-              <strong>${escapeHtml(upstreamKindLabel(upstream))}</strong>
-              ${upstream?.app ? `<span class="badge">${escapeHtml(titleApp(upstream.app))}</span>` : ""}
-            </div>
-            <div class="item-card-grid">
-              <div class="item-card-grid-cell">Provider<span>${escapeHtml(provider)}</span></div>
-              <div class="item-card-grid-cell">Account<span>${escapeHtml(account)}</span></div>
-              <div class="item-card-grid-cell">Official Limit<span>${escapeHtml(quota)}</span></div>
-            </div>
-          </div>
+          ${apps.map((app) => {
+            const enabled = Boolean(share?.support?.[app.key]);
+            const runtime = appRuntimeForApp(share?.appRuntimes, app.key);
+            const provider = runtime?.providerName || "—";
+            const account = runtime?.accountEmail || "—";
+            const quota = enabled ? quotaSummary(runtime) : "—";
+            return `
+              <div class="item-card">
+                <div class="item-card-top">
+                  <strong>${escapeHtml(app.label)}</strong>
+                  <span class="badge ${enabled ? "badge--active" : ""}">${enabled ? "enabled" : "disabled"}</span>
+                </div>
+                <div class="item-card-grid">
+                  <div class="item-card-grid-cell">Kind<span>${escapeHtml(enabled ? upstreamKindLabel(runtime) : "—")}</span></div>
+                  <div class="item-card-grid-cell">Provider<span>${escapeHtml(provider)}</span></div>
+                  <div class="item-card-grid-cell">Account<span>${escapeHtml(account)}</span></div>
+                  <div class="item-card-grid-cell">Quota<span>${escapeHtml(quota)}</span></div>
+                </div>
+              </div>
+            `;
+          }).join("")}
         `;
       }
 
@@ -1297,6 +1325,27 @@
         return `${apiHost}[${share.shareToken || "***"}]`;
       }
 
+      function shareApiParts(share) {
+        if (!share) return { apiUrl: "—", apiKey: "***" };
+        const baseHost = window.location.host || "";
+        const apiUrl = share.subdomain && baseHost ? `${share.subdomain}.${baseHost}` : (share.subdomain || baseHost || "—");
+        return {
+          apiUrl,
+          apiKey: share.shareToken || "***",
+        };
+      }
+
+      function shareApiStack(share) {
+        if (!share) return '<span class="meta">—</span>';
+        const parts = shareApiParts(share);
+        return `
+          <div class="api-stack">
+            <strong>${escapeHtml(parts.apiUrl)}</strong>
+            <span class="token-value">${escapeHtml(parts.apiKey)}</span>
+          </div>
+        `;
+      }
+
       function isUnlimitedExpiry(value) {
         if (!value) return false;
         const expiresAt = new Date(value).getTime();
@@ -1470,7 +1519,7 @@
             </div>
             ${isUnlimitedTokenLimit(share.tokenLimit) ? "" : `<div class="usage-bar usage-bar--full" style="margin-top:10px;width:100%"><div class="${usageBarClass(pct)}" style="width:${pct}%"></div></div>`}
           </div>
-          ${upstreamDetails(share)}
+          ${appRuntimeDetails(share)}
         ` : `
           <div class="drawer-section-label">Share</div>
           <div class="empty"><div class="empty-icon"></div>No share linked to this client</div>
@@ -1554,11 +1603,11 @@
           return `
           <tr onclick="openClient(${i})">
             <td>${share ? `<strong>${escapeHtml(share.shareName)}</strong>` : '<span class="meta">—</span>'}</td>
-            <td class="meta">${share ? `<strong>${escapeHtml(shareApiUrlKey(share))}</strong>` : '<span class="meta">—</span>'}</td>
+            <td class="meta">${shareApiStack(share)}</td>
             <td>${forSalePill(share)}</td>
             <td class="meta">${escapeHtml(item.countryCode || "-")}</td>
             <td>${shareStatusStack(share, pct)}</td>
-            <td>${share ? supportPills(share.support) : '<span class="meta">—</span>'}</td>
+            <td>${share ? supportPills(share.support, share.appRuntimes) : '<span class="meta">—</span>'}</td>
             <td><span class="row-arrow">&rsaquo;</span></td>
           </tr>
         `;

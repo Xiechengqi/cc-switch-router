@@ -19,10 +19,11 @@ use crate::models::{
     ClientMetadata, DashboardClientView, DashboardMap, DashboardMapPoint, DashboardPresenceRequest,
     DashboardResponse, DashboardStats, HealthCheckEntry, Installation, InstallationView,
     IssueLeaseRequest, IssueLeaseResponse, LatLonPoint, LeaseView, PublicMapPointsResponse,
-    RegisterInstallationRequest, RegisterInstallationResponse, ShareBatchSyncRequest,
-    ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptor, ShareHeartbeatRequest,
-    ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRequestLogFetchResponse,
-    ShareSupport, ShareSyncRequest, ShareUpstreamProvider, ShareView, TunnelLease,
+    RegisterInstallationRequest, RegisterInstallationResponse, ShareAppRuntimes,
+    ShareBatchSyncRequest, ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptor,
+    ShareHeartbeatRequest, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry,
+    ShareRequestLogFetchResponse, ShareRuntimeSnapshotResponse, ShareSupport, ShareSyncRequest,
+    ShareUpstreamProvider, ShareView, TunnelLease,
 };
 use crate::proxy::ProxyRegistry;
 
@@ -835,6 +836,7 @@ impl AppStore {
                     expires_at: share.expires_at,
                     support: share.support,
                     upstream_provider: share.upstream_provider,
+                    app_runtimes: share.app_runtimes,
                     installation_id,
                     active_lease_count,
                     online_minutes_24h,
@@ -1269,6 +1271,38 @@ impl AppStore {
         Ok(())
     }
 
+    pub async fn record_share_runtime_snapshot(
+        &self,
+        snapshot: ShareRuntimeSnapshotResponse,
+    ) -> Result<(), AppError> {
+        let app_runtimes_json = serde_json::to_string(&snapshot.app_runtimes)
+            .map_err(|e| AppError::Internal(format!("serialize app runtimes failed: {e}")))?;
+        let refreshed_at = DateTime::<Utc>::from_timestamp(snapshot.queried_at, 0)
+            .unwrap_or_else(Utc::now)
+            .to_rfc3339();
+
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE shares
+             SET enabled_claude = ?2,
+                 enabled_codex = ?3,
+                 enabled_gemini = ?4,
+                 app_runtimes_json = ?5,
+                 runtime_refreshed_at = ?6
+             WHERE share_id = ?1",
+            params![
+                snapshot.share_id,
+                i64::from(snapshot.support.claude as u8),
+                i64::from(snapshot.support.codex as u8),
+                i64::from(snapshot.support.gemini as u8),
+                app_runtimes_json,
+                refreshed_at,
+            ],
+        )
+        .map_err(|e| AppError::Internal(format!("update share runtime snapshot failed: {e}")))?;
+        Ok(())
+    }
+
     async fn upsert_share(
         &self,
         installation_id: &str,
@@ -1406,6 +1440,32 @@ async fn fetch_share_request_logs_from_route(
         .map_err(|e| AppError::Internal(format!("decode share request logs failed: {e}")))
 }
 
+pub async fn fetch_share_runtime_snapshot_from_route(
+    config: &Config,
+    client: &reqwest::Client,
+    subdomain: &str,
+) -> Result<ShareRuntimeSnapshotResponse, AppError> {
+    let url = format!("{}/_portr/share-runtime", config.tunnel_url(subdomain));
+    let response = client
+        .get(&url)
+        .header("X-Portr-Probe", "1")
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("fetch share runtime failed: {e}")))?;
+
+    if !response.status().is_success() {
+        return Err(AppError::Internal(format!(
+            "fetch share runtime failed with status {}",
+            response.status()
+        )));
+    }
+
+    response
+        .json::<ShareRuntimeSnapshotResponse>()
+        .await
+        .map_err(|e| AppError::Internal(format!("decode share runtime failed: {e}")))
+}
+
 fn upsert_share_tx(
     conn: &Connection,
     installation_id: &str,
@@ -1439,16 +1499,18 @@ fn upsert_share_tx(
             share_token = excluded.share_token,
             app_type = excluded.app_type,
             provider_id = excluded.provider_id,
-            enabled_claude = excluded.enabled_claude,
-            enabled_codex = excluded.enabled_codex,
-            enabled_gemini = excluded.enabled_gemini,
+            enabled_claude = shares.enabled_claude,
+            enabled_codex = shares.enabled_codex,
+            enabled_gemini = shares.enabled_gemini,
             token_limit = excluded.token_limit,
             tokens_used = excluded.tokens_used,
             requests_count = excluded.requests_count,
             share_status = excluded.share_status,
             created_at = excluded.created_at,
             expires_at = excluded.expires_at,
-            upstream_provider_json = excluded.upstream_provider_json,
+            upstream_provider_json = shares.upstream_provider_json,
+            app_runtimes_json = shares.app_runtimes_json,
+            runtime_refreshed_at = shares.runtime_refreshed_at,
             updated_at = excluded.updated_at",
         params![
             share.share_id,
@@ -1596,6 +1658,8 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             created_at TEXT NOT NULL,
             expires_at TEXT NOT NULL,
             upstream_provider_json TEXT,
+            app_runtimes_json TEXT,
+            runtime_refreshed_at TEXT,
             updated_at TEXT NOT NULL
         );
 
@@ -1841,6 +1905,17 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         .map_err(|e| {
             AppError::Internal(format!("add shares upstream_provider_json failed: {e}"))
         })?;
+    }
+    if !columns.iter().any(|name| name == "app_runtimes_json") {
+        conn.execute("ALTER TABLE shares ADD COLUMN app_runtimes_json TEXT", [])
+            .map_err(|e| AppError::Internal(format!("add shares app_runtimes_json failed: {e}")))?;
+    }
+    if !columns.iter().any(|name| name == "runtime_refreshed_at") {
+        conn.execute(
+            "ALTER TABLE shares ADD COLUMN runtime_refreshed_at TEXT",
+            [],
+        )
+        .map_err(|e| AppError::Internal(format!("add shares runtime_refreshed_at failed: {e}")))?;
     }
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_shares_subdomain_unique ON shares(subdomain) WHERE subdomain IS NOT NULL",
@@ -2298,7 +2373,7 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor, usize)
         .prepare(
             "SELECT s.installation_id, s.share_id, s.share_name, s.description, s.for_sale, COALESCE(s.subdomain, '-'), s.share_token, s.app_type, s.provider_id,
                     s.enabled_claude, s.enabled_codex, s.enabled_gemini,
-                    s.token_limit, s.tokens_used, s.requests_count, s.share_status, s.created_at, s.expires_at, s.upstream_provider_json,
+                    s.token_limit, s.tokens_used, s.requests_count, s.share_status, s.created_at, s.expires_at, s.upstream_provider_json, s.app_runtimes_json,
                     (
                         SELECT COUNT(*) FROM leases l
                         WHERE json_extract(l.share_json, '$.shareId') = s.share_id
@@ -2333,8 +2408,9 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor, usize)
                     created_at: row.get(16)?,
                     expires_at: row.get(17)?,
                     upstream_provider: parse_upstream_provider(row.get(18)?)?,
+                    app_runtimes: parse_app_runtimes(row.get(19)?)?,
                 },
-                row.get::<_, i64>(19)? as usize,
+                row.get::<_, i64>(20)? as usize,
             ))
         })
         .map_err(|e| AppError::Internal(format!("query shares failed: {e}")))?;
@@ -2378,6 +2454,18 @@ fn parse_upstream_provider(
         return Ok(None);
     }
     serde_json::from_str(&value).map(Some).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+    })
+}
+
+fn parse_app_runtimes(value: Option<String>) -> Result<ShareAppRuntimes, rusqlite::Error> {
+    let Some(value) = value else {
+        return Ok(ShareAppRuntimes::default());
+    };
+    if value.trim().is_empty() {
+        return Ok(ShareAppRuntimes::default());
+    }
+    serde_json::from_str(&value).map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
     })
 }
@@ -2977,6 +3065,7 @@ mod tests {
             expires_at: (Utc::now() + Duration::hours(1)).to_rfc3339(),
             support: ShareSupport::default(),
             upstream_provider: None,
+            app_runtimes: ShareAppRuntimes::default(),
         };
 
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -3082,6 +3171,7 @@ mod tests {
                 gemini: false,
             },
             upstream_provider: None,
+            app_runtimes: ShareAppRuntimes::default(),
         };
         let ops = vec![ShareSyncOperation {
             kind: "upsert".into(),

@@ -18,7 +18,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 
 use crate::config::{Config, ensure_default_env_file, load_env_file};
-use crate::store::{AppStore, ShareRouteTarget};
+use crate::store::{AppStore, ShareRouteTarget, fetch_share_runtime_snapshot_from_route};
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -93,6 +93,8 @@ async fn main() -> Result<()> {
     let cleanup_proxy = state.proxy.clone();
     let probe_store = state.store.clone();
     let probe_config = config.clone();
+    let runtime_store = state.store.clone();
+    let runtime_config = config.clone();
 
     let http_listener = TcpListener::bind(config.api_addr).await?;
     let ssh_listener = TcpListener::bind(config.ssh_addr).await?;
@@ -142,6 +144,24 @@ async fn main() -> Result<()> {
         #[allow(unreachable_code)]
         Ok::<_, anyhow::Error>(())
     });
+    let runtime_task = tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .user_agent("portr-rs/0.1 share-runtime")
+            .timeout(Duration::from_secs(5))
+            .build()?;
+
+        let mut interval = tokio::time::interval(Duration::from_secs(10 * 60));
+        loop {
+            interval.tick().await;
+            if let Err(err) =
+                run_share_runtime_refresh_cycle(&runtime_store, &runtime_config, &client).await
+            {
+                tracing::warn!("share runtime refresh failed: {err}");
+            }
+        }
+        #[allow(unreachable_code)]
+        Ok::<_, anyhow::Error>(())
+    });
     let ssh_task = tokio::spawn(async move { ssh_server.run_with_listener(ssh_listener).await });
     let http_task = tokio::spawn(async move {
         axum::serve(
@@ -156,12 +176,14 @@ async fn main() -> Result<()> {
         ssh_result = ssh_task => {
             cleanup_task.abort();
             probe_task.abort();
+            runtime_task.abort();
             ssh_result??;
             Ok(())
         }
         http_result = http_task => {
             cleanup_task.abort();
             probe_task.abort();
+            runtime_task.abort();
             http_result??;
             Ok(())
         }
@@ -181,6 +203,27 @@ async fn run_route_health_probe_cycle(
             .await
         {
             tracing::warn!(share_id = %target.share_id, "record route health failed: {err}");
+        }
+    }
+    Ok(())
+}
+
+async fn run_share_runtime_refresh_cycle(
+    store: &AppStore,
+    config: &Config,
+    client: &reqwest::Client,
+) -> Result<()> {
+    let targets = store.list_share_route_targets().await?;
+    for target in targets {
+        match fetch_share_runtime_snapshot_from_route(config, client, &target.subdomain).await {
+            Ok(snapshot) => {
+                if let Err(err) = store.record_share_runtime_snapshot(snapshot).await {
+                    tracing::warn!(share_id = %target.share_id, "record share runtime failed: {err}");
+                }
+            }
+            Err(err) => {
+                tracing::warn!(share_id = %target.share_id, "fetch share runtime failed: {err}");
+            }
         }
     }
     Ok(())

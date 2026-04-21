@@ -266,6 +266,27 @@ pub struct ShareUpstreamProvider {
     pub quota: Option<ShareUpstreamQuota>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareAppRuntimes {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude: Option<ShareUpstreamProvider>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex: Option<ShareUpstreamProvider>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gemini: Option<ShareUpstreamProvider>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareRuntimeSnapshotResponse {
+    pub share_id: String,
+    pub queried_at: i64,
+    pub support: ShareSupport,
+    #[serde(default)]
+    pub app_runtimes: ShareAppRuntimes,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareDescriptor {
@@ -290,6 +311,8 @@ pub struct ShareDescriptor {
     pub support: ShareSupport,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_provider: Option<ShareUpstreamProvider>,
+    #[serde(default)]
+    pub app_runtimes: ShareAppRuntimes,
 }
 
 #[derive(Debug, Serialize)]
@@ -402,6 +425,8 @@ pub struct ShareView {
     pub support: ShareSupport,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_provider: Option<ShareUpstreamProvider>,
+    #[serde(default)]
+    pub app_runtimes: ShareAppRuntimes,
     pub installation_id: String,
     pub active_lease_count: usize,
     pub online_minutes_24h: usize,
