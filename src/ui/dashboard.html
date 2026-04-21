@@ -1466,9 +1466,8 @@
         const item = client.installation;
         const share = client.share;
 
-        document.getElementById("drawer-title").textContent = item.platform;
-        document.getElementById("drawer-meta").innerHTML =
-          `<span>${escapeHtml(item.region || "Unknown region")}</span><span style="font-family:'JetBrains Mono',monospace;font-size:12px">${item.id.slice(0, 12)}</span>`;
+        document.getElementById("drawer-title").textContent = share?.description || "";
+        document.getElementById("drawer-meta").textContent = "";
 
         document.getElementById("drawer-summary").innerHTML = `
           <div class="drawer-summary-item">
@@ -1494,9 +1493,6 @@
 
         const leases = (item.leases || []).slice(0, 3);
         const pct = share ? usagePercent(share.tokensUsed, share.tokenLimit) : 0;
-        const description = share?.description ? `
-            <div class="item-card-description">${escapeHtml(share.description)}</div>
-          ` : "";
         const shareSection = share ? `
           <div class="drawer-section-label">Share</div>
           <div class="item-card">
@@ -1504,7 +1500,6 @@
               <strong>${escapeHtml(share.shareName)}</strong>
               ${shareStatusBadge(share)}
             </div>
-            ${description}
             <div class="item-card-grid">
               <div class="item-card-grid-cell">Usage<span>${formatUsage(share.tokensUsed, share.tokenLimit)}</span></div>
               <div class="item-card-grid-cell">Requests<span>${formatNum(share.requestsCount)}</span></div>
