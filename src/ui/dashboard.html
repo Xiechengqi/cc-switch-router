@@ -545,9 +545,9 @@
       }
       th:first-child,
       td:first-child {
-        width: 220px;
-        min-width: 220px;
-        max-width: 220px;
+        width: 180px;
+        min-width: 180px;
+        max-width: 180px;
       }
       tbody tr {
         cursor: pointer;
@@ -1312,6 +1312,19 @@
           privateKey: keys.privateKey,
         });
         return state;
+      }
+
+      function resetInstallationIdentityState() {
+        mergeAuthState({
+          installationId: null,
+          publicKey: null,
+          privateKey: null,
+        });
+      }
+
+      function shouldResetInstallationIdentity(message) {
+        const text = String(message || "").toLowerCase();
+        return text.includes("installation not found");
       }
 
       async function signAuthPayload(action, payload) {
@@ -2180,8 +2193,34 @@
                 signature: signed.signature,
               }),
             });
-            const data = await res.json().catch(() => ({}));
-            if (!res.ok) throw new Error(data.message || `HTTP ${res.status}`);
+            let data = await res.json().catch(() => ({}));
+            if (!res.ok) {
+              const message = data.message || `HTTP ${res.status}`;
+              if (shouldResetInstallationIdentity(message)) {
+                resetInstallationIdentityState();
+                const retrySigned = await signAuthPayload("auth_request_code", {
+                  email,
+                  purpose: "login",
+                });
+                const retryRes = await fetch("/v1/auth/email/request-code", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    email,
+                    installationId: retrySigned.installationId,
+                    timestampMs: retrySigned.timestampMs,
+                    nonce: retrySigned.nonce,
+                    signature: retrySigned.signature,
+                  }),
+                });
+                data = await retryRes.json().catch(() => ({}));
+                if (!retryRes.ok) {
+                  throw new Error(data.message || `HTTP ${retryRes.status}`);
+                }
+              } else {
+                throw new Error(message);
+              }
+            }
             _pendingAuthEmail = email;
             setAuthModalStep("code");
             setAuthModalMeta(
