@@ -855,8 +855,9 @@ impl AppStore {
         let existing_owner_email = get_share_owner_email(&tx, &share.share_id)?;
         enforce_share_owner(&mut share, existing_owner_email.as_deref(), current_user_email)?;
         share.subdomain = subdomain;
-        release_same_owner_subdomain_claim(
+        release_reclaimable_subdomain_claim(
             &tx,
+            &input.installation_id,
             &share.share_id,
             share.owner_email.as_deref(),
             &share.subdomain,
@@ -3225,23 +3226,24 @@ fn get_share_owner_email(conn: &Connection, share_id: &str) -> Result<Option<Str
 fn find_share_claim_by_subdomain(
     conn: &Connection,
     subdomain: &str,
-) -> Result<Option<(String, Option<String>)>, AppError> {
+) -> Result<Option<(String, String, Option<String>)>, AppError> {
     conn.query_row(
-        "SELECT share_id, owner_email FROM shares WHERE subdomain = ?1",
+        "SELECT share_id, installation_id, owner_email FROM shares WHERE subdomain = ?1",
         params![subdomain],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )
     .optional()
     .map_err(|e| AppError::Internal(format!("query subdomain claim failed: {e}")))
 }
 
-fn release_same_owner_subdomain_claim(
+fn release_reclaimable_subdomain_claim(
     conn: &Connection,
+    incoming_installation_id: &str,
     incoming_share_id: &str,
     incoming_owner_email: Option<&str>,
     subdomain: &str,
 ) -> Result<(), AppError> {
-    let Some((existing_share_id, existing_owner_email)) =
+    let Some((existing_share_id, existing_installation_id, existing_owner_email)) =
         find_share_claim_by_subdomain(conn, subdomain)?
     else {
         return Ok(());
@@ -3251,7 +3253,9 @@ fn release_same_owner_subdomain_claim(
         return Ok(());
     }
 
-    if existing_owner_email.as_deref() != incoming_owner_email {
+    let same_installation = existing_installation_id == incoming_installation_id;
+    let same_owner = existing_owner_email.as_deref() == incoming_owner_email;
+    if !same_installation && !same_owner {
         return Ok(());
     }
 
@@ -4093,7 +4097,7 @@ mod tests {
 
     #[tokio::test]
     async fn claim_share_subdomain_allows_same_owner_to_reclaim_existing_subdomain() {
-        let (store, config) = setup_store("signed-share-reclaim").await;
+        let (store, config) = setup_store("signed-share-reclaim-owner").await;
         insert_share(&store, "inst-old", "share-old", "owner-sub", "paused").await;
         let signing_key = insert_signed_installation(&store, "inst-new").await;
 
@@ -4164,6 +4168,83 @@ mod tests {
                 .expect("collect reclaimed subdomain rows")
         };
         assert_eq!(rows, vec![("share-new".into(), "inst-new".into(), "owner-sub".into())]);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn claim_share_subdomain_allows_same_installation_to_replace_deleted_share_claim() {
+        let (store, config) = setup_store("signed-share-reclaim-installation").await;
+        let signing_key = insert_signed_installation(&store, "inst-same").await;
+        insert_share(&store, "inst-same", "share-old", "reused-sub", "paused").await;
+
+        let share = ShareDescriptor {
+            share_id: "share-new".into(),
+            share_name: "owner@example.com".into(),
+            owner_email: Some("different@example.com".into()),
+            shared_with_emails: vec![],
+            description: None,
+            for_sale: "No".into(),
+            subdomain: "reused-sub".into(),
+            share_token: "token-12345678".into(),
+            app_type: "proxy".into(),
+            provider_id: None,
+            token_limit: 1000,
+            parallel_limit: 3,
+            tokens_used: 0,
+            requests_count: 0,
+            share_status: "paused".into(),
+            created_at: Utc::now().to_rfc3339(),
+            expires_at: (Utc::now() + Duration::hours(1)).to_rfc3339(),
+            support: ShareSupport::default(),
+            upstream_provider: None,
+            app_runtimes: ShareAppRuntimes::default(),
+        };
+
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            "inst-same",
+            "share_claim_subdomain",
+            &share,
+            timestamp_ms,
+            &nonce,
+        );
+
+        store
+            .claim_share_subdomain(
+                ShareClaimSubdomainRequest {
+                    installation_id: "inst-same".into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    share: share.clone(),
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                "owner@example.com",
+            )
+            .await
+            .expect("claim reclaimed subdomain for same installation");
+
+        let conn = store.conn.lock().await;
+        let rows: Vec<(String, String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT share_id, installation_id, subdomain
+                     FROM shares
+                     WHERE subdomain = 'reused-sub'",
+                )
+                .expect("prepare reclaimed installation subdomain query");
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .expect("query reclaimed installation subdomain rows")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect reclaimed installation subdomain rows")
+        };
+        assert_eq!(rows, vec![("share-new".into(), "inst-same".into(), "reused-sub".into())]);
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
