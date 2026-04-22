@@ -18,10 +18,10 @@ use crate::error::AppError;
 use crate::models::{
     ClientMetadata, DashboardClientView, DashboardMap, DashboardMapPoint, DashboardPresenceRequest,
     DashboardResponse, DashboardStats, HealthCheckEntry, Installation, InstallationView,
-    IssueLeaseRequest, IssueLeaseResponse, LatLonPoint, LeaseView, PublicMapPointsResponse,
-    RegisterInstallationRequest, RegisterInstallationResponse, ShareAppRuntimes,
-    ShareBatchSyncRequest, ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptor,
-    ShareHeartbeatRequest, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry,
+    IssueLeaseRequest, IssueLeaseResponse, LatLonPoint, LeaseView, PublicMapClientPoint,
+    PublicMapPointsResponse, RegisterInstallationRequest, RegisterInstallationResponse,
+    ShareAppRuntimes, ShareBatchSyncRequest, ShareClaimSubdomainRequest, ShareDeleteRequest,
+    ShareDescriptor, ShareHeartbeatRequest, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry,
     ShareRequestLogFetchResponse, ShareRuntimeSnapshotResponse, ShareSupport, ShareSyncRequest,
     ShareUpstreamProvider, ShareView, TunnelLease,
 };
@@ -1214,7 +1214,7 @@ impl AppStore {
         let conn = self.conn.lock().await;
         let mut stmt = conn
             .prepare(
-                "SELECT DISTINCT i.latitude, i.longitude, i.country_code
+                "SELECT DISTINCT i.id, i.latitude, i.longitude, i.country_code
                  FROM installations i
                  INNER JOIN shares s ON s.installation_id = i.id
                  WHERE i.last_seen_at >= ?1
@@ -1224,9 +1224,9 @@ impl AppStore {
             .map_err(|e| AppError::Internal(format!("prepare public map clients failed: {e}")))?;
         let rows = stmt
             .query_map(params![active_cutoff], |row| {
-                let lat = row.get::<_, Option<f64>>(0)?;
-                let lon = row.get::<_, Option<f64>>(1)?;
-                let country_code = row.get::<_, Option<String>>(2)?;
+                let lat = row.get::<_, Option<f64>>(1)?;
+                let lon = row.get::<_, Option<f64>>(2)?;
+                let country_code = row.get::<_, Option<String>>(3)?;
                 Ok(lat
                     .zip(lon)
                     .map(|(lat, lon)| LatLonPoint { lat, lon })
@@ -1238,16 +1238,34 @@ impl AppStore {
                     }))
             })
             .map_err(|e| AppError::Internal(format!("query public map clients failed: {e}")))?;
-        let clients = collect_rows(rows)?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
+        let mut grouped_clients = HashMap::<String, PublicMapClientPoint>::new();
+        let mut client_count = 0usize;
+        for point in collect_rows(rows)?.into_iter().flatten() {
+            client_count += 1;
+            let key = format!("{:.6},{:.6}", point.lat, point.lon);
+            grouped_clients
+                .entry(key)
+                .and_modify(|existing| existing.count += 1)
+                .or_insert(PublicMapClientPoint {
+                    lat: point.lat,
+                    lon: point.lon,
+                    count: 1,
+                });
+        }
+        let mut clients = grouped_clients.into_values().collect::<Vec<_>>();
+        clients.sort_by(|a, b| {
+            b.count
+                .cmp(&a.count)
+                .then_with(|| a.lat.total_cmp(&b.lat))
+                .then_with(|| a.lon.total_cmp(&b.lon))
+        });
 
         Ok(PublicMapPointsResponse {
             server: server_geo
                 .lat
                 .zip(server_geo.lon)
                 .map(|(lat, lon)| LatLonPoint { lat, lon }),
+            client_count,
             clients,
         })
     }
@@ -2953,6 +2971,19 @@ mod tests {
         .expect("insert installation");
     }
 
+    async fn set_installation_country_code(
+        store: &AppStore,
+        installation_id: &str,
+        country_code: &str,
+    ) {
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "UPDATE installations SET country_code = ?2 WHERE id = ?1",
+            params![installation_id, country_code],
+        )
+        .expect("update installation country_code");
+    }
+
     async fn mark_installation_last_seen(
         store: &AppStore,
         installation_id: &str,
@@ -3431,6 +3462,35 @@ mod tests {
                 .share_status,
             "paused"
         );
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn public_map_points_returns_total_client_count_alongside_deduplicated_points() {
+        let (store, config) = setup_store("public-map-client-count").await;
+        for installation_id in ["inst-1", "inst-2", "inst-3"] {
+            insert_installation(&store, installation_id).await;
+            set_installation_country_code(&store, installation_id, "JP").await;
+        }
+        insert_share(&store, "inst-1", "share-1", "sub-1", "active").await;
+        insert_share(&store, "inst-2", "share-2", "sub-2", "active").await;
+        insert_share(&store, "inst-3", "share-3", "sub-3", "active").await;
+
+        let server_geo = ServerGeo {
+            lat: Some(35.6895),
+            lon: Some(139.692),
+        };
+        let points = store
+            .public_map_points(&server_geo)
+            .await
+            .expect("public map points");
+
+        assert_eq!(points.client_count, 3);
+        assert_eq!(points.clients.len(), 1);
+        assert_eq!(points.clients[0].lat, 36.2);
+        assert_eq!(points.clients[0].lon, 138.25);
+        assert_eq!(points.clients[0].count, 3);
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }

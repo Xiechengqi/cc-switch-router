@@ -107,6 +107,8 @@ curl http://127.0.0.1/v1/healthz
 
 `/` 和 `/v1/dashboard` 默认公开可读，不需要登录。
 
+`GET /v1/public/map-points` 返回公开地图所需的点位数据，其中 `clients` 是按坐标聚合后的地图点数组，每个点包含 `count`；`clientCount` 是符合条件的真实活跃 client 总数，两者可能不相等。
+
 ### systemd 部署示例
 
 ```ini

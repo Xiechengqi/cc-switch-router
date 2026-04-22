@@ -208,7 +208,16 @@ pub struct HealthResponse {
 pub struct PublicMapPointsResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<LatLonPoint>,
-    pub clients: Vec<LatLonPoint>,
+    pub client_count: usize,
+    pub clients: Vec<PublicMapClientPoint>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicMapClientPoint {
+    pub lat: f64,
+    pub lon: f64,
+    pub count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
