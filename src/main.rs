@@ -10,9 +10,12 @@ use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use anyhow::Result;
 use proxy::ProxyRegistry;
+use resend_rs::Resend;
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
@@ -26,8 +29,16 @@ pub struct ServerState {
     pub server_geo: ServerGeo,
     pub store: AppStore,
     pub proxy: Arc<ProxyRegistry>,
+    pub resend: Option<Arc<Resend>>,
+    pub resend_usage_cache: Arc<Mutex<Option<ResendUsageCache>>>,
     /// SSH host key 指纹（`SHA256:<base64-nopad>` 格式），在 /lease 响应中回传给客户端。
     pub ssh_host_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResendUsageCache {
+    pub fetched_at_unix_secs: i64,
+    pub value: crate::models::ResendUsageResponse,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +82,11 @@ async fn main() -> Result<()> {
     // 预加载 SSH host key 并计算指纹，提前失败在配置错误；也作为 lease 响应返回给客户端。
     let ssh_host_key = ssh::load_or_generate_host_key(&config.host_key_path)?;
     let ssh_host_fingerprint = ssh::host_key_fingerprint(&ssh_host_key).ok();
+    let resend = config
+        .resend_api_key
+        .as_deref()
+        .map(Resend::new)
+        .map(Arc::new);
     if let Some(ref fp) = ssh_host_fingerprint {
         info!("ssh host key fingerprint: {}", fp);
     }
@@ -80,6 +96,8 @@ async fn main() -> Result<()> {
         server_geo: server_geo.clone(),
         store: AppStore::new(&config)?,
         proxy: Arc::new(ProxyRegistry::default()),
+        resend,
+        resend_usage_cache: Arc::new(Mutex::new(None)),
         ssh_host_fingerprint: ssh_host_fingerprint.clone(),
     };
 
@@ -95,6 +113,8 @@ async fn main() -> Result<()> {
     let probe_config = config.clone();
     let runtime_store = state.store.clone();
     let runtime_config = config.clone();
+    let resend_usage_cache = state.resend_usage_cache.clone();
+    let resend_usage_api_key = config.resend_api_key.clone();
 
     let http_listener = TcpListener::bind(config.api_addr).await?;
     let ssh_listener = TcpListener::bind(config.ssh_addr).await?;
@@ -162,6 +182,30 @@ async fn main() -> Result<()> {
         #[allow(unreachable_code)]
         Ok::<_, anyhow::Error>(())
     });
+    let resend_usage_task = tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .user_agent("portr-rs/0.1 resend-usage")
+            .timeout(Duration::from_secs(10))
+            .build()?;
+
+        let mut interval = tokio::time::interval(Duration::from_secs(10 * 60));
+        loop {
+            interval.tick().await;
+            match refresh_resend_usage_cache(
+                resend_usage_cache.clone(),
+                resend_usage_api_key.as_deref(),
+                &client,
+            )
+            .await
+            {
+                Ok(Some(label)) => info!(resend_daily_usage = %label, "updated resend daily usage"),
+                Ok(None) => {}
+                Err(err) => tracing::warn!("refresh resend usage failed: {err}"),
+            }
+        }
+        #[allow(unreachable_code)]
+        Ok::<_, anyhow::Error>(())
+    });
     let ssh_task = tokio::spawn(async move { ssh_server.run_with_listener(ssh_listener).await });
     let http_task = tokio::spawn(async move {
         axum::serve(
@@ -177,6 +221,7 @@ async fn main() -> Result<()> {
             cleanup_task.abort();
             probe_task.abort();
             runtime_task.abort();
+            resend_usage_task.abort();
             ssh_result??;
             Ok(())
         }
@@ -184,10 +229,87 @@ async fn main() -> Result<()> {
             cleanup_task.abort();
             probe_task.abort();
             runtime_task.abort();
+            resend_usage_task.abort();
             http_result??;
             Ok(())
         }
     }
+}
+
+async fn refresh_resend_usage_cache(
+    cache: Arc<Mutex<Option<ResendUsageCache>>>,
+    api_key: Option<&str>,
+    client: &reqwest::Client,
+) -> Result<Option<String>> {
+    let value = fetch_resend_usage(api_key, client).await?;
+    let label = if value.available && !value.daily_usage_label.is_empty() {
+        Some(value.daily_usage_label.clone())
+    } else {
+        None
+    };
+    let mut guard = cache.lock().await;
+    *guard = Some(ResendUsageCache {
+        fetched_at_unix_secs: chrono::Utc::now().timestamp(),
+        value,
+    });
+    Ok(label)
+}
+
+async fn fetch_resend_usage(
+    api_key: Option<&str>,
+    client: &reqwest::Client,
+) -> Result<crate::models::ResendUsageResponse> {
+    let Some(api_key) = api_key.filter(|value| !value.trim().is_empty()) else {
+        return Ok(crate::models::ResendUsageResponse {
+            available: false,
+            daily_usage_percent: None,
+            daily_usage_label: String::new(),
+            quota_header: None,
+        });
+    };
+
+    let response = client
+        .get("https://api.resend.com/domains")
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .context("request resend domains failed")?;
+
+    let headers = response.headers().clone();
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("resend usage request failed: HTTP {status} {body}");
+    }
+
+    let quota_header = headers
+        .get("x-resend-daily-quota")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    let Some(quota_header) = quota_header else {
+        return Ok(crate::models::ResendUsageResponse {
+            available: false,
+            daily_usage_percent: None,
+            daily_usage_label: String::new(),
+            quota_header: None,
+        });
+    };
+
+    let used_quota: f64 = quota_header
+        .parse()
+        .with_context(|| format!("parse x-resend-daily-quota failed: {quota_header}"))?;
+    let percent = used_quota;
+    let label = format!("{percent:.0}%");
+
+    Ok(crate::models::ResendUsageResponse {
+        available: true,
+        daily_usage_percent: Some(percent),
+        daily_usage_label: label,
+        quota_header: Some(quota_header),
+    })
 }
 
 async fn run_route_health_probe_cycle(

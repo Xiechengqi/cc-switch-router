@@ -18,6 +18,17 @@ pub struct Config {
     pub cleanup_interval_secs: u64,
     pub lease_retention_secs: i64,
     pub client_stale_secs: i64,
+    pub resend_api_key: Option<String>,
+    pub resend_from: Option<String>,
+    pub resend_reply_to: Option<String>,
+    pub auth_code_ttl_secs: i64,
+    pub auth_code_cooldown_secs: i64,
+    pub auth_session_ttl_secs: i64,
+    pub auth_refresh_ttl_secs: i64,
+    pub auth_max_verify_attempts: i64,
+    pub auth_email_hourly_limit: i64,
+    pub auth_ip_hourly_limit: i64,
+    pub auth_installation_hourly_limit: i64,
 }
 
 impl Config {
@@ -59,6 +70,41 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60 * 60),
+            resend_api_key: env::var("PORTR_RS_RESEND_API_KEY").ok(),
+            resend_from: env::var("PORTR_RS_RESEND_FROM").ok(),
+            resend_reply_to: env::var("PORTR_RS_RESEND_REPLY_TO").ok(),
+            auth_code_ttl_secs: env::var("PORTR_RS_AUTH_CODE_TTL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5 * 60),
+            auth_code_cooldown_secs: env::var("PORTR_RS_AUTH_CODE_COOLDOWN_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
+            auth_session_ttl_secs: env::var("PORTR_RS_AUTH_SESSION_TTL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30 * 60),
+            auth_refresh_ttl_secs: env::var("PORTR_RS_AUTH_REFRESH_TTL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30 * 24 * 60 * 60),
+            auth_max_verify_attempts: env::var("PORTR_RS_AUTH_MAX_VERIFY_ATTEMPTS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5),
+            auth_email_hourly_limit: env::var("PORTR_RS_AUTH_EMAIL_HOURLY_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5),
+            auth_ip_hourly_limit: env::var("PORTR_RS_AUTH_IP_HOURLY_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20),
+            auth_installation_hourly_limit: env::var("PORTR_RS_AUTH_INSTALLATION_HOURLY_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10),
         }
     }
 
@@ -154,6 +200,14 @@ PORTR_RS_DB_PATH={}
 PORTR_RS_CLEANUP_INTERVAL_SECS=300
 PORTR_RS_LEASE_RETENTION_SECS=604800
 PORTR_RS_CLIENT_STALE_SECS=3600
+PORTR_RS_AUTH_CODE_TTL_SECS=300
+PORTR_RS_AUTH_CODE_COOLDOWN_SECS=60
+PORTR_RS_AUTH_SESSION_TTL_SECS=1800
+PORTR_RS_AUTH_REFRESH_TTL_SECS=2592000
+PORTR_RS_AUTH_MAX_VERIFY_ATTEMPTS=5
+PORTR_RS_AUTH_EMAIL_HOURLY_LIMIT=5
+PORTR_RS_AUTH_IP_HOURLY_LIMIT=20
+PORTR_RS_AUTH_INSTALLATION_HOURLY_LIMIT=10
 ",
         default_db_path().display()
     )

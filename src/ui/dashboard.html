@@ -72,6 +72,48 @@
         font-size: 13px;
         color: var(--muted-foreground);
       }
+      .topbar-auth {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 10px;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        background: var(--card);
+      }
+      .topbar-auth input {
+        width: 154px;
+        padding: 7px 10px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        font: inherit;
+        color: var(--foreground);
+        background: #fff;
+      }
+      .topbar-auth button {
+        padding: 8px 12px;
+        border: 0;
+        border-radius: 8px;
+        background: var(--accent);
+        color: #fff;
+        font: 12px/1.2 "JetBrains Mono", monospace;
+        cursor: pointer;
+      }
+      .topbar-auth button.secondary {
+        background: #0f172a;
+      }
+      .topbar-auth button[disabled] {
+        opacity: 0.55;
+        cursor: not-allowed;
+      }
+      .topbar-auth-status {
+        max-width: 220px;
+        font-size: 12px;
+        color: var(--foreground);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
       .topbar-stat {
         display: inline-flex;
         align-items: center;
@@ -298,6 +340,8 @@
         margin-top: auto;
         display: flex;
         justify-content: center;
+        gap: 10px;
+        flex-wrap: wrap;
         font: 11px/1 "JetBrains Mono", monospace;
         letter-spacing: 0.1em;
         text-transform: uppercase;
@@ -307,6 +351,9 @@
       .page-footer strong {
         margin-left: 8px;
         color: var(--foreground);
+      }
+      .page-footer .sep {
+        opacity: 0.5;
       }
 
       /* ── Section labels ── */
@@ -803,6 +850,13 @@
           rel="noopener noreferrer"
         ><span class="dot"></span>TokenSwitch</a>
         <div class="topbar-right">
+          <div class="topbar-auth">
+            <span class="topbar-auth-status" id="auth-status">Anonymous view</span>
+            <input id="auth-email" type="email" placeholder="email@example.com" />
+            <button id="auth-send-code" type="button">Send code</button>
+            <input id="auth-code" type="text" inputmode="numeric" placeholder="123456" />
+            <button class="secondary" id="auth-verify-code" type="button">Verify</button>
+          </div>
           <div class="topbar-region">
             <label for="region-select">Router</label>
             <select id="region-select" aria-label="Router"></select>
@@ -866,8 +920,9 @@
         </div>
       </section>
       <footer class="page-footer">
-        <span>Page Online</span>
-        <strong id="page-online-count">0</strong>
+        <span>Page Online <strong id="page-online-count">0</strong></span>
+        <span class="sep" id="resend-usage-sep" style="display:none">|</span>
+        <span id="resend-usage" style="display:none"></span>
       </footer>
     </main>
 
@@ -893,6 +948,7 @@
       let _mapPanY = 0;
       let _mapDragState = null;
       let _regions = [];
+      const AUTH_STORAGE_KEY = "portr_dashboard_auth_v1";
       const _pagePresenceSession = (window.crypto && crypto.randomUUID)
         ? crypto.randomUUID()
         : `session-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
@@ -947,6 +1003,89 @@
         if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
         if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
         return `${Math.floor(diff / 86400)}d ago`;
+      }
+
+      function readAuthState() {
+        try {
+          const raw = localStorage.getItem(AUTH_STORAGE_KEY);
+          return raw ? JSON.parse(raw) : null;
+        } catch {
+          return null;
+        }
+      }
+
+      function writeAuthState(state) {
+        if (!state) {
+          localStorage.removeItem(AUTH_STORAGE_KEY);
+          return;
+        }
+        localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(state));
+      }
+
+      function authBearerHeaders() {
+        const state = readAuthState();
+        return state?.accessToken ? { Authorization: `Bearer ${state.accessToken}` } : {};
+      }
+
+      function updateAuthUi(status) {
+        const authStatus = document.getElementById("auth-status");
+        const emailInput = document.getElementById("auth-email");
+        if (status?.authenticated && status?.user?.email) {
+          authStatus.textContent = `Signed in as ${status.user.email}`;
+          emailInput.value = status.user.email;
+          return;
+        }
+        const stored = readAuthState();
+        authStatus.textContent = stored?.email ? `Stored session for ${stored.email}` : "Anonymous view";
+      }
+
+      async function refreshAccessToken() {
+        const state = readAuthState();
+        if (!state?.refreshToken) return false;
+        const res = await fetch("/v1/auth/session/refresh", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ refreshToken: state.refreshToken }),
+        });
+        if (!res.ok) {
+          writeAuthState(null);
+          updateAuthUi(null);
+          return false;
+        }
+        const data = await res.json();
+        writeAuthState({
+          email: data.user?.email || state.email,
+          accessToken: data.accessToken,
+          refreshToken: data.refreshToken,
+          expiresAt: data.expiresAt,
+          refreshExpiresAt: data.refreshExpiresAt,
+        });
+        return true;
+      }
+
+      async function authFetch(url, options = {}) {
+        const headers = new Headers(options.headers || {});
+        const authHeaders = authBearerHeaders();
+        Object.entries(authHeaders).forEach(([key, value]) => headers.set(key, value));
+        let response = await fetch(url, { ...options, headers });
+        if (response.status === 401 && (await refreshAccessToken())) {
+          const retryHeaders = new Headers(options.headers || {});
+          const retryAuthHeaders = authBearerHeaders();
+          Object.entries(retryAuthHeaders).forEach(([key, value]) => retryHeaders.set(key, value));
+          response = await fetch(url, { ...options, headers: retryHeaders });
+        }
+        return response;
+      }
+
+      async function ensureSessionStatus() {
+        const response = await authFetch("/v1/auth/session/me");
+        if (!response.ok) {
+          updateAuthUi(null);
+          return null;
+        }
+        const data = await response.json();
+        updateAuthUi(data);
+        return data;
       }
 
       function totalTokens(log) {
@@ -1473,6 +1612,18 @@
         if (!res.ok) throw new Error("Failed to update presence: " + res.status);
         const data = await res.json();
         document.getElementById("page-online-count").textContent = String(data.onlineCount ?? 0);
+        const resendUsage = document.getElementById("resend-usage");
+        const resendUsageSep = document.getElementById("resend-usage-sep");
+        const label = String(data.resendUsageLabel || "").trim();
+        if (label) {
+          resendUsage.textContent = `Resend Usage ${label}`;
+          resendUsage.style.display = "";
+          resendUsageSep.style.display = "";
+        } else {
+          resendUsage.textContent = "";
+          resendUsage.style.display = "none";
+          resendUsageSep.style.display = "none";
+        }
       }
 
       /* ── Drawer ── */
@@ -1575,9 +1726,66 @@
         openDrawer();
       }
 
+      function bindAuthControls() {
+        const emailInput = document.getElementById("auth-email");
+        const codeInput = document.getElementById("auth-code");
+        const sendCodeButton = document.getElementById("auth-send-code");
+        const verifyButton = document.getElementById("auth-verify-code");
+
+        sendCodeButton.addEventListener("click", async () => {
+          const email = emailInput.value.trim().toLowerCase();
+          if (!email) return;
+          sendCodeButton.disabled = true;
+          try {
+            const res = await fetch("/v1/auth/email/request-code", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ email }),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(data.message || `HTTP ${res.status}`);
+            alert(`Verification code sent to ${data.maskedDestination || email}`);
+          } catch (error) {
+            alert(String(error.message || error));
+          } finally {
+            sendCodeButton.disabled = false;
+          }
+        });
+
+        verifyButton.addEventListener("click", async () => {
+          const email = emailInput.value.trim().toLowerCase();
+          const code = codeInput.value.trim();
+          if (!email || !code) return;
+          verifyButton.disabled = true;
+          try {
+            const res = await fetch("/v1/auth/email/verify-code", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ email, code }),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(data.message || `HTTP ${res.status}`);
+            writeAuthState({
+              email: data.user?.email || email,
+              accessToken: data.accessToken,
+              refreshToken: data.refreshToken,
+              expiresAt: data.expiresAt,
+              refreshExpiresAt: data.refreshExpiresAt,
+            });
+            codeInput.value = "";
+            await ensureSessionStatus();
+            await boot();
+          } catch (error) {
+            alert(String(error.message || error));
+          } finally {
+            verifyButton.disabled = false;
+          }
+        });
+      }
+
       /* ── Data fetch ── */
       async function boot() {
-        const res = await fetch("/v1/dashboard");
+        const res = await authFetch("/v1/dashboard");
         if (!res.ok) throw new Error("Failed to fetch: " + res.status);
         const data = await res.json();
 
@@ -1618,7 +1826,9 @@
       }
 
       bootRegions().catch(console.error);
+      bindAuthControls();
       bindRegionSelect();
+      ensureSessionStatus().catch(console.error);
       boot().catch(err => {
         document.body.innerHTML += `<pre style="padding:20px;color:#b91c1c">${String(err)}</pre>`;
       });

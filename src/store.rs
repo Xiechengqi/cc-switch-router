@@ -6,8 +6,11 @@ use base64::Engine;
 use chrono::{DateTime, Duration, Utc};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rand::distributions::{Alphanumeric, DistString};
+use resend_rs::types::CreateEmailBaseOptions;
+use resend_rs::Resend;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 use uuid::Uuid;
@@ -16,14 +19,16 @@ use crate::ServerGeo;
 use crate::config::Config;
 use crate::error::AppError;
 use crate::models::{
-    ClientMetadata, DashboardClientView, DashboardMap, DashboardMapPoint, DashboardPresenceRequest,
-    DashboardResponse, DashboardStats, HealthCheckEntry, Installation, InstallationView,
-    IssueLeaseRequest, IssueLeaseResponse, LatLonPoint, LeaseView, PublicMapClientPoint,
-    PublicMapPointsResponse, RegisterInstallationRequest, RegisterInstallationResponse,
-    ShareAppRuntimes, ShareBatchSyncRequest, ShareClaimSubdomainRequest, ShareDeleteRequest,
-    ShareDescriptor, ShareHeartbeatRequest, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry,
-    ShareRequestLogFetchResponse, ShareRuntimeSnapshotResponse, ShareSupport, ShareSyncRequest,
-    ShareUpstreamProvider, ShareView, TunnelLease,
+    AuthSession, AuthUser, ClientMetadata, DashboardClientView, DashboardMap, DashboardMapPoint,
+    DashboardPresenceRequest, DashboardResponse, DashboardStats, HealthCheckEntry, Installation,
+    InstallationView, IssueLeaseRequest, IssueLeaseResponse, LatLonPoint, LeaseView,
+    PublicMapClientPoint, PublicMapPointsResponse, RefreshSessionRequest,
+    RegisterInstallationRequest, RegisterInstallationResponse, RequestEmailCodeRequest,
+    RequestEmailCodeResponse, SessionStatusResponse, ShareAppRuntimes, ShareBatchSyncRequest,
+    ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptor, ShareHeartbeatRequest,
+    ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRequestLogFetchResponse,
+    ShareRuntimeSnapshotResponse, ShareSupport, ShareSyncRequest, ShareUpstreamProvider, ShareView,
+    TunnelLease, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 use crate::proxy::ProxyRegistry;
 
@@ -32,6 +37,8 @@ const PUBLIC_MAP_CLIENT_ACTIVE_WINDOW_MINUTES: i64 = 5;
 const ONLINE_WINDOW_MINUTES: usize = 24 * 60;
 const SIGNED_REQUEST_MAX_SKEW_MS: i64 = 60_000;
 const NONCE_RETENTION_SECS: i64 = 10 * 60;
+const AUTH_CODE_DIGITS: usize = 6;
+const AUTH_PURPOSE_LOGIN: &str = "login";
 
 fn country_centroid(country_code: &str) -> Option<(f64, f64)> {
     match country_code {
@@ -310,12 +317,288 @@ impl AppStore {
         Ok(count as usize)
     }
 
+    pub async fn request_email_code(
+        &self,
+        config: &Config,
+        resend: Option<&Resend>,
+        input: RequestEmailCodeRequest,
+        metadata: ClientMetadata,
+    ) -> Result<RequestEmailCodeResponse, AppError> {
+        let email = normalize_email(&input.email)?;
+        let now = Utc::now();
+        {
+            let conn = self.conn.lock().await;
+            let installation = get_installation(&conn, &input.installation_id)?
+                .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
+            verify_signed_payload(
+                &installation.public_key,
+                &input.installation_id,
+                "auth_request_code",
+                &serde_json::json!({ "email": email, "purpose": AUTH_PURPOSE_LOGIN }),
+                input.timestamp_ms,
+                &input.nonce,
+                &input.signature,
+            )?;
+            consume_request_nonce(
+                &conn,
+                &input.installation_id,
+                "auth_request_code",
+                &input.nonce,
+                now,
+            )?;
+            enforce_auth_send_limits(&conn, config, &email, &input.installation_id, &metadata, now)?;
+        }
+
+        let code = generate_numeric_code(AUTH_CODE_DIGITS);
+        let resend = resend.ok_or_else(|| AppError::Internal("resend is not configured".into()))?;
+        send_login_code_email(
+            resend,
+            config,
+            &email,
+            &code,
+            config.auth_code_ttl_secs,
+        )
+        .await?;
+
+        let expires_at = now + Duration::seconds(config.auth_code_ttl_secs);
+        let resend_available_at = now + Duration::seconds(config.auth_code_cooldown_secs);
+        let code_hash = hash_token(&format!("{email}:{code}"));
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE email_login_challenges
+             SET consumed_at = ?2
+             WHERE email_normalized = ?1
+               AND purpose = ?3
+               AND consumed_at IS NULL",
+            params![email, now.to_rfc3339(), AUTH_PURPOSE_LOGIN],
+        )
+        .map_err(|e| AppError::Internal(format!("expire old auth challenges failed: {e}")))?;
+        conn.execute(
+            "INSERT INTO email_login_challenges (
+                id, email_normalized, installation_id, purpose, code_hash, expires_at,
+                consumed_at, attempt_count, resend_available_at, created_ip, created_user_agent, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 0, ?7, ?8, NULL, ?9)",
+            params![
+                Uuid::new_v4().to_string(),
+                email,
+                input.installation_id,
+                AUTH_PURPOSE_LOGIN,
+                code_hash,
+                expires_at.to_rfc3339(),
+                resend_available_at.to_rfc3339(),
+                metadata.ip,
+                now.to_rfc3339(),
+            ],
+        )
+        .map_err(|e| AppError::Internal(format!("insert auth challenge failed: {e}")))?;
+
+        Ok(RequestEmailCodeResponse {
+            ok: true,
+            cooldown_secs: config.auth_code_cooldown_secs,
+            masked_destination: mask_email(&email),
+        })
+    }
+
+    pub async fn verify_email_code(
+        &self,
+        config: &Config,
+        input: VerifyEmailCodeRequest,
+    ) -> Result<VerifyEmailCodeResponse, AppError> {
+        let email = normalize_email(&input.email)?;
+        let code = input.code.trim();
+        if code.len() != AUTH_CODE_DIGITS || !code.chars().all(|ch| ch.is_ascii_digit()) {
+            return Err(AppError::Unauthorized("invalid verification code".into()));
+        }
+
+        let now = Utc::now();
+        let conn = self.conn.lock().await;
+        let installation = get_installation(&conn, &input.installation_id)?
+            .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
+        let locked_owner_email = get_installation_owner_email(&conn, &installation.id)?;
+        if let Some(ref owner_email) = locked_owner_email {
+            if owner_email != &email {
+                return Err(AppError::Conflict(
+                    "this installation is locked to a different owner email".into(),
+                ));
+            }
+        }
+
+        let challenge = get_latest_active_email_challenge(
+            &conn,
+            &email,
+            &input.installation_id,
+            AUTH_PURPOSE_LOGIN,
+            now,
+        )?
+        .ok_or_else(|| AppError::Unauthorized("verification code expired or not found".into()))?;
+
+        if challenge.attempt_count >= config.auth_max_verify_attempts {
+            return Err(AppError::TooManyRequests(
+                "too many invalid verification attempts".into(),
+            ));
+        }
+
+        let expected_hash = hash_token(&format!("{email}:{code}"));
+        if expected_hash != challenge.code_hash {
+            conn.execute(
+                "UPDATE email_login_challenges
+                 SET attempt_count = attempt_count + 1
+                 WHERE id = ?1",
+                params![challenge.id],
+            )
+            .map_err(|e| AppError::Internal(format!("update auth attempts failed: {e}")))?;
+            return Err(AppError::Unauthorized("invalid verification code".into()));
+        }
+
+        conn.execute(
+            "UPDATE email_login_challenges SET consumed_at = ?2 WHERE id = ?1",
+            params![challenge.id, now.to_rfc3339()],
+        )
+        .map_err(|e| AppError::Internal(format!("consume auth challenge failed: {e}")))?;
+
+        let user = upsert_user_by_email(&conn, &email, now)?;
+        let access_token = generate_secret(48);
+        let refresh_token = generate_secret(64);
+        let access_expires_at = now + Duration::seconds(config.auth_session_ttl_secs);
+        let refresh_expires_at = now + Duration::seconds(config.auth_refresh_ttl_secs);
+        let session = AuthSession {
+            session_id: Uuid::new_v4().to_string(),
+            user_id: user.id.clone(),
+            email: user.email.clone(),
+            installation_id: installation.id.clone(),
+            access_token_hash: hash_token(&access_token),
+            refresh_token_hash: hash_token(&refresh_token),
+            access_expires_at,
+            refresh_expires_at,
+            created_at: now,
+            last_used_at: now,
+        };
+        persist_session(&conn, &session)?;
+
+        Ok(VerifyEmailCodeResponse {
+            user,
+            access_token,
+            refresh_token,
+            expires_at: access_expires_at,
+            refresh_expires_at,
+        })
+    }
+
+    pub async fn refresh_session(
+        &self,
+        config: &Config,
+        input: RefreshSessionRequest,
+    ) -> Result<VerifyEmailCodeResponse, AppError> {
+        let now = Utc::now();
+        let refresh_hash = hash_token(input.refresh_token.trim());
+        let conn = self.conn.lock().await;
+        let current = get_session_by_refresh_hash(&conn, &refresh_hash)?
+            .ok_or_else(|| AppError::Unauthorized("refresh session not found".into()))?;
+        if current.refresh_expires_at < now {
+            return Err(AppError::Unauthorized("refresh session expired".into()));
+        }
+        if current.installation_id != input.installation_id {
+            return Err(AppError::Unauthorized("refresh session installation mismatch".into()));
+        }
+
+        let user = get_user_by_id(&conn, &current.user_id)?
+            .ok_or_else(|| AppError::Unauthorized("user not found".into()))?;
+        let access_token = generate_secret(48);
+        let refresh_token = generate_secret(64);
+        let access_expires_at = now + Duration::seconds(config.auth_session_ttl_secs);
+        let refresh_expires_at = now + Duration::seconds(config.auth_refresh_ttl_secs);
+        conn.execute(
+            "UPDATE user_sessions
+             SET access_token_hash = ?2,
+                 refresh_token_hash = ?3,
+                 access_expires_at = ?4,
+                 refresh_expires_at = ?5,
+                 last_used_at = ?6,
+                 revoked_at = NULL
+             WHERE id = ?1",
+            params![
+                current.session_id,
+                hash_token(&access_token),
+                hash_token(&refresh_token),
+                access_expires_at.to_rfc3339(),
+                refresh_expires_at.to_rfc3339(),
+                now.to_rfc3339(),
+            ],
+        )
+        .map_err(|e| AppError::Internal(format!("refresh session failed: {e}")))?;
+
+        Ok(VerifyEmailCodeResponse {
+            user,
+            access_token,
+            refresh_token,
+            expires_at: access_expires_at,
+            refresh_expires_at,
+        })
+    }
+
+    pub async fn session_status(
+        &self,
+        access_token: Option<&str>,
+        installation_id: Option<&str>,
+    ) -> Result<SessionStatusResponse, AppError> {
+        let owner_email = if let Some(installation_id) = installation_id {
+            let conn = self.conn.lock().await;
+            get_installation_owner_email(&conn, installation_id)?
+        } else {
+            None
+        };
+
+        let Some(access_token) = access_token.map(str::trim).filter(|v| !v.is_empty()) else {
+            return Ok(SessionStatusResponse {
+                authenticated: false,
+                user: None,
+                expires_at: None,
+                installation_owner_email: owner_email,
+            });
+        };
+
+        let session = self
+            .resolve_session_by_access_token(access_token)
+            .await?
+            .ok_or_else(|| AppError::Unauthorized("session not found".into()))?;
+        Ok(SessionStatusResponse {
+            authenticated: true,
+            user: Some(AuthUser {
+                id: session.user_id,
+                email: session.email,
+            }),
+            expires_at: Some(session.access_expires_at),
+            installation_owner_email: owner_email,
+        })
+    }
+
+    pub async fn resolve_session_by_access_token(
+        &self,
+        access_token: &str,
+    ) -> Result<Option<AuthSession>, AppError> {
+        let now = Utc::now();
+        let conn = self.conn.lock().await;
+        let Some(session) = get_session_by_access_hash(&conn, &hash_token(access_token))? else {
+            return Ok(None);
+        };
+        if session.access_expires_at < now {
+            return Ok(None);
+        }
+        conn.execute(
+            "UPDATE user_sessions SET last_used_at = ?2 WHERE id = ?1",
+            params![session.session_id, now.to_rfc3339()],
+        )
+        .map_err(|e| AppError::Internal(format!("touch session failed: {e}")))?;
+        Ok(Some(session))
+    }
+
     pub async fn issue_lease(
         &self,
         config: &Config,
         proxy: &ProxyRegistry,
         input: IssueLeaseRequest,
         metadata: ClientMetadata,
+        current_user_email: Option<&str>,
     ) -> Result<IssueLeaseResponse, AppError> {
         let now = Utc::now();
         let skew = (now.timestamp_millis() - input.timestamp_ms).abs();
@@ -389,7 +672,21 @@ impl AppStore {
 
         verify_signature(&installation.public_key, &input)?;
 
-        if let Some(share) = input.share.clone() {
+        let normalized_share = if let Some(mut share) = input.share.clone() {
+            let existing_owner_email = {
+                let conn = self.conn.lock().await;
+                get_share_owner_email(&conn, &share.share_id)?
+            };
+            let current_user_email = current_user_email.ok_or_else(|| {
+                AppError::Unauthorized("share lease requires authenticated owner session".into())
+            })?;
+            enforce_share_owner(&mut share, existing_owner_email.as_deref(), current_user_email)?;
+            Some(share)
+        } else {
+            None
+        };
+
+        if let Some(share) = normalized_share.clone() {
             self.upsert_share(&input.installation_id, share).await?;
         }
 
@@ -408,7 +705,7 @@ impl AppStore {
             issued_at,
             expires_at,
             used_at: None,
-            share: input.share,
+            share: normalized_share,
         };
 
         let conn = self.conn.lock().await;
@@ -482,6 +779,7 @@ impl AppStore {
         &self,
         input: ShareSyncRequest,
         metadata: ClientMetadata,
+        current_user_email: &str,
     ) -> Result<(), AppError> {
         {
             let conn = self.conn.lock().await;
@@ -508,13 +806,20 @@ impl AppStore {
                     .await?;
             }
         }
-        self.upsert_share(&input.installation_id, input.share).await
+        let existing_owner_email = {
+            let conn = self.conn.lock().await;
+            get_share_owner_email(&conn, &input.share.share_id)?
+        };
+        let mut share = input.share;
+        enforce_share_owner(&mut share, existing_owner_email.as_deref(), current_user_email)?;
+        self.upsert_share(&input.installation_id, share).await
     }
 
     pub async fn claim_share_subdomain(
         &self,
         input: ShareClaimSubdomainRequest,
         metadata: ClientMetadata,
+        current_user_email: &str,
     ) -> Result<(), AppError> {
         let subdomain = normalize_subdomain(&input.share.subdomain)?;
         ensure_subdomain_allowed(&subdomain)?;
@@ -547,13 +852,19 @@ impl AppStore {
             .unchecked_transaction()
             .map_err(|e| AppError::Internal(format!("begin share claim tx failed: {e}")))?;
         let mut share = input.share;
+        let existing_owner_email = get_share_owner_email(&tx, &share.share_id)?;
+        enforce_share_owner(&mut share, existing_owner_email.as_deref(), current_user_email)?;
         share.subdomain = subdomain;
         upsert_share_tx(&tx, &input.installation_id, share)?;
         tx.commit().map_err(map_share_constraint_error)?;
         Ok(())
     }
 
-    pub async fn delete_share(&self, input: ShareDeleteRequest) -> Result<(), AppError> {
+    pub async fn delete_share(
+        &self,
+        input: ShareDeleteRequest,
+        current_user_email: &str,
+    ) -> Result<(), AppError> {
         let conn = self.conn.lock().await;
         let installation = get_installation(&conn, &input.installation_id)?;
         let Some(installation) = installation else {
@@ -570,6 +881,10 @@ impl AppStore {
             &input.nonce,
             &input.signature,
         )?;
+        let owner_email = get_share_owner_email(&conn, &input.share_id)?;
+        if owner_email.as_deref() != Some(current_user_email) {
+            return Err(AppError::Unauthorized("only share owner can delete share".into()));
+        }
         conn.execute(
             "DELETE FROM shares WHERE share_id = ?1 AND installation_id = ?2",
             params![input.share_id, input.installation_id],
@@ -582,6 +897,7 @@ impl AppStore {
         &self,
         input: ShareBatchSyncRequest,
         metadata: ClientMetadata,
+        current_user_email: &str,
     ) -> Result<(), AppError> {
         let conn = self.conn.lock().await;
         let installation = get_installation(&conn, &input.installation_id)?;
@@ -614,15 +930,27 @@ impl AppStore {
         for op in input.ops {
             match op.kind.as_str() {
                 "upsert" => {
-                    let share = op.share.ok_or_else(|| {
+                    let mut share = op.share.ok_or_else(|| {
                         AppError::BadRequest("share is required for upsert".into())
                     })?;
+                    let existing_owner_email = get_share_owner_email(&tx, &share.share_id)?;
+                    enforce_share_owner(
+                        &mut share,
+                        existing_owner_email.as_deref(),
+                        current_user_email,
+                    )?;
                     upsert_share_tx(&tx, &input.installation_id, share)?;
                 }
                 "delete" => {
                     let share_id = op.share_id.ok_or_else(|| {
                         AppError::BadRequest("shareId is required for delete".into())
                     })?;
+                    let owner_email = get_share_owner_email(&tx, &share_id)?;
+                    if owner_email.as_deref() != Some(current_user_email) {
+                        return Err(AppError::Unauthorized(
+                            "only share owner can delete share".into(),
+                        ));
+                    }
                     tx.execute(
                         "DELETE FROM shares WHERE share_id = ?1 AND installation_id = ?2",
                         params![share_id, input.installation_id],
@@ -647,6 +975,7 @@ impl AppStore {
         &self,
         input: ShareRequestLogBatchSyncRequest,
         metadata: ClientMetadata,
+        current_user_email: &str,
     ) -> Result<(), AppError> {
         let conn = self.conn.lock().await;
         let installation = get_installation(&conn, &input.installation_id)?;
@@ -677,6 +1006,12 @@ impl AppStore {
             AppError::Internal(format!("begin request log batch sync tx failed: {e}"))
         })?;
         for log in input.logs {
+            let owner_email = get_share_owner_email(&tx, &log.share_id)?;
+            if owner_email.as_deref() != Some(current_user_email) {
+                return Err(AppError::Unauthorized(
+                    "only share owner can sync request logs".into(),
+                ));
+            }
             upsert_share_request_log_tx(&tx, &input.installation_id, log)?;
         }
         tx.commit().map_err(|e| {
@@ -690,6 +1025,7 @@ impl AppStore {
         config: &Config,
         server_geo: &ServerGeo,
         proxy: &ProxyRegistry,
+        viewer_email: Option<&str>,
     ) -> Result<DashboardResponse, AppError> {
         let active_subdomains = proxy
             .active_subdomains()
@@ -819,14 +1155,28 @@ impl AppStore {
                 let online_minutes_24h = online_by_share.get(&share.share_id).copied().unwrap_or(0);
                 let online_rate_24h =
                     ((online_minutes_24h as f64 / ONLINE_WINDOW_MINUTES as f64) * 100.0).min(100.0);
+                let can_view_secret = share_visible_to_email(&share, viewer_email);
+                let can_manage = can_manage_share(&share, viewer_email);
                 ShareView {
                     share_id: share.share_id,
                     share_name: share.share_name,
+                    owner_email: share.owner_email,
+                    shared_with_emails: if can_manage {
+                        share.shared_with_emails
+                    } else {
+                        Vec::new()
+                    },
                     description: share.description,
                     for_sale: share.for_sale,
                     subdomain: share.subdomain,
-                    share_token: share.share_token,
+                    share_token: if can_view_secret {
+                        share.share_token
+                    } else {
+                        mask_share_token(&share.share_token)
+                    },
                     app_type: share.app_type,
+                    can_view_secret,
+                    can_manage,
                     provider_id: share.provider_id,
                     token_limit: share.token_limit,
                     parallel_limit: share.parallel_limit,
@@ -1132,6 +1482,18 @@ impl AppStore {
                 params![(Utc::now() - Duration::seconds(NONCE_RETENTION_SECS)).to_rfc3339()],
             )
             .map_err(|e| AppError::Internal(format!("delete stale request nonces failed: {e}")))?;
+            tx.execute(
+                "DELETE FROM email_login_challenges
+                 WHERE expires_at < ?1 OR consumed_at IS NOT NULL",
+                params![cutoff],
+            )
+            .map_err(|e| AppError::Internal(format!("delete stale auth challenges failed: {e}")))?;
+            tx.execute(
+                "DELETE FROM user_sessions
+                 WHERE refresh_expires_at < ?1 OR revoked_at IS NOT NULL",
+                params![cutoff],
+            )
+            .map_err(|e| AppError::Internal(format!("delete stale user sessions failed: {e}")))?;
 
             tx.commit()
                 .map_err(|e| AppError::Internal(format!("commit cleanup tx failed: {e}")))?;
@@ -1498,20 +1860,19 @@ fn upsert_share_tx(
         .map(serde_json::to_string)
         .transpose()
         .map_err(|e| AppError::Internal(format!("serialize upstream provider failed: {e}")))?;
-    let stored_share_token = if for_sale == "Free" {
-        share.share_token.clone()
-    } else {
-        mask_share_token(&share.share_token)
-    };
+    let shared_with_emails_json = serde_json::to_string(&share.shared_with_emails)
+        .map_err(|e| AppError::Internal(format!("serialize shared_with_emails failed: {e}")))?;
     conn.execute(
         "INSERT INTO shares (
-            share_id, installation_id, share_name, description, for_sale, subdomain, share_token, app_type, provider_id,
+            share_id, installation_id, share_name, owner_email, shared_with_emails_json, description, for_sale, subdomain, share_token, app_type, provider_id,
             enabled_claude, enabled_codex, enabled_gemini,
             token_limit, parallel_limit, tokens_used, requests_count, share_status, created_at, expires_at, upstream_provider_json, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
         ON CONFLICT(share_id) DO UPDATE SET
             installation_id = excluded.installation_id,
             share_name = excluded.share_name,
+            owner_email = excluded.owner_email,
+            shared_with_emails_json = excluded.shared_with_emails_json,
             description = excluded.description,
             for_sale = excluded.for_sale,
             subdomain = excluded.subdomain,
@@ -1536,10 +1897,12 @@ fn upsert_share_tx(
             share.share_id,
             installation_id,
             share.share_name,
+            share.owner_email,
+            shared_with_emails_json,
             description,
             for_sale,
             share.subdomain,
-            stored_share_token,
+            share.share_token,
             share.app_type,
             share.provider_id,
             i64::from(share.support.claude as u8),
@@ -1663,6 +2026,8 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             share_id TEXT PRIMARY KEY,
             installation_id TEXT NOT NULL,
             share_name TEXT NOT NULL,
+            owner_email TEXT,
+            shared_with_emails_json TEXT NOT NULL DEFAULT '[]',
             description TEXT,
             for_sale TEXT NOT NULL DEFAULT 'No',
             subdomain TEXT,
@@ -1727,6 +2092,42 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             PRIMARY KEY (installation_id, action, nonce)
         );
 
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            email_normalized TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL,
+            last_login_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS email_login_challenges (
+            id TEXT PRIMARY KEY,
+            email_normalized TEXT NOT NULL,
+            installation_id TEXT NOT NULL,
+            purpose TEXT NOT NULL,
+            code_hash TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            consumed_at TEXT,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            resend_available_at TEXT NOT NULL,
+            created_ip TEXT,
+            created_user_agent TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS user_sessions (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            installation_id TEXT NOT NULL,
+            access_token_hash TEXT NOT NULL UNIQUE,
+            refresh_token_hash TEXT NOT NULL UNIQUE,
+            access_expires_at TEXT NOT NULL,
+            refresh_expires_at TEXT NOT NULL,
+            revoked_at TEXT,
+            created_at TEXT NOT NULL,
+            last_used_at TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_leases_installation_id ON leases(installation_id);
         CREATE INDEX IF NOT EXISTS idx_leases_subdomain ON leases(subdomain);
         CREATE INDEX IF NOT EXISTS idx_shares_installation_id ON shares(installation_id);
@@ -1735,6 +2136,10 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         CREATE INDEX IF NOT EXISTS idx_share_health_checks ON share_health_checks(share_id, checked_at DESC);
         CREATE INDEX IF NOT EXISTS idx_dashboard_presence_last_seen ON dashboard_presence(last_seen_at DESC);
         CREATE INDEX IF NOT EXISTS idx_request_nonces_created_at ON request_nonces(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_auth_challenges_email ON email_login_challenges(email_normalized, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_auth_challenges_installation ON email_login_challenges(installation_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id ON user_sessions(user_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_user_sessions_installation ON user_sessions(installation_id, created_at DESC);
         ",
     )
     .map_err(|e| AppError::Internal(format!("init schema failed: {e}")))?;
@@ -1890,6 +2295,19 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
     if !columns.iter().any(|name| name == "description") {
         conn.execute("ALTER TABLE shares ADD COLUMN description TEXT", [])
             .map_err(|e| AppError::Internal(format!("add shares description failed: {e}")))?;
+    }
+    if !columns.iter().any(|name| name == "owner_email") {
+        conn.execute("ALTER TABLE shares ADD COLUMN owner_email TEXT", [])
+            .map_err(|e| AppError::Internal(format!("add shares owner_email failed: {e}")))?;
+    }
+    if !columns.iter().any(|name| name == "shared_with_emails_json") {
+        conn.execute(
+            "ALTER TABLE shares ADD COLUMN shared_with_emails_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        )
+        .map_err(|e| {
+            AppError::Internal(format!("add shares shared_with_emails_json failed: {e}"))
+        })?;
     }
     if !columns.iter().any(|name| name == "for_sale") {
         conn.execute(
@@ -2400,7 +2818,8 @@ fn list_leases(conn: &Connection) -> Result<Vec<TunnelLease>, AppError> {
 fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor, usize)>, AppError> {
     let mut stmt = conn
         .prepare(
-            "SELECT s.installation_id, s.share_id, s.share_name, s.description, s.for_sale, COALESCE(s.subdomain, '-'), s.share_token, s.app_type, s.provider_id,
+        "SELECT s.installation_id, s.share_id, s.share_name, s.description, s.for_sale, COALESCE(s.subdomain, '-'), s.share_token, s.app_type, s.provider_id,
+                    s.owner_email, s.shared_with_emails_json,
                     s.enabled_claude, s.enabled_codex, s.enabled_gemini,
                     s.token_limit, s.parallel_limit, s.tokens_used, s.requests_count, s.share_status, s.created_at, s.expires_at, s.upstream_provider_json, s.app_runtimes_json,
                     (
@@ -2425,22 +2844,24 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor, usize)
                     share_token: row.get(6)?,
                     app_type: row.get(7)?,
                     provider_id: row.get(8)?,
+                    owner_email: row.get(9)?,
+                    shared_with_emails: parse_string_vec(row.get(10)?)?,
                     support: ShareSupport {
-                        claude: row.get::<_, i64>(9)? != 0,
-                        codex: row.get::<_, i64>(10)? != 0,
-                        gemini: row.get::<_, i64>(11)? != 0,
+                        claude: row.get::<_, i64>(11)? != 0,
+                        codex: row.get::<_, i64>(12)? != 0,
+                        gemini: row.get::<_, i64>(13)? != 0,
                     },
-                    token_limit: row.get(12)?,
-                    parallel_limit: row.get(13)?,
-                    tokens_used: row.get(14)?,
-                    requests_count: row.get(15)?,
-                    share_status: row.get(16)?,
-                    created_at: row.get(17)?,
-                    expires_at: row.get(18)?,
-                    upstream_provider: parse_upstream_provider(row.get(19)?)?,
-                    app_runtimes: parse_app_runtimes(row.get(20)?)?,
+                    token_limit: row.get(14)?,
+                    parallel_limit: row.get(15)?,
+                    tokens_used: row.get(16)?,
+                    requests_count: row.get(17)?,
+                    share_status: row.get(18)?,
+                    created_at: row.get(19)?,
+                    expires_at: row.get(20)?,
+                    upstream_provider: parse_upstream_provider(row.get(21)?)?,
+                    app_runtimes: parse_app_runtimes(row.get(22)?)?,
                 },
-                row.get::<_, i64>(21)? as usize,
+                row.get::<_, i64>(23)? as usize,
             ))
         })
         .map_err(|e| AppError::Internal(format!("query shares failed: {e}")))?;
@@ -2785,6 +3206,16 @@ fn get_share_owned_subdomain(
     .map_err(|e| AppError::Internal(format!("query owned subdomain failed: {e}")))
 }
 
+fn get_share_owner_email(conn: &Connection, share_id: &str) -> Result<Option<String>, AppError> {
+    conn.query_row(
+        "SELECT owner_email FROM shares WHERE share_id = ?1",
+        params![share_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| AppError::Internal(format!("query share owner email failed: {e}")))
+}
+
 fn map_share_constraint_error(err: rusqlite::Error) -> AppError {
     let text = err.to_string();
     if text.contains("UNIQUE constraint failed: shares.subdomain")
@@ -2917,6 +3348,402 @@ fn verify_signed_payload<T: Serialize>(
         .map_err(|_| AppError::Unauthorized("signature verification failed".into()))
 }
 
+#[derive(Debug, Clone)]
+struct EmailLoginChallenge {
+    id: String,
+    code_hash: String,
+    attempt_count: i64,
+}
+
+fn normalize_email(value: &str) -> Result<String, AppError> {
+    let email = value.trim().to_ascii_lowercase();
+    let Some((local, domain)) = email.split_once('@') else {
+        return Err(AppError::BadRequest("invalid email".into()));
+    };
+    if local.is_empty() || domain.is_empty() || !domain.contains('.') {
+        return Err(AppError::BadRequest("invalid email".into()));
+    }
+    if email.len() > 254 {
+        return Err(AppError::BadRequest("invalid email".into()));
+    }
+    Ok(email)
+}
+
+fn normalize_email_list(values: &[String], owner_email: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    for value in values {
+        if let Ok(email) = normalize_email(value) {
+            if email == owner_email || result.contains(&email) {
+                continue;
+            }
+            result.push(email);
+        }
+    }
+    result
+}
+
+fn mask_email(email: &str) -> String {
+    let Some((local, domain)) = email.split_once('@') else {
+        return "***".into();
+    };
+    let mut chars = local.chars();
+    let first = chars.next().unwrap_or('*');
+    let last = local.chars().last().unwrap_or(first);
+    format!("{first}***{last}@{domain}")
+}
+
+fn hash_token(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
+}
+
+fn generate_secret(len: usize) -> String {
+    Alphanumeric.sample_string(&mut rand::thread_rng(), len)
+}
+
+fn generate_numeric_code(len: usize) -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    (0..len)
+        .map(|_| char::from(b'0' + rng.gen_range(0..10)))
+        .collect()
+}
+
+fn parse_string_vec(value: Option<String>) -> Result<Vec<String>, rusqlite::Error> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(&value).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+    })
+}
+
+async fn send_login_code_email(
+    resend: &Resend,
+    config: &Config,
+    email: &str,
+    code: &str,
+    ttl_secs: i64,
+) -> Result<(), AppError> {
+    let from = config
+        .resend_from
+        .as_deref()
+        .ok_or_else(|| AppError::Internal("resend from address is not configured".into()))?;
+    let html = format!(
+        "<div style=\"font-family:Arial,sans-serif\"><p>Your verification code is:</p><p style=\"font-size:28px;font-weight:700;letter-spacing:6px\">{code}</p><p>This code expires in {} minutes.</p></div>",
+        (ttl_secs / 60).max(1)
+    );
+    let mut message =
+        CreateEmailBaseOptions::new(from, [email], "Your portr-rs verification code")
+            .with_html(&html);
+    if let Some(reply_to) = config.resend_reply_to.as_deref() {
+        message = message.with_reply(reply_to);
+    }
+    resend
+        .emails
+        .send(message)
+        .await
+        .map_err(|e| AppError::Internal(format!("send verification email failed: {e}")))?;
+    Ok(())
+}
+
+fn enforce_auth_send_limits(
+    conn: &Connection,
+    config: &Config,
+    email: &str,
+    installation_id: &str,
+    metadata: &ClientMetadata,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let hour_cutoff = (now - Duration::hours(1)).to_rfc3339();
+    if let Some(next_allowed_at) = latest_challenge_cooldown(conn, email, installation_id)? {
+        if next_allowed_at > now {
+            return Err(AppError::TooManyRequests(format!(
+                "verification email cooldown active, retry in {}s",
+                (next_allowed_at - now).num_seconds().max(1)
+            )));
+        }
+    }
+
+    let email_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM email_login_challenges
+             WHERE email_normalized = ?1 AND created_at >= ?2",
+            params![email, hour_cutoff],
+            |row| row.get(0),
+        )
+        .map_err(|e| AppError::Internal(format!("count auth email requests failed: {e}")))?;
+    if email_count >= config.auth_email_hourly_limit {
+        return Err(AppError::TooManyRequests(
+            "email verification rate limit exceeded".into(),
+        ));
+    }
+
+    let installation_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM email_login_challenges
+             WHERE installation_id = ?1 AND created_at >= ?2",
+            params![installation_id, hour_cutoff],
+            |row| row.get(0),
+        )
+        .map_err(|e| {
+            AppError::Internal(format!("count installation auth requests failed: {e}"))
+        })?;
+    if installation_count >= config.auth_installation_hourly_limit {
+        return Err(AppError::TooManyRequests(
+            "installation verification rate limit exceeded".into(),
+        ));
+    }
+
+    if let Some(ip) = metadata.ip.as_deref() {
+        let ip_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM email_login_challenges
+                 WHERE created_ip = ?1 AND created_at >= ?2",
+                params![ip, hour_cutoff],
+                |row| row.get(0),
+            )
+            .map_err(|e| AppError::Internal(format!("count ip auth requests failed: {e}")))?;
+        if ip_count >= config.auth_ip_hourly_limit {
+            return Err(AppError::TooManyRequests(
+                "ip verification rate limit exceeded".into(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn latest_challenge_cooldown(
+    conn: &Connection,
+    email: &str,
+    installation_id: &str,
+) -> Result<Option<DateTime<Utc>>, AppError> {
+    conn.query_row(
+        "SELECT resend_available_at
+         FROM email_login_challenges
+         WHERE email_normalized = ?1
+           AND installation_id = ?2
+         ORDER BY created_at DESC
+         LIMIT 1",
+        params![email, installation_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(|e| AppError::Internal(format!("query latest challenge cooldown failed: {e}")))?
+    .map(|value| parse_dt_sql(&value).map_err(|e| AppError::Internal(format!("parse cooldown failed: {e}"))))
+    .transpose()
+}
+
+fn get_latest_active_email_challenge(
+    conn: &Connection,
+    email: &str,
+    installation_id: &str,
+    purpose: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<EmailLoginChallenge>, AppError> {
+    conn.query_row(
+        "SELECT id, code_hash, attempt_count
+         FROM email_login_challenges
+         WHERE email_normalized = ?1
+           AND installation_id = ?2
+           AND purpose = ?3
+           AND consumed_at IS NULL
+           AND expires_at >= ?4
+         ORDER BY created_at DESC
+         LIMIT 1",
+        params![email, installation_id, purpose, now.to_rfc3339()],
+        |row| {
+            Ok(EmailLoginChallenge {
+                id: row.get(0)?,
+                code_hash: row.get(1)?,
+                attempt_count: row.get(2)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| AppError::Internal(format!("query auth challenge failed: {e}")))
+}
+
+fn upsert_user_by_email(
+    conn: &Connection,
+    email: &str,
+    now: DateTime<Utc>,
+) -> Result<AuthUser, AppError> {
+    if let Some(user) = get_user_by_email(conn, email)? {
+        conn.execute(
+            "UPDATE users SET last_login_at = ?2 WHERE id = ?1",
+            params![user.id, now.to_rfc3339()],
+        )
+        .map_err(|e| AppError::Internal(format!("update user login failed: {e}")))?;
+        return Ok(user);
+    }
+    let user = AuthUser {
+        id: Uuid::new_v4().to_string(),
+        email: email.to_string(),
+    };
+    conn.execute(
+        "INSERT INTO users (id, email_normalized, status, created_at, last_login_at)
+         VALUES (?1, ?2, 'active', ?3, ?4)",
+        params![user.id, user.email, now.to_rfc3339(), now.to_rfc3339()],
+    )
+    .map_err(|e| AppError::Internal(format!("insert user failed: {e}")))?;
+    Ok(user)
+}
+
+fn get_user_by_email(conn: &Connection, email: &str) -> Result<Option<AuthUser>, AppError> {
+    conn.query_row(
+        "SELECT id, email_normalized FROM users WHERE email_normalized = ?1",
+        params![email],
+        |row| {
+            Ok(AuthUser {
+                id: row.get(0)?,
+                email: row.get(1)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| AppError::Internal(format!("query user by email failed: {e}")))
+}
+
+fn get_user_by_id(conn: &Connection, user_id: &str) -> Result<Option<AuthUser>, AppError> {
+    conn.query_row(
+        "SELECT id, email_normalized FROM users WHERE id = ?1",
+        params![user_id],
+        |row| {
+            Ok(AuthUser {
+                id: row.get(0)?,
+                email: row.get(1)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| AppError::Internal(format!("query user by id failed: {e}")))
+}
+
+fn persist_session(conn: &Connection, session: &AuthSession) -> Result<(), AppError> {
+    conn.execute(
+        "INSERT INTO user_sessions (
+            id, user_id, installation_id, access_token_hash, refresh_token_hash,
+            access_expires_at, refresh_expires_at, revoked_at, created_at, last_used_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9)",
+        params![
+            session.session_id,
+            session.user_id,
+            session.installation_id,
+            session.access_token_hash,
+            session.refresh_token_hash,
+            session.access_expires_at.to_rfc3339(),
+            session.refresh_expires_at.to_rfc3339(),
+            session.created_at.to_rfc3339(),
+            session.last_used_at.to_rfc3339(),
+        ],
+    )
+    .map_err(|e| AppError::Internal(format!("persist session failed: {e}")))?;
+    Ok(())
+}
+
+fn map_auth_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthSession> {
+    Ok(AuthSession {
+        session_id: row.get(0)?,
+        user_id: row.get(1)?,
+        installation_id: row.get(2)?,
+        access_token_hash: row.get(3)?,
+        refresh_token_hash: row.get(4)?,
+        access_expires_at: parse_dt_sql(&row.get::<_, String>(5)?)?,
+        refresh_expires_at: parse_dt_sql(&row.get::<_, String>(6)?)?,
+        created_at: parse_dt_sql(&row.get::<_, String>(7)?)?,
+        last_used_at: parse_dt_sql(&row.get::<_, String>(8)?)?,
+        email: row.get(9)?,
+    })
+}
+
+fn get_session_by_access_hash(
+    conn: &Connection,
+    access_hash: &str,
+) -> Result<Option<AuthSession>, AppError> {
+    conn.query_row(
+        "SELECT s.id, s.user_id, s.installation_id, s.access_token_hash, s.refresh_token_hash,
+                s.access_expires_at, s.refresh_expires_at, s.created_at, s.last_used_at, u.email_normalized
+         FROM user_sessions s
+         INNER JOIN users u ON u.id = s.user_id
+         WHERE s.access_token_hash = ?1 AND s.revoked_at IS NULL",
+        params![access_hash],
+        map_auth_session_row,
+    )
+    .optional()
+    .map_err(|e| AppError::Internal(format!("query session by access hash failed: {e}")))
+}
+
+fn get_session_by_refresh_hash(
+    conn: &Connection,
+    refresh_hash: &str,
+) -> Result<Option<AuthSession>, AppError> {
+    conn.query_row(
+        "SELECT s.id, s.user_id, s.installation_id, s.access_token_hash, s.refresh_token_hash,
+                s.access_expires_at, s.refresh_expires_at, s.created_at, s.last_used_at, u.email_normalized
+         FROM user_sessions s
+         INNER JOIN users u ON u.id = s.user_id
+         WHERE s.refresh_token_hash = ?1 AND s.revoked_at IS NULL",
+        params![refresh_hash],
+        map_auth_session_row,
+    )
+    .optional()
+    .map_err(|e| AppError::Internal(format!("query session by refresh hash failed: {e}")))
+}
+
+fn get_installation_owner_email(
+    conn: &Connection,
+    installation_id: &str,
+) -> Result<Option<String>, AppError> {
+    conn.query_row(
+        "SELECT owner_email
+         FROM shares
+         WHERE installation_id = ?1
+           AND owner_email IS NOT NULL
+           AND owner_email != ''
+         ORDER BY created_at DESC
+         LIMIT 1",
+        params![installation_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| AppError::Internal(format!("query installation owner email failed: {e}")))
+}
+
+fn share_visible_to_email(share: &ShareDescriptor, viewer_email: Option<&str>) -> bool {
+    let Some(viewer_email) = viewer_email else {
+        return false;
+    };
+    share.owner_email.as_deref() == Some(viewer_email)
+        || share.shared_with_emails.iter().any(|email| email == viewer_email)
+}
+
+fn can_manage_share(share: &ShareDescriptor, viewer_email: Option<&str>) -> bool {
+    share.owner_email.as_deref() == viewer_email
+}
+
+fn enforce_share_owner(
+    share: &mut ShareDescriptor,
+    existing_owner_email: Option<&str>,
+    current_user_email: &str,
+) -> Result<(), AppError> {
+    let current_user_email = normalize_email(current_user_email)?;
+    if let Some(existing_owner_email) = existing_owner_email {
+        if existing_owner_email != current_user_email {
+            return Err(AppError::Unauthorized("share owner mismatch".into()));
+        }
+    }
+    share.owner_email = Some(current_user_email.clone());
+    share.share_name = current_user_email.clone();
+    share.shared_with_emails = normalize_email_list(&share.shared_with_emails, &current_user_email);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2943,6 +3770,17 @@ mod tests {
             cleanup_interval_secs: 300,
             lease_retention_secs: 7 * 24 * 60 * 60,
             client_stale_secs: 60 * 60,
+            resend_api_key: None,
+            resend_from: None,
+            resend_reply_to: None,
+            auth_code_ttl_secs: 600,
+            auth_code_cooldown_secs: 60,
+            auth_session_ttl_secs: 7 * 24 * 60 * 60,
+            auth_refresh_ttl_secs: 30 * 24 * 60 * 60,
+            auth_max_verify_attempts: 8,
+            auth_email_hourly_limit: 10,
+            auth_ip_hourly_limit: 30,
+            auth_installation_hourly_limit: 15,
         }
     }
 
@@ -3009,14 +3847,16 @@ mod tests {
         let conn = store.conn.lock().await;
         conn.execute(
             "INSERT INTO shares (
-                share_id, installation_id, share_name, description, for_sale, subdomain, share_token,
-                app_type, provider_id, enabled_claude, enabled_codex, enabled_gemini, token_limit,
-                parallel_limit, tokens_used, requests_count, share_status, created_at, expires_at, updated_at
-             ) VALUES (?1, ?2, ?3, NULL, 'No', ?4, 'token', 'proxy', NULL, 1, 1, 1, 1000, 3, 0, 0, ?5, ?6, ?7, ?6)",
+                share_id, installation_id, share_name, owner_email, shared_with_emails_json,
+                description, for_sale, subdomain, share_token, app_type, provider_id,
+                enabled_claude, enabled_codex, enabled_gemini, token_limit, parallel_limit,
+                tokens_used, requests_count, share_status, created_at, expires_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, '[]', NULL, 'No', ?5, 'token', 'proxy', NULL, 1, 1, 1, 1000, 3, 0, 0, ?6, ?7, ?8, ?7)",
             params![
                 share_id,
                 installation_id,
                 format!("share-{share_id}"),
+                "owner@example.com",
                 subdomain,
                 share_status,
                 now.to_rfc3339(),
@@ -3094,6 +3934,8 @@ mod tests {
         let share = ShareDescriptor {
             share_id: "share-1".into(),
             share_name: "Signed Share".into(),
+            owner_email: Some("owner@example.com".into()),
+            shared_with_emails: vec![],
             description: None,
             for_sale: "No".into(),
             subdomain: "signed-sub".into(),
@@ -3138,6 +3980,7 @@ mod tests {
                     ip: Some("127.0.0.1".into()),
                     country_code: None,
                 },
+                "owner@example.com",
             )
             .await
             .expect("valid signed share claim");
@@ -3155,6 +3998,7 @@ mod tests {
                     ip: Some("127.0.0.1".into()),
                     country_code: None,
                 },
+                "owner@example.com",
             )
             .await
             .expect_err("replay should fail");
@@ -3177,6 +4021,7 @@ mod tests {
                     ip: Some("127.0.0.1".into()),
                     country_code: None,
                 },
+                "owner@example.com",
             )
             .await
             .expect_err("tampered payload should fail");
@@ -3197,6 +4042,8 @@ mod tests {
         let share = ShareDescriptor {
             share_id: "share-batch-1".into(),
             share_name: "Batch Share".into(),
+            owner_email: Some("owner@example.com".into()),
+            shared_with_emails: vec![],
             description: Some("signed batch sync".into()),
             for_sale: "No".into(),
             subdomain: "batch-sub".into(),
@@ -3248,6 +4095,7 @@ mod tests {
                     ip: Some("127.0.0.1".into()),
                     country_code: None,
                 },
+                "owner@example.com",
             )
             .await
             .expect("valid signed batch sync");
@@ -3262,7 +4110,7 @@ mod tests {
             )
             .expect("query synced share");
         drop(conn);
-        assert_eq!(synced.0, "Batch Share");
+        assert_eq!(synced.0, "owner@example.com");
         assert_eq!(synced.1, "batch-sub");
         assert_eq!(synced.2, 2048);
 
@@ -3301,6 +4149,7 @@ mod tests {
                     ip: Some("127.0.0.1".into()),
                     country_code: None,
                 },
+                "owner@example.com",
             )
             .await
             .expect_err("tampered batch sync should fail");
@@ -3317,6 +4166,7 @@ mod tests {
     async fn batch_sync_share_request_logs_requires_valid_signature() {
         let (store, config) = setup_store("signed-log-batch").await;
         let signing_key = insert_signed_installation(&store, "inst-logs").await;
+        insert_share(&store, "inst-logs", "share-log-1", "log-sub", "active").await;
 
         let logs = vec![ShareRequestLogEntry {
             request_id: "req-1".into(),
@@ -3363,6 +4213,7 @@ mod tests {
                     ip: Some("127.0.0.1".into()),
                     country_code: None,
                 },
+                "owner@example.com",
             )
             .await
             .expect("valid signed request log batch sync");
@@ -3392,6 +4243,7 @@ mod tests {
                     ip: Some("127.0.0.1".into()),
                     country_code: None,
                 },
+                "owner@example.com",
             )
             .await
             .expect_err("replayed log sync should fail");
@@ -3422,6 +4274,7 @@ mod tests {
                     ip: Some("127.0.0.1".into()),
                     country_code: None,
                 },
+                "owner@example.com",
             )
             .await
             .expect_err("tampered log sync should fail");
@@ -3446,7 +4299,7 @@ mod tests {
         };
         let proxy = ProxyRegistry::default();
         let snapshot = store
-            .dashboard_snapshot(&config, &server_geo, &proxy)
+            .dashboard_snapshot(&config, &server_geo, &proxy, None)
             .await
             .expect("dashboard snapshot");
 
@@ -3578,7 +4431,7 @@ mod tests {
         };
         let proxy = ProxyRegistry::default();
         let snapshot = store
-            .dashboard_snapshot(&config, &server_geo, &proxy)
+            .dashboard_snapshot(&config, &server_geo, &proxy, None)
             .await
             .expect("dashboard snapshot");
         let share = snapshot.clients[0].share.as_ref().expect("share view");

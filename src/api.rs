@@ -1,19 +1,21 @@
 use std::net::SocketAddr;
 
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::routing::{any, get, post};
 use axum::{Json, Router, response::Html};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::ServerState;
 use crate::error::AppError;
 use crate::models::{
     ClientMetadata, DashboardPresenceRequest, DashboardPresenceResponse, DashboardResponse,
     HealthResponse, IssueLeaseRequest, IssueLeaseResponse, PublicMapPointsResponse,
-    RegisterInstallationRequest, RegisterInstallationResponse, ShareBatchSyncRequest,
-    ShareClaimSubdomainRequest, ShareDeleteRequest, ShareHeartbeatRequest,
-    ShareRequestLogBatchSyncRequest, ShareSyncRequest,
+    RefreshSessionRequest, RegisterInstallationRequest, RegisterInstallationResponse,
+    RequestEmailCodeRequest, RequestEmailCodeResponse, SessionStatusResponse,
+    ShareBatchSyncRequest, ShareClaimSubdomainRequest, ShareDeleteRequest, ShareHeartbeatRequest,
+    ShareRequestLogBatchSyncRequest, ShareSyncRequest, VerifyEmailCodeRequest,
+    VerifyEmailCodeResponse,
 };
 use crate::proxy::proxy_handler;
 
@@ -24,6 +26,12 @@ const REGIONS: &str = include_str!("../regions");
 struct RegionOption {
     name: String,
     url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionStatusQuery {
+    installation_id: Option<String>,
 }
 
 pub fn router(state: ServerState) -> Router {
@@ -37,6 +45,10 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/regions", get(regions))
         .route("/v1/dashboard/presence", post(dashboard_presence))
         .route("/v1/installations/register", post(register_installation))
+        .route("/v1/auth/email/request-code", post(request_email_code))
+        .route("/v1/auth/email/verify-code", post(verify_email_code))
+        .route("/v1/auth/session/refresh", post(refresh_session))
+        .route("/v1/auth/session/me", get(session_me))
         .route("/v1/tunnels/lease", post(issue_lease))
         .route("/v1/shares/claim-subdomain", post(claim_share_subdomain))
         .route("/v1/shares/sync", post(sync_share))
@@ -85,17 +97,26 @@ async fn issue_lease(
             &state.proxy,
             input,
             extract_client_metadata(&headers, addr),
+            extract_session_email(&state, &headers).await?.as_deref(),
         )
         .await?;
     response.ssh_host_fingerprint = state.ssh_host_fingerprint.clone();
     Ok(Json(response))
 }
 
-async fn dashboard(State(state): State<ServerState>) -> Result<Json<DashboardResponse>, AppError> {
+async fn dashboard(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<DashboardResponse>, AppError> {
     Ok(Json(
         state
             .store
-            .dashboard_snapshot(&state.config, &state.server_geo, &state.proxy)
+            .dashboard_snapshot(
+                &state.config,
+                &state.server_geo,
+                &state.proxy,
+                extract_session_email(&state, &headers).await?.as_deref(),
+            )
             .await?,
     ))
 }
@@ -136,7 +157,71 @@ async fn dashboard_presence(
     Json(input): Json<DashboardPresenceRequest>,
 ) -> Result<Json<DashboardPresenceResponse>, AppError> {
     let online_count = state.store.record_dashboard_presence(input).await?;
-    Ok(Json(DashboardPresenceResponse { online_count }))
+    let resend_usage_label = state
+        .resend_usage_cache
+        .lock()
+        .await
+        .as_ref()
+        .and_then(|cache| {
+            if cache.value.available && !cache.value.daily_usage_label.is_empty() {
+                Some(cache.value.daily_usage_label.clone())
+            } else {
+                None
+            }
+        });
+    Ok(Json(DashboardPresenceResponse {
+        online_count,
+        resend_usage_label,
+    }))
+}
+
+async fn request_email_code(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(input): Json<RequestEmailCodeRequest>,
+) -> Result<Json<RequestEmailCodeResponse>, AppError> {
+    Ok(Json(
+        state
+            .store
+            .request_email_code(
+                &state.config,
+                state.resend.as_deref(),
+                input,
+                extract_client_metadata(&headers, addr),
+            )
+            .await?,
+    ))
+}
+
+async fn verify_email_code(
+    State(state): State<ServerState>,
+    Json(input): Json<VerifyEmailCodeRequest>,
+) -> Result<Json<VerifyEmailCodeResponse>, AppError> {
+    Ok(Json(state.store.verify_email_code(&state.config, input).await?))
+}
+
+async fn refresh_session(
+    State(state): State<ServerState>,
+    Json(input): Json<RefreshSessionRequest>,
+) -> Result<Json<VerifyEmailCodeResponse>, AppError> {
+    Ok(Json(state.store.refresh_session(&state.config, input).await?))
+}
+
+async fn session_me(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<SessionStatusQuery>,
+) -> Result<Json<SessionStatusResponse>, AppError> {
+    Ok(Json(
+        state
+            .store
+            .session_status(
+                extract_bearer_token(&headers),
+                query.installation_id.as_deref(),
+            )
+            .await?,
+    ))
 }
 
 async fn admin_page() -> Html<&'static str> {
@@ -156,9 +241,10 @@ async fn sync_share(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(input): Json<ShareSyncRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let current_user_email = require_session_email(&state, &headers).await?;
     state
         .store
-        .sync_share(input, extract_client_metadata(&headers, addr))
+        .sync_share(input, extract_client_metadata(&headers, addr), &current_user_email)
         .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -169,9 +255,14 @@ async fn claim_share_subdomain(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(input): Json<ShareClaimSubdomainRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let current_user_email = require_session_email(&state, &headers).await?;
     state
         .store
-        .claim_share_subdomain(input, extract_client_metadata(&headers, addr))
+        .claim_share_subdomain(
+            input,
+            extract_client_metadata(&headers, addr),
+            &current_user_email,
+        )
         .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -191,9 +282,11 @@ async fn share_heartbeat(
 
 async fn delete_share(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Json(input): Json<ShareDeleteRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    state.store.delete_share(input).await?;
+    let current_user_email = require_session_email(&state, &headers).await?;
+    state.store.delete_share(input, &current_user_email).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -203,9 +296,14 @@ async fn batch_sync_share(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(input): Json<ShareBatchSyncRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let current_user_email = require_session_email(&state, &headers).await?;
     state
         .store
-        .batch_sync_shares(input, extract_client_metadata(&headers, addr))
+        .batch_sync_shares(
+            input,
+            extract_client_metadata(&headers, addr),
+            &current_user_email,
+        )
         .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -216,9 +314,14 @@ async fn batch_sync_share_request_logs(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(input): Json<ShareRequestLogBatchSyncRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let current_user_email = require_session_email(&state, &headers).await?;
     state
         .store
-        .batch_sync_share_request_logs(input, extract_client_metadata(&headers, addr))
+        .batch_sync_share_request_logs(
+            input,
+            extract_client_metadata(&headers, addr),
+            &current_user_email,
+        )
         .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -252,4 +355,33 @@ fn extract_client_metadata(headers: &HeaderMap, addr: SocketAddr) -> ClientMetad
         ip: forwarded_ip,
         country_code,
     }
+}
+
+fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+async fn extract_session_email(
+    state: &ServerState,
+    headers: &HeaderMap,
+) -> Result<Option<String>, AppError> {
+    let Some(token) = extract_bearer_token(headers) else {
+        return Ok(None);
+    };
+    Ok(state
+        .store
+        .resolve_session_by_access_token(token)
+        .await?
+        .map(|session| session.email))
+}
+
+async fn require_session_email(state: &ServerState, headers: &HeaderMap) -> Result<String, AppError> {
+    extract_session_email(state, headers)
+        .await?
+        .ok_or_else(|| AppError::Unauthorized("authenticated owner session required".into()))
 }

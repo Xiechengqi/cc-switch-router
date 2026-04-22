@@ -42,6 +42,27 @@ pub struct ClientMetadata {
     pub country_code: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct AuthSession {
+    pub session_id: String,
+    pub user_id: String,
+    pub email: String,
+    pub installation_id: String,
+    pub access_token_hash: String,
+    pub refresh_token_hash: String,
+    pub access_expires_at: DateTime<Utc>,
+    pub refresh_expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthUser {
+    pub id: String,
+    pub email: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TunnelLease {
@@ -71,6 +92,61 @@ pub struct RegisterInstallationRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RegisterInstallationResponse {
     pub installation_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestEmailCodeRequest {
+    pub email: String,
+    pub installation_id: String,
+    pub timestamp_ms: i64,
+    pub nonce: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestEmailCodeResponse {
+    pub ok: bool,
+    pub cooldown_secs: i64,
+    pub masked_destination: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyEmailCodeRequest {
+    pub email: String,
+    pub code: String,
+    pub installation_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyEmailCodeResponse {
+    pub user: AuthUser,
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_at: DateTime<Utc>,
+    pub refresh_expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshSessionRequest {
+    pub refresh_token: String,
+    pub installation_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStatusResponse {
+    pub authenticated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<AuthUser>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installation_owner_email: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -237,6 +313,19 @@ pub struct DashboardPresenceRequest {
 #[serde(rename_all = "camelCase")]
 pub struct DashboardPresenceResponse {
     pub online_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resend_usage_label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResendUsageResponse {
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_usage_percent: Option<f64>,
+    pub daily_usage_label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_header: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -305,6 +394,10 @@ pub struct ShareRuntimeSnapshotResponse {
 pub struct ShareDescriptor {
     pub share_id: String,
     pub share_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_email: Option<String>,
+    #[serde(default)]
+    pub shared_with_emails: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default = "default_share_for_sale")]
@@ -423,11 +516,17 @@ pub struct LeaseView {
 pub struct ShareView {
     pub share_id: String,
     pub share_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_email: Option<String>,
+    #[serde(default)]
+    pub shared_with_emails: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub for_sale: String,
     pub subdomain: String,
     pub share_token: String,
+    pub can_view_secret: bool,
+    pub can_manage: bool,
     pub app_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
