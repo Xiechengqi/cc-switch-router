@@ -1051,6 +1051,22 @@
         `).join("")}</div>`;
       }
 
+      function countdownStr(resetsAt) {
+        if (!resetsAt) return "";
+        const diffMs = new Date(resetsAt).getTime() - Date.now();
+        if (!Number.isFinite(diffMs) || diffMs <= 0) return "";
+
+        const hours = Math.floor(diffMs / (1000 * 60 * 60));
+        const minutes = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+
+        if (hours > 24) {
+          const days = Math.floor(hours / 24);
+          return `${days}d${hours % 24}h`;
+        }
+        if (hours > 0) return `${hours}h${minutes}m`;
+        return `${minutes}m`;
+      }
+
       function titleApp(value) {
         if (!value) return "Unknown";
         return String(value).slice(0, 1).toUpperCase() + String(value).slice(1);
@@ -1069,7 +1085,15 @@
           if (preferredTiers.length) tiers = preferredTiers;
         }
         if (!tiers.length) return "";
-        return tiers.map((tier) => `${tier.label} ${Math.round(tier.utilization || 0)}%`).join(" · ");
+        return tiers
+          .map((tier) => {
+            const countdown = countdownStr(tier.resetsAt);
+            return [tier.label, `${Math.round(tier.utilization || 0)}%`, countdown]
+              .filter(Boolean)
+              .join(" ");
+          })
+          .filter(Boolean)
+          .join(" · ");
       }
 
       function accountSummary(upstream) {
