@@ -855,6 +855,12 @@ impl AppStore {
         let existing_owner_email = get_share_owner_email(&tx, &share.share_id)?;
         enforce_share_owner(&mut share, existing_owner_email.as_deref(), current_user_email)?;
         share.subdomain = subdomain;
+        release_same_owner_subdomain_claim(
+            &tx,
+            &share.share_id,
+            share.owner_email.as_deref(),
+            &share.subdomain,
+        )?;
         upsert_share_tx(&tx, &input.installation_id, share)?;
         tx.commit().map_err(map_share_constraint_error)?;
         Ok(())
@@ -3216,6 +3222,57 @@ fn get_share_owner_email(conn: &Connection, share_id: &str) -> Result<Option<Str
     .map_err(|e| AppError::Internal(format!("query share owner email failed: {e}")))
 }
 
+fn find_share_claim_by_subdomain(
+    conn: &Connection,
+    subdomain: &str,
+) -> Result<Option<(String, Option<String>)>, AppError> {
+    conn.query_row(
+        "SELECT share_id, owner_email FROM shares WHERE subdomain = ?1",
+        params![subdomain],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .map_err(|e| AppError::Internal(format!("query subdomain claim failed: {e}")))
+}
+
+fn release_same_owner_subdomain_claim(
+    conn: &Connection,
+    incoming_share_id: &str,
+    incoming_owner_email: Option<&str>,
+    subdomain: &str,
+) -> Result<(), AppError> {
+    let Some((existing_share_id, existing_owner_email)) =
+        find_share_claim_by_subdomain(conn, subdomain)?
+    else {
+        return Ok(());
+    };
+
+    if existing_share_id == incoming_share_id {
+        return Ok(());
+    }
+
+    if existing_owner_email.as_deref() != incoming_owner_email {
+        return Ok(());
+    }
+
+    conn.execute(
+        "DELETE FROM share_request_logs WHERE share_id = ?1",
+        params![existing_share_id],
+    )
+    .map_err(|e| AppError::Internal(format!("delete replaced share request logs failed: {e}")))?;
+    conn.execute(
+        "DELETE FROM share_health_checks WHERE share_id = ?1",
+        params![existing_share_id],
+    )
+    .map_err(|e| AppError::Internal(format!("delete replaced share health checks failed: {e}")))?;
+    conn.execute(
+        "DELETE FROM shares WHERE share_id = ?1",
+        params![existing_share_id],
+    )
+    .map_err(|e| AppError::Internal(format!("delete replaced share claim failed: {e}")))?;
+    Ok(())
+}
+
 fn map_share_constraint_error(err: rusqlite::Error) -> AppError {
     let text = err.to_string();
     if text.contains("UNIQUE constraint failed: shares.subdomain")
@@ -4030,6 +4087,83 @@ mod tests {
                 .to_string()
                 .contains("signature verification failed")
         );
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn claim_share_subdomain_allows_same_owner_to_reclaim_existing_subdomain() {
+        let (store, config) = setup_store("signed-share-reclaim").await;
+        insert_share(&store, "inst-old", "share-old", "owner-sub", "paused").await;
+        let signing_key = insert_signed_installation(&store, "inst-new").await;
+
+        let share = ShareDescriptor {
+            share_id: "share-new".into(),
+            share_name: "owner@example.com".into(),
+            owner_email: Some("owner@example.com".into()),
+            shared_with_emails: vec![],
+            description: None,
+            for_sale: "No".into(),
+            subdomain: "owner-sub".into(),
+            share_token: "token-12345678".into(),
+            app_type: "proxy".into(),
+            provider_id: None,
+            token_limit: 1000,
+            parallel_limit: 3,
+            tokens_used: 0,
+            requests_count: 0,
+            share_status: "paused".into(),
+            created_at: Utc::now().to_rfc3339(),
+            expires_at: (Utc::now() + Duration::hours(1)).to_rfc3339(),
+            support: ShareSupport::default(),
+            upstream_provider: None,
+            app_runtimes: ShareAppRuntimes::default(),
+        };
+
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            "inst-new",
+            "share_claim_subdomain",
+            &share,
+            timestamp_ms,
+            &nonce,
+        );
+
+        store
+            .claim_share_subdomain(
+                ShareClaimSubdomainRequest {
+                    installation_id: "inst-new".into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    share: share.clone(),
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                "owner@example.com",
+            )
+            .await
+            .expect("claim reclaimed subdomain");
+
+        let conn = store.conn.lock().await;
+        let rows: Vec<(String, String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT share_id, installation_id, subdomain
+                     FROM shares
+                     WHERE subdomain = 'owner-sub'",
+                )
+                .expect("prepare reclaimed subdomain query");
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .expect("query reclaimed subdomain rows")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect reclaimed subdomain rows")
+        };
+        assert_eq!(rows, vec![("share-new".into(), "inst-new".into(), "owner-sub".into())]);
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
