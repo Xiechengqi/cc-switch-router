@@ -16,6 +16,8 @@ pub struct Installation {
     pub public_key: String,
     pub platform: String,
     pub app_version: String,
+    pub owner_email: Option<String>,
+    pub owner_verified_at: Option<DateTime<Utc>>,
     pub last_seen_ip: Option<String>,
     pub country_code: Option<String>,
     pub country: Option<String>,
@@ -147,6 +149,42 @@ pub struct SessionStatusResponse {
     pub expires_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installation_owner_email: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BindInstallationOwnerEmailRequest {
+    pub installation_id: String,
+    pub email: String,
+    pub verification_token: Option<String>,
+    pub timestamp_ms: i64,
+    pub nonce: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BindInstallationOwnerEmailResponse {
+    pub ok: bool,
+    pub owner_email: String,
+    pub already_bound: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetInstallationOwnerEmailQuery {
+    pub installation_id: String,
+    pub timestamp_ms: i64,
+    pub nonce: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetInstallationOwnerEmailResponse {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_email: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

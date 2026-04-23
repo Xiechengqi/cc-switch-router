@@ -29,6 +29,8 @@ pub struct Config {
     pub auth_email_hourly_limit: i64,
     pub auth_ip_hourly_limit: i64,
     pub auth_installation_hourly_limit: i64,
+    pub verification_service_base_url: String,
+    pub verification_service_api_key: Option<String>,
 }
 
 impl Config {
@@ -105,6 +107,9 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10),
+            verification_service_base_url: env::var("PORTR_RS_VERIFICATION_SERVICE_BASE_URL")
+                .unwrap_or_else(|_| "https://tokenswitch.org".to_string()),
+            verification_service_api_key: env::var("PORTR_RS_VERIFICATION_SERVICE_API_KEY").ok(),
         }
     }
 

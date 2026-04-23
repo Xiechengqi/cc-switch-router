@@ -6,8 +6,8 @@ use base64::Engine;
 use chrono::{DateTime, Duration, Utc};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rand::distributions::{Alphanumeric, DistString};
-use resend_rs::types::CreateEmailBaseOptions;
 use resend_rs::Resend;
+use resend_rs::types::CreateEmailBaseOptions;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -19,16 +19,18 @@ use crate::ServerGeo;
 use crate::config::Config;
 use crate::error::AppError;
 use crate::models::{
-    AuthSession, AuthUser, ClientMetadata, DashboardClientView, DashboardMap, DashboardMapPoint,
-    DashboardPresenceRequest, DashboardResponse, DashboardStats, HealthCheckEntry, Installation,
-    InstallationView, IssueLeaseRequest, IssueLeaseResponse, LatLonPoint, LeaseView,
-    PublicMapClientPoint, PublicMapPointsResponse, RefreshSessionRequest,
-    RegisterInstallationRequest, RegisterInstallationResponse, RequestEmailCodeRequest,
-    RequestEmailCodeResponse, SessionStatusResponse, ShareAppRuntimes, ShareBatchSyncRequest,
-    ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptor, ShareHeartbeatRequest,
-    ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRequestLogFetchResponse,
-    ShareRuntimeSnapshotResponse, ShareSupport, ShareSyncRequest, ShareUpstreamProvider, ShareView,
-    TunnelLease, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    AuthSession, AuthUser, BindInstallationOwnerEmailRequest, BindInstallationOwnerEmailResponse,
+    ClientMetadata, DashboardClientView, DashboardMap, DashboardMapPoint, DashboardPresenceRequest,
+    DashboardResponse, DashboardStats, GetInstallationOwnerEmailQuery,
+    GetInstallationOwnerEmailResponse, HealthCheckEntry, Installation, InstallationView,
+    IssueLeaseRequest, IssueLeaseResponse, LatLonPoint, LeaseView, PublicMapClientPoint,
+    PublicMapPointsResponse, RefreshSessionRequest, RegisterInstallationRequest,
+    RegisterInstallationResponse, RequestEmailCodeRequest, RequestEmailCodeResponse,
+    SessionStatusResponse, ShareAppRuntimes, ShareBatchSyncRequest, ShareClaimSubdomainRequest,
+    ShareDeleteRequest, ShareDescriptor, ShareHeartbeatRequest, ShareRequestLogBatchSyncRequest,
+    ShareRequestLogEntry, ShareRequestLogFetchResponse, ShareRuntimeSnapshotResponse, ShareSupport,
+    ShareSyncRequest, ShareUpstreamProvider, ShareView, TunnelLease, VerifyEmailCodeRequest,
+    VerifyEmailCodeResponse,
 };
 use crate::proxy::ProxyRegistry;
 
@@ -39,6 +41,23 @@ const SIGNED_REQUEST_MAX_SKEW_MS: i64 = 60_000;
 const NONCE_RETENTION_SECS: i64 = 10 * 60;
 const AUTH_CODE_DIGITS: usize = 6;
 const AUTH_PURPOSE_LOGIN: &str = "login";
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BindOwnerEmailSignaturePayload<'a> {
+    email: &'a str,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verification_token: Option<&'a str>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VerificationRedeemResponse {
+    ok: bool,
+    email: String,
+    purpose: String,
+    verified_at: i64,
+}
 
 fn country_centroid(country_code: &str) -> Option<(f64, f64)> {
     match country_code {
@@ -220,6 +239,8 @@ impl AppStore {
             public_key: public_key.to_string(),
             platform: platform.to_string(),
             app_version: input.app_version,
+            owner_email: None,
+            owner_verified_at: None,
             last_seen_ip: ip.clone(),
             country_code,
             country: None,
@@ -241,17 +262,21 @@ impl AppStore {
         };
         conn.execute(
             "INSERT INTO installations (
-                id, public_key, platform, app_version, last_seen_ip, country_code, country, region,
+                id, public_key, platform, app_version, owner_email, owner_verified_at, last_seen_ip, country_code, country, region,
                 city, latitude, longitude, geo_candidate_country_code, geo_candidate_country,
                 geo_candidate_region, geo_candidate_city, geo_candidate_latitude,
                 geo_candidate_longitude, geo_candidate_hits, geo_candidate_first_seen_at,
                 geo_last_changed_at, created_at, last_seen_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
             params![
                 installation.id,
                 installation.public_key,
                 installation.platform,
                 installation.app_version,
+                installation.owner_email,
+                installation
+                    .owner_verified_at
+                    .map(|value| value.to_rfc3339()),
                 installation.last_seen_ip,
                 installation.country_code,
                 installation.country,
@@ -280,6 +305,80 @@ impl AppStore {
             .await?;
         Ok(RegisterInstallationResponse {
             installation_id: installation.id,
+        })
+    }
+
+    pub async fn bind_installation_owner_email(
+        &self,
+        config: &Config,
+        input: BindInstallationOwnerEmailRequest,
+    ) -> Result<BindInstallationOwnerEmailResponse, AppError> {
+        let email = normalize_email(&input.email)?;
+        let now = Utc::now();
+        let payload = BindOwnerEmailSignaturePayload {
+            email: &email,
+            verification_token: input
+                .verification_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+        };
+
+        let conn = self.conn.lock().await;
+        let installation = get_installation(&conn, &input.installation_id)?
+            .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
+        verify_signed_share_request(
+            &conn,
+            &installation.public_key,
+            &input.installation_id,
+            "bind_installation_owner_email",
+            &payload,
+            input.timestamp_ms,
+            &input.nonce,
+            &input.signature,
+        )?;
+
+        if let Some(existing_owner_email) = installation.owner_email.as_deref() {
+            if existing_owner_email != email {
+                return Err(AppError::Conflict(
+                    "this installation is locked to a different owner email".into(),
+                ));
+            }
+            return Ok(BindInstallationOwnerEmailResponse {
+                ok: true,
+                owner_email: email,
+                already_bound: true,
+            });
+        }
+        drop(conn);
+
+        let verification_token = payload.verification_token.ok_or_else(|| {
+            AppError::Unauthorized(
+                "verification token is required to bind installation owner".into(),
+            )
+        })?;
+        let redeemed = redeem_verification_token(config, verification_token).await?;
+        if !redeemed.ok || redeemed.purpose != AUTH_PURPOSE_LOGIN || redeemed.email != email {
+            return Err(AppError::Unauthorized(
+                "verification token does not match requested owner email".into(),
+            ));
+        }
+        let verified_at = DateTime::<Utc>::from_timestamp(redeemed.verified_at, 0).unwrap_or(now);
+
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE installations
+             SET owner_email = ?2, owner_verified_at = ?3
+             WHERE id = ?1
+               AND (owner_email IS NULL OR owner_email = '' OR owner_email = ?2)",
+            params![input.installation_id, email, verified_at.to_rfc3339()],
+        )
+        .map_err(|e| AppError::Internal(format!("bind installation owner email failed: {e}")))?;
+
+        Ok(BindInstallationOwnerEmailResponse {
+            ok: true,
+            owner_email: email,
+            already_bound: false,
         })
     }
 
@@ -361,19 +460,20 @@ impl AppStore {
                 &input.nonce,
                 now,
             )?;
-            enforce_auth_send_limits(&conn, config, &email, &input.installation_id, &metadata, now)?;
+            enforce_auth_send_limits(
+                &conn,
+                config,
+                &email,
+                &input.installation_id,
+                &metadata,
+                now,
+            )?;
         }
 
         let code = generate_numeric_code(AUTH_CODE_DIGITS);
         let resend = resend.ok_or_else(|| AppError::Internal("resend is not configured".into()))?;
-        let provider_message_id = send_login_code_email(
-            resend,
-            config,
-            &email,
-            &code,
-            config.auth_code_ttl_secs,
-        )
-        .await?;
+        let provider_message_id =
+            send_login_code_email(resend, config, &email, &code, config.auth_code_ttl_secs).await?;
 
         let expires_at = now + Duration::seconds(config.auth_code_ttl_secs);
         let resend_available_at = now + Duration::seconds(config.auth_code_cooldown_secs);
@@ -527,7 +627,9 @@ impl AppStore {
             return Err(AppError::Unauthorized("refresh session expired".into()));
         }
         if current.installation_id != input.installation_id {
-            return Err(AppError::Unauthorized("refresh session installation mismatch".into()));
+            return Err(AppError::Unauthorized(
+                "refresh session installation mismatch".into(),
+            ));
         }
 
         let user = get_user_by_id(&conn, &current.user_id)?
@@ -601,6 +703,29 @@ impl AppStore {
         })
     }
 
+    pub async fn get_installation_owner_email_status(
+        &self,
+        query: GetInstallationOwnerEmailQuery,
+    ) -> Result<GetInstallationOwnerEmailResponse, AppError> {
+        let conn = self.conn.lock().await;
+        let installation = get_installation(&conn, &query.installation_id)?
+            .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
+        verify_signed_share_request(
+            &conn,
+            &installation.public_key,
+            &query.installation_id,
+            "get_installation_owner_email",
+            &serde_json::json!({}),
+            query.timestamp_ms,
+            &query.nonce,
+            &query.signature,
+        )?;
+        Ok(GetInstallationOwnerEmailResponse {
+            ok: true,
+            owner_email: installation.owner_email,
+        })
+    }
+
     pub async fn resolve_session_by_access_token(
         &self,
         access_token: &str,
@@ -627,7 +752,7 @@ impl AppStore {
         proxy: &ProxyRegistry,
         input: IssueLeaseRequest,
         metadata: ClientMetadata,
-        current_user_email: Option<&str>,
+        _current_user_email: Option<&str>,
     ) -> Result<IssueLeaseResponse, AppError> {
         let now = Utc::now();
         let skew = (now.timestamp_millis() - input.timestamp_ms).abs();
@@ -706,10 +831,15 @@ impl AppStore {
                 let conn = self.conn.lock().await;
                 get_share_owner_email(&conn, &share.share_id)?
             };
-            let current_user_email = current_user_email.ok_or_else(|| {
-                AppError::Unauthorized("share lease requires authenticated owner session".into())
-            })?;
-            enforce_share_owner(&mut share, existing_owner_email.as_deref(), current_user_email)?;
+            let bound_owner_email = {
+                let conn = self.conn.lock().await;
+                require_installation_owner_email(&conn, &input.installation_id)?
+            };
+            enforce_share_owner(
+                &mut share,
+                existing_owner_email.as_deref(),
+                &bound_owner_email,
+            )?;
             Some(share)
         } else {
             None
@@ -808,7 +938,7 @@ impl AppStore {
         &self,
         input: ShareSyncRequest,
         metadata: ClientMetadata,
-        current_user_email: &str,
+        _current_user_email: &str,
     ) -> Result<(), AppError> {
         {
             let conn = self.conn.lock().await;
@@ -839,8 +969,16 @@ impl AppStore {
             let conn = self.conn.lock().await;
             get_share_owner_email(&conn, &input.share.share_id)?
         };
+        let bound_owner_email = {
+            let conn = self.conn.lock().await;
+            require_installation_owner_email(&conn, &input.installation_id)?
+        };
         let mut share = input.share;
-        enforce_share_owner(&mut share, existing_owner_email.as_deref(), current_user_email)?;
+        enforce_share_owner(
+            &mut share,
+            existing_owner_email.as_deref(),
+            &bound_owner_email,
+        )?;
         self.upsert_share(&input.installation_id, share).await
     }
 
@@ -848,7 +986,7 @@ impl AppStore {
         &self,
         input: ShareClaimSubdomainRequest,
         metadata: ClientMetadata,
-        current_user_email: &str,
+        _current_user_email: &str,
     ) -> Result<(), AppError> {
         let subdomain = normalize_subdomain(&input.share.subdomain)?;
         ensure_subdomain_allowed(&subdomain)?;
@@ -882,7 +1020,12 @@ impl AppStore {
             .map_err(|e| AppError::Internal(format!("begin share claim tx failed: {e}")))?;
         let mut share = input.share;
         let existing_owner_email = get_share_owner_email(&tx, &share.share_id)?;
-        enforce_share_owner(&mut share, existing_owner_email.as_deref(), current_user_email)?;
+        let bound_owner_email = require_installation_owner_email(&tx, &input.installation_id)?;
+        enforce_share_owner(
+            &mut share,
+            existing_owner_email.as_deref(),
+            &bound_owner_email,
+        )?;
         share.subdomain = subdomain;
         release_reclaimable_subdomain_claim(
             &tx,
@@ -899,7 +1042,7 @@ impl AppStore {
     pub async fn delete_share(
         &self,
         input: ShareDeleteRequest,
-        current_user_email: &str,
+        _current_user_email: &str,
     ) -> Result<(), AppError> {
         let conn = self.conn.lock().await;
         let installation = get_installation(&conn, &input.installation_id)?;
@@ -918,8 +1061,11 @@ impl AppStore {
             &input.signature,
         )?;
         let owner_email = get_share_owner_email(&conn, &input.share_id)?;
-        if owner_email.as_deref() != Some(current_user_email) {
-            return Err(AppError::Unauthorized("only share owner can delete share".into()));
+        let bound_owner_email = require_installation_owner_email(&conn, &input.installation_id)?;
+        if owner_email.as_deref() != Some(bound_owner_email.as_str()) {
+            return Err(AppError::Unauthorized(
+                "only share owner can delete share".into(),
+            ));
         }
         conn.execute(
             "DELETE FROM shares WHERE share_id = ?1 AND installation_id = ?2",
@@ -933,7 +1079,7 @@ impl AppStore {
         &self,
         input: ShareBatchSyncRequest,
         metadata: ClientMetadata,
-        current_user_email: &str,
+        _current_user_email: &str,
     ) -> Result<(), AppError> {
         let conn = self.conn.lock().await;
         let installation = get_installation(&conn, &input.installation_id)?;
@@ -963,6 +1109,7 @@ impl AppStore {
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| AppError::Internal(format!("begin batch sync tx failed: {e}")))?;
+        let bound_owner_email = require_installation_owner_email(&tx, &input.installation_id)?;
         for op in input.ops {
             match op.kind.as_str() {
                 "upsert" => {
@@ -973,7 +1120,7 @@ impl AppStore {
                     enforce_share_owner(
                         &mut share,
                         existing_owner_email.as_deref(),
-                        current_user_email,
+                        &bound_owner_email,
                     )?;
                     upsert_share_tx(&tx, &input.installation_id, share)?;
                 }
@@ -982,7 +1129,7 @@ impl AppStore {
                         AppError::BadRequest("shareId is required for delete".into())
                     })?;
                     let owner_email = get_share_owner_email(&tx, &share_id)?;
-                    if owner_email.as_deref() != Some(current_user_email) {
+                    if owner_email.as_deref() != Some(bound_owner_email.as_str()) {
                         return Err(AppError::Unauthorized(
                             "only share owner can delete share".into(),
                         ));
@@ -1011,7 +1158,7 @@ impl AppStore {
         &self,
         input: ShareRequestLogBatchSyncRequest,
         metadata: ClientMetadata,
-        current_user_email: &str,
+        _current_user_email: &str,
     ) -> Result<(), AppError> {
         let conn = self.conn.lock().await;
         let installation = get_installation(&conn, &input.installation_id)?;
@@ -1041,9 +1188,10 @@ impl AppStore {
         let tx = conn.unchecked_transaction().map_err(|e| {
             AppError::Internal(format!("begin request log batch sync tx failed: {e}"))
         })?;
+        let bound_owner_email = require_installation_owner_email(&tx, &input.installation_id)?;
         for log in input.logs {
             let owner_email = get_share_owner_email(&tx, &log.share_id)?;
-            if owner_email.as_deref() != Some(current_user_email) {
+            if owner_email.as_deref() != Some(bound_owner_email.as_str()) {
                 return Err(AppError::Unauthorized(
                     "only share owner can sync request logs".into(),
                 ));
@@ -2024,6 +2172,8 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             public_key TEXT NOT NULL,
             platform TEXT NOT NULL,
             app_version TEXT NOT NULL,
+            owner_email TEXT,
+            owner_verified_at TEXT,
             last_seen_ip TEXT,
             country_code TEXT,
             country TEXT,
@@ -2202,6 +2352,21 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             .map_err(|e| {
                 AppError::Internal(format!("add installations last_seen_ip failed: {e}"))
             })?;
+    }
+    if !columns.iter().any(|name| name == "owner_email") {
+        conn.execute("ALTER TABLE installations ADD COLUMN owner_email TEXT", [])
+            .map_err(|e| {
+                AppError::Internal(format!("add installations owner_email failed: {e}"))
+            })?;
+    }
+    if !columns.iter().any(|name| name == "owner_verified_at") {
+        conn.execute(
+            "ALTER TABLE installations ADD COLUMN owner_verified_at TEXT",
+            [],
+        )
+        .map_err(|e| {
+            AppError::Internal(format!("add installations owner_verified_at failed: {e}"))
+        })?;
     }
     if !columns.iter().any(|name| name == "country_code") {
         conn.execute("ALTER TABLE installations ADD COLUMN country_code TEXT", [])
@@ -2434,6 +2599,29 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         [],
     )
     .map_err(|e| AppError::Internal(format!("create subdomain unique index failed: {e}")))?;
+    conn.execute(
+        "UPDATE installations
+         SET owner_email = (
+                 SELECT s.owner_email
+                 FROM shares s
+                 WHERE s.installation_id = installations.id
+                   AND s.owner_email IS NOT NULL
+                   AND s.owner_email != ''
+                 ORDER BY s.created_at DESC
+                 LIMIT 1
+             ),
+             owner_verified_at = COALESCE(owner_verified_at, last_seen_at)
+         WHERE (owner_email IS NULL OR owner_email = '')
+           AND EXISTS (
+                 SELECT 1
+                 FROM shares s
+                 WHERE s.installation_id = installations.id
+                   AND s.owner_email IS NOT NULL
+                   AND s.owner_email != ''
+             )",
+        [],
+    )
+    .map_err(|e| AppError::Internal(format!("backfill installation owner email failed: {e}")))?;
     Ok(())
 }
 
@@ -2442,7 +2630,7 @@ fn get_installation(
     installation_id: &str,
 ) -> Result<Option<Installation>, AppError> {
     conn.query_row(
-        "SELECT id, public_key, platform, app_version, last_seen_ip, country_code, country, region, city, latitude, longitude,
+        "SELECT id, public_key, platform, app_version, owner_email, owner_verified_at, last_seen_ip, country_code, country, region, city, latitude, longitude,
                 geo_candidate_country_code, geo_candidate_country, geo_candidate_region, geo_candidate_city,
                 geo_candidate_latitude, geo_candidate_longitude, geo_candidate_hits, geo_candidate_first_seen_at,
                 geo_last_changed_at, created_at, last_seen_at
@@ -2454,30 +2642,35 @@ fn get_installation(
                 public_key: row.get(1)?,
                 platform: row.get(2)?,
                 app_version: row.get(3)?,
-                last_seen_ip: row.get(4)?,
-                country_code: row.get(5)?,
-                country: row.get(6)?,
-                region: row.get(7)?,
-                city: row.get(8)?,
-                latitude: row.get(9)?,
-                longitude: row.get(10)?,
-                geo_candidate_country_code: row.get(11)?,
-                geo_candidate_country: row.get(12)?,
-                geo_candidate_region: row.get(13)?,
-                geo_candidate_city: row.get(14)?,
-                geo_candidate_latitude: row.get(15)?,
-                geo_candidate_longitude: row.get(16)?,
-                geo_candidate_hits: row.get(17)?,
+                owner_email: row.get(4)?,
+                owner_verified_at: row
+                    .get::<_, Option<String>>(5)?
+                    .map(|value| parse_dt_sql(&value))
+                    .transpose()?,
+                last_seen_ip: row.get(6)?,
+                country_code: row.get(7)?,
+                country: row.get(8)?,
+                region: row.get(9)?,
+                city: row.get(10)?,
+                latitude: row.get(11)?,
+                longitude: row.get(12)?,
+                geo_candidate_country_code: row.get(13)?,
+                geo_candidate_country: row.get(14)?,
+                geo_candidate_region: row.get(15)?,
+                geo_candidate_city: row.get(16)?,
+                geo_candidate_latitude: row.get(17)?,
+                geo_candidate_longitude: row.get(18)?,
+                geo_candidate_hits: row.get(19)?,
                 geo_candidate_first_seen_at: row
-                    .get::<_, Option<String>>(18)?
+                    .get::<_, Option<String>>(20)?
                     .map(|value| parse_dt_sql(&value))
                     .transpose()?,
                 geo_last_changed_at: row
-                    .get::<_, Option<String>>(19)?
+                    .get::<_, Option<String>>(21)?
                     .map(|value| parse_dt_sql(&value))
                     .transpose()?,
-                created_at: parse_dt_sql(&row.get::<_, String>(20)?)?,
-                last_seen_at: parse_dt_sql(&row.get::<_, String>(21)?)?,
+                created_at: parse_dt_sql(&row.get::<_, String>(22)?)?,
+                last_seen_at: parse_dt_sql(&row.get::<_, String>(23)?)?,
             })
         },
     )
@@ -2520,7 +2713,7 @@ fn get_lease_by_connection_id(
 fn list_installations(conn: &Connection) -> Result<Vec<Installation>, AppError> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, public_key, platform, app_version, last_seen_ip, country_code, country, region, city, latitude, longitude,
+            "SELECT id, public_key, platform, app_version, owner_email, owner_verified_at, last_seen_ip, country_code, country, region, city, latitude, longitude,
                     geo_candidate_country_code, geo_candidate_country, geo_candidate_region, geo_candidate_city,
                     geo_candidate_latitude, geo_candidate_longitude, geo_candidate_hits, geo_candidate_first_seen_at,
                     geo_last_changed_at, created_at, last_seen_at
@@ -2534,30 +2727,35 @@ fn list_installations(conn: &Connection) -> Result<Vec<Installation>, AppError> 
                 public_key: row.get(1)?,
                 platform: row.get(2)?,
                 app_version: row.get(3)?,
-                last_seen_ip: row.get(4)?,
-                country_code: row.get(5)?,
-                country: row.get(6)?,
-                region: row.get(7)?,
-                city: row.get(8)?,
-                latitude: row.get(9)?,
-                longitude: row.get(10)?,
-                geo_candidate_country_code: row.get(11)?,
-                geo_candidate_country: row.get(12)?,
-                geo_candidate_region: row.get(13)?,
-                geo_candidate_city: row.get(14)?,
-                geo_candidate_latitude: row.get(15)?,
-                geo_candidate_longitude: row.get(16)?,
-                geo_candidate_hits: row.get(17)?,
+                owner_email: row.get(4)?,
+                owner_verified_at: row
+                    .get::<_, Option<String>>(5)?
+                    .map(|value| parse_dt_sql(&value))
+                    .transpose()?,
+                last_seen_ip: row.get(6)?,
+                country_code: row.get(7)?,
+                country: row.get(8)?,
+                region: row.get(9)?,
+                city: row.get(10)?,
+                latitude: row.get(11)?,
+                longitude: row.get(12)?,
+                geo_candidate_country_code: row.get(13)?,
+                geo_candidate_country: row.get(14)?,
+                geo_candidate_region: row.get(15)?,
+                geo_candidate_city: row.get(16)?,
+                geo_candidate_latitude: row.get(17)?,
+                geo_candidate_longitude: row.get(18)?,
+                geo_candidate_hits: row.get(19)?,
                 geo_candidate_first_seen_at: row
-                    .get::<_, Option<String>>(18)?
+                    .get::<_, Option<String>>(20)?
                     .map(|value| parse_dt_sql(&value))
                     .transpose()?,
                 geo_last_changed_at: row
-                    .get::<_, Option<String>>(19)?
+                    .get::<_, Option<String>>(21)?
                     .map(|value| parse_dt_sql(&value))
                     .transpose()?,
-                created_at: parse_dt_sql(&row.get::<_, String>(20)?)?,
-                last_seen_at: parse_dt_sql(&row.get::<_, String>(21)?)?,
+                created_at: parse_dt_sql(&row.get::<_, String>(22)?)?,
+                last_seen_at: parse_dt_sql(&row.get::<_, String>(23)?)?,
             })
         })
         .map_err(|e| AppError::Internal(format!("query installations failed: {e}")))?;
@@ -3467,6 +3665,44 @@ fn verify_signed_payload<T: Serialize>(
         .map_err(|_| AppError::Unauthorized("signature verification failed".into()))
 }
 
+async fn redeem_verification_token(
+    config: &Config,
+    verification_token: &str,
+) -> Result<VerificationRedeemResponse, AppError> {
+    let url = format!(
+        "{}/v1/verification/email/redeem",
+        config.verification_service_base_url.trim_end_matches('/')
+    );
+    let client = reqwest::Client::builder()
+        .timeout(StdDuration::from_secs(20))
+        .build()
+        .map_err(|e| AppError::Internal(format!("create verification client failed: {e}")))?;
+    let mut request = client.post(&url).json(&serde_json::json!({
+        "verificationToken": verification_token,
+        "purpose": AUTH_PURPOSE_LOGIN,
+    }));
+    if let Some(api_key) = config.verification_service_api_key.as_deref() {
+        request = request.bearer_auth(api_key);
+    }
+    let response = request.send().await.map_err(|e| {
+        AppError::Internal(format!("redeem verification token request failed: {e}"))
+    })?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| format!("HTTP {status}"));
+        return Err(AppError::Unauthorized(format!(
+            "redeem verification token failed: {body}"
+        )));
+    }
+    response
+        .json::<VerificationRedeemResponse>()
+        .await
+        .map_err(|e| AppError::Internal(format!("parse verification redeem response failed: {e}")))
+}
+
 #[derive(Debug, Clone)]
 struct EmailLoginChallenge {
     id: String,
@@ -3609,9 +3845,7 @@ fn enforce_auth_send_limits(
             params![installation_id, hour_cutoff],
             |row| row.get(0),
         )
-        .map_err(|e| {
-            AppError::Internal(format!("count installation auth requests failed: {e}"))
-        })?;
+        .map_err(|e| AppError::Internal(format!("count installation auth requests failed: {e}")))?;
     if installation_count >= config.auth_installation_hourly_limit {
         return Err(AppError::TooManyRequests(
             "installation verification rate limit exceeded".into(),
@@ -3654,7 +3888,9 @@ fn latest_challenge_cooldown(
     )
     .optional()
     .map_err(|e| AppError::Internal(format!("query latest challenge cooldown failed: {e}")))?
-    .map(|value| parse_dt_sql(&value).map_err(|e| AppError::Internal(format!("parse cooldown failed: {e}"))))
+    .map(|value| {
+        parse_dt_sql(&value).map_err(|e| AppError::Internal(format!("parse cooldown failed: {e}")))
+    })
     .transpose()
 }
 
@@ -3821,11 +4057,10 @@ fn get_installation_owner_email(
 ) -> Result<Option<String>, AppError> {
     conn.query_row(
         "SELECT owner_email
-         FROM shares
-         WHERE installation_id = ?1
+         FROM installations
+         WHERE id = ?1
            AND owner_email IS NOT NULL
            AND owner_email != ''
-         ORDER BY created_at DESC
          LIMIT 1",
         params![installation_id],
         |row| row.get(0),
@@ -3834,12 +4069,24 @@ fn get_installation_owner_email(
     .map_err(|e| AppError::Internal(format!("query installation owner email failed: {e}")))
 }
 
+fn require_installation_owner_email(
+    conn: &Connection,
+    installation_id: &str,
+) -> Result<String, AppError> {
+    get_installation_owner_email(conn, installation_id)?.ok_or_else(|| {
+        AppError::Unauthorized("installation owner email binding is required".into())
+    })
+}
+
 fn share_visible_to_email(share: &ShareDescriptor, viewer_email: Option<&str>) -> bool {
     let Some(viewer_email) = viewer_email else {
         return false;
     };
     share.owner_email.as_deref() == Some(viewer_email)
-        || share.shared_with_emails.iter().any(|email| email == viewer_email)
+        || share
+            .shared_with_emails
+            .iter()
+            .any(|email| email == viewer_email)
 }
 
 fn can_manage_share(share: &ShareDescriptor, viewer_email: Option<&str>) -> bool {
@@ -3900,6 +4147,8 @@ mod tests {
             auth_email_hourly_limit: 10,
             auth_ip_hourly_limit: 30,
             auth_installation_hourly_limit: 15,
+            verification_service_base_url: "https://tokenswitch.org".into(),
+            verification_service_api_key: None,
         }
     }
 
@@ -3914,13 +4163,15 @@ mod tests {
         let conn = store.conn.lock().await;
         conn.execute(
             "INSERT INTO installations (
-                id, public_key, platform, app_version, created_at, last_seen_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                id, public_key, platform, app_version, owner_email, owner_verified_at, created_at, last_seen_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 installation_id,
                 format!("pk-{installation_id}"),
                 "macOS",
                 "1.0.0",
+                "owner@example.com",
+                now,
                 now,
                 now,
             ],
@@ -4002,9 +4253,18 @@ mod tests {
         let conn = store.conn.lock().await;
         conn.execute(
             "INSERT INTO installations (
-                id, public_key, platform, app_version, created_at, last_seen_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![installation_id, public_key, "macOS", "1.0.0", now, now],
+                id, public_key, platform, app_version, owner_email, owner_verified_at, created_at, last_seen_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                installation_id,
+                public_key,
+                "macOS",
+                "1.0.0",
+                "owner@example.com",
+                now,
+                now,
+                now
+            ],
         )
         .expect("insert signed installation");
         signing_key
@@ -4225,7 +4485,10 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()
                 .expect("collect reclaimed subdomain rows")
         };
-        assert_eq!(rows, vec![("share-new".into(), "inst-new".into(), "owner-sub".into())]);
+        assert_eq!(
+            rows,
+            vec![("share-new".into(), "inst-new".into(), "owner-sub".into())]
+        );
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
@@ -4302,7 +4565,10 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()
                 .expect("collect reclaimed installation subdomain rows")
         };
-        assert_eq!(rows, vec![("share-new".into(), "inst-same".into(), "reused-sub".into())]);
+        assert_eq!(
+            rows,
+            vec![("share-new".into(), "inst-same".into(), "reused-sub".into())]
+        );
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
