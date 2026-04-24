@@ -6,6 +6,7 @@ mod proxy;
 mod ssh;
 mod store;
 
+use std::collections::HashSet;
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
@@ -112,8 +113,10 @@ async fn main() -> Result<()> {
     let cleanup_config = config.clone();
     let cleanup_proxy = state.proxy.clone();
     let probe_store = state.store.clone();
+    let probe_proxy = state.proxy.clone();
     let probe_config = config.clone();
     let runtime_store = state.store.clone();
+    let runtime_proxy = state.proxy.clone();
     let runtime_config = config.clone();
     let resend_usage_cache = state.resend_usage_cache.clone();
     let resend_usage_api_key = config.resend_api_key.clone();
@@ -155,10 +158,12 @@ async fn main() -> Result<()> {
             .build()?;
 
         let mut interval = tokio::time::interval(Duration::from_secs(30));
+        interval.tick().await;
         loop {
             interval.tick().await;
             if let Err(err) =
-                run_route_health_probe_cycle(&probe_store, &probe_config, &client).await
+                run_route_health_probe_cycle(&probe_store, &probe_proxy, &probe_config, &client)
+                    .await
             {
                 tracing::warn!("route health probe failed: {err}");
             }
@@ -173,10 +178,17 @@ async fn main() -> Result<()> {
             .build()?;
 
         let mut interval = tokio::time::interval(Duration::from_secs(10 * 60));
+        interval.tick().await;
         loop {
             interval.tick().await;
             if let Err(err) =
-                run_share_runtime_refresh_cycle(&runtime_store, &runtime_config, &client).await
+                run_share_runtime_refresh_cycle(
+                    &runtime_store,
+                    &runtime_proxy,
+                    &runtime_config,
+                    &client,
+                )
+                .await
             {
                 tracing::warn!("share runtime refresh failed: {err}");
             }
@@ -316,12 +328,22 @@ async fn fetch_resend_usage(
 
 async fn run_route_health_probe_cycle(
     store: &AppStore,
+    proxy: &ProxyRegistry,
     config: &Config,
     client: &reqwest::Client,
 ) -> Result<()> {
+    let active = proxy
+        .active_subdomains()
+        .await
+        .into_iter()
+        .collect::<HashSet<_>>();
     let targets = store.list_share_route_targets().await?;
     for target in targets {
-        let is_healthy = probe_share_route(config, client, &target).await;
+        let is_healthy = if active.contains(&target.subdomain) {
+            probe_share_route(config, client, &target).await
+        } else {
+            false
+        };
         if let Err(err) = store
             .record_share_route_health(&target.share_id, is_healthy)
             .await
@@ -334,10 +356,14 @@ async fn run_route_health_probe_cycle(
 
 async fn run_share_runtime_refresh_cycle(
     store: &AppStore,
+    proxy: &ProxyRegistry,
     config: &Config,
     client: &reqwest::Client,
 ) -> Result<()> {
-    let targets = store.list_share_route_targets().await?;
+    let targets = filter_registered_route_targets(
+        store.list_share_route_targets().await?,
+        proxy.active_subdomains().await,
+    );
     for target in targets {
         match fetch_share_runtime_snapshot_from_route(config, client, &target.subdomain).await {
             Ok(snapshot) => {
@@ -351,6 +377,17 @@ async fn run_share_runtime_refresh_cycle(
         }
     }
     Ok(())
+}
+
+fn filter_registered_route_targets(
+    targets: Vec<ShareRouteTarget>,
+    active_subdomains: Vec<String>,
+) -> Vec<ShareRouteTarget> {
+    let active = active_subdomains.into_iter().collect::<HashSet<_>>();
+    targets
+        .into_iter()
+        .filter(|target| active.contains(&target.subdomain))
+        .collect()
 }
 
 async fn probe_share_route(
@@ -483,4 +520,31 @@ Default env file:
   The file is auto-created on first start when missing.
 "
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::filter_registered_route_targets;
+    use crate::store::ShareRouteTarget;
+
+    #[test]
+    fn filter_registered_route_targets_only_keeps_active_subdomains() {
+        let filtered = filter_registered_route_targets(
+            vec![
+                ShareRouteTarget {
+                    share_id: "share-1".into(),
+                    subdomain: "aaa".into(),
+                },
+                ShareRouteTarget {
+                    share_id: "share-2".into(),
+                    subdomain: "bbb".into(),
+                },
+            ],
+            vec!["bbb".into()],
+        );
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].share_id, "share-2");
+        assert_eq!(filtered[0].subdomain, "bbb");
+    }
 }

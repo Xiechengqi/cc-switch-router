@@ -718,7 +718,6 @@
       .parallel-shared {
         color: var(--muted-foreground);
         font-weight: 500;
-        margin-left: 4px;
       }
 
       /* ── Token value ── */
@@ -1038,8 +1037,8 @@
             <strong id="stat-active-shares">0</strong> active shares
           </span>
           <span class="topbar-sep">&middot;</span>
-          <span class="topbar-stat" title="Live tunnel leases currently active on this router.">
-            <strong id="stat-leases">0</strong> active leases
+          <span class="topbar-stat" title="Total HTTP requests currently in-flight across every share.">
+            <strong id="stat-inflight">0</strong> in-flight requests
           </span>
           <span class="topbar-sync">synced <span id="last-sync">--</span></span>
         </div>
@@ -1896,18 +1895,6 @@
         return `<span class="health-dots">${dots.join("")}</span>`;
       }
 
-      function shareStatusBadge(share) {
-        if (!share) return '<span class="badge">No share</span>';
-        const healthy = (share.healthChecks || []).some((item) => item.isHealthy);
-        if (share.shareStatus === "active") {
-          return `<span class="badge badge--active">${escapeHtml(formatShareStatus(share.shareStatus))}</span>`;
-        }
-        if (healthy) {
-          return `<span class="badge">${escapeHtml(formatShareStatus(share.shareStatus))}</span>`;
-        }
-        return `<span class="badge">${escapeHtml(formatShareStatus(share.shareStatus))}</span>`;
-      }
-
       function shareApiUrlKey(share) {
         if (!share) return "—";
         const baseHost = window.location.host || "";
@@ -2001,11 +1988,22 @@
           ${isUnlimitedTokenLimit(share.tokenLimit) ? "" : `<div class="usage-bar"><div class="${usageBarClass(pct)}" style="width:${pct}%"></div></div>`}
         `;
         const expires = `<strong title="${escapeHtml(expiryTitle(share.expiresAt))}">${escapeHtml(expiryLabel(share.expiresAt))}</strong>`;
-        const parallel = share.parallelLimit === -1
-          ? `<strong>Unlimited</strong>`
-          : `<strong>${escapeHtml(String(share.parallelLimit || 3))}<span class="parallel-shared">shared</span></strong>`;
-        const online = `<strong title="${share.onlineMinutes24h || 0} / 1440 min with successful route probes in last 24h">${formatPct(share.onlineRate24h || 0)}</strong>`;
-        const health = healthDots(share.healthChecks || []);
+        const inflight = Math.max(0, Number(share.activeRequests || 0));
+        const limitLabel = share.parallelLimit === -1
+          ? "∞"
+          : escapeHtml(String(share.parallelLimit || 3));
+        const parallelTitle = share.parallelLimit === -1
+          ? `${inflight} in-flight request${inflight === 1 ? "" : "s"} (unlimited parallel)`
+          : `${inflight} in-flight / ${limitLabel} parallel limit`;
+        const parallel = `<strong title="${escapeHtml(parallelTitle)}">${inflight}<span class="parallel-shared">/${limitLabel}</span></strong>`;
+        const isActiveShare = share.shareStatus === "active";
+        const reasonLabel = escapeHtml(formatShareStatus(share.shareStatus));
+        const online = isActiveShare
+          ? `<strong title="${share.onlineMinutes24h || 0} / 1440 min with successful route probes in last 24h">${formatPct(share.onlineRate24h || 0)}</strong>`
+          : `<span class="meta" title="Route probes only run while the share is active">—</span>`;
+        const health = isActiveShare
+          ? healthDots(share.healthChecks || [])
+          : `<span class="meta" title="Not probed — share is ${reasonLabel}">${reasonLabel}</span>`;
         return `
           <div class="status-stack">
             <div class="status-line">
@@ -2091,13 +2089,8 @@
           <div class="drawer-summary-item">
             <small>Status</small>
             <strong>${escapeHtml(formatShareStatus(share?.shareStatus || ""))}</strong>
-          </div>
-          <div class="drawer-summary-item">
-            <small>Active Leases</small>
-            <strong>${item.activeLeaseCount}</strong>
           </div>`;
 
-        const leases = (item.leases || []).slice(0, 3);
         const logs = share?.recentRequests || [];
         document.getElementById("drawer-body").innerHTML = `
           <div class="drawer-section-label">Request logs</div>
@@ -2125,22 +2118,7 @@
                 <div class="item-card-grid-cell">Total<span>${totalTokens(log)}</span></div>
               </div>
             </div>
-          `).join("") : '<div class="empty"><div class="empty-icon"></div>No request logs yet</div>'}
-          <div class="drawer-section-label">Recent leases</div>
-          ${leases.length ? leases.map(lease => `
-            <div class="item-card">
-              <div class="item-card-top">
-                <strong>${lease.subdomain}</strong>
-                <span class="pill-sm">${lease.isActive ? "active" : "expired"}</span>
-              </div>
-              <div class="item-card-meta">
-                <span>${lease.tunnelType}</span>
-                <span title="${fullTime(lease.issuedAt)}">issued ${relTime(lease.issuedAt)}</span>
-                <span title="${fullTime(lease.expiresAt)}">expires ${relTime(lease.expiresAt)}</span>
-                ${lease.share ? `<span>share: ${lease.share.shareName}</span>` : ""}
-              </div>
-            </div>
-          `).join("") : '<div class="empty"><div class="empty-icon"></div>No leases yet</div>'}`;
+          `).join("") : '<div class="empty"><div class="empty-icon"></div>No request logs yet</div>'}`;
 
         openDrawer();
       }
@@ -2307,7 +2285,7 @@
         /* topbar stats */
         document.getElementById("stat-clients").textContent = data.stats.clients;
         document.getElementById("stat-active-shares").textContent = data.stats.activeShares;
-        document.getElementById("stat-leases").textContent = data.stats.activeLeases;
+        document.getElementById("stat-inflight").textContent = data.stats.totalActiveRequests ?? 0;
         document.getElementById("last-sync").textContent = relTime(data.generatedAt);
         document.getElementById("last-sync").title = fullTime(data.generatedAt);
         renderMap(data.map || null);

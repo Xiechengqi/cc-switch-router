@@ -53,22 +53,32 @@ impl Drop for ShareConcurrencyPermit {
 }
 
 impl ShareConcurrencyLimiter {
+    /// Increment the in-flight counter for this share. Returns `None` when a
+    /// non-negative `parallel_limit` has been reached (caller should reject the
+    /// request). A negative `parallel_limit` means unlimited — we still track
+    /// the in-flight count so it can be surfaced in the dashboard.
     async fn try_acquire(
         self: &Arc<Self>,
         share_id: &str,
         parallel_limit: i64,
     ) -> Option<ShareConcurrencyPermit> {
-        let limit = usize::try_from(parallel_limit).ok()?;
         let mut shares = self.shares.lock().await;
         let inflight = shares.entry(share_id.to_string()).or_insert(0);
-        if *inflight >= limit {
-            return None;
+        if parallel_limit >= 0 {
+            let limit = parallel_limit as usize;
+            if *inflight >= limit {
+                return None;
+            }
         }
         *inflight += 1;
         Some(ShareConcurrencyPermit {
             limiter: self.clone(),
             share_id: share_id.to_string(),
         })
+    }
+
+    async fn snapshot(&self) -> HashMap<String, usize> {
+        self.shares.lock().await.clone()
     }
 }
 
@@ -118,6 +128,12 @@ impl ProxyRegistry {
 
     pub async fn active_subdomains(&self) -> Vec<String> {
         self.routes.read().await.keys().cloned().collect()
+    }
+
+    /// Snapshot of in-flight request counts per share_id. Share IDs absent from
+    /// the map have zero in-flight requests.
+    pub async fn inflight_by_share(&self) -> HashMap<String, usize> {
+        self.limiter.snapshot().await
     }
 
     async fn try_acquire_share_permit(
@@ -221,8 +237,6 @@ pub async fn proxy_handler(State(state): State<ServerState>, req: Request) -> Re
         .unwrap_or_else(|| "-".to_string());
 
     let share_permit = if is_internal_share_router_path {
-        None
-    } else if route.parallel_limit < 0 {
         None
     } else if let Some(share_id) = route.share_id.as_deref() {
         match state
@@ -421,6 +435,36 @@ mod tests {
         drop(permit_2);
         drop(permit_3);
         drop(permit_4);
+    }
+
+    #[tokio::test]
+    async fn share_concurrency_limiter_tracks_unlimited_shares_in_snapshot() {
+        let limiter = Arc::new(ShareConcurrencyLimiter::default());
+
+        let permit_a = limiter
+            .try_acquire("unlimited-share", -1)
+            .await
+            .expect("unlimited grants permit");
+        let permit_b = limiter
+            .try_acquire("unlimited-share", -1)
+            .await
+            .expect("unlimited grants second permit");
+        let _permit_c = limiter
+            .try_acquire("limited-share", 5)
+            .await
+            .expect("limited grants permit");
+
+        let snapshot = limiter.snapshot().await;
+        assert_eq!(snapshot.get("unlimited-share").copied(), Some(2));
+        assert_eq!(snapshot.get("limited-share").copied(), Some(1));
+
+        drop(permit_a);
+        drop(permit_b);
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        let snapshot = limiter.snapshot().await;
+        assert!(snapshot.get("unlimited-share").is_none());
     }
 
     #[tokio::test]

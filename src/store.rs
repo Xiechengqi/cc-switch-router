@@ -23,7 +23,7 @@ use crate::models::{
     ClientMetadata, DashboardClientView, DashboardMap, DashboardMapPoint, DashboardPresenceRequest,
     DashboardResponse, DashboardStats, GetInstallationOwnerEmailQuery,
     GetInstallationOwnerEmailResponse, HealthCheckEntry, Installation, InstallationView,
-    IssueLeaseRequest, IssueLeaseResponse, LatLonPoint, LeaseView, PublicMapClientPoint,
+    IssueLeaseRequest, IssueLeaseResponse, LatLonPoint, PublicMapClientPoint,
     PublicMapPointsResponse, RefreshSessionRequest, RegisterInstallationRequest,
     RegisterInstallationResponse, RequestEmailCodeRequest, RequestEmailCodeResponse,
     SessionStatusResponse, ShareAppRuntimes, ShareBatchSyncRequest, ShareClaimSubdomainRequest,
@@ -1216,12 +1216,12 @@ impl AppStore {
             .await
             .into_iter()
             .collect::<HashSet<_>>();
+        let inflight_by_share = proxy.inflight_by_share().await;
         let now = Utc::now();
-        let (installations, leases, shares, health_by_share, online_by_share, recent_logs) = {
+        let (installations, shares, health_by_share, online_by_share, recent_logs) = {
             let conn = self.conn.lock().await;
             (
                 list_installations(&conn)?,
-                list_leases(&conn)?,
                 list_shares(&conn)?,
                 list_health_checks(&conn, 10)?,
                 list_online_minutes_24h(&conn)?,
@@ -1239,16 +1239,9 @@ impl AppStore {
             .recover_missing_share_request_logs(config, &active_subdomains, &shares, logs_by_share)
             .await?;
 
-        let mut leases_by_installation: HashMap<String, Vec<TunnelLease>> = HashMap::new();
-        for lease in leases {
-            leases_by_installation
-                .entry(lease.installation_id.clone())
-                .or_default()
-                .push(lease);
-        }
         let mut active_share_subdomains_by_installation: HashMap<String, HashSet<String>> =
             HashMap::new();
-        for (installation_id, share, _) in &shares {
+        for (installation_id, share) in &shares {
             if share.share_status == "active" && active_subdomains.contains(&share.subdomain) {
                 active_share_subdomains_by_installation
                     .entry(installation_id.clone())
@@ -1258,36 +1251,12 @@ impl AppStore {
         }
         let installations = deduplicate_dashboard_installations(
             installations,
-            &leases_by_installation,
             &active_share_subdomains_by_installation,
         );
 
         let mut installation_views = Vec::new();
         let mut client_map_points = Vec::new();
         for installation in installations {
-            let mut lease_views = Vec::new();
-            let mut active_subdomains_for_installation = HashSet::new();
-            if let Some(items) = leases_by_installation.get(&installation.id) {
-                for lease in items {
-                    let is_active =
-                        lease.expires_at > now && active_subdomains.contains(&lease.subdomain);
-                    if is_active {
-                        active_subdomains_for_installation.insert(lease.subdomain.clone());
-                    }
-                    lease_views.push(LeaseView {
-                        connection_id: lease.connection_id.clone(),
-                        subdomain: lease.subdomain.clone(),
-                        tunnel_type: lease.tunnel_type.clone(),
-                        issued_at: lease.issued_at,
-                        expires_at: lease.expires_at,
-                        used_at: lease.used_at,
-                        is_active,
-                        share: lease.share.clone(),
-                    });
-                }
-                lease_views.sort_by(|a, b| b.issued_at.cmp(&a.issued_at));
-            }
-            let active_lease_count = active_subdomains_for_installation.len();
             let is_active = active_share_subdomains_by_installation
                 .get(&installation.id)
                 .map(|subdomains| !subdomains.is_empty())
@@ -1316,18 +1285,17 @@ impl AppStore {
                 country_code: installation.country_code,
                 created_at: installation.created_at,
                 last_seen_at: installation.last_seen_at,
-                active_lease_count,
-                leases: lease_views,
             });
         }
         installation_views.sort_by(|a, b| b.last_seen_at.cmp(&a.last_seen_at));
 
         let share_views = shares
             .into_iter()
-            .map(|(installation_id, share, _active_lease_count)| {
-                let active_lease_count = usize::from(
-                    share.share_status == "active" && active_subdomains.contains(&share.subdomain),
-                );
+            .map(|(installation_id, share)| {
+                let active_requests = inflight_by_share
+                    .get(&share.share_id)
+                    .copied()
+                    .unwrap_or(0);
                 let recent_requests = logs_by_share
                     .get(&share.share_id)
                     .cloned()
@@ -1374,7 +1342,7 @@ impl AppStore {
                     upstream_provider: share.upstream_provider,
                     app_runtimes: share.app_runtimes,
                     installation_id,
-                    active_lease_count,
+                    active_requests,
                     online_minutes_24h,
                     online_rate_24h,
                     recent_requests,
@@ -1406,9 +1374,9 @@ impl AppStore {
             .iter()
             .filter(|client| matches!(client.share.as_ref(), Some(share) if share.share_status == "active"))
             .count();
-        let active_leases_count = client_views
+        let total_active_requests = client_views
             .iter()
-            .map(|client| client.installation.active_lease_count)
+            .filter_map(|client| client.share.as_ref().map(|share| share.active_requests))
             .sum();
 
         Ok(DashboardResponse {
@@ -1416,7 +1384,7 @@ impl AppStore {
             stats: DashboardStats {
                 clients: clients_count,
                 active_shares: active_shares_count,
-                active_leases: active_leases_count,
+                total_active_requests,
             },
             map: DashboardMap {
                 server: server_geo
@@ -1446,19 +1414,19 @@ impl AppStore {
         &self,
         config: &Config,
         active_subdomains: &HashSet<String>,
-        shares: &[(String, ShareDescriptor, usize)],
+        shares: &[(String, ShareDescriptor)],
         mut logs_by_share: HashMap<String, Vec<ShareRequestLogEntry>>,
     ) -> Result<HashMap<String, Vec<ShareRequestLogEntry>>, AppError> {
         let missing_shares = shares
             .iter()
-            .filter(|(_, share, _)| {
+            .filter(|(_, share)| {
                 active_subdomains.contains(&share.subdomain)
                     && logs_by_share
                         .get(&share.share_id)
                         .map(|logs| logs.is_empty())
                         .unwrap_or(true)
             })
-            .map(|(installation_id, share, _)| {
+            .map(|(installation_id, share)| {
                 (
                     installation_id.clone(),
                     share.share_id.clone(),
@@ -2846,7 +2814,6 @@ fn prefer_dashboard_share(candidate: &ShareView, existing: &ShareView) -> bool {
 
 fn deduplicate_dashboard_installations(
     installations: Vec<Installation>,
-    leases_by_installation: &HashMap<String, Vec<TunnelLease>>,
     active_share_subdomains_by_installation: &HashMap<String, HashSet<String>>,
 ) -> Vec<Installation> {
     let mut deduped = Vec::with_capacity(installations.len());
@@ -2864,7 +2831,6 @@ fn deduplicate_dashboard_installations(
                 if prefer_dashboard_installation(
                     &installation,
                     existing,
-                    leases_by_installation,
                     active_share_subdomains_by_installation,
                 ) {
                     *existing = installation;
@@ -2880,7 +2846,6 @@ fn deduplicate_dashboard_installations(
 fn prefer_dashboard_installation(
     candidate: &Installation,
     existing: &Installation,
-    leases_by_installation: &HashMap<String, Vec<TunnelLease>>,
     active_share_subdomains_by_installation: &HashMap<String, HashSet<String>>,
 ) -> bool {
     let candidate_has_share = active_share_subdomains_by_installation
@@ -2893,18 +2858,6 @@ fn prefer_dashboard_installation(
         .unwrap_or(false);
     if candidate_has_share != existing_has_share {
         return candidate_has_share;
-    }
-
-    let candidate_active_lease_count = leases_by_installation
-        .get(&candidate.id)
-        .map(|leases| leases.len())
-        .unwrap_or(0);
-    let existing_active_lease_count = leases_by_installation
-        .get(&existing.id)
-        .map(|leases| leases.len())
-        .unwrap_or(0);
-    if candidate_active_lease_count != existing_active_lease_count {
-        return candidate_active_lease_count > existing_active_lease_count;
     }
 
     if candidate.last_seen_at != existing.last_seen_at {
@@ -3066,38 +3019,19 @@ fn parse_ip_im_geo(body: &str) -> Option<GeoLookupResult> {
     Some(result)
 }
 
-fn list_leases(conn: &Connection) -> Result<Vec<TunnelLease>, AppError> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, installation_id, connection_id, subdomain, tunnel_type, ssh_username,
-                    ssh_password, issued_at, expires_at, used_at, share_json
-             FROM leases ORDER BY issued_at DESC",
-        )
-        .map_err(|e| AppError::Internal(format!("prepare leases failed: {e}")))?;
-    let rows = stmt
-        .query_map([], map_lease_row)
-        .map_err(|e| AppError::Internal(format!("query leases failed: {e}")))?;
-    collect_rows(rows)
-}
-
-fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor, usize)>, AppError> {
+fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppError> {
     let mut stmt = conn
         .prepare(
         "SELECT s.installation_id, s.share_id, s.share_name, s.description, s.for_sale, COALESCE(s.subdomain, '-'), s.share_token, s.app_type, s.provider_id,
                     s.owner_email, s.shared_with_emails_json,
                     s.enabled_claude, s.enabled_codex, s.enabled_gemini,
-                    s.token_limit, s.parallel_limit, s.tokens_used, s.requests_count, s.share_status, s.created_at, s.expires_at, s.upstream_provider_json, s.app_runtimes_json,
-                    (
-                        SELECT COUNT(*) FROM leases l
-                        WHERE json_extract(l.share_json, '$.shareId') = s.share_id
-                          AND l.expires_at > ?1
-                    ) AS active_lease_count
+                    s.token_limit, s.parallel_limit, s.tokens_used, s.requests_count, s.share_status, s.created_at, s.expires_at, s.upstream_provider_json, s.app_runtimes_json
              FROM shares s
              ORDER BY s.share_name ASC",
         )
         .map_err(|e| AppError::Internal(format!("prepare shares failed: {e}")))?;
     let rows = stmt
-        .query_map(params![Utc::now().to_rfc3339()], |row| {
+        .query_map([], |row| {
             Ok((
                 row.get(0)?,
                 ShareDescriptor {
@@ -3126,7 +3060,6 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor, usize)
                     upstream_provider: parse_upstream_provider(row.get(21)?)?,
                     app_runtimes: parse_app_runtimes(row.get(22)?)?,
                 },
-                row.get::<_, i64>(23)? as usize,
             ))
         })
         .map_err(|e| AppError::Internal(format!("query shares failed: {e}")))?;
@@ -4852,7 +4785,7 @@ mod tests {
 
         assert_eq!(snapshot.stats.clients, 1);
         assert_eq!(snapshot.stats.active_shares, 0);
-        assert_eq!(snapshot.stats.active_leases, 0);
+        assert_eq!(snapshot.stats.total_active_requests, 0);
         assert_eq!(snapshot.clients.len(), 1);
         assert_eq!(
             snapshot.clients[0]

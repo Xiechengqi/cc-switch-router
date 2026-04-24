@@ -474,7 +474,8 @@ pub struct DashboardResponse {
 pub struct DashboardStats {
     pub clients: usize,
     pub active_shares: usize,
-    pub active_leases: usize,
+    /// Total number of HTTP requests currently in-flight across every share.
+    pub total_active_requests: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -522,8 +523,6 @@ pub struct InstallationView {
     pub country_code: Option<String>,
     pub created_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
-    pub active_lease_count: usize,
-    pub leases: Vec<LeaseView>,
 }
 
 #[derive(Debug, Serialize)]
@@ -532,20 +531,6 @@ pub struct DashboardClientView {
     pub installation: InstallationView,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub share: Option<ShareView>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LeaseView {
-    pub connection_id: String,
-    pub subdomain: String,
-    pub tunnel_type: String,
-    pub issued_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
-    pub used_at: Option<DateTime<Utc>>,
-    pub is_active: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub share: Option<ShareDescriptor>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -580,7 +565,10 @@ pub struct ShareView {
     #[serde(default)]
     pub app_runtimes: ShareAppRuntimes,
     pub installation_id: String,
-    pub active_lease_count: usize,
+    /// Number of HTTP requests currently in-flight against this share. This is
+    /// the same counter the parallel-limit gate increments, so it is directly
+    /// comparable to `parallel_limit`.
+    pub active_requests: usize,
     pub online_minutes_24h: usize,
     pub online_rate_24h: f64,
     pub recent_requests: Vec<ShareRequestLogEntry>,
