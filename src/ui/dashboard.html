@@ -305,45 +305,6 @@
         color: var(--muted-foreground);
       }
       /* ── Map ── */
-      .map-mini-stats {
-        position: absolute;
-        right: 16px;
-        top: 16px;
-        z-index: 5;
-        display: inline-flex;
-        align-items: center;
-        gap: 14px;
-        padding: 8px 12px;
-        border: 1px solid rgba(226, 232, 240, 0.95);
-        border-radius: 14px;
-        background: rgba(255, 255, 255, 0.9);
-        box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
-        backdrop-filter: blur(8px);
-        font: 11px/1 "JetBrains Mono", monospace;
-        letter-spacing: 0.12em;
-        text-transform: uppercase;
-        color: var(--muted-foreground);
-      }
-      .map-mini-stats .mini-stat {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-      }
-      .map-mini-stats .mini-num {
-        font-size: 13px;
-        font-weight: 600;
-        color: var(--foreground);
-        letter-spacing: 0.02em;
-        text-transform: none;
-      }
-      .map-mini-stats .mini-stat--active .mini-num {
-        color: var(--accent);
-      }
-      .map-mini-sep {
-        width: 1px;
-        height: 12px;
-        background: var(--border);
-      }
       .map-shell {
         position: relative;
         min-height: 420px;
@@ -1274,6 +1235,10 @@
             <strong id="stat-clients">0</strong> clients
           </span>
           <span class="topbar-sep">&middot;</span>
+          <span class="topbar-stat" title="Distinct countries currently routing traffic through this router.">
+            <strong id="stat-countries">0</strong> countries
+          </span>
+          <span class="topbar-sep">&middot;</span>
           <span class="topbar-stat" title="Clients whose share status is currently active.">
             <strong id="stat-active-shares">0</strong> active shares
           </span>
@@ -1287,13 +1252,6 @@
 
       <section class="section">
         <div class="map-shell reveal" id="map-shell" role="region" aria-label="Live network map" tabindex="0">
-          <div class="map-mini-stats" id="map-mini-stats" aria-live="polite">
-            <span class="mini-stat"><span class="mini-num" id="mini-stat-clients">0</span> clients</span>
-            <span class="map-mini-sep" aria-hidden="true"></span>
-            <span class="mini-stat"><span class="mini-num" id="mini-stat-countries">0</span> countries</span>
-            <span class="map-mini-sep" aria-hidden="true"></span>
-            <span class="mini-stat mini-stat--active"><span class="mini-num" id="mini-stat-active">0</span> active</span>
-          </div>
           <div class="map-canvas" id="map-canvas">
             <div class="world-image" aria-hidden="true"></div>
             <svg class="map-overlay" id="map-overlay" viewBox="0 0 360 180" preserveAspectRatio="none" aria-hidden="true"></svg>
@@ -2030,9 +1988,13 @@
 
         const width = 360, height = 180;
         // Backend already fills lat/lon from country centroid when geo IP doesn't provide one.
-        const clients = (map?.clients || []).filter(
-          (item) => item.lat != null && item.lon != null,
-        );
+        // Sort by installation id so spread output is independent of backend row order: same
+        // co-located clients keep landing on the same dots even as last_seen_at heartbeats
+        // reshuffle the upstream sort.
+        const clients = (map?.clients || [])
+          .filter((item) => item.lat != null && item.lon != null)
+          .slice()
+          .sort((a, b) => (a.id || "").localeCompare(b.id || ""));
         const server = map?.server?.lat != null && map?.server?.lon != null ? map.server : null;
 
         if (!server && clients.length === 0) {
@@ -2125,25 +2087,16 @@
         pointsEl.replaceChildren(pointsFrag);
         _mapClientById = idMap;
         _mapRenderHash = hash;
-        updateMapMiniStats(server, clients);
         applyMapZoom();
       }
 
-      function updateMapMiniStats(server, clients) {
-        const total = clients.length;
-        const active = clients.reduce((n, c) => n + (c.isActive ? 1 : 0), 0);
-        const countries = new Set();
-        for (const c of clients) {
-          if (c.countryCode) countries.add(c.countryCode);
+      function countDistinctCountries(map) {
+        const set = new Set();
+        for (const c of (map?.clients || [])) {
+          if (c.countryCode) set.add(c.countryCode);
         }
-        if (server && server.countryCode) countries.add(server.countryCode);
-        const setText = (id, value) => {
-          const el = document.getElementById(id);
-          if (el) el.textContent = String(value);
-        };
-        setText("mini-stat-clients", total);
-        setText("mini-stat-countries", countries.size);
-        setText("mini-stat-active", active);
+        if (map?.server?.countryCode) set.add(map.server.countryCode);
+        return set.size;
       }
 
       function showMapTooltip(target) {
@@ -2913,6 +2866,7 @@
 
         /* topbar stats */
         document.getElementById("stat-clients").textContent = data.stats.clients;
+        document.getElementById("stat-countries").textContent = countDistinctCountries(data.map);
         document.getElementById("stat-active-shares").textContent = data.stats.activeShares;
         document.getElementById("stat-inflight").textContent = data.stats.totalActiveRequests ?? 0;
         document.getElementById("last-sync").textContent = relTime(data.generatedAt);
