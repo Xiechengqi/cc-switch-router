@@ -305,26 +305,20 @@
         color: var(--muted-foreground);
       }
       /* ── Map ── */
-      .map-header {
-        display: flex;
-        flex-wrap: wrap;
-        align-items: center;
-        gap: 12px;
-        margin-bottom: 14px;
-      }
-      .map-section-label {
-        display: inline-flex;
-        align-items: center;
-        gap: 10px;
-        padding: 6px 14px 6px 10px;
-        border: 1px solid rgba(0, 82, 255, 0.22);
-        background: rgba(0, 82, 255, 0.05);
-        border-radius: 999px;
-      }
       .map-mini-stats {
+        position: absolute;
+        right: 16px;
+        top: 16px;
+        z-index: 5;
         display: inline-flex;
         align-items: center;
-        gap: 18px;
+        gap: 14px;
+        padding: 8px 12px;
+        border: 1px solid rgba(226, 232, 240, 0.95);
+        border-radius: 14px;
+        background: rgba(255, 255, 255, 0.9);
+        box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
+        backdrop-filter: blur(8px);
         font: 11px/1 "JetBrains Mono", monospace;
         letter-spacing: 0.12em;
         text-transform: uppercase;
@@ -349,24 +343,6 @@
         width: 1px;
         height: 12px;
         background: var(--border);
-      }
-      .map-section-label .live-dot {
-        width: 7px;
-        height: 7px;
-        border-radius: 999px;
-        background: linear-gradient(135deg, var(--accent), var(--accent-secondary));
-        box-shadow: 0 0 0 4px rgba(0, 82, 255, 0.10);
-        animation: livePulse 2.4s ease-in-out infinite;
-      }
-      .map-section-label .live-text {
-        font: 11px/1 "JetBrains Mono", monospace;
-        letter-spacing: 0.18em;
-        text-transform: uppercase;
-        color: var(--accent);
-      }
-      @keyframes livePulse {
-        0%, 100% { transform: scale(1); opacity: 1; }
-        50% { transform: scale(1.4); opacity: 0.65; }
       }
       .map-shell {
         position: relative;
@@ -713,7 +689,6 @@
         color: var(--muted-foreground);
       }
       @media (prefers-reduced-motion: reduce) {
-        .map-section-label .live-dot,
         .map-dot--server::after,
         .map-dot--server-pulse,
         .map-overlay .flow-line.active,
@@ -1311,11 +1286,7 @@
       </div>
 
       <section class="section">
-        <div class="map-header reveal">
-          <div class="map-section-label">
-            <span class="live-dot" aria-hidden="true"></span>
-            <span class="live-text">Live Network</span>
-          </div>
+        <div class="map-shell reveal" id="map-shell" role="region" aria-label="Live network map" tabindex="0">
           <div class="map-mini-stats" id="map-mini-stats" aria-live="polite">
             <span class="mini-stat"><span class="mini-num" id="mini-stat-clients">0</span> clients</span>
             <span class="map-mini-sep" aria-hidden="true"></span>
@@ -1323,8 +1294,6 @@
             <span class="map-mini-sep" aria-hidden="true"></span>
             <span class="mini-stat mini-stat--active"><span class="mini-num" id="mini-stat-active">0</span> active</span>
           </div>
-        </div>
-        <div class="map-shell reveal" data-reveal-delay="1" id="map-shell" role="region" aria-label="Live network map" tabindex="0">
           <div class="map-canvas" id="map-canvas">
             <div class="world-image" aria-hidden="true"></div>
             <svg class="map-overlay" id="map-overlay" viewBox="0 0 360 180" preserveAspectRatio="none" aria-hidden="true"></svg>
