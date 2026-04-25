@@ -467,6 +467,10 @@ pub struct DashboardResponse {
     pub stats: DashboardStats,
     pub map: DashboardMap,
     pub clients: Vec<DashboardClientView>,
+    /// Active-client count keyed by ISO 3166-1 alpha-3. Drives the SVG country heatmap
+    /// directly (the bundled `world-map.svg` uses alpha-3 as its CSS class names).
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub country_counts: std::collections::HashMap<String, usize>,
 }
 
 #[derive(Debug, Serialize)]

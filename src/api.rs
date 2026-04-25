@@ -255,11 +255,38 @@ async fn admin_page() -> Html<&'static str> {
     Html(include_str!("ui/dashboard.html"))
 }
 
-async fn world_map_svg() -> impl axum::response::IntoResponse {
+const WORLD_MAP_SVG: &str = include_str!("ui/world-map.svg");
+
+fn world_map_etag() -> &'static str {
+    use std::sync::OnceLock;
+    static ETAG: OnceLock<String> = OnceLock::new();
+    ETAG.get_or_init(|| {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(WORLD_MAP_SVG.as_bytes());
+        let digest = hasher.finalize();
+        let hex: String = digest.iter().take(8).map(|b| format!("{:02x}", b)).collect();
+        format!("\"wm-{}\"", hex)
+    })
+}
+
+async fn world_map_svg(headers: HeaderMap) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let etag = world_map_etag();
+    if let Some(if_none_match) = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok())
+        && if_none_match == etag
+    {
+        return (StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response();
+    }
     (
-        [(header::CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
-        include_str!("ui/world-map.svg"),
+        [
+            (header::CONTENT_TYPE, "image/svg+xml; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=2592000"),
+            (header::ETAG, etag),
+        ],
+        WORLD_MAP_SVG,
     )
+        .into_response()
 }
 
 async fn sync_share(

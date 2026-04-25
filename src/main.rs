@@ -1,6 +1,7 @@
 mod api;
 mod config;
 mod error;
+mod geo;
 mod models;
 mod proxy;
 mod ssh;

@@ -304,67 +304,107 @@
         font-size: 12px;
         color: var(--muted-foreground);
       }
+      /* ── Map ── */
+      .map-header {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 14px;
+      }
+      .map-section-label {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        padding: 6px 14px 6px 10px;
+        border: 1px solid rgba(0, 82, 255, 0.22);
+        background: rgba(0, 82, 255, 0.05);
+        border-radius: 999px;
+      }
+      .map-mini-stats {
+        display: inline-flex;
+        align-items: center;
+        gap: 18px;
+        font: 11px/1 "JetBrains Mono", monospace;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: var(--muted-foreground);
+      }
+      .map-mini-stats .mini-stat {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .map-mini-stats .mini-num {
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--foreground);
+        letter-spacing: 0.02em;
+        text-transform: none;
+      }
+      .map-mini-stats .mini-stat--active .mini-num {
+        color: var(--accent);
+      }
+      .map-mini-sep {
+        width: 1px;
+        height: 12px;
+        background: var(--border);
+      }
+      .map-section-label .live-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 999px;
+        background: linear-gradient(135deg, var(--accent), var(--accent-secondary));
+        box-shadow: 0 0 0 4px rgba(0, 82, 255, 0.10);
+        animation: livePulse 2.4s ease-in-out infinite;
+      }
+      .map-section-label .live-text {
+        font: 11px/1 "JetBrains Mono", monospace;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        color: var(--accent);
+      }
+      @keyframes livePulse {
+        0%, 100% { transform: scale(1); opacity: 1; }
+        50% { transform: scale(1.4); opacity: 0.65; }
+      }
       .map-shell {
         position: relative;
-        min-height: 360px;
-        border-radius: 10px;
-        background:
-          linear-gradient(180deg, rgba(0, 82, 255, 0.025), rgba(0, 82, 255, 0.015)),
-          #f8fbff;
-        border: 1px solid rgba(226, 232, 240, 0.9);
+        min-height: 420px;
+        border-radius: 20px;
+        background: var(--card);
+        border: 1px solid var(--border);
+        box-shadow: 0 4px 6px rgba(15, 23, 42, 0.04), 0 12px 28px rgba(15, 23, 42, 0.05);
         overflow: hidden;
         cursor: grab;
         user-select: none;
+        color: var(--accent);
+        outline: none;
+      }
+      .map-shell:focus-visible {
+        box-shadow: 0 0 0 3px rgba(0, 82, 255, 0.18), 0 12px 28px rgba(15, 23, 42, 0.05);
       }
       .map-shell.dragging { cursor: grabbing; }
       .map-shell.dragging .map-canvas { transition: none; }
-      .map-controls {
-        position: absolute;
-        left: 16px;
-        bottom: 16px;
-        z-index: 4;
-        display: inline-flex;
-        align-items: center;
-        gap: 8px;
-        padding: 8px 10px;
-        border: 1px solid rgba(226, 232, 240, 0.95);
-        border-radius: 14px;
-        background: rgba(255, 255, 255, 0.88);
-        box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
-        backdrop-filter: blur(8px);
-      }
-      .map-zoom-label {
-        min-width: 48px;
-        text-align: center;
-        font: 11px/1 "JetBrains Mono", monospace;
-        color: var(--muted-foreground);
-      }
-      .map-control-btn {
-        appearance: none;
-        border: 1px solid rgba(226, 232, 240, 0.95);
-        background: rgba(255, 255, 255, 0.9);
-        color: var(--foreground);
-        border-radius: 10px;
-        width: 30px;
-        height: 30px;
-        font: 16px/1 "JetBrains Mono", monospace;
-        cursor: pointer;
-        box-shadow: 0 8px 20px rgba(15, 23, 42, 0.06);
-      }
-      .map-control-btn:hover {
-        background: #ffffff;
-        border-color: rgba(0, 82, 255, 0.22);
-      }
       .map-shell::before {
         content: "";
         position: absolute;
         inset: 0;
         pointer-events: none;
+        background-image: radial-gradient(circle, rgba(15, 23, 42, 0.05) 1px, transparent 1px);
+        background-size: 28px 28px;
+        background-position: 14px 14px;
+        z-index: 1;
       }
-      .map-shell::before {
+      .map-shell::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
         background:
-          linear-gradient(transparent 24.5%, rgba(15, 23, 42, 0.03) 25%, transparent 25.5%, transparent 49.5%, rgba(15, 23, 42, 0.03) 50%, transparent 50.5%, transparent 74.5%, rgba(15, 23, 42, 0.03) 75%, transparent 75.5%),
-          linear-gradient(90deg, transparent 24.5%, rgba(15, 23, 42, 0.03) 25%, transparent 25.5%, transparent 49.5%, rgba(15, 23, 42, 0.03) 50%, transparent 50.5%, transparent 74.5%, rgba(15, 23, 42, 0.03) 75%, transparent 75.5%);
+          radial-gradient(circle at 6% 12%, rgba(0, 82, 255, 0.10), transparent 38%),
+          radial-gradient(circle at 94% 88%, rgba(77, 124, 255, 0.07), transparent 42%);
+        z-index: 1;
       }
       .map-canvas {
         position: absolute;
@@ -375,7 +415,7 @@
         transform: translate(-50%, -50%);
         transform-origin: center center;
         transition: transform 0.18s ease-out;
-        z-index: 0;
+        z-index: 2;
         will-change: transform;
       }
       .world-image,
@@ -387,75 +427,221 @@
       }
       .world-image {
         background: url("/assets/world-map.svg") center center / 100% 100% no-repeat;
-        opacity: 0.72;
         z-index: 0;
-        filter: saturate(0.4) hue-rotate(180deg) brightness(1.02);
       }
-      .map-overlay { z-index: 1; }
-      .world-land {
-        fill: rgba(0, 82, 255, 0.11);
-        stroke: rgba(0, 82, 255, 0.14);
-        stroke-width: 1;
+      /* Heatmap mode kicks in once we successfully inline the SVG. */
+      .world-image.inline {
+        background: none;
       }
-      .world-outline {
-        fill: none;
-        stroke: rgba(15, 23, 42, 0.06);
-        stroke-width: 1;
+      .world-image.inline svg {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        display: block;
       }
-      .map-overlay line {
-        stroke: rgba(0, 82, 255, 0.18);
+      .world-image.inline .country {
+        --heat: 0;
+        fill-opacity: calc(0.10 + var(--heat) * 0.55);
+        stroke-opacity: calc(0.16 + var(--heat) * 0.4);
+        transition: fill-opacity 0.5s ease, stroke-opacity 0.5s ease;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .world-image.inline .country {
+          transition: none;
+        }
+      }
+      .map-overlay {
+        z-index: 1;
+        overflow: visible;
+      }
+      .map-overlay .flow-line {
+        stroke: rgba(0, 82, 255, 0.42);
         stroke-width: 0.5;
-        stroke-dasharray: 1.5 1.5;
+        stroke-linecap: round;
+        fill: none;
         vector-effect: non-scaling-stroke;
+        stroke-dasharray: 1 3.5;
+      }
+      .map-overlay .flow-line.idle {
+        stroke: rgba(15, 23, 42, 0.18);
+        stroke-dasharray: 1 5;
+      }
+      .map-overlay .flow-line.active {
+        animation: flowDash 7s linear infinite;
+      }
+      .map-overlay .flow-line.bursting {
+        stroke: rgba(0, 82, 255, 0.7);
+        stroke-width: 0.7;
+        stroke-dasharray: 1.5 2.5;
+        animation: flowDash 1.8s linear infinite;
+      }
+      .map-overlay.dense .flow-line.active {
+        animation: none;
+        stroke: rgba(0, 82, 255, 0.32);
+        stroke-dasharray: 1 5;
+      }
+      .map-overlay.dense .flow-line.bursting {
+        animation: flowDash 2.4s linear infinite;
+        stroke: rgba(0, 82, 255, 0.55);
+        stroke-dasharray: 1 4;
+      }
+      @keyframes flowDash {
+        to { stroke-dashoffset: -10; }
       }
       #map-points {
         position: absolute;
         inset: 0;
-        z-index: 2;
+        z-index: 3;
       }
       .map-dot {
         position: absolute;
         transform: translate(-50%, -50%);
         border-radius: 999px;
+        appearance: none;
+        border: 0;
+        padding: 0;
+        margin: 0;
+        cursor: pointer;
+        background: transparent;
+        transition: transform 0.18s ease, box-shadow 0.18s ease, opacity 0.18s ease;
+      }
+      .map-dot:focus { outline: none; }
+      .map-dot:focus-visible::before {
+        content: "";
+        position: absolute;
+        inset: -5px;
+        border-radius: 999px;
+        border: 2px solid var(--accent);
       }
       .map-dot--server {
-        width: 10px;
-        height: 10px;
-        background: #0052ff;
-        box-shadow: 0 0 0 5px rgba(0, 82, 255, 0.14);
+        width: 12px;
+        height: 12px;
+        background: linear-gradient(135deg, var(--accent), var(--accent-secondary));
+        box-shadow:
+          0 0 0 5px rgba(0, 82, 255, 0.10),
+          0 8px 22px rgba(0, 82, 255, 0.32);
+        z-index: 3;
+        cursor: default;
       }
       .map-dot--server::after {
         content: "";
         position: absolute;
-        inset: -4px;
-        border-radius: inherit;
-        border: 1px solid rgba(0, 82, 255, 0.2);
-        animation: pulse 2.8s infinite;
+        inset: -10px;
+        border-radius: 999px;
+        border: 1px dashed rgba(0, 82, 255, 0.32);
+        animation: ringSpin 60s linear infinite;
+        pointer-events: none;
+      }
+      .map-dot--server-pulse {
+        position: absolute;
+        inset: -5px;
+        border-radius: 999px;
+        border: 1px solid rgba(0, 82, 255, 0.24);
+        animation: serverPulse 2.8s ease-in-out infinite;
+        pointer-events: none;
+      }
+      @keyframes ringSpin { to { transform: rotate(360deg); } }
+      @keyframes serverPulse {
+        0%, 100% { transform: scale(1); opacity: 0.9; }
+        50% { transform: scale(1.6); opacity: 0; }
       }
       .map-dot--client {
-        width: 10px;
-        height: 10px;
-        background: #94a3b8;
-        box-shadow: 0 0 0 4px rgba(15, 23, 42, 0.06);
+        width: 6px;
+        height: 6px;
+        background: var(--muted-foreground);
+        opacity: 0.55;
+        box-shadow: 0 0 0 1.5px rgba(15, 23, 42, 0.05);
       }
       .map-dot--client.active {
-        background: #16a34a;
-        box-shadow: 0 0 0 5px rgba(34, 197, 94, 0.14);
+        background: var(--accent);
+        opacity: 1;
+        box-shadow: 0 0 0 2px rgba(0, 82, 255, 0.16);
       }
+      .map-dot--client.bursting {
+        background: linear-gradient(135deg, var(--accent), var(--accent-secondary));
+        box-shadow: 0 0 0 3px rgba(0, 82, 255, 0.22), 0 0 12px rgba(0, 82, 255, 0.55);
+      }
+      .map-dot--client.bursting::after {
+        content: "";
+        position: absolute;
+        inset: -4px;
+        border-radius: 999px;
+        border: 1px solid rgba(0, 82, 255, 0.45);
+        animation: serverPulse 2.2s ease-in-out infinite;
+        pointer-events: none;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .map-dot--client.bursting::after { animation: none; }
+      }
+      .map-dot--client:hover,
+      .map-dot--client:focus-visible,
+      .map-dot--client.map-linked {
+        transform: translate(-50%, -50%) scale(1.9);
+        z-index: 4;
+        opacity: 1;
+        background: var(--accent);
+        box-shadow: 0 0 0 4px rgba(0, 82, 255, 0.18), 0 6px 14px rgba(0, 82, 255, 0.3);
+      }
+      .map-controls {
+        position: absolute;
+        left: 16px;
+        bottom: 16px;
+        z-index: 5;
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 5px;
+        border: 1px solid rgba(226, 232, 240, 0.95);
+        border-radius: 14px;
+        background: rgba(255, 255, 255, 0.9);
+        box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
+        backdrop-filter: blur(8px);
+      }
+      .map-zoom-label {
+        min-width: 44px;
+        text-align: center;
+        font: 11px/1 "JetBrains Mono", monospace;
+        color: var(--muted-foreground);
+        letter-spacing: 0.06em;
+      }
+      .map-control-btn {
+        appearance: none;
+        border: 0;
+        background: transparent;
+        color: var(--foreground);
+        border-radius: 10px;
+        width: 32px;
+        height: 32px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+        transition: background 0.15s ease, color 0.15s ease;
+      }
+      .map-control-btn:hover {
+        background: rgba(0, 82, 255, 0.08);
+        color: var(--accent);
+      }
+      .map-control-btn:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 1px;
+      }
+      .map-control-btn svg { width: 16px; height: 16px; }
       .map-legend {
         position: absolute;
         right: 16px;
         bottom: 16px;
-        z-index: 4;
+        z-index: 5;
         display: flex;
         flex-wrap: wrap;
-        gap: 12px;
+        gap: 14px;
         font-size: 12px;
         color: var(--muted-foreground);
-        padding: 8px 10px;
+        padding: 8px 12px;
         border: 1px solid rgba(226, 232, 240, 0.95);
         border-radius: 14px;
-        background: rgba(255, 255, 255, 0.88);
+        background: rgba(255, 255, 255, 0.9);
         box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
         backdrop-filter: blur(8px);
       }
@@ -470,18 +656,92 @@
         border-radius: 999px;
         display: inline-block;
       }
-      .map-legend .server { background: #0052ff; }
-      .map-legend .active { background: #16a34a; }
-      .map-legend .inactive { background: #94a3b8; }
+      .map-legend .server {
+        background: linear-gradient(135deg, var(--accent), var(--accent-secondary));
+      }
+      .map-legend .active { background: var(--accent); }
+      .map-legend .inactive { background: var(--muted-foreground); opacity: 0.55; }
       .map-empty {
         position: absolute;
         inset: 0;
         display: flex;
+        flex-direction: column;
         align-items: center;
         justify-content: center;
+        gap: 8px;
         color: var(--muted-foreground);
-        font-size: 13px;
-        z-index: 3;
+        z-index: 4;
+        pointer-events: none;
+      }
+      .map-empty-title {
+        font: 600 16px/1.3 Inter, system-ui, sans-serif;
+        color: var(--foreground);
+      }
+      .map-empty-meta {
+        font: 11px/1 "JetBrains Mono", monospace;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        color: var(--muted-foreground);
+      }
+      .map-tooltip {
+        position: fixed;
+        pointer-events: none;
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 10px 12px;
+        box-shadow: 0 10px 30px rgba(15, 23, 42, 0.14);
+        font-size: 12px;
+        line-height: 1.4;
+        color: var(--foreground);
+        z-index: 110;
+        opacity: 0;
+        transform: translate(-50%, calc(-100% - 12px));
+        transition: opacity 0.12s ease;
+        min-width: 140px;
+        max-width: 240px;
+      }
+      .map-tooltip.show { opacity: 1; }
+      .map-tooltip-title {
+        font-weight: 600;
+        margin-bottom: 4px;
+      }
+      .map-tooltip-meta {
+        font: 10px/1.4 "JetBrains Mono", monospace;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--muted-foreground);
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .map-section-label .live-dot,
+        .map-dot--server::after,
+        .map-dot--server-pulse,
+        .map-overlay .flow-line.active,
+        .map-canvas {
+          animation: none !important;
+          transition: none !important;
+        }
+      }
+      /* ── Entrance fade-in ── */
+      .reveal {
+        opacity: 0;
+        transform: translateY(28px);
+        transition: opacity 0.7s cubic-bezier(0.16, 1, 0.3, 1),
+                    transform 0.7s cubic-bezier(0.16, 1, 0.3, 1);
+        will-change: opacity, transform;
+      }
+      .reveal.in-view {
+        opacity: 1;
+        transform: translateY(0);
+      }
+      .reveal[data-reveal-delay="1"] { transition-delay: 0.08s; }
+      .reveal[data-reveal-delay="2"] { transition-delay: 0.16s; }
+      @media (prefers-reduced-motion: reduce) {
+        .reveal {
+          opacity: 1 !important;
+          transform: none !important;
+          transition: none !important;
+        }
       }
       .page-footer {
         margin-top: auto;
@@ -554,7 +814,8 @@
         transition: background 0.15s;
       }
       tbody tr:last-child td { border-bottom: none; }
-      tbody tr:hover { background: rgba(0, 82, 255, 0.025); }
+      tbody tr:hover,
+      tbody tr.map-linked { background: rgba(0, 82, 255, 0.04); }
       tbody td:first-child {
         position: relative;
         white-space: normal;
@@ -577,7 +838,8 @@
         opacity: 0;
         transition: opacity 0.15s;
       }
-      tbody tr:hover td:first-child::before { opacity: 1; }
+      tbody tr:hover td:first-child::before,
+      tbody tr.map-linked td:first-child::before { opacity: 1; }
       td.meta {
         font-size: 13px;
         color: var(--muted-foreground);
@@ -1049,31 +1311,54 @@
       </div>
 
       <section class="section">
-        <div class="map-shell" id="map-shell">
+        <div class="map-header reveal">
+          <div class="map-section-label">
+            <span class="live-dot" aria-hidden="true"></span>
+            <span class="live-text">Live Network</span>
+          </div>
+          <div class="map-mini-stats" id="map-mini-stats" aria-live="polite">
+            <span class="mini-stat"><span class="mini-num" id="mini-stat-clients">0</span> clients</span>
+            <span class="map-mini-sep" aria-hidden="true"></span>
+            <span class="mini-stat"><span class="mini-num" id="mini-stat-countries">0</span> countries</span>
+            <span class="map-mini-sep" aria-hidden="true"></span>
+            <span class="mini-stat mini-stat--active"><span class="mini-num" id="mini-stat-active">0</span> active</span>
+          </div>
+        </div>
+        <div class="map-shell reveal" data-reveal-delay="1" id="map-shell" role="region" aria-label="Live network map" tabindex="0">
           <div class="map-canvas" id="map-canvas">
             <div class="world-image" aria-hidden="true"></div>
-            <svg class="map-overlay" id="map-overlay" viewBox="0 0 360 180"></svg>
+            <svg class="map-overlay" id="map-overlay" viewBox="0 0 360 180" preserveAspectRatio="none" aria-hidden="true"></svg>
             <div id="map-points"></div>
           </div>
           <div class="map-controls">
-            <button class="map-control-btn" id="map-zoom-out" type="button" aria-label="Zoom out">-</button>
+            <button class="map-control-btn" id="map-zoom-out" type="button" aria-label="Zoom out">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            </button>
             <span class="map-zoom-label" id="map-zoom-label">100%</span>
-            <button class="map-control-btn" id="map-zoom-in" type="button" aria-label="Zoom in">+</button>
-            <button class="map-control-btn" id="map-zoom-reset" type="button" aria-label="Reset map view">↺</button>
+            <button class="map-control-btn" id="map-zoom-in" type="button" aria-label="Zoom in">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            </button>
+            <button class="map-control-btn" id="map-zoom-reset" type="button" aria-label="Reset map view">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/></svg>
+            </button>
           </div>
           <div class="map-legend">
             <span><i class="server"></i>router</span>
             <span><i class="active"></i>active client</span>
             <span><i class="inactive"></i>idle client</span>
           </div>
-          <div class="map-empty" id="map-empty">Waiting for server geo or client locations</div>
+          <div class="map-empty" id="map-empty">
+            <div class="map-empty-title">Waiting for the network</div>
+            <div class="map-empty-meta">No server geo · No active clients</div>
+          </div>
+          <div class="map-tooltip" id="map-tooltip" role="tooltip" aria-hidden="true"></div>
         </div>
       </section>
 
       <!-- Clients -->
       <section class="section">
-        <div class="section-label">CLIENTS <span id="client-count">0</span></div>
-        <div class="table-card">
+        <div class="section-label reveal">CLIENTS <span id="client-count">0</span></div>
+        <div class="table-card reveal" data-reveal-delay="1">
           <table>
             <thead>
               <tr>
@@ -1602,21 +1887,6 @@
         return upstream.accountEmail || "";
       }
 
-      const COUNTRY_CENTROIDS = {
-        AR: [-38.42, -63.62], AT: [47.52, 14.55], AU: [-25.27, 133.77], BE: [50.50, 4.47],
-        BR: [-14.23, -51.92], CA: [56.13, -106.35], CH: [46.82, 8.23], CL: [-35.68, -71.54],
-        CN: [35.86, 104.20], CO: [4.57, -74.30], DE: [51.17, 10.45], DK: [56.26, 9.50],
-        EG: [26.82, 30.80], ES: [40.46, -3.75], FI: [61.92, 25.75], FR: [46.22, 2.21],
-        GB: [55.38, -3.43], GR: [39.07, 21.82], HK: [22.32, 114.17], ID: [-0.79, 113.92],
-        IE: [53.41, -8.24], IL: [31.05, 34.85], IN: [20.59, 78.96], IT: [41.87, 12.57],
-        JP: [36.20, 138.25], KR: [35.91, 127.77], MX: [23.63, -102.55], MY: [4.21, 101.98],
-        NG: [9.08, 8.67], NL: [52.13, 5.29], NO: [60.47, 8.47], NZ: [-40.90, 174.89],
-        PE: [-9.19, -75.02], PH: [12.88, 121.77], PL: [51.92, 19.15], PT: [39.40, -8.22],
-        RU: [61.52, 105.31], SA: [23.89, 45.08], SE: [60.13, 18.64], SG: [1.35, 103.82],
-        TH: [15.87, 100.99], TR: [38.96, 35.24], TW: [23.70, 120.96], UA: [48.38, 31.17],
-        US: [39.83, -98.58], VN: [14.06, 108.28], ZA: [-30.56, 22.94]
-      };
-
       function escapeHtml(value) {
         return String(value ?? "")
           .replaceAll("&", "&amp;")
@@ -1634,77 +1904,419 @@
         };
       }
 
-      function renderMap(map) {
+      function spreadPoints(points, minDistPct, lockedIndex) {
+        if (points.length < 2) return;
+        const ITERS = 28;
+        for (let it = 0; it < ITERS; it++) {
+          let moved = false;
+          for (let i = 0; i < points.length; i++) {
+            for (let j = i + 1; j < points.length; j++) {
+              const a = points[i], b = points[j];
+              let dx = b.xPct - a.xPct;
+              let dy = b.yPct - a.yPct;
+              let d = Math.hypot(dx, dy);
+              if (d < 0.0001) {
+                const ang = ((i * 137.5 + j * 23.4) % 360) * (Math.PI / 180);
+                dx = Math.cos(ang); dy = Math.sin(ang); d = 1;
+              }
+              if (d < minDistPct) {
+                const overlap = (minDistPct - d);
+                const ux = dx / d, uy = dy / d;
+                const aLocked = i === lockedIndex;
+                const bLocked = j === lockedIndex;
+                if (aLocked && bLocked) continue;
+                if (aLocked) {
+                  b.xPct += ux * overlap;
+                  b.yPct += uy * overlap;
+                } else if (bLocked) {
+                  a.xPct -= ux * overlap;
+                  a.yPct -= uy * overlap;
+                } else {
+                  a.xPct -= ux * overlap / 2;
+                  a.yPct -= uy * overlap / 2;
+                  b.xPct += ux * overlap / 2;
+                  b.yPct += uy * overlap / 2;
+                }
+                moved = true;
+              }
+            }
+          }
+          if (!moved) break;
+        }
+        for (const p of points) {
+          p.xPct = Math.max(1, Math.min(99, p.xPct));
+          p.yPct = Math.max(1, Math.min(99, p.yPct));
+          p.x = (p.xPct / 100) * 360;
+          p.y = (p.yPct / 100) * 180;
+        }
+      }
+
+      function mapPayloadHash(map, flow) {
+        if (!map) return "empty";
+        const parts = [];
+        const s = map.server;
+        if (s && s.lat != null && s.lon != null) {
+          parts.push([
+            "s", s.id || "", s.lat.toFixed(2), s.lon.toFixed(2),
+            s.label || "", s.platform || "", s.countryCode || "",
+            s.country || "", s.city || "",
+            s.isActive ? 1 : 0, s.lastSeenAt || ""
+          ].join("|"));
+        }
+        for (const c of map.clients || []) {
+          parts.push([
+            "c", c.id || "", c.lat ?? "", c.lon ?? "",
+            c.countryCode || "", c.country || "", c.city || "",
+            c.platform || "", c.label || "",
+            c.isActive ? 1 : 0, c.lastSeenAt || "",
+            (flow && c.id && flow.get(c.id)) || 0
+          ].join("|"));
+        }
+        return parts.join("\n");
+      }
+
+      function clientAriaLabel(c) {
+        const parts = ["Client"];
+        if (c.label) parts.push(c.label);
+        const place = [c.city, c.country].filter(Boolean).join(", ");
+        if (place) parts.push(place);
+        else if (c.countryCode) parts.push(c.countryCode);
+        return parts.join(" · ");
+      }
+
+      let _mapRenderHash = null;
+      let _mapClientById = new Map();
+      let _pendingMapPayload = null;
+      let _worldSvgPromise = null;
+      let _worldSvgRoot = null;
+      let _heatLastApplied = "";
+      const FLOW_DENSE_THRESHOLD = 80;
+
+      function ensureInlineWorldMap() {
+        if (_worldSvgPromise) return _worldSvgPromise;
+        const container = document.querySelector(".world-image");
+        if (!container) return Promise.resolve(null);
+        _worldSvgPromise = fetch("/assets/world-map.svg", { cache: "force-cache" })
+          .then((res) => (res.ok ? res.text() : Promise.reject(res.status)))
+          .then((markup) => {
+            container.innerHTML = markup;
+            container.classList.add("inline");
+            _worldSvgRoot = container.querySelector("svg");
+            // Apply any heatmap data we've already received.
+            if (_pendingHeat) {
+              applyCountryHeatmap(_pendingHeat);
+              _pendingHeat = null;
+            }
+            return _worldSvgRoot;
+          })
+          .catch((err) => {
+            console.warn("Inline world map unavailable, falling back to background image:", err);
+            _worldSvgRoot = null;
+            return null;
+          });
+        return _worldSvgPromise;
+      }
+
+      let _pendingHeat = null;
+      function applyCountryHeatmap(counts) {
+        if (!_worldSvgRoot) {
+          _pendingHeat = counts || {};
+          return;
+        }
+        const data = counts || {};
+        const sig = JSON.stringify(data);
+        if (sig === _heatLastApplied) return;
+        _heatLastApplied = sig;
+        const max = Math.max(1, ...Object.values(data));
+        // Clear previously highlighted countries that are no longer in the set.
+        _worldSvgRoot.querySelectorAll(".country[data-heat-set]").forEach((el) => {
+          if (!(el.dataset.iso3 in data)) {
+            el.style.removeProperty("--heat");
+            el.removeAttribute("data-heat-set");
+          }
+        });
+        for (const [iso3, count] of Object.entries(data)) {
+          if (typeof iso3 !== "string" || !/^[A-Z]{3}$/.test(iso3)) continue;
+          const el = _worldSvgRoot.querySelector(`.country.${iso3}`);
+          if (!el) continue;
+          el.dataset.iso3 = iso3;
+          el.dataset.heatSet = "1";
+          el.style.setProperty("--heat", (count / max).toFixed(3));
+        }
+      }
+
+      function renderMap(map, flow) {
         const pointsEl = document.getElementById("map-points");
         const overlayEl = document.getElementById("map-overlay");
         const emptyEl = document.getElementById("map-empty");
-        const width = 360;
-        const height = 180;
-        const clients = (map?.clients || []).map((item) => {
-          const lat = item.lat ?? COUNTRY_CENTROIDS[item.countryCode]?.[0];
-          const lon = item.lon ?? COUNTRY_CENTROIDS[item.countryCode]?.[1];
-          return lat == null || lon == null ? null : { ...item, lat, lon };
-        }).filter(Boolean);
+        if (!pointsEl || !overlayEl || !emptyEl) return;
+        if (_mapDragState) {
+          _pendingMapPayload = { map, flow };
+          return;
+        }
+        _pendingMapPayload = null;
+
+        const hash = mapPayloadHash(map, flow);
+        if (hash === _mapRenderHash) return;
+
+        const width = 360, height = 180;
+        // Backend already fills lat/lon from country centroid when geo IP doesn't provide one.
+        const clients = (map?.clients || []).filter(
+          (item) => item.lat != null && item.lon != null,
+        );
         const server = map?.server?.lat != null && map?.server?.lon != null ? map.server : null;
 
         if (!server && clients.length === 0) {
-          pointsEl.innerHTML = "";
-          overlayEl.innerHTML = "";
+          pointsEl.replaceChildren();
+          overlayEl.replaceChildren();
           emptyEl.style.display = "flex";
+          _mapClientById = new Map();
+          _mapRenderHash = hash;
           return;
         }
-
         emptyEl.style.display = "none";
-        const points = [];
-        const lines = [];
-        const serverPoint = server ? projectPoint(server.lat, server.lon, width, height) : null;
-        if (server && serverPoint) {
-          points.push(
-            `<div class="map-dot map-dot--server" style="left:${serverPoint.xPct}%;top:${serverPoint.yPct}%" title="${escapeHtml(server.label)}"></div>`
-          );
+
+        const placed = [];
+        let serverIndex = -1;
+        if (server) {
+          placed.push(projectPoint(server.lat, server.lon, width, height));
+          serverIndex = 0;
+        }
+        for (const c of clients) {
+          placed.push(projectPoint(c.lat, c.lon, width, height));
+        }
+        // 6px dot ≈ 1.66% of viewBox width; 2.6% gives breathing room and prevents overlap
+        spreadPoints(placed, 2.6, serverIndex);
+
+        overlayEl.classList.toggle("dense", clients.length > FLOW_DENSE_THRESHOLD);
+
+        const overlayFrag = document.createDocumentFragment();
+        const pointsFrag = document.createDocumentFragment();
+        const idMap = new Map();
+
+        if (server) {
+          const sp = placed[0];
+          const dot = document.createElement("div");
+          dot.className = "map-dot map-dot--server";
+          dot.style.left = `${sp.xPct}%`;
+          dot.style.top = `${sp.yPct}%`;
+          dot.dataset.pointType = "server";
+          dot.dataset.label = server.label || "Router";
+          dot.setAttribute("aria-label", `Router · ${server.label || ""}`.trim());
+          dot.setAttribute("role", "img");
+          const pulse = document.createElement("span");
+          pulse.className = "map-dot--server-pulse";
+          dot.appendChild(pulse);
+          pointsFrag.appendChild(dot);
         }
 
-        // Detect clients overlapping with server and offset them into a ring
-        const OVERLAP_DIST = 2; // percentage threshold
-        const OFFSET_RADIUS = 3; // percentage offset radius
-        const overlapping = [];
-        const nonOverlapping = [];
-        for (const client of clients) {
-          const point = projectPoint(client.lat, client.lon, width, height);
-          if (serverPoint && Math.hypot(point.xPct - serverPoint.xPct, point.yPct - serverPoint.yPct) < OVERLAP_DIST) {
-            overlapping.push({ client, point });
-          } else {
-            nonOverlapping.push({ client, point });
+        for (let i = 0; i < clients.length; i++) {
+          const client = clients[i];
+          const sp = placed[server ? i + 1 : i];
+          const burst = (flow && client.id && flow.get(client.id)) || 0;
+
+          if (server) {
+            const sPos = placed[0];
+            const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+            line.setAttribute("x1", sPos.x.toFixed(2));
+            line.setAttribute("y1", sPos.y.toFixed(2));
+            line.setAttribute("x2", sp.x.toFixed(2));
+            line.setAttribute("y2", sp.y.toFixed(2));
+            const lineClasses = ["flow-line"];
+            if (burst > 0) lineClasses.push("bursting");
+            else lineClasses.push(client.isActive ? "active" : "idle");
+            line.setAttribute("class", lineClasses.join(" "));
+            overlayFrag.appendChild(line);
           }
-        }
-        // Spread overlapping clients in a ring around the server
-        for (let i = 0; i < overlapping.length; i++) {
-          const angle = (2 * Math.PI * i) / overlapping.length - Math.PI / 2;
-          overlapping[i].point.xPct = serverPoint.xPct + Math.cos(angle) * OFFSET_RADIUS;
-          overlapping[i].point.yPct = serverPoint.yPct + Math.sin(angle) * OFFSET_RADIUS;
-          overlapping[i].point.x = (overlapping[i].point.xPct / 100) * width;
-          overlapping[i].point.y = (overlapping[i].point.yPct / 100) * height;
-        }
-        const allClients = [...nonOverlapping, ...overlapping];
 
-        for (const { client, point } of allClients) {
-          if (serverPoint) {
-            lines.push(`<line x1="${serverPoint.x}" y1="${serverPoint.y}" x2="${point.x}" y2="${point.y}"></line>`);
-          }
-          const title = [
-            client.label,
-            client.platform || "",
-            client.countryCode || "",
-            client.lastSeenAt ? fullTime(client.lastSeenAt) : "",
-          ].filter(Boolean).join(" · ");
-          points.push(
-            `<div class="map-dot map-dot--client ${client.isActive ? "active" : ""}" style="left:${point.xPct}%;top:${point.yPct}%" title="${escapeHtml(title)}"></div>`
-          );
+          const dot = document.createElement("button");
+          dot.type = "button";
+          const dotClasses = ["map-dot", "map-dot--client"];
+          if (client.isActive) dotClasses.push("active");
+          if (burst > 0) dotClasses.push("bursting");
+          dot.className = dotClasses.join(" ");
+          dot.style.left = `${sp.xPct}%`;
+          dot.style.top = `${sp.yPct}%`;
+          dot.dataset.pointType = "client";
+          if (client.id) dot.dataset.installationId = client.id;
+          if (client.label) dot.dataset.label = client.label;
+          if (client.platform) dot.dataset.platform = client.platform;
+          if (client.countryCode) dot.dataset.countryCode = client.countryCode;
+          if (client.country) dot.dataset.country = client.country;
+          if (client.city) dot.dataset.city = client.city;
+          if (client.lastSeenAt) dot.dataset.lastSeen = client.lastSeenAt;
+          if (burst > 0) dot.dataset.inflight = String(burst);
+          dot.setAttribute("aria-label", clientAriaLabel(client));
+          pointsFrag.appendChild(dot);
+
+          if (client.id) idMap.set(client.id, sp);
         }
 
-        overlayEl.innerHTML = lines.join("");
-        pointsEl.innerHTML = points.join("");
+        overlayEl.replaceChildren(overlayFrag);
+        pointsEl.replaceChildren(pointsFrag);
+        _mapClientById = idMap;
+        _mapRenderHash = hash;
+        updateMapMiniStats(server, clients);
         applyMapZoom();
+      }
+
+      function updateMapMiniStats(server, clients) {
+        const total = clients.length;
+        const active = clients.reduce((n, c) => n + (c.isActive ? 1 : 0), 0);
+        const countries = new Set();
+        for (const c of clients) {
+          if (c.countryCode) countries.add(c.countryCode);
+        }
+        if (server && server.countryCode) countries.add(server.countryCode);
+        const setText = (id, value) => {
+          const el = document.getElementById(id);
+          if (el) el.textContent = String(value);
+        };
+        setText("mini-stat-clients", total);
+        setText("mini-stat-countries", countries.size);
+        setText("mini-stat-active", active);
+      }
+
+      function showMapTooltip(target) {
+        const tip = document.getElementById("map-tooltip");
+        if (!tip || !target) return;
+        const isServer = target.dataset.pointType === "server";
+        const label = target.dataset.label || (isServer ? "Router" : "Client");
+        const place = [target.dataset.city, target.dataset.country]
+          .filter(Boolean).join(", ") || target.dataset.countryCode || "";
+        const meta = [];
+        if (isServer) {
+          meta.push("ROUTER NODE");
+          if (place) meta.push(place);
+        } else {
+          if (target.dataset.platform) meta.push(target.dataset.platform);
+          if (place) meta.push(place);
+          if (target.dataset.inflight) meta.push(`${target.dataset.inflight} IN-FLIGHT`);
+          if (target.dataset.lastSeen) meta.push(`SEEN ${relTime(target.dataset.lastSeen)}`);
+        }
+        const titleHtml = `<div class="map-tooltip-title">${escapeHtml(label)}</div>`;
+        const metaHtml = meta.length
+          ? `<div class="map-tooltip-meta">${escapeHtml(meta.join(" · "))}</div>`
+          : "";
+        tip.innerHTML = titleHtml + metaHtml;
+        const r = target.getBoundingClientRect();
+        tip.style.left = `${r.left + r.width / 2}px`;
+        tip.style.top = `${r.top}px`;
+        tip.classList.add("show");
+        tip.setAttribute("aria-hidden", "false");
+      }
+
+      function hideMapTooltip() {
+        const tip = document.getElementById("map-tooltip");
+        if (!tip) return;
+        tip.classList.remove("show");
+        tip.setAttribute("aria-hidden", "true");
+      }
+
+      function findClientIndexById(installationId) {
+        if (!installationId) return -1;
+        for (let i = 0; i < _clients.length; i++) {
+          if (_clients[i]?.installation?.id === installationId) return i;
+        }
+        return -1;
+      }
+
+      function highlightLinkedRow(installationId, on) {
+        if (!installationId) return;
+        const row = document.querySelector(`tbody tr[data-installation-id="${CSS.escape(installationId)}"]`);
+        if (row) row.classList.toggle("map-linked", !!on);
+      }
+
+      function highlightLinkedDot(installationId, on) {
+        if (!installationId) return;
+        const dot = document.querySelector(`.map-dot--client[data-installation-id="${CSS.escape(installationId)}"]`);
+        if (dot) dot.classList.toggle("map-linked", !!on);
+      }
+
+      function bindMapDotInteraction() {
+        const pointsEl = document.getElementById("map-points");
+        if (!pointsEl) return;
+        pointsEl.addEventListener("pointerover", (event) => {
+          const dot = event.target.closest(".map-dot");
+          if (!dot) return;
+          showMapTooltip(dot);
+          if (dot.dataset.pointType === "client") {
+            highlightLinkedRow(dot.dataset.installationId, true);
+          }
+        });
+        pointsEl.addEventListener("pointerout", (event) => {
+          const dot = event.target.closest(".map-dot");
+          if (!dot) return;
+          if (event.relatedTarget && event.relatedTarget.closest && event.relatedTarget.closest(".map-dot") === dot) return;
+          hideMapTooltip();
+          if (dot.dataset.pointType === "client") {
+            highlightLinkedRow(dot.dataset.installationId, false);
+          }
+        });
+        pointsEl.addEventListener("focusin", (event) => {
+          const dot = event.target.closest(".map-dot");
+          if (!dot) return;
+          showMapTooltip(dot);
+          if (dot.dataset.pointType === "client") {
+            highlightLinkedRow(dot.dataset.installationId, true);
+          }
+        });
+        pointsEl.addEventListener("focusout", (event) => {
+          const dot = event.target.closest(".map-dot");
+          hideMapTooltip();
+          if (dot && dot.dataset.pointType === "client") {
+            highlightLinkedRow(dot.dataset.installationId, false);
+          }
+        });
+        pointsEl.addEventListener("click", (event) => {
+          const dot = event.target.closest(".map-dot");
+          if (!dot || dot.dataset.pointType !== "client") return;
+          if (_mapDragState && _mapDragState.moved) return;
+          const idx = findClientIndexById(dot.dataset.installationId);
+          if (idx >= 0) openClient(idx);
+        });
+      }
+
+      function bindReveal() {
+        const targets = document.querySelectorAll(".reveal:not(.in-view)");
+        if (!targets.length) return;
+        if (!("IntersectionObserver" in window)) {
+          targets.forEach((el) => el.classList.add("in-view"));
+          return;
+        }
+        const obs = new IntersectionObserver((entries) => {
+          for (const entry of entries) {
+            if (entry.isIntersecting) {
+              entry.target.classList.add("in-view");
+              obs.unobserve(entry.target);
+            }
+          }
+        }, { threshold: 0.15, rootMargin: "-40px 0px" });
+        targets.forEach((el) => obs.observe(el));
+      }
+
+      function bindClientTableHighlight() {
+        const tbody = document.getElementById("clients");
+        if (!tbody) return;
+        tbody.addEventListener("pointerover", (event) => {
+          const row = event.target.closest("tr[data-installation-id]");
+          if (!row) return;
+          highlightLinkedDot(row.dataset.installationId, true);
+        });
+        tbody.addEventListener("pointerout", (event) => {
+          const row = event.target.closest("tr[data-installation-id]");
+          if (!row) return;
+          if (event.relatedTarget && event.relatedTarget.closest && event.relatedTarget.closest("tr[data-installation-id]") === row) return;
+          highlightLinkedDot(row.dataset.installationId, false);
+        });
+        tbody.addEventListener("focusin", (event) => {
+          const row = event.target.closest("tr[data-installation-id]");
+          if (row) highlightLinkedDot(row.dataset.installationId, true);
+        });
+        tbody.addEventListener("focusout", (event) => {
+          const row = event.target.closest("tr[data-installation-id]");
+          if (row) highlightLinkedDot(row.dataset.installationId, false);
+        });
       }
 
       function clampMapZoom(value) {
@@ -1754,38 +2366,74 @@
         const zoomIn = document.getElementById("map-zoom-in");
         const zoomOut = document.getElementById("map-zoom-out");
         const zoomReset = document.getElementById("map-zoom-reset");
-        zoomIn?.addEventListener("click", () => setMapZoom(_mapZoom + 0.2));
-        zoomOut?.addEventListener("click", () => setMapZoom(_mapZoom - 0.2));
+        zoomIn?.addEventListener("click", () => setMapZoom(_mapZoom + 0.25));
+        zoomOut?.addEventListener("click", () => setMapZoom(_mapZoom - 0.25));
         zoomReset?.addEventListener("click", resetMapView);
+
         shell?.addEventListener("wheel", (event) => {
+          // Only intercept page scroll when user clearly wants to zoom:
+          // ctrl/cmd held, or already zoomed in.
+          if (!(event.ctrlKey || event.metaKey || _mapZoom > 1.001)) return;
           event.preventDefault();
-          const delta = event.deltaY < 0 ? 0.15 : -0.15;
+          hideMapTooltip();
+          const delta = event.deltaY < 0 ? 0.18 : -0.18;
           setMapZoom(_mapZoom + delta);
         }, { passive: false });
-        shell?.addEventListener("mousedown", (event) => {
-          if (event.button !== 0) return;
+
+        shell?.addEventListener("pointerdown", (event) => {
+          if (event.pointerType === "mouse" && event.button !== 0) return;
+          if (event.target.closest(".map-dot, .map-controls, .map-legend")) return;
+          hideMapTooltip();
           _mapDragState = {
+            pointerId: event.pointerId,
             startX: event.clientX,
             startY: event.clientY,
             panX: _mapPanX,
             panY: _mapPanY,
+            moved: false,
           };
           shell.classList.add("dragging");
-          event.preventDefault();
+          try { shell.setPointerCapture(event.pointerId); } catch (_) {}
         });
-        window.addEventListener("mousemove", (event) => {
-          if (!_mapDragState) return;
-          _mapPanX = _mapDragState.panX + (event.clientX - _mapDragState.startX);
-          _mapPanY = _mapDragState.panY + (event.clientY - _mapDragState.startY);
+        shell?.addEventListener("pointermove", (event) => {
+          if (!_mapDragState || event.pointerId !== _mapDragState.pointerId) return;
+          const dx = event.clientX - _mapDragState.startX;
+          const dy = event.clientY - _mapDragState.startY;
+          if (Math.hypot(dx, dy) > 3) _mapDragState.moved = true;
+          _mapPanX = _mapDragState.panX + dx;
+          _mapPanY = _mapDragState.panY + dy;
           applyMapZoom();
         });
-        window.addEventListener("mouseup", () => {
+        const endDrag = (event) => {
+          if (!_mapDragState) return;
+          if (event && event.pointerId !== _mapDragState.pointerId) return;
+          try { shell.releasePointerCapture(_mapDragState.pointerId); } catch (_) {}
           _mapDragState = null;
           shell?.classList.remove("dragging");
+          if (_pendingMapPayload !== null) {
+            const queued = _pendingMapPayload;
+            _pendingMapPayload = null;
+            renderMap(queued.map, queued.flow);
+          }
+        };
+        shell?.addEventListener("pointerup", endDrag);
+        shell?.addEventListener("pointercancel", endDrag);
+        shell?.addEventListener("lostpointercapture", endDrag);
+
+        shell?.addEventListener("keydown", (event) => {
+          if (event.target.closest(".map-control-btn, .map-dot")) return;
+          const STEP = 32;
+          switch (event.key) {
+            case "+": case "=": setMapZoom(_mapZoom + 0.25); event.preventDefault(); break;
+            case "-": case "_": setMapZoom(_mapZoom - 0.25); event.preventDefault(); break;
+            case "0": case "r": case "R": resetMapView(); event.preventDefault(); break;
+            case "ArrowUp": _mapPanY += STEP; applyMapZoom(); event.preventDefault(); break;
+            case "ArrowDown": _mapPanY -= STEP; applyMapZoom(); event.preventDefault(); break;
+            case "ArrowLeft": _mapPanX += STEP; applyMapZoom(); event.preventDefault(); break;
+            case "ArrowRight": _mapPanX -= STEP; applyMapZoom(); event.preventDefault(); break;
+          }
         });
-        shell?.addEventListener("mouseleave", () => {
-          if (!_mapDragState) shell.classList.remove("dragging");
-        });
+
         window.addEventListener("resize", () => applyMapZoom());
         applyMapZoom();
       }
@@ -2300,7 +2948,14 @@
         document.getElementById("stat-inflight").textContent = data.stats.totalActiveRequests ?? 0;
         document.getElementById("last-sync").textContent = relTime(data.generatedAt);
         document.getElementById("last-sync").title = fullTime(data.generatedAt);
-        renderMap(data.map || null);
+        const clientFlow = new Map();
+        for (const c of data.clients || []) {
+          const reqs = c?.share?.activeRequests | 0;
+          const id = c?.installation?.id;
+          if (id && reqs > 0) clientFlow.set(id, reqs);
+        }
+        renderMap(data.map || null, clientFlow);
+        applyCountryHeatmap(data.countryCounts || {});
 
         /* section counts */
         document.getElementById("client-count").textContent = _clients.length;
@@ -2315,7 +2970,7 @@
           const share = client.share;
           const pct = share ? usagePercent(share.tokensUsed, share.tokenLimit) : 0;
           return `
-          <tr onclick="openClient(${i})">
+          <tr onclick="openClient(${i})" data-installation-id="${escapeHtml(item.id)}">
             <td>${share ? `<strong>${escapeHtml(share.shareName)}</strong>` : '<span class="meta">—</span>'}</td>
             <td class="meta">${shareApiStack(share)}</td>
             <td>${forSalePill(share)}</td>
@@ -2337,6 +2992,10 @@
         document.body.innerHTML += `<pre style="padding:20px;color:#b91c1c">${String(err)}</pre>`;
       });
       bindMapZoomControls();
+      bindMapDotInteraction();
+      bindClientTableHighlight();
+      bindReveal();
+      ensureInlineWorldMap();
       applyMapZoom();
       updatePagePresence().catch(console.error);
       setInterval(() => boot().catch(console.error), 5000);
