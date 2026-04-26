@@ -2077,6 +2077,28 @@
       const BURST_DRAW_MS = 1300;
       const BURST_HOLD_MS = 350;
       const BURST_FADE_MS = 700;
+      const BURST_MIN_BOW = 16;     // viewBox units; ensures every arc visibly bows
+      const BURST_BOW_RATIO = 0.45; // bow scales with end-to-end distance
+
+      function burstControlPoint(origin, server, target) {
+        // Perpendicular bow off the origin→target line, biased toward the server so
+        // the arc still "passes through" the router. Guarantees a visible curve even
+        // when all three points are clustered (e.g. JP user → Tokyo router → JP client).
+        const dx = target.x - origin.x;
+        const dy = target.y - origin.y;
+        const dist = Math.hypot(dx, dy);
+        const midX = (origin.x + target.x) / 2;
+        const midY = (origin.y + target.y) / 2;
+        // Unit perpendicular (rotated 90° CCW). Defaults handle origin == target.
+        const px = dist > 0.01 ? -dy / dist : 0;
+        const py = dist > 0.01 ? dx / dist : 1;
+        const offset = Math.max(BURST_MIN_BOW, dist * BURST_BOW_RATIO);
+        // Pick the side that puts the bow nearer to the server (so router is "on" the arc).
+        const dot = (server.x - midX) * px + (server.y - midY) * py;
+        const sign = dot >= 0 ? 1 : -1;
+        return { x: midX + px * offset * sign, y: midY + py * offset * sign };
+      }
+
       function fireBurstArc(origin, server, target, meta) {
         if (!origin || !server || !target) return;
         const overlayEl = document.getElementById("map-overlay");
@@ -2084,9 +2106,10 @@
         if (window.__BURST_DEBUG__) {
           console.info("[burst]", { origin, server, target, ...(meta || {}) });
         }
+        const ctrl = burstControlPoint(origin, server, target);
         const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
         const d = `M ${origin.x.toFixed(2)} ${origin.y.toFixed(2)} ` +
-                  `Q ${server.x.toFixed(2)} ${server.y.toFixed(2)} ` +
+                  `Q ${ctrl.x.toFixed(2)} ${ctrl.y.toFixed(2)} ` +
                   `${target.x.toFixed(2)} ${target.y.toFixed(2)}`;
         path.setAttribute("d", d);
         path.setAttribute("class", "burst-arc");
@@ -2100,7 +2123,7 @@
         // Moving head — small bright dot that traces the path so even short
         // requests are visible.
         const head = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-        head.setAttribute("r", "1.2");
+        head.setAttribute("r", "1.6");
         head.setAttribute("cx", origin.x.toFixed(2));
         head.setAttribute("cy", origin.y.toFixed(2));
         head.setAttribute("class", "burst-head");
