@@ -1962,6 +1962,9 @@
             container.innerHTML = markup;
             container.classList.add("inline");
             _worldSvgRoot = container.querySelector("svg");
+            // Force a layout pass so getBBox() returns real dimensions on the
+            // first centroid lookup instead of a 0×0 pre-layout box.
+            void container.getBoundingClientRect();
             // Apply any data that arrived before the inline SVG was ready.
             if (_pendingHeat) {
               applyCountryHeatmap(_pendingHeat);
@@ -1970,6 +1973,11 @@
             if (_pendingDemand) {
               applyCountryDemand(_pendingDemand);
               _pendingDemand = null;
+            }
+            if (_pendingEvents) {
+              const queued = _pendingEvents;
+              _pendingEvents = null;
+              processRequestEvents(queued);
             }
             return _worldSvgRoot;
           })
@@ -1983,13 +1991,19 @@
 
       const _countryCentroidCache = new Map();
       let _pendingDemand = null;
+      let _pendingEvents = null;
       let _seenRequestIds = new Set();
+      let _firstEventBatch = true;
       let _shareToInstallation = new Map();
       let _mapServerPoint = null;
+      // Burst arcs for events older than this are silently seeded into _seenRequestIds
+      // on first boot — keeps the page from flooding with replays of historical traffic.
+      const BURST_FRESH_WINDOW_MS = 4000;
 
       function getCountryCentroid(iso3) {
         if (!_worldSvgRoot || !iso3) return null;
-        if (_countryCentroidCache.has(iso3)) return _countryCentroidCache.get(iso3);
+        const cached = _countryCentroidCache.get(iso3);
+        if (cached !== undefined) return cached;
         const path = _worldSvgRoot.querySelector(`.country.${iso3}`);
         if (!path) {
           _countryCentroidCache.set(iso3, null);
@@ -1997,6 +2011,10 @@
         }
         let bbox;
         try { bbox = path.getBBox(); } catch (_) { return null; }
+        // Don't cache a zero-sized bbox — happens when the inline SVG hasn't laid out
+        // yet. Returning null forces a retry on the next poll once layout has run.
+        if (!Number.isFinite(bbox.width) || !Number.isFinite(bbox.height)) return null;
+        if (bbox.width === 0 && bbox.height === 0) return null;
         const cx = bbox.x + bbox.width / 2;
         const cy = bbox.y + bbox.height / 2;
         // Path lives inside <g id="positioner" transform="matrix(1 0 0 -1 180 90)">,
@@ -2070,11 +2088,27 @@
 
       function processRequestEvents(events) {
         if (!Array.isArray(events) || events.length === 0) return;
-        if (!_mapServerPoint) return; // need a server to draw the curve through
+        // Defer the whole batch until the inline SVG is ready — getCountryCentroid
+        // depends on it. Drops would otherwise be silent and permanent because the
+        // request_id would be marked seen on the way out.
+        if (!_worldSvgRoot) {
+          _pendingEvents = events;
+          return;
+        }
+        if (!_mapServerPoint) return;
+        const now = Date.now();
+        const fresh = (e) => {
+          const ts = Date.parse(e?.startedAt || "");
+          return Number.isFinite(ts) && (now - ts) <= BURST_FRESH_WINDOW_MS;
+        };
         for (const event of events) {
           if (!event || !event.requestId) continue;
           if (_seenRequestIds.has(event.requestId)) continue;
+          // On first boot, suppress the flood of historical events: only fire arcs
+          // for ones that actually started in the last few seconds.
+          const shouldFire = !_firstEventBatch || fresh(event);
           _seenRequestIds.add(event.requestId);
+          if (!shouldFire) continue;
           const installationId = _shareToInstallation.get(event.shareId);
           if (!installationId) continue;
           const target = _mapClientById.get(installationId);
@@ -2083,6 +2117,7 @@
           if (!origin) continue;
           fireBurstArc(origin, _mapServerPoint, { x: target.x, y: target.y });
         }
+        _firstEventBatch = false;
         // Cap remembered IDs so the set can't grow forever.
         if (_seenRequestIds.size > 512) {
           _seenRequestIds = new Set(Array.from(_seenRequestIds).slice(-256));
