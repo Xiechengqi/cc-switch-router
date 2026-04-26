@@ -388,51 +388,77 @@
           transition: none;
         }
       }
-      /* User-origin demand pins (separate visual channel from client heatmap) */
-      .map-overlay #demand-pins .demand-pin {
-        fill: var(--accent-secondary);
-        fill-opacity: 0.32;
-        stroke: var(--accent-secondary);
-        stroke-opacity: 0.55;
-        stroke-width: 0.45;
-        vector-effect: non-scaling-stroke;
-        animation: demandPulse 3.2s ease-in-out infinite;
+      /* Live request ticker (top-left) — chat-room style stream */
+      .map-ticker {
+        position: absolute;
+        top: 16px;
+        left: 16px;
+        z-index: 5;
+        display: flex;
+        flex-direction: column;
+        gap: 5px;
+        max-width: 260px;
         pointer-events: none;
       }
-      @keyframes demandPulse {
-        0%, 100% { fill-opacity: 0.26; }
-        50% { fill-opacity: 0.5; }
-      }
-      .map-overlay .burst-arc {
-        fill: none;
-        stroke: var(--accent);
-        stroke-width: 1.6;
-        stroke-linecap: round;
-        vector-effect: non-scaling-stroke;
-        opacity: 0.95;
-        pointer-events: none;
-        filter: drop-shadow(0 0 3px rgba(0, 82, 255, 0.6));
-      }
-      .map-overlay .burst-arc.fading {
+      .map-ticker:empty { display: none; }
+      .map-ticker-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 10px;
+        border: 1px solid rgba(226, 232, 240, 0.95);
+        border-radius: 12px;
+        background: rgba(255, 255, 255, 0.92);
+        box-shadow: 0 6px 18px rgba(15, 23, 42, 0.07);
+        backdrop-filter: blur(8px);
+        font-size: 12px;
+        color: var(--foreground);
         opacity: 0;
-        transition: opacity 0.7s ease-out;
+        transform: translateY(6px);
+        transition: opacity 0.28s ease, transform 0.28s ease;
+        white-space: nowrap;
+        overflow: hidden;
+        max-width: 100%;
       }
-      .map-overlay .burst-head {
-        fill: var(--accent);
-        stroke: rgba(255, 255, 255, 0.9);
-        stroke-width: 0.5;
-        vector-effect: non-scaling-stroke;
-        pointer-events: none;
-        filter: drop-shadow(0 0 4px rgba(0, 82, 255, 0.85));
+      .map-ticker-row.entered {
+        opacity: 1;
+        transform: translateY(0);
       }
-      .map-overlay .burst-head.fading {
+      .map-ticker-row.leaving {
         opacity: 0;
-        transition: opacity 0.4s ease-out;
+        transform: translateY(-6px);
+      }
+      .map-ticker-row .ticker-flag {
+        font-size: 15px;
+        line-height: 1;
+        flex-shrink: 0;
+      }
+      .map-ticker-row .ticker-country {
+        font-weight: 600;
+        font-size: 12px;
+        letter-spacing: 0.02em;
+      }
+      .map-ticker-row .ticker-arrow {
+        color: var(--muted-foreground);
+        font-size: 11px;
+      }
+      .map-ticker-row .ticker-share {
+        color: var(--muted-foreground);
+        font-size: 12px;
+        max-width: 96px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .map-ticker-row .ticker-time {
+        margin-left: auto;
+        padding-left: 6px;
+        font: 10px/1 "JetBrains Mono", monospace;
+        letter-spacing: 0.04em;
+        color: var(--muted-foreground);
+        flex-shrink: 0;
       }
       @media (prefers-reduced-motion: reduce) {
-        .map-overlay #demand-pins .demand-pin { animation: none; }
-        .map-overlay .burst-arc,
-        .map-overlay .burst-head { display: none; }
+        .map-ticker-row { transition: none; transform: none; }
       }
       .map-overlay {
         z-index: 1;
@@ -1298,6 +1324,7 @@
 
       <section class="section">
         <div class="map-shell reveal" id="map-shell" role="region" aria-label="Live network map" tabindex="0">
+          <div class="map-ticker" id="map-ticker" aria-live="polite" aria-atomic="false"></div>
           <div class="map-canvas" id="map-canvas">
             <div class="world-image" aria-hidden="true"></div>
             <svg class="map-overlay" id="map-overlay" viewBox="0 0 360 180" preserveAspectRatio="none" aria-hidden="true"></svg>
@@ -1978,19 +2005,10 @@
             // Force a layout pass so getBBox() returns real dimensions on the
             // first centroid lookup instead of a 0×0 pre-layout box.
             void container.getBoundingClientRect();
-            // Apply any data that arrived before the inline SVG was ready.
+            // Apply any heatmap data that arrived before the inline SVG was ready.
             if (_pendingHeat) {
               applyCountryHeatmap(_pendingHeat);
               _pendingHeat = null;
-            }
-            if (_pendingDemand) {
-              applyCountryDemand(_pendingDemand);
-              _pendingDemand = null;
-            }
-            if (_pendingEvents) {
-              const queued = _pendingEvents;
-              _pendingEvents = null;
-              processRequestEvents(queued);
             }
             return _worldSvgRoot;
           })
@@ -2002,204 +2020,75 @@
         return _worldSvgPromise;
       }
 
-      const _countryCentroidCache = new Map();
-      let _pendingDemand = null;
-      let _pendingEvents = null;
       let _seenRequestIds = new Set();
-      let _firstEventBatch = true;
       let _shareToInstallation = new Map();
-      let _mapServerPoint = null;
-      // Burst arcs for events older than this are silently seeded into _seenRequestIds
-      // on first boot — keeps the page from flooding with replays of historical traffic.
-      const BURST_FRESH_WINDOW_MS = 4000;
+      let _requestTickerRows = [];
+      const REQUEST_TICKER_MAX = 6;
+      const REQUEST_TICKER_SEED_WINDOW_MS = 12000;
 
-      function getCountryCentroid(iso3) {
-        if (!_worldSvgRoot || !iso3) return null;
-        const cached = _countryCentroidCache.get(iso3);
-        if (cached !== undefined) return cached;
-        const path = _worldSvgRoot.querySelector(`.country.${iso3}`);
-        if (!path) {
-          _countryCentroidCache.set(iso3, null);
-          return null;
-        }
-        let bbox;
-        try { bbox = path.getBBox(); } catch (_) { return null; }
-        // Don't cache a zero-sized bbox — happens when the inline SVG hasn't laid out
-        // yet. Returning null forces a retry on the next poll once layout has run.
-        if (!Number.isFinite(bbox.width) || !Number.isFinite(bbox.height)) return null;
-        if (bbox.width === 0 && bbox.height === 0) return null;
-        const cx = bbox.x + bbox.width / 2;
-        const cy = bbox.y + bbox.height / 2;
-        // Path lives inside <g id="positioner" transform="matrix(1 0 0 -1 180 90)">,
-        // so its local coords are post-flip. Convert to viewBox 0..360 / 0..180.
-        const point = { x: 180 + cx, y: 90 - cy };
-        _countryCentroidCache.set(iso3, point);
-        return point;
+      function countryToFlagEmoji(countryCode) {
+        if (!countryCode || !/^[A-Z]{2}$/.test(countryCode)) return "🌐";
+        const A = 0x1F1E6;
+        return String.fromCodePoint(
+          A + (countryCode.charCodeAt(0) - 65),
+          A + (countryCode.charCodeAt(1) - 65),
+        );
       }
 
-      function applyCountryDemand(counts) {
-        const overlayEl = document.getElementById("map-overlay");
-        if (!overlayEl) return;
-        if (!_worldSvgRoot) {
-          _pendingDemand = counts || {};
-          return;
-        }
-        let group = overlayEl.querySelector("#demand-pins");
-        if (!group) {
-          group = document.createElementNS("http://www.w3.org/2000/svg", "g");
-          group.setAttribute("id", "demand-pins");
-          // Insert before any burst-arcs and points so demand sits between map and arcs
-          const firstChild = overlayEl.firstChild;
-          if (firstChild) overlayEl.insertBefore(group, firstChild);
-          else overlayEl.appendChild(group);
-        }
-        const data = counts || {};
-        const max = Math.max(1, ...Object.values(data));
-        const frag = document.createDocumentFragment();
-        for (const [iso3, count] of Object.entries(data)) {
-          if (typeof iso3 !== "string" || !/^[A-Z]{3}$/.test(iso3)) continue;
-          const point = getCountryCentroid(iso3);
-          if (!point) continue;
-          const intensity = count / max;
-          const r = (1.2 + intensity * 2.6).toFixed(2);
-          const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-          circle.setAttribute("cx", point.x.toFixed(2));
-          circle.setAttribute("cy", point.y.toFixed(2));
-          circle.setAttribute("r", r);
-          circle.setAttribute("class", "demand-pin");
-          circle.dataset.iso3 = iso3;
-          circle.dataset.count = String(count);
-          frag.appendChild(circle);
-        }
-        group.replaceChildren(frag);
+      function requestTickerLabel(event) {
+        const pair = _shareToInstallation.get(event.shareId);
+        const client = _clients.find((c) => c?.installation?.id === pair);
+        const shareName = client?.share?.shareName || client?.installation?.platform || "share";
+        return {
+          shareName,
+          country: event.userCountry || "--",
+          flag: countryToFlagEmoji(event.userCountry),
+        };
       }
 
-      const BURST_DRAW_MS = 1300;
-      const BURST_HOLD_MS = 350;
-      const BURST_FADE_MS = 700;
-      const BURST_MIN_BOW = 16;     // viewBox units; ensures every arc visibly bows
-      const BURST_BOW_RATIO = 0.45; // bow scales with end-to-end distance
-
-      function burstControlPoint(origin, server, target) {
-        // Perpendicular bow off the origin→target line, biased toward the server so
-        // the arc still "passes through" the router. Guarantees a visible curve even
-        // when all three points are clustered (e.g. JP user → Tokyo router → JP client).
-        const dx = target.x - origin.x;
-        const dy = target.y - origin.y;
-        const dist = Math.hypot(dx, dy);
-        const midX = (origin.x + target.x) / 2;
-        const midY = (origin.y + target.y) / 2;
-        // Unit perpendicular (rotated 90° CCW). Defaults handle origin == target.
-        const px = dist > 0.01 ? -dy / dist : 0;
-        const py = dist > 0.01 ? dx / dist : 1;
-        const offset = Math.max(BURST_MIN_BOW, dist * BURST_BOW_RATIO);
-        // Pick the side that puts the bow nearer to the server (so router is "on" the arc).
-        const dot = (server.x - midX) * px + (server.y - midY) * py;
-        const sign = dot >= 0 ? 1 : -1;
-        return { x: midX + px * offset * sign, y: midY + py * offset * sign };
-      }
-
-      function fireBurstArc(origin, server, target, meta) {
-        if (!origin || !server || !target) return;
-        const overlayEl = document.getElementById("map-overlay");
-        if (!overlayEl) return;
-        if (window.__BURST_DEBUG__) {
-          console.info("[burst]", { origin, server, target, ...(meta || {}) });
+      function pushRequestTicker(event) {
+        const ticker = document.getElementById("map-ticker");
+        if (!ticker || !event?.requestId) return;
+        const info = requestTickerLabel(event);
+        const row = document.createElement("div");
+        row.className = "map-ticker-row";
+        row.dataset.requestId = event.requestId;
+        row.innerHTML = `
+          <span class="ticker-flag">${info.flag}</span>
+          <span class="ticker-country">${escapeHtml(info.country)}</span>
+          <span class="ticker-arrow">→</span>
+          <span class="ticker-share">${escapeHtml(info.shareName)}</span>
+          <span class="ticker-time">now</span>
+        `;
+        ticker.prepend(row);
+        requestAnimationFrame(() => row.classList.add("entered"));
+        _requestTickerRows.unshift({ requestId: event.requestId, row, createdAt: Date.now() });
+        while (_requestTickerRows.length > REQUEST_TICKER_MAX) {
+          const stale = _requestTickerRows.pop();
+          if (!stale) break;
+          stale.row.remove();
         }
-        const ctrl = burstControlPoint(origin, server, target);
-        const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-        const d = `M ${origin.x.toFixed(2)} ${origin.y.toFixed(2)} ` +
-                  `Q ${ctrl.x.toFixed(2)} ${ctrl.y.toFixed(2)} ` +
-                  `${target.x.toFixed(2)} ${target.y.toFixed(2)}`;
-        path.setAttribute("d", d);
-        path.setAttribute("class", "burst-arc");
-        overlayEl.appendChild(path);
-        let length = 0;
-        try { length = path.getTotalLength(); } catch (_) {}
-        if (length > 0) {
-          path.style.strokeDasharray = String(length);
-          path.style.strokeDashoffset = String(length);
-        }
-        // Moving head — small bright dot that traces the path so even short
-        // requests are visible.
-        const head = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-        head.setAttribute("r", "1.6");
-        head.setAttribute("cx", origin.x.toFixed(2));
-        head.setAttribute("cy", origin.y.toFixed(2));
-        head.setAttribute("class", "burst-head");
-        overlayEl.appendChild(head);
-
-        // Force one frame of "before" state before transitioning.
-        requestAnimationFrame(() => {
-          if (length > 0) {
-            path.style.transition = `stroke-dashoffset ${BURST_DRAW_MS}ms cubic-bezier(0.4, 0.85, 0.45, 1)`;
-            path.style.strokeDashoffset = "0";
-          }
-        });
-
-        // Animate the head along the curve via JS (more portable than SMIL).
-        const startTs = performance.now();
-        function step(now) {
-          const t = Math.min(1, (now - startTs) / BURST_DRAW_MS);
-          if (length > 0) {
-            try {
-              const p = path.getPointAtLength(t * length);
-              head.setAttribute("cx", p.x.toFixed(2));
-              head.setAttribute("cy", p.y.toFixed(2));
-            } catch (_) {}
-          }
-          if (t < 1 && head.isConnected) requestAnimationFrame(step);
-        }
-        requestAnimationFrame(step);
-
+        const lifetime = 6500;
+        setTimeout(() => row.classList.add("leaving"), lifetime - 350);
         setTimeout(() => {
-          path.classList.add("fading");
-          head.classList.add("fading");
-        }, BURST_DRAW_MS + BURST_HOLD_MS);
-        setTimeout(() => {
-          path.remove();
-          head.remove();
-        }, BURST_DRAW_MS + BURST_HOLD_MS + BURST_FADE_MS);
+          row.remove();
+          _requestTickerRows = _requestTickerRows.filter((item) => item.requestId !== event.requestId);
+        }, lifetime);
       }
 
       function processRequestEvents(events) {
         if (!Array.isArray(events) || events.length === 0) return;
-        // Defer the whole batch until the inline SVG is ready — getCountryCentroid
-        // depends on it. Drops would otherwise be silent and permanent because the
-        // request_id would be marked seen on the way out.
-        if (!_worldSvgRoot) {
-          _pendingEvents = events;
-          return;
-        }
-        if (!_mapServerPoint) return;
         const now = Date.now();
-        const fresh = (e) => {
-          const ts = Date.parse(e?.startedAt || "");
-          return Number.isFinite(ts) && (now - ts) <= BURST_FRESH_WINDOW_MS;
-        };
         for (const event of events) {
           if (!event || !event.requestId) continue;
           if (_seenRequestIds.has(event.requestId)) continue;
-          // On first boot, suppress the flood of historical events: only fire arcs
-          // for ones that actually started in the last few seconds.
-          const shouldFire = !_firstEventBatch || fresh(event);
           _seenRequestIds.add(event.requestId);
-          if (!shouldFire) continue;
-          const installationId = _shareToInstallation.get(event.shareId);
-          if (!installationId) continue;
-          const target = _mapClientById.get(installationId);
-          if (!target) continue;
-          const origin = getCountryCentroid(event.userCountryIso3);
-          if (!origin) continue;
-          fireBurstArc(origin, _mapServerPoint, { x: target.x, y: target.y }, {
-            requestId: event.requestId,
-            shareId: event.shareId,
-            userCountry: event.userCountry,
-            iso3: event.userCountryIso3,
-          });
+          const startedAt = Date.parse(event.startedAt || "");
+          if (Number.isFinite(startedAt) && (now - startedAt) > REQUEST_TICKER_SEED_WINDOW_MS) {
+            continue;
+          }
+          pushRequestTicker(event);
         }
-        _firstEventBatch = false;
-        // Cap remembered IDs so the set can't grow forever.
         if (_seenRequestIds.size > 512) {
           _seenRequestIds = new Set(Array.from(_seenRequestIds).slice(-256));
         }
@@ -2288,7 +2177,6 @@
 
         if (server) {
           const sp = placed[0];
-          _mapServerPoint = { x: sp.x, y: sp.y };
           const dot = document.createElement("div");
           dot.className = "map-dot map-dot--server";
           dot.style.left = `${sp.xPct}%`;
@@ -2301,8 +2189,6 @@
           pulse.className = "map-dot--server-pulse";
           dot.appendChild(pulse);
           pointsFrag.appendChild(dot);
-        } else {
-          _mapServerPoint = null;
         }
 
         for (let i = 0; i < clients.length; i++) {
@@ -3147,7 +3033,6 @@
         _shareToInstallation = shareToInstallation;
         renderMap(data.map || null, clientFlow);
         applyCountryHeatmap(data.countryCounts || {});
-        applyCountryDemand(data.userCountryCounts || {});
         processRequestEvents(data.recentRequestEvents || []);
 
         /* section counts */
