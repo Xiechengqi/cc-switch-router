@@ -175,6 +175,11 @@ impl server::Handler for ClientHandler {
         let backend = format!("{host}:{port}");
         let share_token = lease.share.as_ref().map(|s| s.share_token.clone());
         let share_id = lease.share.as_ref().map(|s| s.share_id.clone());
+        let is_free_share = lease
+            .share
+            .as_ref()
+            .map(|s| s.for_sale == "Free")
+            .unwrap_or(false);
         let parallel_limit = lease.share.as_ref().map(|s| s.parallel_limit).unwrap_or(-1);
         self.proxy
             .set_route(
@@ -182,6 +187,7 @@ impl server::Handler for ClientHandler {
                 backend.clone(),
                 share_token,
                 share_id,
+                is_free_share,
                 parallel_limit,
             )
             .await;

@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
@@ -33,9 +32,7 @@ pub struct Config {
     pub auth_email_hourly_limit: i64,
     pub auth_ip_hourly_limit: i64,
     pub auth_installation_hourly_limit: i64,
-    pub free_model_ids: HashSet<String>,
-    pub free_model_prefixes: Vec<String>,
-    pub free_model_ip_parallel_limit: i64,
+    pub free_share_ip_parallel_limit: i64,
     pub verification_service_base_url: String,
     pub verification_service_api_key: Option<String>,
 }
@@ -142,25 +139,9 @@ impl Config {
             )
             .and_then(|v| v.parse().ok())
             .unwrap_or(10),
-            free_model_ids: parse_env_list(
-                env_var("CC_SWITCH_ROUTER_FREE_MODEL_IDS", "PORTR_RS_FREE_MODEL_IDS").as_deref(),
-            )
-            .into_iter()
-            .map(|value| value.to_ascii_lowercase())
-            .collect(),
-            free_model_prefixes: parse_env_list(
-                env_var(
-                    "CC_SWITCH_ROUTER_FREE_MODEL_PREFIXES",
-                    "PORTR_RS_FREE_MODEL_PREFIXES",
-                )
-                .as_deref(),
-            )
-            .into_iter()
-            .map(|value| value.to_ascii_lowercase())
-            .collect(),
-            free_model_ip_parallel_limit: env_var(
-                "CC_SWITCH_ROUTER_FREE_MODEL_IP_PARALLEL_LIMIT",
-                "PORTR_RS_FREE_MODEL_IP_PARALLEL_LIMIT",
+            free_share_ip_parallel_limit: env_var(
+                "CC_SWITCH_ROUTER_FREE_SHARE_IP_PARALLEL_LIMIT",
+                "PORTR_RS_FREE_SHARE_IP_PARALLEL_LIMIT",
             )
             .and_then(|v| v.parse().ok())
             .unwrap_or(1),
@@ -189,19 +170,8 @@ impl Config {
         format!("{}:{}", self.tunnel_domain, port)
     }
 
-    pub fn free_model_ip_limit_enabled(&self) -> bool {
-        self.free_model_ip_parallel_limit > 0
-            && (!self.free_model_ids.is_empty() || !self.free_model_prefixes.is_empty())
-    }
-
-    pub fn is_free_model(&self, model_id: &str) -> bool {
-        let normalized = model_id.trim().to_ascii_lowercase();
-        !normalized.is_empty()
-            && (self.free_model_ids.contains(&normalized)
-                || self
-                    .free_model_prefixes
-                    .iter()
-                    .any(|prefix| normalized.starts_with(prefix)))
+    pub fn free_share_ip_limit_enabled(&self) -> bool {
+        self.free_share_ip_parallel_limit > 0
     }
 }
 
@@ -294,9 +264,7 @@ CC_SWITCH_ROUTER_AUTH_MAX_VERIFY_ATTEMPTS=5
 CC_SWITCH_ROUTER_AUTH_EMAIL_HOURLY_LIMIT=5
 CC_SWITCH_ROUTER_AUTH_IP_HOURLY_LIMIT=20
 CC_SWITCH_ROUTER_AUTH_INSTALLATION_HOURLY_LIMIT=10
-CC_SWITCH_ROUTER_FREE_MODEL_IDS=
-CC_SWITCH_ROUTER_FREE_MODEL_PREFIXES=
-CC_SWITCH_ROUTER_FREE_MODEL_IP_PARALLEL_LIMIT=1
+CC_SWITCH_ROUTER_FREE_SHARE_IP_PARALLEL_LIMIT=1
 ",
         default_db_path().display()
     )
@@ -304,16 +272,6 @@ CC_SWITCH_ROUTER_FREE_MODEL_IP_PARALLEL_LIMIT=1
 
 fn env_var(primary: &str, legacy: &str) -> Option<String> {
     env::var(primary).ok().or_else(|| env::var(legacy).ok())
-}
-
-fn parse_env_list(value: Option<&str>) -> Vec<String> {
-    value
-        .unwrap_or_default()
-        .split([',', '\n'])
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .collect()
 }
 
 fn path_in_home(app_name: &str, leaf: &str) -> Option<PathBuf> {
@@ -339,7 +297,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn free_model_limit_stays_disabled_without_model_rules() {
+    fn free_share_limit_obeys_parallel_limit_setting() {
         let config = Config {
             api_addr: "127.0.0.1:8787".parse().expect("api addr"),
             ssh_addr: "127.0.0.1:2222".parse().expect("ssh addr"),
@@ -363,51 +321,17 @@ mod tests {
             auth_email_hourly_limit: 5,
             auth_ip_hourly_limit: 5,
             auth_installation_hourly_limit: 5,
-            free_model_ids: HashSet::new(),
-            free_model_prefixes: Vec::new(),
-            free_model_ip_parallel_limit: 1,
+            free_share_ip_parallel_limit: 1,
             verification_service_base_url: "https://example.com".into(),
             verification_service_api_key: None,
         };
 
-        assert!(!config.free_model_ip_limit_enabled());
-    }
+        assert!(config.free_share_ip_limit_enabled());
 
-    #[test]
-    fn free_model_matching_supports_exact_ids_and_prefixes() {
-        let config = Config {
-            api_addr: "127.0.0.1:8787".parse().expect("api addr"),
-            ssh_addr: "127.0.0.1:2222".parse().expect("ssh addr"),
-            tunnel_domain: "example.com".into(),
-            ssh_public_addr: String::new(),
-            use_localhost: true,
-            lease_ttl_secs: 60,
-            db_path: PathBuf::from("/tmp/test.db"),
-            host_key_path: PathBuf::from("/tmp/test.key"),
-            cleanup_interval_secs: 300,
-            lease_retention_secs: 60,
-            client_stale_secs: 60,
-            resend_api_key: None,
-            resend_from: None,
-            resend_reply_to: None,
-            auth_code_ttl_secs: 300,
-            auth_code_cooldown_secs: 60,
-            auth_session_ttl_secs: 300,
-            auth_refresh_ttl_secs: 300,
-            auth_max_verify_attempts: 5,
-            auth_email_hourly_limit: 5,
-            auth_ip_hourly_limit: 5,
-            auth_installation_hourly_limit: 5,
-            free_model_ids: HashSet::from([String::from("gpt-4.1-mini")]),
-            free_model_prefixes: vec![String::from("gemini-2.0-flash")],
-            free_model_ip_parallel_limit: 1,
-            verification_service_base_url: "https://example.com".into(),
-            verification_service_api_key: None,
+        let disabled = Config {
+            free_share_ip_parallel_limit: 0,
+            ..config
         };
-
-        assert!(config.free_model_ip_limit_enabled());
-        assert!(config.is_free_model("gpt-4.1-mini"));
-        assert!(config.is_free_model("GEMINI-2.0-FLASH-LITE"));
-        assert!(!config.is_free_model("claude-3-7-sonnet"));
+        assert!(!disabled.free_share_ip_limit_enabled());
     }
 }

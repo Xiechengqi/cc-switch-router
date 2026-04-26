@@ -85,9 +85,7 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_AUTH_EMAIL_HOURLY_LIMIT` | `5` | 单邮箱每小时最大发送次数 |
 | `CC_SWITCH_ROUTER_AUTH_IP_HOURLY_LIMIT` | `20` | 单 IP 每小时最大发送次数 |
 | `CC_SWITCH_ROUTER_AUTH_INSTALLATION_HOURLY_LIMIT` | `10` | 单 installation 每小时最大发送次数 |
-| `CC_SWITCH_ROUTER_FREE_MODEL_IDS` | 空 | 逗号分隔的 free 模型精确 ID 列表；命中后按真实用户 IP 做并发限制 |
-| `CC_SWITCH_ROUTER_FREE_MODEL_PREFIXES` | 空 | 逗号分隔的 free 模型前缀列表；用于覆盖带后缀/别名的模型名 |
-| `CC_SWITCH_ROUTER_FREE_MODEL_IP_PARALLEL_LIMIT` | `1` | 单真实用户 IP 在所有 free 模型上的总并发上限；当模型列表为空时该功能关闭 |
+| `CC_SWITCH_ROUTER_FREE_SHARE_IP_PARALLEL_LIMIT` | `1` | 所有 `for_sale = Free` share 共用的单真实用户 IP 并发上限；设为 `0` 可关闭 |
 
 最小生产示例：
 
@@ -184,4 +182,4 @@ sudo systemctl status cc-switch-router
 - `cc-switch` 端 share 同步已做短延迟批量聚合，降低高频请求噪音
 - share owner / `shared_with_emails` ACL 以 `cc-switch` 推送为准，`cc-switch-router` 负责持久化、鉴权和 dashboard 脱敏控制
 - `cc-switch-router` 会定时清理超过保留期的历史 lease，以及状态为 `expired` / `deleted` 的陈旧 share 记录
-- 当请求经 Cloudflare 代理进入时，free 模型限流会基于可信的 `CF-Connecting-IP` 识别真实用户 IP；直连源站时会回退到 socket peer IP，防止伪造头绕过限制
+- 当请求经 Cloudflare 代理进入时，free share 限流会基于可信的 `CF-Connecting-IP` 识别真实用户 IP；直连源站时会回退到 socket peer IP，防止伪造头绕过限制

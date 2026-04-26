@@ -4042,7 +4042,6 @@ mod tests {
     use crate::proxy::ProxyRegistry;
     use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
-    use std::collections::HashSet;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::path::PathBuf;
 
@@ -4073,9 +4072,7 @@ mod tests {
             auth_email_hourly_limit: 10,
             auth_ip_hourly_limit: 30,
             auth_installation_hourly_limit: 15,
-            free_model_ids: HashSet::new(),
-            free_model_prefixes: Vec::new(),
-            free_model_ip_parallel_limit: 1,
+            free_share_ip_parallel_limit: 1,
             verification_service_base_url: "https://tokenswitch.org".into(),
             verification_service_api_key: None,
         }
@@ -4865,10 +4862,24 @@ mod tests {
 
         let proxy = ProxyRegistry::default();
         proxy
-            .set_route("stale-sub".into(), "127.0.0.1:1234".into(), None, None, -1)
+            .set_route(
+                "stale-sub".into(),
+                "127.0.0.1:1234".into(),
+                None,
+                None,
+                false,
+                -1,
+            )
             .await;
         proxy
-            .set_route("fresh-sub".into(), "127.0.0.1:5678".into(), None, None, -1)
+            .set_route(
+                "fresh-sub".into(),
+                "127.0.0.1:5678".into(),
+                None,
+                None,
+                false,
+                -1,
+            )
             .await;
 
         let result = store

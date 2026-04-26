@@ -2,8 +2,6 @@ use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
-use http::Method;
-use serde_json::Value;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -20,6 +18,7 @@ pub(crate) struct RouteEntry {
     /// None for non-share tunnels.
     share_token: Option<String>,
     share_id: Option<String>,
+    is_free_share: bool,
     parallel_limit: i64,
 }
 
@@ -85,18 +84,11 @@ impl KeyedConcurrencyLimiter {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum ModelInspection {
-    NotApplicable,
-    Model(String),
-    MissingModel(&'static str),
-}
-
 #[derive(Debug, Default)]
 pub struct ProxyRegistry {
     routes: RwLock<HashMap<String, RouteEntry>>,
     share_limiter: Arc<KeyedConcurrencyLimiter>,
-    free_model_ip_limiter: Arc<KeyedConcurrencyLimiter>,
+    free_share_ip_limiter: Arc<KeyedConcurrencyLimiter>,
 }
 
 impl ProxyRegistry {
@@ -106,6 +98,7 @@ impl ProxyRegistry {
         backend: String,
         share_token: Option<String>,
         share_id: Option<String>,
+        is_free_share: bool,
         parallel_limit: i64,
     ) {
         self.routes.write().await.insert(
@@ -114,6 +107,7 @@ impl ProxyRegistry {
                 backend,
                 share_token,
                 share_id,
+                is_free_share,
                 parallel_limit,
             },
         );
@@ -157,12 +151,12 @@ impl ProxyRegistry {
             .await
     }
 
-    async fn try_acquire_free_model_ip_permit(
+    async fn try_acquire_free_share_ip_permit(
         &self,
         user_ip: &str,
         parallel_limit: i64,
     ) -> Option<KeyedConcurrencyPermit> {
-        self.free_model_ip_limiter
+        self.free_share_ip_limiter
             .try_acquire(user_ip, parallel_limit)
             .await
     }
@@ -315,56 +309,34 @@ pub async fn proxy_handler(
         }
     };
 
-    let free_model_ip_permit =
-        if !is_internal_share_router_path && state.config.free_model_ip_limit_enabled() {
-            match inspect_model_request(&method, &path, &body) {
-                ModelInspection::NotApplicable => None,
-                ModelInspection::Model(model_id) if state.config.is_free_model(&model_id) => {
-                    match state
-                        .proxy
-                        .try_acquire_free_model_ip_permit(
-                            &user_ip,
-                            state.config.free_model_ip_parallel_limit,
-                        )
-                        .await
-                    {
-                        Some(permit) => Some(permit),
-                        None => {
-                            warn!(
-                                method = %method,
-                                host = %host,
-                                path = %path_and_query,
-                                user_ip = %user_ip,
-                                model_id = %model_id,
-                                parallel_limit = state.config.free_model_ip_parallel_limit,
-                                "proxy request rejected: free model ip concurrency limit exceeded"
-                            );
-                            return simple_response(
-                                StatusCode::TOO_MANY_REQUESTS,
-                                "free-model-ip-concurrency-limit-exceeded",
-                            );
-                        }
-                    }
-                }
-                ModelInspection::Model(_) => None,
-                ModelInspection::MissingModel(request_kind) => {
-                    warn!(
-                        method = %method,
-                        host = %host,
-                        path = %path_and_query,
-                        user_ip = %user_ip,
-                        request_kind,
-                        "proxy request rejected: model detection failed for known inference route"
-                    );
-                    return simple_response(
-                        StatusCode::BAD_REQUEST,
-                        "missing-model-for-free-limit-check",
-                    );
-                }
+    let free_share_ip_permit = if !is_internal_share_router_path
+        && route.is_free_share
+        && state.config.free_share_ip_limit_enabled()
+    {
+        match state
+            .proxy
+            .try_acquire_free_share_ip_permit(&user_ip, state.config.free_share_ip_parallel_limit)
+            .await
+        {
+            Some(permit) => Some(permit),
+            None => {
+                warn!(
+                    method = %method,
+                    host = %host,
+                    path = %path_and_query,
+                    user_ip = %user_ip,
+                    parallel_limit = state.config.free_share_ip_parallel_limit,
+                    "proxy request rejected: free share ip concurrency limit exceeded"
+                );
+                return simple_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "free-share-ip-concurrency-limit-exceeded",
+                );
             }
-        } else {
-            None
-        };
+        }
+    } else {
+        None
+    };
 
     // Record the request for the dashboard's "demand" overlay and burst-arc animation.
     if let Some(share_id) = route.share_id.as_deref() {
@@ -404,7 +376,7 @@ pub async fn proxy_handler(
 
         upstream.bytes_stream().map(move |chunk| {
             let _permit = &share_permit;
-            let _free_model_ip_permit = &free_model_ip_permit;
+            let _free_share_ip_permit = &free_share_ip_permit;
             chunk
         })
     };
@@ -492,52 +464,6 @@ fn strip_connection_listed_headers(headers: &mut HeaderMap) {
     }
 }
 
-fn inspect_model_request(method: &Method, path: &str, body: &[u8]) -> ModelInspection {
-    if method != Method::POST {
-        return ModelInspection::NotApplicable;
-    }
-
-    match path {
-        "/v1/responses" => inspect_json_body_model("openai-responses", body),
-        "/v1/chat/completions" => inspect_json_body_model("openai-chat-completions", body),
-        "/v1/messages" => inspect_json_body_model("anthropic-messages", body),
-        _ => inspect_gemini_model_request(path),
-    }
-}
-
-fn inspect_json_body_model(request_kind: &'static str, body: &[u8]) -> ModelInspection {
-    let Ok(payload) = serde_json::from_slice::<Value>(body) else {
-        return ModelInspection::MissingModel(request_kind);
-    };
-    payload
-        .get("model")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| ModelInspection::Model(value.to_string()))
-        .unwrap_or(ModelInspection::MissingModel(request_kind))
-}
-
-fn inspect_gemini_model_request(path: &str) -> ModelInspection {
-    let rest = path
-        .strip_prefix("/v1/models/")
-        .or_else(|| path.strip_prefix("/v1beta/models/"));
-    let Some(rest) = rest else {
-        return ModelInspection::NotApplicable;
-    };
-    let Some((model_id, action)) = rest.split_once(':') else {
-        return ModelInspection::NotApplicable;
-    };
-    if !matches!(action, "generateContent" | "streamGenerateContent") {
-        return ModelInspection::NotApplicable;
-    }
-    let model_id = model_id.trim();
-    if model_id.is_empty() {
-        return ModelInspection::MissingModel("gemini-generate-content");
-    }
-    ModelInspection::Model(model_id.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -614,6 +540,7 @@ mod tests {
                 "127.0.0.1:3000".into(),
                 Some("token-demo".into()),
                 Some("share-1".into()),
+                true,
                 5,
             )
             .await;
@@ -626,56 +553,8 @@ mod tests {
         assert_eq!(route.backend, "127.0.0.1:3000");
         assert_eq!(route.share_token.as_deref(), Some("token-demo"));
         assert_eq!(route.share_id.as_deref(), Some("share-1"));
+        assert!(route.is_free_share);
         assert_eq!(route.parallel_limit, 5);
-    }
-
-    #[test]
-    fn inspect_openai_response_model_from_json_body() {
-        let inspection = inspect_model_request(
-            &Method::POST,
-            "/v1/responses",
-            br#"{"model":"gpt-4.1-mini"}"#,
-        );
-
-        assert_eq!(inspection, ModelInspection::Model("gpt-4.1-mini".into()));
-    }
-
-    #[test]
-    fn inspect_anthropic_message_model_from_json_body() {
-        let inspection = inspect_model_request(
-            &Method::POST,
-            "/v1/messages",
-            br#"{"model":"claude-3-5-haiku-latest"}"#,
-        );
-
-        assert_eq!(
-            inspection,
-            ModelInspection::Model("claude-3-5-haiku-latest".into())
-        );
-    }
-
-    #[test]
-    fn inspect_gemini_model_from_path() {
-        let inspection = inspect_model_request(
-            &Method::POST,
-            "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
-            br#"{}"#,
-        );
-
-        assert_eq!(
-            inspection,
-            ModelInspection::Model("gemini-2.0-flash".into())
-        );
-    }
-
-    #[test]
-    fn inspect_known_route_without_model_fails_closed() {
-        let inspection = inspect_model_request(&Method::POST, "/v1/chat/completions", br#"{}"#);
-
-        assert_eq!(
-            inspection,
-            ModelInspection::MissingModel("openai-chat-completions")
-        );
     }
 }
 
