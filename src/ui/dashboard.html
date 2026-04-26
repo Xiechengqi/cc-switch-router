@@ -406,20 +406,33 @@
       .map-overlay .burst-arc {
         fill: none;
         stroke: var(--accent);
-        stroke-width: 0.55;
+        stroke-width: 1.6;
         stroke-linecap: round;
         vector-effect: non-scaling-stroke;
-        opacity: 0.85;
+        opacity: 0.95;
         pointer-events: none;
-        filter: drop-shadow(0 0 1px rgba(0, 82, 255, 0.55));
+        filter: drop-shadow(0 0 3px rgba(0, 82, 255, 0.6));
       }
       .map-overlay .burst-arc.fading {
         opacity: 0;
-        transition: opacity 0.55s ease-out;
+        transition: opacity 0.7s ease-out;
+      }
+      .map-overlay .burst-head {
+        fill: var(--accent);
+        stroke: rgba(255, 255, 255, 0.9);
+        stroke-width: 0.5;
+        vector-effect: non-scaling-stroke;
+        pointer-events: none;
+        filter: drop-shadow(0 0 4px rgba(0, 82, 255, 0.85));
+      }
+      .map-overlay .burst-head.fading {
+        opacity: 0;
+        transition: opacity 0.4s ease-out;
       }
       @media (prefers-reduced-motion: reduce) {
         .map-overlay #demand-pins .demand-pin { animation: none; }
-        .map-overlay .burst-arc { display: none; }
+        .map-overlay .burst-arc,
+        .map-overlay .burst-head { display: none; }
       }
       .map-overlay {
         z-index: 1;
@@ -2061,10 +2074,16 @@
         group.replaceChildren(frag);
       }
 
-      function fireBurstArc(origin, server, target) {
+      const BURST_DRAW_MS = 1300;
+      const BURST_HOLD_MS = 350;
+      const BURST_FADE_MS = 700;
+      function fireBurstArc(origin, server, target, meta) {
         if (!origin || !server || !target) return;
         const overlayEl = document.getElementById("map-overlay");
         if (!overlayEl) return;
+        if (window.__BURST_DEBUG__) {
+          console.info("[burst]", { origin, server, target, ...(meta || {}) });
+        }
         const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
         const d = `M ${origin.x.toFixed(2)} ${origin.y.toFixed(2)} ` +
                   `Q ${server.x.toFixed(2)} ${server.y.toFixed(2)} ` +
@@ -2075,15 +2094,49 @@
         let length = 0;
         try { length = path.getTotalLength(); } catch (_) {}
         if (length > 0) {
-          path.style.strokeDasharray = `${length}`;
-          path.style.strokeDashoffset = `${length}`;
-          // Force reflow then animate dashoffset → 0 (request races toward target).
-          void path.getBoundingClientRect();
-          path.style.transition = "stroke-dashoffset 0.95s cubic-bezier(0.4, 0.85, 0.45, 1)";
-          requestAnimationFrame(() => { path.style.strokeDashoffset = "0"; });
+          path.style.strokeDasharray = String(length);
+          path.style.strokeDashoffset = String(length);
         }
-        setTimeout(() => { path.classList.add("fading"); }, 1000);
-        setTimeout(() => { path.remove(); }, 1700);
+        // Moving head — small bright dot that traces the path so even short
+        // requests are visible.
+        const head = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+        head.setAttribute("r", "1.2");
+        head.setAttribute("cx", origin.x.toFixed(2));
+        head.setAttribute("cy", origin.y.toFixed(2));
+        head.setAttribute("class", "burst-head");
+        overlayEl.appendChild(head);
+
+        // Force one frame of "before" state before transitioning.
+        requestAnimationFrame(() => {
+          if (length > 0) {
+            path.style.transition = `stroke-dashoffset ${BURST_DRAW_MS}ms cubic-bezier(0.4, 0.85, 0.45, 1)`;
+            path.style.strokeDashoffset = "0";
+          }
+        });
+
+        // Animate the head along the curve via JS (more portable than SMIL).
+        const startTs = performance.now();
+        function step(now) {
+          const t = Math.min(1, (now - startTs) / BURST_DRAW_MS);
+          if (length > 0) {
+            try {
+              const p = path.getPointAtLength(t * length);
+              head.setAttribute("cx", p.x.toFixed(2));
+              head.setAttribute("cy", p.y.toFixed(2));
+            } catch (_) {}
+          }
+          if (t < 1 && head.isConnected) requestAnimationFrame(step);
+        }
+        requestAnimationFrame(step);
+
+        setTimeout(() => {
+          path.classList.add("fading");
+          head.classList.add("fading");
+        }, BURST_DRAW_MS + BURST_HOLD_MS);
+        setTimeout(() => {
+          path.remove();
+          head.remove();
+        }, BURST_DRAW_MS + BURST_HOLD_MS + BURST_FADE_MS);
       }
 
       function processRequestEvents(events) {
@@ -2115,7 +2168,12 @@
           if (!target) continue;
           const origin = getCountryCentroid(event.userCountryIso3);
           if (!origin) continue;
-          fireBurstArc(origin, _mapServerPoint, { x: target.x, y: target.y });
+          fireBurstArc(origin, _mapServerPoint, { x: target.x, y: target.y }, {
+            requestId: event.requestId,
+            shareId: event.shareId,
+            userCountry: event.userCountry,
+            iso3: event.userCountryIso3,
+          });
         }
         _firstEventBatch = false;
         // Cap remembered IDs so the set can't grow forever.
