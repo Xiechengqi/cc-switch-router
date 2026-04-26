@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
@@ -32,6 +33,9 @@ pub struct Config {
     pub auth_email_hourly_limit: i64,
     pub auth_ip_hourly_limit: i64,
     pub auth_installation_hourly_limit: i64,
+    pub free_model_ids: HashSet<String>,
+    pub free_model_prefixes: Vec<String>,
+    pub free_model_ip_parallel_limit: i64,
     pub verification_service_base_url: String,
     pub verification_service_api_key: Option<String>,
 }
@@ -49,8 +53,11 @@ impl Config {
                 .expect("invalid CC_SWITCH_ROUTER_SSH_ADDR/PORTR_RS_SSH_ADDR"),
             tunnel_domain: env_var("CC_SWITCH_ROUTER_TUNNEL_DOMAIN", "PORTR_RS_TUNNEL_DOMAIN")
                 .unwrap_or_else(|| "0.0.0.0:8787".to_string()),
-            ssh_public_addr: env_var("CC_SWITCH_ROUTER_SSH_PUBLIC_ADDR", "PORTR_RS_SSH_PUBLIC_ADDR")
-                .unwrap_or_default(),
+            ssh_public_addr: env_var(
+                "CC_SWITCH_ROUTER_SSH_PUBLIC_ADDR",
+                "PORTR_RS_SSH_PUBLIC_ADDR",
+            )
+            .unwrap_or_default(),
             use_localhost: env_var("CC_SWITCH_ROUTER_USE_LOCALHOST", "PORTR_RS_USE_LOCALHOST")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(true),
@@ -67,20 +74,20 @@ impl Config {
                 "CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS",
                 "PORTR_RS_CLEANUP_INTERVAL_SECS",
             )
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(300),
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300),
             lease_retention_secs: env_var(
                 "CC_SWITCH_ROUTER_LEASE_RETENTION_SECS",
                 "PORTR_RS_LEASE_RETENTION_SECS",
             )
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(7 * 24 * 60 * 60),
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(7 * 24 * 60 * 60),
             client_stale_secs: env_var(
                 "CC_SWITCH_ROUTER_CLIENT_STALE_SECS",
                 "PORTR_RS_CLIENT_STALE_SECS",
             )
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(60 * 60),
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60 * 60),
             resend_api_key: env_var("CC_SWITCH_ROUTER_RESEND_API_KEY", "PORTR_RS_RESEND_API_KEY"),
             resend_from: env_var("CC_SWITCH_ROUTER_RESEND_FROM", "PORTR_RS_RESEND_FROM"),
             resend_reply_to: env_var(
@@ -91,50 +98,72 @@ impl Config {
                 "CC_SWITCH_ROUTER_AUTH_CODE_TTL_SECS",
                 "PORTR_RS_AUTH_CODE_TTL_SECS",
             )
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(5 * 60),
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5 * 60),
             auth_code_cooldown_secs: env_var(
                 "CC_SWITCH_ROUTER_AUTH_CODE_COOLDOWN_SECS",
                 "PORTR_RS_AUTH_CODE_COOLDOWN_SECS",
             )
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(60),
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60),
             auth_session_ttl_secs: env_var(
                 "CC_SWITCH_ROUTER_AUTH_SESSION_TTL_SECS",
                 "PORTR_RS_AUTH_SESSION_TTL_SECS",
             )
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(30 * 60),
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30 * 60),
             auth_refresh_ttl_secs: env_var(
                 "CC_SWITCH_ROUTER_AUTH_REFRESH_TTL_SECS",
                 "PORTR_RS_AUTH_REFRESH_TTL_SECS",
             )
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(30 * 24 * 60 * 60),
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30 * 24 * 60 * 60),
             auth_max_verify_attempts: env_var(
                 "CC_SWITCH_ROUTER_AUTH_MAX_VERIFY_ATTEMPTS",
                 "PORTR_RS_AUTH_MAX_VERIFY_ATTEMPTS",
             )
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(5),
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5),
             auth_email_hourly_limit: env_var(
                 "CC_SWITCH_ROUTER_AUTH_EMAIL_HOURLY_LIMIT",
                 "PORTR_RS_AUTH_EMAIL_HOURLY_LIMIT",
             )
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(5),
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5),
             auth_ip_hourly_limit: env_var(
                 "CC_SWITCH_ROUTER_AUTH_IP_HOURLY_LIMIT",
                 "PORTR_RS_AUTH_IP_HOURLY_LIMIT",
             )
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(20),
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20),
             auth_installation_hourly_limit: env_var(
                 "CC_SWITCH_ROUTER_AUTH_INSTALLATION_HOURLY_LIMIT",
                 "PORTR_RS_AUTH_INSTALLATION_HOURLY_LIMIT",
             )
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(10),
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10),
+            free_model_ids: parse_env_list(
+                env_var("CC_SWITCH_ROUTER_FREE_MODEL_IDS", "PORTR_RS_FREE_MODEL_IDS").as_deref(),
+            )
+            .into_iter()
+            .map(|value| value.to_ascii_lowercase())
+            .collect(),
+            free_model_prefixes: parse_env_list(
+                env_var(
+                    "CC_SWITCH_ROUTER_FREE_MODEL_PREFIXES",
+                    "PORTR_RS_FREE_MODEL_PREFIXES",
+                )
+                .as_deref(),
+            )
+            .into_iter()
+            .map(|value| value.to_ascii_lowercase())
+            .collect(),
+            free_model_ip_parallel_limit: env_var(
+                "CC_SWITCH_ROUTER_FREE_MODEL_IP_PARALLEL_LIMIT",
+                "PORTR_RS_FREE_MODEL_IP_PARALLEL_LIMIT",
+            )
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1),
             verification_service_base_url: env_var(
                 "CC_SWITCH_ROUTER_VERIFICATION_SERVICE_BASE_URL",
                 "PORTR_RS_VERIFICATION_SERVICE_BASE_URL",
@@ -158,6 +187,21 @@ impl Config {
         }
         let port = self.ssh_addr.port();
         format!("{}:{}", self.tunnel_domain, port)
+    }
+
+    pub fn free_model_ip_limit_enabled(&self) -> bool {
+        self.free_model_ip_parallel_limit > 0
+            && (!self.free_model_ids.is_empty() || !self.free_model_prefixes.is_empty())
+    }
+
+    pub fn is_free_model(&self, model_id: &str) -> bool {
+        let normalized = model_id.trim().to_ascii_lowercase();
+        !normalized.is_empty()
+            && (self.free_model_ids.contains(&normalized)
+                || self
+                    .free_model_prefixes
+                    .iter()
+                    .any(|prefix| normalized.starts_with(prefix)))
     }
 }
 
@@ -250,6 +294,9 @@ CC_SWITCH_ROUTER_AUTH_MAX_VERIFY_ATTEMPTS=5
 CC_SWITCH_ROUTER_AUTH_EMAIL_HOURLY_LIMIT=5
 CC_SWITCH_ROUTER_AUTH_IP_HOURLY_LIMIT=20
 CC_SWITCH_ROUTER_AUTH_INSTALLATION_HOURLY_LIMIT=10
+CC_SWITCH_ROUTER_FREE_MODEL_IDS=
+CC_SWITCH_ROUTER_FREE_MODEL_PREFIXES=
+CC_SWITCH_ROUTER_FREE_MODEL_IP_PARALLEL_LIMIT=1
 ",
         default_db_path().display()
     )
@@ -257,6 +304,16 @@ CC_SWITCH_ROUTER_AUTH_INSTALLATION_HOURLY_LIMIT=10
 
 fn env_var(primary: &str, legacy: &str) -> Option<String> {
     env::var(primary).ok().or_else(|| env::var(legacy).ok())
+}
+
+fn parse_env_list(value: Option<&str>) -> Vec<String> {
+    value
+        .unwrap_or_default()
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn path_in_home(app_name: &str, leaf: &str) -> Option<PathBuf> {
@@ -275,4 +332,82 @@ fn existing_env_path() -> Option<PathBuf> {
         return Some(default_path);
     }
     legacy_path_in_home(".env")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn free_model_limit_stays_disabled_without_model_rules() {
+        let config = Config {
+            api_addr: "127.0.0.1:8787".parse().expect("api addr"),
+            ssh_addr: "127.0.0.1:2222".parse().expect("ssh addr"),
+            tunnel_domain: "example.com".into(),
+            ssh_public_addr: String::new(),
+            use_localhost: true,
+            lease_ttl_secs: 60,
+            db_path: PathBuf::from("/tmp/test.db"),
+            host_key_path: PathBuf::from("/tmp/test.key"),
+            cleanup_interval_secs: 300,
+            lease_retention_secs: 60,
+            client_stale_secs: 60,
+            resend_api_key: None,
+            resend_from: None,
+            resend_reply_to: None,
+            auth_code_ttl_secs: 300,
+            auth_code_cooldown_secs: 60,
+            auth_session_ttl_secs: 300,
+            auth_refresh_ttl_secs: 300,
+            auth_max_verify_attempts: 5,
+            auth_email_hourly_limit: 5,
+            auth_ip_hourly_limit: 5,
+            auth_installation_hourly_limit: 5,
+            free_model_ids: HashSet::new(),
+            free_model_prefixes: Vec::new(),
+            free_model_ip_parallel_limit: 1,
+            verification_service_base_url: "https://example.com".into(),
+            verification_service_api_key: None,
+        };
+
+        assert!(!config.free_model_ip_limit_enabled());
+    }
+
+    #[test]
+    fn free_model_matching_supports_exact_ids_and_prefixes() {
+        let config = Config {
+            api_addr: "127.0.0.1:8787".parse().expect("api addr"),
+            ssh_addr: "127.0.0.1:2222".parse().expect("ssh addr"),
+            tunnel_domain: "example.com".into(),
+            ssh_public_addr: String::new(),
+            use_localhost: true,
+            lease_ttl_secs: 60,
+            db_path: PathBuf::from("/tmp/test.db"),
+            host_key_path: PathBuf::from("/tmp/test.key"),
+            cleanup_interval_secs: 300,
+            lease_retention_secs: 60,
+            client_stale_secs: 60,
+            resend_api_key: None,
+            resend_from: None,
+            resend_reply_to: None,
+            auth_code_ttl_secs: 300,
+            auth_code_cooldown_secs: 60,
+            auth_session_ttl_secs: 300,
+            auth_refresh_ttl_secs: 300,
+            auth_max_verify_attempts: 5,
+            auth_email_hourly_limit: 5,
+            auth_ip_hourly_limit: 5,
+            auth_installation_hourly_limit: 5,
+            free_model_ids: HashSet::from([String::from("gpt-4.1-mini")]),
+            free_model_prefixes: vec![String::from("gemini-2.0-flash")],
+            free_model_ip_parallel_limit: 1,
+            verification_service_base_url: "https://example.com".into(),
+            verification_service_api_key: None,
+        };
+
+        assert!(config.free_model_ip_limit_enabled());
+        assert!(config.is_free_model("gpt-4.1-mini"));
+        assert!(config.is_free_model("GEMINI-2.0-FLASH-LITE"));
+        assert!(!config.is_free_model("claude-3-7-sonnet"));
+    }
 }

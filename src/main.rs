@@ -1,5 +1,6 @@
 mod api;
 mod cf;
+mod client_meta;
 mod config;
 mod error;
 mod geo;
@@ -189,14 +190,13 @@ async fn main() -> Result<()> {
         interval.tick().await;
         loop {
             interval.tick().await;
-            if let Err(err) =
-                run_share_runtime_refresh_cycle(
-                    &runtime_store,
-                    &runtime_proxy,
-                    &runtime_config,
-                    &client,
-                )
-                .await
+            if let Err(err) = run_share_runtime_refresh_cycle(
+                &runtime_store,
+                &runtime_proxy,
+                &runtime_config,
+                &client,
+            )
+            .await
             {
                 tracing::warn!("share runtime refresh failed: {err}");
             }
@@ -403,7 +403,10 @@ async fn probe_share_route(
     client: &reqwest::Client,
     target: &ShareRouteTarget,
 ) -> bool {
-    let url = format!("{}/_share-router/health", config.tunnel_url(&target.subdomain));
+    let url = format!(
+        "{}/_share-router/health",
+        config.tunnel_url(&target.subdomain)
+    );
     match client
         .get(&url)
         .header("X-Share-Router-Probe", "1")

@@ -2,6 +2,8 @@ use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
+use http::Method;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -22,23 +24,23 @@ pub(crate) struct RouteEntry {
 }
 
 #[derive(Debug, Default)]
-struct ShareConcurrencyLimiter {
-    shares: Mutex<HashMap<String, usize>>,
+struct KeyedConcurrencyLimiter {
+    counters: Mutex<HashMap<String, usize>>,
 }
 
 #[derive(Debug)]
-struct ShareConcurrencyPermit {
-    limiter: Arc<ShareConcurrencyLimiter>,
-    share_id: String,
+struct KeyedConcurrencyPermit {
+    limiter: Arc<KeyedConcurrencyLimiter>,
+    key: String,
 }
 
-impl Drop for ShareConcurrencyPermit {
+impl Drop for KeyedConcurrencyPermit {
     fn drop(&mut self) {
         let limiter = self.limiter.clone();
-        let share_id = self.share_id.clone();
+        let key = self.key.clone();
         tokio::spawn(async move {
-            let mut shares = limiter.shares.lock().await;
-            let should_remove = match shares.get_mut(&share_id) {
+            let mut counters = limiter.counters.lock().await;
+            let should_remove = match counters.get_mut(&key) {
                 Some(inflight) if *inflight > 1 => {
                     *inflight -= 1;
                     false
@@ -47,24 +49,24 @@ impl Drop for ShareConcurrencyPermit {
                 None => false,
             };
             if should_remove {
-                shares.remove(&share_id);
+                counters.remove(&key);
             }
         });
     }
 }
 
-impl ShareConcurrencyLimiter {
-    /// Increment the in-flight counter for this share. Returns `None` when a
+impl KeyedConcurrencyLimiter {
+    /// Increment the in-flight counter for this key. Returns `None` when a
     /// non-negative `parallel_limit` has been reached (caller should reject the
     /// request). A negative `parallel_limit` means unlimited — we still track
     /// the in-flight count so it can be surfaced in the dashboard.
     async fn try_acquire(
         self: &Arc<Self>,
-        share_id: &str,
+        key: &str,
         parallel_limit: i64,
-    ) -> Option<ShareConcurrencyPermit> {
-        let mut shares = self.shares.lock().await;
-        let inflight = shares.entry(share_id.to_string()).or_insert(0);
+    ) -> Option<KeyedConcurrencyPermit> {
+        let mut counters = self.counters.lock().await;
+        let inflight = counters.entry(key.to_string()).or_insert(0);
         if parallel_limit >= 0 {
             let limit = parallel_limit as usize;
             if *inflight >= limit {
@@ -72,21 +74,29 @@ impl ShareConcurrencyLimiter {
             }
         }
         *inflight += 1;
-        Some(ShareConcurrencyPermit {
+        Some(KeyedConcurrencyPermit {
             limiter: self.clone(),
-            share_id: share_id.to_string(),
+            key: key.to_string(),
         })
     }
 
     async fn snapshot(&self) -> HashMap<String, usize> {
-        self.shares.lock().await.clone()
+        self.counters.lock().await.clone()
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ModelInspection {
+    NotApplicable,
+    Model(String),
+    MissingModel(&'static str),
 }
 
 #[derive(Debug, Default)]
 pub struct ProxyRegistry {
     routes: RwLock<HashMap<String, RouteEntry>>,
-    limiter: Arc<ShareConcurrencyLimiter>,
+    share_limiter: Arc<KeyedConcurrencyLimiter>,
+    free_model_ip_limiter: Arc<KeyedConcurrencyLimiter>,
 }
 
 impl ProxyRegistry {
@@ -134,15 +144,27 @@ impl ProxyRegistry {
     /// Snapshot of in-flight request counts per share_id. Share IDs absent from
     /// the map have zero in-flight requests.
     pub async fn inflight_by_share(&self) -> HashMap<String, usize> {
-        self.limiter.snapshot().await
+        self.share_limiter.snapshot().await
     }
 
     async fn try_acquire_share_permit(
         &self,
         share_id: &str,
         parallel_limit: i64,
-    ) -> Option<ShareConcurrencyPermit> {
-        self.limiter.try_acquire(share_id, parallel_limit).await
+    ) -> Option<KeyedConcurrencyPermit> {
+        self.share_limiter
+            .try_acquire(share_id, parallel_limit)
+            .await
+    }
+
+    async fn try_acquire_free_model_ip_permit(
+        &self,
+        user_ip: &str,
+        parallel_limit: i64,
+    ) -> Option<KeyedConcurrencyPermit> {
+        self.free_model_ip_limiter
+            .try_acquire(user_ip, parallel_limit)
+            .await
     }
 }
 
@@ -206,6 +228,7 @@ pub async fn proxy_handler(
     };
     let backend = route.backend.clone();
     let route_share_token = route.share_token.clone();
+    let client_metadata = crate::client_meta::extract_client_metadata(&parts.headers, peer);
 
     // Determine effective share token: prefer client-supplied header,
     // fall back to the token registered with this tunnel route.
@@ -240,6 +263,10 @@ pub async fn proxy_handler(
         .as_deref()
         .map(mask_token)
         .unwrap_or_else(|| "-".to_string());
+    let user_ip = client_metadata
+        .ip
+        .clone()
+        .unwrap_or_else(|| peer.ip().to_string());
 
     let share_permit = if is_internal_share_router_path {
         None
@@ -269,28 +296,6 @@ pub async fn proxy_handler(
         None
     };
 
-    // Record the request for the dashboard's "demand" overlay and burst-arc animation.
-    // Only honor the Cloudflare country header when the connecting peer is in fact a
-    // Cloudflare edge (or a loopback/private host); otherwise leave country unknown
-    // so spoofed headers cannot taint the visualisation.
-    if let Some(share_id) = route.share_id.as_deref() {
-        let user_country = if crate::cf::is_cloudflare_peer(peer.ip()) {
-            parts
-                .headers
-                .get("cf-ipcountry")
-                .and_then(|v| v.to_str().ok())
-                .map(str::trim)
-                .filter(|v| v.len() == 2 && *v != "XX" && *v != "T1")
-                .map(|v| v.to_ascii_uppercase())
-        } else {
-            None
-        };
-        state
-            .recent_traffic
-            .record(share_id.to_string(), user_country)
-            .await;
-    }
-
     let body = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(body) => body,
         Err(err) => {
@@ -309,6 +314,65 @@ pub async fn proxy_handler(
             );
         }
     };
+
+    let free_model_ip_permit =
+        if !is_internal_share_router_path && state.config.free_model_ip_limit_enabled() {
+            match inspect_model_request(&method, &path, &body) {
+                ModelInspection::NotApplicable => None,
+                ModelInspection::Model(model_id) if state.config.is_free_model(&model_id) => {
+                    match state
+                        .proxy
+                        .try_acquire_free_model_ip_permit(
+                            &user_ip,
+                            state.config.free_model_ip_parallel_limit,
+                        )
+                        .await
+                    {
+                        Some(permit) => Some(permit),
+                        None => {
+                            warn!(
+                                method = %method,
+                                host = %host,
+                                path = %path_and_query,
+                                user_ip = %user_ip,
+                                model_id = %model_id,
+                                parallel_limit = state.config.free_model_ip_parallel_limit,
+                                "proxy request rejected: free model ip concurrency limit exceeded"
+                            );
+                            return simple_response(
+                                StatusCode::TOO_MANY_REQUESTS,
+                                "free-model-ip-concurrency-limit-exceeded",
+                            );
+                        }
+                    }
+                }
+                ModelInspection::Model(_) => None,
+                ModelInspection::MissingModel(request_kind) => {
+                    warn!(
+                        method = %method,
+                        host = %host,
+                        path = %path_and_query,
+                        user_ip = %user_ip,
+                        request_kind,
+                        "proxy request rejected: model detection failed for known inference route"
+                    );
+                    return simple_response(
+                        StatusCode::BAD_REQUEST,
+                        "missing-model-for-free-limit-check",
+                    );
+                }
+            }
+        } else {
+            None
+        };
+
+    // Record the request for the dashboard's "demand" overlay and burst-arc animation.
+    if let Some(share_id) = route.share_id.as_deref() {
+        state
+            .recent_traffic
+            .record(share_id.to_string(), client_metadata.country_code.clone())
+            .await;
+    }
 
     let upstream = match builder.body(body).send().await {
         Ok(response) => response,
@@ -340,6 +404,7 @@ pub async fn proxy_handler(
 
         upstream.bytes_stream().map(move |chunk| {
             let _permit = &share_permit;
+            let _free_model_ip_permit = &free_model_ip_permit;
             chunk
         })
     };
@@ -427,13 +492,59 @@ fn strip_connection_listed_headers(headers: &mut HeaderMap) {
     }
 }
 
+fn inspect_model_request(method: &Method, path: &str, body: &[u8]) -> ModelInspection {
+    if method != Method::POST {
+        return ModelInspection::NotApplicable;
+    }
+
+    match path {
+        "/v1/responses" => inspect_json_body_model("openai-responses", body),
+        "/v1/chat/completions" => inspect_json_body_model("openai-chat-completions", body),
+        "/v1/messages" => inspect_json_body_model("anthropic-messages", body),
+        _ => inspect_gemini_model_request(path),
+    }
+}
+
+fn inspect_json_body_model(request_kind: &'static str, body: &[u8]) -> ModelInspection {
+    let Ok(payload) = serde_json::from_slice::<Value>(body) else {
+        return ModelInspection::MissingModel(request_kind);
+    };
+    payload
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| ModelInspection::Model(value.to_string()))
+        .unwrap_or(ModelInspection::MissingModel(request_kind))
+}
+
+fn inspect_gemini_model_request(path: &str) -> ModelInspection {
+    let rest = path
+        .strip_prefix("/v1/models/")
+        .or_else(|| path.strip_prefix("/v1beta/models/"));
+    let Some(rest) = rest else {
+        return ModelInspection::NotApplicable;
+    };
+    let Some((model_id, action)) = rest.split_once(':') else {
+        return ModelInspection::NotApplicable;
+    };
+    if !matches!(action, "generateContent" | "streamGenerateContent") {
+        return ModelInspection::NotApplicable;
+    }
+    let model_id = model_id.trim();
+    if model_id.is_empty() {
+        return ModelInspection::MissingModel("gemini-generate-content");
+    }
+    ModelInspection::Model(model_id.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[tokio::test]
     async fn share_concurrency_limiter_enforces_limit_and_releases_on_drop() {
-        let limiter = Arc::new(ShareConcurrencyLimiter::default());
+        let limiter = Arc::new(KeyedConcurrencyLimiter::default());
 
         let permit_1 = limiter
             .try_acquire("share-1", 3)
@@ -466,7 +577,7 @@ mod tests {
 
     #[tokio::test]
     async fn share_concurrency_limiter_tracks_unlimited_shares_in_snapshot() {
-        let limiter = Arc::new(ShareConcurrencyLimiter::default());
+        let limiter = Arc::new(KeyedConcurrencyLimiter::default());
 
         let permit_a = limiter
             .try_acquire("unlimited-share", -1)
@@ -516,6 +627,55 @@ mod tests {
         assert_eq!(route.share_token.as_deref(), Some("token-demo"));
         assert_eq!(route.share_id.as_deref(), Some("share-1"));
         assert_eq!(route.parallel_limit, 5);
+    }
+
+    #[test]
+    fn inspect_openai_response_model_from_json_body() {
+        let inspection = inspect_model_request(
+            &Method::POST,
+            "/v1/responses",
+            br#"{"model":"gpt-4.1-mini"}"#,
+        );
+
+        assert_eq!(inspection, ModelInspection::Model("gpt-4.1-mini".into()));
+    }
+
+    #[test]
+    fn inspect_anthropic_message_model_from_json_body() {
+        let inspection = inspect_model_request(
+            &Method::POST,
+            "/v1/messages",
+            br#"{"model":"claude-3-5-haiku-latest"}"#,
+        );
+
+        assert_eq!(
+            inspection,
+            ModelInspection::Model("claude-3-5-haiku-latest".into())
+        );
+    }
+
+    #[test]
+    fn inspect_gemini_model_from_path() {
+        let inspection = inspect_model_request(
+            &Method::POST,
+            "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+            br#"{}"#,
+        );
+
+        assert_eq!(
+            inspection,
+            ModelInspection::Model("gemini-2.0-flash".into())
+        );
+    }
+
+    #[test]
+    fn inspect_known_route_without_model_fails_closed() {
+        let inspection = inspect_model_request(&Method::POST, "/v1/chat/completions", br#"{}"#);
+
+        assert_eq!(
+            inspection,
+            ModelInspection::MissingModel("openai-chat-completions")
+        );
     }
 }
 

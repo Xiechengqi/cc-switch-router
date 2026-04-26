@@ -7,9 +7,10 @@ use axum::{Json, Router, response::Html};
 use serde::{Deserialize, Serialize};
 
 use crate::ServerState;
+use crate::client_meta::extract_client_metadata;
 use crate::error::AppError;
 use crate::models::{
-    BindInstallationOwnerEmailRequest, BindInstallationOwnerEmailResponse, ClientMetadata,
+    BindInstallationOwnerEmailRequest, BindInstallationOwnerEmailResponse,
     DashboardPresenceRequest, DashboardPresenceResponse, DashboardResponse,
     GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse, HealthResponse,
     IssueLeaseRequest, IssueLeaseResponse, PublicMapPointsResponse, RefreshSessionRequest,
@@ -267,7 +268,11 @@ fn world_map_etag() -> &'static str {
         let mut hasher = Sha256::new();
         hasher.update(WORLD_MAP_SVG.as_bytes());
         let digest = hasher.finalize();
-        let hex: String = digest.iter().take(8).map(|b| format!("{:02x}", b)).collect();
+        let hex: String = digest
+            .iter()
+            .take(8)
+            .map(|b| format!("{:02x}", b))
+            .collect();
         format!("\"wm-{}\"", hex)
     })
 }
@@ -275,7 +280,9 @@ fn world_map_etag() -> &'static str {
 async fn world_map_svg(headers: HeaderMap) -> axum::response::Response {
     use axum::response::IntoResponse;
     let etag = world_map_etag();
-    if let Some(if_none_match) = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok())
+    if let Some(if_none_match) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
         && if_none_match == etag
     {
         return (StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response();
@@ -367,50 +374,6 @@ async fn batch_sync_share_request_logs(
         .batch_sync_share_request_logs(input, extract_client_metadata(&headers, addr), "")
         .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
-}
-
-fn extract_client_metadata(headers: &HeaderMap, addr: SocketAddr) -> ClientMetadata {
-    // Only honor Cloudflare-spoof-prone headers when the connecting peer is in fact a
-    // Cloudflare edge (or a loopback/private host for dev). Otherwise an attacker
-    // hitting the origin directly could forge `cf-connecting-ip` / `cf-ipcountry`.
-    let cf_trusted = crate::cf::is_cloudflare_peer(addr.ip());
-
-    let forwarded_ip = if cf_trusted {
-        headers
-            .get("cf-connecting-ip")
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(str::to_string)
-            .or_else(|| {
-                headers
-                    .get("x-forwarded-for")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.split(',').next())
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty())
-                    .map(str::to_string)
-            })
-            .or_else(|| Some(addr.ip().to_string()))
-    } else {
-        Some(addr.ip().to_string())
-    };
-
-    let country_code = if cf_trusted {
-        headers
-            .get("cf-ipcountry")
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|v| v.len() == 2 && *v != "XX" && *v != "T1")
-            .map(|v| v.to_ascii_uppercase())
-    } else {
-        None
-    };
-
-    ClientMetadata {
-        ip: forwarded_ip,
-        country_code,
-    }
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {

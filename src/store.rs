@@ -1269,10 +1269,7 @@ impl AppStore {
         let share_views = shares
             .into_iter()
             .map(|(installation_id, share)| {
-                let active_requests = inflight_by_share
-                    .get(&share.share_id)
-                    .copied()
-                    .unwrap_or(0);
+                let active_requests = inflight_by_share.get(&share.share_id).copied().unwrap_or(0);
                 let recent_requests = logs_by_share
                     .get(&share.share_id)
                     .cloned()
@@ -1940,7 +1937,10 @@ async fn fetch_share_request_logs_from_route(
     client: &reqwest::Client,
     subdomain: &str,
 ) -> Result<ShareRequestLogFetchResponse, AppError> {
-    let url = format!("{}/_share-router/request-logs", config.tunnel_url(subdomain));
+    let url = format!(
+        "{}/_share-router/request-logs",
+        config.tunnel_url(subdomain)
+    );
     let response = client
         .get(&url)
         .send()
@@ -1965,7 +1965,10 @@ pub async fn fetch_share_runtime_snapshot_from_route(
     client: &reqwest::Client,
     subdomain: &str,
 ) -> Result<ShareRuntimeSnapshotResponse, AppError> {
-    let url = format!("{}/_share-router/share-runtime", config.tunnel_url(subdomain));
+    let url = format!(
+        "{}/_share-router/share-runtime",
+        config.tunnel_url(subdomain)
+    );
     let response = client
         .get(&url)
         .header("X-Share-Router-Probe", "1")
@@ -4039,6 +4042,7 @@ mod tests {
     use crate::proxy::ProxyRegistry;
     use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
+    use std::collections::HashSet;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::path::PathBuf;
 
@@ -4069,6 +4073,9 @@ mod tests {
             auth_email_hourly_limit: 10,
             auth_ip_hourly_limit: 30,
             auth_installation_hourly_limit: 15,
+            free_model_ids: HashSet::new(),
+            free_model_prefixes: Vec::new(),
+            free_model_ip_parallel_limit: 1,
             verification_service_base_url: "https://tokenswitch.org".into(),
             verification_service_api_key: None,
         }

@@ -54,9 +54,7 @@ fn ipv6_in_cidr(ip: Ipv6Addr, base: Ipv6Addr, prefix: u8) -> bool {
     if prefix == 0 {
         return true;
     }
-    let mask = (!0u128)
-        .checked_shl(128 - u32::from(prefix))
-        .unwrap_or(0);
+    let mask = (!0u128).checked_shl(128 - u32::from(prefix)).unwrap_or(0);
     let ip_u128 = u128::from(ip);
     let base_u128 = u128::from(base);
     (ip_u128 & mask) == (base_u128 & mask)
