@@ -522,6 +522,7 @@ Environment:
   CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS Cleanup interval, default 300
   CC_SWITCH_ROUTER_LEASE_RETENTION_SECS  Lease retention period, default 604800
   CC_SWITCH_ROUTER_CLIENT_STALE_SECS     Delete clients and shares after no report, default 3600
+  CC_SWITCH_ROUTER_MARKETS               JSON known market registry with token hashes and scopes
 
 Legacy compatibility:
   `PORTR_RS_*` and `$HOME/.config/portr-rs/.env` are still accepted during migration.

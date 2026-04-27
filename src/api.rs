@@ -13,14 +13,14 @@ use crate::models::{
     BindInstallationOwnerEmailRequest, BindInstallationOwnerEmailResponse,
     DashboardPresenceRequest, DashboardPresenceResponse, DashboardResponse,
     GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse, HealthResponse,
-    IssueLeaseRequest, IssueLeaseResponse, PublicMapPointsResponse, RefreshSessionRequest,
-    RegisterInstallationRequest, RegisterInstallationResponse, RequestEmailCodeRequest,
-    RequestEmailCodeResponse, SessionStatusResponse, ShareBatchSyncRequest,
-    ShareClaimSubdomainRequest, ShareDeleteRequest, ShareHeartbeatRequest,
-    ShareRequestLogBatchSyncRequest, ShareSyncRequest, VerifyEmailCodeRequest,
-    VerifyEmailCodeResponse,
+    IssueLeaseRequest, IssueLeaseResponse, MarketShareView, MarketsResponse,
+    PublicMapPointsResponse, RefreshSessionRequest, RegisterInstallationRequest,
+    RegisterInstallationResponse, RequestEmailCodeRequest, RequestEmailCodeResponse,
+    SessionStatusResponse, ShareBatchSyncRequest, ShareClaimSubdomainRequest, ShareDeleteRequest,
+    ShareHeartbeatRequest, ShareRequestLogBatchSyncRequest, ShareSyncRequest,
+    VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
-use crate::proxy::proxy_handler;
+use crate::proxy::{market_proxy_handler, proxy_handler};
 
 const REGIONS: &str = include_str!("../regions");
 
@@ -44,6 +44,9 @@ pub fn router(state: ServerState) -> Router {
         .route("/favicon.ico", get(favicon))
         .route("/v1/healthz", get(health))
         .route("/v1/dashboard", get(dashboard))
+        .route("/v1/markets", get(markets))
+        .route("/v1/market/shares", get(market_shares))
+        .route("/v1/markets/tunnel/lease", post(issue_market_lease))
         .route("/v1/public/map-points", get(public_map_points))
         .route("/v1/regions", get(regions))
         .route("/v1/dashboard/presence", post(dashboard_presence))
@@ -70,6 +73,7 @@ pub fn router(state: ServerState) -> Router {
         )
         .route("/v1/shares/heartbeat", post(share_heartbeat))
         .route("/v1/shares/delete", post(delete_share))
+        .route("/_market/proxy/:share_id/*path", any(market_proxy_handler))
         .route("/*path", any(proxy_handler))
         .with_state(state)
 }
@@ -80,6 +84,44 @@ async fn favicon() -> StatusCode {
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { ok: true })
+}
+
+async fn markets(State(state): State<ServerState>) -> Json<MarketsResponse> {
+    Json(MarketsResponse {
+        markets: state.config.public_markets(),
+    })
+}
+
+async fn market_shares(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<MarketShareView>>, AppError> {
+    let market = authenticate_market(&state, &headers, "market:shares:read")?;
+    let active_subdomains = state.proxy.active_subdomains().await.into_iter().collect();
+    let inflight_by_share = state.proxy.inflight_by_share().await;
+    let shares = state
+        .store
+        .list_market_shares(
+            &market.email,
+            "main",
+            &active_subdomains,
+            &inflight_by_share,
+        )
+        .await?;
+    Ok(Json(shares))
+}
+
+async fn issue_market_lease(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<IssueLeaseResponse>, AppError> {
+    let market = authenticate_market(&state, &headers, "market:proxy:use")?;
+    let mut response = state
+        .store
+        .issue_market_lease(&state.config, &state.proxy, market)
+        .await?;
+    response.ssh_host_fingerprint = state.ssh_host_fingerprint.clone();
+    Ok(Json(response))
 }
 
 async fn register_installation(
@@ -324,7 +366,12 @@ async fn claim_share_subdomain(
 ) -> Result<Json<serde_json::Value>, AppError> {
     state
         .store
-        .claim_share_subdomain(input, extract_client_metadata(&headers, addr), "")
+        .claim_share_subdomain(
+            &state.config,
+            input,
+            extract_client_metadata(&headers, addr),
+            "",
+        )
         .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -383,6 +430,19 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+fn authenticate_market<'a>(
+    state: &'a ServerState,
+    headers: &HeaderMap,
+    required_scope: &str,
+) -> Result<&'a crate::config::MarketConfig, AppError> {
+    let token = extract_bearer_token(headers)
+        .ok_or_else(|| AppError::Unauthorized("missing market bearer token".into()))?;
+    state
+        .config
+        .market_by_token(token, required_scope)
+        .ok_or_else(|| AppError::Unauthorized("invalid market bearer token".into()))
 }
 
 async fn extract_session_email(

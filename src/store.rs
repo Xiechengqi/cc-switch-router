@@ -16,14 +16,14 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 use crate::ServerGeo;
-use crate::config::Config;
+use crate::config::{Config, MarketConfig};
 use crate::error::AppError;
 use crate::models::{
     AuthSession, AuthUser, BindInstallationOwnerEmailRequest, BindInstallationOwnerEmailResponse,
     ClientMetadata, DashboardClientView, DashboardMap, DashboardMapPoint, DashboardPresenceRequest,
     DashboardResponse, DashboardStats, DashboardTickerShare, GetInstallationOwnerEmailQuery,
     GetInstallationOwnerEmailResponse, HealthCheckEntry, Installation, InstallationView,
-    IssueLeaseRequest, IssueLeaseResponse, LatLonPoint, PublicMapClientPoint,
+    IssueLeaseRequest, IssueLeaseResponse, LatLonPoint, MarketShareView, PublicMapClientPoint,
     PublicMapPointsResponse, RefreshSessionRequest, RegisterInstallationRequest,
     RegisterInstallationResponse, RequestEmailCodeRequest, RequestEmailCodeResponse,
     SessionStatusResponse, ShareAppRuntimes, ShareBatchSyncRequest, ShareClaimSubdomainRequest,
@@ -732,6 +732,7 @@ impl AppStore {
         }
 
         let requested_subdomain = normalize_subdomain(&input.requested_subdomain)?;
+        ensure_subdomain_allowed(&requested_subdomain, config)?;
         let subdomain = if let Some(share) = input.share.as_ref() {
             let conn = self.conn.lock().await;
             let owned_subdomain =
@@ -856,6 +857,99 @@ impl AppStore {
         })
     }
 
+    pub async fn issue_market_lease(
+        &self,
+        config: &Config,
+        proxy: &ProxyRegistry,
+        market: &MarketConfig,
+    ) -> Result<IssueLeaseResponse, AppError> {
+        let now = Utc::now();
+        let subdomain = normalize_subdomain(&market.subdomain)?;
+        if !config.is_market_subdomain(&subdomain) {
+            return Err(AppError::Unauthorized(
+                "market subdomain is not registered".into(),
+            ));
+        }
+        {
+            let conn = self.conn.lock().await;
+            let live_lease_exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM leases
+                        WHERE subdomain = ?1 AND expires_at > ?2
+                    )",
+                    params![subdomain, now.to_rfc3339()],
+                    |row| row.get(0),
+                )
+                .map_err(|e| AppError::Internal(format!("check live market lease failed: {e}")))?;
+            if live_lease_exists {
+                return Err(AppError::Conflict("market subdomain already leased".into()));
+            }
+        }
+        if proxy
+            .backend_for_host(
+                &format!("{subdomain}.{}", config.tunnel_domain),
+                &config.tunnel_domain,
+            )
+            .await
+            .is_some()
+        {
+            return Err(AppError::Conflict("market subdomain already in use".into()));
+        }
+
+        let issued_at = Utc::now();
+        let expires_at = issued_at + Duration::seconds(config.lease_ttl_secs);
+        let connection_id = Uuid::new_v4().to_string();
+        let ssh_password = Alphanumeric.sample_string(&mut rand::thread_rng(), 24);
+        let lease = TunnelLease {
+            id: Uuid::new_v4().to_string(),
+            installation_id: format!("market:{}", market.id),
+            connection_id: connection_id.clone(),
+            subdomain: subdomain.clone(),
+            tunnel_type: "market-http".to_string(),
+            ssh_username: connection_id.clone(),
+            ssh_password: ssh_password.clone(),
+            issued_at,
+            expires_at,
+            used_at: None,
+            share: None,
+        };
+
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO leases (
+                id, installation_id, connection_id, subdomain, tunnel_type,
+                ssh_username, ssh_password, issued_at, expires_at, used_at, share_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                lease.id,
+                lease.installation_id,
+                lease.connection_id,
+                lease.subdomain,
+                lease.tunnel_type,
+                lease.ssh_username,
+                lease.ssh_password,
+                lease.issued_at.to_rfc3339(),
+                lease.expires_at.to_rfc3339(),
+                Option::<String>::None,
+                Option::<String>::None,
+            ],
+        )
+        .map_err(|e| AppError::Internal(format!("insert market lease failed: {e}")))?;
+
+        Ok(IssueLeaseResponse {
+            lease_id: lease.id,
+            connection_id: lease.connection_id,
+            ssh_username: lease.ssh_username,
+            ssh_password,
+            ssh_addr: config.effective_ssh_public_addr(),
+            expires_at,
+            tunnel_url: config.tunnel_url(&subdomain),
+            subdomain,
+            ssh_host_fingerprint: None,
+        })
+    }
+
     pub async fn consume_lease(
         &self,
         username: &str,
@@ -933,12 +1027,13 @@ impl AppStore {
 
     pub async fn claim_share_subdomain(
         &self,
+        config: &Config,
         input: ShareClaimSubdomainRequest,
         metadata: ClientMetadata,
         _current_user_email: &str,
     ) -> Result<(), AppError> {
         let subdomain = normalize_subdomain(&input.share.subdomain)?;
-        ensure_subdomain_allowed(&subdomain)?;
+        ensure_subdomain_allowed(&subdomain, config)?;
         let conn = self.conn.lock().await;
         let installation = get_installation(&conn, &input.installation_id)?;
         let Some(installation) = installation else {
@@ -1711,6 +1806,86 @@ impl AppStore {
             })
             .map_err(|e| AppError::Internal(format!("query route targets failed: {e}")))?;
         collect_rows(rows)
+    }
+
+    pub async fn list_market_shares(
+        &self,
+        market_email: &str,
+        router_id: &str,
+        active_subdomains: &HashSet<String>,
+        inflight_by_share: &HashMap<String, usize>,
+    ) -> Result<Vec<MarketShareView>, AppError> {
+        let conn = self.conn.lock().await;
+        let online_minutes = list_online_minutes_24h(&conn)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.share_id, s.installation_id, s.share_name, s.owner_email,
+                        i.owner_email, s.shared_with_emails_json, s.app_type, s.for_sale,
+                        s.share_status, COALESCE(s.subdomain, ''), s.parallel_limit,
+                        i.last_seen_at, s.enabled_claude, s.enabled_codex, s.enabled_gemini,
+                        s.upstream_provider_json, s.app_runtimes_json
+                 FROM shares s
+                 LEFT JOIN installations i ON i.id = s.installation_id
+                 WHERE s.for_sale = 'Yes'
+                   AND s.share_status = 'active'
+                   AND s.subdomain IS NOT NULL
+                   AND s.subdomain != ''
+                   AND s.subdomain != '-'
+                 ORDER BY s.share_name ASC",
+            )
+            .map_err(|e| AppError::Internal(format!("prepare market shares failed: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let share_id: String = row.get(0)?;
+                let shared_with_emails = parse_string_vec(row.get(5)?)?;
+                let subdomain: String = row.get(9)?;
+                Ok((
+                    shared_with_emails,
+                    subdomain,
+                    MarketShareView {
+                        router_id: router_id.to_string(),
+                        share_id: share_id.clone(),
+                        installation_id: row.get(1)?,
+                        share_name: row.get(2)?,
+                        owner_email: row.get(3)?,
+                        installation_owner_email: row.get(4)?,
+                        app_type: row.get(6)?,
+                        for_sale: row.get(7)?,
+                        share_status: row.get(8)?,
+                        online: false,
+                        active_requests: *inflight_by_share.get(&share_id).unwrap_or(&0),
+                        parallel_limit: row.get(10)?,
+                        online_rate_24h: online_minutes
+                            .get(&share_id)
+                            .map(|minutes| *minutes as f64 / ONLINE_WINDOW_MINUTES as f64)
+                            .unwrap_or(0.0),
+                        last_seen_at: row.get(11)?,
+                        support: ShareSupport {
+                            claude: row.get::<_, i64>(12)? != 0,
+                            codex: row.get::<_, i64>(13)? != 0,
+                            gemini: row.get::<_, i64>(14)? != 0,
+                        },
+                        upstream_provider: parse_upstream_provider(row.get(15)?)?,
+                        app_runtimes: parse_app_runtimes(row.get(16)?)?,
+                    },
+                ))
+            })
+            .map_err(|e| AppError::Internal(format!("query market shares failed: {e}")))?;
+
+        let mut shares = Vec::new();
+        for row in rows {
+            let (shared_with_emails, subdomain, mut share) =
+                row.map_err(|e| AppError::Internal(format!("read market share row failed: {e}")))?;
+            let authorized = shared_with_emails
+                .iter()
+                .any(|email| email.eq_ignore_ascii_case(market_email));
+            if !authorized || !active_subdomains.contains(&subdomain) {
+                continue;
+            }
+            share.online = true;
+            shares.push(share);
+        }
+        Ok(shares)
     }
 
     pub async fn public_map_points(
@@ -3381,9 +3556,9 @@ fn normalize_subdomain(value: &str) -> Result<String, AppError> {
     Ok(value)
 }
 
-fn ensure_subdomain_allowed(value: &str) -> Result<(), AppError> {
+fn ensure_subdomain_allowed(value: &str, config: &Config) -> Result<(), AppError> {
     const RESERVED: &[&str] = &["admin", "api", "www", "cdn-cgi"];
-    if RESERVED.contains(&value) {
+    if RESERVED.contains(&value) || config.is_market_subdomain(value) {
         return Err(AppError::Conflict("subdomain is reserved".into()));
     }
     Ok(())
@@ -4047,7 +4222,7 @@ fn enforce_share_owner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, MarketConfig, MarketTokenHash};
     use crate::models::ShareSyncOperation;
     use crate::proxy::ProxyRegistry;
     use ed25519_dalek::{Signer, SigningKey};
@@ -4085,6 +4260,7 @@ mod tests {
             free_share_ip_parallel_limit: 1,
             verification_service_base_url: "https://tokenswitch.org".into(),
             verification_service_api_key: None,
+            markets: Vec::new(),
         }
     }
 
@@ -4092,6 +4268,23 @@ mod tests {
         let config = test_config(name);
         let store = AppStore::new(&config).expect("create store");
         (store, config)
+    }
+
+    fn test_market() -> MarketConfig {
+        MarketConfig {
+            id: "main-market".into(),
+            display_name: "Main Market".into(),
+            email: "market@example.com".into(),
+            subdomain: "market-a".into(),
+            public_base_url: "https://market-a.example.com".into(),
+            token_hashes: vec![MarketTokenHash {
+                hash: "sha256:test".into(),
+                created_at: None,
+                expires_at: None,
+            }],
+            scopes: vec!["market:shares:read".into(), "market:proxy:use".into()],
+            status: "active".into(),
+        }
     }
 
     async fn insert_installation(store: &AppStore, installation_id: &str) {
@@ -4247,6 +4440,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn issue_market_lease_uses_registered_market_subdomain() {
+        let (store, mut config) = setup_store("market-lease").await;
+        config.markets = vec![test_market()];
+        let proxy = ProxyRegistry::default();
+
+        let lease = store
+            .issue_market_lease(&config, &proxy, &config.markets[0])
+            .await
+            .expect("issue market lease");
+
+        assert_eq!(lease.subdomain, "market-a");
+        assert_eq!(lease.tunnel_url, "http://market-a.127.0.0.1:8787");
+
+        let consumed = store
+            .consume_lease(&lease.ssh_username, &lease.ssh_password)
+            .await
+            .expect("consume market lease");
+        assert_eq!(consumed.installation_id, "market:main-market");
+        assert_eq!(consumed.tunnel_type, "market-http");
+        assert!(consumed.share.is_none());
+
+        let replay = store
+            .consume_lease(&lease.ssh_username, &lease.ssh_password)
+            .await
+            .expect_err("market lease cannot be reused");
+        assert!(replay.to_string().contains("lease already used"));
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn issue_market_lease_rejects_duplicate_live_lease() {
+        let (store, mut config) = setup_store("market-lease-duplicate").await;
+        config.markets = vec![test_market()];
+        let proxy = ProxyRegistry::default();
+
+        store
+            .issue_market_lease(&config, &proxy, &config.markets[0])
+            .await
+            .expect("first market lease");
+        let err = store
+            .issue_market_lease(&config, &proxy, &config.markets[0])
+            .await
+            .expect_err("duplicate live market lease should fail");
+        assert!(err.to_string().contains("already leased"));
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn claim_share_subdomain_rejects_registered_market_subdomain() {
+        let (store, mut config) = setup_store("market-subdomain-reserved").await;
+        config.markets = vec![test_market()];
+        let signing_key = insert_signed_installation(&store, "inst-market-reserved").await;
+
+        let share = ShareDescriptor {
+            share_id: "share-market-reserved".into(),
+            share_name: "Reserved".into(),
+            owner_email: Some("owner@example.com".into()),
+            shared_with_emails: vec![],
+            description: None,
+            for_sale: "No".into(),
+            subdomain: "market-a".into(),
+            share_token: "token-reserved".into(),
+            app_type: "proxy".into(),
+            provider_id: None,
+            token_limit: 1000,
+            parallel_limit: 3,
+            tokens_used: 0,
+            requests_count: 0,
+            share_status: "active".into(),
+            created_at: Utc::now().to_rfc3339(),
+            expires_at: (Utc::now() + Duration::days(1)).to_rfc3339(),
+            support: ShareSupport::default(),
+            upstream_provider: None,
+            app_runtimes: ShareAppRuntimes::default(),
+        };
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            "inst-market-reserved",
+            "share_claim_subdomain",
+            &share,
+            timestamp_ms,
+            &nonce,
+        );
+
+        let err = store
+            .claim_share_subdomain(
+                &config,
+                ShareClaimSubdomainRequest {
+                    installation_id: "inst-market-reserved".into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    share,
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                "owner@example.com",
+            )
+            .await
+            .expect_err("market subdomain should be reserved");
+        assert!(err.to_string().contains("subdomain is reserved"));
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
     async fn claim_share_subdomain_accepts_valid_signature_and_rejects_replay_and_tamper() {
         let (store, config) = setup_store("signed-share-claim").await;
         let signing_key = insert_signed_installation(&store, "inst-signed").await;
@@ -4295,6 +4600,7 @@ mod tests {
 
         store
             .claim_share_subdomain(
+                &config,
                 request,
                 ClientMetadata {
                     ip: Some("127.0.0.1".into()),
@@ -4307,6 +4613,7 @@ mod tests {
 
         let replay_err = store
             .claim_share_subdomain(
+                &config,
                 ShareClaimSubdomainRequest {
                     installation_id: "inst-signed".into(),
                     timestamp_ms,
@@ -4330,6 +4637,7 @@ mod tests {
         };
         let tampered_err = store
             .claim_share_subdomain(
+                &config,
                 ShareClaimSubdomainRequest {
                     installation_id: "inst-signed".into(),
                     timestamp_ms: Utc::now().timestamp_millis(),
@@ -4396,6 +4704,7 @@ mod tests {
 
         store
             .claim_share_subdomain(
+                &config,
                 ShareClaimSubdomainRequest {
                     installation_id: "inst-new".into(),
                     timestamp_ms,
@@ -4476,6 +4785,7 @@ mod tests {
 
         store
             .claim_share_subdomain(
+                &config,
                 ShareClaimSubdomainRequest {
                     installation_id: "inst-same".into(),
                     timestamp_ms,

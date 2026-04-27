@@ -1,6 +1,6 @@
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -8,8 +8,8 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
-use crate::recent_traffic::RecentTraffic;
 use crate::ServerState;
+use crate::recent_traffic::RecentTraffic;
 
 /// Per-subdomain routing info.
 #[derive(Debug, Clone)]
@@ -161,6 +161,15 @@ impl ProxyRegistry {
         self.routes.read().await.get(subdomain).cloned()
     }
 
+    pub(crate) async fn route_by_share_id(&self, share_id: &str) -> Option<RouteEntry> {
+        self.routes
+            .read()
+            .await
+            .values()
+            .find(|route| route.share_id.as_deref() == Some(share_id))
+            .cloned()
+    }
+
     pub async fn active_subdomains(&self) -> Vec<String> {
         self.routes.read().await.keys().cloned().collect()
     }
@@ -190,6 +199,250 @@ impl ProxyRegistry {
             .try_acquire(user_ip, parallel_limit)
             .await
     }
+}
+
+pub async fn market_proxy_handler(
+    State(state): State<ServerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request,
+) -> Response {
+    let (parts, body) = req.into_parts();
+    let method = parts.method.clone();
+    let host = parts
+        .headers
+        .get("host")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let path = parts.uri.path().to_string();
+    let query = parts
+        .uri
+        .query()
+        .map(|query| format!("?{query}"))
+        .unwrap_or_default();
+
+    let Some(token) = bearer_token(&parts.headers) else {
+        return simple_response(StatusCode::UNAUTHORIZED, "missing-market-bearer-token");
+    };
+    let Some(market) = state.config.market_by_token(token, "market:proxy:use") else {
+        return simple_response(StatusCode::UNAUTHORIZED, "invalid-market-bearer-token");
+    };
+    let market_email = market.email.clone();
+    let market_subdomain = market.subdomain.clone();
+
+    let host_without_port = host.split(':').next().unwrap_or(&host);
+    let expected_host = format!("{}.{}", market_subdomain, state.config.tunnel_domain);
+    if host_without_port != expected_host {
+        warn!(
+            method = %method,
+            host = %host,
+            expected_host = %expected_host,
+            path = %path,
+            "market proxy rejected: host does not match authenticated market"
+        );
+        return simple_response(StatusCode::FORBIDDEN, "market-host-mismatch");
+    }
+
+    let Some(rest) = path.strip_prefix("/_market/proxy/") else {
+        return simple_response(StatusCode::NOT_FOUND, "invalid-market-proxy-path");
+    };
+    let (share_id, forwarded_path) = match rest.split_once('/') {
+        Some((share_id, forwarded_path)) if !share_id.is_empty() => {
+            (share_id.to_string(), format!("/{forwarded_path}"))
+        }
+        _ if !rest.is_empty() => (rest.to_string(), "/".to_string()),
+        _ => return simple_response(StatusCode::NOT_FOUND, "missing-share-id"),
+    };
+    let path_and_query = format!("{forwarded_path}{query}");
+
+    let active_subdomains = state.proxy.active_subdomains().await.into_iter().collect();
+    let inflight_by_share = state.proxy.inflight_by_share().await;
+    let authorized = match state
+        .store
+        .list_market_shares(
+            &market_email,
+            "main",
+            &active_subdomains,
+            &inflight_by_share,
+        )
+        .await
+    {
+        Ok(shares) => shares.into_iter().any(|share| share.share_id == share_id),
+        Err(err) => {
+            warn!(error = %err, "market proxy share authorization lookup failed");
+            return simple_response(StatusCode::SERVICE_UNAVAILABLE, "share-lookup-failed");
+        }
+    };
+    if !authorized {
+        return simple_response(StatusCode::FORBIDDEN, "share-not-authorized-for-market");
+    }
+
+    let Some(route) = state.proxy.route_by_share_id(&share_id).await else {
+        return simple_response(StatusCode::NOT_FOUND, "share-offline");
+    };
+    let backend = route.backend.clone();
+    let route_share_token = route.share_token.clone();
+    let client_metadata = crate::client_meta::extract_client_metadata(&parts.headers, peer);
+    let target = format!("http://{backend}{path_and_query}");
+
+    let mut builder = reqwest::Client::new().request(method.clone(), target);
+    for (name, value) in &parts.headers {
+        let n = name.as_str();
+        if n.eq_ignore_ascii_case("host")
+            || n.eq_ignore_ascii_case("authorization")
+            || n.eq_ignore_ascii_case("x-share-token")
+            || is_hop_by_hop_header(n)
+        {
+            continue;
+        }
+        builder = builder.header(name, value);
+    }
+    if let Some(ref tok) = route_share_token {
+        builder = builder.header("X-Share-Token", tok.as_str());
+    }
+
+    let log_token = route_share_token
+        .as_deref()
+        .map(mask_token)
+        .unwrap_or_else(|| "-".to_string());
+    let user_ip = client_metadata
+        .ip
+        .clone()
+        .unwrap_or_else(|| peer.ip().to_string());
+
+    let share_permit = match state
+        .proxy
+        .try_acquire_share_permit(&share_id, route.parallel_limit)
+        .await
+    {
+        Some(permit) => permit,
+        None => {
+            warn!(
+                method = %method,
+                host = %host,
+                path = %path_and_query,
+                share_id = %share_id,
+                parallel_limit = route.parallel_limit,
+                "market proxy rejected: share concurrency limit exceeded"
+            );
+            return simple_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "share-concurrency-limit-exceeded",
+            );
+        }
+    };
+
+    let body = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(body) => body,
+        Err(err) => {
+            warn!(
+                method = %method,
+                host = %host,
+                path = %path_and_query,
+                backend = %backend,
+                share_token = %log_token,
+                error = %err,
+                "market proxy request body read failed"
+            );
+            return simple_response(
+                StatusCode::BAD_REQUEST,
+                &format!("failed-to-read-body: {err}"),
+            );
+        }
+    };
+
+    let free_share_ip_permit = if route.is_free_share && state.config.free_share_ip_limit_enabled()
+    {
+        match state
+            .proxy
+            .try_acquire_free_share_ip_permit(&user_ip, state.config.free_share_ip_parallel_limit)
+            .await
+        {
+            Some(permit) => Some(permit),
+            None => {
+                return simple_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "free-share-ip-concurrency-limit-exceeded",
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    let live_request_id = Some(
+        state
+            .recent_traffic
+            .record(
+                share_id.clone(),
+                route.share_name.clone(),
+                Some(route.subdomain.clone()),
+                client_metadata.country_code.clone(),
+            )
+            .await,
+    );
+    if let Some(ref request_id) = live_request_id {
+        builder = builder.header("X-CC-Switch-Request-Id", request_id.as_str());
+    }
+    let recent_traffic_guard = live_request_id.as_ref().map(|id| RecentTrafficGuard {
+        traffic: state.recent_traffic.clone(),
+        request_id: id.clone(),
+    });
+
+    let upstream = match builder.body(body).send().await {
+        Ok(response) => response,
+        Err(err) => {
+            warn!(
+                method = %method,
+                host = %host,
+                path = %path_and_query,
+                backend = %backend,
+                share_token = %log_token,
+                error = %err,
+                "market proxy upstream request failed"
+            );
+            return simple_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("connection-lost: {err}"),
+            );
+        }
+    };
+
+    let status = upstream.status();
+    let response_headers = upstream.headers().clone();
+    let body_stream = {
+        use futures_util::StreamExt;
+
+        upstream.bytes_stream().map(move |chunk| {
+            let _permit = &share_permit;
+            let _free_share_ip_permit = &free_share_ip_permit;
+            let _recent_traffic_guard = &recent_traffic_guard;
+            chunk
+        })
+    };
+    let body = Body::from_stream(body_stream);
+
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
+    response.headers_mut().clear();
+    for (name, value) in &response_headers {
+        if is_hop_by_hop_header(name.as_str()) {
+            continue;
+        }
+        response.headers_mut().insert(name, value.clone());
+    }
+    strip_connection_listed_headers(response.headers_mut());
+    info!(
+        method = %method,
+        host = %host,
+        path = %path_and_query,
+        share_id = %share_id,
+        backend = %backend,
+        status = %status.as_u16(),
+        share_token = %log_token,
+        "market proxy request completed"
+    );
+    response
 }
 
 pub async fn proxy_handler(
@@ -492,6 +745,15 @@ fn simple_response(status: StatusCode, reason: &str) -> Response {
         response.headers_mut().insert("x-portr-error-reason", value);
     }
     response
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 fn is_hop_by_hop_header(name: &str) -> bool {

@@ -329,6 +329,39 @@ pub struct PublicMapPointsResponse {
     pub clients: Vec<PublicMapClientPoint>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketsResponse {
+    pub markets: Vec<crate::config::PublicMarketConfig>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketShareView {
+    pub router_id: String,
+    pub share_id: String,
+    pub installation_id: String,
+    pub share_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installation_owner_email: Option<String>,
+    pub app_type: String,
+    pub for_sale: String,
+    pub share_status: String,
+    pub online: bool,
+    pub active_requests: usize,
+    pub parallel_limit: i64,
+    pub online_rate_24h: f64,
+    pub last_seen_at: String,
+    #[serde(default)]
+    pub support: ShareSupport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_provider: Option<ShareUpstreamProvider>,
+    #[serde(default)]
+    pub app_runtimes: ShareAppRuntimes,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicMapClientPoint {
