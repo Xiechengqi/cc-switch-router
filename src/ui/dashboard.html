@@ -2050,15 +2050,24 @@
         return _worldSvgPromise;
       }
 
-      let _seenRequestIds = new Set();
+      // Ids of rows that have already played their leaving animation. Used to
+      // suppress re-inserting them if a stale completion event for the same id
+      // shows up in a later poll.
+      let _retiredRequestIds = new Set();
       let _shareMetaById = new Map();
       let _requestMetaById = new Map();
       let _latestRequestMetaByShareId = new Map();
+      // Each entry: { requestId, row, startedAt, createdAt, state, retireTimer }
+      // state ∈ { "inflight", "completed" }. "completed" rows have already been
+      // marked .leaving in the DOM and have a pending retireTimer cleanup.
       let _requestTickerRows = [];
       let _requestTickerClock = null;
       let _requestTickerSeeded = false;
       const REQUEST_TICKER_MAX = 5;
       const REQUEST_TICKER_SEED_WINDOW_MS = 12000;
+      // Slightly longer than the .leaving CSS transition (340ms) so the row
+      // finishes its animation before being unmounted.
+      const REQUEST_TICKER_LEAVE_MS = 360;
 
       function countryToFlagEmoji(countryCode) {
         if (!countryCode || !/^[A-Z]{2}$/.test(countryCode)) return "🌐";
@@ -2113,6 +2122,7 @@
         row.className = "map-ticker-row";
         row.dataset.requestId = event.requestId;
         row.dataset.shareId = event.shareId || "";
+        row.dataset.inflight = event.isInflight === false ? "0" : "1";
         if (!info.resolved) row.dataset.unresolved = "1";
         row.innerHTML = `
           <div class="ticker-headline">
@@ -2126,33 +2136,74 @@
         return row;
       }
 
+      function findTickerRow(requestId) {
+        return _requestTickerRows.find((item) => item.requestId === requestId) || null;
+      }
+
       function pushRequestTicker(event) {
         const ticker = document.getElementById("map-ticker");
         if (!ticker || !event?.requestId) {
           console.debug("[ticker] skip push", { hasTicker: Boolean(ticker), requestId: event?.requestId || null, event });
-          return;
+          return null;
         }
         const row = buildTickerRow(event);
         ticker.appendChild(row);
         requestAnimationFrame(() => row.classList.add("entered"));
-        _requestTickerRows.push({ requestId: event.requestId, row, startedAt: event.startedAt || "", createdAt: Date.now() });
+        const initialState = event.isInflight === false ? "completed" : "inflight";
+        const entry = {
+          requestId: event.requestId,
+          row,
+          startedAt: event.startedAt || "",
+          createdAt: Date.now(),
+          state: initialState,
+          retireTimer: null,
+        };
+        _requestTickerRows.push(entry);
         while (_requestTickerRows.length > REQUEST_TICKER_MAX) {
           const stale = _requestTickerRows.shift();
           if (!stale) break;
+          if (stale.retireTimer) clearTimeout(stale.retireTimer);
           stale.row.remove();
+          _retiredRequestIds.add(stale.requestId);
+        }
+        if (initialState === "completed") {
+          // Caller asked us to mount a row that's already past inflight (e.g.
+          // a brief request that finished between two polls). Schedule its
+          // exit immediately so it briefly flashes and then drains.
+          retireTickerRow(entry);
         }
         console.debug("[ticker] pushed", {
           requestId: event.requestId,
           shareId: event.shareId,
           shareSubdomain: event.shareSubdomain || null,
+          state: initialState,
           rows: _requestTickerRows.length,
           domChildren: ticker.childElementCount,
         });
+        return entry;
+      }
+
+      function retireTickerRow(item) {
+        if (!item || item.state === "completed") return;
+        item.state = "completed";
+        item.row.dataset.inflight = "0";
+        item.row.classList.add("leaving");
+        if (item.retireTimer) clearTimeout(item.retireTimer);
+        item.retireTimer = setTimeout(() => {
+          const idx = _requestTickerRows.indexOf(item);
+          if (idx !== -1) _requestTickerRows.splice(idx, 1);
+          item.row.remove();
+          _retiredRequestIds.add(item.requestId);
+          syncRequestTickerClock();
+        }, REQUEST_TICKER_LEAVE_MS);
       }
 
       function resetRequestTickerRows() {
         const ticker = document.getElementById("map-ticker");
         if (ticker) ticker.replaceChildren();
+        for (const item of _requestTickerRows) {
+          if (item.retireTimer) clearTimeout(item.retireTimer);
+        }
         _requestTickerRows = [];
         if (_requestTickerClock) {
           clearInterval(_requestTickerClock);
@@ -2181,36 +2232,67 @@
         _requestTickerClock = setInterval(refreshTickerUtcLabels, 1000);
       }
 
-      function requestTickerEventExists(requestId) {
-        return _requestTickerRows.some((item) => item.requestId === requestId);
-      }
-
       function processRequestEvents(events) {
-        if (!Array.isArray(events) || events.length === 0) {
-          console.debug("[ticker] no events in payload");
-          syncRequestTickerClock();
-          return;
+        const incoming = new Map();
+        if (Array.isArray(events)) {
+          for (const event of events) {
+            if (!event || !event.requestId) continue;
+            // Last occurrence in the payload wins — same id should appear at
+            // most once per snapshot, but be defensive.
+            incoming.set(event.requestId, event);
+          }
         }
         const now = Date.now();
+        const seedingThisPass = !_requestTickerSeeded;
         console.debug("[ticker] process payload", {
-          totalEvents: events.length,
-          seenCount: _seenRequestIds.size,
+          totalEvents: incoming.size,
+          retiredCount: _retiredRequestIds.size,
           seeded: _requestTickerSeeded,
         });
-        for (const event of events) {
-          if (!event || !event.requestId) continue;
-          const startedAt = Date.parse(event.startedAt || "");
-          if (!_requestTickerSeeded && Number.isFinite(startedAt) && (now - startedAt) > REQUEST_TICKER_SEED_WINDOW_MS) {
+
+        // Pass 1: reconcile existing rows against the snapshot.
+        // - Row present + event reports inflight=true → keep as-is.
+        // - Row present + event reports inflight=false → mark completed.
+        // - Row present + id missing from snapshot → backend has dropped it
+        //   (window expired or hard cap evicted). Treat as completed.
+        for (const item of _requestTickerRows.slice()) {
+          if (item.state === "completed") continue;
+          const event = incoming.get(item.requestId);
+          if (!event) {
+            retireTickerRow(item);
             continue;
           }
-          if (_seenRequestIds.has(event.requestId) || requestTickerEventExists(event.requestId)) {
-            continue;
+          if (event.isInflight === false) {
+            retireTickerRow(item);
           }
-          _seenRequestIds.add(event.requestId);
+          // else: still in-flight, nothing to do — the row stays mounted and
+          // patchPendingTickerRows() will fill in the model name once it
+          // arrives via the share's recent-requests log.
+        }
+
+        // Pass 2: insert rows for ids we haven't seen yet.
+        for (const [requestId, event] of incoming) {
+          if (_retiredRequestIds.has(requestId)) continue;
+          if (findTickerRow(requestId)) continue;
+          const isInflight = event.isInflight !== false;
+          if (!isInflight) {
+            // A completed-only event we never had a row for. During seed we
+            // skip stale ones so the page doesn't open with a graveyard of
+            // already-finished requests; after seed we briefly show it so the
+            // ticker still acknowledges short requests that finished between
+            // polls.
+            const startedAt = Date.parse(event.startedAt || "");
+            if (seedingThisPass && Number.isFinite(startedAt) && (now - startedAt) > REQUEST_TICKER_SEED_WINDOW_MS) {
+              continue;
+            }
+          }
+          // Inflight events bypass the seed window: a long-running stream
+          // that started before this tab opened must still be rendered.
           pushRequestTicker(event);
         }
-        if (_seenRequestIds.size > 512) {
-          _seenRequestIds = new Set(Array.from(_seenRequestIds).slice(-256));
+
+        if (_retiredRequestIds.size > 512) {
+          _retiredRequestIds = new Set(Array.from(_retiredRequestIds).slice(-256));
         }
         _requestTickerSeeded = true;
         syncRequestTickerClock();

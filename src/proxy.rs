@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
+use crate::recent_traffic::RecentTraffic;
 use crate::ServerState;
 
 /// Per-subdomain routing info.
@@ -52,6 +53,30 @@ impl Drop for KeyedConcurrencyPermit {
             if should_remove {
                 counters.remove(&key);
             }
+        });
+    }
+}
+
+/// Lifecycle guard that flips a recorded `RecentTraffic` event from
+/// in-flight to completed when the proxy's response body stream ends. We
+/// pair it with the same drop-then-spawn pattern as
+/// [`KeyedConcurrencyPermit`] so the closure that owns the guard never has
+/// to be `async`.
+#[derive(Debug)]
+struct RecentTrafficGuard {
+    traffic: RecentTraffic,
+    request_id: String,
+}
+
+impl Drop for RecentTrafficGuard {
+    fn drop(&mut self) {
+        let traffic = self.traffic.clone();
+        let request_id = std::mem::take(&mut self.request_id);
+        if request_id.is_empty() {
+            return;
+        }
+        tokio::spawn(async move {
+            traffic.complete(&request_id).await;
         });
     }
 }
@@ -346,24 +371,36 @@ pub async fn proxy_handler(
     // Record the request for the dashboard's demand/ticker stream and propagate the
     // generated identity downstream so share clients can write the same request id back
     // in their request logs.
-    let live_request_id = if let Some(share_id) = route.share_id.as_deref() {
-        Some(
-            state
-                .recent_traffic
-                .record(
-                    share_id.to_string(),
-                    route.share_name.clone(),
-                    Some(route.subdomain.clone()),
-                    client_metadata.country_code.clone(),
-                )
-                .await,
-        )
+    let live_request_id = if !is_internal_share_router_path && !is_share_router_probe {
+        if let Some(share_id) = route.share_id.as_deref() {
+            Some(
+                state
+                    .recent_traffic
+                    .record(
+                        share_id.to_string(),
+                        route.share_name.clone(),
+                        Some(route.subdomain.clone()),
+                        client_metadata.country_code.clone(),
+                    )
+                    .await,
+            )
+        } else {
+            None
+        }
     } else {
         None
     };
     if let Some(ref request_id) = live_request_id {
         builder = builder.header("X-CC-Switch-Request-Id", request_id.as_str());
     }
+    // Bind a completion guard to the recorded request id. While this binding
+    // lives at function scope it covers the early-return-on-upstream-error
+    // path; once the body stream is constructed we move it into the streaming
+    // closure so completion fires when the upstream stream actually ends.
+    let recent_traffic_guard = live_request_id.as_ref().map(|id| RecentTrafficGuard {
+        traffic: state.recent_traffic.clone(),
+        request_id: id.clone(),
+    });
 
     let upstream = match builder.body(body).send().await {
         Ok(response) => response,
@@ -396,6 +433,10 @@ pub async fn proxy_handler(
         upstream.bytes_stream().map(move |chunk| {
             let _permit = &share_permit;
             let _free_share_ip_permit = &free_share_ip_permit;
+            // Hold the recent-traffic guard until the upstream stream ends so
+            // the dashboard ticker keeps the row marked in-flight for the full
+            // request lifecycle (success, client disconnect, or chunk error).
+            let _recent_traffic_guard = &recent_traffic_guard;
             chunk
         })
     };
