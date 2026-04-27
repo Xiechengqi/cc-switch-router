@@ -2056,6 +2056,7 @@
       let _latestRequestMetaByShareId = new Map();
       let _requestTickerRows = [];
       let _requestTickerClock = null;
+      let _requestTickerSeeded = false;
       const REQUEST_TICKER_MAX = 5;
       const REQUEST_TICKER_SEED_WINDOW_MS = 12000;
 
@@ -2191,34 +2192,27 @@
           return;
         }
         const now = Date.now();
-        const nextSeen = new Set();
-        const freshEvents = [];
-        console.debug("[ticker] process payload", { totalEvents: events.length, seenCount: _seenRequestIds.size });
+        console.debug("[ticker] process payload", {
+          totalEvents: events.length,
+          seenCount: _seenRequestIds.size,
+          seeded: _requestTickerSeeded,
+        });
         for (const event of events) {
           if (!event || !event.requestId) continue;
           const startedAt = Date.parse(event.startedAt || "");
-          if (Number.isFinite(startedAt) && (now - startedAt) > REQUEST_TICKER_SEED_WINDOW_MS) {
+          if (!_requestTickerSeeded && Number.isFinite(startedAt) && (now - startedAt) > REQUEST_TICKER_SEED_WINDOW_MS) {
             continue;
           }
-          nextSeen.add(event.requestId);
-          freshEvents.push(event);
-          if (!_seenRequestIds.has(event.requestId) && !requestTickerEventExists(event.requestId)) {
-            pushRequestTicker(event);
+          if (_seenRequestIds.has(event.requestId) || requestTickerEventExists(event.requestId)) {
+            continue;
           }
+          _seenRequestIds.add(event.requestId);
+          pushRequestTicker(event);
         }
-        const keepIds = new Set(freshEvents
-          .slice()
-          .sort((a, b) => Date.parse(a.startedAt || "") - Date.parse(b.startedAt || ""))
-          .slice(-REQUEST_TICKER_MAX)
-          .map((event) => event.requestId));
-        _requestTickerRows = _requestTickerRows.filter((item) => {
-          if (!keepIds.has(item.requestId)) {
-            item.row.remove();
-            return false;
-          }
-          return true;
-        });
-        _seenRequestIds = nextSeen;
+        if (_seenRequestIds.size > 512) {
+          _seenRequestIds = new Set(Array.from(_seenRequestIds).slice(-256));
+        }
+        _requestTickerSeeded = true;
         syncRequestTickerClock();
       }
 
