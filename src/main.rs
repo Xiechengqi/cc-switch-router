@@ -1,3 +1,4 @@
+mod abuse;
 mod api;
 mod cf;
 mod client_meta;
@@ -25,6 +26,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 
+use crate::abuse::AbuseTracker;
 use crate::config::{Config, ensure_default_env_file, load_env_file};
 use crate::recent_traffic::RecentTraffic;
 use crate::store::{AppStore, ShareRouteTarget, fetch_share_runtime_snapshot_from_route};
@@ -44,6 +46,8 @@ pub struct ServerState {
     /// In-memory rolling tracker of proxy traffic by user origin. Drives the dashboard
     /// "demand" overlay and burst-arc animation; not persisted across restarts.
     pub recent_traffic: RecentTraffic,
+    /// In-memory temporary ban tracker for repeated invalid API authentication.
+    pub abuse: Arc<AbuseTracker>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +115,7 @@ async fn main() -> Result<()> {
         resend_usage_cache: Arc::new(Mutex::new(None)),
         ssh_host_fingerprint: ssh_host_fingerprint.clone(),
         recent_traffic: RecentTraffic::new(),
+        abuse: Arc::new(AbuseTracker::new()),
     };
 
     let ssh_server = ssh::SshServer {

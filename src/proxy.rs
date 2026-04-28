@@ -509,6 +509,20 @@ pub async fn proxy_handler(
     let user_country = client_metadata.country_code.as_deref().unwrap_or("-");
     let user_asn = trusted_asn_header(&parts.headers, peer);
     let user_agent = header_str(&parts.headers, "user-agent");
+    if let Some(remaining) = state.abuse.ban_remaining(&user_ip).await {
+        warn!(
+            method = %method,
+            host = %host,
+            path = %path_and_query,
+            client_ip = %user_ip,
+            client_country = %user_country,
+            client_asn = %user_asn,
+            user_agent = %user_agent,
+            ban_remaining_secs = remaining.as_secs(),
+            "proxy request rejected: client temporarily banned"
+        );
+        return simple_response(StatusCode::FORBIDDEN, "client-banned");
+    }
     let is_internal_share_router_path =
         path.starts_with("/_share-router") || path.starts_with("/_portr");
     let is_share_router_probe = parts
@@ -763,6 +777,25 @@ pub async fn proxy_handler(
 
     let status = upstream.status();
     let response_headers = upstream.headers().clone();
+    if status == StatusCode::UNAUTHORIZED && is_abuse_tracked_api_path(&path) {
+        if let Some(decision) = state.abuse.record_invalid_auth(&user_ip).await {
+            warn!(
+                method = %method,
+                host = %host,
+                path = %path_and_query,
+                backend = %backend,
+                status = %status.as_u16(),
+                share_token = %log_token,
+                client_ip = %user_ip,
+                client_country = %user_country,
+                client_asn = %user_asn,
+                user_agent = %user_agent,
+                failures_10m = decision.failures,
+                ban_secs = decision.ban_duration.as_secs(),
+                "proxy client temporarily banned: invalid auth threshold reached"
+            );
+        }
+    }
 
     // Stream the response body instead of buffering it entirely.
     // This is critical for SSE (text/event-stream) responses so that
@@ -875,6 +908,13 @@ fn trusted_asn_header(headers: &HeaderMap, peer: SocketAddr) -> &str {
         .map(|name| header_str(headers, name))
         .find(|value| *value != "-")
         .unwrap_or("-")
+}
+
+fn is_abuse_tracked_api_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/v1/chat/completions" | "/v1/responses" | "/v1/messages" | "/v1/completions"
+    )
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
