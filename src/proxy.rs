@@ -519,6 +519,10 @@ pub async fn proxy_handler(
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
         && matches!(path.as_str(), "/_share-router/health" | "/_portr/health");
+    let is_legacy_share_router_ping =
+        matches!(method, axum::http::Method::GET | axum::http::Method::HEAD)
+            && (truthy_header(&parts.headers, "x-share-router-ping-request")
+                || truthy_header(&parts.headers, "x-portr-ping-request"));
 
     let host_without_port = host.split(':').next().unwrap_or(&host);
     let tunnel_suffix = format!(".{}", state.config.tunnel_domain);
@@ -558,6 +562,26 @@ pub async fn proxy_handler(
     };
     let backend = route.backend.clone();
     let route_share_token = route.share_token.clone();
+    if is_legacy_share_router_ping {
+        let legacy_log_token = route_share_token
+            .as_deref()
+            .map(mask_token)
+            .unwrap_or_else(|| "-".to_string());
+        debug!(
+            method = %method,
+            host = %host,
+            path = %path_and_query,
+            backend = %backend,
+            status = %StatusCode::NO_CONTENT.as_u16(),
+            share_token = %legacy_log_token,
+            client_ip = %user_ip,
+            client_country = %user_country,
+            client_asn = %user_asn,
+            user_agent = %user_agent,
+            "proxy legacy health ping completed"
+        );
+        return empty_response(StatusCode::NO_CONTENT);
+    }
 
     // Determine effective share token: prefer client-supplied header,
     // fall back to the token registered with this tunnel route.
@@ -818,6 +842,12 @@ fn simple_response(status: StatusCode, reason: &str) -> Response {
     response
 }
 
+fn empty_response(status: StatusCode) -> Response {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = status;
+    response
+}
+
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
     headers
         .get(name)
@@ -825,6 +855,15 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("-")
+}
+
+fn truthy_header(headers: &HeaderMap, name: &str) -> bool {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 fn trusted_asn_header(headers: &HeaderMap, peer: SocketAddr) -> &str {
