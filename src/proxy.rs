@@ -220,6 +220,14 @@ pub async fn market_proxy_handler(
         .query()
         .map(|query| format!("?{query}"))
         .unwrap_or_default();
+    let client_metadata = crate::client_meta::extract_client_metadata(&parts.headers, peer);
+    let user_ip = client_metadata
+        .ip
+        .clone()
+        .unwrap_or_else(|| peer.ip().to_string());
+    let user_country = client_metadata.country_code.as_deref().unwrap_or("-");
+    let user_asn = trusted_asn_header(&parts.headers, peer);
+    let user_agent = header_str(&parts.headers, "user-agent");
 
     let Some(token) = bearer_token(&parts.headers) else {
         return simple_response(StatusCode::UNAUTHORIZED, "missing-market-bearer-token");
@@ -231,7 +239,14 @@ pub async fn market_proxy_handler(
     {
         Ok(market) => market,
         Err(err) => {
-            warn!(error = %err, "market proxy authentication failed");
+            warn!(
+                client_ip = %user_ip,
+                client_country = %user_country,
+                client_asn = %user_asn,
+                user_agent = %user_agent,
+                error = %err,
+                "market proxy authentication failed"
+            );
             return simple_response(StatusCode::UNAUTHORIZED, "invalid-market-session");
         }
     };
@@ -246,6 +261,10 @@ pub async fn market_proxy_handler(
             host = %host,
             expected_host = %expected_host,
             path = %path,
+            client_ip = %user_ip,
+            client_country = %user_country,
+            client_asn = %user_asn,
+            user_agent = %user_agent,
             "market proxy rejected: host does not match authenticated market"
         );
         return simple_response(StatusCode::FORBIDDEN, "market-host-mismatch");
@@ -290,7 +309,6 @@ pub async fn market_proxy_handler(
     };
     let backend = route.backend.clone();
     let route_share_token = route.share_token.clone();
-    let client_metadata = crate::client_meta::extract_client_metadata(&parts.headers, peer);
     let target = format!("http://{backend}{path_and_query}");
 
     let mut builder = reqwest::Client::new().request(method.clone(), target);
@@ -313,11 +331,6 @@ pub async fn market_proxy_handler(
         .as_deref()
         .map(mask_token)
         .unwrap_or_else(|| "-".to_string());
-    let user_ip = client_metadata
-        .ip
-        .clone()
-        .unwrap_or_else(|| peer.ip().to_string());
-
     let share_permit = match state
         .proxy
         .try_acquire_share_permit(&share_id, route.parallel_limit)
@@ -331,6 +344,10 @@ pub async fn market_proxy_handler(
                 path = %path_and_query,
                 share_id = %share_id,
                 parallel_limit = route.parallel_limit,
+                client_ip = %user_ip,
+                client_country = %user_country,
+                client_asn = %user_asn,
+                user_agent = %user_agent,
                 "market proxy rejected: share concurrency limit exceeded"
             );
             return simple_response(
@@ -349,6 +366,10 @@ pub async fn market_proxy_handler(
                 path = %path_and_query,
                 backend = %backend,
                 share_token = %log_token,
+                client_ip = %user_ip,
+                client_country = %user_country,
+                client_asn = %user_asn,
+                user_agent = %user_agent,
                 error = %err,
                 "market proxy request body read failed"
             );
@@ -406,6 +427,10 @@ pub async fn market_proxy_handler(
                 path = %path_and_query,
                 backend = %backend,
                 share_token = %log_token,
+                client_ip = %user_ip,
+                client_country = %user_country,
+                client_asn = %user_asn,
+                user_agent = %user_agent,
                 error = %err,
                 "market proxy upstream request failed"
             );
@@ -448,6 +473,10 @@ pub async fn market_proxy_handler(
         backend = %backend,
         status = %status.as_u16(),
         share_token = %log_token,
+        client_ip = %user_ip,
+        client_country = %user_country,
+        client_asn = %user_asn,
+        user_agent = %user_agent,
         "market proxy request completed"
     );
     response
@@ -472,6 +501,14 @@ pub async fn proxy_handler(
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
     let path = parts.uri.path().to_string();
+    let client_metadata = crate::client_meta::extract_client_metadata(&parts.headers, peer);
+    let user_ip = client_metadata
+        .ip
+        .clone()
+        .unwrap_or_else(|| peer.ip().to_string());
+    let user_country = client_metadata.country_code.as_deref().unwrap_or("-");
+    let user_asn = trusted_asn_header(&parts.headers, peer);
+    let user_agent = header_str(&parts.headers, "user-agent");
     let is_internal_share_router_path =
         path.starts_with("/_share-router") || path.starts_with("/_portr");
     let is_share_router_probe = parts
@@ -493,6 +530,10 @@ pub async fn proxy_handler(
             host = %host,
             path = %path_and_query,
             tunnel_domain = %state.config.tunnel_domain,
+            client_ip = %user_ip,
+            client_country = %user_country,
+            client_asn = %user_asn,
+            user_agent = %user_agent,
             "proxy request ignored: host outside tunnel domain"
         );
         return simple_response(StatusCode::NOT_FOUND, "not-found");
@@ -507,13 +548,16 @@ pub async fn proxy_handler(
             method = %method,
             host = %host,
             path = %path_and_query,
+            client_ip = %user_ip,
+            client_country = %user_country,
+            client_asn = %user_asn,
+            user_agent = %user_agent,
             "proxy request rejected: unregistered subdomain"
         );
         return simple_response(StatusCode::NOT_FOUND, "unregistered-subdomain");
     };
     let backend = route.backend.clone();
     let route_share_token = route.share_token.clone();
-    let client_metadata = crate::client_meta::extract_client_metadata(&parts.headers, peer);
 
     // Determine effective share token: prefer client-supplied header,
     // fall back to the token registered with this tunnel route.
@@ -548,10 +592,6 @@ pub async fn proxy_handler(
         .as_deref()
         .map(mask_token)
         .unwrap_or_else(|| "-".to_string());
-    let user_ip = client_metadata
-        .ip
-        .clone()
-        .unwrap_or_else(|| peer.ip().to_string());
 
     let share_permit = if is_internal_share_router_path {
         None
@@ -569,6 +609,10 @@ pub async fn proxy_handler(
                     path = %path_and_query,
                     share_id = %share_id,
                     parallel_limit = route.parallel_limit,
+                    client_ip = %user_ip,
+                    client_country = %user_country,
+                    client_asn = %user_asn,
+                    user_agent = %user_agent,
                     "proxy request rejected: share concurrency limit exceeded"
                 );
                 return simple_response(
@@ -590,6 +634,10 @@ pub async fn proxy_handler(
                 path = %path_and_query,
                 backend = %backend,
                 share_token = %log_token,
+                client_ip = %user_ip,
+                client_country = %user_country,
+                client_asn = %user_asn,
+                user_agent = %user_agent,
                 error = %err,
                 "proxy request body read failed"
             );
@@ -617,6 +665,9 @@ pub async fn proxy_handler(
                     path = %path_and_query,
                     user_ip = %user_ip,
                     parallel_limit = state.config.free_share_ip_parallel_limit,
+                    client_country = %user_country,
+                    client_asn = %user_asn,
+                    user_agent = %user_agent,
                     "proxy request rejected: free share ip concurrency limit exceeded"
                 );
                 return simple_response(
@@ -672,6 +723,10 @@ pub async fn proxy_handler(
                 path = %path_and_query,
                 backend = %backend,
                 share_token = %log_token,
+                client_ip = %user_ip,
+                client_country = %user_country,
+                client_asn = %user_asn,
+                user_agent = %user_agent,
                 error = %err,
                 "proxy upstream request failed"
             );
@@ -721,6 +776,10 @@ pub async fn proxy_handler(
             backend = %backend,
             status = %status.as_u16(),
             share_token = %log_token,
+            client_ip = %user_ip,
+            client_country = %user_country,
+            client_asn = %user_asn,
+            user_agent = %user_agent,
             "proxy health probe completed"
         );
     } else {
@@ -731,6 +790,10 @@ pub async fn proxy_handler(
             backend = %backend,
             status = %status.as_u16(),
             share_token = %log_token,
+            client_ip = %user_ip,
+            client_country = %user_country,
+            client_asn = %user_asn,
+            user_agent = %user_agent,
             "proxy request completed"
         );
     }
@@ -753,6 +816,26 @@ fn simple_response(status: StatusCode, reason: &str) -> Response {
         response.headers_mut().insert("x-portr-error-reason", value);
     }
     response
+}
+
+fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("-")
+}
+
+fn trusted_asn_header(headers: &HeaderMap, peer: SocketAddr) -> &str {
+    if !crate::cf::is_cloudflare_peer(peer.ip()) {
+        return "-";
+    }
+    ["cf-asn", "cf-connecting-asn"]
+        .into_iter()
+        .map(|name| header_str(headers, name))
+        .find(|value| *value != "-")
+        .unwrap_or("-")
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
