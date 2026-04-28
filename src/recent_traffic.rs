@@ -70,6 +70,7 @@ pub struct RecentTraffic {
 #[derive(Debug, Clone, Serialize)]
 pub struct RecentTrafficSnapshot {
     pub country_counts: HashMap<String, usize>,
+    pub events: Vec<RecentRequestEvent>,
     pub recent_events: Vec<RecentRequestEvent>,
 }
 
@@ -153,23 +154,29 @@ impl RecentTraffic {
                 *country_counts.entry(iso3.to_string()).or_insert(0) += 1;
             }
         }
-        let recent_events: Vec<_> = state
+        let events: Vec<_> = state
             .events
             .iter()
+            .map(|event| {
+                let mut event = event.clone();
+                event.is_inflight = state.inflight_request_ids.contains(&event.request_id);
+                event
+            })
+            .collect();
+        let recent_events: Vec<_> = events
+            .iter()
             .filter_map(|event| {
-                let is_inflight = state.inflight_request_ids.contains(&event.request_id);
-                if !is_inflight && event.started_at < ticker_cutoff {
+                if !event.is_inflight && event.started_at < ticker_cutoff {
                     return None;
                 }
-                let mut event = event.clone();
-                event.is_inflight = is_inflight;
-                Some(event)
+                Some(event.clone())
             })
             .collect();
         let take_from = recent_events.len().saturating_sub(MAX_EVENTS);
         let recent_events = recent_events.into_iter().skip(take_from).collect();
         RecentTrafficSnapshot {
             country_counts,
+            events,
             recent_events,
         }
     }

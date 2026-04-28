@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 
 use axum::extract::{ConnectInfo, Query, Request, State};
@@ -23,6 +24,7 @@ use crate::models::{
     VerifyEmailCodeResponse,
 };
 use crate::proxy::{market_proxy_handler, proxy_handler};
+use crate::recent_traffic::{RecentRequestEvent, RecentTrafficSnapshot};
 
 const REGIONS: &str = include_str!("../regions");
 
@@ -254,9 +256,38 @@ async fn dashboard(
         )
         .await?;
     let snapshot = state.recent_traffic.snapshot().await;
-    response.user_country_counts = snapshot.country_counts;
-    response.recent_request_events = snapshot.recent_events;
+    let (confirmed_events, confirmed_country_counts) =
+        confirmed_request_events(&snapshot, &response);
+    response.user_country_counts = confirmed_country_counts;
+    response.recent_request_events = confirmed_events;
     Ok(Json(response))
+}
+
+fn confirmed_request_events(
+    snapshot: &RecentTrafficSnapshot,
+    response: &DashboardResponse,
+) -> (Vec<RecentRequestEvent>, HashMap<String, usize>) {
+    let request_log_ids = response
+        .ticker_shares
+        .iter()
+        .flat_map(|share| share.recent_requests.iter())
+        .map(|log| log.request_id.as_str())
+        .collect::<HashSet<_>>();
+    let confirmed_events = snapshot
+        .events
+        .iter()
+        .filter(|event| request_log_ids.contains(event.request_id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut country_counts = HashMap::new();
+    for event in &confirmed_events {
+        if let Some(iso3) = event.user_country_iso3.as_deref() {
+            *country_counts.entry(iso3.to_string()).or_insert(0) += 1;
+        }
+    }
+    let take_from = confirmed_events.len().saturating_sub(64);
+    let events = confirmed_events.into_iter().skip(take_from).collect();
+    (events, country_counts)
 }
 
 async fn public_map_points(

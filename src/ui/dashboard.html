@@ -405,13 +405,12 @@
       .map-ticker:empty { display: none; }
       .map-ticker-row {
         display: flex;
-        flex-direction: column;
-        gap: 4px;
+        align-items: center;
         width: fit-content;
-        max-width: min(360px, calc(100vw - 32px));
-        padding: 9px 11px 8px;
+        max-width: min(620px, calc(100vw - 32px));
+        padding: 8px 11px;
         border: 1px solid rgba(226, 232, 240, 0.95);
-        border-radius: 14px;
+        border-radius: 8px;
         background: rgba(255, 255, 255, 0.94);
         box-shadow: 0 8px 22px rgba(15, 23, 42, 0.09);
         backdrop-filter: blur(10px);
@@ -439,43 +438,49 @@
       }
       .map-ticker-row .ticker-headline {
         display: flex;
-        align-items: baseline;
-        gap: 7px;
-        flex-wrap: wrap;
+        align-items: center;
+        gap: 6px;
+        min-width: 0;
+        max-width: 100%;
+        overflow: hidden;
+        white-space: nowrap;
       }
       .map-ticker-row .ticker-flag {
+        flex: 0 0 auto;
         font-size: 15px;
         line-height: 1.1;
       }
       .map-ticker-row .ticker-country {
+        flex: 0 0 auto;
         font-weight: 600;
         font-size: 12px;
         letter-spacing: 0.02em;
         line-height: 1.35;
       }
       .map-ticker-row .ticker-subdomain {
+        flex: 0 1 auto;
+        min-width: 18px;
+        max-width: 88px;
         color: var(--muted-foreground);
         font-size: 12px;
         line-height: 1.35;
-        overflow-wrap: anywhere;
-        word-break: break-word;
+        overflow: hidden;
+        text-overflow: ellipsis;
       }
       .map-ticker-row .ticker-model {
+        flex: 1 1 auto;
+        min-width: 0;
         color: var(--foreground);
         font-size: 12px;
         font-weight: 600;
         line-height: 1.35;
-        overflow-wrap: anywhere;
-        word-break: break-word;
+        overflow: hidden;
+        text-overflow: ellipsis;
       }
       .map-ticker-row .ticker-time {
+        flex: 0 0 auto;
         color: rgba(100, 116, 139, 0.82);
-        font: 10px/1.3 "JetBrains Mono", monospace;
-        letter-spacing: 0.02em;
-      }
-      .map-ticker-row[data-unresolved="1"] .ticker-model {
-        color: var(--muted-foreground);
-        font-weight: 500;
+        font: 11px/1.3 "JetBrains Mono", monospace;
       }
       @media (max-width: 640px) {
         .map-ticker {
@@ -2108,28 +2113,67 @@
         );
       }
 
-      function formatTickerUtcTime(startedAt) {
+      function formatTickerUtcTime(startedAt, fallbackCreatedAt) {
         const started = Date.parse(startedAt || "");
-        if (!Number.isFinite(started)) return "--:--:-- UTC";
-        const date = new Date(started);
+        let timestamp = Number.isFinite(started) ? started : NaN;
+        const createdAt = Number(fallbackCreatedAt || 0);
+        if (!Number.isFinite(timestamp) && Number.isFinite(createdAt) && createdAt > 0) {
+          timestamp = createdAt * 1000;
+        }
+        if (!Number.isFinite(timestamp)) return "--:--:--";
+        const date = new Date(timestamp);
         const hh = String(date.getUTCHours()).padStart(2, "0");
         const mm = String(date.getUTCMinutes()).padStart(2, "0");
         const ss = String(date.getUTCSeconds()).padStart(2, "0");
-        return `${hh}:${mm}:${ss} UTC`;
+        return `${hh}:${mm}:${ss}`;
       }
 
-      function requestTickerLabel(event) {
+      function formatTickerLatency(latencyMs) {
+        const ms = Number(latencyMs || 0);
+        if (!Number.isFinite(ms) || ms < 0) return "-";
+        if (ms < 1000) return `${Math.round(ms)}ms`;
+        const seconds = ms / 1000;
+        const text = seconds >= 10 ? seconds.toFixed(1) : seconds.toFixed(2);
+        return `${text.replace(/\.0+$/, "").replace(/(\.\d*[1-9])0+$/, "$1")}s`;
+      }
+
+      function formatCompactTokenCount(value) {
+        const count = Math.max(0, Number(value || 0));
+        if (!Number.isFinite(count)) return "0";
+        if (count < 1000) return String(Math.round(count));
+        const units = [
+          { suffix: "m", value: 1000000 },
+          { suffix: "k", value: 1000 },
+        ];
+        const unit = units.find((item) => count >= item.value);
+        const compact = count / unit.value;
+        const text = compact >= 10 ? compact.toFixed(0) : compact.toFixed(1);
+        return `${text.replace(/\.0$/, "")}${unit.suffix}`;
+      }
+
+      function formatTickerTokens(log) {
+        const count = totalTokens(log || {});
+        return `${formatCompactTokenCount(count)} token${count === 1 ? "" : "s"}`;
+      }
+
+      function tickerRowText(event) {
         const shareMeta = _shareMetaById.get(event.shareId) || null;
         const requestMeta = _requestMetaById.get(event.requestId) || null;
         const subdomain = event.shareSubdomain || shareMeta?.subdomain || event.shareName || shareMeta?.shareName || shareMeta?.platform || "share";
-        const modelName = requestMeta?.requestModel || requestMeta?.model || "pending";
+        const modelName = requestMeta?.requestModel || requestMeta?.model || "-";
+        const status = requestMeta?.statusCode ?? "-";
         return {
+          time: formatTickerUtcTime(event.startedAt, requestMeta?.createdAt),
+          flag: countryToFlagEmoji(event.userCountry),
+          country: event.userCountry || "--",
           subdomain,
           modelName,
-          country: event.userCountry || "--",
-          flag: countryToFlagEmoji(event.userCountry),
-          resolved: Boolean(requestMeta?.requestModel || requestMeta?.model),
+          detail: `${modelName} · ${status} · ${formatTickerLatency(requestMeta?.latencyMs)} · ${formatTickerTokens(requestMeta)}`,
         };
+      }
+
+      function requestTickerLabel(event) {
+        return tickerRowText(event);
       }
 
       function patchPendingTickerRows() {
@@ -2153,15 +2197,14 @@
         row.dataset.requestId = event.requestId;
         row.dataset.shareId = event.shareId || "";
         row.dataset.inflight = event.isInflight === false ? "0" : "1";
-        if (!info.resolved) row.dataset.unresolved = "1";
         row.innerHTML = `
           <div class="ticker-headline">
+            <span class="ticker-time">${escapeHtml(info.time)}</span>
             <span class="ticker-flag">${info.flag}</span>
             <span class="ticker-country">${escapeHtml(info.country)}</span>
             <span class="ticker-subdomain">${escapeHtml(info.subdomain)}</span>
+            <span class="ticker-model">${escapeHtml(info.detail)}</span>
           </div>
-          <div class="ticker-model">${escapeHtml(info.modelName)}</div>
-          <div class="ticker-time">${escapeHtml(formatTickerUtcTime(event.startedAt))}</div>
         `;
         return row;
       }
@@ -2245,7 +2288,8 @@
         for (const item of _requestTickerRows) {
           const label = item?.row?.querySelector(".ticker-time");
           if (!label) continue;
-          label.textContent = formatTickerUtcTime(item.startedAt);
+          const requestMeta = _requestMetaById.get(item.requestId) || null;
+          label.textContent = formatTickerUtcTime(item.startedAt, requestMeta?.createdAt);
         }
       }
 
@@ -2358,6 +2402,12 @@
               shareId: req.shareId || shareId,
               model: req.model || "",
               requestModel: req.requestModel || "",
+              statusCode: req.statusCode,
+              latencyMs: req.latencyMs,
+              inputTokens: req.inputTokens || 0,
+              outputTokens: req.outputTokens || 0,
+              cacheReadTokens: req.cacheReadTokens || 0,
+              cacheCreationTokens: req.cacheCreationTokens || 0,
               createdAt: req.createdAt || "",
             });
           }
@@ -2367,6 +2417,12 @@
               shareId,
               model: latest?.model || "",
               requestModel: latest?.requestModel || "",
+              statusCode: latest?.statusCode,
+              latencyMs: latest?.latencyMs,
+              inputTokens: latest?.inputTokens || 0,
+              outputTokens: latest?.outputTokens || 0,
+              cacheReadTokens: latest?.cacheReadTokens || 0,
+              cacheCreationTokens: latest?.cacheCreationTokens || 0,
               createdAt: latest?.createdAt || "",
             });
           }
