@@ -58,7 +58,7 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 
 默认配置文件路径：`$HOME/.config/cc-switch-router/.env`
 
-启动时如果这个文件不存在，`cc-switch-router` 会自动生成默认 `.env`，然后按该文件加载配置。进程环境变量优先级更高，会覆盖 `.env` 里的同名配置。为兼容已有部署，旧的 `PORTR_RS_*` 环境变量和 `$HOME/.config/portr-rs/.env` 仍然可读。
+启动时如果这个文件不存在，`cc-switch-router` 会自动生成默认 `.env`，然后按该文件加载配置。进程环境变量优先级更高，会覆盖 `.env` 里的同名配置。
 
 可用环境变量：
 

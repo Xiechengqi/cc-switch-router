@@ -2353,7 +2353,6 @@ pub async fn fetch_share_runtime_snapshot_from_route(
     let response = client
         .get(&url)
         .header("X-Share-Router-Probe", "1")
-        .header("X-Portr-Probe", "1")
         .send()
         .await
         .map_err(|e| AppError::Internal(format!("fetch share runtime failed: {e}")))?;

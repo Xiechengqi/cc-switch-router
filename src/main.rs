@@ -415,7 +415,6 @@ async fn probe_share_route(
     match client
         .get(&url)
         .header("X-Share-Router-Probe", "1")
-        .header("X-Portr-Probe", "1")
         .send()
         .await
     {
@@ -527,10 +526,6 @@ Environment:
   CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS Cleanup interval, default 300
   CC_SWITCH_ROUTER_LEASE_RETENTION_SECS  Lease retention period, default 604800
   CC_SWITCH_ROUTER_CLIENT_STALE_SECS     Delete clients and shares after no report, default 3600
-
-Legacy compatibility:
-  `PORTR_RS_*` and `$HOME/.config/portr-rs/.env` are still accepted during migration.
-
 Default env file:
   $HOME/.config/cc-switch-router/.env
   The file is auto-created on first start when missing.

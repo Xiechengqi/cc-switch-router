@@ -523,20 +523,17 @@ pub async fn proxy_handler(
         );
         return simple_response(StatusCode::FORBIDDEN, "client-banned");
     }
-    let is_internal_share_router_path =
-        path.starts_with("/_share-router") || path.starts_with("/_portr");
+    let is_internal_share_router_path = path.starts_with("/_share-router");
     let is_share_router_probe = parts
         .headers
         .get("x-share-router-probe")
-        .or_else(|| parts.headers.get("x-portr-probe"))
         .and_then(|value| value.to_str().ok())
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
-        && matches!(path.as_str(), "/_share-router/health" | "/_portr/health");
+        && path == "/_share-router/health";
     let is_legacy_share_router_ping =
         matches!(method, axum::http::Method::GET | axum::http::Method::HEAD)
-            && (truthy_header(&parts.headers, "x-share-router-ping-request")
-                || truthy_header(&parts.headers, "x-portr-ping-request"));
+            && truthy_header(&parts.headers, "x-share-router-ping-request");
 
     let host_without_port = host.split(':').next().unwrap_or(&host);
     let tunnel_suffix = format!(".{}", state.config.tunnel_domain);
@@ -595,6 +592,19 @@ pub async fn proxy_handler(
             "proxy legacy health ping completed"
         );
         return empty_response(StatusCode::NO_CONTENT);
+    }
+    if route.share_id.is_some() && !is_allowed_direct_share_proxy_path(&path) {
+        debug!(
+            method = %method,
+            host = %host,
+            path = %path_and_query,
+            client_ip = %user_ip,
+            client_country = %user_country,
+            client_asn = %user_asn,
+            user_agent = %user_agent,
+            "proxy request ignored: non-api direct share path"
+        );
+        return simple_response(StatusCode::NOT_FOUND, "non-api-path");
     }
 
     // Determine effective share token: prefer client-supplied header,
@@ -863,14 +873,10 @@ fn simple_response(status: StatusCode, reason: &str) -> Response {
     response
         .headers_mut()
         .insert("x-share-router-error", HeaderValue::from_static("true"));
-    response
-        .headers_mut()
-        .insert("x-portr-error", HeaderValue::from_static("true"));
     if let Ok(value) = HeaderValue::from_str(reason) {
         response
             .headers_mut()
             .insert("x-share-router-error-reason", value.clone());
-        response.headers_mut().insert("x-portr-error-reason", value);
     }
     response
 }
@@ -915,6 +921,10 @@ fn is_abuse_tracked_api_path(path: &str) -> bool {
         path,
         "/v1/chat/completions" | "/v1/responses" | "/v1/messages" | "/v1/completions"
     )
+}
+
+fn is_allowed_direct_share_proxy_path(path: &str) -> bool {
+    path == "/v1" || path.starts_with("/v1/") || path.starts_with("/_share-router/")
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {

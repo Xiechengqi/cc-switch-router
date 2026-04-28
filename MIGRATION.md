@@ -17,18 +17,18 @@ This project was previously named `portr-rs`.
   - `X-Portr-Error` -> `X-Share-Router-Error`
   - `X-Portr-Error-Reason` -> `X-Share-Router-Error-Reason`
 
-## Compatibility kept in this version
+## Compatibility removed
 
-This version still accepts:
+Legacy compatibility has been removed. Deployments must use:
 
-- legacy `PORTR_RS_*` environment variables
-- legacy env file at `~/.config/portr-rs/.env`
-- legacy DB path at `~/.config/portr-rs/portr-rs.db`
-- legacy host key path at `~/.config/portr-rs/ssh_host_ed25519_key`
-- legacy internal probe routes under `/_portr/*`
-- legacy internal probe/error headers using `X-Portr-*`
+- `CC_SWITCH_ROUTER_*` environment variables
+- env file at `~/.config/cc-switch-router/.env`
+- DB path at `~/.config/cc-switch-router/cc-switch-router.db`
+- host key path at `~/.config/cc-switch-router/ssh_host_ed25519_key`
+- internal probe routes under `/_share-router/*`
+- internal probe/error headers using `X-Share-Router-*`
 
-This is intentional so existing deployments can upgrade without a hard cutover.
+Move existing deployments to the new names before upgrading to this version.
 
 ## Recommended deployment migration
 
@@ -54,7 +54,8 @@ EnvironmentFile=%h/.config/cc-switch-router/.env
 ExecStart=/opt/cc-switch-router/cc-switch-router
 ```
 
-## Removal plan
+## Removal status
 
-Legacy compatibility should be removed only after all active desktop clients
-and server deployments have been upgraded.
+Legacy compatibility is removed in the current code. The entries above are
+historical rename notes and migration instructions for operators upgrading from
+older deployments.
