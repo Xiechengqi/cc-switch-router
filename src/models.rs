@@ -504,6 +504,8 @@ pub struct DashboardResponse {
     pub map: DashboardMap,
     pub clients: Vec<DashboardClientView>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub markets: Vec<DashboardMarketView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ticker_shares: Vec<DashboardTickerShare>,
     /// Active-client count keyed by ISO 3166-1 alpha-3. Drives the SVG country heatmap
     /// directly (the bundled `world-map.svg` uses alpha-3 as its CSS class names).
@@ -592,6 +594,18 @@ pub struct DashboardClientView {
     pub installation: InstallationView,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub share: Option<ShareView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DashboardMarketView {
+    pub id: String,
+    pub display_name: String,
+    pub email: String,
+    pub subdomain: String,
+    pub public_base_url: String,
+    pub status: String,
+    pub online: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -963,6 +963,17 @@
         background: rgba(239, 68, 68, 0.12);
         color: #b91c1c;
       }
+      .badge--online {
+        background: rgba(16,185,129,0.12);
+        color: #059669;
+      }
+      .badge--online::before {
+        content: "";
+        width: 6px;
+        height: 6px;
+        border-radius: 999px;
+        background: #10b981;
+      }
       .support-pills {
         display: grid;
         gap: 6px;
@@ -1402,6 +1413,25 @@
               </tr>
             </thead>
             <tbody id="clients"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Markets -->
+      <section class="section">
+        <div class="section-label reveal">MARKETS <span id="market-count">0</span></div>
+        <div class="table-card reveal" data-reveal-delay="2">
+          <table>
+            <thead>
+              <tr>
+                <th>Market</th>
+                <th>Public URL</th>
+                <th>Email</th>
+                <th>Subdomain</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="markets"></tbody>
           </table>
         </div>
       </section>
@@ -2949,6 +2979,27 @@
         });
       }
 
+      function sortMarkets(markets) {
+        return [...(markets || [])].sort((left, right) => {
+          if (Boolean(left.online) !== Boolean(right.online)) {
+            return left.online ? -1 : 1;
+          }
+          return String(left.displayName || left.id || "").localeCompare(
+            String(right.displayName || right.id || ""),
+            undefined,
+            { sensitivity: "base" },
+          );
+        });
+      }
+
+      function marketStatusBadge(market) {
+        if (market.online) {
+          return '<span class="badge badge--online">Online</span>';
+        }
+        const label = market.status === "active" ? "Offline" : market.status || "Offline";
+        return `<span class="badge badge--offline">${escapeHtml(label)}</span>`;
+      }
+
       function forSalePill(share) {
         if (!share) return '<span class="meta">—</span>';
         const value = share.forSale === "Free" ? "Free" : (share.forSale === "Yes" ? "Yes" : "No");
@@ -3292,6 +3343,8 @@
 
         /* section counts */
         document.getElementById("client-count").textContent = _clients.length;
+        const markets = sortMarkets(data.markets || []);
+        document.getElementById("market-count").textContent = markets.length;
 
         /* skip DOM rewrite while drawer is open to prevent flicker */
         if (_drawerOpen) return;
@@ -3314,6 +3367,17 @@
           </tr>
         `;
         }).join("") : `<tr><td colspan="7"><div class="empty"><div class="empty-icon"></div>No clients yet</div></td></tr>`;
+
+        const marketsEl = document.getElementById("markets");
+        marketsEl.innerHTML = markets.length ? markets.map((market) => `
+          <tr>
+            <td><strong>${escapeHtml(market.displayName || market.id || "-")}</strong></td>
+            <td class="meta"><a href="${escapeHtml(market.publicBaseUrl || "#")}" target="_blank" rel="noopener noreferrer">${escapeHtml(market.publicBaseUrl || "-")}</a></td>
+            <td class="meta">${escapeHtml(market.email || "-")}</td>
+            <td class="meta">${escapeHtml(market.subdomain || "-")}</td>
+            <td>${marketStatusBadge(market)}</td>
+          </tr>
+        `).join("") : `<tr><td colspan="5"><div class="empty"><div class="empty-icon"></div>No markets configured</div></td></tr>`;
       }
 
       ensureInstallationIdentity().catch(console.error);

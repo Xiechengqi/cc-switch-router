@@ -20,17 +20,17 @@ use crate::config::{Config, MarketConfig};
 use crate::error::AppError;
 use crate::models::{
     AuthSession, AuthUser, BindInstallationOwnerEmailRequest, BindInstallationOwnerEmailResponse,
-    ClientMetadata, DashboardClientView, DashboardMap, DashboardMapPoint, DashboardPresenceRequest,
-    DashboardResponse, DashboardStats, DashboardTickerShare, GetInstallationOwnerEmailQuery,
-    GetInstallationOwnerEmailResponse, HealthCheckEntry, Installation, InstallationView,
-    IssueLeaseRequest, IssueLeaseResponse, LatLonPoint, MarketShareView, PublicMapClientPoint,
-    PublicMapPointsResponse, RefreshSessionRequest, RegisterInstallationRequest,
-    RegisterInstallationResponse, RequestEmailCodeRequest, RequestEmailCodeResponse,
-    SessionStatusResponse, ShareAppRuntimes, ShareBatchSyncRequest, ShareClaimSubdomainRequest,
-    ShareDeleteRequest, ShareDescriptor, ShareHeartbeatRequest, ShareRequestLogBatchSyncRequest,
-    ShareRequestLogEntry, ShareRequestLogFetchResponse, ShareRuntimeSnapshotResponse, ShareSupport,
-    ShareSyncRequest, ShareUpstreamProvider, ShareView, TunnelLease, VerifyEmailCodeRequest,
-    VerifyEmailCodeResponse,
+    ClientMetadata, DashboardClientView, DashboardMap, DashboardMapPoint, DashboardMarketView,
+    DashboardPresenceRequest, DashboardResponse, DashboardStats, DashboardTickerShare,
+    GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse, HealthCheckEntry,
+    Installation, InstallationView, IssueLeaseRequest, IssueLeaseResponse, LatLonPoint,
+    MarketShareView, PublicMapClientPoint, PublicMapPointsResponse, RefreshSessionRequest,
+    RegisterInstallationRequest, RegisterInstallationResponse, RequestEmailCodeRequest,
+    RequestEmailCodeResponse, SessionStatusResponse, ShareAppRuntimes, ShareBatchSyncRequest,
+    ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptor, ShareHeartbeatRequest,
+    ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRequestLogFetchResponse,
+    ShareRuntimeSnapshotResponse, ShareSupport, ShareSyncRequest, ShareUpstreamProvider, ShareView,
+    TunnelLease, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 use crate::proxy::ProxyRegistry;
 
@@ -1462,6 +1462,19 @@ impl AppStore {
             .iter()
             .filter_map(|client| client.share.as_ref().map(|share| share.active_requests))
             .sum();
+        let markets = config
+            .markets
+            .iter()
+            .map(|market| DashboardMarketView {
+                id: market.id.clone(),
+                display_name: market.display_name.clone(),
+                email: market.email.clone(),
+                subdomain: market.subdomain.clone(),
+                public_base_url: market.public_base_url.clone(),
+                status: market.status.clone(),
+                online: active_subdomains.contains(&market.subdomain),
+            })
+            .collect::<Vec<_>>();
 
         Ok(DashboardResponse {
             generated_at: now,
@@ -1491,6 +1504,7 @@ impl AppStore {
                 clients: client_map_points,
             },
             clients: client_views,
+            markets,
             ticker_shares,
             country_counts,
             user_country_counts: HashMap::new(),
