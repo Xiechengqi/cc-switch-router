@@ -456,6 +456,7 @@
         font-size: 10px;
         letter-spacing: 0.02em;
         line-height: 1.35;
+        color: rgba(51, 65, 85, 0.72);
       }
       .map-ticker-row .ticker-subdomain {
         flex: 0 1 auto;
@@ -470,7 +471,7 @@
       .map-ticker-row .ticker-model {
         flex: 1 1 auto;
         min-width: 0;
-        color: var(--foreground);
+        color: rgba(30, 41, 59, 0.76);
         font-size: 10px;
         font-weight: 600;
         line-height: 1.35;
@@ -629,34 +630,34 @@
       }
       .map-controls {
         position: absolute;
-        left: 16px;
-        bottom: 16px;
+        left: 1.6%;
+        bottom: 4%;
         z-index: 5;
         display: inline-flex;
         align-items: center;
-        gap: 4px;
-        padding: 5px;
-        border: 1px solid rgba(226, 232, 240, 0.95);
-        border-radius: 14px;
-        background: rgba(255, 255, 255, 0.9);
-        box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
-        backdrop-filter: blur(8px);
+        gap: 2px;
+        padding: 3px;
+        border: 1px solid rgba(148, 163, 184, 0.16);
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.36);
+        box-shadow: none;
+        backdrop-filter: blur(2px);
       }
       .map-zoom-label {
-        min-width: 44px;
+        min-width: 34px;
         text-align: center;
-        font: 11px/1 "JetBrains Mono", monospace;
-        color: var(--muted-foreground);
-        letter-spacing: 0.06em;
+        font: 10px/1 "JetBrains Mono", monospace;
+        color: rgba(100, 116, 139, 0.72);
+        letter-spacing: 0.03em;
       }
       .map-control-btn {
         appearance: none;
         border: 0;
         background: transparent;
-        color: var(--foreground);
-        border-radius: 10px;
-        width: 32px;
-        height: 32px;
+        color: rgba(71, 85, 105, 0.72);
+        border-radius: 6px;
+        width: 24px;
+        height: 24px;
         display: inline-flex;
         align-items: center;
         justify-content: center;
@@ -664,39 +665,40 @@
         transition: background 0.15s ease, color 0.15s ease;
       }
       .map-control-btn:hover {
-        background: rgba(0, 82, 255, 0.08);
-        color: var(--accent);
+        background: rgba(0, 82, 255, 0.06);
+        color: rgba(0, 82, 255, 0.72);
       }
       .map-control-btn:focus-visible {
         outline: 2px solid var(--accent);
         outline-offset: 1px;
       }
-      .map-control-btn svg { width: 16px; height: 16px; }
+      .map-control-btn svg { width: 13px; height: 13px; }
       .map-legend {
         position: absolute;
-        right: 16px;
-        bottom: 16px;
+        right: 1.6%;
+        bottom: 4%;
         z-index: 5;
         display: flex;
         flex-wrap: wrap;
-        gap: 14px;
-        font-size: 12px;
-        color: var(--muted-foreground);
-        padding: 8px 12px;
-        border: 1px solid rgba(226, 232, 240, 0.95);
-        border-radius: 14px;
-        background: rgba(255, 255, 255, 0.9);
-        box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
-        backdrop-filter: blur(8px);
+        gap: 9px;
+        max-width: min(34%, 280px);
+        font-size: 10px;
+        color: rgba(100, 116, 139, 0.72);
+        padding: 5px 7px;
+        border: 1px solid rgba(148, 163, 184, 0.16);
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.36);
+        box-shadow: none;
+        backdrop-filter: blur(2px);
       }
       .map-legend span {
         display: inline-flex;
         align-items: center;
-        gap: 6px;
+        gap: 4px;
       }
       .map-legend i {
-        width: 8px;
-        height: 8px;
+        width: 6px;
+        height: 6px;
         border-radius: 999px;
         display: inline-block;
       }
@@ -719,7 +721,7 @@
       }
       .map-empty-title {
         font: 600 16px/1.3 Inter, system-ui, sans-serif;
-        color: var(--foreground);
+        color: rgba(51, 65, 85, 0.72);
       }
       .map-empty-meta {
         font: 11px/1 "JetBrains Mono", monospace;
@@ -730,14 +732,15 @@
       .map-tooltip {
         position: fixed;
         pointer-events: none;
-        background: var(--card);
-        border: 1px solid var(--border);
-        border-radius: 12px;
-        padding: 10px 12px;
-        box-shadow: 0 10px 30px rgba(15, 23, 42, 0.14);
-        font-size: 12px;
+        background: rgba(255, 255, 255, 0.58);
+        border: 1px solid rgba(148, 163, 184, 0.2);
+        border-radius: 8px;
+        padding: 7px 9px;
+        box-shadow: none;
+        backdrop-filter: blur(3px);
+        font-size: 11px;
         line-height: 1.4;
-        color: var(--foreground);
+        color: rgba(30, 41, 59, 0.76);
         z-index: 110;
         opacity: 0;
         transform: translate(-50%, calc(-100% - 12px));
@@ -748,13 +751,13 @@
       .map-tooltip.show { opacity: 1; }
       .map-tooltip-title {
         font-weight: 600;
-        margin-bottom: 4px;
+        margin-bottom: 3px;
       }
       .map-tooltip-meta {
-        font: 10px/1.4 "JetBrains Mono", monospace;
-        letter-spacing: 0.08em;
+        font: 9px/1.4 "JetBrains Mono", monospace;
+        letter-spacing: 0.05em;
         text-transform: uppercase;
-        color: var(--muted-foreground);
+        color: rgba(100, 116, 139, 0.72);
       }
       @media (prefers-reduced-motion: reduce) {
         .map-dot--server::after,
