@@ -462,7 +462,7 @@ pub async fn market_proxy_handler(
         if is_hop_by_hop_header(name.as_str()) {
             continue;
         }
-        response.headers_mut().insert(name, value.clone());
+        response.headers_mut().append(name.clone(), value.clone());
     }
     strip_connection_listed_headers(response.headers_mut());
     info!(
@@ -832,7 +832,7 @@ pub async fn proxy_handler(
         if is_hop_by_hop_header(name.as_str()) {
             continue;
         }
-        response.headers_mut().insert(name, value.clone());
+        response.headers_mut().append(name.clone(), value.clone());
     }
     strip_connection_listed_headers(response.headers_mut());
     if is_share_router_probe {
