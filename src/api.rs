@@ -15,10 +15,11 @@ use crate::models::{
     BindInstallationOwnerEmailRequest, BindInstallationOwnerEmailResponse,
     DashboardPresenceRequest, DashboardPresenceResponse, DashboardResponse,
     GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse, HealthResponse,
-    IssueLeaseRequest, IssueLeaseResponse, MarketShareView, MarketsResponse,
-    PublicMapPointsResponse, RefreshSessionRequest, RegisterInstallationRequest,
-    RegisterInstallationResponse, RegisterMarketRequest, RequestEmailCodeRequest,
-    RequestEmailCodeResponse, SessionStatusResponse, ShareBatchSyncRequest,
+    IssueLeaseRequest, IssueLeaseResponse, MarketNotificationEmailLogView,
+    MarketNotificationEmailRequest, MarketNotificationEmailResponse, MarketShareView,
+    MarketsResponse, PublicMapPointsResponse, RefreshSessionRequest,
+    RegisterInstallationRequest, RegisterInstallationResponse, RegisterMarketRequest,
+    RequestEmailCodeRequest, RequestEmailCodeResponse, SessionStatusResponse, ShareBatchSyncRequest,
     ShareClaimSubdomainRequest, ShareDeleteRequest, ShareHeartbeatRequest,
     ShareRequestLogBatchSyncRequest, ShareSyncRequest, VerifyEmailCodeRequest,
     VerifyEmailCodeResponse,
@@ -51,6 +52,8 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/markets", get(markets))
         .route("/v1/markets/register", post(register_market))
         .route("/v1/market/shares", get(market_shares))
+        .route("/v1/market/notifications/email", post(send_market_notification_email))
+        .route("/v1/market/notifications/emails", get(list_market_notification_emails))
         .route("/v1/markets/tunnel/lease", post(issue_market_lease))
         .route("/v1/public/map-points", get(public_map_points))
         .route("/v1/regions", get(regions))
@@ -157,6 +160,33 @@ async fn issue_market_lease(
         "market tunnel lease issued"
     );
     Ok(Json(response))
+}
+
+async fn send_market_notification_email(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<MarketNotificationEmailRequest>,
+) -> Result<Json<MarketNotificationEmailResponse>, AppError> {
+    let market = authenticate_market(&state, &headers, "market:email:notify").await?;
+    Ok(Json(
+        state
+            .store
+            .send_market_notification_email(&state.config, state.resend.as_deref(), &market, input)
+            .await?,
+    ))
+}
+
+async fn list_market_notification_emails(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<MarketNotificationEmailLogView>>, AppError> {
+    let market = authenticate_market(&state, &headers, "market:email:notify").await?;
+    Ok(Json(
+        state
+            .store
+            .list_market_notification_emails(&market.email)
+            .await?,
+    ))
 }
 
 async fn register_installation(

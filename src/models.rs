@@ -371,6 +371,42 @@ pub struct RegisterMarketRequest {
     pub public_base_url: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketNotificationEmailRequest {
+    pub kind: String,
+    pub to: String,
+    #[serde(default)]
+    pub locale: Option<String>,
+    #[serde(default)]
+    pub data: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketNotificationEmailResponse {
+    pub ok: bool,
+    pub message_id: String,
+    pub kind: String,
+    pub to: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketNotificationEmailLogView {
+    pub id: String,
+    pub market_email: String,
+    pub kind: String,
+    pub to_email: String,
+    pub locale: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    pub created_at: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MarketShareView {
