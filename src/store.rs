@@ -374,7 +374,7 @@ impl AppStore {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| {
-                AppError::Unauthorized("authenticated new owner session is required".into())
+                AppError::Unauthorized("authenticated current owner session is required".into())
             })?;
         let session = self
             .resolve_session_by_access_token(access_token)
@@ -385,9 +385,9 @@ impl AppStore {
                 "authenticated session installation mismatch".into(),
             ));
         }
-        if session.email != new_email {
+        if session.email != old_email {
             return Err(AppError::Unauthorized(
-                "authenticated session email does not match new owner email".into(),
+                "authenticated session email does not match current owner email".into(),
             ));
         }
 
@@ -418,6 +418,14 @@ impl AppStore {
         let tx = conn
             .transaction()
             .map_err(|e| AppError::Internal(format!("begin owner email change failed: {e}")))?;
+        let new_user = upsert_user_by_email(&tx, &new_email, now)?;
+        tx.execute(
+            "UPDATE user_sessions
+             SET user_id = ?2
+             WHERE id = ?1",
+            params![session.session_id, new_user.id],
+        )
+        .map_err(|e| AppError::Internal(format!("migrate owner session failed: {e}")))?;
         let updated_shares = tx
             .execute(
                 "UPDATE shares
@@ -5499,7 +5507,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn change_installation_owner_email_uses_new_owner_session() {
+    async fn change_installation_owner_email_uses_current_owner_session() {
         let (store, config) = setup_store("change-owner-session").await;
         let installation_id = "inst-change-owner";
         let signing_key = insert_signed_installation(&store, installation_id).await;
@@ -5517,13 +5525,13 @@ mod tests {
         let now = Utc::now();
         {
             let conn = store.conn.lock().await;
-            let user = upsert_user_by_email(&conn, new_email, now).expect("upsert user");
+            let user = upsert_user_by_email(&conn, old_email, now).expect("upsert user");
             persist_session(
                 &conn,
                 &AuthSession {
                     session_id: Uuid::new_v4().to_string(),
                     user_id: user.id,
-                    email: new_email.into(),
+                    email: old_email.into(),
                     installation_id: installation_id.into(),
                     access_token_hash: hash_token(access_token),
                     refresh_token_hash: hash_token("refresh-token-for-change-owner"),
@@ -5579,6 +5587,10 @@ mod tests {
             get_share_owner_email(&conn, "share-change-owner").expect("share owner"),
             Some(new_email.into())
         );
+        let session = get_session_by_access_hash(&conn, &hash_token(access_token))
+            .expect("query session")
+            .expect("session exists");
+        assert_eq!(session.email, new_email);
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
