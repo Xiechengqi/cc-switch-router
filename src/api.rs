@@ -13,13 +13,14 @@ use crate::client_meta::extract_client_metadata;
 use crate::error::AppError;
 use crate::models::{
     BindInstallationOwnerEmailRequest, BindInstallationOwnerEmailResponse,
+    ChangeInstallationOwnerEmailRequest, ChangeInstallationOwnerEmailResponse,
     DashboardPresenceRequest, DashboardPresenceResponse, DashboardResponse,
     GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse, HealthResponse,
     IssueLeaseRequest, IssueLeaseResponse, MarketNotificationEmailLogView,
     MarketNotificationEmailRequest, MarketNotificationEmailResponse, MarketShareView,
-    MarketsResponse, PublicMapPointsResponse, RefreshSessionRequest,
-    RegisterInstallationRequest, RegisterInstallationResponse, RegisterMarketRequest,
-    RequestEmailCodeRequest, RequestEmailCodeResponse, SessionStatusResponse, ShareBatchSyncRequest,
+    MarketsResponse, PublicMapPointsResponse, RefreshSessionRequest, RegisterInstallationRequest,
+    RegisterInstallationResponse, RegisterMarketRequest, RequestEmailCodeRequest,
+    RequestEmailCodeResponse, SessionStatusResponse, ShareBatchSyncRequest,
     ShareClaimSubdomainRequest, ShareDeleteRequest, ShareHeartbeatRequest,
     ShareRequestLogBatchSyncRequest, ShareSyncRequest, VerifyEmailCodeRequest,
     VerifyEmailCodeResponse,
@@ -62,6 +63,10 @@ pub fn router(state: ServerState) -> Router {
         .route(
             "/v1/installations/bind-owner-email",
             post(bind_installation_owner_email),
+        )
+        .route(
+            "/v1/installations/change-owner-email",
+            post(change_installation_owner_email),
         )
         .route(
             "/v1/installations/owner-email",
@@ -204,12 +209,26 @@ async fn register_installation(
 
 async fn bind_installation_owner_email(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Json(input): Json<BindInstallationOwnerEmailRequest>,
 ) -> Result<Json<BindInstallationOwnerEmailResponse>, AppError> {
     Ok(Json(
         state
             .store
-            .bind_installation_owner_email(&state.config, input)
+            .bind_installation_owner_email(&state.config, input, extract_bearer_token(&headers))
+            .await?,
+    ))
+}
+
+async fn change_installation_owner_email(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<ChangeInstallationOwnerEmailRequest>,
+) -> Result<Json<ChangeInstallationOwnerEmailResponse>, AppError> {
+    Ok(Json(
+        state
+            .store
+            .change_installation_owner_email(input, extract_bearer_token(&headers))
             .await?,
     ))
 }

@@ -20,7 +20,8 @@ use crate::config::Config;
 use crate::error::AppError;
 use crate::models::{
     AuthSession, AuthUser, BindInstallationOwnerEmailRequest, BindInstallationOwnerEmailResponse,
-    ClientMetadata, DashboardClientView, DashboardMap, DashboardMapPoint, DashboardMarketView,
+    ChangeInstallationOwnerEmailRequest, ChangeInstallationOwnerEmailResponse, ClientMetadata,
+    DashboardClientView, DashboardMap, DashboardMapPoint, DashboardMarketView,
     DashboardPresenceRequest, DashboardResponse, DashboardStats, DashboardTickerShare,
     GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse, HealthCheckEntry,
     Installation, InstallationView, IssueLeaseRequest, IssueLeaseResponse, LatLonPoint,
@@ -269,6 +270,7 @@ impl AppStore {
         &self,
         config: &Config,
         input: BindInstallationOwnerEmailRequest,
+        access_token: Option<&str>,
     ) -> Result<BindInstallationOwnerEmailResponse, AppError> {
         let email = normalize_email(&input.email)?;
         let now = Utc::now();
@@ -309,18 +311,35 @@ impl AppStore {
         }
         drop(conn);
 
-        let verification_token = payload.verification_token.ok_or_else(|| {
-            AppError::Unauthorized(
-                "verification token is required to bind installation owner".into(),
-            )
-        })?;
-        let redeemed = redeem_verification_token(config, verification_token).await?;
-        if !redeemed.ok || redeemed.purpose != AUTH_PURPOSE_LOGIN || redeemed.email != email {
-            return Err(AppError::Unauthorized(
-                "verification token does not match requested owner email".into(),
-            ));
-        }
-        let verified_at = DateTime::<Utc>::from_timestamp(redeemed.verified_at, 0).unwrap_or(now);
+        let verified_at = if let Some(verification_token) = payload.verification_token {
+            let redeemed = redeem_verification_token(config, verification_token).await?;
+            if !redeemed.ok || redeemed.purpose != AUTH_PURPOSE_LOGIN || redeemed.email != email {
+                return Err(AppError::Unauthorized(
+                    "verification token does not match requested owner email".into(),
+                ));
+            }
+            DateTime::<Utc>::from_timestamp(redeemed.verified_at, 0).unwrap_or(now)
+        } else {
+            let access_token = access_token
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    AppError::Unauthorized(
+                        "verification token or authenticated session is required to bind installation owner"
+                            .into(),
+                    )
+                })?;
+            let session = self
+                .resolve_session_by_access_token(access_token)
+                .await?
+                .ok_or_else(|| AppError::Unauthorized("session not found".into()))?;
+            if session.email != email {
+                return Err(AppError::Unauthorized(
+                    "authenticated session email does not match requested owner email".into(),
+                ));
+            }
+            session.last_used_at
+        };
 
         let conn = self.conn.lock().await;
         conn.execute(
@@ -336,6 +355,99 @@ impl AppStore {
             ok: true,
             owner_email: email,
             already_bound: false,
+        })
+    }
+
+    pub async fn change_installation_owner_email(
+        &self,
+        input: ChangeInstallationOwnerEmailRequest,
+        access_token: Option<&str>,
+    ) -> Result<ChangeInstallationOwnerEmailResponse, AppError> {
+        let old_email = normalize_email(&input.old_email)?;
+        let new_email = normalize_email(&input.new_email)?;
+        if old_email == new_email {
+            return Err(AppError::BadRequest(
+                "new owner email must be different from current owner email".into(),
+            ));
+        }
+        let access_token = access_token
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                AppError::Unauthorized("authenticated new owner session is required".into())
+            })?;
+        let session = self
+            .resolve_session_by_access_token(access_token)
+            .await?
+            .ok_or_else(|| AppError::Unauthorized("session not found".into()))?;
+        if session.installation_id != input.installation_id {
+            return Err(AppError::Unauthorized(
+                "authenticated session installation mismatch".into(),
+            ));
+        }
+        if session.email != new_email {
+            return Err(AppError::Unauthorized(
+                "authenticated session email does not match new owner email".into(),
+            ));
+        }
+
+        let now = Utc::now();
+        let payload = serde_json::json!({
+            "oldEmail": &old_email,
+            "newEmail": &new_email,
+        });
+        let mut conn = self.conn.lock().await;
+        let installation = get_installation(&conn, &input.installation_id)?
+            .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
+        verify_signed_share_request(
+            &conn,
+            &installation.public_key,
+            &input.installation_id,
+            "change_installation_owner_email",
+            &payload,
+            input.timestamp_ms,
+            &input.nonce,
+            &input.signature,
+        )?;
+        if installation.owner_email.as_deref() != Some(old_email.as_str()) {
+            return Err(AppError::Conflict(
+                "current installation owner email does not match requested old email".into(),
+            ));
+        }
+
+        let tx = conn
+            .transaction()
+            .map_err(|e| AppError::Internal(format!("begin owner email change failed: {e}")))?;
+        let updated_shares = tx
+            .execute(
+                "UPDATE shares
+                 SET owner_email = ?3
+                 WHERE installation_id = ?1
+                   AND owner_email = ?2",
+                params![input.installation_id, old_email, new_email],
+            )
+            .map_err(|e| AppError::Internal(format!("update share owner email failed: {e}")))?;
+        tx.execute(
+            "UPDATE installations
+                 SET owner_email = ?2, owner_verified_at = ?3
+                 WHERE id = ?1
+                   AND owner_email = ?4",
+            params![
+                input.installation_id,
+                new_email,
+                now.to_rfc3339(),
+                old_email
+            ],
+        )
+        .map_err(|e| AppError::Internal(format!("change installation owner email failed: {e}")))?;
+        tx.commit()
+            .map_err(|e| AppError::Internal(format!("commit owner email change failed: {e}")))?;
+
+        Ok(ChangeInstallationOwnerEmailResponse {
+            ok: true,
+            old_email,
+            new_email,
+            updated_shares,
         })
     }
 
@@ -500,14 +612,6 @@ impl AppStore {
         let conn = self.conn.lock().await;
         let installation = get_installation(&conn, &input.installation_id)?
             .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
-        let locked_owner_email = get_installation_owner_email(&conn, &installation.id)?;
-        if let Some(ref owner_email) = locked_owner_email {
-            if owner_email != &email {
-                return Err(AppError::Conflict(
-                    "this installation is locked to a different owner email".into(),
-                ));
-            }
-        }
 
         let challenge = get_latest_active_email_challenge(
             &conn,
@@ -5312,6 +5416,168 @@ mod tests {
             tampered_err
                 .to_string()
                 .contains("signature verification failed")
+        );
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn bind_installation_owner_email_accepts_authenticated_session() {
+        let (store, config) = setup_store("bind-owner-session").await;
+        let installation_id = "inst-bind-session";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        let email = "owner@example.com";
+        let access_token = "access-token-for-owner-binding";
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installations SET owner_email = NULL, owner_verified_at = NULL WHERE id = ?1",
+                params![installation_id],
+            )
+            .expect("clear owner");
+            let user = upsert_user_by_email(&conn, email, now).expect("upsert user");
+            persist_session(
+                &conn,
+                &AuthSession {
+                    session_id: Uuid::new_v4().to_string(),
+                    user_id: user.id,
+                    email: email.into(),
+                    installation_id: installation_id.into(),
+                    access_token_hash: hash_token(access_token),
+                    refresh_token_hash: hash_token("refresh-token-for-owner-binding"),
+                    access_expires_at: now + Duration::hours(1),
+                    refresh_expires_at: now + Duration::days(1),
+                    created_at: now,
+                    last_used_at: now,
+                },
+            )
+            .expect("persist session");
+        }
+
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let payload = BindOwnerEmailSignaturePayload {
+            email,
+            verification_token: None,
+        };
+        let signature = sign_test_payload(
+            &signing_key,
+            installation_id,
+            "bind_installation_owner_email",
+            &payload,
+            timestamp_ms,
+            &nonce,
+        );
+
+        let response = store
+            .bind_installation_owner_email(
+                &config,
+                BindInstallationOwnerEmailRequest {
+                    installation_id: installation_id.into(),
+                    email: email.into(),
+                    verification_token: None,
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                },
+                Some(access_token),
+            )
+            .await
+            .expect("bind owner with session");
+
+        assert!(response.ok);
+        assert_eq!(response.owner_email, email);
+        assert!(!response.already_bound);
+        let conn = store.conn.lock().await;
+        assert_eq!(
+            get_installation_owner_email(&conn, installation_id).expect("owner email"),
+            Some(email.into())
+        );
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn change_installation_owner_email_uses_new_owner_session() {
+        let (store, config) = setup_store("change-owner-session").await;
+        let installation_id = "inst-change-owner";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        insert_share(
+            &store,
+            installation_id,
+            "share-change-owner",
+            "change-owner",
+            "paused",
+        )
+        .await;
+        let old_email = "owner@example.com";
+        let new_email = "new-owner@example.com";
+        let access_token = "access-token-for-change-owner";
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            let user = upsert_user_by_email(&conn, new_email, now).expect("upsert user");
+            persist_session(
+                &conn,
+                &AuthSession {
+                    session_id: Uuid::new_v4().to_string(),
+                    user_id: user.id,
+                    email: new_email.into(),
+                    installation_id: installation_id.into(),
+                    access_token_hash: hash_token(access_token),
+                    refresh_token_hash: hash_token("refresh-token-for-change-owner"),
+                    access_expires_at: now + Duration::hours(1),
+                    refresh_expires_at: now + Duration::days(1),
+                    created_at: now,
+                    last_used_at: now,
+                },
+            )
+            .expect("persist session");
+        }
+
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let payload = serde_json::json!({
+            "oldEmail": old_email,
+            "newEmail": new_email,
+        });
+        let signature = sign_test_payload(
+            &signing_key,
+            installation_id,
+            "change_installation_owner_email",
+            &payload,
+            timestamp_ms,
+            &nonce,
+        );
+
+        let response = store
+            .change_installation_owner_email(
+                ChangeInstallationOwnerEmailRequest {
+                    installation_id: installation_id.into(),
+                    old_email: old_email.into(),
+                    new_email: new_email.into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                },
+                Some(access_token),
+            )
+            .await
+            .expect("change owner email");
+
+        assert!(response.ok);
+        assert_eq!(response.old_email, old_email);
+        assert_eq!(response.new_email, new_email);
+        assert_eq!(response.updated_shares, 1);
+        let conn = store.conn.lock().await;
+        assert_eq!(
+            get_installation_owner_email(&conn, installation_id).expect("owner email"),
+            Some(new_email.into())
+        );
+        assert_eq!(
+            get_share_owner_email(&conn, "share-change-owner").expect("share owner"),
+            Some(new_email.into())
         );
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));

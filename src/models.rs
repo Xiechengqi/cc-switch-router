@@ -172,6 +172,26 @@ pub struct BindInstallationOwnerEmailResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ChangeInstallationOwnerEmailRequest {
+    pub installation_id: String,
+    pub old_email: String,
+    pub new_email: String,
+    pub timestamp_ms: i64,
+    pub nonce: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeInstallationOwnerEmailResponse {
+    pub ok: bool,
+    pub old_email: String,
+    pub new_email: String,
+    pub updated_shares: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GetInstallationOwnerEmailQuery {
     pub installation_id: String,
     pub timestamp_ms: i64,
