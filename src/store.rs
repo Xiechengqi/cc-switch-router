@@ -1839,14 +1839,7 @@ impl AppStore {
                     AppError::Internal(format!("delete stale client leases failed: {e}"))
                 })? as usize;
 
-            let deleted_installations = tx
-                .execute(
-                    "DELETE FROM installations WHERE last_seen_at < ?1",
-                    params![stale_cutoff],
-                )
-                .map_err(|e| {
-                    AppError::Internal(format!("delete stale installations failed: {e}"))
-                })? as usize;
+            let deleted_installations = 0;
 
             let deleted_old_shares = tx
                 .execute(
@@ -6142,7 +6135,7 @@ mod tests {
             .await
             .expect("cleanup stale client");
 
-        assert_eq!(result.deleted_installations, 1);
+        assert_eq!(result.deleted_installations, 0);
         assert_eq!(result.deleted_shares, 1);
         assert_eq!(result.removed_routes, 1);
 
@@ -6170,7 +6163,7 @@ mod tests {
             .expect("count fresh shares");
         drop(conn);
 
-        assert_eq!(stale_installations, 0);
+        assert_eq!(stale_installations, 1);
         assert_eq!(stale_shares, 0);
         assert_eq!(fresh_shares, 1);
         let active_subdomains = proxy.active_subdomains().await;
