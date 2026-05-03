@@ -272,6 +272,23 @@ pub struct ShareRequestLogBatchSyncRequest {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ShareRuntimeRefreshPayload {
+    pub share_id: String,
+    pub subdomain: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareRuntimeRefreshRequest {
+    pub installation_id: String,
+    pub timestamp_ms: i64,
+    pub nonce: String,
+    pub signature: String,
+    pub refresh: ShareRuntimeRefreshPayload,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ShareSyncOperation {
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

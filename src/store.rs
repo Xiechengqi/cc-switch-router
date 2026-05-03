@@ -31,8 +31,9 @@ use crate::models::{
     RequestEmailCodeResponse, SessionStatusResponse, ShareAppRuntimes, ShareBatchSyncRequest,
     ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptor, ShareHeartbeatRequest,
     ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRequestLogFetchResponse,
-    ShareRuntimeSnapshotResponse, ShareSupport, ShareSyncRequest, ShareUpstreamProvider, ShareView,
-    TunnelLease, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    ShareRuntimeRefreshPayload, ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse,
+    ShareSupport, ShareSyncRequest, ShareUpstreamProvider, ShareView, TunnelLease,
+    VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 use crate::proxy::ProxyRegistry;
 
@@ -1394,6 +1395,63 @@ impl AppStore {
             AppError::Internal(format!("commit request log batch sync failed: {e}"))
         })?;
         Ok(())
+    }
+
+    pub async fn prepare_share_runtime_refresh(
+        &self,
+        input: ShareRuntimeRefreshRequest,
+        metadata: ClientMetadata,
+    ) -> Result<ShareRuntimeRefreshPayload, AppError> {
+        let conn = self.conn.lock().await;
+        let installation = get_installation(&conn, &input.installation_id)?;
+        let Some(installation) = installation else {
+            return Err(AppError::Unauthorized("installation not found".into()));
+        };
+        verify_signed_share_request(
+            &conn,
+            &installation.public_key,
+            &input.installation_id,
+            "share_runtime_refresh",
+            &input.refresh,
+            input.timestamp_ms,
+            &input.nonce,
+            &input.signature,
+        )?;
+        let should_refresh_geo =
+            should_refresh_installation_geo(&installation, metadata.ip.as_deref());
+        touch_installation_presence(&conn, &input.installation_id, &metadata, Utc::now())?;
+
+        let bound_owner_email = require_installation_owner_email(&conn, &input.installation_id)?;
+        let row = conn
+            .query_row(
+                "SELECT owner_email, subdomain FROM shares WHERE share_id = ?1 AND installation_id = ?2",
+                params![&input.refresh.share_id, &input.installation_id],
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()
+            .map_err(|e| AppError::Internal(format!("query share runtime target failed: {e}")))?;
+        let Some((owner_email, subdomain)) = row else {
+            return Err(AppError::BadRequest("share not found".into()));
+        };
+        let Some(subdomain) = subdomain else {
+            return Err(AppError::BadRequest("share subdomain is not set".into()));
+        };
+        if owner_email.as_deref() != Some(bound_owner_email.as_str()) {
+            return Err(AppError::Unauthorized(
+                "only share owner can refresh runtime".into(),
+            ));
+        }
+        if subdomain != input.refresh.subdomain {
+            return Err(AppError::BadRequest("share subdomain mismatch".into()));
+        }
+        drop(conn);
+
+        if should_refresh_geo {
+            self.refresh_installation_geo(&input.installation_id, &metadata.ip, false)
+                .await?;
+        }
+
+        Ok(input.refresh)
     }
 
     pub async fn dashboard_snapshot(
@@ -5116,6 +5174,98 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(subdomains, vec!["active-sub".to_string()]);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn share_runtime_refresh_accepts_signed_owner_request() {
+        let (store, config) = setup_store("runtime-refresh-signed").await;
+        let signing_key = insert_signed_installation(&store, "inst-runtime").await;
+        insert_share(&store, "inst-runtime", "share-runtime", "runtime-sub", "active").await;
+        let refresh = ShareRuntimeRefreshPayload {
+            share_id: "share-runtime".into(),
+            subdomain: "runtime-sub".into(),
+        };
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            "inst-runtime",
+            "share_runtime_refresh",
+            &refresh,
+            timestamp_ms,
+            &nonce,
+        );
+
+        let accepted = store
+            .prepare_share_runtime_refresh(
+                ShareRuntimeRefreshRequest {
+                    installation_id: "inst-runtime".into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    refresh,
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+            )
+            .await
+            .expect("runtime refresh should be accepted");
+
+        assert_eq!(accepted.share_id, "share-runtime");
+        assert_eq!(accepted.subdomain, "runtime-sub");
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn share_runtime_refresh_rejects_subdomain_mismatch() {
+        let (store, config) = setup_store("runtime-refresh-mismatch").await;
+        let signing_key = insert_signed_installation(&store, "inst-runtime-mismatch").await;
+        insert_share(
+            &store,
+            "inst-runtime-mismatch",
+            "share-runtime-mismatch",
+            "runtime-sub",
+            "active",
+        )
+        .await;
+        let refresh = ShareRuntimeRefreshPayload {
+            share_id: "share-runtime-mismatch".into(),
+            subdomain: "other-sub".into(),
+        };
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            "inst-runtime-mismatch",
+            "share_runtime_refresh",
+            &refresh,
+            timestamp_ms,
+            &nonce,
+        );
+
+        let err = store
+            .prepare_share_runtime_refresh(
+                ShareRuntimeRefreshRequest {
+                    installation_id: "inst-runtime-mismatch".into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    refresh,
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+            )
+            .await
+            .expect_err("subdomain mismatch should be rejected");
+
+        assert!(err.to_string().contains("subdomain mismatch"));
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }

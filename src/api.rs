@@ -22,8 +22,8 @@ use crate::models::{
     RegisterInstallationResponse, RegisterMarketRequest, RequestEmailCodeRequest,
     RequestEmailCodeResponse, SessionStatusResponse, ShareBatchSyncRequest,
     ShareClaimSubdomainRequest, ShareDeleteRequest, ShareHeartbeatRequest,
-    ShareRequestLogBatchSyncRequest, ShareSyncRequest, VerifyEmailCodeRequest,
-    VerifyEmailCodeResponse,
+    ShareRequestLogBatchSyncRequest, ShareRuntimeRefreshRequest, ShareSyncRequest,
+    VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 use crate::proxy::{market_proxy_handler, proxy_handler};
 use crate::recent_traffic::{RecentRequestEvent, RecentTrafficSnapshot};
@@ -80,6 +80,7 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/shares/claim-subdomain", post(claim_share_subdomain))
         .route("/v1/shares/sync", post(sync_share))
         .route("/v1/shares/batch-sync", post(batch_sync_share))
+        .route("/v1/shares/runtime-refresh", post(refresh_share_runtime))
         .route(
             "/v1/share-request-logs/batch-sync",
             post(batch_sync_share_request_logs),
@@ -581,6 +582,45 @@ async fn batch_sync_share_request_logs(
         .store
         .batch_sync_share_request_logs(input, extract_client_metadata(&headers, addr), "")
         .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn refresh_share_runtime(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(input): Json<ShareRuntimeRefreshRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let refresh = state
+        .store
+        .prepare_share_runtime_refresh(input, extract_client_metadata(&headers, addr))
+        .await?;
+
+    if !state
+        .proxy
+        .active_subdomains()
+        .await
+        .contains(&refresh.subdomain)
+    {
+        return Err(AppError::BadRequest(format!(
+            "share subdomain is not active: {}",
+            refresh.subdomain
+        )));
+    }
+
+    let client = reqwest::Client::builder()
+        .user_agent("cc-switch-router/0.1 share-runtime-refresh")
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| AppError::Internal(format!("create runtime refresh client failed: {e}")))?;
+    let snapshot = crate::store::fetch_share_runtime_snapshot_from_route(
+        &state.config,
+        &client,
+        &refresh.subdomain,
+    )
+    .await?;
+    state.store.record_share_runtime_snapshot(snapshot).await?;
+
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
