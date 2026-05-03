@@ -1971,6 +1971,7 @@
 
       function quotaSummary(upstream) {
         if (!upstream) return "";
+        if (upstream.apiUrl) return "";
         if (upstream.kind !== "official_oauth") return "";
         const quota = upstream.quota;
         if (!quota) return "";
@@ -1995,6 +1996,7 @@
 
       function accountSummary(upstream) {
         if (!upstream) return "";
+        if (upstream.apiUrl) return upstream.apiUrl;
         return upstream.accountEmail || "";
       }
 
