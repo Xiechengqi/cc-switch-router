@@ -59,6 +59,13 @@ struct BindOwnerEmailSignaturePayload<'a> {
     verification_token: Option<&'a str>,
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChangeOwnerEmailSignaturePayload<'a> {
+    old_email: &'a str,
+    new_email: &'a str,
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct VerificationRedeemResponse {
@@ -392,10 +399,10 @@ impl AppStore {
         }
 
         let now = Utc::now();
-        let payload = serde_json::json!({
-            "oldEmail": &old_email,
-            "newEmail": &new_email,
-        });
+        let payload = ChangeOwnerEmailSignaturePayload {
+            old_email: &old_email,
+            new_email: &new_email,
+        };
         let mut conn = self.conn.lock().await;
         let installation = get_installation(&conn, &input.installation_id)?
             .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
@@ -5531,10 +5538,10 @@ mod tests {
 
         let timestamp_ms = Utc::now().timestamp_millis();
         let nonce = Uuid::new_v4().to_string();
-        let payload = serde_json::json!({
-            "oldEmail": old_email,
-            "newEmail": new_email,
-        });
+        let payload = ChangeOwnerEmailSignaturePayload {
+            old_email,
+            new_email,
+        };
         let signature = sign_test_payload(
             &signing_key,
             installation_id,
