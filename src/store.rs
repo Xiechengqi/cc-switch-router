@@ -2184,7 +2184,8 @@ impl AppStore {
         let resend = resend.ok_or_else(|| AppError::Internal("resend is not configured".into()))?;
         let subject = market_notification_subject(&kind, locale);
         let html = render_market_notification_html(&kind, locale, market, &payload);
-        let provider_message_id = send_market_template_email(resend, config, &to, &subject, &html).await?;
+        let provider_message_id =
+            send_market_template_email(resend, config, &to, &subject, &html).await?;
         let now = Utc::now().to_rfc3339();
         let id = Uuid::new_v4().to_string();
         let conn = self.conn.lock().await;
@@ -2234,7 +2235,9 @@ impl AppStore {
                     created_at: row.get(8)?,
                 })
             })
-            .map_err(|e| AppError::Internal(format!("query market notification logs failed: {e}")))?;
+            .map_err(|e| {
+                AppError::Internal(format!("query market notification logs failed: {e}"))
+            })?;
         collect_rows(rows)
     }
 
@@ -4460,14 +4463,8 @@ async fn send_login_code_email(
 fn normalize_market_notification_kind(kind: &str) -> Result<String, AppError> {
     let kind = kind.trim().to_ascii_lowercase();
     match kind.as_str() {
-        "topup_paid"
-        | "topup_refunded"
-        | "topup_chargeback"
-        | "payout_submitted"
-        | "payout_paid"
-        | "payout_failed"
-        | "payout_review"
-        | "payout_cancelled" => Ok(kind),
+        "topup_paid" | "topup_refunded" | "topup_chargeback" | "payout_submitted"
+        | "payout_paid" | "payout_failed" | "payout_review" | "payout_cancelled" => Ok(kind),
         _ => Err(AppError::BadRequest("unsupported notification kind".into())),
     }
 }
@@ -4487,17 +4484,30 @@ fn validate_market_notification_payload(
         .as_object()
         .ok_or_else(|| AppError::BadRequest("notification data must be an object".into()))?;
     let required = match kind {
-        "topup_paid" | "topup_refunded" | "topup_chargeback" => {
-            ["topupId", "grossAmountUsd", "feeAmountUsd", "netAmountUsd", "dashboardUrl"].as_slice()
-        }
-        "payout_submitted" | "payout_paid" | "payout_failed" | "payout_review" | "payout_cancelled" => {
-            ["payoutId", "amountUsd", "feeUsd", "netPayoutUsd", "claimUrl"].as_slice()
-        }
+        "topup_paid" | "topup_refunded" | "topup_chargeback" => [
+            "topupId",
+            "grossAmountUsd",
+            "feeAmountUsd",
+            "netAmountUsd",
+            "dashboardUrl",
+        ]
+        .as_slice(),
+        "payout_submitted" | "payout_paid" | "payout_failed" | "payout_review"
+        | "payout_cancelled" => [
+            "payoutId",
+            "amountUsd",
+            "feeUsd",
+            "netPayoutUsd",
+            "claimUrl",
+        ]
+        .as_slice(),
         _ => &[],
     };
     for key in required {
         if !obj.contains_key(*key) {
-            return Err(AppError::BadRequest(format!("notification data missing field: {key}")));
+            return Err(AppError::BadRequest(format!(
+                "notification data missing field: {key}"
+            )));
         }
     }
     Ok(data.clone())
@@ -4544,63 +4554,138 @@ fn render_market_notification_html(
         ),
         ("topup_refunded", "en") => format!(
             "<div style=\"font-family:Arial,sans-serif\"><h2>Top-up refunded</h2><p>Your top-up has been refunded on {name}.</p><ul><li>Top-up ID: {topup}</li><li>Gross: ${gross}</li><li>Fee: ${fee}</li><li>Net: ${net}</li></ul><p><a href=\"{url}\">Open dashboard</a></p></div>",
-            name = market.display_name, topup = get("topupId"), gross = get("grossAmountUsd"), fee = get("feeAmountUsd"), net = get("netAmountUsd"), url = get("dashboardUrl"),
+            name = market.display_name,
+            topup = get("topupId"),
+            gross = get("grossAmountUsd"),
+            fee = get("feeAmountUsd"),
+            net = get("netAmountUsd"),
+            url = get("dashboardUrl"),
         ),
         ("topup_chargeback", "en") => format!(
             "<div style=\"font-family:Arial,sans-serif\"><h2>Top-up chargeback notice</h2><p>A chargeback/dispute has been recorded on {name}.</p><ul><li>Top-up ID: {topup}</li><li>Gross: ${gross}</li><li>Fee: ${fee}</li><li>Net: ${net}</li></ul><p><a href=\"{url}\">Open dashboard</a></p></div>",
-            name = market.display_name, topup = get("topupId"), gross = get("grossAmountUsd"), fee = get("feeAmountUsd"), net = get("netAmountUsd"), url = get("dashboardUrl"),
+            name = market.display_name,
+            topup = get("topupId"),
+            gross = get("grossAmountUsd"),
+            fee = get("feeAmountUsd"),
+            net = get("netAmountUsd"),
+            url = get("dashboardUrl"),
         ),
         ("payout_submitted", "en") => format!(
             "<div style=\"font-family:Arial,sans-serif\"><h2>Payout submitted</h2><p>Your payout request has been created on {name}.</p><ul><li>Payout ID: {id}</li><li>Gross: ${gross}</li><li>Fee: ${fee}</li><li>Net: ${net}</li></ul><p><a href=\"{url}\">Open claim page</a></p></div>",
-            name = market.display_name, id = get("payoutId"), gross = get("amountUsd"), fee = get("feeUsd"), net = get("netPayoutUsd"), url = get("claimUrl"),
+            name = market.display_name,
+            id = get("payoutId"),
+            gross = get("amountUsd"),
+            fee = get("feeUsd"),
+            net = get("netPayoutUsd"),
+            url = get("claimUrl"),
         ),
         ("payout_paid", "en") => format!(
             "<div style=\"font-family:Arial,sans-serif\"><h2>Payout completed</h2><p>Your payout has been completed on {name}.</p><ul><li>Payout ID: {id}</li><li>Gross: ${gross}</li><li>Fee: ${fee}</li><li>Net: ${net}</li></ul><p><a href=\"{url}\">Open claim page</a></p></div>",
-            name = market.display_name, id = get("payoutId"), gross = get("amountUsd"), fee = get("feeUsd"), net = get("netPayoutUsd"), url = get("claimUrl"),
+            name = market.display_name,
+            id = get("payoutId"),
+            gross = get("amountUsd"),
+            fee = get("feeUsd"),
+            net = get("netPayoutUsd"),
+            url = get("claimUrl"),
         ),
         ("payout_failed", "en") => format!(
             "<div style=\"font-family:Arial,sans-serif\"><h2>Payout failed</h2><p>Your payout could not be completed on {name}.</p><ul><li>Payout ID: {id}</li><li>Gross: ${gross}</li><li>Fee: ${fee}</li><li>Net: ${net}</li></ul><p><a href=\"{url}\">Open claim page</a></p></div>",
-            name = market.display_name, id = get("payoutId"), gross = get("amountUsd"), fee = get("feeUsd"), net = get("netPayoutUsd"), url = get("claimUrl"),
+            name = market.display_name,
+            id = get("payoutId"),
+            gross = get("amountUsd"),
+            fee = get("feeUsd"),
+            net = get("netPayoutUsd"),
+            url = get("claimUrl"),
         ),
         ("payout_review", "en") => format!(
             "<div style=\"font-family:Arial,sans-serif\"><h2>Payout under review</h2><p>Your payout is being reviewed on {name}. Please do not submit another payout.</p><ul><li>Payout ID: {id}</li><li>Gross: ${gross}</li><li>Fee: ${fee}</li><li>Net: ${net}</li></ul><p><a href=\"{url}\">Open claim page</a></p></div>",
-            name = market.display_name, id = get("payoutId"), gross = get("amountUsd"), fee = get("feeUsd"), net = get("netPayoutUsd"), url = get("claimUrl"),
+            name = market.display_name,
+            id = get("payoutId"),
+            gross = get("amountUsd"),
+            fee = get("feeUsd"),
+            net = get("netPayoutUsd"),
+            url = get("claimUrl"),
         ),
         ("payout_cancelled", "en") => format!(
             "<div style=\"font-family:Arial,sans-serif\"><h2>Payout cancelled</h2><p>Your payout was cancelled on {name}.</p><ul><li>Payout ID: {id}</li><li>Gross: ${gross}</li><li>Fee: ${fee}</li><li>Net: ${net}</li></ul><p><a href=\"{url}\">Open claim page</a></p></div>",
-            name = market.display_name, id = get("payoutId"), gross = get("amountUsd"), fee = get("feeUsd"), net = get("netPayoutUsd"), url = get("claimUrl"),
+            name = market.display_name,
+            id = get("payoutId"),
+            gross = get("amountUsd"),
+            fee = get("feeUsd"),
+            net = get("netPayoutUsd"),
+            url = get("claimUrl"),
         ),
         ("topup_paid", _) => format!(
             "<div style=\"font-family:Arial,sans-serif\"><h2>充值已到账</h2><p>你在 {name} 的充值已经到账。</p><ul><li>充值 ID：{topup}</li><li>总额：${gross}</li><li>手续费：${fee}</li><li>净入账：${net}</li></ul><p><a href=\"{url}\">前往控制台</a></p></div>",
-            name = market.display_name, topup = get("topupId"), gross = get("grossAmountUsd"), fee = get("feeAmountUsd"), net = get("netAmountUsd"), url = get("dashboardUrl"),
+            name = market.display_name,
+            topup = get("topupId"),
+            gross = get("grossAmountUsd"),
+            fee = get("feeAmountUsd"),
+            net = get("netAmountUsd"),
+            url = get("dashboardUrl"),
         ),
         ("topup_refunded", _) => format!(
             "<div style=\"font-family:Arial,sans-serif\"><h2>充值已退款</h2><p>你在 {name} 的充值已被退款。</p><ul><li>充值 ID：{topup}</li><li>总额：${gross}</li><li>手续费：${fee}</li><li>净额：${net}</li></ul><p><a href=\"{url}\">前往控制台</a></p></div>",
-            name = market.display_name, topup = get("topupId"), gross = get("grossAmountUsd"), fee = get("feeAmountUsd"), net = get("netAmountUsd"), url = get("dashboardUrl"),
+            name = market.display_name,
+            topup = get("topupId"),
+            gross = get("grossAmountUsd"),
+            fee = get("feeAmountUsd"),
+            net = get("netAmountUsd"),
+            url = get("dashboardUrl"),
         ),
         ("topup_chargeback", _) => format!(
             "<div style=\"font-family:Arial,sans-serif\"><h2>充值争议/拒付提醒</h2><p>你在 {name} 的一笔充值出现争议或拒付。</p><ul><li>充值 ID：{topup}</li><li>总额：${gross}</li><li>手续费：${fee}</li><li>净额：${net}</li></ul><p><a href=\"{url}\">前往控制台</a></p></div>",
-            name = market.display_name, topup = get("topupId"), gross = get("grossAmountUsd"), fee = get("feeAmountUsd"), net = get("netAmountUsd"), url = get("dashboardUrl"),
+            name = market.display_name,
+            topup = get("topupId"),
+            gross = get("grossAmountUsd"),
+            fee = get("feeAmountUsd"),
+            net = get("netAmountUsd"),
+            url = get("dashboardUrl"),
         ),
         ("payout_submitted", _) => format!(
             "<div style=\"font-family:Arial,sans-serif\"><h2>提现请求已提交</h2><p>你在 {name} 的提现请求已创建。</p><ul><li>提现 ID：{id}</li><li>提现金额：${gross}</li><li>手续费：${fee}</li><li>预计到账：${net}</li></ul><p><a href=\"{url}\">前往收益页</a></p></div>",
-            name = market.display_name, id = get("payoutId"), gross = get("amountUsd"), fee = get("feeUsd"), net = get("netPayoutUsd"), url = get("claimUrl"),
+            name = market.display_name,
+            id = get("payoutId"),
+            gross = get("amountUsd"),
+            fee = get("feeUsd"),
+            net = get("netPayoutUsd"),
+            url = get("claimUrl"),
         ),
         ("payout_paid", _) => format!(
             "<div style=\"font-family:Arial,sans-serif\"><h2>提现已完成</h2><p>你在 {name} 的提现已完成。</p><ul><li>提现 ID：{id}</li><li>提现金额：${gross}</li><li>手续费：${fee}</li><li>实际到账：${net}</li></ul><p><a href=\"{url}\">前往收益页</a></p></div>",
-            name = market.display_name, id = get("payoutId"), gross = get("amountUsd"), fee = get("feeUsd"), net = get("netPayoutUsd"), url = get("claimUrl"),
+            name = market.display_name,
+            id = get("payoutId"),
+            gross = get("amountUsd"),
+            fee = get("feeUsd"),
+            net = get("netPayoutUsd"),
+            url = get("claimUrl"),
         ),
         ("payout_failed", _) => format!(
             "<div style=\"font-family:Arial,sans-serif\"><h2>提现失败</h2><p>你在 {name} 的提现未能完成。</p><ul><li>提现 ID：{id}</li><li>提现金额：${gross}</li><li>手续费：${fee}</li><li>预计到账：${net}</li></ul><p><a href=\"{url}\">前往收益页</a></p></div>",
-            name = market.display_name, id = get("payoutId"), gross = get("amountUsd"), fee = get("feeUsd"), net = get("netPayoutUsd"), url = get("claimUrl"),
+            name = market.display_name,
+            id = get("payoutId"),
+            gross = get("amountUsd"),
+            fee = get("feeUsd"),
+            net = get("netPayoutUsd"),
+            url = get("claimUrl"),
         ),
         ("payout_review", _) => format!(
             "<div style=\"font-family:Arial,sans-serif\"><h2>提现正在复核</h2><p>你在 {name} 的提现正在人工复核，请不要重复提交。</p><ul><li>提现 ID：{id}</li><li>提现金额：${gross}</li><li>手续费：${fee}</li><li>预计到账：${net}</li></ul><p><a href=\"{url}\">前往收益页</a></p></div>",
-            name = market.display_name, id = get("payoutId"), gross = get("amountUsd"), fee = get("feeUsd"), net = get("netPayoutUsd"), url = get("claimUrl"),
+            name = market.display_name,
+            id = get("payoutId"),
+            gross = get("amountUsd"),
+            fee = get("feeUsd"),
+            net = get("netPayoutUsd"),
+            url = get("claimUrl"),
         ),
         ("payout_cancelled", _) => format!(
             "<div style=\"font-family:Arial,sans-serif\"><h2>提现已取消</h2><p>你在 {name} 的提现已取消。</p><ul><li>提现 ID：{id}</li><li>提现金额：${gross}</li><li>手续费：${fee}</li><li>预计到账：${net}</li></ul><p><a href=\"{url}\">前往收益页</a></p></div>",
-            name = market.display_name, id = get("payoutId"), gross = get("amountUsd"), fee = get("feeUsd"), net = get("netPayoutUsd"), url = get("claimUrl"),
+            name = market.display_name,
+            id = get("payoutId"),
+            gross = get("amountUsd"),
+            fee = get("feeUsd"),
+            net = get("netPayoutUsd"),
+            url = get("claimUrl"),
         ),
         _ => "<div style=\"font-family:Arial,sans-serif\"><p>Notification</p></div>".into(),
     }
@@ -4621,11 +4706,10 @@ async fn send_market_template_email(
     if let Some(reply_to) = config.resend_reply_to.as_deref() {
         message = message.with_reply(reply_to);
     }
-    let response = resend
-        .emails
-        .send(message)
-        .await
-        .map_err(|e| AppError::Internal(format!("send market notification email failed: {e}")))?;
+    let response =
+        resend.emails.send(message).await.map_err(|e| {
+            AppError::Internal(format!("send market notification email failed: {e}"))
+        })?;
     Ok(Some(response.id.to_string()))
 }
 
@@ -5182,7 +5266,14 @@ mod tests {
     async fn share_runtime_refresh_accepts_signed_owner_request() {
         let (store, config) = setup_store("runtime-refresh-signed").await;
         let signing_key = insert_signed_installation(&store, "inst-runtime").await;
-        insert_share(&store, "inst-runtime", "share-runtime", "runtime-sub", "active").await;
+        insert_share(
+            &store,
+            "inst-runtime",
+            "share-runtime",
+            "runtime-sub",
+            "active",
+        )
+        .await;
         let refresh = ShareRuntimeRefreshPayload {
             share_id: "share-runtime".into(),
             subdomain: "runtime-sub".into(),

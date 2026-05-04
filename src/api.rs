@@ -53,8 +53,14 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/markets", get(markets))
         .route("/v1/markets/register", post(register_market))
         .route("/v1/market/shares", get(market_shares))
-        .route("/v1/market/notifications/email", post(send_market_notification_email))
-        .route("/v1/market/notifications/emails", get(list_market_notification_emails))
+        .route(
+            "/v1/market/notifications/email",
+            post(send_market_notification_email),
+        )
+        .route(
+            "/v1/market/notifications/emails",
+            get(list_market_notification_emails),
+        )
         .route("/v1/markets/tunnel/lease", post(issue_market_lease))
         .route("/v1/public/map-points", get(public_map_points))
         .route("/v1/regions", get(regions))
