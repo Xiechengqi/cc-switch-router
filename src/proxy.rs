@@ -152,13 +152,8 @@ impl ProxyRegistry {
         host: &str,
         tunnel_domain: &str,
     ) -> Option<RouteEntry> {
-        let host_without_port = host.split(':').next().unwrap_or(host);
-        let suffix = format!(".{tunnel_domain}");
-        if !host_without_port.ends_with(&suffix) {
-            return None;
-        }
-        let subdomain = host_without_port.trim_end_matches(&suffix);
-        self.routes.read().await.get(subdomain).cloned()
+        let subdomain = subdomain_for_host(host, tunnel_domain)?;
+        self.routes.read().await.get(&subdomain).cloned()
     }
 
     pub(crate) async fn route_by_share_id(&self, share_id: &str) -> Option<RouteEntry> {
@@ -253,13 +248,13 @@ pub async fn market_proxy_handler(
     let market_email = market.email.clone();
     let market_subdomain = market.subdomain.clone();
 
-    let host_without_port = host.split(':').next().unwrap_or(&host);
-    let expected_host = format!("{}.{}", market_subdomain, state.config.tunnel_domain);
-    if host_without_port != expected_host {
+    if subdomain_for_host(&host, &state.config.tunnel_domain).as_deref()
+        != Some(market_subdomain.as_str())
+    {
         warn!(
             method = %method,
             host = %host,
-            expected_host = %expected_host,
+            expected_subdomain = %market_subdomain,
             path = %path,
             client_ip = %user_ip,
             client_country = %user_country,
@@ -357,29 +352,6 @@ pub async fn market_proxy_handler(
         }
     };
 
-    let body = match axum::body::to_bytes(body, usize::MAX).await {
-        Ok(body) => body,
-        Err(err) => {
-            warn!(
-                method = %method,
-                host = %host,
-                path = %path_and_query,
-                backend = %backend,
-                share_token = %log_token,
-                client_ip = %user_ip,
-                client_country = %user_country,
-                client_asn = %user_asn,
-                user_agent = %user_agent,
-                error = %err,
-                "market proxy request body read failed"
-            );
-            return simple_response(
-                StatusCode::BAD_REQUEST,
-                &format!("failed-to-read-body: {err}"),
-            );
-        }
-    };
-
     let free_share_ip_permit = if route.is_free_share && state.config.free_share_ip_limit_enabled()
     {
         match state
@@ -418,7 +390,11 @@ pub async fn market_proxy_handler(
         request_id: id.clone(),
     });
 
-    let upstream = match builder.body(body).send().await {
+    let upstream = match builder
+        .body(reqwest::Body::wrap_stream(body.into_data_stream()))
+        .send()
+        .await
+    {
         Ok(response) => response,
         Err(err) => {
             warn!(
@@ -535,11 +511,7 @@ pub async fn proxy_handler(
         matches!(method, axum::http::Method::GET | axum::http::Method::HEAD)
             && truthy_header(&parts.headers, "x-share-router-ping-request");
 
-    let host_without_port = host.split(':').next().unwrap_or(&host);
-    let tunnel_suffix = format!(".{}", state.config.tunnel_domain);
-    if host_without_port != state.config.tunnel_domain
-        && !host_without_port.ends_with(&tunnel_suffix)
-    {
+    if !host_matches_tunnel_domain(&host, &state.config.tunnel_domain) {
         tracing::debug!(
             method = %method,
             host = %host,
@@ -1066,6 +1038,47 @@ mod tests {
         assert_eq!(route.parallel_limit, 5);
     }
 
+    #[tokio::test]
+    async fn backend_lookup_handles_tunnel_domain_with_port() {
+        let registry = ProxyRegistry::default();
+        registry
+            .set_route(
+                "demo".into(),
+                "127.0.0.1:3000".into(),
+                None,
+                Some("share-1".into()),
+                None,
+                false,
+                5,
+            )
+            .await;
+
+        assert!(
+            registry
+                .backend_for_host("demo.127.0.0.1:8787", "127.0.0.1:8787")
+                .await
+                .is_some()
+        );
+        assert!(
+            registry
+                .backend_for_host("demo.127.0.0.1:9999", "127.0.0.1:8787")
+                .await
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn host_matching_ignores_request_port_when_tunnel_has_no_port() {
+        assert!(host_matches_tunnel_domain(
+            "demo.example.com:443",
+            "example.com"
+        ));
+        assert_eq!(
+            subdomain_for_host("market-a.example.com:443", "example.com").as_deref(),
+            Some("market-a")
+        );
+    }
+
     #[test]
     fn direct_share_proxy_path_allows_gemini_native_api() {
         assert!(is_allowed_direct_share_proxy_path(
@@ -1088,4 +1101,81 @@ fn mask_token(token: &str) -> String {
         return "*".repeat(token.len());
     }
     format!("{}...{}", &token[..4], &token[token.len() - 4..])
+}
+
+fn subdomain_for_host(host: &str, tunnel_domain: &str) -> Option<String> {
+    let host = parse_authority(host)?;
+    let tunnel = parse_authority(tunnel_domain)?;
+    if let Some(tunnel_port) = tunnel.port {
+        if host.port != Some(tunnel_port) {
+            return None;
+        }
+    }
+    let suffix = format!(".{}", tunnel.host);
+    if !host.host.ends_with(&suffix) {
+        return None;
+    }
+    let subdomain = host.host.trim_end_matches(&suffix);
+    if subdomain.is_empty() || subdomain.contains('.') {
+        return None;
+    }
+    Some(subdomain.to_string())
+}
+
+fn host_matches_tunnel_domain(host: &str, tunnel_domain: &str) -> bool {
+    let Some(host) = parse_authority(host) else {
+        return false;
+    };
+    let Some(tunnel) = parse_authority(tunnel_domain) else {
+        return false;
+    };
+    if let Some(tunnel_port) = tunnel.port {
+        if host.port != Some(tunnel_port) {
+            return false;
+        }
+    }
+    host.host == tunnel.host || host.host.ends_with(&format!(".{}", tunnel.host))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedAuthority {
+    host: String,
+    port: Option<u16>,
+}
+
+fn parse_authority(value: &str) -> Option<ParsedAuthority> {
+    let value = value.trim().trim_end_matches('/').to_ascii_lowercase();
+    if value.is_empty() {
+        return None;
+    }
+    let authority = if value.starts_with("http://") || value.starts_with("https://") {
+        let url = url::Url::parse(&value).ok()?;
+        let host = url.host_str()?.trim_end_matches('.').to_string();
+        return Some(ParsedAuthority {
+            host,
+            port: url.port(),
+        });
+    } else {
+        value.split('/').next()?.to_string()
+    };
+
+    if authority.starts_with('[') {
+        let end = authority.find(']')?;
+        let host = authority[..=end].trim_end_matches('.').to_string();
+        let port = authority[end + 1..]
+            .strip_prefix(':')
+            .and_then(|port| port.parse::<u16>().ok());
+        return Some(ParsedAuthority { host, port });
+    }
+
+    match authority.rsplit_once(':') {
+        Some((host, port)) if port.chars().all(|ch| ch.is_ascii_digit()) => Some(ParsedAuthority {
+            host: host.trim_end_matches('.').to_string(),
+            port: port.parse::<u16>().ok(),
+        }),
+        _ => Some(ParsedAuthority {
+            host: authority.trim_end_matches('.').to_string(),
+            port: None,
+        }),
+    }
 }

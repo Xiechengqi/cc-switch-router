@@ -129,8 +129,8 @@ impl Config {
     }
 
     pub fn is_market_subdomain(&self, subdomain: &str) -> bool {
-        let _ = subdomain;
-        false
+        let subdomain = subdomain.trim().to_ascii_lowercase();
+        subdomain == "market" || subdomain.starts_with("market-")
     }
 }
 
