@@ -118,6 +118,11 @@ pub struct ProxyRegistry {
     routes: RwLock<HashMap<String, RouteEntry>>,
     share_limiter: Arc<KeyedConcurrencyLimiter>,
     free_share_ip_limiter: Arc<KeyedConcurrencyLimiter>,
+    /// Tracks requests that actually traversed the market proxy path, keyed by
+    /// lowercased market email. Independent from `share_limiter` so a request
+    /// that hits a share's own subdomain directly is not counted against the
+    /// market it happens to be linked to.
+    market_limiter: Arc<KeyedConcurrencyLimiter>,
 }
 
 impl ProxyRegistry {
@@ -175,6 +180,26 @@ impl ProxyRegistry {
     /// the map have zero in-flight requests.
     pub async fn inflight_by_share(&self) -> HashMap<String, usize> {
         self.share_limiter.snapshot().await
+    }
+
+    /// Snapshot of in-flight request counts per market email (lowercased).
+    /// Only requests that came through the market proxy handler are counted —
+    /// direct share-subdomain traffic is not.
+    pub async fn inflight_by_market_email(&self) -> HashMap<String, usize> {
+        self.market_limiter.snapshot().await
+    }
+
+    /// Acquire a tracking-only permit for a market-routed request. We pass an
+    /// unlimited parallel cap (`-1`) because the rate gate is applied at the
+    /// share level; this permit exists purely to drive the dashboard's
+    /// PARALLEL aggregate.
+    async fn acquire_market_permit(&self, market_email: &str) -> KeyedConcurrencyPermit {
+        let key = market_email.to_ascii_lowercase();
+        // Unlimited cap means try_acquire never returns None.
+        self.market_limiter
+            .try_acquire(&key, -1)
+            .await
+            .expect("unlimited market permit cannot be denied")
     }
 
     async fn try_acquire_share_permit(
@@ -374,6 +399,10 @@ pub async fn market_proxy_handler(
         None
     };
 
+    // Tracking-only permit so the dashboard's market PARALLEL counter only
+    // reflects requests that actually traversed the market proxy.
+    let market_permit = state.proxy.acquire_market_permit(&market_email).await;
+
     let live_request_id = if let Some(request_id) =
         header_str(&parts.headers, MARKET_REQUEST_ID_HEADER)
             .split_whitespace()
@@ -448,6 +477,7 @@ pub async fn market_proxy_handler(
         upstream.bytes_stream().map(move |chunk| {
             let _permit = &share_permit;
             let _free_share_ip_permit = &free_share_ip_permit;
+            let _market_permit = &market_permit;
             let _recent_traffic_guard = &recent_traffic_guard;
             chunk
         })

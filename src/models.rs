@@ -806,7 +806,15 @@ pub struct DashboardMarketView {
     pub online_share_count: usize,
     pub active_requests: usize,
     pub parallel_capacity: i64,
-    pub avg_online_rate_24h: f64,
+    /// Rolled-up "any linked share was healthy this minute" probe count over
+    /// the last 24h, capped at 1440. Drives the ONLINE % and tooltip.
+    pub online_minutes_24h: usize,
+    pub online_rate_24h: f64,
+    /// 10-minute health probe trail aggregated from linked shares — feeds the
+    /// dashboard's STATUS dots. Per-minute "any healthy → healthy" semantics
+    /// are merged on the frontend by [`healthDots`].
+    #[serde(default)]
+    pub health_checks: Vec<HealthCheckEntry>,
     #[serde(default)]
     pub linked_shares: Vec<MarketLinkedShareView>,
     #[serde(default)]

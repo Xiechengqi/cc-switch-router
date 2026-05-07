@@ -1469,6 +1469,7 @@ impl AppStore {
             .into_iter()
             .collect::<HashSet<_>>();
         let inflight_by_share = proxy.inflight_by_share().await;
+        let inflight_by_market_email = proxy.inflight_by_market_email().await;
         let now = Utc::now();
         let (installations, shares, health_by_share, online_by_share, recent_logs, market_logs) = {
             let conn = self.conn.lock().await;
@@ -1498,6 +1499,8 @@ impl AppStore {
                 &shares,
                 &inflight_by_share,
                 &online_by_share,
+                &health_by_share,
+                &inflight_by_market_email,
                 &market_logs_by_market,
             )?
         };
@@ -4325,6 +4328,8 @@ fn list_dashboard_markets(
     shares: &[(String, ShareDescriptor)],
     inflight_by_share: &HashMap<String, usize>,
     online_by_share: &HashMap<String, usize>,
+    health_by_share: &HashMap<String, Vec<HealthCheckEntry>>,
+    inflight_by_market_email: &HashMap<String, usize>,
     market_logs_by_market: &HashMap<String, Vec<DashboardMarketRequestLogView>>,
 ) -> Result<Vec<DashboardMarketView>, AppError> {
     let mut stmt = conn
@@ -4354,7 +4359,9 @@ fn list_dashboard_markets(
                 online_share_count: 0,
                 active_requests: 0,
                 parallel_capacity: 0,
-                avg_online_rate_24h: 0.0,
+                online_minutes_24h: 0,
+                online_rate_24h: 0.0,
+                health_checks: Vec::new(),
                 linked_shares: Vec::new(),
                 recent_requests: Vec::new(),
                 subdomain,
@@ -4369,6 +4376,8 @@ fn list_dashboard_markets(
             active_subdomains,
             inflight_by_share,
             online_by_share,
+            health_by_share,
+            inflight_by_market_email,
             market_logs_by_market,
         );
     }
@@ -4381,6 +4390,8 @@ fn enrich_dashboard_market(
     active_subdomains: &HashSet<String>,
     inflight_by_share: &HashMap<String, usize>,
     online_by_share: &HashMap<String, usize>,
+    health_by_share: &HashMap<String, Vec<HealthCheckEntry>>,
+    inflight_by_market_email: &HashMap<String, usize>,
     market_logs_by_market: &HashMap<String, Vec<DashboardMarketRequestLogView>>,
 ) {
     let market_email = market.email.to_ascii_lowercase();
@@ -4430,10 +4441,13 @@ fn enrich_dashboard_market(
 
     market.share_count = linked_shares.len();
     market.online_share_count = linked_shares.iter().filter(|share| share.online).count();
-    market.active_requests = linked_shares
-        .iter()
-        .map(|share| share.active_requests)
-        .sum::<usize>();
+    // Count only requests that actually traversed the market proxy. Direct
+    // share-subdomain traffic stays out of this number even though it shows up
+    // in the share-keyed limiter.
+    market.active_requests = inflight_by_market_email
+        .get(&market_email)
+        .copied()
+        .unwrap_or(0);
     market.parallel_capacity = if linked_shares.iter().any(|share| share.parallel_limit < 0) {
         -1
     } else {
@@ -4442,15 +4456,31 @@ fn enrich_dashboard_market(
             .map(|share| share.parallel_limit.max(0))
             .sum()
     };
-    market.avg_online_rate_24h = if linked_shares.is_empty() {
-        0.0
-    } else {
-        linked_shares
-            .iter()
-            .map(|share| share.online_rate_24h)
-            .sum::<f64>()
-            / linked_shares.len() as f64
-    };
+    // Online minutes: take the max across linked shares — i.e. the best path
+    // the market could route through. Approximates the union of healthy
+    // minutes without an additional per-minute SQL pass; stays exact when the
+    // market only has one linked share (the common case).
+    market.online_minutes_24h = linked_shares
+        .iter()
+        .map(|share| {
+            online_by_share
+                .get(&share.share_id)
+                .copied()
+                .unwrap_or(0)
+                .min(ONLINE_WINDOW_MINUTES as usize)
+        })
+        .max()
+        .unwrap_or(0);
+    market.online_rate_24h =
+        ((market.online_minutes_24h as f64 / ONLINE_WINDOW_MINUTES as f64) * 100.0).min(100.0);
+    // Stitch together the recent-10-min health probes from every linked share.
+    // The frontend's healthDots() merges per-minute with OR semantics, so just
+    // concatenating is enough — no extra dedup needed here.
+    market.health_checks = linked_shares
+        .iter()
+        .filter_map(|share| health_by_share.get(&share.share_id))
+        .flat_map(|entries| entries.iter().cloned())
+        .collect();
     market.linked_shares = linked_shares;
     market.recent_requests = market_logs_by_market
         .get(&market.email.to_ascii_lowercase())

@@ -1565,8 +1565,7 @@
               <tr>
                 <th>Market</th>
                 <th>Public URL</th>
-                <th>Health</th>
-                <th>Load</th>
+                <th>Status</th>
                 <th style="width:28px"></th>
               </tr>
             </thead>
@@ -3249,53 +3248,45 @@
         return "Healthy";
       }
 
-      function marketHealthBadge(market) {
-        const label = marketHealthLabel(market);
-        const ok = label === "Healthy";
-        return `<span class="badge ${ok ? "badge--online" : "badge--offline"}">${escapeHtml(label)}</span>`;
-      }
-
       function formatParallelCapacity(value) {
         return Number(value) === -1 ? "∞" : String(Math.max(0, Number(value || 0)));
       }
 
-      function marketHealthStack(market) {
+      function marketStatusStack(market) {
         if (!market) return '<span class="meta">—</span>';
         const shares = `${Number(market.onlineShareCount || 0)} / ${Number(market.shareCount || 0)}`;
-        const onlineRate = formatPct(Number(market.avgOnlineRate24h || 0));
+        const seenRel = market.lastSeenAt ? relTime(market.lastSeenAt) : "—";
+        const seenTitle = market.lastSeenAt ? fullTime(market.lastSeenAt) : "Never seen";
+        const inflight = Math.max(0, Number(market.activeRequests || 0));
+        const limitLabel = escapeHtml(formatParallelCapacity(market.parallelCapacity));
+        const parallelTitle = market.parallelCapacity === -1
+          ? `${inflight} in-flight via market (unlimited capacity)`
+          : `${inflight} in-flight via market / ${limitLabel} aggregate share parallel capacity`;
+        const onlineMinutes = Math.max(0, Number(market.onlineMinutes24h || 0));
+        const onlineRate = formatPct(Number(market.onlineRate24h || 0));
+        const onlineTitle = `${onlineMinutes} / 1440 min with successful route probes in last 24h`;
+        const health = healthDots(market.healthChecks || []);
         return `
           <div class="status-stack">
-            <div class="status-line">
-              <span class="status-line-label">Health</span>
-              <div class="status-line-value">${marketHealthBadge(market)}</div>
-            </div>
-            <div class="status-line">
-              <span class="status-line-label">Registry</span>
-              <div class="status-line-value"><strong>${escapeHtml(market.status || "-")}</strong></div>
-            </div>
             <div class="status-line">
               <span class="status-line-label">Shares</span>
               <div class="status-line-value"><strong>${shares}</strong></div>
             </div>
             <div class="status-line">
-              <span class="status-line-label">Online</span>
-              <div class="status-line-value"><strong>${onlineRate}</strong></div>
+              <span class="status-line-label">Seen</span>
+              <div class="status-line-value"><strong title="${escapeHtml(seenTitle)}">${escapeHtml(seenRel)}</strong></div>
             </div>
-          </div>
-        `;
-      }
-
-      function marketLoadStack(market) {
-        if (!market) return '<span class="meta">—</span>';
-        return `
-          <div class="status-stack">
             <div class="status-line">
               <span class="status-line-label">Parallel</span>
-              <div class="status-line-value"><strong>${Number(market.activeRequests || 0)}<span class="parallel-shared">/${escapeHtml(formatParallelCapacity(market.parallelCapacity))}</span></strong></div>
+              <div class="status-line-value"><strong title="${escapeHtml(parallelTitle)}">${inflight}<span class="parallel-shared">/${limitLabel}</span></strong></div>
             </div>
             <div class="status-line">
-              <span class="status-line-label">Seen</span>
-              <div class="status-line-value"><strong title="${fullTime(market.lastSeenAt)}">${relTime(market.lastSeenAt)}</strong></div>
+              <span class="status-line-label">Online</span>
+              <div class="status-line-value"><strong title="${escapeHtml(onlineTitle)}">${onlineRate}</strong></div>
+            </div>
+            <div class="status-line">
+              <span class="status-line-label">Health</span>
+              <div class="status-line-value">${health}</div>
             </div>
           </div>
         `;
@@ -3882,11 +3873,10 @@
               <a href="${escapeHtml(market.publicBaseUrl || "#")}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">${escapeHtml(market.publicBaseUrl || "-")}</a>
               <div>${escapeHtml(market.subdomain || "-")}</div>
             </td>
-            <td>${marketHealthStack(market)}</td>
-            <td>${marketLoadStack(market)}</td>
+            <td>${marketStatusStack(market)}</td>
             <td><span class="row-arrow">&rsaquo;</span></td>
           </tr>
-        `).join("") : `<tr><td colspan="5"><div class="empty"><div class="empty-icon"></div>No markets configured</div></td></tr>`;
+        `).join("") : `<tr><td colspan="4"><div class="empty"><div class="empty-icon"></div>No markets configured</div></td></tr>`;
       }
 
       ensureInstallationIdentity().catch(console.error);
