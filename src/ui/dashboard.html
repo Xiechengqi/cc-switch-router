@@ -423,7 +423,7 @@
         align-items: flex-start;
         gap: 5px;
         width: fit-content;
-        max-width: min(42%, 440px);
+        max-width: min(68%, 760px);
         pointer-events: none;
       }
       .map-ticker:empty { display: none; }
@@ -483,14 +483,14 @@
         color: rgba(51, 65, 85, 0.72);
       }
       .map-ticker-row .ticker-subdomain {
-        flex: 0 1 auto;
-        min-width: 18px;
-        max-width: 52px;
+        flex: 0 0 auto;
+        min-width: 0;
+        max-width: none;
         color: var(--muted-foreground);
         font-size: 10px;
+        font-weight: 600;
         line-height: 1.35;
-        overflow: hidden;
-        text-overflow: ellipsis;
+        overflow: visible;
       }
       .map-ticker-row .ticker-model {
         flex: 1 1 auto;
@@ -2265,6 +2265,8 @@
         if (value == null || value === "") return "";
         const amount = Number(value);
         if (!Number.isFinite(amount)) return "";
+        if (amount > 0 && amount < 0.0001) return `$${amount.toFixed(8)}`;
+        if (amount > 0 && amount < 0.01) return `$${amount.toFixed(6)}`;
         return `$${amount.toFixed(amount >= 1 ? 2 : 4)}`;
       }
 
@@ -2298,15 +2300,16 @@
 
       function patchPendingTickerRows() {
         for (const item of _requestTickerRows) {
-          if (!item?.row || item.row.dataset.unresolved !== "1") continue;
+          if (!item?.row || !item.event) continue;
           const requestId = item.row.dataset.requestId;
           if (!requestId) continue;
           const requestMeta = _requestMetaById.get(requestId);
-          const modelName = requestMeta?.requestModel || requestMeta?.model;
-          if (!modelName) continue;
+          if (!requestMeta) continue;
+          const info = requestTickerLabel(item.event);
           const modelEl = item.row.querySelector(".ticker-model");
-          if (modelEl) modelEl.textContent = modelName;
-          delete item.row.dataset.unresolved;
+          if (modelEl) modelEl.textContent = info.detail;
+          const subdomainEl = item.row.querySelector(".ticker-subdomain");
+          if (subdomainEl) subdomainEl.textContent = info.subdomain;
         }
       }
 
@@ -2345,6 +2348,7 @@
         const initialState = event.isInflight === false ? "completed" : "inflight";
         const entry = {
           requestId: event.requestId,
+          event: { ...event },
           row,
           startedAt: event.startedAt || "",
           createdAt: Date.now(),
@@ -3374,14 +3378,9 @@
         return `<div class="market-list">${shares.map((share) => `
           <div class="item-card market-list-item">
             <div>
-              <strong>${escapeHtml(share.shareName || share.shareId || "-")}</strong>
+              <strong>${escapeHtml(share.subdomain || share.shareName || share.shareId || "-")}</strong>
               <div class="item-card-meta">
-                <span>${escapeHtml(share.appType || "-")}</span>
                 <span>${escapeHtml(share.ownerEmail || "-")}</span>
-              </div>
-              <div class="item-card-meta">
-                <span>${Number(share.activeRequests || 0)} / ${escapeHtml(formatParallelCapacity(share.parallelLimit))} parallel</span>
-                <span>${formatPct(Number(share.onlineRate24h || 0))} 24h online</span>
               </div>
             </div>
             <div style="display:grid;justify-items:end;gap:6px">
@@ -3580,6 +3579,9 @@
       function openMarket(index) {
         const market = _markets[index];
         if (!market) return;
+        const offlineSinceHtml = market.offlineSince
+          ? `<div class="item-card-grid-cell">Offline Since<span title="${fullTime(market.offlineSince)}">${relTime(market.offlineSince)}</span></div>`
+          : "";
 
         document.getElementById("drawer-title").textContent = market.displayName || market.id || "Market";
         document.getElementById("drawer-meta").textContent = market.email || "";
@@ -3603,22 +3605,12 @@
           </div>`;
 
         document.getElementById("drawer-body").innerHTML = `
-          <div class="drawer-section-label">Access</div>
+          <div class="drawer-section-label">Details</div>
           <div class="item-card">
             <div class="item-card-grid">
-              <div class="item-card-grid-cell">Public URL<span><a href="${escapeHtml(market.publicBaseUrl || "#")}" target="_blank" rel="noopener noreferrer">${escapeHtml(market.publicBaseUrl || "-")}</a></span></div>
-              <div class="item-card-grid-cell">Subdomain<span>${escapeHtml(market.subdomain || "-")}</span></div>
               <div class="item-card-grid-cell">Market ID<span>${escapeHtml(market.id || "-")}</span></div>
-              <div class="item-card-grid-cell">Avg Online<span>${formatPct(Number(market.avgOnlineRate24h || 0))}</span></div>
-            </div>
-          </div>
-          <div class="drawer-section-label" style="margin-top:20px">Timeline</div>
-          <div class="item-card">
-            <div class="item-card-grid">
               <div class="item-card-grid-cell">Created<span title="${fullTime(market.createdAt)}">${relTime(market.createdAt)}</span></div>
-              <div class="item-card-grid-cell">Updated<span title="${fullTime(market.updatedAt)}">${relTime(market.updatedAt)}</span></div>
-              <div class="item-card-grid-cell">Last Seen<span title="${fullTime(market.lastSeenAt)}">${relTime(market.lastSeenAt)}</span></div>
-              <div class="item-card-grid-cell">Offline Since<span title="${fullTime(market.offlineSince)}">${market.offlineSince ? relTime(market.offlineSince) : "—"}</span></div>
+              ${offlineSinceHtml}
             </div>
           </div>
           <div class="drawer-section-label" style="margin-top:20px">Linked Shares</div>

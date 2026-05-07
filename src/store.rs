@@ -4404,6 +4404,7 @@ fn enrich_dashboard_market(
             Some(MarketLinkedShareView {
                 share_id: share.share_id.clone(),
                 share_name: share.share_name.clone(),
+                subdomain: share.subdomain.clone(),
                 owner_email: share.owner_email.clone(),
                 app_type: share.app_type.clone(),
                 online,

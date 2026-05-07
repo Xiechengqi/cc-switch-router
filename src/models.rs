@@ -818,6 +818,7 @@ pub struct DashboardMarketView {
 pub struct MarketLinkedShareView {
     pub share_id: String,
     pub share_name: String,
+    pub subdomain: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_email: Option<String>,
     pub app_type: String,
