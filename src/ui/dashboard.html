@@ -2030,21 +2030,45 @@
         return appRuntimes?.[key] || null;
       }
 
+      function runtimeModelSummary(runtime) {
+        const models = Array.isArray(runtime?.models) ? runtime.models : [];
+        if (models.length === 0) {
+          return runtime?.kind === "official_oauth" ? "official" : "";
+        }
+        return models
+          .map((item) => `${item.slot || "model"}:${item.actualModel || item.actual_model || ""}`)
+          .filter((value) => !value.endsWith(":"))
+          .join(" . ");
+      }
+
+      function runtimeEndpointSummary(runtime) {
+        if (!runtime) return "";
+        const pieces = [];
+        if (runtime.kind === "official_oauth") pieces.push("official");
+        if (runtime.apiUrl || runtime.api_url) pieces.push(runtime.apiUrl || runtime.api_url);
+        if (runtime.accountEmail || runtime.account_email) pieces.push(runtime.accountEmail || runtime.account_email);
+        return pieces.join(" · ");
+      }
+
       function supportPills(support, appRuntimes) {
         const apps = [
           { key: "claude", label: "Claude" },
           { key: "codex", label: "Codex" },
           { key: "gemini", label: "Gemini" },
         ];
-        return `<div class="support-pills">${apps.map((app) => `
+        return `<div class="support-pills">${apps.map((app) => {
+          const runtime = appRuntimeForApp(appRuntimes, app.key);
+          const endpoint = support?.[app.key] ? runtimeEndpointSummary(runtime) : "";
+          const models = support?.[app.key] ? runtimeModelSummary(runtime) : "";
+          return `
           <span class="support-pill ${support?.[app.key] ? "support-pill--on" : ""}">
             <span class="support-pill-label">${app.label}</span>
             <span class="support-pill-meta">
-              <span class="support-pill-quota">${escapeHtml(support?.[app.key] ? quotaSummary(appRuntimeForApp(appRuntimes, app.key)) : "")}</span>
-              <span class="support-pill-account">${escapeHtml(support?.[app.key] ? accountSummary(appRuntimeForApp(appRuntimes, app.key)) : "")}</span>
+              <span class="support-pill-quota">${escapeHtml(models || quotaSummary(runtime))}</span>
+              <span class="support-pill-account">${escapeHtml(endpoint || accountSummary(runtime))}</span>
             </span>
           </span>
-        `).join("")}</div>`;
+        `}).join("")}</div>`;
       }
 
       function countdownStr(resetsAt) {

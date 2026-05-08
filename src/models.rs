@@ -617,6 +617,13 @@ pub struct ShareUpstreamQuota {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ShareUpstreamModel {
+    pub slot: String,
+    pub actual_model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ShareUpstreamProvider {
     pub kind: String,
     pub app: String,
@@ -628,6 +635,8 @@ pub struct ShareUpstreamProvider {
     pub api_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota: Option<ShareUpstreamQuota>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<ShareUpstreamModel>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
