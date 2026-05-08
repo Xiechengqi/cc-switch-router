@@ -2032,19 +2032,21 @@
 
       function runtimeModelSummary(runtime) {
         const models = Array.isArray(runtime?.models) ? runtime.models : [];
-        if (models.length === 0) {
-          return runtime?.kind === "official_oauth" ? "official" : "";
-        }
+        if (models.length === 0) return "";
         return models
           .map((item) => `${item.slot || "model"}:${item.actualModel || item.actual_model || ""}`)
           .filter((value) => !value.endsWith(":"))
           .join(" . ");
       }
 
+      function isOfficialRuntime(runtime) {
+        if (!runtime) return false;
+        return runtime.kind === "official_oauth" && !(runtime.apiUrl || runtime.api_url);
+      }
+
       function runtimeEndpointSummary(runtime) {
         if (!runtime) return "";
         const pieces = [];
-        if (runtime.kind === "official_oauth") pieces.push("official");
         if (runtime.apiUrl || runtime.api_url) pieces.push(runtime.apiUrl || runtime.api_url);
         if (runtime.accountEmail || runtime.account_email) pieces.push(runtime.accountEmail || runtime.account_email);
         return pieces.join(" · ");
@@ -2058,14 +2060,24 @@
         ];
         return `<div class="support-pills">${apps.map((app) => {
           const runtime = appRuntimeForApp(appRuntimes, app.key);
-          const endpoint = support?.[app.key] ? runtimeEndpointSummary(runtime) : "";
-          const models = support?.[app.key] ? runtimeModelSummary(runtime) : "";
+          const supported = support?.[app.key];
+          const official = supported && isOfficialRuntime(runtime);
+          const firstLine = supported
+            ? official
+              ? quotaSummary(runtime)
+              : runtimeModelSummary(runtime) || quotaSummary(runtime)
+            : "";
+          const secondLine = supported
+            ? official
+              ? accountSummary(runtime)
+              : runtimeEndpointSummary(runtime) || accountSummary(runtime)
+            : "";
           return `
-          <span class="support-pill ${support?.[app.key] ? "support-pill--on" : ""}">
+          <span class="support-pill ${supported ? "support-pill--on" : ""}">
             <span class="support-pill-label">${app.label}</span>
             <span class="support-pill-meta">
-              <span class="support-pill-quota">${escapeHtml(models || quotaSummary(runtime))}</span>
-              <span class="support-pill-account">${escapeHtml(endpoint || accountSummary(runtime))}</span>
+              <span class="support-pill-quota">${escapeHtml(firstLine)}</span>
+              <span class="support-pill-account">${escapeHtml(secondLine)}</span>
             </span>
           </span>
         `}).join("")}</div>`;
