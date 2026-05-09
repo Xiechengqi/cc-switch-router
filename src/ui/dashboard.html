@@ -2041,13 +2041,33 @@
 
       function isOfficialRuntime(runtime) {
         if (!runtime) return false;
-        return runtime.kind === "official_oauth" && !(runtime.apiUrl || runtime.api_url);
+        const kind = String(runtime.kind || "").toLowerCase();
+        const apiUrl = runtimeApiUrl(runtime);
+        const models = Array.isArray(runtime.models) ? runtime.models : [];
+        const modelsMarkedOfficial = models.length > 0 && models.every((item) => isOfficialMarker(item.actualModel || item.actual_model));
+        return (kind === "official_oauth" || isOfficialMarker(kind) || isOfficialMarker(apiUrl) || modelsMarkedOfficial)
+          && !hasConcreteApiUrl(runtime);
+      }
+
+      function isOfficialMarker(value) {
+        const normalized = String(value || "").trim().toLowerCase();
+        return normalized === "official" || normalized === "offical";
+      }
+
+      function runtimeApiUrl(runtime) {
+        return runtime?.apiUrl || runtime?.api_url || "";
+      }
+
+      function hasConcreteApiUrl(runtime) {
+        const apiUrl = runtimeApiUrl(runtime);
+        return Boolean(apiUrl && !isOfficialMarker(apiUrl));
       }
 
       function runtimeEndpointSummary(runtime) {
         if (!runtime) return "";
         const pieces = [];
-        if (runtime.apiUrl || runtime.api_url) pieces.push(runtime.apiUrl || runtime.api_url);
+        const apiUrl = runtimeApiUrl(runtime);
+        if (apiUrl && !isOfficialMarker(apiUrl)) pieces.push(apiUrl);
         if (runtime.accountEmail || runtime.account_email) pieces.push(runtime.accountEmail || runtime.account_email);
         return pieces.join(" · ");
       }
@@ -2069,7 +2089,7 @@
             : "";
           const secondLine = supported
             ? official
-              ? accountSummary(runtime)
+              ? officialAccountSummary(runtime)
               : runtimeEndpointSummary(runtime) || accountSummary(runtime)
             : "";
           return `
@@ -2106,7 +2126,7 @@
 
       function quotaSummary(upstream) {
         if (!upstream) return "";
-        if (upstream.apiUrl) return "";
+        if (hasConcreteApiUrl(upstream)) return "";
         if (upstream.kind !== "official_oauth") return "";
         const quota = upstream.quota;
         if (!quota) return "";
@@ -2131,8 +2151,14 @@
 
       function accountSummary(upstream) {
         if (!upstream) return "";
-        if (upstream.apiUrl) return upstream.apiUrl;
-        return upstream.accountEmail || "";
+        const apiUrl = runtimeApiUrl(upstream);
+        if (apiUrl && !isOfficialMarker(apiUrl)) return apiUrl;
+        return upstream.accountEmail || upstream.account_email || "";
+      }
+
+      function officialAccountSummary(upstream) {
+        if (!upstream) return "";
+        return upstream.accountEmail || upstream.account_email || "";
       }
 
       function escapeHtml(value) {
