@@ -12,7 +12,8 @@ use russh::{Channel, ChannelId, server};
 use tokio::io;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 use crate::proxy::ProxyRegistry;
 use crate::store::AppStore;
@@ -127,6 +128,13 @@ impl server::Handler for ClientHandler {
     type Error = anyhow::Error;
 
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
+        if !is_valid_lease_username(user) {
+            debug!("ssh auth rejected for invalid lease username: {user}");
+            return Ok(Auth::Reject {
+                proceed_with_methods: None,
+            });
+        }
+
         match self.store.consume_lease(user, password).await {
             Ok(lease) => {
                 self.lease = Some(lease);
@@ -251,6 +259,10 @@ impl server::Handler for ClientHandler {
     }
 }
 
+fn is_valid_lease_username(user: &str) -> bool {
+    Uuid::parse_str(user.trim()).is_ok()
+}
+
 async fn serve_forward_listener(
     listener: TcpListener,
     handle: russh::server::Handle,
@@ -300,5 +312,25 @@ fn normalize_backend_host(address: &str) -> &str {
     match address.trim() {
         "" | "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
         value => value,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_valid_lease_username;
+
+    #[test]
+    fn lease_username_must_be_uuid() {
+        assert!(is_valid_lease_username(
+            "5222754f-d960-47d5-8fd1-7f5e90aaac93"
+        ));
+        assert!(is_valid_lease_username(
+            " 5222754f-d960-47d5-8fd1-7f5e90aaac93 "
+        ));
+
+        assert!(!is_valid_lease_username("root"));
+        assert!(!is_valid_lease_username("admin"));
+        assert!(!is_valid_lease_username("ubuntu"));
+        assert!(!is_valid_lease_username(""));
     }
 }
