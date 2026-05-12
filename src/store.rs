@@ -2138,6 +2138,12 @@ impl AppStore {
         }
 
         let now = Utc::now().to_rfc3339();
+        let pricing_json = input
+            .pricing_summary
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| AppError::Internal(format!("serialize market pricing failed: {e}")))?;
         let id = get_market_by_email(&conn, &email)?
             .map(|market| market.id)
             .unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -2146,13 +2152,14 @@ impl AppStore {
         conn.execute(
             "INSERT INTO router_markets (
                 id, display_name, email, subdomain, public_base_url, scopes_json,
-                status, listed, created_at, updated_at, last_seen_at, offline_since
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 1, ?7, ?7, ?7, NULL)
+                status, listed, created_at, updated_at, last_seen_at, offline_since, pricing_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 1, ?7, ?7, ?7, NULL, ?8)
              ON CONFLICT(email) DO UPDATE SET
                 display_name = excluded.display_name,
                 subdomain = excluded.subdomain,
                 public_base_url = excluded.public_base_url,
                 scopes_json = excluded.scopes_json,
+                pricing_json = excluded.pricing_json,
                 status = 'active',
                 listed = 1,
                 updated_at = excluded.updated_at,
@@ -2165,7 +2172,8 @@ impl AppStore {
                 subdomain,
                 public_base_url,
                 scopes_json,
-                now
+                now,
+                pricing_json,
             ],
         )
         .map_err(|e| AppError::Internal(format!("register market failed: {e}")))?;
@@ -2177,6 +2185,7 @@ impl AppStore {
             subdomain,
             public_base_url: public_base_url.to_string(),
             status: "active".to_string(),
+            pricing_summary: input.pricing_summary,
         })
     }
 
@@ -2184,7 +2193,7 @@ impl AppStore {
         let conn = self.conn.lock().await;
         let mut stmt = conn
             .prepare(
-                "SELECT id, display_name, email, subdomain, public_base_url, status
+                "SELECT id, display_name, email, subdomain, public_base_url, status, pricing_json
                  FROM router_markets
                  WHERE status = 'active' AND listed = 1
                  ORDER BY display_name ASC, subdomain ASC",
@@ -2199,6 +2208,7 @@ impl AppStore {
                     subdomain: row.get(3)?,
                     public_base_url: row.get(4)?,
                     status: row.get(5)?,
+                    pricing_summary: parse_json_value(row.get(6)?)?,
                 })
             })
             .map_err(|e| AppError::Internal(format!("query public markets failed: {e}")))?;
@@ -2390,10 +2400,10 @@ impl AppStore {
             let authorized = shared_with_emails
                 .iter()
                 .any(|email| email.eq_ignore_ascii_case(market_email));
-            if !authorized || !active_subdomains.contains(&subdomain) {
+            if !authorized {
                 continue;
             }
-            share.online = true;
+            share.online = active_subdomains.contains(&subdomain);
             shares.push(share);
         }
         Ok(shares)
@@ -3087,6 +3097,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             subdomain TEXT NOT NULL UNIQUE,
             public_base_url TEXT NOT NULL,
             scopes_json TEXT NOT NULL DEFAULT '[\"market:shares:read\",\"market:proxy:use\",\"market:email:notify\"]',
+            pricing_json TEXT,
             status TEXT NOT NULL DEFAULT 'active',
             listed INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL,
@@ -3480,6 +3491,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         "actual_model_source",
         "TEXT NOT NULL DEFAULT ''",
     )?;
+    add_column_if_missing(conn, "router_markets", "pricing_json", "TEXT")?;
     conn.execute(
         "UPDATE installations
          SET owner_email = (
@@ -4054,6 +4066,18 @@ fn parse_app_runtimes(value: Option<String>) -> Result<ShareAppRuntimes, rusqlit
     })
 }
 
+fn parse_json_value(value: Option<String>) -> Result<Option<serde_json::Value>, rusqlite::Error> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_str(&value).map(Some).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+    })
+}
+
 fn mask_share_token(token: &str) -> String {
     let mut chars = token.chars();
     let Some(first) = chars.next() else {
@@ -4446,11 +4470,23 @@ fn list_dashboard_markets(
 ) -> Result<Vec<DashboardMarketView>, AppError> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, display_name, email, subdomain, public_base_url, status,
-                    created_at, updated_at, last_seen_at, offline_since
-             FROM router_markets
-             WHERE status IN ('active', 'offline', 'disabled')
-             ORDER BY display_name ASC, subdomain ASC",
+            "SELECT rm.id, rm.display_name, rm.email, rm.subdomain, rm.public_base_url, rm.status,
+                    rm.created_at, rm.updated_at, rm.last_seen_at, rm.offline_since,
+                    rm.pricing_json,
+                    COALESCE(SUM(
+                        CASE
+                            WHEN ml.usage_amount_usd IS NOT NULL THEN
+                                ml.input_tokens + ml.output_tokens + ml.cache_read_tokens + ml.cache_creation_tokens
+                            ELSE 0
+                        END
+                    ), 0) AS usage_tokens,
+                    COALESCE(SUM(CAST(COALESCE(ml.usage_amount_usd, '0') AS REAL)), 0) AS usage_amount_usd
+             FROM router_markets rm
+             LEFT JOIN market_request_logs ml ON lower(ml.market_email) = lower(rm.email)
+             WHERE rm.status IN ('active', 'offline', 'disabled')
+             GROUP BY rm.id, rm.display_name, rm.email, rm.subdomain, rm.public_base_url, rm.status,
+                      rm.created_at, rm.updated_at, rm.last_seen_at, rm.offline_since, rm.pricing_json
+             ORDER BY rm.display_name ASC, rm.subdomain ASC",
         )
         .map_err(|e| AppError::Internal(format!("prepare dashboard markets failed: {e}")))?;
     let rows = stmt
@@ -4473,6 +4509,9 @@ fn list_dashboard_markets(
                 parallel_capacity: 0,
                 online_minutes_24h: 0,
                 online_rate_24h: 0.0,
+                usage_tokens: row.get::<_, i64>(11)?.max(0) as u64,
+                usage_amount_usd: format!("{:.8}", row.get::<_, f64>(12)?.max(0.0)),
+                pricing_summary: parse_json_value(row.get(10)?)?,
                 health_checks: Vec::new(),
                 linked_shares: Vec::new(),
                 recent_requests: Vec::new(),

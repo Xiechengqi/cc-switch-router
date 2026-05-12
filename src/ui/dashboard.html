@@ -1595,6 +1595,7 @@
               <tr>
                 <th>Market</th>
                 <th>Public URL</th>
+                <th>Price</th>
                 <th>Status</th>
                 <th style="width:28px"></th>
               </tr>
@@ -2421,6 +2422,16 @@
         if (amount > 0 && amount < 0.0001) return `$${amount.toFixed(8)}`;
         if (amount > 0 && amount < 0.01) return `$${amount.toFixed(6)}`;
         return `$${amount.toFixed(amount >= 1 ? 2 : 4)}`;
+      }
+
+      function formatRequestModelRoute(log) {
+        const agent = log?.requestAgent || log?.appType || "";
+        const requestedModel = log?.requestedModel || log?.requestModel || "";
+        const actualModel = log?.actualModel || log?.model || "";
+        const modelText = requestedModel && actualModel && requestedModel !== actualModel
+          ? `${requestedModel} -> ${actualModel}`
+          : (actualModel || requestedModel || "-");
+        return [agent, modelText].filter(Boolean).join(" · ");
       }
 
       function tickerRowText(event) {
@@ -3393,6 +3404,8 @@
       function marketStatusStack(market) {
         if (!market) return '<span class="meta">—</span>';
         const shares = `${Number(market.onlineShareCount || 0)} / ${Number(market.shareCount || 0)}`;
+        const usageTokens = formatCompactTokenCount(Number(market.usageTokens || 0));
+        const usageAmount = formatMarketFee(market.usageAmountUsd || 0) || "$0.00";
         const seenRel = market.lastSeenAt ? relTime(market.lastSeenAt) : "—";
         const seenTitle = market.lastSeenAt ? fullTime(market.lastSeenAt) : "Never seen";
         const inflight = Math.max(0, Number(market.activeRequests || 0));
@@ -3423,11 +3436,42 @@
               <div class="status-line-value"><strong title="${escapeHtml(onlineTitle)}">${onlineRate}</strong></div>
             </div>
             <div class="status-line">
+              <span class="status-line-label">Usage</span>
+              <div class="status-line-value"><strong>${escapeHtml(usageTokens)} / ${escapeHtml(usageAmount)}</strong></div>
+            </div>
+            <div class="status-line">
               <span class="status-line-label">Health</span>
               <div class="status-line-value">${health}</div>
             </div>
           </div>
         `;
+      }
+
+      function marketPricingStack(market) {
+        const summary = market?.pricingSummary || {};
+        const entries = [
+          ["Claude", summary.claude],
+          ["Codex", summary.codex],
+          ["Gemini", summary.gemini],
+          ["DeepSeek", summary.deepseek],
+        ];
+        const lines = entries
+          .map(([label, value]) => {
+            let display = "-";
+            if (typeof value === "number" && Number.isFinite(value)) {
+              display = `${value}%`;
+            } else if (typeof value === "string" && value.trim()) {
+              display = value.trim().toLowerCase() === "mixed" ? "mixed" : `${value.trim()}%`;
+            }
+            return `<div><span class="meta">${escapeHtml(label)}</span> <strong>${escapeHtml(display)}</strong></div>`;
+          })
+          .join("");
+        return `<div class="status-stack">${lines}</div>`;
+      }
+
+      function upstreamSalePercent(upstream) {
+        const value = upstream?.forSaleOfficialPricePercent;
+        return Number.isInteger(value) && value > 0 ? `${value}%` : "-";
       }
 
       function forSalePill(share) {
@@ -3449,6 +3493,11 @@
         return `
           <div class="for-sale-market-stack">
             ${forSalePill(share)}
+            <div class="for-sale-market-list">
+              <div>Claude ${escapeHtml(upstreamSalePercent(share.appRuntimes?.claude))}</div>
+              <div>Codex ${escapeHtml(upstreamSalePercent(share.appRuntimes?.codex))}</div>
+              <div>Gemini ${escapeHtml(upstreamSalePercent(share.appRuntimes?.gemini))}</div>
+            </div>
             ${marketLines.length
               ? `<div class="for-sale-market-list">${marketLines.map((line) => `<div>${line}</div>`).join("")}</div>`
               : ""}
@@ -3569,7 +3618,7 @@
         return logs.slice(0, 20).map((log) => {
           const total = totalTokens(log);
           const status = log.statusCode || log.status || "-";
-          const modelText = [log.requestAgent || "", log.actualModel || log.model || "-"].filter(Boolean).join(" · ");
+          const modelText = formatRequestModelRoute(log);
           const parts = [
             log.userEmail || "-",
             log.shareSubdomain || log.shareId || "-",
@@ -3722,7 +3771,7 @@
             <div class="item-card">
               <div class="item-card-top">
                 <div>
-                  <strong>${escapeHtml([log.requestAgent || log.appType || "", log.actualModel || log.model || "-"].filter(Boolean).join(" · "))}</strong>
+                  <strong>${escapeHtml(formatRequestModelRoute(log))}</strong>
                   <div class="item-card-meta">
                     <span>${log.providerName || log.providerId}</span>
                     <span>${escapeHtml(log.requestedModel || log.requestModel || "-")}</span>
@@ -3774,6 +3823,10 @@
           <div class="drawer-summary-item">
             <small>Parallel</small>
             <strong>${Number(market.activeRequests || 0)} / ${escapeHtml(formatParallelCapacity(market.parallelCapacity))}</strong>
+          </div>
+          <div class="drawer-summary-item">
+            <small>Usage</small>
+            <strong>${escapeHtml(formatCompactTokenCount(Number(market.usageTokens || 0)))} / ${escapeHtml(formatMarketFee(market.usageAmountUsd || 0) || "$0.00")}</strong>
           </div>`;
 
         document.getElementById("drawer-body").innerHTML = `
@@ -4013,10 +4066,11 @@
               <a href="${escapeHtml(market.publicBaseUrl || "#")}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">${escapeHtml(market.publicBaseUrl || "-")}</a>
               <div>${escapeHtml(market.subdomain || "-")}</div>
             </td>
+            <td>${marketPricingStack(market)}</td>
             <td>${marketStatusStack(market)}</td>
             <td><span class="row-arrow">&rsaquo;</span></td>
           </tr>
-        `).join("") : `<tr><td colspan="4"><div class="empty"><div class="empty-icon"></div>No markets configured</div></td></tr>`;
+        `).join("") : `<tr><td colspan="5"><div class="empty"><div class="empty-icon"></div>No markets configured</div></td></tr>`;
       }
 
       ensureInstallationIdentity().catch(console.error);

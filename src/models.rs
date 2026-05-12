@@ -470,6 +470,8 @@ pub struct PublicMarketConfig {
     pub subdomain: String,
     pub public_base_url: String,
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_summary: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -495,6 +497,8 @@ pub struct RegisterMarketRequest {
     pub subdomain: String,
     pub display_name: String,
     pub public_base_url: String,
+    #[serde(default)]
+    pub pricing_summary: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -641,6 +645,8 @@ pub struct ShareUpstreamProvider {
     pub app: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub for_sale_official_price_percent: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_email: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -831,6 +837,10 @@ pub struct DashboardMarketView {
     /// the last 24h, capped at 1440. Drives the ONLINE % and tooltip.
     pub online_minutes_24h: usize,
     pub online_rate_24h: f64,
+    pub usage_tokens: u64,
+    pub usage_amount_usd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_summary: Option<serde_json::Value>,
     /// 10-minute health probe trail aggregated from linked shares — feeds the
     /// dashboard's STATUS dots. Per-minute "any healthy → healthy" semantics
     /// are merged on the frontend by [`healthDots`].
