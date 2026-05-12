@@ -1622,12 +1622,19 @@ impl AppStore {
                 let can_view_secret =
                     share.for_sale == "Free" || share_visible_to_email(&share, viewer_email);
                 let can_manage = can_manage_share(&share, viewer_email);
-                let market_links = share
-                    .shared_with_emails
-                    .iter()
-                    .filter_map(|email| market_by_email.get(&email.to_ascii_lowercase()))
-                    .map(dashboard_market_to_share_link)
-                    .collect::<Vec<_>>();
+                let market_links = if share.market_access_mode == "all" {
+                    markets
+                        .iter()
+                        .map(dashboard_market_to_share_link)
+                        .collect::<Vec<_>>()
+                } else {
+                    share
+                        .shared_with_emails
+                        .iter()
+                        .filter_map(|email| market_by_email.get(&email.to_ascii_lowercase()))
+                        .map(dashboard_market_to_share_link)
+                        .collect::<Vec<_>>()
+                };
                 let unknown_market_emails = if can_manage {
                     share
                         .shared_with_emails
@@ -1651,6 +1658,7 @@ impl AppStore {
                     unknown_market_emails,
                     description: share.description,
                     for_sale: share.for_sale,
+                    market_access_mode: share.market_access_mode,
                     subdomain: share.subdomain,
                     share_token: if can_view_secret {
                         share.share_token
@@ -2340,7 +2348,7 @@ impl AppStore {
         let mut stmt = conn
             .prepare(
                 "SELECT s.share_id, s.installation_id, s.share_name, s.owner_email,
-                        i.owner_email, s.shared_with_emails_json, s.app_type, s.for_sale,
+                        i.owner_email, s.shared_with_emails_json, s.market_access_mode, s.app_type, s.for_sale,
                         s.share_status, COALESCE(s.subdomain, ''), s.parallel_limit,
                         i.last_seen_at, s.enabled_claude, s.enabled_codex, s.enabled_gemini,
                         s.upstream_provider_json, s.app_runtimes_json
@@ -2370,24 +2378,25 @@ impl AppStore {
                         share_name: row.get(2)?,
                         owner_email: row.get(3)?,
                         installation_owner_email: row.get(4)?,
-                        app_type: row.get(6)?,
-                        for_sale: row.get(7)?,
-                        share_status: row.get(8)?,
+                        market_access_mode: row.get(6)?,
+                        app_type: row.get(7)?,
+                        for_sale: row.get(8)?,
+                        share_status: row.get(9)?,
                         online: false,
                         active_requests: *inflight_by_share.get(&share_id).unwrap_or(&0),
-                        parallel_limit: row.get(10)?,
+                        parallel_limit: row.get(11)?,
                         online_rate_24h: online_minutes
                             .get(&share_id)
                             .map(|minutes| *minutes as f64 / ONLINE_WINDOW_MINUTES as f64)
                             .unwrap_or(0.0),
-                        last_seen_at: row.get(11)?,
+                        last_seen_at: row.get(12)?,
                         support: ShareSupport {
-                            claude: row.get::<_, i64>(12)? != 0,
-                            codex: row.get::<_, i64>(13)? != 0,
-                            gemini: row.get::<_, i64>(14)? != 0,
+                            claude: row.get::<_, i64>(13)? != 0,
+                            codex: row.get::<_, i64>(14)? != 0,
+                            gemini: row.get::<_, i64>(15)? != 0,
                         },
-                        upstream_provider: parse_upstream_provider(row.get(15)?)?,
-                        app_runtimes: parse_app_runtimes(row.get(16)?)?,
+                        upstream_provider: parse_upstream_provider(row.get(16)?)?,
+                        app_runtimes: parse_app_runtimes(row.get(17)?)?,
                     },
                 ))
             })
@@ -2397,9 +2406,10 @@ impl AppStore {
         for row in rows {
             let (shared_with_emails, subdomain, mut share) =
                 row.map_err(|e| AppError::Internal(format!("read market share row failed: {e}")))?;
-            let authorized = shared_with_emails
-                .iter()
-                .any(|email| email.eq_ignore_ascii_case(market_email));
+            let authorized = share.market_access_mode == "all"
+                || shared_with_emails
+                    .iter()
+                    .any(|email| email.eq_ignore_ascii_case(market_email));
             if !authorized {
                 continue;
             }
@@ -2702,6 +2712,7 @@ fn upsert_share_tx(
 ) -> Result<(), AppError> {
     let description = normalize_share_description(share.description.clone())?;
     let for_sale = normalize_share_for_sale(&share.for_sale)?;
+    let market_access_mode = normalize_market_access_mode(&share.market_access_mode)?;
     let upstream_provider_json = share
         .upstream_provider
         .as_ref()
@@ -2712,15 +2723,16 @@ fn upsert_share_tx(
         .map_err(|e| AppError::Internal(format!("serialize shared_with_emails failed: {e}")))?;
     conn.execute(
         "INSERT INTO shares (
-            share_id, installation_id, share_name, owner_email, shared_with_emails_json, description, for_sale, subdomain, share_token, app_type, provider_id,
+            share_id, installation_id, share_name, owner_email, shared_with_emails_json, market_access_mode, description, for_sale, subdomain, share_token, app_type, provider_id,
             enabled_claude, enabled_codex, enabled_gemini,
             token_limit, parallel_limit, tokens_used, requests_count, share_status, created_at, expires_at, upstream_provider_json, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
         ON CONFLICT(share_id) DO UPDATE SET
             installation_id = excluded.installation_id,
             share_name = excluded.share_name,
             owner_email = excluded.owner_email,
             shared_with_emails_json = excluded.shared_with_emails_json,
+            market_access_mode = excluded.market_access_mode,
             description = excluded.description,
             for_sale = excluded.for_sale,
             subdomain = excluded.subdomain,
@@ -2747,6 +2759,7 @@ fn upsert_share_tx(
             share.share_name,
             share.owner_email,
             shared_with_emails_json,
+            market_access_mode,
             description,
             for_sale,
             share.subdomain,
@@ -2976,6 +2989,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             share_name TEXT NOT NULL,
             owner_email TEXT,
             shared_with_emails_json TEXT NOT NULL DEFAULT '[]',
+            market_access_mode TEXT NOT NULL DEFAULT 'selected',
             description TEXT,
             for_sale TEXT NOT NULL DEFAULT 'No',
             subdomain TEXT,
@@ -3364,6 +3378,13 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         .map_err(|e| {
             AppError::Internal(format!("add shares shared_with_emails_json failed: {e}"))
         })?;
+    }
+    if !columns.iter().any(|name| name == "market_access_mode") {
+        conn.execute(
+            "ALTER TABLE shares ADD COLUMN market_access_mode TEXT NOT NULL DEFAULT 'selected'",
+            [],
+        )
+        .map_err(|e| AppError::Internal(format!("add shares market_access_mode failed: {e}")))?;
     }
     if !columns.iter().any(|name| name == "for_sale") {
         conn.execute(
@@ -3969,7 +3990,7 @@ fn parse_ip_im_geo(body: &str) -> Option<GeoLookupResult> {
 fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppError> {
     let mut stmt = conn
         .prepare(
-        "SELECT s.installation_id, s.share_id, s.share_name, s.description, s.for_sale, COALESCE(s.subdomain, '-'), s.share_token, s.app_type, s.provider_id,
+        "SELECT s.installation_id, s.share_id, s.share_name, s.description, s.for_sale, s.market_access_mode, COALESCE(s.subdomain, '-'), s.share_token, s.app_type, s.provider_id,
                     s.owner_email, s.shared_with_emails_json,
                     s.enabled_claude, s.enabled_codex, s.enabled_gemini,
                     s.token_limit, s.parallel_limit, s.tokens_used, s.requests_count, s.share_status, s.created_at, s.expires_at, s.upstream_provider_json, s.app_runtimes_json
@@ -3986,26 +4007,27 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                     share_name: row.get(2)?,
                     description: row.get(3)?,
                     for_sale: row.get(4)?,
-                    subdomain: row.get(5)?,
-                    share_token: row.get(6)?,
-                    app_type: row.get(7)?,
-                    provider_id: row.get(8)?,
-                    owner_email: row.get(9)?,
-                    shared_with_emails: parse_string_vec(row.get(10)?)?,
+                    market_access_mode: row.get(5)?,
+                    subdomain: row.get(6)?,
+                    share_token: row.get(7)?,
+                    app_type: row.get(8)?,
+                    provider_id: row.get(9)?,
+                    owner_email: row.get(10)?,
+                    shared_with_emails: parse_string_vec(row.get(11)?)?,
                     support: ShareSupport {
-                        claude: row.get::<_, i64>(11)? != 0,
-                        codex: row.get::<_, i64>(12)? != 0,
-                        gemini: row.get::<_, i64>(13)? != 0,
+                        claude: row.get::<_, i64>(12)? != 0,
+                        codex: row.get::<_, i64>(13)? != 0,
+                        gemini: row.get::<_, i64>(14)? != 0,
                     },
-                    token_limit: row.get(14)?,
-                    parallel_limit: row.get(15)?,
-                    tokens_used: row.get(16)?,
-                    requests_count: row.get(17)?,
-                    share_status: row.get(18)?,
-                    created_at: row.get(19)?,
-                    expires_at: row.get(20)?,
-                    upstream_provider: parse_upstream_provider(row.get(21)?)?,
-                    app_runtimes: parse_app_runtimes(row.get(22)?)?,
+                    token_limit: row.get(15)?,
+                    parallel_limit: row.get(16)?,
+                    tokens_used: row.get(17)?,
+                    requests_count: row.get(18)?,
+                    share_status: row.get(19)?,
+                    created_at: row.get(20)?,
+                    expires_at: row.get(21)?,
+                    upstream_provider: parse_upstream_provider(row.get(22)?)?,
+                    app_runtimes: parse_app_runtimes(row.get(23)?)?,
                 },
             ))
         })
@@ -4036,6 +4058,16 @@ fn normalize_share_for_sale(value: &str) -> Result<String, AppError> {
         "Free" => Ok("Free".to_string()),
         _ => Err(AppError::BadRequest(
             "share for_sale must be Yes, No, or Free".into(),
+        )),
+    }
+}
+
+fn normalize_market_access_mode(value: &str) -> Result<String, AppError> {
+    match value.trim() {
+        "selected" => Ok("selected".to_string()),
+        "all" => Ok("all".to_string()),
+        _ => Err(AppError::BadRequest(
+            "share market_access_mode must be selected or all".into(),
         )),
     }
 }
@@ -4550,10 +4582,11 @@ fn enrich_dashboard_market(
         .iter()
         .filter_map(|(_, share)| {
             if share.for_sale != "Yes"
-                || !share
-                    .shared_with_emails
-                    .iter()
-                    .any(|email| email.eq_ignore_ascii_case(&market_email))
+                || (share.market_access_mode != "all"
+                    && !share
+                        .shared_with_emails
+                        .iter()
+                        .any(|email| email.eq_ignore_ascii_case(&market_email)))
             {
                 return None;
             }
@@ -5774,6 +5807,37 @@ mod tests {
         .expect("insert health check");
     }
 
+    #[tokio::test]
+    async fn list_market_shares_all_access_allows_future_market_email() {
+        let (store, config) = setup_store("market-share-all-access").await;
+        insert_installation(&store, "inst-all").await;
+        insert_share(&store, "inst-all", "share-all", "all-share-sub", "active").await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET for_sale = 'Yes', market_access_mode = 'all' WHERE share_id = ?1",
+                params!["share-all"],
+            )
+            .expect("enable all market access");
+        }
+
+        let shares = store
+            .list_market_shares(
+                "future-market@example.com",
+                "router-test",
+                &HashSet::new(),
+                &HashMap::new(),
+            )
+            .await
+            .expect("list market shares");
+
+        assert_eq!(shares.len(), 1);
+        assert_eq!(shares[0].share_id, "share-all");
+        assert_eq!(shares[0].market_access_mode, "all");
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
     async fn insert_signed_installation(store: &AppStore, installation_id: &str) -> SigningKey {
         let signing_key = SigningKey::generate(&mut OsRng);
         let public_key = base64::engine::general_purpose::STANDARD
@@ -5976,6 +6040,7 @@ mod tests {
                     subdomain: "market-a".into(),
                     display_name: "Main Market".into(),
                     public_base_url: "https://market-a.example.com".into(),
+                    pricing_summary: None,
                 },
             )
             .await
@@ -5990,6 +6055,7 @@ mod tests {
                     subdomain: "market-b".into(),
                     display_name: "Renamed Market".into(),
                     public_base_url: "https://market-b.example.com".into(),
+                    pricing_summary: None,
                 },
             )
             .await
@@ -6004,6 +6070,7 @@ mod tests {
                     subdomain: "market-b".into(),
                     display_name: "Other Market".into(),
                     public_base_url: "https://market-b.example.com".into(),
+                    pricing_summary: None,
                 },
             )
             .await
@@ -6072,6 +6139,7 @@ mod tests {
             share_name: "Reserved".into(),
             owner_email: Some("owner@example.com".into()),
             shared_with_emails: vec![],
+            market_access_mode: "selected".into(),
             description: None,
             for_sale: "No".into(),
             subdomain: "market-a".into(),
@@ -6133,6 +6201,7 @@ mod tests {
             share_name: "Signed Share".into(),
             owner_email: Some("owner@example.com".into()),
             shared_with_emails: vec![],
+            market_access_mode: "selected".into(),
             description: None,
             for_sale: "No".into(),
             subdomain: "signed-sub".into(),
@@ -6406,6 +6475,7 @@ mod tests {
             share_name: "owner@example.com".into(),
             owner_email: Some("owner@example.com".into()),
             shared_with_emails: vec![],
+            market_access_mode: "selected".into(),
             description: None,
             for_sale: "No".into(),
             subdomain: "owner-sub".into(),
@@ -6500,6 +6570,7 @@ mod tests {
             share_name: "router@example.com".into(),
             owner_email: Some("router@example.com".into()),
             shared_with_emails: vec![],
+            market_access_mode: "selected".into(),
             description: None,
             for_sale: "No".into(),
             subdomain: "heal-sub".into(),
@@ -6568,6 +6639,7 @@ mod tests {
             share_name: "owner@example.com".into(),
             owner_email: Some("different@example.com".into()),
             shared_with_emails: vec![],
+            market_access_mode: "selected".into(),
             description: None,
             for_sale: "No".into(),
             subdomain: "reused-sub".into(),
@@ -6648,6 +6720,7 @@ mod tests {
             share_name: "Batch Share".into(),
             owner_email: Some("owner@example.com".into()),
             shared_with_emails: vec![],
+            market_access_mode: "selected".into(),
             description: Some("signed batch sync".into()),
             for_sale: "No".into(),
             subdomain: "batch-sub".into(),

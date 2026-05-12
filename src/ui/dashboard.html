@@ -3490,6 +3490,9 @@
           .map((market) => market.subdomain || "")
           .filter(Boolean)
           .map(escapeHtml);
+        if (share.marketAccessMode === "all") {
+          marketLines.unshift("All markets");
+        }
         return `
           <div class="for-sale-market-stack">
             ${forSalePill(share)}
@@ -3519,6 +3522,15 @@
 
         const links = share.marketLinks || [];
         const unknown = share.unknownMarketEmails || [];
+        if (share.marketAccessMode === "all") {
+          const onlineCount = links.filter((market) => market.online).length;
+          return `
+            <div class="market-stack" title="Authorized for every registered market, including future markets.">
+              <strong>All markets</strong>
+              <span class="meta">${onlineCount} online</span>
+            </div>
+          `;
+        }
         if (links.length === 0 && unknown.length === 0) {
           return '<span class="badge badge--offline" title="ForSale is Yes, but no registered market is authorized.">No market</span>';
         }
@@ -3554,8 +3566,11 @@
         }
         const links = share.marketLinks || [];
         const unknown = share.unknownMarketEmails || [];
+        const allNotice = share.marketAccessMode === "all"
+          ? '<div class="item-card">Authorized for all registered markets, including future markets.</div>'
+          : "";
         if (links.length === 0 && unknown.length === 0) {
-          return '<div class="item-card">ForSale is Yes, but no registered market is authorized.</div>';
+          return allNotice || '<div class="item-card">ForSale is Yes, but no registered market is authorized.</div>';
         }
         const knownHtml = links.map((market) => `
           <div class="item-card market-list-item">
@@ -3578,7 +3593,7 @@
             <span class="badge badge--offline">Unknown</span>
           </div>
         `).join("");
-        return `<div class="market-list">${knownHtml}${unknownHtml}</div>`;
+        return `<div class="market-list">${allNotice}${knownHtml}${unknownHtml}</div>`;
       }
 
       function marketLinkedShareList(market) {

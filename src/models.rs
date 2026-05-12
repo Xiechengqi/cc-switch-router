@@ -5,6 +5,10 @@ fn default_share_for_sale() -> String {
     "No".to_string()
 }
 
+fn default_market_access_mode() -> String {
+    "selected".to_string()
+}
+
 fn default_share_parallel_limit() -> i64 {
     3
 }
@@ -551,6 +555,8 @@ pub struct MarketShareView {
     pub installation_owner_email: Option<String>,
     pub app_type: String,
     pub for_sale: String,
+    #[serde(default = "default_market_access_mode")]
+    pub market_access_mode: String,
     pub share_status: String,
     pub online: bool,
     pub active_requests: usize,
@@ -687,6 +693,8 @@ pub struct ShareDescriptor {
     pub owner_email: Option<String>,
     #[serde(default)]
     pub shared_with_emails: Vec<String>,
+    #[serde(default = "default_market_access_mode")]
+    pub market_access_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default = "default_share_for_sale")]
@@ -896,6 +904,8 @@ pub struct ShareView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub for_sale: String,
+    #[serde(default = "default_market_access_mode")]
+    pub market_access_mode: String,
     pub subdomain: String,
     pub share_token: String,
     pub can_view_secret: bool,
