@@ -2366,7 +2366,7 @@ impl AppStore {
             .query_map([], |row| {
                 let share_id: String = row.get(0)?;
                 let shared_with_emails = parse_string_vec(row.get(5)?)?;
-                let subdomain: String = row.get(9)?;
+                let subdomain: String = row.get(10)?;
                 Ok((
                     shared_with_emails,
                     subdomain.clone(),
@@ -6039,6 +6039,47 @@ mod tests {
         assert_eq!(shares.len(), 1);
         assert_eq!(shares[0].share_id, "share-all");
         assert_eq!(shares[0].market_access_mode, "all");
+        assert_eq!(shares[0].subdomain, "all-share-sub");
+        assert_eq!(shares[0].share_status, "active");
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn list_market_shares_marks_online_by_subdomain() {
+        let (store, config) = setup_store("market-share-online-subdomain").await;
+        insert_installation(&store, "inst-online").await;
+        insert_share(
+            &store,
+            "inst-online",
+            "share-online",
+            "online-share-sub",
+            "active",
+        )
+        .await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET for_sale = 'Yes', market_access_mode = 'all' WHERE share_id = ?1",
+                params!["share-online"],
+            )
+            .expect("enable all market access");
+        }
+        let active_subdomains = HashSet::from(["online-share-sub".to_string()]);
+
+        let shares = store
+            .list_market_shares(
+                "future-market@example.com",
+                "router-test",
+                &active_subdomains,
+                &HashMap::new(),
+            )
+            .await
+            .expect("list market shares");
+
+        assert_eq!(shares.len(), 1);
+        assert_eq!(shares[0].subdomain, "online-share-sub");
+        assert!(shares[0].online);
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
