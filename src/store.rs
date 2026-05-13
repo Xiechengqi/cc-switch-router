@@ -5026,16 +5026,22 @@ async fn send_login_code_email(
     code: &str,
     ttl_secs: i64,
 ) -> Result<Option<String>, AppError> {
-    let from = config
-        .resend_from
-        .as_deref()
-        .ok_or_else(|| AppError::Internal("resend from address is not configured".into()))?;
-    let html = format!(
-        "<div style=\"font-family:Arial,sans-serif\"><p>Your verification code is:</p><p style=\"font-size:28px;font-weight:700;letter-spacing:6px\">{code}</p><p>This code expires in {} minutes.</p></div>",
-        (ttl_secs / 60).max(1)
+    let from = resend_from_address(config)?;
+    let ttl_minutes = (ttl_secs / 60).max(1);
+    let body = format!(
+        "<p style=\"margin:0 0 18px;color:#475569;font-size:15px;line-height:1.6\">Use this code to finish signing in to TokenSwitch.</p>\
+         <div style=\"margin:22px 0;padding:18px 20px;border-radius:12px;background:#0f172a;color:#ffffff;font-size:32px;font-weight:700;letter-spacing:8px;text-align:center\">{}</div>\
+         <p style=\"margin:0;color:#64748b;font-size:14px;line-height:1.6\">This code expires in {} minutes. If you did not request it, you can safely ignore this email.</p>",
+        escape_html(code),
+        ttl_minutes
+    );
+    let html = render_email_layout(
+        "Your verification code",
+        "Use this code to finish signing in.",
+        &body,
     );
     let mut message =
-        CreateEmailBaseOptions::new(from, [email], "Your TokenSwitch verification code")
+        CreateEmailBaseOptions::new(&from, [email], "Your TokenSwitch verification code")
             .with_html(&html);
     if let Some(reply_to) = config.resend_reply_to.as_deref() {
         message = message.with_reply(reply_to);
@@ -5046,6 +5052,90 @@ async fn send_login_code_email(
         .await
         .map_err(|e| AppError::Internal(format!("send verification email failed: {e}")))?;
     Ok(Some(response.id.to_string()))
+}
+
+fn resend_from_address(config: &Config) -> Result<String, AppError> {
+    let from = config
+        .resend_from
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::Internal("resend from address is not configured".into()))?;
+    let from = from
+        .chars()
+        .filter(|ch| !matches!(ch, '\r' | '\n'))
+        .collect::<String>();
+    let from = from.trim();
+
+    if from.contains('<') && from.contains('>') {
+        return Ok(from.to_string());
+    }
+
+    if !from.contains('@') {
+        return Err(AppError::Internal(
+            "resend from address must be an email address".into(),
+        ));
+    }
+
+    let name = config
+        .resend_from_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("TokenSwitch");
+    Ok(format!("{} <{}>", sanitize_email_display_name(name), from))
+}
+
+fn sanitize_email_display_name(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .filter(|ch| !matches!(ch, '\r' | '\n' | '<' | '>' | '"'))
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if sanitized.is_empty() {
+        "TokenSwitch".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn render_email_layout(title: &str, preheader: &str, body_html: &str) -> String {
+    format!(
+        "<!doctype html>\
+         <html>\
+           <head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"></head>\
+           <body style=\"margin:0;background:#f6f7fb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;color:#0f172a\">\
+             <div style=\"display:none;max-height:0;overflow:hidden;opacity:0;color:transparent\">{preheader}</div>\
+             <table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"background:#f6f7fb;padding:28px 12px\">\
+               <tr><td align=\"center\">\
+                 <table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"max-width:560px;background:#ffffff;border:1px solid #e5e7eb;border-radius:18px;overflow:hidden;box-shadow:0 16px 40px rgba(15,23,42,0.08)\">\
+                   <tr><td style=\"padding:26px 28px 18px;border-bottom:1px solid #eef2f7;background:#ffffff\">\
+                     <div style=\"font-size:13px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#2563eb\">TokenSwitch</div>\
+                     <h1 style=\"margin:10px 0 0;font-size:24px;line-height:1.25;color:#0f172a\">{title}</h1>\
+                   </td></tr>\
+                   <tr><td style=\"padding:28px\">{body_html}</td></tr>\
+                   <tr><td style=\"padding:18px 28px;background:#f8fafc;border-top:1px solid #eef2f7;color:#64748b;font-size:12px;line-height:1.6\">\
+                     TokenSwitch router notification. If this email was unexpected, no action is required.\
+                   </td></tr>\
+                 </table>\
+               </td></tr>\
+             </table>\
+           </body>\
+         </html>",
+        preheader = escape_html(preheader),
+        title = escape_html(title),
+        body_html = body_html
+    )
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 fn normalize_market_notification_kind(kind: &str) -> Result<String, AppError> {
@@ -5130,152 +5220,223 @@ fn render_market_notification_html(
     payload: &serde_json::Value,
 ) -> String {
     let get = |key: &str| payload.get(key).and_then(|v| v.as_str()).unwrap_or("-");
+    let market_name = escape_html(&market.display_name);
+    let topup_details = || {
+        vec![
+            ("Top-up ID", get("topupId").to_string()),
+            ("Gross", format!("${}", get("grossAmountUsd"))),
+            ("Fee", format!("${}", get("feeAmountUsd"))),
+            ("Net", format!("${}", get("netAmountUsd"))),
+        ]
+    };
+    let topup_details_zh = || {
+        vec![
+            ("充值 ID", get("topupId").to_string()),
+            ("总额", format!("${}", get("grossAmountUsd"))),
+            ("手续费", format!("${}", get("feeAmountUsd"))),
+            ("净额", format!("${}", get("netAmountUsd"))),
+        ]
+    };
+    let payout_details = || {
+        vec![
+            ("Payout ID", get("payoutId").to_string()),
+            ("Gross", format!("${}", get("amountUsd"))),
+            ("Fee", format!("${}", get("feeUsd"))),
+            ("Net", format!("${}", get("netPayoutUsd"))),
+        ]
+    };
+    let payout_details_zh = || {
+        vec![
+            ("提现 ID", get("payoutId").to_string()),
+            ("提现金额", format!("${}", get("amountUsd"))),
+            ("手续费", format!("${}", get("feeUsd"))),
+            ("预计到账", format!("${}", get("netPayoutUsd"))),
+        ]
+    };
+
     match (kind, locale) {
-        ("topup_paid", "en") => format!(
-            "<div style=\"font-family:Arial,sans-serif\"><h2>Top-up received</h2><p>Your balance has been credited on {name}.</p><ul><li>Top-up ID: {topup}</li><li>Gross: ${gross}</li><li>Fee: ${fee}</li><li>Net: ${net}</li></ul><p><a href=\"{url}\">Open dashboard</a></p></div>",
-            name = market.display_name,
-            topup = get("topupId"),
-            gross = get("grossAmountUsd"),
-            fee = get("feeAmountUsd"),
-            net = get("netAmountUsd"),
-            url = get("dashboardUrl"),
+        ("topup_paid", "en") => render_market_notification_card(
+            "Top-up received",
+            &format!("Your balance has been credited on {market_name}."),
+            "Open dashboard",
+            get("dashboardUrl"),
+            topup_details(),
         ),
-        ("topup_refunded", "en") => format!(
-            "<div style=\"font-family:Arial,sans-serif\"><h2>Top-up refunded</h2><p>Your top-up has been refunded on {name}.</p><ul><li>Top-up ID: {topup}</li><li>Gross: ${gross}</li><li>Fee: ${fee}</li><li>Net: ${net}</li></ul><p><a href=\"{url}\">Open dashboard</a></p></div>",
-            name = market.display_name,
-            topup = get("topupId"),
-            gross = get("grossAmountUsd"),
-            fee = get("feeAmountUsd"),
-            net = get("netAmountUsd"),
-            url = get("dashboardUrl"),
+        ("topup_refunded", "en") => render_market_notification_card(
+            "Top-up refunded",
+            &format!("Your top-up has been refunded on {market_name}."),
+            "Open dashboard",
+            get("dashboardUrl"),
+            topup_details(),
         ),
-        ("topup_chargeback", "en") => format!(
-            "<div style=\"font-family:Arial,sans-serif\"><h2>Top-up chargeback notice</h2><p>A chargeback/dispute has been recorded on {name}.</p><ul><li>Top-up ID: {topup}</li><li>Gross: ${gross}</li><li>Fee: ${fee}</li><li>Net: ${net}</li></ul><p><a href=\"{url}\">Open dashboard</a></p></div>",
-            name = market.display_name,
-            topup = get("topupId"),
-            gross = get("grossAmountUsd"),
-            fee = get("feeAmountUsd"),
-            net = get("netAmountUsd"),
-            url = get("dashboardUrl"),
+        ("topup_chargeback", "en") => render_market_notification_card(
+            "Top-up chargeback notice",
+            &format!("A chargeback or dispute has been recorded on {market_name}."),
+            "Open dashboard",
+            get("dashboardUrl"),
+            topup_details(),
         ),
-        ("payout_submitted", "en") => format!(
-            "<div style=\"font-family:Arial,sans-serif\"><h2>Payout submitted</h2><p>Your payout request has been created on {name}.</p><ul><li>Payout ID: {id}</li><li>Gross: ${gross}</li><li>Fee: ${fee}</li><li>Net: ${net}</li></ul><p><a href=\"{url}\">Open claim page</a></p></div>",
-            name = market.display_name,
-            id = get("payoutId"),
-            gross = get("amountUsd"),
-            fee = get("feeUsd"),
-            net = get("netPayoutUsd"),
-            url = get("claimUrl"),
+        ("payout_submitted", "en") => render_market_notification_card(
+            "Payout submitted",
+            &format!("Your payout request has been created on {market_name}."),
+            "Open claim page",
+            get("claimUrl"),
+            payout_details(),
         ),
-        ("payout_paid", "en") => format!(
-            "<div style=\"font-family:Arial,sans-serif\"><h2>Payout completed</h2><p>Your payout has been completed on {name}.</p><ul><li>Payout ID: {id}</li><li>Gross: ${gross}</li><li>Fee: ${fee}</li><li>Net: ${net}</li></ul><p><a href=\"{url}\">Open claim page</a></p></div>",
-            name = market.display_name,
-            id = get("payoutId"),
-            gross = get("amountUsd"),
-            fee = get("feeUsd"),
-            net = get("netPayoutUsd"),
-            url = get("claimUrl"),
+        ("payout_paid", "en") => render_market_notification_card(
+            "Payout completed",
+            &format!("Your payout has been completed on {market_name}."),
+            "Open claim page",
+            get("claimUrl"),
+            payout_details(),
         ),
-        ("payout_failed", "en") => format!(
-            "<div style=\"font-family:Arial,sans-serif\"><h2>Payout failed</h2><p>Your payout could not be completed on {name}.</p><ul><li>Payout ID: {id}</li><li>Gross: ${gross}</li><li>Fee: ${fee}</li><li>Net: ${net}</li></ul><p><a href=\"{url}\">Open claim page</a></p></div>",
-            name = market.display_name,
-            id = get("payoutId"),
-            gross = get("amountUsd"),
-            fee = get("feeUsd"),
-            net = get("netPayoutUsd"),
-            url = get("claimUrl"),
+        ("payout_failed", "en") => render_market_notification_card(
+            "Payout failed",
+            &format!("Your payout could not be completed on {market_name}."),
+            "Open claim page",
+            get("claimUrl"),
+            payout_details(),
         ),
-        ("payout_review", "en") => format!(
-            "<div style=\"font-family:Arial,sans-serif\"><h2>Payout under review</h2><p>Your payout is being reviewed on {name}. Please do not submit another payout.</p><ul><li>Payout ID: {id}</li><li>Gross: ${gross}</li><li>Fee: ${fee}</li><li>Net: ${net}</li></ul><p><a href=\"{url}\">Open claim page</a></p></div>",
-            name = market.display_name,
-            id = get("payoutId"),
-            gross = get("amountUsd"),
-            fee = get("feeUsd"),
-            net = get("netPayoutUsd"),
-            url = get("claimUrl"),
+        ("payout_review", "en") => render_market_notification_card(
+            "Payout under review",
+            &format!(
+                "Your payout is being reviewed on {market_name}. Please do not submit another payout."
+            ),
+            "Open claim page",
+            get("claimUrl"),
+            payout_details(),
         ),
-        ("payout_cancelled", "en") => format!(
-            "<div style=\"font-family:Arial,sans-serif\"><h2>Payout cancelled</h2><p>Your payout was cancelled on {name}.</p><ul><li>Payout ID: {id}</li><li>Gross: ${gross}</li><li>Fee: ${fee}</li><li>Net: ${net}</li></ul><p><a href=\"{url}\">Open claim page</a></p></div>",
-            name = market.display_name,
-            id = get("payoutId"),
-            gross = get("amountUsd"),
-            fee = get("feeUsd"),
-            net = get("netPayoutUsd"),
-            url = get("claimUrl"),
+        ("payout_cancelled", "en") => render_market_notification_card(
+            "Payout cancelled",
+            &format!("Your payout was cancelled on {market_name}."),
+            "Open claim page",
+            get("claimUrl"),
+            payout_details(),
         ),
-        ("topup_paid", _) => format!(
-            "<div style=\"font-family:Arial,sans-serif\"><h2>充值已到账</h2><p>你在 {name} 的充值已经到账。</p><ul><li>充值 ID：{topup}</li><li>总额：${gross}</li><li>手续费：${fee}</li><li>净入账：${net}</li></ul><p><a href=\"{url}\">前往控制台</a></p></div>",
-            name = market.display_name,
-            topup = get("topupId"),
-            gross = get("grossAmountUsd"),
-            fee = get("feeAmountUsd"),
-            net = get("netAmountUsd"),
-            url = get("dashboardUrl"),
+        ("topup_paid", _) => render_market_notification_card(
+            "充值已到账",
+            &format!("你在 {market_name} 的充值已经到账。"),
+            "前往控制台",
+            get("dashboardUrl"),
+            topup_details_zh(),
         ),
-        ("topup_refunded", _) => format!(
-            "<div style=\"font-family:Arial,sans-serif\"><h2>充值已退款</h2><p>你在 {name} 的充值已被退款。</p><ul><li>充值 ID：{topup}</li><li>总额：${gross}</li><li>手续费：${fee}</li><li>净额：${net}</li></ul><p><a href=\"{url}\">前往控制台</a></p></div>",
-            name = market.display_name,
-            topup = get("topupId"),
-            gross = get("grossAmountUsd"),
-            fee = get("feeAmountUsd"),
-            net = get("netAmountUsd"),
-            url = get("dashboardUrl"),
+        ("topup_refunded", _) => render_market_notification_card(
+            "充值已退款",
+            &format!("你在 {market_name} 的充值已被退款。"),
+            "前往控制台",
+            get("dashboardUrl"),
+            topup_details_zh(),
         ),
-        ("topup_chargeback", _) => format!(
-            "<div style=\"font-family:Arial,sans-serif\"><h2>充值争议/拒付提醒</h2><p>你在 {name} 的一笔充值出现争议或拒付。</p><ul><li>充值 ID：{topup}</li><li>总额：${gross}</li><li>手续费：${fee}</li><li>净额：${net}</li></ul><p><a href=\"{url}\">前往控制台</a></p></div>",
-            name = market.display_name,
-            topup = get("topupId"),
-            gross = get("grossAmountUsd"),
-            fee = get("feeAmountUsd"),
-            net = get("netAmountUsd"),
-            url = get("dashboardUrl"),
+        ("topup_chargeback", _) => render_market_notification_card(
+            "充值争议/拒付提醒",
+            &format!("你在 {market_name} 的一笔充值出现争议或拒付。"),
+            "前往控制台",
+            get("dashboardUrl"),
+            topup_details_zh(),
         ),
-        ("payout_submitted", _) => format!(
-            "<div style=\"font-family:Arial,sans-serif\"><h2>提现请求已提交</h2><p>你在 {name} 的提现请求已创建。</p><ul><li>提现 ID：{id}</li><li>提现金额：${gross}</li><li>手续费：${fee}</li><li>预计到账：${net}</li></ul><p><a href=\"{url}\">前往收益页</a></p></div>",
-            name = market.display_name,
-            id = get("payoutId"),
-            gross = get("amountUsd"),
-            fee = get("feeUsd"),
-            net = get("netPayoutUsd"),
-            url = get("claimUrl"),
+        ("payout_submitted", _) => render_market_notification_card(
+            "提现请求已提交",
+            &format!("你在 {market_name} 的提现请求已创建。"),
+            "前往收益页",
+            get("claimUrl"),
+            payout_details_zh(),
         ),
-        ("payout_paid", _) => format!(
-            "<div style=\"font-family:Arial,sans-serif\"><h2>提现已完成</h2><p>你在 {name} 的提现已完成。</p><ul><li>提现 ID：{id}</li><li>提现金额：${gross}</li><li>手续费：${fee}</li><li>实际到账：${net}</li></ul><p><a href=\"{url}\">前往收益页</a></p></div>",
-            name = market.display_name,
-            id = get("payoutId"),
-            gross = get("amountUsd"),
-            fee = get("feeUsd"),
-            net = get("netPayoutUsd"),
-            url = get("claimUrl"),
+        ("payout_paid", _) => render_market_notification_card(
+            "提现已完成",
+            &format!("你在 {market_name} 的提现已完成。"),
+            "前往收益页",
+            get("claimUrl"),
+            payout_details_zh(),
         ),
-        ("payout_failed", _) => format!(
-            "<div style=\"font-family:Arial,sans-serif\"><h2>提现失败</h2><p>你在 {name} 的提现未能完成。</p><ul><li>提现 ID：{id}</li><li>提现金额：${gross}</li><li>手续费：${fee}</li><li>预计到账：${net}</li></ul><p><a href=\"{url}\">前往收益页</a></p></div>",
-            name = market.display_name,
-            id = get("payoutId"),
-            gross = get("amountUsd"),
-            fee = get("feeUsd"),
-            net = get("netPayoutUsd"),
-            url = get("claimUrl"),
+        ("payout_failed", _) => render_market_notification_card(
+            "提现失败",
+            &format!("你在 {market_name} 的提现未能完成。"),
+            "前往收益页",
+            get("claimUrl"),
+            payout_details_zh(),
         ),
-        ("payout_review", _) => format!(
-            "<div style=\"font-family:Arial,sans-serif\"><h2>提现正在复核</h2><p>你在 {name} 的提现正在人工复核，请不要重复提交。</p><ul><li>提现 ID：{id}</li><li>提现金额：${gross}</li><li>手续费：${fee}</li><li>预计到账：${net}</li></ul><p><a href=\"{url}\">前往收益页</a></p></div>",
-            name = market.display_name,
-            id = get("payoutId"),
-            gross = get("amountUsd"),
-            fee = get("feeUsd"),
-            net = get("netPayoutUsd"),
-            url = get("claimUrl"),
+        ("payout_review", _) => render_market_notification_card(
+            "提现正在复核",
+            &format!("你在 {market_name} 的提现正在人工复核，请不要重复提交。"),
+            "前往收益页",
+            get("claimUrl"),
+            payout_details_zh(),
         ),
-        ("payout_cancelled", _) => format!(
-            "<div style=\"font-family:Arial,sans-serif\"><h2>提现已取消</h2><p>你在 {name} 的提现已取消。</p><ul><li>提现 ID：{id}</li><li>提现金额：${gross}</li><li>手续费：${fee}</li><li>预计到账：${net}</li></ul><p><a href=\"{url}\">前往收益页</a></p></div>",
-            name = market.display_name,
-            id = get("payoutId"),
-            gross = get("amountUsd"),
-            fee = get("feeUsd"),
-            net = get("netPayoutUsd"),
-            url = get("claimUrl"),
+        ("payout_cancelled", _) => render_market_notification_card(
+            "提现已取消",
+            &format!("你在 {market_name} 的提现已取消。"),
+            "前往收益页",
+            get("claimUrl"),
+            payout_details_zh(),
         ),
-        _ => "<div style=\"font-family:Arial,sans-serif\"><p>Notification</p></div>".into(),
+        _ => render_market_notification_card(
+            "Notification",
+            "You have a new TokenSwitch Market notification.",
+            "Open dashboard",
+            "#",
+            Vec::new(),
+        ),
+    }
+}
+
+fn render_market_notification_card(
+    heading: &str,
+    message: &str,
+    action_label: &str,
+    action_url: &str,
+    details: Vec<(&'static str, String)>,
+) -> String {
+    let mut rows = String::new();
+    for (label, value) in details {
+        rows.push_str(&format!(
+            "<tr>\
+               <td style=\"padding:10px 12px;color:#64748b;font-size:13px;border-bottom:1px solid #eef2f7\">{}</td>\
+               <td align=\"right\" style=\"padding:10px 12px;color:#0f172a;font-size:13px;font-weight:600;border-bottom:1px solid #eef2f7\">{}</td>\
+             </tr>",
+            escape_html(label),
+            escape_html(&value)
+        ));
+    }
+
+    let href = normalize_email_href(action_url);
+    let action = if href == "#" {
+        String::new()
+    } else {
+        format!(
+            "<p style=\"margin:24px 0 0\"><a href=\"{}\" style=\"display:inline-block;background:#2563eb;color:#ffffff;text-decoration:none;border-radius:8px;padding:11px 16px;font-size:14px;font-weight:700\">{}</a></p>",
+            href,
+            escape_html(action_label)
+        )
+    };
+
+    let details_table = if rows.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"margin:22px 0 0;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden;background:#ffffff\">{rows}</table>"
+        )
+    };
+
+    format!(
+        "<div>\
+           <h2 style=\"margin:0 0 10px;color:#0f172a;font-size:20px;line-height:1.35\">{}</h2>\
+           <p style=\"margin:0;color:#475569;font-size:15px;line-height:1.6\">{}</p>\
+           {}\
+           {}\
+         </div>",
+        escape_html(heading),
+        message,
+        details_table,
+        action
+    )
+}
+
+fn normalize_email_href(value: &str) -> String {
+    let value = value.trim();
+    if value.starts_with("https://") || value.starts_with("http://") {
+        escape_html(value)
+    } else {
+        "#".to_string()
     }
 }
 
@@ -5286,11 +5447,9 @@ async fn send_market_template_email(
     subject: &str,
     html: &str,
 ) -> Result<Option<String>, AppError> {
-    let from = config
-        .resend_from
-        .as_deref()
-        .ok_or_else(|| AppError::Internal("resend from address is not configured".into()))?;
-    let mut message = CreateEmailBaseOptions::new(from, [email], subject).with_html(html);
+    let from = resend_from_address(config)?;
+    let html = render_email_layout(subject, subject, html);
+    let mut message = CreateEmailBaseOptions::new(&from, [email], subject).with_html(&html);
     if let Some(reply_to) = config.resend_reply_to.as_deref() {
         message = message.with_reply(reply_to);
     }
@@ -5633,6 +5792,51 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::path::PathBuf;
 
+    #[test]
+    fn resend_from_address_adds_default_display_name_for_plain_email() {
+        let mut config = test_config("resend-from-default-name");
+        config.resend_from = Some("noreply@jptokenswitch.cc".into());
+
+        assert_eq!(
+            resend_from_address(&config).expect("from address"),
+            "TokenSwitch <noreply@jptokenswitch.cc>"
+        );
+    }
+
+    #[test]
+    fn resend_from_address_preserves_formatted_sender() {
+        let mut config = test_config("resend-from-formatted");
+        config.resend_from = Some("TokenSwitch <noreply@jptokenswitch.cc>".into());
+
+        assert_eq!(
+            resend_from_address(&config).expect("from address"),
+            "TokenSwitch <noreply@jptokenswitch.cc>"
+        );
+    }
+
+    #[test]
+    fn resend_from_address_uses_configured_display_name() {
+        let mut config = test_config("resend-from-custom-name");
+        config.resend_from = Some("noreply@jptokenswitch.cc".into());
+        config.resend_from_name = Some("TokenSwitch Router".into());
+
+        assert_eq!(
+            resend_from_address(&config).expect("from address"),
+            "TokenSwitch Router <noreply@jptokenswitch.cc>"
+        );
+    }
+
+    #[test]
+    fn resend_from_address_strips_newlines() {
+        let mut config = test_config("resend-from-newlines");
+        config.resend_from = Some("TokenSwitch\r\n <noreply@jptokenswitch.cc>".into());
+
+        assert_eq!(
+            resend_from_address(&config).expect("from address"),
+            "TokenSwitch <noreply@jptokenswitch.cc>"
+        );
+    }
+
     fn test_config(name: &str) -> Config {
         let db_path =
             std::env::temp_dir().join(format!("cc-switch-router-{name}-{}.db", Uuid::new_v4()));
@@ -5651,6 +5855,7 @@ mod tests {
             client_stale_secs: 60 * 60,
             resend_api_key: None,
             resend_from: None,
+            resend_from_name: None,
             resend_reply_to: None,
             auth_code_ttl_secs: 600,
             auth_code_cooldown_secs: 60,

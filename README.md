@@ -75,7 +75,8 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_LEASE_RETENTION_SECS` | `604800` | 过期 lease 保留时长（秒） |
 | `CC_SWITCH_ROUTER_CLIENT_STALE_SECS` | `3600` | client 超过该时间未上报时清理其 share、lease 和 client 记录 |
 | `CC_SWITCH_ROUTER_RESEND_API_KEY` | 空 | Resend API Key，用于邮箱验证码发送和 dashboard 用量读取 |
-| `CC_SWITCH_ROUTER_RESEND_FROM` | 空 | 验证码邮件发件人 |
+| `CC_SWITCH_ROUTER_RESEND_FROM` | 空 | 邮件发件人，可填裸邮箱或 `TokenSwitch <noreply@example.com>`；裸邮箱会自动显示为 `TokenSwitch <邮箱>` |
+| `CC_SWITCH_ROUTER_RESEND_FROM_NAME` | `TokenSwitch` | `CC_SWITCH_ROUTER_RESEND_FROM` 为裸邮箱时使用的发件人显示名 |
 | `CC_SWITCH_ROUTER_RESEND_REPLY_TO` | 空 | 验证码邮件 Reply-To |
 | `CC_SWITCH_ROUTER_AUTH_CODE_TTL_SECS` | `300` | 邮件验证码有效期（秒） |
 | `CC_SWITCH_ROUTER_AUTH_CODE_COOLDOWN_SECS` | `60` | 同邮箱 / 设备发验证码冷却（秒） |
@@ -96,7 +97,7 @@ CC_SWITCH_ROUTER_SSH_ADDR=0.0.0.0:2222
 CC_SWITCH_ROUTER_TUNNEL_DOMAIN=example.com
 CC_SWITCH_ROUTER_USE_LOCALHOST=false
 CC_SWITCH_ROUTER_RESEND_API_KEY=re_xxx
-CC_SWITCH_ROUTER_RESEND_FROM=TokenSwitch <noreply@example.com>
+CC_SWITCH_ROUTER_RESEND_FROM=noreply@example.com
 EOF
 ```
 

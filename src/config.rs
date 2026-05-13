@@ -22,6 +22,7 @@ pub struct Config {
     pub client_stale_secs: i64,
     pub resend_api_key: Option<String>,
     pub resend_from: Option<String>,
+    pub resend_from_name: Option<String>,
     pub resend_reply_to: Option<String>,
     pub auth_code_ttl_secs: i64,
     pub auth_code_cooldown_secs: i64,
@@ -73,6 +74,7 @@ impl Config {
                 .unwrap_or(60 * 60),
             resend_api_key: env_var("CC_SWITCH_ROUTER_RESEND_API_KEY"),
             resend_from: env_var("CC_SWITCH_ROUTER_RESEND_FROM"),
+            resend_from_name: env_var("CC_SWITCH_ROUTER_RESEND_FROM_NAME"),
             resend_reply_to: env_var("CC_SWITCH_ROUTER_RESEND_REPLY_TO"),
             auth_code_ttl_secs: env_var("CC_SWITCH_ROUTER_AUTH_CODE_TTL_SECS")
                 .and_then(|v| v.parse().ok())
@@ -257,6 +259,7 @@ mod tests {
             client_stale_secs: 60,
             resend_api_key: None,
             resend_from: None,
+            resend_from_name: None,
             resend_reply_to: None,
             auth_code_ttl_secs: 300,
             auth_code_cooldown_secs: 60,
