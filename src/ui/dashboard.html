@@ -44,6 +44,12 @@
         flex-wrap: wrap;
         margin-bottom: 32px;
       }
+      .topbar-left {
+        display: inline-flex;
+        align-items: center;
+        gap: 14px;
+        flex-wrap: wrap;
+      }
       .topbar-brand {
         display: inline-flex;
         align-items: center;
@@ -1452,6 +1458,7 @@
       /* ── Responsive ── */
       @media (max-width: 980px) {
         .topbar { flex-direction: column; align-items: flex-start; }
+        .topbar-left { width: 100%; }
         .drawer-summary { grid-template-columns: 1fr 1fr; }
         .topbar-right { width: 100%; }
       }
@@ -1467,46 +1474,37 @@
     <main class="page">
       <!-- Topbar -->
       <div class="topbar">
-        <a
-          class="topbar-brand"
-          href="https://tokenswitch.org"
-          target="_blank"
-          rel="noopener noreferrer"
-          aria-label="Switch Router"
-        >
-          <svg class="brand-mark brand-mark--pulse" viewBox="0 0 80 80" xmlns="http://www.w3.org/2000/svg" role="img" aria-hidden="true">
-            <line x1="40" y1="22" x2="40" y2="8" stroke="#1E293B" stroke-width="2.5" stroke-linecap="round"/>
-            <line x1="58" y1="40" x2="72" y2="40" stroke="#1E293B" stroke-width="2.5" stroke-linecap="round"/>
-            <line x1="40" y1="58" x2="40" y2="72" stroke="#1E293B" stroke-width="2.5" stroke-linecap="round"/>
-            <line x1="22" y1="40" x2="8" y2="40" stroke="#1E293B" stroke-width="2.5" stroke-linecap="round"/>
-            <circle cx="40" cy="6" r="6" fill="#8B5CF6" stroke="#1E293B" stroke-width="2"/>
-            <circle cx="74" cy="40" r="6" fill="#F472B6" stroke="#1E293B" stroke-width="2"/>
-            <circle cx="40" cy="74" r="6" fill="#FBBF24" stroke="#1E293B" stroke-width="2"/>
-            <circle cx="6" cy="40" r="6" fill="#10B981" stroke="#1E293B" stroke-width="2"/>
-            <circle cx="43" cy="43" r="18" fill="#1E293B"/>
-            <circle cx="40" cy="40" r="18" fill="#34D399" stroke="#1E293B" stroke-width="2"/>
-            <text x="40" y="48" text-anchor="middle" font-weight="800" font-size="22" fill="#FFFFFF">R</text>
-          </svg>
-          <span class="brand-lockup">
-            <span class="brand-title">CC-Switch Router</span>
-          </span>
-        </a>
-        <div class="topbar-right">
-          <div class="topbar-auth">
-            <button class="topbar-auth-trigger" id="auth-login-button" type="button">Login</button>
-            <div class="auth-menu" id="auth-menu">
-              <button class="auth-menu-button" id="auth-menu-button" type="button"></button>
-              <div class="auth-menu-panel">
-                <div class="auth-menu-email" id="auth-menu-email"></div>
-                <button class="auth-menu-button" id="auth-logout-button" type="button">Logout</button>
-              </div>
-            </div>
-          </div>
+        <div class="topbar-left">
+          <a
+            class="topbar-brand"
+            href="https://tokenswitch.org"
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label="Switch Router"
+          >
+            <svg class="brand-mark brand-mark--pulse" viewBox="0 0 80 80" xmlns="http://www.w3.org/2000/svg" role="img" aria-hidden="true">
+              <line x1="40" y1="22" x2="40" y2="8" stroke="#1E293B" stroke-width="2.5" stroke-linecap="round"/>
+              <line x1="58" y1="40" x2="72" y2="40" stroke="#1E293B" stroke-width="2.5" stroke-linecap="round"/>
+              <line x1="40" y1="58" x2="40" y2="72" stroke="#1E293B" stroke-width="2.5" stroke-linecap="round"/>
+              <line x1="22" y1="40" x2="8" y2="40" stroke="#1E293B" stroke-width="2.5" stroke-linecap="round"/>
+              <circle cx="40" cy="6" r="6" fill="#8B5CF6" stroke="#1E293B" stroke-width="2"/>
+              <circle cx="74" cy="40" r="6" fill="#F472B6" stroke="#1E293B" stroke-width="2"/>
+              <circle cx="40" cy="74" r="6" fill="#FBBF24" stroke="#1E293B" stroke-width="2"/>
+              <circle cx="6" cy="40" r="6" fill="#10B981" stroke="#1E293B" stroke-width="2"/>
+              <circle cx="43" cy="43" r="18" fill="#1E293B"/>
+              <circle cx="40" cy="40" r="18" fill="#34D399" stroke="#1E293B" stroke-width="2"/>
+              <text x="40" y="48" text-anchor="middle" font-weight="800" font-size="22" fill="#FFFFFF">R</text>
+            </svg>
+            <span class="brand-lockup">
+              <span class="brand-title">CC-Switch Router</span>
+            </span>
+          </a>
           <div class="topbar-region">
             <label for="region-select">Router</label>
             <select id="region-select" aria-label="Router"></select>
           </div>
-          <span class="topbar-sep">&middot;</span>
+        </div>
+        <div class="topbar-right">
           <span class="topbar-stat" title="Total number of clients registered on this router.">
             <strong id="stat-clients">0</strong> clients
           </span>
@@ -1523,6 +1521,16 @@
             <strong id="stat-inflight">0</strong> in-flight requests
           </span>
           <span class="topbar-sync">synced <span id="last-sync">--</span></span>
+          <div class="topbar-auth">
+            <button class="topbar-auth-trigger" id="auth-login-button" type="button">Login</button>
+            <div class="auth-menu" id="auth-menu">
+              <button class="auth-menu-button" id="auth-menu-button" type="button"></button>
+              <div class="auth-menu-panel">
+                <div class="auth-menu-email" id="auth-menu-email"></div>
+                <button class="auth-menu-button" id="auth-logout-button" type="button">Logout</button>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -3491,6 +3499,7 @@
       function forSaleMarketCell(share) {
         if (!share) return '<span class="meta">—</span>';
         const links = share.marketLinks || [];
+        const showRuntimePricing = share.forSale === "Yes";
         const marketLines = links
           .map((market) => market.subdomain || "")
           .filter(Boolean)
@@ -3501,11 +3510,13 @@
         return `
           <div class="for-sale-market-stack">
             ${forSalePill(share)}
-            <div class="for-sale-market-list">
-              <div>Claude ${escapeHtml(upstreamSalePercent(share.appRuntimes?.claude))}</div>
-              <div>Codex ${escapeHtml(upstreamSalePercent(share.appRuntimes?.codex))}</div>
-              <div>Gemini ${escapeHtml(upstreamSalePercent(share.appRuntimes?.gemini))}</div>
-            </div>
+            ${showRuntimePricing
+              ? `<div class="for-sale-market-list">
+                  <div>Claude ${escapeHtml(upstreamSalePercent(share.appRuntimes?.claude))}</div>
+                  <div>Codex ${escapeHtml(upstreamSalePercent(share.appRuntimes?.codex))}</div>
+                  <div>Gemini ${escapeHtml(upstreamSalePercent(share.appRuntimes?.gemini))}</div>
+                </div>`
+              : ""}
             ${marketLines.length
               ? `<div class="for-sale-market-list">${marketLines.map((line) => `<div>${line}</div>`).join("")}</div>`
               : ""}
@@ -4084,7 +4095,6 @@
             </td>
             <td class="meta">
               <a href="${escapeHtml(market.publicBaseUrl || "#")}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">${escapeHtml(market.publicBaseUrl || "-")}</a>
-              <div>${escapeHtml(market.subdomain || "-")}</div>
             </td>
             <td>${marketPricingStack(market)}</td>
             <td>${marketStatusStack(market)}</td>

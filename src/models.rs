@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 fn default_share_for_sale() -> String {
     "No".to_string()
@@ -241,7 +242,18 @@ pub struct ShareClaimSubdomainRequest {
     pub timestamp_ms: i64,
     pub nonce: String,
     pub signature: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<ShareClaimPayload>,
     pub share: ShareDescriptor,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareClaimPayload {
+    pub share_id: String,
+    pub subdomain: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_email: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -695,6 +707,8 @@ pub struct ShareDescriptor {
     pub shared_with_emails: Vec<String>,
     #[serde(default = "default_market_access_mode")]
     pub market_access_mode: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub for_sale_official_price_percent_by_app: BTreeMap<String, u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default = "default_share_for_sale")]

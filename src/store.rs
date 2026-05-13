@@ -30,11 +30,11 @@ use crate::models::{
     PublicMarketConfig, RefreshSessionRequest, RegisterInstallationRequest,
     RegisterInstallationResponse, RegisterMarketRequest, RequestEmailCodeRequest,
     RequestEmailCodeResponse, SessionStatusResponse, ShareAppRuntimes, ShareBatchSyncRequest,
-    ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptor, ShareHeartbeatRequest,
-    ShareMarketLinkView, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry,
-    ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload, ShareRuntimeRefreshRequest,
-    ShareRuntimeSnapshotResponse, ShareSupport, ShareSyncRequest, ShareUpstreamProvider, ShareView,
-    TunnelLease, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    ShareClaimPayload, ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptor,
+    ShareHeartbeatRequest, ShareMarketLinkView, ShareRequestLogBatchSyncRequest,
+    ShareRequestLogEntry, ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload,
+    ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse, ShareSupport, ShareSyncRequest,
+    ShareUpstreamProvider, ShareView, TunnelLease, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 use crate::proxy::ProxyRegistry;
 
@@ -1191,12 +1191,12 @@ impl AppStore {
         let Some(installation) = installation else {
             return Err(AppError::Unauthorized("installation not found".into()));
         };
-        verify_signed_share_request(
+        verify_share_claim_request(
             &conn,
             &installation.public_key,
             &input.installation_id,
-            "share_claim_subdomain",
             &input.share,
+            input.claim.as_ref(),
             input.timestamp_ms,
             &input.nonce,
             &input.signature,
@@ -4008,6 +4008,7 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                     description: row.get(3)?,
                     for_sale: row.get(4)?,
                     market_access_mode: row.get(5)?,
+                    for_sale_official_price_percent_by_app: Default::default(),
                     subdomain: row.get(6)?,
                     share_token: row.get(7)?,
                     app_type: row.get(8)?,
@@ -4843,6 +4844,68 @@ fn verify_signed_share_request<T: Serialize>(
         signature,
     )?;
     consume_request_nonce(conn, installation_id, action, nonce, now)
+}
+
+fn verify_share_claim_request(
+    conn: &Connection,
+    public_key: &str,
+    installation_id: &str,
+    share: &ShareDescriptor,
+    claim: Option<&ShareClaimPayload>,
+    timestamp_ms: i64,
+    nonce: &str,
+    signature: &str,
+) -> Result<(), AppError> {
+    let now = Utc::now();
+    let skew = (now.timestamp_millis() - timestamp_ms).abs();
+    if skew > SIGNED_REQUEST_MAX_SKEW_MS {
+        return Err(AppError::Unauthorized("stale signed request".into()));
+    }
+
+    let derived_claim = share_claim_payload(share);
+    if let Some(claim) = claim {
+        if claim.share_id != derived_claim.share_id
+            || claim.subdomain != derived_claim.subdomain
+            || claim.owner_email != derived_claim.owner_email
+        {
+            return Err(AppError::BadRequest(
+                "share claim does not match share metadata".into(),
+            ));
+        }
+    }
+
+    let claim_payload = claim.unwrap_or(&derived_claim);
+    let new_result = verify_signed_payload(
+        public_key,
+        installation_id,
+        "share_claim_subdomain",
+        claim_payload,
+        timestamp_ms,
+        nonce,
+        signature,
+    );
+    if let Err(new_err) = new_result {
+        verify_signed_payload(
+            public_key,
+            installation_id,
+            "share_claim_subdomain",
+            share,
+            timestamp_ms,
+            nonce,
+            signature,
+        )
+        .map_err(|_| new_err)?;
+    }
+
+    consume_request_nonce(conn, installation_id, "share_claim_subdomain", nonce, now)
+}
+
+fn share_claim_payload(share: &ShareDescriptor) -> ShareClaimPayload {
+    ShareClaimPayload {
+        share_id: share.share_id.clone(),
+        subdomain: share.subdomain.clone(),
+        owner_email: share.owner_email.clone(),
+    }
 }
 
 fn consume_request_nonce(
@@ -6386,6 +6449,7 @@ mod tests {
             owner_email: Some("owner@example.com".into()),
             shared_with_emails: vec![],
             market_access_mode: "selected".into(),
+            for_sale_official_price_percent_by_app: Default::default(),
             description: None,
             for_sale: "No".into(),
             subdomain: "market-a".into(),
@@ -6422,6 +6486,7 @@ mod tests {
                     timestamp_ms,
                     nonce,
                     signature,
+                    claim: None,
                     share,
                 },
                 ClientMetadata {
@@ -6448,6 +6513,7 @@ mod tests {
             owner_email: Some("owner@example.com".into()),
             shared_with_emails: vec![],
             market_access_mode: "selected".into(),
+            for_sale_official_price_percent_by_app: Default::default(),
             description: None,
             for_sale: "No".into(),
             subdomain: "signed-sub".into(),
@@ -6482,6 +6548,7 @@ mod tests {
             timestamp_ms,
             nonce: nonce.clone(),
             signature: signature.clone(),
+            claim: None,
             share: share.clone(),
         };
 
@@ -6506,6 +6573,7 @@ mod tests {
                     timestamp_ms,
                     nonce: nonce.clone(),
                     signature: signature.clone(),
+                    claim: None,
                     share: share.clone(),
                 },
                 ClientMetadata {
@@ -6530,6 +6598,7 @@ mod tests {
                     timestamp_ms: Utc::now().timestamp_millis(),
                     nonce: Uuid::new_v4().to_string(),
                     signature,
+                    claim: None,
                     share: tampered_share,
                 },
                 ClientMetadata {
@@ -6711,6 +6780,154 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claim_share_subdomain_accepts_minimal_claim_signature() {
+        let (store, config) = setup_store("signed-share-minimal-claim").await;
+        let signing_key = insert_signed_installation(&store, "inst-minimal").await;
+
+        let share = ShareDescriptor {
+            share_id: "share-minimal".into(),
+            share_name: "Signed Share".into(),
+            owner_email: Some("owner@example.com".into()),
+            shared_with_emails: vec![],
+            market_access_mode: "all".into(),
+            for_sale_official_price_percent_by_app: std::collections::BTreeMap::from([
+                ("claude".to_string(), 5),
+                ("codex".to_string(), 5),
+            ]),
+            description: Some("metadata outside claim signature".into()),
+            for_sale: "Yes".into(),
+            subdomain: "minimal-sub".into(),
+            share_token: "token-minimal-123".into(),
+            app_type: "proxy".into(),
+            provider_id: None,
+            token_limit: -1,
+            parallel_limit: -1,
+            tokens_used: 0,
+            requests_count: 0,
+            share_status: "active".into(),
+            created_at: Utc::now().to_rfc3339(),
+            expires_at: (Utc::now() + Duration::hours(1)).to_rfc3339(),
+            support: ShareSupport::default(),
+            upstream_provider: None,
+            app_runtimes: ShareAppRuntimes::default(),
+        };
+        let claim = share_claim_payload(&share);
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            "inst-minimal",
+            "share_claim_subdomain",
+            &claim,
+            timestamp_ms,
+            &nonce,
+        );
+
+        store
+            .claim_share_subdomain(
+                &config,
+                ShareClaimSubdomainRequest {
+                    installation_id: "inst-minimal".into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    claim: Some(claim),
+                    share: share.clone(),
+                },
+                ClientMetadata {
+                    ip: Some("127.0.0.1".into()),
+                    country_code: None,
+                },
+                "owner@example.com",
+            )
+            .await
+            .expect("minimal claim signature should be accepted");
+
+        let conn = store.conn.lock().await;
+        let synced: (String, String, String) = conn
+            .query_row(
+                "SELECT share_name, subdomain, for_sale FROM shares
+                 WHERE installation_id = ?1 AND share_id = ?2",
+                params!["inst-minimal", "share-minimal"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("query minimal claim share");
+        assert_eq!(synced.0, "owner@example.com");
+        assert_eq!(synced.1, "minimal-sub");
+        assert_eq!(synced.2, "Yes");
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn claim_share_subdomain_rejects_claim_share_mismatch() {
+        let (store, config) = setup_store("signed-share-claim-mismatch").await;
+        let signing_key = insert_signed_installation(&store, "inst-mismatch").await;
+
+        let share = ShareDescriptor {
+            share_id: "share-mismatch".into(),
+            share_name: "Signed Share".into(),
+            owner_email: Some("owner@example.com".into()),
+            shared_with_emails: vec![],
+            market_access_mode: "selected".into(),
+            for_sale_official_price_percent_by_app: Default::default(),
+            description: None,
+            for_sale: "No".into(),
+            subdomain: "mismatch-sub".into(),
+            share_token: "token-mismatch-123".into(),
+            app_type: "proxy".into(),
+            provider_id: None,
+            token_limit: 1000,
+            parallel_limit: 3,
+            tokens_used: 0,
+            requests_count: 0,
+            share_status: "active".into(),
+            created_at: Utc::now().to_rfc3339(),
+            expires_at: (Utc::now() + Duration::hours(1)).to_rfc3339(),
+            support: ShareSupport::default(),
+            upstream_provider: None,
+            app_runtimes: ShareAppRuntimes::default(),
+        };
+        let claim = ShareClaimPayload {
+            subdomain: "other-sub".into(),
+            ..share_claim_payload(&share)
+        };
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            "inst-mismatch",
+            "share_claim_subdomain",
+            &claim,
+            timestamp_ms,
+            &nonce,
+        );
+
+        let err = store
+            .claim_share_subdomain(
+                &config,
+                ShareClaimSubdomainRequest {
+                    installation_id: "inst-mismatch".into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    claim: Some(claim),
+                    share,
+                },
+                ClientMetadata {
+                    ip: Some("127.0.0.1".into()),
+                    country_code: None,
+                },
+                "owner@example.com",
+            )
+            .await
+            .expect_err("claim/share mismatch should fail");
+        assert!(err.to_string().contains("claim does not match"));
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
     async fn claim_share_subdomain_allows_same_owner_to_reclaim_existing_subdomain() {
         let (store, config) = setup_store("signed-share-reclaim-owner").await;
         insert_share(&store, "inst-old", "share-old", "owner-sub", "paused").await;
@@ -6722,6 +6939,7 @@ mod tests {
             owner_email: Some("owner@example.com".into()),
             shared_with_emails: vec![],
             market_access_mode: "selected".into(),
+            for_sale_official_price_percent_by_app: Default::default(),
             description: None,
             for_sale: "No".into(),
             subdomain: "owner-sub".into(),
@@ -6759,6 +6977,7 @@ mod tests {
                     timestamp_ms,
                     nonce,
                     signature,
+                    claim: None,
                     share: share.clone(),
                 },
                 ClientMetadata {
@@ -6817,6 +7036,7 @@ mod tests {
             owner_email: Some("router@example.com".into()),
             shared_with_emails: vec![],
             market_access_mode: "selected".into(),
+            for_sale_official_price_percent_by_app: Default::default(),
             description: None,
             for_sale: "No".into(),
             subdomain: "heal-sub".into(),
@@ -6854,6 +7074,7 @@ mod tests {
                     timestamp_ms,
                     nonce,
                     signature,
+                    claim: None,
                     share,
                 },
                 ClientMetadata {
@@ -6886,6 +7107,7 @@ mod tests {
             owner_email: Some("different@example.com".into()),
             shared_with_emails: vec![],
             market_access_mode: "selected".into(),
+            for_sale_official_price_percent_by_app: Default::default(),
             description: None,
             for_sale: "No".into(),
             subdomain: "reused-sub".into(),
@@ -6923,6 +7145,7 @@ mod tests {
                     timestamp_ms,
                     nonce,
                     signature,
+                    claim: None,
                     share: share.clone(),
                 },
                 ClientMetadata {
@@ -6966,9 +7189,13 @@ mod tests {
             share_name: "Batch Share".into(),
             owner_email: Some("owner@example.com".into()),
             shared_with_emails: vec![],
-            market_access_mode: "selected".into(),
+            market_access_mode: "all".into(),
+            for_sale_official_price_percent_by_app: std::collections::BTreeMap::from([
+                ("claude".to_string(), 10),
+                ("codex".to_string(), 20),
+            ]),
             description: Some("signed batch sync".into()),
-            for_sale: "No".into(),
+            for_sale: "Yes".into(),
             subdomain: "batch-sub".into(),
             share_token: "token-batch-123".into(),
             app_type: "proxy".into(),
@@ -7024,18 +7251,20 @@ mod tests {
             .expect("valid signed batch sync");
 
         let conn = store.conn.lock().await;
-        let synced: (String, String, i64) = conn
+        let synced: (String, String, i64, String, String) = conn
             .query_row(
-                "SELECT share_name, subdomain, token_limit FROM shares
+                "SELECT share_name, subdomain, token_limit, for_sale, market_access_mode FROM shares
                  WHERE installation_id = ?1 AND share_id = ?2",
                 params!["inst-batch", "share-batch-1"],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .expect("query synced share");
         drop(conn);
         assert_eq!(synced.0, "owner@example.com");
         assert_eq!(synced.1, "batch-sub");
         assert_eq!(synced.2, 2048);
+        assert_eq!(synced.3, "Yes");
+        assert_eq!(synced.4, "all");
 
         let tampered_ops = vec![ShareSyncOperation {
             kind: "upsert".into(),
