@@ -32,7 +32,11 @@ impl TelegramNotifier {
             .timeout(Duration::from_secs(8))
             .build()
             .ok()?;
-        let scheme = if config.use_localhost { "http" } else { "https" };
+        let scheme = if config.use_localhost {
+            "http"
+        } else {
+            "https"
+        };
         let dashboard_url = format!("{scheme}://{}", config.tunnel_domain);
         Some(Arc::new(Self {
             client,
@@ -108,9 +112,12 @@ fn format_message(dashboard_url: &str, message: &BoardMessageView) -> String {
     let time = message.created_at.format("%Y-%m-%d %H:%M UTC").to_string();
     let time = escape_md(&time);
     let body_excerpt = excerpt(&message.body, 400);
-    let body = escape_md(&body_excerpt)
-        .replace('\n', "\n> ");
-    let link = format!("{}/#board-{}", dashboard_url.trim_end_matches('/'), message.id);
+    let body = escape_md(&body_excerpt).replace('\n', "\n> ");
+    let link = format!(
+        "{}/#board-{}",
+        dashboard_url.trim_end_matches('/'),
+        message.id
+    );
     let link_label = escape_md("Open dashboard");
     let link_target = escape_url(&link);
     let mut tags = Vec::new();
@@ -196,7 +203,9 @@ mod tests {
             is_mine: false,
             pinned: true,
             featured: false,
-            created_at: chrono::Utc.with_ymd_and_hms(2026, 5, 14, 12, 33, 0).unwrap(),
+            created_at: chrono::Utc
+                .with_ymd_and_hms(2026, 5, 14, 12, 33, 0)
+                .unwrap(),
             pinned_at: None,
             featured_at: None,
         }

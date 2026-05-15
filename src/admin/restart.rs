@@ -1,9 +1,6 @@
 use std::process::{Command, Stdio};
-use std::time::Duration;
 
-use crate::admin::version::{
-    BINARY_INSTALL_PATH, SERVICE_LOG_PATH, SERVICE_UNIT, ServiceManager,
-};
+use crate::admin::version::{BINARY_INSTALL_PATH, SERVICE_LOG_PATH, SERVICE_UNIT, ServiceManager};
 use crate::error::AppError;
 
 #[derive(Debug, Clone, Copy)]
@@ -88,21 +85,13 @@ fn spawn_detached(script: &str) -> Result<(), AppError> {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
-                .map_err(|err| {
-                    AppError::Internal(format!("spawn restart child failed: {err}"))
-                })?;
+                .map_err(|err| AppError::Internal(format!("spawn restart child failed: {err}")))?;
             Ok(())
         }
         Err(err) => Err(AppError::Internal(format!(
             "spawn setsid restart child failed: {err}"
         ))),
     }
-}
-
-/// Sleep helper used by the upgrade pipeline so the HTTP response has
-/// time to flush before SIGTERM arrives.
-pub fn flush_delay() -> Duration {
-    Duration::from_millis(150)
 }
 
 #[cfg(test)]

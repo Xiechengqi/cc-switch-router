@@ -64,11 +64,11 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `CC_SWITCH_ROUTER_API_ADDR` | `0.0.0.0:8787` | HTTP 监听地址 |
+| `CC_SWITCH_ROUTER_API_ADDR` | `0.0.0.0:80` | HTTP 监听地址 |
 | `CC_SWITCH_ROUTER_SSH_ADDR` | `0.0.0.0:2222` | SSH 监听地址 |
 | `CC_SWITCH_ROUTER_TUNNEL_DOMAIN` | `0.0.0.0:8787` | 公共 tunnel 域名 |
 | `CC_SWITCH_ROUTER_SSH_PUBLIC_ADDR` | `{TUNNEL_DOMAIN}:{SSH_PORT}` | 下发给客户端的 SSH 地址（Cloudflare 代理时填源站 IP:端口） |
-| `CC_SWITCH_ROUTER_USE_LOCALHOST` | `true` | 为 `false` 时 tunnel URL 使用 `https://` |
+| `CC_SWITCH_ROUTER_USE_LOCALHOST` | `false` | 为 `false` 时 tunnel URL 使用 `https://` |
 | `CC_SWITCH_ROUTER_LEASE_TTL_SECS` | `60` | Tunnel lease 有效期（秒） |
 | `CC_SWITCH_ROUTER_DB_PATH` | `$HOME/.config/cc-switch-router/cc-switch-router.db` | SQLite 路径 |
 | `CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS` | `300` | 清理任务执行间隔（秒） |

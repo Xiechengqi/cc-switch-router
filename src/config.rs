@@ -51,8 +51,8 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Self {
-        let tunnel_domain = env_var("CC_SWITCH_ROUTER_TUNNEL_DOMAIN")
-            .unwrap_or_else(|| "0.0.0.0:8787".to_string());
+        let tunnel_domain =
+            env_var("CC_SWITCH_ROUTER_TUNNEL_DOMAIN").unwrap_or_else(|| "0.0.0.0:8787".to_string());
         let mut admin_emails =
             parse_admin_emails(env_var("CC_SWITCH_ROUTER_ADMIN_EMAILS").as_deref());
         if let Some(default_admin) = derive_default_admin_email(&tunnel_domain) {
@@ -60,7 +60,7 @@ impl Config {
         }
         Self {
             api_addr: env_var("CC_SWITCH_ROUTER_API_ADDR")
-                .unwrap_or_else(|| "0.0.0.0:8787".to_string())
+                .unwrap_or_else(|| "0.0.0.0:80".to_string())
                 .parse()
                 .expect("invalid CC_SWITCH_ROUTER_API_ADDR"),
             ssh_addr: env_var("CC_SWITCH_ROUTER_SSH_ADDR")
@@ -71,7 +71,7 @@ impl Config {
             ssh_public_addr: env_var("CC_SWITCH_ROUTER_SSH_PUBLIC_ADDR").unwrap_or_default(),
             use_localhost: env_var("CC_SWITCH_ROUTER_USE_LOCALHOST")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(true),
+                .unwrap_or(false),
             lease_ttl_secs: env_var("CC_SWITCH_ROUTER_LEASE_TTL_SECS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
@@ -255,10 +255,10 @@ fn default_host_key_path() -> PathBuf {
 fn default_env_contents() -> String {
     format!(
         "\
-CC_SWITCH_ROUTER_API_ADDR=0.0.0.0:8787
+CC_SWITCH_ROUTER_API_ADDR=0.0.0.0:80
 CC_SWITCH_ROUTER_SSH_ADDR=0.0.0.0:2222
 CC_SWITCH_ROUTER_TUNNEL_DOMAIN=0.0.0.0:8787
-CC_SWITCH_ROUTER_USE_LOCALHOST=true
+CC_SWITCH_ROUTER_USE_LOCALHOST=false
 CC_SWITCH_ROUTER_LEASE_TTL_SECS=60
 CC_SWITCH_ROUTER_DB_PATH={}
 CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS=300

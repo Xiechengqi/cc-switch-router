@@ -9,15 +9,13 @@ use crate::error::AppError;
 pub const SERVICE_UNIT: &str = "cc-switch-router.service";
 pub const BINARY_INSTALL_PATH: &str = "/usr/local/bin/cc-switch-router";
 pub const SERVICE_LOG_PATH: &str = "/var/log/cc-switch-router.log";
-pub const RELEASE_BINARY_URL: &str =
-    "https://github.com/Xiechengqi/cc-switch-router/releases/download/latest/cc-switch-router-linux-amd64";
+pub const RELEASE_BINARY_URL: &str = "https://github.com/Xiechengqi/cc-switch-router/releases/download/latest/cc-switch-router-linux-amd64";
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceManager {
     Systemd,
     Nohup,
-    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -138,8 +136,7 @@ pub async fn fetch_latest_release_meta(client: &reqwest::Client) -> LatestReleas
                     meta.etag = value.to_str().ok().map(str::to_string);
                 }
                 if let Some(value) = resp.headers().get("content-length") {
-                    meta.content_length =
-                        value.to_str().ok().and_then(|v| v.trim().parse().ok());
+                    meta.content_length = value.to_str().ok().and_then(|v| v.trim().parse().ok());
                 }
             } else {
                 meta.error = Some(format!("HTTP {}", resp.status()));
@@ -164,19 +161,8 @@ pub struct VersionResponse {
     pub latest: LatestReleaseMeta,
 }
 
-pub fn current_binary_path() -> &'static str {
-    BINARY_INSTALL_PATH
-}
-
 pub fn uptime_secs_from(start: Instant) -> u64 {
     start.elapsed().as_secs()
-}
-
-pub fn redacted_for_anonymous(mut value: VersionResponse) -> VersionResponse {
-    // Anonymous viewers still see version + commit; service unit name and
-    // binary path are sensitive enough to hide.
-    value.service.unit_name = None;
-    value
 }
 
 pub fn ensure_binary_writable() -> Result<(), AppError> {

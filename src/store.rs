@@ -2755,7 +2755,9 @@ impl AppStore {
         let tab = normalize_board_tab(tab);
         let where_clause = match tab.as_str() {
             "pinned" => "status = 'visible' AND pinned_at IS NOT NULL",
-            "featured" => "status = 'visible' AND (featured_at IS NOT NULL OR pinned_at IS NOT NULL)",
+            "featured" => {
+                "status = 'visible' AND (featured_at IS NOT NULL OR pinned_at IS NOT NULL)"
+            }
             _ => "status = 'visible'",
         };
         let sql = format!(
@@ -2778,8 +2780,7 @@ impl AppStore {
             .map_err(|e| AppError::Internal(format!("query board messages failed: {e}")))?;
         let mut messages = Vec::new();
         for row in rows {
-            let row = row
-                .map_err(|e| AppError::Internal(format!("read board row failed: {e}")))?;
+            let row = row.map_err(|e| AppError::Internal(format!("read board row failed: {e}")))?;
             messages.push(row.into_view(viewer_user_id, viewer_guest_id));
         }
         let total_visible: i64 = conn
@@ -2915,9 +2916,7 @@ impl AppStore {
             false
         };
         if !allowed {
-            return Err(AppError::Forbidden(
-                "you cannot delete this message".into(),
-            ));
+            return Err(AppError::Forbidden("you cannot delete this message".into()));
         }
         conn.execute(
             "UPDATE board_messages
@@ -2998,10 +2997,7 @@ impl AppStore {
         Ok(())
     }
 
-    pub async fn list_admin_audit(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<AdminAuditEntry>, AppError> {
+    pub async fn list_admin_audit(&self, limit: usize) -> Result<Vec<AdminAuditEntry>, AppError> {
         let limit = limit.clamp(1, 500);
         let conn = self.conn.lock().await;
         let mut stmt = conn
@@ -3079,13 +3075,7 @@ impl BoardAuthor {
             ),
             BoardAuthor::User { user_id, email } => {
                 let label = mask_email(&email);
-                (
-                    "user".to_string(),
-                    Some(user_id),
-                    Some(email),
-                    label,
-                    None,
-                )
+                ("user".to_string(), Some(user_id), Some(email), label, None)
             }
             BoardAuthor::Guest { guest_id, name } => {
                 let label = name
@@ -3093,13 +3083,7 @@ impl BoardAuthor {
                     .map(normalize_guest_name)
                     .filter(|value| !value.is_empty())
                     .unwrap_or_else(|| "Guest".to_string());
-                (
-                    "guest".to_string(),
-                    None,
-                    None,
-                    label,
-                    Some(guest_id),
-                )
+                ("guest".to_string(), None, None, label, Some(guest_id))
             }
         }
     }
@@ -3165,14 +3149,8 @@ fn map_board_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BoardMessageRow> {
         author_label: row.get(4)?,
         guest_id: row.get(5)?,
         body: row.get(6)?,
-        pinned_at: pinned_at
-            .as_deref()
-            .map(parse_dt_sql)
-            .transpose()?,
-        featured_at: featured_at
-            .as_deref()
-            .map(parse_dt_sql)
-            .transpose()?,
+        pinned_at: pinned_at.as_deref().map(parse_dt_sql).transpose()?,
+        featured_at: featured_at.as_deref().map(parse_dt_sql).transpose()?,
         created_at: parse_dt_sql(&created_at)?,
         status: "visible".to_string(),
     })
@@ -3200,14 +3178,8 @@ fn load_board_message_row(
                 author_label: row.get(4)?,
                 guest_id: row.get(5)?,
                 body: row.get(6)?,
-                pinned_at: pinned_at
-                    .as_deref()
-                    .map(parse_dt_sql)
-                    .transpose()?,
-                featured_at: featured_at
-                    .as_deref()
-                    .map(parse_dt_sql)
-                    .transpose()?,
+                pinned_at: pinned_at.as_deref().map(parse_dt_sql).transpose()?,
+                featured_at: featured_at.as_deref().map(parse_dt_sql).transpose()?,
                 created_at: parse_dt_sql(&created_at)?,
                 status: row.get(10)?,
             })

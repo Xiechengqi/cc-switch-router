@@ -115,9 +115,9 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         field_type: FieldType::Text,
         required: true,
         restart_required: true,
-        default: Some("0.0.0.0:8787"),
+        default: Some("0.0.0.0:80"),
         description: "axum HTTP server bind address. Must be host:port.",
-        placeholder: Some("0.0.0.0:8787"),
+        placeholder: Some("0.0.0.0:80"),
         dynamic_group: None,
     },
     SettingsField {
@@ -140,8 +140,7 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         required: true,
         restart_required: true,
         default: Some("0.0.0.0:8787"),
-        description:
-            "Public host[:port]. Derives router@<host> as the built-in admin and \
+        description: "Public host[:port]. Derives router@<host> as the built-in admin and \
              is sent to clients in lease responses.",
         placeholder: Some("router.example.com"),
         dynamic_group: None,
@@ -165,7 +164,7 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         field_type: FieldType::Bool,
         required: false,
         restart_required: true,
-        default: Some("true"),
+        default: Some("false"),
         description: "When true, generated tunnel URLs use http://. Set false for HTTPS in production.",
         placeholder: None,
         dynamic_group: None,
@@ -437,8 +436,7 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         required: false,
         restart_required: false,
         default: None,
-        description:
-            "Comma-separated extra admin emails. router@<tunnel-host> is always admin.",
+        description: "Comma-separated extra admin emails. router@<tunnel-host> is always admin.",
         placeholder: Some("ops@example.com, sre@example.com"),
         dynamic_group: Some(DynamicGroup::AdminEmails),
     },
@@ -651,11 +649,7 @@ pub fn values_response(env_path: &Path) -> Result<SettingsValuesResponse, AppErr
         };
         let has_value = value.as_deref().map(|v| !v.is_empty()).unwrap_or(false);
         let is_secret = matches!(field.field_type, FieldType::Secret);
-        let display_value = if is_secret {
-            None
-        } else {
-            value.clone()
-        };
+        let display_value = if is_secret { None } else { value.clone() };
         entries.push(SettingValueEntry {
             key: field.key.to_string(),
             value: display_value,
@@ -687,7 +681,10 @@ pub fn validate_and_diff(
     let mut unchanged = Vec::new();
     let mut restart_keys = Vec::new();
     let mut groups: Vec<DynamicGroup> = Vec::new();
-    let mut next: BTreeMap<String, String> = existing.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let mut next: BTreeMap<String, String> = existing
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
 
     for (key, raw_value) in updates {
         let field = field_by_key(key)
@@ -723,7 +720,10 @@ pub fn validate_and_diff(
             restart_keys.push(key.clone());
         }
         if let Some(group) = field.dynamic_group {
-            if !groups.iter().any(|g| std::mem::discriminant(g) == std::mem::discriminant(&group)) {
+            if !groups
+                .iter()
+                .any(|g| std::mem::discriminant(g) == std::mem::discriminant(&group))
+            {
                 groups.push(group);
             }
         }
@@ -752,7 +752,9 @@ pub fn write_env_file_atomic(path: &Path, kv: &BTreeMap<String, String>) -> Resu
     })?;
 
     let mut body = String::new();
-    body.push_str("# cc-switch-router env file. Managed by the admin UI; manual edits remain valid.\n\n");
+    body.push_str(
+        "# cc-switch-router env file. Managed by the admin UI; manual edits remain valid.\n\n",
+    );
     let mut emitted = HashSet::new();
     for field in SETTINGS_FIELDS {
         if let Some(value) = kv.get(field.key) {
@@ -818,10 +820,7 @@ fn normalize_value(field: &SettingsField, raw: &str) -> Result<Option<String>, A
     match field.field_type {
         FieldType::Int => {
             trimmed.parse::<i64>().map_err(|_| {
-                AppError::BadRequest(format!(
-                    "{} must be an integer, got: {raw}",
-                    field.key
-                ))
+                AppError::BadRequest(format!("{} must be an integer, got: {raw}", field.key))
             })?;
             Ok(Some(trimmed.to_string()))
         }
@@ -901,10 +900,7 @@ pub fn apply_updates_to_dynamic(
     static_config: &Config,
 ) {
     for (key, raw) in updates {
-        let value = raw
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
+        let value = raw.as_deref().map(str::trim).filter(|s| !s.is_empty());
         match key.as_str() {
             "CC_SWITCH_ROUTER_ADMIN_EMAILS" => {
                 let mut set = std::collections::HashSet::new();
@@ -933,39 +929,28 @@ pub fn apply_updates_to_dynamic(
                 current.telegram.topic_id = value.and_then(|v| v.parse().ok());
             }
             "CC_SWITCH_ROUTER_TELEGRAM_NOTIFY_ALL" => {
-                current.telegram.notify_all = value
-                    .map(parse_bool_truthy)
-                    .unwrap_or(true);
+                current.telegram.notify_all = value.map(parse_bool_truthy).unwrap_or(true);
             }
             "CC_SWITCH_ROUTER_TELEGRAM_NOTIFY_ADMIN" => {
-                current.telegram.notify_admin = value
-                    .map(parse_bool_truthy)
-                    .unwrap_or(true);
+                current.telegram.notify_admin = value.map(parse_bool_truthy).unwrap_or(true);
             }
             "CC_SWITCH_ROUTER_BOARD_MAX_LEN" => {
-                current.board.max_len = value
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or(1000);
+                current.board.max_len = value.and_then(|v| v.parse::<usize>().ok()).unwrap_or(1000);
             }
             "CC_SWITCH_ROUTER_BOARD_GUEST_PER_HOUR" => {
-                current.board.guest_per_hour = value
-                    .and_then(|v| v.parse::<i64>().ok())
-                    .unwrap_or(5);
+                current.board.guest_per_hour =
+                    value.and_then(|v| v.parse::<i64>().ok()).unwrap_or(5);
             }
             "CC_SWITCH_ROUTER_BOARD_USER_PER_HOUR" => {
-                current.board.user_per_hour = value
-                    .and_then(|v| v.parse::<i64>().ok())
-                    .unwrap_or(30);
+                current.board.user_per_hour =
+                    value.and_then(|v| v.parse::<i64>().ok()).unwrap_or(30);
             }
             "CC_SWITCH_ROUTER_BOARD_PIN_LIMIT" => {
-                current.board.pin_limit = value
-                    .and_then(|v| v.parse::<i64>().ok())
-                    .unwrap_or(3);
+                current.board.pin_limit = value.and_then(|v| v.parse::<i64>().ok()).unwrap_or(3);
             }
             "CC_SWITCH_ROUTER_BOARD_GUEST_SELF_DELETE_SECS" => {
-                current.board.guest_self_delete_secs = value
-                    .and_then(|v| v.parse::<i64>().ok())
-                    .unwrap_or(300);
+                current.board.guest_self_delete_secs =
+                    value.and_then(|v| v.parse::<i64>().ok()).unwrap_or(300);
             }
             // Restart-required fields (paths, addresses, TTLs, Resend API
             // key, auth limits, verification URLs, email From/Reply-To):
@@ -998,14 +983,8 @@ mod tests {
     #[test]
     fn normalize_bool_canonicalizes() {
         let field = field_by_key("CC_SWITCH_ROUTER_TELEGRAM_NOTIFY_ALL").unwrap();
-        assert_eq!(
-            normalize_value(field, "ON").unwrap(),
-            Some("true".into())
-        );
-        assert_eq!(
-            normalize_value(field, "off").unwrap(),
-            Some("false".into())
-        );
+        assert_eq!(normalize_value(field, "ON").unwrap(), Some("true".into()));
+        assert_eq!(normalize_value(field, "off").unwrap(), Some("false".into()));
         assert!(normalize_value(field, "maybe").is_err());
     }
 
@@ -1024,7 +1003,7 @@ mod tests {
         let mut existing = HashMap::new();
         existing.insert(
             "CC_SWITCH_ROUTER_API_ADDR".to_string(),
-            "0.0.0.0:8787".to_string(),
+            "0.0.0.0:80".to_string(),
         );
         let mut updates = BTreeMap::new();
         updates.insert("CC_SWITCH_ROUTER_API_ADDR".into(), Some("".into()));
@@ -1048,16 +1027,22 @@ mod tests {
     fn write_and_read_env_roundtrip() {
         use std::env;
         let dir = env::temp_dir();
-        let path = dir.join(format!("cc-switch-router-test-{}.env", uuid::Uuid::new_v4()));
+        let path = dir.join(format!(
+            "cc-switch-router-test-{}.env",
+            uuid::Uuid::new_v4()
+        ));
         let mut kv = BTreeMap::new();
-        kv.insert("CC_SWITCH_ROUTER_API_ADDR".into(), "0.0.0.0:8787".into());
+        kv.insert("CC_SWITCH_ROUTER_API_ADDR".into(), "0.0.0.0:80".into());
         kv.insert(
             "CC_SWITCH_ROUTER_RESEND_FROM_NAME".into(),
             "Token Switch".into(),
         );
         write_env_file_atomic(&path, &kv).unwrap();
         let parsed = read_env_file(&path).unwrap();
-        assert_eq!(parsed.get("CC_SWITCH_ROUTER_API_ADDR").unwrap(), "0.0.0.0:8787");
+        assert_eq!(
+            parsed.get("CC_SWITCH_ROUTER_API_ADDR").unwrap(),
+            "0.0.0.0:80"
+        );
         assert_eq!(
             parsed.get("CC_SWITCH_ROUTER_RESEND_FROM_NAME").unwrap(),
             "Token Switch"
@@ -1097,9 +1082,7 @@ mod tests {
         // (derived from tunnel_domain) is still merged in.
         assert!(current.admin_emails.contains("alice@example.com"));
         assert!(
-            current
-                .admin_emails
-                .contains("router@router.example.com"),
+            current.admin_emails.contains("router@router.example.com"),
             "default admin must always be present"
         );
     }

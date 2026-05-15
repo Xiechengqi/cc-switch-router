@@ -1,13 +1,15 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 
+use axum::body::Body;
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{any, delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
+use crate::ServerState;
 use crate::admin::{
     restart::{RestartStrategy, schedule_restart},
     settings::{
@@ -18,12 +20,11 @@ use crate::admin::{
     upgrade::{UpgradeLogEntry, UpgradeStatus},
     version::{
         BINARY_INSTALL_PATH, SERVICE_UNIT, ServiceManager, VersionResponse, build_info,
-        detect_service_status, fetch_latest_release_meta, uptime_secs_from,
+        detect_service_status, ensure_binary_writable, fetch_latest_release_meta, uptime_secs_from,
     },
 };
-use crate::dynamic_settings::DynamicSettings;
-use crate::ServerState;
 use crate::client_meta::extract_client_metadata;
+use crate::dynamic_settings::DynamicSettings;
 use crate::error::AppError;
 use crate::models::{
     AuthSession, BindInstallationOwnerEmailRequest, BindInstallationOwnerEmailResponse,
@@ -47,6 +48,10 @@ use crate::store::BoardAuthor;
 
 const REGIONS: &str = include_str!("../regions");
 
+mod ui_assets {
+    include!(concat!(env!("OUT_DIR"), "/ui_assets.rs"));
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RegionOption {
@@ -63,8 +68,6 @@ struct SessionStatusQuery {
 pub fn router(state: ServerState) -> Router {
     Router::new()
         .route("/", any(root_handler))
-        .route("/assets/world-map.svg", get(world_map_svg))
-        .route("/assets/alpine.min.js", get(alpine_js))
         .route("/favicon.ico", get(favicon))
         .route("/v1/healthz", get(health))
         .route("/v1/dashboard", get(dashboard))
@@ -118,7 +121,10 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/board/messages", get(list_board_messages))
         .route("/v1/board/messages", post(post_board_message))
         .route("/v1/board/messages/:id/pin", post(pin_board_message))
-        .route("/v1/board/messages/:id/feature", post(feature_board_message))
+        .route(
+            "/v1/board/messages/:id/feature",
+            post(feature_board_message),
+        )
         .route("/v1/board/messages/:id", delete(delete_board_message))
         .route("/v1/board/meta", get(board_meta))
         .route("/v1/admin/settings/schema", get(admin_settings_schema))
@@ -133,7 +139,7 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/admin/telegram/test", post(admin_telegram_test))
         .route("/v1/admin/audit", get(admin_audit_list))
         .route("/_market/proxy/:share_id/*path", any(market_proxy_handler))
-        .route("/*path", any(proxy_handler))
+        .route("/*path", any(ui_or_proxy_handler))
         .with_state(state)
 }
 
@@ -523,65 +529,83 @@ async fn root_handler(
     }
 
     if matches!(*req.method(), Method::GET | Method::HEAD) {
-        return Html(include_str!("ui/dashboard.html")).into_response();
+        if let Some(response) = ui_response("index.html") {
+            return response;
+        }
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "frontend assets are missing; run frontend build before cargo build",
+        )
+            .into_response();
     }
     StatusCode::NOT_FOUND.into_response()
 }
 
-const WORLD_MAP_SVG: &str = include_str!("ui/world-map.svg");
-const ALPINE_JS: &str = include_str!("ui/assets/alpine.min.js");
-
-fn world_map_etag() -> &'static str {
-    use std::sync::OnceLock;
-    static ETAG: OnceLock<String> = OnceLock::new();
-    ETAG.get_or_init(|| {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(WORLD_MAP_SVG.as_bytes());
-        let digest = hasher.finalize();
-        let hex: String = digest
-            .iter()
-            .take(8)
-            .map(|b| format!("{:02x}", b))
-            .collect();
-        format!("\"wm-{}\"", hex)
-    })
-}
-
-async fn world_map_svg(headers: HeaderMap) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    let etag = world_map_etag();
-    if let Some(if_none_match) = headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok())
-        && if_none_match == etag
-    {
-        return (StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response();
+async fn ui_or_proxy_handler(
+    State(state): State<ServerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request,
+) -> Response {
+    if should_proxy_host(&state, request_host(&req)).await {
+        return proxy_handler(State(state), ConnectInfo(peer), req).await;
     }
-    (
-        [
-            (header::CONTENT_TYPE, "image/svg+xml; charset=utf-8"),
-            (header::CACHE_CONTROL, "public, max-age=2592000"),
-            (header::ETAG, etag),
-        ],
-        WORLD_MAP_SVG,
-    )
-        .into_response()
+    if matches!(*req.method(), Method::GET | Method::HEAD) {
+        if let Some(response) = ui_response_for_request_path(req.uri().path()) {
+            return response;
+        }
+    }
+    proxy_handler(State(state), ConnectInfo(peer), req).await
 }
 
-async fn alpine_js() -> axum::response::Response {
-    use axum::response::IntoResponse;
-    (
-        [
-            (
-                header::CONTENT_TYPE,
-                "application/javascript; charset=utf-8",
-            ),
-            (header::CACHE_CONTROL, "public, max-age=2592000"),
-        ],
-        ALPINE_JS,
-    )
-        .into_response()
+fn request_host(req: &Request) -> String {
+    req.headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
+async fn should_proxy_host(state: &ServerState, host: String) -> bool {
+    state
+        .proxy
+        .backend_for_host(&host, &state.config.tunnel_domain)
+        .await
+        .is_some()
+}
+
+fn ui_response_for_request_path(path: &str) -> Option<Response> {
+    let trimmed = path.trim_start_matches('/');
+    let candidates = [
+        trimmed.to_string(),
+        format!("{}/index.html", trimmed.trim_end_matches('/')),
+        format!("{}index.html", trimmed),
+    ];
+    for candidate in candidates {
+        if candidate.is_empty() {
+            continue;
+        }
+        if let Some(response) = ui_response(&candidate) {
+            return Some(response);
+        }
+    }
+    None
+}
+
+fn ui_response(path: &str) -> Option<Response> {
+    let asset = ui_assets::ui_asset(path)?;
+    let cache_control = if asset.immutable {
+        "public, max-age=31536000, immutable"
+    } else if asset.content_type.starts_with("text/html") {
+        "no-cache"
+    } else {
+        "public, max-age=2592000"
+    };
+    Response::builder()
+        .header(header::CONTENT_TYPE, asset.content_type)
+        .header(header::CACHE_CONTROL, cache_control)
+        .header("X-UI-Asset", asset.path)
+        .body(Body::from(asset.bytes))
+        .ok()
 }
 
 #[cfg(test)]
@@ -928,11 +952,7 @@ async fn post_board_message(
             .as_ref()
             .map(|s| dynamic.is_admin(&s.email))
             .unwrap_or(false);
-        (
-            dynamic.board.clone(),
-            dynamic.telegram.notify_all,
-            admin,
-        )
+        (dynamic.board.clone(), dynamic.telegram.notify_all, admin)
     };
     let author = if let Some(session) = session.as_ref() {
         if is_admin_session {
@@ -1239,6 +1259,7 @@ async fn admin_upgrade_start(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let session = require_admin_session(&state, &headers).await?;
+    ensure_binary_writable()?;
     let client = reqwest::Client::builder()
         .user_agent("cc-switch-router/0.1 upgrade")
         .build()
@@ -1278,9 +1299,12 @@ async fn admin_upgrade_stream(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Query(query): Query<UpgradeStreamQuery>,
-) -> Result<axum::response::Sse<
-    impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
->, AppError> {
+) -> Result<
+    axum::response::Sse<
+        impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+    >,
+    AppError,
+> {
     let session = if let Some(token) = query.access_token.as_deref() {
         state
             .store
@@ -1380,7 +1404,9 @@ async fn emit_done_if_finished(
 
 fn sse_event_from_entry(entry: &UpgradeLogEntry) -> axum::response::sse::Event {
     let data = serde_json::to_string(entry).unwrap_or_default();
-    axum::response::sse::Event::default().event("log").data(data)
+    axum::response::sse::Event::default()
+        .event("log")
+        .data(data)
 }
 
 async fn admin_telegram_test(

@@ -550,11 +550,11 @@ Usage:
   cc-switch-router -h
 
 Environment:
-  CC_SWITCH_ROUTER_API_ADDR              HTTP listen address, default 0.0.0.0:8787
+  CC_SWITCH_ROUTER_API_ADDR              HTTP listen address, default 0.0.0.0:80
   CC_SWITCH_ROUTER_SSH_ADDR              SSH listen address, default 0.0.0.0:2222
   CC_SWITCH_ROUTER_TUNNEL_DOMAIN         Public tunnel domain, default 0.0.0.0:8787
   CC_SWITCH_ROUTER_SSH_PUBLIC_ADDR       SSH address sent to clients, default TUNNEL_DOMAIN:SSH_PORT
-  CC_SWITCH_ROUTER_USE_LOCALHOST         Use http for localhost-style domains, default true
+  CC_SWITCH_ROUTER_USE_LOCALHOST         Use http for localhost-style domains, default false
   CC_SWITCH_ROUTER_LEASE_TTL_SECS        Tunnel lease ttl, default 60
   CC_SWITCH_ROUTER_DB_PATH               SQLite path, default $HOME/.config/cc-switch-router/cc-switch-router.db
   CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS Cleanup interval, default 300

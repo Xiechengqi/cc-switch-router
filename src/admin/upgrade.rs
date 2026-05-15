@@ -1,5 +1,5 @@
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -80,7 +80,9 @@ impl UpgradeRegistry {
         if let Some(handle) = guard.as_ref() {
             let status = *handle.status.lock().await;
             if matches!(status, UpgradeStatus::Running) {
-                return Err(AppError::Conflict("an upgrade is already in progress".into()));
+                return Err(AppError::Conflict(
+                    "an upgrade is already in progress".into(),
+                ));
             }
         }
         let task_id = Uuid::new_v4().to_string();
@@ -182,8 +184,7 @@ async fn run_upgrade(
             "ensure install dir failed: {err}"
         )));
     }
-    let tmp_path =
-        target_parent.join(format!("cc-switch-router.upgrade-{}", handle.task_id));
+    let tmp_path = target_parent.join(format!("cc-switch-router.upgrade-{}", handle.task_id));
     emit(
         handle,
         1,
@@ -202,21 +203,22 @@ async fn run_upgrade(
         Some(progress_pct(2, 0)),
     )
     .await;
-    let bytes_written = match download_with_progress(&client, RELEASE_BINARY_URL, &tmp_path, handle).await {
-        Ok(n) => n,
-        Err(err) => {
-            cleanup_tmp(&tmp_path);
-            emit(
-                handle,
-                2,
-                UpgradeLogLevel::Error,
-                format!("download failed: {err}"),
-                None,
-            )
-            .await;
-            return Err(err);
-        }
-    };
+    let bytes_written =
+        match download_with_progress(&client, RELEASE_BINARY_URL, &tmp_path, handle).await {
+            Ok(n) => n,
+            Err(err) => {
+                cleanup_tmp(&tmp_path);
+                emit(
+                    handle,
+                    2,
+                    UpgradeLogLevel::Error,
+                    format!("download failed: {err}"),
+                    None,
+                )
+                .await;
+                return Err(err);
+            }
+        };
     emit(
         handle,
         2,
@@ -318,9 +320,7 @@ async fn run_upgrade(
         handle,
         5,
         UpgradeLogLevel::Success,
-        format!(
-            "installed new binary at {BINARY_INSTALL_PATH} (backup at {bak_path})"
-        ),
+        format!("installed new binary at {BINARY_INSTALL_PATH} (backup at {bak_path})"),
         Some(progress_pct(5, 100)),
     )
     .await;
@@ -397,7 +397,8 @@ async fn download_with_progress(
     let mut downloaded: u64 = 0;
     let mut next_tick: u64 = DOWNLOAD_BUFFER_TICK_BYTES;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|err| AppError::Internal(format!("download chunk failed: {err}")))?;
+        let chunk =
+            chunk.map_err(|err| AppError::Internal(format!("download chunk failed: {err}")))?;
         file.write_all(&chunk)
             .await
             .map_err(|err| AppError::Internal(format!("write tmp failed: {err}")))?;
@@ -405,7 +406,9 @@ async fn download_with_progress(
         if downloaded >= next_tick {
             next_tick = downloaded + DOWNLOAD_BUFFER_TICK_BYTES;
             let pct = match total {
-                Some(t) if t > 0 => Some(((downloaded as f64 / t as f64) * 100.0).clamp(0.0, 100.0) as u8),
+                Some(t) if t > 0 => {
+                    Some(((downloaded as f64 / t as f64) * 100.0).clamp(0.0, 100.0) as u8)
+                }
                 _ => None,
             };
             let msg = match total {
@@ -435,13 +438,10 @@ fn chmod_exec(path: &Path) -> Result<(), AppError> {
 }
 
 async fn sanity_exec(path: &Path) -> Result<(), AppError> {
-    let output = tokio::time::timeout(
-        SANITY_TIMEOUT,
-        Command::new(path).arg("--help").output(),
-    )
-    .await
-    .map_err(|_| AppError::Internal("sanity --help timed out".into()))?
-    .map_err(|err| AppError::Internal(format!("sanity exec failed: {err}")))?;
+    let output = tokio::time::timeout(SANITY_TIMEOUT, Command::new(path).arg("--help").output())
+        .await
+        .map_err(|_| AppError::Internal("sanity --help timed out".into()))?
+        .map_err(|err| AppError::Internal(format!("sanity exec failed: {err}")))?;
     if !output.status.success() {
         return Err(AppError::Internal(format!(
             "sanity --help exited with status {}",
@@ -477,7 +477,9 @@ fn swap_binary(new_path: &Path, target: &Path, bak: &Path) -> Result<(), AppErro
         if bak.exists() {
             let _ = std::fs::rename(bak, target);
         }
-        return Err(AppError::Internal(format!("install new binary failed: {err}")));
+        return Err(AppError::Internal(format!(
+            "install new binary failed: {err}"
+        )));
     }
     Ok(())
 }
@@ -513,14 +515,4 @@ mod tests {
     }
 }
 
-/// Backports of arc-by-ref helpers so the registry stays Send + Sync.
-pub fn registry() -> Arc<UpgradeRegistry> {
-    Arc::new(UpgradeRegistry::new())
-}
-
 pub type SharedUpgradeRegistry = Arc<UpgradeRegistry>;
-
-/// Path to the latest backup, if any.
-pub fn current_backup_path() -> PathBuf {
-    PathBuf::from(format!("{BINARY_INSTALL_PATH}.bak"))
-}
