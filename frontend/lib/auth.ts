@@ -138,13 +138,8 @@ export async function signAuthPayload(action: string, payload: Record<string, un
   const identity = await ensureInstallationIdentity();
   const timestampMs = Date.now();
   const nonce = crypto.randomUUID ? crypto.randomUUID() : `${timestampMs}-${Math.random()}`;
-  const body = JSON.stringify({
-    action,
-    installationId: identity.installationId,
-    timestampMs,
-    nonce,
-    payload,
-  });
+  const payloadJson = JSON.stringify(payload);
+  const body = `${identity.installationId}\n${action}\n${payloadJson}\n${timestampMs}\n${nonce}`;
   const privateKey = await importPrivateKey(identity.privateKey);
   const signature = bytesToBase64(new Uint8Array(await crypto.subtle.sign("Ed25519", privateKey, new TextEncoder().encode(body))));
   return {

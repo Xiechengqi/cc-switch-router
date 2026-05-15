@@ -128,6 +128,62 @@ a {
   backdrop-filter: blur(14px);
 }
 
+.settings-surface {
+  --foreground: rgb(var(--router-foreground));
+  --surface: rgb(var(--router-card));
+  --surface-foreground: rgb(var(--router-card-foreground));
+  --surface-secondary: rgb(var(--router-muted));
+  --surface-secondary-foreground: rgb(var(--router-foreground));
+  --surface-tertiary: rgb(226 232 240);
+  --surface-tertiary-foreground: rgb(var(--router-foreground));
+  --overlay: rgb(var(--router-popover));
+  --overlay-foreground: rgb(var(--router-popover-foreground));
+  --muted: rgb(var(--router-muted-foreground));
+  --default: rgb(var(--router-muted));
+  --default-foreground: rgb(var(--router-foreground));
+  --field-background: rgb(var(--router-card));
+  --field-foreground: rgb(var(--router-foreground));
+  --field-placeholder: rgb(var(--router-muted-foreground));
+  --field-border: rgb(var(--router-border));
+  --accent: rgb(var(--router-accent));
+  --accent-foreground: rgb(var(--router-accent-foreground));
+  --accent-soft: rgba(0, 82, 255, 0.12);
+  --accent-soft-foreground: rgb(var(--router-accent));
+  --success: rgb(22 163 74);
+  --success-foreground: rgb(15 23 42);
+  --success-soft: rgb(220 252 231);
+  --success-soft-foreground: rgb(21 128 61);
+  --warning: rgb(217 119 6);
+  --warning-foreground: rgb(15 23 42);
+  --warning-soft: rgb(254 243 199);
+  --warning-soft-foreground: rgb(146 64 14);
+  --danger: rgb(220 38 38);
+  --danger-foreground: rgb(255 255 255);
+  --danger-soft: rgb(254 226 226);
+  --danger-soft-foreground: rgb(185 28 28);
+  color: rgb(var(--router-foreground));
+}
+
+.settings-surface .card,
+.settings-surface .modal__dialog {
+  color: rgb(var(--router-card-foreground));
+}
+
+.settings-surface .card__description,
+.settings-surface .alert__description {
+  color: rgb(var(--router-muted-foreground));
+}
+
+.settings-surface .alert__content,
+.settings-surface .alert__title {
+  color: rgb(var(--router-foreground));
+}
+
+.settings-surface .input,
+.settings-surface .textarea {
+  color: rgb(var(--router-foreground));
+}
+
 .mono-label {
   font-family: var(--font-jetbrains), "JetBrains Mono", monospace;
   font-size: 0.72rem;

@@ -1,7 +1,9 @@
 "use client";
 
 import { Minus, Plus, RotateCcw } from "lucide-react";
+import { Button } from "@heroui/react";
 import * as React from "react";
+import { useLocaleText } from "@/components/i18n/locale-provider";
 import type { DashboardResponse, MapPoint, MarketRequestLog, RecentRequestEvent, ShareRequestLog } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -92,6 +94,7 @@ function RequestTicker({ data }: { data: DashboardResponse | null }) {
 }
 
 export function LiveMap({ data }: { data: DashboardResponse | null }) {
+  const { t } = useLocaleText();
   const shellRef = React.useRef<HTMLDivElement | null>(null);
   const worldRef = React.useRef<HTMLDivElement | null>(null);
   const dragRef = React.useRef<{ pointerId: number; x: number; y: number; panX: number; panY: number } | null>(null);
@@ -193,7 +196,7 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
         touchAction: "none",
       }}
       tabIndex={0}
-      aria-label="Live network map"
+      aria-label={t("map.aria")}
       onDragStart={(event) => event.preventDefault()}
       onWheel={(event) => {
         event.preventDefault();
@@ -279,7 +282,7 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
                 key={`${point.pointType}-${point.id}`}
                 className="absolute -translate-x-1/2 -translate-y-1/2 rounded-full focus:outline-none"
                 style={{ left: `${pos.x}%`, top: `${pos.y}%` }}
-                title={[point.label, point.city, point.region, point.country, point.activeRequests ? `${point.activeRequests} active` : ""].filter(Boolean).join(" · ")}
+                title={[point.label, point.city, point.region, point.country, point.activeRequests ? t("map.active", { count: point.activeRequests }) : ""].filter(Boolean).join(" · ")}
               >
                 <div
                   className={cn(
@@ -294,27 +297,27 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
           })}
       </div>
       <div className="absolute bottom-[4%] left-[1.6%] z-30 inline-flex items-center gap-0.5 rounded-lg border border-slate-200/70 bg-white/50 p-1 text-slate-600 backdrop-blur-sm">
-        <button className="grid h-6 w-6 place-items-center rounded-md hover:bg-blue-50 hover:text-primary" type="button" aria-label="Zoom out" onClick={() => setZoom(zoom - 0.25)}>
+        <Button variant="ghost" size="sm" isIconOnly className="h-6 w-6 min-w-0 rounded-md p-0 text-slate-600 hover:bg-blue-50 hover:text-primary" aria-label={t("map.zoomOut")} onClick={() => setZoom(zoom - 0.25)}>
           <Minus className="h-3.5 w-3.5" />
-        </button>
+        </Button>
         <span className="min-w-9 text-center font-mono text-[10px] text-slate-500">{Math.round(zoom * 100)}%</span>
-        <button className="grid h-6 w-6 place-items-center rounded-md hover:bg-blue-50 hover:text-primary" type="button" aria-label="Zoom in" onClick={() => setZoom(zoom + 0.25)}>
+        <Button variant="ghost" size="sm" isIconOnly className="h-6 w-6 min-w-0 rounded-md p-0 text-slate-600 hover:bg-blue-50 hover:text-primary" aria-label={t("map.zoomIn")} onClick={() => setZoom(zoom + 0.25)}>
           <Plus className="h-3.5 w-3.5" />
-        </button>
-        <button className="grid h-6 w-6 place-items-center rounded-md hover:bg-blue-50 hover:text-primary" type="button" aria-label="Reset map view" onClick={reset}>
+        </Button>
+        <Button variant="ghost" size="sm" isIconOnly className="h-6 w-6 min-w-0 rounded-md p-0 text-slate-600 hover:bg-blue-50 hover:text-primary" aria-label={t("map.reset")} onClick={reset}>
           <RotateCcw className="h-3.5 w-3.5" />
-        </button>
+        </Button>
       </div>
       <div className="absolute bottom-[4%] right-[1.6%] z-30 flex max-w-[min(34%,280px)] flex-wrap gap-2 rounded-lg border border-slate-200/70 bg-white/50 px-2 py-1.5 text-[10px] text-slate-500 backdrop-blur-sm">
-        <span className="inline-flex items-center gap-1"><i className="h-1.5 w-1.5 rounded-full bg-primary" />router</span>
-        <span className="inline-flex items-center gap-1"><i className="h-1.5 w-1.5 rounded-full bg-primary" />active client</span>
-        <span className="inline-flex items-center gap-1"><i className="h-1.5 w-1.5 rounded-full bg-slate-500 opacity-55" />idle client</span>
+        <span className="inline-flex items-center gap-1"><i className="h-1.5 w-1.5 rounded-full bg-primary" />{t("map.router")}</span>
+        <span className="inline-flex items-center gap-1"><i className="h-1.5 w-1.5 rounded-full bg-primary" />{t("map.activeClient")}</span>
+        <span className="inline-flex items-center gap-1"><i className="h-1.5 w-1.5 rounded-full bg-slate-500 opacity-55" />{t("map.idleClient")}</span>
       </div>
       {points.length === 0 ? (
         <div className="pointer-events-none absolute inset-0 z-20 grid place-items-center text-center text-muted-foreground">
           <div>
-            <div className="font-semibold text-slate-600">Waiting for the network</div>
-            <div className="mt-2 font-mono text-[11px] uppercase tracking-[0.14em]">No server geo · No active clients</div>
+            <div className="font-semibold text-slate-600">{t("map.waiting")}</div>
+            <div className="mt-2 font-mono text-[11px] uppercase tracking-[0.14em]">{t("map.empty")}</div>
           </div>
         </div>
       ) : null}

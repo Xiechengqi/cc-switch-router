@@ -3,6 +3,7 @@
 import { Loader2, RefreshCw, Rocket, RotateCcw } from "lucide-react";
 import { Alert, Button, Card, Chip, Modal, ScrollShadow } from "@heroui/react";
 import * as React from "react";
+import { useLocaleText } from "@/components/i18n/locale-provider";
 import { readAuthState } from "@/lib/auth";
 import { getVersion, restartService, startUpgrade } from "@/lib/api";
 import type { VersionResponse } from "@/lib/types";
@@ -23,6 +24,7 @@ function formatBytes(bytes?: number | null) {
 }
 
 export function VersionPanel({ isAdmin }: { isAdmin: boolean }) {
+  const { t } = useLocaleText();
   const [info, setInfo] = React.useState<VersionResponse | null>(null);
   const [error, setError] = React.useState("");
   const [busy, setBusy] = React.useState<string | null>(null);
@@ -43,12 +45,12 @@ export function VersionPanel({ isAdmin }: { isAdmin: boolean }) {
   }, [refresh]);
 
   async function restart() {
-    if (!window.confirm("Restart cc-switch-router now?")) return;
+    if (!window.confirm(t("version.confirmRestart"))) return;
     setBusy("restart");
     setError("");
     try {
       await restartService();
-      setLogs((prev) => [...prev, "Restart scheduled. Waiting for service health..."]);
+      setLogs((prev) => [...prev, t("version.restartScheduledHealth")]);
       pollHealthAndReload().catch(console.error);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -57,7 +59,7 @@ export function VersionPanel({ isAdmin }: { isAdmin: boolean }) {
   }
 
   async function upgrade() {
-    if (!window.confirm("Download latest binary, replace current binary, and restart?")) return;
+    if (!window.confirm(t("version.confirmUpgrade"))) return;
     setBusy("upgrade");
     setError("");
     setLogs([]);
@@ -90,7 +92,7 @@ export function VersionPanel({ isAdmin }: { isAdmin: boolean }) {
       pollHealthAndReload().catch(console.error);
     });
     source.onerror = () => {
-      setLogs((prev) => [...prev, "upgrade stream disconnected"]);
+      setLogs((prev) => [...prev, t("version.streamDisconnected")]);
       source.close();
       setBusy(null);
     };
@@ -100,32 +102,32 @@ export function VersionPanel({ isAdmin }: { isAdmin: boolean }) {
     <Card className="rounded-lg">
       <Card.Header className="flex-row items-start justify-between gap-4 space-y-0">
         <div>
-          <Card.Title>Version</Card.Title>
-          <Card.Description>Build, service status, and binary lifecycle.</Card.Description>
+          <Card.Title>{t("settings.version")}</Card.Title>
+          <Card.Description>{t("version.description")}</Card.Description>
         </div>
-        <Button variant="outline" isIconOnly onClick={() => refresh()} aria-label="Refresh version">
+        <Button variant="outline" isIconOnly onClick={() => refresh()} aria-label={t("version.refresh")}>
           <RefreshCw className="h-4 w-4" />
         </Button>
       </Card.Header>
       <Card.Content className="grid gap-4">
-        {error ? <Alert status="danger">{error}</Alert> : null}
+        {error ? <Alert status="danger" className="!text-slate-900">{error}</Alert> : null}
         <div className="grid gap-3 sm:grid-cols-2">
-          <Info label="Current" value={`${info?.version || "--"} (${info?.commit || "--"})`} />
-          <Info label="Built" value={formatDateTime(info?.buildTime)} />
-          <Info label="Uptime" value={formatUptime(info?.uptimeSecs || 0)} />
-          <Info label="Service" value={<Chip color={info?.service.active ? "success" : "default"} size="sm" variant={info?.service.active ? "soft" : "tertiary"}>{info?.service.manager || "--"} / {info?.service.activeState || (info?.service.active ? "active" : "inactive")}</Chip>} />
-          <Info label="Latest binary" value={info?.latest.available ? `available ${formatBytes(info.latest.contentLength)}` : info?.latest.error || "unknown"} />
-          <Info label="Binary path" value={isAdmin ? info?.binaryPath || "--" : "admin only"} />
+          <Info label={t("version.current")} value={`${info?.version || "--"} (${info?.commit || "--"})`} />
+          <Info label={t("version.built")} value={formatDateTime(info?.buildTime)} />
+          <Info label={t("version.uptime")} value={formatUptime(info?.uptimeSecs || 0)} />
+          <Info label={t("version.service")} value={<Chip color={info?.service.active ? "success" : "default"} size="sm" variant={info?.service.active ? "soft" : "tertiary"}>{info?.service.manager || "--"} / {info?.service.activeState || (info?.service.active ? "active" : "inactive")}</Chip>} />
+          <Info label={t("version.latestBinary")} value={info?.latest.available ? t("version.available", { size: formatBytes(info.latest.contentLength) }) : info?.latest.error || t("version.unknown")} />
+          <Info label={t("version.binaryPath")} value={isAdmin ? info?.binaryPath || "--" : t("version.adminOnly")} />
         </div>
         {isAdmin ? (
           <div className="flex flex-wrap gap-2">
             <Button variant="outline" onClick={restart} isDisabled={!!busy}>
               {busy === "restart" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}
-              Restart
+              {t("common.restart")}
             </Button>
             <Button variant="primary" onClick={upgrade} isDisabled={!!busy}>
               {busy === "upgrade" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Rocket className="h-4 w-4" />}
-              Upgrade
+              {t("common.upgrade")}
             </Button>
           </div>
         ) : null}
@@ -133,18 +135,18 @@ export function VersionPanel({ isAdmin }: { isAdmin: boolean }) {
       <Modal isOpen={upgradeOpen} onOpenChange={setUpgradeOpen}>
         <Modal.Backdrop>
           <Modal.Container placement="center" size="lg">
-            <Modal.Dialog>
-              <Modal.CloseTrigger />
+            <Modal.Dialog className="!bg-white !text-slate-900">
+              <Modal.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
               <Modal.Header>
                 <div>
-                  <Modal.Heading>Upgrade Log</Modal.Heading>
-                  <p className="mt-1 text-sm text-muted-foreground">Live output from the binary upgrade task.</p>
+                  <Modal.Heading>{t("version.upgradeLog")}</Modal.Heading>
+                  <p className="mt-1 text-sm text-muted-foreground">{t("version.upgradeLogDesc")}</p>
                 </div>
               </Modal.Header>
               <Modal.Body>
                 <ScrollShadow className="h-96 rounded-lg border bg-slate-950 p-4 font-mono text-xs text-slate-100">
                   <div className="grid gap-2 pr-3">
-                    {logs.length ? logs.map((line, index) => <div key={`${index}-${line}`}>{line}</div>) : <div>Waiting for log entries...</div>}
+                    {logs.length ? logs.map((line, index) => <div key={`${index}-${line}`}>{line}</div>) : <div>{t("version.waitingLogs")}</div>}
                   </div>
                 </ScrollShadow>
               </Modal.Body>
@@ -158,10 +160,12 @@ export function VersionPanel({ isAdmin }: { isAdmin: boolean }) {
 
 function Info({ label, value }: { label: string; value?: React.ReactNode }) {
   return (
-    <div className="rounded-lg border bg-muted/30 p-3">
-      <div className="mono-label text-muted-foreground">{label}</div>
-      <div className="mt-2 break-words text-sm font-medium">{value || "--"}</div>
-    </div>
+    <Card className="rounded-lg border bg-muted/30 p-0 shadow-none">
+      <Card.Content className="p-3">
+        <div className="mono-label text-muted-foreground">{label}</div>
+        <div className="mt-2 break-words text-sm font-medium">{value || "--"}</div>
+      </Card.Content>
+    </Card>
   );
 }
 

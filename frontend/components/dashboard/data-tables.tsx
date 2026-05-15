@@ -1,8 +1,9 @@
 "use client";
 
 import { ExternalLink } from "lucide-react";
-import { Card, Chip, Modal } from "@heroui/react";
+import { Card, Chip, Modal, ProgressBar } from "@heroui/react";
 import * as React from "react";
+import { useLocaleText } from "@/components/i18n/locale-provider";
 import type { DashboardClient, DashboardMarket, HealthCheckEntry, ShareAppRuntimes, ShareView } from "@/lib/types";
 import { compactTokens, formatDateTime, formatNumber, formatRelativeTime } from "@/lib/utils";
 
@@ -49,17 +50,21 @@ function sortMarkets(markets: DashboardMarket[]) {
   return [...markets].sort((a, b) => Number(b.online) - Number(a.online) || (a.displayName || a.id).localeCompare(b.displayName || b.id));
 }
 
+type TFn = ReturnType<typeof useLocaleText>["t"];
+
 function StatusBadge({ active, label }: { active: boolean; label: string }) {
   return <Chip color={active ? "success" : "default"} size="sm" variant={active ? "soft" : "tertiary"}>{label}</Chip>;
 }
 
-function UsageBar({ used, limit }: { used: number; limit: number }) {
-  if (isUnlimited(limit)) return <span className="text-muted-foreground">unlimited</span>;
+function UsageBar({ used, limit, t }: { used: number; limit: number; t: TFn }) {
+  if (isUnlimited(limit)) return <span className="text-muted-foreground">{t("common.unlimited")}</span>;
   const pct = limit > 0 ? Math.min(100, Math.max(0, (used / limit) * 100)) : 0;
   return (
-    <div className="mt-1 h-1 w-32 overflow-hidden rounded bg-muted">
-      <div className="h-full rounded bg-primary" style={{ width: `${pct}%` }} />
-    </div>
+    <ProgressBar aria-label={t("progress.usage")} value={pct} minValue={0} maxValue={100} size="sm" className="mt-1 w-32 gap-0">
+      <ProgressBar.Track className="h-1 rounded bg-muted">
+        <ProgressBar.Fill className="rounded bg-primary" />
+      </ProgressBar.Track>
+    </ProgressBar>
   );
 }
 
@@ -86,14 +91,14 @@ function upstreamPercent(apps?: ShareAppRuntimes, key?: keyof ShareAppRuntimes) 
   return Number.isInteger(value) && Number(value) > 0 ? `${value}%` : "-";
 }
 
-function ForSaleCell({ share }: { share?: ShareView }) {
+function ForSaleCell({ share, t }: { share?: ShareView; t: TFn }) {
   if (!share) return <span className="text-muted-foreground">-</span>;
-  const value = share.forSale === "Free" ? "Free" : share.forSale === "Yes" ? "Yes" : "No";
-  const marketLines = share.marketAccessMode === "all" ? ["All markets"] : (share.marketLinks || []).map((market) => market.subdomain).filter(Boolean);
+  const value = share.forSale === "Free" ? t("dashboard.free") : share.forSale === "Yes" ? t("dashboard.yes") : t("dashboard.no");
+  const marketLines = share.marketAccessMode === "all" ? [t("dashboard.allMarkets")] : (share.marketLinks || []).map((market) => market.subdomain).filter(Boolean);
   return (
     <div className="grid min-w-32 gap-1.5">
       <Chip size="sm" variant={value === "No" ? "tertiary" : "soft"}>{value}</Chip>
-      {value === "Yes" ? (
+      {share.forSale === "Yes" ? (
         <div className="grid gap-0.5 font-mono text-[11px] text-muted-foreground">
           <div>Claude {upstreamPercent(share.appRuntimes, "claude")}</div>
           <div>Codex {upstreamPercent(share.appRuntimes, "codex")}</div>
@@ -105,7 +110,7 @@ function ForSaleCell({ share }: { share?: ShareView }) {
   );
 }
 
-function SupportCell({ share }: { share?: ShareView }) {
+function SupportCell({ share, t }: { share?: ShareView; t: TFn }) {
   if (!share) return <span className="text-muted-foreground">-</span>;
   const rows: Array<[keyof ShareAppRuntimes, string]> = [["claude", "Claude"], ["codex", "Codex"], ["gemini", "Gemini"]];
   return (
@@ -117,7 +122,7 @@ function SupportCell({ share }: { share?: ShareView }) {
         return (
           <div key={key} className={`grid grid-cols-[56px_1fr] gap-2 rounded-lg border px-2 py-1.5 text-[11px] ${enabled ? "border-emerald-200 bg-emerald-50 text-emerald-700" : "bg-slate-50 text-muted-foreground"}`}>
             <span className="font-mono uppercase">{label}</span>
-            <span className="truncate text-right font-semibold">{enabled ? runtime?.kind || models || "on" : "off"}</span>
+            <span className="truncate text-right font-semibold">{enabled ? runtime?.kind || models || t("dashboard.on") : t("dashboard.off")}</span>
           </div>
         );
       })}
@@ -125,41 +130,42 @@ function SupportCell({ share }: { share?: ShareView }) {
   );
 }
 
-function ShareStatusCell({ share }: { share?: ShareView }) {
+function ShareStatusCell({ share, t }: { share?: ShareView; t: TFn }) {
   if (!share) return <span className="text-muted-foreground">-</span>;
-  if (!share.isOnline) return <Chip size="sm" variant="tertiary">Offline</Chip>;
+  if (!share.isOnline) return <Chip size="sm" variant="tertiary">{t("common.offline")}</Chip>;
   const limit = isUnlimited(share.parallelLimit) ? "∞" : String(share.parallelLimit || 0);
   return (
     <div className="grid min-w-52 gap-2 text-sm">
-      <div className="grid grid-cols-[54px_1fr] gap-2"><span className="mono-label text-muted-foreground">Usage</span><div><strong>{compactTokens(share.tokensUsed)} / {isUnlimited(share.tokenLimit) ? "∞" : compactTokens(share.tokenLimit)}</strong><UsageBar used={share.tokensUsed} limit={share.tokenLimit} /></div></div>
-      <div className="grid grid-cols-[54px_1fr] gap-2"><span className="mono-label text-muted-foreground">Expires</span><strong title={formatDateTime(share.expiresAt)}>{formatRelativeTime(share.expiresAt)}</strong></div>
-      <div className="grid grid-cols-[54px_1fr] gap-2"><span className="mono-label text-muted-foreground">Parallel</span><strong>{share.activeRequests || 0}<span className="text-muted-foreground">/{limit}</span></strong></div>
-      <div className="grid grid-cols-[54px_1fr] gap-2"><span className="mono-label text-muted-foreground">Online</span><strong title={`${share.onlineMinutes24h || 0} / 1440 min with successful route probes in last 24h`}>{(share.onlineRate24h || 0).toFixed(1)}%</strong></div>
-      <div className="grid grid-cols-[54px_1fr] gap-2"><span className="mono-label text-muted-foreground">Health</span><HealthDots entries={share.healthChecks} /></div>
+      <div className="grid grid-cols-[54px_1fr] gap-2"><span className="mono-label text-muted-foreground">{t("dashboard.usage")}</span><div><strong>{compactTokens(share.tokensUsed)} / {isUnlimited(share.tokenLimit) ? "∞" : compactTokens(share.tokenLimit)}</strong><UsageBar used={share.tokensUsed} limit={share.tokenLimit} t={t} /></div></div>
+      <div className="grid grid-cols-[54px_1fr] gap-2"><span className="mono-label text-muted-foreground">{t("dashboard.expires")}</span><strong title={formatDateTime(share.expiresAt)}>{formatRelativeTime(share.expiresAt)}</strong></div>
+      <div className="grid grid-cols-[54px_1fr] gap-2"><span className="mono-label text-muted-foreground">{t("dashboard.parallel")}</span><strong>{share.activeRequests || 0}<span className="text-muted-foreground">/{limit}</span></strong></div>
+      <div className="grid grid-cols-[54px_1fr] gap-2"><span className="mono-label text-muted-foreground">{t("dashboard.online")}</span><strong title={`${share.onlineMinutes24h || 0} / 1440 min with successful route probes in last 24h`}>{(share.onlineRate24h || 0).toFixed(1)}%</strong></div>
+      <div className="grid grid-cols-[54px_1fr] gap-2"><span className="mono-label text-muted-foreground">{t("dashboard.health")}</span><HealthDots entries={share.healthChecks} /></div>
     </div>
   );
 }
 
 export function ClientsTable({ clients }: { clients: DashboardClient[] }) {
   const [selected, setSelected] = React.useState<DashboardClient | null>(null);
+  const { t } = useLocaleText();
   const sorted = sortClients(clients);
   return (
     <section className="grid gap-3">
       <div className="flex items-center justify-between font-mono text-[11px] uppercase tracking-[0.14em] text-muted-foreground">
-        <div>CLIENTS <span className="font-semibold text-foreground">{sorted.length}</span></div>
-        <a href="https://github.com/Xiechengqi/cc-switch/releases" target="_blank" rel="noopener noreferrer" className="transition-colors hover:text-blue-400">[install]</a>
+        <div>{t("dashboard.clients")} <span className="font-semibold text-foreground">{sorted.length}</span></div>
+        <a href="https://github.com/Xiechengqi/cc-switch/releases" target="_blank" rel="noopener noreferrer" className="transition-colors hover:text-blue-400">{t("dashboard.install")}</a>
       </div>
       <Card className="overflow-hidden rounded-[20px]">
         <Card.Content className="overflow-x-auto p-0">
           <table className="w-full min-w-[1180px] border-collapse text-sm">
             <thead className="bg-muted text-left font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground">
               <tr>
-                <th className="w-44 px-4 py-3">Share</th>
-                <th className="px-4 py-3">API URL&KEY</th>
-                <th className="px-4 py-3">ForSale</th>
-                <th className="px-4 py-3">Region</th>
-                <th className="px-4 py-3">Status</th>
-                <th className="px-4 py-3">Support</th>
+                <th className="w-44 px-4 py-3">{t("dashboard.share")}</th>
+                <th className="px-4 py-3">{t("dashboard.apiUrlKey")}</th>
+                <th className="px-4 py-3">{t("dashboard.forSale")}</th>
+                <th className="px-4 py-3">{t("dashboard.region")}</th>
+                <th className="px-4 py-3">{t("dashboard.status")}</th>
+                <th className="px-4 py-3">{t("dashboard.support")}</th>
                 <th className="w-7 px-4 py-3" />
               </tr>
             </thead>
@@ -169,24 +175,24 @@ export function ClientsTable({ clients }: { clients: DashboardClient[] }) {
                 const api = shareApiParts(share);
                 return (
                   <tr key={client.installation.id} className="cursor-pointer border-b last:border-0 hover:bg-primary/5" onClick={() => setSelected(client)}>
-                    <td className="w-44 break-words px-4 py-3 align-middle font-medium text-muted-foreground">{share?.shareName || "No share"}</td>
+                    <td className="w-44 break-words px-4 py-3 align-middle font-medium text-muted-foreground">{share?.shareName || t("dashboard.noShare")}</td>
                     <td className="px-4 py-3 align-middle">
                       <div className="grid min-w-48 gap-1.5">
                         <strong>{api.apiUrl}</strong>
                         <span className="break-all font-mono text-xs text-muted-foreground">{share?.canViewSecret ? api.apiKey : share ? "***" : "-"}</span>
                       </div>
                     </td>
-                    <td className="px-4 py-3 align-middle"><ForSaleCell share={share} /></td>
+                    <td className="px-4 py-3 align-middle"><ForSaleCell share={share} t={t} /></td>
                     <td className="px-4 py-3 align-middle text-muted-foreground">
                       {client.installation.countryCode || "-"}
                     </td>
-                    <td className="px-4 py-3 align-middle"><ShareStatusCell share={share} /></td>
-                    <td className="px-4 py-3 align-middle"><SupportCell share={share} /></td>
+                    <td className="px-4 py-3 align-middle"><ShareStatusCell share={share} t={t} /></td>
+                    <td className="px-4 py-3 align-middle"><SupportCell share={share} t={t} /></td>
                     <td className="px-4 py-3 align-middle text-lg text-muted-foreground">›</td>
                   </tr>
                 );
               }) : (
-                <tr><td colSpan={7} className="px-4 py-10 text-center text-muted-foreground">No clients yet</td></tr>
+                <tr><td colSpan={7} className="px-4 py-10 text-center text-muted-foreground">{t("dashboard.noClients")}</td></tr>
               )}
             </tbody>
           </table>
@@ -195,8 +201,8 @@ export function ClientsTable({ clients }: { clients: DashboardClient[] }) {
       <Modal isOpen={!!selected} onOpenChange={(open) => !open && setSelected(null)}>
         <Modal.Backdrop>
           <Modal.Container placement="center" size="lg">
-            <Modal.Dialog>
-              <Modal.CloseTrigger />
+            <Modal.Dialog className="!bg-white !text-slate-900">
+              <Modal.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
               <Modal.Header>
                 <div>
                   <Modal.Heading>{selected?.share?.shareName || selected?.installation.id}</Modal.Heading>
@@ -206,12 +212,12 @@ export function ClientsTable({ clients }: { clients: DashboardClient[] }) {
               <Modal.Body>
                 {selected ? (
                   <div className="grid gap-4 sm:grid-cols-2">
-                    <Info label="Platform" value={`${selected.installation.platform} ${selected.installation.appVersion}`} />
-                    <Info label="Last seen" value={formatDateTime(selected.installation.lastSeenAt)} />
-                    <Info label="Owner" value={selected.share?.ownerEmail || "-"} />
-                    <Info label="Active requests" value={formatNumber(selected.share?.activeRequests || 0)} />
-                    <Info label="Created" value={formatDateTime(selected.share?.createdAt)} />
-                    <Info label="Expires" value={selected.share?.expiresAt || "-"} />
+                    <Info label={t("dashboard.platform")} value={`${selected.installation.platform} ${selected.installation.appVersion}`} />
+                    <Info label={t("dashboard.lastSeen")} value={formatDateTime(selected.installation.lastSeenAt)} />
+                    <Info label={t("dashboard.owner")} value={selected.share?.ownerEmail || "-"} />
+                    <Info label={t("dashboard.activeRequests")} value={formatNumber(selected.share?.activeRequests || 0)} />
+                    <Info label={t("dashboard.created")} value={formatDateTime(selected.share?.createdAt)} />
+                    <Info label={t("dashboard.expires")} value={selected.share?.expiresAt || "-"} />
                   </div>
                 ) : null}
               </Modal.Body>
@@ -223,12 +229,12 @@ export function ClientsTable({ clients }: { clients: DashboardClient[] }) {
   );
 }
 
-function marketStatusLabel(market: DashboardMarket) {
-  if (market.online) return "Online";
-  return market.status === "active" ? "Offline" : market.status || "Offline";
+function marketStatusLabel(market: DashboardMarket, t: TFn) {
+  if (market.online) return t("common.online");
+  return market.status === "active" ? t("common.offline") : market.status || t("common.offline");
 }
 
-function MarketPricingCell({ market }: { market: DashboardMarket }) {
+function MarketPricingCell({ market, t }: { market: DashboardMarket; t: TFn }) {
   const summary = market.pricingSummary || {};
   const entries = [["Claude", summary.claude], ["Codex", summary.codex], ["Gemini", summary.gemini], ["DeepSeek", summary.deepseek]];
   return (
@@ -236,45 +242,46 @@ function MarketPricingCell({ market }: { market: DashboardMarket }) {
       {entries.map(([label, value]) => (
         <div key={label as string} className="grid grid-cols-[66px_1fr] gap-2 text-sm">
           <span className="mono-label text-muted-foreground">{label as string}</span>
-          <strong>{typeof value === "number" ? `${value}%` : typeof value === "string" && value ? (value.toLowerCase() === "mixed" ? "mixed" : `${value}%`) : "-"}</strong>
+          <strong>{typeof value === "number" ? `${value}%` : typeof value === "string" && value ? (value.toLowerCase() === "mixed" ? t("dashboard.mixed") : `${value}%`) : "-"}</strong>
         </div>
       ))}
     </div>
   );
 }
 
-function MarketStatusCell({ market }: { market: DashboardMarket }) {
+function MarketStatusCell({ market, t }: { market: DashboardMarket; t: TFn }) {
   const limit = isUnlimited(market.parallelCapacity) ? "∞" : String(market.parallelCapacity || 0);
   return (
     <div className="grid min-w-52 gap-2 text-sm">
-      <div className="grid grid-cols-[54px_1fr] gap-2"><span className="mono-label text-muted-foreground">Shares</span><strong>{market.onlineShareCount || 0} / {market.shareCount || 0}</strong></div>
-      <div className="grid grid-cols-[54px_1fr] gap-2"><span className="mono-label text-muted-foreground">Seen</span><strong>{formatRelativeTime(market.lastSeenAt)}</strong></div>
-      <div className="grid grid-cols-[54px_1fr] gap-2"><span className="mono-label text-muted-foreground">Parallel</span><strong>{market.activeRequests || 0}<span className="text-muted-foreground">/{limit}</span></strong></div>
-      <div className="grid grid-cols-[54px_1fr] gap-2"><span className="mono-label text-muted-foreground">Online</span><strong title={`${market.onlineMinutes24h || 0} / 1440 min with successful route probes in last 24h`}>{(market.onlineRate24h || 0).toFixed(1)}%</strong></div>
-      <div className="grid grid-cols-[54px_1fr] gap-2"><span className="mono-label text-muted-foreground">Usage</span><strong>{compactTokens(market.usageTokens)} / {market.usageAmountUsd || "$0.00"}</strong></div>
-      <div className="grid grid-cols-[54px_1fr] gap-2"><span className="mono-label text-muted-foreground">Health</span><HealthDots entries={market.healthChecks} /></div>
+      <div className="grid grid-cols-[54px_1fr] gap-2"><span className="mono-label text-muted-foreground">{t("dashboard.shares")}</span><strong>{market.onlineShareCount || 0} / {market.shareCount || 0}</strong></div>
+      <div className="grid grid-cols-[54px_1fr] gap-2"><span className="mono-label text-muted-foreground">{t("dashboard.seen")}</span><strong>{formatRelativeTime(market.lastSeenAt)}</strong></div>
+      <div className="grid grid-cols-[54px_1fr] gap-2"><span className="mono-label text-muted-foreground">{t("dashboard.parallel")}</span><strong>{market.activeRequests || 0}<span className="text-muted-foreground">/{limit}</span></strong></div>
+      <div className="grid grid-cols-[54px_1fr] gap-2"><span className="mono-label text-muted-foreground">{t("dashboard.online")}</span><strong title={`${market.onlineMinutes24h || 0} / 1440 min with successful route probes in last 24h`}>{(market.onlineRate24h || 0).toFixed(1)}%</strong></div>
+      <div className="grid grid-cols-[54px_1fr] gap-2"><span className="mono-label text-muted-foreground">{t("dashboard.usage")}</span><strong>{compactTokens(market.usageTokens)} / {market.usageAmountUsd || "$0.00"}</strong></div>
+      <div className="grid grid-cols-[54px_1fr] gap-2"><span className="mono-label text-muted-foreground">{t("dashboard.health")}</span><HealthDots entries={market.healthChecks} /></div>
     </div>
   );
 }
 
 export function MarketsTable({ markets }: { markets: DashboardMarket[] }) {
   const [selected, setSelected] = React.useState<DashboardMarket | null>(null);
+  const { t } = useLocaleText();
   const sorted = sortMarkets(markets);
   return (
     <section className="grid gap-3">
       <div className="flex items-center justify-between font-mono text-[11px] uppercase tracking-[0.14em] text-muted-foreground">
-        <div>MARKETS <span className="font-semibold text-foreground">{sorted.length}</span></div>
-        <a href="https://github.com/Xiechengqi/cc-switch-market/releases" target="_blank" rel="noopener noreferrer" className="transition-colors hover:text-blue-400">[install]</a>
+        <div>{t("dashboard.markets")} <span className="font-semibold text-foreground">{sorted.length}</span></div>
+        <a href="https://github.com/Xiechengqi/cc-switch-market/releases" target="_blank" rel="noopener noreferrer" className="transition-colors hover:text-blue-400">{t("dashboard.install")}</a>
       </div>
       <Card className="overflow-hidden rounded-[20px]">
         <Card.Content className="overflow-x-auto p-0">
           <table className="w-full min-w-[900px] border-collapse text-sm">
             <thead className="bg-muted text-left font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground">
               <tr>
-                <th className="w-44 px-4 py-3">Market</th>
-                <th className="px-4 py-3">Public URL</th>
-                <th className="px-4 py-3">?% official price</th>
-                <th className="px-4 py-3">Status</th>
+                <th className="w-44 px-4 py-3">{t("dashboard.market")}</th>
+                <th className="px-4 py-3">{t("dashboard.publicUrl")}</th>
+                <th className="px-4 py-3">{t("dashboard.officialPrice")}</th>
+                <th className="px-4 py-3">{t("dashboard.status")}</th>
                 <th className="w-7 px-4 py-3" />
               </tr>
             </thead>
@@ -284,7 +291,7 @@ export function MarketsTable({ markets }: { markets: DashboardMarket[] }) {
                   <td className="w-44 break-words px-4 py-3 align-middle">
                     <div className="font-medium">{market.displayName || market.id}</div>
                     <div className="text-xs text-muted-foreground">{market.email}</div>
-                    <div className="mt-1"><StatusBadge active={market.online} label={marketStatusLabel(market)} /></div>
+                    <div className="mt-1"><StatusBadge active={market.online} label={marketStatusLabel(market, t)} /></div>
                   </td>
                   <td className="px-4 py-3 align-middle">
                     <a href={market.publicBaseUrl} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()} className="inline-flex items-center gap-1 font-semibold hover:text-primary">
@@ -292,12 +299,12 @@ export function MarketsTable({ markets }: { markets: DashboardMarket[] }) {
                       <ExternalLink className="h-3 w-3" />
                     </a>
                   </td>
-                  <td className="px-4 py-3 align-middle"><MarketPricingCell market={market} /></td>
-                  <td className="px-4 py-3 align-middle"><MarketStatusCell market={market} /></td>
+                  <td className="px-4 py-3 align-middle"><MarketPricingCell market={market} t={t} /></td>
+                  <td className="px-4 py-3 align-middle"><MarketStatusCell market={market} t={t} /></td>
                   <td className="px-4 py-3 align-middle text-lg text-muted-foreground">›</td>
                 </tr>
               )) : (
-                <tr><td colSpan={5} className="px-4 py-10 text-center text-muted-foreground">No markets configured</td></tr>
+                <tr><td colSpan={5} className="px-4 py-10 text-center text-muted-foreground">{t("dashboard.noMarkets")}</td></tr>
               )}
             </tbody>
           </table>
@@ -306,8 +313,8 @@ export function MarketsTable({ markets }: { markets: DashboardMarket[] }) {
       <Modal isOpen={!!selected} onOpenChange={(open) => !open && setSelected(null)}>
         <Modal.Backdrop>
           <Modal.Container placement="center" size="lg">
-            <Modal.Dialog>
-              <Modal.CloseTrigger />
+            <Modal.Dialog className="!bg-white !text-slate-900">
+              <Modal.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
               <Modal.Header>
                 <div>
                   <Modal.Heading>{selected?.displayName || selected?.id}</Modal.Heading>
@@ -318,19 +325,21 @@ export function MarketsTable({ markets }: { markets: DashboardMarket[] }) {
                 {selected ? (
                   <div className="grid gap-4">
                     <div className="grid gap-4 sm:grid-cols-3">
-                      <Info label="Status" value={marketStatusLabel(selected)} />
-                      <Info label="Parallel" value={`${selected.activeRequests} / ${isUnlimited(selected.parallelCapacity) ? "∞" : selected.parallelCapacity}`} />
-                      <Info label="Online 24h" value={`${(selected.onlineRate24h || 0).toFixed(1)}%`} />
+                      <Info label={t("dashboard.status")} value={marketStatusLabel(selected, t)} />
+                      <Info label={t("dashboard.parallel")} value={`${selected.activeRequests} / ${isUnlimited(selected.parallelCapacity) ? "∞" : selected.parallelCapacity}`} />
+                      <Info label={t("dashboard.online24h")} value={`${(selected.onlineRate24h || 0).toFixed(1)}%`} />
                     </div>
-                    <div className="rounded-lg border">
+                    <Card className="rounded-lg border p-0 shadow-none">
+                      <Card.Content className="gap-0 p-0">
                       {(selected.linkedShares || []).slice(0, 8).map((share) => (
                         <div key={share.shareId} className="flex items-center justify-between border-b px-3 py-2 last:border-0">
                           <span className="font-medium">{share.shareName}</span>
-                          <Chip color={share.online ? "success" : "default"} size="sm" variant={share.online ? "soft" : "tertiary"}>{share.online ? "online" : "offline"}</Chip>
+                          <Chip color={share.online ? "success" : "default"} size="sm" variant={share.online ? "soft" : "tertiary"}>{share.online ? t("common.online") : t("common.offline")}</Chip>
                         </div>
                       ))}
-                      {!selected.linkedShares?.length ? <div className="p-4 text-sm text-muted-foreground">No linked shares</div> : null}
-                    </div>
+                      {!selected.linkedShares?.length ? <div className="p-4 text-sm text-muted-foreground">{t("dashboard.noLinkedShares")}</div> : null}
+                      </Card.Content>
+                    </Card>
                   </div>
                 ) : null}
               </Modal.Body>
@@ -344,14 +353,17 @@ export function MarketsTable({ markets }: { markets: DashboardMarket[] }) {
 
 function Info({ label, value }: { label: string; value?: React.ReactNode }) {
   return (
-    <div className="rounded-lg border bg-muted/30 p-3">
-      <div className="mono-label text-muted-foreground">{label}</div>
-      <div className="mt-2 break-words text-sm font-medium">{value || "--"}</div>
-    </div>
+    <Card className="rounded-lg border bg-muted/30 p-0 shadow-none">
+      <Card.Content className="p-3">
+        <div className="mono-label text-muted-foreground">{label}</div>
+        <div className="mt-2 break-words text-sm font-medium">{value || "--"}</div>
+      </Card.Content>
+    </Card>
   );
 }
 
 export function PresenceFooter() {
+  const { t } = useLocaleText();
   const [presence, setPresence] = React.useState<{ onlineCount: number; emailSent24h: number } | null>(null);
   React.useEffect(() => {
     const sessionId = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
@@ -369,9 +381,9 @@ export function PresenceFooter() {
   }, []);
   return (
     <footer className="mx-auto flex w-[calc(100%-2rem)] max-w-7xl flex-wrap items-center justify-center gap-2 py-6 font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground">
-      <span>Page Online <strong className="ml-1 text-foreground">{presence?.onlineCount ?? 0}</strong></span>
+      <span>{t("dashboard.pageOnline")} <strong className="ml-1 text-foreground">{presence?.onlineCount ?? 0}</strong></span>
       <span className="opacity-50">|</span>
-      <span>EMAIL SENT 24H <strong className="ml-1 text-foreground">{presence?.emailSent24h ?? 0}</strong></span>
+      <span>{t("dashboard.emailSent24h")} <strong className="ml-1 text-foreground">{presence?.emailSent24h ?? 0}</strong></span>
       <span className="opacity-50">|</span>
       <a href="https://github.com/Xiechengqi/cc-switch-router" target="_blank" rel="noopener noreferrer" className="hover:text-primary">GitHub</a>
     </footer>

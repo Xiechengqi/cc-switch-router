@@ -1,17 +1,20 @@
 "use client";
 
 import { Loader2, Save, Send, RotateCcw } from "lucide-react";
-import { Alert, Button, Card, Chip, Input, ScrollShadow, Switch, TextArea } from "@heroui/react";
+import { Alert, Button, Card, Chip, Input, ListBox, ScrollShadow, Switch, TextArea } from "@heroui/react";
 import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
+import { useLocaleText } from "@/components/i18n/locale-provider";
 import { VersionPanel } from "@/components/settings/version-panel";
 import { getSettingsSchema, getSettingsValues, saveSettings, testTelegram, restartService } from "@/lib/api";
 import type { SettingValueEntry, SettingsField, SettingsSchema } from "@/lib/types";
 
 type DirtyValue = string | boolean | null;
+const VERSION_GROUP = "__version";
 
 export function SettingsPage() {
   const { session, loading } = useAuth();
+  const { t } = useLocaleText();
   const [schema, setSchema] = React.useState<SettingsSchema | null>(null);
   const [values, setValues] = React.useState<Record<string, SettingValueEntry>>({});
   const [activeGroup, setActiveGroup] = React.useState<string>("");
@@ -42,16 +45,16 @@ export function SettingsPage() {
   }, [isAdmin, load]);
 
   if (loading) {
-    return <main className="mx-auto w-[calc(100%-2rem)] max-w-7xl py-12 text-muted-foreground">Loading session...</main>;
+    return <main className="mx-auto w-[calc(100%-2rem)] max-w-7xl py-12 text-muted-foreground">{t("common.loadingSession")}</main>;
   }
 
   if (!isAdmin) {
     return (
-      <main className="mx-auto grid w-[calc(100%-2rem)] max-w-4xl gap-6 py-12">
+      <main className="settings-surface mx-auto grid w-[calc(100%-2rem)] max-w-4xl gap-6 py-12 text-foreground">
         <div>
-          <div className="section-label">Settings</div>
-          <h1 className="mt-4 font-display text-4xl">Admin access required</h1>
-          <p className="mt-3 text-muted-foreground">Sign in as a configured router administrator to edit runtime settings.</p>
+          <div className="section-label">{t("settings.title")}</div>
+          <h1 className="mt-4 font-display text-4xl">{t("settings.adminRequired")}</h1>
+          <p className="mt-3 text-muted-foreground">{t("settings.adminRequiredDesc")}</p>
         </div>
         <VersionPanel isAdmin={false} />
       </main>
@@ -59,103 +62,99 @@ export function SettingsPage() {
   }
 
   const groups = schema?.groups || [];
-  const fields = (schema?.fields || []).filter((field) => field.group === activeGroup);
+  const fields = activeGroup === VERSION_GROUP ? [] : (schema?.fields || []).filter((field) => field.group === activeGroup);
   const dirtyCount = Object.keys(dirty).length;
 
   return (
-    <main className="mx-auto grid w-[calc(100%-2rem)] max-w-7xl gap-6 pb-10">
-      <section className="flex flex-wrap items-end justify-between gap-4">
-        <div>
-          <div className="section-label">Settings</div>
-          <h1 className="mt-4 font-display text-4xl leading-tight md:text-5xl">
-            Router control <span className="gradient-text">surface</span>
-          </h1>
-          <p className="mt-3 max-w-2xl text-muted-foreground">Edit environment-backed settings, apply dynamic changes, and manage the running binary from one page.</p>
-        </div>
+    <main className="settings-surface mx-auto grid w-[calc(100%-2rem)] max-w-7xl gap-6 pb-10 text-foreground">
+      <section className="flex flex-wrap justify-end gap-2">
         <div className="flex flex-wrap gap-2">
           <Button variant="outline" onClick={() => load()} isDisabled={!!busy}>
             {busy === "load" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}
-            Reload
+            {t("common.reload")}
+          </Button>
+          <Button variant="outline" onClick={telegramTest} isDisabled={!!busy}>
+            {busy === "telegram" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+            {t("settings.testTelegram")}
+          </Button>
+          <Button variant="outline" onClick={() => submit(true)} isDisabled={!!busy || dirtyCount === 0}>
+            {busy === "restart" ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+            {t("settings.saveRestart")}
           </Button>
           <Button variant="primary" onClick={() => submit(false)} isDisabled={!!busy || dirtyCount === 0}>
             {busy === "save" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-            Save {dirtyCount ? `(${dirtyCount})` : ""}
+            {dirtyCount ? t("common.saveWithCount", { count: dirtyCount }) : t("common.save")}
           </Button>
         </div>
       </section>
 
-      {banner ? <Alert status={banner.kind === "destructive" ? "danger" : banner.kind}>{banner.text}</Alert> : null}
+      {banner ? <Alert status={banner.kind === "destructive" ? "danger" : banner.kind} className="!text-slate-900">{banner.text}</Alert> : null}
 
       <section className="grid gap-6 lg:grid-cols-[260px_1fr]">
         <Card className="h-fit rounded-lg lg:sticky lg:top-4">
           <Card.Header>
-            <Card.Title>Groups</Card.Title>
-            <Card.Description>{dirtyCount} unsaved changes</Card.Description>
+            <Card.Title>{t("settings.groups")}</Card.Title>
+            <Card.Description>{t("settings.unsavedChanges", { count: dirtyCount })}</Card.Description>
           </Card.Header>
           <Card.Content>
             <ScrollShadow className="max-h-[520px]">
-              <div className="grid gap-1 pr-3">
+              <ListBox
+                aria-label={t("settings.groupsAria")}
+                selectionMode="single"
+                selectedKeys={activeGroup ? [activeGroup] : []}
+                onSelectionChange={(keys) => {
+                  const [next] = Array.from(keys);
+                  if (next) setActiveGroup(String(next));
+                }}
+                className="gap-1 pr-3"
+              >
                 {groups.map((group) => {
                   const count = (schema?.fields || []).filter((field) => field.group === group && Object.prototype.hasOwnProperty.call(dirty, field.key)).length;
                   return (
-                    <button
+                    <ListBox.Item
                       key={group}
-                      type="button"
-                      onClick={() => setActiveGroup(group)}
-                      className={`flex items-center justify-between rounded-md px-3 py-2 text-left text-sm transition-colors ${activeGroup === group ? "bg-muted font-medium" : "hover:bg-muted/60"}`}
+                      id={group}
+                      textValue={group}
+                      className="flex items-center justify-between"
                     >
                       <span>{group}</span>
                       {count ? <Chip size="sm" variant="soft">{count}</Chip> : null}
-                    </button>
+                    </ListBox.Item>
                   );
                 })}
-              </div>
+                <ListBox.Item id={VERSION_GROUP} textValue={t("settings.version")} className="flex items-center justify-between">
+                  <span>{t("settings.version")}</span>
+                </ListBox.Item>
+              </ListBox>
             </ScrollShadow>
           </Card.Content>
         </Card>
 
         <div className="grid gap-6">
-          <Card className="rounded-lg">
-            <Card.Header>
-              <Card.Title>{activeGroup || "Settings"}</Card.Title>
-              <Card.Description>Fields marked restart required are persisted immediately but need a process restart to take full effect.</Card.Description>
-            </Card.Header>
-            <Card.Content className="grid gap-4">
-              {busy === "load" && !schema ? <div className="text-sm text-muted-foreground">Loading settings...</div> : null}
-              {fields.map((field) => (
-                <SettingsFieldRow
-                  key={field.key}
-                  field={field}
-                  entry={values[field.key]}
-                  value={dirtyValue(field, values[field.key], dirty)}
+          {activeGroup === VERSION_GROUP ? (
+            <VersionPanel isAdmin={true} />
+          ) : (
+            <Card className="rounded-lg">
+              <Card.Header>
+                <Card.Title>{activeGroup || t("settings.title")}</Card.Title>
+                <Card.Description>{t("settings.restartFieldDesc")}</Card.Description>
+              </Card.Header>
+              <Card.Content className="grid gap-4">
+                {busy === "load" && !schema ? <div className="text-sm text-muted-foreground">{t("settings.loading")}</div> : null}
+                {fields.map((field) => (
+                  <SettingsFieldRow
+                    key={field.key}
+                    field={field}
+                    entry={values[field.key]}
+                    value={dirtyValue(field, values[field.key], dirty)}
                   dirty={Object.prototype.hasOwnProperty.call(dirty, field.key)}
+                  t={t}
                   onChange={(value) => setDirty((prev) => ({ ...prev, [field.key]: value }))}
-                />
-              ))}
-            </Card.Content>
-          </Card>
-
-          <Card className="rounded-lg">
-            <Card.Header>
-              <Card.Title>Operations</Card.Title>
-              <Card.Description>Apply changes, send integration probes, or restart after static setting changes.</Card.Description>
-            </Card.Header>
-            <Card.Content className="flex flex-wrap gap-2">
-              <Button variant="primary" onClick={() => submit(false)} isDisabled={!!busy || dirtyCount === 0}>
-                <Save className="h-4 w-4" />
-                Save changes
-              </Button>
-              <Button variant="outline" onClick={() => submit(true)} isDisabled={!!busy || dirtyCount === 0}>
-                Save and restart
-              </Button>
-              <Button variant="outline" onClick={telegramTest} isDisabled={!!busy}>
-                <Send className="h-4 w-4" />
-                Test Telegram
-              </Button>
-            </Card.Content>
-          </Card>
-
-          <VersionPanel isAdmin={true} />
+                  />
+                ))}
+              </Card.Content>
+            </Card>
+          )}
         </div>
       </section>
     </main>
@@ -169,13 +168,13 @@ export function SettingsPage() {
       const result = await saveSettings(updates);
       setBanner({
         kind: "success",
-        text: `Saved. updated=${result.updatedKeys.length} unchanged=${result.unchangedKeys.length} restartRequired=${result.restartRequiredKeys.length}`,
+        text: t("settings.saved", { updated: result.updatedKeys.length, unchanged: result.unchangedKeys.length, restartRequired: result.restartRequiredKeys.length }),
       });
       await load();
       if (thenRestart) {
         setBusy("restart");
         await restartService();
-        setBanner({ kind: "default", text: "Restart scheduled. Waiting for service to return..." });
+        setBanner({ kind: "default", text: t("settings.restartScheduled") });
         pollHealthAndReload().catch(console.error);
       }
     } catch (err) {
@@ -189,7 +188,7 @@ export function SettingsPage() {
     setBusy("telegram");
     try {
       await testTelegram();
-      setBanner({ kind: "success", text: "Telegram test sent." });
+      setBanner({ kind: "success", text: t("settings.telegramSent") });
     } catch (err) {
       setBanner({ kind: "destructive", text: err instanceof Error ? err.message : String(err) });
     } finally {
@@ -203,34 +202,37 @@ function SettingsFieldRow({
   entry,
   value,
   dirty,
+  t,
   onChange,
 }: {
   field: SettingsField;
   entry?: SettingValueEntry;
   value: DirtyValue;
   dirty: boolean;
+  t: ReturnType<typeof useLocaleText>["t"];
   onChange: (value: DirtyValue) => void;
 }) {
   return (
-    <div className="grid gap-3 rounded-lg border p-4 md:grid-cols-[minmax(220px,0.8fr)_minmax(0,1.2fr)]">
+    <Card className="rounded-lg border p-0 shadow-none">
+      <Card.Content className="grid gap-3 p-4 md:grid-cols-[minmax(220px,0.8fr)_minmax(0,1.2fr)]">
       <div>
         <div className="flex flex-wrap items-center gap-2">
           <label className="font-medium" htmlFor={field.key}>{field.label}</label>
-          {field.required ? <Chip size="sm" variant="soft">required</Chip> : null}
-          {field.restartRequired ? <Chip color="warning" size="sm" variant="soft">restart</Chip> : null}
-          {dirty ? <Chip color="accent" size="sm" variant="soft">changed</Chip> : null}
+          {field.required ? <Chip size="sm" variant="soft">{t("common.required")}</Chip> : null}
+          {field.restartRequired ? <Chip color="warning" size="sm" variant="soft">{t("common.restartRequired")}</Chip> : null}
+          {dirty ? <Chip color="accent" size="sm" variant="soft">{t("common.changed")}</Chip> : null}
         </div>
         <p className="mt-2 text-sm leading-6 text-muted-foreground">{field.description}</p>
         <div className="mt-2 text-xs text-muted-foreground">
-          <code>{field.key}</code> · {entry?.source || "unset"}
-          {field.fieldType === "secret" && entry?.hasValue ? " · currently set" : ""}
+          <code>{field.key}</code> · {entry?.source || t("common.unset")}
+          {field.fieldType === "secret" && entry?.hasValue ? ` · ${t("settings.currentlySet")}` : ""}
         </div>
       </div>
       <div className="grid content-start gap-2">
         {field.fieldType === "bool" ? (
           <div className="flex items-center gap-3 rounded-md border bg-background p-3">
             <Switch isSelected={Boolean(value)} onChange={onChange} id={field.key} />
-            <span className="text-sm text-muted-foreground">{Boolean(value) ? "Enabled" : "Disabled"}</span>
+            <span className="text-sm text-muted-foreground">{Boolean(value) ? t("common.enabled") : t("common.disabled")}</span>
           </div>
         ) : field.fieldType === "email_list" ? (
           <TextArea id={field.key} value={String(value ?? "")} onChange={(event: React.ChangeEvent<HTMLTextAreaElement>) => onChange(event.target.value)} placeholder={field.placeholder || ""} />
@@ -240,11 +242,12 @@ function SettingsFieldRow({
             type={field.fieldType === "secret" ? "password" : field.fieldType === "int" ? "number" : field.fieldType === "url" ? "url" : field.fieldType === "email" ? "email" : "text"}
             value={String(value ?? "")}
             onChange={(event) => onChange(event.target.value)}
-            placeholder={field.fieldType === "secret" && entry?.hasValue ? "Leave blank to keep; type - to clear" : field.placeholder || field.default || ""}
+            placeholder={field.fieldType === "secret" && entry?.hasValue ? t("settings.secretPlaceholder") : field.placeholder || field.default || ""}
           />
         )}
       </div>
-    </div>
+      </Card.Content>
+    </Card>
   );
 }
 

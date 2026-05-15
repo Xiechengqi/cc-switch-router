@@ -30,7 +30,7 @@ export function DashboardPage() {
   return (
     <>
       <main className="mx-auto grid w-[calc(100%-2rem)] max-w-7xl gap-6 pb-6">
-        {error ? <Alert status="danger">{error}</Alert> : null}
+        {error ? <Alert status="danger" className="!text-slate-900">{error}</Alert> : null}
         <LiveMap data={data} />
         <ClientsTable clients={data?.clients || []} />
         <MarketsTable markets={data?.markets || []} />
