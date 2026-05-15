@@ -149,7 +149,7 @@ export function ClientsTable({ clients }: { clients: DashboardClient[] }) {
     <section className="grid gap-3">
       <div className="flex items-center justify-between font-mono text-[11px] uppercase tracking-[0.14em] text-muted-foreground">
         <div>CLIENTS <span className="font-semibold text-foreground">{sorted.length}</span></div>
-        <a href="https://github.com/Xiechengqi/cc-switch/releases" target="_blank" rel="noopener noreferrer" className="hover:text-primary">[install]</a>
+        <a href="https://github.com/Xiechengqi/cc-switch/releases" target="_blank" rel="noopener noreferrer" className="transition-colors hover:text-blue-400">[install]</a>
       </div>
       <Card className="overflow-hidden rounded-[20px]">
         <CardContent className="overflow-x-auto p-0">
@@ -257,7 +257,7 @@ export function MarketsTable({ markets }: { markets: DashboardMarket[] }) {
     <section className="grid gap-3">
       <div className="flex items-center justify-between font-mono text-[11px] uppercase tracking-[0.14em] text-muted-foreground">
         <div>MARKETS <span className="font-semibold text-foreground">{sorted.length}</span></div>
-        <a href="https://github.com/Xiechengqi/cc-switch-market/releases" target="_blank" rel="noopener noreferrer" className="hover:text-primary">[install]</a>
+        <a href="https://github.com/Xiechengqi/cc-switch-market/releases" target="_blank" rel="noopener noreferrer" className="transition-colors hover:text-blue-400">[install]</a>
       </div>
       <Card className="overflow-hidden rounded-[20px]">
         <CardContent className="overflow-x-auto p-0">

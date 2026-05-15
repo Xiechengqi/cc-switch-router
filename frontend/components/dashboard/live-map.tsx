@@ -101,8 +101,49 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
   const server = data?.map?.server;
   const points = [server, ...clients].filter(Boolean) as MapPoint[];
 
+  const clampPan = React.useCallback((nextPan: { x: number; y: number }, nextZoom = zoom) => {
+    const shell = shellRef.current;
+    if (!shell) return nextPan;
+    const viewportWidth = shell.clientWidth;
+    const viewportHeight = shell.clientHeight;
+    const mapWidth = viewportWidth;
+    const mapHeight = viewportWidth / 2;
+    const maxX = Math.max(0, (mapWidth * nextZoom - viewportWidth) / 2);
+    const maxY = Math.max(0, (mapHeight * nextZoom - viewportHeight) / 2);
+    return {
+      x: Math.max(-maxX, Math.min(maxX, nextPan.x)),
+      y: Math.max(-maxY, Math.min(maxY, nextPan.y)),
+    };
+  }, [zoom]);
+
   const setZoom = React.useCallback((next: number) => {
-    setZoomState(Math.max(1, Math.min(3, Number(next.toFixed(2)))));
+    const nextZoom = Math.max(1, Math.min(3, Number(next.toFixed(2))));
+    setZoomState(nextZoom);
+    setPan((current) => nextZoom <= 1 ? { x: 0, y: 0 } : clampPan(current, nextZoom));
+  }, [clampPan]);
+
+  React.useEffect(() => {
+    function handleResize() {
+      setPan((current) => clampPan(current));
+    }
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, [clampPan]);
+
+  const setClampedPan = React.useCallback((nextPan: { x: number; y: number }) => {
+    setPan(clampPan(nextPan));
+  }, [clampPan]);
+
+  const endDrag = React.useCallback((pointerId?: number) => {
+    const shell = shellRef.current;
+    if (pointerId != null) {
+      try {
+        shell?.releasePointerCapture(pointerId);
+      } catch {
+        // Pointer capture may already be released by the browser.
+      }
+    }
+    dragRef.current = null;
   }, []);
 
   function reset() {
@@ -113,9 +154,16 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
   return (
     <section
       ref={shellRef}
-      className="relative min-h-[420px] cursor-grab overflow-hidden rounded-[20px] border bg-white shadow-[0_4px_6px_rgba(15,23,42,0.04),0_12px_28px_rgba(15,23,42,0.05)] outline-none active:cursor-grabbing"
+      className="relative aspect-[2/1] min-h-[420px] cursor-grab select-none overflow-hidden rounded-[20px] border bg-white text-primary shadow-[0_4px_6px_rgba(15,23,42,0.04),0_12px_28px_rgba(15,23,42,0.05)] outline-none active:cursor-grabbing"
+      style={{
+        userSelect: "none",
+        WebkitUserSelect: "none",
+        WebkitTapHighlightColor: "transparent",
+        touchAction: zoom > 1 ? "none" : "pan-y",
+      }}
       tabIndex={0}
       aria-label="Live network map"
+      onDragStart={(event) => event.preventDefault()}
       onWheel={(event) => {
         if (!(event.ctrlKey || event.metaKey || zoom > 1)) return;
         event.preventDefault();
@@ -123,26 +171,31 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
       }}
       onPointerDown={(event) => {
         if (zoom <= 1 || (event.target as HTMLElement).closest("button")) return;
+        event.preventDefault();
         dragRef.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, panX: pan.x, panY: pan.y };
         shellRef.current?.setPointerCapture(event.pointerId);
       }}
       onPointerMove={(event) => {
         const drag = dragRef.current;
         if (!drag || drag.pointerId !== event.pointerId) return;
-        setPan({ x: drag.panX + event.clientX - drag.x, y: drag.panY + event.clientY - drag.y });
+        event.preventDefault();
+        setClampedPan({ x: drag.panX + event.clientX - drag.x, y: drag.panY + event.clientY - drag.y });
       }}
       onPointerUp={(event) => {
-        if (dragRef.current?.pointerId === event.pointerId) dragRef.current = null;
+        if (dragRef.current?.pointerId === event.pointerId) endDrag(event.pointerId);
+      }}
+      onPointerCancel={(event) => {
+        if (dragRef.current?.pointerId === event.pointerId) endDrag(event.pointerId);
       }}
       onKeyDown={(event) => {
         const step = 24;
         if (event.key === "+" || event.key === "=") setZoom(zoom + 0.25);
         else if (event.key === "-" || event.key === "_") setZoom(zoom - 0.25);
         else if (event.key === "0") reset();
-        else if (event.key === "ArrowUp") setPan((p) => ({ ...p, y: p.y + step }));
-        else if (event.key === "ArrowDown") setPan((p) => ({ ...p, y: p.y - step }));
-        else if (event.key === "ArrowLeft") setPan((p) => ({ ...p, x: p.x + step }));
-        else if (event.key === "ArrowRight") setPan((p) => ({ ...p, x: p.x - step }));
+        else if (event.key === "ArrowUp") setPan((p) => clampPan({ ...p, y: p.y + step }));
+        else if (event.key === "ArrowDown") setPan((p) => clampPan({ ...p, y: p.y - step }));
+        else if (event.key === "ArrowLeft") setPan((p) => clampPan({ ...p, x: p.x + step }));
+        else if (event.key === "ArrowRight") setPan((p) => clampPan({ ...p, x: p.x - step }));
         else return;
         event.preventDefault();
       }}
@@ -154,7 +207,7 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
         className="absolute left-1/2 top-1/2 z-20 aspect-[2/1] w-full origin-center transition-transform duration-200 ease-out"
         style={{ transform: `translate(-50%, -50%) translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}
       >
-        <Image src="/world-map.svg" alt="" fill className="object-fill opacity-100" priority />
+        <Image src="/world-map.svg" alt="" fill draggable={false} className="pointer-events-none object-fill opacity-100" priority />
         <svg className="absolute inset-0 h-full w-full overflow-visible" viewBox="0 0 360 180" preserveAspectRatio="none" aria-hidden="true">
           {server
             ? clients.map((client) => {
@@ -185,7 +238,7 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
               <button
                 type="button"
                 key={`${point.pointType}-${point.id}`}
-                className="absolute -translate-x-1/2 -translate-y-1/2 rounded-full"
+                className="absolute -translate-x-1/2 -translate-y-1/2 rounded-full focus:outline-none"
                 style={{ left: `${pos.x}%`, top: `${pos.y}%` }}
                 title={[point.label, point.city, point.region, point.country, point.activeRequests ? `${point.activeRequests} active` : ""].filter(Boolean).join(" · ")}
               >

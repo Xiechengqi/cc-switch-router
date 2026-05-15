@@ -82,7 +82,18 @@ export function LoginDialog({ open, onOpenChange }: { open: boolean; onOpenChang
           <DialogTitle>Share Email Login</DialogTitle>
           <DialogDescription>Sign in with an email verification code.</DialogDescription>
         </DialogHeader>
-        <div className="grid gap-4">
+        <div
+          className="grid gap-4"
+          onKeyDown={(event) => {
+            if (event.key !== "Enter" || event.nativeEvent.isComposing) return;
+            event.preventDefault();
+            if (step === "email") {
+              if (!busy && email.trim()) sendCode().catch(console.error);
+            } else if (!busy && code.trim()) {
+              verify().catch(console.error);
+            }
+          }}
+        >
           <label className="grid gap-2 text-sm">
             <span className="mono-label text-muted-foreground">Email</span>
             <Input value={email} onChange={(event) => setEmail(event.target.value)} placeholder="email@example.com" type="email" />

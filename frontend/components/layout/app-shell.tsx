@@ -17,7 +17,12 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { getDashboard } from "@/lib/api";
 import type { DashboardResponse } from "@/lib/types";
-import { formatNumber, formatRelativeTime } from "@/lib/utils";
+import { formatNumber } from "@/lib/utils";
+
+type RegionOption = {
+  name: string;
+  url: string;
+};
 
 function countDistinctCountries(data: DashboardResponse | null) {
   const set = new Set<string>();
@@ -58,8 +63,68 @@ function TopbarStats() {
       <span title="Total HTTP requests currently in-flight across every share.">
         <strong className="text-foreground">{formatNumber(data?.stats?.totalActiveRequests || 0)}</strong> in-flight requests
       </span>
-      <span className="border-l pl-3">synced {formatRelativeTime(data?.generatedAt)}</span>
     </div>
+  );
+}
+
+function normalizeRegionUrl(url: string) {
+  const trimmed = url.trim();
+  if (!trimmed) return "";
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+}
+
+function currentRegionName(regions: RegionOption[]) {
+  if (typeof window === "undefined") return "";
+  const hostname = window.location.hostname || "";
+  const matched = regions.find((region) => {
+    try {
+      return new URL(normalizeRegionUrl(region.url)).hostname === hostname;
+    } catch {
+      return false;
+    }
+  });
+  return matched?.name || "";
+}
+
+function RouterSwitcher() {
+  const [regions, setRegions] = React.useState<RegionOption[]>([]);
+  const [selected, setSelected] = React.useState("");
+
+  React.useEffect(() => {
+    async function load() {
+      const response = await fetch("/v1/regions", { cache: "no-store" });
+      if (!response.ok) return;
+      const nextRegions = (await response.json()) as RegionOption[];
+      setRegions(nextRegions);
+      setSelected(currentRegionName(nextRegions) || nextRegions[0]?.name || "");
+    }
+    load().catch(console.error);
+  }, []);
+
+  if (regions.length === 0) return null;
+
+  return (
+    <label className="hidden items-center gap-2 rounded-lg border bg-card px-2.5 py-1.5 text-xs text-muted-foreground sm:inline-flex">
+      <span className="font-semibold text-foreground">Router</span>
+      <select
+        value={selected}
+        aria-label="Router"
+        className="max-w-32 bg-transparent text-foreground outline-none"
+        onChange={(event) => {
+          const name = event.target.value;
+          setSelected(name);
+          const region = regions.find((item) => item.name === name);
+          const href = region ? normalizeRegionUrl(region.url) : "";
+          if (href) window.location.href = href;
+        }}
+      >
+        {regions.map((region) => (
+          <option key={region.name} value={region.name}>
+            {region.name}
+          </option>
+        ))}
+      </select>
+    </label>
   );
 }
 
@@ -74,6 +139,7 @@ function Topbar({ active }: { active: "dashboard" | "settings" }) {
         <Image src="/router-logo.svg" alt="" width={36} height={36} className="h-9 w-9" priority />
         <span className="text-base font-extrabold leading-none">CC-Switch Router</span>
       </Link>
+      <RouterSwitcher />
       <div className="flex flex-1 items-center justify-end gap-4">
         {active === "dashboard" ? <TopbarStats /> : null}
         {authed ? (
@@ -102,7 +168,7 @@ function Topbar({ active }: { active: "dashboard" | "settings" }) {
             </DropdownMenuContent>
           </DropdownMenu>
         ) : (
-          <Button variant="outline" size="sm" onClick={() => setLoginOpen(true)} disabled={loading}>
+          <Button variant="outline" size="sm" className="text-xs font-normal text-muted-foreground" onClick={() => setLoginOpen(true)} disabled={loading}>
             Login
           </Button>
         )}

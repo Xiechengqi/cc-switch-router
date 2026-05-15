@@ -18,6 +18,7 @@ const GUEST_NAME_KEY = "cc_switch_router_board_guest_name_v1";
 
 export function BoardDock() {
   const { session } = useAuth();
+  const dockRef = React.useRef<HTMLElement | null>(null);
   const [open, setOpen] = React.useState(true);
   const [tab, setTab] = React.useState("all");
   const [meta, setMeta] = React.useState<BoardMeta | null>(null);
@@ -48,6 +49,18 @@ export function BoardDock() {
     setOpen(next);
     localStorage.setItem(DOCK_KEY, next ? "open" : "closed");
   }
+
+  React.useEffect(() => {
+    if (!open) return;
+    function handlePointerDown(event: PointerEvent) {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (dockRef.current?.contains(target)) return;
+      setDockOpen(false);
+    }
+    document.addEventListener("pointerdown", handlePointerDown);
+    return () => document.removeEventListener("pointerdown", handlePointerDown);
+  }, [open]);
 
   async function send() {
     const trimmed = body.trim();
@@ -81,7 +94,7 @@ export function BoardDock() {
   }
 
   return (
-    <aside className="fixed bottom-5 right-5 z-40 flex h-[min(620px,calc(100vh-2rem))] w-[min(420px,calc(100vw-2rem))] flex-col rounded-lg border bg-card shadow-2xl">
+    <aside ref={dockRef} className="fixed bottom-5 right-5 z-40 flex h-[min(620px,calc(100vh-2rem))] w-[min(420px,calc(100vw-2rem))] flex-col rounded-lg border bg-card shadow-2xl">
       <div className="flex items-center justify-between gap-3 border-b p-4">
         <div>
           <div className="font-semibold">Message Board</div>

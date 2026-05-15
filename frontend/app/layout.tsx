@@ -22,8 +22,13 @@ const jetbrains = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Switch Router",
+  title: "CC-Switch Router",
   description: "cc-switch-router dashboard and administration console",
+  icons: {
+    icon: "/router-logo.svg",
+    shortcut: "/router-logo.svg",
+    apple: "/router-logo.svg",
+  },
 };
 
 export default function RootLayout({
