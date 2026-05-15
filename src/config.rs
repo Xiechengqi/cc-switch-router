@@ -51,8 +51,7 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Self {
-        let tunnel_domain =
-            env_var("CC_SWITCH_ROUTER_TUNNEL_DOMAIN").unwrap_or_else(|| "0.0.0.0:8787".to_string());
+        let tunnel_domain = env_var("CC_SWITCH_ROUTER_TUNNEL_DOMAIN").unwrap_or_default();
         let mut admin_emails =
             parse_admin_emails(env_var("CC_SWITCH_ROUTER_ADMIN_EMAILS").as_deref());
         if let Some(default_admin) = derive_default_admin_email(&tunnel_domain) {
@@ -91,7 +90,8 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60 * 60),
             resend_api_key: env_var("CC_SWITCH_ROUTER_RESEND_API_KEY"),
-            resend_from: env_var("CC_SWITCH_ROUTER_RESEND_FROM"),
+            resend_from: env_var("CC_SWITCH_ROUTER_RESEND_FROM")
+                .or_else(|| crate::startup_config::default_resend_from(&tunnel_domain)),
             resend_from_name: env_var("CC_SWITCH_ROUTER_RESEND_FROM_NAME"),
             resend_reply_to: env_var("CC_SWITCH_ROUTER_RESEND_REPLY_TO"),
             auth_code_ttl_secs: env_var("CC_SWITCH_ROUTER_AUTH_CODE_TTL_SECS")
@@ -257,7 +257,8 @@ fn default_env_contents() -> String {
         "\
 CC_SWITCH_ROUTER_API_ADDR=0.0.0.0:80
 CC_SWITCH_ROUTER_SSH_ADDR=0.0.0.0:2222
-CC_SWITCH_ROUTER_TUNNEL_DOMAIN=0.0.0.0:8787
+CC_SWITCH_ROUTER_TUNNEL_DOMAIN=
+CC_SWITCH_ROUTER_SSH_PUBLIC_ADDR=
 CC_SWITCH_ROUTER_USE_LOCALHOST=false
 CC_SWITCH_ROUTER_LEASE_TTL_SECS=60
 CC_SWITCH_ROUTER_DB_PATH={}
@@ -273,6 +274,9 @@ CC_SWITCH_ROUTER_AUTH_EMAIL_HOURLY_LIMIT=30
 CC_SWITCH_ROUTER_AUTH_IP_HOURLY_LIMIT=20
 CC_SWITCH_ROUTER_AUTH_INSTALLATION_HOURLY_LIMIT=10
 CC_SWITCH_ROUTER_FREE_SHARE_IP_PARALLEL_LIMIT=1
+CC_SWITCH_ROUTER_RESEND_API_KEY=
+# CC_SWITCH_ROUTER_RESEND_FROM defaults to noreply@[CC_SWITCH_ROUTER_TUNNEL_DOMAIN]
+CC_SWITCH_ROUTER_RESEND_FROM=
 # router@<tunnel_domain-host> is always treated as admin. Use this variable
 # to add additional admin emails (comma-separated, case-insensitive).
 # Admins post with an OFFICIAL badge and can pin/feature/delete any message.
@@ -294,7 +298,10 @@ CC_SWITCH_ROUTER_BOARD_GUEST_SELF_DELETE_SECS=300
 }
 
 fn env_var(key: &str) -> Option<String> {
-    env::var(key).ok()
+    env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn env_bool(key: &str, default: bool) -> bool {
@@ -320,7 +327,7 @@ fn parse_admin_emails(value: Option<&str>) -> HashSet<String> {
     set
 }
 
-fn derive_default_admin_email(tunnel_domain: &str) -> Option<String> {
+pub fn tunnel_domain_host(tunnel_domain: &str) -> Option<String> {
     let raw = tunnel_domain.trim();
     if raw.is_empty() {
         return None;
@@ -336,7 +343,11 @@ fn derive_default_admin_email(tunnel_domain: &str) -> Option<String> {
     if host.is_empty() {
         return None;
     }
-    Some(format!("router@{}", host.to_ascii_lowercase()))
+    Some(host.to_ascii_lowercase())
+}
+
+fn derive_default_admin_email(tunnel_domain: &str) -> Option<String> {
+    tunnel_domain_host(tunnel_domain).map(|host| format!("router@{host}"))
 }
 
 fn path_in_home(app_name: &str, leaf: &str) -> Option<PathBuf> {
@@ -450,6 +461,23 @@ mod tests {
         assert!(!config.is_admin("eve@router.example.com"));
         unsafe {
             env::remove_var("CC_SWITCH_ROUTER_TUNNEL_DOMAIN");
+        }
+    }
+
+    #[test]
+    fn resend_from_defaults_to_tunnel_domain_host() {
+        unsafe {
+            env::set_var("CC_SWITCH_ROUTER_TUNNEL_DOMAIN", "router.example.com:8787");
+            env::set_var("CC_SWITCH_ROUTER_RESEND_FROM", "");
+        }
+        let config = Config::from_env();
+        assert_eq!(
+            config.resend_from.as_deref(),
+            Some("noreply@router.example.com")
+        );
+        unsafe {
+            env::remove_var("CC_SWITCH_ROUTER_TUNNEL_DOMAIN");
+            env::remove_var("CC_SWITCH_ROUTER_RESEND_FROM");
         }
     }
 

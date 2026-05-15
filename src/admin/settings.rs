@@ -113,7 +113,7 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         label: "HTTP listen address",
         group: "Network",
         field_type: FieldType::Text,
-        required: true,
+        required: false,
         restart_required: true,
         default: Some("0.0.0.0:80"),
         description: "axum HTTP server bind address. Must be host:port.",
@@ -125,7 +125,7 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         label: "SSH listen address",
         group: "Network",
         field_type: FieldType::Text,
-        required: true,
+        required: false,
         restart_required: true,
         default: Some("0.0.0.0:2222"),
         description: "russh server bind address for tunnel reverse forwarding.",
@@ -139,7 +139,7 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         field_type: FieldType::Text,
         required: true,
         restart_required: true,
-        default: Some("0.0.0.0:8787"),
+        default: None,
         description: "Public host[:port]. Derives router@<host> as the built-in admin and \
              is sent to clients in lease responses.",
         placeholder: Some("router.example.com"),
@@ -150,10 +150,10 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         label: "SSH public address",
         group: "Network",
         field_type: FieldType::Text,
-        required: false,
+        required: true,
         restart_required: true,
         default: None,
-        description: "Optional; defaults to TUNNEL_DOMAIN:SSH_PORT when empty.",
+        description: "Public SSH host:port returned to clients. Must be reachable from clients.",
         placeholder: Some("router.example.com:2222"),
         dynamic_group: None,
     },
@@ -175,7 +175,7 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         label: "SQLite DB path",
         group: "Persistence",
         field_type: FieldType::Path,
-        required: true,
+        required: false,
         restart_required: true,
         default: None,
         description: "Filesystem path for the SQLite database. Created if missing.",
@@ -249,7 +249,7 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         label: "Resend API key",
         group: "Email (Resend)",
         field_type: FieldType::Secret,
-        required: false,
+        required: true,
         restart_required: true,
         default: None,
         description: "re_xxx API key from Resend. Required for sending verification emails.",
@@ -263,8 +263,8 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         field_type: FieldType::Email,
         required: false,
         restart_required: true,
-        default: None,
-        description: "From: address used for outgoing mail.",
+        default: Some("noreply@[CC_SWITCH_ROUTER_TUNNEL_DOMAIN]"),
+        description: "From: address used for outgoing mail. Defaults to noreply@<tunnel-domain-host>.",
         placeholder: Some("noreply@example.com"),
         dynamic_group: None,
     },
@@ -1002,11 +1002,11 @@ mod tests {
     fn validate_required_field_rejects_clear() {
         let mut existing = HashMap::new();
         existing.insert(
-            "CC_SWITCH_ROUTER_API_ADDR".to_string(),
-            "0.0.0.0:80".to_string(),
+            "CC_SWITCH_ROUTER_TUNNEL_DOMAIN".to_string(),
+            "router.example.com".to_string(),
         );
         let mut updates = BTreeMap::new();
-        updates.insert("CC_SWITCH_ROUTER_API_ADDR".into(), Some("".into()));
+        updates.insert("CC_SWITCH_ROUTER_TUNNEL_DOMAIN".into(), Some("".into()));
         assert!(validate_and_diff(&existing, &updates).is_err());
     }
 

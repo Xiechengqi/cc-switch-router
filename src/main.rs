@@ -12,6 +12,7 @@ mod models;
 mod proxy;
 mod recent_traffic;
 mod ssh;
+mod startup_config;
 mod store;
 
 use std::collections::HashSet;
@@ -36,6 +37,7 @@ use crate::board_telegram::TelegramNotifier;
 use crate::config::{Config, ensure_default_env_file, load_env_file};
 use crate::dynamic_settings::DynamicSettings;
 use crate::recent_traffic::RecentTraffic;
+use crate::startup_config::{StartupConfigMode, ensure_startup_config};
 use crate::store::{AppStore, ShareRouteTarget, fetch_share_runtime_snapshot_from_route};
 
 const APP_NAME: &str = "cc-switch-router";
@@ -86,6 +88,7 @@ async fn main() -> Result<()> {
 
     let env_path = ensure_default_env_file()?;
     load_env_file(&env_path)?;
+    ensure_startup_config(&env_path, StartupConfigMode::Start)?;
 
     let env_filter = EnvFilter::builder()
         .with_default_directive(LevelFilter::INFO.into())
@@ -534,6 +537,18 @@ fn try_handle_cli() -> Result<bool> {
             print_help();
             Ok(true)
         }
+        "setup" => {
+            let env_path = ensure_default_env_file()?;
+            load_env_file(&env_path)?;
+            ensure_startup_config(&env_path, StartupConfigMode::SetupOnly)?;
+            Ok(true)
+        }
+        "check-config" => {
+            let env_path = ensure_default_env_file()?;
+            load_env_file(&env_path)?;
+            ensure_startup_config(&env_path, StartupConfigMode::CheckOnly)?;
+            Ok(true)
+        }
         other => anyhow::bail!("unknown command: {other}\n\nRun `{APP_NAME} help` for usage."),
     }
 }
@@ -545,6 +560,8 @@ cc-switch-router
 
 Usage:
   cc-switch-router
+  cc-switch-router setup
+  cc-switch-router check-config
   cc-switch-router help
   cc-switch-router --help
   cc-switch-router -h
@@ -552,8 +569,10 @@ Usage:
 Environment:
   CC_SWITCH_ROUTER_API_ADDR              HTTP listen address, default 0.0.0.0:80
   CC_SWITCH_ROUTER_SSH_ADDR              SSH listen address, default 0.0.0.0:2222
-  CC_SWITCH_ROUTER_TUNNEL_DOMAIN         Public tunnel domain, default 0.0.0.0:8787
-  CC_SWITCH_ROUTER_SSH_PUBLIC_ADDR       SSH address sent to clients, default TUNNEL_DOMAIN:SSH_PORT
+  CC_SWITCH_ROUTER_TUNNEL_DOMAIN         Public tunnel domain, required
+  CC_SWITCH_ROUTER_SSH_PUBLIC_ADDR       SSH address sent to clients, required
+  CC_SWITCH_ROUTER_RESEND_API_KEY        Resend API key for email login, required
+  CC_SWITCH_ROUTER_RESEND_FROM           Sender email, default noreply@[TUNNEL_DOMAIN]
   CC_SWITCH_ROUTER_USE_LOCALHOST         Use http for localhost-style domains, default false
   CC_SWITCH_ROUTER_LEASE_TTL_SECS        Tunnel lease ttl, default 60
   CC_SWITCH_ROUTER_DB_PATH               SQLite path, default $HOME/.config/cc-switch-router/cc-switch-router.db
