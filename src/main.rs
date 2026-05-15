@@ -1,8 +1,11 @@
 mod abuse;
+mod admin;
 mod api;
+mod board_telegram;
 mod cf;
 mod client_meta;
 mod config;
+mod dynamic_settings;
 mod error;
 mod geo;
 mod models;
@@ -13,21 +16,25 @@ mod store;
 
 use std::collections::HashSet;
 use std::env;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use anyhow::Result;
 use proxy::ProxyRegistry;
 use resend_rs::Resend;
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 
 use crate::abuse::AbuseTracker;
+use crate::admin::upgrade::SharedUpgradeRegistry;
+use crate::board_telegram::TelegramNotifier;
 use crate::config::{Config, ensure_default_env_file, load_env_file};
+use crate::dynamic_settings::DynamicSettings;
 use crate::recent_traffic::RecentTraffic;
 use crate::store::{AppStore, ShareRouteTarget, fetch_share_runtime_snapshot_from_route};
 
@@ -41,6 +48,7 @@ pub struct ServerState {
     pub proxy: Arc<ProxyRegistry>,
     pub resend: Option<Arc<Resend>>,
     pub resend_usage_cache: Arc<Mutex<Option<ResendUsageCache>>>,
+    pub dynamic: Arc<RwLock<DynamicSettings>>,
     /// SSH host key 指纹（`SHA256:<base64-nopad>` 格式），在 /lease 响应中回传给客户端。
     pub ssh_host_fingerprint: Option<String>,
     /// In-memory rolling tracker of proxy traffic by user origin. Drives the dashboard
@@ -48,6 +56,14 @@ pub struct ServerState {
     pub recent_traffic: RecentTraffic,
     /// In-memory temporary ban tracker for repeated invalid API authentication.
     pub abuse: Arc<AbuseTracker>,
+    /// Optional Telegram bot client; populated when telegram env vars are set.
+    pub telegram: Arc<RwLock<Option<Arc<TelegramNotifier>>>>,
+    /// Single-flight upgrade orchestrator with SSE log fan-out.
+    pub upgrade_registry: SharedUpgradeRegistry,
+    /// Path to the live env file (also the apply target).
+    pub env_path: PathBuf,
+    /// When the process started; powers the uptime value on /v1/admin/version.
+    pub start_instant: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +122,14 @@ async fn main() -> Result<()> {
         .as_deref()
         .map(Resend::new)
         .map(Arc::new);
+    let telegram = TelegramNotifier::from_config(&config);
+    let default_admin_email = config.default_admin_email();
+    info!(
+        admin_emails = config.admin_emails.len(),
+        default_admin = default_admin_email.as_deref().unwrap_or("-"),
+        telegram_enabled = telegram.is_some(),
+        "message board configured"
+    );
     if let Some(ref fp) = ssh_host_fingerprint {
         info!("ssh host key fingerprint: {}", fp);
     }
@@ -118,9 +142,14 @@ async fn main() -> Result<()> {
         proxy: Arc::new(ProxyRegistry::default()),
         resend,
         resend_usage_cache: Arc::new(Mutex::new(None)),
+        dynamic: Arc::new(RwLock::new(DynamicSettings::from_config(&config))),
         ssh_host_fingerprint: ssh_host_fingerprint.clone(),
         recent_traffic: RecentTraffic::new(),
         abuse: Arc::new(AbuseTracker::new()),
+        telegram: Arc::new(RwLock::new(telegram)),
+        upgrade_registry: Arc::new(crate::admin::upgrade::UpgradeRegistry::new()),
+        env_path: env_path.clone(),
+        start_instant: Instant::now(),
     };
 
     let ssh_server = ssh::SshServer {

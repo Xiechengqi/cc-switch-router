@@ -1479,7 +1479,780 @@
           max-width: 1360px;
         }
       }
+
+      /* ── Message board dock ── */
+      .board-dock {
+        position: fixed;
+        right: 24px;
+        top: 96px;
+        bottom: 24px;
+        width: 360px;
+        max-width: calc(100vw - 32px);
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        box-shadow: 0 18px 50px rgba(15, 23, 42, 0.1);
+        display: flex;
+        flex-direction: column;
+        z-index: 70;
+        overflow: hidden;
+        transform: translateX(20px);
+        opacity: 0;
+        pointer-events: none;
+        transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.25s;
+      }
+      .board-dock.open {
+        transform: translateX(0);
+        opacity: 1;
+        pointer-events: auto;
+      }
+      .board-dock-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        padding: 14px 18px 12px;
+        border-bottom: 1px solid var(--border);
+        flex-shrink: 0;
+      }
+      .board-dock-title {
+        margin: 0;
+        font: 600 15px/1.2 Inter, system-ui, sans-serif;
+        color: var(--foreground);
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .board-dock-count {
+        font: 11px/1 "JetBrains Mono", monospace;
+        letter-spacing: 0.08em;
+        background: rgba(0, 82, 255, 0.08);
+        color: var(--accent);
+        padding: 3px 8px;
+        border-radius: 999px;
+      }
+      .board-dock-close {
+        appearance: none;
+        border: none;
+        background: var(--muted);
+        color: var(--muted-foreground);
+        width: 28px;
+        height: 28px;
+        border-radius: 8px;
+        cursor: pointer;
+        font-size: 16px;
+        line-height: 1;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        transition: background 0.15s, color 0.15s;
+      }
+      .board-dock-close:hover { background: var(--border); color: var(--foreground); }
+      .board-tabs {
+        display: flex;
+        gap: 4px;
+        padding: 10px 18px 0;
+        border-bottom: 1px solid var(--border);
+      }
+      .board-tab {
+        appearance: none;
+        border: none;
+        background: transparent;
+        font: 12px/1 "JetBrains Mono", monospace;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        color: var(--muted-foreground);
+        padding: 8px 10px 10px;
+        cursor: pointer;
+        border-bottom: 2px solid transparent;
+        margin-bottom: -1px;
+        transition: color 0.15s, border-color 0.15s;
+      }
+      .board-tab:hover { color: var(--foreground); }
+      .board-tab.active {
+        color: var(--accent);
+        border-bottom-color: var(--accent);
+      }
+      .board-list {
+        flex: 1;
+        overflow-y: auto;
+        padding: 14px 14px 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        scrollbar-width: thin;
+      }
+      .board-list::-webkit-scrollbar { width: 8px; }
+      .board-list::-webkit-scrollbar-thumb {
+        background: var(--border);
+        border-radius: 4px;
+      }
+      .board-empty {
+        text-align: center;
+        color: var(--muted-foreground);
+        font-size: 13px;
+        padding: 32px 18px;
+      }
+      .board-msg {
+        position: relative;
+        padding: 12px 14px;
+        border-radius: 12px;
+        background: var(--card);
+        border: 1px solid var(--border);
+        display: flex;
+        gap: 10px;
+        align-items: flex-start;
+        transition: box-shadow 0.2s, border-color 0.2s;
+      }
+      .board-msg.is-mine {
+        background: rgba(0, 82, 255, 0.04);
+        border-color: rgba(0, 82, 255, 0.18);
+      }
+      .board-msg.pinned {
+        background: linear-gradient(135deg, rgba(0, 82, 255, 0.05), rgba(77, 124, 255, 0.02));
+        border-color: rgba(0, 82, 255, 0.25);
+      }
+      .board-msg.pinned::before {
+        content: "";
+        position: absolute;
+        left: 0;
+        top: 14px;
+        bottom: 14px;
+        width: 2px;
+        border-radius: 2px;
+        background: linear-gradient(180deg, #0052ff, #4d7cff);
+      }
+      .board-msg-avatar {
+        flex: none;
+        width: 32px;
+        height: 32px;
+        border-radius: 50%;
+        font: 600 12px/1 Inter, system-ui, sans-serif;
+        color: #ffffff;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        background: linear-gradient(135deg, #64748b, #94a3b8);
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+      .board-msg-avatar.admin {
+        background: linear-gradient(135deg, #0052ff, #4d7cff);
+        box-shadow: 0 4px 14px rgba(0, 82, 255, 0.25);
+      }
+      .board-msg-avatar.guest {
+        background: linear-gradient(135deg, #94a3b8, #cbd5e1);
+        color: #0f172a;
+      }
+      .board-msg-main {
+        min-width: 0;
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+      .board-msg-header {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex-wrap: wrap;
+      }
+      .board-msg-author {
+        font: 600 13px/1.2 Inter, system-ui, sans-serif;
+        color: var(--foreground);
+        max-width: 180px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .board-msg-time {
+        font: 11px/1 "JetBrains Mono", monospace;
+        color: var(--muted-foreground);
+        letter-spacing: 0.04em;
+      }
+      .board-badge {
+        font: 600 9px/1 "JetBrains Mono", monospace;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        padding: 3px 6px;
+        border-radius: 4px;
+      }
+      .board-badge.official {
+        background: linear-gradient(135deg, #0052ff, #4d7cff);
+        color: #ffffff;
+      }
+      .board-badge.pinned {
+        background: rgba(0, 82, 255, 0.08);
+        color: var(--accent);
+        border: 1px solid rgba(0, 82, 255, 0.2);
+      }
+      .board-badge.featured {
+        background: rgba(245, 158, 11, 0.1);
+        color: #b45309;
+        border: 1px solid rgba(245, 158, 11, 0.3);
+      }
+      .board-msg-body {
+        font: 13px/1.55 Inter, system-ui, sans-serif;
+        color: var(--foreground);
+        word-break: break-word;
+        white-space: pre-wrap;
+      }
+      .board-msg-actions {
+        display: flex;
+        gap: 4px;
+        flex-wrap: wrap;
+        margin-top: 4px;
+      }
+      .board-msg-action {
+        appearance: none;
+        border: 1px solid var(--border);
+        background: transparent;
+        color: var(--muted-foreground);
+        font: 11px/1 "JetBrains Mono", monospace;
+        letter-spacing: 0.05em;
+        padding: 4px 8px;
+        border-radius: 6px;
+        cursor: pointer;
+        transition: color 0.15s, border-color 0.15s, background 0.15s;
+      }
+      .board-msg-action:hover {
+        color: var(--foreground);
+        border-color: rgba(0, 82, 255, 0.3);
+        background: rgba(0, 82, 255, 0.04);
+      }
+      .board-msg-action.danger:hover {
+        color: #b91c1c;
+        border-color: rgba(220, 38, 38, 0.3);
+        background: rgba(220, 38, 38, 0.05);
+      }
+      .board-composer {
+        flex-shrink: 0;
+        padding: 12px 14px 14px;
+        border-top: 1px solid var(--border);
+        background: var(--card);
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .board-composer-row {
+        display: flex;
+        gap: 8px;
+        align-items: stretch;
+      }
+      .board-composer textarea {
+        flex: 1;
+        appearance: none;
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 10px 12px;
+        font: 13px/1.45 Inter, system-ui, sans-serif;
+        color: var(--foreground);
+        background: var(--card);
+        resize: none;
+        min-height: 56px;
+        max-height: 140px;
+        outline: none;
+        transition: border-color 0.15s, box-shadow 0.15s;
+      }
+      .board-composer textarea:focus {
+        border-color: var(--accent);
+        box-shadow: 0 0 0 3px rgba(0, 82, 255, 0.15);
+      }
+      .board-composer-send {
+        appearance: none;
+        border: none;
+        background: linear-gradient(135deg, #0052ff, #4d7cff);
+        color: #ffffff;
+        font: 600 12px/1 Inter, system-ui, sans-serif;
+        padding: 0 14px;
+        border-radius: 12px;
+        cursor: pointer;
+        align-self: stretch;
+        min-width: 56px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        transition: filter 0.15s, transform 0.15s, box-shadow 0.15s;
+      }
+      .board-composer-send:hover {
+        filter: brightness(1.05);
+        box-shadow: 0 4px 14px rgba(0, 82, 255, 0.25);
+      }
+      .board-composer-send:active { transform: scale(0.98); }
+      .board-composer-send[disabled] {
+        opacity: 0.55;
+        cursor: not-allowed;
+      }
+      .board-composer-meta {
+        display: flex;
+        justify-content: space-between;
+        font: 11px/1 "JetBrains Mono", monospace;
+        color: var(--muted-foreground);
+        letter-spacing: 0.04em;
+      }
+      .board-composer-meta .err { color: #b91c1c; letter-spacing: 0; font-family: Inter, system-ui, sans-serif; }
+      .board-composer-meta .ok { color: var(--accent); letter-spacing: 0; font-family: Inter, system-ui, sans-serif; }
+      .board-composer input[type="text"].board-guest-name {
+        appearance: none;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 8px 10px;
+        font: 12px/1.4 Inter, system-ui, sans-serif;
+        color: var(--foreground);
+        background: var(--card);
+        outline: none;
+      }
+      .board-composer input[type="text"].board-guest-name:focus {
+        border-color: var(--accent);
+        box-shadow: 0 0 0 3px rgba(0, 82, 255, 0.15);
+      }
+      .board-fab {
+        position: fixed;
+        right: 24px;
+        bottom: 24px;
+        width: 52px;
+        height: 52px;
+        border-radius: 999px;
+        background: linear-gradient(135deg, #0052ff, #4d7cff);
+        color: #ffffff;
+        border: none;
+        box-shadow: 0 12px 30px rgba(0, 82, 255, 0.3);
+        cursor: pointer;
+        z-index: 65;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        font-size: 22px;
+        transition: transform 0.2s, box-shadow 0.2s;
+      }
+      .board-fab:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 16px 36px rgba(0, 82, 255, 0.35);
+      }
+      .board-fab.visible { display: inline-flex; }
+      .board-fab-badge {
+        position: absolute;
+        top: -6px;
+        right: -6px;
+        min-width: 18px;
+        height: 18px;
+        padding: 0 5px;
+        border-radius: 999px;
+        background: #ef4444;
+        color: #ffffff;
+        font: 600 10px/1 Inter, system-ui, sans-serif;
+        display: none;
+        align-items: center;
+        justify-content: center;
+      }
+      .board-fab-badge.visible { display: inline-flex; }
+
+      @media (max-width: 1499px) {
+        .board-dock {
+          top: auto;
+          right: 16px;
+          bottom: 16px;
+          width: min(380px, calc(100vw - 32px));
+          height: min(620px, calc(100vh - 32px));
+        }
+      }
+      @media (max-width: 640px) {
+        .board-dock {
+          right: 8px;
+          left: 8px;
+          bottom: 8px;
+          width: auto;
+          height: min(72vh, 560px);
+        }
+        .board-fab {
+          right: 16px;
+          bottom: 16px;
+        }
+      }
+
+      /* ── Admin modals (Settings / Version / Upgrade) ── */
+      .auth-menu-item {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        width: 100%;
+        appearance: none;
+        border: none;
+        background: transparent;
+        color: var(--foreground);
+        font: 13px/1.2 Inter, system-ui, sans-serif;
+        padding: 10px 12px;
+        border-radius: 8px;
+        cursor: pointer;
+        text-align: left;
+        transition: background 0.15s, color 0.15s;
+      }
+      .auth-menu-item:hover { background: rgba(0, 82, 255, 0.06); color: var(--accent); }
+      .auth-menu-item.danger { color: #b91c1c; }
+      .auth-menu-item.danger:hover { background: rgba(220, 38, 38, 0.06); color: #b91c1c; }
+      .auth-menu-item .icon {
+        width: 16px;
+        height: 16px;
+        flex: none;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        color: currentColor;
+      }
+      .auth-menu-item .icon svg { width: 16px; height: 16px; }
+      body:not([data-is-admin="true"]) .menu-admin-only { display: none !important; }
+      body:not([data-authenticated="true"]) .menu-when-auth { display: none !important; }
+
+      .admin-modal-backdrop {
+        position: fixed;
+        inset: 0;
+        background: rgba(15, 23, 42, 0.4);
+        backdrop-filter: blur(4px);
+        z-index: 200;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+      }
+      .admin-modal-backdrop[data-open="true"] {
+        display: flex;
+      }
+      .admin-modal {
+        width: min(960px, 100%);
+        max-height: calc(100vh - 48px);
+        background: var(--card);
+        border-radius: 18px;
+        box-shadow: 0 30px 80px rgba(15, 23, 42, 0.25);
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+      .admin-modal.small { width: min(560px, 100%); }
+      .admin-modal-header {
+        padding: 18px 22px;
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        flex-shrink: 0;
+      }
+      .admin-modal-title {
+        margin: 0;
+        font: 600 18px/1.1 Inter, system-ui, sans-serif;
+        color: var(--foreground);
+      }
+      .admin-modal-subtitle {
+        margin: 4px 0 0;
+        font: 12px/1.4 "JetBrains Mono", monospace;
+        color: var(--muted-foreground);
+        letter-spacing: 0.06em;
+      }
+      .admin-modal-close {
+        appearance: none;
+        border: none;
+        background: var(--muted);
+        width: 32px;
+        height: 32px;
+        border-radius: 10px;
+        cursor: pointer;
+        color: var(--muted-foreground);
+        font-size: 18px;
+      }
+      .admin-modal-close:hover { background: var(--border); color: var(--foreground); }
+      .admin-modal-body {
+        padding: 18px 22px;
+        overflow-y: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+      }
+      .admin-modal-footer {
+        padding: 14px 22px;
+        border-top: 1px solid var(--border);
+        display: flex;
+        justify-content: flex-end;
+        gap: 10px;
+        align-items: center;
+        flex-shrink: 0;
+        background: rgba(241, 245, 249, 0.4);
+      }
+      .admin-btn {
+        appearance: none;
+        border: 1px solid var(--border);
+        background: var(--card);
+        color: var(--foreground);
+        padding: 9px 16px;
+        border-radius: 10px;
+        font: 13px/1 Inter, system-ui, sans-serif;
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        transition: border-color 0.15s, background 0.15s, color 0.15s;
+      }
+      .admin-btn:hover { border-color: rgba(0, 82, 255, 0.3); background: rgba(0, 82, 255, 0.03); }
+      .admin-btn.primary {
+        background: linear-gradient(135deg, #0052ff, #4d7cff);
+        color: #ffffff;
+        border-color: transparent;
+        box-shadow: 0 4px 14px rgba(0, 82, 255, 0.25);
+      }
+      .admin-btn.primary:hover { filter: brightness(1.05); box-shadow: 0 6px 20px rgba(0, 82, 255, 0.3); }
+      .admin-btn.danger { color: #b91c1c; border-color: rgba(220, 38, 38, 0.3); }
+      .admin-btn.danger:hover { background: rgba(220, 38, 38, 0.05); }
+      .admin-btn[disabled] { opacity: 0.55; cursor: not-allowed; }
+
+      .settings-tabs {
+        display: flex;
+        gap: 4px;
+        padding: 0 22px;
+        border-bottom: 1px solid var(--border);
+        overflow-x: auto;
+        flex-shrink: 0;
+        background: rgba(241, 245, 249, 0.4);
+      }
+      .settings-tab {
+        appearance: none;
+        border: none;
+        background: transparent;
+        font: 12px/1 "JetBrains Mono", monospace;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        color: var(--muted-foreground);
+        padding: 12px 12px 12px;
+        margin-bottom: -1px;
+        cursor: pointer;
+        border-bottom: 2px solid transparent;
+        white-space: nowrap;
+        transition: color 0.15s, border-color 0.15s;
+      }
+      .settings-tab:hover { color: var(--foreground); }
+      .settings-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+      .settings-tab .count {
+        margin-left: 6px;
+        font-size: 10px;
+        padding: 2px 6px;
+        border-radius: 999px;
+        background: rgba(0, 82, 255, 0.08);
+        color: var(--accent);
+      }
+
+      .settings-field {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 6px;
+        padding: 12px;
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        background: var(--card);
+        transition: border-color 0.15s, box-shadow 0.15s;
+      }
+      .settings-field:hover { border-color: rgba(0, 82, 255, 0.18); }
+      .settings-field.dirty { border-color: rgba(0, 82, 255, 0.45); box-shadow: 0 0 0 3px rgba(0, 82, 255, 0.1); }
+      .settings-field-label {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+        font: 600 13px/1.2 Inter, system-ui, sans-serif;
+        color: var(--foreground);
+      }
+      .settings-field-required { color: #ef4444; font-weight: 700; }
+      .settings-field-restart {
+        font: 10px/1 "JetBrains Mono", monospace;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        background: rgba(245, 158, 11, 0.1);
+        color: #b45309;
+        border: 1px solid rgba(245, 158, 11, 0.3);
+        padding: 3px 6px;
+        border-radius: 4px;
+      }
+      .settings-field-key {
+        font: 11px/1 "JetBrains Mono", monospace;
+        letter-spacing: 0.04em;
+        color: var(--muted-foreground);
+        margin-left: auto;
+      }
+      .settings-field-desc {
+        font: 12px/1.5 Inter, system-ui, sans-serif;
+        color: var(--muted-foreground);
+        margin: 0;
+      }
+      .settings-field-input,
+      .settings-field input[type="text"],
+      .settings-field input[type="number"],
+      .settings-field input[type="password"],
+      .settings-field input[type="url"],
+      .settings-field input[type="email"] {
+        appearance: none;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 9px 12px;
+        font: 13px/1.3 "JetBrains Mono", monospace;
+        background: rgba(241, 245, 249, 0.3);
+        color: var(--foreground);
+        outline: none;
+        transition: border-color 0.15s, background 0.15s, box-shadow 0.15s;
+      }
+      .settings-field input:focus {
+        border-color: var(--accent);
+        background: var(--card);
+        box-shadow: 0 0 0 3px rgba(0, 82, 255, 0.15);
+      }
+      .settings-toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        font: 12px/1.2 Inter, system-ui, sans-serif;
+        color: var(--foreground);
+      }
+      .settings-toggle input[type="checkbox"] {
+        width: 36px;
+        height: 20px;
+        appearance: none;
+        background: var(--border);
+        border-radius: 999px;
+        position: relative;
+        cursor: pointer;
+        transition: background 0.2s;
+      }
+      .settings-toggle input[type="checkbox"]::after {
+        content: "";
+        position: absolute;
+        top: 2px;
+        left: 2px;
+        width: 16px;
+        height: 16px;
+        background: #ffffff;
+        border-radius: 50%;
+        transition: transform 0.2s;
+        box-shadow: 0 1px 3px rgba(15, 23, 42, 0.15);
+      }
+      .settings-toggle input[type="checkbox"]:checked {
+        background: linear-gradient(135deg, #0052ff, #4d7cff);
+      }
+      .settings-toggle input[type="checkbox"]:checked::after { transform: translateX(16px); }
+      .settings-secret-state {
+        font: 11px/1 "JetBrains Mono", monospace;
+        color: var(--muted-foreground);
+        letter-spacing: 0.05em;
+      }
+      .settings-secret-state .on { color: var(--accent); }
+      .settings-banner {
+        padding: 12px 14px;
+        border-radius: 10px;
+        background: rgba(245, 158, 11, 0.08);
+        color: #92400e;
+        border: 1px solid rgba(245, 158, 11, 0.3);
+        font: 12px/1.5 Inter, system-ui, sans-serif;
+      }
+      .settings-banner.success {
+        background: rgba(16, 185, 129, 0.08);
+        color: #065f46;
+        border-color: rgba(16, 185, 129, 0.3);
+      }
+      .settings-banner.error {
+        background: rgba(220, 38, 38, 0.06);
+        color: #991b1b;
+        border-color: rgba(220, 38, 38, 0.3);
+      }
+
+      /* Version drawer */
+      .version-card {
+        background: linear-gradient(135deg, rgba(0, 82, 255, 0.05), rgba(77, 124, 255, 0.02));
+        border-radius: 12px;
+        padding: 18px;
+        border: 1px solid rgba(0, 82, 255, 0.15);
+      }
+      .version-card .row {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 6px 0;
+        font-size: 13px;
+      }
+      .version-card .row + .row { border-top: 1px dashed rgba(15, 23, 42, 0.05); }
+      .version-card .key {
+        font: 11px/1 "JetBrains Mono", monospace;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        color: var(--muted-foreground);
+      }
+      .version-card .value {
+        font: 600 13px/1.3 Inter, system-ui, sans-serif;
+        color: var(--foreground);
+        text-align: right;
+        word-break: break-all;
+      }
+      .version-card .value.mono { font-family: "JetBrains Mono", monospace; }
+      .service-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 10px;
+        border-radius: 999px;
+        font: 11px/1 "JetBrains Mono", monospace;
+        letter-spacing: 0.08em;
+      }
+      .service-badge.systemd { background: rgba(16, 185, 129, 0.08); color: #047857; }
+      .service-badge.nohup { background: rgba(245, 158, 11, 0.08); color: #b45309; }
+      .service-badge.unknown { background: var(--muted); color: var(--muted-foreground); }
+      .service-badge .dot {
+        width: 6px; height: 6px; border-radius: 50%;
+        background: currentColor;
+      }
+
+      .upgrade-progress {
+        height: 6px;
+        background: var(--muted);
+        border-radius: 999px;
+        overflow: hidden;
+      }
+      .upgrade-progress-bar {
+        height: 100%;
+        background: linear-gradient(135deg, #0052ff, #4d7cff);
+        width: 0;
+        transition: width 0.25s ease-out;
+      }
+      .upgrade-log {
+        font: 12px/1.5 "JetBrains Mono", monospace;
+        background: #0f172a;
+        color: #e2e8f0;
+        border-radius: 10px;
+        padding: 12px;
+        max-height: 360px;
+        overflow-y: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+      .upgrade-log .entry {
+        display: flex;
+        gap: 8px;
+        align-items: flex-start;
+        line-height: 1.45;
+      }
+      .upgrade-log .step {
+        flex: none;
+        opacity: 0.7;
+      }
+      .upgrade-log .entry.info .msg { color: #cbd5e1; }
+      .upgrade-log .entry.progress .msg { color: #93c5fd; }
+      .upgrade-log .entry.success .msg { color: #6ee7b7; }
+      .upgrade-log .entry.warn .msg { color: #fcd34d; }
+      .upgrade-log .entry.error .msg { color: #fca5a5; }
+
+      @media (max-width: 720px) {
+        .settings-field { padding: 10px; }
+        .settings-field-key { display: none; }
+        .admin-modal-header { padding: 14px 16px; }
+        .admin-modal-body { padding: 14px 16px; }
+        .settings-tabs { padding: 0 12px; }
+      }
     </style>
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
   </head>
   <body>
     <main class="page">
@@ -1538,7 +2311,24 @@
               <button class="auth-menu-button" id="auth-menu-button" type="button"></button>
               <div class="auth-menu-panel">
                 <div class="auth-menu-email" id="auth-menu-email"></div>
-                <button class="auth-menu-button" id="auth-logout-button" type="button">Logout</button>
+                <button class="auth-menu-item menu-when-auth menu-admin-only" id="auth-settings-button" type="button">
+                  <span class="icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                  </span>
+                  Settings
+                </button>
+                <button class="auth-menu-item menu-when-auth" id="auth-version-button" type="button">
+                  <span class="icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>
+                  </span>
+                  Version
+                </button>
+                <button class="auth-menu-item danger" id="auth-logout-button" type="button">
+                  <span class="icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+                  </span>
+                  Logout
+                </button>
               </div>
             </div>
           </div>
@@ -1632,6 +2422,49 @@
       </footer>
     </main>
 
+    <!-- Message board dock -->
+    <aside class="board-dock" id="board-dock" role="region" aria-label="Message board">
+      <div class="board-dock-header">
+        <h3 class="board-dock-title">
+          <span>留言板</span>
+          <span class="board-dock-count" id="board-count">0</span>
+        </h3>
+        <button class="board-dock-close" id="board-dock-close" type="button" aria-label="Close message board">&times;</button>
+      </div>
+      <div class="board-tabs" role="tablist">
+        <button class="board-tab active" data-board-tab="all" type="button" role="tab">All</button>
+        <button class="board-tab" data-board-tab="pinned" type="button" role="tab">Pinned</button>
+        <button class="board-tab" data-board-tab="featured" type="button" role="tab">Featured</button>
+      </div>
+      <div class="board-list" id="board-list" role="log" aria-live="polite"></div>
+      <div class="board-composer">
+        <input
+          type="text"
+          class="board-guest-name"
+          id="board-guest-name"
+          placeholder="昵称（可选，最多 16 字）"
+          maxlength="16"
+        />
+        <div class="board-composer-row">
+          <textarea
+            id="board-input"
+            placeholder="说点什么…"
+            rows="2"
+            aria-label="留言内容"
+          ></textarea>
+          <button class="board-composer-send" id="board-send" type="button">发送</button>
+        </div>
+        <div class="board-composer-meta">
+          <span id="board-status"></span>
+          <span><span id="board-counter">0</span>/<span id="board-counter-max">1000</span></span>
+        </div>
+      </div>
+    </aside>
+    <button class="board-fab" id="board-fab" type="button" aria-label="Open message board">
+      💬
+      <span class="board-fab-badge" id="board-fab-badge"></span>
+    </button>
+
     <!-- Universal drawer -->
     <div class="drawer-overlay" id="drawer-overlay"></div>
     <aside class="drawer" id="drawer">
@@ -1672,6 +2505,177 @@
           </div>
           <div class="auth-modal-meta" id="auth-modal-meta"></div>
         </div>
+      </div>
+    </div>
+
+    <!-- Admin: Settings modal -->
+    <div class="admin-modal-backdrop" id="settings-modal-backdrop" x-data="settingsModal()" :data-open="open" x-init="init()" @keydown.escape.window="if (open) close()">
+      <div class="admin-modal" @click.outside="close()">
+        <header class="admin-modal-header">
+          <div>
+            <h2 class="admin-modal-title">Settings</h2>
+            <p class="admin-modal-subtitle">CC_SWITCH_ROUTER_* · <span x-text="envPath || '~/.config/cc-switch-router/.env'"></span></p>
+          </div>
+          <button class="admin-modal-close" @click="close()" aria-label="Close">&times;</button>
+        </header>
+        <div class="settings-tabs">
+          <template x-for="group in groups" :key="group">
+            <button class="settings-tab" :class="{ active: activeGroup === group }" @click="activeGroup = group" type="button">
+              <span x-text="group"></span>
+              <span class="count" x-text="dirtyCountFor(group)" x-show="dirtyCountFor(group) > 0"></span>
+            </button>
+          </template>
+        </div>
+        <div class="admin-modal-body">
+          <template x-if="loading">
+            <div class="settings-banner">Loading…</div>
+          </template>
+          <template x-if="banner">
+            <div class="settings-banner" :class="bannerKind" x-text="banner"></div>
+          </template>
+          <template x-for="field in fieldsForGroup(activeGroup)" :key="field.key">
+            <div class="settings-field" :class="{ dirty: isDirty(field.key) }">
+              <div class="settings-field-label">
+                <span x-text="field.label"></span>
+                <template x-if="field.required"><span class="settings-field-required">*</span></template>
+                <template x-if="field.restartRequired"><span class="settings-field-restart">RESTART</span></template>
+                <span class="settings-field-key" x-text="field.key"></span>
+              </div>
+              <p class="settings-field-desc" x-text="field.description"></p>
+              <template x-if="field.fieldType === 'bool'">
+                <label class="settings-toggle">
+                  <input type="checkbox" :checked="boolValue(field.key)" @change="setValue(field.key, $event.target.checked ? 'true' : 'false')">
+                  <span x-text="boolValue(field.key) ? 'Enabled' : 'Disabled'"></span>
+                </label>
+              </template>
+              <template x-if="field.fieldType === 'int'">
+                <input type="number" :placeholder="field.placeholder" :value="rawValue(field.key)" @input="setValue(field.key, $event.target.value)">
+              </template>
+              <template x-if="field.fieldType === 'secret'">
+                <div style="display: flex; flex-direction: column; gap: 6px;">
+                  <div class="settings-secret-state">
+                    <span :class="hasSecretSet(field.key) ? 'on' : ''" x-text="hasSecretSet(field.key) ? '✓ 已设置 (保密)' : '未设置'"></span>
+                  </div>
+                  <input type="password" placeholder="留空保持不变；填新值则覆盖；填 - 清除" :value="rawValue(field.key)" @input="setValue(field.key, $event.target.value)" autocomplete="new-password">
+                </div>
+              </template>
+              <template x-if="['text','path','url','email','email-list'].includes(field.fieldType)">
+                <input type="text" :placeholder="field.placeholder" :value="rawValue(field.key)" @input="setValue(field.key, $event.target.value)">
+              </template>
+              <template x-if="field.key === 'CC_SWITCH_ROUTER_TELEGRAM_BOT_TOKEN'">
+                <button class="admin-btn" style="align-self: flex-start; margin-top: 6px;" @click="testTelegram()" :disabled="testingTelegram" type="button">
+                  <span x-text="testingTelegram ? 'Testing…' : 'Send test message'"></span>
+                </button>
+              </template>
+            </div>
+          </template>
+        </div>
+        <footer class="admin-modal-footer">
+          <span x-text="dirtyCount + ' changed'" style="margin-right: auto; color: var(--muted-foreground); font: 12px JetBrains Mono, monospace;"></span>
+          <button class="admin-btn" @click="close()" type="button">Cancel</button>
+          <button class="admin-btn primary" :disabled="saving || dirtyCount === 0" @click="save(false)" type="button">
+            <span x-text="saving ? 'Saving…' : 'Save'"></span>
+          </button>
+          <button class="admin-btn primary" :disabled="saving || dirtyCount === 0" @click="save(true)" type="button">Save &amp; Restart</button>
+        </footer>
+      </div>
+    </div>
+
+    <!-- Admin: Version modal -->
+    <div class="admin-modal-backdrop" id="version-modal-backdrop" x-data="versionModal()" :data-open="open" x-init="init()" @keydown.escape.window="if (open) close()">
+      <div class="admin-modal small" @click.outside="close()">
+        <header class="admin-modal-header">
+          <div>
+            <h2 class="admin-modal-title">Version</h2>
+            <p class="admin-modal-subtitle" x-text="info ? `${info.version} · ${info.commit}` : '...'"></p>
+          </div>
+          <button class="admin-modal-close" @click="close()" aria-label="Close">&times;</button>
+        </header>
+        <div class="admin-modal-body">
+          <template x-if="info">
+            <div class="version-card">
+              <div class="row"><span class="key">Version</span><span class="value mono" x-text="info.version"></span></div>
+              <div class="row"><span class="key">Commit</span><span class="value mono" x-text="info.commit"></span></div>
+              <div class="row"><span class="key">Built at</span><span class="value mono" x-text="info.buildTime"></span></div>
+              <div class="row"><span class="key">Uptime</span><span class="value" x-text="formatUptime(info.uptimeSecs)"></span></div>
+              <template x-if="info.binaryPath">
+                <div class="row"><span class="key">Binary</span><span class="value mono" x-text="info.binaryPath"></span></div>
+              </template>
+              <div class="row">
+                <span class="key">Service</span>
+                <span class="value">
+                  <span class="service-badge" :class="info.service.manager">
+                    <span class="dot"></span>
+                    <span x-text="info.service.manager + (info.service.unitName ? ' · ' + info.service.unitName : '')"></span>
+                  </span>
+                </span>
+              </div>
+              <template x-if="info.latest && info.latest.available">
+                <div class="row">
+                  <span class="key">Latest</span>
+                  <span class="value mono" x-text="formatBytes(info.latest.contentLength)"></span>
+                </div>
+              </template>
+              <template x-if="info.latest && info.latest.error">
+                <div class="row">
+                  <span class="key">Release</span>
+                  <span class="value" style="color: #b91c1c;" x-text="info.latest.error"></span>
+                </div>
+              </template>
+            </div>
+          </template>
+          <template x-if="info && info.service.manager === 'nohup'">
+            <div class="settings-banner">
+              该实例当前以 nohup 方式运行。重启/升级将杀掉当前进程并通过 setsid 重启，日志写入 /var/log/cc-switch-router.log。
+            </div>
+          </template>
+          <template x-if="error">
+            <div class="settings-banner error" x-text="error"></div>
+          </template>
+        </div>
+        <footer class="admin-modal-footer">
+          <button class="admin-btn" @click="close()" type="button">Close</button>
+          <template x-if="isAdmin && info">
+            <button class="admin-btn" @click="restart()" :disabled="busy" type="button">
+              <span x-text="busy === 'restart' ? 'Restarting…' : '♻ 单独重启'"></span>
+            </button>
+          </template>
+          <template x-if="isAdmin && info">
+            <button class="admin-btn primary" @click="upgrade()" :disabled="busy" type="button">
+              <span x-text="busy === 'upgrade' ? 'Upgrading…' : '🔄 立即升级'"></span>
+            </button>
+          </template>
+        </footer>
+      </div>
+    </div>
+
+    <!-- Admin: Upgrade log modal -->
+    <div class="admin-modal-backdrop" id="upgrade-modal-backdrop" x-data="upgradeLogModal()" :data-open="open" x-init="init()">
+      <div class="admin-modal small">
+        <header class="admin-modal-header">
+          <div>
+            <h2 class="admin-modal-title" x-text="title"></h2>
+            <p class="admin-modal-subtitle" x-text="subtitle"></p>
+          </div>
+          <button class="admin-modal-close" @click="close()" aria-label="Close" :disabled="!canClose">&times;</button>
+        </header>
+        <div class="admin-modal-body">
+          <div class="upgrade-progress">
+            <div class="upgrade-progress-bar" :style="`width: ${progress}%`"></div>
+          </div>
+          <div class="upgrade-log" x-ref="log">
+            <template x-for="(entry, i) in entries" :key="i">
+              <div class="entry" :class="entry.level">
+                <span class="step" x-text="`[${entry.step}/${entry.totalSteps}]`"></span>
+                <span class="msg" x-text="entry.message"></span>
+              </div>
+            </template>
+          </div>
+        </div>
+        <footer class="admin-modal-footer">
+          <span x-text="statusLabel" style="margin-right: auto; font: 12px JetBrains Mono, monospace; color: var(--muted-foreground);"></span>
+          <button class="admin-btn" @click="close()" :disabled="!canClose" type="button">Close</button>
+        </footer>
       </div>
     </div>
 
@@ -1940,6 +2944,8 @@
           menu.classList.add("open");
           menuButton.textContent = email;
           menuEmail.textContent = email;
+          document.body.dataset.authenticated = "true";
+          document.body.dataset.isAdmin = status?.isAdmin ? "true" : "false";
           return;
         }
         const stored = readAuthState();
@@ -1948,12 +2954,16 @@
           menu.classList.add("open");
           menuButton.textContent = stored.email;
           menuEmail.textContent = stored.email;
+          document.body.dataset.authenticated = "true";
+          document.body.dataset.isAdmin = stored?.isAdmin ? "true" : "false";
           return;
         }
         loginButton.style.display = "";
         menu.classList.remove("open");
         menuButton.textContent = "";
         menuEmail.textContent = "";
+        document.body.dataset.authenticated = "false";
+        document.body.dataset.isAdmin = "false";
       }
 
       async function refreshAccessToken() {
@@ -4137,6 +5147,798 @@
       updatePagePresence().catch(console.error);
       setInterval(() => boot().catch(console.error), 5000);
       setInterval(() => updatePagePresence().catch(console.error), 15000);
+
+      /* ── Message board ── */
+      const BOARD_GUEST_KEY = "cc_switch_router_board_guest_v1";
+      const BOARD_DOCK_KEY = "cc_switch_router_board_dock_v1";
+      const BOARD_LAST_SEEN_KEY = "cc_switch_router_board_last_seen_v1";
+      const BOARD_GUEST_NAME_KEY = "cc_switch_router_board_guest_name_v1";
+
+      const _board = {
+        tab: "all",
+        messages: [],
+        loading: false,
+        maxLen: 1000,
+        guestSelfDeleteSecs: 300,
+        canPostAsAdmin: false,
+        lastSeenId: null,
+      };
+
+      function boardGuestId() {
+        let id = localStorage.getItem(BOARD_GUEST_KEY);
+        if (id && /^[a-z0-9-]{8,80}$/i.test(id)) return id;
+        id = (window.crypto && crypto.randomUUID)
+          ? crypto.randomUUID()
+          : `guest-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+        localStorage.setItem(BOARD_GUEST_KEY, id);
+        return id;
+      }
+
+      function boardDockOpen() {
+        const value = localStorage.getItem(BOARD_DOCK_KEY);
+        return value !== "closed";
+      }
+
+      function setBoardDockOpen(open) {
+        localStorage.setItem(BOARD_DOCK_KEY, open ? "open" : "closed");
+        const dock = document.getElementById("board-dock");
+        const fab = document.getElementById("board-fab");
+        if (!dock || !fab) return;
+        if (open) {
+          dock.classList.add("open");
+          fab.classList.remove("visible");
+          markBoardSeen();
+        } else {
+          dock.classList.remove("open");
+          fab.classList.add("visible");
+        }
+      }
+
+      function markBoardSeen() {
+        if (_board.messages.length === 0) return;
+        const newest = _board.messages.reduce((acc, msg) => {
+          const ts = new Date(msg.createdAt).getTime();
+          return ts > acc.ts ? { id: msg.id, ts } : acc;
+        }, { id: null, ts: 0 });
+        if (newest.id) {
+          _board.lastSeenId = newest.id;
+          localStorage.setItem(BOARD_LAST_SEEN_KEY, newest.id);
+        }
+        updateBoardFabBadge();
+      }
+
+      function updateBoardFabBadge() {
+        const badge = document.getElementById("board-fab-badge");
+        if (!badge) return;
+        const lastSeen = _board.lastSeenId || localStorage.getItem(BOARD_LAST_SEEN_KEY);
+        let unread = 0;
+        for (const msg of _board.messages) {
+          if (msg.id === lastSeen) break;
+          if (msg.isMine) continue;
+          unread += 1;
+        }
+        if (unread > 0) {
+          badge.textContent = unread > 99 ? "99+" : String(unread);
+          badge.classList.add("visible");
+        } else {
+          badge.textContent = "";
+          badge.classList.remove("visible");
+        }
+      }
+
+      function boardHeaders(extra = {}) {
+        const headers = new Headers(extra);
+        const auth = authBearerHeaders();
+        Object.entries(auth).forEach(([key, value]) => headers.set(key, value));
+        headers.set("X-Board-Guest-Id", boardGuestId());
+        return headers;
+      }
+
+      async function boardFetch(url, options = {}) {
+        const headers = boardHeaders(options.headers || {});
+        if (!headers.has("Content-Type") && options.body) {
+          headers.set("Content-Type", "application/json");
+        }
+        let response = await fetch(url, { ...options, headers });
+        if (response.status === 401 && (await refreshAccessToken())) {
+          const retryHeaders = boardHeaders(options.headers || {});
+          if (!retryHeaders.has("Content-Type") && options.body) {
+            retryHeaders.set("Content-Type", "application/json");
+          }
+          response = await fetch(url, { ...options, headers: retryHeaders });
+        }
+        return response;
+      }
+
+      function boardInitials(label, kind) {
+        if (kind === "admin") return "★";
+        const trimmed = String(label || "").trim();
+        if (!trimmed) return "?";
+        const ch = Array.from(trimmed)[0] || "?";
+        return ch.toUpperCase();
+      }
+
+      function escapeHtml(value) {
+        return String(value)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;")
+          .replace(/'/g, "&#39;");
+      }
+
+      function renderBoardMessage(msg) {
+        const badges = [];
+        if (msg.authorKind === "admin") badges.push('<span class="board-badge official">Official</span>');
+        if (msg.pinned) badges.push('<span class="board-badge pinned">置顶</span>');
+        if (msg.featured && !msg.pinned) badges.push('<span class="board-badge featured">精华</span>');
+
+        const time = relTimestamp(msg.createdAt);
+        const fullStamp = fullTimestamp(msg.createdAt);
+        const author = escapeHtml(msg.authorLabel || "Guest");
+        const avatarClass = msg.authorKind === "admin"
+          ? "admin"
+          : (msg.authorKind === "guest" ? "guest" : "");
+        const avatar = boardInitials(msg.authorLabel, msg.authorKind);
+        const classes = ["board-msg"];
+        if (msg.isMine) classes.push("is-mine");
+        if (msg.pinned) classes.push("pinned");
+
+        const actions = [];
+        if (_board.canPostAsAdmin) {
+          actions.push(`<button class="board-msg-action" data-board-action="pin" data-id="${msg.id}">${msg.pinned ? "取消置顶" : "置顶"}</button>`);
+          actions.push(`<button class="board-msg-action" data-board-action="feature" data-id="${msg.id}">${msg.featured ? "取消精华" : "精华"}</button>`);
+          actions.push(`<button class="board-msg-action danger" data-board-action="delete" data-id="${msg.id}">删除</button>`);
+        } else if (msg.isMine && msg.authorKind === "guest") {
+          const age = (Date.now() - new Date(msg.createdAt).getTime()) / 1000;
+          if (age <= _board.guestSelfDeleteSecs) {
+            actions.push(`<button class="board-msg-action danger" data-board-action="delete" data-id="${msg.id}">删除</button>`);
+          }
+        }
+
+        return `
+          <article class="${classes.join(' ')}" data-board-id="${msg.id}" id="board-${msg.id}">
+            <div class="board-msg-avatar ${avatarClass}">${escapeHtml(avatar)}</div>
+            <div class="board-msg-main">
+              <div class="board-msg-header">
+                <span class="board-msg-author">${author}</span>
+                ${badges.join("")}
+                <span class="board-msg-time" title="${escapeHtml(fullStamp)}">${escapeHtml(time)}</span>
+              </div>
+              <div class="board-msg-body">${escapeHtml(msg.body)}</div>
+              ${actions.length ? `<div class="board-msg-actions">${actions.join("")}</div>` : ""}
+            </div>
+          </article>`;
+      }
+
+      function renderBoard() {
+        const list = document.getElementById("board-list");
+        const counter = document.getElementById("board-count");
+        if (!list) return;
+        counter.textContent = String(_board.messages.length);
+        if (_board.messages.length === 0) {
+          list.innerHTML = `<div class="board-empty">还没有留言。来发第一条吧。</div>`;
+          return;
+        }
+        list.innerHTML = _board.messages.map(renderBoardMessage).join("");
+        updateBoardFabBadge();
+      }
+
+      async function loadBoardMessages() {
+        if (_board.loading) return;
+        _board.loading = true;
+        try {
+          const res = await boardFetch(`/v1/board/messages?tab=${encodeURIComponent(_board.tab)}&limit=50`);
+          if (!res.ok) {
+            console.warn("[board] list failed", res.status);
+            return;
+          }
+          const data = await res.json();
+          _board.messages = Array.isArray(data?.messages) ? data.messages : [];
+          renderBoard();
+        } finally {
+          _board.loading = false;
+        }
+      }
+
+      async function loadBoardMeta() {
+        try {
+          const res = await boardFetch("/v1/board/meta");
+          if (!res.ok) return;
+          const data = await res.json();
+          _board.canPostAsAdmin = !!data.canPostAsAdmin;
+          _board.maxLen = data.maxBodyLength || 1000;
+          _board.guestSelfDeleteSecs = data.guestSelfDeleteSecs || 300;
+          const max = document.getElementById("board-counter-max");
+          if (max) max.textContent = String(_board.maxLen);
+        } catch (err) {
+          console.warn("[board] meta failed", err);
+        }
+      }
+
+      function setBoardStatus(text, kind) {
+        const el = document.getElementById("board-status");
+        if (!el) return;
+        el.className = kind || "";
+        el.textContent = text || "";
+      }
+
+      async function postBoardMessage() {
+        const ta = document.getElementById("board-input");
+        const nameInput = document.getElementById("board-guest-name");
+        const sendBtn = document.getElementById("board-send");
+        if (!ta || !sendBtn) return;
+        const body = (ta.value || "").trim();
+        if (!body) {
+          setBoardStatus("内容不能为空", "err");
+          return;
+        }
+        if (body.length > _board.maxLen) {
+          setBoardStatus(`超过 ${_board.maxLen} 字`, "err");
+          return;
+        }
+        sendBtn.disabled = true;
+        setBoardStatus("发送中…", null);
+        const payload = { body };
+        const auth = readAuthState();
+        if (!auth?.accessToken && nameInput && nameInput.value.trim()) {
+          payload.guestName = nameInput.value.trim();
+          localStorage.setItem(BOARD_GUEST_NAME_KEY, payload.guestName);
+        }
+        try {
+          const res = await boardFetch("/v1/board/messages", {
+            method: "POST",
+            body: JSON.stringify(payload),
+          });
+          if (!res.ok) {
+            const data = await res.json().catch(() => ({}));
+            setBoardStatus(data?.message || `发送失败 (${res.status})`, "err");
+            return;
+          }
+          ta.value = "";
+          updateBoardCounter();
+          setBoardStatus("已发送", "ok");
+          await loadBoardMessages();
+          markBoardSeen();
+          setTimeout(() => setBoardStatus("", null), 1500);
+        } catch (err) {
+          setBoardStatus(String(err?.message || err), "err");
+        } finally {
+          sendBtn.disabled = false;
+        }
+      }
+
+      async function pinBoardMessage(id, value) {
+        const res = await boardFetch(`/v1/board/messages/${encodeURIComponent(id)}/pin`, {
+          method: "POST",
+          body: JSON.stringify({ value }),
+        });
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          setBoardStatus(data?.message || `操作失败 (${res.status})`, "err");
+          return;
+        }
+        await loadBoardMessages();
+      }
+
+      async function featureBoardMessage(id, value) {
+        const res = await boardFetch(`/v1/board/messages/${encodeURIComponent(id)}/feature`, {
+          method: "POST",
+          body: JSON.stringify({ value }),
+        });
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          setBoardStatus(data?.message || `操作失败 (${res.status})`, "err");
+          return;
+        }
+        await loadBoardMessages();
+      }
+
+      async function deleteBoardMessage(id) {
+        if (!window.confirm("确定要删除这条留言吗？")) return;
+        const res = await boardFetch(`/v1/board/messages/${encodeURIComponent(id)}`, {
+          method: "DELETE",
+        });
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          setBoardStatus(data?.message || `删除失败 (${res.status})`, "err");
+          return;
+        }
+        await loadBoardMessages();
+      }
+
+      function updateBoardCounter() {
+        const ta = document.getElementById("board-input");
+        const counter = document.getElementById("board-counter");
+        if (!ta || !counter) return;
+        counter.textContent = String((ta.value || "").length);
+      }
+
+      function setBoardTab(tab) {
+        _board.tab = tab;
+        document.querySelectorAll(".board-tab").forEach((el) => {
+          el.classList.toggle("active", el.dataset.boardTab === tab);
+        });
+        loadBoardMessages().catch(console.error);
+      }
+
+      function bindBoardUi() {
+        const dock = document.getElementById("board-dock");
+        const fab = document.getElementById("board-fab");
+        const closeBtn = document.getElementById("board-dock-close");
+        const sendBtn = document.getElementById("board-send");
+        const input = document.getElementById("board-input");
+        const nameInput = document.getElementById("board-guest-name");
+        const list = document.getElementById("board-list");
+        if (!dock || !fab) return;
+
+        _board.lastSeenId = localStorage.getItem(BOARD_LAST_SEEN_KEY) || null;
+        const savedGuestName = localStorage.getItem(BOARD_GUEST_NAME_KEY);
+        if (nameInput && savedGuestName) nameInput.value = savedGuestName;
+
+        if (boardDockOpen()) {
+          dock.classList.add("open");
+          fab.classList.remove("visible");
+        } else {
+          dock.classList.remove("open");
+          fab.classList.add("visible");
+        }
+
+        closeBtn?.addEventListener("click", () => setBoardDockOpen(false));
+        fab.addEventListener("click", () => setBoardDockOpen(true));
+        sendBtn?.addEventListener("click", () => postBoardMessage().catch(console.error));
+        input?.addEventListener("input", () => updateBoardCounter());
+        input?.addEventListener("keydown", (event) => {
+          if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+            event.preventDefault();
+            postBoardMessage().catch(console.error);
+          }
+        });
+        document.querySelectorAll(".board-tab").forEach((el) => {
+          el.addEventListener("click", () => setBoardTab(el.dataset.boardTab));
+        });
+        list?.addEventListener("click", (event) => {
+          const target = event.target.closest("[data-board-action]");
+          if (!target) return;
+          const id = target.getAttribute("data-id");
+          const action = target.getAttribute("data-board-action");
+          if (action === "pin") {
+            const msg = _board.messages.find((m) => m.id === id);
+            pinBoardMessage(id, !(msg && msg.pinned)).catch(console.error);
+          } else if (action === "feature") {
+            const msg = _board.messages.find((m) => m.id === id);
+            featureBoardMessage(id, !(msg && msg.featured)).catch(console.error);
+          } else if (action === "delete") {
+            deleteBoardMessage(id).catch(console.error);
+          }
+        });
+        list?.addEventListener("scroll", () => {
+          if (!list) return;
+          if (list.scrollTop + list.clientHeight >= list.scrollHeight - 8) {
+            markBoardSeen();
+          }
+        });
+      }
+
+      async function refreshBoard() {
+        await loadBoardMeta();
+        await loadBoardMessages();
+      }
+
+      bindBoardUi();
+      refreshBoard().catch(console.error);
+      setInterval(() => refreshBoard().catch(console.error), 7000);
+
+      /* ── Admin: Settings + Version ── */
+      function dispatchAdminEvent(name) {
+        window.dispatchEvent(new CustomEvent(name));
+      }
+
+      document.getElementById("auth-settings-button")?.addEventListener("click", () => {
+        dispatchAdminEvent("open-settings-modal");
+      });
+      document.getElementById("auth-version-button")?.addEventListener("click", () => {
+        dispatchAdminEvent("open-version-modal");
+      });
+
+      async function pollHealthAndReload(maxAttempts = 60) {
+        for (let i = 0; i < maxAttempts; i += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+          try {
+            const res = await fetch("/v1/healthz", { cache: "no-store" });
+            if (res.ok) {
+              window.location.reload();
+              return;
+            }
+          } catch {
+            // ignore
+          }
+        }
+      }
+
+      function settingsModal() {
+        return {
+          open: false,
+          loading: false,
+          saving: false,
+          testingTelegram: false,
+          schema: null,
+          values: {},
+          dirty: {},
+          activeGroup: null,
+          groups: [],
+          envPath: "",
+          banner: "",
+          bannerKind: "",
+          init() {
+            window.addEventListener("open-settings-modal", () => this.show());
+          },
+          async show() {
+            this.open = true;
+            this.banner = "";
+            this.bannerKind = "";
+            await this.load();
+          },
+          close() {
+            this.open = false;
+          },
+          async load() {
+            this.loading = true;
+            try {
+              const [schemaRes, valuesRes] = await Promise.all([
+                authFetch("/v1/admin/settings/schema"),
+                authFetch("/v1/admin/settings/values"),
+              ]);
+              if (!schemaRes.ok) throw new Error(`schema HTTP ${schemaRes.status}`);
+              if (!valuesRes.ok) throw new Error(`values HTTP ${valuesRes.status}`);
+              this.schema = await schemaRes.json();
+              const valuesData = await valuesRes.json();
+              this.groups = this.schema.groups;
+              this.activeGroup = this.activeGroup || this.groups[0];
+              this.values = {};
+              for (const entry of valuesData.values) {
+                this.values[entry.key] = entry;
+              }
+              this.dirty = {};
+            } catch (err) {
+              this.banner = String(err?.message || err);
+              this.bannerKind = "error";
+            } finally {
+              this.loading = false;
+            }
+          },
+          fieldsForGroup(group) {
+            if (!this.schema) return [];
+            return this.schema.fields.filter((f) => f.group === group);
+          },
+          rawValue(key) {
+            if (Object.prototype.hasOwnProperty.call(this.dirty, key)) {
+              return this.dirty[key] ?? "";
+            }
+            const entry = this.values[key];
+            return entry?.value ?? "";
+          },
+          boolValue(key) {
+            const raw = this.rawValue(key);
+            if (raw === "" || raw == null) {
+              const field = this.schema?.fields.find((f) => f.key === key);
+              return field?.default === "true";
+            }
+            return raw === "true" || raw === "1" || raw === "yes" || raw === "on";
+          },
+          hasSecretSet(key) {
+            const entry = this.values[key];
+            return !!entry?.hasValue;
+          },
+          isDirty(key) {
+            return Object.prototype.hasOwnProperty.call(this.dirty, key);
+          },
+          setValue(key, value) {
+            // Allow user to clear by typing "-" or leaving empty when nothing was set before.
+            this.dirty[key] = value;
+          },
+          dirtyCountFor(group) {
+            if (!this.schema) return 0;
+            return this.schema.fields
+              .filter((f) => f.group === group)
+              .filter((f) => this.isDirty(f.key)).length;
+          },
+          get dirtyCount() {
+            return Object.keys(this.dirty).length;
+          },
+          buildUpdates() {
+            const updates = {};
+            for (const [key, value] of Object.entries(this.dirty)) {
+              const field = this.schema.fields.find((f) => f.key === key);
+              if (!field) continue;
+              if (field.fieldType === "secret") {
+                if (value === "" || value == null) continue; // unchanged
+                if (value === "-") {
+                  updates[key] = null;
+                  continue;
+                }
+                updates[key] = value;
+                continue;
+              }
+              if (field.fieldType === "bool") {
+                updates[key] = value;
+                continue;
+              }
+              const trimmed = (value ?? "").toString().trim();
+              updates[key] = trimmed === "" ? null : trimmed;
+            }
+            return updates;
+          },
+          async save(thenRestart) {
+            this.saving = true;
+            this.banner = "";
+            try {
+              const updates = this.buildUpdates();
+              if (Object.keys(updates).length === 0) {
+                this.banner = "No changes to save.";
+                this.bannerKind = "";
+                return;
+              }
+              const res = await authFetch("/v1/admin/settings/values", {
+                method: "PATCH",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ updates }),
+              });
+              const data = await res.json().catch(() => ({}));
+              if (!res.ok) {
+                this.banner = data?.message || `Save failed (HTTP ${res.status})`;
+                this.bannerKind = "error";
+                return;
+              }
+              const restartKeys = data?.restartRequiredKeys || [];
+              const verb = restartKeys.length ? "Saved; some changes need a restart." : "Saved.";
+              this.banner = `${verb} updated=${(data?.updatedKeys || []).length} dynamic=${(data?.dynamicGroupsRefreshed || []).length}`;
+              this.bannerKind = "success";
+              this.dirty = {};
+              await this.load();
+              if (thenRestart) {
+                await this.triggerRestart();
+              }
+            } catch (err) {
+              this.banner = String(err?.message || err);
+              this.bannerKind = "error";
+            } finally {
+              this.saving = false;
+            }
+          },
+          async triggerRestart() {
+            const res = await authFetch("/v1/admin/restart", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({}),
+            });
+            if (!res.ok) {
+              this.banner = `Restart failed (HTTP ${res.status})`;
+              this.bannerKind = "error";
+              return;
+            }
+            this.banner = "Restart scheduled, waiting for service to come back…";
+            this.bannerKind = "";
+            pollHealthAndReload().catch(console.error);
+          },
+          async testTelegram() {
+            this.testingTelegram = true;
+            try {
+              const res = await authFetch("/v1/admin/telegram/test", { method: "POST" });
+              const data = await res.json().catch(() => ({}));
+              if (!res.ok) {
+                this.banner = data?.message || `Telegram test failed (HTTP ${res.status})`;
+                this.bannerKind = "error";
+              } else {
+                this.banner = "Telegram test sent.";
+                this.bannerKind = "success";
+              }
+            } catch (err) {
+              this.banner = String(err?.message || err);
+              this.bannerKind = "error";
+            } finally {
+              this.testingTelegram = false;
+            }
+          },
+        };
+      }
+
+      function versionModal() {
+        return {
+          open: false,
+          info: null,
+          isAdmin: false,
+          busy: null,
+          error: "",
+          init() {
+            window.addEventListener("open-version-modal", () => this.show());
+          },
+          async show() {
+            this.open = true;
+            this.error = "";
+            this.isAdmin = document.body.dataset.isAdmin === "true";
+            await this.refresh();
+          },
+          close() {
+            this.open = false;
+          },
+          async refresh() {
+            try {
+              const res = await authFetch("/v1/admin/version");
+              if (!res.ok) throw new Error(`HTTP ${res.status}`);
+              this.info = await res.json();
+            } catch (err) {
+              this.error = String(err?.message || err);
+            }
+          },
+          formatUptime(secs) {
+            if (!secs || secs < 0) return "--";
+            const days = Math.floor(secs / 86400);
+            const h = Math.floor((secs % 86400) / 3600);
+            const m = Math.floor((secs % 3600) / 60);
+            const parts = [];
+            if (days) parts.push(`${days}d`);
+            if (h || days) parts.push(`${h}h`);
+            parts.push(`${m}m`);
+            return parts.join(" ");
+          },
+          formatBytes(bytes) {
+            if (!bytes) return "--";
+            const mib = bytes / 1024 / 1024;
+            return mib >= 1 ? `${mib.toFixed(1)} MiB` : `${(bytes / 1024).toFixed(1)} KiB`;
+          },
+          async restart() {
+            if (this.busy) return;
+            if (!window.confirm("确定要重启 cc-switch-router 进程吗？")) return;
+            this.busy = "restart";
+            this.error = "";
+            try {
+              const res = await authFetch("/v1/admin/restart", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({}),
+              });
+              if (!res.ok) {
+                const data = await res.json().catch(() => ({}));
+                this.error = data?.message || `Restart failed (HTTP ${res.status})`;
+                this.busy = null;
+                return;
+              }
+              pollHealthAndReload().catch(console.error);
+            } catch (err) {
+              this.error = String(err?.message || err);
+              this.busy = null;
+            }
+          },
+          async upgrade() {
+            if (this.busy) return;
+            if (!window.confirm("将从 GitHub 下载最新 binary，备份当前文件并重启进程。继续？")) return;
+            this.busy = "upgrade";
+            this.error = "";
+            try {
+              const res = await authFetch("/v1/admin/upgrade", { method: "POST" });
+              const data = await res.json().catch(() => ({}));
+              if (!res.ok) {
+                this.error = data?.message || `Upgrade failed (HTTP ${res.status})`;
+                this.busy = null;
+                return;
+              }
+              window.dispatchEvent(
+                new CustomEvent("open-upgrade-modal", { detail: { taskId: data.taskId } })
+              );
+              this.close();
+            } catch (err) {
+              this.error = String(err?.message || err);
+              this.busy = null;
+            }
+          },
+        };
+      }
+
+      function upgradeLogModal() {
+        return {
+          open: false,
+          entries: [],
+          progress: 0,
+          status: "running",
+          taskId: null,
+          source: null,
+          canClose: false,
+          init() {
+            window.addEventListener("open-upgrade-modal", (event) => {
+              const taskId = event.detail?.taskId;
+              if (taskId) this.show(taskId);
+            });
+          },
+          get title() {
+            if (this.status === "success") return "Upgrade complete";
+            if (this.status === "failed") return "Upgrade failed";
+            return "Upgrading…";
+          },
+          get subtitle() {
+            return this.taskId ? `task ${this.taskId.slice(0, 8)}` : "";
+          },
+          get statusLabel() {
+            switch (this.status) {
+              case "success": return "service is restarting; reloading dashboard shortly";
+              case "failed": return "see log above";
+              default: return "downloading + installing";
+            }
+          },
+          show(taskId) {
+            this.taskId = taskId;
+            this.entries = [];
+            this.progress = 0;
+            this.status = "running";
+            this.canClose = false;
+            this.open = true;
+            this.connect();
+          },
+          close() {
+            if (!this.canClose) return;
+            this.disconnect();
+            this.open = false;
+          },
+          connect() {
+            const state = readAuthState();
+            const token = state?.accessToken ? encodeURIComponent(state.accessToken) : "";
+            const params = new URLSearchParams({ taskId: this.taskId });
+            if (token) params.set("accessToken", state.accessToken);
+            this.source = new EventSource(`/v1/admin/upgrade/stream?${params.toString()}`);
+            this.source.addEventListener("log", (event) => {
+              try {
+                const entry = JSON.parse(event.data);
+                this.entries.push(entry);
+                if (typeof entry.progress === "number") {
+                  this.progress = entry.progress;
+                }
+                this.$nextTick(() => {
+                  const log = this.$refs.log;
+                  if (log) log.scrollTop = log.scrollHeight;
+                });
+              } catch (err) {
+                console.warn("[upgrade] parse failed", err);
+              }
+            });
+            this.source.addEventListener("done", (event) => {
+              try {
+                const payload = JSON.parse(event.data);
+                this.status = payload.status || "success";
+              } catch {
+                this.status = "success";
+              }
+              this.canClose = true;
+              this.disconnect();
+              if (this.status === "success") {
+                pollHealthAndReload().catch(console.error);
+              }
+            });
+            this.source.onerror = () => {
+              if (this.status === "running" && this.entries.length === 0) {
+                this.entries.push({
+                  step: 0,
+                  totalSteps: 7,
+                  level: "error",
+                  message: "Failed to connect to upgrade stream",
+                });
+                this.status = "failed";
+                this.canClose = true;
+              }
+            };
+          },
+          disconnect() {
+            if (this.source) {
+              this.source.close();
+              this.source = null;
+            }
+          },
+        };
+      }
+
+      // Expose factories so Alpine.js (deferred) can find them.
+      window.settingsModal = settingsModal;
+      window.versionModal = versionModal;
+      window.upgradeLogModal = upgradeLogModal;
     </script>
   </body>
 </html>

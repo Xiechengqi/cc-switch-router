@@ -2,9 +2,11 @@
 name = "cc-switch-router"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 
 [dependencies]
 anyhow = "1"
+async-stream = "0.3"
 async-trait = "0.1"
 axum = { version = "0.7", features = ["json"] }
 base64 = "0.22"

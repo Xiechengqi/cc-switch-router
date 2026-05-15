@@ -154,6 +154,8 @@ pub struct SessionStatusResponse {
     pub expires_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installation_owner_email: Option<String>,
+    #[serde(default)]
+    pub is_admin: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -967,4 +969,54 @@ pub struct ShareHeartbeatRequest {
 pub struct HealthCheckEntry {
     pub checked_at: i64,
     pub is_healthy: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardMessageView {
+    pub id: String,
+    pub body: String,
+    pub author_kind: String,
+    pub author_label: String,
+    pub is_mine: bool,
+    pub pinned: bool,
+    pub featured: bool,
+    pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub featured_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardMessageListResponse {
+    pub messages: Vec<BoardMessageView>,
+    pub tab: String,
+    pub total_visible: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostBoardMessageRequest {
+    pub body: String,
+    #[serde(default)]
+    pub guest_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardMessageToggleRequest {
+    pub value: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardMetaResponse {
+    pub total: usize,
+    pub pinned_count: usize,
+    pub featured_count: usize,
+    pub can_post_as_admin: bool,
+    pub max_body_length: usize,
+    pub guest_self_delete_secs: i64,
 }

@@ -1,32 +1,49 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 
-use axum::extract::{ConnectInfo, Query, Request, State};
+use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{any, get, post};
+use axum::routing::{any, delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
+use crate::admin::{
+    restart::{RestartStrategy, schedule_restart},
+    settings::{
+        SettingsSchemaResponse, SettingsUpdateRequest, SettingsUpdateResponse,
+        SettingsValuesResponse, apply_updates_to_dynamic, read_env_file, schema_response,
+        validate_and_diff, values_response, write_env_file_atomic,
+    },
+    upgrade::{UpgradeLogEntry, UpgradeStatus},
+    version::{
+        BINARY_INSTALL_PATH, SERVICE_UNIT, ServiceManager, VersionResponse, build_info,
+        detect_service_status, fetch_latest_release_meta, uptime_secs_from,
+    },
+};
+use crate::dynamic_settings::DynamicSettings;
 use crate::ServerState;
 use crate::client_meta::extract_client_metadata;
 use crate::error::AppError;
 use crate::models::{
-    BindInstallationOwnerEmailRequest, BindInstallationOwnerEmailResponse,
+    AuthSession, BindInstallationOwnerEmailRequest, BindInstallationOwnerEmailResponse,
+    BoardMessageListResponse, BoardMessageToggleRequest, BoardMessageView, BoardMetaResponse,
     ChangeInstallationOwnerEmailRequest, ChangeInstallationOwnerEmailResponse,
     DashboardPresenceRequest, DashboardPresenceResponse, DashboardResponse,
     GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse, HealthResponse,
     IssueLeaseRequest, IssueLeaseResponse, MarketNotificationEmailLogView,
     MarketNotificationEmailRequest, MarketNotificationEmailResponse,
-    MarketRequestLogBatchSyncRequest, MarketShareView, MarketsResponse, PublicMapPointsResponse,
-    RefreshSessionRequest, RegisterInstallationRequest, RegisterInstallationResponse,
-    RegisterMarketRequest, RequestEmailCodeRequest, RequestEmailCodeResponse,
-    SessionStatusResponse, ShareBatchSyncRequest, ShareClaimSubdomainRequest, ShareDeleteRequest,
-    ShareHeartbeatRequest, ShareRequestLogBatchSyncRequest, ShareRuntimeRefreshRequest,
-    ShareSyncRequest, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    MarketRequestLogBatchSyncRequest, MarketShareView, MarketsResponse, PostBoardMessageRequest,
+    PublicMapPointsResponse, RefreshSessionRequest, RegisterInstallationRequest,
+    RegisterInstallationResponse, RegisterMarketRequest, RequestEmailCodeRequest,
+    RequestEmailCodeResponse, SessionStatusResponse, ShareBatchSyncRequest,
+    ShareClaimSubdomainRequest, ShareDeleteRequest, ShareHeartbeatRequest,
+    ShareRequestLogBatchSyncRequest, ShareRuntimeRefreshRequest, ShareSyncRequest,
+    VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 use crate::proxy::{market_proxy_handler, proxy_handler};
 use crate::recent_traffic::{RecentRequestEvent, RecentTrafficSnapshot};
+use crate::store::BoardAuthor;
 
 const REGIONS: &str = include_str!("../regions");
 
@@ -97,6 +114,23 @@ pub fn router(state: ServerState) -> Router {
         )
         .route("/v1/shares/heartbeat", post(share_heartbeat))
         .route("/v1/shares/delete", post(delete_share))
+        .route("/v1/board/messages", get(list_board_messages))
+        .route("/v1/board/messages", post(post_board_message))
+        .route("/v1/board/messages/:id/pin", post(pin_board_message))
+        .route("/v1/board/messages/:id/feature", post(feature_board_message))
+        .route("/v1/board/messages/:id", delete(delete_board_message))
+        .route("/v1/board/meta", get(board_meta))
+        .route("/v1/admin/settings/schema", get(admin_settings_schema))
+        .route(
+            "/v1/admin/settings/values",
+            get(admin_settings_values).patch(admin_settings_apply),
+        )
+        .route("/v1/admin/version", get(admin_version))
+        .route("/v1/admin/restart", post(admin_restart))
+        .route("/v1/admin/upgrade", post(admin_upgrade_start))
+        .route("/v1/admin/upgrade/stream", get(admin_upgrade_stream))
+        .route("/v1/admin/telegram/test", post(admin_telegram_test))
+        .route("/v1/admin/audit", get(admin_audit_list))
         .route("/_market/proxy/:share_id/*path", any(market_proxy_handler))
         .route("/*path", any(proxy_handler))
         .with_state(state)
@@ -454,15 +488,17 @@ async fn session_me(
     headers: HeaderMap,
     Query(query): Query<SessionStatusQuery>,
 ) -> Result<Json<SessionStatusResponse>, AppError> {
-    Ok(Json(
-        state
-            .store
-            .session_status(
-                extract_bearer_token(&headers),
-                query.installation_id.as_deref(),
-            )
-            .await?,
-    ))
+    let mut response = state
+        .store
+        .session_status(
+            extract_bearer_token(&headers),
+            query.installation_id.as_deref(),
+        )
+        .await?;
+    if let Some(user) = response.user.as_ref() {
+        response.is_admin = state.dynamic.read().await.is_admin(&user.email);
+    }
+    Ok(Json(response))
 }
 
 async fn root_handler(
@@ -602,6 +638,33 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].request_id, "req_market_confirmed");
         assert_eq!(country_counts.get("USA"), Some(&1));
+    }
+
+    /// Regression guard for the SSE late-subscriber bug Codex flagged: a
+    /// client that connects after the upgrade task has already flipped its
+    /// status used to block on `rx.recv()` forever. The fix is to surface a
+    /// `done` event purely from the status snapshot, with no further log
+    /// traffic required.
+    #[tokio::test]
+    async fn emit_done_if_finished_succeeds_for_post_completion_subscribers() {
+        let status = std::sync::Arc::new(tokio::sync::Mutex::new(UpgradeStatus::Success));
+        let event = emit_done_if_finished(&status).await;
+        let event = event.expect("done event expected for completed upgrade");
+        let serialized = format!("{event:?}");
+        assert!(
+            serialized.contains("done"),
+            "event payload missing done marker: {serialized}"
+        );
+        assert!(
+            serialized.contains("success"),
+            "event payload missing success status: {serialized}"
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_done_if_finished_returns_none_while_running() {
+        let status = std::sync::Arc::new(tokio::sync::Mutex::new(UpgradeStatus::Running));
+        assert!(emit_done_if_finished(&status).await.is_none());
     }
 }
 
@@ -770,4 +833,578 @@ async fn require_session_email(
     extract_session_email(state, headers)
         .await?
         .ok_or_else(|| AppError::Unauthorized("authenticated owner session required".into()))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BoardListQuery {
+    #[serde(default)]
+    tab: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+async fn resolve_session(
+    state: &ServerState,
+    headers: &HeaderMap,
+) -> Result<Option<AuthSession>, AppError> {
+    let Some(token) = extract_bearer_token(headers) else {
+        return Ok(None);
+    };
+    state.store.resolve_session_by_access_token(token).await
+}
+
+fn extract_guest_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-board-guest-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 80)
+        .map(str::to_string)
+}
+
+async fn require_admin_session(
+    state: &ServerState,
+    headers: &HeaderMap,
+) -> Result<AuthSession, AppError> {
+    let session = resolve_session(state, headers)
+        .await?
+        .ok_or_else(|| AppError::Unauthorized("login required".into()))?;
+    if !state.dynamic.read().await.is_admin(&session.email) {
+        return Err(AppError::Forbidden("admin privilege required".into()));
+    }
+    Ok(session)
+}
+
+async fn list_board_messages(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<BoardListQuery>,
+) -> Result<Json<BoardMessageListResponse>, AppError> {
+    let session = resolve_session(&state, &headers).await?;
+    let guest_id = extract_guest_id(&headers);
+    let viewer_user_id = session.as_ref().map(|s| s.user_id.clone());
+    let response = state
+        .store
+        .list_board_messages(
+            query.tab.as_deref().unwrap_or("all"),
+            query.limit.unwrap_or(50),
+            viewer_user_id.as_deref(),
+            guest_id.as_deref(),
+        )
+        .await?;
+    Ok(Json(response))
+}
+
+async fn post_board_message(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(input): Json<PostBoardMessageRequest>,
+) -> Result<Json<BoardMessageView>, AppError> {
+    let session = resolve_session(&state, &headers).await?;
+    let metadata = extract_client_metadata(&headers, addr);
+    let client_ip = metadata.ip.clone();
+    let (board_settings, telegram_notify_all, is_admin_session) = {
+        let dynamic = state.dynamic.read().await;
+        let admin = session
+            .as_ref()
+            .map(|s| dynamic.is_admin(&s.email))
+            .unwrap_or(false);
+        (
+            dynamic.board.clone(),
+            dynamic.telegram.notify_all,
+            admin,
+        )
+    };
+    let author = if let Some(session) = session.as_ref() {
+        if is_admin_session {
+            BoardAuthor::Admin {
+                user_id: session.user_id.clone(),
+                email: session.email.clone(),
+            }
+        } else {
+            BoardAuthor::User {
+                user_id: session.user_id.clone(),
+                email: session.email.clone(),
+            }
+        }
+    } else {
+        let guest_id = extract_guest_id(&headers).ok_or_else(|| {
+            AppError::BadRequest("anonymous posts require an X-Board-Guest-Id header".into())
+        })?;
+        BoardAuthor::Guest {
+            guest_id,
+            name: input.guest_name.clone(),
+        }
+    };
+    let message = state
+        .store
+        .create_board_message(&board_settings, author, input.body, client_ip.as_deref())
+        .await?;
+
+    if telegram_notify_all {
+        let notifier = state.telegram.read().await.clone();
+        if let Some(notifier) = notifier {
+            let payload = message.clone();
+            tokio::spawn(async move {
+                notifier.notify_new_message(&payload).await;
+            });
+        }
+    }
+
+    Ok(Json(message))
+}
+
+async fn pin_board_message(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<BoardMessageToggleRequest>,
+) -> Result<Json<BoardMessageView>, AppError> {
+    require_admin_session(&state, &headers).await?;
+    let board_settings = state.dynamic.read().await.board.clone();
+    let view = state
+        .store
+        .set_board_pinned(&board_settings, &id, input.value)
+        .await?;
+    Ok(Json(view))
+}
+
+async fn feature_board_message(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<BoardMessageToggleRequest>,
+) -> Result<Json<BoardMessageView>, AppError> {
+    require_admin_session(&state, &headers).await?;
+    let view = state.store.set_board_featured(&id, input.value).await?;
+    Ok(Json(view))
+}
+
+async fn delete_board_message(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let session = resolve_session(&state, &headers).await?;
+    let (board_settings, is_admin) = {
+        let dynamic = state.dynamic.read().await;
+        let admin = session
+            .as_ref()
+            .map(|s| dynamic.is_admin(&s.email))
+            .unwrap_or(false);
+        (dynamic.board.clone(), admin)
+    };
+    let admin_email = if is_admin {
+        session.as_ref().map(|s| s.email.clone())
+    } else {
+        None
+    };
+    let guest_id = extract_guest_id(&headers);
+    state
+        .store
+        .delete_board_message(
+            &board_settings,
+            &id,
+            is_admin,
+            admin_email.as_deref(),
+            guest_id.as_deref(),
+        )
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn board_meta(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<BoardMetaResponse>, AppError> {
+    let session = resolve_session(&state, &headers).await?;
+    let (board_settings, can_post_as_admin) = {
+        let dynamic = state.dynamic.read().await;
+        let admin = session
+            .as_ref()
+            .map(|s| dynamic.is_admin(&s.email))
+            .unwrap_or(false);
+        (dynamic.board.clone(), admin)
+    };
+    let meta = state
+        .store
+        .board_meta(
+            can_post_as_admin,
+            board_settings.max_len,
+            board_settings.guest_self_delete_secs,
+        )
+        .await?;
+    Ok(Json(meta))
+}
+
+async fn admin_settings_schema(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<SettingsSchemaResponse>, AppError> {
+    require_admin_session(&state, &headers).await?;
+    Ok(Json(schema_response()))
+}
+
+async fn admin_settings_values(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<SettingsValuesResponse>, AppError> {
+    require_admin_session(&state, &headers).await?;
+    Ok(Json(values_response(&state.env_path)?))
+}
+
+async fn admin_settings_apply(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(input): Json<SettingsUpdateRequest>,
+) -> Result<Json<SettingsUpdateResponse>, AppError> {
+    let session = require_admin_session(&state, &headers).await?;
+    if input.updates.is_empty() {
+        return Err(AppError::BadRequest("updates is empty".into()));
+    }
+
+    // 1) acquire write lock first so reads see the new dynamic state atomically.
+    let mut dynamic_guard = state.dynamic.write().await;
+
+    // 2) load current env, validate updates against the schema.
+    let existing = read_env_file(&state.env_path)?;
+    let outcome = validate_and_diff(&existing, &input.updates)?;
+
+    // 3) persist .env atomically (keeps .bak of the prior file).
+    write_env_file_atomic(&state.env_path, &outcome.new_env_kv)?;
+
+    // 4) apply the diff to the live DynamicSettings. Only fields named in
+    //    `updates` change; everything else keeps the current runtime value,
+    //    so an unrelated PATCH cannot silently revert process-env overrides.
+    //    Clears (Some("") / None) reset to the canonical default, which is
+    //    what gives admin revocation immediate effect.
+    apply_updates_to_dynamic(&mut dynamic_guard, &input.updates, &state.config);
+    let next_dynamic = dynamic_guard.clone();
+    drop(dynamic_guard);
+
+    // 5) rebuild telegram notifier if its inputs changed.
+    let needs_telegram = outcome
+        .updated_keys
+        .iter()
+        .any(|k| k.starts_with("CC_SWITCH_ROUTER_TELEGRAM_"));
+    if needs_telegram {
+        let rebuilt = build_notifier_from_dynamic(&state, &next_dynamic).await;
+        *state.telegram.write().await = rebuilt;
+    }
+
+    // 6) audit.
+    let metadata = extract_client_metadata(&headers, addr);
+    let payload = serde_json::json!({
+        "updatedKeys": outcome.updated_keys,
+        "restartRequiredKeys": outcome.restart_required_keys,
+    });
+    let _ = state
+        .store
+        .record_admin_audit(
+            Some(&session.email),
+            "settings.apply",
+            Some(&payload),
+            metadata.ip.as_deref(),
+        )
+        .await;
+
+    let dynamic_groups: Vec<String> = outcome
+        .dynamic_groups
+        .iter()
+        .map(|g| format!("{:?}", g))
+        .collect();
+
+    Ok(Json(SettingsUpdateResponse {
+        updated_keys: outcome.updated_keys,
+        unchanged_keys: outcome.unchanged_keys,
+        restart_required_keys: outcome.restart_required_keys,
+        dynamic_groups_refreshed: dynamic_groups,
+        env_path: state.env_path.display().to_string(),
+    }))
+}
+
+async fn build_notifier_from_dynamic(
+    state: &ServerState,
+    dynamic: &DynamicSettings,
+) -> Option<std::sync::Arc<crate::board_telegram::TelegramNotifier>> {
+    // Reuse the existing constructor by spoofing a Config-shaped view; simpler
+    // than rewriting it for two callers. The notifier only inspects telegram_*,
+    // tunnel_domain, and use_localhost — the rest can stay as the boot snapshot.
+    let mut config = state.config.clone();
+    config.telegram_bot_token = dynamic.telegram.bot_token.clone();
+    config.telegram_chat_id = dynamic.telegram.chat_id.clone();
+    config.telegram_topic_id = dynamic.telegram.topic_id;
+    config.telegram_notify_all = dynamic.telegram.notify_all;
+    config.telegram_notify_admin = dynamic.telegram.notify_admin;
+    crate::board_telegram::TelegramNotifier::from_config(&config)
+}
+
+async fn admin_version(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<VersionResponse>, AppError> {
+    let session = resolve_session(&state, &headers).await?;
+    let is_admin = match session.as_ref() {
+        Some(s) => state.dynamic.read().await.is_admin(&s.email),
+        None => false,
+    };
+    let info = build_info();
+    let service = detect_service_status();
+    let client = reqwest::Client::builder()
+        .user_agent("cc-switch-router/0.1 version-probe")
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .map_err(|e| AppError::Internal(format!("version client failed: {e}")))?;
+    let latest = fetch_latest_release_meta(&client).await;
+    let mut response = VersionResponse {
+        version: info.version,
+        commit: info.commit,
+        build_time: info.build_time,
+        binary_path: BINARY_INSTALL_PATH,
+        uptime_secs: uptime_secs_from(state.start_instant),
+        service,
+        latest,
+    };
+    if !is_admin {
+        response.service.unit_name = None;
+        response.service.unit_file_state = None;
+        if matches!(response.service.manager, ServiceManager::Systemd) {
+            // Hide active_state details from anonymous viewers; only show on/off.
+            response.service.active_state = if response.service.active {
+                Some("active".into())
+            } else {
+                Some("inactive".into())
+            };
+        }
+    } else {
+        // Tag the unit name explicitly for clarity in the UI.
+        if matches!(response.service.manager, ServiceManager::Systemd) {
+            response.service.unit_name = Some(SERVICE_UNIT);
+        }
+    }
+    Ok(Json(response))
+}
+
+async fn admin_restart(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let session = require_admin_session(&state, &headers).await?;
+    let strategy = RestartStrategy::from_manager(detect_service_status().manager);
+    let script = schedule_restart(strategy)?;
+    let metadata = extract_client_metadata(&headers, addr);
+    let payload = serde_json::json!({
+        "strategy": strategy.label(),
+        "script": script,
+    });
+    let _ = state
+        .store
+        .record_admin_audit(
+            Some(&session.email),
+            "service.restart",
+            Some(&payload),
+            metadata.ip.as_deref(),
+        )
+        .await;
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "strategy": strategy.label(),
+    })))
+}
+
+async fn admin_upgrade_start(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let session = require_admin_session(&state, &headers).await?;
+    let client = reqwest::Client::builder()
+        .user_agent("cc-switch-router/0.1 upgrade")
+        .build()
+        .map_err(|e| AppError::Internal(format!("upgrade client failed: {e}")))?;
+    let handle = state
+        .upgrade_registry
+        .start(client, Some(session.email.clone()))
+        .await?;
+    let metadata = extract_client_metadata(&headers, addr);
+    let payload = serde_json::json!({ "taskId": handle.task_id });
+    let _ = state
+        .store
+        .record_admin_audit(
+            Some(&session.email),
+            "service.upgrade",
+            Some(&payload),
+            metadata.ip.as_deref(),
+        )
+        .await;
+    Ok(Json(serde_json::json!({
+        "taskId": handle.task_id,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpgradeStreamQuery {
+    #[serde(default)]
+    task_id: Option<String>,
+    /// Fallback bearer for EventSource (no header support). Use HTTPS in
+    /// production; tokens are short-lived (auth_session_ttl_secs).
+    #[serde(default)]
+    access_token: Option<String>,
+}
+
+async fn admin_upgrade_stream(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<UpgradeStreamQuery>,
+) -> Result<axum::response::Sse<
+    impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+>, AppError> {
+    let session = if let Some(token) = query.access_token.as_deref() {
+        state
+            .store
+            .resolve_session_by_access_token(token)
+            .await?
+            .ok_or_else(|| AppError::Unauthorized("session not found".into()))?
+    } else {
+        let token = extract_bearer_token(&headers)
+            .ok_or_else(|| AppError::Unauthorized("missing bearer token".into()))?;
+        state
+            .store
+            .resolve_session_by_access_token(token)
+            .await?
+            .ok_or_else(|| AppError::Unauthorized("session not found".into()))?
+    };
+    if !state.dynamic.read().await.is_admin(&session.email) {
+        return Err(AppError::Forbidden("admin privilege required".into()));
+    }
+    let handle = state
+        .upgrade_registry
+        .current()
+        .await
+        .ok_or_else(|| AppError::NotFound("no upgrade task running".into()))?;
+    if let Some(expected) = query.task_id.as_deref() {
+        if expected != handle.task_id {
+            return Err(AppError::NotFound("upgrade task id does not match".into()));
+        }
+    }
+    let history: Vec<UpgradeLogEntry> = handle.history.lock().await.clone();
+    let receiver = handle.sender.subscribe();
+    let status = handle.status.clone();
+    let stream = async_stream::stream! {
+        for entry in history {
+            yield Ok(sse_event_from_entry(&entry));
+        }
+        // The upgrade task can finish before this subscription happens, in which
+        // case no new broadcast events will ever arrive — without a periodic
+        // status poll the stream would block forever. Check once up front, then
+        // wake every 2s while waiting for log entries.
+        if let Some(event) = emit_done_if_finished(&status).await {
+            yield Ok(event);
+            return;
+        }
+        let mut rx = receiver;
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await {
+                Ok(Ok(entry)) => {
+                    yield Ok(sse_event_from_entry(&entry));
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                    if let Some(event) = emit_done_if_finished(&status).await {
+                        yield Ok(event);
+                    }
+                    break;
+                }
+                Err(_) => {
+                    // Timeout: re-check status so we don't hang after the
+                    // background task finishes between events.
+                }
+            }
+            if let Some(event) = emit_done_if_finished(&status).await {
+                // Drain any messages buffered after the status flipped.
+                while let Ok(entry) = rx.try_recv() {
+                    yield Ok(sse_event_from_entry(&entry));
+                }
+                yield Ok(event);
+                break;
+            }
+        }
+    };
+    Ok(axum::response::Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)),
+    ))
+}
+
+async fn emit_done_if_finished(
+    status: &std::sync::Arc<tokio::sync::Mutex<UpgradeStatus>>,
+) -> Option<axum::response::sse::Event> {
+    let current = *status.lock().await;
+    if matches!(current, UpgradeStatus::Running) {
+        return None;
+    }
+    let payload = serde_json::json!({
+        "status": match current {
+            UpgradeStatus::Success => "success",
+            UpgradeStatus::Failed => "failed",
+            UpgradeStatus::Running => "running",
+        }
+    });
+    Some(
+        axum::response::sse::Event::default()
+            .event("done")
+            .data(serde_json::to_string(&payload).unwrap_or_default()),
+    )
+}
+
+fn sse_event_from_entry(entry: &UpgradeLogEntry) -> axum::response::sse::Event {
+    let data = serde_json::to_string(entry).unwrap_or_default();
+    axum::response::sse::Event::default().event("log").data(data)
+}
+
+async fn admin_telegram_test(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let session = require_admin_session(&state, &headers).await?;
+    let notifier = state.telegram.read().await.clone().ok_or_else(|| {
+        AppError::BadRequest("telegram is not configured (bot token / chat id missing)".into())
+    })?;
+    let preview = crate::models::BoardMessageView {
+        id: "preview".into(),
+        body: format!("🧪 settings test from {}", session.email),
+        author_kind: "admin".into(),
+        author_label: "Official".into(),
+        is_mine: true,
+        pinned: false,
+        featured: false,
+        created_at: chrono::Utc::now(),
+        pinned_at: None,
+        featured_at: None,
+    };
+    notifier.notify_new_message(&preview).await;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminAuditQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+async fn admin_audit_list(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<AdminAuditQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_admin_session(&state, &headers).await?;
+    let entries = state
+        .store
+        .list_admin_audit(query.limit.unwrap_or(50))
+        .await?;
+    Ok(Json(serde_json::json!({ "entries": entries })))
 }

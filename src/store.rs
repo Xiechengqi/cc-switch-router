@@ -17,9 +17,11 @@ use uuid::Uuid;
 
 use crate::ServerGeo;
 use crate::config::Config;
+use crate::dynamic_settings::BoardSettings;
 use crate::error::AppError;
 use crate::models::{
     AuthSession, AuthUser, BindInstallationOwnerEmailRequest, BindInstallationOwnerEmailResponse,
+    BoardMessageListResponse, BoardMessageView, BoardMetaResponse,
     ChangeInstallationOwnerEmailRequest, ChangeInstallationOwnerEmailResponse, ClientMetadata,
     DashboardClientView, DashboardMap, DashboardMapPoint, DashboardMarketRequestLogView,
     DashboardMarketView, DashboardPresenceRequest, DashboardResponse, DashboardStats,
@@ -84,6 +86,7 @@ use crate::geo::country_centroid;
 pub struct AppStore {
     conn: Arc<Mutex<Connection>>,
     share_log_recovery_attempts: Arc<Mutex<HashSet<String>>>,
+    ip_hash_salt: Arc<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -148,9 +151,11 @@ impl AppStore {
         let conn = Connection::open(&config.db_path)
             .map_err(|e| AppError::Internal(format!("open db failed: {e}")))?;
         init_schema(&conn)?;
+        let salt = Alphanumeric.sample_string(&mut rand::thread_rng(), 32);
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             share_log_recovery_attempts: Arc::new(Mutex::new(HashSet::new())),
+            ip_hash_salt: Arc::new(salt),
         })
     }
 
@@ -756,6 +761,7 @@ impl AppStore {
                 user: None,
                 expires_at: None,
                 installation_owner_email: owner_email,
+                is_admin: false,
             });
         };
 
@@ -771,6 +777,7 @@ impl AppStore {
             }),
             expires_at: Some(session.access_expires_at),
             installation_owner_email: owner_email,
+            is_admin: false,
         })
     }
 
@@ -2670,6 +2677,677 @@ impl AppStore {
         }
         Ok(())
     }
+
+    pub async fn create_board_message(
+        &self,
+        settings: &BoardSettings,
+        author: BoardAuthor,
+        body: String,
+        client_ip: Option<&str>,
+    ) -> Result<BoardMessageView, AppError> {
+        let normalized = normalize_board_body(&body, settings.max_len)?;
+        let now = Utc::now();
+        let id = Uuid::new_v4().to_string();
+        let (author_kind, author_user_id, author_email, author_label, guest_id) =
+            author.into_storage_fields();
+        let ip_hash = client_ip.map(|ip| hash_ip_for_board(ip, &self.ip_hash_salt));
+        let viewer_user_id = author_user_id.clone();
+        let viewer_guest_id = guest_id.clone();
+
+        let conn = self.conn.lock().await;
+
+        if author_kind != "admin" {
+            // Anonymous posts: prefer the salted IP bucket. The
+            // `X-Board-Guest-Id` header is attacker-controlled (a client can
+            // rotate it on every request to mint a fresh bucket), so it is
+            // only used as a fallback when no IP is available — that scope
+            // is intentionally narrow.
+            let scope = if let Some(email) = author_email.as_deref() {
+                format!("user:{email}")
+            } else if let Some(hash) = ip_hash.as_deref() {
+                format!("ip:{hash}")
+            } else if let Some(guest) = guest_id.as_deref() {
+                format!("guest:{guest}")
+            } else {
+                "guest:anon".to_string()
+            };
+            let limit = if author_kind == "user" {
+                settings.user_per_hour
+            } else {
+                settings.guest_per_hour
+            };
+            consume_board_rate_limit_tx(&conn, &scope, limit, now)?;
+        }
+
+        conn.execute(
+            "INSERT INTO board_messages (
+                id, author_kind, author_user_id, author_email, author_label,
+                guest_id, client_ip_hash, body, status, pinned_at, featured_at,
+                deleted_by, deleted_at, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'visible', NULL, NULL, NULL, NULL, ?9, ?9)",
+            params![
+                id,
+                author_kind,
+                author_user_id,
+                author_email,
+                author_label,
+                guest_id,
+                ip_hash,
+                normalized,
+                now.to_rfc3339(),
+            ],
+        )
+        .map_err(|e| AppError::Internal(format!("insert board message failed: {e}")))?;
+
+        let row = load_board_message_row(&conn, &id)?
+            .ok_or_else(|| AppError::Internal("inserted board message not found".into()))?;
+        Ok(row.into_view(viewer_user_id.as_deref(), viewer_guest_id.as_deref()))
+    }
+
+    pub async fn list_board_messages(
+        &self,
+        tab: &str,
+        limit: usize,
+        viewer_user_id: Option<&str>,
+        viewer_guest_id: Option<&str>,
+    ) -> Result<BoardMessageListResponse, AppError> {
+        let limit = limit.clamp(1, 200);
+        let tab = normalize_board_tab(tab);
+        let where_clause = match tab.as_str() {
+            "pinned" => "status = 'visible' AND pinned_at IS NOT NULL",
+            "featured" => "status = 'visible' AND (featured_at IS NOT NULL OR pinned_at IS NOT NULL)",
+            _ => "status = 'visible'",
+        };
+        let sql = format!(
+            "SELECT id, author_kind, author_user_id, author_email, author_label,
+                    guest_id, body, pinned_at, featured_at, created_at
+               FROM board_messages
+              WHERE {where_clause}
+              ORDER BY (pinned_at IS NOT NULL) DESC, pinned_at DESC,
+                       (featured_at IS NOT NULL) DESC, featured_at DESC,
+                       datetime(created_at) DESC
+              LIMIT ?1"
+        );
+
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| AppError::Internal(format!("prepare board list failed: {e}")))?;
+        let rows = stmt
+            .query_map(params![limit as i64], map_board_row)
+            .map_err(|e| AppError::Internal(format!("query board messages failed: {e}")))?;
+        let mut messages = Vec::new();
+        for row in rows {
+            let row = row
+                .map_err(|e| AppError::Internal(format!("read board row failed: {e}")))?;
+            messages.push(row.into_view(viewer_user_id, viewer_guest_id));
+        }
+        let total_visible: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM board_messages WHERE status = 'visible'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        Ok(BoardMessageListResponse {
+            messages,
+            tab,
+            total_visible: total_visible.max(0) as usize,
+        })
+    }
+
+    pub async fn set_board_pinned(
+        &self,
+        settings: &BoardSettings,
+        id: &str,
+        value: bool,
+    ) -> Result<BoardMessageView, AppError> {
+        let now = Utc::now();
+        let conn = self.conn.lock().await;
+        let existing = load_board_message_row(&conn, id)?
+            .ok_or_else(|| AppError::NotFound("message not found".into()))?;
+        if existing.status != "visible" {
+            return Err(AppError::Conflict("message is not visible".into()));
+        }
+        if value {
+            // Enforce pin cap: keep the latest N pinned, oldest auto-unpin.
+            if settings.pin_limit > 0 {
+                let cap = settings.pin_limit as i64;
+                let pinned_ids: Vec<String> = {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT id FROM board_messages
+                              WHERE status = 'visible' AND pinned_at IS NOT NULL
+                                AND id <> ?1
+                              ORDER BY pinned_at DESC",
+                        )
+                        .map_err(|e| AppError::Internal(format!("prepare pin scan failed: {e}")))?;
+                    let rows = stmt
+                        .query_map(params![id], |row| row.get::<_, String>(0))
+                        .map_err(|e| AppError::Internal(format!("scan pinned failed: {e}")))?;
+                    rows.collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| AppError::Internal(format!("read pinned ids failed: {e}")))?
+                };
+                if pinned_ids.len() as i64 >= cap {
+                    let take = pinned_ids.len() as i64 - (cap - 1);
+                    for victim in pinned_ids.iter().rev().take(take.max(0) as usize) {
+                        conn.execute(
+                            "UPDATE board_messages
+                                SET pinned_at = NULL, updated_at = ?2
+                              WHERE id = ?1",
+                            params![victim, now.to_rfc3339()],
+                        )
+                        .map_err(|e| AppError::Internal(format!("auto-unpin failed: {e}")))?;
+                    }
+                }
+            }
+            conn.execute(
+                "UPDATE board_messages
+                    SET pinned_at = ?2, updated_at = ?2
+                  WHERE id = ?1",
+                params![id, now.to_rfc3339()],
+            )
+            .map_err(|e| AppError::Internal(format!("pin message failed: {e}")))?;
+        } else {
+            conn.execute(
+                "UPDATE board_messages
+                    SET pinned_at = NULL, updated_at = ?2
+                  WHERE id = ?1",
+                params![id, now.to_rfc3339()],
+            )
+            .map_err(|e| AppError::Internal(format!("unpin message failed: {e}")))?;
+        }
+        let row = load_board_message_row(&conn, id)?
+            .ok_or_else(|| AppError::NotFound("message not found".into()))?;
+        Ok(row.into_view(None, None))
+    }
+
+    pub async fn set_board_featured(
+        &self,
+        id: &str,
+        value: bool,
+    ) -> Result<BoardMessageView, AppError> {
+        let now = Utc::now();
+        let conn = self.conn.lock().await;
+        let existing = load_board_message_row(&conn, id)?
+            .ok_or_else(|| AppError::NotFound("message not found".into()))?;
+        if existing.status != "visible" {
+            return Err(AppError::Conflict("message is not visible".into()));
+        }
+        let featured_at = if value { Some(now.to_rfc3339()) } else { None };
+        conn.execute(
+            "UPDATE board_messages
+                SET featured_at = ?2, updated_at = ?3
+              WHERE id = ?1",
+            params![id, featured_at, now.to_rfc3339()],
+        )
+        .map_err(|e| AppError::Internal(format!("feature message failed: {e}")))?;
+        let row = load_board_message_row(&conn, id)?
+            .ok_or_else(|| AppError::NotFound("message not found".into()))?;
+        Ok(row.into_view(None, None))
+    }
+
+    pub async fn delete_board_message(
+        &self,
+        settings: &BoardSettings,
+        id: &str,
+        is_admin: bool,
+        admin_email: Option<&str>,
+        viewer_guest_id: Option<&str>,
+    ) -> Result<(), AppError> {
+        let now = Utc::now();
+        let conn = self.conn.lock().await;
+        let existing = load_board_message_row(&conn, id)?
+            .ok_or_else(|| AppError::NotFound("message not found".into()))?;
+        if existing.status != "visible" {
+            return Ok(());
+        }
+        let allowed = if is_admin {
+            true
+        } else if existing.author_kind == "guest" {
+            let matches_guest = match (viewer_guest_id, existing.guest_id.as_deref()) {
+                (Some(viewer), Some(owner)) => !viewer.is_empty() && viewer == owner,
+                _ => false,
+            };
+            let age = (now - existing.created_at).num_seconds();
+            matches_guest && age <= settings.guest_self_delete_secs
+        } else {
+            false
+        };
+        if !allowed {
+            return Err(AppError::Forbidden(
+                "you cannot delete this message".into(),
+            ));
+        }
+        conn.execute(
+            "UPDATE board_messages
+                SET status = 'deleted', deleted_by = ?2, deleted_at = ?3,
+                    updated_at = ?3, pinned_at = NULL, featured_at = NULL
+              WHERE id = ?1",
+            params![id, admin_email, now.to_rfc3339()],
+        )
+        .map_err(|e| AppError::Internal(format!("delete board message failed: {e}")))?;
+        Ok(())
+    }
+
+    pub async fn board_meta(
+        &self,
+        can_post_as_admin: bool,
+        max_body_length: usize,
+        guest_self_delete_secs: i64,
+    ) -> Result<BoardMetaResponse, AppError> {
+        let conn = self.conn.lock().await;
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM board_messages WHERE status = 'visible'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let pinned: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM board_messages
+                  WHERE status = 'visible' AND pinned_at IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let featured: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM board_messages
+                  WHERE status = 'visible'
+                    AND (featured_at IS NOT NULL OR pinned_at IS NOT NULL)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        Ok(BoardMetaResponse {
+            total: total.max(0) as usize,
+            pinned_count: pinned.max(0) as usize,
+            featured_count: featured.max(0) as usize,
+            can_post_as_admin,
+            max_body_length,
+            guest_self_delete_secs,
+        })
+    }
+
+    pub async fn record_admin_audit(
+        &self,
+        actor_email: Option<&str>,
+        action: &str,
+        payload: Option<&serde_json::Value>,
+        ip: Option<&str>,
+    ) -> Result<(), AppError> {
+        let payload_json = payload
+            .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "null".to_string()))
+            .or(None);
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO admin_audit_log (id, actor_email, action, payload_json, ip, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                Uuid::new_v4().to_string(),
+                actor_email,
+                action,
+                payload_json,
+                ip,
+                Utc::now().to_rfc3339(),
+            ],
+        )
+        .map_err(|e| AppError::Internal(format!("write audit log failed: {e}")))?;
+        Ok(())
+    }
+
+    pub async fn list_admin_audit(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<AdminAuditEntry>, AppError> {
+        let limit = limit.clamp(1, 500);
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, actor_email, action, payload_json, ip, created_at
+                   FROM admin_audit_log
+                  ORDER BY datetime(created_at) DESC
+                  LIMIT ?1",
+            )
+            .map_err(|e| AppError::Internal(format!("prepare audit list failed: {e}")))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok(AdminAuditEntry {
+                    id: row.get(0)?,
+                    actor_email: row.get(1)?,
+                    action: row.get(2)?,
+                    payload_json: row.get(3)?,
+                    ip: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })
+            .map_err(|e| AppError::Internal(format!("query audit log failed: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| AppError::Internal(format!("read audit row failed: {e}")))?);
+        }
+        Ok(out)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminAuditEntry {
+    pub id: String,
+    pub actor_email: Option<String>,
+    pub action: String,
+    pub payload_json: Option<String>,
+    pub ip: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum BoardAuthor {
+    Admin {
+        user_id: String,
+        email: String,
+    },
+    User {
+        user_id: String,
+        email: String,
+    },
+    Guest {
+        guest_id: String,
+        name: Option<String>,
+    },
+}
+
+impl BoardAuthor {
+    fn into_storage_fields(
+        self,
+    ) -> (
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        Option<String>,
+    ) {
+        match self {
+            BoardAuthor::Admin { user_id, email } => (
+                "admin".to_string(),
+                Some(user_id),
+                Some(email),
+                "Official".to_string(),
+                None,
+            ),
+            BoardAuthor::User { user_id, email } => {
+                let label = mask_email(&email);
+                (
+                    "user".to_string(),
+                    Some(user_id),
+                    Some(email),
+                    label,
+                    None,
+                )
+            }
+            BoardAuthor::Guest { guest_id, name } => {
+                let label = name
+                    .as_deref()
+                    .map(normalize_guest_name)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "Guest".to_string());
+                (
+                    "guest".to_string(),
+                    None,
+                    None,
+                    label,
+                    Some(guest_id),
+                )
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BoardMessageRow {
+    id: String,
+    author_kind: String,
+    author_user_id: Option<String>,
+    #[allow(dead_code)]
+    author_email: Option<String>,
+    author_label: String,
+    guest_id: Option<String>,
+    body: String,
+    pinned_at: Option<DateTime<Utc>>,
+    featured_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+    status: String,
+}
+
+impl BoardMessageRow {
+    fn into_view(
+        self,
+        viewer_user_id: Option<&str>,
+        viewer_guest_id: Option<&str>,
+    ) -> BoardMessageView {
+        let is_mine = match self.author_kind.as_str() {
+            "guest" => match (viewer_guest_id, self.guest_id.as_deref()) {
+                (Some(viewer), Some(owner)) => !viewer.is_empty() && viewer == owner,
+                _ => false,
+            },
+            "user" | "admin" => match (viewer_user_id, self.author_user_id.as_deref()) {
+                (Some(viewer), Some(owner)) => !viewer.is_empty() && viewer == owner,
+                _ => false,
+            },
+            _ => false,
+        };
+        BoardMessageView {
+            id: self.id,
+            body: self.body,
+            author_kind: self.author_kind,
+            author_label: self.author_label,
+            is_mine,
+            pinned: self.pinned_at.is_some(),
+            featured: self.featured_at.is_some(),
+            created_at: self.created_at,
+            pinned_at: self.pinned_at,
+            featured_at: self.featured_at,
+        }
+    }
+}
+
+fn map_board_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BoardMessageRow> {
+    let pinned_at: Option<String> = row.get(7)?;
+    let featured_at: Option<String> = row.get(8)?;
+    let created_at: String = row.get(9)?;
+    Ok(BoardMessageRow {
+        id: row.get(0)?,
+        author_kind: row.get(1)?,
+        author_user_id: row.get(2)?,
+        author_email: row.get(3)?,
+        author_label: row.get(4)?,
+        guest_id: row.get(5)?,
+        body: row.get(6)?,
+        pinned_at: pinned_at
+            .as_deref()
+            .map(parse_dt_sql)
+            .transpose()?,
+        featured_at: featured_at
+            .as_deref()
+            .map(parse_dt_sql)
+            .transpose()?,
+        created_at: parse_dt_sql(&created_at)?,
+        status: "visible".to_string(),
+    })
+}
+
+fn load_board_message_row(
+    conn: &Connection,
+    id: &str,
+) -> Result<Option<BoardMessageRow>, AppError> {
+    conn.query_row(
+        "SELECT id, author_kind, author_user_id, author_email, author_label,
+                guest_id, body, pinned_at, featured_at, created_at, status
+           FROM board_messages
+          WHERE id = ?1",
+        params![id],
+        |row| {
+            let pinned_at: Option<String> = row.get(7)?;
+            let featured_at: Option<String> = row.get(8)?;
+            let created_at: String = row.get(9)?;
+            Ok(BoardMessageRow {
+                id: row.get(0)?,
+                author_kind: row.get(1)?,
+                author_user_id: row.get(2)?,
+                author_email: row.get(3)?,
+                author_label: row.get(4)?,
+                guest_id: row.get(5)?,
+                body: row.get(6)?,
+                pinned_at: pinned_at
+                    .as_deref()
+                    .map(parse_dt_sql)
+                    .transpose()?,
+                featured_at: featured_at
+                    .as_deref()
+                    .map(parse_dt_sql)
+                    .transpose()?,
+                created_at: parse_dt_sql(&created_at)?,
+                status: row.get(10)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| AppError::Internal(format!("load board message failed: {e}")))
+}
+
+fn normalize_board_tab(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "pinned" => "pinned".into(),
+        "featured" => "featured".into(),
+        _ => "all".into(),
+    }
+}
+
+fn normalize_board_body(body: &str, max_len: usize) -> Result<String, AppError> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::BadRequest("message body is empty".into()));
+    }
+    let max_len = max_len.max(1);
+    let char_count = trimmed.chars().count();
+    if char_count > max_len {
+        return Err(AppError::BadRequest(format!(
+            "message body exceeds {max_len} characters"
+        )));
+    }
+    let stripped: String = trimmed
+        .chars()
+        .filter(|ch| {
+            if ch.is_control() {
+                matches!(*ch, '\n' | '\r' | '\t')
+            } else {
+                // Strip common zero-width / bidi formatting characters.
+                !matches!(
+                    *ch,
+                    '\u{200B}'
+                        | '\u{200C}'
+                        | '\u{200D}'
+                        | '\u{2060}'
+                        | '\u{FEFF}'
+                        | '\u{202A}'
+                        | '\u{202B}'
+                        | '\u{202C}'
+                        | '\u{202D}'
+                        | '\u{202E}'
+                )
+            }
+        })
+        .collect();
+    let cleaned = stripped.trim().to_string();
+    if cleaned.is_empty() {
+        return Err(AppError::BadRequest("message body is empty".into()));
+    }
+    let link_count = cleaned.matches("http://").count() + cleaned.matches("https://").count();
+    if link_count >= 3 {
+        return Err(AppError::BadRequest(
+            "too many links in a single message".into(),
+        ));
+    }
+    Ok(cleaned)
+}
+
+fn normalize_guest_name(value: &str) -> String {
+    let cleaned: String = value
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .filter(|ch| {
+            !matches!(
+                *ch,
+                '\u{200B}'
+                    | '\u{200C}'
+                    | '\u{200D}'
+                    | '\u{2060}'
+                    | '\u{FEFF}'
+                    | '\u{202A}'
+                    | '\u{202B}'
+                    | '\u{202C}'
+                    | '\u{202D}'
+                    | '\u{202E}'
+            )
+        })
+        .collect();
+    let trimmed = cleaned.trim();
+    let truncated: String = trimmed.chars().take(16).collect();
+    truncated
+}
+
+fn hash_ip_for_board(ip: &str, salt: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(salt.as_bytes());
+    hasher.update(b"\x00");
+    hasher.update(ip.as_bytes());
+    let digest = hasher.finalize();
+    digest.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn consume_board_rate_limit_tx(
+    conn: &Connection,
+    scope: &str,
+    limit: i64,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    if limit <= 0 {
+        return Err(AppError::TooManyRequests(
+            "message board posting is disabled for this audience".into(),
+        ));
+    }
+    let bucket = now.timestamp() / 3600;
+    let cleanup_cutoff = bucket - 24;
+    conn.execute(
+        "DELETE FROM board_rate_limit WHERE bucket_start < ?1",
+        params![cleanup_cutoff],
+    )
+    .map_err(|e| AppError::Internal(format!("prune board rate limit failed: {e}")))?;
+
+    let current: i64 = conn
+        .query_row(
+            "SELECT count FROM board_rate_limit WHERE scope = ?1 AND bucket_start = ?2",
+            params![scope, bucket],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| AppError::Internal(format!("read board rate limit failed: {e}")))?
+        .unwrap_or(0);
+    if current >= limit {
+        return Err(AppError::TooManyRequests(
+            "message board posting rate limit exceeded".into(),
+        ));
+    }
+    conn.execute(
+        "INSERT INTO board_rate_limit (scope, bucket_start, count)
+         VALUES (?1, ?2, 1)
+         ON CONFLICT(scope, bucket_start) DO UPDATE SET count = count + 1",
+        params![scope, bucket],
+    )
+    .map_err(|e| AppError::Internal(format!("bump board rate limit failed: {e}")))?;
+    Ok(())
 }
 
 async fn fetch_share_request_logs_from_route(
@@ -3298,6 +3976,47 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         CREATE INDEX IF NOT EXISTS idx_market_request_logs_market_created ON market_request_logs(market_email, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_market_request_logs_share_created ON market_request_logs(share_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_market_request_logs_created ON market_request_logs(created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS board_messages (
+            id TEXT PRIMARY KEY,
+            author_kind TEXT NOT NULL,
+            author_user_id TEXT,
+            author_email TEXT,
+            author_label TEXT NOT NULL,
+            guest_id TEXT,
+            client_ip_hash TEXT,
+            body TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'visible',
+            pinned_at TEXT,
+            featured_at TEXT,
+            deleted_by TEXT,
+            deleted_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_board_msgs_created ON board_messages(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_board_msgs_pinned ON board_messages(pinned_at DESC) WHERE pinned_at IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_board_msgs_featured ON board_messages(featured_at DESC) WHERE featured_at IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_board_msgs_author_user ON board_messages(author_user_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_board_msgs_guest ON board_messages(guest_id, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS board_rate_limit (
+            scope TEXT NOT NULL,
+            bucket_start INTEGER NOT NULL,
+            count INTEGER NOT NULL,
+            PRIMARY KEY (scope, bucket_start)
+        );
+        CREATE INDEX IF NOT EXISTS idx_board_rate_bucket ON board_rate_limit(bucket_start DESC);
+
+        CREATE TABLE IF NOT EXISTS admin_audit_log (
+            id TEXT PRIMARY KEY,
+            actor_email TEXT,
+            action TEXT NOT NULL,
+            payload_json TEXT,
+            ip TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_admin_audit_created ON admin_audit_log(created_at DESC);
         ",
     )
     .map_err(|e| AppError::Internal(format!("init schema failed: {e}")))?;
@@ -6051,6 +6770,17 @@ mod tests {
             free_share_ip_parallel_limit: 1,
             verification_service_base_url: "https://tokenswitch.org".into(),
             verification_service_api_key: None,
+            admin_emails: HashSet::new(),
+            telegram_bot_token: None,
+            telegram_chat_id: None,
+            telegram_topic_id: None,
+            telegram_notify_all: false,
+            telegram_notify_admin: false,
+            board_max_len: 1000,
+            board_guest_per_hour: 5,
+            board_user_per_hour: 30,
+            board_pin_limit: 3,
+            board_guest_self_delete_secs: 300,
         }
     }
 
@@ -8100,5 +8830,69 @@ mod tests {
         drop(conn);
 
         assert_eq!(online.get("share-1"), Some(&2));
+    }
+
+    /// Regression test for the rate-limit bypass Codex flagged: a guest can
+    /// rotate `X-Board-Guest-Id` to mint fresh buckets. The fix keys
+    /// anonymous posts by salted IP instead, so guest_id rotation must NOT
+    /// bypass `board_guest_per_hour`.
+    #[tokio::test]
+    async fn guest_rate_limit_keys_on_ip_not_guest_id() {
+        use crate::dynamic_settings::BoardSettings;
+        let (store, _config) = setup_store("guest-rate-limit-by-ip").await;
+        let settings = BoardSettings {
+            max_len: 1000,
+            guest_per_hour: 3,
+            user_per_hour: 100,
+            pin_limit: 3,
+            guest_self_delete_secs: 300,
+        };
+        let same_ip = Some("203.0.113.5");
+
+        // Rotate guest_id on every call from the same IP. After
+        // `guest_per_hour` successful posts, the next one must be rejected.
+        for i in 0..settings.guest_per_hour {
+            let guest_id = format!("rotated-guest-{i}");
+            let author = BoardAuthor::Guest {
+                guest_id,
+                name: None,
+            };
+            store
+                .create_board_message(&settings, author, format!("msg {i}"), same_ip)
+                .await
+                .expect("post under limit succeeds");
+        }
+        let overflow = store
+            .create_board_message(
+                &settings,
+                BoardAuthor::Guest {
+                    guest_id: "rotated-guest-final".into(),
+                    name: None,
+                },
+                "overflow".into(),
+                same_ip,
+            )
+            .await;
+        assert!(
+            matches!(overflow, Err(AppError::TooManyRequests(_))),
+            "guest_id rotation must not bypass the per-IP guest rate limit, \
+             got: {overflow:?}"
+        );
+
+        // A request from a different IP, even with a reused guest_id, gets
+        // its own bucket and succeeds.
+        let other_ip = Some("198.51.100.7");
+        store
+            .create_board_message(
+                &settings,
+                BoardAuthor::Guest {
+                    guest_id: "rotated-guest-0".into(),
+                    name: None,
+                },
+                "from-other-ip".into(),
+                other_ip,
+            )
+            .await
+            .expect("different IP gets a fresh bucket");
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
@@ -35,10 +36,28 @@ pub struct Config {
     pub free_share_ip_parallel_limit: i64,
     pub verification_service_base_url: String,
     pub verification_service_api_key: Option<String>,
+    pub admin_emails: HashSet<String>,
+    pub telegram_bot_token: Option<String>,
+    pub telegram_chat_id: Option<String>,
+    pub telegram_topic_id: Option<i64>,
+    pub telegram_notify_all: bool,
+    pub telegram_notify_admin: bool,
+    pub board_max_len: usize,
+    pub board_guest_per_hour: i64,
+    pub board_user_per_hour: i64,
+    pub board_pin_limit: i64,
+    pub board_guest_self_delete_secs: i64,
 }
 
 impl Config {
     pub fn from_env() -> Self {
+        let tunnel_domain = env_var("CC_SWITCH_ROUTER_TUNNEL_DOMAIN")
+            .unwrap_or_else(|| "0.0.0.0:8787".to_string());
+        let mut admin_emails =
+            parse_admin_emails(env_var("CC_SWITCH_ROUTER_ADMIN_EMAILS").as_deref());
+        if let Some(default_admin) = derive_default_admin_email(&tunnel_domain) {
+            admin_emails.insert(default_admin);
+        }
         Self {
             api_addr: env_var("CC_SWITCH_ROUTER_API_ADDR")
                 .unwrap_or_else(|| "0.0.0.0:8787".to_string())
@@ -48,8 +67,7 @@ impl Config {
                 .unwrap_or_else(|| "0.0.0.0:2222".to_string())
                 .parse()
                 .expect("invalid CC_SWITCH_ROUTER_SSH_ADDR"),
-            tunnel_domain: env_var("CC_SWITCH_ROUTER_TUNNEL_DOMAIN")
-                .unwrap_or_else(|| "0.0.0.0:8787".to_string()),
+            tunnel_domain: tunnel_domain.clone(),
             ssh_public_addr: env_var("CC_SWITCH_ROUTER_SSH_PUBLIC_ADDR").unwrap_or_default(),
             use_localhost: env_var("CC_SWITCH_ROUTER_USE_LOCALHOST")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -110,7 +128,46 @@ impl Config {
             )
             .unwrap_or_else(|| "https://tokenswitch.org".to_string()),
             verification_service_api_key: env_var("CC_SWITCH_ROUTER_VERIFICATION_SERVICE_API_KEY"),
+            admin_emails,
+            telegram_bot_token: env_var("CC_SWITCH_ROUTER_TELEGRAM_BOT_TOKEN")
+                .filter(|v| !v.trim().is_empty()),
+            telegram_chat_id: env_var("CC_SWITCH_ROUTER_TELEGRAM_CHAT_ID")
+                .filter(|v| !v.trim().is_empty()),
+            telegram_topic_id: env_var("CC_SWITCH_ROUTER_TELEGRAM_TOPIC_ID")
+                .and_then(|v| v.trim().parse().ok()),
+            telegram_notify_all: env_bool("CC_SWITCH_ROUTER_TELEGRAM_NOTIFY_ALL", true),
+            telegram_notify_admin: env_bool("CC_SWITCH_ROUTER_TELEGRAM_NOTIFY_ADMIN", true),
+            board_max_len: env_var("CC_SWITCH_ROUTER_BOARD_MAX_LEN")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1000),
+            board_guest_per_hour: env_var("CC_SWITCH_ROUTER_BOARD_GUEST_PER_HOUR")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5),
+            board_user_per_hour: env_var("CC_SWITCH_ROUTER_BOARD_USER_PER_HOUR")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
+            board_pin_limit: env_var("CC_SWITCH_ROUTER_BOARD_PIN_LIMIT")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3),
+            board_guest_self_delete_secs: env_var("CC_SWITCH_ROUTER_BOARD_GUEST_SELF_DELETE_SECS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300),
         }
+    }
+
+    pub fn is_admin(&self, email: &str) -> bool {
+        let normalized = email.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            return false;
+        }
+        self.admin_emails.contains(&normalized)
+    }
+
+    /// The built-in admin email derived from `tunnel_domain` (e.g.
+    /// `router.example.com` → `router@router.example.com`). Always returned
+    /// in lowercase. Returns `None` if the tunnel domain has no usable host.
+    pub fn default_admin_email(&self) -> Option<String> {
+        derive_default_admin_email(&self.tunnel_domain)
     }
 
     pub fn tunnel_url(&self, subdomain: &str) -> String {
@@ -216,6 +273,21 @@ CC_SWITCH_ROUTER_AUTH_EMAIL_HOURLY_LIMIT=30
 CC_SWITCH_ROUTER_AUTH_IP_HOURLY_LIMIT=20
 CC_SWITCH_ROUTER_AUTH_INSTALLATION_HOURLY_LIMIT=10
 CC_SWITCH_ROUTER_FREE_SHARE_IP_PARALLEL_LIMIT=1
+# router@<tunnel_domain-host> is always treated as admin. Use this variable
+# to add additional admin emails (comma-separated, case-insensitive).
+# Admins post with an OFFICIAL badge and can pin/feature/delete any message.
+CC_SWITCH_ROUTER_ADMIN_EMAILS=
+# Telegram bot push for new board messages. Leave the token empty to disable.
+CC_SWITCH_ROUTER_TELEGRAM_BOT_TOKEN=
+CC_SWITCH_ROUTER_TELEGRAM_CHAT_ID=
+# CC_SWITCH_ROUTER_TELEGRAM_TOPIC_ID=
+CC_SWITCH_ROUTER_TELEGRAM_NOTIFY_ALL=true
+CC_SWITCH_ROUTER_TELEGRAM_NOTIFY_ADMIN=true
+CC_SWITCH_ROUTER_BOARD_MAX_LEN=1000
+CC_SWITCH_ROUTER_BOARD_GUEST_PER_HOUR=5
+CC_SWITCH_ROUTER_BOARD_USER_PER_HOUR=30
+CC_SWITCH_ROUTER_BOARD_PIN_LIMIT=3
+CC_SWITCH_ROUTER_BOARD_GUEST_SELF_DELETE_SECS=300
 ",
         default_db_path().display()
     )
@@ -223,6 +295,48 @@ CC_SWITCH_ROUTER_FREE_SHARE_IP_PARALLEL_LIMIT=1
 
 fn env_var(key: &str) -> Option<String> {
     env::var(key).ok()
+}
+
+fn env_bool(key: &str, default: bool) -> bool {
+    let Some(value) = env_var(key) else {
+        return default;
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        _ => default,
+    }
+}
+
+fn parse_admin_emails(value: Option<&str>) -> HashSet<String> {
+    let mut set = HashSet::new();
+    let Some(raw) = value else { return set };
+    for piece in raw.split(',') {
+        let trimmed = piece.trim().to_ascii_lowercase();
+        if !trimmed.is_empty() {
+            set.insert(trimmed);
+        }
+    }
+    set
+}
+
+fn derive_default_admin_email(tunnel_domain: &str) -> Option<String> {
+    let raw = tunnel_domain.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // Strip the optional :port suffix, including bracketed IPv6 literals.
+    let host = if let Some(rest) = raw.strip_prefix('[') {
+        let end = rest.find(']')?;
+        &rest[..end]
+    } else {
+        raw.rsplit_once(':').map(|(host, _)| host).unwrap_or(raw)
+    };
+    let host = host.trim().trim_matches('.');
+    if host.is_empty() {
+        return None;
+    }
+    Some(format!("router@{}", host.to_ascii_lowercase()))
 }
 
 fn path_in_home(app_name: &str, leaf: &str) -> Option<PathBuf> {
@@ -272,6 +386,17 @@ mod tests {
             free_share_ip_parallel_limit: 1,
             verification_service_base_url: "https://example.com".into(),
             verification_service_api_key: None,
+            admin_emails: HashSet::new(),
+            telegram_bot_token: None,
+            telegram_chat_id: None,
+            telegram_topic_id: None,
+            telegram_notify_all: true,
+            telegram_notify_admin: true,
+            board_max_len: 1000,
+            board_guest_per_hour: 5,
+            board_user_per_hour: 30,
+            board_pin_limit: 3,
+            board_guest_self_delete_secs: 300,
         };
 
         assert!(config.free_share_ip_limit_enabled());
@@ -281,5 +406,62 @@ mod tests {
             ..config
         };
         assert!(!disabled.free_share_ip_limit_enabled());
+    }
+
+    #[test]
+    fn parse_admin_emails_normalizes_and_dedupes() {
+        let parsed = parse_admin_emails(Some(" Alice@Example.com, bob@x.org ,alice@example.com,"));
+        assert!(parsed.contains("alice@example.com"));
+        assert!(parsed.contains("bob@x.org"));
+        assert_eq!(parsed.len(), 2);
+    }
+
+    #[test]
+    fn derive_default_admin_email_strips_port_and_lowercases() {
+        assert_eq!(
+            derive_default_admin_email("Router.Example.COM:8443"),
+            Some("router@router.example.com".into())
+        );
+        assert_eq!(
+            derive_default_admin_email("router.example.com"),
+            Some("router@router.example.com".into())
+        );
+        assert_eq!(
+            derive_default_admin_email("127.0.0.1:8787"),
+            Some("router@127.0.0.1".into())
+        );
+        assert_eq!(
+            derive_default_admin_email("[::1]:8787"),
+            Some("router@::1".into())
+        );
+        assert_eq!(derive_default_admin_email(":8787"), None);
+        assert_eq!(derive_default_admin_email("   "), None);
+    }
+
+    #[test]
+    fn default_admin_email_is_always_in_admin_set() {
+        unsafe {
+            env::set_var("CC_SWITCH_ROUTER_TUNNEL_DOMAIN", "router.example.com");
+            env::remove_var("CC_SWITCH_ROUTER_ADMIN_EMAILS");
+        }
+        let config = Config::from_env();
+        assert!(config.is_admin("router@router.example.com"));
+        assert!(config.is_admin("Router@Router.Example.com"));
+        assert!(!config.is_admin("eve@router.example.com"));
+        unsafe {
+            env::remove_var("CC_SWITCH_ROUTER_TUNNEL_DOMAIN");
+        }
+    }
+
+    #[test]
+    fn env_bool_falls_back_to_default_for_garbage() {
+        unsafe {
+            env::set_var("CC_SWITCH_ROUTER_TEST_BOOL_GARBAGE", "maybe");
+        }
+        assert!(env_bool("CC_SWITCH_ROUTER_TEST_BOOL_GARBAGE", true));
+        assert!(!env_bool("CC_SWITCH_ROUTER_TEST_BOOL_GARBAGE", false));
+        unsafe {
+            env::remove_var("CC_SWITCH_ROUTER_TEST_BOOL_GARBAGE");
+        }
     }
 }
