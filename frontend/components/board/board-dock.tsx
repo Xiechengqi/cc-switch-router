@@ -100,11 +100,11 @@ export function BoardDock() {
         </Button>
       </div>
       <div className="border-b p-3">
-        <Tabs selectedKey={tab} onSelectionChange={(key) => setTab(String(key))} variant="secondary">
-          <Tabs.List className="grid w-full grid-cols-3">
-            <Tabs.Tab id="all">All</Tabs.Tab>
-            <Tabs.Tab id="pinned">Pinned</Tabs.Tab>
-            <Tabs.Tab id="featured">Featured</Tabs.Tab>
+        <Tabs selectedKey={tab} onSelectionChange={(key) => setTab(String(key))} variant="secondary" className="text-foreground">
+          <Tabs.List className="grid w-full grid-cols-3 text-foreground">
+            <Tabs.Tab id="all" className="text-muted-foreground data-[selected=true]:text-foreground">All</Tabs.Tab>
+            <Tabs.Tab id="pinned" className="text-muted-foreground data-[selected=true]:text-foreground">Pinned</Tabs.Tab>
+            <Tabs.Tab id="featured" className="text-muted-foreground data-[selected=true]:text-foreground">Featured</Tabs.Tab>
           </Tabs.List>
         </Tabs>
       </div>

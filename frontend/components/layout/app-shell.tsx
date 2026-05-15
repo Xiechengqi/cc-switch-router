@@ -2,7 +2,7 @@
 
 import Image from "next/image";
 import Link from "next/link";
-import { Button, Dropdown } from "@heroui/react";
+import { Button, Dropdown, ListBox, Select } from "@heroui/react";
 import { LogOut, Settings, UserRound } from "lucide-react";
 import * as React from "react";
 import { LoginDialog } from "@/components/auth/login-dialog";
@@ -96,27 +96,36 @@ function RouterSwitcher() {
   if (regions.length === 0) return null;
 
   return (
-    <label className="hidden items-center gap-2 rounded-lg border bg-card px-2.5 py-1.5 text-xs text-muted-foreground sm:inline-flex">
-      <span className="font-semibold text-foreground">Router</span>
-      <select
-        value={selected}
-        aria-label="Router"
-        className="max-w-32 bg-transparent text-foreground outline-none"
-        onChange={(event) => {
-          const name = event.target.value;
+    <Select
+      selectedKey={selected || null}
+      aria-label="Router"
+      className="hidden sm:flex"
+      onSelectionChange={(key) => {
+        const name = String(key || "");
+        if (!name) return;
           setSelected(name);
           const region = regions.find((item) => item.name === name);
           const href = region ? normalizeRegionUrl(region.url) : "";
           if (href) window.location.href = href;
-        }}
-      >
-        {regions.map((region) => (
-          <option key={region.name} value={region.name}>
-            {region.name}
-          </option>
-        ))}
-      </select>
-    </label>
+      }}
+    >
+      <Select.Trigger className="min-h-8 items-center gap-2 rounded-lg border border-border bg-card px-2.5 py-1.5 text-xs text-foreground shadow-none">
+        <span className="font-semibold text-foreground">Router</span>
+        <Select.Value className="max-w-32 truncate text-xs font-normal text-foreground">
+          {selected || "Router"}
+        </Select.Value>
+        <Select.Indicator className="text-muted-foreground" />
+      </Select.Trigger>
+      <Select.Popover className="min-w-40">
+        <ListBox aria-label="Routers">
+          {regions.map((region) => (
+            <ListBox.Item key={region.name} id={region.name} textValue={region.name}>
+              {region.name}
+            </ListBox.Item>
+          ))}
+        </ListBox>
+      </Select.Popover>
+    </Select>
   );
 }
 
