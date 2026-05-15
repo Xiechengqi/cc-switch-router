@@ -64,6 +64,7 @@ pub fn router(state: ServerState) -> Router {
     Router::new()
         .route("/", any(root_handler))
         .route("/assets/world-map.svg", get(world_map_svg))
+        .route("/assets/alpine.min.js", get(alpine_js))
         .route("/favicon.ico", get(favicon))
         .route("/v1/healthz", get(health))
         .route("/v1/dashboard", get(dashboard))
@@ -528,6 +529,7 @@ async fn root_handler(
 }
 
 const WORLD_MAP_SVG: &str = include_str!("ui/world-map.svg");
+const ALPINE_JS: &str = include_str!("ui/assets/alpine.min.js");
 
 fn world_map_etag() -> &'static str {
     use std::sync::OnceLock;
@@ -563,6 +565,21 @@ async fn world_map_svg(headers: HeaderMap) -> axum::response::Response {
             (header::ETAG, etag),
         ],
         WORLD_MAP_SVG,
+    )
+        .into_response()
+}
+
+async fn alpine_js() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            ),
+            (header::CACHE_CONTROL, "public, max-age=2592000"),
+        ],
+        ALPINE_JS,
     )
         .into_response()
 }
