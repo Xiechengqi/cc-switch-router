@@ -5931,10 +5931,10 @@ async fn send_login_code_email(
     let from = resend_from_address(config)?;
     let ttl_minutes = (ttl_secs / 60).max(1);
     let body = format!(
-        "<p style=\"margin:0 0 18px;color:#475569;font-size:15px;line-height:1.6\">Use this code to finish signing in to TokenSwitch.</p>\
-         <div style=\"margin:22px 0;padding:18px 20px;border-radius:12px;background:#0f172a;color:#ffffff;font-size:32px;font-weight:700;letter-spacing:8px;text-align:center\">{}</div>\
+        "<p style=\"margin:0 0 18px;color:#475569;font-size:15px;line-height:1.6\">Use this code to finish signing in to <span translate=\"no\">TokenSwitch</span>.</p>\
+         {}\
          <p style=\"margin:0;color:#64748b;font-size:14px;line-height:1.6\">This code expires in {} minutes. If you did not request it, you can safely ignore this email.</p>",
-        escape_html(code),
+        render_verification_code_block(code),
         ttl_minutes
     );
     let html = render_email_layout(
@@ -6002,23 +6002,38 @@ fn sanitize_email_display_name(value: &str) -> String {
     }
 }
 
+fn render_verification_code_block(code: &str) -> String {
+    format!(
+        "<table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"margin:22px 0;border-collapse:separate\">\
+           <tr>\
+             <td align=\"center\" translate=\"no\" style=\"padding:18px 20px;border-radius:12px;background:#0f172a;color:#ffffff;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,'Liberation Mono','Courier New',monospace;font-size:32px;line-height:1.15;font-weight:700;letter-spacing:8px;text-align:center;white-space:nowrap\">{}</td>\
+           </tr>\
+         </table>",
+        escape_html(code)
+    )
+}
+
 fn render_email_layout(title: &str, preheader: &str, body_html: &str) -> String {
     format!(
         "<!doctype html>\
-         <html>\
-           <head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"></head>\
+         <html lang=\"en\">\
+           <head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"x-apple-disable-message-reformatting\"></head>\
            <body style=\"margin:0;background:#f6f7fb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;color:#0f172a\">\
              <div style=\"display:none;max-height:0;overflow:hidden;opacity:0;color:transparent\">{preheader}</div>\
-             <table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"background:#f6f7fb;padding:28px 12px\">\
+             <table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"width:100%;background:#f6f7fb;border-collapse:collapse\">\
                <tr><td align=\"center\">\
-                 <table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"max-width:560px;background:#ffffff;border:1px solid #e5e7eb;border-radius:18px;overflow:hidden;box-shadow:0 16px 40px rgba(15,23,42,0.08)\">\
-                   <tr><td style=\"padding:26px 28px 18px;border-bottom:1px solid #eef2f7;background:#ffffff\">\
-                     <div style=\"font-size:13px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#2563eb\">TokenSwitch</div>\
+                 <table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"width:100%;max-width:560px;margin:28px auto 0;background:#ffffff;border:1px solid #e5e7eb;border-bottom:0;border-radius:18px 18px 0 0;border-collapse:separate;box-shadow:0 16px 40px rgba(15,23,42,0.08)\">\
+                   <tr><td style=\"padding:26px 28px 18px;border-bottom:1px solid #eef2f7;background:#ffffff;border-radius:18px 18px 0 0\">\
+                     <div translate=\"no\" style=\"font-size:13px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#2563eb\">TokenSwitch</div>\
                      <h1 style=\"margin:10px 0 0;font-size:24px;line-height:1.25;color:#0f172a\">{title}</h1>\
                    </td></tr>\
+                 </table>\
+                 <table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"width:100%;max-width:560px;margin:0 auto;background:#ffffff;border-left:1px solid #e5e7eb;border-right:1px solid #e5e7eb;border-collapse:collapse\">\
                    <tr><td style=\"padding:28px\">{body_html}</td></tr>\
-                   <tr><td style=\"padding:18px 28px;background:#f8fafc;border-top:1px solid #eef2f7;color:#64748b;font-size:12px;line-height:1.6\">\
-                     TokenSwitch router notification. If this email was unexpected, no action is required.\
+                 </table>\
+                 <table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"width:100%;max-width:560px;margin:0 auto 28px;background:#f8fafc;border:1px solid #e5e7eb;border-top:1px solid #eef2f7;border-radius:0 0 18px 18px;border-collapse:separate\">\
+                   <tr><td style=\"padding:18px 28px;color:#64748b;font-size:12px;line-height:1.6;border-radius:0 0 18px 18px\">\
+                     <span translate=\"no\">TokenSwitch</span> router notification. If this email was unexpected, no action is required.\
                    </td></tr>\
                  </table>\
                </td></tr>\
@@ -6737,6 +6752,32 @@ mod tests {
             resend_from_address(&config).expect("from address"),
             "TokenSwitch <noreply@jptokenswitch.cc>"
         );
+    }
+
+    #[test]
+    fn verification_code_email_block_is_translation_resistant() {
+        let block = render_verification_code_block("784058");
+
+        assert!(block.contains("role=\"presentation\""));
+        assert!(block.contains("translate=\"no\""));
+        assert!(block.contains("white-space:nowrap"));
+        assert!(block.contains("784058"));
+    }
+
+    #[test]
+    fn email_layout_sections_carry_their_own_width() {
+        let html = render_email_layout(
+            "Your verification code",
+            "Use this code to finish signing in.",
+            "<p>Body</p>",
+        );
+
+        assert!(html.contains("x-apple-disable-message-reformatting"));
+        assert!(html.contains("<html lang=\"en\">"));
+        assert!(html.matches("max-width:560px").count() >= 3);
+        assert!(html.contains("border-radius:18px 18px 0 0"));
+        assert!(html.contains("border-radius:0 0 18px 18px"));
+        assert!(html.contains("<span translate=\"no\">TokenSwitch</span> router notification"));
     }
 
     fn test_config(name: &str) -> Config {
