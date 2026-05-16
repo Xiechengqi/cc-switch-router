@@ -19,6 +19,7 @@ pub enum FieldType {
     Url,
     Email,
     EmailList,
+    IpList,
     Secret,
 }
 
@@ -26,6 +27,7 @@ pub enum FieldType {
 #[serde(rename_all = "snake_case")]
 pub enum DynamicGroup {
     AdminEmails,
+    Security,
     Telegram,
     Board,
 }
@@ -388,6 +390,18 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         description: "Maximum login code requests per installation per hour.",
         placeholder: Some("10"),
         dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_IP_BLACKLIST",
+        label: "IP blacklist",
+        group: "Security",
+        field_type: FieldType::IpList,
+        required: false,
+        restart_required: false,
+        default: None,
+        description: "Comma, whitespace, or newline-separated source IP/CIDR entries blocked at the HTTP edge. Applies immediately.",
+        placeholder: Some("203.0.113.10\n198.51.100.0/24\n2001:db8::/32"),
+        dynamic_group: Some(DynamicGroup::Security),
     },
     // ── Free share ──
     SettingsField {
@@ -862,6 +876,14 @@ fn normalize_value(field: &SettingsField, raw: &str) -> Result<Option<String>, A
                 Ok(Some(cleaned.join(",")))
             }
         }
+        FieldType::IpList => crate::dynamic_settings::normalize_ip_blacklist(trimmed)
+            .map(Some)
+            .ok_or_else(|| {
+                AppError::BadRequest(format!(
+                    "{} must contain only IP or CIDR entries, got: {raw}",
+                    field.key
+                ))
+            }),
         FieldType::Url => {
             let url = trimmed.to_string();
             if !(url.starts_with("http://") || url.starts_with("https://")) {
@@ -921,6 +943,11 @@ pub fn apply_updates_to_dynamic(
             }
             "CC_SWITCH_ROUTER_TELEGRAM_BOT_TOKEN" => {
                 current.telegram.bot_token = value.map(str::to_string);
+            }
+            "CC_SWITCH_ROUTER_IP_BLACKLIST" => {
+                current.security.ip_blacklist = value
+                    .map(crate::dynamic_settings::parse_ip_blacklist)
+                    .unwrap_or_default();
             }
             "CC_SWITCH_ROUTER_TELEGRAM_CHAT_ID" => {
                 current.telegram.chat_id = value.map(str::to_string);
@@ -1174,6 +1201,7 @@ mod tests {
             auth_email_hourly_limit: 30,
             auth_ip_hourly_limit: 20,
             auth_installation_hourly_limit: 10,
+            ip_blacklist: String::new(),
             free_share_ip_parallel_limit: 1,
             verification_service_base_url: "https://example.com".into(),
             verification_service_api_key: None,

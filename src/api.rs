@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, delete, get, post};
 use axum::{Json, Router};
@@ -66,6 +67,7 @@ struct SessionStatusQuery {
 }
 
 pub fn router(state: ServerState) -> Router {
+    let middleware_state = state.clone();
     Router::new()
         .route("/", any(root_handler))
         .route("/favicon.ico", get(favicon))
@@ -140,7 +142,31 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/admin/audit", get(admin_audit_list))
         .route("/_market/proxy/:share_id/*path", any(market_proxy_handler))
         .route("/*path", any(ui_or_proxy_handler))
+        .layer(middleware::from_fn_with_state(
+            middleware_state,
+            ip_blacklist_middleware,
+        ))
         .with_state(state)
+}
+
+async fn ip_blacklist_middleware(
+    State(state): State<ServerState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if let Some(ip) = source_ip_from_request(&req) {
+        if state.dynamic.read().await.is_ip_blacklisted(ip) {
+            tracing::warn!(client_ip = %ip, path = %req.uri().path(), "request blocked by IP blacklist");
+            return (StatusCode::FORBIDDEN, "IP blacklisted").into_response();
+        }
+    }
+    next.run(req).await
+}
+
+fn source_ip_from_request(req: &Request) -> Option<std::net::IpAddr> {
+    let peer = req.extensions().get::<ConnectInfo<SocketAddr>>()?.0;
+    let metadata = extract_client_metadata(req.headers(), peer);
+    metadata.ip.as_deref()?.parse().ok()
 }
 
 async fn favicon() -> StatusCode {
@@ -883,6 +909,9 @@ struct BoardListQuery {
     tab: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
+    /// RFC3339 timestamp; if present, the server returns only changes since that time.
+    #[serde(default)]
+    since: Option<String>,
 }
 
 async fn resolve_session(
@@ -925,6 +954,11 @@ async fn list_board_messages(
     let session = resolve_session(&state, &headers).await?;
     let guest_id = extract_guest_id(&headers);
     let viewer_user_id = session.as_ref().map(|s| s.user_id.clone());
+    let since = query
+        .since
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc));
     let response = state
         .store
         .list_board_messages(
@@ -932,6 +966,7 @@ async fn list_board_messages(
             query.limit.unwrap_or(50),
             viewer_user_id.as_deref(),
             guest_id.as_deref(),
+            since,
         )
         .await?;
     Ok(Json(response))

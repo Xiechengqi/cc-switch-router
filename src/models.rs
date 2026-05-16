@@ -994,6 +994,14 @@ pub struct BoardMessageListResponse {
     pub messages: Vec<BoardMessageView>,
     pub tab: String,
     pub total_visible: usize,
+    /// Server-snapshot time clients echo back as `?since=` to receive only changes.
+    pub as_of: DateTime<Utc>,
+    /// IDs that became invisible to this tab since `since` (deleted, unpinned, unfeatured).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_ids: Vec<String>,
+    /// True when the response is a delta against `since` rather than a full snapshot.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub incremental: bool,
 }
 
 #[derive(Debug, Deserialize)]

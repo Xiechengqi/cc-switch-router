@@ -11,7 +11,64 @@ function projectPoint(point: MapPoint) {
   if (typeof point.lat !== "number" || typeof point.lon !== "number") return null;
   const x = ((point.lon + 180) / 360) * 100;
   const y = ((90 - point.lat) / 180) * 100;
-  return { x: Math.max(1, Math.min(99, x)), y: Math.max(1, Math.min(99, y)) };
+  const xPct = Math.max(1, Math.min(99, x));
+  const yPct = Math.max(1, Math.min(99, y));
+  return { x: xPct * 3.6, y: yPct * 1.8, xPct, yPct };
+}
+
+type PlacedPoint = NonNullable<ReturnType<typeof projectPoint>>;
+type TickerMeta = Partial<Omit<ShareRequestLog, "createdAt"> & Omit<MarketRequestLog, "createdAt">> & {
+  createdAt?: string | number;
+  shareName?: string;
+};
+
+function spreadPoints(points: PlacedPoint[], minDistPct: number, lockedIndex: number) {
+  if (points.length < 2) return points;
+  const placed = points.map((point) => ({ ...point }));
+  for (let iteration = 0; iteration < 28; iteration++) {
+    let moved = false;
+    for (let i = 0; i < placed.length; i++) {
+      for (let j = i + 1; j < placed.length; j++) {
+        const a = placed[i];
+        const b = placed[j];
+        let dx = b.xPct - a.xPct;
+        let dy = b.yPct - a.yPct;
+        let d = Math.hypot(dx, dy);
+        if (d < 0.0001) {
+          const angle = ((i * 137.5 + j * 23.4) % 360) * (Math.PI / 180);
+          dx = Math.cos(angle);
+          dy = Math.sin(angle);
+          d = 1;
+        }
+        if (d >= minDistPct) continue;
+        const overlap = minDistPct - d;
+        const ux = dx / d;
+        const uy = dy / d;
+        const aLocked = i === lockedIndex;
+        const bLocked = j === lockedIndex;
+        if (aLocked && bLocked) continue;
+        if (aLocked) {
+          b.xPct += ux * overlap;
+          b.yPct += uy * overlap;
+        } else if (bLocked) {
+          a.xPct -= ux * overlap;
+          a.yPct -= uy * overlap;
+        } else {
+          a.xPct -= (ux * overlap) / 2;
+          a.yPct -= (uy * overlap) / 2;
+          b.xPct += (ux * overlap) / 2;
+          b.yPct += (uy * overlap) / 2;
+        }
+        moved = true;
+      }
+    }
+    if (!moved) break;
+  }
+  return placed.map((point) => {
+    const xPct = Math.max(1, Math.min(99, point.xPct));
+    const yPct = Math.max(1, Math.min(99, point.yPct));
+    return { x: xPct * 3.6, y: yPct * 1.8, xPct, yPct };
+  });
 }
 
 function countryFlag(code?: string) {
@@ -20,47 +77,95 @@ function countryFlag(code?: string) {
   return String.fromCodePoint(...[...cc].map((ch) => 127397 + ch.charCodeAt(0)));
 }
 
-function formatTickerTime(value?: string | number) {
-  const date = value ? new Date(value) : new Date();
+function formatTickerTime(value?: string | number, fallbackSeconds?: string | number) {
+  let timestamp = typeof value === "number" ? value : Date.parse(value || "");
+  const fallback = Number(fallbackSeconds || 0);
+  if (!Number.isFinite(timestamp) && Number.isFinite(fallback) && fallback > 0) {
+    timestamp = fallback * 1000;
+  }
+  const date = Number.isFinite(timestamp) ? new Date(timestamp) : new Date();
   if (!Number.isFinite(date.getTime())) return "--:--:--";
-  return date.toISOString().slice(11, 19);
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(date);
 }
 
-function totalTokens(log?: Partial<ShareRequestLog | MarketRequestLog> | null) {
-  return Number(log?.inputTokens || 0) + Number(log?.outputTokens || 0);
+function totalTokens(log?: Pick<TickerMeta, "inputTokens" | "outputTokens" | "cacheReadTokens" | "cacheCreationTokens"> | null) {
+  return Number(log?.inputTokens || 0) + Number(log?.outputTokens || 0) + Number(log?.cacheReadTokens || 0) + Number(log?.cacheCreationTokens || 0);
 }
 
-function tickerDetail(event: RecentRequestEvent, meta?: Partial<ShareRequestLog | MarketRequestLog>) {
-  const agent = "requestAgent" in (meta || {}) ? meta?.requestAgent : "";
-  const requested = "requestedModel" in (meta || {}) ? meta?.requestedModel : "";
-  const actual = "actualModel" in (meta || {}) ? meta?.actualModel : "";
-  const model = actual || requested || ("model" in (meta || {}) ? meta?.model : "") || "-";
-  const status = "statusCode" in (meta || {}) ? meta?.statusCode : undefined;
-  const latency = "latencyMs" in (meta || {}) ? meta?.latencyMs : undefined;
+function compactTickerTokens(value: number) {
+  const count = Math.max(0, Number(value || 0));
+  if (!Number.isFinite(count)) return "0";
+  if (count < 1000) return String(Math.round(count));
+  const unit = count >= 1_000_000 ? { suffix: "m", value: 1_000_000 } : { suffix: "k", value: 1000 };
+  const compact = count / unit.value;
+  const text = compact >= 10 ? compact.toFixed(0) : compact.toFixed(1);
+  return `${text.replace(/\.0$/, "")}${unit.suffix}`;
+}
+
+function formatTickerLatency(value?: number) {
+  const ms = Number(value || 0);
+  if (!Number.isFinite(ms) || ms < 0) return "-";
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  const seconds = ms / 1000;
+  const text = seconds >= 10 ? seconds.toFixed(1) : seconds.toFixed(2);
+  return `${text.replace(/\.0+$/, "").replace(/(\.\d*[1-9])0+$/, "$1")}s`;
+}
+
+function formatMarketFee(value?: string | number) {
+  if (value == null || value === "") return "";
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return "";
+  if (amount > 0 && amount < 0.0001) return `$${amount.toFixed(8)}`;
+  if (amount > 0 && amount < 0.01) return `$${amount.toFixed(6)}`;
+  return `$${amount.toFixed(amount >= 1 ? 2 : 4)}`;
+}
+
+function tickerDetail(meta?: TickerMeta) {
+  const agent = meta?.requestAgent || "";
+  const requested = meta?.requestedModel || meta?.requestModel || "";
+  const actual = meta?.actualModel || meta?.model || "";
+  const modelName = [agent, requested && actual && requested !== actual ? `${requested} -> ${actual}` : actual || requested || "-"].filter(Boolean).join(" · ");
+  const status = meta?.statusCode ?? meta?.status ?? "-";
+  const latency = formatTickerLatency(meta?.latencyMs);
+  const tokens = `${compactTickerTokens(totalTokens(meta))} token${totalTokens(meta) === 1 ? "" : "s"}`;
+  const fee = formatMarketFee(meta?.usageAmountUsd);
   const parts = [
-    [agent, requested && actual && requested !== actual ? `${requested} -> ${actual}` : model].filter(Boolean).join(" · "),
-    status ? String(status) : "",
-    latency ? `${latency}ms` : "",
-    totalTokens(meta) ? `${totalTokens(meta)} tok` : "",
+    meta?.userEmail || "",
+    modelName,
+    String(status),
+    latency,
+    tokens,
+    fee,
   ].filter(Boolean);
-  return parts.join(" · ") || event.shareName || event.subdomain || "request";
+  return parts.join(" · ");
 }
 
 function buildRequestMeta(data: DashboardResponse | null) {
-  const meta = new Map<string, Partial<ShareRequestLog | MarketRequestLog>>();
+  const marketMeta = new Map<string, MarketRequestLog>();
+  const meta = new Map<string, TickerMeta>();
+  for (const log of data?.marketRequestLogs || []) {
+    marketMeta.set(log.requestId, log);
+  }
   for (const share of data?.tickerShares || []) {
     for (const log of share.recentRequests || []) {
-      meta.set(log.requestId, { ...log, shareName: share.shareName, shareId: share.shareId });
+      const market = marketMeta.get(log.requestId);
+      meta.set(log.requestId, { ...log, shareName: share.shareName, shareId: share.shareId, userEmail: market?.userEmail, apiKeyPrefix: market?.apiKeyPrefix, usageAmountUsd: market?.usageAmountUsd });
     }
   }
   for (const client of data?.clients || []) {
     const share = client.share;
     for (const log of share?.recentRequests || []) {
-      meta.set(log.requestId, { ...log, shareName: share?.shareName || log.shareName, shareId: share?.shareId || log.shareId });
+      const market = marketMeta.get(log.requestId);
+      meta.set(log.requestId, { ...log, shareName: share?.shareName || log.shareName, shareId: share?.shareId || log.shareId, userEmail: market?.userEmail, apiKeyPrefix: market?.apiKeyPrefix, usageAmountUsd: market?.usageAmountUsd });
     }
   }
-  for (const log of data?.marketRequestLogs || []) {
-    meta.set(log.requestId, { ...(meta.get(log.requestId) || {}), ...log });
+  for (const [requestId, log] of marketMeta) {
+    meta.set(requestId, { ...(meta.get(requestId) || {}), ...log });
   }
   return meta;
 }
@@ -70,7 +175,8 @@ function RequestTicker({ data }: { data: DashboardResponse | null }) {
   const events = React.useMemo(() => {
     return [...(data?.recentRequestEvents || [])]
       .sort((a, b) => new Date(b.startedAt || b.createdAt || 0).getTime() - new Date(a.startedAt || a.createdAt || 0).getTime())
-      .slice(0, 6);
+      .slice(0, 5)
+      .reverse();
   }, [data]);
 
   if (!events.length) return null;
@@ -79,13 +185,15 @@ function RequestTicker({ data }: { data: DashboardResponse | null }) {
     <div className="absolute left-[1.6%] top-[3.5%] z-20 flex max-w-[min(68%,760px)] flex-col items-start gap-1.5">
       {events.map((event) => {
         const item = meta.get(event.requestId);
+        const country = event.userCountry || event.countryCode || "--";
+        const subdomain = event.shareSubdomain || event.subdomain || event.shareName || item?.shareName || "share";
         return (
           <div key={event.requestId} className="flex max-w-full items-center gap-1 overflow-hidden rounded-md border border-slate-200/70 bg-white/55 px-2 py-1 text-[10px] text-slate-700 backdrop-blur-sm">
-            <span className="font-mono text-slate-500">{formatTickerTime(event.startedAt || event.createdAt)}</span>
-            <span>{countryFlag(event.countryCode)}</span>
-            <span className="font-semibold text-slate-600">{event.countryCode || "??"}</span>
-            <span className="font-semibold text-slate-500">{event.subdomain || event.shareName || "-"}</span>
-            <span className="truncate font-semibold text-slate-700/80">{tickerDetail(event, item)}</span>
+            <span className="font-mono text-slate-500">{formatTickerTime(event.startedAt || event.createdAt, item?.createdAt)}</span>
+            <span>{countryFlag(country)}</span>
+            <span className="font-semibold text-slate-600">{country}</span>
+            <span className="font-semibold text-slate-500">{subdomain}</span>
+            <span className="truncate font-semibold text-slate-700/80">{tickerDetail(item)}</span>
           </div>
         );
       })}
@@ -104,6 +212,17 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
   const clients = data?.map?.clients || [];
   const server = data?.map?.server;
   const points = [server, ...clients].filter(Boolean) as MapPoint[];
+  const placed = React.useMemo(() => {
+    const raw = [
+      ...(server ? [server] : []),
+      ...[...clients].sort((a, b) => (a.id || "").localeCompare(b.id || "")),
+    ];
+    const projected = raw.map((point) => ({ point, pos: projectPoint(point) })).filter((item): item is { point: MapPoint; pos: PlacedPoint } => !!item.pos);
+    const positions = spreadPoints(projected.map((item) => item.pos), 2.6, server ? 0 : -1);
+    return projected.map((item, index) => ({ ...item, pos: positions[index] }));
+  }, [clients, server]);
+  const serverPlaced = placed.find((item) => item.point.pointType === "server");
+  const clientPlaced = placed.filter((item) => item.point.pointType !== "server");
 
   const clampPan = React.useCallback((nextPan: { x: number; y: number }, nextZoom = zoom) => {
     const shell = shellRef.current;
@@ -203,7 +322,7 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
         setZoom(zoom + (event.deltaY < 0 ? 0.18 : -0.18));
       }}
       onPointerDown={(event) => {
-        if ((event.target as HTMLElement).closest("button")) return;
+        if ((event.target as HTMLElement).closest("[data-map-control]")) return;
         event.preventDefault();
         dragRef.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, panX: pan.x, panY: pan.y };
         shellRef.current?.setPointerCapture(event.pointerId);
@@ -251,18 +370,16 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
           <div className="pointer-events-none absolute inset-0 bg-[url('/world-map.svg')] bg-[length:100%_100%] bg-center bg-no-repeat" aria-hidden="true" />
         )}
         <svg className="absolute inset-0 h-full w-full overflow-visible" viewBox="0 0 360 180" preserveAspectRatio="none" aria-hidden="true">
-          {server
-            ? clients.map((client) => {
-                const a = projectPoint(server);
-                const b = projectPoint(client);
-                if (!a || !b) return null;
+          {serverPlaced
+            ? clientPlaced.map(({ point: client, pos: b }) => {
+                const a = serverPlaced.pos;
                 return (
                   <line
                     key={`flow-${client.id}`}
-                    x1={a.x * 3.6}
-                    y1={a.y * 1.8}
-                    x2={b.x * 3.6}
-                    y2={b.y * 1.8}
+                    x1={a.x}
+                    y1={a.y}
+                    x2={b.x}
+                    y2={b.y}
                     className={cn("stroke-blue-500/35", client.activeRequests > 0 ? "animate-pulse" : "stroke-slate-400/25")}
                     strokeWidth={client.activeRequests > 0 ? 0.7 : 0.5}
                     strokeDasharray={client.activeRequests > 0 ? "1.5 2.5" : "1 5"}
@@ -272,17 +389,16 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
               })
             : null}
         </svg>
-          {points.map((point) => {
-            const pos = projectPoint(point);
-            if (!pos) return null;
+          {placed.map(({ point, pos }) => {
             const isServer = point.pointType === "server";
             return (
-              <button
-                type="button"
+              <div
                 key={`${point.pointType}-${point.id}`}
-                className="absolute -translate-x-1/2 -translate-y-1/2 rounded-full focus:outline-none"
-                style={{ left: `${pos.x}%`, top: `${pos.y}%` }}
+                className="absolute -translate-x-1/2 -translate-y-1/2 rounded-full"
+                style={{ left: `${pos.xPct}%`, top: `${pos.yPct}%` }}
                 title={[point.label, point.city, point.region, point.country, point.activeRequests ? t("map.active", { count: point.activeRequests }) : ""].filter(Boolean).join(" · ")}
+                role="img"
+                aria-label={[isServer ? t("map.router") : point.label, point.country].filter(Boolean).join(" · ")}
               >
                 <div
                   className={cn(
@@ -292,19 +408,19 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
                     point.activeRequests > 0 && "pulse-dot",
                   )}
                 />
-              </button>
+              </div>
             );
           })}
       </div>
       <div className="absolute bottom-[4%] left-[1.6%] z-30 inline-flex items-center gap-0.5 rounded-lg border border-slate-200/70 bg-white/50 p-1 text-slate-600 backdrop-blur-sm">
-        <Button variant="ghost" size="sm" isIconOnly className="h-6 w-6 min-w-0 rounded-md p-0 text-slate-600 hover:bg-blue-50 hover:text-primary" aria-label={t("map.zoomOut")} onClick={() => setZoom(zoom - 0.25)}>
+        <Button data-map-control variant="ghost" size="sm" isIconOnly className="h-6 w-6 min-w-0 rounded-md p-0 text-slate-600 hover:bg-blue-50 hover:text-primary" aria-label={t("map.zoomOut")} onClick={() => setZoom(zoom - 0.25)}>
           <Minus className="h-3.5 w-3.5" />
         </Button>
         <span className="min-w-9 text-center font-mono text-[10px] text-slate-500">{Math.round(zoom * 100)}%</span>
-        <Button variant="ghost" size="sm" isIconOnly className="h-6 w-6 min-w-0 rounded-md p-0 text-slate-600 hover:bg-blue-50 hover:text-primary" aria-label={t("map.zoomIn")} onClick={() => setZoom(zoom + 0.25)}>
+        <Button data-map-control variant="ghost" size="sm" isIconOnly className="h-6 w-6 min-w-0 rounded-md p-0 text-slate-600 hover:bg-blue-50 hover:text-primary" aria-label={t("map.zoomIn")} onClick={() => setZoom(zoom + 0.25)}>
           <Plus className="h-3.5 w-3.5" />
         </Button>
-        <Button variant="ghost" size="sm" isIconOnly className="h-6 w-6 min-w-0 rounded-md p-0 text-slate-600 hover:bg-blue-50 hover:text-primary" aria-label={t("map.reset")} onClick={reset}>
+        <Button data-map-control variant="ghost" size="sm" isIconOnly className="h-6 w-6 min-w-0 rounded-md p-0 text-slate-600 hover:bg-blue-50 hover:text-primary" aria-label={t("map.reset")} onClick={reset}>
           <RotateCcw className="h-3.5 w-3.5" />
         </Button>
       </div>

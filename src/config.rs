@@ -33,6 +33,7 @@ pub struct Config {
     pub auth_email_hourly_limit: i64,
     pub auth_ip_hourly_limit: i64,
     pub auth_installation_hourly_limit: i64,
+    pub ip_blacklist: String,
     pub free_share_ip_parallel_limit: i64,
     pub verification_service_base_url: String,
     pub verification_service_api_key: Option<String>,
@@ -120,6 +121,7 @@ impl Config {
             )
             .and_then(|v| v.parse().ok())
             .unwrap_or(10),
+            ip_blacklist: env_var("CC_SWITCH_ROUTER_IP_BLACKLIST").unwrap_or_default(),
             free_share_ip_parallel_limit: env_var("CC_SWITCH_ROUTER_FREE_SHARE_IP_PARALLEL_LIMIT")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1),
@@ -273,6 +275,7 @@ CC_SWITCH_ROUTER_AUTH_MAX_VERIFY_ATTEMPTS=5
 CC_SWITCH_ROUTER_AUTH_EMAIL_HOURLY_LIMIT=30
 CC_SWITCH_ROUTER_AUTH_IP_HOURLY_LIMIT=20
 CC_SWITCH_ROUTER_AUTH_INSTALLATION_HOURLY_LIMIT=10
+CC_SWITCH_ROUTER_IP_BLACKLIST=
 CC_SWITCH_ROUTER_FREE_SHARE_IP_PARALLEL_LIMIT=1
 CC_SWITCH_ROUTER_RESEND_API_KEY=
 # CC_SWITCH_ROUTER_RESEND_FROM defaults to noreply@[CC_SWITCH_ROUTER_TUNNEL_DOMAIN]
@@ -394,6 +397,7 @@ mod tests {
             auth_email_hourly_limit: 30,
             auth_ip_hourly_limit: 5,
             auth_installation_hourly_limit: 5,
+            ip_blacklist: String::new(),
             free_share_ip_parallel_limit: 1,
             verification_service_base_url: "https://example.com".into(),
             verification_service_api_key: None,

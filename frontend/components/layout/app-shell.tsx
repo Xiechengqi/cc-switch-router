@@ -6,6 +6,7 @@ import { Button, Dropdown, ListBox, Select, Tabs } from "@heroui/react";
 import { LogOut, Settings, UserRound } from "lucide-react";
 import * as React from "react";
 import { LoginDialog } from "@/components/auth/login-dialog";
+import { Toast } from "@heroui/react";
 import { AuthProvider, useAuth } from "@/components/auth/auth-provider";
 import { LocaleProvider, useLocaleText } from "@/components/i18n/locale-provider";
 import { getDashboard } from "@/lib/api";
@@ -104,7 +105,7 @@ function RouterSwitcher() {
       selectedKey={selected || null}
       aria-label={t("nav.router")}
       className="hidden sm:flex"
-      onSelectionChange={(key) => {
+      onSelectionChange={(key: React.Key | null) => {
         const name = String(key || "");
         if (!name) return;
         setSelected(name);
@@ -140,7 +141,7 @@ function LanguageSwitcher() {
       aria-label={t("common.language")}
       variant="secondary"
       className="text-foreground"
-      onSelectionChange={(key) => {
+      onSelectionChange={(key: React.Key) => {
         if (key === "en" || key === "zh-CN") setLocale(key as AppLocale);
       }}
     >
@@ -225,6 +226,7 @@ export function AppShell({
       <AuthProvider>
         <Topbar active={active} />
         {children}
+        <Toast.Provider placement="top end" />
       </AuthProvider>
     </LocaleProvider>
   );

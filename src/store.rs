@@ -2750,39 +2750,90 @@ impl AppStore {
         limit: usize,
         viewer_user_id: Option<&str>,
         viewer_guest_id: Option<&str>,
+        since: Option<DateTime<Utc>>,
     ) -> Result<BoardMessageListResponse, AppError> {
         let limit = limit.clamp(1, 200);
         let tab = normalize_board_tab(tab);
-        let where_clause = match tab.as_str() {
+        let tab_visible_clause = match tab.as_str() {
             "pinned" => "status = 'visible' AND pinned_at IS NOT NULL",
             "featured" => {
                 "status = 'visible' AND (featured_at IS NOT NULL OR pinned_at IS NOT NULL)"
             }
             _ => "status = 'visible'",
         };
-        let sql = format!(
-            "SELECT id, author_kind, author_user_id, author_email, author_label,
-                    guest_id, body, pinned_at, featured_at, created_at
-               FROM board_messages
-              WHERE {where_clause}
-              ORDER BY (pinned_at IS NOT NULL) DESC, pinned_at DESC,
-                       (featured_at IS NOT NULL) DESC, featured_at DESC,
-                       datetime(created_at) DESC
-              LIMIT ?1"
-        );
 
         let conn = self.conn.lock().await;
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| AppError::Internal(format!("prepare board list failed: {e}")))?;
-        let rows = stmt
-            .query_map(params![limit as i64], map_board_row)
-            .map_err(|e| AppError::Internal(format!("query board messages failed: {e}")))?;
-        let mut messages = Vec::new();
-        for row in rows {
-            let row = row.map_err(|e| AppError::Internal(format!("read board row failed: {e}")))?;
-            messages.push(row.into_view(viewer_user_id, viewer_guest_id));
-        }
+
+        let (messages, removed_ids, incremental) = if let Some(since) = since.as_ref() {
+            let since_str = since.to_rfc3339();
+            let messages_sql = format!(
+                "SELECT id, author_kind, author_user_id, author_email, author_label,
+                        guest_id, body, pinned_at, featured_at, created_at
+                   FROM board_messages
+                  WHERE {tab_visible_clause}
+                    AND datetime(updated_at) > datetime(?1)
+                  ORDER BY (pinned_at IS NOT NULL) DESC, pinned_at DESC,
+                           (featured_at IS NOT NULL) DESC, featured_at DESC,
+                           datetime(created_at) DESC
+                  LIMIT ?2"
+            );
+            let mut stmt = conn.prepare(&messages_sql).map_err(|e| {
+                AppError::Internal(format!("prepare board incremental list failed: {e}"))
+            })?;
+            let rows = stmt
+                .query_map(params![since_str, limit as i64], map_board_row)
+                .map_err(|e| AppError::Internal(format!("query board incremental failed: {e}")))?;
+            let mut messages = Vec::new();
+            for row in rows {
+                let row =
+                    row.map_err(|e| AppError::Internal(format!("read board row failed: {e}")))?;
+                messages.push(row.into_view(viewer_user_id, viewer_guest_id));
+            }
+
+            let removed_sql = format!(
+                "SELECT id FROM board_messages
+                  WHERE datetime(updated_at) > datetime(?1)
+                    AND NOT ({tab_visible_clause})
+                  LIMIT ?2"
+            );
+            let mut stmt = conn.prepare(&removed_sql).map_err(|e| {
+                AppError::Internal(format!("prepare board removed list failed: {e}"))
+            })?;
+            let removed: Vec<String> = stmt
+                .query_map(params![since_str, limit as i64], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(|e| AppError::Internal(format!("query board removed failed: {e}")))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| AppError::Internal(format!("read board removed failed: {e}")))?;
+
+            (messages, removed, true)
+        } else {
+            let sql = format!(
+                "SELECT id, author_kind, author_user_id, author_email, author_label,
+                        guest_id, body, pinned_at, featured_at, created_at
+                   FROM board_messages
+                  WHERE {tab_visible_clause}
+                  ORDER BY (pinned_at IS NOT NULL) DESC, pinned_at DESC,
+                           (featured_at IS NOT NULL) DESC, featured_at DESC,
+                           datetime(created_at) DESC
+                  LIMIT ?1"
+            );
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| AppError::Internal(format!("prepare board list failed: {e}")))?;
+            let rows = stmt
+                .query_map(params![limit as i64], map_board_row)
+                .map_err(|e| AppError::Internal(format!("query board messages failed: {e}")))?;
+            let mut messages = Vec::new();
+            for row in rows {
+                let row =
+                    row.map_err(|e| AppError::Internal(format!("read board row failed: {e}")))?;
+                messages.push(row.into_view(viewer_user_id, viewer_guest_id));
+            }
+            (messages, Vec::new(), false)
+        };
+
         let total_visible: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM board_messages WHERE status = 'visible'",
@@ -2790,10 +2841,18 @@ impl AppStore {
                 |row| row.get(0),
             )
             .unwrap_or(0);
+
+        // Capture as_of after the queries — under the connection lock, no concurrent writes
+        // could have applied in between, so any future write will have updated_at > as_of.
+        let as_of = Utc::now();
+
         Ok(BoardMessageListResponse {
             messages,
             tab,
             total_visible: total_visible.max(0) as usize,
+            as_of,
+            removed_ids,
+            incremental,
         })
     }
 
@@ -6780,6 +6839,7 @@ mod tests {
             auth_email_hourly_limit: 10,
             auth_ip_hourly_limit: 30,
             auth_installation_hourly_limit: 15,
+            ip_blacklist: String::new(),
             free_share_ip_parallel_limit: 1,
             verification_service_base_url: "https://tokenswitch.org".into(),
             verification_service_api_key: None,

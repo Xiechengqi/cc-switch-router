@@ -201,10 +201,14 @@ export type RecentRequestEvent = {
   requestId: string;
   shareId?: string;
   shareName?: string;
+  shareSubdomain?: string;
   subdomain?: string;
   countryCode?: string;
+  userCountry?: string;
+  userCountryIso3?: string;
   startedAt?: string;
   createdAt?: string;
+  isInflight?: boolean;
   latencyMs?: number;
   inputTokens?: number;
   outputTokens?: number;
@@ -219,8 +223,17 @@ export type ShareSupport = {
 export type ShareUpstreamProvider = {
   kind?: string;
   app?: string;
+  accountEmail?: string;
   forSaleOfficialPricePercent?: number;
   apiUrl?: string;
+  quota?: {
+    status?: string;
+    tiers?: Array<{
+      label?: string;
+      utilization?: number;
+      resetsAt?: string;
+    }>;
+  };
   models?: Array<{
     slot?: string;
     actualModel?: string;
@@ -242,7 +255,7 @@ export type SettingsField = {
   key: string;
   label: string;
   group: string;
-  fieldType: "text" | "int" | "bool" | "path" | "url" | "email" | "email_list" | "secret";
+  fieldType: "text" | "int" | "bool" | "path" | "url" | "email" | "email_list" | "ip_list" | "secret";
   required: boolean;
   restartRequired: boolean;
   default?: string | null;
@@ -306,6 +319,17 @@ export type BoardMessage = {
   pinned: boolean;
   featured: boolean;
   createdAt: string;
+  pinnedAt?: string;
+  featuredAt?: string;
+};
+
+export type BoardListResponse = {
+  messages: BoardMessage[];
+  tab: string;
+  totalVisible: number;
+  asOf: string;
+  removedIds?: string[];
+  incremental?: boolean;
 };
 
 export type BoardMeta = {

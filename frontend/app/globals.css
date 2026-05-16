@@ -184,6 +184,42 @@ a {
   color: rgb(var(--router-foreground));
 }
 
+.router-drawer-light {
+  color: rgb(var(--router-foreground)) !important;
+  color-scheme: light;
+}
+
+.router-drawer-light,
+.router-drawer-light * {
+  --foreground: rgb(var(--router-foreground));
+  --surface-foreground: rgb(var(--router-foreground));
+  --surface-secondary-foreground: rgb(var(--router-foreground));
+  --surface-tertiary-foreground: rgb(var(--router-foreground));
+  --overlay-foreground: rgb(var(--router-foreground));
+  --default-foreground: rgb(var(--router-foreground));
+  --muted: rgb(var(--router-muted-foreground));
+  --default: rgb(var(--router-muted));
+  --surface: #fff;
+  --overlay: #fff;
+  --card: #fff;
+}
+
+.router-drawer-light :is(.drawer__heading, .drawer__body, .card, .card__content, .label, strong, b) {
+  color: rgb(var(--router-foreground)) !important;
+}
+
+.router-drawer-light :is(.text-muted-foreground, .description, .card__description, .drawer__header p) {
+  color: rgb(var(--router-muted-foreground)) !important;
+}
+
+.router-drawer-light :is(.text-foreground) {
+  color: rgb(var(--router-foreground)) !important;
+}
+
+.router-drawer-light :is(.bg-muted\/20, .bg-muted\/30, .bg-muted\/40) {
+  background-color: rgba(241, 245, 249, 0.72) !important;
+}
+
 .mono-label {
   font-family: var(--font-jetbrains), "JetBrains Mono", monospace;
   font-size: 0.72rem;

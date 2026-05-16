@@ -100,12 +100,7 @@ export function SettingsPage() {
             <ScrollShadow className="max-h-[520px]">
               <ListBox
                 aria-label={t("settings.groupsAria")}
-                selectionMode="single"
-                selectedKeys={activeGroup ? [activeGroup] : []}
-                onSelectionChange={(keys) => {
-                  const [next] = Array.from(keys);
-                  if (next) setActiveGroup(String(next));
-                }}
+                onAction={(key: React.Key) => setActiveGroup(String(key))}
                 className="gap-1 pr-3"
               >
                 {groups.map((group) => {
@@ -115,14 +110,14 @@ export function SettingsPage() {
                       key={group}
                       id={group}
                       textValue={group}
-                      className="flex items-center justify-between"
+                      className={`flex items-center justify-between ${activeGroup === group ? "bg-primary/10 text-foreground" : ""}`}
                     >
                       <span>{group}</span>
                       {count ? <Chip size="sm" variant="soft">{count}</Chip> : null}
                     </ListBox.Item>
                   );
                 })}
-                <ListBox.Item id={VERSION_GROUP} textValue={t("settings.version")} className="flex items-center justify-between">
+                <ListBox.Item id={VERSION_GROUP} textValue={t("settings.version")} className={`flex items-center justify-between ${activeGroup === VERSION_GROUP ? "bg-primary/10 text-foreground" : ""}`}>
                   <span>{t("settings.version")}</span>
                 </ListBox.Item>
               </ListBox>
@@ -234,7 +229,7 @@ function SettingsFieldRow({
             <Switch isSelected={Boolean(value)} onChange={onChange} id={field.key} />
             <span className="text-sm text-muted-foreground">{Boolean(value) ? t("common.enabled") : t("common.disabled")}</span>
           </div>
-        ) : field.fieldType === "email_list" ? (
+        ) : field.fieldType === "email_list" || field.fieldType === "ip_list" ? (
           <TextArea id={field.key} value={String(value ?? "")} onChange={(event: React.ChangeEvent<HTMLTextAreaElement>) => onChange(event.target.value)} placeholder={field.placeholder || ""} />
         ) : (
           <Input

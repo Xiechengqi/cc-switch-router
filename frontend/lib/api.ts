@@ -1,5 +1,6 @@
 import { authFetch } from "@/lib/auth";
 import type {
+  BoardListResponse,
   BoardMessage,
   BoardMeta,
   DashboardResponse,
@@ -8,6 +9,8 @@ import type {
   SettingsValuesResponse,
   VersionResponse,
 } from "@/lib/types";
+
+export type { BoardListResponse, BoardMessage, BoardMeta };
 
 export async function parseJson<T>(response: Response): Promise<T> {
   const data = await response.json().catch(() => ({}));
@@ -82,13 +85,18 @@ export async function getBoardMeta() {
   return parseJson<BoardMeta>(await boardFetch("/v1/board/meta", { cache: "no-store" }));
 }
 
-export async function getBoardMessages(tab = "all") {
+export async function getBoardMessages(tab = "all", since?: string, signal?: AbortSignal) {
   const params = new URLSearchParams({ tab, limit: "50" });
-  return parseJson<{ messages: BoardMessage[] }>(await boardFetch(`/v1/board/messages?${params}`, { cache: "no-store" }));
+  if (since) params.set("since", since);
+  return parseJson<BoardListResponse>(await boardFetch(`/v1/board/messages?${params}`, { cache: "no-store", signal }));
+}
+
+export async function getBoardMetaWithSignal(signal?: AbortSignal) {
+  return parseJson<BoardMeta>(await boardFetch("/v1/board/meta", { cache: "no-store", signal }));
 }
 
 export async function postBoardMessage(body: string, guestName?: string) {
-  return parseJson<unknown>(
+  return parseJson<BoardMessage>(
     await boardFetch("/v1/board/messages", {
       method: "POST",
       body: JSON.stringify({ body, guestName: guestName || undefined }),
