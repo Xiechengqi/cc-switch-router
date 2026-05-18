@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
@@ -33,14 +33,18 @@ use crate::models::{
     RegisterInstallationResponse, RegisterMarketRequest, RequestEmailCodeRequest,
     RequestEmailCodeResponse, SessionStatusResponse, ShareAppRuntimes, ShareBatchSyncRequest,
     ShareClaimPayload, ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptor,
-    ShareHeartbeatRequest, ShareMarketLinkView, ShareRequestLogBatchSyncRequest,
+    ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest, ShareMarketLinkView,
+    SharePendingEditsRequest, SharePendingEditsResponse, ShareRequestLogBatchSyncRequest,
     ShareRequestLogEntry, ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload,
-    ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse, ShareSupport, ShareSyncRequest,
-    ShareUpstreamProvider, ShareView, TunnelLease, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse, ShareSettingsPatch,
+    ShareSettingsUpdateResponse, ShareSupport, ShareSyncRequest, ShareUpstreamProvider, ShareView,
+    TunnelLease, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 use crate::proxy::ProxyRegistry;
 
 const SHARE_REQUEST_LOG_RECOVERY_LIMIT: usize = 10;
+const SHARE_REQUEST_LOG_RECOVERY_STALE_SECS: i64 = 10 * 60;
+const SHARE_REQUEST_LOG_RECOVERY_COOLDOWN_SECS: i64 = 5 * 60;
 const PUBLIC_MAP_CLIENT_ACTIVE_WINDOW_MINUTES: i64 = 5;
 const ONLINE_WINDOW_MINUTES: usize = 24 * 60;
 const SIGNED_REQUEST_MAX_SKEW_MS: i64 = 60_000;
@@ -85,7 +89,7 @@ use crate::geo::country_centroid;
 #[derive(Clone)]
 pub struct AppStore {
     conn: Arc<Mutex<Connection>>,
-    share_log_recovery_attempts: Arc<Mutex<HashSet<String>>>,
+    share_log_recovery_attempts: Arc<Mutex<HashMap<String, i64>>>,
     ip_hash_salt: Arc<String>,
 }
 
@@ -154,7 +158,7 @@ impl AppStore {
         let salt = Alphanumeric.sample_string(&mut rand::thread_rng(), 32);
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
-            share_log_recovery_attempts: Arc::new(Mutex::new(HashSet::new())),
+            share_log_recovery_attempts: Arc::new(Mutex::new(HashMap::new())),
             ip_hash_salt: Arc::new(salt),
         })
     }
@@ -879,8 +883,17 @@ impl AppStore {
             ensure_subdomain_not_registered_market(&conn, &requested_subdomain)?;
             requested_subdomain
         };
+        let requested_share_id = input.share.as_ref().map(|share| share.share_id.as_str());
         {
             let conn = self.conn.lock().await;
+            conn.execute(
+                "DELETE FROM leases
+                 WHERE subdomain = ?1
+                   AND installation_id = ?2
+                   AND tunnel_type = 'http'",
+                params![subdomain, input.installation_id],
+            )
+            .map_err(|e| AppError::Internal(format!("delete stale client leases failed: {e}")))?;
             let live_lease_exists: bool = conn
                 .query_row(
                     "SELECT EXISTS(
@@ -903,7 +916,18 @@ impl AppStore {
             .await
             .is_some()
         {
-            return Err(AppError::Conflict("subdomain already in use".into()));
+            let route = proxy
+                .backend_for_host(
+                    &format!("{subdomain}.{}", config.tunnel_domain),
+                    &config.tunnel_domain,
+                )
+                .await
+                .expect("route existence checked above");
+            let is_same_share_route =
+                requested_share_id.is_some() && route.share_id() == requested_share_id;
+            if !is_same_share_route {
+                return Err(AppError::Conflict("subdomain already in use".into()));
+            }
         }
 
         verify_signature(&installation.public_key, &input)?;
@@ -1371,6 +1395,181 @@ impl AppStore {
         Ok(())
     }
 
+    pub async fn create_share_settings_edit(
+        &self,
+        share_id: &str,
+        current_user_email: &str,
+        patch: ShareSettingsPatch,
+    ) -> Result<ShareSettingsUpdateResponse, AppError> {
+        let current_user_email = normalize_email(current_user_email)?;
+        let patch = normalize_share_settings_patch(patch, Some(&current_user_email))?;
+        if share_settings_patch_is_empty(&patch) {
+            return Err(AppError::BadRequest("share settings patch is empty".into()));
+        }
+
+        let now = Utc::now();
+        let conn = self.conn.lock().await;
+        let (installation_id, owner_email): (String, String) = conn
+            .query_row(
+                "SELECT installation_id, owner_email FROM shares WHERE share_id = ?1",
+                params![share_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| AppError::Internal(format!("query share owner failed: {e}")))?
+            .ok_or_else(|| AppError::NotFound("share not found".into()))?;
+        if owner_email != current_user_email {
+            return Err(AppError::Forbidden(
+                "only share owner can edit share settings".into(),
+            ));
+        }
+        if let Some(active) = get_active_share_edit(&conn, share_id)? {
+            return Err(AppError::Conflict(format!(
+                "share settings edit {} is {} and must be applied before another edit",
+                active.revision, active.status
+            )));
+        }
+        let revision = next_share_edit_revision(&conn, share_id)?;
+        let id = Uuid::new_v4().to_string();
+        let patch_json = serde_json::to_string(&patch).map_err(|e| {
+            AppError::Internal(format!("serialize share settings patch failed: {e}"))
+        })?;
+        conn.execute(
+            "INSERT INTO share_edit_requests (
+                id, share_id, installation_id, owner_email, revision, status, patch_json,
+                created_by_email, created_at, updated_at, applied_at, error_message
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7, ?8, ?8, NULL, NULL)",
+            params![
+                id,
+                share_id,
+                installation_id,
+                owner_email,
+                revision,
+                patch_json,
+                current_user_email,
+                now.to_rfc3339(),
+            ],
+        )
+        .map_err(|e| AppError::Internal(format!("insert share settings edit failed: {e}")))?;
+        let edit = get_share_edit_by_id(&conn, &id)?
+            .ok_or_else(|| AppError::Internal("created share edit is missing".into()))?;
+        Ok(ShareSettingsUpdateResponse { ok: true, edit })
+    }
+
+    pub async fn pending_share_edits(
+        &self,
+        input: SharePendingEditsRequest,
+        metadata: ClientMetadata,
+    ) -> Result<SharePendingEditsResponse, AppError> {
+        let conn = self.conn.lock().await;
+        let installation = get_installation(&conn, &input.installation_id)?;
+        let Some(installation) = installation else {
+            return Err(AppError::Unauthorized("installation not found".into()));
+        };
+        verify_signed_share_request(
+            &conn,
+            &installation.public_key,
+            &input.installation_id,
+            "share_pending_edits",
+            &input.share_ids,
+            input.timestamp_ms,
+            &input.nonce,
+            &input.signature,
+        )?;
+        touch_installation_presence(&conn, &input.installation_id, &metadata, Utc::now())?;
+        let edits = list_pending_share_edits_for_installation(
+            &conn,
+            &input.installation_id,
+            &input.share_ids,
+        )?;
+        Ok(SharePendingEditsResponse { edits })
+    }
+
+    pub async fn ack_share_edit(
+        &self,
+        input: ShareEditAckRequest,
+        metadata: ClientMetadata,
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().await;
+        let installation = get_installation(&conn, &input.installation_id)?;
+        let Some(installation) = installation else {
+            return Err(AppError::Unauthorized("installation not found".into()));
+        };
+        verify_signed_share_request(
+            &conn,
+            &installation.public_key,
+            &input.installation_id,
+            "share_edit_ack",
+            &input.ack,
+            input.timestamp_ms,
+            &input.nonce,
+            &input.signature,
+        )?;
+        touch_installation_presence(&conn, &input.installation_id, &metadata, Utc::now())?;
+        let status = match input.ack.status.as_str() {
+            "applied" => "applied",
+            "rejected" => "rejected",
+            _ => {
+                return Err(AppError::BadRequest(
+                    "share edit ack status must be applied or rejected".into(),
+                ));
+            }
+        };
+        let now = Utc::now().to_rfc3339();
+        let changed = conn
+            .execute(
+                "UPDATE share_edit_requests
+                 SET status = ?4,
+                     updated_at = ?5,
+                     applied_at = CASE WHEN ?4 = 'applied' THEN ?5 ELSE applied_at END,
+                     error_message = ?6
+                 WHERE id = ?1
+                   AND installation_id = ?2
+                   AND revision = ?3
+                   AND status = 'pending'",
+                params![
+                    input.ack.edit_id,
+                    input.installation_id,
+                    input.ack.revision,
+                    status,
+                    now,
+                    input.ack.error_message,
+                ],
+            )
+            .map_err(|e| AppError::Internal(format!("ack share edit failed: {e}")))?;
+        if changed == 0 {
+            return Err(AppError::Conflict(
+                "share edit ack did not match an active pending edit".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn verify_share_edit_event_stream(
+        &self,
+        installation_id: &str,
+        payload: &impl Serialize,
+        timestamp_ms: i64,
+        nonce: &str,
+        signature: &str,
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().await;
+        let installation = get_installation(&conn, installation_id)?;
+        let Some(installation) = installation else {
+            return Err(AppError::Unauthorized("installation not found".into()));
+        };
+        verify_signed_share_request(
+            &conn,
+            &installation.public_key,
+            installation_id,
+            "share_edit_events",
+            payload,
+            timestamp_ms,
+            nonce,
+            signature,
+        )
+    }
+
     pub async fn batch_sync_share_request_logs(
         &self,
         input: ShareRequestLogBatchSyncRequest,
@@ -1493,11 +1692,20 @@ impl AppStore {
         let inflight_by_share = proxy.inflight_by_share().await;
         let inflight_by_market_email = proxy.inflight_by_market_email().await;
         let now = Utc::now();
-        let (installations, shares, health_by_share, online_by_share, recent_logs, market_logs) = {
+        let (
+            installations,
+            shares,
+            active_edits_by_share,
+            health_by_share,
+            online_by_share,
+            recent_logs,
+            market_logs,
+        ) = {
             let conn = self.conn.lock().await;
             (
                 list_installations(&conn)?,
                 list_shares(&conn)?,
+                list_active_share_edits(&conn)?,
                 list_health_checks(&conn, 10)?,
                 list_online_minutes_24h(&conn)?,
                 list_recent_share_request_logs(&conn, SHARE_REQUEST_LOG_RECOVERY_LIMIT)?,
@@ -1642,6 +1850,12 @@ impl AppStore {
                 let can_view_secret =
                     share.for_sale == "Free" || share_visible_to_email(&share, viewer_email);
                 let can_manage = can_manage_share(&share, viewer_email);
+                let active_edit = active_edits_by_share.get(&share.share_id).cloned();
+                let can_edit_settings = can_manage
+                    && active_edit
+                        .as_ref()
+                        .map(|edit| edit.status != "pending")
+                        .unwrap_or(true);
                 let market_links = if share.market_access_mode == "all" {
                     markets
                         .iter()
@@ -1688,6 +1902,8 @@ impl AppStore {
                     app_type: share.app_type,
                     can_view_secret,
                     can_manage,
+                    can_edit_settings,
+                    active_edit,
                     provider_id: share.provider_id,
                     token_limit: share.token_limit,
                     parallel_limit: share.parallel_limit,
@@ -1744,7 +1960,7 @@ impl AppStore {
                 }
             }
         }
-        let client_views = installation_views
+        let mut client_views = installation_views
             .iter()
             .cloned()
             .map(|installation| DashboardClientView {
@@ -1753,6 +1969,24 @@ impl AppStore {
             })
             .filter(|client| client.share.is_some())
             .collect::<Vec<_>>();
+        client_views.sort_by(|left, right| {
+            let left_owned = left
+                .share
+                .as_ref()
+                .map(|share| share.can_manage)
+                .unwrap_or(false);
+            let right_owned = right
+                .share
+                .as_ref()
+                .map(|share| share.can_manage)
+                .unwrap_or(false);
+            right_owned.cmp(&left_owned).then_with(|| {
+                right
+                    .installation
+                    .last_seen_at
+                    .cmp(&left.installation.last_seen_at)
+            })
+        });
         let clients_count = client_views.len();
         let active_shares_count = client_views
             .iter()
@@ -1804,14 +2038,15 @@ impl AppStore {
         shares: &[(String, ShareDescriptor)],
         mut logs_by_share: HashMap<String, Vec<ShareRequestLogEntry>>,
     ) -> Result<HashMap<String, Vec<ShareRequestLogEntry>>, AppError> {
+        let now_ts = Utc::now().timestamp();
         let missing_shares = shares
             .iter()
             .filter(|(_, share)| {
                 active_subdomains.contains(&share.subdomain)
-                    && logs_by_share
-                        .get(&share.share_id)
-                        .map(|logs| logs.is_empty())
-                        .unwrap_or(true)
+                    && share_logs_need_recovery(
+                        logs_by_share.get(&share.share_id).map(Vec::as_slice),
+                        now_ts,
+                    )
             })
             .map(|(installation_id, share)| {
                 (
@@ -1826,10 +2061,16 @@ impl AppStore {
             missing_shares
                 .into_iter()
                 .filter(|(_, share_id, _)| {
-                    if attempted.contains(share_id) {
+                    if attempted
+                        .get(share_id)
+                        .map(|last_attempt| {
+                            now_ts - *last_attempt < SHARE_REQUEST_LOG_RECOVERY_COOLDOWN_SECS
+                        })
+                        .unwrap_or(false)
+                    {
                         return false;
                     }
-                    attempted.insert(share_id.clone());
+                    attempted.insert(share_id.clone(), now_ts);
                     true
                 })
                 .collect::<Vec<_>>()
@@ -3087,6 +3328,14 @@ impl AppStore {
     }
 }
 
+fn share_logs_need_recovery(logs: Option<&[ShareRequestLogEntry]>, now_ts: i64) -> bool {
+    let Some(logs) = logs else {
+        return true;
+    };
+    let newest_created_at = logs.iter().map(|log| log.created_at).max().unwrap_or(0);
+    newest_created_at <= now_ts - SHARE_REQUEST_LOG_RECOVERY_STALE_SECS
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdminAuditEntry {
@@ -3871,6 +4120,21 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             is_healthy INTEGER NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS share_edit_requests (
+            id TEXT PRIMARY KEY,
+            share_id TEXT NOT NULL,
+            installation_id TEXT NOT NULL,
+            owner_email TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            patch_json TEXT NOT NULL,
+            created_by_email TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            applied_at TEXT,
+            error_message TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS dashboard_presence (
             session_id TEXT PRIMARY KEY,
             last_seen_at INTEGER NOT NULL
@@ -4331,6 +4595,16 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         [],
     )
     .map_err(|e| AppError::Internal(format!("create subdomain unique index failed: {e}")))?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_share_edit_requests_share_status ON share_edit_requests(share_id, status, revision DESC)",
+        [],
+    )
+    .map_err(|e| AppError::Internal(format!("create share edit status index failed: {e}")))?;
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_share_edit_requests_pending_unique ON share_edit_requests(share_id) WHERE status = 'pending'",
+        [],
+    )
+    .map_err(|e| AppError::Internal(format!("create pending share edit unique index failed: {e}")))?;
     add_column_if_missing(
         conn,
         "share_request_logs",
@@ -4904,6 +5178,218 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
         })
         .map_err(|e| AppError::Internal(format!("query shares failed: {e}")))?;
     collect_rows(rows)
+}
+
+fn list_active_share_edits(conn: &Connection) -> Result<HashMap<String, ShareEditView>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, share_id, installation_id, revision, status, patch_json, created_by_email, created_at, updated_at, applied_at, error_message
+             FROM share_edit_requests
+             WHERE status IN ('pending', 'rejected')
+             ORDER BY revision DESC",
+        )
+        .map_err(|e| AppError::Internal(format!("prepare active share edits failed: {e}")))?;
+    let rows = stmt
+        .query_map([], share_edit_from_row)
+        .map_err(|e| AppError::Internal(format!("query active share edits failed: {e}")))?;
+    let mut result = HashMap::new();
+    for edit in collect_rows(rows)? {
+        result.entry(edit.share_id.clone()).or_insert(edit);
+    }
+    Ok(result)
+}
+
+fn get_active_share_edit(
+    conn: &Connection,
+    share_id: &str,
+) -> Result<Option<ShareEditView>, AppError> {
+    conn.query_row(
+        "SELECT id, share_id, installation_id, revision, status, patch_json, created_by_email, created_at, updated_at, applied_at, error_message
+         FROM share_edit_requests
+         WHERE share_id = ?1 AND status = 'pending'
+         ORDER BY revision DESC
+         LIMIT 1",
+        params![share_id],
+        share_edit_from_row,
+    )
+    .optional()
+    .map_err(|e| AppError::Internal(format!("query active share edit failed: {e}")))
+}
+
+fn get_share_edit_by_id(conn: &Connection, id: &str) -> Result<Option<ShareEditView>, AppError> {
+    conn.query_row(
+        "SELECT id, share_id, installation_id, revision, status, patch_json, created_by_email, created_at, updated_at, applied_at, error_message
+         FROM share_edit_requests
+         WHERE id = ?1",
+        params![id],
+        share_edit_from_row,
+    )
+    .optional()
+    .map_err(|e| AppError::Internal(format!("query share edit failed: {e}")))
+}
+
+fn list_pending_share_edits_for_installation(
+    conn: &Connection,
+    installation_id: &str,
+    share_ids: &[String],
+) -> Result<Vec<ShareEditView>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, share_id, installation_id, revision, status, patch_json, created_by_email, created_at, updated_at, applied_at, error_message
+             FROM share_edit_requests
+             WHERE installation_id = ?1 AND status = 'pending'
+             ORDER BY revision ASC",
+        )
+        .map_err(|e| AppError::Internal(format!("prepare pending share edits failed: {e}")))?;
+    let rows = stmt
+        .query_map(params![installation_id], share_edit_from_row)
+        .map_err(|e| AppError::Internal(format!("query pending share edits failed: {e}")))?;
+    let requested = share_ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<HashSet<_>>();
+    let mut edits = collect_rows(rows)?;
+    if !requested.is_empty() {
+        edits.retain(|edit| requested.contains(&edit.share_id));
+    }
+    Ok(edits)
+}
+
+fn next_share_edit_revision(conn: &Connection, share_id: &str) -> Result<i64, AppError> {
+    conn.query_row(
+        "SELECT COALESCE(MAX(revision), 0) + 1 FROM share_edit_requests WHERE share_id = ?1",
+        params![share_id],
+        |row| row.get(0),
+    )
+    .map_err(|e| AppError::Internal(format!("query next share edit revision failed: {e}")))
+}
+
+fn share_edit_from_row(row: &rusqlite::Row<'_>) -> Result<ShareEditView, rusqlite::Error> {
+    let patch_json: String = row.get(5)?;
+    let patch = serde_json::from_str::<ShareSettingsPatch>(&patch_json).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(err))
+    })?;
+    let created_at = parse_rfc3339_row(row.get::<_, String>(7)?, 7)?;
+    let updated_at = parse_rfc3339_row(row.get::<_, String>(8)?, 8)?;
+    let applied_at = match row.get::<_, Option<String>>(9)? {
+        Some(value) => Some(parse_rfc3339_row(value, 9)?),
+        None => None,
+    };
+    Ok(ShareEditView {
+        id: row.get(0)?,
+        share_id: row.get(1)?,
+        installation_id: row.get(2)?,
+        revision: row.get(3)?,
+        status: row.get(4)?,
+        patch,
+        created_by_email: row.get(6)?,
+        created_at,
+        updated_at,
+        applied_at,
+        error_message: row.get(10)?,
+    })
+}
+
+fn parse_rfc3339_row(value: String, index: usize) -> Result<DateTime<Utc>, rusqlite::Error> {
+    DateTime::parse_from_rfc3339(&value)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                index,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })
+}
+
+fn share_settings_patch_is_empty(patch: &ShareSettingsPatch) -> bool {
+    patch.description.is_none()
+        && patch.for_sale.is_none()
+        && patch.market_access_mode.is_none()
+        && patch.shared_with_emails.is_none()
+        && patch.for_sale_official_price_percent_by_app.is_none()
+        && patch.token_limit.is_none()
+        && patch.parallel_limit.is_none()
+        && patch.expires_at.is_none()
+        && patch.auto_start.is_none()
+}
+
+fn normalize_share_settings_patch(
+    patch: ShareSettingsPatch,
+    owner_email: Option<&str>,
+) -> Result<ShareSettingsPatch, AppError> {
+    let shared_with_emails = match patch.shared_with_emails {
+        Some(values) => {
+            let owner_email = owner_email.unwrap_or("");
+            Some(normalize_email_list(&values, owner_email))
+        }
+        None => None,
+    };
+    let pricing = match patch.for_sale_official_price_percent_by_app {
+        Some(values) => {
+            let mut normalized = BTreeMap::new();
+            for (app, percent) in values {
+                let app = app.trim().to_ascii_lowercase();
+                if !matches!(app.as_str(), "claude" | "codex" | "gemini") {
+                    return Err(AppError::BadRequest(
+                        "official price percent app must be claude, codex, or gemini".into(),
+                    ));
+                }
+                if !(1..=100).contains(&percent) {
+                    return Err(AppError::BadRequest(
+                        "official price percent must be between 1 and 100".into(),
+                    ));
+                }
+                normalized.insert(app, percent);
+            }
+            Some(normalized)
+        }
+        None => None,
+    };
+    if let Some(token_limit) = patch.token_limit {
+        if token_limit <= 0 && token_limit != -1 {
+            return Err(AppError::BadRequest(
+                "tokenLimit must be positive or -1".into(),
+            ));
+        }
+    }
+    if let Some(parallel_limit) = patch.parallel_limit {
+        if parallel_limit != -1 && parallel_limit < 3 {
+            return Err(AppError::BadRequest(
+                "parallelLimit must be at least 3 or -1".into(),
+            ));
+        }
+    }
+    if let Some(expires_at) = patch.expires_at.as_deref() {
+        let expires = DateTime::parse_from_rfc3339(expires_at)
+            .map_err(|_| AppError::BadRequest("expiresAt must be RFC3339".into()))?
+            .with_timezone(&Utc);
+        if expires <= Utc::now() {
+            return Err(AppError::BadRequest(
+                "expiresAt must be in the future".into(),
+            ));
+        }
+    }
+    Ok(ShareSettingsPatch {
+        description: match patch.description {
+            Some(value) => Some(normalize_share_description(value)?),
+            None => None,
+        },
+        for_sale: match patch.for_sale {
+            Some(value) => Some(normalize_share_for_sale(&value)?),
+            None => None,
+        },
+        market_access_mode: match patch.market_access_mode {
+            Some(value) => Some(normalize_market_access_mode(&value)?),
+            None => None,
+        },
+        shared_with_emails,
+        for_sale_official_price_percent_by_app: pricing,
+        token_limit: patch.token_limit,
+        parallel_limit: patch.parallel_limit,
+        expires_at: patch.expires_at,
+        auto_start: patch.auto_start,
+    })
 }
 
 fn normalize_share_description(description: Option<String>) -> Result<Option<String>, AppError> {
@@ -7055,6 +7541,58 @@ mod tests {
         }
     }
 
+    fn test_share_request_log_entry(
+        request_id: &str,
+        share_id: &str,
+        created_at: i64,
+    ) -> ShareRequestLogEntry {
+        ShareRequestLogEntry {
+            request_id: request_id.into(),
+            share_id: share_id.into(),
+            share_name: "Share".into(),
+            provider_id: "provider-1".into(),
+            provider_name: "Provider One".into(),
+            app_type: "codex".into(),
+            model: "gpt-5".into(),
+            request_model: "gpt-5".into(),
+            request_agent: "codex".into(),
+            requested_model: "gpt-5".into(),
+            actual_model: "gpt-5".into(),
+            actual_model_source: "official".into(),
+            status_code: 200,
+            latency_ms: 100,
+            first_token_ms: None,
+            input_tokens: 1,
+            output_tokens: 2,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            is_streaming: false,
+            session_id: None,
+            created_at,
+        }
+    }
+
+    #[test]
+    fn share_logs_need_recovery_for_empty_or_stale_logs() {
+        let now_ts = Utc::now().timestamp();
+        assert!(share_logs_need_recovery(None, now_ts));
+        assert!(share_logs_need_recovery(Some(&[]), now_ts));
+
+        let stale = vec![test_share_request_log_entry(
+            "req-stale",
+            "share-1",
+            now_ts - SHARE_REQUEST_LOG_RECOVERY_STALE_SECS - 1,
+        )];
+        assert!(share_logs_need_recovery(Some(&stale), now_ts));
+
+        let fresh = vec![test_share_request_log_entry(
+            "req-fresh",
+            "share-1",
+            now_ts - 60,
+        )];
+        assert!(!share_logs_need_recovery(Some(&fresh), now_ts));
+    }
+
     #[tokio::test]
     async fn list_market_shares_all_access_allows_future_market_email() {
         let (store, config) = setup_store("market-share-all-access").await;
@@ -7162,6 +7700,21 @@ mod tests {
     ) -> String {
         let payload_json = serde_json::to_string(payload).expect("serialize test payload");
         let body = format!("{installation_id}\n{action}\n{payload_json}\n{timestamp_ms}\n{nonce}");
+        let signature = signing_key.sign(body.as_bytes());
+        base64::engine::general_purpose::STANDARD.encode(signature.to_bytes())
+    }
+
+    fn sign_issue_lease_request(
+        signing_key: &SigningKey,
+        installation_id: &str,
+        requested_subdomain: &str,
+        tunnel_type: &str,
+        timestamp_ms: i64,
+        nonce: &str,
+    ) -> String {
+        let body = format!(
+            "{installation_id}\n{requested_subdomain}\n{tunnel_type}\n{timestamp_ms}\n{nonce}"
+        );
         let signature = signing_key.sign(body.as_bytes());
         base64::engine::general_purpose::STANDARD.encode(signature.to_bytes())
     }
@@ -7282,6 +7835,62 @@ mod tests {
             .expect_err("subdomain mismatch should be rejected");
 
         assert!(err.to_string().contains("subdomain mismatch"));
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn issue_lease_allows_same_share_to_renew_existing_route() {
+        let (store, config) = setup_store("issue-lease-same-share-renew").await;
+        let signing_key = insert_signed_installation(&store, "inst-renew").await;
+        insert_share(&store, "inst-renew", "share-renew", "aaa", "active").await;
+        let proxy = ProxyRegistry::default();
+        proxy
+            .set_route(
+                "aaa".into(),
+                "127.0.0.1:65530".into(),
+                Some("token-share-renew".into()),
+                Some("share-renew".into()),
+                Some("share-share-renew".into()),
+                false,
+                -1,
+            )
+            .await;
+
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_issue_lease_request(
+            &signing_key,
+            "inst-renew",
+            "aaa",
+            "http",
+            timestamp_ms,
+            &nonce,
+        );
+
+        let lease = store
+            .issue_lease(
+                &config,
+                &proxy,
+                IssueLeaseRequest {
+                    installation_id: "inst-renew".into(),
+                    requested_subdomain: "aaa".into(),
+                    tunnel_type: "http".into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    share: Some(test_share_descriptor("share-renew", "aaa")),
+                },
+                ClientMetadata {
+                    ip: Some("127.0.0.1".into()),
+                    country_code: None,
+                },
+                None,
+            )
+            .await
+            .expect("same share route should be renewable");
+
+        assert_eq!(lease.subdomain, "aaa");
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }

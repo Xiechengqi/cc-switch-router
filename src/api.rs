@@ -1,12 +1,14 @@
 use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 use std::net::SocketAddr;
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
-use axum::routing::{any, delete, get, post};
+use axum::response::sse::Event;
+use axum::response::{IntoResponse, Response, Sse};
+use axum::routing::{any, delete, get, patch, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
@@ -39,9 +41,10 @@ use crate::models::{
     PublicMapPointsResponse, RefreshSessionRequest, RegisterInstallationRequest,
     RegisterInstallationResponse, RegisterMarketRequest, RequestEmailCodeRequest,
     RequestEmailCodeResponse, SessionStatusResponse, ShareBatchSyncRequest,
-    ShareClaimSubdomainRequest, ShareDeleteRequest, ShareHeartbeatRequest,
-    ShareRequestLogBatchSyncRequest, ShareRuntimeRefreshRequest, ShareSyncRequest,
-    VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    ShareClaimSubdomainRequest, ShareDeleteRequest, ShareEditAckRequest, ShareEditAvailableEvent,
+    ShareEditEventSignaturePayload, ShareHeartbeatRequest, SharePendingEditsRequest,
+    ShareRequestLogBatchSyncRequest, ShareRuntimeRefreshRequest, ShareSettingsUpdateRequest,
+    ShareSyncRequest, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 use crate::proxy::{market_proxy_handler, proxy_handler};
 use crate::recent_traffic::{RecentRequestEvent, RecentTrafficSnapshot};
@@ -64,6 +67,15 @@ struct RegionOption {
 #[serde(rename_all = "camelCase")]
 struct SessionStatusQuery {
     installation_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShareEditEventsQuery {
+    installation_id: String,
+    timestamp_ms: i64,
+    nonce: String,
+    signature: String,
 }
 
 pub fn router(state: ServerState) -> Router {
@@ -114,6 +126,13 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/shares/sync", post(sync_share))
         .route("/v1/shares/batch-sync", post(batch_sync_share))
         .route("/v1/shares/runtime-refresh", post(refresh_share_runtime))
+        .route(
+            "/v1/shares/:share_id/settings",
+            patch(update_share_settings),
+        )
+        .route("/v1/shares/pending-edits", post(pending_share_edits))
+        .route("/v1/shares/edit-ack", post(ack_share_edit))
+        .route("/v1/shares/edit-events", get(share_edit_events))
         .route(
             "/v1/share-request-logs/batch-sync",
             post(batch_sync_share_request_logs),
@@ -803,6 +822,91 @@ async fn batch_sync_share(
         .batch_sync_shares(input, extract_client_metadata(&headers, addr), "")
         .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn update_share_settings(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(share_id): Path<String>,
+    Json(input): Json<ShareSettingsUpdateRequest>,
+) -> Result<Json<crate::models::ShareSettingsUpdateResponse>, AppError> {
+    let current_user_email = require_session_email(&state, &headers).await?;
+    let response = state
+        .store
+        .create_share_settings_edit(&share_id, &current_user_email, input.patch)
+        .await?;
+    let _ = state.share_edit_events.send(ShareEditAvailableEvent {
+        kind: "share_edit_available".to_string(),
+        installation_id: response.edit.installation_id.clone(),
+        share_id: response.edit.share_id.clone(),
+        revision: response.edit.revision,
+    });
+    Ok(Json(response))
+}
+
+async fn pending_share_edits(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(input): Json<SharePendingEditsRequest>,
+) -> Result<Json<crate::models::SharePendingEditsResponse>, AppError> {
+    Ok(Json(
+        state
+            .store
+            .pending_share_edits(input, extract_client_metadata(&headers, addr))
+            .await?,
+    ))
+}
+
+async fn ack_share_edit(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(input): Json<ShareEditAckRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    state
+        .store
+        .ack_share_edit(input, extract_client_metadata(&headers, addr))
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn share_edit_events(
+    State(state): State<ServerState>,
+    Query(query): Query<ShareEditEventsQuery>,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, AppError> {
+    let payload = ShareEditEventSignaturePayload {
+        installation_id: query.installation_id.clone(),
+    };
+    state
+        .store
+        .verify_share_edit_event_stream(
+            &query.installation_id,
+            &payload,
+            query.timestamp_ms,
+            &query.nonce,
+            &query.signature,
+        )
+        .await?;
+    let installation_id = query.installation_id;
+    let mut rx = state.share_edit_events.subscribe();
+    let stream = async_stream::stream! {
+        yield Ok(Event::default().event("ready").data("{}"));
+        loop {
+            match rx.recv().await {
+                Ok(event) if event.installation_id == installation_id => {
+                    let data = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
+                    yield Ok(Event::default().event("share_edit_available").data(data));
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    yield Ok(Event::default().event("resync").data("{}"));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+    Ok(Sse::new(stream))
 }
 
 async fn batch_sync_share_request_logs(

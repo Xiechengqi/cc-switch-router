@@ -26,7 +26,7 @@ use anyhow::Result;
 use proxy::ProxyRegistry;
 use resend_rs::Resend;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, broadcast};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
@@ -36,6 +36,7 @@ use crate::admin::upgrade::SharedUpgradeRegistry;
 use crate::board_telegram::TelegramNotifier;
 use crate::config::{Config, ensure_default_env_file, load_env_file};
 use crate::dynamic_settings::DynamicSettings;
+use crate::models::ShareEditAvailableEvent;
 use crate::recent_traffic::RecentTraffic;
 use crate::startup_config::{StartupConfigMode, ensure_startup_config};
 use crate::store::{AppStore, ShareRouteTarget, fetch_share_runtime_snapshot_from_route};
@@ -62,6 +63,9 @@ pub struct ServerState {
     pub telegram: Arc<RwLock<Option<Arc<TelegramNotifier>>>>,
     /// Single-flight upgrade orchestrator with SSE log fan-out.
     pub upgrade_registry: SharedUpgradeRegistry,
+    /// Fan-out control channel for online cc-switch clients. Events are wake-ups only;
+    /// clients still pull signed pending edits before applying anything.
+    pub share_edit_events: broadcast::Sender<ShareEditAvailableEvent>,
     /// Path to the live env file (also the apply target).
     pub env_path: PathBuf,
     /// When the process started; powers the uptime value on /v1/admin/version.
@@ -151,6 +155,7 @@ async fn main() -> Result<()> {
         abuse: Arc::new(AbuseTracker::new()),
         telegram: Arc::new(RwLock::new(telegram)),
         upgrade_registry: Arc::new(crate::admin::upgrade::UpgradeRegistry::new()),
+        share_edit_events: broadcast::channel(512).0,
         env_path: env_path.clone(),
         start_instant: Instant::now(),
     };

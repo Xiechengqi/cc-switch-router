@@ -7,6 +7,8 @@ import type {
   SettingsSchema,
   SettingsUpdateResponse,
   SettingsValuesResponse,
+  ShareSettingsPatch,
+  ShareEditView,
   VersionResponse,
 } from "@/lib/types";
 
@@ -22,6 +24,16 @@ export async function parseJson<T>(response: Response): Promise<T> {
 
 export async function getDashboard() {
   return parseJson<DashboardResponse>(await authFetch("/v1/dashboard", { cache: "no-store" }));
+}
+
+export async function updateShareSettings(shareId: string, patch: ShareSettingsPatch) {
+  return parseJson<{ ok: boolean; edit: ShareEditView }>(
+    await authFetch(`/v1/shares/${encodeURIComponent(shareId)}/settings`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ patch }),
+    }),
+  );
 }
 
 export async function getSettingsSchema() {

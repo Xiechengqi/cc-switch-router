@@ -390,6 +390,112 @@ pub struct ShareRuntimeRefreshRequest {
     pub refresh: ShareRuntimeRefreshPayload,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShareSettingsPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub for_sale: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_access_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_with_emails: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub for_sale_official_price_percent_by_app: Option<BTreeMap<String, u16>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_limit: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_limit: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_start: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareEditView {
+    pub id: String,
+    pub share_id: String,
+    pub installation_id: String,
+    pub revision: i64,
+    pub status: String,
+    pub patch: ShareSettingsPatch,
+    pub created_by_email: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareSettingsUpdateRequest {
+    pub patch: ShareSettingsPatch,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareSettingsUpdateResponse {
+    pub ok: bool,
+    pub edit: ShareEditView,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SharePendingEditsRequest {
+    pub installation_id: String,
+    pub timestamp_ms: i64,
+    pub nonce: String,
+    pub signature: String,
+    #[serde(default)]
+    pub share_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SharePendingEditsResponse {
+    pub edits: Vec<ShareEditView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareEditAckPayload {
+    pub edit_id: String,
+    pub revision: i64,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareEditAckRequest {
+    pub installation_id: String,
+    pub timestamp_ms: i64,
+    pub nonce: String,
+    pub signature: String,
+    pub ack: ShareEditAckPayload,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareEditEventSignaturePayload {
+    pub installation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareEditAvailableEvent {
+    pub kind: String,
+    pub installation_id: String,
+    pub share_id: String,
+    pub revision: i64,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareSyncOperation {
@@ -928,6 +1034,9 @@ pub struct ShareView {
     pub share_token: String,
     pub can_view_secret: bool,
     pub can_manage: bool,
+    pub can_edit_settings: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_edit: Option<ShareEditView>,
     pub app_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,

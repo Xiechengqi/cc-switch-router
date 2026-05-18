@@ -32,7 +32,7 @@ export function DashboardPage() {
       <main className="mx-auto grid w-[calc(100%-2rem)] max-w-7xl gap-6 pb-6">
         {error ? <Alert status="danger" className="!text-slate-900">{error}</Alert> : null}
         <LiveMap data={data} />
-        <ClientsTable clients={data?.clients || []} />
+        <ClientsTable clients={data?.clients || []} onChanged={load} />
         <MarketsTable markets={data?.markets || []} />
       </main>
       <PresenceFooter />

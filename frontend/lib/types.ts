@@ -73,6 +73,9 @@ export type ShareView = {
   subdomain: string;
   shareToken?: string;
   canViewSecret?: boolean;
+  canManage?: boolean;
+  canEditSettings?: boolean;
+  activeEdit?: ShareEditView;
   appType: string;
   providerId?: string;
   tokenLimit: number;
@@ -90,6 +93,32 @@ export type ShareView = {
   healthChecks?: HealthCheckEntry[];
   support?: ShareSupport;
   appRuntimes?: ShareAppRuntimes;
+};
+
+export type ShareSettingsPatch = {
+  description?: string | null;
+  forSale?: "Yes" | "No" | "Free";
+  marketAccessMode?: "selected" | "all";
+  sharedWithEmails?: string[];
+  forSaleOfficialPricePercentByApp?: Record<string, number>;
+  tokenLimit?: number;
+  parallelLimit?: number;
+  expiresAt?: string;
+  autoStart?: boolean;
+};
+
+export type ShareEditView = {
+  id: string;
+  shareId: string;
+  installationId: string;
+  revision: number;
+  status: "pending" | "applied" | "rejected" | string;
+  patch: ShareSettingsPatch;
+  createdByEmail: string;
+  createdAt: string;
+  updatedAt: string;
+  appliedAt?: string;
+  errorMessage?: string;
 };
 
 export type ShareMarketLink = {

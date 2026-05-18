@@ -1,11 +1,12 @@
 "use client";
 
-import { ExternalLink } from "lucide-react";
-import { Card, Chip, Drawer, ProgressBar } from "@heroui/react";
+import { ExternalLink, Loader2, Pencil, Save } from "lucide-react";
+import { Button, Card, Chip, Drawer, Input, ListBox, Modal, ProgressBar, Select, TextArea } from "@heroui/react";
 import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import { updateShareSettings } from "@/lib/api";
 import type { AppLocale } from "@/lib/i18n";
-import type { DashboardClient, DashboardMarket, HealthCheckEntry, MarketRequestLog, ShareAppRuntimes, ShareRequestLog, ShareUpstreamProvider, ShareView } from "@/lib/types";
+import type { DashboardClient, DashboardMarket, HealthCheckEntry, MarketRequestLog, ShareAppRuntimes, ShareRequestLog, ShareSettingsPatch, ShareUpstreamProvider, ShareView } from "@/lib/types";
 import { compactTokens, formatDateTime, formatNumber, formatRelativeTime } from "@/lib/utils";
 
 function compareDesc(left: number, right: number) {
@@ -125,6 +126,7 @@ function sortClients(clients: DashboardClient[]) {
     const l = left.share;
     const r = right.share;
     return (
+      Number(!!r?.canManage) - Number(!!l?.canManage) ||
       compareDesc(l?.onlineMinutes24h || 0, r?.onlineMinutes24h || 0) ||
       compareDesc(isUnlimited(l?.tokenLimit) ? Infinity : l?.tokenLimit || 0, isUnlimited(r?.tokenLimit) ? Infinity : r?.tokenLimit || 0) ||
       compareDesc(expirySortValue(l), expirySortValue(r)) ||
@@ -308,6 +310,194 @@ function SupportCell({ share, t }: { share?: ShareView; t: TFn }) {
   );
 }
 
+function ShareEditAction({ share, onEdit, t }: { share?: ShareView; onEdit: (share: ShareView) => void; t: TFn }) {
+  if (!share?.canManage) return null;
+  if (share.activeEdit?.status === "pending") {
+    return <Chip size="sm" color="warning" variant="soft">Pending apply</Chip>;
+  }
+  if (share.activeEdit?.status === "rejected") {
+    return (
+      <Button size="sm" variant="outline" className="border-red-200 text-red-700 hover:bg-red-50" onClick={(event) => {
+        event.stopPropagation();
+        onEdit(share);
+      }}>
+        应用失败
+      </Button>
+    );
+  }
+  return (
+    <Button size="sm" variant="primary" onClick={(event) => {
+      event.stopPropagation();
+      onEdit(share);
+    }}>
+      <Pencil className="h-3.5 w-3.5" />
+      编辑
+    </Button>
+  );
+}
+
+function splitEmails(value: string) {
+  return value
+    .split(/[\s,;]+/)
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function toLocalDateTimeValue(value?: string) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "";
+  const pad = (num: number) => String(num).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function fromLocalDateTimeValue(value: string) {
+  if (!value.trim()) return undefined;
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : value;
+}
+
+function ShareEditDialog({ share, onClose, onSaved }: { share: ShareView | null; onClose: () => void; onSaved: () => Promise<void> }) {
+  const [description, setDescription] = React.useState("");
+  const [forSale, setForSale] = React.useState<"Yes" | "No" | "Free">("No");
+  const [marketAccessMode, setMarketAccessMode] = React.useState<"selected" | "all">("selected");
+  const [sharedEmails, setSharedEmails] = React.useState("");
+  const [tokenLimit, setTokenLimit] = React.useState("");
+  const [parallelLimit, setParallelLimit] = React.useState("");
+  const [expiresAt, setExpiresAt] = React.useState("");
+  const [claudePrice, setClaudePrice] = React.useState("");
+  const [codexPrice, setCodexPrice] = React.useState("");
+  const [geminiPrice, setGeminiPrice] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState("");
+
+  React.useEffect(() => {
+    if (!share) return;
+    const pricing = share.activeEdit?.status === "rejected" ? share.activeEdit.patch.forSaleOfficialPricePercentByApp || {} : {};
+    setDescription(share.description || "");
+    setForSale((share.forSale as "Yes" | "No" | "Free") || "No");
+    setMarketAccessMode((share.marketAccessMode as "selected" | "all") || "selected");
+    setSharedEmails((share.sharedWithEmails || []).join("\n"));
+    setTokenLimit(String(share.tokenLimit ?? -1));
+    setParallelLimit(String(share.parallelLimit ?? 3));
+    setExpiresAt(toLocalDateTimeValue(share.expiresAt));
+    setClaudePrice(pricing.claude ? String(pricing.claude) : "");
+    setCodexPrice(pricing.codex ? String(pricing.codex) : "");
+    setGeminiPrice(pricing.gemini ? String(pricing.gemini) : "");
+    setError(share.activeEdit?.status === "rejected" ? share.activeEdit.errorMessage || "上一轮应用失败" : "");
+  }, [share]);
+
+  const save = async () => {
+    if (!share || busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      const pricing: Record<string, number> = {};
+      if (claudePrice.trim()) pricing.claude = Number(claudePrice);
+      if (codexPrice.trim()) pricing.codex = Number(codexPrice);
+      if (geminiPrice.trim()) pricing.gemini = Number(geminiPrice);
+      const patch: ShareSettingsPatch = {
+        description: description.trim() || null,
+        forSale,
+        marketAccessMode,
+        sharedWithEmails: marketAccessMode === "all" ? [] : splitEmails(sharedEmails),
+        tokenLimit: Number(tokenLimit),
+        parallelLimit: Number(parallelLimit),
+        expiresAt: fromLocalDateTimeValue(expiresAt),
+      };
+      if (Object.keys(pricing).length > 0) {
+        patch.forSaleOfficialPricePercentByApp = pricing;
+      }
+      await updateShareSettings(share.shareId, patch);
+      await onSaved();
+      onClose();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal isOpen={!!share} onOpenChange={(open) => !open && !busy && onClose()}>
+      <Modal.Backdrop>
+        <Modal.Container>
+          <Modal.Dialog className="w-[min(720px,calc(100vw-2rem))] max-w-none">
+            <Modal.Header>
+              <Modal.Heading>编辑 share 设置</Modal.Heading>
+              <p className="mt-1 break-all text-sm text-muted-foreground">{share?.subdomain || share?.shareName}</p>
+            </Modal.Header>
+            <Modal.Body className="grid max-h-[70vh] gap-4 overflow-y-auto">
+              {error ? <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div> : null}
+              <label className="grid gap-2 text-sm">
+                <span className="mono-label text-muted-foreground">Description</span>
+                <TextArea value={description} onChange={(event) => setDescription(event.target.value)} maxLength={200} />
+              </label>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <label className="grid gap-2 text-sm">
+                  <span className="mono-label text-muted-foreground">For sale</span>
+                  <Select selectedKey={forSale} onSelectionChange={(key) => setForSale(String(key || "No") as "Yes" | "No" | "Free")}>
+                    <Select.Trigger className="rounded-lg border bg-card px-3 py-2"><Select.Value>{forSale}</Select.Value><Select.Indicator /></Select.Trigger>
+                    <Select.Popover><ListBox>{["No", "Yes", "Free"].map((item) => <ListBox.Item key={item} id={item}>{item}</ListBox.Item>)}</ListBox></Select.Popover>
+                  </Select>
+                </label>
+                <label className="grid gap-2 text-sm">
+                  <span className="mono-label text-muted-foreground">Market access</span>
+                  <Select selectedKey={marketAccessMode} onSelectionChange={(key) => setMarketAccessMode(String(key || "selected") as "selected" | "all")}>
+                    <Select.Trigger className="rounded-lg border bg-card px-3 py-2"><Select.Value>{marketAccessMode === "all" ? "All markets" : "Selected markets"}</Select.Value><Select.Indicator /></Select.Trigger>
+                    <Select.Popover><ListBox><ListBox.Item id="selected">Selected markets</ListBox.Item><ListBox.Item id="all">All markets</ListBox.Item></ListBox></Select.Popover>
+                  </Select>
+                </label>
+              </div>
+              {marketAccessMode === "selected" ? (
+                <label className="grid gap-2 text-sm">
+                  <span className="mono-label text-muted-foreground">Market emails</span>
+                  <TextArea value={sharedEmails} onChange={(event) => setSharedEmails(event.target.value)} placeholder="market@example.com" />
+                </label>
+              ) : null}
+              <div className="grid gap-3 sm:grid-cols-3">
+                <label className="grid gap-2 text-sm">
+                  <span className="mono-label text-muted-foreground">Token limit</span>
+                  <Input value={tokenLimit} type="number" onChange={(event) => setTokenLimit(event.target.value)} />
+                </label>
+                <label className="grid gap-2 text-sm">
+                  <span className="mono-label text-muted-foreground">Parallel limit</span>
+                  <Input value={parallelLimit} type="number" onChange={(event) => setParallelLimit(event.target.value)} />
+                </label>
+                <label className="grid gap-2 text-sm">
+                  <span className="mono-label text-muted-foreground">Expires at</span>
+                  <Input value={expiresAt} type="datetime-local" onChange={(event) => setExpiresAt(event.target.value)} />
+                </label>
+              </div>
+              <div className="grid gap-3 sm:grid-cols-3">
+                <label className="grid gap-2 text-sm">
+                  <span className="mono-label text-muted-foreground">Claude price %</span>
+                  <Input value={claudePrice} type="number" min={1} max={100} onChange={(event) => setClaudePrice(event.target.value)} />
+                </label>
+                <label className="grid gap-2 text-sm">
+                  <span className="mono-label text-muted-foreground">Codex price %</span>
+                  <Input value={codexPrice} type="number" min={1} max={100} onChange={(event) => setCodexPrice(event.target.value)} />
+                </label>
+                <label className="grid gap-2 text-sm">
+                  <span className="mono-label text-muted-foreground">Gemini price %</span>
+                  <Input value={geminiPrice} type="number" min={1} max={100} onChange={(event) => setGeminiPrice(event.target.value)} />
+                </label>
+              </div>
+            </Modal.Body>
+            <Modal.Footer>
+              <Button variant="outline" onClick={onClose} isDisabled={busy}>取消</Button>
+              <Button variant="primary" onClick={save} isDisabled={busy}>
+                {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                保存
+              </Button>
+            </Modal.Footer>
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
+    </Modal>
+  );
+}
+
 function ShareStatusCell({ client, share, t, locale }: { client: DashboardClient; share?: ShareView; t: TFn; locale: AppLocale }) {
   if (!share) return <span className="text-muted-foreground">-</span>;
   const limit = isUnlimited(share.parallelLimit) ? "∞" : String(share.parallelLimit || 0);
@@ -331,8 +521,9 @@ function ShareStatusCell({ client, share, t, locale }: { client: DashboardClient
   );
 }
 
-export function ClientsTable({ clients }: { clients: DashboardClient[] }) {
+export function ClientsTable({ clients, onChanged }: { clients: DashboardClient[]; onChanged?: () => Promise<void> | void }) {
   const [selected, setSelected] = React.useState<DashboardClient | null>(null);
+  const [editingShare, setEditingShare] = React.useState<ShareView | null>(null);
   const { locale, t } = useLocaleText();
   const sorted = sortClients(clients);
   const selectedShareApi = shareApiParts(selected?.share);
@@ -365,7 +556,10 @@ export function ClientsTable({ clients }: { clients: DashboardClient[] }) {
                       <div className="grid min-w-72 gap-1">
                         <strong className="break-all font-mono text-xs text-foreground">{share ? `${api.apiUrl}/${maskSecret(api.apiKey)}` : "-"}</strong>
                         <span className="break-all text-xs text-muted-foreground">{share?.ownerEmail || "-"}</span>
-                        <div className="mt-1"><ShareStatusBadge share={share} t={t} /></div>
+                        <div className="mt-1 flex flex-wrap items-center gap-2">
+                          <ShareStatusBadge share={share} t={t} />
+                          <ShareEditAction share={share} onEdit={setEditingShare} t={t} />
+                        </div>
                       </div>
                     </td>
                     <td className="px-4 py-3 align-middle"><ForSaleCell share={share} t={t} /></td>
@@ -412,6 +606,7 @@ export function ClientsTable({ clients }: { clients: DashboardClient[] }) {
           </Drawer.Content>
         </Drawer.Backdrop>
       </Drawer>
+      <ShareEditDialog share={editingShare} onClose={() => setEditingShare(null)} onSaved={async () => { await onChanged?.(); }} />
     </section>
   );
 }

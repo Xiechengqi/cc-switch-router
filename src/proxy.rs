@@ -27,6 +27,12 @@ pub(crate) struct RouteEntry {
     parallel_limit: i64,
 }
 
+impl RouteEntry {
+    pub(crate) fn share_id(&self) -> Option<&str> {
+        self.share_id.as_deref()
+    }
+}
+
 #[derive(Debug, Default)]
 struct KeyedConcurrencyLimiter {
     counters: Mutex<HashMap<String, usize>>,
