@@ -36,7 +36,8 @@ use crate::models::{
     ChangeInstallationOwnerEmailRequest, ChangeInstallationOwnerEmailResponse,
     DashboardPresenceRequest, DashboardPresenceResponse, DashboardResponse,
     GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse, HealthResponse,
-    IssueLeaseRequest, IssueLeaseResponse, MarketNotificationEmailLogView,
+    IssueLeaseRequest, IssueLeaseResponse, MarketDisabledSharesUpdateRequest,
+    MarketDisabledSharesUpdateResponse, MarketNotificationEmailLogView,
     MarketNotificationEmailRequest, MarketNotificationEmailResponse,
     MarketRequestLogBatchSyncRequest, MarketShareView, MarketsResponse, PostBoardMessageRequest,
     PublicMapPointsResponse, RefreshSessionRequest, RegisterInstallationRequest,
@@ -89,6 +90,14 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/markets", get(markets))
         .route("/v1/markets/register", post(register_market))
         .route("/v1/market/shares", get(market_shares))
+        .route(
+            "/v1/admin/markets/:market_email/linked-shares",
+            get(admin_market_linked_shares),
+        )
+        .route(
+            "/v1/admin/markets/:market_email/disabled-shares",
+            patch(admin_update_market_disabled_shares),
+        )
         .route(
             "/v1/market/request-logs/batch",
             post(batch_sync_market_request_logs),
@@ -230,6 +239,54 @@ async fn market_shares(
         )
         .await?;
     Ok(Json(shares))
+}
+
+async fn admin_market_linked_shares(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(market_email): Path<String>,
+) -> Result<Json<Vec<MarketShareView>>, AppError> {
+    let current_user_email = require_session_email(&state, &headers).await?;
+    Ok(Json(
+        state
+            .store
+            .list_manageable_market_shares(
+                &market_email,
+                &current_user_email,
+                &state.proxy.active_subdomains().await.into_iter().collect(),
+                &state.proxy.inflight_by_share().await,
+            )
+            .await?,
+    ))
+}
+
+async fn admin_update_market_disabled_shares(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path(market_email): Path<String>,
+    Json(input): Json<MarketDisabledSharesUpdateRequest>,
+) -> Result<Json<MarketDisabledSharesUpdateResponse>, AppError> {
+    let current_user_email = require_session_email(&state, &headers).await?;
+    let response = state
+        .store
+        .update_market_disabled_shares(&market_email, &current_user_email, input)
+        .await?;
+    let metadata = extract_client_metadata(&headers, addr);
+    let payload = serde_json::json!({
+        "marketEmail": market_email,
+        "disabledShareIds": response.disabled_share_ids.clone(),
+    });
+    let _ = state
+        .store
+        .record_admin_audit(
+            Some(&current_user_email),
+            "market.disabled_shares.update",
+            Some(&payload),
+            metadata.ip.as_deref(),
+        )
+        .await;
+    Ok(Json(response))
 }
 
 async fn batch_sync_market_request_logs(

@@ -373,7 +373,15 @@ pub async fn market_proxy_handler(
         )
         .await
     {
-        Ok(shares) => shares.into_iter().any(|share| share.share_id == share_id),
+        Ok(shares) => {
+            let Some(share) = shares.into_iter().find(|share| share.share_id == share_id) else {
+                return simple_response(StatusCode::FORBIDDEN, "share-not-authorized-for-market");
+            };
+            if share.disabled_by_market {
+                return simple_response(StatusCode::FORBIDDEN, "share-disabled-by-market");
+            }
+            true
+        }
         Err(err) => {
             warn!(error = %err, "market proxy share authorization lookup failed");
             return simple_response(StatusCode::SERVICE_UNAVAILABLE, "share-lookup-failed");

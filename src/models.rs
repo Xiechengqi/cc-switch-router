@@ -684,11 +684,29 @@ pub struct MarketShareView {
     pub online_rate_24h: f64,
     pub last_seen_at: String,
     #[serde(default)]
+    pub disabled_by_market: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_disabled_at: Option<String>,
+    #[serde(default)]
     pub support: ShareSupport,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_provider: Option<ShareUpstreamProvider>,
     #[serde(default)]
     pub app_runtimes: ShareAppRuntimes,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketDisabledSharesUpdateRequest {
+    #[serde(default)]
+    pub disabled_share_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketDisabledSharesUpdateResponse {
+    pub ok: bool,
+    pub disabled_share_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -956,6 +974,8 @@ pub struct DashboardMarketView {
     pub public_base_url: String,
     pub status: String,
     pub online: bool,
+    #[serde(default)]
+    pub can_manage: bool,
     pub created_at: String,
     pub updated_at: String,
     pub last_seen_at: String,
@@ -997,6 +1017,10 @@ pub struct MarketLinkedShareView {
     pub active_requests: usize,
     pub parallel_limit: i64,
     pub online_rate_24h: f64,
+    #[serde(default)]
+    pub disabled_by_market: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_disabled_at: Option<String>,
     pub support: ShareSupport,
 }
 

@@ -139,6 +139,7 @@ export type DashboardMarket = {
   publicBaseUrl: string;
   status: string;
   online: boolean;
+  canManage?: boolean;
   createdAt: string;
   updatedAt: string;
   lastSeenAt: string;
@@ -163,9 +164,34 @@ export type DashboardMarket = {
     activeRequests: number;
     parallelLimit: number;
     onlineRate24h: number;
+    disabledByMarket?: boolean;
+    marketDisabledAt?: string;
     support?: ShareSupport;
   }>;
   recentRequests?: MarketRequestLog[];
+};
+
+export type MarketShare = {
+  routerId: string;
+  shareId: string;
+  subdomain: string;
+  installationId: string;
+  shareName: string;
+  ownerEmail?: string;
+  installationOwnerEmail?: string;
+  appType: string;
+  forSale: string;
+  marketAccessMode: string;
+  shareStatus: string;
+  online: boolean;
+  activeRequests: number;
+  parallelLimit: number;
+  onlineRate24h: number;
+  lastSeenAt: string;
+  disabledByMarket?: boolean;
+  marketDisabledAt?: string;
+  support?: ShareSupport;
+  appRuntimes?: ShareAppRuntimes;
 };
 
 export type ShareRequestLog = {

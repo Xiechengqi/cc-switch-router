@@ -4,6 +4,7 @@ import type {
   BoardMessage,
   BoardMeta,
   DashboardResponse,
+  MarketShare,
   SettingsSchema,
   SettingsUpdateResponse,
   SettingsValuesResponse,
@@ -32,6 +33,24 @@ export async function updateShareSettings(shareId: string, patch: ShareSettingsP
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ patch }),
+    }),
+  );
+}
+
+export async function getMarketLinkedShares(marketEmail: string) {
+  return parseJson<MarketShare[]>(
+    await authFetch(`/v1/admin/markets/${encodeURIComponent(marketEmail)}/linked-shares`, {
+      cache: "no-store",
+    }),
+  );
+}
+
+export async function updateMarketDisabledShares(marketEmail: string, disabledShareIds: string[]) {
+  return parseJson<{ ok: boolean; disabledShareIds: string[] }>(
+    await authFetch(`/v1/admin/markets/${encodeURIComponent(marketEmail)}/disabled-shares`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ disabledShareIds }),
     }),
   );
 }

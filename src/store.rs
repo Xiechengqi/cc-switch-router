@@ -27,7 +27,8 @@ use crate::models::{
     DashboardMarketView, DashboardPresenceRequest, DashboardResponse, DashboardStats,
     DashboardTickerShare, GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse,
     HealthCheckEntry, Installation, InstallationView, IssueLeaseRequest, IssueLeaseResponse,
-    LatLonPoint, MarketLinkedShareView, MarketRegistryRecord, MarketRequestLogBatchSyncRequest,
+    LatLonPoint, MarketDisabledSharesUpdateRequest, MarketDisabledSharesUpdateResponse,
+    MarketLinkedShareView, MarketRegistryRecord, MarketRequestLogBatchSyncRequest,
     MarketRequestLogEntry, MarketShareView, PublicMapClientPoint, PublicMapPointsResponse,
     PublicMarketConfig, RefreshSessionRequest, RegisterInstallationRequest,
     RegisterInstallationResponse, RegisterMarketRequest, RequestEmailCodeRequest,
@@ -1733,6 +1734,7 @@ impl AppStore {
             let conn = self.conn.lock().await;
             list_dashboard_markets(
                 &conn,
+                viewer_email,
                 &active_subdomains,
                 &shares,
                 &inflight_by_share,
@@ -2625,15 +2627,19 @@ impl AppStore {
     ) -> Result<Vec<MarketShareView>, AppError> {
         let conn = self.conn.lock().await;
         let online_minutes = list_online_minutes_24h(&conn)?;
+        let market_email_lower = market_email.to_ascii_lowercase();
         let mut stmt = conn
             .prepare(
                 "SELECT s.share_id, s.installation_id, s.share_name, s.owner_email,
                         i.owner_email, s.shared_with_emails_json, s.market_access_mode, s.app_type, s.for_sale,
                         s.share_status, COALESCE(s.subdomain, ''), s.parallel_limit,
                         i.last_seen_at, s.enabled_claude, s.enabled_codex, s.enabled_gemini,
-                        s.upstream_provider_json, s.app_runtimes_json
+                        s.upstream_provider_json, s.app_runtimes_json,
+                        mds.created_at
                  FROM shares s
                  LEFT JOIN installations i ON i.id = s.installation_id
+                 LEFT JOIN market_disabled_shares mds
+                   ON lower(mds.market_email) = ?1 AND mds.share_id = s.share_id
                  WHERE s.for_sale = 'Yes'
                    AND s.share_status = 'active'
                    AND s.subdomain IS NOT NULL
@@ -2643,7 +2649,7 @@ impl AppStore {
             )
             .map_err(|e| AppError::Internal(format!("prepare market shares failed: {e}")))?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(params![market_email_lower], |row| {
                 let share_id: String = row.get(0)?;
                 let shared_with_emails = parse_string_vec(row.get(5)?)?;
                 let subdomain: String = row.get(10)?;
@@ -2670,6 +2676,8 @@ impl AppStore {
                             .map(|minutes| *minutes as f64 / ONLINE_WINDOW_MINUTES as f64)
                             .unwrap_or(0.0),
                         last_seen_at: row.get(12)?,
+                        disabled_by_market: row.get::<_, Option<String>>(18)?.is_some(),
+                        market_disabled_at: row.get(18)?,
                         support: ShareSupport {
                             claude: row.get::<_, i64>(13)? != 0,
                             codex: row.get::<_, i64>(14)? != 0,
@@ -2697,6 +2705,91 @@ impl AppStore {
             shares.push(share);
         }
         Ok(shares)
+    }
+
+    pub async fn list_manageable_market_shares(
+        &self,
+        market_email: &str,
+        current_user_email: &str,
+        active_subdomains: &HashSet<String>,
+        inflight_by_share: &HashMap<String, usize>,
+    ) -> Result<Vec<MarketShareView>, AppError> {
+        self.require_market_owner(market_email, current_user_email)
+            .await?;
+        self.list_market_shares(market_email, "main", active_subdomains, inflight_by_share)
+            .await
+    }
+
+    pub async fn update_market_disabled_shares(
+        &self,
+        market_email: &str,
+        current_user_email: &str,
+        input: MarketDisabledSharesUpdateRequest,
+    ) -> Result<MarketDisabledSharesUpdateResponse, AppError> {
+        self.require_market_owner(market_email, current_user_email)
+            .await?;
+        let normalized_market_email = normalize_email(market_email)?;
+        let mut disabled_share_ids = input
+            .disabled_share_ids
+            .into_iter()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .collect::<Vec<_>>();
+        disabled_share_ids.sort();
+        disabled_share_ids.dedup();
+
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        let visible_share_ids = list_market_visible_share_ids(&conn, &normalized_market_email)?;
+        for share_id in &disabled_share_ids {
+            if !visible_share_ids.contains(share_id) {
+                return Err(AppError::BadRequest(format!(
+                    "share is not linked to market: {share_id}"
+                )));
+            }
+        }
+
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| AppError::Internal(format!("begin disabled shares update failed: {e}")))?;
+        tx.execute(
+            "DELETE FROM market_disabled_shares WHERE lower(market_email) = lower(?1)",
+            params![normalized_market_email],
+        )
+        .map_err(|e| AppError::Internal(format!("clear disabled market shares failed: {e}")))?;
+        for share_id in &disabled_share_ids {
+            tx.execute(
+                "INSERT INTO market_disabled_shares (market_email, share_id, disabled_by_email, reason, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, NULL, ?4, ?4)",
+                params![normalized_market_email, share_id, current_user_email, now],
+            )
+            .map_err(|e| AppError::Internal(format!("insert disabled market share failed: {e}")))?;
+        }
+        tx.commit().map_err(|e| {
+            AppError::Internal(format!("commit disabled shares update failed: {e}"))
+        })?;
+
+        Ok(MarketDisabledSharesUpdateResponse {
+            ok: true,
+            disabled_share_ids,
+        })
+    }
+
+    async fn require_market_owner(
+        &self,
+        market_email: &str,
+        current_user_email: &str,
+    ) -> Result<(), AppError> {
+        let normalized_market_email = normalize_email(market_email)?;
+        let conn = self.conn.lock().await;
+        let market = get_market_by_email(&conn, &normalized_market_email)?
+            .ok_or_else(|| AppError::NotFound("market not found".into()))?;
+        if !market.email.eq_ignore_ascii_case(current_user_email) {
+            return Err(AppError::Forbidden(
+                "only market owner can manage disabled shares".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub async fn public_map_points(
@@ -4143,6 +4236,16 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             error_message TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS market_disabled_shares (
+            market_email TEXT NOT NULL,
+            share_id TEXT NOT NULL,
+            disabled_by_email TEXT NOT NULL,
+            reason TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (market_email, share_id)
+        );
+
         CREATE TABLE IF NOT EXISTS dashboard_presence (
             session_id TEXT PRIMARY KEY,
             last_seen_at INTEGER NOT NULL
@@ -4613,6 +4716,11 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         [],
     )
     .map_err(|e| AppError::Internal(format!("create pending share edit unique index failed: {e}")))?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_market_disabled_shares_share ON market_disabled_shares(share_id)",
+        [],
+    )
+    .map_err(|e| AppError::Internal(format!("create market disabled share index failed: {e}")))?;
     add_column_if_missing(
         conn,
         "share_request_logs",
@@ -5857,6 +5965,7 @@ fn get_market_by_email(
 
 fn list_dashboard_markets(
     conn: &Connection,
+    viewer_email: Option<&str>,
     active_subdomains: &HashSet<String>,
     shares: &[(String, ShareDescriptor)],
     inflight_by_share: &HashMap<String, usize>,
@@ -5896,6 +6005,7 @@ fn list_dashboard_markets(
                 public_base_url: row.get(4)?,
                 status: row.get(5)?,
                 online: active_subdomains.contains(&subdomain),
+                can_manage: false,
                 created_at: row.get(6)?,
                 updated_at: row.get(7)?,
                 last_seen_at: row.get(8)?,
@@ -5917,10 +6027,15 @@ fn list_dashboard_markets(
         })
         .map_err(|e| AppError::Internal(format!("query dashboard markets failed: {e}")))?;
     let mut markets = collect_rows(rows)?;
+    let disabled_by_market = list_market_disabled_share_map(conn)?;
     for market in &mut markets {
+        market.can_manage = viewer_email
+            .map(|email| email.eq_ignore_ascii_case(&market.email))
+            .unwrap_or(false);
         enrich_dashboard_market(
             market,
             shares,
+            &disabled_by_market,
             active_subdomains,
             inflight_by_share,
             online_by_share,
@@ -5935,6 +6050,7 @@ fn list_dashboard_markets(
 fn enrich_dashboard_market(
     market: &mut DashboardMarketView,
     shares: &[(String, ShareDescriptor)],
+    disabled_by_market: &HashMap<String, HashMap<String, String>>,
     active_subdomains: &HashSet<String>,
     inflight_by_share: &HashMap<String, usize>,
     online_by_share: &HashMap<String, usize>,
@@ -5943,6 +6059,7 @@ fn enrich_dashboard_market(
     market_logs_by_market: &HashMap<String, Vec<DashboardMarketRequestLogView>>,
 ) {
     let market_email = market.email.to_ascii_lowercase();
+    let disabled_for_market = disabled_by_market.get(&market_email);
     let mut linked_shares = shares
         .iter()
         .filter_map(|(_, share)| {
@@ -5961,6 +6078,8 @@ fn enrich_dashboard_market(
             let online_minutes_24h = online_by_share.get(&share.share_id).copied().unwrap_or(0);
             let online_rate_24h =
                 ((online_minutes_24h as f64 / ONLINE_WINDOW_MINUTES as f64) * 100.0).min(100.0);
+            let market_disabled_at =
+                disabled_for_market.and_then(|disabled| disabled.get(&share.share_id).cloned());
             Some(MarketLinkedShareView {
                 share_id: share.share_id.clone(),
                 share_name: share.share_name.clone(),
@@ -5971,6 +6090,8 @@ fn enrich_dashboard_market(
                 active_requests,
                 parallel_limit: share.parallel_limit,
                 online_rate_24h,
+                disabled_by_market: market_disabled_at.is_some(),
+                market_disabled_at,
                 support: share.support.clone(),
             })
         })
@@ -5989,7 +6110,10 @@ fn enrich_dashboard_market(
     });
 
     market.share_count = linked_shares.len();
-    market.online_share_count = linked_shares.iter().filter(|share| share.online).count();
+    market.online_share_count = linked_shares
+        .iter()
+        .filter(|share| share.online && !share.disabled_by_market)
+        .count();
     // Count only requests that actually traversed the market proxy. Direct
     // share-subdomain traffic stays out of this number even though it shows up
     // in the share-keyed limiter.
@@ -5997,10 +6121,17 @@ fn enrich_dashboard_market(
         .get(&market_email)
         .copied()
         .unwrap_or(0);
-    market.parallel_capacity = if linked_shares.iter().any(|share| share.parallel_limit < 0) {
+    let enabled_linked_shares = linked_shares
+        .iter()
+        .filter(|share| !share.disabled_by_market)
+        .collect::<Vec<_>>();
+    market.parallel_capacity = if enabled_linked_shares
+        .iter()
+        .any(|share| share.parallel_limit < 0)
+    {
         -1
     } else {
-        linked_shares
+        enabled_linked_shares
             .iter()
             .map(|share| share.parallel_limit.max(0))
             .sum()
@@ -6011,6 +6142,7 @@ fn enrich_dashboard_market(
     // market only has one linked share (the common case).
     market.online_minutes_24h = linked_shares
         .iter()
+        .filter(|share| !share.disabled_by_market)
         .map(|share| {
             online_by_share
                 .get(&share.share_id)
@@ -6027,6 +6159,7 @@ fn enrich_dashboard_market(
     // concatenating is enough — no extra dedup needed here.
     market.health_checks = linked_shares
         .iter()
+        .filter(|share| !share.disabled_by_market)
         .filter_map(|share| health_by_share.get(&share.share_id))
         .flat_map(|entries| entries.iter().cloned())
         .collect();
@@ -6047,6 +6180,72 @@ fn dashboard_market_to_share_link(market: &DashboardMarketView) -> ShareMarketLi
         status: market.status.clone(),
         online: market.online,
     }
+}
+
+fn list_market_disabled_share_map(
+    conn: &Connection,
+) -> Result<HashMap<String, HashMap<String, String>>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT lower(market_email), share_id, created_at FROM market_disabled_shares")
+        .map_err(|e| AppError::Internal(format!("prepare disabled market shares failed: {e}")))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| AppError::Internal(format!("query disabled market shares failed: {e}")))?;
+    let mut result: HashMap<String, HashMap<String, String>> = HashMap::new();
+    for row in rows {
+        let (market_email, share_id, created_at) =
+            row.map_err(|e| AppError::Internal(format!("read disabled market share failed: {e}")))?;
+        result
+            .entry(market_email)
+            .or_default()
+            .insert(share_id, created_at);
+    }
+    Ok(result)
+}
+
+fn list_market_visible_share_ids(
+    conn: &Connection,
+    market_email: &str,
+) -> Result<HashSet<String>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT share_id, shared_with_emails_json, market_access_mode
+             FROM shares
+             WHERE for_sale = 'Yes'
+               AND share_status = 'active'
+               AND subdomain IS NOT NULL
+               AND subdomain != ''
+               AND subdomain != '-'",
+        )
+        .map_err(|e| AppError::Internal(format!("prepare visible market shares failed: {e}")))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                parse_string_vec(row.get(1)?)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| AppError::Internal(format!("query visible market shares failed: {e}")))?;
+    let mut result = HashSet::new();
+    for row in rows {
+        let (share_id, shared_with_emails, market_access_mode) =
+            row.map_err(|e| AppError::Internal(format!("read visible market share failed: {e}")))?;
+        if market_access_mode == "all"
+            || shared_with_emails
+                .iter()
+                .any(|email| email.eq_ignore_ascii_case(market_email))
+        {
+            result.insert(share_id);
+        }
+    }
+    Ok(result)
 }
 
 fn get_share_owned_subdomain(
