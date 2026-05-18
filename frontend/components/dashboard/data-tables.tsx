@@ -628,7 +628,7 @@ function ShareEditDialog({
       <Modal isOpen={!!share} onOpenChange={(open) => !open && !busy && onClose()}>
         <Modal.Backdrop>
           <Modal.Container>
-            <Modal.Dialog className="share-edit-surface w-[min(760px,calc(100vw-2rem))] max-w-none">
+            <Modal.Dialog className="share-edit-surface light w-[min(760px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
               <Modal.Header>
                 <Modal.Heading>编辑 share 设置</Modal.Heading>
                 <p className="mt-1 break-all text-sm text-muted-foreground">{share?.subdomain || share?.shareName}</p>
@@ -660,7 +660,7 @@ function ShareEditDialog({
                         <Select.Value>{forSale}</Select.Value>
                         <Select.Indicator />
                       </Select.Trigger>
-                      <Select.Popover>
+                      <Select.Popover className="share-edit-popover light !bg-white !text-slate-900">
                         <ListBox>
                           {["No", "Yes", "Free"].map((item) => (
                             <ListBox.Item key={item} id={item}>{item}</ListBox.Item>
@@ -683,7 +683,7 @@ function ShareEditDialog({
                         </Select.Value>
                         <Select.Indicator />
                       </Select.Trigger>
-                      <Select.Popover>
+                      <Select.Popover className="share-edit-popover light !bg-white !text-slate-900">
                         <ListBox>
                           <ListBox.Item id="__all__">All markets</ListBox.Item>
                           {availableMarkets.map((market) => (
@@ -895,7 +895,7 @@ function ShareEditDialog({
       <Modal isOpen={confirmFreeOpen} onOpenChange={(open) => !open && setConfirmFreeOpen(false)}>
         <Modal.Backdrop>
           <Modal.Container>
-            <Modal.Dialog className="share-edit-surface w-[min(420px,calc(100vw-2rem))]">
+            <Modal.Dialog className="share-edit-surface light w-[min(420px,calc(100vw-2rem))] !bg-white !text-slate-900">
               <Modal.Header>
                 <Modal.Heading>确认切换为 Free</Modal.Heading>
               </Modal.Header>
@@ -1106,6 +1106,23 @@ function formatAgeDaysOrHours(value?: string, locale: AppLocale = "en") {
   return isZh ? `${hours}小时` : `${hours}h`;
 }
 
+function MarketEditAction({ market, onEdit }: { market: DashboardMarket; onEdit: (market: DashboardMarket) => void }) {
+  if (!market.canManage) return null;
+  return (
+    <button
+      type="button"
+      onClick={(event) => {
+        event.stopPropagation();
+        onEdit(market);
+      }}
+      className="inline-flex h-[22px] items-center gap-1 rounded-full border border-primary/20 bg-primary/10 px-2.5 text-[11px] font-medium text-primary transition-colors hover:border-primary/30 hover:bg-primary/15"
+    >
+      <Pencil className="h-3 w-3" />
+      编辑
+    </button>
+  );
+}
+
 function MarketPricingCell({ market, t }: { market: DashboardMarket; t: TFn }) {
   const summary = market.pricingSummary || {};
   const entries = [["Claude", summary.claude], ["Codex", summary.codex], ["Gemini", summary.gemini], ["DeepSeek", summary.deepseek]];
@@ -1121,7 +1138,7 @@ function MarketPricingCell({ market, t }: { market: DashboardMarket; t: TFn }) {
   );
 }
 
-function MarketStatusCell({ market, t, locale }: { market: DashboardMarket; t: TFn; locale: AppLocale }) {
+function MarketStatusCell({ market, t, locale, onEdit }: { market: DashboardMarket; t: TFn; locale: AppLocale; onEdit: (market: DashboardMarket) => void }) {
   const limit = isUnlimited(market.parallelCapacity) ? "∞" : String(market.parallelCapacity || 0);
   const ageValue = formatAgeDaysOrHours(market.createdAt, locale);
   const onlineValue = market.online ? `${(market.onlineRate24h || 0).toFixed(1)}% / ${ageValue}` : ageValue;
@@ -1129,7 +1146,13 @@ function MarketStatusCell({ market, t, locale }: { market: DashboardMarket; t: T
   return (
     <div className="grid min-w-52 gap-2 text-sm">
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.shares")}</span><strong>{market.onlineShareCount || 0} / {market.shareCount || 0}</strong></div>
-      <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.online")}</span><strong title={`${market.onlineMinutes24h || 0} / 1440 min · ${formatDateTime(market.createdAt)}`}>{onlineValue}</strong></div>
+      <div className={rowClass}>
+        <span className="mono-label text-muted-foreground">{t("dashboard.online")}</span>
+        <strong className="flex flex-wrap items-center gap-2" title={`${market.onlineMinutes24h || 0} / 1440 min · ${formatDateTime(market.createdAt)}`}>
+          {onlineValue}
+          <MarketEditAction market={market} onEdit={onEdit} />
+        </strong>
+      </div>
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.parallel")}</span><strong>{market.activeRequests || 0}<span className="text-muted-foreground">/{limit}</span></strong></div>
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.usage")}</span><strong>{compactTokens(market.usageTokens)} / {formatUsdOneDecimal(market.usageAmountUsd)}</strong></div>
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.health")}</span><HealthDots entries={market.healthChecks} /></div>
@@ -1164,18 +1187,10 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
               {sorted.length ? sorted.map((market) => (
                 <tr key={market.id} className="cursor-pointer border-b last:border-0 hover:bg-primary/5" onClick={() => setSelected(market)}>
                   <td className="w-44 break-words px-4 py-3 align-middle">
-                    <div className="flex items-start gap-2">
-                      {market.canManage ? (
-                        <Button size="sm" variant="outline" onClick={(event) => { event.stopPropagation(); setEditingMarket(market); }}>
-                          <Pencil className="h-3.5 w-3.5" />
-                          {t("common.edit")}
-                        </Button>
-                      ) : null}
-                      <div className="min-w-0">
-                        <div className="font-medium">{market.displayName || market.id}</div>
-                        <div className="text-xs text-muted-foreground">{market.email}</div>
-                        <div className="mt-1"><StatusBadge active={market.online} label={marketStatusLabel(market, t)} /></div>
-                      </div>
+                    <div className="min-w-0">
+                      <div className="font-medium">{market.displayName || market.id}</div>
+                      <div className="text-xs text-muted-foreground">{market.email}</div>
+                      <div className="mt-1"><StatusBadge active={market.online} label={marketStatusLabel(market, t)} /></div>
                     </div>
                   </td>
                   <td className="px-4 py-3 align-middle">
@@ -1185,7 +1200,7 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
                     </a>
                   </td>
                   <td className="px-4 py-3 align-middle"><MarketPricingCell market={market} t={t} /></td>
-                  <td className="px-4 py-3 align-middle"><MarketStatusCell market={market} t={t} locale={locale} /></td>
+                  <td className="px-4 py-3 align-middle"><MarketStatusCell market={market} t={t} locale={locale} onEdit={setEditingMarket} /></td>
                   <td className="px-4 py-3 align-middle text-lg text-muted-foreground">›</td>
                 </tr>
               )) : (
@@ -1283,7 +1298,7 @@ function MarketEditDialog({ market, onClose, onSaved }: { market: DashboardMarke
     <Modal isOpen={!!market} onOpenChange={(open) => !open && !busy && onClose()}>
       <Modal.Backdrop>
         <Modal.Container>
-          <Modal.Dialog className="w-[min(1080px,calc(100vw-2rem))] max-w-none">
+          <Modal.Dialog className="share-edit-surface light w-[min(1080px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
             <Modal.Header>
               <Modal.Heading>{t("dashboard.editMarketShares")}</Modal.Heading>
               <p className="mt-1 break-all text-sm text-muted-foreground">{market?.displayName || market?.email} · {market?.subdomain}</p>

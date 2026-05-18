@@ -220,17 +220,20 @@ a {
   background-color: rgba(241, 245, 249, 0.72) !important;
 }
 
-.share-edit-surface {
+.share-edit-surface,
+.share-edit-popover {
   --foreground: rgb(var(--router-foreground));
   --muted: rgb(var(--router-muted-foreground));
   --default: rgb(var(--router-muted));
   --default-foreground: rgb(var(--router-foreground));
-  --surface: rgb(var(--router-card));
+  --surface: #fff;
   --surface-foreground: rgb(var(--router-card-foreground));
   --surface-secondary: rgb(var(--router-muted));
   --surface-secondary-foreground: rgb(var(--router-foreground));
-  --overlay: rgb(var(--router-popover));
+  --overlay: #fff;
   --overlay-foreground: rgb(var(--router-popover-foreground));
+  --card: #fff;
+  --card-foreground: rgb(var(--router-card-foreground));
   --accent: rgb(var(--router-accent));
   --accent-foreground: rgb(var(--router-accent-foreground));
   --accent-soft: rgba(0, 82, 255, 0.12);
@@ -248,10 +251,22 @@ a {
   --field-border: rgb(var(--router-border));
   --field-border-width: 1px;
   color: rgb(var(--router-foreground));
+  color-scheme: light;
+}
+
+.share-edit-surface :is(.modal__heading, .modal__body, .modal__footer, .card, .card__content, .label, table, th, td, strong, b),
+.share-edit-popover :is(.listbox, .listbox__item, .select__popover) {
+  color: rgb(var(--router-foreground)) !important;
+}
+
+.share-edit-surface :is(.text-muted-foreground, .description, .card__description),
+.share-edit-popover :is(.text-muted-foreground, .description) {
+  color: rgb(var(--router-muted-foreground)) !important;
 }
 
 .share-edit-surface :is(.input, .textarea, .select__trigger) {
   background-color: rgb(var(--router-card));
+  color: rgb(var(--router-foreground));
 }
 
 .share-edit-surface :is(.input, .textarea, .select__trigger):focus,
