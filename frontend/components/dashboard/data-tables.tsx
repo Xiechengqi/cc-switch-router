@@ -102,6 +102,11 @@ function maskSecret(value?: string) {
   return `${value.slice(0, 1)}***${value.slice(-1)}`;
 }
 
+function shareApiKeyLabel(share?: ShareView, apiKey?: string) {
+  if (!share) return "***";
+  return share.canViewSecret ? apiKey || "***" : maskSecret(apiKey);
+}
+
 function formatUsdOneDecimal(value?: string | number) {
   const amount = Number(value || 0);
   return Number.isFinite(amount) ? `$${amount.toFixed(1)}` : "$0.0";
@@ -1022,13 +1027,13 @@ export function ClientsTable({ clients, markets, onChanged }: { clients: Dashboa
                 const share = client.share;
                 const api = shareApiParts(share);
                 return (
-                  <tr key={client.installation.id} className="cursor-pointer border-b last:border-0 hover:bg-primary/5" onClick={() => setSelected(client)}>
-                    <td className="w-72 break-words px-4 py-3 align-middle">
-                      <div className="grid min-w-72 gap-1">
-                        <strong className="break-all font-mono text-xs text-foreground">{share ? `${api.apiUrl}/${maskSecret(api.apiKey)}` : "-"}</strong>
-                        <span className="break-all text-xs text-muted-foreground">{share?.ownerEmail || "-"}</span>
-                        <div className="mt-1 flex flex-wrap items-center gap-2">
-                          <ShareStatusBadge share={share} t={t} />
+	                  <tr key={client.installation.id} className="cursor-pointer border-b last:border-0 hover:bg-primary/5" onClick={() => setSelected(client)}>
+	                    <td className="w-72 break-words px-4 py-3 align-middle">
+	                      <div className="grid min-w-72 gap-1">
+	                        <strong className="break-all font-mono text-xs text-foreground">{share ? `${api.apiUrl}/${shareApiKeyLabel(share, api.apiKey)}` : "-"}</strong>
+	                        <span className="break-all text-xs text-muted-foreground">{share?.ownerEmail || "-"}</span>
+	                        <div className="mt-1 flex flex-wrap items-center gap-2">
+	                          <ShareStatusBadge share={share} t={t} />
                           <ShareEditAction share={share} onEdit={setEditingShare} t={t} />
                         </div>
                       </div>
@@ -1054,11 +1059,11 @@ export function ClientsTable({ clients, markets, onChanged }: { clients: Dashboa
           <Drawer.Content placement="right">
             <Drawer.Dialog className={drawerDialogClassName}>
               <Drawer.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
-              <Drawer.Header>
-                <div>
-                  <Drawer.Heading className="break-all font-mono text-base">
-                    {selected?.share ? `${selectedShareApi.apiUrl}/${maskSecret(selectedShareApi.apiKey)}` : selected?.installation.id}
-                  </Drawer.Heading>
+	              <Drawer.Header>
+	                <div>
+	                  <Drawer.Heading className="break-all font-mono text-base">
+	                    {selected?.share ? `${selectedShareApi.apiUrl}/${shareApiKeyLabel(selected.share, selectedShareApi.apiKey)}` : selected?.installation.id}
+	                  </Drawer.Heading>
                   <p className="mt-1 break-all text-sm text-muted-foreground">{selected?.share?.ownerEmail || "-"}</p>
                   {selected?.share?.description ? (
                     <p className="mt-2 whitespace-pre-wrap break-words text-xs leading-5 text-muted-foreground">{selected.share.description}</p>

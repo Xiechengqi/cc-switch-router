@@ -1559,6 +1559,29 @@ impl AppStore {
         Ok(())
     }
 
+    pub async fn is_share_edit_pending(
+        &self,
+        edit_id: &str,
+        revision: i64,
+    ) -> Result<bool, AppError> {
+        let conn = self.conn.lock().await;
+        let pending = conn
+            .query_row(
+                "SELECT 1
+                 FROM share_edit_requests
+                 WHERE id = ?1
+                   AND revision = ?2
+                   AND status = 'pending'
+                 LIMIT 1",
+                params![edit_id, revision],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|e| AppError::Internal(format!("query share edit pending state failed: {e}")))?
+            .is_some();
+        Ok(pending)
+    }
+
     pub async fn verify_share_edit_event_stream(
         &self,
         installation_id: &str,
@@ -7438,7 +7461,7 @@ fn enforce_share_owner_for_installation(
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::models::ShareSyncOperation;
+    use crate::models::{ShareEditAckPayload, ShareSyncOperation};
     use crate::proxy::ProxyRegistry;
     use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
@@ -9690,6 +9713,75 @@ mod tests {
                 "shared@example.com".into(),
                 "other@example.com".into()
             ])
+        );
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn share_edit_pending_state_tracks_ack() {
+        let (store, config) = setup_store("share-edit-pending-state").await;
+        let signing_key = insert_signed_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-edit", "edit-sub", "active").await;
+
+        let response = store
+            .create_share_settings_edit(
+                "share-edit",
+                "owner@example.com",
+                ShareSettingsPatch {
+                    description: Some(Some("pending state test".into())),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .await
+            .expect("owner can create edit");
+
+        assert!(
+            store
+                .is_share_edit_pending(&response.edit.id, response.edit.revision)
+                .await
+                .expect("query pending state")
+        );
+
+        let ack = ShareEditAckPayload {
+            edit_id: response.edit.id.clone(),
+            revision: response.edit.revision,
+            status: "applied".into(),
+            error_message: None,
+        };
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            "inst-1",
+            "share_edit_ack",
+            &ack,
+            timestamp_ms,
+            &nonce,
+        );
+
+        store
+            .ack_share_edit(
+                ShareEditAckRequest {
+                    installation_id: "inst-1".into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    ack,
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+            )
+            .await
+            .expect("ack edit");
+
+        assert!(
+            !store
+                .is_share_edit_pending(&response.edit.id, response.edit.revision)
+                .await
+                .expect("query pending state after ack")
         );
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));

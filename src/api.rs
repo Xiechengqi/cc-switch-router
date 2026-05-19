@@ -11,6 +11,7 @@ use axum::response::{IntoResponse, Response, Sse};
 use axum::routing::{any, delete, get, patch, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use tokio::time::{Duration, sleep};
 
 use crate::ServerState;
 use crate::admin::{
@@ -53,6 +54,8 @@ use crate::recent_traffic::{RecentRequestEvent, RecentTrafficSnapshot};
 use crate::store::BoardAuthor;
 
 const REGIONS: &str = include_str!("../regions");
+const SHARE_EDIT_WAKE_RETRY_INTERVAL_SECS: u64 = 20;
+const SHARE_EDIT_WAKE_RETRY_ATTEMPTS: usize = 3;
 
 mod ui_assets {
     include!(concat!(env!("OUT_DIR"), "/ui_assets.rs"));
@@ -900,7 +903,49 @@ async fn update_share_settings(
         share_id: response.edit.share_id.clone(),
         revision: response.edit.revision,
     });
+    schedule_share_edit_wake_retries(state.clone(), response.edit.clone());
     Ok(Json(response))
+}
+
+fn schedule_share_edit_wake_retries(state: ServerState, edit: crate::models::ShareEditView) {
+    tokio::spawn(async move {
+        for attempt in 1..=SHARE_EDIT_WAKE_RETRY_ATTEMPTS {
+            sleep(Duration::from_secs(SHARE_EDIT_WAKE_RETRY_INTERVAL_SECS)).await;
+            match state
+                .store
+                .is_share_edit_pending(&edit.id, edit.revision)
+                .await
+            {
+                Ok(true) => {
+                    tracing::info!(
+                        edit_id = %edit.id,
+                        share_id = %edit.share_id,
+                        installation_id = %edit.installation_id,
+                        revision = edit.revision,
+                        attempt,
+                        "share edit still pending; rebroadcasting wake event"
+                    );
+                    let _ = state.share_edit_events.send(ShareEditAvailableEvent {
+                        kind: "share_edit_available".to_string(),
+                        installation_id: edit.installation_id.clone(),
+                        share_id: edit.share_id.clone(),
+                        revision: edit.revision,
+                    });
+                }
+                Ok(false) => break,
+                Err(err) => {
+                    tracing::warn!(
+                        edit_id = %edit.id,
+                        share_id = %edit.share_id,
+                        revision = edit.revision,
+                        error = %err,
+                        "failed to check share edit pending state for wake retry"
+                    );
+                    break;
+                }
+            }
+        }
+    });
 }
 
 async fn pending_share_edits(
