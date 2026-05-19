@@ -22,6 +22,8 @@ type TickerMeta = Partial<Omit<ShareRequestLog, "createdAt"> & Omit<MarketReques
   shareName?: string;
 };
 
+const REQUEST_TICKER_LIMIT = 5;
+
 function spreadPoints(points: PlacedPoint[], minDistPct: number, lockedIndex: number) {
   if (points.length < 2) return points;
   const placed = points.map((point) => ({ ...point }));
@@ -175,7 +177,7 @@ function RequestTicker({ data }: { data: DashboardResponse | null }) {
   const events = React.useMemo(() => {
     return [...(data?.recentRequestEvents || [])]
       .sort((a, b) => new Date(b.startedAt || b.createdAt || 0).getTime() - new Date(a.startedAt || a.createdAt || 0).getTime())
-      .slice(0, 5)
+      .slice(0, REQUEST_TICKER_LIMIT)
       .reverse();
   }, [data]);
 
@@ -183,12 +185,13 @@ function RequestTicker({ data }: { data: DashboardResponse | null }) {
 
   return (
     <div className="absolute left-[1.6%] top-[3.5%] z-20 flex max-w-[min(68%,760px)] flex-col items-start gap-1.5">
-      {events.map((event) => {
+      {events.map((event, index) => {
         const item = meta.get(event.requestId);
         const country = event.userCountry || event.countryCode || "--";
         const subdomain = event.shareSubdomain || event.subdomain || event.shareName || item?.shareName || "share";
+        const eventKey = [event.requestId, event.startedAt || event.createdAt || "", index].join(":");
         return (
-          <div key={event.requestId} className="flex max-w-full items-center gap-1 overflow-hidden rounded-md border border-slate-200/70 bg-white/55 px-2 py-1 text-[10px] text-slate-700 backdrop-blur-sm">
+          <div key={eventKey} className="flex max-w-full items-center gap-1 overflow-hidden rounded-md border border-slate-200/70 bg-white/55 px-2 py-1 text-[10px] text-slate-700 backdrop-blur-sm">
             <span className="font-mono text-slate-500">{formatTickerTime(event.startedAt || event.createdAt, item?.createdAt)}</span>
             <span>{countryFlag(country)}</span>
             <span className="font-semibold text-slate-600">{country}</span>

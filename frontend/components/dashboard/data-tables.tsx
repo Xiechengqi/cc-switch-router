@@ -429,8 +429,6 @@ function ShareEditDialog({
   const [lastFiniteParallelLimit, setLastFiniteParallelLimit] = React.useState(DEFAULT_PARALLEL_LIMIT);
   const [expiresAtInput, setExpiresAtInput] = React.useState("");
   const [expiresPermanent, setExpiresPermanent] = React.useState(false);
-  const [pricingGlobal, setPricingGlobal] = React.useState(true);
-  const [globalPriceInput, setGlobalPriceInput] = React.useState("");
   const [priceInputs, setPriceInputs] = React.useState<Record<PriceApp, string>>({ claude: "", codex: "", gemini: "" });
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
@@ -443,20 +441,14 @@ function ShareEditDialog({
       share.activeEdit?.status === "rejected"
         ? share.activeEdit.patch.forSaleOfficialPricePercentByApp || {}
         : {};
-    const runtimePricing: Partial<Record<PriceApp, number>> = {
-      claude: share.appRuntimes?.claude?.forSaleOfficialPricePercent,
-      codex: share.appRuntimes?.codex?.forSaleOfficialPricePercent,
-      gemini: share.appRuntimes?.gemini?.forSaleOfficialPricePercent,
-    };
+    const sharePricing = share.forSaleOfficialPricePercentByApp || {};
     const initialPricing: Record<PriceApp, string> = { claude: "", codex: "", gemini: "" };
     for (const app of PRICE_APPS) {
       const pending = pendingPricing[app.key];
-      const fallback = runtimePricing[app.key];
+      const fallback = sharePricing[app.key];
       const value = typeof pending === "number" ? pending : fallback;
       initialPricing[app.key] = typeof value === "number" && value > 0 ? String(value) : "";
     }
-    const values = PRICE_APPS.map((app) => initialPricing[app.key]).filter(Boolean);
-    const allSame = values.length > 0 && values.every((value) => value === values[0]);
 
     setDescription(share.description || "");
     setForSale((share.forSale as "Yes" | "No" | "Free") || "No");
@@ -485,15 +477,7 @@ function ShareEditDialog({
     setExpiresPermanent(permanent);
     setExpiresAtInput(permanent ? "" : toLocalDateTimeValue(share.expiresAt));
 
-    if (allSame) {
-      setPricingGlobal(true);
-      setGlobalPriceInput(values[0]);
-      setPriceInputs(initialPricing);
-    } else {
-      setPricingGlobal(values.length === 0);
-      setGlobalPriceInput("");
-      setPriceInputs(initialPricing);
-    }
+    setPriceInputs(initialPricing);
     setError(share.activeEdit?.status === "rejected" ? share.activeEdit.errorMessage || "上一轮应用失败" : "");
     setConfirmFreeOpen(false);
     setMarketSelectKey((current) => current + 1);
@@ -527,33 +511,6 @@ function ShareEditDialog({
     } else {
       setParallelLimitInput(String(lastFiniteParallelLimit));
     }
-  };
-
-  const handlePricingGlobalChange = (checked: boolean) => {
-    setPricingGlobal(checked);
-    if (!checked) return;
-    const nextGlobal = globalPriceInput || PRICE_APPS.map((app) => priceInputs[app.key]).find(Boolean) || "";
-    setGlobalPriceInput(nextGlobal);
-    if (!nextGlobal) return;
-    setPriceInputs((current) => {
-      const next = { ...current };
-      for (const app of PRICE_APPS) {
-        if (share?.support?.[app.key]) next[app.key] = nextGlobal;
-      }
-      return next;
-    });
-  };
-
-  const handleGlobalPriceInput = (value: string) => {
-    setGlobalPriceInput(value);
-    if (!pricingGlobal) return;
-    setPriceInputs((current) => {
-      const next = { ...current };
-      for (const app of PRICE_APPS) {
-        if (share?.support?.[app.key]) next[app.key] = value;
-      }
-      return next;
-    });
   };
 
   const removeMarketEmail = (email: string) => {
@@ -595,20 +552,15 @@ function ShareEditDialog({
 
   const pricingPayload = React.useMemo<Record<string, number>>(() => {
     const result: Record<string, number> = {};
-    const globalValue = Number.parseInt(globalPriceInput, 10);
-    const hasValidGlobal = pricingGlobal && Number.isFinite(globalValue) && globalValue >= 1 && globalValue <= 100;
     for (const app of PRICE_APPS) {
       if (!share?.support?.[app.key]) continue;
       const raw = priceInputs[app.key];
-      if (!raw || !raw.trim()) {
-        if (hasValidGlobal) result[app.key] = globalValue;
-        continue;
-      }
+      if (!raw || !raw.trim()) continue;
       const value = Number.parseInt(raw, 10);
       if (Number.isFinite(value) && value >= 1 && value <= 100) result[app.key] = value;
     }
     return result;
-  }, [pricingGlobal, globalPriceInput, priceInputs, share]);
+  }, [priceInputs, share]);
 
   const pricingInvalid = React.useMemo(() => {
     const check = (raw: string) => {
@@ -616,8 +568,8 @@ function ShareEditDialog({
       const value = Number.parseInt(raw, 10);
       return !(Number.isFinite(value) && value >= 1 && value <= 100);
     };
-    return (pricingGlobal && check(globalPriceInput)) || PRICE_APPS.some((app) => check(priceInputs[app.key]));
-  }, [pricingGlobal, globalPriceInput, priceInputs]);
+    return PRICE_APPS.some((app) => check(priceInputs[app.key]));
+  }, [priceInputs]);
 
   const formInvalid =
     descriptionInvalid || tokenInvalid || parallelInvalid || expiryInvalid || pricingInvalid;
@@ -639,9 +591,7 @@ function ShareEditDialog({
         parallelLimit: parallelLimitUnlimited ? UNLIMITED_PARALLEL_LIMIT : parallelParsed,
       };
       if (expiresIso) patch.expiresAt = expiresIso;
-      if (Object.keys(pricingPayload).length > 0) {
-        patch.forSaleOfficialPricePercentByApp = pricingPayload;
-      }
+      patch.forSaleOfficialPricePercentByApp = pricingPayload;
       await updateShareSettings(share.shareId, patch);
       await onSaved();
       onClose();
@@ -856,31 +806,10 @@ function ShareEditDialog({
 
                 <FieldGroup
                   label="Model pricing (% of official)"
-                  hint="留空则使用 market 默认定价；范围 1-100"
+                  hint="Share 级默认定价；供应商配置了百分比时优先使用供应商值。留空则使用 market 默认定价；范围 1-100"
                   invalid={pricingInvalid}
                 >
                   <div className="grid gap-3">
-                    <Checkbox
-                      isSelected={pricingGlobal}
-                      onChange={(value: boolean) => handlePricingGlobalChange(value)}
-                      isDisabled={busy}
-                    >
-                      <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
-                      <Checkbox.Content>
-                        <span className="text-sm">使用全局百分比（可继续单独覆盖各 app）</span>
-                      </Checkbox.Content>
-                    </Checkbox>
-                    {pricingGlobal ? (
-                      <Input
-                        type="number"
-                        min={1}
-                        max={100}
-                        step={1}
-                        value={globalPriceInput}
-                        onChange={(event) => handleGlobalPriceInput(event.target.value)}
-                        placeholder="未设置"
-                      />
-                    ) : null}
                     <div className="grid gap-3 sm:grid-cols-3">
                       {PRICE_APPS.map((app) => {
                         const supported = !!share?.support?.[app.key];

@@ -1054,6 +1054,8 @@ pub struct ShareView {
     pub for_sale: String,
     #[serde(default = "default_market_access_mode")]
     pub market_access_mode: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub for_sale_official_price_percent_by_app: BTreeMap<String, u16>,
     pub subdomain: String,
     pub share_token: String,
     pub can_view_secret: bool,

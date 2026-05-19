@@ -1931,6 +1931,8 @@ impl AppStore {
                     description: share.description,
                     for_sale: share.for_sale,
                     market_access_mode: share.market_access_mode,
+                    for_sale_official_price_percent_by_app: share
+                        .for_sale_official_price_percent_by_app,
                     subdomain: share.subdomain,
                     share_token: if can_view_secret {
                         share.share_token

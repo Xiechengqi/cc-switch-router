@@ -70,6 +70,7 @@ export type ShareView = {
   description?: string;
   forSale: string;
   marketAccessMode: string;
+  forSaleOfficialPricePercentByApp?: Record<string, number>;
   subdomain: string;
   shareToken?: string;
   canViewSecret?: boolean;
