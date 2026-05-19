@@ -54,6 +54,31 @@
   --router-input: 226 232 240;
   --router-ring: 0 82 255;
   --radius: 0.625rem;
+
+  /* HeroUI field tokens — neutral hairline border, no focus halo */
+  --field-border: rgb(var(--router-border));
+  --field-border-width: 1px;
+  --color-field-border: rgb(var(--router-border));
+  --color-field-border-hover: rgb(15 23 42 / 0.18);
+  --color-field-border-focus: rgb(15 23 42 / 0.32);
+  --color-field-focus: rgb(var(--router-card));
+}
+
+:is(.input, .textarea, .select__trigger, .input-otp__slot, .input-group, .combo-box__input, .number-field__input):focus,
+:is(.input, .textarea, .select__trigger, .input-otp__slot, .input-group, .combo-box__input, .number-field__input):focus-visible,
+:is(.input, .textarea, .select__trigger, .input-otp__slot)[data-focused="true"],
+:is(.input, .textarea, .select__trigger, .input-otp__slot)[data-focus-visible="true"] {
+  --tw-ring-shadow: 0 0 #0000;
+  box-shadow: inset 0 1px 0 rgb(15 23 42 / 0.04);
+  border-color: rgb(15 23 42 / 0.32);
+  outline: none;
+}
+
+:is(.input, .textarea, .select__trigger, .input-otp__slot)[data-invalid="true"] {
+  --tw-ring-shadow: 0 0 #0000;
+  box-shadow: none;
+  outline: none;
+  border-color: rgb(var(--router-destructive));
 }
 
 * {
@@ -144,7 +169,6 @@ a {
   --field-background: rgb(var(--router-card));
   --field-foreground: rgb(var(--router-foreground));
   --field-placeholder: rgb(var(--router-muted-foreground));
-  --field-border: rgb(var(--router-border));
   --accent: rgb(var(--router-accent));
   --accent-foreground: rgb(var(--router-accent-foreground));
   --accent-soft: rgba(0, 82, 255, 0.12);
@@ -248,8 +272,6 @@ a {
   --field-background: rgb(var(--router-card));
   --field-foreground: rgb(var(--router-foreground));
   --field-placeholder: rgb(var(--router-muted-foreground));
-  --field-border: rgb(var(--router-border));
-  --field-border-width: 1px;
   color: rgb(var(--router-foreground));
   color-scheme: light;
 }
@@ -267,12 +289,6 @@ a {
 .share-edit-surface :is(.input, .textarea, .select__trigger) {
   background-color: rgb(var(--router-card));
   color: rgb(var(--router-foreground));
-}
-
-.share-edit-surface :is(.input, .textarea, .select__trigger):focus,
-.share-edit-surface :is(.input, .textarea, .select__trigger)[data-focused="true"] {
-  border-color: rgb(var(--router-accent));
-  box-shadow: 0 0 0 3px rgba(0, 82, 255, 0.16);
 }
 
 .mono-label {

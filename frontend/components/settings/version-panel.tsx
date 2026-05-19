@@ -3,6 +3,7 @@
 import { Loader2, RefreshCw, Rocket, RotateCcw } from "lucide-react";
 import { Alert, Button, Card, Chip, Modal, ScrollShadow } from "@heroui/react";
 import * as React from "react";
+import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { readAuthState } from "@/lib/auth";
 import { getVersion, restartService, rollbackService, startUpgrade } from "@/lib/api";
@@ -23,6 +24,8 @@ function formatBytes(bytes?: number | null) {
   return mib >= 1 ? `${mib.toFixed(1)} MiB` : `${(bytes / 1024).toFixed(1)} KiB`;
 }
 
+type ConfirmAction = "restart" | "upgrade" | "rollback" | "rollbackAgain";
+
 export function VersionPanel({ isAdmin }: { isAdmin: boolean }) {
   const { t } = useLocaleText();
   const [info, setInfo] = React.useState<VersionResponse | null>(null);
@@ -30,6 +33,7 @@ export function VersionPanel({ isAdmin }: { isAdmin: boolean }) {
   const [busy, setBusy] = React.useState<string | null>(null);
   const [upgradeOpen, setUpgradeOpen] = React.useState(false);
   const [logs, setLogs] = React.useState<string[]>([]);
+  const [confirmAction, setConfirmAction] = React.useState<ConfirmAction | null>(null);
 
   const refresh = React.useCallback(async () => {
     try {
@@ -45,7 +49,7 @@ export function VersionPanel({ isAdmin }: { isAdmin: boolean }) {
   }, [refresh]);
 
   async function restart() {
-    if (!window.confirm(t("version.confirmRestart"))) return;
+    setConfirmAction(null);
     setBusy("restart");
     setError("");
     try {
@@ -59,7 +63,7 @@ export function VersionPanel({ isAdmin }: { isAdmin: boolean }) {
   }
 
   async function upgrade() {
-    if (!window.confirm(t("version.confirmUpgrade"))) return;
+    setConfirmAction(null);
     setBusy("upgrade");
     setError("");
     setLogs([]);
@@ -74,8 +78,7 @@ export function VersionPanel({ isAdmin }: { isAdmin: boolean }) {
   }
 
   async function rollback() {
-    if (!window.confirm(t("version.confirmRollback"))) return;
-    if (!window.confirm(t("version.confirmRollbackAgain"))) return;
+    setConfirmAction(null);
     setBusy("rollback");
     setError("");
     try {
@@ -87,6 +90,59 @@ export function VersionPanel({ isAdmin }: { isAdmin: boolean }) {
       setBusy(null);
     }
   }
+
+  function confirmCurrentAction() {
+    if (confirmAction === "restart") {
+      restart().catch(console.error);
+      return;
+    }
+    if (confirmAction === "upgrade") {
+      upgrade().catch(console.error);
+      return;
+    }
+    if (confirmAction === "rollback") {
+      setConfirmAction("rollbackAgain");
+      return;
+    }
+    if (confirmAction === "rollbackAgain") {
+      rollback().catch(console.error);
+    }
+  }
+
+  const confirmCopy = (() => {
+    switch (confirmAction) {
+      case "restart":
+        return {
+          title: t("common.restart"),
+          description: t("version.confirmRestart"),
+          confirmLabel: t("common.restart"),
+          tone: "primary" as const,
+        };
+      case "upgrade":
+        return {
+          title: t("common.upgrade"),
+          description: t("version.confirmUpgrade"),
+          confirmLabel: t("common.upgrade"),
+          tone: "primary" as const,
+        };
+      case "rollback":
+        return {
+          title: t("common.rollback"),
+          description: t("version.confirmRollback"),
+          confirmLabel: t("common.rollback"),
+          tone: "warning" as const,
+        };
+      case "rollbackAgain":
+        return {
+          title: t("common.rollback"),
+          description: t("version.confirmRollbackAgain"),
+          confirmLabel: t("common.rollback"),
+          tone: "warning" as const,
+        };
+      default:
+        return null;
+    }
+  })();
 
   function streamUpgrade(taskId: string) {
     const token = readAuthState().accessToken;
@@ -137,15 +193,15 @@ export function VersionPanel({ isAdmin }: { isAdmin: boolean }) {
         </div>
         {isAdmin ? (
           <div className="flex flex-wrap gap-2">
-            <Button variant="outline" onClick={restart} isDisabled={!!busy}>
+            <Button variant="outline" onClick={() => setConfirmAction("restart")} isDisabled={!!busy}>
               {busy === "restart" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}
               {t("common.restart")}
             </Button>
-            <Button variant="primary" onClick={upgrade} isDisabled={!!busy}>
+            <Button variant="primary" onClick={() => setConfirmAction("upgrade")} isDisabled={!!busy}>
               {busy === "upgrade" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Rocket className="h-4 w-4" />}
               {t("common.upgrade")}
             </Button>
-            <Button variant="outline" onClick={rollback} isDisabled={!!busy || !info?.rollbackAvailable} className="border-amber-300 text-amber-700 hover:bg-amber-50">
+            <Button variant="outline" onClick={() => setConfirmAction("rollback")} isDisabled={!!busy || !info?.rollbackAvailable} className="border-amber-300 text-amber-700 hover:bg-amber-50">
               {busy === "rollback" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}
               {t("common.rollback")}
             </Button>
@@ -174,6 +230,19 @@ export function VersionPanel({ isAdmin }: { isAdmin: boolean }) {
           </Modal.Container>
         </Modal.Backdrop>
       </Modal>
+      {confirmCopy ? (
+        <ConfirmAlertDialog
+          open={!!confirmAction}
+          title={confirmCopy.title}
+          description={confirmCopy.description}
+          confirmLabel={confirmCopy.confirmLabel}
+          cancelLabel={t("common.cancel")}
+          tone={confirmCopy.tone}
+          busy={!!busy}
+          onConfirm={confirmCurrentAction}
+          onOpenChange={(open) => !open && setConfirmAction(null)}
+        />
+      ) : null}
     </Card>
   );
 }

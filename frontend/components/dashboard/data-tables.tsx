@@ -3,6 +3,7 @@
 import { ExternalLink, Loader2, Pencil, Save, X } from "lucide-react";
 import { Button, Card, Checkbox, Chip, Drawer, Input, ListBox, Modal, ProgressBar, Select, TextArea } from "@heroui/react";
 import * as React from "react";
+import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getMarketLinkedShares, updateMarketDisabledShares, updateShareSettings } from "@/lib/api";
 import type { AppLocale } from "@/lib/i18n";
@@ -919,32 +920,19 @@ function ShareEditDialog({
         </Modal.Backdrop>
       </Modal>
 
-      <Modal isOpen={confirmFreeOpen} onOpenChange={(open) => !open && setConfirmFreeOpen(false)}>
-        <Modal.Backdrop>
-          <Modal.Container>
-            <Modal.Dialog className="share-edit-surface light w-[min(420px,calc(100vw-2rem))] !bg-white !text-slate-900">
-              <Modal.Header>
-                <Modal.Heading>确认切换为 Free</Modal.Heading>
-              </Modal.Header>
-              <Modal.Body className="text-sm text-muted-foreground">
-                Free share 会向所有市场免费曝光，且不再产生收益。请确认切换。
-              </Modal.Body>
-              <Modal.Footer>
-                <Button variant="outline" onClick={() => setConfirmFreeOpen(false)}>取消</Button>
-                <Button
-                  variant="danger"
-                  onClick={() => {
-                    setForSale("Free");
-                    setConfirmFreeOpen(false);
-                  }}
-                >
-                  确认切换
-                </Button>
-              </Modal.Footer>
-            </Modal.Dialog>
-          </Modal.Container>
-        </Modal.Backdrop>
-      </Modal>
+      <ConfirmAlertDialog
+        open={confirmFreeOpen}
+        title="确认切换为 Free"
+        description="Free share 会向所有市场免费曝光，且不再产生收益。请确认切换。"
+        confirmLabel="确认切换"
+        cancelLabel="取消"
+        tone="danger"
+        onConfirm={() => {
+          setForSale("Free");
+          setConfirmFreeOpen(false);
+        }}
+        onOpenChange={(open) => !open && setConfirmFreeOpen(false)}
+      />
     </>
   );
 }
