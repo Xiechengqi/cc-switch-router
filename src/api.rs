@@ -35,19 +35,20 @@ use crate::models::{
     AuthSession, BindInstallationOwnerEmailRequest, BindInstallationOwnerEmailResponse,
     BoardMessageListResponse, BoardMessageToggleRequest, BoardMessageView, BoardMetaResponse,
     ChangeInstallationOwnerEmailRequest, ChangeInstallationOwnerEmailResponse,
-    DashboardPresenceRequest, DashboardPresenceResponse, DashboardResponse,
-    GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse, HealthResponse,
-    IssueLeaseRequest, IssueLeaseResponse, MarketDisabledSharesUpdateRequest,
-    MarketDisabledSharesUpdateResponse, MarketNotificationEmailLogView,
-    MarketNotificationEmailRequest, MarketNotificationEmailResponse,
-    MarketRequestLogBatchSyncRequest, MarketShareView, MarketsResponse, PostBoardMessageRequest,
-    PublicMapPointsResponse, RefreshSessionRequest, RegisterInstallationRequest,
-    RegisterInstallationResponse, RegisterMarketRequest, RequestEmailCodeRequest,
-    RequestEmailCodeResponse, SessionStatusResponse, ShareBatchSyncRequest,
-    ShareClaimSubdomainRequest, ShareDeleteRequest, ShareEditAckRequest, ShareEditAvailableEvent,
-    ShareEditEventSignaturePayload, ShareHeartbeatRequest, SharePendingEditsRequest,
-    ShareRequestLogBatchSyncRequest, ShareRuntimeRefreshRequest, ShareSettingsUpdateRequest,
-    ShareSyncRequest, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    DashboardMarketRequestLogView, DashboardPresenceRequest, DashboardPresenceResponse,
+    DashboardResponse, DashboardTickerShare, GetInstallationOwnerEmailQuery,
+    GetInstallationOwnerEmailResponse, HealthResponse, IssueLeaseRequest, IssueLeaseResponse,
+    MarketDisabledSharesUpdateRequest, MarketDisabledSharesUpdateResponse,
+    MarketNotificationEmailLogView, MarketNotificationEmailRequest,
+    MarketNotificationEmailResponse, MarketRequestLogBatchSyncRequest, MarketShareView,
+    MarketsResponse, PostBoardMessageRequest, PublicMapPointsResponse, RefreshSessionRequest,
+    RegisterInstallationRequest, RegisterInstallationResponse, RegisterMarketRequest,
+    RequestEmailCodeRequest, RequestEmailCodeResponse, SessionStatusResponse,
+    ShareBatchSyncRequest, ShareClaimSubdomainRequest, ShareDeleteRequest, ShareEditAckRequest,
+    ShareEditAvailableEvent, ShareEditEventSignaturePayload, ShareHeartbeatRequest,
+    SharePendingEditsRequest, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry,
+    ShareRuntimeRefreshRequest, ShareSettingsUpdateRequest, ShareSyncRequest,
+    VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 use crate::proxy::{market_proxy_handler, proxy_handler};
 use crate::recent_traffic::{RecentRequestEvent, RecentTrafficSnapshot};
@@ -56,6 +57,7 @@ use crate::store::BoardAuthor;
 const REGIONS: &str = include_str!("../regions");
 const SHARE_EDIT_WAKE_RETRY_INTERVAL_SECS: u64 = 20;
 const SHARE_EDIT_WAKE_RETRY_ATTEMPTS: usize = 3;
+const DASHBOARD_REQUEST_TICKER_LIMIT: usize = 5;
 
 mod ui_assets {
     include!(concat!(env!("OUT_DIR"), "/ui_assets.rs"));
@@ -488,33 +490,96 @@ fn confirmed_request_events(
     snapshot: &RecentTrafficSnapshot,
     response: &DashboardResponse,
 ) -> (Vec<RecentRequestEvent>, HashMap<String, usize>) {
-    let mut request_log_ids = response
+    let mut events_by_id = persisted_ticker_request_events(response)
+        .into_iter()
+        .map(|event| (event.request_id.clone(), event))
+        .collect::<HashMap<_, _>>();
+    let request_log_ids = response
         .ticker_shares
         .iter()
         .flat_map(|share| share.recent_requests.iter())
         .map(|log| log.request_id.as_str())
+        .chain(
+            response
+                .market_request_logs
+                .iter()
+                .map(|log| log.request_id.as_str()),
+        )
         .collect::<HashSet<_>>();
-    request_log_ids.extend(
-        response
-            .market_request_logs
-            .iter()
-            .map(|log| log.request_id.as_str()),
-    );
-    let confirmed_events = snapshot
+    let confirmed_live_events = snapshot
         .events
         .iter()
         .filter(|event| request_log_ids.contains(event.request_id.as_str()))
         .cloned()
         .collect::<Vec<_>>();
+    for event in &confirmed_live_events {
+        events_by_id.insert(event.request_id.clone(), event.clone());
+    }
+    let mut events = events_by_id.into_values().collect::<Vec<_>>();
+    events.sort_by(|left, right| left.started_at.cmp(&right.started_at));
+    if events.len() > DASHBOARD_REQUEST_TICKER_LIMIT {
+        events.drain(0..events.len() - DASHBOARD_REQUEST_TICKER_LIMIT);
+    }
     let mut country_counts = HashMap::new();
-    for event in &confirmed_events {
+    for event in &confirmed_live_events {
         if let Some(iso3) = event.user_country_iso3.as_deref() {
             *country_counts.entry(iso3.to_string()).or_insert(0) += 1;
         }
     }
-    let take_from = confirmed_events.len().saturating_sub(64);
-    let events = confirmed_events.into_iter().skip(take_from).collect();
     (events, country_counts)
+}
+
+fn persisted_ticker_request_events(response: &DashboardResponse) -> Vec<RecentRequestEvent> {
+    let mut events = Vec::new();
+    for share in &response.ticker_shares {
+        for log in &share.recent_requests {
+            events.push(share_log_to_ticker_event(share, log));
+        }
+    }
+    for log in &response.market_request_logs {
+        events.push(market_log_to_ticker_event(log));
+    }
+    events
+}
+
+fn share_log_to_ticker_event(
+    share: &DashboardTickerShare,
+    log: &ShareRequestLogEntry,
+) -> RecentRequestEvent {
+    RecentRequestEvent {
+        request_id: log.request_id.clone(),
+        share_id: log.share_id.clone(),
+        share_name: Some(if log.share_name.is_empty() {
+            share.share_name.clone()
+        } else {
+            log.share_name.clone()
+        }),
+        share_subdomain: Some(share.subdomain.clone()),
+        user_country: None,
+        user_country_iso3: None,
+        started_at: chrono::DateTime::<chrono::Utc>::from_timestamp(log.created_at, 0)
+            .unwrap_or_else(chrono::Utc::now),
+        is_inflight: false,
+    }
+}
+
+fn market_log_to_ticker_event(log: &DashboardMarketRequestLogView) -> RecentRequestEvent {
+    RecentRequestEvent {
+        request_id: log.request_id.clone(),
+        share_id: log.share_id.clone().unwrap_or_default(),
+        share_name: log.share_subdomain.clone(),
+        share_subdomain: log.share_subdomain.clone(),
+        user_country: None,
+        user_country_iso3: None,
+        started_at: parse_dashboard_log_time(&log.created_at),
+        is_inflight: false,
+    }
+}
+
+fn parse_dashboard_log_time(value: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| chrono::Utc::now())
 }
 
 async fn public_map_points(
@@ -786,6 +851,130 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].request_id, "req_market_confirmed");
         assert_eq!(country_counts.get("USA"), Some(&1));
+    }
+
+    #[test]
+    fn confirmed_request_events_restores_last_five_from_persisted_share_logs() {
+        let response = DashboardResponse {
+            generated_at: Utc::now(),
+            stats: crate::models::DashboardStats {
+                clients: 0,
+                active_shares: 0,
+                total_active_requests: 0,
+            },
+            map: crate::models::DashboardMap {
+                server: None,
+                clients: Vec::new(),
+            },
+            clients: Vec::new(),
+            markets: Vec::new(),
+            ticker_shares: vec![crate::models::DashboardTickerShare {
+                share_id: "share-1".into(),
+                share_name: "Share".into(),
+                subdomain: "share-sub".into(),
+                recent_requests: (1..=7)
+                    .map(|index| share_log(&format!("req-{index}"), index))
+                    .collect(),
+            }],
+            country_counts: HashMap::new(),
+            user_country_counts: HashMap::new(),
+            recent_request_events: Vec::new(),
+            market_request_logs: Vec::new(),
+        };
+        let snapshot = RecentTrafficSnapshot {
+            country_counts: HashMap::new(),
+            events: Vec::new(),
+            recent_events: Vec::new(),
+        };
+
+        let (events, country_counts) = confirmed_request_events(&snapshot, &response);
+
+        assert_eq!(country_counts.len(), 0);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["req-3", "req-4", "req-5", "req-6", "req-7"]
+        );
+        assert!(events.iter().all(|event| !event.is_inflight));
+    }
+
+    #[test]
+    fn confirmed_request_events_prefers_live_event_over_persisted_copy() {
+        let live = RecentRequestEvent {
+            request_id: "req-1".into(),
+            share_id: "share-1".into(),
+            share_name: Some("Live Share".into()),
+            share_subdomain: Some("live-sub".into()),
+            user_country: Some("US".into()),
+            user_country_iso3: Some("USA".into()),
+            started_at: Utc::now(),
+            is_inflight: true,
+        };
+        let snapshot = RecentTrafficSnapshot {
+            country_counts: HashMap::new(),
+            events: vec![live],
+            recent_events: Vec::new(),
+        };
+        let response = DashboardResponse {
+            generated_at: Utc::now(),
+            stats: crate::models::DashboardStats {
+                clients: 0,
+                active_shares: 0,
+                total_active_requests: 0,
+            },
+            map: crate::models::DashboardMap {
+                server: None,
+                clients: Vec::new(),
+            },
+            clients: Vec::new(),
+            markets: Vec::new(),
+            ticker_shares: vec![crate::models::DashboardTickerShare {
+                share_id: "share-1".into(),
+                share_name: "Persisted Share".into(),
+                subdomain: "persisted-sub".into(),
+                recent_requests: vec![share_log("req-1", 1)],
+            }],
+            country_counts: HashMap::new(),
+            user_country_counts: HashMap::new(),
+            recent_request_events: Vec::new(),
+            market_request_logs: Vec::new(),
+        };
+
+        let (events, country_counts) = confirmed_request_events(&snapshot, &response);
+
+        assert_eq!(events.len(), 1);
+        assert!(events[0].is_inflight);
+        assert_eq!(events[0].share_subdomain.as_deref(), Some("live-sub"));
+        assert_eq!(country_counts.get("USA"), Some(&1));
+    }
+
+    fn share_log(request_id: &str, created_at: i64) -> crate::models::ShareRequestLogEntry {
+        crate::models::ShareRequestLogEntry {
+            request_id: request_id.into(),
+            share_id: "share-1".into(),
+            share_name: "Share".into(),
+            provider_id: "provider-1".into(),
+            provider_name: "Provider".into(),
+            app_type: "codex".into(),
+            model: "gpt-5".into(),
+            request_model: "gpt-5".into(),
+            request_agent: "codex".into(),
+            requested_model: "gpt-5".into(),
+            actual_model: "gpt-5".into(),
+            actual_model_source: "official".into(),
+            status_code: 200,
+            latency_ms: 1,
+            first_token_ms: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            is_streaming: false,
+            session_id: None,
+            created_at,
+        }
     }
 
     /// Regression guard for the SSE late-subscriber bug Codex flagged: a
