@@ -15,6 +15,20 @@ function compareDesc(left: number, right: number) {
   return left > right ? -1 : 1;
 }
 
+function shouldOpenRowDrawer(event: React.MouseEvent<HTMLElement>) {
+  const selection = window.getSelection();
+  if (selection && !selection.isCollapsed && selection.toString().trim()) {
+    return false;
+  }
+
+  const target = event.target as HTMLElement | null;
+  if (target?.closest("a,button,input,textarea,select,[role='button'],[data-no-row-drawer]")) {
+    return false;
+  }
+
+  return true;
+}
+
 const UNLIMITED_TOKEN_LIMIT = -1;
 const UNLIMITED_PARALLEL_LIMIT = -1;
 const MIN_PARALLEL_LIMIT = 3;
@@ -1009,7 +1023,7 @@ export function ClientsTable({ clients, markets, onChanged }: { clients: Dashboa
                 const share = client.share;
                 const api = shareApiParts(share);
                 return (
-	                  <tr key={client.installation.id} className="cursor-pointer border-b last:border-0 hover:bg-primary/5" onClick={() => setSelected(client)}>
+	                  <tr key={client.installation.id} className="cursor-pointer border-b last:border-0 hover:bg-primary/5" onClick={(event) => { if (shouldOpenRowDrawer(event)) setSelected(client); }}>
 	                    <td className="w-72 break-words px-4 py-3 align-middle">
 	                      <div className="grid min-w-72 gap-1">
 	                        <strong className="break-all font-mono text-xs text-foreground">{share ? `${api.apiUrl}/${shareApiKeyLabel(share, api.apiKey)}` : "-"}</strong>
@@ -1188,7 +1202,7 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
             </thead>
             <tbody>
               {sorted.length ? sorted.map((market) => (
-                <tr key={market.id} className="cursor-pointer border-b last:border-0 hover:bg-primary/5" onClick={() => setSelected(market)}>
+                <tr key={market.id} className="cursor-pointer border-b last:border-0 hover:bg-primary/5" onClick={(event) => { if (shouldOpenRowDrawer(event)) setSelected(market); }}>
                   <td className="w-44 break-words px-4 py-3 align-middle">
                     <div className="min-w-0">
                       <div className="font-medium">{market.displayName || market.id}</div>
