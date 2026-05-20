@@ -6102,10 +6102,19 @@ fn filter_provider_models_by_health(
     health: &[ModelHealthSummary],
 ) -> Option<ShareUpstreamProvider> {
     let provider = provider?;
-    if health.iter().any(|entry| entry.status == "success") {
-        Some(provider)
-    } else {
+    let recent_results = health
+        .iter()
+        .flat_map(|entry| entry.recent_results.iter())
+        .take(3)
+        .collect::<Vec<_>>();
+    if recent_results.len() >= 3
+        && recent_results
+            .iter()
+            .all(|result| result.as_str() == "failed")
+    {
         None
+    } else {
+        Some(provider)
     }
 }
 

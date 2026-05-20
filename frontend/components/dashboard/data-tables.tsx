@@ -351,8 +351,8 @@ function modelHealthTone(share: ShareView, key: keyof ShareAppRuntimes) {
   const results = entries.flatMap((entry) => (entry.recentResults || []).slice(0, 3));
   if (!results.length) {
     return {
-      className: "border-slate-200 bg-slate-50 text-muted-foreground",
-      label: "unknown",
+      className: "border-emerald-200 bg-emerald-50 text-emerald-700",
+      label: "healthy",
     };
   }
   const failures = results.filter((result) => result === "failed").length;
@@ -376,7 +376,7 @@ function modelHealthTone(share: ShareView, key: keyof ShareAppRuntimes) {
 
 function modelHealthTitle(share: ShareView, key: keyof ShareAppRuntimes) {
   const entries = share.modelHealth?.[key] || [];
-  if (!entries.length) return "No model health checks yet";
+  if (!entries.length) return "No failures recorded yet";
   return entries
     .map((entry) => {
       const recent = (entry.recentResults || []).join(" / ") || entry.status;

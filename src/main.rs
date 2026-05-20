@@ -640,29 +640,17 @@ async fn run_share_model_health_check_cycle(
 
 fn model_health_targets(runtimes: &crate::models::ShareAppRuntimes) -> Vec<ShareModelHealthTarget> {
     let mut targets = Vec::new();
-    if runtimes
-        .claude
-        .as_ref()
-        .is_some_and(|provider| !provider.models.is_empty())
-    {
+    if runtimes.claude.is_some() {
         targets.push(ShareModelHealthTarget {
             app_type: "claude".to_string(),
         });
     }
-    if runtimes
-        .codex
-        .as_ref()
-        .is_some_and(|provider| !provider.models.is_empty())
-    {
+    if runtimes.codex.is_some() {
         targets.push(ShareModelHealthTarget {
             app_type: "codex".to_string(),
         });
     }
-    if runtimes
-        .gemini
-        .as_ref()
-        .is_some_and(|provider| !provider.models.is_empty())
-    {
+    if runtimes.gemini.is_some() {
         targets.push(ShareModelHealthTarget {
             app_type: "gemini".to_string(),
         });
