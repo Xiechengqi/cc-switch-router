@@ -1612,6 +1612,7 @@ impl AppStore {
         input: ShareRequestLogBatchSyncRequest,
         metadata: ClientMetadata,
         _current_user_email: &str,
+        live_country_by_request_id: HashMap<String, (Option<String>, Option<String>)>,
     ) -> Result<(), AppError> {
         let conn = self.conn.lock().await;
         let installation = get_installation(&conn, &input.installation_id)?;
@@ -1642,12 +1643,22 @@ impl AppStore {
             AppError::Internal(format!("begin request log batch sync tx failed: {e}"))
         })?;
         let bound_owner_email = require_installation_owner_email(&tx, &input.installation_id)?;
-        for log in input.logs {
+        for mut log in input.logs {
             let owner_email = get_share_owner_email(&tx, &log.share_id)?;
             if owner_email.as_deref() != Some(bound_owner_email.as_str()) {
                 return Err(AppError::Unauthorized(
                     "only share owner can sync request logs".into(),
                 ));
+            }
+            if let Some((user_country, user_country_iso3)) =
+                live_country_by_request_id.get(&log.request_id)
+            {
+                if log.user_country.is_none() {
+                    log.user_country = user_country.clone();
+                }
+                if log.user_country_iso3.is_none() {
+                    log.user_country_iso3 = user_country_iso3.clone();
+                }
             }
             upsert_share_request_log_tx(&tx, &input.installation_id, log)?;
         }
@@ -4001,8 +4012,8 @@ fn upsert_share_request_log_tx(
             app_type, model, request_model, request_agent, requested_model, actual_model, actual_model_source,
             status_code, latency_ms, first_token_ms,
             input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
-            is_streaming, session_id, created_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
+            is_streaming, session_id, user_country, user_country_iso3, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
         ON CONFLICT(request_id) DO UPDATE SET
             installation_id = excluded.installation_id,
             share_id = excluded.share_id,
@@ -4025,6 +4036,8 @@ fn upsert_share_request_log_tx(
             cache_creation_tokens = excluded.cache_creation_tokens,
             is_streaming = excluded.is_streaming,
             session_id = excluded.session_id,
+            user_country = COALESCE(excluded.user_country, share_request_logs.user_country),
+            user_country_iso3 = COALESCE(excluded.user_country_iso3, share_request_logs.user_country_iso3),
             created_at = excluded.created_at",
         params![
             log.request_id,
@@ -4049,6 +4062,8 @@ fn upsert_share_request_log_tx(
             i64::from(log.cache_creation_tokens),
             i64::from(log.is_streaming as u8),
             log.session_id,
+            log.user_country,
+            log.user_country_iso3,
             log.created_at,
         ],
     )
@@ -4086,8 +4101,8 @@ fn upsert_market_request_log_tx(
             router_id, share_id, share_subdomain, model, request_agent, requested_model, actual_model, actual_model_source,
             status, status_code, latency_ms,
             input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
-            usage_amount_usd, created_at, settled_at, synced_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
+            usage_amount_usd, created_at, settled_at, user_country, user_country_iso3, synced_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
         ON CONFLICT(request_id) DO UPDATE SET
             market_id = excluded.market_id,
             market_email = excluded.market_email,
@@ -4112,6 +4127,8 @@ fn upsert_market_request_log_tx(
             usage_amount_usd = COALESCE(excluded.usage_amount_usd, market_request_logs.usage_amount_usd),
             created_at = excluded.created_at,
             settled_at = COALESCE(excluded.settled_at, market_request_logs.settled_at),
+            user_country = COALESCE(excluded.user_country, market_request_logs.user_country),
+            user_country_iso3 = COALESCE(excluded.user_country_iso3, market_request_logs.user_country_iso3),
             synced_at = excluded.synced_at",
         params![
             log.request_id,
@@ -4138,6 +4155,8 @@ fn upsert_market_request_log_tx(
             log.usage_amount_usd,
             log.created_at,
             log.settled_at,
+            log.user_country,
+            log.user_country_iso3,
             synced_at,
         ],
     )
@@ -4241,6 +4260,8 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             cache_creation_tokens INTEGER NOT NULL,
             is_streaming INTEGER NOT NULL,
             session_id TEXT,
+            user_country TEXT,
+            user_country_iso3 TEXT,
             created_at INTEGER NOT NULL
         );
 
@@ -4389,6 +4410,8 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             usage_amount_usd TEXT,
             created_at TEXT NOT NULL,
             settled_at TEXT,
+            user_country TEXT,
+            user_country_iso3 TEXT,
             synced_at TEXT NOT NULL
         );
 
@@ -4775,6 +4798,8 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         "actual_model_source",
         "TEXT NOT NULL DEFAULT ''",
     )?;
+    add_column_if_missing(conn, "share_request_logs", "user_country", "TEXT")?;
+    add_column_if_missing(conn, "share_request_logs", "user_country_iso3", "TEXT")?;
     add_column_if_missing(
         conn,
         "market_request_logs",
@@ -4799,6 +4824,8 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         "actual_model_source",
         "TEXT NOT NULL DEFAULT ''",
     )?;
+    add_column_if_missing(conn, "market_request_logs", "user_country", "TEXT")?;
+    add_column_if_missing(conn, "market_request_logs", "user_country_iso3", "TEXT")?;
     add_column_if_missing(conn, "router_markets", "pricing_json", "TEXT")?;
     conn.execute(
         "UPDATE installations
@@ -5632,13 +5659,13 @@ fn list_recent_share_request_logs(
                     request_model, request_agent, requested_model, actual_model, actual_model_source,
                     status_code, latency_ms, first_token_ms, input_tokens,
                     output_tokens, cache_read_tokens, cache_creation_tokens, is_streaming,
-                    session_id, created_at
+                    session_id, user_country, user_country_iso3, created_at
              FROM (
                  SELECT request_id, share_id, share_name, provider_id, provider_name, app_type, model,
                         request_model, request_agent, requested_model, actual_model, actual_model_source,
                         status_code, latency_ms, first_token_ms, input_tokens,
                         output_tokens, cache_read_tokens, cache_creation_tokens, is_streaming,
-                        session_id, created_at,
+                        session_id, user_country, user_country_iso3, created_at,
                         ROW_NUMBER() OVER (PARTITION BY share_id ORDER BY created_at DESC) AS row_num
                  FROM share_request_logs
              )
@@ -5670,7 +5697,9 @@ fn list_recent_share_request_logs(
                 cache_creation_tokens: row.get::<_, i64>(18)? as u32,
                 is_streaming: row.get::<_, i64>(19)? != 0,
                 session_id: row.get(20)?,
-                created_at: row.get(21)?,
+                user_country: row.get(21)?,
+                user_country_iso3: row.get(22)?,
+                created_at: row.get(23)?,
             })
         })
         .map_err(|e| AppError::Internal(format!("query recent share request logs failed: {e}")))?;
@@ -5688,7 +5717,8 @@ fn list_recent_market_request_logs(
                     api_key_prefix, router_id, share_id, share_subdomain, model,
                     request_agent, requested_model, actual_model, actual_model_source, status,
                     status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens,
-                    cache_creation_tokens, usage_amount_usd, created_at, settled_at
+                    cache_creation_tokens, usage_amount_usd, created_at, settled_at,
+                    user_country, user_country_iso3
              FROM market_request_logs
              ORDER BY created_at DESC
              LIMIT ?1",
@@ -5723,6 +5753,8 @@ fn list_recent_market_request_logs(
                 usage_amount_usd: row.get(21)?,
                 created_at: row.get(22)?,
                 settled_at: row.get(23)?,
+                user_country: row.get(24)?,
+                user_country_iso3: row.get(25)?,
             })
         })
         .map_err(|e| AppError::Internal(format!("query recent market request logs failed: {e}")))?;
@@ -7798,6 +7830,8 @@ mod tests {
             usage_amount_usd: Some("0.001".into()),
             created_at: Utc::now().to_rfc3339(),
             settled_at: Some(Utc::now().to_rfc3339()),
+            user_country: None,
+            user_country_iso3: None,
         }
     }
 
@@ -7828,6 +7862,8 @@ mod tests {
             cache_creation_tokens: 0,
             is_streaming: false,
             session_id: None,
+            user_country: None,
+            user_country_iso3: None,
             created_at,
         }
     }
@@ -9199,6 +9235,8 @@ mod tests {
                     cache_creation_tokens: 0,
                     is_streaming: false,
                     session_id: None,
+                    user_country: None,
+                    user_country_iso3: None,
                     created_at: Utc::now().timestamp(),
                 },
             )
@@ -9348,6 +9386,8 @@ mod tests {
             cache_creation_tokens: 0,
             is_streaming: true,
             session_id: Some("session-1".into()),
+            user_country: None,
+            user_country_iso3: None,
             created_at: Utc::now().timestamp(),
         }];
 
@@ -9362,6 +9402,8 @@ mod tests {
             &nonce,
         );
 
+        let live_country_by_request_id =
+            HashMap::from([("req-1".to_string(), (Some("JP".into()), Some("JPN".into())))]);
         store
             .batch_sync_share_request_logs(
                 ShareRequestLogBatchSyncRequest {
@@ -9376,21 +9418,24 @@ mod tests {
                     country_code: None,
                 },
                 "owner@example.com",
+                live_country_by_request_id,
             )
             .await
             .expect("valid signed request log batch sync");
 
         let conn = store.conn.lock().await;
-        let stored_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM share_request_logs
+        let (stored_count, user_country, user_country_iso3): (i64, Option<String>, Option<String>) =
+            conn.query_row(
+                "SELECT COUNT(*), MAX(user_country), MAX(user_country_iso3) FROM share_request_logs
                  WHERE installation_id = ?1 AND request_id = ?2",
                 params!["inst-logs", "req-1"],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("count synced request logs");
         drop(conn);
         assert_eq!(stored_count, 1);
+        assert_eq!(user_country.as_deref(), Some("JP"));
+        assert_eq!(user_country_iso3.as_deref(), Some("JPN"));
 
         let replay_err = store
             .batch_sync_share_request_logs(
@@ -9406,6 +9451,7 @@ mod tests {
                     country_code: None,
                 },
                 "owner@example.com",
+                HashMap::new(),
             )
             .await
             .expect_err("replayed log sync should fail");
@@ -9437,6 +9483,7 @@ mod tests {
                     country_code: None,
                 },
                 "owner@example.com",
+                HashMap::new(),
             )
             .await
             .expect_err("tampered log sync should fail");

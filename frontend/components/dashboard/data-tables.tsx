@@ -78,6 +78,22 @@ function shareExpiryProgress(share: ShareView, locale: AppLocale) {
   return `${age}/${expiry}`;
 }
 
+function averageRecentLatencyMs(logs?: ShareRequestLog[], limit = 10) {
+  const samples = [...(logs || [])]
+    .sort((left, right) => Number(right.createdAt || 0) - Number(left.createdAt || 0))
+    .slice(0, limit)
+    .map((log) => Number(log.latencyMs || 0))
+    .filter((latency) => Number.isFinite(latency) && latency > 0);
+  if (!samples.length) return null;
+  return samples.reduce((sum, latency) => sum + latency, 0) / samples.length;
+}
+
+function formatLatencySeconds(latencyMs: number | null) {
+  if (latencyMs == null || !Number.isFinite(latencyMs) || latencyMs <= 0) return "-";
+  const seconds = latencyMs / 1000;
+  return `${seconds < 1 ? seconds.toFixed(2) : seconds.toFixed(1)}s`;
+}
+
 function expirySortValue(share?: ShareView) {
   if (!share?.expiresAt) return 0;
   if (isUnlimitedExpiry(share.expiresAt)) return Number.POSITIVE_INFINITY;
@@ -894,6 +910,7 @@ function FieldGroup({
 function ShareStatusCell({ client, share, t, locale }: { client: DashboardClient; share?: ShareView; t: TFn; locale: AppLocale }) {
   if (!share) return <span className="text-muted-foreground">-</span>;
   const limit = isUnlimited(share.parallelLimit) ? "∞" : String(share.parallelLimit || 0);
+  const averageLatency = averageRecentLatencyMs(share.recentRequests);
   const rowClass = "grid grid-cols-[76px_minmax(0,1fr)] gap-2";
   if (!share.isOnline) {
     return (
@@ -908,6 +925,7 @@ function ShareStatusCell({ client, share, t, locale }: { client: DashboardClient
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.usage")}</span><div><strong>{compactTokens(share.tokensUsed)} / {isUnlimited(share.tokenLimit) ? "∞" : compactTokens(share.tokenLimit)}</strong><UsageBar used={share.tokensUsed} limit={share.tokenLimit} t={t} /></div></div>
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.expires")}</span><strong title={`${formatDateTime(share.createdAt)} / ${expiryTitle(share.expiresAt)}`}>{shareExpiryProgress(share, locale)}</strong></div>
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.parallel")}</span><strong>{share.activeRequests || 0}<span className="text-muted-foreground">/{limit}</span></strong></div>
+      <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.response")}</span><strong>{formatLatencySeconds(averageLatency)}</strong></div>
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.online")}</span><strong title={`${share.onlineMinutes24h || 0} / 1440 min with successful route probes in last 24h`}>{(share.onlineRate24h || 0).toFixed(1)}%</strong></div>
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.health")}</span><HealthDots entries={share.healthChecks} /></div>
     </div>

@@ -332,6 +332,10 @@ pub struct MarketRequestLogEntry {
     pub created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settled_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_country: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_country_iso3: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -371,6 +375,10 @@ pub struct DashboardMarketRequestLogView {
     pub created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settled_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_country: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_country_iso3: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -535,6 +543,10 @@ pub struct ShareRequestLogEntry {
     pub is_streaming: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_country: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_country_iso3: Option<String>,
     pub created_at: i64,
 }
 

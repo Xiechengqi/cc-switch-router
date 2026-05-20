@@ -297,9 +297,11 @@ async fn admin_update_market_disabled_shares(
 async fn batch_sync_market_request_logs(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    Json(input): Json<MarketRequestLogBatchSyncRequest>,
+    Json(mut input): Json<MarketRequestLogBatchSyncRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let market = authenticate_market(&state, &headers, "market:request_logs:write").await?;
+    let snapshot = state.recent_traffic.snapshot().await;
+    enrich_market_request_logs_with_live_country(&mut input.logs, &snapshot);
     let count = state
         .store
         .batch_sync_market_request_logs(&market, input)
@@ -529,6 +531,43 @@ fn confirmed_request_events(
     (events, country_counts)
 }
 
+fn live_country_by_request_id(
+    snapshot: &RecentTrafficSnapshot,
+) -> HashMap<String, (Option<String>, Option<String>)> {
+    snapshot
+        .events
+        .iter()
+        .filter(|event| event.user_country.is_some() || event.user_country_iso3.is_some())
+        .map(|event| {
+            (
+                event.request_id.clone(),
+                (event.user_country.clone(), event.user_country_iso3.clone()),
+            )
+        })
+        .collect()
+}
+
+fn enrich_market_request_logs_with_live_country(
+    logs: &mut [crate::models::MarketRequestLogEntry],
+    snapshot: &RecentTrafficSnapshot,
+) {
+    let country_by_request_id = live_country_by_request_id(snapshot);
+    for log in logs {
+        if log.user_country.is_some() && log.user_country_iso3.is_some() {
+            continue;
+        }
+        if let Some((user_country, user_country_iso3)) = country_by_request_id.get(&log.request_id)
+        {
+            if log.user_country.is_none() {
+                log.user_country = user_country.clone();
+            }
+            if log.user_country_iso3.is_none() {
+                log.user_country_iso3 = user_country_iso3.clone();
+            }
+        }
+    }
+}
+
 fn persisted_ticker_request_events(response: &DashboardResponse) -> Vec<RecentRequestEvent> {
     let mut events = Vec::new();
     for share in &response.ticker_shares {
@@ -555,8 +594,8 @@ fn share_log_to_ticker_event(
             log.share_name.clone()
         }),
         share_subdomain: Some(share.subdomain.clone()),
-        user_country: None,
-        user_country_iso3: None,
+        user_country: log.user_country.clone(),
+        user_country_iso3: log.user_country_iso3.clone(),
         started_at: chrono::DateTime::<chrono::Utc>::from_timestamp(log.created_at, 0)
             .unwrap_or_else(chrono::Utc::now),
         is_inflight: false,
@@ -569,8 +608,8 @@ fn market_log_to_ticker_event(log: &DashboardMarketRequestLogView) -> RecentRequ
         share_id: log.share_id.clone().unwrap_or_default(),
         share_name: log.share_subdomain.clone(),
         share_subdomain: log.share_subdomain.clone(),
-        user_country: None,
-        user_country_iso3: None,
+        user_country: log.user_country.clone(),
+        user_country_iso3: log.user_country_iso3.clone(),
         started_at: parse_dashboard_log_time(&log.created_at),
         is_inflight: false,
     }
@@ -844,6 +883,8 @@ mod tests {
                 usage_amount_usd: None,
                 created_at: Utc::now().to_rfc3339(),
                 settled_at: None,
+                user_country: None,
+                user_country_iso3: None,
             }],
         };
 
@@ -898,6 +939,47 @@ mod tests {
             vec!["req-3", "req-4", "req-5", "req-6", "req-7"]
         );
         assert!(events.iter().all(|event| !event.is_inflight));
+    }
+
+    #[test]
+    fn confirmed_request_events_restores_country_from_persisted_logs() {
+        let mut share_log = share_log("req-country-share", 1);
+        share_log.user_country = Some("JP".into());
+        share_log.user_country_iso3 = Some("JPN".into());
+        let response = DashboardResponse {
+            generated_at: Utc::now(),
+            stats: crate::models::DashboardStats {
+                clients: 0,
+                active_shares: 0,
+                total_active_requests: 0,
+            },
+            map: crate::models::DashboardMap {
+                server: None,
+                clients: Vec::new(),
+            },
+            clients: Vec::new(),
+            markets: Vec::new(),
+            ticker_shares: vec![crate::models::DashboardTickerShare {
+                share_id: "share-1".into(),
+                share_name: "Share".into(),
+                subdomain: "share-sub".into(),
+                recent_requests: vec![share_log],
+            }],
+            country_counts: HashMap::new(),
+            user_country_counts: HashMap::new(),
+            recent_request_events: Vec::new(),
+            market_request_logs: Vec::new(),
+        };
+        let snapshot = RecentTrafficSnapshot {
+            country_counts: HashMap::new(),
+            events: Vec::new(),
+            recent_events: Vec::new(),
+        };
+
+        let (events, _) = confirmed_request_events(&snapshot, &response);
+
+        assert_eq!(events[0].user_country.as_deref(), Some("JP"));
+        assert_eq!(events[0].user_country_iso3.as_deref(), Some("JPN"));
     }
 
     #[test]
@@ -973,6 +1055,8 @@ mod tests {
             cache_creation_tokens: 0,
             is_streaming: false,
             session_id: None,
+            user_country: None,
+            user_country_iso3: None,
             created_at,
         }
     }
@@ -1208,9 +1292,16 @@ async fn batch_sync_share_request_logs(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(input): Json<ShareRequestLogBatchSyncRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let snapshot = state.recent_traffic.snapshot().await;
+    let live_country_map = live_country_by_request_id(&snapshot);
     state
         .store
-        .batch_sync_share_request_logs(input, extract_client_metadata(&headers, addr), "")
+        .batch_sync_share_request_logs(
+            input,
+            extract_client_metadata(&headers, addr),
+            "",
+            live_country_map,
+        )
         .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
