@@ -3124,6 +3124,15 @@ impl AppStore {
         Ok(())
     }
 
+    pub async fn clear_share_model_health_checks(&self) -> Result<(), AppError> {
+        let conn = self.conn.lock().await;
+        conn.execute("DELETE FROM share_model_health_checks", [])
+            .map_err(|e| AppError::Internal(format!("clear model health checks failed: {e}")))?;
+        conn.execute("DELETE FROM share_model_health_state", [])
+            .map_err(|e| AppError::Internal(format!("clear model health state failed: {e}")))?;
+        Ok(())
+    }
+
     pub async fn record_share_health_request_log(
         &self,
         installation_id: &str,
@@ -6092,21 +6101,11 @@ fn filter_provider_models_by_health(
     provider: Option<ShareUpstreamProvider>,
     health: &[ModelHealthSummary],
 ) -> Option<ShareUpstreamProvider> {
-    let Some(mut provider) = provider else {
-        return None;
-    };
-    let healthy = health
-        .iter()
-        .filter(|entry| entry.status == "success")
-        .map(|entry| entry.requested_model.as_str())
-        .collect::<HashSet<_>>();
-    provider.models.retain(|model| {
-        healthy.contains(model.actual_model.as_str()) || healthy.contains(model.slot.as_str())
-    });
-    if health.is_empty() || provider.models.is_empty() {
-        None
-    } else {
+    let provider = provider?;
+    if health.iter().any(|entry| entry.status == "success") {
         Some(provider)
+    } else {
+        None
     }
 }
 

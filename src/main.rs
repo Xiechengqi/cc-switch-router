@@ -38,7 +38,7 @@ use crate::board_telegram::TelegramNotifier;
 use crate::config::{Config, ensure_default_env_file, load_env_file};
 use crate::dynamic_settings::DynamicSettings;
 use crate::models::ShareEditAvailableEvent;
-use crate::models::{ShareModelHealthCheckEntry, ShareRequestLogEntry, ShareUpstreamProvider};
+use crate::models::{ShareModelHealthCheckEntry, ShareRequestLogEntry};
 use crate::recent_traffic::RecentTraffic;
 use crate::scheduling_signals::OverrideStore;
 use crate::startup_config::{StartupConfigMode, ensure_startup_config};
@@ -193,6 +193,8 @@ async fn main() -> Result<()> {
     let ssh_listener = TcpListener::bind(config.ssh_addr).await?;
     info!("http listening on {}", config.api_addr);
     info!("ssh listener bound on {}", config.ssh_addr);
+    state.store.clear_share_model_health_checks().await?;
+    info!("cleared previous share model health checks");
 
     let cleanup_task = tokio::spawn(async move {
         let mut interval =
@@ -270,7 +272,7 @@ async fn main() -> Result<()> {
             .timeout(Duration::from_secs(20))
             .build()?;
 
-        tokio::time::sleep(Duration::from_secs(90)).await;
+        tokio::time::sleep(Duration::from_secs(120)).await;
         let mut interval = tokio::time::interval(Duration::from_secs(30 * 60));
         loop {
             if let Err(err) = run_share_model_health_check_cycle(
@@ -477,8 +479,27 @@ async fn run_share_runtime_refresh_cycle(
 #[derive(Debug, Clone)]
 struct ShareModelHealthTarget {
     app_type: String,
-    requested_model: String,
-    actual_model: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShareRouterModelHealthResponse {
+    #[serde(default)]
+    success: bool,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    status_code: Option<u16>,
+    #[serde(default)]
+    model_used: String,
+    #[serde(default)]
+    response_time_ms: Option<u64>,
+    #[serde(default)]
+    tested_at: Option<i64>,
+    #[serde(default)]
+    provider_id: Option<String>,
+    #[serde(default)]
+    provider_name: Option<String>,
 }
 
 async fn run_share_model_health_check_cycle(
@@ -507,27 +528,62 @@ async fn run_share_model_health_check_cycle(
             .await;
             let latency_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
             let checked_at = chrono::Utc::now().timestamp();
-            let (status, status_code, error_message) = match result {
-                Ok(status_code) if status_code.is_success() => {
-                    ("success".to_string(), Some(status_code.as_u16()), None)
-                }
-                Ok(status_code) => (
-                    "failed".to_string(),
-                    Some(status_code.as_u16()),
-                    Some(format!("HTTP {status_code}")),
+            let (
+                status,
+                status_code,
+                error_message,
+                model_used,
+                effective_latency_ms,
+                checked_at,
+                provider_id,
+                provider_name,
+            ) = match result {
+                Ok(response) if response.success => (
+                    "success".to_string(),
+                    response.status_code.or(Some(200)),
+                    None,
+                    response.model_used,
+                    response.response_time_ms.unwrap_or(latency_ms),
+                    response.tested_at.unwrap_or(checked_at),
+                    response.provider_id,
+                    response.provider_name,
                 ),
-                Err(err) => ("failed".to_string(), None, Some(err.to_string())),
+                Ok(response) => (
+                    "failed".to_string(),
+                    response.status_code,
+                    Some(response.message),
+                    response.model_used,
+                    response.response_time_ms.unwrap_or(latency_ms),
+                    response.tested_at.unwrap_or(checked_at),
+                    response.provider_id,
+                    response.provider_name,
+                ),
+                Err(err) => (
+                    "failed".to_string(),
+                    None,
+                    Some(err.to_string()),
+                    model_target.app_type.clone(),
+                    latency_ms,
+                    checked_at,
+                    None,
+                    None,
+                ),
+            };
+            let model_used = if model_used.trim().is_empty() {
+                model_target.app_type.clone()
+            } else {
+                model_used
             };
             let check = ShareModelHealthCheckEntry {
                 request_id: request_id.clone(),
                 share_id: target.share_id.clone(),
                 subdomain: target.subdomain.clone(),
                 app_type: model_target.app_type.clone(),
-                requested_model: model_target.requested_model.clone(),
-                actual_model: model_target.actual_model.clone(),
+                requested_model: model_used.clone(),
+                actual_model: model_used.clone(),
                 status: status.clone(),
                 status_code,
-                latency_ms,
+                latency_ms: effective_latency_ms,
                 first_token_ms: None,
                 error_message: error_message.clone(),
                 checked_at,
@@ -538,17 +594,18 @@ async fn run_share_model_health_check_cycle(
                 request_id: request_id.clone(),
                 share_id: target.share_id.clone(),
                 share_name: target.share_name.clone(),
-                provider_id: "router-health".to_string(),
-                provider_name: "Router health check".to_string(),
+                provider_id: provider_id
+                    .unwrap_or_else(|| format!("router-health-{}", model_target.app_type)),
+                provider_name: provider_name.unwrap_or_else(|| "Router health check".to_string()),
                 app_type: model_target.app_type.clone(),
-                model: model_target.actual_model.clone(),
-                request_model: model_target.requested_model.clone(),
+                model: model_used.clone(),
+                request_model: model_used.clone(),
                 request_agent: model_target.app_type.clone(),
-                requested_model: model_target.requested_model.clone(),
-                actual_model: model_target.actual_model.clone(),
+                requested_model: model_used.clone(),
+                actual_model: model_used.clone(),
                 actual_model_source: "health_check".to_string(),
                 status_code: status_code.unwrap_or(0),
-                latency_ms,
+                latency_ms: effective_latency_ms,
                 first_token_ms: None,
                 input_tokens: 0,
                 output_tokens: 0,
@@ -572,7 +629,7 @@ async fn run_share_model_health_check_cycle(
                     Some(target.subdomain.clone()),
                     status,
                     model_target.app_type,
-                    model_target.requested_model,
+                    model_used,
                 )
                 .await;
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -583,40 +640,34 @@ async fn run_share_model_health_check_cycle(
 
 fn model_health_targets(runtimes: &crate::models::ShareAppRuntimes) -> Vec<ShareModelHealthTarget> {
     let mut targets = Vec::new();
-    push_provider_model_targets(&mut targets, "claude", runtimes.claude.as_ref());
-    push_provider_model_targets(&mut targets, "codex", runtimes.codex.as_ref());
-    push_provider_model_targets(&mut targets, "gemini", runtimes.gemini.as_ref());
-    targets
-}
-
-fn push_provider_model_targets(
-    out: &mut Vec<ShareModelHealthTarget>,
-    app_type: &str,
-    provider: Option<&ShareUpstreamProvider>,
-) {
-    let Some(provider) = provider else {
-        return;
-    };
-    for model in &provider.models {
-        let requested_model = if model.slot.trim().is_empty() {
-            model.actual_model.trim()
-        } else {
-            model.slot.trim()
-        };
-        let actual_model = if model.actual_model.trim().is_empty() {
-            requested_model
-        } else {
-            model.actual_model.trim()
-        };
-        if requested_model.is_empty() {
-            continue;
-        }
-        out.push(ShareModelHealthTarget {
-            app_type: app_type.to_string(),
-            requested_model: requested_model.to_string(),
-            actual_model: actual_model.to_string(),
+    if runtimes
+        .claude
+        .as_ref()
+        .is_some_and(|provider| !provider.models.is_empty())
+    {
+        targets.push(ShareModelHealthTarget {
+            app_type: "claude".to_string(),
         });
     }
+    if runtimes
+        .codex
+        .as_ref()
+        .is_some_and(|provider| !provider.models.is_empty())
+    {
+        targets.push(ShareModelHealthTarget {
+            app_type: "codex".to_string(),
+        });
+    }
+    if runtimes
+        .gemini
+        .as_ref()
+        .is_some_and(|provider| !provider.models.is_empty())
+    {
+        targets.push(ShareModelHealthTarget {
+            app_type: "gemini".to_string(),
+        });
+    }
+    targets
 }
 
 async fn probe_share_model(
@@ -625,46 +676,38 @@ async fn probe_share_model(
     subdomain: &str,
     request_id: &str,
     target: &ShareModelHealthTarget,
-) -> Result<reqwest::StatusCode> {
+) -> Result<ShareRouterModelHealthResponse> {
     let base = config.tunnel_url(subdomain);
-    let (url, body) = match target.app_type.as_str() {
-        "claude" => (
-            format!("{base}/v1/messages"),
-            serde_json::json!({
-                "model": target.requested_model,
-                "max_tokens": 1,
-                "messages": [{"role": "user", "content": "ping"}]
-            }),
-        ),
-        "gemini" => (
-            format!(
-                "{base}/gemini/v1beta/models/{}:generateContent",
-                target.requested_model
-            ),
-            serde_json::json!({
-                "contents": [{"parts": [{"text": "ping"}]}],
-                "generationConfig": {"maxOutputTokens": 1}
-            }),
-        ),
-        _ => (
-            format!("{base}/v1/responses"),
-            serde_json::json!({
-                "model": target.requested_model,
-                "input": "ping",
-                "max_output_tokens": 1
-            }),
-        ),
-    };
+    let url = format!("{base}/_share-router/model-health");
     let response = client
         .post(url)
+        .header("X-Share-Router-Probe", "1")
         .header("X-Share-Router-Health-Check", "1")
         .header("X-Share-Router-Health-Check-Source", "scheduled")
         .header("X-CC-Switch-Request-Id", request_id)
-        .json(&body)
+        .json(&serde_json::json!({ "appType": target.app_type }))
         .send()
         .await
         .context("send share model health check failed")?;
-    Ok(response.status())
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .context("read share model health check response failed")?;
+    if !status.is_success() {
+        return Ok(ShareRouterModelHealthResponse {
+            success: false,
+            message: text,
+            status_code: Some(status.as_u16()),
+            model_used: target.app_type.clone(),
+            response_time_ms: None,
+            tested_at: None,
+            provider_id: None,
+            provider_name: None,
+        });
+    }
+    serde_json::from_str(&text)
+        .with_context(|| format!("parse share model health check response failed; body={text}"))
 }
 
 fn filter_registered_route_targets(
