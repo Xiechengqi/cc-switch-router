@@ -10,7 +10,7 @@ fn default_market_access_mode() -> String {
     "selected".to_string()
 }
 
-fn default_share_parallel_limit() -> i64 {
+pub fn default_share_parallel_limit() -> i64 {
     3
 }
 
@@ -695,6 +695,10 @@ pub struct MarketShareView {
     pub parallel_limit: i64,
     pub online_rate_24h: f64,
     pub last_seen_at: String,
+    /// RFC3339 timestamp from `shares.created_at`. Used by markets as a
+    /// freshness/seniority input for diversification profiles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share_created_at: Option<String>,
     #[serde(default)]
     pub disabled_by_market: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -705,6 +709,48 @@ pub struct MarketShareView {
     pub upstream_provider: Option<ShareUpstreamProvider>,
     #[serde(default)]
     pub app_runtimes: ShareAppRuntimes,
+    /// Router-computed scheduling signals. Markets sort using these directly
+    /// (no recomputation) and then layer their profile preferences on top.
+    #[serde(default)]
+    pub signals: ShareSignals,
+}
+
+/// Router-computed scheduling signals shipped to markets in every
+/// `/v1/market/shares` response. All values are normalized so a higher number
+/// is preferred. `samples_10m` is included so the market can decide whether
+/// to trust the short-window stability signal (e.g. for diversification).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareSignals {
+    /// `0.0..=1.5`: 1.0 = empty quota, 0.0 = exhausted; >1.0 expresses urgency
+    /// (a near-reset window with lots of headroom). Neutral = 0.5 when no
+    /// quota signal is available.
+    pub quota_health: f64,
+    /// `0.0..=1.0`: confidence-weighted online rate. Defaults to the 24h rate
+    /// when no recent samples exist.
+    pub stability: f64,
+    /// `0.1..=1.0`: free-capacity ratio against `parallel_limit`. Floored at
+    /// 0.1 so saturated shares remain schedulable.
+    pub headroom: f64,
+    /// Healthy-minute count inside the trailing 10 minutes (0..=10). The
+    /// confidence input to `stability`.
+    pub samples_10m: u32,
+    /// `(0.0..=1.0]`: owner-level penalty applied on top of the base score.
+    /// 1.0 = no penalty. Sourced from the in-memory override store (429
+    /// feedback). Decays via TTL.
+    pub owner_penalty: f64,
+}
+
+impl ShareSignals {
+    pub fn neutral() -> Self {
+        Self {
+            quota_health: 0.5,
+            stability: 0.0,
+            headroom: 1.0,
+            samples_10m: 0,
+            owner_penalty: 1.0,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

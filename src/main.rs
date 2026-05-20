@@ -11,6 +11,7 @@ mod geo;
 mod models;
 mod proxy;
 mod recent_traffic;
+mod scheduling_signals;
 mod ssh;
 mod startup_config;
 mod store;
@@ -38,6 +39,7 @@ use crate::config::{Config, ensure_default_env_file, load_env_file};
 use crate::dynamic_settings::DynamicSettings;
 use crate::models::ShareEditAvailableEvent;
 use crate::recent_traffic::RecentTraffic;
+use crate::scheduling_signals::OverrideStore;
 use crate::startup_config::{StartupConfigMode, ensure_startup_config};
 use crate::store::{AppStore, ShareRouteTarget, fetch_share_runtime_snapshot_from_route};
 
@@ -70,6 +72,9 @@ pub struct ServerState {
     pub env_path: PathBuf,
     /// When the process started; powers the uptime value on /v1/admin/version.
     pub start_instant: Instant,
+    /// Per-owner penalty multipliers seeded by market 429/rate-limit feedback.
+    /// Decays via TTL; never persisted.
+    pub scheduling_overrides: Arc<OverrideStore>,
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +163,7 @@ async fn main() -> Result<()> {
         share_edit_events: broadcast::channel(512).0,
         env_path: env_path.clone(),
         start_instant: Instant::now(),
+        scheduling_overrides: OverrideStore::new(),
     };
 
     let ssh_server = ssh::SshServer {
@@ -168,6 +174,7 @@ async fn main() -> Result<()> {
     let cleanup_store = state.store.clone();
     let cleanup_config = config.clone();
     let cleanup_proxy = state.proxy.clone();
+    let cleanup_overrides = state.scheduling_overrides.clone();
     let probe_store = state.store.clone();
     let probe_proxy = state.proxy.clone();
     let probe_config = config.clone();
@@ -187,6 +194,7 @@ async fn main() -> Result<()> {
             tokio::time::interval(Duration::from_secs(cleanup_config.cleanup_interval_secs));
         loop {
             interval.tick().await;
+            cleanup_overrides.cleanup_expired();
             match cleanup_store
                 .cleanup_expired_data(&cleanup_config, &cleanup_proxy)
                 .await

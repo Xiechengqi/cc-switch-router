@@ -29,7 +29,7 @@ use crate::models::{
     HealthCheckEntry, Installation, InstallationView, IssueLeaseRequest, IssueLeaseResponse,
     LatLonPoint, MarketDisabledSharesUpdateRequest, MarketDisabledSharesUpdateResponse,
     MarketLinkedShareView, MarketRegistryRecord, MarketRequestLogBatchSyncRequest,
-    MarketRequestLogEntry, MarketShareView, PublicMapClientPoint, PublicMapPointsResponse,
+    MarketRequestLogEntry, MarketShareView, PublicMapClientPoint, PublicMapPointsResponse, ShareSignals,
     PublicMarketConfig, RefreshSessionRequest, RegisterInstallationRequest,
     RegisterInstallationResponse, RegisterMarketRequest, RequestEmailCodeRequest,
     RequestEmailCodeResponse, SessionStatusResponse, ShareAppRuntimes, ShareBatchSyncRequest,
@@ -2668,6 +2668,7 @@ impl AppStore {
     ) -> Result<Vec<MarketShareView>, AppError> {
         let conn = self.conn.lock().await;
         let online_minutes = list_online_minutes_24h(&conn)?;
+        let samples_10m = list_online_minutes_10m(&conn)?;
         let market_email_lower = market_email.to_ascii_lowercase();
         let mut stmt = conn
             .prepare(
@@ -2676,7 +2677,7 @@ impl AppStore {
                         s.share_status, COALESCE(s.subdomain, ''), s.parallel_limit,
                         i.last_seen_at, s.enabled_claude, s.enabled_codex, s.enabled_gemini,
                         s.upstream_provider_json, s.app_runtimes_json,
-                        mds.created_at
+                        mds.created_at, s.created_at
                  FROM shares s
                  LEFT JOIN installations i ON i.id = s.installation_id
                  LEFT JOIN market_disabled_shares mds
@@ -2689,11 +2690,28 @@ impl AppStore {
                  ORDER BY s.share_name ASC",
             )
             .map_err(|e| AppError::Internal(format!("prepare market shares failed: {e}")))?;
+        let now = Utc::now();
         let rows = stmt
             .query_map(params![market_email_lower], |row| {
                 let share_id: String = row.get(0)?;
                 let shared_with_emails = parse_string_vec(row.get(5)?)?;
                 let subdomain: String = row.get(10)?;
+                let parallel_limit: i64 = row.get(11)?;
+                let active_requests = *inflight_by_share.get(&share_id).unwrap_or(&0);
+                let online_rate_24h = online_minutes
+                    .get(&share_id)
+                    .map(|minutes| *minutes as f64 / ONLINE_WINDOW_MINUTES as f64)
+                    .unwrap_or(0.0);
+                let samples = samples_10m.get(&share_id).copied().unwrap_or(0);
+                let upstream_provider: Option<ShareUpstreamProvider> = parse_upstream_provider(row.get(16)?)?;
+                let quota_health = crate::scheduling_signals::compute_quota_health(
+                    upstream_provider.as_ref().and_then(|p| p.quota.as_ref()),
+                    now,
+                );
+                let stability =
+                    crate::scheduling_signals::compute_stability(samples, online_rate_24h);
+                let headroom =
+                    crate::scheduling_signals::compute_headroom(active_requests, parallel_limit);
                 Ok((
                     shared_with_emails,
                     subdomain.clone(),
@@ -2710,13 +2728,11 @@ impl AppStore {
                         for_sale: row.get(8)?,
                         share_status: row.get(9)?,
                         online: false,
-                        active_requests: *inflight_by_share.get(&share_id).unwrap_or(&0),
-                        parallel_limit: row.get(11)?,
-                        online_rate_24h: online_minutes
-                            .get(&share_id)
-                            .map(|minutes| *minutes as f64 / ONLINE_WINDOW_MINUTES as f64)
-                            .unwrap_or(0.0),
+                        active_requests,
+                        parallel_limit,
+                        online_rate_24h,
                         last_seen_at: row.get(12)?,
+                        share_created_at: row.get(19)?,
                         disabled_by_market: row.get::<_, Option<String>>(18)?.is_some(),
                         market_disabled_at: row.get(18)?,
                         support: ShareSupport {
@@ -2724,8 +2740,15 @@ impl AppStore {
                             codex: row.get::<_, i64>(14)? != 0,
                             gemini: row.get::<_, i64>(15)? != 0,
                         },
-                        upstream_provider: parse_upstream_provider(row.get(16)?)?,
+                        upstream_provider,
                         app_runtimes: parse_app_runtimes(row.get(17)?)?,
+                        signals: ShareSignals {
+                            quota_health,
+                            stability,
+                            headroom,
+                            samples_10m: samples as u32,
+                            owner_penalty: 1.0,
+                        },
                     },
                 ))
             })
@@ -2746,6 +2769,64 @@ impl AppStore {
             shares.push(share);
         }
         Ok(shares)
+    }
+
+    /// Batched lookup of `parallel_limit` for a set of share_ids. Backs the
+    /// real-time headroom probe so the market doesn't depend on the 30s-stale
+    /// snapshot for limits either.
+    pub async fn share_parallel_limits(
+        &self,
+        share_ids: &HashSet<String>,
+    ) -> Result<HashMap<String, i64>, AppError> {
+        if share_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let conn = self.conn.lock().await;
+        // Use a single IN-clause query; rusqlite doesn't support array params,
+        // so build a placeholder list. The batch is capped by the caller.
+        let placeholders: Vec<&str> = share_ids.iter().map(|_| "?").collect();
+        let sql = format!(
+            "SELECT share_id, parallel_limit FROM shares WHERE share_id IN ({})",
+            placeholders.join(",")
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| AppError::Internal(format!("prepare parallel_limits failed: {e}")))?;
+        let params: Vec<&dyn rusqlite::ToSql> = share_ids
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|e| AppError::Internal(format!("query parallel_limits failed: {e}")))?;
+        let mut out = HashMap::new();
+        for r in rows {
+            let (id, limit) = r
+                .map_err(|e| AppError::Internal(format!("read parallel_limit row failed: {e}")))?;
+            out.insert(id, limit);
+        }
+        Ok(out)
+    }
+
+    /// Look up the share owner email by share_id. Used by the feedback endpoint
+    /// to scope 429 penalties to all shares of the same owner.
+    pub async fn lookup_share_owner_email(
+        &self,
+        share_id: &str,
+    ) -> Result<Option<String>, AppError> {
+        let conn = self.conn.lock().await;
+        let owner: Option<String> = conn
+            .query_row(
+                "SELECT s.owner_email FROM shares s WHERE s.share_id = ?1",
+                params![share_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|e| AppError::Internal(format!("lookup share owner failed: {e}")))?
+            .flatten();
+        Ok(owner)
     }
 
     pub async fn list_manageable_market_shares(
@@ -5897,6 +5978,32 @@ fn list_online_minutes_24h(conn: &Connection) -> Result<HashMap<String, usize>, 
         let (share_id, online_minutes) =
             row.map_err(|e| AppError::Internal(format!("read online minute row failed: {e}")))?;
         map.insert(share_id, online_minutes.min(ONLINE_WINDOW_MINUTES));
+    }
+    Ok(map)
+}
+
+/// Healthy-minute counts inside the trailing 10 minutes. Used as the
+/// confidence numerator for `stability`.
+fn list_online_minutes_10m(conn: &Connection) -> Result<HashMap<String, usize>, AppError> {
+    let cutoff = Utc::now().timestamp() - 10 * 60;
+    let mut stmt = conn
+        .prepare(
+            "SELECT share_id, COUNT(DISTINCT checked_at / 60) AS online_minutes
+             FROM share_health_checks
+             WHERE checked_at >= ?1 AND is_healthy = 1
+             GROUP BY share_id",
+        )
+        .map_err(|e| AppError::Internal(format!("prepare online minutes 10m failed: {e}")))?;
+    let rows = stmt
+        .query_map(params![cutoff], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+        })
+        .map_err(|e| AppError::Internal(format!("query online minutes 10m failed: {e}")))?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let (share_id, online_minutes) =
+            row.map_err(|e| AppError::Internal(format!("read 10m row failed: {e}")))?;
+        map.insert(share_id, online_minutes.min(10));
     }
     Ok(map)
 }

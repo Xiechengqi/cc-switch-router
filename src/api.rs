@@ -51,6 +51,10 @@ use crate::models::{
     VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 use crate::proxy::{market_proxy_handler, proxy_handler};
+use crate::scheduling_signals::{
+    ShareFeedbackKind, ShareFeedbackRequest, ShareFeedbackResponse, ShareHeadroomEntry,
+    ShareHeadroomRequest, ShareHeadroomResponse,
+};
 use crate::recent_traffic::{RecentRequestEvent, RecentTrafficSnapshot};
 use crate::store::BoardAuthor;
 
@@ -95,6 +99,8 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/markets", get(markets))
         .route("/v1/markets/register", post(register_market))
         .route("/v1/market/shares", get(market_shares))
+        .route("/v1/market/shares/headroom", post(market_shares_headroom))
+        .route("/v1/market/shares/feedback", post(market_shares_feedback))
         .route(
             "/v1/admin/markets/:market_email/linked-shares",
             get(admin_market_linked_shares),
@@ -234,7 +240,7 @@ async fn market_shares(
     let market = authenticate_market(&state, &headers, "market:shares:read").await?;
     let active_subdomains = state.proxy.active_subdomains().await.into_iter().collect();
     let inflight_by_share = state.proxy.inflight_by_share().await;
-    let shares = state
+    let mut shares = state
         .store
         .list_market_shares(
             &market.email,
@@ -243,7 +249,111 @@ async fn market_shares(
             &inflight_by_share,
         )
         .await?;
+    // Overlay per-owner penalty from the in-memory override store. Done at the
+    // edge so the store layer stays unaware of the runtime feedback channel.
+    for share in &mut shares {
+        if let Some(email) = share.owner_email.as_deref() {
+            if let Some(penalty) = state.scheduling_overrides.get(email) {
+                share.signals.owner_penalty = penalty;
+            }
+        }
+    }
     Ok(Json(shares))
+}
+
+/// Per-request real-time headroom probe. The market normally consumes the
+/// 30s-stale snapshot embedded in `MarketShareView`, but right before
+/// scheduling a request it can POST a small batch of candidate share_ids to
+/// learn their live `inflight` counts. This avoids over-packing a saturated
+/// share while still keeping the steady-state cost low.
+async fn market_shares_headroom(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<ShareHeadroomRequest>,
+) -> Result<Json<ShareHeadroomResponse>, AppError> {
+    let _market = authenticate_market(&state, &headers, "market:shares:read").await?;
+    if input.share_ids.is_empty() {
+        return Ok(Json(ShareHeadroomResponse {
+            queried_at: chrono::Utc::now().to_rfc3339(),
+            entries: Vec::new(),
+        }));
+    }
+    // De-dupe + cap to avoid abusive payloads. 256 is well above any sane
+    // candidate pool the scheduler would build for a single request.
+    let mut wanted: HashSet<String> = HashSet::new();
+    for id in input.share_ids.into_iter().take(256) {
+        wanted.insert(id);
+    }
+
+    let inflight = state.proxy.inflight_by_share().await;
+    let parallel_limits = state.store.share_parallel_limits(&wanted).await?;
+    let entries: Vec<ShareHeadroomEntry> = wanted
+        .iter()
+        .map(|share_id| {
+            let active = *inflight.get(share_id).unwrap_or(&0);
+            let limit = parallel_limits
+                .get(share_id)
+                .copied()
+                .unwrap_or(crate::models::default_share_parallel_limit());
+            let headroom = crate::scheduling_signals::compute_headroom(active, limit);
+            ShareHeadroomEntry {
+                share_id: share_id.clone(),
+                active_requests: active,
+                parallel_limit: limit,
+                headroom,
+            }
+        })
+        .collect();
+    Ok(Json(ShareHeadroomResponse {
+        queried_at: chrono::Utc::now().to_rfc3339(),
+        entries,
+    }))
+}
+
+/// 429/rate-limit feedback from a market. Because the same owner_email
+/// typically backs all shares with shared upstream credentials, the penalty
+/// is applied to *every* share of that owner, not just the offending one.
+/// The override decays via TTL (default 30m).
+async fn market_shares_feedback(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<ShareFeedbackRequest>,
+) -> Result<Json<ShareFeedbackResponse>, AppError> {
+    let _market = authenticate_market(&state, &headers, "market:shares:read").await?;
+    let owner = state.store.lookup_share_owner_email(&input.share_id).await?;
+    let Some(owner_email) = owner else {
+        return Ok(Json(ShareFeedbackResponse {
+            ok: false,
+            owner_scope: None,
+            applied_penalty: 1.0,
+            expires_in_secs: 0,
+        }));
+    };
+
+    let (default_penalty, default_ttl_secs) = match input.kind {
+        ShareFeedbackKind::RateLimited => (0.5_f64, 30 * 60_u64),
+    };
+    let penalty = input.penalty.unwrap_or(default_penalty);
+    let ttl_secs = input.ttl_secs.unwrap_or(default_ttl_secs).min(24 * 60 * 60);
+    state.scheduling_overrides.set(
+        &owner_email,
+        penalty,
+        Some(std::time::Duration::from_secs(ttl_secs)),
+    );
+
+    tracing::info!(
+        share_id = %input.share_id,
+        owner = %owner_email,
+        penalty,
+        ttl_secs,
+        "applied market feedback penalty"
+    );
+    Ok(Json(ShareFeedbackResponse {
+        ok: true,
+        owner_scope: Some(owner_email),
+        applied_penalty: penalty.clamp(0.05, 1.0),
+        expires_in_secs: ttl_secs,
+    }))
 }
 
 async fn admin_market_linked_shares(
