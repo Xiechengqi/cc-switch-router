@@ -141,7 +141,16 @@ export function LogsPanel() {
         <div className="rounded-lg border bg-slate-950 text-slate-100">
           <ScrollShadow className="h-[560px]">
             <pre ref={viewportRef} className="h-[560px] overflow-auto whitespace-pre-wrap break-words p-4 font-mono text-xs leading-5">
-              {lines.length ? lines.join("\n") : t("logs.waiting")}
+              {lines.length ? (
+                lines.map((line, index) => (
+                  <React.Fragment key={`${index}-${line.slice(0, 24)}`}>
+                    <AnsiLogLine line={line} />
+                    {index < lines.length - 1 ? "\n" : null}
+                  </React.Fragment>
+                ))
+              ) : (
+                t("logs.waiting")
+              )}
             </pre>
           </ScrollShadow>
         </div>
@@ -155,6 +164,138 @@ function parsePayload(event: Event): LogPayload {
     return JSON.parse((event as MessageEvent).data || "{}");
   } catch {
     return { line: (event as MessageEvent).data || "" };
+  }
+}
+
+function AnsiLogLine({ line }: { line: string }) {
+  return <>{ansiToParts(line).map((part, index) => <span key={index} className={part.className}>{part.text}</span>)}</>;
+}
+
+type AnsiPart = {
+  text: string;
+  className: string;
+};
+
+type AnsiStyle = {
+  dim: boolean;
+  italic: boolean;
+  color: string;
+};
+
+const ANSI_RE = /\x1b\[([0-9;]*)m/g;
+
+function ansiToParts(input: string): AnsiPart[] {
+  const parts: AnsiPart[] = [];
+  const style: AnsiStyle = { dim: false, italic: false, color: "" };
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+
+  ANSI_RE.lastIndex = 0;
+  while ((match = ANSI_RE.exec(input)) !== null) {
+    if (match.index > lastIndex) {
+      parts.push({ text: input.slice(lastIndex, match.index), className: ansiClassName(style) });
+    }
+    applyAnsiCodes(style, match[1]);
+    lastIndex = ANSI_RE.lastIndex;
+  }
+
+  if (lastIndex < input.length) {
+    parts.push({ text: input.slice(lastIndex), className: ansiClassName(style) });
+  }
+  return parts.length ? parts : [{ text: input, className: "" }];
+}
+
+function applyAnsiCodes(style: AnsiStyle, rawCodes: string) {
+  const codes = rawCodes
+    .split(";")
+    .filter(Boolean)
+    .map((code) => Number.parseInt(code, 10))
+    .filter(Number.isFinite);
+  const normalized = codes.length ? codes : [0];
+  for (const code of normalized) {
+    switch (code) {
+      case 0:
+        style.dim = false;
+        style.italic = false;
+        style.color = "";
+        break;
+      case 2:
+        style.dim = true;
+        break;
+      case 3:
+        style.italic = true;
+        break;
+      case 22:
+        style.dim = false;
+        break;
+      case 23:
+        style.italic = false;
+        break;
+      case 30:
+      case 31:
+      case 32:
+      case 33:
+      case 34:
+      case 35:
+      case 36:
+      case 37:
+      case 90:
+      case 91:
+      case 92:
+      case 93:
+      case 94:
+      case 95:
+      case 96:
+      case 97:
+        style.color = ansiColorClass(code);
+        break;
+      case 39:
+        style.color = "";
+        break;
+    }
+  }
+}
+
+function ansiClassName(style: AnsiStyle) {
+  return [style.color, style.dim ? "opacity-60" : "", style.italic ? "italic" : ""].filter(Boolean).join(" ");
+}
+
+function ansiColorClass(code: number) {
+  switch (code) {
+    case 30:
+      return "text-slate-500";
+    case 31:
+      return "text-red-400";
+    case 32:
+      return "text-emerald-400";
+    case 33:
+      return "text-amber-300";
+    case 34:
+      return "text-sky-400";
+    case 35:
+      return "text-fuchsia-400";
+    case 36:
+      return "text-cyan-300";
+    case 37:
+      return "text-slate-100";
+    case 90:
+      return "text-slate-500";
+    case 91:
+      return "text-red-300";
+    case 92:
+      return "text-emerald-300";
+    case 93:
+      return "text-yellow-200";
+    case 94:
+      return "text-sky-300";
+    case 95:
+      return "text-fuchsia-300";
+    case 96:
+      return "text-cyan-200";
+    case 97:
+      return "text-white";
+    default:
+      return "";
   }
 }
 
