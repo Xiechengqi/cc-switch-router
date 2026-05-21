@@ -582,7 +582,7 @@ pub struct ModelHealthSummary {
     pub status: String,
     #[serde(default)]
     pub recent_results: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "checkedAt", skip_serializing_if = "Option::is_none")]
     pub last_checked_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_success_at: Option<i64>,
@@ -590,6 +590,16 @@ pub struct ModelHealthSummary {
     pub last_failed_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<u16>,
+    #[serde(default)]
+    pub latency_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -956,6 +966,8 @@ pub struct ShareRuntimeSnapshotResponse {
     pub support: ShareSupport,
     #[serde(default)]
     pub app_runtimes: ShareAppRuntimes,
+    #[serde(default)]
+    pub model_health: ShareModelHealthSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

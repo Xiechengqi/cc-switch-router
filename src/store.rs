@@ -3171,6 +3171,7 @@ impl AppStore {
             ],
         )
         .map_err(|e| AppError::Internal(format!("update share runtime snapshot failed: {e}")))?;
+        record_runtime_model_health_snapshot_conn(&conn, &snapshot)?;
         Ok(())
     }
 
@@ -5926,6 +5927,83 @@ fn normalize_model_health_status(status: &str) -> &'static str {
     }
 }
 
+fn record_runtime_model_health_snapshot_conn(
+    conn: &Connection,
+    snapshot: &ShareRuntimeSnapshotResponse,
+) -> Result<(), AppError> {
+    let subdomain = conn
+        .query_row(
+            "SELECT subdomain FROM shares WHERE share_id = ?1",
+            params![snapshot.share_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| AppError::Internal(format!("read share subdomain for health failed: {e}")))?
+        .unwrap_or_default();
+
+    for summary in snapshot
+        .model_health
+        .claude
+        .iter()
+        .chain(snapshot.model_health.codex.iter())
+        .chain(snapshot.model_health.gemini.iter())
+    {
+        let checked_at = summary.last_checked_at.unwrap_or(snapshot.queried_at);
+        let requested_model = if summary.requested_model.trim().is_empty() {
+            summary.app_type.clone()
+        } else {
+            summary.requested_model.clone()
+        };
+        let actual_model = if summary.actual_model.trim().is_empty() {
+            requested_model.clone()
+        } else {
+            summary.actual_model.clone()
+        };
+        let check = ShareModelHealthCheckEntry {
+            request_id: format!(
+                "cc-switch-health:{}:{}:{}:{}",
+                snapshot.share_id, summary.app_type, requested_model, checked_at
+            ),
+            share_id: snapshot.share_id.clone(),
+            subdomain: subdomain.clone(),
+            app_type: summary.app_type.clone(),
+            requested_model,
+            actual_model,
+            status: summary.status.clone(),
+            status_code: summary.status_code,
+            latency_ms: summary.latency_ms,
+            first_token_ms: None,
+            error_message: summary.error_message.clone(),
+            checked_at,
+            source: summary
+                .source
+                .clone()
+                .unwrap_or_else(|| "cc-switch-scheduled".to_string()),
+        };
+        record_share_model_health_check_conn(conn, &check)?;
+        if !summary.recent_results.is_empty() {
+            let recent_json = serde_json::to_string(&summary.recent_results).map_err(|e| {
+                AppError::Internal(format!(
+                    "serialize runtime model health results failed: {e}"
+                ))
+            })?;
+            conn.execute(
+                "UPDATE share_model_health_state
+                 SET recent_results_json = ?4
+                 WHERE share_id = ?1 AND app_type = ?2 AND requested_model = ?3",
+                params![
+                    snapshot.share_id,
+                    summary.app_type,
+                    check.requested_model,
+                    recent_json,
+                ],
+            )
+            .map_err(|e| AppError::Internal(format!("update model health results failed: {e}")))?;
+        }
+    }
+    Ok(())
+}
+
 fn record_share_model_health_check_conn(
     conn: &Connection,
     check: &ShareModelHealthCheckEntry,
@@ -6068,6 +6146,11 @@ fn list_model_health_summaries(
                     last_checked_at: row.get(7)?,
                     recent_results: parse_recent_results(row.get(8)?)?,
                     error_message: row.get(9)?,
+                    status_code: None,
+                    latency_ms: 0,
+                    source: None,
+                    provider_id: None,
+                    provider_name: None,
                 },
             ))
         })
