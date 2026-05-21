@@ -8,6 +8,7 @@ mod config;
 mod dynamic_settings;
 mod error;
 mod geo;
+mod ip_blacklist_stats;
 mod models;
 mod proxy;
 mod recent_traffic;
@@ -37,6 +38,7 @@ use crate::admin::upgrade::SharedUpgradeRegistry;
 use crate::board_telegram::TelegramNotifier;
 use crate::config::{Config, ensure_default_env_file, load_env_file};
 use crate::dynamic_settings::DynamicSettings;
+use crate::ip_blacklist_stats::{IpBlacklistStats, format_top_counts};
 use crate::models::{ShareEditAvailableEvent, ShareRuntimeSnapshotResponse};
 use crate::recent_traffic::RecentTraffic;
 use crate::scheduling_signals::OverrideStore;
@@ -61,6 +63,8 @@ pub struct ServerState {
     pub recent_traffic: RecentTraffic,
     /// In-memory temporary ban tracker for repeated invalid API authentication.
     pub abuse: Arc<AbuseTracker>,
+    /// In-memory aggregation for blocked IP blacklist requests. Flushed to logs periodically.
+    pub ip_blacklist_stats: Arc<IpBlacklistStats>,
     /// Optional Telegram bot client; populated when telegram env vars are set.
     pub telegram: Arc<RwLock<Option<Arc<TelegramNotifier>>>>,
     /// Single-flight upgrade orchestrator with SSE log fan-out.
@@ -158,6 +162,7 @@ async fn main() -> Result<()> {
         ssh_host_fingerprint: ssh_host_fingerprint.clone(),
         recent_traffic: RecentTraffic::new(),
         abuse: Arc::new(AbuseTracker::new()),
+        ip_blacklist_stats: Arc::new(IpBlacklistStats::new()),
         telegram: Arc::new(RwLock::new(telegram)),
         upgrade_registry: Arc::new(crate::admin::upgrade::UpgradeRegistry::new()),
         share_edit_events: broadcast::channel(512).0,
@@ -175,6 +180,7 @@ async fn main() -> Result<()> {
     let cleanup_config = config.clone();
     let cleanup_proxy = state.proxy.clone();
     let cleanup_overrides = state.scheduling_overrides.clone();
+    let ip_blacklist_stats = state.ip_blacklist_stats.clone();
     let probe_store = state.store.clone();
     let probe_proxy = state.proxy.clone();
     let probe_config = config.clone();
@@ -191,6 +197,22 @@ async fn main() -> Result<()> {
     info!("ssh listener bound on {}", config.ssh_addr);
     state.store.clear_share_model_health_checks().await?;
     info!("cleared previous share model health checks");
+
+    let ip_blacklist_log_task = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            if let Some(summary) = ip_blacklist_stats.flush() {
+                tracing::warn!(
+                    blocked = summary.blocked,
+                    unique_ips = summary.unique_ips,
+                    window_secs = summary.window_secs,
+                    top_ips = %format_top_counts(&summary.top_ips),
+                    top_paths = %format_top_counts(&summary.top_paths),
+                    "IP blacklist summary"
+                );
+            }
+        }
+    });
 
     let cleanup_task = tokio::spawn(async move {
         let mut interval =
@@ -300,6 +322,7 @@ async fn main() -> Result<()> {
     tokio::select! {
         ssh_result = ssh_task => {
             cleanup_task.abort();
+            ip_blacklist_log_task.abort();
             probe_task.abort();
             runtime_task.abort();
             resend_usage_task.abort();
@@ -308,6 +331,7 @@ async fn main() -> Result<()> {
         }
         http_result = http_task => {
             cleanup_task.abort();
+            ip_blacklist_log_task.abort();
             probe_task.abort();
             runtime_task.abort();
             resend_usage_task.abort();

@@ -206,11 +206,11 @@ async fn ip_blacklist_middleware(
     req: Request,
     next: Next,
 ) -> Response {
-    if let Some(ip) = source_ip_from_request(&req) {
-        if state.dynamic.read().await.is_ip_blacklisted(ip) {
-            tracing::warn!(client_ip = %ip, path = %req.uri().path(), "request blocked by IP blacklist");
-            return (StatusCode::FORBIDDEN, "IP blacklisted").into_response();
-        }
+    if let Some(ip) = source_ip_from_request(&req)
+        && state.dynamic.read().await.is_ip_blacklisted(ip)
+    {
+        state.ip_blacklist_stats.record(ip, req.uri().path());
+        return (StatusCode::FORBIDDEN, "IP blacklisted").into_response();
     }
     next.run(req).await
 }

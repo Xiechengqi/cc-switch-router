@@ -8,7 +8,7 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rand::distributions::{Alphanumeric, DistString};
 use resend_rs::Resend;
 use resend_rs::types::CreateEmailBaseOptions;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
@@ -55,6 +55,7 @@ const SIGNED_REQUEST_MAX_SKEW_MS: i64 = 60_000;
 const NONCE_RETENTION_SECS: i64 = 10 * 60;
 const MARKET_OFFLINE_GRACE_SECS: i64 = 24 * 60 * 60;
 const MARKET_ACTIVE_MISSING_GRACE_SECS: i64 = 5 * 60;
+const CLEANUP_ACTIVE_SUBDOMAIN_CHUNK_SIZE: usize = 500;
 const AUTH_CODE_DIGITS: usize = 6;
 const AUTH_PURPOSE_LOGIN: &str = "login";
 const MARKET_DEFAULT_SCOPES: &[&str] = &[
@@ -2234,11 +2235,52 @@ impl AppStore {
             (Utc::now() - Duration::seconds(MARKET_ACTIVE_MISSING_GRACE_SECS)).to_rfc3339();
         let market_release_cutoff =
             (Utc::now() - Duration::seconds(MARKET_OFFLINE_GRACE_SECS)).to_rfc3339();
+        let active_subdomains_set = active_subdomains.iter().cloned().collect::<HashSet<_>>();
         let (mut result, stale_subdomains) = {
             let conn = self.conn.lock().await;
             let tx = conn
                 .unchecked_transaction()
                 .map_err(|e| AppError::Internal(format!("begin cleanup tx failed: {e}")))?;
+
+            if !active_subdomains.is_empty() {
+                let now = Utc::now().to_rfc3339();
+                for chunk in active_subdomains.chunks(CLEANUP_ACTIVE_SUBDOMAIN_CHUNK_SIZE) {
+                    let placeholders = repeat_vars(chunk.len());
+                    let mut update_installation_params = Vec::with_capacity(chunk.len() + 1);
+                    update_installation_params.push(now.clone());
+                    update_installation_params.extend(chunk.iter().cloned());
+                    tx.execute(
+                        &format!(
+                            "UPDATE installations
+                             SET last_seen_at = ?
+                             WHERE id IN (
+                                 SELECT DISTINCT installation_id
+                                 FROM shares
+                                 WHERE subdomain IN ({placeholders})
+                             )"
+                        ),
+                        params_from_iter(update_installation_params),
+                    )
+                    .map_err(|e| {
+                        AppError::Internal(format!("touch active route installations failed: {e}"))
+                    })?;
+
+                    let mut update_share_params = Vec::with_capacity(chunk.len() + 1);
+                    update_share_params.push(now.clone());
+                    update_share_params.extend(chunk.iter().cloned());
+                    tx.execute(
+                        &format!(
+                            "UPDATE shares
+                             SET updated_at = ?
+                             WHERE subdomain IN ({placeholders})"
+                        ),
+                        params_from_iter(update_share_params),
+                    )
+                    .map_err(|e| {
+                        AppError::Internal(format!("touch active route shares failed: {e}"))
+                    })?;
+                }
+            }
 
             let stale_subdomains = {
                 let mut stmt = tx
@@ -2410,6 +2452,9 @@ impl AppStore {
 
         let mut removed_routes = 0;
         for subdomain in stale_subdomains {
+            if active_subdomains_set.contains(&subdomain) {
+                continue;
+            }
             proxy.remove_route(&subdomain).await;
             removed_routes += 1;
         }
@@ -5363,6 +5408,12 @@ fn touch_installation_presence(
     )
     .map_err(|e| AppError::Internal(format!("update installation failed: {e}")))?;
     Ok(())
+}
+
+fn repeat_vars(count: usize) -> String {
+    std::iter::repeat_n("?", count)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn should_refresh_installation_geo(installation: &Installation, next_ip: Option<&str>) -> bool {
@@ -10555,7 +10606,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_removes_clients_and_shares_after_one_hour_without_report() {
+    async fn cleanup_keeps_stale_clients_with_active_routes() {
         let (store, config) = setup_store("cleanup-stale-client").await;
         insert_installation(&store, "inst-stale").await;
         insert_installation(&store, "inst-fresh").await;
@@ -10595,8 +10646,8 @@ mod tests {
             .expect("cleanup stale client");
 
         assert_eq!(result.deleted_installations, 0);
-        assert_eq!(result.deleted_shares, 1);
-        assert_eq!(result.removed_routes, 1);
+        assert_eq!(result.deleted_shares, 0);
+        assert_eq!(result.removed_routes, 0);
 
         let conn = store.conn.lock().await;
         let stale_installations: i64 = conn
@@ -10623,6 +10674,64 @@ mod tests {
         drop(conn);
 
         assert_eq!(stale_installations, 1);
+        assert_eq!(stale_shares, 1);
+        assert_eq!(fresh_shares, 1);
+        let active_subdomains = proxy.active_subdomains().await;
+        assert!(active_subdomains.contains(&"stale-sub".to_string()));
+        assert!(active_subdomains.contains(&"fresh-sub".to_string()));
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_stale_clients_without_active_routes() {
+        let (store, config) = setup_store("cleanup-stale-client-no-route").await;
+        insert_installation(&store, "inst-stale").await;
+        insert_installation(&store, "inst-fresh").await;
+        insert_share(&store, "inst-stale", "share-stale", "stale-sub", "active").await;
+        insert_share(&store, "inst-fresh", "share-fresh", "fresh-sub", "active").await;
+        mark_installation_last_seen(&store, "inst-stale", Utc::now() - Duration::hours(2)).await;
+
+        let proxy = ProxyRegistry::default();
+        proxy
+            .set_route(
+                "fresh-sub".into(),
+                "127.0.0.1:5678".into(),
+                None,
+                None,
+                None,
+                None,
+                false,
+                -1,
+            )
+            .await;
+
+        let result = store
+            .cleanup_expired_data(&config, &proxy)
+            .await
+            .expect("cleanup stale client");
+
+        assert_eq!(result.deleted_installations, 0);
+        assert_eq!(result.deleted_shares, 1);
+        assert_eq!(result.removed_routes, 1);
+
+        let conn = store.conn.lock().await;
+        let stale_shares: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM shares WHERE share_id = 'share-stale'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count stale shares");
+        let fresh_shares: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM shares WHERE share_id = 'share-fresh'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count fresh shares");
+        drop(conn);
+
         assert_eq!(stale_shares, 0);
         assert_eq!(fresh_shares, 1);
         let active_subdomains = proxy.active_subdomains().await;
