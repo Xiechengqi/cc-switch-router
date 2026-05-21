@@ -1243,6 +1243,8 @@ pub struct ShareView {
     pub recent_requests: Vec<ShareRequestLogEntry>,
     pub health_checks: Vec<HealthCheckEntry>,
     #[serde(default)]
+    pub recent_model_health_checks: Vec<ShareModelHealthCheckEntry>,
+    #[serde(default)]
     pub model_health: ShareModelHealthSummary,
 }
 

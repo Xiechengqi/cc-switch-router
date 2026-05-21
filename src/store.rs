@@ -45,6 +45,7 @@ use crate::models::{
 use crate::proxy::ProxyRegistry;
 
 const SHARE_REQUEST_LOG_RECOVERY_LIMIT: usize = 10;
+const SHARE_MODEL_HEALTH_CHECK_LIMIT: usize = 10;
 const SHARE_REQUEST_LOG_RECOVERY_STALE_SECS: i64 = 10 * 60;
 const SHARE_REQUEST_LOG_RECOVERY_COOLDOWN_SECS: i64 = 5 * 60;
 const ROUTE_REGISTRATION_PENDING_GRACE_SECS: u64 = 30;
@@ -1751,6 +1752,7 @@ impl AppStore {
             health_by_share,
             online_by_share,
             recent_logs,
+            recent_model_health_checks,
             market_logs,
             model_health_by_share,
         ) = {
@@ -1762,6 +1764,7 @@ impl AppStore {
                 list_health_checks(&conn, 10)?,
                 list_online_minutes_24h(&conn)?,
                 list_recent_share_request_logs(&conn, SHARE_REQUEST_LOG_RECOVERY_LIMIT)?,
+                list_recent_share_model_health_checks(&conn, SHARE_MODEL_HEALTH_CHECK_LIMIT)?,
                 list_recent_market_request_logs(&conn, 200)?,
                 list_model_health_summaries(&conn)?,
             )
@@ -1799,6 +1802,13 @@ impl AppStore {
         let logs_by_share = self
             .recover_missing_share_request_logs(config, &active_subdomains, &shares, logs_by_share)
             .await?;
+        let model_health_checks_by_share = recent_model_health_checks.into_iter().fold(
+            HashMap::<String, Vec<ShareModelHealthCheckEntry>>::new(),
+            |mut acc, check| {
+                acc.entry(check.share_id.clone()).or_default().push(check);
+                acc
+            },
+        );
 
         let mut active_share_subdomains_by_installation: HashMap<String, HashSet<String>> =
             HashMap::new();
@@ -1897,6 +1907,10 @@ impl AppStore {
                     .get(&share.share_id)
                     .cloned()
                     .unwrap_or_default();
+                let recent_model_health_checks = model_health_checks_by_share
+                    .get(&share.share_id)
+                    .cloned()
+                    .unwrap_or_default();
                 let is_online =
                     share.share_status == "active" && active_subdomains.contains(&share.subdomain);
                 let online_minutes_24h = online_by_share.get(&share.share_id).copied().unwrap_or(0);
@@ -1986,6 +2000,7 @@ impl AppStore {
                     online_rate_24h,
                     recent_requests,
                     health_checks,
+                    recent_model_health_checks,
                     model_health,
                 }
             })
@@ -6282,6 +6297,52 @@ fn list_recent_share_request_logs(
     Ok(deduplicate_recent_share_request_logs(logs))
 }
 
+fn list_recent_share_model_health_checks(
+    conn: &Connection,
+    per_share_limit: usize,
+) -> Result<Vec<ShareModelHealthCheckEntry>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT request_id, share_id, subdomain, app_type, requested_model, actual_model,
+                    status, status_code, latency_ms, first_token_ms, error_message, checked_at, source
+             FROM (
+                 SELECT request_id, share_id, subdomain, app_type, requested_model, actual_model,
+                        status, status_code, latency_ms, first_token_ms, error_message, checked_at, source,
+                        ROW_NUMBER() OVER (PARTITION BY share_id ORDER BY checked_at DESC, request_id DESC) AS row_num
+                 FROM share_model_health_checks
+             )
+             WHERE row_num <= ?1
+             ORDER BY checked_at DESC, request_id DESC",
+        )
+        .map_err(|e| AppError::Internal(format!("prepare recent model health checks failed: {e}")))?;
+    let rows = stmt
+        .query_map(params![per_share_limit as i64], |row| {
+            Ok(ShareModelHealthCheckEntry {
+                request_id: row.get(0)?,
+                share_id: row.get(1)?,
+                subdomain: row.get(2)?,
+                app_type: row.get(3)?,
+                requested_model: row.get(4)?,
+                actual_model: row.get(5)?,
+                status: row.get(6)?,
+                status_code: row.get::<_, Option<i64>>(7)?.map(|v| v as u16),
+                latency_ms: row.get::<_, i64>(8)? as u64,
+                first_token_ms: row.get::<_, Option<i64>>(9)?.map(|v| v as u64),
+                error_message: row.get(10)?,
+                checked_at: row.get(11)?,
+                source: row.get(12)?,
+            })
+        })
+        .map_err(|e| AppError::Internal(format!("query recent model health checks failed: {e}")))?;
+    let mut checks = Vec::new();
+    for row in rows {
+        checks.push(
+            row.map_err(|e| AppError::Internal(format!("read model health check failed: {e}")))?,
+        );
+    }
+    Ok(checks)
+}
+
 fn list_recent_market_request_logs(
     conn: &Connection,
     limit: usize,
@@ -8385,6 +8446,23 @@ mod tests {
             params![share_id, checked_at, if is_healthy { 1 } else { 0 }],
         )
         .expect("insert health check");
+    }
+
+    async fn insert_model_health_check(
+        store: &AppStore,
+        share_id: &str,
+        checked_at: i64,
+        status: &str,
+    ) {
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "INSERT INTO share_model_health_checks (
+                request_id, share_id, subdomain, app_type, requested_model, actual_model,
+                status, status_code, latency_ms, first_token_ms, error_message, checked_at, source
+             ) VALUES (?1, ?2, 'share-sub', 'codex', 'codex', 'gpt-5.5', ?3, 200, 100, NULL, NULL, ?4, 'test')",
+            params![format!("health-{share_id}-{checked_at}"), share_id, status, checked_at],
+        )
+        .expect("insert model health check");
     }
 
     fn test_share_descriptor(share_id: &str, subdomain: &str) -> ShareDescriptor {
@@ -10604,6 +10682,36 @@ mod tests {
         drop(conn);
 
         assert_eq!(online.get("share-1"), Some(&2));
+    }
+
+    #[tokio::test]
+    async fn dashboard_snapshot_includes_recent_model_health_checks() {
+        let (store, config) = setup_store("recent-model-health-checks").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-1", "share-sub", "active").await;
+
+        let now = Utc::now().timestamp();
+        for offset in 0..12 {
+            let status = if offset % 2 == 0 { "success" } else { "failed" };
+            insert_model_health_check(&store, "share-1", now - offset, status).await;
+        }
+
+        let server_geo = ServerGeo {
+            lat: None,
+            lon: None,
+        };
+        let proxy = ProxyRegistry::default();
+        let snapshot = store
+            .dashboard_snapshot(&config, &server_geo, &proxy, None)
+            .await
+            .expect("dashboard snapshot");
+        let share = snapshot.clients[0].share.as_ref().expect("share view");
+
+        assert_eq!(share.recent_model_health_checks.len(), 10);
+        assert_eq!(share.recent_model_health_checks[0].checked_at, now);
+        assert_eq!(share.recent_model_health_checks[9].checked_at, now - 9);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 
     /// Regression test for the rate-limit bypass Codex flagged: a guest can

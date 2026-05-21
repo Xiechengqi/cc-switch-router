@@ -92,6 +92,7 @@ export type ShareView = {
   onlineRate24h: number;
   recentRequests?: ShareRequestLog[];
   healthChecks?: HealthCheckEntry[];
+  recentModelHealthChecks?: ShareModelHealthCheck[];
   support?: ShareSupport;
   appRuntimes?: ShareAppRuntimes;
   modelHealth?: ShareModelHealthSummary;
@@ -222,6 +223,22 @@ export type ShareRequestLog = {
   isStreaming?: boolean;
   isHealthCheck?: boolean;
   createdAt: number;
+};
+
+export type ShareModelHealthCheck = {
+  requestId: string;
+  shareId: string;
+  subdomain: string;
+  appType: string;
+  requestedModel: string;
+  actualModel: string;
+  status: string;
+  statusCode?: number;
+  latencyMs: number;
+  firstTokenMs?: number;
+  errorMessage?: string;
+  checkedAt: number;
+  source: string;
 };
 
 export type DashboardTickerShare = {

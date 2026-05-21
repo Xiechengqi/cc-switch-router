@@ -7,7 +7,7 @@ import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getMarketLinkedShares, updateMarketDisabledShares, updateMarketMaintenance, updateShareSettings } from "@/lib/api";
 import type { AppLocale } from "@/lib/i18n";
-import type { DashboardClient, DashboardMarket, HealthCheckEntry, MarketRequestLog, MarketShare, ShareAppRuntimes, ShareRequestLog, ShareSettingsPatch, ShareUpstreamProvider, ShareView } from "@/lib/types";
+import type { DashboardClient, DashboardMarket, HealthCheckEntry, MarketRequestLog, MarketShare, ShareAppRuntimes, ShareModelHealthCheck, ShareRequestLog, ShareSettingsPatch, ShareUpstreamProvider, ShareView } from "@/lib/types";
 import { compactTokens, formatDateTime, formatNumber, formatRelativeTime } from "@/lib/utils";
 
 function compareDesc(left: number, right: number) {
@@ -1071,6 +1071,7 @@ export function ClientsTable({ clients, markets, onChanged }: { clients: Dashboa
                   <div className="grid gap-5">
                     <DrawerSection label={t("dashboard.markets")}><ShareMarkets share={selected.share} t={t} /></DrawerSection>
                     <DrawerSection label={t("dashboard.requestLogs")}><ShareRequestLogs logs={selected.share?.recentRequests || []} /></DrawerSection>
+                    <DrawerSection label={t("dashboard.modelHealthChecks")}><ShareModelHealthChecks checks={selected.share?.recentModelHealthChecks || []} /></DrawerSection>
                   </div>
                 ) : null}
               </Drawer.Body>
@@ -1537,6 +1538,41 @@ function ShareRequestLogs({ logs }: { logs: ShareRequestLog[] }) {
           </Card.Content>
         </Card>
       ))}
+    </div>
+  );
+}
+
+function ShareModelHealthChecks({ checks }: { checks: ShareModelHealthCheck[] }) {
+  const { t } = useLocaleText();
+  if (!checks.length) return <EmptyBlock>{t("dashboard.noModelHealthChecks")}</EmptyBlock>;
+  return (
+    <div className="grid gap-2">
+      {checks.slice(0, 10).map((check) => {
+        const success = check.status === "success";
+        const model = check.actualModel || check.requestedModel || "-";
+        return (
+          <Card key={check.requestId} className="rounded-lg border p-0 shadow-none">
+            <Card.Content className="gap-3 p-3">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="truncate font-medium">{check.appType} · {model}</div>
+                  <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                    <span title={formatDateTime(check.checkedAt * 1000)}>{formatRelativeTime(check.checkedAt * 1000)}</span>
+                    <span>{check.source || "-"}</span>
+                    {check.requestedModel && check.requestedModel !== model ? <span>{check.requestedModel}</span> : null}
+                  </div>
+                </div>
+                <div className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground">
+                  <Chip color={success ? "success" : "danger"} size="sm" variant="soft">{success ? t("dashboard.success") : t("dashboard.failed")}</Chip>
+                  {typeof check.statusCode === "number" ? <Chip color={check.statusCode >= 200 && check.statusCode < 400 ? "success" : "danger"} size="sm" variant="soft">{check.statusCode}</Chip> : null}
+                  <span>{check.latencyMs}ms</span>
+                </div>
+              </div>
+              {check.errorMessage ? <div className="truncate rounded-md bg-danger-50 px-2 py-1.5 text-xs text-danger-700" title={check.errorMessage}>{check.errorMessage}</div> : null}
+            </Card.Content>
+          </Card>
+        );
+      })}
     </div>
   );
 }
