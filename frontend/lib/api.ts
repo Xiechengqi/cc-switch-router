@@ -114,6 +114,23 @@ export async function startUpgrade() {
   return parseJson<{ taskId: string }>(await authFetch("/v1/admin/upgrade", { method: "POST" }));
 }
 
+export async function downloadRouterLog() {
+  const response = await authFetch("/v1/admin/logs/router/download", { cache: "no-store" });
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data?.message || `HTTP ${response.status}`);
+  }
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = "cc-switch-router.log";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+}
+
 export async function testTelegram() {
   return parseJson<{ ok: boolean }>(await authFetch("/v1/admin/telegram/test", { method: "POST" }));
 }

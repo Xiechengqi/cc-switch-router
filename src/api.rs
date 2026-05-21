@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
+use std::io::{Read, Seek, SeekFrom};
 use std::net::SocketAddr;
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
-use axum::http::{HeaderMap, Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::Event;
 use axum::response::{IntoResponse, Response, Sse};
@@ -23,9 +24,9 @@ use crate::admin::{
     },
     upgrade::{UpgradeLogEntry, UpgradeStatus},
     version::{
-        BINARY_INSTALL_PATH, BINARY_ROLLBACK_PATH, SERVICE_UNIT, ServiceManager, VersionResponse,
-        build_info, detect_service_status, ensure_binary_writable, fetch_latest_release_meta,
-        uptime_secs_from,
+        BINARY_INSTALL_PATH, BINARY_ROLLBACK_PATH, SERVICE_LOG_PATH, SERVICE_UNIT, ServiceManager,
+        VersionResponse, build_info, detect_service_status, ensure_binary_writable,
+        fetch_latest_release_meta, uptime_secs_from,
     },
 };
 use crate::client_meta::extract_client_metadata;
@@ -184,6 +185,11 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/admin/upgrade", post(admin_upgrade_start))
         .route("/v1/admin/rollback", post(admin_rollback))
         .route("/v1/admin/upgrade/stream", get(admin_upgrade_stream))
+        .route("/v1/admin/logs/router/tail", get(admin_router_log_tail))
+        .route(
+            "/v1/admin/logs/router/download",
+            get(admin_router_log_download),
+        )
         .route("/v1/admin/telegram/test", post(admin_telegram_test))
         .route("/v1/admin/audit", get(admin_audit_list))
         .route("/_market/proxy/:share_id/*path", any(market_proxy_handler))
@@ -2137,6 +2143,242 @@ fn sse_event_from_entry(entry: &UpgradeLogEntry) -> axum::response::sse::Event {
     axum::response::sse::Event::default()
         .event("log")
         .data(data)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RouterLogTailQuery {
+    /// Fallback bearer for EventSource (no header support). Use HTTPS in
+    /// production; tokens are short-lived (auth_session_ttl_secs).
+    #[serde(default)]
+    access_token: Option<String>,
+}
+
+async fn admin_router_log_tail(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<RouterLogTailQuery>,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, AppError> {
+    require_admin_for_stream(&state, &headers, query.access_token.as_deref()).await?;
+    let stream = async_stream::stream! {
+        let path = SERVICE_LOG_PATH.to_string();
+        let mut offset = 0u64;
+        let mut partial = String::new();
+        let mut missing_reported;
+
+        match read_last_log_lines(&path, 100) {
+            Ok((lines, next_offset)) => {
+                offset = next_offset;
+                missing_reported = false;
+                yield Ok(router_log_event("ready", serde_json::json!({
+                    "path": path,
+                    "tailLines": lines.len(),
+                })));
+                for line in lines {
+                    yield Ok(router_log_line_event(&line, true));
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                missing_reported = true;
+                yield Ok(router_log_event("missing", serde_json::json!({
+                    "path": path,
+                    "message": "log file not found",
+                })));
+            }
+            Err(err) => {
+                missing_reported = true;
+                yield Ok(router_log_event("error", serde_json::json!({
+                    "path": path,
+                    "message": format!("read log failed: {err}"),
+                })));
+            }
+        }
+
+        loop {
+            sleep(Duration::from_secs(1)).await;
+            let metadata = match tokio::fs::metadata(&path).await {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    if !missing_reported {
+                        missing_reported = true;
+                        yield Ok(router_log_event("missing", serde_json::json!({
+                            "path": path,
+                            "message": "log file not found",
+                        })));
+                    }
+                    continue;
+                }
+                Err(err) => {
+                    yield Ok(router_log_event("error", serde_json::json!({
+                        "path": path,
+                        "message": format!("stat log failed: {err}"),
+                    })));
+                    continue;
+                }
+            };
+            missing_reported = false;
+            let len = metadata.len();
+            if len < offset {
+                offset = 0;
+                partial.clear();
+                yield Ok(router_log_event("reset", serde_json::json!({
+                    "path": path,
+                    "message": "log file was truncated; continuing from the beginning",
+                })));
+            }
+            if len == offset {
+                continue;
+            }
+
+            let mut file = match tokio::fs::File::open(&path).await {
+                Ok(file) => file,
+                Err(err) => {
+                    yield Ok(router_log_event("error", serde_json::json!({
+                        "path": path,
+                        "message": format!("open log failed: {err}"),
+                    })));
+                    continue;
+                }
+            };
+            if let Err(err) = tokio::io::AsyncSeekExt::seek(&mut file, SeekFrom::Start(offset)).await {
+                yield Ok(router_log_event("error", serde_json::json!({
+                    "path": path,
+                    "message": format!("seek log failed: {err}"),
+                })));
+                continue;
+            }
+            let mut bytes = Vec::new();
+            if let Err(err) = tokio::io::AsyncReadExt::read_to_end(&mut file, &mut bytes).await {
+                yield Ok(router_log_event("error", serde_json::json!({
+                    "path": path,
+                    "message": format!("read log failed: {err}"),
+                })));
+                continue;
+            }
+            offset = len;
+            if bytes.is_empty() {
+                continue;
+            }
+            partial.push_str(&String::from_utf8_lossy(&bytes));
+            let ended_with_newline = partial.ends_with('\n') || partial.ends_with('\r');
+            let mut lines = partial
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if ended_with_newline {
+                partial.clear();
+            } else {
+                partial = lines.pop().unwrap_or_default();
+            }
+            for line in lines {
+                yield Ok(router_log_line_event(&line, false));
+            }
+        }
+    };
+    Ok(Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)),
+    ))
+}
+
+async fn admin_router_log_download(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    require_admin_session(&state, &headers).await?;
+    let bytes = tokio::fs::read(SERVICE_LOG_PATH)
+        .await
+        .map_err(|err| match err.kind() {
+            std::io::ErrorKind::NotFound => AppError::NotFound("log file not found".into()),
+            _ => AppError::Internal(format!("read log file failed: {err}")),
+        })?;
+    let mut response = Body::from(bytes).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment; filename=\"cc-switch-router.log\""),
+    );
+    Ok(response)
+}
+
+async fn require_admin_for_stream(
+    state: &ServerState,
+    headers: &HeaderMap,
+    access_token: Option<&str>,
+) -> Result<(), AppError> {
+    let session = if let Some(token) = access_token {
+        state
+            .store
+            .resolve_session_by_access_token(token)
+            .await?
+            .ok_or_else(|| AppError::Unauthorized("session not found".into()))?
+    } else {
+        require_admin_session(state, headers).await?
+    };
+    if !state.dynamic.read().await.is_admin(&session.email) {
+        return Err(AppError::Forbidden("admin privilege required".into()));
+    }
+    Ok(())
+}
+
+fn read_last_log_lines(path: &str, max_lines: usize) -> std::io::Result<(Vec<String>, u64)> {
+    const CHUNK_SIZE: usize = 8192;
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if len == 0 || max_lines == 0 {
+        return Ok((Vec::new(), len));
+    }
+
+    let mut pos = len;
+    let mut chunks = Vec::new();
+    let mut newline_count = 0usize;
+    while pos > 0 && newline_count <= max_lines {
+        let read_len = CHUNK_SIZE.min(pos as usize);
+        pos -= read_len as u64;
+        file.seek(SeekFrom::Start(pos))?;
+        let mut chunk = vec![0u8; read_len];
+        file.read_exact(&mut chunk)?;
+        newline_count += chunk.iter().filter(|byte| **byte == b'\n').count();
+        chunks.push(chunk);
+    }
+
+    chunks.reverse();
+    let bytes = chunks.concat();
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines = text.lines().map(str::to_string).collect::<Vec<_>>();
+    if lines.len() > max_lines {
+        lines = lines.split_off(lines.len() - max_lines);
+    }
+    Ok((lines, len))
+}
+
+fn router_log_line_event(line: &str, historical: bool) -> Event {
+    router_log_event(
+        "line",
+        serde_json::json!({
+            "line": clamp_log_line(line),
+            "historical": historical,
+        }),
+    )
+}
+
+fn router_log_event(event: &'static str, payload: serde_json::Value) -> Event {
+    Event::default()
+        .event(event)
+        .data(serde_json::to_string(&payload).unwrap_or_default())
+}
+
+fn clamp_log_line(line: &str) -> String {
+    const MAX_CHARS: usize = 16 * 1024;
+    if line.chars().count() <= MAX_CHARS {
+        return line.to_string();
+    }
+    let mut value = line.chars().take(MAX_CHARS).collect::<String>();
+    value.push_str(" ...[truncated]");
+    value
 }
 
 async fn admin_telegram_test(

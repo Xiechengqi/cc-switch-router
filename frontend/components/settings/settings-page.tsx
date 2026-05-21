@@ -5,12 +5,14 @@ import { Alert, Button, Card, Chip, Input, ListBox, ScrollShadow, Switch, TextAr
 import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import { LogsPanel } from "@/components/settings/logs-panel";
 import { VersionPanel } from "@/components/settings/version-panel";
 import { getSettingsSchema, getSettingsValues, saveSettings, testTelegram, restartService } from "@/lib/api";
 import type { SettingValueEntry, SettingsField, SettingsSchema } from "@/lib/types";
 
 type DirtyValue = string | boolean | null;
 const VERSION_GROUP = "__version";
+const LOGS_GROUP = "__logs";
 
 export function SettingsPage() {
   const { session, loading } = useAuth();
@@ -62,7 +64,7 @@ export function SettingsPage() {
   }
 
   const groups = schema?.groups || [];
-  const fields = activeGroup === VERSION_GROUP ? [] : (schema?.fields || []).filter((field) => field.group === activeGroup);
+  const fields = activeGroup === VERSION_GROUP || activeGroup === LOGS_GROUP ? [] : (schema?.fields || []).filter((field) => field.group === activeGroup);
   const dirtyCount = Object.keys(dirty).length;
 
   return (
@@ -120,6 +122,9 @@ export function SettingsPage() {
                 <ListBox.Item id={VERSION_GROUP} textValue={t("settings.version")} className={`flex items-center justify-between ${activeGroup === VERSION_GROUP ? "bg-primary/10 text-foreground" : ""}`}>
                   <span>{t("settings.version")}</span>
                 </ListBox.Item>
+                <ListBox.Item id={LOGS_GROUP} textValue={t("settings.logs")} className={`flex items-center justify-between ${activeGroup === LOGS_GROUP ? "bg-primary/10 text-foreground" : ""}`}>
+                  <span>{t("settings.logs")}</span>
+                </ListBox.Item>
               </ListBox>
             </ScrollShadow>
           </Card.Content>
@@ -128,6 +133,8 @@ export function SettingsPage() {
         <div className="grid gap-6">
           {activeGroup === VERSION_GROUP ? (
             <VersionPanel isAdmin={true} />
+          ) : activeGroup === LOGS_GROUP ? (
+            <LogsPanel />
           ) : (
             <Card className="rounded-lg">
               <Card.Header>

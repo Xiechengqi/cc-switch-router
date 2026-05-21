@@ -35,6 +35,9 @@ impl RestartStrategy {
 ///   stdout/stderr to `/var/log/cc-switch-router.log`. `setsid` detaches
 ///   from the controlling tty / parent stdio so the new process survives.
 ///
+/// Both strategies truncate the service log immediately before restarting so
+/// web-triggered restart/upgrade actions start with a fresh log file.
+///
 /// Returns the literal shell command (for logging / dry-run tests).
 pub fn schedule_restart(strategy: RestartStrategy) -> Result<String, AppError> {
     let script = render_restart_script(strategy);
@@ -46,11 +49,17 @@ fn render_restart_script(strategy: RestartStrategy) -> String {
     let pid = std::process::id();
     match strategy {
         RestartStrategy::Systemd => format!(
-            "sleep 1 && /bin/systemctl restart {unit}",
-            unit = SERVICE_UNIT
+            "sleep 1; \
+             mkdir -p $(dirname {log}) 2>/dev/null || true; \
+             : > {log} 2>/dev/null || true; \
+             /bin/systemctl restart {unit}",
+            unit = SERVICE_UNIT,
+            log = SERVICE_LOG_PATH,
         ),
         RestartStrategy::Nohup => format!(
             "sleep 1; \
+             mkdir -p $(dirname {log}) 2>/dev/null || true; \
+             : > {log} 2>/dev/null || true; \
              kill -TERM {pid} 2>/dev/null; \
              for i in $(seq 1 60); do \
                  if ! kill -0 {pid} 2>/dev/null; then break; fi; \
@@ -102,6 +111,7 @@ mod tests {
     fn systemd_script_references_unit() {
         let script = render_restart_script(RestartStrategy::Systemd);
         assert!(script.contains("systemctl restart cc-switch-router.service"));
+        assert!(script.contains(": > /var/log/cc-switch-router.log"));
     }
 
     #[test]
@@ -110,5 +120,6 @@ mod tests {
         assert!(script.contains("kill -TERM"));
         assert!(script.contains("/usr/local/bin/cc-switch-router"));
         assert!(script.contains("/var/log/cc-switch-router.log"));
+        assert!(script.contains(": > /var/log/cc-switch-router.log"));
     }
 }
