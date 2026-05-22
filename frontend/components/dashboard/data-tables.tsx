@@ -283,6 +283,22 @@ function runtimeModelSummary(runtime?: ShareUpstreamProvider) {
     .join(" . ");
 }
 
+function modelHealthKey(value?: string) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function runtimeModelKeys(runtime?: ShareUpstreamProvider) {
+  const models = Array.isArray(runtime?.models) ? runtime.models : [];
+  return new Set(models.map((item) => modelHealthKey(item.actualModel)).filter(Boolean));
+}
+
+function relevantModelHealthEntries(share: ShareView, key: keyof ShareAppRuntimes) {
+  const entries = share.modelHealth?.[key] || [];
+  const currentModels = runtimeModelKeys(share.appRuntimes?.[key]);
+  if (currentModels.size === 0) return entries;
+  return entries.filter((entry) => currentModels.has(modelHealthKey(entry.requestedModel)) || currentModels.has(modelHealthKey(entry.actualModel)));
+}
+
 function runtimeEndpointSummary(runtime?: ShareUpstreamProvider) {
   if (!runtime) return "";
   const pieces = [];
@@ -347,7 +363,7 @@ function ForSaleCell({ share, t }: { share?: ShareView; t: TFn }) {
 }
 
 function modelHealthTone(share: ShareView, key: keyof ShareAppRuntimes) {
-  const entries = share.modelHealth?.[key] || [];
+  const entries = relevantModelHealthEntries(share, key);
   const results = entries.flatMap((entry) => (entry.recentResults || []).slice(0, 3));
   if (!results.length) {
     return {
@@ -356,7 +372,11 @@ function modelHealthTone(share: ShareView, key: keyof ShareAppRuntimes) {
     };
   }
   const failures = results.filter((result) => result === "failed").length;
-  if (failures === results.length) {
+  const allModelsFailed = entries.length > 0 && entries.every((entry) => {
+    const recent = (entry.recentResults || []).slice(0, 3);
+    return recent.length >= 3 && recent.every((result) => result === "failed");
+  });
+  if (allModelsFailed) {
     return {
       className: "border-red-200 bg-red-50 text-red-700",
       label: "failed",
@@ -375,7 +395,7 @@ function modelHealthTone(share: ShareView, key: keyof ShareAppRuntimes) {
 }
 
 function modelHealthTitle(share: ShareView, key: keyof ShareAppRuntimes) {
-  const entries = share.modelHealth?.[key] || [];
+  const entries = relevantModelHealthEntries(share, key);
   if (!entries.length) return "No failures recorded yet";
   return entries
     .map((entry) => {

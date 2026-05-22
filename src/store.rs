@@ -40,7 +40,8 @@ use crate::models::{
     ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRequestLogFetchResponse,
     ShareRuntimeRefreshPayload, ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse,
     ShareSettingsPatch, ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest,
-    ShareUpstreamProvider, ShareView, TunnelLease, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    ShareUpstreamModel, ShareUpstreamProvider, ShareView, TunnelLease, VerifyEmailCodeRequest,
+    VerifyEmailCodeResponse,
 };
 use crate::proxy::ProxyRegistry;
 
@@ -6007,6 +6008,7 @@ fn record_runtime_model_health_snapshot_conn(
         .map_err(|e| AppError::Internal(format!("read share subdomain for health failed: {e}")))?
         .unwrap_or_default();
 
+    let mut current_models_by_app = HashMap::<String, HashSet<String>>::new();
     for summary in snapshot
         .model_health
         .claude
@@ -6020,6 +6022,10 @@ fn record_runtime_model_health_snapshot_conn(
         } else {
             summary.requested_model.clone()
         };
+        current_models_by_app
+            .entry(summary.app_type.clone())
+            .or_default()
+            .insert(model_health_key(&requested_model));
         let actual_model = if summary.actual_model.trim().is_empty() {
             requested_model.clone()
         } else {
@@ -6056,16 +6062,42 @@ fn record_runtime_model_health_snapshot_conn(
             conn.execute(
                 "UPDATE share_model_health_state
                  SET recent_results_json = ?4
-                 WHERE share_id = ?1 AND app_type = ?2 AND requested_model = ?3",
+                 WHERE share_id = ?1
+                   AND app_type = ?2
+                   AND requested_model = ?3
+                   AND last_checked_at <= ?5",
                 params![
                     snapshot.share_id,
                     summary.app_type,
                     check.requested_model,
                     recent_json,
+                    checked_at,
                 ],
             )
             .map_err(|e| AppError::Internal(format!("update model health results failed: {e}")))?;
         }
+    }
+    for (app_type, current_models) in current_models_by_app {
+        if current_models.is_empty() {
+            continue;
+        }
+        let placeholders = repeat_vars(current_models.len());
+        let mut values = Vec::<String>::with_capacity(current_models.len() + 3);
+        values.push(snapshot.share_id.clone());
+        values.push(app_type);
+        values.push(snapshot.queried_at.to_string());
+        values.extend(current_models.into_iter());
+        conn.execute(
+            &format!(
+                "DELETE FROM share_model_health_state
+                 WHERE share_id = ?
+                   AND app_type = ?
+                   AND last_checked_at <= CAST(? AS INTEGER)
+                   AND lower(trim(requested_model)) NOT IN ({placeholders})",
+            ),
+            params_from_iter(values),
+        )
+        .map_err(|e| AppError::Internal(format!("delete stale model health state failed: {e}")))?;
     }
     Ok(())
 }
@@ -6123,14 +6155,24 @@ fn record_share_model_health_check_conn(
             CASE WHEN ?5 = 'failed' THEN ?6 ELSE NULL END,
             ?6, ?7, ?8, ?6)
          ON CONFLICT(share_id, app_type, requested_model) DO UPDATE SET
-            actual_model = excluded.actual_model,
-            last_status = excluded.last_status,
-            last_success_at = CASE WHEN excluded.last_status = 'success' THEN excluded.last_checked_at ELSE share_model_health_state.last_success_at END,
-            last_failed_at = CASE WHEN excluded.last_status = 'failed' THEN excluded.last_checked_at ELSE share_model_health_state.last_failed_at END,
-            last_checked_at = excluded.last_checked_at,
-            recent_results_json = excluded.recent_results_json,
-            error_message = excluded.error_message,
-            updated_at = excluded.updated_at",
+            actual_model = CASE WHEN excluded.last_checked_at >= share_model_health_state.last_checked_at THEN excluded.actual_model ELSE share_model_health_state.actual_model END,
+            last_status = CASE WHEN excluded.last_checked_at >= share_model_health_state.last_checked_at THEN excluded.last_status ELSE share_model_health_state.last_status END,
+            last_success_at = CASE
+                WHEN excluded.last_status = 'success'
+                 AND (share_model_health_state.last_success_at IS NULL OR excluded.last_checked_at > share_model_health_state.last_success_at)
+                THEN excluded.last_checked_at
+                ELSE share_model_health_state.last_success_at
+            END,
+            last_failed_at = CASE
+                WHEN excluded.last_status = 'failed'
+                 AND (share_model_health_state.last_failed_at IS NULL OR excluded.last_checked_at > share_model_health_state.last_failed_at)
+                THEN excluded.last_checked_at
+                ELSE share_model_health_state.last_failed_at
+            END,
+            last_checked_at = max(share_model_health_state.last_checked_at, excluded.last_checked_at),
+            recent_results_json = CASE WHEN excluded.last_checked_at >= share_model_health_state.last_checked_at THEN excluded.recent_results_json ELSE share_model_health_state.recent_results_json END,
+            error_message = CASE WHEN excluded.last_checked_at >= share_model_health_state.last_checked_at THEN excluded.error_message ELSE share_model_health_state.error_message END,
+            updated_at = max(share_model_health_state.updated_at, excluded.updated_at)",
         params![
             check.share_id,
             check.app_type,
@@ -6251,20 +6293,45 @@ fn filter_provider_models_by_health(
     health: &[ModelHealthSummary],
 ) -> Option<ShareUpstreamProvider> {
     let provider = provider?;
-    let recent_results = health
+    let current_models = provider_model_keys(&provider);
+    let relevant_health = health
         .iter()
-        .flat_map(|entry| entry.recent_results.iter())
-        .take(3)
+        .filter(|entry| {
+            current_models.is_empty()
+                || current_models.contains(&model_health_key(&entry.requested_model))
+                || current_models.contains(&model_health_key(&entry.actual_model))
+        })
         .collect::<Vec<_>>();
-    if recent_results.len() >= 3
-        && recent_results
-            .iter()
-            .all(|result| result.as_str() == "failed")
-    {
+    if relevant_health.is_empty() {
+        return Some(provider);
+    }
+    let all_relevant_models_failed = relevant_health.iter().all(|entry| {
+        let recent_results = entry.recent_results.iter().take(3).collect::<Vec<_>>();
+        recent_results.len() >= 3
+            && recent_results
+                .iter()
+                .all(|result| result.as_str() == "failed")
+    });
+    if all_relevant_models_failed {
         None
     } else {
         Some(provider)
     }
+}
+
+fn model_health_key(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn provider_model_keys(provider: &ShareUpstreamProvider) -> HashSet<String> {
+    provider
+        .models
+        .iter()
+        .filter_map(|model| {
+            let key = model_health_key(&model.actual_model);
+            if key.is_empty() { None } else { Some(key) }
+        })
+        .collect()
 }
 
 fn is_failed_market_model_log(log: &MarketRequestLogEntry) -> bool {
@@ -8514,6 +8581,67 @@ mod tests {
             params![format!("health-{share_id}-{checked_at}"), share_id, status, checked_at],
         )
         .expect("insert model health check");
+    }
+
+    fn test_upstream_provider(model: &str) -> ShareUpstreamProvider {
+        ShareUpstreamProvider {
+            kind: "test".into(),
+            app: "codex".into(),
+            provider_name: Some("test".into()),
+            for_sale_official_price_percent: None,
+            account_email: None,
+            api_url: None,
+            quota: None,
+            models: vec![ShareUpstreamModel {
+                slot: "default".into(),
+                actual_model: model.into(),
+            }],
+        }
+    }
+
+    fn test_model_summary(model: &str, recent_results: &[&str]) -> ModelHealthSummary {
+        ModelHealthSummary {
+            app_type: "codex".into(),
+            requested_model: model.into(),
+            actual_model: model.into(),
+            status: recent_results.first().copied().unwrap_or("success").into(),
+            recent_results: recent_results
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+            last_checked_at: Some(Utc::now().timestamp()),
+            last_success_at: None,
+            last_failed_at: None,
+            error_message: None,
+            status_code: None,
+            latency_ms: 0,
+            source: None,
+            provider_id: None,
+            provider_name: None,
+        }
+    }
+
+    fn test_health_check(
+        share_id: &str,
+        model: &str,
+        status: &str,
+        checked_at: i64,
+    ) -> ShareModelHealthCheckEntry {
+        ShareModelHealthCheckEntry {
+            request_id: format!("health-{share_id}-{model}-{checked_at}"),
+            share_id: share_id.into(),
+            subdomain: "share-sub".into(),
+            app_type: "codex".into(),
+            requested_model: model.into(),
+            actual_model: model.into(),
+            status: status.into(),
+            status_code: Some(if status == "success" { 200 } else { 500 }),
+            latency_ms: 100,
+            first_token_ms: None,
+            error_message: None,
+            checked_at,
+            source: "test".into(),
+        }
     }
 
     fn test_share_descriptor(share_id: &str, subdomain: &str) -> ShareDescriptor {
@@ -10819,6 +10947,246 @@ mod tests {
         assert_eq!(share.recent_model_health_checks.len(), 10);
         assert_eq!(share.recent_model_health_checks[0].checked_at, now);
         assert_eq!(share.recent_model_health_checks[9].checked_at, now - 9);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[test]
+    fn market_runtime_filter_ignores_stale_failed_models() {
+        let runtimes = ShareAppRuntimes {
+            codex: Some(test_upstream_provider("gpt-5.5")),
+            ..ShareAppRuntimes::default()
+        };
+        let health = ShareModelHealthSummary {
+            codex: vec![
+                test_model_summary("codex", &["failed", "failed", "failed"]),
+                test_model_summary("gpt-5.5", &["success", "success", "success"]),
+            ],
+            ..ShareModelHealthSummary::default()
+        };
+
+        let filtered = filter_app_runtimes_by_model_health(runtimes, &health);
+
+        assert!(filtered.codex.is_some());
+    }
+
+    #[test]
+    fn market_runtime_filter_removes_current_model_after_three_failures() {
+        let runtimes = ShareAppRuntimes {
+            codex: Some(test_upstream_provider("gpt-5.5")),
+            ..ShareAppRuntimes::default()
+        };
+        let health = ShareModelHealthSummary {
+            codex: vec![test_model_summary(
+                "gpt-5.5",
+                &["failed", "failed", "failed"],
+            )],
+            ..ShareModelHealthSummary::default()
+        };
+
+        let filtered = filter_app_runtimes_by_model_health(runtimes, &health);
+
+        assert!(filtered.codex.is_none());
+    }
+
+    #[test]
+    fn market_runtime_filter_keeps_app_when_any_current_model_is_healthy() {
+        let mut provider = test_upstream_provider("gpt-5.5");
+        provider.models.push(ShareUpstreamModel {
+            slot: "backup".into(),
+            actual_model: "gpt-5.4".into(),
+        });
+        let runtimes = ShareAppRuntimes {
+            codex: Some(provider),
+            ..ShareAppRuntimes::default()
+        };
+        let health = ShareModelHealthSummary {
+            codex: vec![
+                test_model_summary("gpt-5.5", &["failed", "failed", "failed"]),
+                test_model_summary("gpt-5.4", &["success", "success", "success"]),
+            ],
+            ..ShareModelHealthSummary::default()
+        };
+
+        let filtered = filter_app_runtimes_by_model_health(runtimes, &health);
+
+        assert!(filtered.codex.is_some());
+    }
+
+    #[test]
+    fn market_runtime_filter_keeps_provider_without_model_keys() {
+        let mut provider = test_upstream_provider("");
+        provider.models.clear();
+        let runtimes = ShareAppRuntimes {
+            codex: Some(provider),
+            ..ShareAppRuntimes::default()
+        };
+        let health = ShareModelHealthSummary::default();
+
+        let filtered = filter_app_runtimes_by_model_health(runtimes, &health);
+
+        assert!(filtered.codex.is_some());
+    }
+
+    #[tokio::test]
+    async fn runtime_snapshot_removes_stale_model_health_state() {
+        let (store, config) = setup_store("runtime-removes-stale-model-health").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-1", "share-sub", "active").await;
+        let now = Utc::now().timestamp();
+        store
+            .record_share_model_health_check(test_health_check(
+                "share-1",
+                "codex",
+                "failed",
+                now - 60,
+            ))
+            .await
+            .expect("record stale check");
+
+        store
+            .record_share_runtime_snapshot(ShareRuntimeSnapshotResponse {
+                share_id: "share-1".into(),
+                queried_at: now,
+                support: ShareSupport {
+                    claude: false,
+                    codex: true,
+                    gemini: false,
+                },
+                app_runtimes: ShareAppRuntimes {
+                    codex: Some(test_upstream_provider("gpt-5.5")),
+                    ..ShareAppRuntimes::default()
+                },
+                model_health: ShareModelHealthSummary {
+                    codex: vec![test_model_summary("gpt-5.5", &["success"])],
+                    ..ShareModelHealthSummary::default()
+                },
+            })
+            .await
+            .expect("record runtime snapshot");
+
+        let conn = store.conn.lock().await;
+        let stale_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM share_model_health_state WHERE share_id = 'share-1' AND requested_model = 'codex'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count stale state");
+        let current_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM share_model_health_state WHERE share_id = 'share-1' AND requested_model = 'gpt-5.5'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count current state");
+        drop(conn);
+
+        assert_eq!(stale_count, 0);
+        assert_eq!(current_count, 1);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn older_runtime_snapshot_does_not_delete_newer_model_health_state() {
+        let (store, config) = setup_store("runtime-stale-snapshot-keeps-newer-health").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-1", "share-sub", "active").await;
+        let now = Utc::now().timestamp();
+        let mut current_summary = test_model_summary("gpt-5.5", &["success"]);
+        current_summary.last_checked_at = Some(now);
+        store
+            .record_share_runtime_snapshot(ShareRuntimeSnapshotResponse {
+                share_id: "share-1".into(),
+                queried_at: now,
+                support: ShareSupport {
+                    claude: false,
+                    codex: true,
+                    gemini: false,
+                },
+                app_runtimes: ShareAppRuntimes {
+                    codex: Some(test_upstream_provider("gpt-5.5")),
+                    ..ShareAppRuntimes::default()
+                },
+                model_health: ShareModelHealthSummary {
+                    codex: vec![current_summary],
+                    ..ShareModelHealthSummary::default()
+                },
+            })
+            .await
+            .expect("record newer runtime snapshot");
+
+        let mut stale_summary = test_model_summary("codex", &["failed"]);
+        stale_summary.last_checked_at = Some(now - 60);
+        store
+            .record_share_runtime_snapshot(ShareRuntimeSnapshotResponse {
+                share_id: "share-1".into(),
+                queried_at: now - 60,
+                support: ShareSupport {
+                    claude: false,
+                    codex: true,
+                    gemini: false,
+                },
+                app_runtimes: ShareAppRuntimes {
+                    codex: Some(test_upstream_provider("codex")),
+                    ..ShareAppRuntimes::default()
+                },
+                model_health: ShareModelHealthSummary {
+                    codex: vec![stale_summary],
+                    ..ShareModelHealthSummary::default()
+                },
+            })
+            .await
+            .expect("record older runtime snapshot");
+
+        let conn = store.conn.lock().await;
+        let current_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM share_model_health_state WHERE share_id = 'share-1' AND requested_model = 'gpt-5.5'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count current state");
+        drop(conn);
+
+        assert_eq!(current_count, 1);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn older_model_health_check_does_not_roll_back_state() {
+        let (store, config) = setup_store("model-health-no-rollback").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-1", "share-sub", "active").await;
+        let now = Utc::now().timestamp();
+        store
+            .record_share_model_health_check(test_health_check("share-1", "gpt-5.5", "failed", now))
+            .await
+            .expect("record newer failed check");
+        store
+            .record_share_model_health_check(test_health_check(
+                "share-1",
+                "gpt-5.5",
+                "success",
+                now - 60,
+            ))
+            .await
+            .expect("record older success check");
+
+        let conn = store.conn.lock().await;
+        let (last_status, last_checked_at): (String, i64) = conn
+            .query_row(
+                "SELECT last_status, last_checked_at FROM share_model_health_state WHERE share_id = 'share-1' AND requested_model = 'gpt-5.5'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read model health state");
+        drop(conn);
+
+        assert_eq!(last_status, "failed");
+        assert_eq!(last_checked_at, now);
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
