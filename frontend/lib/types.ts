@@ -312,6 +312,7 @@ export type ModelHealthSummary = {
   lastSuccessAt?: number;
   lastFailedAt?: number;
   errorMessage?: string;
+  statusCode?: number;
 };
 
 export type ShareModelHealthSummary = {

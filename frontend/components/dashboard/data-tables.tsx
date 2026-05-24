@@ -7,7 +7,7 @@ import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getMarketLinkedShares, updateMarketDisabledShares, updateMarketMaintenance, updateShareSettings } from "@/lib/api";
 import type { AppLocale } from "@/lib/i18n";
-import type { DashboardClient, DashboardMarket, HealthCheckEntry, MarketRequestLog, MarketShare, ShareAppRuntimes, ShareModelHealthCheck, ShareRequestLog, ShareSettingsPatch, ShareUpstreamProvider, ShareView } from "@/lib/types";
+import type { DashboardClient, DashboardMarket, HealthCheckEntry, MarketRequestLog, MarketShare, ModelHealthSummary, ShareAppRuntimes, ShareModelHealthCheck, ShareRequestLog, ShareSettingsPatch, ShareUpstreamProvider, ShareView } from "@/lib/types";
 import { compactTokens, formatDateTime, formatNumber, formatRelativeTime } from "@/lib/utils";
 
 function compareDesc(left: number, right: number) {
@@ -299,6 +299,22 @@ function relevantModelHealthEntries(share: ShareView, key: keyof ShareAppRuntime
   return entries.filter((entry) => currentModels.has(modelHealthKey(entry.requestedModel)) || currentModels.has(modelHealthKey(entry.actualModel)));
 }
 
+function modelHealthFailureReason(entries: ModelHealthSummary[]) {
+  const failed = entries
+    .filter((entry) => entry.status === "failed" || (entry.recentResults || []).includes("failed"))
+    .sort((left, right) => Number(right.lastCheckedAt || 0) - Number(left.lastCheckedAt || 0))[0];
+  const code = Number(failed?.statusCode || 0);
+  const message = String(failed?.errorMessage || "").toLowerCase();
+  if (code === 429 || message.includes("429") || message.includes("rate limit") || message.includes("rate limited") || message.includes("usage limit")) return "Rate Limited";
+  if (code === 401 || message.includes("auth rejected (401)") || message.includes("token_invalidated") || message.includes("token invalidated") || message.includes("invalidated")) return "Banned";
+  if (code === 403 || message.includes("403") || message.includes("forbidden")) return "Forbidden";
+  if (code === 402 || message.includes("insufficient") || message.includes("quota")) return "No Credits";
+  if (message.includes("timeout") || message.includes("timed out")) return "Timeout";
+  if (message.includes("oauth") || message.includes("refresh token")) return "Auth Failed";
+  if (code >= 500 || message.includes("server error")) return "Provider Error";
+  return "Failed";
+}
+
 function runtimeEndpointSummary(runtime?: ShareUpstreamProvider) {
   if (!runtime) return "";
   const pieces = [];
@@ -379,7 +395,7 @@ function modelHealthTone(share: ShareView, key: keyof ShareAppRuntimes) {
   if (allModelsFailed) {
     return {
       className: "border-red-200 bg-red-50 text-red-700",
-      label: "failed",
+      label: modelHealthFailureReason(entries),
     };
   }
   if (failures > 0) {
@@ -425,7 +441,7 @@ function SupportCell({ share, t }: { share?: ShareView; t: TFn }) {
             <span className="grid min-w-0 gap-0.5 text-right">
               <span className="whitespace-normal break-words font-semibold">{enabled ? firstLine || (official ? "Official" : t("dashboard.on")) : ""}</span>
               {enabled && secondLine ? <span className="whitespace-normal break-words text-[10px] font-medium opacity-75">{secondLine}</span> : null}
-              {enabled ? <span className="text-[10px] font-semibold uppercase opacity-70">{tone.label}</span> : null}
+              {enabled ? <span className="text-[10px] font-semibold opacity-70">{tone.label}</span> : null}
             </span>
           </div>
         );
