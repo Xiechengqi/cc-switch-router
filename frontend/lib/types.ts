@@ -415,6 +415,170 @@ export type VersionResponse = {
   };
 };
 
+export type MetricsHealth = "healthy" | "warning" | "critical";
+
+export type MetricEvent = {
+  id?: number | null;
+  timestamp: number;
+  severity: "info" | "warning" | "critical" | string;
+  kind: string;
+  message: string;
+  details?: Record<string, unknown>;
+};
+
+export type DiskUsage = {
+  label: string;
+  mountPoint: string;
+  usedBytes: number;
+  totalBytes: number;
+};
+
+export type HostMetricsInfo = {
+  hostname?: string | null;
+  osName?: string | null;
+  osVersion?: string | null;
+  kernelVersion?: string | null;
+  arch: string;
+  cpuBrand?: string | null;
+  cpuCores: number;
+  memoryTotalBytes?: number | null;
+  disks: Array<{ name: string; mountPoint: string; totalBytes: number }>;
+};
+
+export type HostMetricsStatus = {
+  timestamp: number;
+  uptimeSecs?: number | null;
+  cpuPercent?: number | null;
+  load1?: number | null;
+  load5?: number | null;
+  load15?: number | null;
+  memoryUsedBytes?: number | null;
+  memoryTotalBytes?: number | null;
+  memoryAvailableBytes?: number | null;
+  swapUsedBytes?: number | null;
+  swapTotalBytes?: number | null;
+  disks: DiskUsage[];
+  network: {
+    rxBytesPerSec?: number | null;
+    txBytesPerSec?: number | null;
+    tcpEstablished?: number | null;
+    tcpTimeWait?: number | null;
+  };
+  process: {
+    openFds?: number | null;
+    maxFds?: number | null;
+    fdUsagePercent?: number | null;
+    threads?: number | null;
+    rssBytes?: number | null;
+    cpuPercent?: number | null;
+    uptimeSecs?: number | null;
+  };
+};
+
+export type RouterMetricsStatus = {
+  activeRoutes: number;
+  pendingRoutes: number;
+  healthProbeFailureCache: number;
+  sshActiveSessions: number;
+  sshForwardListeners: number;
+  sshForwardListenerCreatedTotal: number;
+  sshForwardListenerShutdownTotal: number;
+  sshForwardBindErrorsTotal: number;
+  sshForwardAcceptErrorsTotal: number;
+  sshForwardEmfileErrorsTotal: number;
+  proxyInflight: number;
+  proxyRequestsTotal: number;
+  proxyUpstreamErrorsTotal: number;
+  proxy5xxTotal: number;
+  healthProbeFailuresTotal: number;
+  healthProbeCachedFailuresTotal: number;
+  dbErrorsTotal: number;
+};
+
+export type LlmMetricsSnapshot = {
+  rpm: number;
+  tpm: number;
+  inputTpm: number;
+  outputTpm: number;
+  inflight: number;
+  errorRate: number;
+  rateLimitPerMinute: number;
+  p95LatencyMs?: number | null;
+  p95TtftMs?: number | null;
+  activeModels: number;
+  activeShares: number;
+  failoverSuccessRate?: number | null;
+};
+
+export type MetricsSnapshot = {
+  status: MetricsHealth;
+  sampledAt: number;
+  host: HostMetricsStatus;
+  router: RouterMetricsStatus;
+  llm: LlmMetricsSnapshot;
+  alerts: MetricEvent[];
+};
+
+export type HostMetricsPoint = {
+  timestamp: number;
+  cpuPercent?: number | null;
+  memoryUsagePercent?: number | null;
+  diskUsagePercent?: number | null;
+  fdUsagePercent?: number | null;
+  rxBytesPerSec?: number | null;
+  txBytesPerSec?: number | null;
+  processRssBytes?: number | null;
+};
+
+export type RouterMetricsPoint = {
+  timestamp: number;
+  activeRoutes: number;
+  forwardListeners: number;
+  proxyInflight: number;
+  proxyUpstreamErrorsTotal: number;
+  healthProbeFailuresTotal: number;
+  dbErrorsTotal: number;
+};
+
+export type LlmMetricsPoint = {
+  timestamp: number;
+  rpm: number;
+  tpm: number;
+  inputTpm: number;
+  outputTpm: number;
+  errorRate: number;
+  rateLimited: number;
+  p95LatencyMs?: number | null;
+  p95TtftMs?: number | null;
+};
+
+export type MetricsSeriesResponse = {
+  range: string;
+  step: string;
+  host: HostMetricsPoint[];
+  router: RouterMetricsPoint[];
+  llm: LlmMetricsPoint[];
+};
+
+export type LlmTopResponse = {
+  range: string;
+  by: string;
+  items: Array<{
+    key: string;
+    requests: number;
+    totalTokens: number;
+    errors: number;
+    errorRate: number;
+    p95LatencyMs?: number | null;
+    lastRequestAt?: number | null;
+  }>;
+};
+
+export type ClearMetricsResponse = {
+  ok: boolean;
+  deletedRows: Record<string, number>;
+};
+
 export type BoardMessage = {
   id: string;
   body: string;

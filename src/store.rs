@@ -8415,6 +8415,15 @@ mod tests {
             board_user_per_hour: 30,
             board_pin_limit: 3,
             board_guest_self_delete_secs: 300,
+            metrics: crate::config::MetricsConfig {
+                enabled: true,
+                db_path: std::env::temp_dir().join(format!(
+                    "cc-switch-router-{name}-{}-metrics.db",
+                    Uuid::new_v4()
+                )),
+                retention_days: 7,
+                sample_interval_secs: 5,
+            },
         }
     }
 

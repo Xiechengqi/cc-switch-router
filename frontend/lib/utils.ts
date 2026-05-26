@@ -45,3 +45,36 @@ export function compactTokens(value: unknown) {
   if (Math.abs(n) >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
   return String(n);
 }
+
+export function fixed(value: unknown) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n.toFixed(n >= 10 ? 0 : 1) : "-";
+}
+
+export function percent(value: unknown) {
+  const n = Number(value);
+  return Number.isFinite(n) ? `${n.toFixed(n >= 10 ? 0 : 1)}%` : "-";
+}
+
+export function formatBytes(value: unknown) {
+  const n = Number(value || 0);
+  if (!Number.isFinite(n) || n <= 0) return "-";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let v = n;
+  let idx = 0;
+  while (v >= 1024 && idx < units.length - 1) {
+    v /= 1024;
+    idx += 1;
+  }
+  return `${v.toFixed(v >= 10 ? 0 : 1)} ${units[idx]}`;
+}
+
+export function formatUptime(value?: number | null) {
+  if (!value) return "-";
+  const days = Math.floor(value / 86400);
+  const hours = Math.floor((value % 86400) / 3600);
+  const minutes = Math.floor((value % 3600) / 60);
+  if (days) return `${days}d ${hours}h`;
+  if (hours) return `${hours}h ${minutes}m`;
+  return `${minutes}m`;
+}

@@ -5,12 +5,20 @@ import type {
   BoardMeta,
   DashboardResponse,
   MarketShare,
+  ClearMetricsResponse,
   SettingsSchema,
   SettingsUpdateResponse,
   SettingsValuesResponse,
   ShareSettingsPatch,
   ShareEditView,
   VersionResponse,
+  MetricsSnapshot,
+  HostMetricsInfo,
+  HostMetricsStatus,
+  MetricsSeriesResponse,
+  LlmMetricsSnapshot,
+  LlmTopResponse,
+  MetricEvent,
 } from "@/lib/types";
 
 export type { BoardListResponse, BoardMessage, BoardMeta };
@@ -133,6 +141,43 @@ export async function downloadRouterLog() {
 
 export async function testTelegram() {
   return parseJson<{ ok: boolean }>(await authFetch("/v1/admin/telegram/test", { method: "POST" }));
+}
+
+export async function getMetricsSnapshot() {
+  return parseJson<MetricsSnapshot>(await authFetch("/v1/admin/metrics/snapshot", { cache: "no-store" }));
+}
+
+export async function getMetricsHostInfo() {
+  return parseJson<HostMetricsInfo>(await authFetch("/v1/admin/metrics/host/info", { cache: "no-store" }));
+}
+
+export async function getMetricsHostStatus() {
+  return parseJson<HostMetricsStatus>(await authFetch("/v1/admin/metrics/host/status", { cache: "no-store" }));
+}
+
+export async function getMetricsSeries(range: string, step?: string) {
+  const params = new URLSearchParams({ range });
+  if (step) params.set("step", step);
+  return parseJson<MetricsSeriesResponse>(await authFetch(`/v1/admin/metrics/series?${params}`, { cache: "no-store" }));
+}
+
+export async function getLlmMetricsSnapshot(range = "5m") {
+  const params = new URLSearchParams({ range });
+  return parseJson<LlmMetricsSnapshot>(await authFetch(`/v1/admin/metrics/llm/snapshot?${params}`, { cache: "no-store" }));
+}
+
+export async function getLlmMetricsTop(range = "1h", by = "tokens") {
+  const params = new URLSearchParams({ range, by });
+  return parseJson<LlmTopResponse>(await authFetch(`/v1/admin/metrics/llm/top?${params}`, { cache: "no-store" }));
+}
+
+export async function getMetricEvents(limit = 100) {
+  const params = new URLSearchParams({ limit: String(limit) });
+  return parseJson<MetricEvent[]>(await authFetch(`/v1/admin/metrics/events?${params}`, { cache: "no-store" }));
+}
+
+export async function clearMetrics() {
+  return parseJson<ClearMetricsResponse>(await authFetch("/v1/admin/metrics", { method: "DELETE" }));
 }
 
 const BOARD_GUEST_KEY = "cc_switch_router_board_guest_v1";

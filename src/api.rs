@@ -192,6 +192,23 @@ pub fn router(state: ServerState) -> Router {
         )
         .route("/v1/admin/telegram/test", post(admin_telegram_test))
         .route("/v1/admin/audit", get(admin_audit_list))
+        .route("/v1/admin/metrics/snapshot", get(admin_metrics_snapshot))
+        .route("/v1/admin/metrics/host/info", get(admin_metrics_host_info))
+        .route(
+            "/v1/admin/metrics/host/status",
+            get(admin_metrics_host_status),
+        )
+        .route("/v1/admin/metrics/series", get(admin_metrics_series))
+        .route(
+            "/v1/admin/metrics/llm/snapshot",
+            get(admin_metrics_llm_snapshot),
+        )
+        .route("/v1/admin/metrics/llm/series", get(admin_metrics_series))
+        .route("/v1/admin/metrics/llm/top", get(admin_metrics_llm_top))
+        .route("/v1/admin/metrics/llm/errors", get(admin_metrics_events))
+        .route("/v1/admin/metrics/llm/failover", get(admin_metrics_events))
+        .route("/v1/admin/metrics/events", get(admin_metrics_events))
+        .route("/v1/admin/metrics", delete(admin_metrics_clear))
         .route("/_market/proxy/:share_id/*path", any(market_proxy_handler))
         .route("/*path", any(ui_or_proxy_handler))
         .layer(middleware::from_fn_with_state(
@@ -459,10 +476,14 @@ async fn batch_sync_market_request_logs(
     let market = authenticate_market(&state, &headers, "market:request_logs:write").await?;
     let snapshot = state.recent_traffic.snapshot().await;
     enrich_market_request_logs_with_live_country(&mut input.logs, &snapshot);
+    let metric_logs = input.logs.clone();
     let count = state
         .store
         .batch_sync_market_request_logs(&market, input)
         .await?;
+    state
+        .metrics
+        .record_market_request_logs(&market.email, &metric_logs);
     Ok(Json(serde_json::json!({ "ok": true, "synced": count })))
 }
 
@@ -883,6 +904,9 @@ async fn session_me(
     headers: HeaderMap,
     Query(query): Query<SessionStatusQuery>,
 ) -> Result<Json<SessionStatusResponse>, AppError> {
+    if dev_auth_bypass_enabled() && extract_bearer_token(&headers).is_none() {
+        return Ok(Json(dev_session_status()));
+    }
     let mut response = state
         .store
         .session_status(
@@ -1480,6 +1504,7 @@ async fn batch_sync_share_request_logs(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let snapshot = state.recent_traffic.snapshot().await;
     let live_country_map = live_country_by_request_id(&snapshot);
+    let metric_logs = input.logs.clone();
     state
         .store
         .batch_sync_share_request_logs(
@@ -1489,6 +1514,7 @@ async fn batch_sync_share_request_logs(
             live_country_map,
         )
         .await?;
+    state.metrics.record_share_request_logs(&metric_logs);
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -1558,7 +1584,7 @@ async fn extract_session_email(
     headers: &HeaderMap,
 ) -> Result<Option<String>, AppError> {
     let Some(token) = extract_bearer_token(headers) else {
-        return Ok(None);
+        return Ok(dev_auth_bypass_enabled().then(dev_auth_email));
     };
     Ok(state
         .store
@@ -1593,9 +1619,67 @@ async fn resolve_session(
     headers: &HeaderMap,
 ) -> Result<Option<AuthSession>, AppError> {
     let Some(token) = extract_bearer_token(headers) else {
-        return Ok(None);
+        return Ok(dev_auth_bypass_enabled().then(dev_auth_session));
     };
     state.store.resolve_session_by_access_token(token).await
+}
+
+fn dev_auth_email() -> String {
+    std::env::var("CC_SWITCH_ROUTER_DEV_AUTH_EMAIL")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "dev-admin@localhost".into())
+}
+
+fn dev_auth_bypass_enabled() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        match std::env::var("CC_SWITCH_ROUTER_DEV_AUTH_BYPASS")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("0" | "false" | "no" | "off") => false,
+            Some("1" | "true" | "yes" | "on") => true,
+            Some(_) | None => true,
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
+}
+
+fn dev_auth_session() -> AuthSession {
+    let now = chrono::Utc::now();
+    let email = dev_auth_email();
+    AuthSession {
+        session_id: "dev-auth-bypass-session".into(),
+        user_id: "dev-auth-bypass-user".into(),
+        email,
+        installation_id: "dev-auth-bypass-installation".into(),
+        access_token_hash: String::new(),
+        refresh_token_hash: String::new(),
+        access_expires_at: now + chrono::Duration::days(365),
+        refresh_expires_at: now + chrono::Duration::days(365),
+        created_at: now,
+        last_used_at: now,
+    }
+}
+
+fn dev_session_status() -> SessionStatusResponse {
+    let session = dev_auth_session();
+    SessionStatusResponse {
+        authenticated: true,
+        user: Some(crate::models::AuthUser {
+            id: session.user_id,
+            email: session.email,
+        }),
+        expires_at: Some(session.access_expires_at),
+        installation_owner_email: None,
+        is_admin: true,
+    }
 }
 
 fn extract_guest_id(headers: &HeaderMap) -> Option<String> {
@@ -1611,6 +1695,9 @@ async fn require_admin_session(
     state: &ServerState,
     headers: &HeaderMap,
 ) -> Result<AuthSession, AppError> {
+    if dev_auth_bypass_enabled() && extract_bearer_token(headers).is_none() {
+        return Ok(dev_auth_session());
+    }
     let session = resolve_session(state, headers)
         .await?
         .ok_or_else(|| AppError::Unauthorized("login required".into()))?;
@@ -2422,4 +2509,114 @@ async fn admin_audit_list(
         .list_admin_audit(query.limit.unwrap_or(50))
         .await?;
     Ok(Json(serde_json::json!({ "entries": entries })))
+}
+
+async fn admin_metrics_snapshot(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<crate::metrics::models::MetricsSnapshot>, AppError> {
+    require_admin_session(&state, &headers).await?;
+    Ok(Json(
+        state.metrics.snapshot(&state.config, &state.proxy).await?,
+    ))
+}
+
+async fn admin_metrics_host_info(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<crate::metrics::models::HostMetricsInfo>, AppError> {
+    require_admin_session(&state, &headers).await?;
+    Ok(Json(state.metrics.host_info(&state.config).await))
+}
+
+async fn admin_metrics_host_status(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<crate::metrics::models::HostMetricsStatus>, AppError> {
+    require_admin_session(&state, &headers).await?;
+    Ok(Json(state.metrics.current_host_status(&state.config).await))
+}
+
+async fn admin_metrics_series(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<crate::metrics::models::MetricsRangeQuery>,
+) -> Result<Json<crate::metrics::models::MetricsSeriesResponse>, AppError> {
+    require_admin_session(&state, &headers).await?;
+    let range = query.range.unwrap_or_else(|| "1h".into());
+    let range_secs = crate::metrics::store::parse_duration_to_secs(&range)
+        .ok_or_else(|| AppError::BadRequest("invalid metrics range".into()))?;
+    let step = query
+        .step
+        .unwrap_or_else(|| crate::metrics::store::default_step_label(range_secs));
+    Ok(Json(state.metrics.store().series(range, step).await?))
+}
+
+async fn admin_metrics_llm_snapshot(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<crate::metrics::models::MetricsRangeQuery>,
+) -> Result<Json<crate::metrics::models::LlmMetricsSnapshot>, AppError> {
+    require_admin_session(&state, &headers).await?;
+    let range = query.range.unwrap_or_else(|| "5m".into());
+    let range_secs = crate::metrics::store::parse_duration_to_secs(&range)
+        .ok_or_else(|| AppError::BadRequest("invalid metrics range".into()))?;
+    Ok(Json(state.metrics.store().llm_snapshot(range_secs).await?))
+}
+
+async fn admin_metrics_llm_top(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<crate::metrics::models::MetricsRangeQuery>,
+) -> Result<Json<crate::metrics::models::LlmTopResponse>, AppError> {
+    require_admin_session(&state, &headers).await?;
+    let range = query.range.unwrap_or_else(|| "1h".into());
+    let by = query
+        .by
+        .or(query.group_by)
+        .unwrap_or_else(|| "tokens".into());
+    Ok(Json(
+        state
+            .metrics
+            .store()
+            .llm_top(range, by, query.limit.unwrap_or(10).min(50))
+            .await?,
+    ))
+}
+
+async fn admin_metrics_events(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<crate::metrics::models::MetricsRangeQuery>,
+) -> Result<Json<Vec<crate::metrics::models::MetricEvent>>, AppError> {
+    require_admin_session(&state, &headers).await?;
+    Ok(Json(
+        state
+            .metrics
+            .store()
+            .events(query.limit.unwrap_or(100).min(500))
+            .await?,
+    ))
+}
+
+async fn admin_metrics_clear(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Result<Json<crate::metrics::models::ClearMetricsResponse>, AppError> {
+    let session = require_admin_session(&state, &headers).await?;
+    let result = state.metrics.store().clear().await?;
+    let payload =
+        serde_json::to_value(&result).unwrap_or_else(|_| serde_json::json!({ "ok": true }));
+    let metadata = extract_client_metadata(&headers, addr);
+    let _ = state
+        .store
+        .record_admin_audit(
+            Some(&session.email),
+            "metrics.clear",
+            Some(&payload),
+            metadata.ip.as_deref(),
+        )
+        .await;
+    Ok(Json(result))
 }

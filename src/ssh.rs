@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use crate::metrics::MetricsRegistry;
 use crate::proxy::{ProxyRegistry, RouteShutdown};
 use crate::store::AppStore;
 
@@ -24,6 +25,7 @@ pub struct SshServer {
     pub store: AppStore,
     pub proxy: Arc<ProxyRegistry>,
     pub host_key: KeyPair,
+    pub metrics: Arc<MetricsRegistry>,
 }
 
 /// 加载持久化的 SSH host key；不存在则生成并写入磁盘。
@@ -81,6 +83,7 @@ pub fn host_key_fingerprint(key: &KeyPair) -> Result<String> {
 struct ClientHandler {
     store: AppStore,
     proxy: Arc<ProxyRegistry>,
+    metrics: Arc<MetricsRegistry>,
     lease: Option<crate::models::TunnelLease>,
     backend: Option<String>,
     forward: Option<ForwardHandle>,
@@ -91,6 +94,7 @@ impl Clone for ClientHandler {
         Self {
             store: self.store.clone(),
             proxy: self.proxy.clone(),
+            metrics: self.metrics.clone(),
             lease: self.lease.clone(),
             backend: self.backend.clone(),
             forward: None,
@@ -102,6 +106,7 @@ struct ForwardHandle {
     task: Option<JoinHandle<()>>,
     shutdown: RouteShutdown,
     proxy: Arc<ProxyRegistry>,
+    metrics: Arc<MetricsRegistry>,
     subdomain: String,
     connection_id: String,
     closed: bool,
@@ -112,6 +117,7 @@ impl ForwardHandle {
         task: JoinHandle<()>,
         shutdown: RouteShutdown,
         proxy: Arc<ProxyRegistry>,
+        metrics: Arc<MetricsRegistry>,
         subdomain: String,
         connection_id: String,
     ) -> Self {
@@ -119,6 +125,7 @@ impl ForwardHandle {
             task: Some(task),
             shutdown,
             proxy,
+            metrics,
             subdomain,
             connection_id,
             closed: false,
@@ -142,6 +149,7 @@ impl ForwardHandle {
                 .remove_route_if_connection(&subdomain, &connection_id)
                 .await;
         });
+        self.metrics.forward_listener_shutdown();
     }
 }
 
@@ -175,11 +183,13 @@ impl SshServer {
             let handler = ClientHandler {
                 store: self.store.clone(),
                 proxy: self.proxy.clone(),
+                metrics: self.metrics.clone(),
                 lease: None,
                 backend: None,
                 forward: None,
             };
             tokio::spawn(async move {
+                let _session_guard = handler.metrics.ssh_session_started();
                 if let Err(err) = server::run_stream(config, socket, handler).await {
                     error!("ssh client {peer} failed: {err}");
                 }
@@ -246,6 +256,7 @@ impl server::Handler for ClientHandler {
             Ok(listener) => listener,
             Err(err) => {
                 error!("failed to bind forwarded port {}:{}: {}", host, *port, err);
+                self.metrics.forward_bind_error(&err.to_string());
                 return Ok(false);
             }
         };
@@ -278,6 +289,7 @@ impl server::Handler for ClientHandler {
         let handle = session.handle();
         let connected_address = address.to_string();
         let proxy = self.proxy.clone();
+        let metrics = self.metrics.clone();
         let subdomain = lease.subdomain.clone();
         let connection_id = lease.connection_id.clone();
         let task = tokio::spawn(async move {
@@ -287,6 +299,7 @@ impl server::Handler for ClientHandler {
                 connected_address,
                 bound_port,
                 proxy,
+                metrics,
                 subdomain,
                 connection_id,
                 shutdown_rx,
@@ -296,10 +309,12 @@ impl server::Handler for ClientHandler {
                 error!("forward listener failed on port {}: {}", bound_port, err);
             }
         });
+        self.metrics.forward_listener_started();
         self.forward = Some(ForwardHandle::new(
             task,
             route_shutdown,
             self.proxy.clone(),
+            self.metrics.clone(),
             lease.subdomain.clone(),
             lease.connection_id.clone(),
         ));
@@ -346,6 +361,7 @@ async fn serve_forward_listener(
     connected_address: String,
     connected_port: u16,
     proxy: Arc<ProxyRegistry>,
+    metrics: Arc<MetricsRegistry>,
     subdomain: String,
     connection_id: String,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -366,6 +382,7 @@ async fn serve_forward_listener(
         let (stream, peer) = match accepted {
             Ok(accepted) => accepted,
             Err(err) => {
+                metrics.forward_accept_error(&err.to_string());
                 proxy
                     .remove_route_if_connection(&subdomain, &connection_id)
                     .await;

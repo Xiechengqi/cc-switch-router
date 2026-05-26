@@ -162,6 +162,13 @@ pub struct ProxyRegistry {
     market_limiter: Arc<KeyedConcurrencyLimiter>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ProxyRegistryCounts {
+    pub active_routes: usize,
+    pub pending_routes: usize,
+    pub health_probe_failure_cache: usize,
+}
+
 impl ProxyRegistry {
     pub async fn set_route(
         &self,
@@ -258,6 +265,19 @@ impl ProxyRegistry {
 
     pub async fn active_subdomains(&self) -> Vec<String> {
         self.routes.read().await.keys().cloned().collect()
+    }
+
+    pub async fn counts(&self) -> ProxyRegistryCounts {
+        let now = Instant::now();
+        let mut pending = self.pending_routes.write().await;
+        pending.retain(|_, entry| entry.expires_at > now);
+        let mut failures = self.health_probe_failures.lock().await;
+        failures.retain(|_, expires_at| *expires_at > now);
+        ProxyRegistryCounts {
+            active_routes: self.routes.read().await.len(),
+            pending_routes: pending.len(),
+            health_probe_failure_cache: failures.len(),
+        }
     }
 
     /// Snapshot of in-flight request counts per share_id. Share IDs absent from
@@ -452,6 +472,7 @@ pub async fn market_proxy_handler(
     let route_share_token = route.share_token.clone();
     let target = format!("http://{backend}{path_and_query}");
 
+    let metrics_permit = state.metrics.proxy_request_started();
     let mut builder = state.proxy_http.request(method.clone(), target);
     for (name, value) in &parts.headers {
         let n = name.as_str();
@@ -568,6 +589,7 @@ pub async fn market_proxy_handler(
     {
         Ok(response) => response,
         Err(err) => {
+            state.metrics.record_proxy_upstream_error(false);
             warn!(
                 method = %method,
                 host = %host,
@@ -589,6 +611,7 @@ pub async fn market_proxy_handler(
     };
 
     let status = upstream.status();
+    state.metrics.record_proxy_status(status);
     let response_headers = upstream.headers().clone();
     let body_stream = {
         use futures_util::StreamExt;
@@ -598,6 +621,7 @@ pub async fn market_proxy_handler(
             let _free_share_ip_permit = &free_share_ip_permit;
             let _market_permit = &market_permit;
             let _recent_traffic_guard = &recent_traffic_guard;
+            let _metrics_permit = &metrics_permit;
             chunk
         })
     };
@@ -776,6 +800,7 @@ pub async fn proxy_handler(
             .has_cached_health_probe_failure(&route.subdomain)
             .await
     {
+        state.metrics.record_health_probe_cached_failure();
         debug!(
             method = %method,
             host = %host,
@@ -801,6 +826,7 @@ pub async fn proxy_handler(
 
     let target = format!("http://{backend}{path_and_query}");
 
+    let metrics_permit = state.metrics.proxy_request_started();
     let mut builder = state.proxy_http.request(method.clone(), target);
     for (name, value) in &parts.headers {
         let n = name.as_str();
@@ -973,6 +999,9 @@ pub async fn proxy_handler(
                     .record_health_probe_failure(route.subdomain.clone())
                     .await;
             }
+            state
+                .metrics
+                .record_proxy_upstream_error(is_health_check_request);
             warn!(
                 method = %method,
                 host = %host,
@@ -994,6 +1023,7 @@ pub async fn proxy_handler(
     };
 
     let status = upstream.status();
+    state.metrics.record_proxy_status(status);
     if is_health_check_request {
         state
             .proxy
@@ -1034,6 +1064,7 @@ pub async fn proxy_handler(
             // the dashboard ticker keeps the row marked in-flight for the full
             // request lifecycle (success, client disconnect, or chunk error).
             let _recent_traffic_guard = &recent_traffic_guard;
+            let _metrics_permit = &metrics_permit;
             chunk
         })
     };

@@ -3,7 +3,7 @@
 import Image from "next/image";
 import Link from "next/link";
 import { Button, Dropdown, ListBox, Select, Tabs } from "@heroui/react";
-import { LogOut, Settings, UserRound } from "lucide-react";
+import { Activity, LogOut, Settings, UserRound } from "lucide-react";
 import * as React from "react";
 import { LoginDialog } from "@/components/auth/login-dialog";
 import { Toast } from "@heroui/react";
@@ -153,7 +153,7 @@ function LanguageSwitcher() {
   );
 }
 
-function Topbar({ active }: { active: "dashboard" | "settings" }) {
+function Topbar({ active }: { active: "dashboard" | "settings" | "metrics" }) {
   const { session, loading, logout } = useAuth();
   const { t } = useLocaleText();
   const [loginOpen, setLoginOpen] = React.useState(false);
@@ -185,10 +185,16 @@ function Topbar({ active }: { active: "dashboard" | "settings" }) {
                   </Dropdown.Item>
                 </Dropdown.Section>
                 {session?.isAdmin ? (
-                  <Dropdown.Item id="settings" href="/settings/" target="_blank" rel="noopener noreferrer">
-                    <Settings className="h-4 w-4" />
-                    {t("nav.settings")}
-                  </Dropdown.Item>
+                  <>
+                    <Dropdown.Item id="metrics" href="/metrics/">
+                      <Activity className="h-4 w-4" />
+                      {t("nav.metrics")}
+                    </Dropdown.Item>
+                    <Dropdown.Item id="settings" href="/settings/">
+                      <Settings className="h-4 w-4" />
+                      {t("nav.settings")}
+                    </Dropdown.Item>
+                  </>
                 ) : null}
                 <Dropdown.Item id="logout" onAction={() => logout().catch(console.error)} className="text-destructive">
                   <LogOut className="h-4 w-4" />
@@ -218,7 +224,7 @@ export function AppShell({
   active,
   children,
 }: {
-  active: "dashboard" | "settings";
+  active: "dashboard" | "settings" | "metrics";
   children: React.ReactNode;
 }) {
   return (

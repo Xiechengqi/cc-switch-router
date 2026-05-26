@@ -575,6 +575,54 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         placeholder: None,
         dynamic_group: Some(DynamicGroup::Telegram),
     },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_METRICS_ENABLED",
+        label: "Enable metrics",
+        group: "Metrics",
+        field_type: FieldType::Bool,
+        required: false,
+        restart_required: true,
+        default: Some("true"),
+        description: "Collect host, router, and LLM metrics into a separate metrics database.",
+        placeholder: None,
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_METRICS_DB_PATH",
+        label: "Metrics DB path",
+        group: "Metrics",
+        field_type: FieldType::Path,
+        required: false,
+        restart_required: true,
+        default: Some("/root/.config/cc-switch-router/cc-switch-router-metrics.db"),
+        description: "SQLite file used only for metrics history. This is separate from the business database.",
+        placeholder: Some("/root/.config/cc-switch-router/cc-switch-router-metrics.db"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_METRICS_RETENTION_DAYS",
+        label: "Metrics retention days",
+        group: "Metrics",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("7"),
+        description: "Number of days to keep metrics samples before automatic pruning.",
+        placeholder: Some("7"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_METRICS_SAMPLE_INTERVAL_SECS",
+        label: "Metrics sample interval",
+        group: "Metrics",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("5"),
+        description: "Sampling interval in seconds for host and router metrics.",
+        placeholder: Some("5"),
+        dynamic_group: None,
+    },
 ];
 
 pub fn schema_response() -> SettingsSchemaResponse {
@@ -1219,6 +1267,12 @@ mod tests {
             board_user_per_hour: 99,
             board_pin_limit: 7,
             board_guest_self_delete_secs: 600,
+            metrics: crate::config::MetricsConfig {
+                enabled: true,
+                db_path: std::env::temp_dir().join("cc-switch-router-rebuild-test-metrics.db"),
+                retention_days: 7,
+                sample_interval_secs: 5,
+            },
         }
     }
 }

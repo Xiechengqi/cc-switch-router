@@ -9,6 +9,14 @@ use anyhow::{Context, Result};
 const APP_NAME: &str = "cc-switch-router";
 
 #[derive(Debug, Clone)]
+pub struct MetricsConfig {
+    pub enabled: bool,
+    pub db_path: PathBuf,
+    pub retention_days: u32,
+    pub sample_interval_secs: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct Config {
     pub api_addr: SocketAddr,
     pub ssh_addr: SocketAddr,
@@ -48,6 +56,7 @@ pub struct Config {
     pub board_user_per_hour: i64,
     pub board_pin_limit: i64,
     pub board_guest_self_delete_secs: i64,
+    pub metrics: MetricsConfig,
 }
 
 impl Config {
@@ -154,6 +163,18 @@ impl Config {
             board_guest_self_delete_secs: env_var("CC_SWITCH_ROUTER_BOARD_GUEST_SELF_DELETE_SECS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(300),
+            metrics: MetricsConfig {
+                enabled: env_bool("CC_SWITCH_ROUTER_METRICS_ENABLED", true),
+                db_path: env_var("CC_SWITCH_ROUTER_METRICS_DB_PATH")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(default_metrics_db_path),
+                retention_days: env_var("CC_SWITCH_ROUTER_METRICS_RETENTION_DAYS")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(7),
+                sample_interval_secs: env_var("CC_SWITCH_ROUTER_METRICS_SAMPLE_INTERVAL_SECS")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(5),
+            },
         }
     }
 
@@ -249,6 +270,11 @@ fn default_db_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(format!("./data/{APP_NAME}.db")))
 }
 
+fn default_metrics_db_path() -> PathBuf {
+    path_in_home(APP_NAME, &format!("{APP_NAME}-metrics.db"))
+        .unwrap_or_else(|| PathBuf::from(format!("./data/{APP_NAME}-metrics.db")))
+}
+
 fn default_host_key_path() -> PathBuf {
     path_in_home(APP_NAME, "ssh_host_ed25519_key")
         .unwrap_or_else(|| PathBuf::from("./data/ssh_host_ed25519_key"))
@@ -295,8 +321,13 @@ CC_SWITCH_ROUTER_BOARD_GUEST_PER_HOUR=5
 CC_SWITCH_ROUTER_BOARD_USER_PER_HOUR=30
 CC_SWITCH_ROUTER_BOARD_PIN_LIMIT=3
 CC_SWITCH_ROUTER_BOARD_GUEST_SELF_DELETE_SECS=300
+CC_SWITCH_ROUTER_METRICS_ENABLED=true
+CC_SWITCH_ROUTER_METRICS_DB_PATH={}
+CC_SWITCH_ROUTER_METRICS_RETENTION_DAYS=7
+CC_SWITCH_ROUTER_METRICS_SAMPLE_INTERVAL_SECS=5
 ",
-        default_db_path().display()
+        default_db_path().display(),
+        default_metrics_db_path().display()
     )
 }
 
@@ -412,6 +443,12 @@ mod tests {
             board_user_per_hour: 30,
             board_pin_limit: 3,
             board_guest_self_delete_secs: 300,
+            metrics: MetricsConfig {
+                enabled: true,
+                db_path: PathBuf::from("/tmp/test-metrics.db"),
+                retention_days: 7,
+                sample_interval_secs: 5,
+            },
         };
 
         assert!(config.free_share_ip_limit_enabled());

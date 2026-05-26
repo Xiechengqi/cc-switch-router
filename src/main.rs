@@ -9,6 +9,7 @@ mod dynamic_settings;
 mod error;
 mod geo;
 mod ip_blacklist_stats;
+mod metrics;
 mod models;
 mod proxy;
 mod recent_traffic;
@@ -39,6 +40,7 @@ use crate::board_telegram::TelegramNotifier;
 use crate::config::{Config, ensure_default_env_file, load_env_file};
 use crate::dynamic_settings::DynamicSettings;
 use crate::ip_blacklist_stats::{IpBlacklistStats, format_top_counts};
+use crate::metrics::MetricsRegistry;
 use crate::models::{ShareEditAvailableEvent, ShareRuntimeSnapshotResponse};
 use crate::recent_traffic::RecentTraffic;
 use crate::scheduling_signals::OverrideStore;
@@ -82,6 +84,8 @@ pub struct ServerState {
     /// Per-owner penalty multipliers seeded by market 429/rate-limit feedback.
     /// Decays via TTL; never persisted.
     pub scheduling_overrides: Arc<OverrideStore>,
+    /// Separate metrics collector/store for host, router, and LLM observability.
+    pub metrics: Arc<MetricsRegistry>,
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +165,7 @@ async fn main() -> Result<()> {
         .tcp_keepalive(Duration::from_secs(60))
         .build()
         .context("build proxy http client failed")?;
+    let metrics = MetricsRegistry::new(config.metrics.clone());
 
     let state = ServerState {
         config: config.clone(),
@@ -181,12 +186,14 @@ async fn main() -> Result<()> {
         env_path: env_path.clone(),
         start_instant: Instant::now(),
         scheduling_overrides: OverrideStore::new(),
+        metrics: metrics.clone(),
     };
 
     let ssh_server = ssh::SshServer {
         store: state.store.clone(),
         proxy: state.proxy.clone(),
         host_key: ssh_host_key,
+        metrics: state.metrics.clone(),
     };
     let cleanup_store = state.store.clone();
     let cleanup_config = config.clone();
@@ -202,6 +209,9 @@ async fn main() -> Result<()> {
     let runtime_traffic = state.recent_traffic.clone();
     let resend_usage_cache = state.resend_usage_cache.clone();
     let resend_usage_api_key = config.resend_api_key.clone();
+    let metrics_config = config.clone();
+    let metrics_proxy = state.proxy.clone();
+    let metrics_registry = state.metrics.clone();
 
     let http_listener = TcpListener::bind(config.api_addr).await?;
     let ssh_listener = TcpListener::bind(config.ssh_addr).await?;
@@ -321,6 +331,10 @@ async fn main() -> Result<()> {
         #[allow(unreachable_code)]
         Ok::<_, anyhow::Error>(())
     });
+    let metrics_task = tokio::spawn(async move {
+        crate::metrics::run_collector(metrics_registry, metrics_config, metrics_proxy).await;
+        Ok::<_, anyhow::Error>(())
+    });
     let ssh_task = tokio::spawn(async move { ssh_server.run_with_listener(ssh_listener).await });
     let http_task = tokio::spawn(async move {
         axum::serve(
@@ -338,6 +352,7 @@ async fn main() -> Result<()> {
             probe_task.abort();
             runtime_task.abort();
             resend_usage_task.abort();
+            metrics_task.abort();
             ssh_result??;
             Ok(())
         }
@@ -347,6 +362,7 @@ async fn main() -> Result<()> {
             probe_task.abort();
             runtime_task.abort();
             resend_usage_task.abort();
+            metrics_task.abort();
             http_result??;
             Ok(())
         }
