@@ -84,7 +84,7 @@ export function ResourceTrendChart({
         </Card.Description>
       </Card.Header>
       <Card.Content>
-        <div className="mb-3 flex flex-wrap gap-3 text-xs text-muted-foreground">
+        <div className="mb-2 flex flex-wrap gap-2 text-xs text-muted-foreground">
           {series.map((item) => (
             <span key={item.label} className="flex items-center gap-1">
               <span className="h-2 w-2 rounded-full" style={{ background: item.color }} />
@@ -99,13 +99,13 @@ export function ResourceTrendChart({
         ) : (
           <>
             <div className="flex">
-              <div className="flex h-40 w-10 flex-col justify-between pr-2 text-right text-[10px] text-muted-foreground">
+              <div className="flex h-32 w-10 flex-col justify-between pr-2 text-right text-[10px] text-muted-foreground">
                 <span>{fixed(max)}</span>
                 <span>{fixed(max / 2)}</span>
                 <span>0</span>
               </div>
               <div className="relative flex-1" onMouseMove={handleMove} onMouseLeave={handleLeave}>
-                <svg viewBox={`0 0 ${WIDTH} ${HEIGHT}`} preserveAspectRatio="none" className="h-40 w-full">
+                <svg viewBox={`0 0 ${WIDTH} ${HEIGHT}`} preserveAspectRatio="none" className="h-32 w-full">
                   <line x1={0} x2={WIDTH} y1={HEIGHT / 2} y2={HEIGHT / 2} stroke="#E2E8F0" strokeWidth="1" strokeDasharray="4 4" />
                   {lines.map((item) => (
                     <polyline key={item.label} fill="none" stroke={item.color} strokeWidth="2" points={item.points} />
@@ -116,7 +116,7 @@ export function ResourceTrendChart({
                 </svg>
                 {hover !== null && timestamps[hover] ? (
                   <div
-                    className="pointer-events-none absolute top-2 z-10 rounded-lg border bg-background p-3 text-xs shadow"
+                    className="pointer-events-none absolute top-2 z-10 rounded-lg border bg-background p-2 text-xs shadow"
                     style={flip ? { right: `${100 - hoverPct}%` } : { left: `${hoverPct}%` }}
                   >
                     <p className="font-medium">{new Date(timestamps[hover] * 1000).toLocaleTimeString()}</p>

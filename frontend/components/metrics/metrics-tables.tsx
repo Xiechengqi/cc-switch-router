@@ -15,7 +15,7 @@ export function SimpleTable({ headers, rows }: { headers: string[]; rows: React.
         <thead className="text-xs text-muted-foreground">
           <tr>
             {headers.map((h) => (
-              <th key={h} className="border-b px-3 py-2 font-medium">
+              <th key={h} className="border-b px-2.5 py-1.5 font-medium">
                 {h}
               </th>
             ))}
@@ -24,7 +24,7 @@ export function SimpleTable({ headers, rows }: { headers: string[]; rows: React.
         <tbody>
           {rows.length === 0 ? (
             <tr>
-              <td className="px-3 py-4 text-muted-foreground" colSpan={headers.length}>
+              <td className="px-2.5 py-3 text-muted-foreground" colSpan={headers.length}>
                 {t("metrics.table.noData")}
               </td>
             </tr>
@@ -32,7 +32,7 @@ export function SimpleTable({ headers, rows }: { headers: string[]; rows: React.
             rows.map((row, i) => (
               <tr key={i}>
                 {row.map((cell, j) => (
-                  <td key={j} className="border-b px-3 py-2">
+                  <td key={j} className="border-b px-2.5 py-1.5">
                     {cell}
                   </td>
                 ))}
@@ -112,13 +112,13 @@ export function MetricEventsList({ events, full = false }: { events: MetricEvent
         <Card.Description>{t("metrics.panel.eventsCount", { count: events.length })}</Card.Description>
       </Card.Header>
       <Card.Content>
-        <ScrollShadow className={full ? "max-h-[680px]" : "max-h-[380px]"}>
+        <ScrollShadow className={full ? "max-h-[520px]" : "max-h-[320px]"}>
           <div className="grid gap-2 pr-2">
             {events.length === 0 ? (
               <p className="text-sm text-muted-foreground">{t("metrics.panel.noAlerts")}</p>
             ) : (
               events.map((event, index) => (
-                <div key={`${event.timestamp}-${event.kind}-${index}`} className="rounded-lg border p-3">
+                <div key={`${event.timestamp}-${event.kind}-${index}`} className="rounded-lg border p-2.5">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div className="flex items-center gap-2">
                       <StatusChip

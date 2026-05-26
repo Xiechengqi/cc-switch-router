@@ -9,7 +9,7 @@ import { diskPercent, type MetricTone } from "./metrics-utils";
 
 export function KpiGrid({ children }: { children: React.ReactNode }) {
   return (
-    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
       {React.Children.map(children, (child, index) => (
         <div className="h-full animate-fade-in-up" style={{ animationDelay: `${index * 60}ms` }}>
           {child}
@@ -42,13 +42,13 @@ export function MetricKpiCard({
     <Card
       className={`group h-full rounded-xl transition-all duration-200 hover:-translate-y-0.5 hover:shadow-lg ${toneClass}`}
     >
-      <Card.Content className="flex h-full items-center justify-between gap-4 p-5">
+      <Card.Content className="flex h-full items-center justify-between gap-3 p-4">
         <div className="min-w-0">
           <p className="text-sm text-muted-foreground">{label}</p>
-          <p className="mt-2 truncate text-2xl font-semibold">{value}</p>
+          <p className="mt-1 truncate text-lg font-semibold">{value}</p>
           <p className="mt-1 truncate text-xs text-muted-foreground">{detail}</p>
         </div>
-        <div className="rounded-lg bg-muted p-3 text-muted-foreground transition-transform duration-200 group-hover:scale-110 [&>svg]:h-5 [&>svg]:w-5">
+        <div className="rounded-lg bg-muted p-2.5 text-muted-foreground transition-transform duration-200 group-hover:scale-110 [&>svg]:h-5 [&>svg]:w-5">
           {icon}
         </div>
       </Card.Content>
@@ -77,7 +77,7 @@ export function ProcessPanel({ host }: { host?: MetricsSnapshot["host"] }) {
         {rows.map(([label, value, extra]) => (
           <div
             key={label}
-            className="flex items-center justify-between rounded-lg border p-3 text-sm"
+            className="flex items-center justify-between rounded-lg border p-2.5 text-sm"
           >
             <span className="text-muted-foreground">{label}</span>
             <span className="font-medium">
@@ -105,7 +105,7 @@ export function DiskUsageList({ disks }: { disks: DiskUsage[] }) {
             const pct = diskPercent(disk) || 0;
             const barColor = pct >= 90 ? "bg-red-500" : pct >= 80 ? "bg-amber-500" : "bg-emerald-500";
             return (
-              <div key={`${disk.label}-${disk.mountPoint}`} className="rounded-lg border p-4">
+              <div key={`${disk.label}-${disk.mountPoint}`} className="rounded-lg border p-3">
                 <div className="flex items-center justify-between text-sm">
                   <span className="font-medium">{disk.label}</span>
                   <span>{percent(pct)}</span>
@@ -113,7 +113,7 @@ export function DiskUsageList({ disks }: { disks: DiskUsage[] }) {
                 <p className="mt-1 text-xs text-muted-foreground">
                   {disk.mountPoint} · {formatBytes(disk.usedBytes)} / {formatBytes(disk.totalBytes)}
                 </p>
-                <div className="mt-3 h-2 rounded-full bg-muted">
+                <div className="mt-2 h-2 rounded-full bg-muted">
                   <div
                     className={`h-2 rounded-full ${barColor}`}
                     style={{ width: `${Math.min(100, pct)}%` }}
@@ -156,7 +156,7 @@ export function HostInfoPanel({
       </Card.Header>
       <Card.Content className="grid gap-3">
         {rows.map(([k, v]) => (
-          <div key={k} className="rounded-lg bg-muted p-3">
+          <div key={k} className="rounded-lg bg-muted p-2.5">
             <p className="text-xs text-muted-foreground">{k}</p>
             <p className="mt-1 text-sm font-medium">{v}</p>
           </div>

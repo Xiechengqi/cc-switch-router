@@ -79,10 +79,12 @@ export function MetricsPage() {
 
   const isAdmin = !!session?.isAdmin;
 
-  const load = React.useCallback(async () => {
+  const load = React.useCallback(async (silent = false) => {
     if (!isAdmin) return;
-    setBusy((value) => value || "load");
-    setError("");
+    if (!silent) {
+      setBusy((value) => value || "load");
+      setError("");
+    }
     try {
       const wantSeries = activeTab !== "events";
       const wantInfo = activeTab === "overview" || activeTab === "host";
@@ -103,7 +105,7 @@ export function MetricsPage() {
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setBusy("");
+      if (!silent) setBusy("");
     }
   }, [isAdmin, range, activeTab]);
 
@@ -116,7 +118,7 @@ export function MetricsPage() {
     let cancelled = false;
     let timer = 0;
     const tick = async () => {
-      await load().catch(console.error);
+      await load(true).catch(console.error);
       if (!cancelled) timer = window.setTimeout(tick, 5000);
     };
     timer = window.setTimeout(tick, 5000);
@@ -142,7 +144,7 @@ export function MetricsPage() {
 
   if (!isAdmin) {
     return (
-      <main className="settings-surface mx-auto grid w-[calc(100%-2rem)] max-w-4xl gap-6 py-12 text-foreground">
+      <main className="settings-surface mx-auto grid w-[calc(100%-2rem)] max-w-4xl gap-5 py-12 text-foreground">
         <div>
           <div className="section-label">{t("metrics.title")}</div>
           <h1 className="mt-4 font-display text-4xl">{t("settings.adminRequired")}</h1>
@@ -157,7 +159,7 @@ export function MetricsPage() {
   const alertEvents = mergeMetricEvents(snapshot?.alerts, events);
 
   return (
-    <main className="settings-surface mx-auto grid w-[calc(100%-2rem)] max-w-7xl gap-6 pb-10 text-foreground">
+    <main className="settings-surface mx-auto grid w-[calc(100%-2rem)] max-w-7xl gap-5 pb-10 text-foreground">
       <section className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <div className="flex flex-wrap items-center gap-2">
@@ -284,7 +286,7 @@ function OverviewTab({
   const llm = snapshot?.llm;
   const disk = host?.disks?.[0];
   return (
-    <div className="grid animate-fade-in-up gap-6">
+    <div className="grid animate-fade-in-up gap-5">
       <div className="section-label">{t("metrics.tab.overview")}</div>
       <KpiGrid>
         <MetricKpiCard
@@ -346,7 +348,7 @@ function OverviewTab({
           tone={(llm?.errorRate || 0) > 0.1 ? "warning" : "default"}
         />
       </KpiGrid>
-      <div className="grid gap-6 xl:grid-cols-[2fr_1fr]">
+      <div className="grid gap-5 xl:grid-cols-[2fr_1fr]">
         <ResourceTrendChart
           title={t("metrics.chart.systemRisk")}
           series={[
@@ -375,7 +377,7 @@ function HostTab({
   const { t } = useLocaleText();
   const host = snapshot?.host;
   return (
-    <div className="grid animate-fade-in-up gap-6">
+    <div className="grid animate-fade-in-up gap-5">
       <div className="section-label">{t("metrics.tab.host")}</div>
       <KpiGrid>
         <MetricKpiCard
@@ -403,7 +405,7 @@ function HostTab({
           icon={<Network />}
         />
       </KpiGrid>
-      <div className="grid gap-6 xl:grid-cols-[2fr_1fr]">
+      <div className="grid gap-5 xl:grid-cols-[2fr_1fr]">
         <ResourceTrendChart
           title={t("metrics.chart.hostPerformance")}
           series={[
@@ -416,7 +418,7 @@ function HostTab({
         />
         <ProcessPanel host={host} />
       </div>
-      <div className="grid gap-6 xl:grid-cols-[1.3fr_1fr]">
+      <div className="grid gap-5 xl:grid-cols-[1.3fr_1fr]">
         <DiskUsageList disks={host?.disks || []} />
         <HostInfoPanel info={hostInfo} host={host} />
       </div>
@@ -434,7 +436,7 @@ function RouterTab({
   const { t } = useLocaleText();
   const router = snapshot?.router;
   return (
-    <div className="grid animate-fade-in-up gap-6">
+    <div className="grid animate-fade-in-up gap-5">
       <div className="section-label">{t("metrics.tab.router")}</div>
       <KpiGrid>
         <MetricKpiCard
@@ -463,7 +465,7 @@ function RouterTab({
           tone={(router?.sshForwardEmfileErrorsTotal || 0) > 0 ? "critical" : "default"}
         />
       </KpiGrid>
-      <div className="grid gap-6 xl:grid-cols-2">
+      <div className="grid gap-5 xl:grid-cols-2">
         <ResourceTrendChart
           title={t("metrics.chart.routesVsListeners")}
           maxMode="auto"
@@ -501,7 +503,7 @@ function LlmTab({
   const { t } = useLocaleText();
   const llm = snapshot?.llm;
   return (
-    <div className="grid animate-fade-in-up gap-6">
+    <div className="grid animate-fade-in-up gap-5">
       <div className="section-label">{t("metrics.tab.llm")}</div>
       <KpiGrid>
         <MetricKpiCard
@@ -533,7 +535,7 @@ function LlmTab({
           tone={(llm?.errorRate || 0) > 0.1 ? "warning" : "default"}
         />
       </KpiGrid>
-      <div className="grid gap-6 xl:grid-cols-2">
+      <div className="grid gap-5 xl:grid-cols-2">
         <ResourceTrendChart
           title={t("metrics.chart.requestErrorTrend")}
           maxMode="auto"
@@ -563,7 +565,7 @@ function LlmTab({
 function EventsTab({ events }: { events: MetricEvent[] }) {
   const { t } = useLocaleText();
   return (
-    <div className="grid animate-fade-in-up gap-6">
+    <div className="grid animate-fade-in-up gap-5">
       <div className="section-label">{t("metrics.tab.events")}</div>
       <MetricEventsList events={events} full />
     </div>
