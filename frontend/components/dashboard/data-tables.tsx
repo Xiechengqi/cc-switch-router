@@ -7,7 +7,7 @@ import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getMarketLinkedShares, updateMarketDisabledShares, updateMarketMaintenance, updateShareSettings } from "@/lib/api";
 import type { AppLocale } from "@/lib/i18n";
-import type { DashboardClient, DashboardMarket, HealthCheckEntry, MarketRequestLog, MarketShare, ModelHealthSummary, ShareAppRuntimes, ShareModelHealthCheck, ShareRequestLog, ShareSettingsPatch, ShareUpstreamProvider, ShareView } from "@/lib/types";
+import type { DashboardClient, DashboardMarket, HealthCheckEntry, MarketAppAvailabilityEntry, MarketRequestLog, MarketShare, ModelHealthSummary, ShareAppRuntimes, ShareModelHealthCheck, ShareRequestLog, ShareSettingsPatch, ShareUpstreamProvider, ShareView } from "@/lib/types";
 import { compactTokens, formatDateTime, formatNumber, formatRelativeTime } from "@/lib/utils";
 
 function compareDesc(left: number, right: number) {
@@ -1642,6 +1642,15 @@ function TokenGrid({ log }: { log: ShareRequestLog | MarketRequestLog }) {
 function MarketLinkedShares({ market, t }: { market: DashboardMarket; t: TFn }) {
   const shares = market.linkedShares || [];
   if (!shares.length) return <EmptyBlock>{t("dashboard.noLinkedShares")}</EmptyBlock>;
+  const availabilityTitle = (app: string, availability?: MarketAppAvailabilityEntry) => {
+    if (!availability) return app;
+    const parts = [
+      `${app}: ${String(availability.status || "unknown")}`,
+      availability.reason,
+      availability.requestedModel,
+    ].filter(Boolean);
+    return parts.join(" · ");
+  };
   return (
     <div className="grid gap-2">
       {shares.map((share) => {
@@ -1660,7 +1669,25 @@ function MarketLinkedShares({ market, t }: { market: DashboardMarket; t: TFn }) 
               <div className="grid justify-items-end gap-1">
                 <Chip color={share.online ? "success" : "default"} size="sm" variant={share.online ? "soft" : "tertiary"}>{share.online ? t("common.online") : t("common.offline")}</Chip>
                 {share.disabledByMarket ? <Chip color="warning" size="sm" variant="soft">{t("dashboard.disabled")}</Chip> : null}
-                {supported.length ? <div className="flex gap-1">{supported.map(([, label]) => <Chip key={label} size="sm" variant="tertiary">{label}</Chip>)}</div> : null}
+                {supported.length ? (
+                  <div className="flex gap-1">
+                    {supported.map(([key, label]) => {
+                      const availability = share.appAvailability?.[key as keyof typeof share.appAvailability];
+                      const unavailable = availability?.status === "unavailable";
+                      return (
+                        <Chip
+                          key={label}
+                          color={unavailable ? "danger" : "default"}
+                          size="sm"
+                          title={availabilityTitle(label, availability)}
+                          variant={unavailable ? "soft" : "tertiary"}
+                        >
+                          {label}
+                        </Chip>
+                      );
+                    })}
+                  </div>
+                ) : null}
               </div>
             </Card.Content>
           </Card>

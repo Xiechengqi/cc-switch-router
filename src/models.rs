@@ -780,6 +780,8 @@ pub struct MarketShareView {
     pub app_runtimes: ShareAppRuntimes,
     #[serde(default)]
     pub model_health: ShareModelHealthSummary,
+    #[serde(default)]
+    pub app_availability: MarketAppAvailability,
     /// Router-computed scheduling signals. Markets sort using these directly
     /// (no recomputation) and then layer their profile preferences on top.
     #[serde(default)]
@@ -1184,6 +1186,35 @@ pub struct MarketLinkedShareView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub market_disabled_at: Option<String>,
     pub support: ShareSupport,
+    #[serde(default)]
+    pub app_availability: MarketAppAvailability,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketAppAvailability {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude: Option<MarketAppAvailabilityEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex: Option<MarketAppAvailabilityEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gemini: Option<MarketAppAvailabilityEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketAppAvailabilityEntry {
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_checked_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_results: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

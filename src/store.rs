@@ -29,19 +29,20 @@ use crate::models::{
     DashboardMarketView, DashboardPresenceRequest, DashboardResponse, DashboardStats,
     DashboardTickerShare, GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse,
     HealthCheckEntry, Installation, InstallationView, IssueLeaseRequest, IssueLeaseResponse,
-    LatLonPoint, MarketDisabledSharesUpdateRequest, MarketDisabledSharesUpdateResponse,
-    MarketLinkedShareView, MarketMaintenanceUpdateRequest, MarketMaintenanceUpdateResponse,
-    MarketRegistryRecord, MarketRequestLogBatchSyncRequest, MarketRequestLogEntry, MarketShareView,
-    ModelHealthSummary, PublicMapClientPoint, PublicMapPointsResponse, PublicMarketConfig,
-    RefreshSessionRequest, RegisterInstallationRequest, RegisterInstallationResponse,
-    RegisterMarketRequest, RequestEmailCodeRequest, RequestEmailCodeResponse,
-    SessionStatusResponse, ShareAppRuntimes, ShareBatchSyncRequest, ShareClaimPayload,
-    ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptor, ShareEditAckRequest,
-    ShareEditView, ShareHeartbeatRequest, ShareMarketLinkView, ShareModelHealthCheckEntry,
-    ShareModelHealthSummary, SharePendingEditsRequest, SharePendingEditsResponse,
-    ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRequestLogFetchResponse,
-    ShareRuntimeRefreshPayload, ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse,
-    ShareSettingsPatch, ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest,
+    LatLonPoint, MarketAppAvailability, MarketAppAvailabilityEntry,
+    MarketDisabledSharesUpdateRequest, MarketDisabledSharesUpdateResponse, MarketLinkedShareView,
+    MarketMaintenanceUpdateRequest, MarketMaintenanceUpdateResponse, MarketRegistryRecord,
+    MarketRequestLogBatchSyncRequest, MarketRequestLogEntry, MarketShareView, ModelHealthSummary,
+    PublicMapClientPoint, PublicMapPointsResponse, PublicMarketConfig, RefreshSessionRequest,
+    RegisterInstallationRequest, RegisterInstallationResponse, RegisterMarketRequest,
+    RequestEmailCodeRequest, RequestEmailCodeResponse, SessionStatusResponse, ShareAppRuntimes,
+    ShareBatchSyncRequest, ShareClaimPayload, ShareClaimSubdomainRequest, ShareDeleteRequest,
+    ShareDescriptor, ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest,
+    ShareMarketLinkView, ShareModelHealthCheckEntry, ShareModelHealthSummary,
+    SharePendingEditsRequest, SharePendingEditsResponse, ShareRequestLogBatchSyncRequest,
+    ShareRequestLogEntry, ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload,
+    ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse, ShareSettingsPatch,
+    ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest,
     ShareUpstreamProvider, ShareView, TunnelLease, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 use crate::proxy::ProxyRegistry;
@@ -2736,30 +2737,7 @@ impl AppStore {
         let mut count = 0;
         for log in input.logs {
             validate_market_request_log(&log)?;
-            if is_failed_market_model_log(&log) {
-                if let (Some(share_id), Some(subdomain)) =
-                    (log.share_id.clone(), log.share_subdomain.clone())
-                {
-                    let check = ShareModelHealthCheckEntry {
-                        request_id: format!("market-failure:{}", log.request_id),
-                        share_id,
-                        subdomain,
-                        app_type: log.request_agent.clone(),
-                        requested_model: log.requested_model.clone(),
-                        actual_model: log.actual_model.clone(),
-                        status: "failed".to_string(),
-                        status_code: log.status_code,
-                        latency_ms: log.latency_ms.unwrap_or(0),
-                        first_token_ms: None,
-                        error_message: Some(log.status.clone()),
-                        checked_at: DateTime::parse_from_rfc3339(&log.created_at)
-                            .map(|dt| dt.timestamp())
-                            .unwrap_or_else(|_| Utc::now().timestamp()),
-                        source: "market_failure".to_string(),
-                    };
-                    record_share_model_health_check_conn(&tx, &check)?;
-                }
-            }
+            record_market_share_model_failure_state_conn(&tx, &market.email, &log)?;
             upsert_market_request_log_tx(&tx, market, log)?;
             count += 1;
         }
@@ -2781,6 +2759,8 @@ impl AppStore {
         let samples_10m = list_online_minutes_10m(&conn)?;
         let model_health_by_share = list_model_health_summaries(&conn)?;
         let market_email_lower = market_email.to_ascii_lowercase();
+        let market_availability_by_share =
+            list_market_app_availability(&conn, &market_email_lower)?;
         let mut stmt = conn
             .prepare(
                 "SELECT s.share_id, s.installation_id, s.share_name, s.owner_email,
@@ -2832,6 +2812,11 @@ impl AppStore {
                     crate::scheduling_signals::compute_stability(samples, online_rate_24h);
                 let headroom =
                     crate::scheduling_signals::compute_headroom(active_requests, parallel_limit);
+                let app_availability = market_availability_by_share
+                    .get(&share_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let market_failure_penalty = market_app_availability_penalty(&app_availability);
                 Ok((
                     shared_with_emails,
                     subdomain.clone(),
@@ -2863,12 +2848,13 @@ impl AppStore {
                         upstream_provider,
                         app_runtimes,
                         model_health,
+                        app_availability,
                         signals: ShareSignals {
                             quota_health,
                             stability,
                             headroom,
                             samples_10m: samples as u32,
-                            owner_penalty: 1.0,
+                            owner_penalty: market_failure_penalty,
                         },
                     },
                 ))
@@ -4629,6 +4615,22 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             PRIMARY KEY (market_email, share_id)
         );
 
+        CREATE TABLE IF NOT EXISTS market_share_model_failure_state (
+            market_email TEXT NOT NULL,
+            share_id TEXT NOT NULL,
+            app_type TEXT NOT NULL,
+            requested_model TEXT NOT NULL,
+            actual_model TEXT NOT NULL DEFAULT '',
+            last_status TEXT NOT NULL,
+            last_success_at INTEGER,
+            last_failed_at INTEGER,
+            last_checked_at INTEGER NOT NULL,
+            recent_results_json TEXT NOT NULL DEFAULT '[]',
+            error_message TEXT,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (market_email, share_id, app_type, requested_model)
+        );
+
         CREATE TABLE IF NOT EXISTS dashboard_presence (
             session_id TEXT PRIMARY KEY,
             last_seen_at INTEGER NOT NULL
@@ -4771,6 +4773,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         CREATE INDEX IF NOT EXISTS idx_market_request_logs_market_created ON market_request_logs(market_email, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_market_request_logs_share_created ON market_request_logs(share_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_market_request_logs_created ON market_request_logs(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_market_share_model_failure_state_share ON market_share_model_failure_state(market_email, share_id, app_type, last_status);
 
         CREATE TABLE IF NOT EXISTS board_messages (
             id TEXT PRIMARY KEY,
@@ -5110,6 +5113,30 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         [],
     )
     .map_err(|e| AppError::Internal(format!("create market disabled share index failed: {e}")))?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS market_share_model_failure_state (
+            market_email TEXT NOT NULL,
+            share_id TEXT NOT NULL,
+            app_type TEXT NOT NULL,
+            requested_model TEXT NOT NULL,
+            actual_model TEXT NOT NULL DEFAULT '',
+            last_status TEXT NOT NULL,
+            last_success_at INTEGER,
+            last_failed_at INTEGER,
+            last_checked_at INTEGER NOT NULL,
+            recent_results_json TEXT NOT NULL DEFAULT '[]',
+            error_message TEXT,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (market_email, share_id, app_type, requested_model)
+        )",
+        [],
+    )
+    .map_err(|e| AppError::Internal(format!("create market failure state table failed: {e}")))?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_market_share_model_failure_state_share ON market_share_model_failure_state(market_email, share_id, app_type, last_status)",
+        [],
+    )
+    .map_err(|e| AppError::Internal(format!("create market failure state index failed: {e}")))?;
     add_column_if_missing(
         conn,
         "share_request_logs",
@@ -6240,6 +6267,157 @@ fn parse_recent_results(value: String) -> Result<Vec<String>, rusqlite::Error> {
     })
 }
 
+fn market_app_availability_status(last_status: &str, recent_results: &[String]) -> String {
+    if recent_results.len() >= 3 && recent_results.iter().all(|status| status == "failed") {
+        "unavailable".to_string()
+    } else if last_status == "failed" || recent_results.iter().any(|status| status == "failed") {
+        "degraded".to_string()
+    } else if last_status == "success" {
+        "available".to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn market_app_availability_rank(status: &str) -> u8 {
+    match status {
+        "unavailable" => 3,
+        "degraded" => 2,
+        "available" => 1,
+        _ => 0,
+    }
+}
+
+fn should_replace_market_app_availability(
+    current: Option<&MarketAppAvailabilityEntry>,
+    candidate: &MarketAppAvailabilityEntry,
+) -> bool {
+    let Some(current) = current else {
+        return true;
+    };
+    let candidate_rank = market_app_availability_rank(&candidate.status);
+    let current_rank = market_app_availability_rank(&current.status);
+    candidate_rank > current_rank
+        || (candidate_rank == current_rank
+            && candidate.last_checked_at.unwrap_or_default()
+                > current.last_checked_at.unwrap_or_default())
+}
+
+fn set_market_app_availability_entry(
+    availability: &mut MarketAppAvailability,
+    app_type: &str,
+    entry: MarketAppAvailabilityEntry,
+) {
+    let slot = match app_type {
+        "claude" => &mut availability.claude,
+        "codex" => &mut availability.codex,
+        "gemini" => &mut availability.gemini,
+        _ => return,
+    };
+    if should_replace_market_app_availability(slot.as_ref(), &entry) {
+        *slot = Some(entry);
+    }
+}
+
+fn market_app_availability_penalty(availability: &MarketAppAvailability) -> f64 {
+    [
+        &availability.claude,
+        &availability.codex,
+        &availability.gemini,
+    ]
+    .into_iter()
+    .filter_map(|entry| entry.as_ref())
+    .map(|entry| match entry.status.as_str() {
+        "unavailable" => 0.25,
+        "degraded" => 0.7,
+        _ => 1.0,
+    })
+    .fold(1.0_f64, f64::min)
+}
+
+fn list_market_app_availability(
+    conn: &Connection,
+    market_email: &str,
+) -> Result<HashMap<String, MarketAppAvailability>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT share_id, app_type, requested_model, actual_model, last_status,
+                    last_checked_at, recent_results_json, error_message
+             FROM market_share_model_failure_state
+             WHERE lower(market_email) = lower(?1)",
+        )
+        .map_err(|e| AppError::Internal(format!("prepare market app availability failed: {e}")))?;
+    let rows = stmt
+        .query_map(params![market_email], |row| {
+            let recent_results = parse_recent_results(row.get(6)?)?;
+            let last_status: String = row.get(4)?;
+            let status = market_app_availability_status(&last_status, &recent_results);
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?.to_ascii_lowercase(),
+                MarketAppAvailabilityEntry {
+                    status,
+                    reason: row.get(7)?,
+                    requested_model: row.get(2)?,
+                    actual_model: row.get(3)?,
+                    last_checked_at: row.get(5)?,
+                    recent_results,
+                },
+            ))
+        })
+        .map_err(|e| AppError::Internal(format!("query market app availability failed: {e}")))?;
+    let mut map = HashMap::<String, MarketAppAvailability>::new();
+    for row in rows {
+        let (share_id, app_type, entry) = row
+            .map_err(|e| AppError::Internal(format!("read market app availability failed: {e}")))?;
+        set_market_app_availability_entry(map.entry(share_id).or_default(), &app_type, entry);
+    }
+    Ok(map)
+}
+
+fn list_all_market_app_availability(
+    conn: &Connection,
+) -> Result<HashMap<String, HashMap<String, MarketAppAvailability>>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT lower(market_email), share_id, app_type, requested_model, actual_model, last_status,
+                    last_checked_at, recent_results_json, error_message
+             FROM market_share_model_failure_state",
+        )
+        .map_err(|e| AppError::Internal(format!("prepare all market app availability failed: {e}")))?;
+    let rows = stmt
+        .query_map([], |row| {
+            let recent_results = parse_recent_results(row.get(7)?)?;
+            let last_status: String = row.get(5)?;
+            let status = market_app_availability_status(&last_status, &recent_results);
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?.to_ascii_lowercase(),
+                MarketAppAvailabilityEntry {
+                    status,
+                    reason: row.get(8)?,
+                    requested_model: row.get(3)?,
+                    actual_model: row.get(4)?,
+                    last_checked_at: row.get(6)?,
+                    recent_results,
+                },
+            ))
+        })
+        .map_err(|e| {
+            AppError::Internal(format!("query all market app availability failed: {e}"))
+        })?;
+    let mut map = HashMap::<String, HashMap<String, MarketAppAvailability>>::new();
+    for row in rows {
+        let (market_email, share_id, app_type, entry) = row.map_err(|e| {
+            AppError::Internal(format!("read all market app availability failed: {e}"))
+        })?;
+        let share_map = map.entry(market_email).or_default();
+        set_market_app_availability_entry(share_map.entry(share_id).or_default(), &app_type, entry);
+    }
+    Ok(map)
+}
+
 fn list_model_health_summaries(
     conn: &Connection,
 ) -> Result<HashMap<String, ShareModelHealthSummary>, AppError> {
@@ -6356,6 +6534,138 @@ fn is_failed_market_model_log(log: &MarketRequestLogEntry) -> bool {
     log.status_code
         .map(|code| code == 429 || code >= 500)
         .unwrap_or(false)
+}
+
+fn is_success_market_model_log(log: &MarketRequestLogEntry) -> bool {
+    let status = log.status.to_ascii_lowercase();
+    if matches!(status.as_str(), "success" | "ok" | "completed") {
+        return true;
+    }
+    log.status_code
+        .map(|code| (200..400).contains(&code))
+        .unwrap_or(false)
+}
+
+fn market_model_status(log: &MarketRequestLogEntry) -> Option<&'static str> {
+    if is_failed_market_model_log(log) {
+        Some("failed")
+    } else if is_success_market_model_log(log) {
+        Some("success")
+    } else {
+        None
+    }
+}
+
+fn record_market_share_model_failure_state_conn(
+    conn: &Connection,
+    market_email: &str,
+    log: &MarketRequestLogEntry,
+) -> Result<(), AppError> {
+    let Some(status) = market_model_status(log) else {
+        return Ok(());
+    };
+    let Some(share_id) = log
+        .share_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    else {
+        return Ok(());
+    };
+    let app_type = log.request_agent.trim().to_ascii_lowercase();
+    if !matches!(app_type.as_str(), "claude" | "codex" | "gemini") {
+        return Ok(());
+    }
+    if conn
+        .query_row(
+            "SELECT 1 FROM market_request_logs WHERE request_id = ?1",
+            params![log.request_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|e| AppError::Internal(format!("check existing market request log failed: {e}")))?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    let requested_model = if log.requested_model.trim().is_empty() {
+        log.model
+            .as_deref()
+            .unwrap_or(app_type.as_str())
+            .trim()
+            .to_string()
+    } else {
+        log.requested_model.trim().to_string()
+    };
+    let actual_model = if log.actual_model.trim().is_empty() {
+        requested_model.clone()
+    } else {
+        log.actual_model.trim().to_string()
+    };
+    let market_email = market_email.trim().to_ascii_lowercase();
+    let checked_at = DateTime::parse_from_rfc3339(&log.created_at)
+        .map(|dt| dt.timestamp())
+        .unwrap_or_else(|_| Utc::now().timestamp());
+    let existing_recent = conn
+        .query_row(
+            "SELECT recent_results_json
+             FROM market_share_model_failure_state
+             WHERE market_email = ?1 AND share_id = ?2 AND app_type = ?3 AND requested_model = ?4",
+            params![market_email, share_id, app_type, requested_model],
+            |row| parse_recent_results(row.get(0)?),
+        )
+        .optional()
+        .map_err(|e| AppError::Internal(format!("read market failure state failed: {e}")))?
+        .unwrap_or_default();
+    let mut recent_results = Vec::with_capacity(3);
+    recent_results.push(status.to_string());
+    recent_results.extend(existing_recent.into_iter().take(2));
+    let recent_json = serde_json::to_string(&recent_results)
+        .map_err(|e| AppError::Internal(format!("serialize market failure state failed: {e}")))?;
+    let error_message = (status == "failed").then(|| log.status.clone());
+    conn.execute(
+        "INSERT INTO market_share_model_failure_state (
+            market_email, share_id, app_type, requested_model, actual_model, last_status,
+            last_success_at, last_failed_at, last_checked_at, recent_results_json,
+            error_message, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+            CASE WHEN ?6 = 'success' THEN ?7 ELSE NULL END,
+            CASE WHEN ?6 = 'failed' THEN ?7 ELSE NULL END,
+            ?7, ?8, ?9, ?7)
+         ON CONFLICT(market_email, share_id, app_type, requested_model) DO UPDATE SET
+            actual_model = CASE WHEN excluded.last_checked_at >= market_share_model_failure_state.last_checked_at THEN excluded.actual_model ELSE market_share_model_failure_state.actual_model END,
+            last_status = CASE WHEN excluded.last_checked_at >= market_share_model_failure_state.last_checked_at THEN excluded.last_status ELSE market_share_model_failure_state.last_status END,
+            last_success_at = CASE
+                WHEN excluded.last_status = 'success'
+                 AND (market_share_model_failure_state.last_success_at IS NULL OR excluded.last_checked_at > market_share_model_failure_state.last_success_at)
+                THEN excluded.last_checked_at
+                ELSE market_share_model_failure_state.last_success_at
+            END,
+            last_failed_at = CASE
+                WHEN excluded.last_status = 'failed'
+                 AND (market_share_model_failure_state.last_failed_at IS NULL OR excluded.last_checked_at > market_share_model_failure_state.last_failed_at)
+                THEN excluded.last_checked_at
+                ELSE market_share_model_failure_state.last_failed_at
+            END,
+            last_checked_at = max(market_share_model_failure_state.last_checked_at, excluded.last_checked_at),
+            recent_results_json = CASE WHEN excluded.last_checked_at >= market_share_model_failure_state.last_checked_at THEN excluded.recent_results_json ELSE market_share_model_failure_state.recent_results_json END,
+            error_message = CASE WHEN excluded.last_checked_at >= market_share_model_failure_state.last_checked_at THEN excluded.error_message ELSE market_share_model_failure_state.error_message END,
+            updated_at = max(market_share_model_failure_state.updated_at, excluded.updated_at)",
+        params![
+            market_email,
+            share_id,
+            app_type,
+            requested_model,
+            actual_model,
+            status,
+            checked_at,
+            recent_json,
+            error_message,
+        ],
+    )
+    .map_err(|e| AppError::Internal(format!("upsert market failure state failed: {e}")))?;
+    Ok(())
 }
 
 fn mask_share_token(token: &str) -> String {
@@ -6889,6 +7199,7 @@ fn list_dashboard_markets(
         .map_err(|e| AppError::Internal(format!("query dashboard markets failed: {e}")))?;
     let mut markets = collect_rows(rows)?;
     let disabled_by_market = list_market_disabled_share_map(conn)?;
+    let app_availability_by_market = list_all_market_app_availability(conn)?;
     for market in &mut markets {
         market.can_manage = viewer_email
             .map(|email| email.eq_ignore_ascii_case(&market.email))
@@ -6903,6 +7214,7 @@ fn list_dashboard_markets(
             health_by_share,
             inflight_by_market_email,
             market_logs_by_market,
+            &app_availability_by_market,
         );
     }
     Ok(markets)
@@ -6918,9 +7230,11 @@ fn enrich_dashboard_market(
     health_by_share: &HashMap<String, Vec<HealthCheckEntry>>,
     inflight_by_market_email: &HashMap<String, usize>,
     market_logs_by_market: &HashMap<String, Vec<DashboardMarketRequestLogView>>,
+    app_availability_by_market: &HashMap<String, HashMap<String, MarketAppAvailability>>,
 ) {
     let market_email = market.email.to_ascii_lowercase();
     let disabled_for_market = disabled_by_market.get(&market_email);
+    let app_availability_for_market = app_availability_by_market.get(&market_email);
     let mut linked_shares = shares
         .iter()
         .filter_map(|(_, share)| {
@@ -6954,6 +7268,10 @@ fn enrich_dashboard_market(
                 disabled_by_market: market_disabled_at.is_some(),
                 market_disabled_at,
                 support: share.support.clone(),
+                app_availability: app_availability_for_market
+                    .and_then(|entries| entries.get(&share.share_id))
+                    .cloned()
+                    .unwrap_or_default(),
             })
         })
         .collect::<Vec<_>>();
@@ -8721,6 +9039,155 @@ mod tests {
             user_country: None,
             user_country_iso3: None,
         }
+    }
+
+    fn test_failed_market_request_log(request_id: &str, share_id: &str) -> MarketRequestLogEntry {
+        let mut log = test_market_request_log(request_id, share_id);
+        log.status = "failed".into();
+        log.status_code = Some(500);
+        log.usage_amount_usd = None;
+        log
+    }
+
+    #[tokio::test]
+    async fn market_request_failure_is_market_local_and_not_global_health() {
+        let (store, config) = setup_store("market-failure-local-only").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-1", "share-sub", "active").await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET for_sale = 'Yes', market_access_mode = 'all' WHERE share_id = 'share-1'",
+                [],
+            )
+            .expect("make share market visible");
+        }
+        let market = test_market();
+
+        store
+            .batch_sync_market_request_logs(
+                &market,
+                MarketRequestLogBatchSyncRequest {
+                    logs: vec![test_failed_market_request_log(
+                        "req_market_fail_1",
+                        "share-1",
+                    )],
+                },
+            )
+            .await
+            .expect("sync market failure");
+
+        let conn = store.conn.lock().await;
+        let global_health_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM share_model_health_state", [], |row| {
+                row.get(0)
+            })
+            .expect("count global health");
+        let market_state_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM market_share_model_failure_state WHERE lower(market_email) = 'market@example.com'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count market state");
+        drop(conn);
+
+        assert_eq!(global_health_count, 0);
+        assert_eq!(market_state_count, 1);
+
+        let active = HashSet::from(["share-sub".to_string()]);
+        let shares = store
+            .list_market_shares(&market.email, "main", &active, &HashMap::new())
+            .await
+            .expect("list market shares");
+        assert_eq!(shares.len(), 1);
+        assert!((shares[0].signals.owner_penalty - 0.7).abs() < 1e-9);
+
+        let other_shares = store
+            .list_market_shares("other@example.com", "main", &active, &HashMap::new())
+            .await
+            .expect("list other market shares");
+        assert_eq!(other_shares.len(), 1);
+        assert!((other_shares[0].signals.owner_penalty - 1.0).abs() < 1e-9);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn market_dashboard_marks_only_market_unavailable_app_red() {
+        let (store, config) = setup_store("market-dashboard-app-unavailable").await;
+        let market = test_market();
+        insert_market(&store, &market).await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-1", "share-sub", "active").await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET for_sale = 'Yes', market_access_mode = 'all' WHERE share_id = 'share-1'",
+                [],
+            )
+            .expect("make share market visible");
+        }
+
+        store
+            .batch_sync_market_request_logs(
+                &market,
+                MarketRequestLogBatchSyncRequest {
+                    logs: vec![
+                        test_failed_market_request_log("req_market_fail_1", "share-1"),
+                        test_failed_market_request_log("req_market_fail_2", "share-1"),
+                        test_failed_market_request_log("req_market_fail_3", "share-1"),
+                    ],
+                },
+            )
+            .await
+            .expect("sync market failures");
+
+        let server_geo = ServerGeo {
+            lat: None,
+            lon: None,
+        };
+        let proxy = ProxyRegistry::default();
+        proxy
+            .set_route(
+                "share-sub".into(),
+                "127.0.0.1:1234".into(),
+                None,
+                None,
+                None,
+                None,
+                false,
+                -1,
+                None,
+            )
+            .await;
+        let snapshot = store
+            .dashboard_snapshot(&config, &server_geo, &proxy, None)
+            .await
+            .expect("dashboard snapshot");
+        let market_view = snapshot
+            .markets
+            .iter()
+            .find(|item| item.email == market.email)
+            .expect("market view");
+        let share = market_view
+            .linked_shares
+            .iter()
+            .find(|item| item.share_id == "share-1")
+            .expect("linked share");
+
+        assert_eq!(
+            share
+                .app_availability
+                .codex
+                .as_ref()
+                .map(|entry| entry.status.as_str()),
+            Some("unavailable")
+        );
+        assert!(share.app_availability.claude.is_none());
+        assert!(share.app_availability.gemini.is_none());
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 
     fn test_share_request_log_entry(

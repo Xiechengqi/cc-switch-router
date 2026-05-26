@@ -282,7 +282,8 @@ async fn market_shares(
     for share in &mut shares {
         if let Some(email) = share.owner_email.as_deref() {
             if let Some(penalty) = state.scheduling_overrides.get(email) {
-                share.signals.owner_penalty = penalty;
+                share.signals.owner_penalty =
+                    (share.signals.owner_penalty * penalty).clamp(0.05, 1.0);
             }
         }
     }

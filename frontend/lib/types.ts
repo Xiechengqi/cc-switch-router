@@ -172,6 +172,7 @@ export type DashboardMarket = {
     disabledByMarket?: boolean;
     marketDisabledAt?: string;
     support?: ShareSupport;
+    appAvailability?: MarketAppAvailability;
   }>;
   recentRequests?: MarketRequestLog[];
 };
@@ -196,6 +197,7 @@ export type MarketShare = {
   disabledByMarket?: boolean;
   marketDisabledAt?: string;
   support?: ShareSupport;
+  appAvailability?: MarketAppAvailability;
   appRuntimes?: ShareAppRuntimes;
   modelHealth?: ShareModelHealthSummary;
 };
@@ -300,6 +302,21 @@ export type ShareSupport = {
   claude?: boolean;
   codex?: boolean;
   gemini?: boolean;
+};
+
+export type MarketAppAvailability = {
+  claude?: MarketAppAvailabilityEntry;
+  codex?: MarketAppAvailabilityEntry;
+  gemini?: MarketAppAvailabilityEntry;
+};
+
+export type MarketAppAvailabilityEntry = {
+  status: "available" | "degraded" | "unavailable" | "unknown" | string;
+  reason?: string;
+  requestedModel?: string;
+  actualModel?: string;
+  lastCheckedAt?: number;
+  recentResults?: string[];
 };
 
 export type ModelHealthSummary = {
