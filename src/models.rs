@@ -916,6 +916,8 @@ pub struct ShareUpstreamQuotaTier {
 pub struct ShareUpstreamQuota {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queried_at: Option<i64>,
     #[serde(default)]
     pub tiers: Vec<ShareUpstreamQuotaTier>,
@@ -963,6 +965,14 @@ pub struct ShareAppRuntimes {
 pub struct ShareRuntimeSnapshotResponse {
     pub share_id: String,
     pub queried_at: i64,
+    #[serde(default)]
+    pub token_limit: Option<i64>,
+    #[serde(default)]
+    pub tokens_used: Option<i64>,
+    #[serde(default)]
+    pub requests_count: Option<i64>,
+    #[serde(default)]
+    pub share_status: Option<String>,
     pub support: ShareSupport,
     #[serde(default)]
     pub app_runtimes: ShareAppRuntimes,

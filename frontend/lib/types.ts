@@ -329,6 +329,8 @@ export type ShareUpstreamProvider = {
   apiUrl?: string;
   quota?: {
     status?: string;
+    plan?: string;
+    queriedAt?: number;
     tiers?: Array<{
       label?: string;
       utilization?: number;

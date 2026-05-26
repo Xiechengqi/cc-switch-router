@@ -304,6 +304,7 @@ mod tests {
     fn quota_health_skips_short_windows() {
         let quota = ShareUpstreamQuota {
             status: "ok".into(),
+            plan: None,
             queried_at: None,
             tiers: vec![crate::models::ShareUpstreamQuotaTier {
                 label: "5h".into(),
@@ -319,6 +320,7 @@ mod tests {
     fn quota_health_softmin_picks_worst_tier() {
         let quota = ShareUpstreamQuota {
             status: "ok".into(),
+            plan: None,
             queried_at: None,
             tiers: vec![
                 crate::models::ShareUpstreamQuotaTier {

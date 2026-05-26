@@ -342,6 +342,12 @@ function countdownStr(resetsAt?: string) {
   return `${minutes}m`;
 }
 
+function quotaTierLabel(label?: string) {
+  const normalized = String(label || "").trim().toLowerCase();
+  if (normalized === "premium") return "高级请求";
+  return label || "";
+}
+
 function quotaSummary(runtime?: ShareUpstreamProvider) {
   if (!runtime || hasConcreteApiUrl(runtime)) return "";
   const quota = runtime.quota;
@@ -352,9 +358,10 @@ function quotaSummary(runtime?: ShareUpstreamProvider) {
     const preferredTiers = tiers.filter((tier) => preferredLabels.has(String(tier.label).toLowerCase()));
     if (preferredTiers.length) tiers = preferredTiers;
   }
-  return tiers
-    .map((tier) => [tier.label, `${Math.round(tier.utilization || 0)}%`, countdownStr(tier.resetsAt)].filter(Boolean).join(" "))
+  const tierText = tiers
+    .map((tier) => [quotaTierLabel(tier.label), `${Math.round(tier.utilization || 0)}%`, countdownStr(tier.resetsAt)].filter(Boolean).join(" "))
     .join(" · ");
+  return [quota.plan, tierText].filter(Boolean).join(" · ");
 }
 
 function ForSaleCell({ share, t }: { share?: ShareView; t: TFn }) {

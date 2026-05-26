@@ -6,13 +6,30 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, watch};
 use tracing::{debug, info, warn};
 
 use crate::ServerState;
 use crate::recent_traffic::RecentTraffic;
 
 const MARKET_REQUEST_ID_HEADER: &str = "x-cc-switch-market-request-id";
+const HEALTH_PROBE_FAILURE_CACHE_TTL: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone)]
+pub struct RouteShutdown {
+    tx: watch::Sender<bool>,
+}
+
+impl RouteShutdown {
+    pub(crate) fn new() -> (Self, watch::Receiver<bool>) {
+        let (tx, rx) = watch::channel(false);
+        (Self { tx }, rx)
+    }
+
+    pub(crate) fn shutdown(&self) {
+        let _ = self.tx.send(true);
+    }
+}
 
 /// Per-subdomain routing info.
 #[derive(Debug, Clone)]
@@ -27,6 +44,7 @@ pub(crate) struct RouteEntry {
     connection_id: Option<String>,
     is_free_share: bool,
     parallel_limit: i64,
+    shutdown: Option<RouteShutdown>,
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +152,7 @@ impl KeyedConcurrencyLimiter {
 pub struct ProxyRegistry {
     routes: RwLock<HashMap<String, RouteEntry>>,
     pending_routes: RwLock<HashMap<String, PendingRouteEntry>>,
+    health_probe_failures: Mutex<HashMap<String, Instant>>,
     share_limiter: Arc<KeyedConcurrencyLimiter>,
     free_share_ip_limiter: Arc<KeyedConcurrencyLimiter>,
     /// Tracks requests that actually traversed the market proxy path, keyed by
@@ -154,21 +173,29 @@ impl ProxyRegistry {
         share_name: Option<String>,
         is_free_share: bool,
         parallel_limit: i64,
+        shutdown: Option<RouteShutdown>,
     ) {
         self.pending_routes.write().await.remove(&subdomain);
-        self.routes.write().await.insert(
-            subdomain.clone(),
-            RouteEntry {
-                backend,
-                share_token,
-                share_id,
-                share_name,
-                subdomain,
-                connection_id,
-                is_free_share,
-                parallel_limit,
-            },
-        );
+        let old_route = {
+            let mut routes = self.routes.write().await;
+            routes.insert(
+                subdomain.clone(),
+                RouteEntry {
+                    backend,
+                    share_token,
+                    share_id,
+                    share_name,
+                    subdomain,
+                    connection_id,
+                    is_free_share,
+                    parallel_limit,
+                    shutdown,
+                },
+            )
+        };
+        if let Some(shutdown) = old_route.and_then(|route| route.shutdown) {
+            shutdown.shutdown();
+        }
     }
 
     pub async fn mark_route_pending(&self, subdomain: String, ttl: Duration) {
@@ -188,7 +215,10 @@ impl ProxyRegistry {
     }
 
     pub async fn remove_route(&self, subdomain: &str) {
-        self.routes.write().await.remove(subdomain);
+        let old_route = self.routes.write().await.remove(subdomain);
+        if let Some(shutdown) = old_route.and_then(|route| route.shutdown) {
+            shutdown.shutdown();
+        }
     }
 
     pub async fn remove_route_if_connection(&self, subdomain: &str, connection_id: &str) {
@@ -197,8 +227,14 @@ impl ProxyRegistry {
             .get(subdomain)
             .and_then(|route| route.connection_id())
             == Some(connection_id);
-        if should_remove {
-            routes.remove(subdomain);
+        let old_route = if should_remove {
+            routes.remove(subdomain)
+        } else {
+            None
+        };
+        drop(routes);
+        if let Some(shutdown) = old_route.and_then(|route| route.shutdown) {
+            shutdown.shutdown();
         }
     }
 
@@ -235,6 +271,24 @@ impl ProxyRegistry {
     /// direct share-subdomain traffic is not.
     pub async fn inflight_by_market_email(&self) -> HashMap<String, usize> {
         self.market_limiter.snapshot().await
+    }
+
+    pub(crate) async fn has_cached_health_probe_failure(&self, subdomain: &str) -> bool {
+        let now = Instant::now();
+        let mut failures = self.health_probe_failures.lock().await;
+        failures.retain(|_, expires_at| *expires_at > now);
+        failures.contains_key(subdomain)
+    }
+
+    pub(crate) async fn record_health_probe_failure(&self, subdomain: String) {
+        self.health_probe_failures
+            .lock()
+            .await
+            .insert(subdomain, Instant::now() + HEALTH_PROBE_FAILURE_CACHE_TTL);
+    }
+
+    pub(crate) async fn clear_health_probe_failure(&self, subdomain: &str) {
+        self.health_probe_failures.lock().await.remove(subdomain);
     }
 
     #[cfg(test)]
@@ -398,7 +452,7 @@ pub async fn market_proxy_handler(
     let route_share_token = route.share_token.clone();
     let target = format!("http://{backend}{path_and_query}");
 
-    let mut builder = reqwest::Client::new().request(method.clone(), target);
+    let mut builder = state.proxy_http.request(method.clone(), target);
     for (name, value) in &parts.headers {
         let n = name.as_str();
         if n.eq_ignore_ascii_case("host")
@@ -682,6 +736,7 @@ pub async fn proxy_handler(
     };
     let backend = route.backend.clone();
     let route_share_token = route.share_token.clone();
+    let is_health_check_request = is_share_router_probe || is_share_model_health_check;
     if is_legacy_share_router_ping {
         let legacy_log_token = route_share_token
             .as_deref()
@@ -715,6 +770,25 @@ pub async fn proxy_handler(
         );
         return simple_response(StatusCode::NOT_FOUND, "non-api-path");
     }
+    if is_health_check_request
+        && state
+            .proxy
+            .has_cached_health_probe_failure(&route.subdomain)
+            .await
+    {
+        debug!(
+            method = %method,
+            host = %host,
+            path = %path_and_query,
+            backend = %backend,
+            client_ip = %user_ip,
+            client_country = %user_country,
+            client_asn = %user_asn,
+            user_agent = %user_agent,
+            "proxy health check short-circuited by recent upstream failure"
+        );
+        return simple_response(StatusCode::SERVICE_UNAVAILABLE, "connection-lost-cached");
+    }
 
     // Determine effective share token: prefer client-supplied header,
     // fall back to the token registered with this tunnel route.
@@ -727,7 +801,7 @@ pub async fn proxy_handler(
 
     let target = format!("http://{backend}{path_and_query}");
 
-    let mut builder = reqwest::Client::new().request(method.clone(), target);
+    let mut builder = state.proxy_http.request(method.clone(), target);
     for (name, value) in &parts.headers {
         let n = name.as_str();
         if n.eq_ignore_ascii_case("host") || is_hop_by_hop_header(n) {
@@ -893,6 +967,12 @@ pub async fn proxy_handler(
                 );
                 return empty_response(StatusCode::NO_CONTENT);
             }
+            if is_health_check_request {
+                state
+                    .proxy
+                    .record_health_probe_failure(route.subdomain.clone())
+                    .await;
+            }
             warn!(
                 method = %method,
                 host = %host,
@@ -914,6 +994,12 @@ pub async fn proxy_handler(
     };
 
     let status = upstream.status();
+    if is_health_check_request {
+        state
+            .proxy
+            .clear_health_probe_failure(&route.subdomain)
+            .await;
+    }
     let response_headers = upstream.headers().clone();
     if is_invalid_auth_status(status) && is_abuse_tracked_api_path(&path) {
         if let Some(decision) = state.abuse.record_invalid_auth(&user_ip).await {
@@ -1184,6 +1270,7 @@ mod tests {
                 Some("Demo Share".into()),
                 true,
                 5,
+                None,
             )
             .await;
 
@@ -1212,6 +1299,7 @@ mod tests {
                 None,
                 false,
                 5,
+                None,
             )
             .await;
 
@@ -1242,6 +1330,7 @@ mod tests {
                 Some("Demo Share".into()),
                 false,
                 5,
+                None,
             )
             .await;
         registry
@@ -1254,6 +1343,7 @@ mod tests {
                 Some("Demo Share".into()),
                 false,
                 5,
+                None,
             )
             .await;
 
@@ -1277,6 +1367,69 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn replacing_or_removing_route_signals_forward_shutdown() {
+        let registry = ProxyRegistry::default();
+        let (old_shutdown, mut old_rx) = RouteShutdown::new();
+        registry
+            .set_route(
+                "demo".into(),
+                "127.0.0.1:3000".into(),
+                Some("old-connection".into()),
+                None,
+                Some("share-1".into()),
+                None,
+                false,
+                5,
+                Some(old_shutdown),
+            )
+            .await;
+
+        let (new_shutdown, mut new_rx) = RouteShutdown::new();
+        registry
+            .set_route(
+                "demo".into(),
+                "127.0.0.1:3001".into(),
+                Some("new-connection".into()),
+                None,
+                Some("share-1".into()),
+                None,
+                false,
+                5,
+                Some(new_shutdown),
+            )
+            .await;
+
+        old_rx
+            .changed()
+            .await
+            .expect("old route should receive shutdown");
+        assert!(*old_rx.borrow());
+        assert!(!*new_rx.borrow());
+
+        registry
+            .remove_route_if_connection("demo", "new-connection")
+            .await;
+        new_rx
+            .changed()
+            .await
+            .expect("removed route should receive shutdown");
+        assert!(*new_rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn health_probe_failure_cache_is_scoped_by_subdomain() {
+        let registry = ProxyRegistry::default();
+
+        registry.record_health_probe_failure("demo".into()).await;
+
+        assert!(registry.has_cached_health_probe_failure("demo").await);
+        assert!(!registry.has_cached_health_probe_failure("other").await);
+
+        registry.clear_health_probe_failure("demo").await;
+        assert!(!registry.has_cached_health_probe_failure("demo").await);
     }
 
     #[test]

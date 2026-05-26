@@ -19,6 +19,8 @@ use crate::ServerGeo;
 use crate::config::Config;
 use crate::dynamic_settings::BoardSettings;
 use crate::error::AppError;
+#[cfg(test)]
+use crate::models::ShareUpstreamModel;
 use crate::models::{
     AuthSession, AuthUser, BindInstallationOwnerEmailRequest, BindInstallationOwnerEmailResponse,
     BoardMessageListResponse, BoardMessageView, BoardMetaResponse,
@@ -40,8 +42,7 @@ use crate::models::{
     ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRequestLogFetchResponse,
     ShareRuntimeRefreshPayload, ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse,
     ShareSettingsPatch, ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest,
-    ShareUpstreamModel, ShareUpstreamProvider, ShareView, TunnelLease, VerifyEmailCodeRequest,
-    VerifyEmailCodeResponse,
+    ShareUpstreamProvider, ShareView, TunnelLease, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 use crate::proxy::ProxyRegistry;
 
@@ -3220,7 +3221,12 @@ impl AppStore {
                  enabled_codex = ?3,
                  enabled_gemini = ?4,
                  app_runtimes_json = ?5,
-                 runtime_refreshed_at = ?6
+                 runtime_refreshed_at = ?6,
+                 token_limit = COALESCE(?7, token_limit),
+                 tokens_used = COALESCE(?8, tokens_used),
+                 requests_count = COALESCE(?9, requests_count),
+                 share_status = COALESCE(?10, share_status),
+                 updated_at = ?11
              WHERE share_id = ?1",
             params![
                 snapshot.share_id,
@@ -3229,6 +3235,11 @@ impl AppStore {
                 i64::from(snapshot.support.gemini as u8),
                 app_runtimes_json,
                 refreshed_at,
+                snapshot.token_limit,
+                snapshot.tokens_used,
+                snapshot.requests_count,
+                snapshot.share_status,
+                Utc::now().to_rfc3339(),
             ],
         )
         .map_err(|e| AppError::Internal(format!("update share runtime snapshot failed: {e}")))?;
@@ -9020,6 +9031,7 @@ mod tests {
                 Some("share-share-renew".into()),
                 false,
                 -1,
+                None,
             )
             .await;
 
@@ -9169,6 +9181,7 @@ mod tests {
                 None,
                 false,
                 -1,
+                None,
             )
             .await;
 
@@ -10424,6 +10437,7 @@ mod tests {
                 Some("Old Share".into()),
                 false,
                 -1,
+                None,
             )
             .await;
         proxy
@@ -10436,6 +10450,7 @@ mod tests {
                 Some("New Share".into()),
                 false,
                 -1,
+                None,
             )
             .await;
         proxy.set_share_inflight_for_test("share-old", 2).await;
@@ -10753,6 +10768,7 @@ mod tests {
                 None,
                 false,
                 -1,
+                None,
             )
             .await;
         proxy
@@ -10765,6 +10781,7 @@ mod tests {
                 None,
                 false,
                 -1,
+                None,
             )
             .await;
 
@@ -10831,6 +10848,7 @@ mod tests {
                 None,
                 false,
                 -1,
+                None,
             )
             .await;
 
@@ -11057,6 +11075,10 @@ mod tests {
                     codex: Some(test_upstream_provider("gpt-5.5")),
                     ..ShareAppRuntimes::default()
                 },
+                token_limit: None,
+                tokens_used: None,
+                requests_count: None,
+                share_status: None,
                 model_health: ShareModelHealthSummary {
                     codex: vec![test_model_summary("gpt-5.5", &["success"])],
                     ..ShareModelHealthSummary::default()
@@ -11089,6 +11111,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_snapshot_refreshes_share_usage_counters() {
+        let (store, config) = setup_store("runtime-refreshes-share-usage").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-1", "share-sub", "active").await;
+        let now = Utc::now().timestamp();
+
+        store
+            .record_share_runtime_snapshot(ShareRuntimeSnapshotResponse {
+                share_id: "share-1".into(),
+                queried_at: now,
+                token_limit: Some(-1),
+                tokens_used: Some(31_900_000),
+                requests_count: Some(137),
+                share_status: Some("active".into()),
+                support: ShareSupport {
+                    claude: true,
+                    codex: true,
+                    gemini: true,
+                },
+                app_runtimes: ShareAppRuntimes::default(),
+                model_health: ShareModelHealthSummary::default(),
+            })
+            .await
+            .expect("record runtime snapshot");
+
+        let conn = store.conn.lock().await;
+        let (token_limit, tokens_used, requests_count, share_status): (i64, i64, i64, String) =
+            conn.query_row(
+                "SELECT token_limit, tokens_used, requests_count, share_status FROM shares WHERE share_id = 'share-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("query share usage");
+        drop(conn);
+
+        assert_eq!(token_limit, -1);
+        assert_eq!(tokens_used, 31_900_000);
+        assert_eq!(requests_count, 137);
+        assert_eq!(share_status, "active");
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
     async fn older_runtime_snapshot_does_not_delete_newer_model_health_state() {
         let (store, config) = setup_store("runtime-stale-snapshot-keeps-newer-health").await;
         insert_installation(&store, "inst-1").await;
@@ -11109,6 +11175,10 @@ mod tests {
                     codex: Some(test_upstream_provider("gpt-5.5")),
                     ..ShareAppRuntimes::default()
                 },
+                token_limit: None,
+                tokens_used: None,
+                requests_count: None,
+                share_status: None,
                 model_health: ShareModelHealthSummary {
                     codex: vec![current_summary],
                     ..ShareModelHealthSummary::default()
@@ -11132,6 +11202,10 @@ mod tests {
                     codex: Some(test_upstream_provider("codex")),
                     ..ShareAppRuntimes::default()
                 },
+                token_limit: None,
+                tokens_used: None,
+                requests_count: None,
+                share_status: None,
                 model_health: ShareModelHealthSummary {
                     codex: vec![stale_summary],
                     ..ShareModelHealthSummary::default()

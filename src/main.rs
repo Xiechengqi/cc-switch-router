@@ -53,6 +53,9 @@ pub struct ServerState {
     pub server_geo: ServerGeo,
     pub store: AppStore,
     pub proxy: Arc<ProxyRegistry>,
+    /// Shared HTTP client for proxied tunnel traffic. It keeps connection pools
+    /// bounded and avoids allocating a new client for every request.
+    pub proxy_http: reqwest::Client,
     pub resend: Option<Arc<Resend>>,
     pub resend_usage_cache: Arc<Mutex<Option<ResendUsageCache>>>,
     pub dynamic: Arc<RwLock<DynamicSettings>>,
@@ -150,12 +153,21 @@ async fn main() -> Result<()> {
         info!("ssh host key fingerprint: {}", fp);
     }
     info!("router dashboard branding enabled: Switch Router logo + favicon");
+    let proxy_http = reqwest::Client::builder()
+        .user_agent("cc-switch-router/0.1 proxy")
+        .connect_timeout(Duration::from_secs(10))
+        .pool_idle_timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(64)
+        .tcp_keepalive(Duration::from_secs(60))
+        .build()
+        .context("build proxy http client failed")?;
 
     let state = ServerState {
         config: config.clone(),
         server_geo: server_geo.clone(),
         store: AppStore::new(&config)?,
         proxy: Arc::new(ProxyRegistry::default()),
+        proxy_http,
         resend,
         resend_usage_cache: Arc::new(Mutex::new(None)),
         dynamic: Arc::new(RwLock::new(DynamicSettings::from_config(&config))),

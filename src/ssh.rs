@@ -11,11 +11,12 @@ use russh::server::{Auth, Session};
 use russh::{Channel, ChannelId, server};
 use tokio::io;
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::proxy::ProxyRegistry;
+use crate::proxy::{ProxyRegistry, RouteShutdown};
 use crate::store::AppStore;
 
 #[derive(Clone)]
@@ -77,13 +78,85 @@ pub fn host_key_fingerprint(key: &KeyPair) -> Result<String> {
     Ok(format!("SHA256:{}", public.fingerprint()))
 }
 
-#[derive(Clone)]
 struct ClientHandler {
     store: AppStore,
     proxy: Arc<ProxyRegistry>,
     lease: Option<crate::models::TunnelLease>,
     backend: Option<String>,
-    forward_task: Option<Arc<JoinHandle<()>>>,
+    forward: Option<ForwardHandle>,
+}
+
+impl Clone for ClientHandler {
+    fn clone(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            proxy: self.proxy.clone(),
+            lease: self.lease.clone(),
+            backend: self.backend.clone(),
+            forward: None,
+        }
+    }
+}
+
+struct ForwardHandle {
+    task: Option<JoinHandle<()>>,
+    shutdown: RouteShutdown,
+    proxy: Arc<ProxyRegistry>,
+    subdomain: String,
+    connection_id: String,
+    closed: bool,
+}
+
+impl ForwardHandle {
+    fn new(
+        task: JoinHandle<()>,
+        shutdown: RouteShutdown,
+        proxy: Arc<ProxyRegistry>,
+        subdomain: String,
+        connection_id: String,
+    ) -> Self {
+        Self {
+            task: Some(task),
+            shutdown,
+            proxy,
+            subdomain,
+            connection_id,
+            closed: false,
+        }
+    }
+
+    fn shutdown(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        self.shutdown.shutdown();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        let proxy = self.proxy.clone();
+        let subdomain = self.subdomain.clone();
+        let connection_id = self.connection_id.clone();
+        tokio::spawn(async move {
+            proxy
+                .remove_route_if_connection(&subdomain, &connection_id)
+                .await;
+        });
+    }
+}
+
+impl Drop for ForwardHandle {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+impl ClientHandler {
+    fn shutdown_forward(&mut self) {
+        if let Some(mut forward) = self.forward.take() {
+            forward.shutdown();
+        }
+    }
 }
 
 impl SshServer {
@@ -104,7 +177,7 @@ impl SshServer {
                 proxy: self.proxy.clone(),
                 lease: None,
                 backend: None,
-                forward_task: None,
+                forward: None,
             };
             tokio::spawn(async move {
                 if let Err(err) = server::run_stream(config, socket, handler).await {
@@ -163,12 +236,10 @@ impl server::Handler for ClientHandler {
         port: &mut u32,
         session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        let Some(lease) = self.lease.as_ref() else {
+        let Some(lease) = self.lease.clone() else {
             return Ok(false);
         };
-        if let Some(task) = self.forward_task.take() {
-            task.abort();
-        }
+        self.shutdown_forward();
 
         let host = normalize_backend_host(address);
         let listener = match TcpListener::bind((host, *port as u16)).await {
@@ -189,6 +260,7 @@ impl server::Handler for ClientHandler {
             .map(|s| s.for_sale == "Free")
             .unwrap_or(false);
         let parallel_limit = lease.share.as_ref().map(|s| s.parallel_limit).unwrap_or(-1);
+        let (route_shutdown, shutdown_rx) = RouteShutdown::new();
         self.proxy
             .set_route(
                 lease.subdomain.clone(),
@@ -199,6 +271,7 @@ impl server::Handler for ClientHandler {
                 lease.share.as_ref().map(|s| s.share_name.clone()),
                 is_free_share,
                 parallel_limit,
+                Some(route_shutdown.clone()),
             )
             .await;
         self.backend = Some(backend.clone());
@@ -216,13 +289,20 @@ impl server::Handler for ClientHandler {
                 proxy,
                 subdomain,
                 connection_id,
+                shutdown_rx,
             )
             .await
             {
                 error!("forward listener failed on port {}: {}", bound_port, err);
             }
         });
-        self.forward_task = Some(Arc::new(task));
+        self.forward = Some(ForwardHandle::new(
+            task,
+            route_shutdown,
+            self.proxy.clone(),
+            lease.subdomain.clone(),
+            lease.connection_id.clone(),
+        ));
         info!(
             "registered backend for subdomain={} connection_id={} backend={}",
             lease.subdomain, lease.connection_id, backend
@@ -235,14 +315,7 @@ impl server::Handler for ClientHandler {
         _channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(task) = self.forward_task.take() {
-            task.abort();
-        }
-        if let Some(lease) = self.lease.as_ref() {
-            self.proxy
-                .remove_route_if_connection(&lease.subdomain, &lease.connection_id)
-                .await;
-        }
+        self.shutdown_forward();
         Ok(())
     }
 
@@ -252,15 +325,14 @@ impl server::Handler for ClientHandler {
         _port: u32,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        if let Some(task) = self.forward_task.take() {
-            task.abort();
-        }
-        if let Some(lease) = self.lease.as_ref() {
-            self.proxy
-                .remove_route_if_connection(&lease.subdomain, &lease.connection_id)
-                .await;
-        }
+        self.shutdown_forward();
         Ok(true)
+    }
+}
+
+impl Drop for ClientHandler {
+    fn drop(&mut self) {
+        self.shutdown_forward();
     }
 }
 
@@ -276,9 +348,30 @@ async fn serve_forward_listener(
     proxy: Arc<ProxyRegistry>,
     subdomain: String,
     connection_id: String,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let accepted = tokio::select! {
+            biased;
+
+            changed = shutdown_rx.changed() => {
+                match changed {
+                    Ok(()) if *shutdown_rx.borrow() => return Ok(()),
+                    Ok(()) => continue,
+                    Err(_) => return Ok(()),
+                }
+            }
+            accepted = listener.accept() => accepted,
+        };
+        let (stream, peer) = match accepted {
+            Ok(accepted) => accepted,
+            Err(err) => {
+                proxy
+                    .remove_route_if_connection(&subdomain, &connection_id)
+                    .await;
+                return Err(err.into());
+            }
+        };
         let handle = handle.clone();
         let connected_address = connected_address.clone();
         let originator_address = peer.ip().to_string();
