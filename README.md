@@ -1,6 +1,6 @@
 # cc-switch-router
 
-面向 `cc-switch` 的最小 Rust tunnel server。
+面向 `cc-switch` 的最小 Rust tunnel server
 
 ## 技术架构
 
