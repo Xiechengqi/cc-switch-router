@@ -50,7 +50,8 @@ use crate::models::{
     ShareEditAvailableEvent, ShareEditEventSignaturePayload, ShareHeartbeatRequest,
     SharePendingEditsRequest, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry,
     ShareRuntimeRefreshRequest, ShareSettingsUpdateRequest, ShareSyncRequest,
-    VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    UserApiTokenResetResponse, UserApiTokenResponse, UserSharesResponse, VerifyEmailCodeRequest,
+    VerifyEmailCodeResponse,
 };
 use crate::proxy::{market_proxy_handler, proxy_handler};
 use crate::recent_traffic::{RecentRequestEvent, RecentTrafficSnapshot};
@@ -148,6 +149,9 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/auth/email/verify-code", post(verify_email_code))
         .route("/v1/auth/session/refresh", post(refresh_session))
         .route("/v1/auth/session/me", get(session_me))
+        .route("/v1/me/api-token", get(get_default_api_token))
+        .route("/v1/me/api-token/reset", post(reset_default_api_token))
+        .route("/v1/me/shares", get(my_shares))
         .route("/v1/tunnels/lease", post(issue_lease))
         .route("/v1/shares/claim-subdomain", post(claim_share_subdomain))
         .route("/v1/shares/sync", post(sync_share))
@@ -710,17 +714,25 @@ fn confirmed_request_events(
     (events, country_counts)
 }
 
-fn live_country_by_request_id(
+fn live_request_context_by_request_id(
     snapshot: &RecentTrafficSnapshot,
-) -> HashMap<String, (Option<String>, Option<String>)> {
+) -> HashMap<String, (Option<String>, Option<String>, Option<String>)> {
     snapshot
         .events
         .iter()
-        .filter(|event| event.user_country.is_some() || event.user_country_iso3.is_some())
+        .filter(|event| {
+            event.user_country.is_some()
+                || event.user_country_iso3.is_some()
+                || event.user_email.is_some()
+        })
         .map(|event| {
             (
                 event.request_id.clone(),
-                (event.user_country.clone(), event.user_country_iso3.clone()),
+                (
+                    event.user_country.clone(),
+                    event.user_country_iso3.clone(),
+                    event.user_email.clone(),
+                ),
             )
         })
         .collect()
@@ -730,12 +742,13 @@ fn enrich_market_request_logs_with_live_country(
     logs: &mut [crate::models::MarketRequestLogEntry],
     snapshot: &RecentTrafficSnapshot,
 ) {
-    let country_by_request_id = live_country_by_request_id(snapshot);
+    let context_by_request_id = live_request_context_by_request_id(snapshot);
     for log in logs {
         if log.user_country.is_some() && log.user_country_iso3.is_some() {
             continue;
         }
-        if let Some((user_country, user_country_iso3)) = country_by_request_id.get(&log.request_id)
+        if let Some((user_country, user_country_iso3, _)) =
+            context_by_request_id.get(&log.request_id)
         {
             if log.user_country.is_none() {
                 log.user_country = user_country.clone();
@@ -775,6 +788,7 @@ fn share_log_to_ticker_event(
         share_subdomain: Some(share.subdomain.clone()),
         user_country: log.user_country.clone(),
         user_country_iso3: log.user_country_iso3.clone(),
+        user_email: log.user_email.clone(),
         started_at: chrono::DateTime::<chrono::Utc>::from_timestamp(log.created_at, 0)
             .unwrap_or_else(chrono::Utc::now),
         is_inflight: false,
@@ -805,6 +819,7 @@ fn market_log_to_ticker_event(log: &DashboardMarketRequestLogView) -> RecentRequ
         share_subdomain: log.share_subdomain.clone(),
         user_country: log.user_country.clone(),
         user_country_iso3: log.user_country_iso3.clone(),
+        user_email: log.user_email.clone(),
         started_at: parse_dashboard_log_time(&log.created_at),
         is_inflight: false,
         is_health_check: false,
@@ -921,6 +936,40 @@ async fn session_me(
     Ok(Json(response))
 }
 
+async fn get_default_api_token(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<UserApiTokenResponse>, AppError> {
+    let email = require_session_email(&state, &headers).await?;
+    Ok(Json(state.store.get_default_api_token(&email).await?))
+}
+
+async fn reset_default_api_token(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<UserApiTokenResetResponse>, AppError> {
+    let email = require_session_email(&state, &headers).await?;
+    Ok(Json(state.store.reset_default_api_token(&email).await?))
+}
+
+async fn my_shares(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<UserSharesResponse>, AppError> {
+    let email = require_user_email(&state, &headers, "share:read").await?;
+    Ok(Json(
+        state
+            .store
+            .list_user_shares(
+                &state.config,
+                &email,
+                &state.proxy.active_subdomains().await.into_iter().collect(),
+                &state.proxy.inflight_by_share().await,
+            )
+            .await?,
+    ))
+}
+
 async fn root_handler(
     State(state): State<ServerState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -1027,6 +1076,25 @@ mod tests {
     use chrono::Utc;
 
     #[test]
+    fn router_api_token_extraction_accepts_share_client_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-goog-api-key", "gemini-router-token".parse().unwrap());
+        assert_eq!(
+            extract_router_api_token(&headers),
+            Some("gemini-router-token")
+        );
+
+        headers.insert("x-api-key", "router-token".parse().unwrap());
+        assert_eq!(extract_router_api_token(&headers), Some("router-token"));
+
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer bearer-token".parse().unwrap(),
+        );
+        assert_eq!(extract_router_api_token(&headers), Some("bearer-token"));
+    }
+
+    #[test]
     fn confirmed_request_events_accepts_market_request_logs() {
         let event = RecentRequestEvent {
             request_id: "req_market_confirmed".into(),
@@ -1035,6 +1103,7 @@ mod tests {
             share_subdomain: Some("share-sub".into()),
             user_country: Some("US".into()),
             user_country_iso3: Some("USA".into()),
+            user_email: Some("user@example.com".into()),
             started_at: Utc::now(),
             is_inflight: true,
             is_health_check: false,
@@ -1198,6 +1267,7 @@ mod tests {
             share_subdomain: Some("live-sub".into()),
             user_country: Some("US".into()),
             user_country_iso3: Some("USA".into()),
+            user_email: Some("live-user@example.com".into()),
             started_at: Utc::now(),
             is_inflight: true,
             is_health_check: false,
@@ -1268,6 +1338,7 @@ mod tests {
             session_id: None,
             user_country: None,
             user_country_iso3: None,
+            user_email: None,
             created_at,
             is_health_check: false,
         }
@@ -1377,7 +1448,7 @@ async fn update_share_settings(
     Path(share_id): Path<String>,
     Json(input): Json<ShareSettingsUpdateRequest>,
 ) -> Result<Json<crate::models::ShareSettingsUpdateResponse>, AppError> {
-    let current_user_email = require_session_email(&state, &headers).await?;
+    let current_user_email = require_user_email(&state, &headers, "share:write").await?;
     let response = state
         .store
         .create_share_settings_edit(&share_id, &current_user_email, input.patch)
@@ -1505,7 +1576,7 @@ async fn batch_sync_share_request_logs(
     Json(input): Json<ShareRequestLogBatchSyncRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let snapshot = state.recent_traffic.snapshot().await;
-    let live_country_map = live_country_by_request_id(&snapshot);
+    let live_context_map = live_request_context_by_request_id(&snapshot);
     let metric_logs = input.logs.clone();
     state
         .store
@@ -1513,7 +1584,7 @@ async fn batch_sync_share_request_logs(
             input,
             extract_client_metadata(&headers, addr),
             "",
-            live_country_map,
+            live_context_map,
         )
         .await?;
     state.metrics.record_share_request_logs(&metric_logs);
@@ -1602,6 +1673,34 @@ async fn require_session_email(
     extract_session_email(state, headers)
         .await?
         .ok_or_else(|| AppError::Unauthorized("authenticated owner session required".into()))
+}
+
+async fn require_user_email(
+    state: &ServerState,
+    headers: &HeaderMap,
+    required_scope: &str,
+) -> Result<String, AppError> {
+    if let Some(email) = extract_session_email(state, headers).await? {
+        return Ok(email);
+    }
+    let token = extract_router_api_token(headers)
+        .ok_or_else(|| AppError::Unauthorized("authenticated user token required".into()))?;
+    state
+        .store
+        .resolve_user_api_token(token, required_scope)
+        .await?
+        .map(|principal| principal.email)
+        .ok_or_else(|| AppError::Unauthorized("invalid user api token".into()))
+}
+
+pub(crate) fn extract_router_api_token(headers: &HeaderMap) -> Option<&str> {
+    extract_bearer_token(headers).or_else(|| {
+        ["x-api-key", "x-goog-api-key"]
+            .iter()
+            .find_map(|name| headers.get(*name).and_then(|value| value.to_str().ok()))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })
 }
 
 #[derive(Debug, Deserialize)]

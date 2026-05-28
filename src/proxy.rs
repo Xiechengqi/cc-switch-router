@@ -558,6 +558,7 @@ pub async fn market_proxy_handler(
                 route.share_name.clone(),
                 Some(route.subdomain.clone()),
                 client_metadata.country_code.clone(),
+                None,
             )
             .await;
         Some(request_id)
@@ -570,6 +571,7 @@ pub async fn market_proxy_handler(
                     route.share_name.clone(),
                     Some(route.subdomain.clone()),
                     client_metadata.country_code.clone(),
+                    None,
                 )
                 .await,
         )
@@ -815,14 +817,69 @@ pub async fn proxy_handler(
         return simple_response(StatusCode::SERVICE_UNAVAILABLE, "connection-lost-cached");
     }
 
-    // Determine effective share token: prefer client-supplied header,
-    // fall back to the token registered with this tunnel route.
-    let client_token = parts
-        .headers
-        .get("x-share-token")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    let effective_token = client_token.or(route_share_token);
+    // User-facing credentials terminate at the router. The client only sees
+    // the internal share secret registered with this tunnel route.
+    let mut api_user_email = None;
+    if !is_internal_share_router_path && !is_share_model_health_check {
+        if let Some(share_id) = route.share_id.as_deref() {
+            let Some(user_token) = crate::api::extract_router_api_token(&parts.headers) else {
+                return simple_response(StatusCode::UNAUTHORIZED, "missing-router-api-token");
+            };
+            let principal = match state
+                .store
+                .resolve_user_api_token(user_token, "share:invoke")
+                .await
+            {
+                Ok(Some(principal)) => principal,
+                Ok(None) => {
+                    return simple_response(StatusCode::UNAUTHORIZED, "invalid-router-api-token");
+                }
+                Err(err) => {
+                    warn!(
+                        method = %method,
+                        host = %host,
+                        path = %path_and_query,
+                        share_id = %share_id,
+                        client_ip = %user_ip,
+                        client_country = %user_country,
+                        client_asn = %user_asn,
+                        user_agent = %user_agent,
+                        error = %err,
+                        "proxy request rejected: router api token authentication failed"
+                    );
+                    return simple_response(StatusCode::UNAUTHORIZED, "invalid-router-api-token");
+                }
+            };
+            match state
+                .store
+                .user_can_invoke_share(&principal.email, share_id)
+                .await
+            {
+                Ok(true) => {
+                    api_user_email = Some(principal.email.clone());
+                }
+                Ok(false) => {
+                    return simple_response(StatusCode::FORBIDDEN, "share-not-authorized-for-user");
+                }
+                Err(err) => {
+                    warn!(
+                        method = %method,
+                        host = %host,
+                        path = %path_and_query,
+                        share_id = %share_id,
+                        user_email = %principal.email,
+                        error = %err,
+                        "proxy request rejected: share acl lookup failed"
+                    );
+                    return simple_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "share-acl-lookup-failed",
+                    );
+                }
+            }
+        }
+    }
+    let effective_token = route_share_token;
 
     let target = format!("http://{backend}{path_and_query}");
 
@@ -833,8 +890,20 @@ pub async fn proxy_handler(
         if n.eq_ignore_ascii_case("host") || is_hop_by_hop_header(n) {
             continue;
         }
-        // Skip client-supplied x-share-token; we inject the effective one below.
+        // Skip client-supplied user/share credentials on share routes; router
+        // authenticates them at the edge and injects the internal share secret.
         if n.eq_ignore_ascii_case("x-share-token") {
+            continue;
+        }
+        if n.eq_ignore_ascii_case("x-cc-switch-user-email") {
+            continue;
+        }
+        if route.share_id.is_some()
+            && (n.eq_ignore_ascii_case("authorization")
+                || n.eq_ignore_ascii_case("x-api-key")
+                || n.eq_ignore_ascii_case("x-goog-api-key")
+                || n.eq_ignore_ascii_case("api-key"))
+        {
             continue;
         }
         builder = builder.header(name, value);
@@ -843,6 +912,9 @@ pub async fn proxy_handler(
     // Inject effective share token so cc-switch can track share usage.
     if let Some(ref tok) = effective_token {
         builder = builder.header("X-Share-Token", tok.as_str());
+    }
+    if let Some(ref email) = api_user_email {
+        builder = builder.header("X-CC-Switch-User-Email", email.as_str());
     }
 
     let log_token = effective_token
@@ -953,6 +1025,7 @@ pub async fn proxy_handler(
                             route.share_name.clone(),
                             Some(route.subdomain.clone()),
                             client_metadata.country_code.clone(),
+                            api_user_email.clone(),
                         )
                         .await,
                 )

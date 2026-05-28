@@ -224,6 +224,7 @@ export type ShareRequestLog = {
   cacheCreationTokens?: number;
   isStreaming?: boolean;
   isHealthCheck?: boolean;
+  userEmail?: string;
   createdAt: number;
 };
 
@@ -287,6 +288,7 @@ export type RecentRequestEvent = {
   countryCode?: string;
   userCountry?: string;
   userCountryIso3?: string;
+  userEmail?: string;
   startedAt?: string;
   createdAt?: string;
   isInflight?: boolean;

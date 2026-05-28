@@ -161,18 +161,19 @@ function buildRequestMeta(data: DashboardResponse | null) {
   for (const share of data?.tickerShares || []) {
     for (const log of share.recentRequests || []) {
       const market = marketMeta.get(log.requestId);
-      meta.set(log.requestId, { ...log, shareName: share.shareName, shareId: share.shareId, userEmail: market?.userEmail, apiKeyPrefix: market?.apiKeyPrefix, usageAmountUsd: market?.usageAmountUsd });
+      meta.set(log.requestId, { ...log, shareName: share.shareName, shareId: share.shareId, userEmail: log.userEmail || market?.userEmail, apiKeyPrefix: market?.apiKeyPrefix, usageAmountUsd: market?.usageAmountUsd });
     }
   }
   for (const client of data?.clients || []) {
     const share = client.share;
     for (const log of share?.recentRequests || []) {
       const market = marketMeta.get(log.requestId);
-      meta.set(log.requestId, { ...log, shareName: share?.shareName || log.shareName, shareId: share?.shareId || log.shareId, userEmail: market?.userEmail, apiKeyPrefix: market?.apiKeyPrefix, usageAmountUsd: market?.usageAmountUsd });
+      meta.set(log.requestId, { ...log, shareName: share?.shareName || log.shareName, shareId: share?.shareId || log.shareId, userEmail: log.userEmail || market?.userEmail, apiKeyPrefix: market?.apiKeyPrefix, usageAmountUsd: market?.usageAmountUsd });
     }
   }
   for (const [requestId, log] of marketMeta) {
-    meta.set(requestId, { ...(meta.get(requestId) || {}), ...log });
+    const existing = meta.get(requestId);
+    meta.set(requestId, { ...(existing || {}), ...log, userEmail: log.userEmail || existing?.userEmail });
   }
   return meta;
 }
@@ -192,15 +193,21 @@ function RequestTicker({ data }: { data: DashboardResponse | null }) {
     <div className="absolute left-[1.6%] top-[3.5%] z-20 flex max-w-[min(68%,760px)] flex-col items-start gap-1.5">
       {events.map((event, index) => {
         const item = meta.get(event.requestId);
+        const eventUserEmail = event.userEmail;
         const mergedItem = event.isHealthCheck
           ? {
               ...(item || {}),
+              userEmail: item?.userEmail || eventUserEmail,
               isHealthCheck: true,
               requestAgent: event.healthAppType || item?.requestAgent || "",
               requestedModel: event.healthModel || item?.requestedModel || item?.requestModel || "",
               status: event.healthStatus || item?.status,
             }
-          : item;
+          : item
+            ? { ...item, userEmail: item.userEmail || eventUserEmail }
+            : eventUserEmail
+              ? { userEmail: eventUserEmail }
+              : undefined;
         const country = event.userCountry || event.countryCode || "--";
         const subdomain = event.shareSubdomain || event.subdomain || event.shareName || mergedItem?.shareName || "share";
         const eventKey = [event.requestId, event.startedAt || event.createdAt || "", index].join(":");

@@ -1589,6 +1589,7 @@ function ShareRequestLogs({ logs }: { logs: ShareRequestLog[] }) {
                 <div className="truncate font-medium">{requestModelRoute(log)}</div>
                 <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
                   {log.isHealthCheck ? <Chip color={log.statusCode >= 200 && log.statusCode < 400 ? "success" : "danger"} size="sm" variant="soft">健康检查</Chip> : null}
+                  {log.userEmail ? <span>{log.userEmail}</span> : null}
                   <span>{log.providerName || log.providerId || "-"}</span>
                   <span>{log.requestedModel || log.requestModel || "-"}</span>
                   <span title={formatDateTime(log.createdAt * 1000)}>{formatRelativeTime(log.createdAt * 1000)}</span>

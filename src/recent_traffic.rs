@@ -46,6 +46,8 @@ pub struct RecentRequestEvent {
     /// Same value translated to alpha-3, ready to address SVG country paths.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_country_iso3: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_email: Option<String>,
     pub started_at: DateTime<Utc>,
     /// True while the underlying proxy request is still streaming. Stamped at
     /// snapshot time from the `inflight_request_ids` set, not stored on the
@@ -97,6 +99,7 @@ impl RecentTraffic {
         share_name: Option<String>,
         share_subdomain: Option<String>,
         user_country_iso2: Option<String>,
+        user_email: Option<String>,
     ) -> String {
         let request_id = Uuid::new_v4().to_string();
         self.record_with_id(
@@ -105,6 +108,7 @@ impl RecentTraffic {
             share_name,
             share_subdomain,
             user_country_iso2,
+            user_email,
         )
         .await;
         request_id
@@ -117,6 +121,7 @@ impl RecentTraffic {
         share_name: Option<String>,
         share_subdomain: Option<String>,
         user_country_iso2: Option<String>,
+        user_email: Option<String>,
     ) {
         let user_country_iso3 = user_country_iso2
             .as_deref()
@@ -129,6 +134,7 @@ impl RecentTraffic {
             share_subdomain,
             user_country: user_country_iso2,
             user_country_iso3,
+            user_email,
             started_at: Utc::now(),
             is_inflight: true,
             is_health_check: false,
@@ -168,6 +174,7 @@ impl RecentTraffic {
             share_subdomain,
             user_country: None,
             user_country_iso3: None,
+            user_email: None,
             started_at: Utc::now(),
             is_inflight: false,
             is_health_check: true,
@@ -256,6 +263,7 @@ mod tests {
                 None,
                 None,
                 country.map(|c| c.to_string()),
+                None,
             )
             .await
     }

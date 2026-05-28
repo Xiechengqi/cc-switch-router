@@ -45,7 +45,9 @@ use crate::models::{
     ShareRequestLogEntry, ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload,
     ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse, ShareSettingsPatch,
     ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest,
-    ShareUpstreamProvider, ShareView, TunnelLease, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    ShareUpstreamProvider, ShareView, TunnelLease, UserApiTokenResetResponse, UserApiTokenResponse,
+    UserApiTokenStatus, UserShareView, UserSharesResponse, VerifyEmailCodeRequest,
+    VerifyEmailCodeResponse,
 };
 use crate::proxy::ProxyRegistry;
 
@@ -69,6 +71,8 @@ const MARKET_DEFAULT_SCOPES: &[&str] = &[
     "market:email:notify",
     "market:request_logs:write",
 ];
+const USER_DEFAULT_API_TOKEN_SCOPES: &[&str] = &["share:read", "share:write", "share:invoke"];
+const USER_DEFAULT_API_TOKEN_NAME: &str = "default";
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -92,6 +96,21 @@ struct VerificationRedeemResponse {
     email: String,
     purpose: String,
     verified_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserApiTokenPrincipal {
+    pub user_id: String,
+    pub email: String,
+    pub scopes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct UserApiTokenRecord {
+    prefix: String,
+    scopes: Vec<String>,
+    created_at: DateTime<Utc>,
+    last_used_at: Option<DateTime<Utc>>,
 }
 
 use crate::geo::country_centroid;
@@ -696,6 +715,7 @@ impl AppStore {
             last_used_at: now,
         };
         persist_session(&conn, &session)?;
+        let (api_token, api_token_status) = ensure_default_user_api_token(&conn, &user.id, now)?;
 
         Ok(VerifyEmailCodeResponse {
             user,
@@ -703,6 +723,8 @@ impl AppStore {
             refresh_token,
             expires_at: access_expires_at,
             refresh_expires_at,
+            api_token,
+            api_token_prefix: Some(api_token_status.prefix),
         })
     }
 
@@ -757,6 +779,9 @@ impl AppStore {
             refresh_token,
             expires_at: access_expires_at,
             refresh_expires_at,
+            api_token: None,
+            api_token_prefix: get_default_user_api_token(&conn, &current.user_id)?
+                .map(|token| token.prefix),
         })
     }
 
@@ -839,6 +864,158 @@ impl AppStore {
         )
         .map_err(|e| AppError::Internal(format!("touch session failed: {e}")))?;
         Ok(Some(session))
+    }
+
+    pub async fn resolve_user_api_token(
+        &self,
+        token: &str,
+        required_scope: &str,
+    ) -> Result<Option<UserApiTokenPrincipal>, AppError> {
+        let token = token.trim();
+        if token.is_empty() {
+            return Ok(None);
+        }
+        let now = Utc::now();
+        let conn = self.conn.lock().await;
+        let Some((id, user_id, email, scopes)) =
+            get_user_api_token_by_hash(&conn, &hash_token(token))?
+        else {
+            return Ok(None);
+        };
+        if !scopes.iter().any(|scope| scope == required_scope) {
+            return Err(AppError::Unauthorized(
+                "api token scope is not allowed".into(),
+            ));
+        }
+        conn.execute(
+            "UPDATE user_api_tokens SET last_used_at = ?2 WHERE id = ?1",
+            params![id, now.to_rfc3339()],
+        )
+        .map_err(|e| AppError::Internal(format!("touch user api token failed: {e}")))?;
+        Ok(Some(UserApiTokenPrincipal {
+            user_id,
+            email,
+            scopes,
+        }))
+    }
+
+    pub async fn get_default_api_token(
+        &self,
+        current_user_email: &str,
+    ) -> Result<UserApiTokenResponse, AppError> {
+        let email = normalize_email(current_user_email)?;
+        let now = Utc::now();
+        let conn = self.conn.lock().await;
+        let user = upsert_user_by_email(&conn, &email, now)?;
+        let (_raw, record) = ensure_default_user_api_token(&conn, &user.id, now)?;
+        Ok(UserApiTokenResponse {
+            token: user_api_token_status(record),
+        })
+    }
+
+    pub async fn reset_default_api_token(
+        &self,
+        current_user_email: &str,
+    ) -> Result<UserApiTokenResetResponse, AppError> {
+        let email = normalize_email(current_user_email)?;
+        let now = Utc::now();
+        let conn = self.conn.lock().await;
+        let user = upsert_user_by_email(&conn, &email, now)?;
+        let (api_token, record) = reset_default_user_api_token(&conn, &user.id, now)?;
+        Ok(UserApiTokenResetResponse {
+            api_token,
+            token: user_api_token_status(record),
+        })
+    }
+
+    pub async fn list_user_shares(
+        &self,
+        config: &Config,
+        current_user_email: &str,
+        active_subdomains: &HashSet<String>,
+        inflight_by_share: &HashMap<String, usize>,
+    ) -> Result<UserSharesResponse, AppError> {
+        let email = normalize_email(current_user_email)?;
+        let conn = self.conn.lock().await;
+        let active_edits = list_active_share_edits(&conn)?;
+        let mut shares = Vec::new();
+        for (_, share) in list_shares(&conn)? {
+            let owner = share
+                .owner_email
+                .as_deref()
+                .is_some_and(|owner| owner.eq_ignore_ascii_case(&email));
+            let shared = share
+                .shared_with_emails
+                .iter()
+                .any(|shared| shared.eq_ignore_ascii_case(&email));
+            if !owner && !shared {
+                continue;
+            }
+            let role = if owner { "owner" } else { "shared" }.to_string();
+            let active_requests = inflight_by_share
+                .get(&share.share_id)
+                .copied()
+                .unwrap_or_default();
+            shares.push(UserShareView {
+                router_id: "main".to_string(),
+                share_id: share.share_id.clone(),
+                share_name: share.share_name.clone(),
+                owner_email: share.owner_email.clone(),
+                shared_with_emails: share.shared_with_emails.clone(),
+                role,
+                can_invoke: true,
+                can_manage: owner || shared,
+                description: share.description.clone(),
+                for_sale: share.for_sale.clone(),
+                market_access_mode: share.market_access_mode.clone(),
+                subdomain: share.subdomain.clone(),
+                tunnel_url: config.tunnel_url(&share.subdomain),
+                app_type: share.app_type.clone(),
+                provider_id: share.provider_id.clone(),
+                token_limit: share.token_limit,
+                parallel_limit: share.parallel_limit,
+                tokens_used: share.tokens_used,
+                requests_count: share.requests_count,
+                share_status: share.share_status.clone(),
+                created_at: share.created_at.clone(),
+                expires_at: share.expires_at.clone(),
+                is_online: active_subdomains.contains(&share.subdomain),
+                active_requests,
+                active_edit: active_edits.get(&share.share_id).cloned(),
+            });
+        }
+        Ok(UserSharesResponse { shares })
+    }
+
+    pub async fn user_can_invoke_share(
+        &self,
+        user_email: &str,
+        share_id: &str,
+    ) -> Result<bool, AppError> {
+        let email = normalize_email(user_email)?;
+        let conn = self.conn.lock().await;
+        let Some((owner_email, shared_with_emails_json)): Option<(Option<String>, String)> = conn
+            .query_row(
+                "SELECT owner_email, shared_with_emails_json FROM shares WHERE share_id = ?1",
+                params![share_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| AppError::Internal(format!("query share invoke acl failed: {e}")))?
+        else {
+            return Ok(false);
+        };
+        if owner_email
+            .as_deref()
+            .is_some_and(|owner| owner.eq_ignore_ascii_case(&email))
+        {
+            return Ok(true);
+        }
+        let shared_with_emails = parse_string_vec(Some(shared_with_emails_json))
+            .map_err(|e| AppError::Internal(format!("parse share invoke acl failed: {e}")))?;
+        Ok(shared_with_emails
+            .iter()
+            .any(|shared| shared.eq_ignore_ascii_case(&email)))
     }
 
     pub async fn issue_lease(
@@ -1590,7 +1767,10 @@ impl AppStore {
         input: ShareRequestLogBatchSyncRequest,
         metadata: ClientMetadata,
         _current_user_email: &str,
-        live_country_by_request_id: HashMap<String, (Option<String>, Option<String>)>,
+        live_request_context_by_id: HashMap<
+            String,
+            (Option<String>, Option<String>, Option<String>),
+        >,
     ) -> Result<(), AppError> {
         let conn = self.conn.lock().await;
         let installation = get_installation(&conn, &input.installation_id)?;
@@ -1626,14 +1806,17 @@ impl AppStore {
                     "only share installation can sync request logs".into(),
                 ));
             }
-            if let Some((user_country, user_country_iso3)) =
-                live_country_by_request_id.get(&log.request_id)
+            if let Some((user_country, user_country_iso3, user_email)) =
+                live_request_context_by_id.get(&log.request_id)
             {
                 if log.user_country.is_none() {
                     log.user_country = user_country.clone();
                 }
                 if log.user_country_iso3.is_none() {
                     log.user_country_iso3 = user_country_iso3.clone();
+                }
+                if log.user_email.is_none() {
+                    log.user_email = user_email.clone();
                 }
             }
             upsert_share_request_log_tx(&tx, &input.installation_id, log)?;
@@ -4256,8 +4439,8 @@ fn upsert_share_request_log_tx(
             app_type, model, request_model, request_agent, requested_model, actual_model, actual_model_source,
             status_code, latency_ms, first_token_ms,
             input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
-            is_streaming, session_id, user_country, user_country_iso3, is_health_check, created_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
+            is_streaming, session_id, user_country, user_country_iso3, user_email, is_health_check, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
         ON CONFLICT(request_id) DO UPDATE SET
             installation_id = excluded.installation_id,
             share_id = excluded.share_id,
@@ -4282,6 +4465,7 @@ fn upsert_share_request_log_tx(
             session_id = excluded.session_id,
             user_country = COALESCE(excluded.user_country, share_request_logs.user_country),
             user_country_iso3 = COALESCE(excluded.user_country_iso3, share_request_logs.user_country_iso3),
+            user_email = COALESCE(excluded.user_email, share_request_logs.user_email),
             is_health_check = excluded.is_health_check,
             created_at = excluded.created_at",
         params![
@@ -4309,6 +4493,7 @@ fn upsert_share_request_log_tx(
             log.session_id,
             log.user_country,
             log.user_country_iso3,
+            log.user_email,
             i64::from(log.is_health_check as u8),
             log.created_at,
         ],
@@ -4510,6 +4695,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             session_id TEXT,
             user_country TEXT,
             user_country_iso3 TEXT,
+            user_email TEXT,
             is_health_check INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL
         );
@@ -4651,6 +4837,19 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             revoked_at TEXT,
             created_at TEXT NOT NULL,
             last_used_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS user_api_tokens (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            token_prefix TEXT NOT NULL,
+            scopes_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_used_at TEXT,
+            reset_at TEXT,
+            revoked_at TEXT
         );
 
         CREATE TABLE IF NOT EXISTS router_markets (
@@ -5127,6 +5326,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
     )?;
     add_column_if_missing(conn, "share_request_logs", "user_country", "TEXT")?;
     add_column_if_missing(conn, "share_request_logs", "user_country_iso3", "TEXT")?;
+    add_column_if_missing(conn, "share_request_logs", "user_email", "TEXT")?;
     add_column_if_missing(
         conn,
         "share_request_logs",
@@ -6727,13 +6927,13 @@ fn list_recent_share_request_logs(
                     request_model, request_agent, requested_model, actual_model, actual_model_source,
                     status_code, latency_ms, first_token_ms, input_tokens,
                     output_tokens, cache_read_tokens, cache_creation_tokens, is_streaming,
-                    session_id, user_country, user_country_iso3, is_health_check, created_at
+                    session_id, user_country, user_country_iso3, user_email, is_health_check, created_at
              FROM (
                  SELECT request_id, share_id, share_name, provider_id, provider_name, app_type, model,
                         request_model, request_agent, requested_model, actual_model, actual_model_source,
                         status_code, latency_ms, first_token_ms, input_tokens,
                         output_tokens, cache_read_tokens, cache_creation_tokens, is_streaming,
-                        session_id, user_country, user_country_iso3, is_health_check, created_at,
+                        session_id, user_country, user_country_iso3, user_email, is_health_check, created_at,
                         ROW_NUMBER() OVER (PARTITION BY share_id ORDER BY created_at DESC) AS row_num
                  FROM share_request_logs
              )
@@ -6767,8 +6967,9 @@ fn list_recent_share_request_logs(
                 session_id: row.get(20)?,
                 user_country: row.get(21)?,
                 user_country_iso3: row.get(22)?,
-                is_health_check: row.get::<_, i64>(23)? != 0,
-                created_at: row.get(24)?,
+                user_email: row.get(23)?,
+                is_health_check: row.get::<_, i64>(24)? != 0,
+                created_at: row.get(25)?,
             })
         })
         .map_err(|e| AppError::Internal(format!("query recent share request logs failed: {e}")))?;
@@ -8610,6 +8811,142 @@ fn get_session_by_refresh_hash(
     .map_err(|e| AppError::Internal(format!("query session by refresh hash failed: {e}")))
 }
 
+fn parse_scopes_json(value: String) -> Result<Vec<String>, rusqlite::Error> {
+    serde_json::from_str::<Vec<String>>(&value).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+    })
+}
+
+fn user_api_token_status(record: UserApiTokenRecord) -> UserApiTokenStatus {
+    UserApiTokenStatus {
+        prefix: record.prefix,
+        created_at: record.created_at,
+        last_used_at: record.last_used_at,
+        scopes: record.scopes,
+    }
+}
+
+fn get_default_user_api_token(
+    conn: &Connection,
+    user_id: &str,
+) -> Result<Option<UserApiTokenRecord>, AppError> {
+    conn.query_row(
+        "SELECT token_prefix, scopes_json, created_at, last_used_at
+         FROM user_api_tokens
+         WHERE user_id = ?1 AND name = ?2 AND revoked_at IS NULL",
+        params![user_id, USER_DEFAULT_API_TOKEN_NAME],
+        |row| {
+            Ok(UserApiTokenRecord {
+                prefix: row.get(0)?,
+                scopes: parse_scopes_json(row.get(1)?)?,
+                created_at: parse_dt_sql(&row.get::<_, String>(2)?)?,
+                last_used_at: row
+                    .get::<_, Option<String>>(3)?
+                    .map(|value| parse_dt_sql(&value))
+                    .transpose()?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| AppError::Internal(format!("query default api token failed: {e}")))
+}
+
+fn ensure_default_user_api_token(
+    conn: &Connection,
+    user_id: &str,
+    now: DateTime<Utc>,
+) -> Result<(Option<String>, UserApiTokenRecord), AppError> {
+    if let Some(record) = get_default_user_api_token(conn, user_id)? {
+        return Ok((None, record));
+    }
+    let (raw, record) = insert_default_user_api_token(conn, user_id, now)?;
+    Ok((Some(raw), record))
+}
+
+fn reset_default_user_api_token(
+    conn: &Connection,
+    user_id: &str,
+    now: DateTime<Utc>,
+) -> Result<(String, UserApiTokenRecord), AppError> {
+    conn.execute(
+        "UPDATE user_api_tokens
+         SET revoked_at = ?3, reset_at = ?3
+         WHERE user_id = ?1 AND name = ?2 AND revoked_at IS NULL",
+        params![user_id, USER_DEFAULT_API_TOKEN_NAME, now.to_rfc3339()],
+    )
+    .map_err(|e| AppError::Internal(format!("revoke default api token failed: {e}")))?;
+    insert_default_user_api_token(conn, user_id, now)
+}
+
+fn insert_default_user_api_token(
+    conn: &Connection,
+    user_id: &str,
+    now: DateTime<Utc>,
+) -> Result<(String, UserApiTokenRecord), AppError> {
+    let scopes = USER_DEFAULT_API_TOKEN_SCOPES
+        .iter()
+        .map(|scope| (*scope).to_string())
+        .collect::<Vec<_>>();
+    let scopes_json = serde_json::to_string(&scopes)
+        .map_err(|e| AppError::Internal(format!("serialize api token scopes failed: {e}")))?;
+    for _ in 0..5 {
+        let raw = format!("ccrt_{}", generate_secret(48));
+        let prefix = raw.chars().take(14).collect::<String>();
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO user_api_tokens
+              (id, user_id, name, token_hash, token_prefix, scopes_json, created_at, last_used_at, reset_at, revoked_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, NULL)",
+            params![
+                Uuid::new_v4().to_string(),
+                user_id,
+                USER_DEFAULT_API_TOKEN_NAME,
+                hash_token(&raw),
+                prefix,
+                scopes_json,
+                now.to_rfc3339(),
+            ],
+        )
+        .map_err(|e| AppError::Internal(format!("insert default api token failed: {e}")))?;
+        if inserted > 0 {
+            return Ok((
+                raw,
+                UserApiTokenRecord {
+                    prefix,
+                    scopes,
+                    created_at: now,
+                    last_used_at: None,
+                },
+            ));
+        }
+    }
+    Err(AppError::Internal(
+        "failed to generate unique default api token".into(),
+    ))
+}
+
+fn get_user_api_token_by_hash(
+    conn: &Connection,
+    token_hash: &str,
+) -> Result<Option<(String, String, String, Vec<String>)>, AppError> {
+    conn.query_row(
+        "SELECT t.id, t.user_id, u.email_normalized, t.scopes_json
+         FROM user_api_tokens t
+         INNER JOIN users u ON u.id = t.user_id
+         WHERE t.token_hash = ?1 AND t.revoked_at IS NULL AND u.status = 'active'",
+        params![token_hash],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                parse_scopes_json(row.get(3)?)?,
+            ))
+        },
+    )
+    .optional()
+    .map_err(|e| AppError::Internal(format!("query user api token failed: {e}")))
+}
+
 fn get_installation_owner_email(
     conn: &Connection,
     installation_id: &str,
@@ -8930,6 +9267,119 @@ mod tests {
             ],
         )
         .expect("update share shared emails");
+    }
+
+    #[tokio::test]
+    async fn default_user_api_token_is_unique_resolvable_and_resettable() {
+        let (store, config) = setup_store("user-api-token-lifecycle").await;
+        let now = Utc::now();
+        let user_id = {
+            let conn = store.conn.lock().await;
+            let user = upsert_user_by_email(&conn, "owner@example.com", now).expect("upsert user");
+            let (first_raw, first_record) =
+                ensure_default_user_api_token(&conn, &user.id, now).expect("create api token");
+            let first_raw = first_raw.expect("first creation returns raw token");
+            assert!(first_raw.starts_with("ccrt_"));
+            assert_eq!(
+                first_record.prefix,
+                first_raw.chars().take(14).collect::<String>()
+            );
+            assert_eq!(
+                first_record.scopes,
+                vec![
+                    "share:read".to_string(),
+                    "share:write".to_string(),
+                    "share:invoke".to_string()
+                ]
+            );
+
+            let (second_raw, second_record) =
+                ensure_default_user_api_token(&conn, &user.id, now).expect("reuse api token");
+            assert!(second_raw.is_none());
+            assert_eq!(second_record.prefix, first_record.prefix);
+
+            (user.id, first_raw)
+        };
+        let old_token = user_id.1;
+        let user_id = user_id.0;
+
+        let principal = store
+            .resolve_user_api_token(&old_token, "share:invoke")
+            .await
+            .expect("resolve old token")
+            .expect("old token principal");
+        assert_eq!(principal.user_id, user_id);
+        assert_eq!(principal.email, "owner@example.com");
+
+        let forbidden_scope = store
+            .resolve_user_api_token(&old_token, "admin:write")
+            .await;
+        assert!(matches!(forbidden_scope, Err(AppError::Unauthorized(_))));
+
+        let reset = store
+            .reset_default_api_token("Owner@Example.com")
+            .await
+            .expect("reset default api token");
+        assert!(reset.api_token.starts_with("ccrt_"));
+        assert_ne!(reset.api_token, old_token);
+        assert_eq!(
+            reset.token.prefix,
+            reset.api_token.chars().take(14).collect::<String>()
+        );
+
+        assert!(
+            store
+                .resolve_user_api_token(&old_token, "share:invoke")
+                .await
+                .expect("old token lookup after reset")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .resolve_user_api_token(&reset.api_token, "share:invoke")
+                .await
+                .expect("new token lookup")
+                .expect("new token principal")
+                .email,
+            "owner@example.com"
+        );
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn user_api_token_share_invoke_acl_allows_owner_and_shared_email() {
+        let (store, config) = setup_store("user-api-token-share-acl").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-acl", "acl-sub", "active").await;
+        set_share_shared_with_emails(&store, "share-acl", &["Shared@Example.com"]).await;
+
+        assert!(
+            store
+                .user_can_invoke_share("OWNER@example.com", "share-acl")
+                .await
+                .expect("owner acl")
+        );
+        assert!(
+            store
+                .user_can_invoke_share("shared@example.com", "share-acl")
+                .await
+                .expect("shared acl")
+        );
+        assert!(
+            !store
+                .user_can_invoke_share("other@example.com", "share-acl")
+                .await
+                .expect("other acl")
+        );
+        assert!(
+            !store
+                .user_can_invoke_share("owner@example.com", "missing-share")
+                .await
+                .expect("missing share acl")
+        );
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 
     async fn insert_health_check(
@@ -9489,6 +9939,7 @@ mod tests {
             session_id: None,
             user_country: None,
             user_country_iso3: None,
+            user_email: None,
             created_at,
             is_health_check: false,
         }
@@ -10866,6 +11317,7 @@ mod tests {
                     session_id: None,
                     user_country: None,
                     user_country_iso3: None,
+                    user_email: None,
                     created_at: Utc::now().timestamp(),
                     is_health_check: false,
                 },
@@ -11020,6 +11472,7 @@ mod tests {
             session_id: Some("session-1".into()),
             user_country: None,
             user_country_iso3: None,
+            user_email: None,
             created_at: Utc::now().timestamp(),
             is_health_check: false,
         }];
@@ -11035,8 +11488,14 @@ mod tests {
             &nonce,
         );
 
-        let live_country_by_request_id =
-            HashMap::from([("req-1".to_string(), (Some("JP".into()), Some("JPN".into())))]);
+        let live_request_context_by_id = HashMap::from([(
+            "req-1".to_string(),
+            (
+                Some("JP".into()),
+                Some("JPN".into()),
+                Some("user@example.com".into()),
+            ),
+        )]);
         store
             .batch_sync_share_request_logs(
                 ShareRequestLogBatchSyncRequest {
@@ -11051,24 +11510,30 @@ mod tests {
                     country_code: None,
                 },
                 "owner@example.com",
-                live_country_by_request_id,
+                live_request_context_by_id,
             )
             .await
             .expect("valid signed request log batch sync");
 
         let conn = store.conn.lock().await;
-        let (stored_count, user_country, user_country_iso3): (i64, Option<String>, Option<String>) =
-            conn.query_row(
-                "SELECT COUNT(*), MAX(user_country), MAX(user_country_iso3) FROM share_request_logs
+        let (stored_count, user_country, user_country_iso3, user_email): (
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(user_country), MAX(user_country_iso3), MAX(user_email) FROM share_request_logs
                  WHERE installation_id = ?1 AND request_id = ?2",
                 params!["inst-logs", "req-1"],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .expect("count synced request logs");
         drop(conn);
         assert_eq!(stored_count, 1);
         assert_eq!(user_country.as_deref(), Some("JP"));
         assert_eq!(user_country_iso3.as_deref(), Some("JPN"));
+        assert_eq!(user_email.as_deref(), Some("user@example.com"));
 
         let replay_err = store
             .batch_sync_share_request_logs(

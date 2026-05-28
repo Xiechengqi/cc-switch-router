@@ -135,6 +135,34 @@ pub struct VerifyEmailCodeResponse {
     pub refresh_token: String,
     pub expires_at: DateTime<Utc>,
     pub refresh_expires_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_token_prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserApiTokenStatus {
+    pub prefix: String,
+    pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserApiTokenResponse {
+    pub token: UserApiTokenStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserApiTokenResetResponse {
+    pub api_token: String,
+    pub token: UserApiTokenStatus,
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,6 +184,47 @@ pub struct SessionStatusResponse {
     pub installation_owner_email: Option<String>,
     #[serde(default)]
     pub is_admin: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserShareView {
+    pub router_id: String,
+    pub share_id: String,
+    pub share_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_email: Option<String>,
+    #[serde(default)]
+    pub shared_with_emails: Vec<String>,
+    pub role: String,
+    pub can_invoke: bool,
+    pub can_manage: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub for_sale: String,
+    pub market_access_mode: String,
+    pub subdomain: String,
+    pub tunnel_url: String,
+    pub app_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    pub token_limit: i64,
+    pub parallel_limit: i64,
+    pub tokens_used: i64,
+    pub requests_count: i64,
+    pub share_status: String,
+    pub created_at: String,
+    pub expires_at: String,
+    pub is_online: bool,
+    pub active_requests: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_edit: Option<ShareEditView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserSharesResponse {
+    pub shares: Vec<UserShareView>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -551,6 +620,8 @@ pub struct ShareRequestLogEntry {
     pub user_country: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_country_iso3: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_email: Option<String>,
     pub created_at: i64,
     #[serde(default)]
     pub is_health_check: bool,
