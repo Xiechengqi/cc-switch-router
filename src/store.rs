@@ -15,6 +15,8 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 use uuid::Uuid;
 
+const MARKET_APP_AVAILABILITY_FAILURE_TTL_SECS: i64 = 30 * 60;
+
 use crate::ServerGeo;
 use crate::config::Config;
 use crate::dynamic_settings::BoardSettings;
@@ -944,20 +946,15 @@ impl AppStore {
         verify_signature(&installation.public_key, &input)?;
 
         let normalized_share = if let Some(mut share) = input.share.clone() {
-            let existing_owner_binding = {
+            {
                 let conn = self.conn.lock().await;
-                get_share_owner_binding(&conn, &share.share_id)?
-            };
-            let bound_owner_email = {
-                let conn = self.conn.lock().await;
-                require_installation_owner_email(&conn, &input.installation_id)?
-            };
-            enforce_share_owner_for_installation(
-                &mut share,
-                existing_owner_binding.as_ref(),
-                &input.installation_id,
-                &bound_owner_email,
-            )?;
+                ensure_share_id_writable_by_installation(
+                    &conn,
+                    &share.share_id,
+                    &input.installation_id,
+                )?;
+            }
+            normalize_self_reported_share_owner(&mut share)?;
             Some(share)
         } else {
             None
@@ -1208,20 +1205,16 @@ impl AppStore {
                     .await?;
             }
         }
-        let existing_owner_email = {
-            let conn = self.conn.lock().await;
-            get_share_owner_email(&conn, &input.share.share_id)?
-        };
-        let bound_owner_email = {
-            let conn = self.conn.lock().await;
-            require_installation_owner_email(&conn, &input.installation_id)?
-        };
         let mut share = input.share;
-        enforce_share_owner(
-            &mut share,
-            existing_owner_email.as_deref(),
-            &bound_owner_email,
-        )?;
+        {
+            let conn = self.conn.lock().await;
+            ensure_share_id_writable_by_installation(
+                &conn,
+                &share.share_id,
+                &input.installation_id,
+            )?;
+        }
+        normalize_self_reported_share_owner(&mut share)?;
         self.upsert_share(&input.installation_id, share).await
     }
 
@@ -1264,14 +1257,8 @@ impl AppStore {
             .unchecked_transaction()
             .map_err(|e| AppError::Internal(format!("begin share claim tx failed: {e}")))?;
         let mut share = input.share;
-        let existing_owner_binding = get_share_owner_binding(&tx, &share.share_id)?;
-        let bound_owner_email = require_installation_owner_email(&tx, &input.installation_id)?;
-        enforce_share_owner_for_installation(
-            &mut share,
-            existing_owner_binding.as_ref(),
-            &input.installation_id,
-            &bound_owner_email,
-        )?;
+        ensure_share_id_writable_by_installation(&tx, &share.share_id, &input.installation_id)?;
+        normalize_self_reported_share_owner(&mut share)?;
         share.subdomain = subdomain;
         release_reclaimable_subdomain_claim(
             &tx,
@@ -1306,13 +1293,6 @@ impl AppStore {
             &input.nonce,
             &input.signature,
         )?;
-        let owner_email = get_share_owner_email(&conn, &input.share_id)?;
-        let bound_owner_email = require_installation_owner_email(&conn, &input.installation_id)?;
-        if owner_email.as_deref() != Some(bound_owner_email.as_str()) {
-            return Err(AppError::Unauthorized(
-                "only share owner can delete share".into(),
-            ));
-        }
         conn.execute(
             "DELETE FROM shares WHERE share_id = ?1 AND installation_id = ?2",
             params![input.share_id, input.installation_id],
@@ -1355,7 +1335,6 @@ impl AppStore {
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| AppError::Internal(format!("begin batch sync tx failed: {e}")))?;
-        let bound_owner_email = require_installation_owner_email(&tx, &input.installation_id)?;
         let upsert_count = input.ops.iter().filter(|op| op.kind == "upsert").count();
         if upsert_count > 1 {
             return Err(AppError::BadRequest(
@@ -1368,28 +1347,18 @@ impl AppStore {
                     let mut share = op.share.ok_or_else(|| {
                         AppError::BadRequest("share is required for upsert".into())
                     })?;
-                    let existing_owner_binding = get_share_owner_binding(&tx, &share.share_id)?;
-                    enforce_share_owner_for_installation(
-                        &mut share,
-                        existing_owner_binding.as_ref(),
+                    ensure_share_id_writable_by_installation(
+                        &tx,
+                        &share.share_id,
                         &input.installation_id,
-                        &bound_owner_email,
                     )?;
+                    normalize_self_reported_share_owner(&mut share)?;
                     upsert_share_tx(&tx, &input.installation_id, share)?;
                 }
                 "delete" => {
                     let share_id = op.share_id.ok_or_else(|| {
                         AppError::BadRequest("shareId is required for delete".into())
                     })?;
-                    let owner_email = get_share_owner_email(&tx, &share_id)?;
-                    if owner_email.is_none() {
-                        continue;
-                    }
-                    if owner_email.as_deref() != Some(bound_owner_email.as_str()) {
-                        return Err(AppError::Unauthorized(
-                            "only share owner can delete share".into(),
-                        ));
-                    }
                     tx.execute(
                         "DELETE FROM shares WHERE share_id = ?1 AND installation_id = ?2",
                         params![share_id, input.installation_id],
@@ -1651,12 +1620,10 @@ impl AppStore {
         let tx = conn.unchecked_transaction().map_err(|e| {
             AppError::Internal(format!("begin request log batch sync tx failed: {e}"))
         })?;
-        let bound_owner_email = require_installation_owner_email(&tx, &input.installation_id)?;
         for mut log in input.logs {
-            let owner_email = get_share_owner_email(&tx, &log.share_id)?;
-            if owner_email.as_deref() != Some(bound_owner_email.as_str()) {
+            if !share_belongs_to_installation(&tx, &log.share_id, &input.installation_id)? {
                 return Err(AppError::Unauthorized(
-                    "only share owner can sync request logs".into(),
+                    "only share installation can sync request logs".into(),
                 ));
             }
             if let Some((user_country, user_country_iso3)) =
@@ -1701,26 +1668,20 @@ impl AppStore {
             should_refresh_installation_geo(&installation, metadata.ip.as_deref());
         touch_installation_presence(&conn, &input.installation_id, &metadata, Utc::now())?;
 
-        let bound_owner_email = require_installation_owner_email(&conn, &input.installation_id)?;
-        let row = conn
+        let subdomain = conn
             .query_row(
-                "SELECT owner_email, subdomain FROM shares WHERE share_id = ?1 AND installation_id = ?2",
+                "SELECT subdomain FROM shares WHERE share_id = ?1 AND installation_id = ?2",
                 params![&input.refresh.share_id, &input.installation_id],
-                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)),
+                |row| row.get::<_, Option<String>>(0),
             )
             .optional()
             .map_err(|e| AppError::Internal(format!("query share runtime target failed: {e}")))?;
-        let Some((owner_email, subdomain)) = row else {
+        let Some(subdomain) = subdomain else {
             return Err(AppError::BadRequest("share not found".into()));
         };
         let Some(subdomain) = subdomain else {
             return Err(AppError::BadRequest("share subdomain is not set".into()));
         };
-        if owner_email.as_deref() != Some(bound_owner_email.as_str()) {
-            return Err(AppError::Unauthorized(
-                "only share owner can refresh runtime".into(),
-            ));
-        }
         if subdomain != input.refresh.subdomain {
             return Err(AppError::BadRequest("share subdomain mismatch".into()));
         }
@@ -4384,10 +4345,10 @@ fn upsert_market_request_log_tx(
         "INSERT INTO market_request_logs (
             request_id, market_id, market_email, market_subdomain, user_email, api_key_prefix,
             router_id, share_id, share_subdomain, model, request_agent, requested_model, actual_model, actual_model_source,
-            status, status_code, latency_ms,
+            status, status_code, error_message, latency_ms,
             input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
             usage_amount_usd, created_at, settled_at, user_country, user_country_iso3, synced_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
         ON CONFLICT(request_id) DO UPDATE SET
             market_id = excluded.market_id,
             market_email = excluded.market_email,
@@ -4404,6 +4365,7 @@ fn upsert_market_request_log_tx(
             actual_model_source = excluded.actual_model_source,
             status = excluded.status,
             status_code = COALESCE(excluded.status_code, market_request_logs.status_code),
+            error_message = COALESCE(excluded.error_message, market_request_logs.error_message),
             latency_ms = COALESCE(excluded.latency_ms, market_request_logs.latency_ms),
             input_tokens = excluded.input_tokens,
             output_tokens = excluded.output_tokens,
@@ -4432,6 +4394,7 @@ fn upsert_market_request_log_tx(
             log.actual_model_source,
             log.status,
             log.status_code.map(i64::from),
+            log.error_message,
             log.latency_ms.map(|value| value as i64),
             i64::from(log.input_tokens),
             i64::from(log.output_tokens),
@@ -4738,6 +4701,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             actual_model_source TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL,
             status_code INTEGER,
+            error_message TEXT,
             latency_ms INTEGER,
             input_tokens INTEGER NOT NULL DEFAULT 0,
             output_tokens INTEGER NOT NULL DEFAULT 0,
@@ -5193,6 +5157,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         "actual_model_source",
         "TEXT NOT NULL DEFAULT ''",
     )?;
+    add_column_if_missing(conn, "market_request_logs", "error_message", "TEXT")?;
     add_column_if_missing(conn, "market_request_logs", "user_country", "TEXT")?;
     add_column_if_missing(conn, "market_request_logs", "user_country_iso3", "TEXT")?;
     add_column_if_missing(conn, "router_markets", "pricing_json", "TEXT")?;
@@ -6270,7 +6235,11 @@ fn parse_recent_results(value: String) -> Result<Vec<String>, rusqlite::Error> {
 fn market_app_availability_status(last_status: &str, recent_results: &[String]) -> String {
     if recent_results.len() >= 3 && recent_results.iter().all(|status| status == "failed") {
         "unavailable".to_string()
-    } else if last_status == "failed" || recent_results.iter().any(|status| status == "failed") {
+    } else if matches!(last_status, "failed" | "degraded")
+        || recent_results
+            .iter()
+            .any(|status| matches!(status.as_str(), "failed" | "degraded"))
+    {
         "degraded".to_string()
     } else if last_status == "success" {
         "available".to_string()
@@ -6297,10 +6266,10 @@ fn should_replace_market_app_availability(
     };
     let candidate_rank = market_app_availability_rank(&candidate.status);
     let current_rank = market_app_availability_rank(&current.status);
-    candidate_rank > current_rank
-        || (candidate_rank == current_rank
-            && candidate.last_checked_at.unwrap_or_default()
-                > current.last_checked_at.unwrap_or_default())
+    let candidate_checked_at = candidate.last_checked_at.unwrap_or_default();
+    let current_checked_at = current.last_checked_at.unwrap_or_default();
+    candidate_checked_at > current_checked_at
+        || (candidate_checked_at == current_checked_at && candidate_rank > current_rank)
 }
 
 fn set_market_app_availability_entry(
@@ -6339,16 +6308,18 @@ fn list_market_app_availability(
     conn: &Connection,
     market_email: &str,
 ) -> Result<HashMap<String, MarketAppAvailability>, AppError> {
+    let fresh_after = Utc::now().timestamp() - MARKET_APP_AVAILABILITY_FAILURE_TTL_SECS;
     let mut stmt = conn
         .prepare(
             "SELECT share_id, app_type, requested_model, actual_model, last_status,
                     last_checked_at, recent_results_json, error_message
              FROM market_share_model_failure_state
-             WHERE lower(market_email) = lower(?1)",
+             WHERE lower(market_email) = lower(?1)
+               AND (last_status = 'success' OR last_checked_at >= ?2)",
         )
         .map_err(|e| AppError::Internal(format!("prepare market app availability failed: {e}")))?;
     let rows = stmt
-        .query_map(params![market_email], |row| {
+        .query_map(params![market_email, fresh_after], |row| {
             let recent_results = parse_recent_results(row.get(6)?)?;
             let last_status: String = row.get(4)?;
             let status = market_app_availability_status(&last_status, &recent_results);
@@ -6378,15 +6349,17 @@ fn list_market_app_availability(
 fn list_all_market_app_availability(
     conn: &Connection,
 ) -> Result<HashMap<String, HashMap<String, MarketAppAvailability>>, AppError> {
+    let fresh_after = Utc::now().timestamp() - MARKET_APP_AVAILABILITY_FAILURE_TTL_SECS;
     let mut stmt = conn
         .prepare(
             "SELECT lower(market_email), share_id, app_type, requested_model, actual_model, last_status,
                     last_checked_at, recent_results_json, error_message
-             FROM market_share_model_failure_state",
+             FROM market_share_model_failure_state
+             WHERE last_status = 'success' OR last_checked_at >= ?1",
         )
         .map_err(|e| AppError::Internal(format!("prepare all market app availability failed: {e}")))?;
     let rows = stmt
-        .query_map([], |row| {
+        .query_map(params![fresh_after], |row| {
             let recent_results = parse_recent_results(row.get(7)?)?;
             let last_status: String = row.get(5)?;
             let status = market_app_availability_status(&last_status, &recent_results);
@@ -6474,6 +6447,11 @@ fn filter_app_runtimes_by_model_health(
     runtimes.claude = filter_provider_models_by_health(runtimes.claude, &health.claude);
     runtimes.codex = filter_provider_models_by_health(runtimes.codex, &health.codex);
     runtimes.gemini = filter_provider_models_by_health(runtimes.gemini, &health.gemini);
+    // OAuth-only providers have no model-level health entries; pass through as-is.
+    runtimes.kiro = filter_provider_models_by_health(runtimes.kiro, &[]);
+    runtimes.cursor = filter_provider_models_by_health(runtimes.cursor, &[]);
+    runtimes.antigravity = filter_provider_models_by_health(runtimes.antigravity, &[]);
+    runtimes.copilot = filter_provider_models_by_health(runtimes.copilot, &[]);
     runtimes
 }
 
@@ -6523,7 +6501,46 @@ fn provider_model_keys(provider: &ShareUpstreamProvider) -> HashSet<String> {
         .collect()
 }
 
+fn market_request_error_text(log: &MarketRequestLogEntry) -> String {
+    [
+        Some(log.status.as_str()),
+        log.error_message.as_deref(),
+        log.model.as_deref(),
+        Some(log.requested_model.as_str()),
+        Some(log.actual_model.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ")
+    .to_ascii_lowercase()
+}
+
+fn is_request_scoped_market_model_error(log: &MarketRequestLogEntry) -> bool {
+    let text = market_request_error_text(log);
+    if text.contains("model_max_prompt_tokens_exceeded")
+        || text.contains("prompt token count")
+        || text.contains("context length")
+        || text.contains("context_length_exceeded")
+        || text.contains("maximum context")
+    {
+        return true;
+    }
+    matches!(log.status_code, Some(400 | 404 | 422))
+}
+
+fn is_degraded_market_model_log(log: &MarketRequestLogEntry) -> bool {
+    let status = log.status.to_ascii_lowercase();
+    if matches!(status.as_str(), "rate_limited" | "degraded") {
+        return true;
+    }
+    log.status_code == Some(429)
+}
+
 fn is_failed_market_model_log(log: &MarketRequestLogEntry) -> bool {
+    if is_request_scoped_market_model_error(log) || is_degraded_market_model_log(log) {
+        return false;
+    }
     let status = log.status.to_ascii_lowercase();
     if matches!(
         status.as_str(),
@@ -6547,12 +6564,29 @@ fn is_success_market_model_log(log: &MarketRequestLogEntry) -> bool {
 }
 
 fn market_model_status(log: &MarketRequestLogEntry) -> Option<&'static str> {
-    if is_failed_market_model_log(log) {
+    if is_request_scoped_market_model_error(log) {
+        None
+    } else if is_failed_market_model_log(log) {
         Some("failed")
+    } else if is_degraded_market_model_log(log) {
+        Some("degraded")
     } else if is_success_market_model_log(log) {
         Some("success")
     } else {
         None
+    }
+}
+
+fn normalize_market_model_key(app_type: &str, model: &str) -> String {
+    let model = model.trim();
+    if app_type.eq_ignore_ascii_case("claude") {
+        match model {
+            "claude-sonnet-4-6" => "claude-sonnet-4.6".to_string(),
+            "claude-opus-4-7" => "claude-opus-4.7".to_string(),
+            _ => model.to_string(),
+        }
+    } else {
+        model.to_string()
     }
 }
 
@@ -6598,10 +6632,11 @@ fn record_market_share_model_failure_state_conn(
     } else {
         log.requested_model.trim().to_string()
     };
+    let requested_model = normalize_market_model_key(&app_type, &requested_model);
     let actual_model = if log.actual_model.trim().is_empty() {
         requested_model.clone()
     } else {
-        log.actual_model.trim().to_string()
+        normalize_market_model_key(&app_type, log.actual_model.trim())
     };
     let market_email = market_email.trim().to_ascii_lowercase();
     let checked_at = DateTime::parse_from_rfc3339(&log.created_at)
@@ -6623,7 +6658,12 @@ fn record_market_share_model_failure_state_conn(
     recent_results.extend(existing_recent.into_iter().take(2));
     let recent_json = serde_json::to_string(&recent_results)
         .map_err(|e| AppError::Internal(format!("serialize market failure state failed: {e}")))?;
-    let error_message = (status == "failed").then(|| log.status.clone());
+    let error_message = matches!(status, "failed" | "degraded").then(|| {
+        log.error_message
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| log.status.clone())
+    });
     conn.execute(
         "INSERT INTO market_share_model_failure_state (
             market_email, share_id, app_type, requested_model, actual_model, last_status,
@@ -6791,7 +6831,7 @@ fn list_recent_market_request_logs(
             "SELECT request_id, market_id, market_email, market_subdomain, user_email,
                     api_key_prefix, router_id, share_id, share_subdomain, model,
                     request_agent, requested_model, actual_model, actual_model_source, status,
-                    status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens,
+                    status_code, error_message, latency_ms, input_tokens, output_tokens, cache_read_tokens,
                     cache_creation_tokens, usage_amount_usd, created_at, settled_at,
                     user_country, user_country_iso3
              FROM market_request_logs
@@ -6820,16 +6860,17 @@ fn list_recent_market_request_logs(
                 actual_model_source: row.get(13)?,
                 status: row.get(14)?,
                 status_code: row.get::<_, Option<i64>>(15)?.map(|value| value as u16),
-                latency_ms: row.get::<_, Option<i64>>(16)?.map(|value| value as u64),
-                input_tokens: row.get::<_, i64>(17)? as u32,
-                output_tokens: row.get::<_, i64>(18)? as u32,
-                cache_read_tokens: row.get::<_, i64>(19)? as u32,
-                cache_creation_tokens: row.get::<_, i64>(20)? as u32,
-                usage_amount_usd: row.get(21)?,
-                created_at: row.get(22)?,
-                settled_at: row.get(23)?,
-                user_country: row.get(24)?,
-                user_country_iso3: row.get(25)?,
+                error_message: row.get(16)?,
+                latency_ms: row.get::<_, Option<i64>>(17)?.map(|value| value as u64),
+                input_tokens: row.get::<_, i64>(18)? as u32,
+                output_tokens: row.get::<_, i64>(19)? as u32,
+                cache_read_tokens: row.get::<_, i64>(20)? as u32,
+                cache_creation_tokens: row.get::<_, i64>(21)? as u32,
+                usage_amount_usd: row.get(22)?,
+                created_at: row.get(23)?,
+                settled_at: row.get(24)?,
+                user_country: row.get(25)?,
+                user_country_iso3: row.get(26)?,
             })
         })
         .map_err(|e| AppError::Internal(format!("query recent market request logs failed: {e}")))?;
@@ -7441,6 +7482,7 @@ fn get_share_owned_subdomain(
     .map_err(|e| AppError::Internal(format!("query owned subdomain failed: {e}")))
 }
 
+#[cfg(test)]
 fn get_share_owner_email(conn: &Connection, share_id: &str) -> Result<Option<String>, AppError> {
     conn.query_row(
         "SELECT owner_email FROM shares WHERE share_id = ?1",
@@ -7464,6 +7506,50 @@ fn get_share_owner_binding(
     .map_err(|e| AppError::Internal(format!("query share owner binding failed: {e}")))
 }
 
+fn share_belongs_to_installation(
+    conn: &Connection,
+    share_id: &str,
+    installation_id: &str,
+) -> Result<bool, AppError> {
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM shares WHERE share_id = ?1 AND installation_id = ?2 LIMIT 1",
+            params![share_id, installation_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|e| AppError::Internal(format!("query share installation ownership failed: {e}")))?
+        .is_some();
+    Ok(exists)
+}
+
+fn ensure_share_id_writable_by_installation(
+    conn: &Connection,
+    share_id: &str,
+    installation_id: &str,
+) -> Result<(), AppError> {
+    if let Some((existing_installation_id, _)) = get_share_owner_binding(conn, share_id)? {
+        if existing_installation_id != installation_id {
+            return Err(AppError::Unauthorized(
+                "share id belongs to a different installation".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_self_reported_share_owner(share: &mut ShareDescriptor) -> Result<(), AppError> {
+    let owner_email = share
+        .owner_email
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("share owner email is required".into()))
+        .and_then(normalize_email)?;
+    share.owner_email = Some(owner_email.clone());
+    share.share_name = owner_email.clone();
+    share.shared_with_emails = normalize_email_list(&share.shared_with_emails, &owner_email);
+    Ok(())
+}
+
 fn find_share_claim_by_subdomain(
     conn: &Connection,
     subdomain: &str,
@@ -7481,10 +7567,10 @@ fn release_reclaimable_subdomain_claim(
     conn: &Connection,
     incoming_installation_id: &str,
     incoming_share_id: &str,
-    incoming_owner_email: Option<&str>,
+    _incoming_owner_email: Option<&str>,
     subdomain: &str,
 ) -> Result<(), AppError> {
-    let Some((existing_share_id, existing_installation_id, existing_owner_email)) =
+    let Some((existing_share_id, existing_installation_id, _existing_owner_email)) =
         find_share_claim_by_subdomain(conn, subdomain)?
     else {
         return Ok(());
@@ -7495,8 +7581,7 @@ fn release_reclaimable_subdomain_claim(
     }
 
     let same_installation = existing_installation_id == incoming_installation_id;
-    let same_owner = existing_owner_email.as_deref() == incoming_owner_email;
-    if !same_installation && !same_owner {
+    if !same_installation {
         return Ok(());
     }
 
@@ -8543,15 +8628,6 @@ fn get_installation_owner_email(
     .map_err(|e| AppError::Internal(format!("query installation owner email failed: {e}")))
 }
 
-fn require_installation_owner_email(
-    conn: &Connection,
-    installation_id: &str,
-) -> Result<String, AppError> {
-    get_installation_owner_email(conn, installation_id)?.ok_or_else(|| {
-        AppError::Unauthorized("installation owner email binding is required".into())
-    })
-}
-
 fn share_visible_to_email(share: &ShareDescriptor, viewer_email: Option<&str>) -> bool {
     let Some(viewer_email) = viewer_email else {
         return false;
@@ -8572,40 +8648,6 @@ fn can_manage_share(share: &ShareDescriptor, viewer_email: Option<&str>) -> bool
             .shared_with_emails
             .iter()
             .any(|email| email == viewer_email)
-}
-
-fn enforce_share_owner(
-    share: &mut ShareDescriptor,
-    existing_owner_email: Option<&str>,
-    current_user_email: &str,
-) -> Result<(), AppError> {
-    let current_user_email = normalize_email(current_user_email)?;
-    if let Some(existing_owner_email) = existing_owner_email {
-        if existing_owner_email != current_user_email {
-            return Err(AppError::Unauthorized("share owner mismatch".into()));
-        }
-    }
-    share.owner_email = Some(current_user_email.clone());
-    share.share_name = current_user_email.clone();
-    share.shared_with_emails = normalize_email_list(&share.shared_with_emails, &current_user_email);
-    Ok(())
-}
-
-fn enforce_share_owner_for_installation(
-    share: &mut ShareDescriptor,
-    existing_owner_binding: Option<&(String, Option<String>)>,
-    current_installation_id: &str,
-    current_user_email: &str,
-) -> Result<(), AppError> {
-    let existing_owner_email =
-        existing_owner_binding.and_then(|(existing_installation_id, owner_email)| {
-            if existing_installation_id == current_installation_id {
-                None
-            } else {
-                owner_email.as_deref()
-            }
-        });
-    enforce_share_owner(share, existing_owner_email, current_user_email)
 }
 
 #[cfg(test)]
@@ -9028,6 +9070,7 @@ mod tests {
             actual_model_source: "official".into(),
             status: "settled".into(),
             status_code: Some(200),
+            error_message: None,
             latency_ms: Some(100),
             input_tokens: 1,
             output_tokens: 2,
@@ -9045,6 +9088,32 @@ mod tests {
         let mut log = test_market_request_log(request_id, share_id);
         log.status = "failed".into();
         log.status_code = Some(500);
+        log.usage_amount_usd = None;
+        log
+    }
+
+    fn test_claude_market_request_log(
+        request_id: &str,
+        share_id: &str,
+        requested_model: &str,
+    ) -> MarketRequestLogEntry {
+        let mut log = test_market_request_log(request_id, share_id);
+        log.model = Some(requested_model.into());
+        log.request_agent = "claude".into();
+        log.requested_model = requested_model.into();
+        log.actual_model = requested_model.into();
+        log
+    }
+
+    fn test_failed_claude_market_request_log(
+        request_id: &str,
+        share_id: &str,
+        requested_model: &str,
+    ) -> MarketRequestLogEntry {
+        let mut log = test_claude_market_request_log(request_id, share_id, requested_model);
+        log.status = "failed_released".into();
+        log.status_code = Some(500);
+        log.error_message = Some("upstream failed".into());
         log.usage_amount_usd = None;
         log
     }
@@ -9186,6 +9255,207 @@ mod tests {
         );
         assert!(share.app_availability.claude.is_none());
         assert!(share.app_availability.gemini.is_none());
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn market_prompt_too_long_does_not_mark_claude_unavailable() {
+        let (store, config) = setup_store("market-prompt-too-long-ignored").await;
+        let market = test_market();
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-1", "share-sub", "active").await;
+
+        let mut log = test_failed_claude_market_request_log(
+            "req_market_prompt_too_long",
+            "share-1",
+            "claude-sonnet-4-6",
+        );
+        log.status_code = Some(400);
+        log.error_message = Some("prompt token count of 128078 exceeds the limit of 128000".into());
+        store
+            .batch_sync_market_request_logs(
+                &market,
+                MarketRequestLogBatchSyncRequest { logs: vec![log] },
+            )
+            .await
+            .expect("sync prompt-too-long failure");
+
+        let conn = store.conn.lock().await;
+        let market_state_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM market_share_model_failure_state WHERE lower(market_email) = 'market@example.com'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count market state");
+        drop(conn);
+
+        assert_eq!(market_state_count, 0);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn market_rate_limit_marks_claude_degraded_not_unavailable() {
+        let (store, config) = setup_store("market-rate-limit-degraded").await;
+        let market = test_market();
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-1", "share-sub", "active").await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET for_sale = 'Yes', market_access_mode = 'all' WHERE share_id = 'share-1'",
+                [],
+            )
+            .expect("make share market visible");
+        }
+
+        let logs = (1..=3)
+            .map(|idx| {
+                let mut log = test_failed_claude_market_request_log(
+                    &format!("req_market_rate_limit_{idx}"),
+                    "share-1",
+                    "claude-sonnet-4-6",
+                );
+                log.status_code = Some(429);
+                log.error_message =
+                    Some("Usage credits are required for long context requests.".into());
+                log
+            })
+            .collect();
+        store
+            .batch_sync_market_request_logs(&market, MarketRequestLogBatchSyncRequest { logs })
+            .await
+            .expect("sync rate limits");
+
+        let active = HashSet::from(["share-sub".to_string()]);
+        let shares = store
+            .list_market_shares(&market.email, "main", &active, &HashMap::new())
+            .await
+            .expect("list market shares");
+        assert_eq!(shares.len(), 1);
+        assert_eq!(
+            shares[0]
+                .app_availability
+                .claude
+                .as_ref()
+                .map(|entry| entry.status.as_str()),
+            Some("degraded")
+        );
+        assert!((shares[0].signals.owner_penalty - 0.7).abs() < 1e-9);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn market_claude_alias_success_softens_prior_failures() {
+        let (store, config) = setup_store("market-claude-alias-success").await;
+        let market = test_market();
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-1", "share-sub", "active").await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET for_sale = 'Yes', market_access_mode = 'all' WHERE share_id = 'share-1'",
+                [],
+            )
+            .expect("make share market visible");
+        }
+
+        store
+            .batch_sync_market_request_logs(
+                &market,
+                MarketRequestLogBatchSyncRequest {
+                    logs: vec![
+                        test_failed_claude_market_request_log(
+                            "req_market_alias_fail_1",
+                            "share-1",
+                            "claude-sonnet-4-6",
+                        ),
+                        test_failed_claude_market_request_log(
+                            "req_market_alias_fail_2",
+                            "share-1",
+                            "claude-sonnet-4-6",
+                        ),
+                        test_failed_claude_market_request_log(
+                            "req_market_alias_fail_3",
+                            "share-1",
+                            "claude-sonnet-4-6",
+                        ),
+                        test_claude_market_request_log(
+                            "req_market_alias_success",
+                            "share-1",
+                            "claude-sonnet-4.6",
+                        ),
+                    ],
+                },
+            )
+            .await
+            .expect("sync alias failures and success");
+
+        let conn = store.conn.lock().await;
+        let stored_model: String = conn
+            .query_row(
+                "SELECT requested_model FROM market_share_model_failure_state WHERE lower(market_email) = 'market@example.com'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read stored model");
+        drop(conn);
+        assert_eq!(stored_model, "claude-sonnet-4.6");
+
+        let active = HashSet::from(["share-sub".to_string()]);
+        let shares = store
+            .list_market_shares(&market.email, "main", &active, &HashMap::new())
+            .await
+            .expect("list market shares");
+        assert_ne!(
+            shares[0]
+                .app_availability
+                .claude
+                .as_ref()
+                .map(|entry| entry.status.as_str()),
+            Some("unavailable")
+        );
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn stale_market_failures_do_not_keep_claude_red() {
+        let (store, config) = setup_store("market-stale-failures-expire").await;
+        let market = test_market();
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-1", "share-sub", "active").await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET for_sale = 'Yes', market_access_mode = 'all' WHERE share_id = 'share-1'",
+                [],
+            )
+            .expect("make share market visible");
+            let stale_checked_at =
+                Utc::now().timestamp() - MARKET_APP_AVAILABILITY_FAILURE_TTL_SECS - 1;
+            conn.execute(
+                "INSERT INTO market_share_model_failure_state (
+                    market_email, share_id, app_type, requested_model, actual_model, last_status,
+                    last_failed_at, last_checked_at, recent_results_json, error_message, updated_at
+                 ) VALUES (?1, 'share-1', 'claude', 'claude-sonnet-4.6', 'claude-sonnet-4.6',
+                    'failed', ?2, ?2, '[\"failed\",\"failed\",\"failed\"]', 'stale failure', ?2)",
+                params![market.email.to_ascii_lowercase(), stale_checked_at],
+            )
+            .expect("insert stale market failure");
+        }
+
+        let active = HashSet::from(["share-sub".to_string()]);
+        let shares = store
+            .list_market_shares(&market.email, "main", &active, &HashMap::new())
+            .await
+            .expect("list market shares");
+
+        assert!(shares[0].app_availability.claude.is_none());
+        assert!((shares[0].signals.owner_penalty - 1.0).abs() < 1e-9);
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
@@ -10173,8 +10443,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claim_share_subdomain_allows_same_owner_to_reclaim_existing_subdomain() {
-        let (store, config) = setup_store("signed-share-reclaim-owner").await;
+    async fn claim_share_subdomain_rejects_same_owner_reclaim_from_different_installation() {
+        let (store, config) = setup_store("signed-share-reject-owner-reclaim").await;
         insert_share(&store, "inst-old", "share-old", "owner-sub", "paused").await;
         let signing_key = insert_signed_installation(&store, "inst-new").await;
 
@@ -10214,7 +10484,7 @@ mod tests {
             &nonce,
         );
 
-        store
+        let err = store
             .claim_share_subdomain(
                 &config,
                 ShareClaimSubdomainRequest {
@@ -10232,7 +10502,8 @@ mod tests {
                 "owner@example.com",
             )
             .await
-            .expect("claim reclaimed subdomain");
+            .expect_err("different installation must not reclaim by self-reported owner email");
+        assert!(err.to_string().contains("subdomain already claimed"));
 
         let conn = store.conn.lock().await;
         let rows: Vec<(String, String, String)> = {
@@ -10250,7 +10521,7 @@ mod tests {
         };
         assert_eq!(
             rows,
-            vec![("share-new".into(), "inst-new".into(), "owner-sub".into())]
+            vec![("share-old".into(), "inst-old".into(), "owner-sub".into())]
         );
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));

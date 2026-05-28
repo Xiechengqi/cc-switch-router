@@ -1081,6 +1081,7 @@ mod tests {
                 actual_model_source: "official".into(),
                 status: "streaming".into(),
                 status_code: Some(200),
+                error_message: None,
                 latency_ms: Some(1),
                 input_tokens: 0,
                 output_tokens: 0,

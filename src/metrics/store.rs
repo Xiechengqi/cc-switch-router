@@ -37,8 +37,9 @@ impl MetricsStore {
     /// Opens a connection, running the schema bootstrap only on the first call.
     fn open(&self) -> Result<Connection, AppError> {
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|err| AppError::Internal(format!("create metrics db dir failed: {err}")))?;
+            std::fs::create_dir_all(parent).map_err(|err| {
+                AppError::Internal(format!("create metrics db dir failed: {err}"))
+            })?;
         }
         let conn = Connection::open(&self.path)
             .map_err(|err| AppError::Internal(format!("open metrics db failed: {err}")))?;

@@ -318,6 +318,8 @@ pub struct MarketRequestLogEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_code: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<u64>,
     #[serde(default)]
     pub input_tokens: u32,
@@ -364,6 +366,8 @@ pub struct DashboardMarketRequestLogView {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_code: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<u64>,
     pub input_tokens: u32,
@@ -960,6 +964,14 @@ pub struct ShareAppRuntimes {
     pub codex: Option<ShareUpstreamProvider>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gemini: Option<ShareUpstreamProvider>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kiro: Option<ShareUpstreamProvider>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<ShareUpstreamProvider>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub antigravity: Option<ShareUpstreamProvider>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copilot: Option<ShareUpstreamProvider>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

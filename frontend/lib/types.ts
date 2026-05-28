@@ -267,6 +267,7 @@ export type MarketRequestLog = {
   actualModelSource?: string;
   status: string;
   statusCode?: number;
+  errorMessage?: string;
   latencyMs?: number;
   inputTokens: number;
   outputTokens: number;
@@ -364,6 +365,10 @@ export type ShareAppRuntimes = {
   claude?: ShareUpstreamProvider;
   codex?: ShareUpstreamProvider;
   gemini?: ShareUpstreamProvider;
+  kiro?: ShareUpstreamProvider;
+  cursor?: ShareUpstreamProvider;
+  antigravity?: ShareUpstreamProvider;
+  copilot?: ShareUpstreamProvider;
 };
 
 export type HealthCheckEntry = {

@@ -292,7 +292,7 @@ function runtimeModelKeys(runtime?: ShareUpstreamProvider) {
   return new Set(models.map((item) => modelHealthKey(item.actualModel)).filter(Boolean));
 }
 
-function relevantModelHealthEntries(share: ShareView, key: keyof ShareAppRuntimes) {
+function relevantModelHealthEntries(share: ShareView, key: "claude" | "codex" | "gemini") {
   const entries = share.modelHealth?.[key] || [];
   const currentModels = runtimeModelKeys(share.appRuntimes?.[key]);
   if (currentModels.size === 0) return entries;
@@ -385,7 +385,7 @@ function ForSaleCell({ share, t }: { share?: ShareView; t: TFn }) {
   );
 }
 
-function modelHealthTone(share: ShareView, key: keyof ShareAppRuntimes) {
+function modelHealthTone(share: ShareView, key: "claude" | "codex" | "gemini") {
   const entries = relevantModelHealthEntries(share, key);
   const results = entries.flatMap((entry) => (entry.recentResults || []).slice(0, 3));
   if (!results.length) {
@@ -417,7 +417,7 @@ function modelHealthTone(share: ShareView, key: keyof ShareAppRuntimes) {
   };
 }
 
-function modelHealthTitle(share: ShareView, key: keyof ShareAppRuntimes) {
+function modelHealthTitle(share: ShareView, key: "claude" | "codex" | "gemini") {
   const entries = relevantModelHealthEntries(share, key);
   if (!entries.length) return "No failures recorded yet";
   return entries
@@ -432,7 +432,15 @@ function modelHealthTitle(share: ShareView, key: keyof ShareAppRuntimes) {
 
 function SupportCell({ share, t }: { share?: ShareView; t: TFn }) {
   if (!share) return <span className="text-muted-foreground">-</span>;
-  const rows: Array<[keyof ShareAppRuntimes, string]> = [["claude", "Claude"], ["codex", "Codex"], ["gemini", "Gemini"]];
+  type CoreAppKey = "claude" | "codex" | "gemini";
+  const rows: Array<[CoreAppKey, string]> = [["claude", "Claude"], ["codex", "Codex"], ["gemini", "Gemini"]];
+  // OAuth-standalone providers: enabled when a runtime snapshot exists (no per-share support flag).
+  const oauthRows: Array<[keyof ShareAppRuntimes, string]> = [
+    ["kiro", "Kiro"],
+    ["cursor", "Cursor"],
+    ["antigravity", "Antigravity"],
+    ["copilot", "Copilot"],
+  ];
   return (
     <div className="grid min-w-72 gap-1.5">
       {rows.map(([key, label]) => {
@@ -449,6 +457,21 @@ function SupportCell({ share, t }: { share?: ShareView; t: TFn }) {
               <span className="whitespace-normal break-words font-semibold">{enabled ? firstLine || (official ? "Official" : t("dashboard.on")) : ""}</span>
               {enabled && secondLine ? <span className="whitespace-normal break-words text-[10px] font-medium opacity-75">{secondLine}</span> : null}
               {enabled ? <span className="text-[10px] font-semibold opacity-70">{tone.label}</span> : null}
+            </span>
+          </div>
+        );
+      })}
+      {oauthRows.map(([key, label]) => {
+        const runtime = share.appRuntimes?.[key];
+        if (!runtime) return null;
+        const summary = quotaSummary(runtime);
+        const email = runtime.accountEmail || "";
+        return (
+          <div key={key} className="grid grid-cols-[56px_1fr] gap-2 rounded-lg border px-2 py-1.5 text-[11px] bg-blue-50 dark:bg-blue-950/30 text-blue-900 dark:text-blue-200 border-blue-200 dark:border-blue-800">
+            <span className="font-mono uppercase">{label}</span>
+            <span className="grid min-w-0 gap-0.5 text-right">
+              <span className="whitespace-normal break-words font-semibold">{summary || "OAuth"}</span>
+              {email ? <span className="whitespace-normal break-words text-[10px] font-medium opacity-75">{email}</span> : null}
             </span>
           </div>
         );
@@ -1646,6 +1669,7 @@ function MarketLinkedShares({ market, t }: { market: DashboardMarket; t: TFn }) 
     if (!availability) return app;
     const parts = [
       `${app}: ${String(availability.status || "unknown")}`,
+      "market request history, not client health",
       availability.reason,
       availability.requestedModel,
     ].filter(Boolean);
