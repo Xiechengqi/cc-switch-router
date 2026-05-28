@@ -11,6 +11,8 @@ import type {
   SettingsValuesResponse,
   ShareSettingsPatch,
   ShareEditView,
+  UserApiTokenResponse,
+  UserApiTokenResetResponse,
   VersionResponse,
   MetricsSnapshot,
   HostMetricsInfo,
@@ -42,6 +44,16 @@ export async function updateShareSettings(shareId: string, patch: ShareSettingsP
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ patch }),
     }),
+  );
+}
+
+export async function getUserApiToken() {
+  return parseJson<UserApiTokenResponse>(await authFetch("/v1/me/api-token", { cache: "no-store" }));
+}
+
+export async function resetUserApiToken() {
+  return parseJson<UserApiTokenResetResponse>(
+    await authFetch("/v1/me/api-token/reset", { method: "POST" }),
   );
 }
 

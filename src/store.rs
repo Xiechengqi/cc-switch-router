@@ -37,14 +37,14 @@ use crate::models::{
     MarketRequestLogBatchSyncRequest, MarketRequestLogEntry, MarketShareView, ModelHealthSummary,
     PublicMapClientPoint, PublicMapPointsResponse, PublicMarketConfig, RefreshSessionRequest,
     RegisterInstallationRequest, RegisterInstallationResponse, RegisterMarketRequest,
-    RequestEmailCodeRequest, RequestEmailCodeResponse, SessionStatusResponse, ShareAppRuntimes,
-    ShareBatchSyncRequest, ShareClaimPayload, ShareClaimSubdomainRequest, ShareDeleteRequest,
-    ShareDescriptor, ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest,
-    ShareMarketLinkView, ShareModelHealthCheckEntry, ShareModelHealthSummary,
-    SharePendingEditsRequest, SharePendingEditsResponse, ShareRequestLogBatchSyncRequest,
-    ShareRequestLogEntry, ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload,
-    ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse, ShareSettingsPatch,
-    ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest,
+    RequestEmailCodeRequest, RequestEmailCodeResponse, SessionStatusResponse, ShareAppProvider,
+    ShareAppProviders, ShareAppRuntimes, ShareBatchSyncRequest, ShareClaimPayload,
+    ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptor, ShareEditAckRequest,
+    ShareEditView, ShareHeartbeatRequest, ShareMarketLinkView, ShareModelHealthCheckEntry,
+    ShareModelHealthSummary, SharePendingEditsRequest, SharePendingEditsResponse,
+    ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRequestLogFetchResponse,
+    ShareRuntimeRefreshPayload, ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse,
+    ShareSettingsPatch, ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest,
     ShareUpstreamProvider, ShareView, TunnelLease, UserApiTokenResetResponse, UserApiTokenResponse,
     UserApiTokenStatus, UserShareView, UserSharesResponse, VerifyEmailCodeRequest,
     VerifyEmailCodeResponse,
@@ -964,7 +964,7 @@ impl AppStore {
                 shared_with_emails: share.shared_with_emails.clone(),
                 role,
                 can_invoke: true,
-                can_manage: owner || shared,
+                can_manage: owner,
                 description: share.description.clone(),
                 for_sale: share.for_sale.clone(),
                 market_access_mode: share.market_access_mode.clone(),
@@ -1568,28 +1568,23 @@ impl AppStore {
         let current_user_email = normalize_email(current_user_email)?;
         let now = Utc::now();
         let conn = self.conn.lock().await;
-        let (installation_id, owner_email, shared_with_emails): (String, String, Vec<String>) = conn
+        let (installation_id, owner_email): (String, String) = conn
             .query_row(
-                "SELECT installation_id, owner_email, shared_with_emails_json FROM shares WHERE share_id = ?1",
+                "SELECT installation_id, owner_email FROM shares WHERE share_id = ?1",
                 params![share_id],
-                |row| Ok((row.get(0)?, row.get(1)?, parse_string_vec(row.get(2)?)?)),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(|e| AppError::Internal(format!("query share owner failed: {e}")))?
             .ok_or_else(|| AppError::NotFound("share not found".into()))?;
         let owner_email = normalize_email(&owner_email)?;
-        let shared_with_emails = normalize_email_list(&shared_with_emails, &owner_email);
         let patch = normalize_share_settings_patch(patch, Some(&owner_email))?;
         if share_settings_patch_is_empty(&patch) {
             return Err(AppError::BadRequest("share settings patch is empty".into()));
         }
-        if owner_email != current_user_email
-            && !shared_with_emails
-                .iter()
-                .any(|email| email == &current_user_email)
-        {
+        if owner_email != current_user_email {
             return Err(AppError::Forbidden(
-                "only share owner or shared user can edit share settings".into(),
+                "only share owner can edit share settings".into(),
             ));
         }
         if let Some(active) = get_active_share_edit(&conn, share_id)? {
@@ -2064,8 +2059,8 @@ impl AppStore {
                 let online_minutes_24h = online_by_share.get(&share.share_id).copied().unwrap_or(0);
                 let online_rate_24h =
                     ((online_minutes_24h as f64 / ONLINE_WINDOW_MINUTES as f64) * 100.0).min(100.0);
-                let can_view_secret =
-                    share.for_sale == "Free" || share_visible_to_email(&share, viewer_email);
+                let can_view_share = share_visible_to_email(&share, viewer_email);
+                let can_view_secret = share.for_sale == "Free" || can_view_share;
                 let can_manage = can_manage_share(&share, viewer_email);
                 let active_edit = active_edits_by_share.get(&share.share_id).cloned();
                 let can_edit_settings = can_manage
@@ -2104,7 +2099,7 @@ impl AppStore {
                     share_id: share.share_id,
                     share_name: share.share_name,
                     owner_email: share.owner_email,
-                    shared_with_emails: if can_manage {
+                    shared_with_emails: if can_view_share {
                         share.shared_with_emails
                     } else {
                         Vec::new()
@@ -2138,6 +2133,7 @@ impl AppStore {
                     support: share.support,
                     upstream_provider: share.upstream_provider,
                     app_runtimes: share.app_runtimes,
+                    app_providers: share.app_providers,
                     installation_id: installation_id.clone(),
                     is_online,
                     cleanup_at: (!is_online)
@@ -3340,6 +3336,8 @@ impl AppStore {
     ) -> Result<(), AppError> {
         let app_runtimes_json = serde_json::to_string(&snapshot.app_runtimes)
             .map_err(|e| AppError::Internal(format!("serialize app runtimes failed: {e}")))?;
+        let app_providers_json = serde_json::to_string(&snapshot.app_providers)
+            .map_err(|e| AppError::Internal(format!("serialize app providers failed: {e}")))?;
         let refreshed_at = DateTime::<Utc>::from_timestamp(snapshot.queried_at, 0)
             .unwrap_or_else(Utc::now)
             .to_rfc3339();
@@ -3351,12 +3349,13 @@ impl AppStore {
                  enabled_codex = ?3,
                  enabled_gemini = ?4,
                  app_runtimes_json = ?5,
-                 runtime_refreshed_at = ?6,
-                 token_limit = COALESCE(?7, token_limit),
-                 tokens_used = COALESCE(?8, tokens_used),
-                 requests_count = COALESCE(?9, requests_count),
-                 share_status = COALESCE(?10, share_status),
-                 updated_at = ?11
+                 app_providers_json = ?6,
+                 runtime_refreshed_at = ?7,
+                 token_limit = COALESCE(?8, token_limit),
+                 tokens_used = COALESCE(?9, tokens_used),
+                 requests_count = COALESCE(?10, requests_count),
+                 share_status = COALESCE(?11, share_status),
+                 updated_at = ?12
              WHERE share_id = ?1",
             params![
                 snapshot.share_id,
@@ -3364,6 +3363,7 @@ impl AppStore {
                 i64::from(snapshot.support.codex as u8),
                 i64::from(snapshot.support.gemini as u8),
                 app_runtimes_json,
+                app_providers_json,
                 refreshed_at,
                 snapshot.token_limit,
                 snapshot.tokens_used,
@@ -4303,6 +4303,7 @@ fn upsert_share_tx(
             expires_at = excluded.expires_at,
             upstream_provider_json = shares.upstream_provider_json,
             app_runtimes_json = shares.app_runtimes_json,
+            app_providers_json = shares.app_providers_json,
             runtime_refreshed_at = shares.runtime_refreshed_at,
             updated_at = excluded.updated_at",
         params![
@@ -4666,6 +4667,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             expires_at TEXT NOT NULL,
             upstream_provider_json TEXT,
             app_runtimes_json TEXT,
+            app_providers_json TEXT,
             runtime_refreshed_at TEXT,
             updated_at TEXT NOT NULL
         );
@@ -5241,6 +5243,12 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
     if !columns.iter().any(|name| name == "app_runtimes_json") {
         conn.execute("ALTER TABLE shares ADD COLUMN app_runtimes_json TEXT", [])
             .map_err(|e| AppError::Internal(format!("add shares app_runtimes_json failed: {e}")))?;
+    }
+    if !columns.iter().any(|name| name == "app_providers_json") {
+        conn.execute("ALTER TABLE shares ADD COLUMN app_providers_json TEXT", [])
+            .map_err(|e| {
+                AppError::Internal(format!("add shares app_providers_json failed: {e}"))
+            })?;
     }
     if !columns.iter().any(|name| name == "parallel_limit") {
         conn.execute(
@@ -5857,7 +5865,7 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
         "SELECT s.installation_id, s.share_id, s.share_name, s.description, s.for_sale, s.market_access_mode, COALESCE(s.subdomain, '-'), s.share_token, s.app_type, s.provider_id,
                     s.owner_email, s.shared_with_emails_json,
                     s.enabled_claude, s.enabled_codex, s.enabled_gemini,
-                    s.token_limit, s.parallel_limit, s.tokens_used, s.requests_count, s.share_status, s.created_at, s.expires_at, s.upstream_provider_json, s.app_runtimes_json
+                    s.token_limit, s.parallel_limit, s.tokens_used, s.requests_count, s.share_status, s.created_at, s.expires_at, s.upstream_provider_json, s.app_runtimes_json, s.app_providers_json
              FROM shares s
              ORDER BY s.share_name ASC",
         )
@@ -5893,6 +5901,7 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                     expires_at: row.get(21)?,
                     upstream_provider: parse_upstream_provider(row.get(22)?)?,
                     app_runtimes: parse_app_runtimes(row.get(23)?)?,
+                    app_providers: parse_app_providers(row.get(24)?)?,
                 },
             ))
         })
@@ -6169,6 +6178,18 @@ fn parse_app_runtimes(value: Option<String>) -> Result<ShareAppRuntimes, rusqlit
     };
     if value.trim().is_empty() {
         return Ok(ShareAppRuntimes::default());
+    }
+    serde_json::from_str(&value).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+    })
+}
+
+fn parse_app_providers(value: Option<String>) -> Result<ShareAppProviders, rusqlite::Error> {
+    let Some(value) = value else {
+        return Ok(ShareAppProviders::default());
+    };
+    if value.trim().is_empty() {
+        return Ok(ShareAppProviders::default());
     }
     serde_json::from_str(&value).map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
@@ -8981,10 +9002,6 @@ fn can_manage_share(share: &ShareDescriptor, viewer_email: Option<&str>) -> bool
         return false;
     };
     share.owner_email.as_deref() == Some(viewer_email)
-        || share
-            .shared_with_emails
-            .iter()
-            .any(|email| email == viewer_email)
 }
 
 #[cfg(test)]
@@ -9502,6 +9519,7 @@ mod tests {
             },
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
+            app_providers: ShareAppProviders::default(),
         }
     }
 
@@ -10432,6 +10450,7 @@ mod tests {
             support: ShareSupport::default(),
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
+            app_providers: ShareAppProviders::default(),
         };
         let timestamp_ms = Utc::now().timestamp_millis();
         let nonce = Uuid::new_v4().to_string();
@@ -10496,6 +10515,7 @@ mod tests {
             support: ShareSupport::default(),
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
+            app_providers: ShareAppProviders::default(),
         };
 
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -10776,6 +10796,7 @@ mod tests {
             support: ShareSupport::default(),
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
+            app_providers: ShareAppProviders::default(),
         };
         let claim = share_claim_payload(&share);
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -10853,6 +10874,7 @@ mod tests {
             support: ShareSupport::default(),
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
+            app_providers: ShareAppProviders::default(),
         };
         let claim = ShareClaimPayload {
             subdomain: "other-sub".into(),
@@ -10922,6 +10944,7 @@ mod tests {
             support: ShareSupport::default(),
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
+            app_providers: ShareAppProviders::default(),
         };
 
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -11020,6 +11043,7 @@ mod tests {
             support: ShareSupport::default(),
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
+            app_providers: ShareAppProviders::default(),
         };
 
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -11091,6 +11115,7 @@ mod tests {
             support: ShareSupport::default(),
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
+            app_providers: ShareAppProviders::default(),
         };
 
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -11181,6 +11206,7 @@ mod tests {
             },
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
+            app_providers: ShareAppProviders::default(),
         };
         let ops = vec![ShareSyncOperation {
             kind: "upsert".into(),
@@ -11798,8 +11824,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_email_can_manage_share_in_dashboard() {
-        let (store, config) = setup_store("dashboard-shared-manager").await;
+    async fn shared_email_can_view_share_read_only_in_dashboard() {
+        let (store, config) = setup_store("dashboard-shared-read-only").await;
         insert_installation(&store, "inst-1").await;
         insert_share(&store, "inst-1", "share-shared", "shared-sub", "active").await;
         set_share_shared_with_emails(&store, "share-shared", &["shared@example.com"]).await;
@@ -11812,11 +11838,11 @@ mod tests {
         let snapshot = store
             .dashboard_snapshot(&config, &server_geo, &proxy, Some("shared@example.com"))
             .await
-            .expect("dashboard snapshot for shared manager");
+            .expect("dashboard snapshot for shared viewer");
         let share = snapshot.clients[0].share.as_ref().expect("share view");
 
-        assert!(share.can_manage);
-        assert!(share.can_edit_settings);
+        assert!(!share.can_manage);
+        assert!(!share.can_edit_settings);
         assert_eq!(share.shared_with_emails, vec!["shared@example.com"]);
         assert_eq!(share.share_token, "token");
 
@@ -11824,13 +11850,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_email_can_create_share_settings_edit() {
+    async fn shared_email_cannot_create_share_settings_edit() {
         let (store, config) = setup_store("shared-share-settings-edit").await;
         insert_installation(&store, "inst-1").await;
         insert_share(&store, "inst-1", "share-edit", "edit-sub", "active").await;
         set_share_shared_with_emails(&store, "share-edit", &["shared@example.com"]).await;
 
-        let response = store
+        let err = store
             .create_share_settings_edit(
                 "share-edit",
                 "shared@example.com",
@@ -11845,24 +11871,9 @@ mod tests {
                 },
             )
             .await
-            .expect("shared email can create edit");
+            .expect_err("shared email should not create edit");
 
-        assert!(response.ok);
-        assert_eq!(response.edit.share_id, "share-edit");
-        assert_eq!(response.edit.installation_id, "inst-1");
-        assert_eq!(response.edit.status, "pending");
-        assert_eq!(response.edit.created_by_email, "shared@example.com");
-        assert_eq!(
-            response.edit.patch.description,
-            Some(Some("updated by shared user".into()))
-        );
-        assert_eq!(
-            response.edit.patch.shared_with_emails,
-            Some(vec![
-                "shared@example.com".into(),
-                "other@example.com".into()
-            ])
-        );
+        assert!(err.to_string().contains("only share owner"));
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
@@ -11955,7 +11966,7 @@ mod tests {
             .await
             .expect_err("unshared email should be rejected");
 
-        assert!(err.to_string().contains("owner or shared user"));
+        assert!(err.to_string().contains("only share owner"));
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
@@ -12287,6 +12298,7 @@ mod tests {
                     codex: Some(test_upstream_provider("gpt-5.5")),
                     ..ShareAppRuntimes::default()
                 },
+                app_providers: ShareAppProviders::default(),
                 token_limit: None,
                 tokens_used: None,
                 requests_count: None,
@@ -12343,6 +12355,23 @@ mod tests {
                     gemini: true,
                 },
                 app_runtimes: ShareAppRuntimes::default(),
+                app_providers: ShareAppProviders {
+                    codex: vec![ShareAppProvider {
+                        id: "provider-1".into(),
+                        name: "OpenAI Official".into(),
+                        app: "codex".into(),
+                        kind: Some("official_oauth".into()),
+                        provider_type: Some("codex_oauth".into()),
+                        is_current: true,
+                        enabled: true,
+                        for_sale_official_price_percent: Some(80),
+                        account_email: Some("account@example.com".into()),
+                        api_url: None,
+                        quota: None,
+                        models: Vec::new(),
+                    }],
+                    ..ShareAppProviders::default()
+                },
                 model_health: ShareModelHealthSummary::default(),
             })
             .await
@@ -12356,12 +12385,21 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .expect("query share usage");
+        let app_providers_json: String = conn
+            .query_row(
+                "SELECT app_providers_json FROM shares WHERE share_id = 'share-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query app providers");
         drop(conn);
 
         assert_eq!(token_limit, -1);
         assert_eq!(tokens_used, 31_900_000);
         assert_eq!(requests_count, 137);
         assert_eq!(share_status, "active");
+        assert!(app_providers_json.contains("provider-1"));
+        assert!(app_providers_json.contains("account@example.com"));
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
@@ -12387,6 +12425,7 @@ mod tests {
                     codex: Some(test_upstream_provider("gpt-5.5")),
                     ..ShareAppRuntimes::default()
                 },
+                app_providers: ShareAppProviders::default(),
                 token_limit: None,
                 tokens_used: None,
                 requests_count: None,
@@ -12414,6 +12453,7 @@ mod tests {
                     codex: Some(test_upstream_provider("codex")),
                     ..ShareAppRuntimes::default()
                 },
+                app_providers: ShareAppProviders::default(),
                 token_limit: None,
                 tokens_used: None,
                 requests_count: None,

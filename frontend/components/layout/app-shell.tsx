@@ -2,16 +2,16 @@
 
 import Image from "next/image";
 import Link from "next/link";
-import { Button, Dropdown, ListBox, Select, Tabs } from "@heroui/react";
-import { Activity, LogOut, Settings, UserRound } from "lucide-react";
+import { Button, Dropdown, ListBox, Modal, Select, Tabs } from "@heroui/react";
+import { Activity, Copy, KeyRound, Loader2, LogOut, RotateCcw, Settings, UserRound } from "lucide-react";
 import * as React from "react";
 import { LoginDialog } from "@/components/auth/login-dialog";
 import { Toast } from "@heroui/react";
 import { AuthProvider, useAuth } from "@/components/auth/auth-provider";
 import { LocaleProvider, useLocaleText } from "@/components/i18n/locale-provider";
-import { getDashboard } from "@/lib/api";
+import { getDashboard, getUserApiToken, resetUserApiToken } from "@/lib/api";
 import type { AppLocale } from "@/lib/i18n";
-import type { DashboardResponse } from "@/lib/types";
+import type { DashboardResponse, UserApiTokenStatus } from "@/lib/types";
 import { formatNumber } from "@/lib/utils";
 
 type RegionOption = {
@@ -153,10 +153,120 @@ function LanguageSwitcher() {
   );
 }
 
+function ApiTokenDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
+  const [token, setToken] = React.useState<UserApiTokenStatus | null>(null);
+  const [rawToken, setRawToken] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState("");
+  const [copied, setCopied] = React.useState(false);
+
+  const load = React.useCallback(async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const response = await getUserApiToken();
+      setToken(response.token);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    if (!open) return;
+    setRawToken("");
+    setCopied(false);
+    load().catch(console.error);
+  }, [load, open]);
+
+  const reset = async () => {
+    setBusy(true);
+    setError("");
+    setCopied(false);
+    try {
+      const response = await resetUserApiToken();
+      setToken(response.token);
+      setRawToken(response.apiToken);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const copy = async () => {
+    if (!rawToken) return;
+    await navigator.clipboard.writeText(rawToken);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1500);
+  };
+
+  return (
+    <Modal isOpen={open} onOpenChange={onOpenChange}>
+      <Modal.Backdrop>
+        <Modal.Container placement="center">
+          <Modal.Dialog className="w-[min(560px,calc(100vw-2rem))] max-w-none">
+            <Modal.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
+            <Modal.Header>
+              <div>
+                <Modal.Heading>API Token</Modal.Heading>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  用它调用 router API，也可作为 share 调用的 `Authorization: Bearer ...`。
+                </p>
+              </div>
+            </Modal.Header>
+            <Modal.Body className="grid gap-4">
+              {error ? <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div> : null}
+              <div className="grid gap-2 rounded-lg border bg-muted/30 p-3 text-sm">
+                <div className="flex justify-between gap-3">
+                  <span className="text-muted-foreground">Prefix</span>
+                  <strong className="font-mono">{token?.prefix || (busy ? "loading..." : "-")}</strong>
+                </div>
+                <div className="flex justify-between gap-3">
+                  <span className="text-muted-foreground">Created</span>
+                  <span>{token?.createdAt ? new Date(token.createdAt).toLocaleString() : "-"}</span>
+                </div>
+                <div className="flex justify-between gap-3">
+                  <span className="text-muted-foreground">Last used</span>
+                  <span>{token?.lastUsedAt ? new Date(token.lastUsedAt).toLocaleString() : "-"}</span>
+                </div>
+                <div className="flex justify-between gap-3">
+                  <span className="text-muted-foreground">Scopes</span>
+                  <span className="text-right">{token?.scopes?.join(", ") || "-"}</span>
+                </div>
+              </div>
+              <div className="grid gap-2">
+                <span className="text-xs text-muted-foreground">
+                  现有 token 只保存 hash，不能再次查看明文；重置后新 token 会在这里显示一次。
+                </span>
+                <div className="break-all rounded-lg border bg-background px-3 py-2 font-mono text-xs">
+                  {rawToken || "重置后显示新的 API token"}
+                </div>
+              </div>
+            </Modal.Body>
+            <Modal.Footer>
+              <Button variant="outline" onClick={copy} isDisabled={!rawToken || busy}>
+                <Copy className="h-4 w-4" />
+                {copied ? "已复制" : "复制"}
+              </Button>
+              <Button variant="primary" onClick={reset} isDisabled={busy}>
+                {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}
+                重置并显示
+              </Button>
+            </Modal.Footer>
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
+    </Modal>
+  );
+}
+
 function Topbar({ active }: { active: "dashboard" | "settings" | "metrics" }) {
   const { session, loading, logout } = useAuth();
   const { t } = useLocaleText();
   const [loginOpen, setLoginOpen] = React.useState(false);
+  const [apiTokenOpen, setApiTokenOpen] = React.useState(false);
   const authed = !!session?.authenticated;
 
   return (
@@ -184,6 +294,10 @@ function Topbar({ active }: { active: "dashboard" | "settings" | "metrics" }) {
                     {session?.user?.email}
                   </Dropdown.Item>
                 </Dropdown.Section>
+                <Dropdown.Item id="api-token" onAction={() => setApiTokenOpen(true)}>
+                  <KeyRound className="h-4 w-4" />
+                  API Token
+                </Dropdown.Item>
                 {session?.isAdmin ? (
                   <>
                     <Dropdown.Item id="metrics" href="/metrics/">
@@ -216,6 +330,7 @@ function Topbar({ active }: { active: "dashboard" | "settings" | "metrics" }) {
         )}
       </div>
       <LoginDialog open={loginOpen} onOpenChange={setLoginOpen} />
+      <ApiTokenDialog open={apiTokenOpen} onOpenChange={setApiTokenOpen} />
     </header>
   );
 }

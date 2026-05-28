@@ -95,6 +95,7 @@ export type ShareView = {
   recentModelHealthChecks?: ShareModelHealthCheck[];
   support?: ShareSupport;
   appRuntimes?: ShareAppRuntimes;
+  appProviders?: ShareAppProviders;
   modelHealth?: ShareModelHealthSummary;
 };
 
@@ -122,6 +123,22 @@ export type ShareEditView = {
   updatedAt: string;
   appliedAt?: string;
   errorMessage?: string;
+};
+
+export type UserApiTokenStatus = {
+  prefix: string;
+  createdAt: string;
+  lastUsedAt?: string;
+  scopes: string[];
+};
+
+export type UserApiTokenResponse = {
+  token: UserApiTokenStatus;
+};
+
+export type UserApiTokenResetResponse = {
+  apiToken: string;
+  token: UserApiTokenStatus;
 };
 
 export type ShareMarketLink = {
@@ -342,6 +359,7 @@ export type ShareModelHealthSummary = {
 };
 
 export type ShareUpstreamProvider = {
+  providerName?: string;
   kind?: string;
   app?: string;
   accountEmail?: string;
@@ -361,6 +379,27 @@ export type ShareUpstreamProvider = {
     slot?: string;
     actualModel?: string;
   }>;
+};
+
+export type ShareAppProvider = {
+  id: string;
+  name: string;
+  app: "claude" | "codex" | "gemini" | string;
+  kind?: string;
+  providerType?: string;
+  isCurrent?: boolean;
+  enabled?: boolean;
+  forSaleOfficialPricePercent?: number;
+  accountEmail?: string;
+  apiUrl?: string;
+  quota?: ShareUpstreamProvider["quota"];
+  models?: ShareUpstreamProvider["models"];
+};
+
+export type ShareAppProviders = {
+  claude?: ShareAppProvider[];
+  codex?: ShareAppProvider[];
+  gemini?: ShareAppProvider[];
 };
 
 export type ShareAppRuntimes = {

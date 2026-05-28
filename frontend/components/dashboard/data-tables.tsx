@@ -1,13 +1,13 @@
 "use client";
 
-import { ExternalLink, Loader2, Pencil, Save, X } from "lucide-react";
-import { Button, Card, Checkbox, Chip, Drawer, Input, ListBox, Modal, ProgressBar, Select, TextArea } from "@heroui/react";
+import { Eye, ExternalLink, Loader2, Pencil, Save, X } from "lucide-react";
+import { Button, Card, Checkbox, Chip, Drawer, Input, ListBox, Modal, ProgressBar, Select, Tabs, TextArea } from "@heroui/react";
 import * as React from "react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getMarketLinkedShares, updateMarketDisabledShares, updateMarketMaintenance, updateShareSettings } from "@/lib/api";
 import type { AppLocale } from "@/lib/i18n";
-import type { DashboardClient, DashboardMarket, HealthCheckEntry, MarketAppAvailabilityEntry, MarketRequestLog, MarketShare, ModelHealthSummary, ShareAppRuntimes, ShareModelHealthCheck, ShareRequestLog, ShareSettingsPatch, ShareUpstreamProvider, ShareView } from "@/lib/types";
+import type { DashboardClient, DashboardMarket, HealthCheckEntry, MarketAppAvailabilityEntry, MarketRequestLog, MarketShare, ModelHealthSummary, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareModelHealthCheck, ShareRequestLog, ShareSettingsPatch, ShareUpstreamProvider, ShareView } from "@/lib/types";
 import { compactTokens, formatDateTime, formatNumber, formatRelativeTime } from "@/lib/utils";
 
 function compareDesc(left: number, right: number) {
@@ -120,22 +120,10 @@ function shareApiUrlKey(share?: ShareView) {
 }
 
 function shareApiParts(share?: ShareView) {
-  if (!share) return { apiUrl: "-", apiKey: "***" };
+  if (!share) return { apiUrl: "-" };
   const baseHost = typeof window === "undefined" ? "" : window.location.host || "";
   const apiUrl = share.subdomain && baseHost ? `${share.subdomain}.${baseHost}` : share.subdomain || baseHost || "-";
-  return { apiUrl, apiKey: share.shareToken || "***" };
-}
-
-function maskSecret(value?: string) {
-  if (!value) return "***";
-  if (/^\*+$/.test(value)) return value;
-  if (value.length === 1) return `${value}***${value}`;
-  return `${value.slice(0, 1)}***${value.slice(-1)}`;
-}
-
-function shareApiKeyLabel(share?: ShareView, apiKey?: string) {
-  if (!share) return "***";
-  return share.canViewSecret ? apiKey || "***" : maskSecret(apiKey);
+  return { apiUrl };
 }
 
 function formatUsdOneDecimal(value?: string | number) {
@@ -434,13 +422,6 @@ function SupportCell({ share, t }: { share?: ShareView; t: TFn }) {
   if (!share) return <span className="text-muted-foreground">-</span>;
   type CoreAppKey = "claude" | "codex" | "gemini";
   const rows: Array<[CoreAppKey, string]> = [["claude", "Claude"], ["codex", "Codex"], ["gemini", "Gemini"]];
-  // OAuth-standalone providers: enabled when a runtime snapshot exists (no per-share support flag).
-  const oauthRows: Array<[keyof ShareAppRuntimes, string]> = [
-    ["kiro", "Kiro"],
-    ["cursor", "Cursor"],
-    ["antigravity", "Antigravity"],
-    ["copilot", "Copilot"],
-  ];
   return (
     <div className="grid min-w-72 gap-1.5">
       {rows.map(([key, label]) => {
@@ -461,35 +442,20 @@ function SupportCell({ share, t }: { share?: ShareView; t: TFn }) {
           </div>
         );
       })}
-      {oauthRows.map(([key, label]) => {
-        const runtime = share.appRuntimes?.[key];
-        if (!runtime) return null;
-        const summary = quotaSummary(runtime);
-        const email = runtime.accountEmail || "";
-        return (
-          <div key={key} className="grid grid-cols-[56px_1fr] gap-2 rounded-lg border px-2 py-1.5 text-[11px] bg-blue-50 dark:bg-blue-950/30 text-blue-900 dark:text-blue-200 border-blue-200 dark:border-blue-800">
-            <span className="font-mono uppercase">{label}</span>
-            <span className="grid min-w-0 gap-0.5 text-right">
-              <span className="whitespace-normal break-words font-semibold">{summary || "OAuth"}</span>
-              {email ? <span className="whitespace-normal break-words text-[10px] font-medium opacity-75">{email}</span> : null}
-            </span>
-          </div>
-        );
-      })}
     </div>
   );
 }
 
 function ShareEditAction({ share, onEdit, t: _t }: { share?: ShareView; onEdit: (share: ShareView) => void; t: TFn }) {
-  if (!share?.canManage) return null;
-  if (share.activeEdit?.status === "pending") {
+  if (!share) return null;
+  if (share.canManage && share.activeEdit?.status === "pending") {
     return <Chip size="sm" color="warning" variant="soft">Pending apply</Chip>;
   }
   const handle = (event: React.MouseEvent) => {
     event.stopPropagation();
     onEdit(share);
   };
-  if (share.activeEdit?.status === "rejected") {
+  if (share.canManage && share.activeEdit?.status === "rejected") {
     return (
       <button
         type="button"
@@ -508,8 +474,8 @@ function ShareEditAction({ share, onEdit, t: _t }: { share?: ShareView; onEdit: 
       onClick={handle}
       className="inline-flex h-[22px] items-center gap-1 rounded-full border border-primary/20 bg-primary/10 px-2.5 text-[11px] font-medium text-primary transition-colors hover:border-primary/30 hover:bg-primary/15"
     >
-      <Pencil className="h-3 w-3" />
-      编辑
+      {share.canManage ? <Pencil className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
+      {share.canManage ? "编辑" : "查看"}
     </button>
   );
 }
@@ -577,6 +543,7 @@ function ShareEditDialog({
   const [error, setError] = React.useState("");
   const [confirmFreeOpen, setConfirmFreeOpen] = React.useState(false);
   const [marketSelectKey, setMarketSelectKey] = React.useState(0);
+  const readOnly = !!share && !share.canManage;
 
   React.useEffect(() => {
     if (!share) return;
@@ -718,7 +685,7 @@ function ShareEditDialog({
     descriptionInvalid || tokenInvalid || parallelInvalid || expiryInvalid || pricingInvalid;
 
   const save = async () => {
-    if (!share || busy || formInvalid) return;
+    if (!share || readOnly || busy || formInvalid) return;
     setBusy(true);
     setError("");
     try {
@@ -752,8 +719,11 @@ function ShareEditDialog({
           <Modal.Container>
             <Modal.Dialog className="share-edit-surface light w-[min(760px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
               <Modal.Header>
-                <Modal.Heading>编辑 share 设置</Modal.Heading>
+                <Modal.Heading>{readOnly ? "查看 share 设置" : "编辑 share 设置"}</Modal.Heading>
                 <p className="mt-1 break-all text-sm text-muted-foreground">{share?.subdomain || share?.shareName}</p>
+                {readOnly ? (
+                  <p className="mt-2 text-xs text-muted-foreground">你是此 share 的 shareto 用户，只能只读查看；只有 owner email 可以编辑。</p>
+                ) : null}
               </Modal.Header>
               <Modal.Body className="grid max-h-[72vh] gap-4 overflow-y-auto">
                 {error ? (
@@ -765,19 +735,21 @@ function ShareEditDialog({
                   hint={<span>最多 200 字。<span className="ml-2 font-mono">{descriptionLength}/200</span></span>}
                   invalid={descriptionInvalid}
                 >
-                  <TextArea
-                    value={description}
-                    maxLength={200}
-                    onChange={(event) => setDescription(event.target.value)}
-                  />
+	                  <TextArea
+	                    value={description}
+	                    maxLength={200}
+                      disabled={readOnly}
+	                    onChange={(event) => setDescription(event.target.value)}
+	                  />
                 </FieldGroup>
 
                 <div className="grid gap-3 sm:grid-cols-2">
                   <FieldGroup label="For sale">
-                    <Select
-                      selectedKey={forSale}
-                      onSelectionChange={(key) => handleForSaleChange(String(key || "No") as "Yes" | "No" | "Free")}
-                    >
+	                    <Select
+	                      selectedKey={forSale}
+	                      onSelectionChange={(key) => handleForSaleChange(String(key || "No") as "Yes" | "No" | "Free")}
+                      isDisabled={readOnly}
+	                    >
                       <Select.Trigger>
                         <Select.Value>{forSale}</Select.Value>
                         <Select.Indicator />
@@ -795,10 +767,10 @@ function ShareEditDialog({
                   <FieldGroup label="Market access" hint={forSale === "Yes" ? undefined : "仅 ForSale = Yes 时生效"}>
                     <Select
                       key={marketSelectKey}
-                      selectedKey={null}
-                      onSelectionChange={(key) => onMarketPicked(String(key || ""))}
-                      isDisabled={forSale !== "Yes"}
-                    >
+	                      selectedKey={null}
+	                      onSelectionChange={(key) => onMarketPicked(String(key || ""))}
+	                      isDisabled={readOnly || forSale !== "Yes"}
+	                    >
                       <Select.Trigger>
                         <Select.Value>
                           {marketAccessMode === "all" ? "All markets" : "Add a market…"}
@@ -833,14 +805,16 @@ function ShareEditDialog({
                               className="inline-flex items-center gap-1.5 rounded-full border border-primary/20 bg-primary/10 px-2.5 py-1 text-xs font-medium text-primary"
                             >
                               {label}
-                              <button
-                                type="button"
-                                aria-label={`remove ${email}`}
-                                className="inline-flex h-4 w-4 items-center justify-center rounded-full bg-primary/15 transition-colors hover:bg-primary/25"
-                                onClick={() => removeMarketEmail(email)}
-                              >
-                                <X className="h-3 w-3" />
-                              </button>
+	                              {readOnly ? null : (
+	                                <button
+	                                  type="button"
+	                                  aria-label={`remove ${email}`}
+	                                  className="inline-flex h-4 w-4 items-center justify-center rounded-full bg-primary/15 transition-colors hover:bg-primary/25"
+	                                  onClick={() => removeMarketEmail(email)}
+	                                >
+	                                  <X className="h-3 w-3" />
+	                                </button>
+	                              )}
                             </span>
                           );
                         })}
@@ -856,10 +830,11 @@ function ShareEditDialog({
                 {forSale === "Yes" && marketAccessMode === "all" ? (
                   <div className="rounded-lg border border-primary/20 bg-primary/5 px-3 py-2 text-xs text-primary">
                     已选择「All markets」— 所有在线 market 都可访问此 share
-                    <button
-                      type="button"
-                      className="ml-3 text-[11px] underline decoration-dotted underline-offset-2 hover:text-primary/80"
-                      onClick={() => {
+	                    <button
+	                      type="button"
+	                      className="ml-3 text-[11px] underline decoration-dotted underline-offset-2 hover:text-primary/80"
+                      disabled={readOnly}
+	                      onClick={() => {
                         setMarketAccessMode("selected");
                         setSelectedMarketEmails([]);
                       }}
@@ -869,12 +844,13 @@ function ShareEditDialog({
                   </div>
                 ) : null}
 
-                <FieldGroup label="Shared with" hint="多个邮箱用换行/逗号分隔。这些邮箱登录 dashboard 后可看到此 share 的 API Key 明文。">
-                  <TextArea
-                    value={sharedWithEmails}
-                    placeholder="friend@example.com, teammate@example.com"
-                    onChange={(event) => setSharedWithEmails(event.target.value)}
-                  />
+	                <FieldGroup label="Shared with" hint={readOnly ? "只读查看；只有 owner email 可以修改 shareto 列表。" : "多个邮箱用换行/逗号分隔。这些邮箱登录 dashboard 后可查看此 share。"}>
+	                  <TextArea
+	                    value={sharedWithEmails}
+	                    placeholder="friend@example.com, teammate@example.com"
+                      disabled={readOnly}
+	                    onChange={(event) => setSharedWithEmails(event.target.value)}
+	                  />
                 </FieldGroup>
 
                 <div className="grid gap-3 sm:grid-cols-2">
@@ -884,8 +860,8 @@ function ShareEditDialog({
                         type="number"
                         min={1}
                         step={1}
-                        value={tokenLimitInput}
-                        disabled={tokenLimitUnlimited}
+	                        value={tokenLimitInput}
+	                        disabled={readOnly || tokenLimitUnlimited}
                         onChange={(event) => {
                           setTokenLimitInput(event.target.value);
                           const parsed = Number.parseInt(event.target.value, 10);
@@ -893,9 +869,10 @@ function ShareEditDialog({
                         }}
                       />
                       <Checkbox
-                        isSelected={tokenLimitUnlimited}
-                        onChange={(value: boolean) => handleTokenUnlimited(value)}
-                      >
+	                        isSelected={tokenLimitUnlimited}
+	                        onChange={(value: boolean) => handleTokenUnlimited(value)}
+                          isDisabled={readOnly}
+	                      >
                         <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
                         <Checkbox.Content><span className="text-xs text-muted-foreground">无限制</span></Checkbox.Content>
                       </Checkbox>
@@ -908,8 +885,8 @@ function ShareEditDialog({
                         type="number"
                         min={MIN_PARALLEL_LIMIT}
                         step={1}
-                        value={parallelLimitInput}
-                        disabled={parallelLimitUnlimited}
+	                        value={parallelLimitInput}
+	                        disabled={readOnly || parallelLimitUnlimited}
                         onChange={(event) => {
                           setParallelLimitInput(event.target.value);
                           const parsed = Number.parseInt(event.target.value, 10);
@@ -919,9 +896,10 @@ function ShareEditDialog({
                         }}
                       />
                       <Checkbox
-                        isSelected={parallelLimitUnlimited}
-                        onChange={(value: boolean) => handleParallelUnlimited(value)}
-                      >
+	                        isSelected={parallelLimitUnlimited}
+	                        onChange={(value: boolean) => handleParallelUnlimited(value)}
+                          isDisabled={readOnly}
+	                      >
                         <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
                         <Checkbox.Content><span className="text-xs text-muted-foreground">无限制</span></Checkbox.Content>
                       </Checkbox>
@@ -933,14 +911,15 @@ function ShareEditDialog({
                   <div className="grid gap-2">
                     <Input
                       type="datetime-local"
-                      value={expiresAtInput}
-                      disabled={expiresPermanent}
-                      onChange={(event) => setExpiresAtInput(event.target.value)}
+	                      value={expiresAtInput}
+	                      disabled={readOnly || expiresPermanent}
+	                      onChange={(event) => setExpiresAtInput(event.target.value)}
                     />
                     <Checkbox
-                      isSelected={expiresPermanent}
-                      onChange={(value: boolean) => setExpiresPermanent(value)}
-                    >
+	                      isSelected={expiresPermanent}
+	                      onChange={(value: boolean) => setExpiresPermanent(value)}
+                        isDisabled={readOnly}
+	                    >
                       <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
                       <Checkbox.Content><span className="text-xs text-muted-foreground">永久（不过期）</span></Checkbox.Content>
                     </Checkbox>
@@ -965,8 +944,8 @@ function ShareEditDialog({
                               min={1}
                               max={100}
                               step={1}
-                              value={priceInputs[app.key]}
-                              disabled={!supported}
+	                              value={priceInputs[app.key]}
+	                              disabled={readOnly || !supported}
                               placeholder={supported ? "未设置" : "无当前节点"}
                               onChange={(event) =>
                                 setPriceInputs((current) => ({ ...current, [app.key]: event.target.value }))
@@ -981,11 +960,13 @@ function ShareEditDialog({
                 </FieldGroup>
               </Modal.Body>
               <Modal.Footer>
-                <Button variant="outline" onClick={onClose} isDisabled={busy}>取消</Button>
-                <Button variant="primary" onClick={save} isDisabled={busy || formInvalid}>
-                  {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-                  保存
-                </Button>
+	                <Button variant="outline" onClick={onClose} isDisabled={busy}>{readOnly ? "关闭" : "取消"}</Button>
+	                {readOnly ? null : (
+	                  <Button variant="primary" onClick={save} isDisabled={busy || formInvalid}>
+	                    {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+	                    保存
+	                  </Button>
+	                )}
               </Modal.Footer>
             </Modal.Dialog>
           </Modal.Container>
@@ -1092,7 +1073,7 @@ export function ClientsTable({ clients, markets, onChanged }: { clients: Dashboa
 	                  <tr key={client.installation.id} className="cursor-pointer border-b last:border-0 hover:bg-primary/5" onClick={(event) => { if (shouldOpenRowDrawer(event)) setSelected(client); }}>
 	                    <td className="w-72 break-words px-4 py-3 align-middle">
 	                      <div className="grid min-w-72 gap-1">
-	                        <strong className="break-all font-mono text-xs text-foreground">{share ? `${api.apiUrl}/${shareApiKeyLabel(share, api.apiKey)}` : "-"}</strong>
+		                        <strong className="break-all font-mono text-xs text-foreground">{share ? api.apiUrl : "-"}</strong>
 	                        <span className="break-all text-xs text-muted-foreground">{share?.ownerEmail || "-"}</span>
 	                        <div className="mt-1 flex flex-wrap items-center gap-2">
 	                          <ShareStatusBadge share={share} t={t} />
@@ -1124,7 +1105,7 @@ export function ClientsTable({ clients, markets, onChanged }: { clients: Dashboa
 	              <Drawer.Header>
 	                <div>
 	                  <Drawer.Heading className="break-all font-mono text-base">
-	                    {selected?.share ? `${selectedShareApi.apiUrl}/${shareApiKeyLabel(selected.share, selectedShareApi.apiKey)}` : selected?.installation.id}
+		                    {selected?.share ? selectedShareApi.apiUrl : selected?.installation.id}
 	                  </Drawer.Heading>
                   <p className="mt-1 break-all text-sm text-muted-foreground">{selected?.share?.ownerEmail || "-"}</p>
                   {selected?.share?.description ? (
@@ -1136,6 +1117,7 @@ export function ClientsTable({ clients, markets, onChanged }: { clients: Dashboa
                 {selected ? (
                   <div className="grid gap-5">
                     <DrawerSection label={t("dashboard.markets")}><ShareMarkets share={selected.share} t={t} /></DrawerSection>
+                    <DrawerSection label={t("dashboard.providers")}><ShareProvidersPanel providers={selected.share?.appProviders} /></DrawerSection>
                     <DrawerSection label={t("dashboard.requestLogs")}><ShareRequestLogs logs={selected.share?.recentRequests || []} /></DrawerSection>
                     <DrawerSection label={t("dashboard.modelHealthChecks")}><ShareModelHealthChecks checks={selected.share?.recentModelHealthChecks || []} /></DrawerSection>
                   </div>
@@ -1572,6 +1554,83 @@ function ShareMarkets({ share, t }: { share?: ShareView; t: TFn }) {
       ))}
       {unknown.map((email) => <EmptyBlock key={email}>{t("dashboard.unknownMarket")}: {email}</EmptyBlock>)}
       {!links.length && !unknown.length && share.marketAccessMode !== "all" ? <EmptyBlock>{t("dashboard.noLinkedShares")}</EmptyBlock> : null}
+    </div>
+  );
+}
+
+const PROVIDER_APP_TABS: Array<{ key: keyof ShareAppProviders; label: string }> = [
+  { key: "claude", label: "Claude" },
+  { key: "codex", label: "Codex" },
+  { key: "gemini", label: "Gemini" },
+];
+
+function providerRuntime(provider: ShareAppProvider): ShareUpstreamProvider {
+  return {
+    providerName: provider.name,
+    kind: provider.kind,
+    app: provider.app,
+    accountEmail: provider.accountEmail,
+    forSaleOfficialPricePercent: provider.forSaleOfficialPricePercent,
+    apiUrl: provider.apiUrl,
+    quota: provider.quota,
+    models: provider.models,
+  };
+}
+
+function providerMetaLabel(provider: ShareAppProvider) {
+  return [provider.kind, provider.providerType].filter(Boolean).join(" · ");
+}
+
+function ShareProvidersPanel({ providers }: { providers?: ShareAppProviders }) {
+  const { t } = useLocaleText();
+  const [selectedKey, setSelectedKey] = React.useState<keyof ShareAppProviders>("claude");
+  const currentProviders = providers?.[selectedKey] || [];
+
+  return (
+    <div className="grid gap-3">
+      <Tabs selectedKey={selectedKey} onSelectionChange={(key: React.Key) => setSelectedKey(String(key) as keyof ShareAppProviders)} variant="secondary" className="text-foreground">
+        <Tabs.List className="grid w-full grid-cols-3 text-foreground">
+          {PROVIDER_APP_TABS.map((tab) => (
+            <Tabs.Tab key={tab.key} id={tab.key} className="px-2 text-xs text-muted-foreground data-[selected=true]:text-foreground">
+              {tab.label}
+            </Tabs.Tab>
+          ))}
+        </Tabs.List>
+      </Tabs>
+      {!currentProviders.length ? (
+        <EmptyBlock>{t("dashboard.noProviders")}</EmptyBlock>
+      ) : (
+        <div className="grid gap-2">
+          {currentProviders.map((provider) => {
+            const runtime = providerRuntime(provider);
+            const quota = quotaSummary(runtime);
+            const models = runtimeModelSummary(runtime);
+            const endpoint = runtimeEndpointSummary(runtime);
+            const meta = providerMetaLabel(provider);
+            return (
+              <div key={provider.id} className="rounded-lg border bg-background p-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-semibold">{provider.name || provider.id}</div>
+                    <div className="mt-1 truncate font-mono text-[11px] text-muted-foreground">{provider.id}</div>
+                  </div>
+                  <div className="flex shrink-0 flex-wrap justify-end gap-1">
+                    {provider.isCurrent ? <Chip color="success" size="sm" variant="soft">{t("dashboard.current")}</Chip> : null}
+                    {provider.isCurrent ? <Chip color={provider.enabled ? "success" : "default"} size="sm" variant="soft">{provider.enabled ? t("dashboard.on") : t("dashboard.off")}</Chip> : null}
+                  </div>
+                </div>
+                <div className="mt-2 grid gap-1 text-xs text-muted-foreground">
+                  {meta ? <div className="break-words">{meta}</div> : null}
+                  {endpoint ? <div className="break-words">{endpoint}</div> : null}
+                  {quota ? <div className="break-words">{quota}</div> : null}
+                  {models ? <div className="break-words">{models}</div> : null}
+                  {provider.forSaleOfficialPricePercent ? <div>{provider.forSaleOfficialPricePercent}%</div> : null}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }

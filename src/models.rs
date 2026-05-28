@@ -1026,6 +1026,43 @@ pub struct ShareUpstreamProvider {
     pub models: Vec<ShareUpstreamModel>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareAppProvider {
+    pub id: String,
+    pub name: String,
+    pub app: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_type: Option<String>,
+    #[serde(default)]
+    pub is_current: bool,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub for_sale_official_price_percent: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota: Option<ShareUpstreamQuota>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<ShareUpstreamModel>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareAppProviders {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claude: Vec<ShareAppProvider>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub codex: Vec<ShareAppProvider>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gemini: Vec<ShareAppProvider>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareAppRuntimes {
@@ -1061,6 +1098,8 @@ pub struct ShareRuntimeSnapshotResponse {
     pub support: ShareSupport,
     #[serde(default)]
     pub app_runtimes: ShareAppRuntimes,
+    #[serde(default)]
+    pub app_providers: ShareAppProviders,
     #[serde(default)]
     pub model_health: ShareModelHealthSummary,
 }
@@ -1101,6 +1140,8 @@ pub struct ShareDescriptor {
     pub upstream_provider: Option<ShareUpstreamProvider>,
     #[serde(default)]
     pub app_runtimes: ShareAppRuntimes,
+    #[serde(default)]
+    pub app_providers: ShareAppProviders,
 }
 
 #[derive(Debug, Serialize)]
@@ -1354,6 +1395,8 @@ pub struct ShareView {
     pub upstream_provider: Option<ShareUpstreamProvider>,
     #[serde(default)]
     pub app_runtimes: ShareAppRuntimes,
+    #[serde(default)]
+    pub app_providers: ShareAppProviders,
     pub installation_id: String,
     pub is_online: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
