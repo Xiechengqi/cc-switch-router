@@ -585,19 +585,6 @@ function SupportCell({ share, t, locale }: { share?: ShareView; t: TFn; locale: 
           </div>
         );
       })}
-      {OAUTH_RUNTIME_ROWS.map(([key, label]) => {
-        const runtime = share.appRuntimes?.[key];
-        if (!runtime) return null;
-        return (
-          <div key={key} className="grid grid-cols-[56px_1fr] gap-2 rounded-lg border border-blue-200 bg-blue-50 px-2 py-1.5 text-[11px] text-blue-900 dark:border-blue-800 dark:bg-blue-950/30 dark:text-blue-200">
-            <span className="font-mono uppercase">{label}</span>
-            <span className="grid min-w-0 gap-0.5 text-right">
-              <span className="whitespace-normal break-words font-semibold">{providerAccountLevel(runtime, locale)}</span>
-              <span className="whitespace-normal break-words text-[10px] font-medium opacity-75">{providerAccountIdentity(runtime)}</span>
-            </span>
-          </div>
-        );
-      })}
     </div>
   );
 }
