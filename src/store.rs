@@ -1030,17 +1030,24 @@ impl AppStore {
     ) -> Result<bool, AppError> {
         let email = normalize_email(user_email)?;
         let conn = self.conn.lock().await;
-        let Some((owner_email, shared_with_emails_json)): Option<(Option<String>, String)> = conn
+        let Some((owner_email, shared_with_emails_json, for_sale)): Option<(
+            Option<String>,
+            String,
+            String,
+        )> = conn
             .query_row(
-                "SELECT owner_email, shared_with_emails_json FROM shares WHERE share_id = ?1",
+                "SELECT owner_email, shared_with_emails_json, for_sale FROM shares WHERE share_id = ?1",
                 params![share_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(|e| AppError::Internal(format!("query share invoke acl failed: {e}")))?
         else {
             return Ok(false);
         };
+        if for_sale == "Free" {
+            return Ok(true);
+        }
         if owner_email
             .as_deref()
             .is_some_and(|owner| owner.eq_ignore_ascii_case(&email))
@@ -1656,7 +1663,97 @@ impl AppStore {
         .map_err(|e| AppError::Internal(format!("insert share settings edit failed: {e}")))?;
         let edit = get_share_edit_by_id(&conn, &id)?
             .ok_or_else(|| AppError::Internal("created share edit is missing".into()))?;
-        Ok(ShareSettingsUpdateResponse { ok: true, edit })
+        Ok(ShareSettingsUpdateResponse {
+            ok: true,
+            edit,
+            applied_synchronously: false,
+        })
+    }
+
+    /// Applies a share-settings edit using the descriptor the client returned
+    /// from its `/_ctl/apply_share_settings` call. The client remains
+    /// authoritative — the server only writes what the client reported and
+    /// only after verifying that report actually satisfies every field the
+    /// pending edit requested. A report that drops a requested field (e.g. an
+    /// owner transfer that forgot to demote the old owner into `shareto`) is
+    /// rejected, the edit is marked `rejected`, and `shares` is left untouched.
+    pub async fn apply_share_edit_directly(
+        &self,
+        edit_id: &str,
+        mut returned_share: ShareDescriptor,
+    ) -> Result<(), AppError> {
+        let now = Utc::now();
+        let conn = self.conn.lock().await;
+        let edit = get_share_edit_by_id(&conn, edit_id)?
+            .ok_or_else(|| AppError::NotFound("share edit not found".into()))?;
+        if edit.status != "pending" {
+            return Err(AppError::Conflict(format!(
+                "share edit is {} and cannot be applied",
+                edit.status
+            )));
+        }
+        if returned_share.share_id != edit.share_id {
+            return Err(AppError::BadRequest(
+                "control reply share_id does not match edit".into(),
+            ));
+        }
+        if let Err(field) = validate_returned_share_against_patch(&edit.patch, &returned_share) {
+            let message = format!("client reply did not satisfy patch field: {field}");
+            conn.execute(
+                "UPDATE share_edit_requests
+                 SET status = 'rejected', updated_at = ?2, error_message = ?3
+                 WHERE id = ?1 AND status = 'pending'",
+                params![edit_id, now.to_rfc3339(), message],
+            )
+            .map_err(|e| AppError::Internal(format!("reject share edit failed: {e}")))?;
+            return Err(AppError::UnprocessableEntity(message));
+        }
+
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| AppError::Internal(format!("begin apply edit tx failed: {e}")))?;
+        ensure_share_id_writable_by_installation(
+            &tx,
+            &returned_share.share_id,
+            &edit.installation_id,
+        )?;
+        normalize_self_reported_share_owner(&mut returned_share)?;
+        upsert_share_tx(&tx, &edit.installation_id, returned_share)?;
+        let changed = tx
+            .execute(
+                "UPDATE share_edit_requests
+                 SET status = 'applied', updated_at = ?2, applied_at = ?2, error_message = NULL
+                 WHERE id = ?1 AND status = 'pending'",
+                params![edit_id, now.to_rfc3339()],
+            )
+            .map_err(|e| AppError::Internal(format!("apply share edit failed: {e}")))?;
+        if changed == 0 {
+            return Err(AppError::Conflict(
+                "share edit was no longer pending".into(),
+            ));
+        }
+        tx.commit().map_err(map_share_constraint_error)?;
+        Ok(())
+    }
+
+    /// Marks a pending edit rejected with an operator-facing reason. Used when
+    /// the control RPC itself failed in a non-transport way (e.g. the client
+    /// returned a hard error) and the dashboard should see the failure rather
+    /// than silently fall back.
+    pub async fn mark_share_edit_rejected(
+        &self,
+        edit_id: &str,
+        error_message: &str,
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE share_edit_requests
+             SET status = 'rejected', updated_at = ?2, error_message = ?3
+             WHERE id = ?1 AND status = 'pending'",
+            params![edit_id, Utc::now().to_rfc3339(), error_message],
+        )
+        .map_err(|e| AppError::Internal(format!("reject share edit failed: {e}")))?;
+        Ok(())
     }
 
     pub async fn pending_share_edits(
@@ -2111,7 +2208,7 @@ impl AppStore {
                 let online_rate_24h =
                     ((online_minutes_24h as f64 / ONLINE_WINDOW_MINUTES as f64) * 100.0).min(100.0);
                 let can_view_share = share_visible_to_email(&share, viewer_email);
-                let can_view_secret = share.for_sale == "Free" || can_view_share;
+                let can_view_secret = can_view_share;
                 let can_manage = can_manage_share(&share, viewer_email);
                 let active_edit = active_edits_by_share.get(&share.share_id).cloned();
                 let can_edit_settings = can_manage
@@ -6108,6 +6205,93 @@ fn share_settings_patch_is_empty(patch: &ShareSettingsPatch) -> bool {
         && patch.auto_start.is_none()
 }
 
+/// Verifies that the descriptor the client reported back through the control
+/// RPC actually reflects every field the pending edit requested. Returns the
+/// name of the first field that does not match, or `Ok(())` if the client
+/// honored the whole patch. The server uses this to refuse writing a partial
+/// application (the desktop bug where an owner transfer dropped the demoted
+/// owner from `shareto`) instead of silently persisting it.
+///
+/// `auto_start` is intentionally not checked: it is not part of
+/// `ShareDescriptor`, so the report cannot confirm it.
+fn validate_returned_share_against_patch(
+    patch: &ShareSettingsPatch,
+    share: &ShareDescriptor,
+) -> Result<(), &'static str> {
+    if let Some(owner) = patch.owner_email.as_deref() {
+        let want = normalize_email(owner).map_err(|_| "ownerEmail")?;
+        let got = share
+            .owner_email
+            .as_deref()
+            .and_then(|value| normalize_email(value).ok())
+            .unwrap_or_default();
+        if want != got {
+            return Err("ownerEmail");
+        }
+    }
+    if let Some(list) = patch.shared_with_emails.as_ref() {
+        let got: std::collections::HashSet<String> = share
+            .shared_with_emails
+            .iter()
+            .filter_map(|value| normalize_email(value).ok())
+            .collect();
+        for email in list {
+            if let Ok(normalized) = normalize_email(email) {
+                if !got.contains(&normalized) {
+                    return Err("sharedWithEmails");
+                }
+            }
+        }
+    }
+    if let Some(for_sale) = patch.for_sale.as_deref() {
+        if for_sale != share.for_sale {
+            return Err("forSale");
+        }
+    }
+    if let Some(mode) = patch.market_access_mode.as_deref() {
+        if mode != share.market_access_mode {
+            return Err("marketAccessMode");
+        }
+    }
+    if let Some(token_limit) = patch.token_limit {
+        if token_limit != share.token_limit {
+            return Err("tokenLimit");
+        }
+    }
+    if let Some(parallel_limit) = patch.parallel_limit {
+        if parallel_limit != share.parallel_limit {
+            return Err("parallelLimit");
+        }
+    }
+    if let Some(description) = patch.description.as_ref() {
+        // patch.description is Option<Option<String>>: outer Some means "set",
+        // inner None means "clear". Both sides are already normalized.
+        if description.as_deref() != share.description.as_deref() {
+            return Err("description");
+        }
+    }
+    if let Some(expires_at) = patch.expires_at.as_deref() {
+        let matches = match (
+            DateTime::parse_from_rfc3339(expires_at),
+            DateTime::parse_from_rfc3339(&share.expires_at),
+        ) {
+            (Ok(want), Ok(got)) => want.with_timezone(&Utc) == got.with_timezone(&Utc),
+            _ => expires_at == share.expires_at,
+        };
+        if !matches {
+            return Err("expiresAt");
+        }
+    }
+    if let Some(pricing) = patch.for_sale_official_price_percent_by_app.as_ref() {
+        for (app, percent) in pricing {
+            if share.for_sale_official_price_percent_by_app.get(app) != Some(percent) {
+                return Err("forSaleOfficialPricePercentByApp");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn normalize_share_settings_patch(
     patch: ShareSettingsPatch,
     owner_email: Option<&str>,
@@ -9842,6 +10026,47 @@ mod tests {
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 
+    #[tokio::test]
+    async fn user_api_token_share_invoke_acl_allows_any_user_for_free_share() {
+        let (store, config) = setup_store("user-api-token-free-share-acl").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-free", "free-sub", "active").await;
+
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET for_sale = 'Free' WHERE share_id = 'share-free'",
+                [],
+            )
+            .expect("mark share free");
+        }
+
+        assert!(
+            store
+                .user_can_invoke_share("other@example.com", "share-free")
+                .await
+                .expect("free share acl")
+        );
+
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET for_sale = 'No' WHERE share_id = 'share-free'",
+                [],
+            )
+            .expect("mark share private");
+        }
+
+        assert!(
+            !store
+                .user_can_invoke_share("other@example.com", "share-free")
+                .await
+                .expect("private share acl")
+        );
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
     async fn insert_health_check(
         store: &AppStore,
         share_id: &str,
@@ -12167,7 +12392,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dashboard_snapshot_shows_free_share_token_without_login() {
+    async fn dashboard_snapshot_masks_free_share_token_without_login() {
         let (store, config) = setup_store("dashboard-free-share-token").await;
         insert_installation(&store, "inst-1").await;
         insert_share(&store, "inst-1", "share-free", "free-sub", "active").await;
@@ -12192,9 +12417,9 @@ mod tests {
             .expect("dashboard snapshot");
 
         let share = snapshot.clients[0].share.as_ref().expect("share view");
-        assert!(share.can_view_secret);
+        assert!(!share.can_view_secret);
         assert_eq!(share.for_sale, "Free");
-        assert_eq!(share.share_token, "token-free-1234");
+        assert_eq!(share.share_token, "t***4");
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }

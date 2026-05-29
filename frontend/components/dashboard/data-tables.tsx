@@ -795,6 +795,7 @@ function ShareEditDialog({
   const [priceInputs, setPriceInputs] = React.useState<Record<PriceApp, string>>({ claude: "", codex: "", gemini: "" });
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
+  const [notice, setNotice] = React.useState("");
   const [confirmFreeOpen, setConfirmFreeOpen] = React.useState(false);
   const [transferTargetEmail, setTransferTargetEmail] = React.useState("");
   const [marketSelectKey, setMarketSelectKey] = React.useState(0);
@@ -846,6 +847,7 @@ function ShareEditDialog({
 
     setPriceInputs(initialPricing);
     setError(share.activeEdit?.status === "rejected" ? share.activeEdit.errorMessage || t("dashboard.applyFailedFallback") : "");
+    setNotice("");
     setConfirmFreeOpen(false);
     setTransferTargetEmail("");
     setMarketSelectKey((current) => current + 1);
@@ -946,6 +948,7 @@ function ShareEditDialog({
     if (!share || readOnly || busy || formInvalid) return;
     setBusy(true);
     setError("");
+    setNotice("");
     try {
       const expiresIso = expiresPermanent
         ? PERMANENT_EXPIRES_AT_ISO
@@ -960,9 +963,13 @@ function ShareEditDialog({
       };
       if (expiresIso) patch.expiresAt = expiresIso;
       patch.forSaleOfficialPricePercentByApp = pricingPayload;
-      await updateShareSettings(share.shareId, patch);
+      const res = await updateShareSettings(share.shareId, patch);
       await onSaved();
-      onClose();
+      if (res.appliedSynchronously) {
+        onClose();
+      } else {
+        setNotice(t("dashboard.shareEditQueued"));
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -974,6 +981,7 @@ function ShareEditDialog({
     if (!share || readOnly || busy || !transferTargetEmail) return;
     setBusy(true);
     setError("");
+    setNotice("");
     try {
       const targetEmail = transferTargetEmail.toLowerCase();
       const shared = sharedWithEmails;
@@ -981,13 +989,17 @@ function ShareEditDialog({
         ...shared.filter((email) => email !== targetEmail),
         share.ownerEmail || "",
       ].filter(Boolean))).sort();
-      await updateShareSettings(share.shareId, {
+      const res = await updateShareSettings(share.shareId, {
         ownerEmail: targetEmail,
         sharedWithEmails: nextShared,
       });
       await onSaved();
       setTransferTargetEmail("");
-      onClose();
+      if (res.appliedSynchronously) {
+        onClose();
+      } else {
+        setNotice(t("dashboard.shareEditQueued"));
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -1011,6 +1023,9 @@ function ShareEditDialog({
               <Modal.Body className="grid max-h-[72vh] gap-4 overflow-y-auto">
                 {error ? (
                   <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div>
+                ) : null}
+                {notice ? (
+                  <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">{notice}</div>
                 ) : null}
 
                 <FieldGroup

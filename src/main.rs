@@ -5,6 +5,7 @@ mod board_telegram;
 mod cf;
 mod client_meta;
 mod config;
+mod ctl_client;
 mod dynamic_settings;
 mod error;
 mod geo;

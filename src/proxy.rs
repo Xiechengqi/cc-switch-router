@@ -60,6 +60,13 @@ impl RouteEntry {
     pub(crate) fn connection_id(&self) -> Option<&str> {
         self.connection_id.as_deref()
     }
+
+    /// Local `host:port` the server proxies into to reach this installation's
+    /// tunnelled HTTP server. Used by the control-plane RPC client to call the
+    /// client's `/_ctl/*` API over the same reverse SSH forward.
+    pub(crate) fn route_target(&self) -> &str {
+        &self.backend
+    }
 }
 
 #[derive(Debug, Default)]
@@ -368,6 +375,9 @@ pub async fn market_proxy_handler(
         .unwrap_or_default()
         .to_string();
     let path = parts.uri.path().to_string();
+    if path.starts_with("/_ctl/") || path == "/_ctl" {
+        return simple_response(StatusCode::NOT_FOUND, "not-found");
+    }
     let query = parts
         .uri
         .query()
@@ -675,6 +685,14 @@ pub async fn proxy_handler(
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
     let path = parts.uri.path().to_string();
+    // The `/_ctl/*` namespace is reserved for the server→client control-plane
+    // RPC, which the server reaches by connecting directly to the tunnel
+    // backend (bypassing this handler). Inbound public traffic must never be
+    // proxied into it, otherwise an external caller could try to drive the
+    // client's control API. Reject before any routing happens.
+    if path.starts_with("/_ctl/") || path == "/_ctl" {
+        return simple_response(StatusCode::NOT_FOUND, "not-found");
+    }
     let client_metadata = crate::client_meta::extract_client_metadata(&parts.headers, peer);
     let user_ip = client_metadata
         .ip

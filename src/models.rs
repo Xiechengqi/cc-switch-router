@@ -533,6 +533,10 @@ pub struct ShareSettingsUpdateRequest {
 pub struct ShareSettingsUpdateResponse {
     pub ok: bool,
     pub edit: ShareEditView,
+    /// True when the edit was applied immediately via the control-plane RPC to
+    /// the online client. False means it was queued (client offline / control
+    /// channel unavailable) and will apply on the next client sync.
+    pub applied_synchronously: bool,
 }
 
 #[derive(Debug, Deserialize)]

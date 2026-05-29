@@ -1452,10 +1452,64 @@ async fn update_share_settings(
     Json(input): Json<ShareSettingsUpdateRequest>,
 ) -> Result<Json<crate::models::ShareSettingsUpdateResponse>, AppError> {
     let current_user_email = require_user_email(&state, &headers, "share:write").await?;
-    let response = state
+    let mut response = state
         .store
         .create_share_settings_edit(&share_id, &current_user_email, input.patch)
         .await?;
+
+    // Happy path: if the owning installation is online and supports the control
+    // API, apply the (normalized) patch synchronously by calling the client's
+    // local `/_ctl/apply_share_settings` over its reverse tunnel. The client
+    // stays authoritative — it applies to its own config and reports back the
+    // descriptor it wrote; the store only persists that report after verifying
+    // it satisfies the patch. Transport failures fall back to the async path;
+    // a client that rejects or under-applies surfaces as a hard error.
+    let installation_id = response.edit.installation_id.clone();
+    let route = state.proxy.route_by_share_id(&share_id).await;
+    let control_secret = state
+        .store
+        .installation_control_secret(&installation_id)
+        .await
+        .unwrap_or(None);
+
+    if let (Some(route), Some(secret)) = (route, control_secret) {
+        match crate::ctl_client::apply_share_settings(
+            route.route_target(),
+            &installation_id,
+            &secret,
+            &share_id,
+            &response.edit.patch,
+        )
+        .await
+        {
+            Ok(returned_share) => {
+                state
+                    .store
+                    .apply_share_edit_directly(&response.edit.id, returned_share)
+                    .await?;
+                response.applied_synchronously = true;
+                return Ok(Json(response));
+            }
+            Err(err) if err.is_transport() => {
+                tracing::info!(
+                    share_id = %share_id,
+                    installation_id = %installation_id,
+                    error = %err,
+                    "control RPC unavailable; falling back to async share edit"
+                );
+                // fall through to async path
+            }
+            Err(err) => {
+                let message = err.to_string();
+                let _ = state
+                    .store
+                    .mark_share_edit_rejected(&response.edit.id, &message)
+                    .await;
+                return Err(AppError::UnprocessableEntity(message));
+            }
+        }
+    }
+
     let _ = state.share_edit_events.send(ShareEditAvailableEvent {
         kind: "share_edit_available".to_string(),
         installation_id: response.edit.installation_id.clone(),

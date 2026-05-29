@@ -39,7 +39,7 @@ export async function getDashboard() {
 }
 
 export async function updateShareSettings(shareId: string, patch: ShareSettingsPatch) {
-  return parseJson<{ ok: boolean; edit: ShareEditView }>(
+  return parseJson<{ ok: boolean; edit: ShareEditView; appliedSynchronously: boolean }>(
     await authFetch(`/v1/shares/${encodeURIComponent(shareId)}/settings`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
