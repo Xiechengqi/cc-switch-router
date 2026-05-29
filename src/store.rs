@@ -30,8 +30,8 @@ use crate::models::{
     DashboardClientView, DashboardMap, DashboardMapPoint, DashboardMarketRequestLogView,
     DashboardMarketView, DashboardPresenceRequest, DashboardResponse, DashboardStats,
     DashboardTickerShare, GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse,
-    HealthCheckEntry, Installation, InstallationView, IssueLeaseRequest, IssueLeaseResponse,
-    LatLonPoint, MarketAppAvailability, MarketAppAvailabilityEntry,
+    HealthCheckEntry, HealthTimelineBucket, Installation, InstallationView, IssueLeaseRequest,
+    IssueLeaseResponse, LatLonPoint, MarketAppAvailability, MarketAppAvailabilityEntry,
     MarketDisabledSharesUpdateRequest, MarketDisabledSharesUpdateResponse, MarketLinkedShareView,
     MarketMaintenanceUpdateRequest, MarketMaintenanceUpdateResponse, MarketRegistryRecord,
     MarketRequestLogBatchSyncRequest, MarketRequestLogEntry, MarketShareView, ModelHealthSummary,
@@ -58,6 +58,8 @@ const SHARE_REQUEST_LOG_RECOVERY_COOLDOWN_SECS: i64 = 5 * 60;
 const ROUTE_REGISTRATION_PENDING_GRACE_SECS: u64 = 30;
 const PUBLIC_MAP_CLIENT_ACTIVE_WINDOW_MINUTES: i64 = 5;
 const ONLINE_WINDOW_MINUTES: usize = 24 * 60;
+const HEALTH_TIMELINE_BUCKETS: usize = 48;
+const HEALTH_TIMELINE_BUCKET_SECS: i64 = 30 * 60;
 const SIGNED_REQUEST_MAX_SKEW_MS: i64 = 60_000;
 const NONCE_RETENTION_SECS: i64 = 10 * 60;
 const MARKET_OFFLINE_GRACE_SECS: i64 = 24 * 60 * 60;
@@ -107,6 +109,7 @@ pub struct UserApiTokenPrincipal {
 
 #[derive(Debug, Clone)]
 struct UserApiTokenRecord {
+    raw_token: Option<String>,
     prefix: String,
     scopes: Vec<String>,
     created_at: DateTime<Utc>,
@@ -211,6 +214,7 @@ impl AppStore {
         let now = Utc::now();
         let ip = metadata.ip.clone();
         let country_code = metadata.country_code.clone();
+        let new_control_secret = Alphanumeric.sample_string(&mut rand::thread_rng(), 44);
         let conn = self.conn.lock().await;
         if let Some(existing_installation_id) =
             find_installation_id_by_public_key(&conn, public_key)?
@@ -222,7 +226,8 @@ impl AppStore {
                      app_version = ?4,
                      last_seen_ip = COALESCE(?5, last_seen_ip),
                      country_code = COALESCE(?6, country_code),
-                     last_seen_at = ?7
+                     last_seen_at = ?7,
+                     control_secret_b64 = COALESCE(control_secret_b64, ?8)
                  WHERE id = ?1",
                 params![
                     existing_installation_id,
@@ -232,14 +237,25 @@ impl AppStore {
                     ip,
                     country_code,
                     now.to_rfc3339(),
+                    new_control_secret,
                 ],
             )
             .map_err(|e| AppError::Internal(format!("update installation failed: {e}")))?;
+            let control_secret: Option<String> = conn
+                .query_row(
+                    "SELECT control_secret_b64 FROM installations WHERE id = ?1",
+                    params![existing_installation_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| AppError::Internal(format!("read control secret failed: {e}")))?
+                .flatten();
             drop(conn);
             self.refresh_installation_geo(&existing_installation_id, &ip, true)
                 .await?;
             return Ok(RegisterInstallationResponse {
                 installation_id: existing_installation_id,
+                control_secret,
             });
         }
 
@@ -275,8 +291,8 @@ impl AppStore {
                 city, latitude, longitude, geo_candidate_country_code, geo_candidate_country,
                 geo_candidate_region, geo_candidate_city, geo_candidate_latitude,
                 geo_candidate_longitude, geo_candidate_hits, geo_candidate_first_seen_at,
-                geo_last_changed_at, created_at, last_seen_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                geo_last_changed_at, created_at, last_seen_at, control_secret_b64
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
             params![
                 installation.id,
                 installation.public_key,
@@ -306,6 +322,7 @@ impl AppStore {
                 installation.geo_last_changed_at.map(|value| value.to_rfc3339()),
                 installation.created_at.to_rfc3339(),
                 installation.last_seen_at.to_rfc3339(),
+                new_control_secret,
             ],
         )
         .map_err(|e| AppError::Internal(format!("insert installation failed: {e}")))?;
@@ -314,7 +331,25 @@ impl AppStore {
             .await?;
         Ok(RegisterInstallationResponse {
             installation_id: installation.id,
+            control_secret: Some(new_control_secret),
         })
+    }
+
+    pub async fn installation_control_secret(
+        &self,
+        installation_id: &str,
+    ) -> Result<Option<String>, AppError> {
+        let conn = self.conn.lock().await;
+        let secret: Option<String> = conn
+            .query_row(
+                "SELECT control_secret_b64 FROM installations WHERE id = ?1",
+                params![installation_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| AppError::Internal(format!("read control secret failed: {e}")))?
+            .flatten();
+        Ok(secret)
     }
 
     pub async fn bind_installation_owner_email(
@@ -909,6 +944,7 @@ impl AppStore {
         let user = upsert_user_by_email(&conn, &email, now)?;
         let (_raw, record) = ensure_default_user_api_token(&conn, &user.id, now)?;
         Ok(UserApiTokenResponse {
+            api_token: record.raw_token.clone(),
             token: user_api_token_status(record),
         })
     }
@@ -1891,15 +1927,18 @@ impl AppStore {
         let inflight_by_share = proxy.inflight_by_share().await;
         let inflight_by_market_email = proxy.inflight_by_market_email().await;
         let now = Utc::now();
+        let (health_timeline_start, _) = health_timeline_window(now);
         let (
             installations,
             shares,
             active_edits_by_share,
             health_by_share,
+            health_timeline_by_share,
             online_by_share,
             recent_logs,
             recent_model_health_checks,
             market_logs,
+            market_request_timeline_by_market,
             model_health_by_share,
         ) = {
             let conn = self.conn.lock().await;
@@ -1908,10 +1947,12 @@ impl AppStore {
                 list_shares(&conn)?,
                 list_active_share_edits(&conn)?,
                 list_health_checks(&conn, 10)?,
+                list_share_health_timeline_24h(&conn, now)?,
                 list_online_minutes_24h(&conn)?,
                 list_recent_share_request_logs(&conn, SHARE_REQUEST_LOG_RECOVERY_LIMIT)?,
                 list_recent_share_model_health_checks(&conn, SHARE_MODEL_HEALTH_CHECK_LIMIT)?,
                 list_recent_market_request_logs(&conn, 200)?,
+                list_market_request_timeline_stats_24h(&conn, now)?,
                 list_model_health_summaries(&conn)?,
             )
         };
@@ -1934,8 +1975,11 @@ impl AppStore {
                 &inflight_by_share,
                 &online_by_share,
                 &health_by_share,
+                &health_timeline_by_share,
                 &inflight_by_market_email,
                 &market_logs_by_market,
+                &market_request_timeline_by_market,
+                health_timeline_start,
             )?
         };
         let logs_by_share = recent_logs.into_iter().fold(
@@ -2053,6 +2097,10 @@ impl AppStore {
                     .get(&share.share_id)
                     .cloned()
                     .unwrap_or_default();
+                let health_timeline = health_timeline_by_share
+                    .get(&share.share_id)
+                    .cloned()
+                    .unwrap_or_default();
                 let recent_model_health_checks = model_health_checks_by_share
                     .get(&share.share_id)
                     .cloned()
@@ -2147,6 +2195,7 @@ impl AppStore {
                     online_rate_24h,
                     recent_requests,
                     health_checks,
+                    health_timeline,
                     recent_model_health_checks,
                     model_health,
                 }
@@ -2724,7 +2773,7 @@ impl AppStore {
                 email,
                 subdomain,
                 public_base_url,
-                scopes_json,
+                scopes_json.clone(),
                 now,
                 pricing_json,
             ],
@@ -4628,7 +4677,8 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             geo_candidate_first_seen_at TEXT,
             geo_last_changed_at TEXT,
             created_at TEXT NOT NULL,
-            last_seen_at TEXT NOT NULL
+            last_seen_at TEXT NOT NULL,
+            control_secret_b64 TEXT
         );
 
         CREATE TABLE IF NOT EXISTS leases (
@@ -4850,6 +4900,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             name TEXT NOT NULL,
             token_hash TEXT NOT NULL UNIQUE,
             token_prefix TEXT NOT NULL,
+            token_plaintext TEXT,
             scopes_json TEXT NOT NULL,
             created_at TEXT NOT NULL,
             last_used_at TEXT,
@@ -5153,6 +5204,15 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             AppError::Internal(format!("add installations geo_last_changed_at failed: {e}"))
         })?;
     }
+    if !columns.iter().any(|name| name == "control_secret_b64") {
+        conn.execute(
+            "ALTER TABLE installations ADD COLUMN control_secret_b64 TEXT",
+            [],
+        )
+        .map_err(|e| {
+            AppError::Internal(format!("add installations control_secret_b64 failed: {e}"))
+        })?;
+    }
     let columns = conn
         .prepare("PRAGMA table_info(shares)")
         .and_then(|mut stmt| {
@@ -5368,6 +5428,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         "actual_model_source",
         "TEXT NOT NULL DEFAULT ''",
     )?;
+    add_column_if_missing(conn, "user_api_tokens", "token_plaintext", "TEXT")?;
     add_column_if_missing(conn, "market_request_logs", "error_message", "TEXT")?;
     add_column_if_missing(conn, "market_request_logs", "user_country", "TEXT")?;
     add_column_if_missing(conn, "market_request_logs", "user_country_iso3", "TEXT")?;
@@ -7290,6 +7351,310 @@ fn list_online_minutes_24h(conn: &Connection) -> Result<HashMap<String, usize>, 
     Ok(map)
 }
 
+#[derive(Debug, Clone, Default)]
+struct HealthTimelineBucketStats {
+    healthy_minutes: HashSet<i64>,
+    observed_minutes: HashSet<i64>,
+    request_count: usize,
+    failure_count: usize,
+}
+
+fn empty_health_timeline_stats() -> Vec<HealthTimelineBucketStats> {
+    (0..HEALTH_TIMELINE_BUCKETS)
+        .map(|_| HealthTimelineBucketStats::default())
+        .collect()
+}
+
+fn health_timeline_window(now: DateTime<Utc>) -> (i64, i64) {
+    let end = now.timestamp();
+    let start = end - HEALTH_TIMELINE_BUCKETS as i64 * HEALTH_TIMELINE_BUCKET_SECS;
+    (start, end)
+}
+
+fn health_timeline_bucket_index(timestamp: i64, start: i64, end: i64) -> Option<usize> {
+    if timestamp < start || timestamp > end {
+        return None;
+    }
+    Some(
+        ((timestamp - start) / HEALTH_TIMELINE_BUCKET_SECS)
+            .clamp(0, HEALTH_TIMELINE_BUCKETS as i64 - 1) as usize,
+    )
+}
+
+fn timeline_timestamp_rfc3339(timestamp: i64) -> String {
+    DateTime::<Utc>::from_timestamp(timestamp, 0)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_else(|| timestamp.to_string())
+}
+
+fn parse_rfc3339_timestamp(value: &str) -> Option<i64> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.timestamp())
+}
+
+fn health_timeline_status(score: f64, stats: &HealthTimelineBucketStats) -> &'static str {
+    health_timeline_status_for_values(
+        score,
+        !stats.observed_minutes.is_empty() || stats.request_count > 0,
+    )
+}
+
+fn health_timeline_status_for_values(score: f64, has_data: bool) -> &'static str {
+    if !has_data {
+        return "unknown";
+    }
+    if score >= 90.0 {
+        "healthy"
+    } else if score >= 70.0 {
+        "degraded"
+    } else if score >= 30.0 {
+        "unhealthy"
+    } else {
+        "offline"
+    }
+}
+
+fn health_timeline_score(stats: &HealthTimelineBucketStats) -> f64 {
+    let online_ratio = (stats.healthy_minutes.len() as f64 / 30.0).clamp(0.0, 1.0);
+    if stats.request_count == 0 {
+        return online_ratio * 100.0;
+    }
+    let success_count = stats.request_count.saturating_sub(stats.failure_count);
+    let request_success_ratio = (success_count as f64 / stats.request_count as f64).clamp(0.0, 1.0);
+    if stats.observed_minutes.is_empty() {
+        request_success_ratio * 100.0
+    } else {
+        online_ratio * 70.0 + request_success_ratio * 30.0
+    }
+}
+
+fn health_timeline_bucket_from_stats(
+    stats: &HealthTimelineBucketStats,
+    start: i64,
+    index: usize,
+) -> HealthTimelineBucket {
+    let bucket_start = start + index as i64 * HEALTH_TIMELINE_BUCKET_SECS;
+    let bucket_end = bucket_start + HEALTH_TIMELINE_BUCKET_SECS;
+    let score = health_timeline_score(stats);
+    HealthTimelineBucket {
+        start_at: timeline_timestamp_rfc3339(bucket_start),
+        end_at: timeline_timestamp_rfc3339(bucket_end),
+        status: health_timeline_status(score, stats).into(),
+        score,
+        online_minutes: stats.healthy_minutes.len().min(30),
+        observed_minutes: stats.observed_minutes.len().min(30),
+        request_count: stats.request_count,
+        failure_count: stats.failure_count,
+    }
+}
+
+fn materialize_health_timeline(
+    stats: &[HealthTimelineBucketStats],
+    start: i64,
+) -> Vec<HealthTimelineBucket> {
+    stats
+        .iter()
+        .enumerate()
+        .map(|(index, bucket)| health_timeline_bucket_from_stats(bucket, start, index))
+        .collect()
+}
+
+fn merge_market_health_timeline(
+    linked_shares: &[MarketLinkedShareView],
+    health_timeline_by_share: &HashMap<String, Vec<HealthTimelineBucket>>,
+    market_request_stats: Option<&Vec<HealthTimelineBucketStats>>,
+    start: i64,
+) -> Vec<HealthTimelineBucket> {
+    (0..HEALTH_TIMELINE_BUCKETS)
+        .map(|index| {
+            let mut best_score: Option<f64> = None;
+            let mut online_minutes = 0;
+            let mut observed_minutes = 0;
+            for share in linked_shares
+                .iter()
+                .filter(|share| !share.disabled_by_market)
+            {
+                let Some(bucket) = health_timeline_by_share
+                    .get(&share.share_id)
+                    .and_then(|timeline| timeline.get(index))
+                else {
+                    continue;
+                };
+                if bucket.status != "unknown" {
+                    best_score =
+                        Some(best_score.map_or(bucket.score, |score| score.max(bucket.score)));
+                    online_minutes = online_minutes.max(bucket.online_minutes);
+                    observed_minutes = observed_minutes.max(bucket.observed_minutes);
+                }
+            }
+
+            let request_stats = market_request_stats
+                .and_then(|stats| stats.get(index))
+                .cloned()
+                .unwrap_or_default();
+            let mut score = best_score.unwrap_or_else(|| health_timeline_score(&request_stats));
+            if request_stats.request_count > 0 {
+                let success_count = request_stats
+                    .request_count
+                    .saturating_sub(request_stats.failure_count);
+                let request_score = (success_count as f64 / request_stats.request_count as f64)
+                    .clamp(0.0, 1.0)
+                    * 100.0;
+                score = if best_score.is_some() {
+                    best_score.unwrap_or(0.0) * 0.7 + request_score * 0.3
+                } else {
+                    request_score
+                };
+            }
+            let has_data = best_score.is_some() || request_stats.request_count > 0;
+            let bucket_start = start + index as i64 * HEALTH_TIMELINE_BUCKET_SECS;
+            HealthTimelineBucket {
+                start_at: timeline_timestamp_rfc3339(bucket_start),
+                end_at: timeline_timestamp_rfc3339(bucket_start + HEALTH_TIMELINE_BUCKET_SECS),
+                status: health_timeline_status_for_values(score, has_data).into(),
+                score,
+                online_minutes,
+                observed_minutes,
+                request_count: request_stats.request_count,
+                failure_count: request_stats.failure_count,
+            }
+        })
+        .collect()
+}
+
+fn request_status_failed(status: &str, status_code: Option<u16>) -> bool {
+    let status = status.trim().to_ascii_lowercase();
+    if matches!(
+        status.as_str(),
+        "failed" | "error" | "failed_released" | "rate_limited" | "upstream_error"
+    ) {
+        return true;
+    }
+    status_code.map(|code| code >= 400).unwrap_or(false)
+}
+
+fn list_share_health_timeline_24h(
+    conn: &Connection,
+    now: DateTime<Utc>,
+) -> Result<HashMap<String, Vec<HealthTimelineBucket>>, AppError> {
+    let (start, end) = health_timeline_window(now);
+    let mut by_share: HashMap<String, Vec<HealthTimelineBucketStats>> = HashMap::new();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT share_id, checked_at, is_healthy
+             FROM share_health_checks
+             WHERE checked_at >= ?1 AND checked_at <= ?2",
+        )
+        .map_err(|e| AppError::Internal(format!("prepare health timeline failed: {e}")))?;
+    let rows = stmt
+        .query_map(params![start, end], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)? != 0,
+            ))
+        })
+        .map_err(|e| AppError::Internal(format!("query health timeline failed: {e}")))?;
+    for row in rows {
+        let (share_id, checked_at, is_healthy) =
+            row.map_err(|e| AppError::Internal(format!("read health timeline row failed: {e}")))?;
+        let Some(index) = health_timeline_bucket_index(checked_at, start, end) else {
+            continue;
+        };
+        let minute = checked_at.div_euclid(60);
+        let bucket = &mut by_share
+            .entry(share_id)
+            .or_insert_with(empty_health_timeline_stats)[index];
+        bucket.observed_minutes.insert(minute);
+        if is_healthy {
+            bucket.healthy_minutes.insert(minute);
+        }
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT share_id, status_code, created_at
+             FROM share_request_logs
+             WHERE created_at >= ?1 AND created_at <= ?2 AND is_health_check = 0",
+        )
+        .map_err(|e| AppError::Internal(format!("prepare share request timeline failed: {e}")))?;
+    let rows = stmt
+        .query_map(params![start, end], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)? as u16,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|e| AppError::Internal(format!("query share request timeline failed: {e}")))?;
+    for row in rows {
+        let (share_id, status_code, created_at) = row.map_err(|e| {
+            AppError::Internal(format!("read share request timeline row failed: {e}"))
+        })?;
+        let Some(index) = health_timeline_bucket_index(created_at, start, end) else {
+            continue;
+        };
+        let bucket = &mut by_share
+            .entry(share_id)
+            .or_insert_with(empty_health_timeline_stats)[index];
+        bucket.request_count += 1;
+        if status_code >= 400 {
+            bucket.failure_count += 1;
+        }
+    }
+
+    Ok(by_share
+        .into_iter()
+        .map(|(share_id, stats)| (share_id, materialize_health_timeline(&stats, start)))
+        .collect())
+}
+
+fn list_market_request_timeline_stats_24h(
+    conn: &Connection,
+    now: DateTime<Utc>,
+) -> Result<HashMap<String, Vec<HealthTimelineBucketStats>>, AppError> {
+    let (start, end) = health_timeline_window(now);
+    let mut by_market: HashMap<String, Vec<HealthTimelineBucketStats>> = HashMap::new();
+    let mut stmt = conn
+        .prepare(
+            "SELECT market_email, status, status_code, created_at
+             FROM market_request_logs
+             WHERE created_at >= ?1",
+        )
+        .map_err(|e| AppError::Internal(format!("prepare market request timeline failed: {e}")))?;
+    let rows = stmt
+        .query_map(params![timeline_timestamp_rfc3339(start)], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?.map(|value| value as u16),
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|e| AppError::Internal(format!("query market request timeline failed: {e}")))?;
+    for row in rows {
+        let (market_email, status, status_code, created_at) = row.map_err(|e| {
+            AppError::Internal(format!("read market request timeline row failed: {e}"))
+        })?;
+        let Some(created_at) = parse_rfc3339_timestamp(&created_at) else {
+            continue;
+        };
+        let Some(index) = health_timeline_bucket_index(created_at, start, end) else {
+            continue;
+        };
+        let bucket = &mut by_market
+            .entry(market_email.to_ascii_lowercase())
+            .or_insert_with(empty_health_timeline_stats)[index];
+        bucket.request_count += 1;
+        if request_status_failed(&status, status_code) {
+            bucket.failure_count += 1;
+        }
+    }
+    Ok(by_market)
+}
+
 /// Healthy-minute counts inside the trailing 10 minutes. Used as the
 /// confidence numerator for `stability`.
 fn list_online_minutes_10m(conn: &Connection) -> Result<HashMap<String, usize>, AppError> {
@@ -7451,8 +7816,11 @@ fn list_dashboard_markets(
     inflight_by_share: &HashMap<String, usize>,
     online_by_share: &HashMap<String, usize>,
     health_by_share: &HashMap<String, Vec<HealthCheckEntry>>,
+    health_timeline_by_share: &HashMap<String, Vec<HealthTimelineBucket>>,
     inflight_by_market_email: &HashMap<String, usize>,
     market_logs_by_market: &HashMap<String, Vec<DashboardMarketRequestLogView>>,
+    market_request_timeline_by_market: &HashMap<String, Vec<HealthTimelineBucketStats>>,
+    health_timeline_start: i64,
 ) -> Result<Vec<DashboardMarketView>, AppError> {
     let mut stmt = conn
         .prepare(
@@ -7505,6 +7873,7 @@ fn list_dashboard_markets(
                 usage_amount_usd: format!("{:.8}", row.get::<_, f64>(14)?.max(0.0)),
                 pricing_summary: parse_json_value(row.get(10)?)?,
                 health_checks: Vec::new(),
+                health_timeline: Vec::new(),
                 linked_shares: Vec::new(),
                 recent_requests: Vec::new(),
                 subdomain,
@@ -7526,8 +7895,11 @@ fn list_dashboard_markets(
             inflight_by_share,
             online_by_share,
             health_by_share,
+            health_timeline_by_share,
             inflight_by_market_email,
             market_logs_by_market,
+            market_request_timeline_by_market,
+            health_timeline_start,
             &app_availability_by_market,
         );
     }
@@ -7542,8 +7914,11 @@ fn enrich_dashboard_market(
     inflight_by_share: &HashMap<String, usize>,
     online_by_share: &HashMap<String, usize>,
     health_by_share: &HashMap<String, Vec<HealthCheckEntry>>,
+    health_timeline_by_share: &HashMap<String, Vec<HealthTimelineBucket>>,
     inflight_by_market_email: &HashMap<String, usize>,
     market_logs_by_market: &HashMap<String, Vec<DashboardMarketRequestLogView>>,
+    market_request_timeline_by_market: &HashMap<String, Vec<HealthTimelineBucketStats>>,
+    health_timeline_start: i64,
     app_availability_by_market: &HashMap<String, HashMap<String, MarketAppAvailability>>,
 ) {
     let market_email = market.email.to_ascii_lowercase();
@@ -7657,6 +8032,12 @@ fn enrich_dashboard_market(
         .filter_map(|share| health_by_share.get(&share.share_id))
         .flat_map(|entries| entries.iter().cloned())
         .collect();
+    market.health_timeline = merge_market_health_timeline(
+        &linked_shares,
+        health_timeline_by_share,
+        market_request_timeline_by_market.get(&market_email),
+        health_timeline_start,
+    );
     market.linked_shares = linked_shares;
     market.recent_requests = market_logs_by_market
         .get(&market.email.to_ascii_lowercase())
@@ -8904,17 +9285,18 @@ fn get_default_user_api_token(
     user_id: &str,
 ) -> Result<Option<UserApiTokenRecord>, AppError> {
     conn.query_row(
-        "SELECT token_prefix, scopes_json, created_at, last_used_at
+        "SELECT token_plaintext, token_prefix, scopes_json, created_at, last_used_at
          FROM user_api_tokens
          WHERE user_id = ?1 AND name = ?2 AND revoked_at IS NULL",
         params![user_id, USER_DEFAULT_API_TOKEN_NAME],
         |row| {
             Ok(UserApiTokenRecord {
-                prefix: row.get(0)?,
-                scopes: parse_scopes_json(row.get(1)?)?,
-                created_at: parse_dt_sql(&row.get::<_, String>(2)?)?,
+                raw_token: row.get(0)?,
+                prefix: row.get(1)?,
+                scopes: parse_scopes_json(row.get(2)?)?,
+                created_at: parse_dt_sql(&row.get::<_, String>(3)?)?,
                 last_used_at: row
-                    .get::<_, Option<String>>(3)?
+                    .get::<_, Option<String>>(4)?
                     .map(|value| parse_dt_sql(&value))
                     .transpose()?,
             })
@@ -8967,14 +9349,15 @@ fn insert_default_user_api_token(
         let prefix = raw.chars().take(14).collect::<String>();
         let inserted = conn.execute(
             "INSERT OR IGNORE INTO user_api_tokens
-              (id, user_id, name, token_hash, token_prefix, scopes_json, created_at, last_used_at, reset_at, revoked_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, NULL)",
+              (id, user_id, name, token_hash, token_prefix, token_plaintext, scopes_json, created_at, last_used_at, reset_at, revoked_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL)",
             params![
                 Uuid::new_v4().to_string(),
                 user_id,
                 USER_DEFAULT_API_TOKEN_NAME,
                 hash_token(&raw),
-                prefix,
+                prefix.clone(),
+                raw.clone(),
                 scopes_json,
                 now.to_rfc3339(),
             ],
@@ -8982,8 +9365,9 @@ fn insert_default_user_api_token(
         .map_err(|e| AppError::Internal(format!("insert default api token failed: {e}")))?;
         if inserted > 0 {
             return Ok((
-                raw,
+                raw.clone(),
                 UserApiTokenRecord {
+                    raw_token: Some(raw),
                     prefix,
                     scopes,
                     created_at: now,
@@ -9349,6 +9733,7 @@ mod tests {
                 ensure_default_user_api_token(&conn, &user.id, now).expect("create api token");
             let first_raw = first_raw.expect("first creation returns raw token");
             assert!(first_raw.starts_with("ccrt_"));
+            assert_eq!(first_record.raw_token.as_deref(), Some(first_raw.as_str()));
             assert_eq!(
                 first_record.prefix,
                 first_raw.chars().take(14).collect::<String>()
@@ -9365,6 +9750,7 @@ mod tests {
             let (second_raw, second_record) =
                 ensure_default_user_api_token(&conn, &user.id, now).expect("reuse api token");
             assert!(second_raw.is_none());
+            assert_eq!(second_record.raw_token.as_deref(), Some(first_raw.as_str()));
             assert_eq!(second_record.prefix, first_record.prefix);
 
             (user.id, first_raw)
@@ -9395,6 +9781,11 @@ mod tests {
             reset.token.prefix,
             reset.api_token.chars().take(14).collect::<String>()
         );
+        let current = store
+            .get_default_api_token("Owner@Example.com")
+            .await
+            .expect("get default api token");
+        assert_eq!(current.api_token.as_deref(), Some(reset.api_token.as_str()));
 
         assert!(
             store
@@ -9775,6 +10166,14 @@ mod tests {
         );
         assert!(share.app_availability.claude.is_none());
         assert!(share.app_availability.gemini.is_none());
+        assert_eq!(market_view.health_timeline.len(), HEALTH_TIMELINE_BUCKETS);
+        let latest = market_view
+            .health_timeline
+            .last()
+            .expect("latest market health bucket");
+        assert_eq!(latest.status, "offline");
+        assert_eq!(latest.request_count, 3);
+        assert_eq!(latest.failure_count, 3);
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
@@ -12275,6 +12674,40 @@ mod tests {
         drop(conn);
 
         assert_eq!(online.get("share-1"), Some(&2));
+    }
+
+    #[tokio::test]
+    async fn health_timeline_24h_groups_share_probe_minutes() {
+        let (store, config) = setup_store("health-timeline-share-probes").await;
+        let now = Utc::now();
+        for minute_offset in 0..30 {
+            insert_health_check(
+                &store,
+                "share-1",
+                now.timestamp() - minute_offset * 60,
+                true,
+            )
+            .await;
+        }
+        insert_health_check(&store, "share-1", now.timestamp() - 45 * 60, false).await;
+
+        let conn = store.conn.lock().await;
+        let timelines = list_share_health_timeline_24h(&conn, now).expect("list health timeline");
+        drop(conn);
+
+        let timeline = timelines.get("share-1").expect("share timeline");
+        assert_eq!(timeline.len(), HEALTH_TIMELINE_BUCKETS);
+        let latest = timeline.last().expect("latest bucket");
+        assert_eq!(latest.status, "healthy");
+        assert_eq!(latest.online_minutes, 30);
+        assert!(latest.score >= 90.0);
+        let previous = timeline
+            .get(HEALTH_TIMELINE_BUCKETS - 2)
+            .expect("previous bucket");
+        assert_eq!(previous.status, "offline");
+        assert_eq!(previous.observed_minutes, 1);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 
     #[tokio::test]

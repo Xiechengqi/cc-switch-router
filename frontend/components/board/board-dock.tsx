@@ -90,7 +90,7 @@ function sortBoardMessages<T extends BoardMessage>(items: T[]): T[] {
 
 export function BoardDock() {
   const { session } = useAuth();
-  const { t } = useLocaleText();
+  const { locale, t } = useLocaleText();
   const dockRef = React.useRef<HTMLDivElement | null>(null);
   const scrollRef = React.useRef<HTMLDivElement | null>(null);
   const textareaRef = React.useRef<HTMLTextAreaElement | null>(null);
@@ -459,7 +459,7 @@ export function BoardDock() {
                       ) : null}
                       <span className="ml-auto flex items-center gap-1 text-xs text-muted-foreground" title={message.createdAt}>
                         {message.__pending ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
-                        {formatRelativeTime(message.createdAt)}
+                        {formatRelativeTime(message.createdAt, locale)}
                       </span>
                     </div>
                     <p className="mt-2 whitespace-pre-wrap break-words text-sm leading-6">{renderBody(message.body)}</p>

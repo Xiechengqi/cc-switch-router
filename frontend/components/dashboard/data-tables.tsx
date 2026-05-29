@@ -7,7 +7,7 @@ import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getMarketLinkedShares, updateMarketDisabledShares, updateMarketMaintenance, updateShareSettings } from "@/lib/api";
 import type { AppLocale } from "@/lib/i18n";
-import type { DashboardClient, DashboardMarket, HealthCheckEntry, MarketAppAvailabilityEntry, MarketRequestLog, MarketShare, ModelHealthSummary, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareModelHealthCheck, ShareRequestLog, ShareSettingsPatch, ShareUpstreamProvider, ShareView } from "@/lib/types";
+import type { DashboardClient, DashboardMarket, HealthCheckEntry, HealthTimelineBucket, MarketAppAvailabilityEntry, MarketRequestLog, MarketShare, ModelHealthSummary, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareModelHealthCheck, ShareRequestLog, ShareSettingsPatch, ShareUpstreamProvider, ShareView } from "@/lib/types";
 import { compactTokens, formatDateTime, formatNumber, formatRelativeTime } from "@/lib/utils";
 
 function compareDesc(left: number, right: number) {
@@ -235,6 +235,87 @@ function HealthDots({ entries = [] }: { entries?: HealthCheckEntry[] }) {
   );
 }
 
+function healthTimelineTone(status?: string) {
+  switch (status) {
+    case "healthy":
+      return "border-emerald-600 bg-emerald-500";
+    case "degraded":
+      return "border-lime-500 bg-lime-300";
+    case "unhealthy":
+      return "border-amber-500 bg-amber-400";
+    case "offline":
+      return "border-rose-600 bg-rose-500";
+    default:
+      return "border-slate-300 bg-slate-200 dark:border-slate-700 dark:bg-slate-800";
+  }
+}
+
+function healthTimelineLabel(status?: string, locale: AppLocale = "en") {
+  const zh = locale.startsWith("zh");
+  switch (status) {
+    case "healthy":
+      return zh ? "健康" : "Healthy";
+    case "degraded":
+      return zh ? "轻微降级" : "Degraded";
+    case "unhealthy":
+      return zh ? "不稳定" : "Unhealthy";
+    case "offline":
+      return zh ? "离线" : "Offline";
+    default:
+      return zh ? "未知" : "Unknown";
+  }
+}
+
+function HealthTimelineStrip({ timeline = [] }: { timeline?: HealthTimelineBucket[] }) {
+  const { locale, t } = useLocaleText();
+  const buckets = timeline.length
+    ? timeline.slice(-48)
+    : Array.from({ length: 48 }, (_, index) => ({
+        startAt: "",
+        endAt: "",
+        status: "unknown",
+        score: 0,
+        onlineMinutes: 0,
+        observedMinutes: 0,
+        requestCount: 0,
+        failureCount: 0,
+      }));
+  const latest = [...buckets].reverse().find((bucket) => bucket.status !== "unknown");
+  const latestLabel = healthTimelineLabel(latest?.status, locale);
+  const latestScore = latest ? `${Math.round(latest.score || 0)}%` : "--";
+  return (
+    <div className="grid gap-3">
+      <div className="flex items-center justify-between gap-3 text-xs">
+        <span className="font-semibold text-foreground">{t("dashboard.health")} · 24h</span>
+        <span className="font-mono text-[11px] text-muted-foreground">{latestLabel} {latestScore}</span>
+      </div>
+      <div className="grid grid-cols-[repeat(24,minmax(0,1fr))] gap-1 max-sm:grid-cols-[repeat(12,minmax(0,1fr))]">
+        {buckets.map((bucket, index) => {
+          const title = [
+            bucket.startAt && bucket.endAt ? `${formatDateTime(bucket.startAt)} - ${formatDateTime(bucket.endAt)}` : "",
+            healthTimelineLabel(bucket.status, locale),
+            `${Math.round(bucket.score || 0)}%`,
+            `${bucket.onlineMinutes || 0}/30m`,
+            bucket.requestCount ? `${bucket.requestCount} req · ${bucket.failureCount || 0} failed` : "",
+          ].filter(Boolean).join(" · ");
+          return (
+            <span
+              key={`${bucket.startAt || "unknown"}-${index}`}
+              title={title}
+              className={`aspect-square min-h-2 rounded-[3px] border ${healthTimelineTone(bucket.status)}`}
+            />
+          );
+        })}
+      </div>
+      <div className="flex items-center justify-between gap-2 font-mono text-[10px] uppercase tracking-[0.08em] text-muted-foreground">
+        <span>-24h</span>
+        <span>{formatMinutesShort(30, locale)}</span>
+        <span>now</span>
+      </div>
+    </div>
+  );
+}
+
 function upstreamPercent(apps?: ShareAppRuntimes, key?: keyof ShareAppRuntimes) {
   const value = key ? apps?.[key]?.forSaleOfficialPricePercent : undefined;
   return Number.isInteger(value) && Number(value) > 0 ? `${value}%` : "-";
@@ -335,9 +416,9 @@ function countdownStr(resetsAt?: string) {
   return `${minutes}m`;
 }
 
-function quotaTierLabel(label?: string) {
+function quotaTierLabel(label?: string, locale: AppLocale = "en") {
   const normalized = String(label || "").trim().toLowerCase();
-  if (normalized === "premium") return "高级请求";
+  if (normalized === "premium") return locale.startsWith("zh") ? "高级请求" : "Premium request";
   return label || "";
 }
 
@@ -385,7 +466,7 @@ function mergeStandaloneOAuthRuntime(
   };
 }
 
-function quotaSummary(runtime?: ShareUpstreamProvider) {
+function quotaSummary(runtime?: ShareUpstreamProvider, locale: AppLocale = "en") {
   if (!runtime || (hasConcreteApiUrl(runtime) && !runtimeLooksOAuth(runtime))) return "";
   const quota = runtime.quota;
   const status = String(quota?.status || "").toLowerCase();
@@ -399,13 +480,13 @@ function quotaSummary(runtime?: ShareUpstreamProvider) {
     if (preferredTiers.length) tiers = preferredTiers;
   }
   const tierText = tiers
-    .map((tier) => [quotaTierLabel(tier.label), `${Math.round(tier.utilization || 0)}%`, countdownStr(tier.resetsAt)].filter(Boolean).join(" "))
+    .map((tier) => [quotaTierLabel(tier.label, locale), `${Math.round(tier.utilization || 0)}%`, countdownStr(tier.resetsAt)].filter(Boolean).join(" "))
     .join(" · ");
   return [quota.plan || quota.credentialMessage, tierText].filter(Boolean).join(" · ");
 }
 
-function providerAccountLevel(runtime?: ShareUpstreamProvider) {
-  return quotaSummary(runtime) || runtime?.providerName || runtime?.kind || "-";
+function providerAccountLevel(runtime?: ShareUpstreamProvider, locale: AppLocale = "en") {
+  return quotaSummary(runtime, locale) || runtime?.providerName || runtime?.kind || "-";
 }
 
 function providerAccountIdentity(runtime?: ShareUpstreamProvider) {
@@ -482,7 +563,7 @@ function modelHealthTitle(share: ShareView, key: "claude" | "codex" | "gemini") 
     .join("\n");
 }
 
-function SupportCell({ share, t }: { share?: ShareView; t: TFn }) {
+function SupportCell({ share, t, locale }: { share?: ShareView; t: TFn; locale: AppLocale }) {
   if (!share) return <span className="text-muted-foreground">-</span>;
   type CoreAppKey = "claude" | "codex" | "gemini";
   const rows: Array<[CoreAppKey, string]> = [["claude", "Claude"], ["codex", "Codex"], ["gemini", "Gemini"]];
@@ -496,7 +577,7 @@ function SupportCell({ share, t }: { share?: ShareView; t: TFn }) {
           <div key={key} title={enabled ? modelHealthTitle(share, key) : undefined} className={`grid grid-cols-[56px_1fr] gap-2 rounded-lg border px-2 py-1.5 text-[11px] ${tone.className}`}>
             <span className="font-mono uppercase">{label}</span>
             <span className="grid min-w-0 gap-0.5 text-right">
-              <span className="whitespace-normal break-words font-semibold">{enabled ? providerAccountLevel(runtime) : ""}</span>
+              <span className="whitespace-normal break-words font-semibold">{enabled ? providerAccountLevel(runtime, locale) : ""}</span>
               <span className="whitespace-normal break-words text-[10px] font-medium opacity-75">{enabled ? providerAccountIdentity(runtime) : ""}</span>
               <span className="whitespace-normal break-words text-[10px] font-medium opacity-75">{enabled ? providerModelMap(runtime) : ""}</span>
               <span className="text-[10px] font-semibold opacity-70">{enabled ? tone.label : ""}</span>
@@ -511,7 +592,7 @@ function SupportCell({ share, t }: { share?: ShareView; t: TFn }) {
           <div key={key} className="grid grid-cols-[56px_1fr] gap-2 rounded-lg border border-blue-200 bg-blue-50 px-2 py-1.5 text-[11px] text-blue-900 dark:border-blue-800 dark:bg-blue-950/30 dark:text-blue-200">
             <span className="font-mono uppercase">{label}</span>
             <span className="grid min-w-0 gap-0.5 text-right">
-              <span className="whitespace-normal break-words font-semibold">{providerAccountLevel(runtime)}</span>
+              <span className="whitespace-normal break-words font-semibold">{providerAccountLevel(runtime, locale)}</span>
               <span className="whitespace-normal break-words text-[10px] font-medium opacity-75">{providerAccountIdentity(runtime)}</span>
             </span>
           </div>
@@ -521,10 +602,10 @@ function SupportCell({ share, t }: { share?: ShareView; t: TFn }) {
   );
 }
 
-function ShareEditAction({ share, onEdit, t: _t }: { share?: ShareView; onEdit: (share: ShareView) => void; t: TFn }) {
+function ShareEditAction({ share, onEdit, t }: { share?: ShareView; onEdit: (share: ShareView) => void; t: TFn }) {
   if (!share) return null;
   if (share.canManage && share.activeEdit?.status === "pending") {
-    return <Chip size="sm" color="warning" variant="soft">Pending apply</Chip>;
+    return <Chip size="sm" color="warning" variant="soft">{t("dashboard.pendingApply")}</Chip>;
   }
   const handle = (event: React.MouseEvent) => {
     event.stopPropagation();
@@ -535,11 +616,11 @@ function ShareEditAction({ share, onEdit, t: _t }: { share?: ShareView; onEdit: 
       <button
         type="button"
         onClick={handle}
-        title={share.activeEdit.errorMessage || "上一轮应用失败"}
+        title={share.activeEdit.errorMessage || t("dashboard.applyFailedFallback")}
         className="inline-flex h-[22px] items-center gap-1 rounded-full border border-red-200 bg-red-50 px-2.5 text-[11px] font-medium text-red-700 transition-colors hover:border-red-300 hover:bg-red-100"
       >
         <Pencil className="h-3 w-3" />
-        应用失败
+        {t("dashboard.applyFailed")}
       </button>
     );
   }
@@ -550,7 +631,7 @@ function ShareEditAction({ share, onEdit, t: _t }: { share?: ShareView; onEdit: 
       className="inline-flex h-[22px] items-center gap-1 rounded-full border border-primary/20 bg-primary/10 px-2.5 text-[11px] font-medium text-primary transition-colors hover:border-primary/30 hover:bg-primary/15"
     >
       {share.canManage ? <Pencil className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
-      {share.canManage ? "编辑" : "查看"}
+      {share.canManage ? t("common.edit") : t("common.view")}
     </button>
   );
 }
@@ -717,6 +798,7 @@ function ShareEditDialog({
   const [confirmFreeOpen, setConfirmFreeOpen] = React.useState(false);
   const [transferTargetEmail, setTransferTargetEmail] = React.useState("");
   const [marketSelectKey, setMarketSelectKey] = React.useState(0);
+  const { t } = useLocaleText();
   const readOnly = !!share && !share.canManage;
   const transferableShareEmails = splitEmails((share?.sharedWithEmails || []).join("\n"));
 
@@ -763,11 +845,11 @@ function ShareEditDialog({
     setExpiresAtInput(permanent ? "" : toLocalDateTimeValue(share.expiresAt));
 
     setPriceInputs(initialPricing);
-    setError(share.activeEdit?.status === "rejected" ? share.activeEdit.errorMessage || "上一轮应用失败" : "");
+    setError(share.activeEdit?.status === "rejected" ? share.activeEdit.errorMessage || t("dashboard.applyFailedFallback") : "");
     setConfirmFreeOpen(false);
     setTransferTargetEmail("");
     setMarketSelectKey((current) => current + 1);
-  }, [share]);
+  }, [share, t]);
 
   const handleForSaleChange = (next: "Yes" | "No" | "Free") => {
     if (next === "Free" && forSale !== "Free") {
@@ -920,10 +1002,10 @@ function ShareEditDialog({
           <Modal.Container>
             <Modal.Dialog className="share-edit-surface light w-[min(760px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
               <Modal.Header>
-                <Modal.Heading>{readOnly ? "查看 share 设置" : "编辑 share 设置"}</Modal.Heading>
+                <Modal.Heading>{readOnly ? t("dashboard.shareViewSettings") : t("dashboard.shareEditSettings")}</Modal.Heading>
                 <p className="mt-1 break-all text-sm text-muted-foreground">{share?.subdomain || share?.shareName}</p>
                 {readOnly ? (
-                  <p className="mt-2 text-xs text-muted-foreground">你是此 share 的 shareto 用户，只能只读查看；只有 owner email 可以编辑。</p>
+                  <p className="mt-2 text-xs text-muted-foreground">{t("dashboard.shareReadOnlyNotice")}</p>
                 ) : null}
               </Modal.Header>
               <Modal.Body className="grid max-h-[72vh] gap-4 overflow-y-auto">
@@ -932,8 +1014,8 @@ function ShareEditDialog({
                 ) : null}
 
                 <FieldGroup
-                  label="Description"
-                  hint={<span>最多 200 字。<span className="ml-2 font-mono">{descriptionLength}/200</span></span>}
+                  label={t("dashboard.field.description")}
+                  hint={<span>{t("dashboard.hint.maxChars")}<span className="ml-2 font-mono">{descriptionLength}/200</span></span>}
                   invalid={descriptionInvalid}
                 >
 	                  <TextArea
@@ -945,7 +1027,7 @@ function ShareEditDialog({
                 </FieldGroup>
 
                 <div className="grid gap-3 sm:grid-cols-2">
-                  <FieldGroup label="For sale">
+                  <FieldGroup label={t("dashboard.field.forSale")}>
 	                    <Select
 	                      selectedKey={forSale}
 	                      onSelectionChange={(key) => handleForSaleChange(String(key || "No") as "Yes" | "No" | "Free")}
@@ -965,7 +1047,7 @@ function ShareEditDialog({
                     </Select>
                   </FieldGroup>
 
-                  <FieldGroup label="Market access" hint={forSale === "Yes" ? undefined : "仅 ForSale = Yes 时生效"}>
+                  <FieldGroup label={t("dashboard.field.marketAccess")} hint={forSale === "Yes" ? undefined : t("dashboard.hint.forSaleOnly")}>
                     <Select
                       key={marketSelectKey}
 	                      selectedKey={null}
@@ -974,13 +1056,13 @@ function ShareEditDialog({
 	                    >
                       <Select.Trigger>
                         <Select.Value>
-                          {marketAccessMode === "all" ? "All markets" : "Add a market…"}
+                          {marketAccessMode === "all" ? t("dashboard.allMarkets") : "Add a market..."}
                         </Select.Value>
                         <Select.Indicator />
                       </Select.Trigger>
                       <Select.Popover className="share-edit-popover light !bg-white !text-slate-900">
                         <ListBox>
-                          <ListBox.Item id="__all__">All markets</ListBox.Item>
+                          <ListBox.Item id="__all__">{t("dashboard.allMarkets")}</ListBox.Item>
                           {availableMarkets.map((market) => (
                             <ListBox.Item key={market.email} id={market.email}>
                               {(market.displayName || market.subdomain || market.email)}
@@ -994,7 +1076,7 @@ function ShareEditDialog({
                 </div>
 
                 {forSale === "Yes" && marketAccessMode === "selected" ? (
-                  <FieldGroup label="Selected markets" hint="点 × 移除；空 = 不授权任何 market">
+                  <FieldGroup label={t("dashboard.field.selectedMarkets")} hint={t("dashboard.hint.selectedMarkets")}>
                     {selectedMarketEmails.length ? (
                       <div className="flex flex-wrap gap-1.5">
                         {selectedMarketEmails.map((email) => {
@@ -1022,7 +1104,7 @@ function ShareEditDialog({
                       </div>
                     ) : (
                       <div className="rounded-lg border border-dashed border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-                        默认不授权任何 market
+                        {t("dashboard.noAuthorizedMarkets")}
                       </div>
                     )}
                   </FieldGroup>
@@ -1030,7 +1112,7 @@ function ShareEditDialog({
 
                 {forSale === "Yes" && marketAccessMode === "all" ? (
                   <div className="rounded-lg border border-primary/20 bg-primary/5 px-3 py-2 text-xs text-primary">
-                    已选择「All markets」— 所有在线 market 都可访问此 share
+                    {t("dashboard.allMarketsSelected")}
 	                    <button
 	                      type="button"
 	                      className="ml-3 text-[11px] underline decoration-dotted underline-offset-2 hover:text-primary/80"
@@ -1040,12 +1122,12 @@ function ShareEditDialog({
                         setSelectedMarketEmails([]);
                       }}
                     >
-                      切回 selected
+                      {t("dashboard.switchToSelected")}
                     </button>
                   </div>
                 ) : null}
 
-	                <FieldGroup label="Shared with" hint={readOnly ? "只读查看；只有 owner email 可以修改 shareto 列表。" : "多个邮箱用换行/逗号分隔。这些邮箱登录 dashboard 后可查看此 share。"}>
+	                <FieldGroup label={t("dashboard.field.sharedWith")} hint={readOnly ? t("dashboard.hint.sharedWithReadOnly") : t("dashboard.hint.sharedWith")}>
 	                  <EmailTagsField
 	                    value={sharedWithEmails}
 	                    placeholder="friend@example.com, teammate@example.com"
@@ -1053,12 +1135,12 @@ function ShareEditDialog({
 	                    onChange={setSharedWithEmails}
 	                    onPromote={(email) => setTransferTargetEmail(email)}
 	                    promotableEmails={transferableShareEmails}
-	                    promoteLabel="设为 Owner"
+	                    promoteLabel={t("dashboard.setAsOwner")}
 	                  />
                 </FieldGroup>
 
                 <div className="grid gap-3 sm:grid-cols-2">
-                  <FieldGroup label="Token limit" invalid={tokenInvalid}>
+                  <FieldGroup label={t("dashboard.field.tokenLimit")} invalid={tokenInvalid}>
                     <div className="grid gap-2">
                       <Input
                         type="number"
@@ -1078,12 +1160,12 @@ function ShareEditDialog({
                           isDisabled={readOnly}
 	                      >
                         <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
-                        <Checkbox.Content><span className="text-xs text-muted-foreground">无限制</span></Checkbox.Content>
+                        <Checkbox.Content><span className="text-xs text-muted-foreground">{t("common.unlimited")}</span></Checkbox.Content>
                       </Checkbox>
                     </div>
                   </FieldGroup>
 
-                  <FieldGroup label="Parallel limit" hint={`最小 ${MIN_PARALLEL_LIMIT}`} invalid={parallelInvalid}>
+                  <FieldGroup label={t("dashboard.field.parallelLimit")} hint={t("dashboard.hint.minValue", { value: MIN_PARALLEL_LIMIT })} invalid={parallelInvalid}>
                     <div className="grid gap-2">
                       <Input
                         type="number"
@@ -1105,13 +1187,13 @@ function ShareEditDialog({
                           isDisabled={readOnly}
 	                      >
                         <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
-                        <Checkbox.Content><span className="text-xs text-muted-foreground">无限制</span></Checkbox.Content>
+                        <Checkbox.Content><span className="text-xs text-muted-foreground">{t("common.unlimited")}</span></Checkbox.Content>
                       </Checkbox>
                     </div>
                   </FieldGroup>
                 </div>
 
-                <FieldGroup label="Expires at" invalid={expiryInvalid}>
+                <FieldGroup label={t("dashboard.field.expiresAt")} invalid={expiryInvalid}>
                   <div className="grid gap-2">
                     <Input
                       type="datetime-local"
@@ -1125,14 +1207,14 @@ function ShareEditDialog({
                         isDisabled={readOnly}
 	                    >
                       <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
-                      <Checkbox.Content><span className="text-xs text-muted-foreground">永久（不过期）</span></Checkbox.Content>
+                      <Checkbox.Content><span className="text-xs text-muted-foreground">{t("dashboard.permanent")}</span></Checkbox.Content>
                     </Checkbox>
                   </div>
                 </FieldGroup>
 
                 <FieldGroup
-                  label="Model pricing (% of official)"
-                  hint="Share 级默认定价；供应商配置了百分比时优先使用供应商值。留空则使用 market 默认定价；范围 1-100"
+                  label={t("dashboard.field.modelPricing")}
+                  hint={t("dashboard.hint.modelPricing")}
                   invalid={pricingInvalid}
                 >
                   <div className="grid gap-3">
@@ -1150,7 +1232,7 @@ function ShareEditDialog({
                               step={1}
 	                              value={priceInputs[app.key]}
 	                              disabled={readOnly || !supported}
-                              placeholder={supported ? "未设置" : "无当前节点"}
+                              placeholder={supported ? t("common.unset") : t("dashboard.noCurrentNode")}
                               onChange={(event) =>
                                 setPriceInputs((current) => ({ ...current, [app.key]: event.target.value }))
                               }
@@ -1164,11 +1246,11 @@ function ShareEditDialog({
                 </FieldGroup>
               </Modal.Body>
               <Modal.Footer>
-	                <Button variant="outline" onClick={onClose} isDisabled={busy}>{readOnly ? "关闭" : "取消"}</Button>
+	                <Button variant="outline" onClick={onClose} isDisabled={busy}>{readOnly ? t("common.close") : t("common.cancel")}</Button>
 	                {readOnly ? null : (
 	                  <Button variant="primary" onClick={save} isDisabled={busy || formInvalid}>
 	                    {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-	                    保存
+	                    {t("common.save")}
 	                  </Button>
 	                )}
               </Modal.Footer>
@@ -1179,10 +1261,10 @@ function ShareEditDialog({
 
       <ConfirmAlertDialog
         open={confirmFreeOpen}
-        title="确认切换为 Free"
-        description="Free share 会向所有市场免费曝光，且不再产生收益。请确认切换。"
-        confirmLabel="确认切换"
-        cancelLabel="取消"
+        title={t("dashboard.confirmFreeTitle")}
+        description={t("dashboard.confirmFreeDesc")}
+        confirmLabel={t("dashboard.confirmFree")}
+        cancelLabel={t("common.cancel")}
         tone="danger"
         onConfirm={() => {
           setForSale("Free");
@@ -1192,10 +1274,10 @@ function ShareEditDialog({
       />
       <ConfirmAlertDialog
         open={Boolean(transferTargetEmail)}
-        title="转移 Owner?"
-        description={`将 ${transferTargetEmail || "-"} 升级为 owner，并把当前 owner ${share?.ownerEmail || "-"} 降级为 shareto。`}
-        confirmLabel="确认转移"
-        cancelLabel="取消"
+        title={t("dashboard.transferOwnerTitle")}
+        description={t("dashboard.transferOwnerDesc", { target: transferTargetEmail || "-", owner: share?.ownerEmail || "-" })}
+        confirmLabel={t("dashboard.transferOwnerConfirm")}
+        cancelLabel={t("common.cancel")}
         tone="danger"
         onConfirm={transferOwner}
         onOpenChange={(open) => !open && setTransferTargetEmail("")}
@@ -1215,13 +1297,14 @@ function FieldGroup({
   invalid?: boolean;
   children: React.ReactNode;
 }) {
+  const { t } = useLocaleText();
   return (
     <div className="grid gap-1.5 text-sm">
       <span className="mono-label text-muted-foreground">{label}</span>
       {children}
       {hint || invalid ? (
         <span className={`text-xs ${invalid ? "text-red-600" : "text-muted-foreground"}`}>
-          {invalid ? "请检查该字段" : null}
+          {invalid ? t("dashboard.fieldInvalid") : null}
           {hint && !invalid ? hint : null}
         </span>
       ) : null}
@@ -1300,7 +1383,7 @@ export function ClientsTable({ clients, markets, onChanged }: { clients: Dashboa
                       {client.installation.countryCode || "-"}
                     </td>
                     <td className="px-4 py-3 align-middle"><ShareStatusCell client={client} share={share} t={t} locale={locale} /></td>
-                    <td className="px-4 py-3 align-middle"><SupportCell share={share} t={t} /></td>
+                    <td className="px-4 py-3 align-middle"><SupportCell share={share} t={t} locale={locale} /></td>
                     <td className="px-4 py-3 align-middle text-lg text-muted-foreground">›</td>
                   </tr>
                 );
@@ -1330,6 +1413,7 @@ export function ClientsTable({ clients, markets, onChanged }: { clients: Dashboa
               <Drawer.Body className="overflow-y-auto">
                 {selected ? (
                   <div className="grid gap-5">
+                    <DrawerSection label="24h"><HealthTimelineStrip timeline={selected.share?.healthTimeline} /></DrawerSection>
                     <DrawerSection label={t("dashboard.markets")}><ShareMarkets share={selected.share} t={t} /></DrawerSection>
                     <DrawerSection label={t("dashboard.providers")}><ShareProvidersPanel share={selected.share} /></DrawerSection>
                     <DrawerSection label={t("dashboard.requestLogs")}><ShareRequestLogs logs={selected.share?.recentRequests || []} /></DrawerSection>
@@ -1392,7 +1476,7 @@ function formatAgeDaysOrHours(value?: string, locale: AppLocale = "en") {
   return isZh ? `${hours}小时` : `${hours}h`;
 }
 
-function MarketEditAction({ market, onEdit }: { market: DashboardMarket; onEdit: (market: DashboardMarket) => void }) {
+function MarketEditAction({ market, onEdit, t }: { market: DashboardMarket; onEdit: (market: DashboardMarket) => void; t: TFn }) {
   if (!market.canManage) return null;
   return (
     <button
@@ -1404,7 +1488,7 @@ function MarketEditAction({ market, onEdit }: { market: DashboardMarket; onEdit:
       className="inline-flex h-[22px] items-center gap-1 rounded-full border border-primary/20 bg-primary/10 px-2.5 text-[11px] font-medium text-primary transition-colors hover:border-primary/30 hover:bg-primary/15"
     >
       <Pencil className="h-3 w-3" />
-      编辑
+      {t("common.edit")}
     </button>
   );
 }
@@ -1472,8 +1556,8 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
                       <div className="text-xs text-muted-foreground">{market.email}</div>
                       <div className="mt-1 flex flex-wrap items-center gap-2">
                         <StatusBadge active={market.online} label={marketStatusLabel(market, t)} />
-                        {market.maintenanceEnabled ? <Chip color="warning" size="sm" variant="soft">维护中</Chip> : null}
-                        <MarketEditAction market={market} onEdit={setEditingMarket} />
+                        {market.maintenanceEnabled ? <Chip color="warning" size="sm" variant="soft">{t("dashboard.maintenance")}</Chip> : null}
+                        <MarketEditAction market={market} onEdit={setEditingMarket} t={t} />
                       </div>
                     </div>
                   </td>
@@ -1509,7 +1593,8 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
               <Drawer.Body className="overflow-y-auto">
                 {selected ? (
                   <div className="grid gap-4">
-                    <DrawerSection label={t("dashboard.linkedShares")}><MarketLinkedShares market={selected} t={t} /></DrawerSection>
+                    <DrawerSection label="24h"><HealthTimelineStrip timeline={selected.healthTimeline} /></DrawerSection>
+                    <DrawerSection label={t("dashboard.linkedShares")}><MarketLinkedShares market={selected} t={t} locale={locale} /></DrawerSection>
                     <DrawerSection label={t("dashboard.recentRequests")}><MarketRequestLogs logs={selected.recentRequests || []} /></DrawerSection>
                   </div>
                 ) : null}
@@ -1623,18 +1708,18 @@ function MarketEditDialog({ market, onClose, onSaved }: { market: DashboardMarke
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <Checkbox isSelected={maintenanceEnabled} onChange={(value: boolean) => setMaintenanceEnabled(value)} isDisabled={busy}>
                       <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
-                      <Checkbox.Content><span className="text-sm font-medium text-slate-900">维护模式</span></Checkbox.Content>
+                      <Checkbox.Content><span className="text-sm font-medium text-slate-900">{t("dashboard.maintenanceMode")}</span></Checkbox.Content>
                     </Checkbox>
                     <Button size="sm" variant="outline" isDisabled={busy} onClick={saveMaintenance}>
                       {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-                      保存维护模式
+                      {t("dashboard.saveMaintenanceMode")}
                     </Button>
                   </div>
-                  <FieldGroup label="维护提示">
+                  <FieldGroup label={t("dashboard.field.maintenanceMessage")}>
                     <TextArea
                       value={maintenanceMessage}
                       onChange={(event) => setMaintenanceMessage(event.target.value.slice(0, 240))}
-                      placeholder="Market 正在维护，预计稍后恢复。"
+                      placeholder={t("dashboard.maintenancePlaceholder")}
                       disabled={busy || !maintenanceEnabled}
                     />
                   </FieldGroup>
@@ -1796,7 +1881,7 @@ function providerMetaLabel(provider: ShareAppProvider) {
 }
 
 function ShareProvidersPanel({ share }: { share?: ShareView }) {
-  const { t } = useLocaleText();
+  const { locale, t } = useLocaleText();
   const [selectedKey, setSelectedKey] = React.useState<keyof ShareAppProviders>("claude");
   const providers = share?.appProviders;
   const currentProviders = providers?.[selectedKey] || [];
@@ -1820,7 +1905,7 @@ function ShareProvidersPanel({ share }: { share?: ShareView }) {
             const runtime = mergeStandaloneOAuthRuntime(providerRuntime(provider), share?.appRuntimes, provider);
             const endpoint = runtimeEndpointSummary(runtime);
             const meta = providerMetaLabel(provider);
-            const accountLevel = providerAccountLevel(runtime);
+            const accountLevel = providerAccountLevel(runtime, locale);
             const accountIdentity = providerAccountIdentity(runtime);
             const modelMap = providerModelMap(runtime);
             return (
@@ -1853,7 +1938,7 @@ function ShareProvidersPanel({ share }: { share?: ShareView }) {
 }
 
 function ShareRequestLogs({ logs }: { logs: ShareRequestLog[] }) {
-  const { t } = useLocaleText();
+  const { locale, t } = useLocaleText();
   if (!logs.length) return <EmptyBlock>{t("dashboard.noRequestLogs")}</EmptyBlock>;
   return (
     <div className="grid gap-2">
@@ -1864,11 +1949,11 @@ function ShareRequestLogs({ logs }: { logs: ShareRequestLog[] }) {
               <div className="min-w-0">
                 <div className="truncate font-medium">{requestModelRoute(log)}</div>
                 <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
-                  {log.isHealthCheck ? <Chip color={log.statusCode >= 200 && log.statusCode < 400 ? "success" : "danger"} size="sm" variant="soft">健康检查</Chip> : null}
+                  {log.isHealthCheck ? <Chip color={log.statusCode >= 200 && log.statusCode < 400 ? "success" : "danger"} size="sm" variant="soft">{t("dashboard.healthCheck")}</Chip> : null}
                   {log.userEmail ? <span>{log.userEmail}</span> : null}
                   <span>{log.providerName || log.providerId || "-"}</span>
                   <span>{log.requestedModel || log.requestModel || "-"}</span>
-                  <span title={formatDateTime(log.createdAt * 1000)}>{formatRelativeTime(log.createdAt * 1000)}</span>
+                  <span title={formatDateTime(log.createdAt * 1000)}>{formatRelativeTime(log.createdAt * 1000, locale)}</span>
                   {log.isStreaming ? <span>stream</span> : null}
                 </div>
               </div>
@@ -1886,7 +1971,7 @@ function ShareRequestLogs({ logs }: { logs: ShareRequestLog[] }) {
 }
 
 function ShareModelHealthChecks({ checks }: { checks: ShareModelHealthCheck[] }) {
-  const { t } = useLocaleText();
+  const { locale, t } = useLocaleText();
   if (!checks.length) return <EmptyBlock>{t("dashboard.noModelHealthChecks")}</EmptyBlock>;
   return (
     <div className="grid gap-2">
@@ -1900,7 +1985,7 @@ function ShareModelHealthChecks({ checks }: { checks: ShareModelHealthCheck[] })
                 <div className="min-w-0">
                   <div className="truncate font-medium">{check.appType} · {model}</div>
                   <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
-                    <span title={formatDateTime(check.checkedAt * 1000)}>{formatRelativeTime(check.checkedAt * 1000)}</span>
+                    <span title={formatDateTime(check.checkedAt * 1000)}>{formatRelativeTime(check.checkedAt * 1000, locale)}</span>
                     <span>{check.source || "-"}</span>
                     {check.requestedModel && check.requestedModel !== model ? <span>{check.requestedModel}</span> : null}
                   </div>
@@ -1939,7 +2024,7 @@ function TokenGrid({ log }: { log: ShareRequestLog | MarketRequestLog }) {
   );
 }
 
-function MarketLinkedShares({ market, t }: { market: DashboardMarket; t: TFn }) {
+function MarketLinkedShares({ market, t, locale }: { market: DashboardMarket; t: TFn; locale: AppLocale }) {
   const shares = market.linkedShares || [];
   if (!shares.length) return <EmptyBlock>{t("dashboard.noLinkedShares")}</EmptyBlock>;
   const availabilityTitle = (app: string, availability?: MarketAppAvailabilityEntry) => {
@@ -1994,7 +2079,7 @@ function MarketLinkedShares({ market, t }: { market: DashboardMarket; t: TFn }) 
                   <div className="flex flex-wrap justify-end gap-1">
                     {oauthSupported.map(([key, label]) => {
                       const runtime = share.appRuntimes?.[key];
-                      const level = providerAccountLevel(runtime);
+                      const level = providerAccountLevel(runtime, locale);
                       return (
                         <Chip
                           key={key}
@@ -2019,7 +2104,7 @@ function MarketLinkedShares({ market, t }: { market: DashboardMarket; t: TFn }) 
 }
 
 function MarketRequestLogs({ logs }: { logs: MarketRequestLog[] }) {
-  const { t } = useLocaleText();
+  const { locale, t } = useLocaleText();
   if (!logs.length) return <EmptyBlock>{t("dashboard.noMarketRequests")}</EmptyBlock>;
   return (
     <div className="grid gap-2">
@@ -2031,7 +2116,7 @@ function MarketRequestLogs({ logs }: { logs: MarketRequestLog[] }) {
                 {[log.userEmail || "-", log.shareSubdomain || log.shareId || "-", requestModelRoute(log), log.statusCode || log.status || "-", log.latencyMs ? `${log.latencyMs}ms` : "", `${compactTokens(totalTokens(log))} tokens`, formatUsdExactTrimmed(log.usageAmountUsd)].filter(Boolean).join(" · ")}
               </div>
               <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
-                <span title={formatDateTime(log.createdAt)}>{formatRelativeTime(log.createdAt)}</span>
+                <span title={formatDateTime(log.createdAt)}>{formatRelativeTime(log.createdAt, locale)}</span>
                 <span>{log.requestId || "-"}</span>
               </div>
             </div>

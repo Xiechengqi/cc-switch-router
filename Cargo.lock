@@ -302,6 +302,7 @@ dependencies = [
  "chrono",
  "ed25519-dalek",
  "futures-util",
+ "hmac",
  "http",
  "rand 0.8.5",
  "reqwest",

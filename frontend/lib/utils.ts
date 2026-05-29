@@ -10,7 +10,7 @@ export function formatNumber(value: unknown) {
   return Number.isFinite(n) ? new Intl.NumberFormat().format(n) : "0";
 }
 
-export function formatRelativeTime(value?: string | number | Date | null) {
+export function formatRelativeTime(value?: string | number | Date | null, locale?: string) {
   if (!value) return "--";
   const ts = value instanceof Date ? value.getTime() : new Date(value).getTime();
   if (!Number.isFinite(ts)) return "--";
@@ -22,7 +22,7 @@ export function formatRelativeTime(value?: string | number | Date | null) {
     ["minute", 60000],
     ["second", 1000],
   ];
-  const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
+  const rtf = new Intl.RelativeTimeFormat(locale, { numeric: "auto" });
   for (const [unit, ms] of units) {
     if (abs >= ms || unit === "second") {
       return rtf.format(Math.round(-diff / ms), unit);

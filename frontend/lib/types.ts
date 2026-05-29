@@ -92,6 +92,7 @@ export type ShareView = {
   onlineRate24h: number;
   recentRequests?: ShareRequestLog[];
   healthChecks?: HealthCheckEntry[];
+  healthTimeline?: HealthTimelineBucket[];
   recentModelHealthChecks?: ShareModelHealthCheck[];
   support?: ShareSupport;
   appRuntimes?: ShareAppRuntimes;
@@ -134,6 +135,7 @@ export type UserApiTokenStatus = {
 };
 
 export type UserApiTokenResponse = {
+  apiToken?: string;
   token: UserApiTokenStatus;
 };
 
@@ -177,6 +179,7 @@ export type DashboardMarket = {
   usageAmountUsd: string;
   pricingSummary?: Record<string, string | number | null>;
   healthChecks?: HealthCheckEntry[];
+  healthTimeline?: HealthTimelineBucket[];
   linkedShares?: Array<{
     shareId: string;
     shareName: string;
@@ -419,6 +422,17 @@ export type ShareAppRuntimes = {
 export type HealthCheckEntry = {
   checkedAt: number;
   isHealthy: boolean;
+};
+
+export type HealthTimelineBucket = {
+  startAt: string;
+  endAt: string;
+  status: "healthy" | "degraded" | "unhealthy" | "offline" | "unknown" | string;
+  score: number;
+  onlineMinutes: number;
+  observedMinutes: number;
+  requestCount: number;
+  failureCount: number;
 };
 
 export type SettingsField = {

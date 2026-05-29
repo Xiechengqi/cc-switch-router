@@ -3,7 +3,7 @@
 import Image from "next/image";
 import Link from "next/link";
 import { Button, Dropdown, ListBox, Modal, Select, Tabs } from "@heroui/react";
-import { Activity, Copy, KeyRound, Loader2, LogOut, RotateCcw, Settings, UserRound } from "lucide-react";
+import { Activity, Copy, Eye, EyeOff, KeyRound, Loader2, LogOut, RotateCcw, Settings, UserRound } from "lucide-react";
 import * as React from "react";
 import { LoginDialog } from "@/components/auth/login-dialog";
 import { Toast } from "@heroui/react";
@@ -156,9 +156,18 @@ function LanguageSwitcher() {
 function ApiTokenDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
   const [token, setToken] = React.useState<UserApiTokenStatus | null>(null);
   const [rawToken, setRawToken] = React.useState("");
+  const [showToken, setShowToken] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
   const [copied, setCopied] = React.useState(false);
+  const maskedToken = React.useMemo(() => {
+    if (rawToken) {
+      if (rawToken.length <= 12) return "•".repeat(rawToken.length);
+      return `${rawToken.slice(0, 8)}${"•".repeat(16)}${rawToken.slice(-4)}`;
+    }
+    if (token?.prefix) return `${token.prefix}${"•".repeat(16)}`;
+    return "Reset to generate a new API token";
+  }, [rawToken, token?.prefix]);
 
   const load = React.useCallback(async () => {
     setBusy(true);
@@ -166,6 +175,8 @@ function ApiTokenDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (
     try {
       const response = await getUserApiToken();
       setToken(response.token);
+      setRawToken(response.apiToken || "");
+      setShowToken(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -176,6 +187,7 @@ function ApiTokenDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (
   React.useEffect(() => {
     if (!open) return;
     setRawToken("");
+    setShowToken(false);
     setCopied(false);
     load().catch(console.error);
   }, [load, open]);
@@ -188,6 +200,7 @@ function ApiTokenDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (
       const response = await resetUserApiToken();
       setToken(response.token);
       setRawToken(response.apiToken);
+      setShowToken(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -206,42 +219,54 @@ function ApiTokenDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (
     <Modal isOpen={open} onOpenChange={onOpenChange}>
       <Modal.Backdrop>
         <Modal.Container placement="center">
-          <Modal.Dialog className="w-[min(560px,calc(100vw-2rem))] max-w-none">
+          <Modal.Dialog className="light w-[min(560px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900 [--foreground:rgb(15,23,42)] [--muted:rgb(100,116,139)] [--overlay:#fff] [--overlay-foreground:rgb(15,23,42)] [--surface:#fff] [--surface-foreground:rgb(15,23,42)]">
             <Modal.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
             <Modal.Header>
               <div>
                 <Modal.Heading>API Token</Modal.Heading>
-                <p className="mt-1 text-sm text-muted-foreground">
+                <p className="mt-1 text-sm text-slate-600">
                   用它调用 router API，也可作为 share 调用的 `Authorization: Bearer ...`。
                 </p>
               </div>
             </Modal.Header>
             <Modal.Body className="grid gap-4">
               {error ? <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div> : null}
-              <div className="grid gap-2 rounded-lg border bg-muted/30 p-3 text-sm">
+              <div className="grid gap-2 rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-900">
                 <div className="flex justify-between gap-3">
-                  <span className="text-muted-foreground">Prefix</span>
+                  <span className="text-slate-500">Prefix</span>
                   <strong className="font-mono">{token?.prefix || (busy ? "loading..." : "-")}</strong>
                 </div>
                 <div className="flex justify-between gap-3">
-                  <span className="text-muted-foreground">Created</span>
+                  <span className="text-slate-500">Created</span>
                   <span>{token?.createdAt ? new Date(token.createdAt).toLocaleString() : "-"}</span>
                 </div>
                 <div className="flex justify-between gap-3">
-                  <span className="text-muted-foreground">Last used</span>
+                  <span className="text-slate-500">Last used</span>
                   <span>{token?.lastUsedAt ? new Date(token.lastUsedAt).toLocaleString() : "-"}</span>
                 </div>
                 <div className="flex justify-between gap-3">
-                  <span className="text-muted-foreground">Scopes</span>
+                  <span className="text-slate-500">Scopes</span>
                   <span className="text-right">{token?.scopes?.join(", ") || "-"}</span>
                 </div>
               </div>
               <div className="grid gap-2">
-                <span className="text-xs text-muted-foreground">
-                  现有 token 只保存 hash，不能再次查看明文；重置后新 token 会在这里显示一次。
+                <span className="text-xs text-slate-500">
+                  默认脱敏显示。点击小眼睛可查看完整 API token；旧 token 如未保存明文，请重置后查看。
                 </span>
-                <div className="break-all rounded-lg border bg-background px-3 py-2 font-mono text-xs">
-                  {rawToken || "重置后显示新的 API token"}
+                <div className="flex items-start gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-slate-900">
+                  <div className="min-w-0 flex-1 break-all font-mono text-xs">
+                    {showToken && rawToken ? rawToken : maskedToken}
+                  </div>
+                  <button
+                    type="button"
+                    aria-label={showToken ? "Hide API token" : "Show API token"}
+                    title={showToken ? "Hide API token" : "Show API token"}
+                    className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-40"
+                    disabled={!rawToken}
+                    onClick={() => setShowToken((value) => !value)}
+                  >
+                    {showToken ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                  </button>
                 </div>
               </div>
             </Modal.Body>

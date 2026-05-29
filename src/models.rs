@@ -99,6 +99,12 @@ pub struct RegisterInstallationRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RegisterInstallationResponse {
     pub installation_id: String,
+    /// Symmetric secret the server uses to HMAC-sign control-plane RPC calls it
+    /// makes back to this installation's local `/_ctl/*` API. Independent of the
+    /// client's Ed25519 keypair. Clients must persist it and verify inbound
+    /// control calls against it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_secret: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,6 +161,8 @@ pub struct UserApiTokenStatus {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserApiTokenResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_token: Option<String>,
     pub token: UserApiTokenStatus,
 }
 
@@ -1294,6 +1302,8 @@ pub struct DashboardMarketView {
     #[serde(default)]
     pub health_checks: Vec<HealthCheckEntry>,
     #[serde(default)]
+    pub health_timeline: Vec<HealthTimelineBucket>,
+    #[serde(default)]
     pub linked_shares: Vec<MarketLinkedShareView>,
     #[serde(default)]
     pub recent_requests: Vec<DashboardMarketRequestLogView>,
@@ -1419,6 +1429,8 @@ pub struct ShareView {
     pub recent_requests: Vec<ShareRequestLogEntry>,
     pub health_checks: Vec<HealthCheckEntry>,
     #[serde(default)]
+    pub health_timeline: Vec<HealthTimelineBucket>,
+    #[serde(default)]
     pub recent_model_health_checks: Vec<ShareModelHealthCheckEntry>,
     #[serde(default)]
     pub model_health: ShareModelHealthSummary,
@@ -1436,6 +1448,19 @@ pub struct ShareHeartbeatRequest {
 pub struct HealthCheckEntry {
     pub checked_at: i64,
     pub is_healthy: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthTimelineBucket {
+    pub start_at: String,
+    pub end_at: String,
+    pub status: String,
+    pub score: f64,
+    pub online_minutes: usize,
+    pub observed_minutes: usize,
+    pub request_count: usize,
+    pub failure_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]

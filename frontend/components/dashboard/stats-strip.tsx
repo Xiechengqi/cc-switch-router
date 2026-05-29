@@ -7,7 +7,7 @@ import type { DashboardResponse } from "@/lib/types";
 import { formatNumber, formatRelativeTime } from "@/lib/utils";
 
 export function StatsStrip({ data }: { data: DashboardResponse | null }) {
-  const { t } = useLocaleText();
+  const { locale, t } = useLocaleText();
   const countries = new Set((data?.map?.clients || []).map((point) => point.countryCode).filter(Boolean)).size;
   const items = [
     { label: t("stats.clients"), value: data?.stats?.clients || 0, icon: UsersRound },
@@ -29,7 +29,7 @@ export function StatsStrip({ data }: { data: DashboardResponse | null }) {
         </Card>
       ))}
       <div className="md:col-span-4 -mt-1 text-right text-xs text-muted-foreground">
-        {t("dashboard.synced", { time: formatRelativeTime(data?.generatedAt) })}
+        {t("dashboard.synced", { time: formatRelativeTime(data?.generatedAt, locale) })}
       </div>
     </section>
   );
