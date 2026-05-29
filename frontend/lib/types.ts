@@ -190,6 +190,7 @@ export type DashboardMarket = {
     disabledByMarket?: boolean;
     marketDisabledAt?: string;
     support?: ShareSupport;
+    appRuntimes?: ShareAppRuntimes;
     appAvailability?: MarketAppAvailability;
   }>;
   recentRequests?: MarketRequestLog[];
@@ -369,8 +370,10 @@ export type ShareUpstreamProvider = {
   quota?: {
     status?: string;
     plan?: string;
+    credentialMessage?: string;
     queriedAt?: number;
     tiers?: Array<{
+      name?: string;
       label?: string;
       utilization?: number;
       resetsAt?: string;

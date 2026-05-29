@@ -104,7 +104,9 @@ impl MetricsRegistry {
             LlmMetricsSnapshot::default()
         };
         if self.enabled {
-            self.store.insert_sample(host.clone(), router.clone()).await?;
+            self.store
+                .insert_sample(host.clone(), router.clone())
+                .await?;
             let alerts = build_alerts(&host, &router, &llm);
             for event in alerts {
                 if let Err(err) = self.store.insert_event_deduped(event).await {

@@ -1,6 +1,6 @@
 "use client";
 
-import { Eye, ExternalLink, Loader2, Pencil, Save, X } from "lucide-react";
+import { Eye, ExternalLink, Loader2, Pencil, Save, Crown, X } from "lucide-react";
 import { Button, Card, Checkbox, Chip, Drawer, Input, ListBox, Modal, ProgressBar, Select, Tabs, TextArea } from "@heroui/react";
 import * as React from "react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
@@ -254,6 +254,18 @@ function hasConcreteApiUrl(runtime?: ShareUpstreamProvider) {
   return Boolean(apiUrl && !isOfficialMarker(apiUrl));
 }
 
+function runtimeLooksOAuth(runtime?: ShareUpstreamProvider) {
+  const text = [
+    runtime?.app,
+    runtime?.kind,
+    runtime?.providerName,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  return text.includes("oauth") || Boolean(oauthRuntimeKeyFromProvider(runtime));
+}
+
 function isOfficialRuntime(runtime?: ShareUpstreamProvider) {
   if (!runtime) return false;
   const kind = String(runtime.kind || "").toLowerCase();
@@ -329,11 +341,58 @@ function quotaTierLabel(label?: string) {
   return label || "";
 }
 
+type OAuthRuntimeKey = "kiro" | "cursor" | "antigravity" | "copilot";
+
+const OAUTH_RUNTIME_ROWS: Array<[OAuthRuntimeKey, string]> = [
+  ["kiro", "Kiro"],
+  ["cursor", "Cursor"],
+  ["antigravity", "Antigravity"],
+  ["copilot", "Copilot"],
+];
+
+function oauthRuntimeKeyFromProvider(value?: Partial<ShareUpstreamProvider & ShareAppProvider>): OAuthRuntimeKey | undefined {
+  const text = [
+    value?.app,
+    value?.kind,
+    value?.providerName,
+    value?.providerType,
+    value?.name,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  if (text.includes("kiro")) return "kiro";
+  if (text.includes("cursor")) return "cursor";
+  if (text.includes("antigravity")) return "antigravity";
+  if (text.includes("copilot") || text.includes("github_copilot")) return "copilot";
+  return undefined;
+}
+
+function mergeStandaloneOAuthRuntime(
+  runtime?: ShareUpstreamProvider,
+  appRuntimes?: ShareAppRuntimes,
+  provider?: Partial<ShareUpstreamProvider & ShareAppProvider>,
+) {
+  const key = oauthRuntimeKeyFromProvider(provider || runtime);
+  const standalone = key ? appRuntimes?.[key] : undefined;
+  if (!runtime) return standalone;
+  if (!standalone) return runtime;
+  return {
+    ...runtime,
+    accountEmail: runtime.accountEmail || standalone.accountEmail,
+    quota: runtime.quota || standalone.quota,
+    models: runtime.models?.length ? runtime.models : standalone.models,
+  };
+}
+
 function quotaSummary(runtime?: ShareUpstreamProvider) {
-  if (!runtime || hasConcreteApiUrl(runtime)) return "";
+  if (!runtime || (hasConcreteApiUrl(runtime) && !runtimeLooksOAuth(runtime))) return "";
   const quota = runtime.quota;
-  if (!quota || (quota.status && quota.status !== "ok")) return "";
-  let tiers = (quota.tiers || []).filter((tier) => tier.label);
+  const status = String(quota?.status || "").toLowerCase();
+  if (!quota || (status && !["ok", "success", "valid"].includes(status))) return "";
+  let tiers = (quota.tiers || [])
+    .map((tier) => ({ ...tier, label: tier.label || tier.name }))
+    .filter((tier) => tier.label);
   if (runtime.app === "claude") {
     const preferredLabels = new Set(["5h", "1w"]);
     const preferredTiers = tiers.filter((tier) => preferredLabels.has(String(tier.label).toLowerCase()));
@@ -342,7 +401,7 @@ function quotaSummary(runtime?: ShareUpstreamProvider) {
   const tierText = tiers
     .map((tier) => [quotaTierLabel(tier.label), `${Math.round(tier.utilization || 0)}%`, countdownStr(tier.resetsAt)].filter(Boolean).join(" "))
     .join(" · ");
-  return [quota.plan, tierText].filter(Boolean).join(" · ");
+  return [quota.plan || quota.credentialMessage, tierText].filter(Boolean).join(" · ");
 }
 
 function providerAccountLevel(runtime?: ShareUpstreamProvider) {
@@ -431,7 +490,7 @@ function SupportCell({ share, t }: { share?: ShareView; t: TFn }) {
     <div className="grid min-w-72 gap-1.5">
       {rows.map(([key, label]) => {
         const enabled = !!share.support?.[key];
-        const runtime = share.appRuntimes?.[key];
+        const runtime = mergeStandaloneOAuthRuntime(share.appRuntimes?.[key], share.appRuntimes);
         const tone = enabled ? modelHealthTone(share, key) : { className: "bg-slate-50 text-muted-foreground", label: "" };
         return (
           <div key={key} title={enabled ? modelHealthTitle(share, key) : undefined} className={`grid grid-cols-[56px_1fr] gap-2 rounded-lg border px-2 py-1.5 text-[11px] ${tone.className}`}>
@@ -441,6 +500,19 @@ function SupportCell({ share, t }: { share?: ShareView; t: TFn }) {
               <span className="whitespace-normal break-words text-[10px] font-medium opacity-75">{enabled ? providerAccountIdentity(runtime) : ""}</span>
               <span className="whitespace-normal break-words text-[10px] font-medium opacity-75">{enabled ? providerModelMap(runtime) : ""}</span>
               <span className="text-[10px] font-semibold opacity-70">{enabled ? tone.label : ""}</span>
+            </span>
+          </div>
+        );
+      })}
+      {OAUTH_RUNTIME_ROWS.map(([key, label]) => {
+        const runtime = share.appRuntimes?.[key];
+        if (!runtime) return null;
+        return (
+          <div key={key} className="grid grid-cols-[56px_1fr] gap-2 rounded-lg border border-blue-200 bg-blue-50 px-2 py-1.5 text-[11px] text-blue-900 dark:border-blue-800 dark:bg-blue-950/30 dark:text-blue-200">
+            <span className="font-mono uppercase">{label}</span>
+            <span className="grid min-w-0 gap-0.5 text-right">
+              <span className="whitespace-normal break-words font-semibold">{providerAccountLevel(runtime)}</span>
+              <span className="whitespace-normal break-words text-[10px] font-medium opacity-75">{providerAccountIdentity(runtime)}</span>
             </span>
           </div>
         );
@@ -490,6 +562,104 @@ function splitEmails(value: string) {
     .filter(Boolean);
 }
 
+function EmailTagsField({
+  value,
+  onChange,
+  disabled,
+  placeholder,
+  onPromote,
+  promotableEmails,
+  promoteLabel,
+}: {
+  value: string[];
+  onChange: (next: string[]) => void;
+  disabled?: boolean;
+  placeholder?: string;
+  onPromote?: (email: string) => void;
+  promotableEmails?: string[];
+  promoteLabel?: string;
+}) {
+  const [draft, setDraft] = React.useState("");
+  const promotableSet = React.useMemo(
+    () => new Set(promotableEmails ?? []),
+    [promotableEmails],
+  );
+  const commit = (raw: string) => {
+    const parts = splitEmails(raw);
+    setDraft("");
+    if (!parts.length) return;
+    const next = [...value];
+    for (const part of parts) {
+      if (!next.includes(part)) next.push(part);
+    }
+    if (next.length !== value.length) onChange(next);
+  };
+  const removeAt = (idx: number) => onChange(value.filter((_, i) => i !== idx));
+  return (
+    <div
+      className={`flex min-h-10 w-full flex-wrap items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-sm transition-colors focus-within:border-primary/50 ${disabled ? "cursor-not-allowed opacity-60" : ""}`}
+    >
+      {value.map((email, idx) => {
+        const canPromote =
+          !disabled && Boolean(onPromote) && promotableSet.has(email);
+        return (
+          <span
+            key={email}
+            className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-primary/20 bg-primary/10 px-2.5 py-1 text-xs font-medium text-primary"
+          >
+            <span className="min-w-0 truncate">{email}</span>
+            {canPromote ? (
+              <button
+                type="button"
+                aria-label={`${promoteLabel ?? "Set as owner"}: ${email}`}
+                title={promoteLabel ?? "Set as owner"}
+                className="inline-flex h-4 w-4 items-center justify-center rounded-full bg-amber-100/70 text-amber-700 transition-colors hover:bg-amber-200/80"
+                onClick={() => onPromote?.(email)}
+              >
+                <Crown className="h-3 w-3" />
+              </button>
+            ) : null}
+            {disabled ? null : (
+              <button
+                type="button"
+                aria-label={`remove ${email}`}
+                className="inline-flex h-4 w-4 items-center justify-center rounded-full bg-primary/15 transition-colors hover:bg-primary/25"
+                onClick={() => removeAt(idx)}
+              >
+                <X className="h-3 w-3" />
+              </button>
+            )}
+          </span>
+        );
+      })}
+      <input
+        value={draft}
+        disabled={disabled}
+        className="h-7 min-w-[10rem] flex-1 bg-transparent text-slate-900 placeholder:text-muted-foreground focus:outline-none disabled:cursor-not-allowed"
+        placeholder={value.length ? "" : placeholder}
+        onChange={(event) => setDraft(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === ",") {
+            event.preventDefault();
+            commit(draft);
+          } else if (event.key === "Backspace" && draft === "" && value.length) {
+            event.preventDefault();
+            removeAt(value.length - 1);
+          }
+        }}
+        onBlur={() => commit(draft)}
+        onPaste={(event) => {
+          const text = event.clipboardData.getData("text");
+          if (/[\s,;]/.test(text)) {
+            event.preventDefault();
+            commit(text);
+          }
+        }}
+      />
+    </div>
+  );
+}
+
 function toLocalDateTimeValue(value?: string) {
   if (!value) return "";
   const date = new Date(value);
@@ -532,7 +702,7 @@ function ShareEditDialog({
   const [forSale, setForSale] = React.useState<"Yes" | "No" | "Free">("No");
   const [marketAccessMode, setMarketAccessMode] = React.useState<"selected" | "all">("selected");
   const [selectedMarketEmails, setSelectedMarketEmails] = React.useState<string[]>([]);
-  const [sharedWithEmails, setSharedWithEmails] = React.useState("");
+  const [sharedWithEmails, setSharedWithEmails] = React.useState<string[]>([]);
   const [tokenLimitInput, setTokenLimitInput] = React.useState(String(DEFAULT_TOKEN_LIMIT));
   const [tokenLimitUnlimited, setTokenLimitUnlimited] = React.useState(false);
   const [lastFiniteTokenLimit, setLastFiniteTokenLimit] = React.useState(DEFAULT_TOKEN_LIMIT);
@@ -574,7 +744,7 @@ function ShareEditDialog({
         ? (share.marketLinks || []).map((link) => (link.email || "").toLowerCase()).filter(Boolean)
         : [],
     );
-    setSharedWithEmails((share.sharedWithEmails || []).join("\n"));
+    setSharedWithEmails(splitEmails((share.sharedWithEmails || []).join("\n")));
 
     const initialToken = share.tokenLimit ?? UNLIMITED_TOKEN_LIMIT;
     const tokenUnlimited = isUnlimitedTokenLimit(initialToken);
@@ -702,7 +872,7 @@ function ShareEditDialog({
         description: description.trim() || null,
         forSale,
         marketAccessMode,
-        sharedWithEmails: splitEmails(sharedWithEmails),
+        sharedWithEmails: sharedWithEmails,
         tokenLimit: tokenLimitUnlimited ? UNLIMITED_TOKEN_LIMIT : tokenParsed,
         parallelLimit: parallelLimitUnlimited ? UNLIMITED_PARALLEL_LIMIT : parallelParsed,
       };
@@ -724,7 +894,7 @@ function ShareEditDialog({
     setError("");
     try {
       const targetEmail = transferTargetEmail.toLowerCase();
-      const shared = splitEmails(sharedWithEmails);
+      const shared = sharedWithEmails;
       const nextShared = Array.from(new Set([
         ...shared.filter((email) => email !== targetEmail),
         share.ownerEmail || "",
@@ -876,24 +1046,15 @@ function ShareEditDialog({
                 ) : null}
 
 	                <FieldGroup label="Shared with" hint={readOnly ? "只读查看；只有 owner email 可以修改 shareto 列表。" : "多个邮箱用换行/逗号分隔。这些邮箱登录 dashboard 后可查看此 share。"}>
-	                  <TextArea
+	                  <EmailTagsField
 	                    value={sharedWithEmails}
 	                    placeholder="friend@example.com, teammate@example.com"
                       disabled={readOnly}
-	                    onChange={(event) => setSharedWithEmails(event.target.value)}
+	                    onChange={setSharedWithEmails}
+	                    onPromote={(email) => setTransferTargetEmail(email)}
+	                    promotableEmails={transferableShareEmails}
+	                    promoteLabel="设为 Owner"
 	                  />
-                  {!readOnly && transferableShareEmails.length ? (
-                    <div className="mt-3 grid gap-2 rounded-lg border border-slate-200 bg-slate-50 p-3">
-                      <div className="text-xs font-medium text-muted-foreground">升级 shareto 为 owner</div>
-                      <div className="flex flex-wrap gap-2">
-                        {transferableShareEmails.map((email) => (
-                          <Button key={email} size="sm" variant="outline" onClick={() => setTransferTargetEmail(email)} isDisabled={busy}>
-                            设为 Owner <span className="font-mono">{email}</span>
-                          </Button>
-                        ))}
-                      </div>
-                    </div>
-                  ) : null}
                 </FieldGroup>
 
                 <div className="grid gap-3 sm:grid-cols-2">
@@ -1170,7 +1331,7 @@ export function ClientsTable({ clients, markets, onChanged }: { clients: Dashboa
                 {selected ? (
                   <div className="grid gap-5">
                     <DrawerSection label={t("dashboard.markets")}><ShareMarkets share={selected.share} t={t} /></DrawerSection>
-                    <DrawerSection label={t("dashboard.providers")}><ShareProvidersPanel providers={selected.share?.appProviders} /></DrawerSection>
+                    <DrawerSection label={t("dashboard.providers")}><ShareProvidersPanel share={selected.share} /></DrawerSection>
                     <DrawerSection label={t("dashboard.requestLogs")}><ShareRequestLogs logs={selected.share?.recentRequests || []} /></DrawerSection>
                     <DrawerSection label={t("dashboard.modelHealthChecks")}><ShareModelHealthChecks checks={selected.share?.recentModelHealthChecks || []} /></DrawerSection>
                   </div>
@@ -1634,9 +1795,10 @@ function providerMetaLabel(provider: ShareAppProvider) {
   return [provider.kind, provider.providerType].filter(Boolean).join(" · ");
 }
 
-function ShareProvidersPanel({ providers }: { providers?: ShareAppProviders }) {
+function ShareProvidersPanel({ share }: { share?: ShareView }) {
   const { t } = useLocaleText();
   const [selectedKey, setSelectedKey] = React.useState<keyof ShareAppProviders>("claude");
+  const providers = share?.appProviders;
   const currentProviders = providers?.[selectedKey] || [];
 
   return (
@@ -1655,7 +1817,7 @@ function ShareProvidersPanel({ providers }: { providers?: ShareAppProviders }) {
       ) : (
         <div className="grid gap-2">
           {currentProviders.map((provider) => {
-            const runtime = providerRuntime(provider);
+            const runtime = mergeStandaloneOAuthRuntime(providerRuntime(provider), share?.appRuntimes, provider);
             const endpoint = runtimeEndpointSummary(runtime);
             const meta = providerMetaLabel(provider);
             const accountLevel = providerAccountLevel(runtime);
@@ -1798,6 +1960,7 @@ function MarketLinkedShares({ market, t }: { market: DashboardMarket; t: TFn }) 
           ["codex", "Codex"],
           ["gemini", "Gemini"],
         ].filter(([key]) => share.support?.[key as keyof typeof share.support]);
+        const oauthSupported = OAUTH_RUNTIME_ROWS.filter(([key]) => share.appRuntimes?.[key]);
         return (
           <Card key={share.shareId} className={`rounded-lg border p-0 shadow-none ${share.disabledByMarket ? "border-amber-200 bg-amber-50/40" : ""}`}>
             <Card.Content className="flex-row items-center justify-between gap-3 p-3">
@@ -1822,6 +1985,25 @@ function MarketLinkedShares({ market, t }: { market: DashboardMarket; t: TFn }) 
                           variant={unavailable ? "soft" : "tertiary"}
                         >
                           {label}
+                        </Chip>
+                      );
+                    })}
+                  </div>
+                ) : null}
+                {oauthSupported.length ? (
+                  <div className="flex flex-wrap justify-end gap-1">
+                    {oauthSupported.map(([key, label]) => {
+                      const runtime = share.appRuntimes?.[key];
+                      const level = providerAccountLevel(runtime);
+                      return (
+                        <Chip
+                          key={key}
+                          color="default"
+                          size="sm"
+                          title={[label, level, providerAccountIdentity(runtime)].filter(Boolean).join(" · ")}
+                          variant="tertiary"
+                        >
+                          {level && level !== "-" ? `${label} ${level}` : label}
                         </Chip>
                       );
                     })}

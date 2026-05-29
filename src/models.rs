@@ -984,6 +984,7 @@ pub struct ShareSupport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareUpstreamQuotaTier {
+    #[serde(alias = "name")]
     pub label: String,
     pub utilization: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -994,7 +995,11 @@ pub struct ShareUpstreamQuotaTier {
 #[serde(rename_all = "camelCase")]
 pub struct ShareUpstreamQuota {
     pub status: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "credentialMessage",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub plan: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queried_at: Option<i64>,
@@ -1312,6 +1317,8 @@ pub struct MarketLinkedShareView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub market_disabled_at: Option<String>,
     pub support: ShareSupport,
+    #[serde(default)]
+    pub app_runtimes: ShareAppRuntimes,
     #[serde(default)]
     pub app_availability: MarketAppAvailability,
 }

@@ -7582,6 +7582,7 @@ fn enrich_dashboard_market(
                 disabled_by_market: market_disabled_at.is_some(),
                 market_disabled_at,
                 support: share.support.clone(),
+                app_runtimes: share.app_runtimes.clone(),
                 app_availability: app_availability_for_market
                     .and_then(|entries| entries.get(&share.share_id))
                     .cloned()

@@ -210,7 +210,10 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/admin/metrics/llm/series", get(admin_metrics_series))
         .route("/v1/admin/metrics/llm/top", get(admin_metrics_llm_top))
         .route("/v1/admin/metrics/llm/errors", get(admin_metrics_events))
-        .route("/v1/admin/metrics/llm/failover", get(admin_metrics_llm_failover))
+        .route(
+            "/v1/admin/metrics/llm/failover",
+            get(admin_metrics_llm_failover),
+        )
         .route("/v1/admin/metrics/events", get(admin_metrics_events))
         .route("/v1/admin/metrics", delete(admin_metrics_clear))
         .route("/_market/proxy/:share_id/*path", any(market_proxy_handler))

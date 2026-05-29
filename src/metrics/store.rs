@@ -162,11 +162,9 @@ impl MetricsStore {
         spawn_blocking(move || {
             let conn = store.open()?;
             let value: Option<i64> = conn
-                .query_row(
-                    "SELECT MAX(timestamp) FROM host_metrics",
-                    [],
-                    |row| row.get(0),
-                )
+                .query_row("SELECT MAX(timestamp) FROM host_metrics", [], |row| {
+                    row.get(0)
+                })
                 .optional()
                 .map_err(|err| {
                     AppError::Internal(format!("load latest sample timestamp failed: {err}"))
@@ -470,9 +468,7 @@ fn migrate_metrics_db(conn: &Connection) -> Result<(), AppError> {
     let ensure_column = |table: &str, column: &str, decl: &str| -> Result<(), AppError> {
         let exists: i64 = conn
             .query_row(
-                &format!(
-                    "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"
-                ),
+                &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
                 params![column],
                 |row| row.get(0),
             )
@@ -965,7 +961,8 @@ where
     }
     let first_bucket = (start_ts / step_secs) * step_secs;
     let last_bucket = (end_ts / step_secs) * step_secs;
-    let mut existing: HashMap<i64, T> = buckets.into_iter().map(|item| (key(&item), item)).collect();
+    let mut existing: HashMap<i64, T> =
+        buckets.into_iter().map(|item| (key(&item), item)).collect();
     let mut out = Vec::new();
     let mut ts = first_bucket;
     while ts <= last_bucket {
@@ -1074,7 +1071,15 @@ fn load_llm_reliability(
     start_ts: i64,
     end_ts: i64,
     limit: usize,
-) -> Result<(u64, u64, Option<f64>, Vec<super::models::LlmSubstitutionItem>), AppError> {
+) -> Result<
+    (
+        u64,
+        u64,
+        Option<f64>,
+        Vec<super::models::LlmSubstitutionItem>,
+    ),
+    AppError,
+> {
     let (total, substituted, sub_success_total, sub_success_ok): (i64, i64, i64, i64) = conn
         .query_row(
             "SELECT
