@@ -268,7 +268,7 @@ function runtimeModelSummary(runtime?: ShareUpstreamProvider) {
   return models
     .map((item) => `${item.slot || "model"}:${item.actualModel || ""}`)
     .filter((value) => !value.endsWith(":"))
-    .join(" . ");
+    .join(" · ");
 }
 
 function modelHealthKey(value?: string) {
@@ -305,15 +305,8 @@ function modelHealthFailureReason(entries: ModelHealthSummary[]) {
 
 function runtimeEndpointSummary(runtime?: ShareUpstreamProvider) {
   if (!runtime) return "";
-  const pieces = [];
   const apiUrl = runtimeApiUrl(runtime);
-  if (apiUrl && !isOfficialMarker(apiUrl)) pieces.push(apiUrl);
-  if (runtime.accountEmail) pieces.push(runtime.accountEmail);
-  return pieces.join(" · ");
-}
-
-function officialAccountSummary(runtime?: ShareUpstreamProvider) {
-  return runtime?.accountEmail || "";
+  return apiUrl && !isOfficialMarker(apiUrl) ? apiUrl : "";
 }
 
 function countdownStr(resetsAt?: string) {
@@ -350,6 +343,18 @@ function quotaSummary(runtime?: ShareUpstreamProvider) {
     .map((tier) => [quotaTierLabel(tier.label), `${Math.round(tier.utilization || 0)}%`, countdownStr(tier.resetsAt)].filter(Boolean).join(" "))
     .join(" · ");
   return [quota.plan, tierText].filter(Boolean).join(" · ");
+}
+
+function providerAccountLevel(runtime?: ShareUpstreamProvider) {
+  return quotaSummary(runtime) || runtime?.providerName || runtime?.kind || "-";
+}
+
+function providerAccountIdentity(runtime?: ShareUpstreamProvider) {
+  return runtime?.accountEmail || "-";
+}
+
+function providerModelMap(runtime?: ShareUpstreamProvider) {
+  return runtimeModelSummary(runtime) || "-";
 }
 
 function ForSaleCell({ share, t }: { share?: ShareView; t: TFn }) {
@@ -427,17 +432,15 @@ function SupportCell({ share, t }: { share?: ShareView; t: TFn }) {
       {rows.map(([key, label]) => {
         const enabled = !!share.support?.[key];
         const runtime = share.appRuntimes?.[key];
-        const official = enabled && isOfficialRuntime(runtime);
-        const firstLine = enabled ? (official ? quotaSummary(runtime) : runtimeModelSummary(runtime) || quotaSummary(runtime)) : "";
-        const secondLine = enabled ? (official ? officialAccountSummary(runtime) : runtimeEndpointSummary(runtime) || runtime?.accountEmail || "") : "";
         const tone = enabled ? modelHealthTone(share, key) : { className: "bg-slate-50 text-muted-foreground", label: "" };
         return (
           <div key={key} title={enabled ? modelHealthTitle(share, key) : undefined} className={`grid grid-cols-[56px_1fr] gap-2 rounded-lg border px-2 py-1.5 text-[11px] ${tone.className}`}>
             <span className="font-mono uppercase">{label}</span>
             <span className="grid min-w-0 gap-0.5 text-right">
-              <span className="whitespace-normal break-words font-semibold">{enabled ? firstLine || (official ? "Official" : t("dashboard.on")) : ""}</span>
-              {enabled && secondLine ? <span className="whitespace-normal break-words text-[10px] font-medium opacity-75">{secondLine}</span> : null}
-              {enabled ? <span className="text-[10px] font-semibold opacity-70">{tone.label}</span> : null}
+              <span className="whitespace-normal break-words font-semibold">{enabled ? providerAccountLevel(runtime) : t("dashboard.off")}</span>
+              <span className="whitespace-normal break-words text-[10px] font-medium opacity-75">{enabled ? providerAccountIdentity(runtime) : "-"}</span>
+              <span className="whitespace-normal break-words text-[10px] font-medium opacity-75">{enabled ? providerModelMap(runtime) : "-"}</span>
+              <span className="text-[10px] font-semibold opacity-70">{enabled ? tone.label : "-"}</span>
             </span>
           </div>
         );
@@ -1603,10 +1606,11 @@ function ShareProvidersPanel({ providers }: { providers?: ShareAppProviders }) {
         <div className="grid gap-2">
           {currentProviders.map((provider) => {
             const runtime = providerRuntime(provider);
-            const quota = quotaSummary(runtime);
-            const models = runtimeModelSummary(runtime);
             const endpoint = runtimeEndpointSummary(runtime);
             const meta = providerMetaLabel(provider);
+            const accountLevel = providerAccountLevel(runtime);
+            const accountIdentity = providerAccountIdentity(runtime);
+            const modelMap = providerModelMap(runtime);
             return (
               <div key={provider.id} className="rounded-lg border bg-background p-3">
                 <div className="flex items-start justify-between gap-3">
@@ -1622,9 +1626,10 @@ function ShareProvidersPanel({ providers }: { providers?: ShareAppProviders }) {
                 <div className="mt-2 grid gap-1 text-xs text-muted-foreground">
                   {meta ? <div className="break-words">{meta}</div> : null}
                   {endpoint ? <div className="break-words">{endpoint}</div> : null}
-                  {quota ? <div className="break-words">{quota}</div> : null}
-                  {models ? <div className="break-words">{models}</div> : null}
                   {provider.forSaleOfficialPricePercent ? <div>{provider.forSaleOfficialPricePercent}%</div> : null}
+                  <div className="break-words">{accountLevel}</div>
+                  <div className="break-words">{accountIdentity}</div>
+                  <div className="break-words">{modelMap}</div>
                 </div>
               </div>
             );
