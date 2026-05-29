@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 pub struct MetricsSnapshot {
     pub status: MetricsHealth,
     pub sampled_at: i64,
+    pub enabled: bool,
+    pub sample_interval_secs: u64,
+    pub last_persisted_at: Option<i64>,
     pub host: HostMetricsStatus,
     pub router: RouterMetricsStatus,
     pub llm: LlmMetricsSnapshot,
@@ -129,6 +132,7 @@ pub struct LlmMetricsSnapshot {
     pub active_models: u64,
     pub active_shares: u64,
     pub failover_success_rate: Option<f64>,
+    pub cache_hit_rate: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -216,6 +220,29 @@ pub struct LlmTopItem {
 pub struct ClearMetricsResponse {
     pub ok: bool,
     pub deleted_rows: HashMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmReliabilityResponse {
+    pub range: String,
+    pub total_requests: u64,
+    /// Requests whose served model differs from what the caller asked for.
+    pub substituted_requests: u64,
+    pub substitution_rate: f64,
+    /// Fraction of substituted requests that still completed successfully.
+    pub substitution_success_rate: Option<f64>,
+    pub items: Vec<LlmSubstitutionItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmSubstitutionItem {
+    pub requested_model: String,
+    pub actual_model: String,
+    pub requests: u64,
+    pub errors: u64,
+    pub error_rate: f64,
 }
 
 #[derive(Debug, Clone)]

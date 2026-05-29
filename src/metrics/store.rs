@@ -116,6 +116,68 @@ impl MetricsStore {
         .map_err(|err| AppError::Internal(format!("metric event task failed: {err}")))?
     }
 
+    /// Persists an alert only when the same `(kind, severity)` pair has either
+    /// never been seen or was last seen long enough ago to count as a new
+    /// incident. This is how the live alerts returned from `build_alerts` flow
+    /// into the persisted `metric_events` table without spamming on every
+    /// sample tick.
+    pub async fn insert_event_deduped(&self, event: MetricEvent) -> Result<(), AppError> {
+        let store = self.clone();
+        spawn_blocking(move || {
+            let conn = store.open()?;
+            let cooldown_secs: i64 = 5 * 60;
+            let recent: Option<i64> = conn
+                .query_row(
+                    "SELECT MAX(timestamp) FROM metric_events
+                      WHERE kind = ?1 AND severity = ?2 AND timestamp >= ?3",
+                    params![event.kind, event.severity, event.timestamp - cooldown_secs],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|err| AppError::Internal(format!("dedupe metric event failed: {err}")))?
+                .flatten();
+            if recent.is_some() {
+                return Ok(());
+            }
+            conn.execute(
+                "INSERT INTO metric_events (timestamp, severity, kind, message, details_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    event.timestamp,
+                    event.severity,
+                    event.kind,
+                    event.message,
+                    event.details.to_string(),
+                ],
+            )
+            .map_err(|err| AppError::Internal(format!("insert metric event failed: {err}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|err| AppError::Internal(format!("metric event task failed: {err}")))?
+    }
+
+    pub async fn latest_sample_timestamp(&self) -> Result<Option<i64>, AppError> {
+        let store = self.clone();
+        spawn_blocking(move || {
+            let conn = store.open()?;
+            let value: Option<i64> = conn
+                .query_row(
+                    "SELECT MAX(timestamp) FROM host_metrics",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|err| {
+                    AppError::Internal(format!("load latest sample timestamp failed: {err}"))
+                })?
+                .flatten();
+            Ok(value)
+        })
+        .await
+        .map_err(|err| AppError::Internal(format!("latest sample task failed: {err}")))?
+    }
+
     pub async fn latest_host_status(&self) -> Result<Option<HostMetricsStatus>, AppError> {
         let store = self.clone();
         spawn_blocking(move || {
@@ -202,6 +264,37 @@ impl MetricsStore {
         .map_err(|err| AppError::Internal(format!("metric events task failed: {err}")))?
     }
 
+    pub async fn llm_reliability(
+        &self,
+        range_label: String,
+        limit: usize,
+    ) -> Result<super::models::LlmReliabilityResponse, AppError> {
+        let range_secs = parse_duration_to_secs(&range_label)
+            .ok_or_else(|| AppError::BadRequest("invalid metrics range".into()))?;
+        let store = self.clone();
+        spawn_blocking(move || {
+            let conn = store.open()?;
+            let end_ts = chrono::Utc::now().timestamp();
+            let start_ts = end_ts - range_secs;
+            let (total, substituted, success_rate, items) =
+                load_llm_reliability(&conn, start_ts, end_ts, limit)?;
+            Ok(super::models::LlmReliabilityResponse {
+                range: range_label,
+                total_requests: total,
+                substituted_requests: substituted,
+                substitution_rate: if total > 0 {
+                    substituted as f64 / total as f64
+                } else {
+                    0.0
+                },
+                substitution_success_rate: success_rate,
+                items,
+            })
+        })
+        .await
+        .map_err(|err| AppError::Internal(format!("llm reliability task failed: {err}")))?
+    }
+
     pub async fn clear(&self) -> Result<ClearMetricsResponse, AppError> {
         let store = self.clone();
         spawn_blocking(move || {
@@ -211,7 +304,6 @@ impl MetricsStore {
                 "host_metrics",
                 "router_metrics",
                 "llm_request_metrics",
-                "llm_route_attempt_metrics",
                 "metric_events",
             ] {
                 let deleted = conn
@@ -286,7 +378,9 @@ fn init_metrics_db(conn: &Connection) -> Result<(), AppError> {
             process_fd_usage_percent REAL,
             process_threads INTEGER,
             process_rss_bytes INTEGER,
-            process_cpu_percent REAL
+            process_cpu_percent REAL,
+            uptime_secs INTEGER,
+            process_uptime_secs INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_host_metrics_ts ON host_metrics(timestamp);
 
@@ -352,22 +446,6 @@ fn init_metrics_db(conn: &Connection) -> Result<(), AppError> {
         CREATE UNIQUE INDEX IF NOT EXISTS idx_llm_request_metrics_request_id
             ON llm_request_metrics(request_id);
 
-        CREATE TABLE IF NOT EXISTS llm_route_attempt_metrics (
-            timestamp INTEGER NOT NULL,
-            request_id TEXT NOT NULL,
-            attempt_no INTEGER NOT NULL,
-            primary_subdomain TEXT,
-            selected_subdomain TEXT,
-            fallback_subdomain TEXT,
-            status TEXT NOT NULL,
-            failure_kind TEXT,
-            retry_policy TEXT,
-            latency_ms INTEGER,
-            stream_started INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE INDEX IF NOT EXISTS idx_llm_route_attempt_metrics_ts ON llm_route_attempt_metrics(timestamp);
-        CREATE INDEX IF NOT EXISTS idx_llm_route_attempt_metrics_request ON llm_route_attempt_metrics(request_id);
-
         CREATE TABLE IF NOT EXISTS metric_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp INTEGER NOT NULL,
@@ -380,6 +458,35 @@ fn init_metrics_db(conn: &Connection) -> Result<(), AppError> {
         ",
     )
     .map_err(|err| AppError::Internal(format!("init metrics db failed: {err}")))?;
+    migrate_metrics_db(conn)?;
+    Ok(())
+}
+
+/// Adds columns introduced after a DB was first created. SQLite does not have
+/// `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, so we inspect `pragma_table_info`
+/// and only ALTER when the column is missing — that way migrations are safe to
+/// re-run on every boot and won't error on fresh DBs.
+fn migrate_metrics_db(conn: &Connection) -> Result<(), AppError> {
+    let ensure_column = |table: &str, column: &str, decl: &str| -> Result<(), AppError> {
+        let exists: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"
+                ),
+                params![column],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if exists == 0 {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))
+                .map_err(|err| {
+                    AppError::Internal(format!("migrate {table}.{column} failed: {err}"))
+                })?;
+        }
+        Ok(())
+    };
+    ensure_column("host_metrics", "uptime_secs", "INTEGER")?;
+    ensure_column("host_metrics", "process_uptime_secs", "INTEGER")?;
     Ok(())
 }
 
@@ -392,8 +499,9 @@ fn insert_host_metrics(conn: &Connection, host: &HostMetricsStatus) -> Result<()
             swap_used_bytes, swap_total_bytes, disk_used_bytes, disk_total_bytes,
             rx_bytes_per_sec, tx_bytes_per_sec, tcp_established, tcp_time_wait,
             process_open_fds, process_max_fds, process_fd_usage_percent,
-            process_threads, process_rss_bytes, process_cpu_percent
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+            process_threads, process_rss_bytes, process_cpu_percent,
+            uptime_secs, process_uptime_secs
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
         params![
             host.timestamp,
             host.cpu_percent,
@@ -417,6 +525,8 @@ fn insert_host_metrics(conn: &Connection, host: &HostMetricsStatus) -> Result<()
             host.process.threads.map(|v| v as i64),
             host.process.rss_bytes.map(|v| v as i64),
             host.process.cpu_percent,
+            host.uptime_secs.map(|v| v as i64),
+            host.process.uptime_secs.map(|v| v as i64),
         ],
     )
     .map_err(|err| AppError::Internal(format!("insert host metrics failed: {err}")))?;
@@ -535,7 +645,6 @@ fn prune_old_metrics(conn: &Connection, now_ts: i64, retention_days: u32) -> Res
         ("host_metrics", "timestamp"),
         ("router_metrics", "timestamp"),
         ("llm_request_metrics", "timestamp"),
-        ("llm_route_attempt_metrics", "timestamp"),
         ("metric_events", "timestamp"),
     ] {
         conn.execute(
@@ -554,7 +663,8 @@ fn latest_host_status(conn: &Connection) -> Result<Option<HostMetricsStatus>, Ap
                 swap_used_bytes, swap_total_bytes, disk_used_bytes, disk_total_bytes,
                 rx_bytes_per_sec, tx_bytes_per_sec, tcp_established, tcp_time_wait,
                 process_open_fds, process_max_fds, process_fd_usage_percent,
-                process_threads, process_rss_bytes, process_cpu_percent
+                process_threads, process_rss_bytes, process_cpu_percent,
+                uptime_secs, process_uptime_secs
            FROM host_metrics ORDER BY timestamp DESC LIMIT 1",
         [],
         |row| {
@@ -562,7 +672,7 @@ fn latest_host_status(conn: &Connection) -> Result<Option<HostMetricsStatus>, Ap
             let disk_total = row.get::<_, Option<i64>>(11)?.unwrap_or_default() as u64;
             Ok(HostMetricsStatus {
                 timestamp: row.get(0)?,
-                uptime_secs: None,
+                uptime_secs: opt_i64_to_u64(row.get(22)?),
                 cpu_percent: row.get(1)?,
                 load_1: row.get(2)?,
                 load_5: row.get(3)?,
@@ -591,7 +701,7 @@ fn latest_host_status(conn: &Connection) -> Result<Option<HostMetricsStatus>, Ap
                     threads: opt_i64_to_u64(row.get(19)?),
                     rss_bytes: opt_i64_to_u64(row.get(20)?),
                     cpu_percent: row.get(21)?,
-                    uptime_secs: None,
+                    uptime_secs: opt_i64_to_u64(row.get(23)?),
                 },
             })
         },
@@ -639,7 +749,24 @@ fn load_host_series(
             })
         })
         .map_err(|err| AppError::Internal(format!("query host metrics series failed: {err}")))?;
-    collect_rows(rows, "host metrics series")
+    let buckets = collect_rows(rows, "host metrics series")?;
+    Ok(fill_time_axis(
+        start_ts,
+        end_ts,
+        step_secs,
+        buckets,
+        |p| p.timestamp,
+        |ts| HostMetricsPoint {
+            timestamp: ts,
+            cpu_percent: None,
+            memory_usage_percent: None,
+            disk_usage_percent: None,
+            fd_usage_percent: None,
+            rx_bytes_per_sec: None,
+            tx_bytes_per_sec: None,
+            process_rss_bytes: None,
+        },
+    ))
 }
 
 fn load_router_series(
@@ -679,7 +806,23 @@ fn load_router_series(
             })
         })
         .map_err(|err| AppError::Internal(format!("query router metrics series failed: {err}")))?;
-    collect_rows(rows, "router metrics series")
+    let buckets = collect_rows(rows, "router metrics series")?;
+    Ok(fill_time_axis(
+        start_ts,
+        end_ts,
+        step_secs,
+        buckets,
+        |p| p.timestamp,
+        |ts| RouterMetricsPoint {
+            timestamp: ts,
+            active_routes: 0,
+            forward_listeners: 0,
+            proxy_inflight: 0,
+            proxy_upstream_errors_total: 0,
+            health_probe_failures_total: 0,
+            db_errors_total: 0,
+        },
+    ))
 }
 
 fn load_llm_series(
@@ -780,7 +923,59 @@ fn load_llm_series(
             })
         })
         .map_err(|err| AppError::Internal(format!("query llm metrics series failed: {err}")))?;
-    collect_rows(rows, "llm metrics series")
+    let buckets = collect_rows(rows, "llm metrics series")?;
+    Ok(fill_time_axis(
+        start_ts,
+        end_ts,
+        step_secs,
+        buckets,
+        |p| p.timestamp,
+        |ts| LlmMetricsPoint {
+            timestamp: ts,
+            rpm: 0.0,
+            tpm: 0.0,
+            input_tpm: 0.0,
+            output_tpm: 0.0,
+            error_rate: 0.0,
+            rate_limited: 0,
+            p95_latency_ms: None,
+            p95_ttft_ms: None,
+        },
+    ))
+}
+
+/// Materializes empty buckets between sparse samples so the time axis is
+/// continuous. Without this, the frontend cannot distinguish "no data" from
+/// "no traffic" — both produce a sparse series, which the chart renders as
+/// "sampling".
+fn fill_time_axis<T, K, F>(
+    start_ts: i64,
+    end_ts: i64,
+    step_secs: i64,
+    buckets: Vec<T>,
+    key: K,
+    blank: F,
+) -> Vec<T>
+where
+    K: Fn(&T) -> i64,
+    F: Fn(i64) -> T,
+{
+    if step_secs <= 0 {
+        return buckets;
+    }
+    let first_bucket = (start_ts / step_secs) * step_secs;
+    let last_bucket = (end_ts / step_secs) * step_secs;
+    let mut existing: HashMap<i64, T> = buckets.into_iter().map(|item| (key(&item), item)).collect();
+    let mut out = Vec::new();
+    let mut ts = first_bucket;
+    while ts <= last_bucket {
+        match existing.remove(&ts) {
+            Some(item) => out.push(item),
+            None => out.push(blank(ts)),
+        }
+        ts += step_secs;
+    }
+    out
 }
 
 fn load_llm_snapshot(
@@ -791,6 +986,7 @@ fn load_llm_snapshot(
     let start_ts = end_ts - range_secs;
     let p95_latency_ms = load_llm_percentile(conn, "latency_ms", start_ts, end_ts)?;
     let p95_ttft_ms = load_llm_percentile(conn, "ttft_ms", start_ts, end_ts)?;
+    let failover_success_rate = load_substitution_success_rate(conn, start_ts, end_ts)?;
     conn.query_row(
         "SELECT
             COUNT(*),
@@ -800,17 +996,20 @@ fn load_llm_snapshot(
             COALESCE(SUM(output_tokens), 0),
             COALESCE(SUM(total_tokens), 0),
             COUNT(DISTINCT COALESCE(NULLIF(actual_model, ''), requested_model)),
-            COUNT(DISTINCT share_id)
+            COUNT(DISTINCT share_id),
+            COALESCE(SUM(cache_read_tokens), 0)
          FROM llm_request_metrics WHERE timestamp >= ?1 AND timestamp <= ?2",
         params![start_ts, end_ts],
         |row| {
             let requests = row.get::<_, i64>(0)?.max(0) as f64;
             let errors = row.get::<_, i64>(1)?.max(0) as f64;
+            let input_tokens = row.get::<_, i64>(3)?.max(0) as f64;
+            let cache_read_tokens = row.get::<_, i64>(8)?.max(0) as f64;
             let factor = 60.0 / range_secs.max(1) as f64;
             Ok(super::models::LlmMetricsSnapshot {
                 rpm: requests * factor,
                 tpm: row.get::<_, i64>(5)?.max(0) as f64 * factor,
-                input_tpm: row.get::<_, i64>(3)?.max(0) as f64 * factor,
+                input_tpm: input_tokens * factor,
                 output_tpm: row.get::<_, i64>(4)?.max(0) as f64 * factor,
                 inflight: 0,
                 error_rate: if requests > 0.0 {
@@ -823,11 +1022,124 @@ fn load_llm_snapshot(
                 p95_ttft_ms,
                 active_models: row.get::<_, i64>(6)?.max(0) as u64,
                 active_shares: row.get::<_, i64>(7)?.max(0) as u64,
-                failover_success_rate: None,
+                failover_success_rate,
+                cache_hit_rate: if cache_read_tokens + input_tokens > 0.0 {
+                    Some(cache_read_tokens / (cache_read_tokens + input_tokens))
+                } else {
+                    None
+                },
             })
         },
     )
     .map_err(|err| AppError::Internal(format!("load llm snapshot failed: {err}")))
+}
+
+/// A model substitution is a request served by a model other than the one the
+/// caller asked for — the router's effective "failover". This returns the
+/// success rate among those substituted requests, or `None` when no
+/// substitution happened in the window.
+fn load_substitution_success_rate(
+    conn: &Connection,
+    start_ts: i64,
+    end_ts: i64,
+) -> Result<Option<f64>, AppError> {
+    conn.query_row(
+        "SELECT
+            COUNT(*),
+            COALESCE(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END), 0)
+         FROM llm_request_metrics
+         WHERE timestamp >= ?1 AND timestamp <= ?2
+           AND actual_model IS NOT NULL AND actual_model != ''
+           AND requested_model IS NOT NULL AND requested_model != ''
+           AND actual_model != requested_model",
+        params![start_ts, end_ts],
+        |row| {
+            let total = row.get::<_, i64>(0)?.max(0);
+            let success = row.get::<_, i64>(1)?.max(0);
+            Ok(if total > 0 {
+                Some(success as f64 / total as f64)
+            } else {
+                None
+            })
+        },
+    )
+    .map_err(|err| AppError::Internal(format!("load substitution success rate failed: {err}")))
+}
+
+/// Aggregates model-substitution pairs (`requested_model` → `actual_model`)
+/// over a window so the dashboard can show which models the router is
+/// silently rerouting and how reliable each substitution is.
+fn load_llm_reliability(
+    conn: &Connection,
+    start_ts: i64,
+    end_ts: i64,
+    limit: usize,
+) -> Result<(u64, u64, Option<f64>, Vec<super::models::LlmSubstitutionItem>), AppError> {
+    let (total, substituted, sub_success_total, sub_success_ok): (i64, i64, i64, i64) = conn
+        .query_row(
+            "SELECT
+                COUNT(*),
+                COALESCE(SUM(CASE WHEN actual_model IS NOT NULL AND actual_model != ''
+                    AND requested_model IS NOT NULL AND requested_model != ''
+                    AND actual_model != requested_model THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN actual_model IS NOT NULL AND actual_model != ''
+                    AND requested_model IS NOT NULL AND requested_model != ''
+                    AND actual_model != requested_model THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN actual_model IS NOT NULL AND actual_model != ''
+                    AND requested_model IS NOT NULL AND requested_model != ''
+                    AND actual_model != requested_model AND status = 'success' THEN 1 ELSE 0 END), 0)
+             FROM llm_request_metrics
+             WHERE timestamp >= ?1 AND timestamp <= ?2",
+            params![start_ts, end_ts],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(|err| AppError::Internal(format!("load reliability totals failed: {err}")))?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT requested_model, actual_model,
+                    COUNT(*) AS requests,
+                    SUM(CASE WHEN status != 'success' THEN 1 ELSE 0 END) AS errors
+             FROM llm_request_metrics
+             WHERE timestamp >= ?1 AND timestamp <= ?2
+               AND actual_model IS NOT NULL AND actual_model != ''
+               AND requested_model IS NOT NULL AND requested_model != ''
+               AND actual_model != requested_model
+             GROUP BY requested_model, actual_model
+             ORDER BY requests DESC
+             LIMIT ?3",
+        )
+        .map_err(|err| AppError::Internal(format!("prepare reliability items failed: {err}")))?;
+    let rows = stmt
+        .query_map(params![start_ts, end_ts, limit as i64], |row| {
+            let requests = row.get::<_, i64>(2)?.max(0) as u64;
+            let errors = row.get::<_, i64>(3)?.max(0) as u64;
+            Ok(super::models::LlmSubstitutionItem {
+                requested_model: row.get(0)?,
+                actual_model: row.get(1)?,
+                requests,
+                errors,
+                error_rate: if requests > 0 {
+                    errors as f64 / requests as f64
+                } else {
+                    0.0
+                },
+            })
+        })
+        .map_err(|err| AppError::Internal(format!("query reliability items failed: {err}")))?;
+    let items = collect_rows(rows, "reliability items")?;
+
+    let substitution_success_rate = if sub_success_total > 0 {
+        Some(sub_success_ok as f64 / sub_success_total as f64)
+    } else {
+        None
+    };
+    Ok((
+        total.max(0) as u64,
+        substituted.max(0) as u64,
+        substitution_success_rate,
+        items,
+    ))
 }
 
 fn load_llm_top(

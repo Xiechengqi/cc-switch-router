@@ -100,6 +100,7 @@ export type ShareView = {
 };
 
 export type ShareSettingsPatch = {
+  ownerEmail?: string;
   description?: string | null;
   forSale?: "Yes" | "No" | "Free";
   marketAccessMode?: "selected" | "all";
@@ -571,11 +572,15 @@ export type LlmMetricsSnapshot = {
   activeModels: number;
   activeShares: number;
   failoverSuccessRate?: number | null;
+  cacheHitRate?: number | null;
 };
 
 export type MetricsSnapshot = {
   status: MetricsHealth;
   sampledAt: number;
+  enabled: boolean;
+  sampleIntervalSecs: number;
+  lastPersistedAt?: number | null;
   host: HostMetricsStatus;
   router: RouterMetricsStatus;
   llm: LlmMetricsSnapshot;
@@ -634,6 +639,21 @@ export type LlmTopResponse = {
     errorRate: number;
     p95LatencyMs?: number | null;
     lastRequestAt?: number | null;
+  }>;
+};
+
+export type LlmReliabilityResponse = {
+  range: string;
+  totalRequests: number;
+  substitutedRequests: number;
+  substitutionRate: number;
+  substitutionSuccessRate?: number | null;
+  items: Array<{
+    requestedModel: string;
+    actualModel: string;
+    requests: number;
+    errors: number;
+    errorRate: number;
   }>;
 };
 

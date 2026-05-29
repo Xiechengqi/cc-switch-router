@@ -20,6 +20,7 @@ import type {
   MetricsSeriesResponse,
   LlmMetricsSnapshot,
   LlmTopResponse,
+  LlmReliabilityResponse,
   MetricEvent,
 } from "@/lib/types";
 
@@ -181,6 +182,11 @@ export async function getLlmMetricsSnapshot(range = "5m") {
 export async function getLlmMetricsTop(range = "1h", by = "tokens") {
   const params = new URLSearchParams({ range, by });
   return parseJson<LlmTopResponse>(await authFetch(`/v1/admin/metrics/llm/top?${params}`, { cache: "no-store" }));
+}
+
+export async function getLlmMetricsFailover(range = "1h", limit = 10) {
+  const params = new URLSearchParams({ range, limit: String(limit) });
+  return parseJson<LlmReliabilityResponse>(await authFetch(`/v1/admin/metrics/llm/failover?${params}`, { cache: "no-store" }));
 }
 
 export async function getMetricEvents(limit = 100) {

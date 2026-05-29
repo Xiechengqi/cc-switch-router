@@ -13,6 +13,7 @@ import {
   RefreshCw,
   Route,
   ServerCrash,
+  Shuffle,
   Trash2,
 } from "lucide-react";
 import { Alert, Button, Card, Switch } from "@heroui/react";
@@ -22,6 +23,7 @@ import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   clearMetrics,
+  getLlmMetricsFailover,
   getLlmMetricsTop,
   getMetricEvents,
   getMetricsHostInfo,
@@ -31,27 +33,42 @@ import {
 import type { MessageKey } from "@/lib/i18n";
 import type {
   HostMetricsInfo,
+  LlmReliabilityResponse,
   LlmTopResponse,
   MetricEvent,
   MetricsSeriesResponse,
   MetricsSnapshot,
 } from "@/lib/types";
 import { compactTokens, fixed, formatBytes, formatDateTime, formatNumber, formatUptime, percent } from "@/lib/utils";
-import { diskPercent, memoryPercent, mergeMetricEvents, toneFor } from "./metrics-utils";
+import { deltaSeries, diskPercent, memoryPercent, mergeMetricEvents, pipelineState, toneFor } from "./metrics-utils";
 import {
   DiskUsageList,
   HostInfoPanel,
   KpiGrid,
+  LiveSummaryStrip,
   MetricKpiCard,
   ProcessPanel,
   StatusChip,
 } from "./metrics-cards";
-import { ResourceTrendChart } from "./metrics-charts";
-import { CountersTable, MetricEventsList, TopConsumersTable } from "./metrics-tables";
+import { type ChartState, ResourceTrendChart } from "./metrics-charts";
+import { CountersTable, MetricEventsList, ModelSubstitutionPanel, TopConsumersTable } from "./metrics-tables";
 
 type MetricsTab = "overview" | "host" | "router" | "llm" | "events";
 
 const RANGES = ["15m", "1h", "6h", "24h", "7d"];
+
+// Mirrors the backend `default_step_label` so the header can show the bucket
+// size the server will pick for a given range.
+function defaultStepLabel(range: string): string {
+  const map: Record<string, string> = {
+    "15m": "15s",
+    "1h": "30s",
+    "6h": "1m",
+    "24h": "5m",
+    "7d": "15m",
+  };
+  return map[range] || "30s";
+}
 
 const TAB_LABELS: Record<MetricsTab, MessageKey> = {
   overview: "metrics.tab.overview",
@@ -72,6 +89,7 @@ export function MetricsPage() {
   const [hostInfo, setHostInfo] = React.useState<HostMetricsInfo | null>(null);
   const [events, setEvents] = React.useState<MetricEvent[]>([]);
   const [top, setTop] = React.useState<LlmTopResponse | null>(null);
+  const [failover, setFailover] = React.useState<LlmReliabilityResponse | null>(null);
   const [busy, setBusy] = React.useState("");
   const [error, setError] = React.useState("");
   const [clearOpen, setClearOpen] = React.useState(false);
@@ -90,18 +108,20 @@ export function MetricsPage() {
       const wantInfo = activeTab === "overview" || activeTab === "host";
       const wantEvents = activeTab === "overview" || activeTab === "events";
       const wantTop = activeTab === "llm";
-      const [nextSnapshot, nextSeries, nextInfo, nextEvents, nextTop] = await Promise.all([
+      const [nextSnapshot, nextSeries, nextInfo, nextEvents, nextTop, nextFailover] = await Promise.all([
         getMetricsSnapshot(),
         wantSeries ? getMetricsSeries(range) : Promise.resolve(null),
         wantInfo ? getMetricsHostInfo() : Promise.resolve(null),
         wantEvents ? getMetricEvents(100) : Promise.resolve(null),
         wantTop ? getLlmMetricsTop(range, "tokens") : Promise.resolve(null),
+        wantTop ? getLlmMetricsFailover(range, 10) : Promise.resolve(null),
       ]);
       setSnapshot(nextSnapshot);
       if (nextSeries) setSeries(nextSeries);
       if (nextInfo) setHostInfo(nextInfo);
       if (nextEvents) setEvents(nextEvents);
       if (nextTop) setTop(nextTop);
+      if (nextFailover) setFailover(nextFailover);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -157,6 +177,7 @@ export function MetricsPage() {
   const lastSample = snapshot?.sampledAt ? formatDateTime(snapshot.sampledAt * 1000) : "--";
   const showSkeleton = snapshot === null && busy === "load";
   const alertEvents = mergeMetricEvents(snapshot?.alerts, events);
+  const chartState = pipelineState(snapshot, busy === "load");
 
   return (
     <main className="settings-surface mx-auto grid w-[calc(100%-2rem)] max-w-7xl gap-5 pb-10 text-foreground">
@@ -167,10 +188,22 @@ export function MetricsPage() {
             <h1 className="font-display text-3xl">
               <span className="gradient-text">{t("metrics.title")}</span>
             </h1>
+            {chartState === "disabled" ? (
+              <span className="rounded-full border border-amber-300 bg-amber-50 px-2.5 py-0.5 text-xs text-amber-700">
+                {t("metrics.chart.disabled")}
+              </span>
+            ) : chartState === "stale" ? (
+              <span className="rounded-full border border-amber-300 bg-amber-50 px-2.5 py-0.5 text-xs text-amber-700">
+                {t("metrics.chart.stale")}
+              </span>
+            ) : null}
           </div>
           <p className="mt-2 text-sm text-muted-foreground">{t("metrics.subtitle")}</p>
           <p className="mt-1 text-xs text-muted-foreground">
             {t("metrics.lastSample")}: {lastSample}
+            <span className="ml-2 font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground/70">
+              {range} · {defaultStepLabel(range)} bucket
+            </span>
           </p>
         </div>
         <div className="flex flex-wrap items-center justify-end gap-2">
@@ -193,7 +226,7 @@ export function MetricsPage() {
             {busy === "load" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
             {t("common.reload")}
           </Button>
-          <Button variant="danger" onClick={() => setClearOpen(true)} isDisabled={!!busy}>
+          <Button variant="ghost" className="!text-red-600 hover:!bg-red-50" onClick={() => setClearOpen(true)} isDisabled={!!busy}>
             <Trash2 className="h-4 w-4" />
             {t("metrics.clear")}
           </Button>
@@ -219,10 +252,10 @@ export function MetricsPage() {
         <MetricsSkeleton />
       ) : (
         <>
-          {activeTab === "overview" ? <OverviewTab snapshot={snapshot} series={series} events={alertEvents} /> : null}
-          {activeTab === "host" ? <HostTab snapshot={snapshot} series={series} hostInfo={hostInfo} /> : null}
-          {activeTab === "router" ? <RouterTab snapshot={snapshot} series={series} /> : null}
-          {activeTab === "llm" ? <LlmTab snapshot={snapshot} series={series} top={top} /> : null}
+          {activeTab === "overview" ? <OverviewTab snapshot={snapshot} series={series} events={alertEvents} state={chartState} /> : null}
+          {activeTab === "host" ? <HostTab snapshot={snapshot} series={series} hostInfo={hostInfo} state={chartState} /> : null}
+          {activeTab === "router" ? <RouterTab snapshot={snapshot} series={series} state={chartState} /> : null}
+          {activeTab === "llm" ? <LlmTab snapshot={snapshot} series={series} top={top} failover={failover} state={chartState} /> : null}
           {activeTab === "events" ? <EventsTab events={alertEvents} /> : null}
         </>
       )}
@@ -275,19 +308,25 @@ function OverviewTab({
   snapshot,
   series,
   events,
+  state,
 }: {
   snapshot: MetricsSnapshot | null;
   series: MetricsSeriesResponse | null;
   events: MetricEvent[];
+  state: ChartState;
 }) {
   const { t } = useLocaleText();
   const host = snapshot?.host;
   const router = snapshot?.router;
   const llm = snapshot?.llm;
   const disk = host?.disks?.[0];
+  const hostPts = series?.host || [];
+  const routerPts = series?.router || [];
+  const llmPts = series?.llm || [];
   return (
     <div className="grid animate-fade-in-up gap-5">
       <div className="section-label">{t("metrics.tab.overview")}</div>
+      <LiveSummaryStrip snapshot={snapshot} />
       <KpiGrid>
         <MetricKpiCard
           label={t("metrics.kpi.fdUsage")}
@@ -298,6 +337,7 @@ function OverviewTab({
           })}
           icon={<Gauge />}
           tone={toneFor(host?.process.fdUsagePercent, 70, 85)}
+          spark={hostPts.map((p) => p.fdUsagePercent || 0)}
         />
         <MetricKpiCard
           label={t("metrics.kpi.cpu")}
@@ -305,6 +345,7 @@ function OverviewTab({
           detail={t("metrics.detail.load", { value: fixed(host?.load1) })}
           icon={<Cpu />}
           tone={toneFor(host?.cpuPercent, 75, 90)}
+          spark={hostPts.map((p) => p.cpuPercent || 0)}
         />
         <MetricKpiCard
           label={t("metrics.kpi.memory")}
@@ -312,6 +353,7 @@ function OverviewTab({
           detail={`${formatBytes(host?.memoryUsedBytes)} / ${formatBytes(host?.memoryTotalBytes)}`}
           icon={<MemoryStick />}
           tone={toneFor(memoryPercent(host), 80, 92)}
+          spark={hostPts.map((p) => p.memoryUsagePercent || 0)}
         />
         <MetricKpiCard
           label={t("metrics.kpi.disk")}
@@ -319,12 +361,14 @@ function OverviewTab({
           detail={`${formatBytes(disk?.usedBytes)} / ${formatBytes(disk?.totalBytes)}`}
           icon={<HardDrive />}
           tone={toneFor(diskPercent(disk), 80, 90)}
+          spark={hostPts.map((p) => p.diskUsagePercent || 0)}
         />
         <MetricKpiCard
           label={t("metrics.kpi.activeRoutes")}
           value={formatNumber(router?.activeRoutes)}
           detail={t("metrics.detail.pending", { count: formatNumber(router?.pendingRoutes) })}
           icon={<Route />}
+          spark={routerPts.map((p) => p.activeRoutes)}
         />
         <MetricKpiCard
           label={t("metrics.kpi.forwardListeners")}
@@ -332,6 +376,7 @@ function OverviewTab({
           detail={t("metrics.detail.sshSessions", { count: formatNumber(router?.sshActiveSessions) })}
           icon={<Activity />}
           tone={(router?.sshForwardListeners || 0) > (router?.activeRoutes || 0) + 2 ? "critical" : "default"}
+          spark={routerPts.map((p) => p.forwardListeners)}
         />
         <MetricKpiCard
           label={t("metrics.kpi.proxyErrors")}
@@ -339,6 +384,7 @@ function OverviewTab({
           detail={t("metrics.detail.inflight", { count: formatNumber(router?.proxyInflight) })}
           icon={<ServerCrash />}
           tone={(router?.proxyUpstreamErrorsTotal || 0) > 0 ? "warning" : "default"}
+          spark={deltaSeries(routerPts.map((p) => p.proxyUpstreamErrorsTotal))}
         />
         <MetricKpiCard
           label={t("metrics.kpi.llmRpmTpm")}
@@ -346,11 +392,14 @@ function OverviewTab({
           detail={t("metrics.detail.error", { value: percent((llm?.errorRate || 0) * 100) })}
           icon={<BrainCircuit />}
           tone={(llm?.errorRate || 0) > 0.1 ? "warning" : "default"}
+          spark={llmPts.map((p) => p.rpm)}
         />
       </KpiGrid>
       <div className="grid gap-5 xl:grid-cols-[2fr_1fr]">
         <ResourceTrendChart
           title={t("metrics.chart.systemRisk")}
+          state={state}
+          unit="%"
           series={[
             { label: "FD", color: "#EF4444", values: series?.host.map((p) => p.fdUsagePercent || 0) || [] },
             { label: "CPU", color: "#6366F1", values: series?.host.map((p) => p.cpuPercent || 0) || [] },
@@ -369,13 +418,16 @@ function HostTab({
   snapshot,
   series,
   hostInfo,
+  state,
 }: {
   snapshot: MetricsSnapshot | null;
   series: MetricsSeriesResponse | null;
   hostInfo: HostMetricsInfo | null;
+  state: ChartState;
 }) {
   const { t } = useLocaleText();
   const host = snapshot?.host;
+  const hostPts = series?.host || [];
   return (
     <div className="grid animate-fade-in-up gap-5">
       <div className="section-label">{t("metrics.tab.host")}</div>
@@ -391,23 +443,29 @@ function HostTab({
           value={percent(host?.cpuPercent)}
           detail={t("metrics.detail.cores", { count: hostInfo?.cpuCores ?? "-" })}
           icon={<Cpu />}
+          tone={toneFor(host?.cpuPercent, 75, 90)}
+          spark={hostPts.map((p) => p.cpuPercent || 0)}
         />
         <MetricKpiCard
           label={t("metrics.kpi.memory")}
           value={formatBytes(host?.memoryUsedBytes)}
           detail={t("metrics.detail.total", { value: formatBytes(host?.memoryTotalBytes) })}
           icon={<MemoryStick />}
+          spark={hostPts.map((p) => p.memoryUsagePercent || 0)}
         />
         <MetricKpiCard
           label={t("metrics.kpi.network")}
           value={`${formatBytes(host?.network.rxBytesPerSec)}/s`}
           detail={t("metrics.detail.txRate", { value: formatBytes(host?.network.txBytesPerSec) })}
           icon={<Network />}
+          spark={hostPts.map((p) => p.rxBytesPerSec || 0)}
         />
       </KpiGrid>
       <div className="grid gap-5 xl:grid-cols-[2fr_1fr]">
         <ResourceTrendChart
           title={t("metrics.chart.hostPerformance")}
+          state={state}
+          unit="%"
           series={[
             { label: "CPU", color: "#6366F1", values: series?.host.map((p) => p.cpuPercent || 0) || [] },
             { label: "Memory", color: "#10B981", values: series?.host.map((p) => p.memoryUsagePercent || 0) || [] },
@@ -429,12 +487,15 @@ function HostTab({
 function RouterTab({
   snapshot,
   series,
+  state,
 }: {
   snapshot: MetricsSnapshot | null;
   series: MetricsSeriesResponse | null;
+  state: ChartState;
 }) {
   const { t } = useLocaleText();
   const router = snapshot?.router;
+  const routerPts = series?.router || [];
   return (
     <div className="grid animate-fade-in-up gap-5">
       <div className="section-label">{t("metrics.tab.router")}</div>
@@ -444,18 +505,21 @@ function RouterTab({
           value={formatNumber(router?.activeRoutes)}
           detail={t("metrics.detail.pending", { count: formatNumber(router?.pendingRoutes) })}
           icon={<Route />}
+          spark={routerPts.map((p) => p.activeRoutes)}
         />
         <MetricKpiCard
           label={t("metrics.kpi.forwardListeners")}
           value={formatNumber(router?.sshForwardListeners)}
           detail={t("metrics.detail.created", { count: formatNumber(router?.sshForwardListenerCreatedTotal) })}
           icon={<Activity />}
+          spark={routerPts.map((p) => p.forwardListeners)}
         />
         <MetricKpiCard
           label={t("metrics.kpi.sshSessions")}
           value={formatNumber(router?.sshActiveSessions)}
           detail={t("metrics.detail.activeSessions")}
           icon={<Network />}
+          spark={routerPts.map((p) => p.proxyInflight)}
         />
         <MetricKpiCard
           label={t("metrics.kpi.emfile")}
@@ -469,6 +533,7 @@ function RouterTab({
         <ResourceTrendChart
           title={t("metrics.chart.routesVsListeners")}
           maxMode="auto"
+          state={state}
           series={[
             { label: "Routes", color: "#10B981", values: series?.router.map((p) => p.activeRoutes) || [] },
             { label: "Listeners", color: "#EF4444", values: series?.router.map((p) => p.forwardListeners) || [] },
@@ -478,10 +543,12 @@ function RouterTab({
         <ResourceTrendChart
           title={t("metrics.chart.proxyErrorCounters")}
           maxMode="auto"
+          state={state}
+          hint={t("metrics.chart.deltaHint")}
           series={[
-            { label: "Upstream", color: "#EF4444", values: series?.router.map((p) => p.proxyUpstreamErrorsTotal) || [] },
-            { label: "Health", color: "#F59E0B", values: series?.router.map((p) => p.healthProbeFailuresTotal) || [] },
-            { label: "DB", color: "#8B5CF6", values: series?.router.map((p) => p.dbErrorsTotal) || [] },
+            { label: "Upstream", color: "#EF4444", values: deltaSeries(series?.router.map((p) => p.proxyUpstreamErrorsTotal)) },
+            { label: "Health", color: "#F59E0B", values: deltaSeries(series?.router.map((p) => p.healthProbeFailuresTotal)) },
+            { label: "DB", color: "#8B5CF6", values: deltaSeries(series?.router.map((p) => p.dbErrorsTotal)) },
           ]}
           timestamps={series?.router.map((p) => p.timestamp) || []}
         />
@@ -495,13 +562,20 @@ function LlmTab({
   snapshot,
   series,
   top,
+  failover,
+  state,
 }: {
   snapshot: MetricsSnapshot | null;
   series: MetricsSeriesResponse | null;
   top: LlmTopResponse | null;
+  failover: LlmReliabilityResponse | null;
+  state: ChartState;
 }) {
   const { t } = useLocaleText();
   const llm = snapshot?.llm;
+  const llmPts = series?.llm || [];
+  const failoverPct = llm?.failoverSuccessRate != null ? llm.failoverSuccessRate * 100 : null;
+  const cachePct = llm?.cacheHitRate != null ? llm.cacheHitRate * 100 : null;
   return (
     <div className="grid animate-fade-in-up gap-5">
       <div className="section-label">{t("metrics.tab.llm")}</div>
@@ -511,6 +585,8 @@ function LlmTab({
           value={fixed(llm?.rpm)}
           detail={t("metrics.detail.requestsPerMin")}
           icon={<BrainCircuit />}
+          emphasize
+          spark={llmPts.map((p) => p.rpm)}
         />
         <MetricKpiCard
           label={t("metrics.kpi.tpm")}
@@ -520,11 +596,12 @@ function LlmTab({
             out: compactTokens(llm?.outputTpm),
           })}
           icon={<Activity />}
+          spark={llmPts.map((p) => p.tpm)}
         />
         <MetricKpiCard
-          label={t("metrics.kpi.inflight")}
-          value={formatNumber(llm?.inflight)}
-          detail={t("metrics.detail.proxyInflight")}
+          label={t("metrics.kpi.cacheHit")}
+          value={cachePct != null ? percent(cachePct) : "-"}
+          detail={t("metrics.detail.cacheHit")}
           icon={<Gauge />}
         />
         <MetricKpiCard
@@ -533,12 +610,23 @@ function LlmTab({
           detail={t("metrics.detail.rateLimitPerMin", { value: fixed(llm?.rateLimitPerMinute) })}
           icon={<AlertTriangle />}
           tone={(llm?.errorRate || 0) > 0.1 ? "warning" : "default"}
+          spark={llmPts.map((p) => p.errorRate * 100)}
+        />
+        <MetricKpiCard
+          label={t("metrics.kpi.failover")}
+          value={failoverPct != null ? percent(failoverPct) : "-"}
+          detail={t("metrics.detail.substitutionRate", {
+            value: percent((failover?.substitutionRate || 0) * 100),
+          })}
+          icon={<Shuffle />}
+          tone={failoverPct != null && failoverPct < 90 ? "warning" : "default"}
         />
       </KpiGrid>
       <div className="grid gap-5 xl:grid-cols-2">
         <ResourceTrendChart
           title={t("metrics.chart.requestErrorTrend")}
           maxMode="auto"
+          state={state}
           series={[
             { label: "RPM", color: "#06B6D4", values: series?.llm.map((p) => p.rpm) || [] },
             { label: "429", color: "#F59E0B", values: series?.llm.map((p) => p.rateLimited) || [] },
@@ -549,6 +637,8 @@ function LlmTab({
         <ResourceTrendChart
           title={t("metrics.chart.tokenTrend")}
           maxMode="auto"
+          state={state}
+          unit="tok/min"
           series={[
             { label: "TPM", color: "#8B5CF6", values: series?.llm.map((p) => p.tpm) || [] },
             { label: "Input", color: "#6366F1", values: series?.llm.map((p) => p.inputTpm) || [] },
@@ -557,7 +647,10 @@ function LlmTab({
           timestamps={series?.llm.map((p) => p.timestamp) || []}
         />
       </div>
-      <TopConsumersTable top={top} />
+      <div className="grid gap-5 xl:grid-cols-[1fr_1fr]">
+        <ModelSubstitutionPanel data={failover} />
+        <TopConsumersTable top={top} />
+      </div>
     </div>
   );
 }

@@ -1568,17 +1568,20 @@ impl AppStore {
         let current_user_email = normalize_email(current_user_email)?;
         let now = Utc::now();
         let conn = self.conn.lock().await;
-        let (installation_id, owner_email): (String, String) = conn
+        let (installation_id, owner_email, shared_with_emails_json): (String, String, String) = conn
             .query_row(
-                "SELECT installation_id, owner_email FROM shares WHERE share_id = ?1",
+                "SELECT installation_id, owner_email, shared_with_emails_json FROM shares WHERE share_id = ?1",
                 params![share_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(|e| AppError::Internal(format!("query share owner failed: {e}")))?
             .ok_or_else(|| AppError::NotFound("share not found".into()))?;
         let owner_email = normalize_email(&owner_email)?;
-        let patch = normalize_share_settings_patch(patch, Some(&owner_email))?;
+        let shared_with_emails = parse_string_vec(Some(shared_with_emails_json))
+            .map_err(|e| AppError::Internal(format!("parse share acl failed: {e}")))?;
+        let patch =
+            normalize_share_settings_patch(patch, Some(&owner_email), Some(&shared_with_emails))?;
         if share_settings_patch_is_empty(&patch) {
             return Err(AppError::BadRequest("share settings patch is empty".into()));
         }
@@ -6032,7 +6035,8 @@ fn parse_rfc3339_row(value: String, index: usize) -> Result<DateTime<Utc>, rusql
 }
 
 fn share_settings_patch_is_empty(patch: &ShareSettingsPatch) -> bool {
-    patch.description.is_none()
+    patch.owner_email.is_none()
+        && patch.description.is_none()
         && patch.for_sale.is_none()
         && patch.market_access_mode.is_none()
         && patch.shared_with_emails.is_none()
@@ -6046,11 +6050,57 @@ fn share_settings_patch_is_empty(patch: &ShareSettingsPatch) -> bool {
 fn normalize_share_settings_patch(
     patch: ShareSettingsPatch,
     owner_email: Option<&str>,
+    current_shared_with_emails: Option<&[String]>,
 ) -> Result<ShareSettingsPatch, AppError> {
+    let current_owner_email = owner_email.unwrap_or("");
+    let next_owner_email = match patch.owner_email {
+        Some(value) => Some(normalize_email(&value)?),
+        None => None,
+    };
+    let effective_owner_email = next_owner_email.as_deref().unwrap_or(current_owner_email);
+    if let Some(next_owner_email) = next_owner_email.as_deref() {
+        if next_owner_email == current_owner_email {
+            return Err(AppError::BadRequest(
+                "new share owner email must be different".into(),
+            ));
+        }
+        let current_shared_normalized = normalize_email_list(
+            current_shared_with_emails.unwrap_or(&[]),
+            current_owner_email,
+        );
+        if !current_shared_normalized
+            .iter()
+            .any(|email| email == next_owner_email)
+        {
+            return Err(AppError::BadRequest(
+                "new share owner must already be a shareto email".into(),
+            ));
+        }
+    }
     let shared_with_emails = match patch.shared_with_emails {
         Some(values) => {
-            let owner_email = owner_email.unwrap_or("");
-            Some(normalize_email_list(&values, owner_email))
+            let mut normalized = normalize_email_list(&values, effective_owner_email);
+            if next_owner_email.is_some()
+                && !current_owner_email.is_empty()
+                && !normalized.iter().any(|email| email == current_owner_email)
+            {
+                normalized.push(current_owner_email.to_string());
+                normalized.sort();
+            }
+            Some(normalized)
+        }
+        None if next_owner_email.is_some() => {
+            let mut normalized = normalize_email_list(
+                current_shared_with_emails.unwrap_or(&[]),
+                effective_owner_email,
+            );
+            if !current_owner_email.is_empty()
+                && !normalized.iter().any(|email| email == current_owner_email)
+            {
+                normalized.push(current_owner_email.to_string());
+                normalized.sort();
+            }
+            Some(normalized)
         }
         None => None,
     };
@@ -6100,6 +6150,7 @@ fn normalize_share_settings_patch(
         }
     }
     Ok(ShareSettingsPatch {
+        owner_email: next_owner_email,
         description: match patch.description {
             Some(value) => Some(normalize_share_description(value)?),
             None => None,
@@ -11874,6 +11925,69 @@ mod tests {
             .expect_err("shared email should not create edit");
 
         assert!(err.to_string().contains("only share owner"));
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn owner_can_transfer_share_owner_to_existing_shared_email() {
+        let (store, config) = setup_store("share-settings-owner-transfer").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-edit", "edit-sub", "active").await;
+        set_share_shared_with_emails(
+            &store,
+            "share-edit",
+            &["shared@example.com", "other@example.com"],
+        )
+        .await;
+
+        let response = store
+            .create_share_settings_edit(
+                "share-edit",
+                "owner@example.com",
+                ShareSettingsPatch {
+                    owner_email: Some("shared@example.com".into()),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .await
+            .expect("owner can transfer share owner to shareto");
+
+        assert_eq!(
+            response.edit.patch.owner_email.as_deref(),
+            Some("shared@example.com")
+        );
+        assert_eq!(
+            response.edit.patch.shared_with_emails,
+            Some(vec!["other@example.com".into(), "owner@example.com".into()])
+        );
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn owner_cannot_transfer_share_owner_to_unshared_email() {
+        let (store, config) = setup_store("share-settings-owner-transfer-unshared").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-edit", "edit-sub", "active").await;
+        set_share_shared_with_emails(&store, "share-edit", &["shared@example.com"]).await;
+
+        let err = store
+            .create_share_settings_edit(
+                "share-edit",
+                "owner@example.com",
+                ShareSettingsPatch {
+                    owner_email: Some("stranger@example.com".into()),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .await
+            .expect_err("owner transfer target must already be shared");
+
+        assert!(
+            err.to_string()
+                .contains("new share owner must already be a shareto email")
+        );
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }

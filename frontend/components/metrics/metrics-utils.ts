@@ -8,6 +8,26 @@ export type ChartSeries = {
   values: number[];
 };
 
+/**
+ * Derives the base "is the pipeline healthy" state for charts from the
+ * snapshot. The chart itself decides no-data vs no-traffic from the series;
+ * this only covers states that the series alone cannot express: loading,
+ * collection disabled, and a collector that appears to have stopped.
+ */
+export function pipelineState(
+  snapshot: MetricsSnapshot | null,
+  loading: boolean,
+): "loading" | "disabled" | "stale" | "ready" {
+  if (loading && !snapshot) return "loading";
+  if (snapshot && snapshot.enabled === false) return "disabled";
+  if (snapshot?.lastPersistedAt) {
+    const ageSecs = Date.now() / 1000 - snapshot.lastPersistedAt;
+    const interval = Math.max(snapshot.sampleIntervalSecs || 5, 1);
+    if (ageSecs > Math.max(interval * 6, 60)) return "stale";
+  }
+  return "ready";
+}
+
 export function memoryPercent(host?: MetricsSnapshot["host"]) {
   if (!host?.memoryTotalBytes || !host.memoryUsedBytes) return undefined;
   return (host.memoryUsedBytes * 100) / host.memoryTotalBytes;
@@ -34,6 +54,21 @@ export function polyline(values: number[], width: number, height: number, max: n
       return `${x},${Math.max(0, Math.min(height, y))}`;
     })
     .join(" ");
+}
+
+/**
+ * Converts a monotonic counter series (e.g. `*_total`) into per-bucket deltas
+ * so charts show the rate of new events rather than an ever-rising staircase.
+ * Counter resets (process restart) clamp to 0 instead of going negative.
+ */
+export function deltaSeries(values: number[] | undefined): number[] {
+  if (!values || values.length === 0) return [];
+  const out: number[] = [0];
+  for (let i = 1; i < values.length; i += 1) {
+    const diff = values[i] - values[i - 1];
+    out.push(diff > 0 ? diff : 0);
+  }
+  return out;
 }
 
 // The router computes live threshold alerts into `snapshot.alerts` but does not

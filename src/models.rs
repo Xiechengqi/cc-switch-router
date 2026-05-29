@@ -475,6 +475,8 @@ pub struct ShareRuntimeRefreshRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareSettingsPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub for_sale: Option<String>,

@@ -4,8 +4,8 @@ import { Card, Chip } from "@heroui/react";
 import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import type { DiskUsage, HostMetricsInfo, MetricsHealth, MetricsSnapshot } from "@/lib/types";
-import { formatBytes, formatNumber, percent } from "@/lib/utils";
-import { diskPercent, type MetricTone } from "./metrics-utils";
+import { compactTokens, formatBytes, fixed, formatNumber, percent } from "@/lib/utils";
+import { diskPercent, type MetricTone, polyline } from "./metrics-utils";
 
 export function KpiGrid({ children }: { children: React.ReactNode }) {
   return (
@@ -19,38 +19,66 @@ export function KpiGrid({ children }: { children: React.ReactNode }) {
   );
 }
 
+function Sparkline({ values, tone }: { values: number[]; tone: MetricTone }) {
+  const clean = values.filter((v) => Number.isFinite(v));
+  if (clean.length < 2) return <div className="h-6" />;
+  const max = Math.max(1, ...clean);
+  const stroke = tone === "critical" ? "#EF4444" : tone === "warning" ? "#F59E0B" : "#0052FF";
+  return (
+    <svg viewBox="0 0 120 24" preserveAspectRatio="none" className="h-6 w-full">
+      <polyline
+        fill="none"
+        stroke={stroke}
+        strokeWidth="1.5"
+        strokeLinejoin="round"
+        points={polyline(clean, 120, 24, max)}
+      />
+    </svg>
+  );
+}
+
 export function MetricKpiCard({
   label,
   value,
   detail,
   icon,
   tone = "default",
+  spark,
+  emphasize = false,
 }: {
   label: string;
   value: React.ReactNode;
   detail: React.ReactNode;
   icon: React.ReactNode;
   tone?: MetricTone;
+  spark?: number[];
+  emphasize?: boolean;
 }) {
-  const toneClass =
+  const accent =
     tone === "critical"
-      ? "border-red-300 bg-red-50/60"
+      ? "before:bg-red-500"
       : tone === "warning"
-        ? "border-amber-300 bg-amber-50/60"
-        : "";
+        ? "before:bg-amber-500"
+        : "before:bg-gradient-to-b before:from-[var(--accent,#0052FF)] before:to-[#4D7CFF]";
+  const glow = tone === "critical" ? "after:bg-red-500/[0.06]" : "after:bg-transparent";
   return (
     <Card
-      className={`group h-full rounded-xl transition-all duration-200 hover:-translate-y-0.5 hover:shadow-lg ${toneClass}`}
+      className={`group relative h-full overflow-hidden rounded-2xl pl-1 transition-all duration-200 hover:-translate-y-0.5 hover:shadow-lg before:absolute before:inset-y-3 before:left-0 before:w-1 before:rounded-full ${accent} after:pointer-events-none after:absolute after:inset-0 after:blur-2xl ${glow}`}
     >
-      <Card.Content className="flex h-full items-center justify-between gap-3 p-4">
-        <div className="min-w-0">
-          <p className="text-sm text-muted-foreground">{label}</p>
-          <p className="mt-1 truncate text-lg font-semibold">{value}</p>
-          <p className="mt-1 truncate text-xs text-muted-foreground">{detail}</p>
+      <Card.Content className="flex h-full flex-col justify-between gap-2 p-4">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <p className="text-sm text-muted-foreground">{label}</p>
+            <p className={`mt-1 truncate font-semibold ${emphasize ? "gradient-text text-2xl" : "text-lg"}`}>
+              {value}
+            </p>
+            <p className="mt-1 truncate text-xs text-muted-foreground">{detail}</p>
+          </div>
+          <div className="rounded-lg bg-muted p-2.5 text-muted-foreground transition-transform duration-200 group-hover:scale-110 [&>svg]:h-5 [&>svg]:w-5">
+            {icon}
+          </div>
         </div>
-        <div className="rounded-lg bg-muted p-2.5 text-muted-foreground transition-transform duration-200 group-hover:scale-110 [&>svg]:h-5 [&>svg]:w-5">
-          {icon}
-        </div>
+        {spark && spark.length > 1 ? <Sparkline values={spark} tone={tone} /> : null}
       </Card.Content>
     </Card>
   );
@@ -136,11 +164,20 @@ export function HostInfoPanel({
   host?: MetricsSnapshot["host"];
 }) {
   const { t } = useLocaleText();
+  const swapText =
+    host?.swapTotalBytes && host.swapTotalBytes > 0
+      ? `${formatBytes(host?.swapUsedBytes)} / ${formatBytes(host?.swapTotalBytes)}`
+      : t("metrics.hostinfo.noSwap");
   const rows: Array<[string, React.ReactNode]> = [
     [t("metrics.hostinfo.hostname"), info?.hostname || "-"],
     [t("metrics.hostinfo.os"), `${info?.osName || "-"} ${info?.osVersion || ""}`],
     [t("metrics.hostinfo.kernel"), info?.kernelVersion || "-"],
     [t("metrics.hostinfo.cpu"), info?.cpuBrand || "-"],
+    [
+      t("metrics.hostinfo.load"),
+      `${fixed(host?.load1)} · ${fixed(host?.load5)} · ${fixed(host?.load15)}`,
+    ],
+    [t("metrics.hostinfo.swap"), swapText],
     [
       t("metrics.hostinfo.tcp"),
       t("metrics.hostinfo.tcpValue", {
@@ -168,9 +205,66 @@ export function HostInfoPanel({
 
 export function StatusChip({ status }: { status: MetricsHealth | string }) {
   const color = status === "critical" ? "danger" : status === "warning" ? "warning" : "success";
+  const dot = status === "critical" ? "bg-red-500" : status === "warning" ? "bg-amber-500" : "bg-emerald-500";
+  const pulse = status === "critical" || status === "warning";
   return (
     <Chip color={color} size="sm" variant="soft">
+      <span className="mr-1.5 inline-flex h-2 w-2">
+        {pulse ? (
+          <span className={`absolute inline-flex h-2 w-2 animate-ping rounded-full ${dot} opacity-70`} />
+        ) : null}
+        <span className={`relative inline-flex h-2 w-2 rounded-full ${dot}`} />
+      </span>
       {status}
     </Chip>
+  );
+}
+
+/**
+ * The one inverted (dark) section called for by the design system — a live
+ * pulse strip that breaks up the light theme and spotlights the headline LLM
+ * numbers. Uses current snapshot values, not historical totals, so it stays
+ * truthful without a separate aggregate query.
+ */
+export function LiveSummaryStrip({ snapshot }: { snapshot: MetricsSnapshot | null }) {
+  const { t } = useLocaleText();
+  const llm = snapshot?.llm;
+  const items: Array<[string, React.ReactNode, string]> = [
+    [t("metrics.kpi.rpm"), fixed(llm?.rpm), t("metrics.detail.requestsPerMin")],
+    [t("metrics.kpi.tpm"), compactTokens(llm?.tpm), t("metrics.live.tokensPerMin")],
+    [
+      t("metrics.kpi.errorRate"),
+      percent((llm?.errorRate || 0) * 100),
+      t("metrics.live.last5m"),
+    ],
+    [
+      t("metrics.live.shares"),
+      formatNumber(llm?.activeShares),
+      t("metrics.live.activeModels", { count: formatNumber(llm?.activeModels) }),
+    ],
+  ];
+  return (
+    <div
+      className="relative overflow-hidden rounded-2xl bg-[var(--foreground,#0F172A)] px-6 py-5 text-[var(--background,#FAFAFA)]"
+      style={{
+        backgroundImage:
+          "radial-gradient(circle at 1px 1px, rgba(255,255,255,0.06) 1px, transparent 1px)",
+        backgroundSize: "28px 28px",
+      }}
+    >
+      <div
+        className="pointer-events-none absolute -right-16 -top-16 h-48 w-48 rounded-full opacity-30 blur-[120px]"
+        style={{ background: "var(--accent,#0052FF)" }}
+      />
+      <div className="relative grid grid-cols-2 gap-6 md:grid-cols-4">
+        {items.map(([label, value, hint]) => (
+          <div key={label}>
+            <p className="font-mono text-[10px] uppercase tracking-[0.15em] opacity-60">{label}</p>
+            <p className="mt-1 font-display text-3xl leading-none">{value}</p>
+            <p className="mt-1 text-xs opacity-50">{hint}</p>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }

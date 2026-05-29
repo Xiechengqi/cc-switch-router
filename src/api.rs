@@ -210,7 +210,7 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/admin/metrics/llm/series", get(admin_metrics_series))
         .route("/v1/admin/metrics/llm/top", get(admin_metrics_llm_top))
         .route("/v1/admin/metrics/llm/errors", get(admin_metrics_events))
-        .route("/v1/admin/metrics/llm/failover", get(admin_metrics_events))
+        .route("/v1/admin/metrics/llm/failover", get(admin_metrics_llm_failover))
         .route("/v1/admin/metrics/events", get(admin_metrics_events))
         .route("/v1/admin/metrics", delete(admin_metrics_clear))
         .route("/_market/proxy/:share_id/*path", any(market_proxy_handler))
@@ -2696,6 +2696,22 @@ async fn admin_metrics_events(
             .metrics
             .store()
             .events(query.limit.unwrap_or(100).min(500))
+            .await?,
+    ))
+}
+
+async fn admin_metrics_llm_failover(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<crate::metrics::models::MetricsRangeQuery>,
+) -> Result<Json<crate::metrics::models::LlmReliabilityResponse>, AppError> {
+    require_admin_session(&state, &headers).await?;
+    let range = query.range.unwrap_or_else(|| "1h".into());
+    Ok(Json(
+        state
+            .metrics
+            .store()
+            .llm_reliability(range, query.limit.unwrap_or(10).min(50))
             .await?,
     ))
 }

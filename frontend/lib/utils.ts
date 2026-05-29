@@ -46,6 +46,15 @@ export function compactTokens(value: unknown) {
   return String(n);
 }
 
+export function compactNumber(value: unknown) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "0";
+  if (Math.abs(n) >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (Math.abs(n) >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  if (Number.isInteger(n)) return String(n);
+  return n.toFixed(Math.abs(n) >= 10 ? 0 : 1);
+}
+
 export function fixed(value: unknown) {
   const n = Number(value);
   return Number.isFinite(n) ? n.toFixed(n >= 10 ? 0 : 1) : "-";

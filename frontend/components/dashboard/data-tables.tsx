@@ -437,10 +437,10 @@ function SupportCell({ share, t }: { share?: ShareView; t: TFn }) {
           <div key={key} title={enabled ? modelHealthTitle(share, key) : undefined} className={`grid grid-cols-[56px_1fr] gap-2 rounded-lg border px-2 py-1.5 text-[11px] ${tone.className}`}>
             <span className="font-mono uppercase">{label}</span>
             <span className="grid min-w-0 gap-0.5 text-right">
-              <span className="whitespace-normal break-words font-semibold">{enabled ? providerAccountLevel(runtime) : t("dashboard.off")}</span>
-              <span className="whitespace-normal break-words text-[10px] font-medium opacity-75">{enabled ? providerAccountIdentity(runtime) : "-"}</span>
-              <span className="whitespace-normal break-words text-[10px] font-medium opacity-75">{enabled ? providerModelMap(runtime) : "-"}</span>
-              <span className="text-[10px] font-semibold opacity-70">{enabled ? tone.label : "-"}</span>
+              <span className="whitespace-normal break-words font-semibold">{enabled ? providerAccountLevel(runtime) : ""}</span>
+              <span className="whitespace-normal break-words text-[10px] font-medium opacity-75">{enabled ? providerAccountIdentity(runtime) : ""}</span>
+              <span className="whitespace-normal break-words text-[10px] font-medium opacity-75">{enabled ? providerModelMap(runtime) : ""}</span>
+              <span className="text-[10px] font-semibold opacity-70">{enabled ? tone.label : ""}</span>
             </span>
           </div>
         );
@@ -545,8 +545,10 @@ function ShareEditDialog({
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
   const [confirmFreeOpen, setConfirmFreeOpen] = React.useState(false);
+  const [transferTargetEmail, setTransferTargetEmail] = React.useState("");
   const [marketSelectKey, setMarketSelectKey] = React.useState(0);
   const readOnly = !!share && !share.canManage;
+  const transferableShareEmails = splitEmails((share?.sharedWithEmails || []).join("\n"));
 
   React.useEffect(() => {
     if (!share) return;
@@ -593,6 +595,7 @@ function ShareEditDialog({
     setPriceInputs(initialPricing);
     setError(share.activeEdit?.status === "rejected" ? share.activeEdit.errorMessage || "上一轮应用失败" : "");
     setConfirmFreeOpen(false);
+    setTransferTargetEmail("");
     setMarketSelectKey((current) => current + 1);
   }, [share]);
 
@@ -707,6 +710,31 @@ function ShareEditDialog({
       patch.forSaleOfficialPricePercentByApp = pricingPayload;
       await updateShareSettings(share.shareId, patch);
       await onSaved();
+      onClose();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const transferOwner = async () => {
+    if (!share || readOnly || busy || !transferTargetEmail) return;
+    setBusy(true);
+    setError("");
+    try {
+      const targetEmail = transferTargetEmail.toLowerCase();
+      const shared = splitEmails(sharedWithEmails);
+      const nextShared = Array.from(new Set([
+        ...shared.filter((email) => email !== targetEmail),
+        share.ownerEmail || "",
+      ].filter(Boolean))).sort();
+      await updateShareSettings(share.shareId, {
+        ownerEmail: targetEmail,
+        sharedWithEmails: nextShared,
+      });
+      await onSaved();
+      setTransferTargetEmail("");
       onClose();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -854,6 +882,18 @@ function ShareEditDialog({
                       disabled={readOnly}
 	                    onChange={(event) => setSharedWithEmails(event.target.value)}
 	                  />
+                  {!readOnly && transferableShareEmails.length ? (
+                    <div className="mt-3 grid gap-2 rounded-lg border border-slate-200 bg-slate-50 p-3">
+                      <div className="text-xs font-medium text-muted-foreground">升级 shareto 为 owner</div>
+                      <div className="flex flex-wrap gap-2">
+                        {transferableShareEmails.map((email) => (
+                          <Button key={email} size="sm" variant="outline" onClick={() => setTransferTargetEmail(email)} isDisabled={busy}>
+                            设为 Owner <span className="font-mono">{email}</span>
+                          </Button>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
                 </FieldGroup>
 
                 <div className="grid gap-3 sm:grid-cols-2">
@@ -988,6 +1028,16 @@ function ShareEditDialog({
           setConfirmFreeOpen(false);
         }}
         onOpenChange={(open) => !open && setConfirmFreeOpen(false)}
+      />
+      <ConfirmAlertDialog
+        open={Boolean(transferTargetEmail)}
+        title="转移 Owner?"
+        description={`将 ${transferTargetEmail || "-"} 升级为 owner，并把当前 owner ${share?.ownerEmail || "-"} 降级为 shareto。`}
+        confirmLabel="确认转移"
+        cancelLabel="取消"
+        tone="danger"
+        onConfirm={transferOwner}
+        onOpenChange={(open) => !open && setTransferTargetEmail("")}
       />
     </>
   );

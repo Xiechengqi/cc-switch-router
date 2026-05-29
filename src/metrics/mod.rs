@@ -24,6 +24,7 @@ use self::store::MetricsStore;
 #[derive(Debug)]
 pub struct MetricsRegistry {
     enabled: bool,
+    sample_interval_secs: u64,
     store: MetricsStore,
     sampler: Mutex<HostSampler>,
     last_host: Mutex<Option<HostMetricsStatus>>,
@@ -45,8 +46,10 @@ pub struct MetricsRegistry {
 
 impl MetricsRegistry {
     pub fn new(config: MetricsConfig) -> Arc<Self> {
+        let sample_interval_secs = config.sample_interval_secs.max(1);
         Arc::new(Self {
             enabled: config.enabled,
+            sample_interval_secs,
             store: MetricsStore::new(config.db_path, config.retention_days),
             sampler: Mutex::new(HostSampler::default()),
             last_host: Mutex::new(None),
@@ -95,8 +98,19 @@ impl MetricsRegistry {
     ) -> Result<(), AppError> {
         let host = self.current_host_status(config).await;
         let router = self.router_status(proxy).await;
+        let llm = if self.enabled {
+            self.store.llm_snapshot(5 * 60).await.unwrap_or_default()
+        } else {
+            LlmMetricsSnapshot::default()
+        };
         if self.enabled {
-            self.store.insert_sample(host, router).await?;
+            self.store.insert_sample(host.clone(), router.clone()).await?;
+            let alerts = build_alerts(&host, &router, &llm);
+            for event in alerts {
+                if let Err(err) = self.store.insert_event_deduped(event).await {
+                    debug!("persist metric alert failed: {err}");
+                }
+            }
         }
         Ok(())
     }
@@ -124,9 +138,17 @@ impl MetricsRegistry {
                     (other, _) => other,
                 }
             });
+        let last_persisted_at = if self.enabled {
+            self.store.latest_sample_timestamp().await.unwrap_or(None)
+        } else {
+            None
+        };
         Ok(MetricsSnapshot {
             status,
             sampled_at: host.timestamp,
+            enabled: self.enabled,
+            sample_interval_secs: self.sample_interval_secs,
+            last_persisted_at,
             host,
             router,
             llm,

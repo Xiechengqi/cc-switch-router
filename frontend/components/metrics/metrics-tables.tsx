@@ -3,9 +3,8 @@
 import { Card, ScrollShadow } from "@heroui/react";
 import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import type { LlmTopResponse, MetricEvent, MetricsSnapshot } from "@/lib/types";
-import { compactTokens, formatDateTime, formatNumber, percent } from "@/lib/utils";
-import { StatusChip } from "./metrics-cards";
+import type { LlmReliabilityResponse, LlmTopResponse, MetricEvent, MetricsSnapshot } from "@/lib/types";
+import { compactTokens, formatNumber, formatDateTime, percent } from "@/lib/utils";
 
 export function SimpleTable({ headers, rows }: { headers: string[]; rows: React.ReactNode[][] }) {
   const { t } = useLocaleText();
@@ -103,49 +102,103 @@ export function TopConsumersTable({ top }: { top: LlmTopResponse | null }) {
   );
 }
 
+export function ModelSubstitutionPanel({ data }: { data: LlmReliabilityResponse | null }) {
+  const { t } = useLocaleText();
+  const subRate = data ? data.substitutionRate * 100 : 0;
+  const successRate =
+    data?.substitutionSuccessRate != null ? data.substitutionSuccessRate * 100 : null;
+  return (
+    <Card className="rounded-2xl">
+      <Card.Header>
+        <Card.Title className="text-base font-semibold tracking-[-0.01em]">
+          {t("metrics.panel.substitution")}
+        </Card.Title>
+        <Card.Description>{t("metrics.panel.substitutionDesc")}</Card.Description>
+      </Card.Header>
+      <Card.Content>
+        <div className="mb-4 grid grid-cols-3 gap-3">
+          <div className="rounded-xl border bg-muted/30 p-3">
+            <div className="text-xs text-muted-foreground">{t("metrics.sub.total")}</div>
+            <div className="mt-1 font-display text-xl">{formatNumber(data?.totalRequests)}</div>
+          </div>
+          <div className="rounded-xl border bg-muted/30 p-3">
+            <div className="text-xs text-muted-foreground">{t("metrics.sub.rate")}</div>
+            <div className="mt-1 font-display text-xl">{percent(subRate)}</div>
+            <div className="text-[11px] text-muted-foreground">
+              {formatNumber(data?.substitutedRequests)}
+            </div>
+          </div>
+          <div className="rounded-xl border bg-muted/30 p-3">
+            <div className="text-xs text-muted-foreground">{t("metrics.sub.success")}</div>
+            <div className="mt-1 font-display text-xl">
+              {successRate != null ? percent(successRate) : "-"}
+            </div>
+          </div>
+        </div>
+        <SimpleTable
+          headers={[
+            t("metrics.header.requested"),
+            t("metrics.header.actual"),
+            t("metrics.header.requests"),
+            t("metrics.header.errorRate"),
+          ]}
+          rows={(data?.items || []).map((item) => [
+            <span key="r" className="font-mono text-xs">{item.requestedModel}</span>,
+            <span key="a" className="font-mono text-xs text-accent">{item.actualModel}</span>,
+            formatNumber(item.requests),
+            percent(item.errorRate * 100),
+          ])}
+        />
+      </Card.Content>
+    </Card>
+  );
+}
+
 export function MetricEventsList({ events, full = false }: { events: MetricEvent[]; full?: boolean }) {
   const { t } = useLocaleText();
+  const dotFor = (severity: string) =>
+    severity === "critical" ? "bg-red-500" : severity === "warning" ? "bg-amber-500" : "bg-slate-400";
   return (
-    <Card className="rounded-xl">
+    <Card className="rounded-2xl">
       <Card.Header>
-        <Card.Title>{t("metrics.panel.recentAlerts")}</Card.Title>
+        <Card.Title className="text-base font-semibold tracking-[-0.01em]">
+          {t("metrics.panel.recentAlerts")}
+        </Card.Title>
         <Card.Description>{t("metrics.panel.eventsCount", { count: events.length })}</Card.Description>
       </Card.Header>
       <Card.Content>
-        <ScrollShadow className={full ? "max-h-[520px]" : "max-h-[320px]"}>
-          <div className="grid gap-2 pr-2">
-            {events.length === 0 ? (
-              <p className="text-sm text-muted-foreground">{t("metrics.panel.noAlerts")}</p>
-            ) : (
-              events.map((event, index) => (
-                <div key={`${event.timestamp}-${event.kind}-${index}`} className="rounded-lg border p-2.5">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="flex items-center gap-2">
-                      <StatusChip
-                        status={
-                          event.severity === "critical"
-                            ? "critical"
-                            : event.severity === "warning"
-                              ? "warning"
-                              : "healthy"
-                        }
-                      />
-                      <span className="text-sm font-medium">{event.kind}</span>
+        <ScrollShadow className={full ? "max-h-[560px]" : "max-h-[320px]"}>
+          {events.length === 0 ? (
+            <p className="text-sm text-muted-foreground">{t("metrics.panel.noAlerts")}</p>
+          ) : (
+            <ol className="relative grid gap-1 pr-2">
+              <span className="absolute bottom-2 left-[5px] top-2 w-px bg-border" aria-hidden />
+              {events.map((event, index) => (
+                <li
+                  key={`${event.timestamp}-${event.kind}-${index}`}
+                  className="relative grid grid-cols-[16px_1fr] gap-3 rounded-lg py-2 pl-0.5 pr-2 transition-colors hover:bg-gradient-to-r hover:from-accent/[0.04] hover:to-transparent"
+                >
+                  <span className={`relative z-10 mt-1.5 h-2.5 w-2.5 rounded-full ring-4 ring-card ${dotFor(event.severity)}`} />
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="font-mono text-xs uppercase tracking-[0.1em] text-foreground/80">
+                        {event.kind}
+                      </span>
+                      <span className="text-xs text-muted-foreground">
+                        {formatDateTime(event.timestamp * 1000)}
+                      </span>
                     </div>
-                    <span className="text-xs text-muted-foreground">
-                      {formatDateTime(event.timestamp * 1000)}
-                    </span>
+                    <p className="mt-1 text-sm">{event.message}</p>
+                    {full ? (
+                      <pre className="mt-2 overflow-auto rounded-lg bg-muted p-2 text-xs text-muted-foreground">
+                        {JSON.stringify(event.details || {}, null, 2)}
+                      </pre>
+                    ) : null}
                   </div>
-                  <p className="mt-2 text-sm">{event.message}</p>
-                  {full ? (
-                    <pre className="mt-2 overflow-auto rounded bg-muted p-2 text-xs text-muted-foreground">
-                      {JSON.stringify(event.details || {}, null, 2)}
-                    </pre>
-                  ) : null}
-                </div>
-              ))
-            )}
-          </div>
+                </li>
+              ))}
+            </ol>
+          )}
         </ScrollShadow>
       </Card.Content>
     </Card>
