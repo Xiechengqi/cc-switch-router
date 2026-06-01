@@ -781,6 +781,8 @@ pub async fn proxy_handler(
     let backend = route.backend.clone();
     let route_share_token = route.share_token.clone();
     let is_health_check_request = is_share_router_probe || is_share_model_health_check;
+    let is_direct_share_web_request =
+        route.share_id.is_some() && is_allowed_direct_share_web_path(&path);
     if is_legacy_share_router_ping {
         let legacy_log_token = route_share_token
             .as_deref()
@@ -838,7 +840,10 @@ pub async fn proxy_handler(
     // User-facing credentials terminate at the router. The client only sees
     // the internal share secret registered with this tunnel route.
     let mut api_user_email = None;
-    if !is_internal_share_router_path && !is_share_model_health_check {
+    if !is_internal_share_router_path
+        && !is_share_model_health_check
+        && !is_direct_share_web_request
+    {
         if let Some(share_id) = route.share_id.as_deref() {
             let Some(user_token) = crate::api::extract_router_api_token(&parts.headers) else {
                 return simple_response(StatusCode::UNAUTHORIZED, "missing-router-api-token");
@@ -931,6 +936,10 @@ pub async fn proxy_handler(
     if let Some(ref tok) = effective_token {
         builder = builder.header("X-Share-Token", tok.as_str());
     }
+    if let Some(ref share_id) = route.share_id {
+        builder = builder.header("X-CC-Switch-Share-Id", share_id.as_str());
+    }
+    builder = builder.header("X-CC-Switch-Share-Subdomain", route.subdomain.as_str());
     if let Some(ref email) = api_user_email {
         builder = builder.header("X-CC-Switch-User-Email", email.as_str());
     }
@@ -940,7 +949,10 @@ pub async fn proxy_handler(
         .map(mask_token)
         .unwrap_or_else(|| "-".to_string());
 
-    let share_permit = if is_internal_share_router_path || is_share_model_health_check {
+    let share_permit = if is_internal_share_router_path
+        || is_share_model_health_check
+        || is_direct_share_web_request
+    {
         None
     } else if let Some(share_id) = route.share_id.as_deref() {
         match state
@@ -997,6 +1009,7 @@ pub async fn proxy_handler(
 
     let free_share_ip_permit = if !is_internal_share_router_path
         && !is_share_model_health_check
+        && !is_direct_share_web_request
         && route.is_free_share
         && state.config.free_share_ip_limit_enabled()
     {
@@ -1031,28 +1044,30 @@ pub async fn proxy_handler(
     // Record the request for the dashboard's demand/ticker stream and propagate the
     // generated identity downstream so share clients can write the same request id back
     // in their request logs.
-    let live_request_id =
-        if !is_internal_share_router_path && !is_share_router_probe && !is_share_model_health_check
-        {
-            if let Some(share_id) = route.share_id.as_deref() {
-                Some(
-                    state
-                        .recent_traffic
-                        .record(
-                            share_id.to_string(),
-                            route.share_name.clone(),
-                            Some(route.subdomain.clone()),
-                            client_metadata.country_code.clone(),
-                            api_user_email.clone(),
-                        )
-                        .await,
-                )
-            } else {
-                None
-            }
+    let live_request_id = if !is_internal_share_router_path
+        && !is_share_router_probe
+        && !is_share_model_health_check
+        && !is_direct_share_web_request
+    {
+        if let Some(share_id) = route.share_id.as_deref() {
+            Some(
+                state
+                    .recent_traffic
+                    .record(
+                        share_id.to_string(),
+                        route.share_name.clone(),
+                        Some(route.subdomain.clone()),
+                        client_metadata.country_code.clone(),
+                        api_user_email.clone(),
+                    )
+                    .await,
+            )
         } else {
             None
-        };
+        }
+    } else {
+        None
+    };
     if let Some(ref request_id) = live_request_id {
         builder = builder.header("X-CC-Switch-Request-Id", request_id.as_str());
     }
@@ -1264,6 +1279,10 @@ fn is_invalid_auth_status(status: StatusCode) -> bool {
 }
 
 fn is_allowed_direct_share_proxy_path(path: &str) -> bool {
+    is_allowed_direct_share_api_path(path) || is_allowed_direct_share_web_path(path)
+}
+
+fn is_allowed_direct_share_api_path(path: &str) -> bool {
     path == "/v1"
         || path.starts_with("/v1/")
         || path == "/v1beta"
@@ -1271,6 +1290,14 @@ fn is_allowed_direct_share_proxy_path(path: &str) -> bool {
         || path == "/gemini/v1beta"
         || path.starts_with("/gemini/v1beta/")
         || path.starts_with("/_share-router/")
+}
+
+fn is_allowed_direct_share_web_path(path: &str) -> bool {
+    path == "/"
+        || path == "/favicon.ico"
+        || path.starts_with("/assets/")
+        || path == "/web-api/context"
+        || path.starts_with("/web-api/invoke/")
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -1577,9 +1604,20 @@ mod tests {
     }
 
     #[test]
-    fn direct_share_proxy_path_still_rejects_non_api_paths() {
+    fn direct_share_proxy_path_allows_web_shell_paths() {
+        assert!(is_allowed_direct_share_proxy_path("/"));
+        assert!(is_allowed_direct_share_proxy_path("/favicon.ico"));
+        assert!(is_allowed_direct_share_proxy_path("/assets/index-abc.js"));
+        assert!(is_allowed_direct_share_proxy_path("/web-api/context"));
+        assert!(is_allowed_direct_share_proxy_path(
+            "/web-api/invoke/list_shares"
+        ));
+    }
+
+    #[test]
+    fn direct_share_proxy_path_still_rejects_unknown_paths() {
         assert!(!is_allowed_direct_share_proxy_path("/health"));
-        assert!(!is_allowed_direct_share_proxy_path("/favicon.ico"));
+        assert!(!is_allowed_direct_share_proxy_path("/settings"));
     }
 }
 

@@ -1680,6 +1680,7 @@ async fn refresh_share_runtime(
         &state.config,
         &client,
         &refresh.subdomain,
+        &refresh.share_id,
     )
     .await?;
     state.store.record_share_runtime_snapshot(snapshot).await?;

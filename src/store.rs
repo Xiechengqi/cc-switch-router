@@ -21,8 +21,6 @@ use crate::ServerGeo;
 use crate::config::Config;
 use crate::dynamic_settings::BoardSettings;
 use crate::error::AppError;
-#[cfg(test)]
-use crate::models::ShareUpstreamModel;
 use crate::models::{
     AuthSession, AuthUser, BindInstallationOwnerEmailRequest, BindInstallationOwnerEmailResponse,
     BoardMessageListResponse, BoardMessageView, BoardMetaResponse,
@@ -37,18 +35,20 @@ use crate::models::{
     MarketRequestLogBatchSyncRequest, MarketRequestLogEntry, MarketShareView, ModelHealthSummary,
     PublicMapClientPoint, PublicMapPointsResponse, PublicMarketConfig, RefreshSessionRequest,
     RegisterInstallationRequest, RegisterInstallationResponse, RegisterMarketRequest,
-    RequestEmailCodeRequest, RequestEmailCodeResponse, SessionStatusResponse, ShareAppProvider,
-    ShareAppProviders, ShareAppRuntimes, ShareBatchSyncRequest, ShareClaimPayload,
-    ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptor, ShareEditAckRequest,
-    ShareEditView, ShareHeartbeatRequest, ShareMarketLinkView, ShareModelHealthCheckEntry,
-    ShareModelHealthSummary, SharePendingEditsRequest, SharePendingEditsResponse,
-    ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRequestLogFetchResponse,
-    ShareRuntimeRefreshPayload, ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse,
-    ShareSettingsPatch, ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest,
+    RequestEmailCodeRequest, RequestEmailCodeResponse, SessionStatusResponse, ShareAppProviders,
+    ShareAppRuntimes, ShareBatchSyncRequest, ShareClaimPayload, ShareClaimSubdomainRequest,
+    ShareDeleteRequest, ShareDescriptor, ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest,
+    ShareMarketLinkView, ShareModelHealthCheckEntry, ShareModelHealthSummary,
+    SharePendingEditsRequest, SharePendingEditsResponse, ShareRequestLogBatchSyncRequest,
+    ShareRequestLogEntry, ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload,
+    ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse, ShareSettingsPatch,
+    ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest,
     ShareUpstreamProvider, ShareView, TunnelLease, UserApiTokenResetResponse, UserApiTokenResponse,
     UserApiTokenStatus, UserShareView, UserSharesResponse, VerifyEmailCodeRequest,
     VerifyEmailCodeResponse,
 };
+#[cfg(test)]
+use crate::models::{ShareAppProvider, ShareUpstreamModel};
 use crate::proxy::ProxyRegistry;
 
 const SHARE_REQUEST_LOG_RECOVERY_LIMIT: usize = 10;
@@ -4380,9 +4380,15 @@ pub async fn fetch_share_runtime_snapshot_from_route(
     config: &Config,
     client: &reqwest::Client,
     subdomain: &str,
+    share_id: &str,
 ) -> Result<ShareRuntimeSnapshotResponse, AppError> {
+    // 多 share 模式：同一 cc-switch 可能挂多个 share。
+    // 用 `?shareId=...` 显式定位，避免老路径"取第一个 share"的歧义。
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("shareId", share_id)
+        .finish();
     let url = format!(
-        "{}/_share-router/share-runtime",
+        "{}/_share-router/share-runtime?{query}",
         config.tunnel_url(subdomain)
     );
     let response = client
@@ -4410,7 +4416,6 @@ fn upsert_share_tx(
     installation_id: &str,
     share: ShareDescriptor,
 ) -> Result<(), AppError> {
-    let keep_share_id = share.share_id.clone();
     let description = normalize_share_description(share.description.clone())?;
     let for_sale = normalize_share_for_sale(&share.for_sale)?;
     let market_access_mode = normalize_market_access_mode(&share.market_access_mode)?;
@@ -4483,51 +4488,7 @@ fn upsert_share_tx(
         ],
     )
     .map_err(map_share_constraint_error)?;
-    delete_other_shares_for_installation_tx(conn, installation_id, &keep_share_id)?;
     Ok(())
-}
-
-fn delete_other_shares_for_installation_tx(
-    conn: &Connection,
-    installation_id: &str,
-    keep_share_id: &str,
-) -> Result<usize, AppError> {
-    let old_share_ids = {
-        let mut stmt = conn
-            .prepare(
-                "SELECT share_id FROM shares
-                 WHERE installation_id = ?1 AND share_id != ?2",
-            )
-            .map_err(|e| AppError::Internal(format!("prepare old shares cleanup failed: {e}")))?;
-        let rows = stmt
-            .query_map(params![installation_id, keep_share_id], |row| {
-                row.get::<_, String>(0)
-            })
-            .map_err(|e| AppError::Internal(format!("query old shares cleanup failed: {e}")))?;
-        collect_rows(rows)?
-    };
-
-    for old_share_id in &old_share_ids {
-        conn.execute(
-            "DELETE FROM share_request_logs WHERE share_id = ?1",
-            params![old_share_id],
-        )
-        .map_err(|e| AppError::Internal(format!("delete old share request logs failed: {e}")))?;
-        conn.execute(
-            "DELETE FROM share_health_checks WHERE share_id = ?1",
-            params![old_share_id],
-        )
-        .map_err(|e| AppError::Internal(format!("delete old share health checks failed: {e}")))?;
-    }
-
-    let deleted = conn
-        .execute(
-            "DELETE FROM shares
-             WHERE installation_id = ?1 AND share_id != ?2",
-            params![installation_id, keep_share_id],
-        )
-        .map_err(|e| AppError::Internal(format!("delete old installation shares failed: {e}")))?;
-    Ok(deleted)
 }
 
 fn delete_all_shares_for_installation_tx(
@@ -11984,8 +11945,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_share_removes_other_installation_shares_but_keeps_market_logs() {
-        let (store, config) = setup_store("single-share-upsert-cleanup").await;
+    async fn upsert_share_preserves_other_installation_shares_and_logs() {
+        let (store, config) = setup_store("multi-share-upsert-preserve").await;
         insert_installation(&store, "inst-clean").await;
         insert_share(&store, "inst-clean", "share-old", "old-sub", "active").await;
         insert_health_check(&store, "share-old", Utc::now().timestamp(), true).await;
@@ -12086,10 +12047,10 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("count old market logs");
-        assert_eq!(old_share_count, 0);
+        assert_eq!(old_share_count, 1);
         assert_eq!(new_share_count, 1);
-        assert_eq!(old_share_logs, 0);
-        assert_eq!(old_health, 0);
+        assert_eq!(old_share_logs, 1);
+        assert_eq!(old_health, 1);
         assert_eq!(old_market_logs, 1);
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));

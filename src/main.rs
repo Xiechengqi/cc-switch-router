@@ -486,7 +486,14 @@ async fn run_share_runtime_refresh_cycle(
         proxy.active_subdomains().await,
     );
     for target in targets {
-        match fetch_share_runtime_snapshot_from_route(config, client, &target.subdomain).await {
+        match fetch_share_runtime_snapshot_from_route(
+            config,
+            client,
+            &target.subdomain,
+            &target.share_id,
+        )
+        .await
+        {
             Ok(snapshot) => {
                 record_runtime_model_health_traffic(recent_traffic, &target, &snapshot).await;
                 if let Err(err) = store.record_share_runtime_snapshot(snapshot).await {
