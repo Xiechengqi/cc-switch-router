@@ -325,7 +325,6 @@ function OverviewTab({
   const llmPts = series?.llm || [];
   return (
     <div className="grid animate-fade-in-up gap-5">
-      <div className="section-label">{t("metrics.tab.overview")}</div>
       <LiveSummaryStrip snapshot={snapshot} />
       <KpiGrid>
         <MetricKpiCard
@@ -430,7 +429,6 @@ function HostTab({
   const hostPts = series?.host || [];
   return (
     <div className="grid animate-fade-in-up gap-5">
-      <div className="section-label">{t("metrics.tab.host")}</div>
       <KpiGrid>
         <MetricKpiCard
           label={t("metrics.kpi.uptime")}
@@ -498,7 +496,6 @@ function RouterTab({
   const routerPts = series?.router || [];
   return (
     <div className="grid animate-fade-in-up gap-5">
-      <div className="section-label">{t("metrics.tab.router")}</div>
       <KpiGrid>
         <MetricKpiCard
           label={t("metrics.kpi.activeRoutes")}
@@ -578,7 +575,6 @@ function LlmTab({
   const cachePct = llm?.cacheHitRate != null ? llm.cacheHitRate * 100 : null;
   return (
     <div className="grid animate-fade-in-up gap-5">
-      <div className="section-label">{t("metrics.tab.llm")}</div>
       <KpiGrid>
         <MetricKpiCard
           label={t("metrics.kpi.rpm")}
@@ -656,10 +652,8 @@ function LlmTab({
 }
 
 function EventsTab({ events }: { events: MetricEvent[] }) {
-  const { t } = useLocaleText();
   return (
     <div className="grid animate-fade-in-up gap-5">
-      <div className="section-label">{t("metrics.tab.events")}</div>
       <MetricEventsList events={events} full />
     </div>
   );

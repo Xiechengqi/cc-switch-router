@@ -710,6 +710,14 @@ fn opt_i64_to_u64(value: Option<i64>) -> Option<u64> {
     value.and_then(|v| u64::try_from(v).ok())
 }
 
+fn opt_f64_to_u64(value: Option<f64>) -> Option<u64> {
+    let value = value?;
+    if !value.is_finite() || value < 0.0 || value > u64::MAX as f64 {
+        return None;
+    }
+    Some(value.round() as u64)
+}
+
 fn load_host_series(
     conn: &Connection,
     start_ts: i64,
@@ -741,7 +749,7 @@ fn load_host_series(
                 fd_usage_percent: row.get(4)?,
                 rx_bytes_per_sec: row.get(5)?,
                 tx_bytes_per_sec: row.get(6)?,
-                process_rss_bytes: opt_i64_to_u64(row.get(7)?),
+                process_rss_bytes: opt_f64_to_u64(row.get(7)?),
             })
         })
         .map_err(|err| AppError::Internal(format!("query host metrics series failed: {err}")))?;
@@ -1295,6 +1303,64 @@ fn load_events(conn: &Connection, limit: usize) -> Result<Vec<MetricEvent>, AppE
         })
         .map_err(|err| AppError::Internal(format!("query metric events failed: {err}")))?;
     collect_rows(rows, "metric events")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metrics::models::{DiskUsage, NetworkMetricsStatus, ProcessMetricsStatus};
+
+    #[test]
+    fn host_series_reads_avg_rss_as_real() {
+        let conn = Connection::open_in_memory().expect("open in-memory metrics db");
+        init_metrics_db(&conn).expect("init metrics db");
+
+        insert_host_metrics(&conn, &host_sample(900, 100)).expect("insert first host sample");
+        insert_host_metrics(&conn, &host_sample(910, 102)).expect("insert second host sample");
+
+        let series = load_host_series(&conn, 900, 929, 30).expect("load host series");
+
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].timestamp, 900);
+        assert_eq!(series[0].process_rss_bytes, Some(101));
+    }
+
+    fn host_sample(timestamp: i64, rss_bytes: u64) -> HostMetricsStatus {
+        HostMetricsStatus {
+            timestamp,
+            uptime_secs: Some(120),
+            cpu_percent: Some(25.0),
+            load_1: Some(0.2),
+            load_5: Some(0.3),
+            load_15: Some(0.4),
+            memory_used_bytes: Some(1_000),
+            memory_total_bytes: Some(2_000),
+            memory_available_bytes: Some(1_000),
+            swap_used_bytes: Some(0),
+            swap_total_bytes: Some(0),
+            disks: vec![DiskUsage {
+                label: "root".into(),
+                mount_point: "/".into(),
+                used_bytes: 2_000,
+                total_bytes: 4_000,
+            }],
+            network: NetworkMetricsStatus {
+                rx_bytes_per_sec: Some(10.0),
+                tx_bytes_per_sec: Some(20.0),
+                tcp_established: Some(1),
+                tcp_time_wait: Some(0),
+            },
+            process: ProcessMetricsStatus {
+                open_fds: Some(10),
+                max_fds: Some(100),
+                fd_usage_percent: Some(10.0),
+                threads: Some(4),
+                rss_bytes: Some(rss_bytes),
+                cpu_percent: Some(1.0),
+                uptime_secs: Some(60),
+            },
+        }
+    }
 }
 
 fn collect_rows<T, F>(rows: rusqlite::MappedRows<'_, F>, label: &str) -> Result<Vec<T>, AppError>

@@ -221,10 +221,8 @@ export function StatusChip({ status }: { status: MetricsHealth | string }) {
 }
 
 /**
- * The one inverted (dark) section called for by the design system — a live
- * pulse strip that breaks up the light theme and spotlights the headline LLM
- * numbers. Uses current snapshot values, not historical totals, so it stays
- * truthful without a separate aggregate query.
+ * Uses current snapshot values, not historical totals, so it stays truthful
+ * without a separate aggregate query.
  */
 export function LiveSummaryStrip({ snapshot }: { snapshot: MetricsSnapshot | null }) {
   const { t } = useLocaleText();
@@ -244,24 +242,13 @@ export function LiveSummaryStrip({ snapshot }: { snapshot: MetricsSnapshot | nul
     ],
   ];
   return (
-    <div
-      className="relative overflow-hidden rounded-2xl bg-[var(--foreground,#0F172A)] px-6 py-5 text-[var(--background,#FAFAFA)]"
-      style={{
-        backgroundImage:
-          "radial-gradient(circle at 1px 1px, rgba(255,255,255,0.06) 1px, transparent 1px)",
-        backgroundSize: "28px 28px",
-      }}
-    >
-      <div
-        className="pointer-events-none absolute -right-16 -top-16 h-48 w-48 rounded-full opacity-30 blur-[120px]"
-        style={{ background: "var(--accent,#0052FF)" }}
-      />
-      <div className="relative grid grid-cols-2 gap-6 md:grid-cols-4">
+    <div className="rounded-lg border bg-card px-6 py-5 text-foreground shadow-sm">
+      <div className="grid grid-cols-2 gap-6 md:grid-cols-4">
         {items.map(([label, value, hint]) => (
           <div key={label}>
-            <p className="font-mono text-[10px] uppercase tracking-[0.15em] opacity-60">{label}</p>
+            <p className="font-mono text-[10px] uppercase tracking-[0.15em] text-muted-foreground">{label}</p>
             <p className="mt-1 font-display text-3xl leading-none">{value}</p>
-            <p className="mt-1 text-xs opacity-50">{hint}</p>
+            <p className="mt-1 text-xs text-muted-foreground">{hint}</p>
           </div>
         ))}
       </div>
