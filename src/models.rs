@@ -1201,6 +1201,10 @@ pub struct DashboardResponse {
     pub stats: DashboardStats,
     pub map: DashboardMap,
     pub clients: Vec<DashboardClientView>,
+    /// 多 share 模式：把所有 share 平铺到顶层，前端 SharesTable 直接消费。
+    /// 与 `clients[*].share` 是两套视图（installation 维度 vs share 维度），新前端用 shares。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shares: Vec<ShareView>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub markets: Vec<DashboardMarketView>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1294,8 +1298,17 @@ pub struct InstallationView {
 #[serde(rename_all = "camelCase")]
 pub struct DashboardClientView {
     pub installation: InstallationView,
+    /// 单 share 时代字段；多 share 模式下保留一个"代表 share"（按 prefer_dashboard_share
+    /// 排序的 top share）用于老前端兼容，新前端应改用 `shares` 顶层字段做 share 维度展示。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub share: Option<ShareView>,
+    /// 该 installation 名下挂的所有 active share id 列表；新前端 Clients 表用它显示"#shares"
+    /// 列，并在抽屉里展开多 share 详情。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub share_ids: Vec<String>,
+    /// 与 share_ids.len() 等价的便利字段，避免前端做 length 调用。
+    #[serde(default)]
+    pub share_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]

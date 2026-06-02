@@ -23,6 +23,8 @@ export type DashboardResponse = {
     clients: MapPoint[];
   };
   clients: DashboardClient[];
+  /** P7: per-share 全量列表（多 share 模式下用 SharesTable 直接消费）。 */
+  shares?: ShareView[];
   markets?: DashboardMarket[];
   tickerShares?: DashboardTickerShare[];
   countryCounts?: Record<string, number>;
@@ -57,7 +59,12 @@ export type DashboardClient = {
     createdAt: string;
     lastSeenAt: string;
   };
+  /** 单 share 时代字段：保留兼容老前端；新 ShareTable 走顶层 shares 字段。 */
   share?: ShareView;
+  /** P7: 该 installation 名下所有 share 的 id 集合（多 share 模式）。 */
+  shareIds?: string[];
+  /** P7: 该 installation 名下 share 总数；等价于 shareIds.length。 */
+  shareCount?: number;
 };
 
 export type ShareView = {

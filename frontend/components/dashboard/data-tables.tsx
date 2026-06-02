@@ -1432,6 +1432,220 @@ export function ClientsTable({ clients, markets, onChanged }: { clients: Dashboa
   );
 }
 
+/**
+ * P7：share 维度表。每行对应一个 share；installation 维度信息（region / platform）
+ * 通过 clients[].shareIds 反查得到。Clients 表保留作"机器维度"概览，
+ * 两个表互补存在，避免老前端断裂。
+ */
+export function SharesTable({
+  clients,
+  shares,
+  markets,
+  onChanged,
+}: {
+  clients: DashboardClient[];
+  shares: ShareView[];
+  markets: DashboardMarket[];
+  onChanged?: () => Promise<void> | void;
+}) {
+  const { locale, t } = useLocaleText();
+  const [selected, setSelected] = React.useState<ShareView | null>(null);
+  const [editingShare, setEditingShare] = React.useState<ShareView | null>(null);
+
+  // shareId → 所属 installation 的 DashboardClient（含 region / platform）。
+  const clientByShareId = React.useMemo(() => {
+    const map = new Map<string, DashboardClient>();
+    clients.forEach((c) => {
+      (c.shareIds ?? []).forEach((id) => map.set(id, c));
+    });
+    return map;
+  }, [clients]);
+
+  // 排序：管理权限 > active 状态 > 活跃请求数 > shareName。
+  const sorted = React.useMemo(() => {
+    return [...shares].sort((left, right) => {
+      const lOwned = left.canManage ? 1 : 0;
+      const rOwned = right.canManage ? 1 : 0;
+      if (lOwned !== rOwned) return rOwned - lOwned;
+      const lActive = left.shareStatus === "active" ? 1 : 0;
+      const rActive = right.shareStatus === "active" ? 1 : 0;
+      if (lActive !== rActive) return rActive - lActive;
+      if (left.activeRequests !== right.activeRequests)
+        return (right.activeRequests || 0) - (left.activeRequests || 0);
+      return shareApiUrlKey(left).localeCompare(
+        shareApiUrlKey(right),
+        undefined,
+        { sensitivity: "base" },
+      );
+    });
+  }, [shares]);
+
+  const selectedApi = shareApiParts(selected ?? undefined);
+  const selectedClient = selected ? clientByShareId.get(selected.shareId) : undefined;
+
+  return (
+    <section className="grid gap-3">
+      <div className="flex items-center justify-between font-mono text-[11px] uppercase tracking-[0.14em] text-muted-foreground">
+        <div>
+          {t("dashboard.shares")}{" "}
+          <span className="font-semibold text-foreground">{sorted.length}</span>
+        </div>
+      </div>
+      <Card className="overflow-hidden rounded-[20px]">
+        <Card.Content className="overflow-x-auto p-0">
+          <table className="w-full min-w-[1180px] border-collapse text-sm">
+            <thead className="bg-muted text-left font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground">
+              <tr>
+                <th className="w-80 px-4 py-3">{t("dashboard.share")}</th>
+                <th className="px-4 py-3">{t("dashboard.appType")}</th>
+                <th className="px-4 py-3">{t("dashboard.forSale")}</th>
+                <th className="px-4 py-3">{t("dashboard.region")}</th>
+                <th className="px-4 py-3">{t("dashboard.status")}</th>
+                <th className="px-4 py-3">{t("dashboard.support")}</th>
+                <th className="w-7 px-4 py-3" />
+              </tr>
+            </thead>
+            <tbody>
+              {sorted.length ? (
+                sorted.map((share) => {
+                  const api = shareApiParts(share);
+                  const client = clientByShareId.get(share.shareId);
+                  return (
+                    <tr
+                      key={share.shareId}
+                      className="cursor-pointer border-b last:border-0 hover:bg-primary/5"
+                      onClick={(event) => {
+                        if (shouldOpenRowDrawer(event)) setSelected(share);
+                      }}
+                    >
+                      <td className="w-80 break-words px-4 py-3 align-middle">
+                        <div className="grid min-w-72 gap-1">
+                          <strong className="break-all font-mono text-xs text-foreground">
+                            {api.apiUrl}
+                          </strong>
+                          <span className="break-all text-xs text-muted-foreground">
+                            {share.ownerEmail || "-"}
+                          </span>
+                          <div className="mt-1 flex flex-wrap items-center gap-2">
+                            <ShareStatusBadge share={share} t={t} />
+                            <ShareEditAction share={share} onEdit={setEditingShare} t={t} />
+                          </div>
+                        </div>
+                      </td>
+                      <td className="px-4 py-3 align-middle text-xs uppercase text-muted-foreground">
+                        {share.appType || "-"}
+                      </td>
+                      <td className="px-4 py-3 align-middle">
+                        <ForSaleCell share={share} t={t} />
+                      </td>
+                      <td className="px-4 py-3 align-middle text-muted-foreground">
+                        {client?.installation.countryCode || "-"}
+                      </td>
+                      <td className="px-4 py-3 align-middle">
+                        {client ? (
+                          <ShareStatusCell client={client} share={share} t={t} locale={locale} />
+                        ) : (
+                          <span className="text-muted-foreground">-</span>
+                        )}
+                      </td>
+                      <td className="px-4 py-3 align-middle">
+                        <SupportCell share={share} t={t} locale={locale} />
+                      </td>
+                      <td className="px-4 py-3 align-middle text-lg text-muted-foreground">›</td>
+                    </tr>
+                  );
+                })
+              ) : (
+                <tr>
+                  <td colSpan={7} className="px-4 py-10 text-center text-muted-foreground">
+                    {t("dashboard.noShares")}
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </Card.Content>
+      </Card>
+      <Drawer isOpen={!!selected} onOpenChange={(open) => !open && setSelected(null)}>
+        <Drawer.Backdrop>
+          <Drawer.Content placement="right">
+            <Drawer.Dialog className={drawerDialogClassName}>
+              <Drawer.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
+              <Drawer.Header>
+                <div>
+                  <Drawer.Heading className="break-all font-mono text-base">
+                    {selectedApi.apiUrl}
+                  </Drawer.Heading>
+                  <p className="mt-1 break-all text-sm text-muted-foreground">
+                    {selected?.ownerEmail || "-"}
+                  </p>
+                  {selected?.description ? (
+                    <p className="mt-2 whitespace-pre-wrap break-words text-xs leading-5 text-muted-foreground">
+                      {selected.description}
+                    </p>
+                  ) : null}
+                </div>
+              </Drawer.Header>
+              <Drawer.Body className="overflow-y-auto">
+                {selected ? (
+                  <div className="grid gap-5">
+                    <DrawerSection label="24h">
+                      <HealthTimelineStrip timeline={selected.healthTimeline} />
+                    </DrawerSection>
+                    {selectedClient ? (
+                      <DrawerSection label={t("dashboard.installation")}>
+                        <div className="grid gap-1 text-xs text-muted-foreground">
+                          <span>
+                            {t("dashboard.platform")}:{" "}
+                            <strong className="text-foreground">
+                              {selectedClient.installation.platform}
+                            </strong>
+                          </span>
+                          <span>
+                            {t("dashboard.region")}:{" "}
+                            <strong className="text-foreground">
+                              {selectedClient.installation.countryCode || "-"}
+                            </strong>
+                          </span>
+                          <span className="break-all">
+                            id: {selectedClient.installation.id}
+                          </span>
+                        </div>
+                      </DrawerSection>
+                    ) : null}
+                    <DrawerSection label={t("dashboard.markets")}>
+                      <ShareMarkets share={selected} t={t} />
+                    </DrawerSection>
+                    <DrawerSection label={t("dashboard.providers")}>
+                      <ShareProvidersPanel share={selected} />
+                    </DrawerSection>
+                    <DrawerSection label={t("dashboard.requestLogs")}>
+                      <ShareRequestLogs logs={selected.recentRequests || []} />
+                    </DrawerSection>
+                    <DrawerSection label={t("dashboard.modelHealthChecks")}>
+                      <ShareModelHealthChecks
+                        checks={selected.recentModelHealthChecks || []}
+                      />
+                    </DrawerSection>
+                  </div>
+                ) : null}
+              </Drawer.Body>
+            </Drawer.Dialog>
+          </Drawer.Content>
+        </Drawer.Backdrop>
+      </Drawer>
+      <ShareEditDialog
+        share={editingShare}
+        markets={markets}
+        onClose={() => setEditingShare(null)}
+        onSaved={async () => {
+          await onChanged?.();
+        }}
+      />
+    </section>
+  );
+}
+
 function marketStatusLabel(market: DashboardMarket, t: TFn) {
   if (market.online) return t("common.online");
   return market.status === "active" ? t("common.offline") : market.status || t("common.offline");

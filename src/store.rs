@@ -2392,8 +2392,15 @@ impl AppStore {
             })
             .collect::<Vec<_>>();
         let mut share_by_installation = HashMap::<String, ShareView>::new();
+        // 多 share 模式：同 installation 下按 share_id 累积所有 share，给 Clients 表用来显示
+        // share_count 和 share_ids；同时仍 collapse 出一个"代表 share"喂老 clients[*].share 字段。
+        let mut share_ids_by_installation = HashMap::<String, Vec<String>>::new();
         for share in &share_views {
             let installation_id = share.installation_id.clone();
+            share_ids_by_installation
+                .entry(installation_id.clone())
+                .or_default()
+                .push(share.share_id.clone());
             match share_by_installation.get(&installation_id) {
                 Some(existing) if !prefer_dashboard_share(share, existing) => {}
                 _ => {
@@ -2404,9 +2411,17 @@ impl AppStore {
         let mut client_views = installation_views
             .iter()
             .cloned()
-            .map(|installation| DashboardClientView {
-                share: share_by_installation.remove(&installation.id),
-                installation,
+            .map(|installation| {
+                let share_ids = share_ids_by_installation
+                    .remove(&installation.id)
+                    .unwrap_or_default();
+                let share_count = share_ids.len();
+                DashboardClientView {
+                    share: share_by_installation.remove(&installation.id),
+                    share_count,
+                    share_ids,
+                    installation,
+                }
             })
             .filter(|client| client.share.is_some())
             .collect::<Vec<_>>();
@@ -2463,6 +2478,9 @@ impl AppStore {
                 clients: client_map_points,
             },
             clients: client_views,
+            // P7：share 维度全量列表，供新前端 SharesTable 直接消费；
+            // 与 `clients[*].share` 并行存在，老前端继续读 clients。
+            shares: share_views.clone(),
             markets,
             ticker_shares,
             country_counts,
@@ -2875,6 +2893,20 @@ impl AppStore {
             })
             .map_err(|e| AppError::Internal(format!("query route targets failed: {e}")))?;
         collect_rows(rows)
+    }
+
+    /// True if the given subdomain is currently bound to a registered market
+    /// (any status — active, offline, or disabled). Used by HTTP handlers to
+    /// skip the "share landing UI" injection on market subdomains, so the
+    /// market's own web app reaches the user when they hit `/`.
+    pub async fn is_market_subdomain(&self, subdomain: &str) -> bool {
+        if subdomain.is_empty() {
+            return false;
+        }
+        let conn = self.conn.lock().await;
+        market_subdomain_owner(&conn, subdomain)
+            .map(|owner| owner.is_some())
+            .unwrap_or(false)
     }
 
     pub async fn register_market(
@@ -11028,6 +11060,53 @@ mod tests {
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 
+    /// `is_market_subdomain` is what HTTP handlers use to decide whether to
+    /// skip the router's bundled share-landing UI on the request's host. It
+    /// must return true exactly for subdomains that have a row in
+    /// `router_markets` — any registration status (active/offline/disabled)
+    /// counts, because all of them still proxy traffic to a market backend.
+    #[tokio::test]
+    async fn is_market_subdomain_matches_registered_markets_only() {
+        let (store, config) = setup_store("is-market-subdomain").await;
+
+        assert!(
+            !store.is_market_subdomain("market-a").await,
+            "before registration, market subdomain must not be considered a market"
+        );
+        assert!(
+            !store.is_market_subdomain("").await,
+            "empty subdomain must short-circuit to false"
+        );
+
+        store
+            .register_market(
+                "market@example.com",
+                RegisterMarketRequest {
+                    subdomain: "market-a".into(),
+                    display_name: "Main".into(),
+                    public_base_url: "https://market-a.example.com".into(),
+                    pricing_summary: None,
+                },
+            )
+            .await
+            .expect("register market");
+
+        assert!(
+            store.is_market_subdomain("market-a").await,
+            "registered market subdomain must be recognized"
+        );
+        assert!(
+            !store.is_market_subdomain("market-b").await,
+            "unrelated subdomain must stay non-market"
+        );
+        assert!(
+            !store.is_market_subdomain("alpha-share").await,
+            "share subdomain must never be flagged as market"
+        );
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
     #[tokio::test]
     async fn register_market_upserts_same_email_and_rejects_subdomain_conflict() {
         let (store, config) = setup_store("market-register").await;
@@ -12419,6 +12498,16 @@ mod tests {
                 .share_id,
             "share-old"
         );
+        // P7：新前端用 shares 顶层数组 + clients[*].share_ids 做 share 维度展示。
+        assert_eq!(snapshot.shares.len(), 2);
+        let mut shares_ids: Vec<_> =
+            snapshot.shares.iter().map(|s| s.share_id.clone()).collect();
+        shares_ids.sort();
+        assert_eq!(shares_ids, vec!["share-new", "share-old"]);
+        assert_eq!(snapshot.clients[0].share_count, 2);
+        let mut client_share_ids = snapshot.clients[0].share_ids.clone();
+        client_share_ids.sort();
+        assert_eq!(client_share_ids, vec!["share-new", "share-old"]);
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }

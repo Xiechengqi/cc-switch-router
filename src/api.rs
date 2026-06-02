@@ -1156,6 +1156,7 @@ async fn root_handler(
     {
         if matches!(*req.method(), Method::GET | Method::HEAD)
             && is_router_share_ui_path(req.uri().path())
+            && !is_market_host(&state, &host).await
         {
             if let Some(response) = ui_response_for_request_path(req.uri().path()) {
                 return response;
@@ -1188,6 +1189,7 @@ async fn ui_or_proxy_handler(
     if should_proxy_host(&state, request_host(&req)).await {
         if matches!(*req.method(), Method::GET | Method::HEAD)
             && is_router_share_ui_path(req.uri().path())
+            && !is_market_host(&state, &request_host(&req)).await
         {
             if let Some(response) = ui_response_for_request_path(req.uri().path()) {
                 return response;
@@ -1204,6 +1206,23 @@ async fn ui_or_proxy_handler(
         }
     }
     proxy_handler(State(state), ConnectInfo(peer), req).await
+}
+
+/// True if the request's Host belongs to a market subdomain. Used to skip the
+/// router's bundled "share landing UI" so the market's own web app reaches
+/// the user. Naming heuristic (`market` / `market-*`, see
+/// `Config::is_market_subdomain`) catches the common case cheaply; the DB
+/// lookup catches market deployments that registered under another name.
+async fn is_market_host(state: &ServerState, host: &str) -> bool {
+    let Some(subdomain) =
+        crate::proxy::subdomain_for_host(host, &state.config.tunnel_domain)
+    else {
+        return false;
+    };
+    if state.config.is_market_subdomain(&subdomain) {
+        return true;
+    }
+    state.store.is_market_subdomain(&subdomain).await
 }
 
 fn is_router_share_ui_path(path: &str) -> bool {
@@ -1349,6 +1368,7 @@ mod tests {
                 clients: Vec::new(),
             },
             clients: Vec::new(),
+            shares: Vec::new(),
             markets: Vec::new(),
             ticker_shares: Vec::new(),
             country_counts: HashMap::new(),
@@ -1405,6 +1425,7 @@ mod tests {
                 clients: Vec::new(),
             },
             clients: Vec::new(),
+            shares: Vec::new(),
             markets: Vec::new(),
             ticker_shares: vec![crate::models::DashboardTickerShare {
                 share_id: "share-1".into(),
@@ -1455,6 +1476,7 @@ mod tests {
                 clients: Vec::new(),
             },
             clients: Vec::new(),
+            shares: Vec::new(),
             markets: Vec::new(),
             ticker_shares: vec![crate::models::DashboardTickerShare {
                 share_id: "share-1".into(),
@@ -1513,6 +1535,7 @@ mod tests {
                 clients: Vec::new(),
             },
             clients: Vec::new(),
+            shares: Vec::new(),
             markets: Vec::new(),
             ticker_shares: vec![crate::models::DashboardTickerShare {
                 share_id: "share-1".into(),

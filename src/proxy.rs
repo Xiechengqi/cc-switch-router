@@ -1640,7 +1640,7 @@ fn is_valid_market_request_id(value: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
 }
 
-fn subdomain_for_host(host: &str, tunnel_domain: &str) -> Option<String> {
+pub(crate) fn subdomain_for_host(host: &str, tunnel_domain: &str) -> Option<String> {
     let host = parse_authority(host)?;
     let tunnel = parse_authority(tunnel_domain)?;
     if let Some(tunnel_port) = tunnel.port {
