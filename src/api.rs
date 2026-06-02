@@ -45,13 +45,13 @@ use crate::models::{
     MarketNotificationEmailResponse, MarketRequestLogBatchSyncRequest, MarketShareView,
     MarketsResponse, PostBoardMessageRequest, PublicMapPointsResponse, RefreshSessionRequest,
     RegisterInstallationRequest, RegisterInstallationResponse, RegisterMarketRequest,
-    RequestEmailCodeRequest, RequestEmailCodeResponse, SessionStatusResponse,
-    ShareBatchSyncRequest, ShareClaimSubdomainRequest, ShareDeleteRequest, ShareEditAckRequest,
-    ShareEditAvailableEvent, ShareEditEventSignaturePayload, ShareHeartbeatRequest,
-    SharePendingEditsRequest, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry,
-    ShareRuntimeRefreshRequest, ShareSettingsUpdateRequest, ShareSyncRequest,
-    UserApiTokenResetResponse, UserApiTokenResponse, UserSharesResponse, VerifyEmailCodeRequest,
-    VerifyEmailCodeResponse,
+    RequestEmailCodeRequest, RequestEmailCodeResponse, SessionStatusResponse, ShareApiAuthResponse,
+    ShareApiAuthUser, ShareApiContextResponse, ShareApiShareResponse, ShareBatchSyncRequest,
+    ShareClaimSubdomainRequest, ShareDeleteRequest, ShareEditAckRequest, ShareEditAvailableEvent,
+    ShareEditEventSignaturePayload, ShareHeartbeatRequest, SharePendingEditsRequest,
+    ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRuntimeRefreshRequest,
+    ShareSettingsPatch, ShareSettingsUpdateRequest, ShareSyncRequest, UserApiTokenResetResponse,
+    UserApiTokenResponse, UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 use crate::proxy::{market_proxy_handler, proxy_handler};
 use crate::recent_traffic::{RecentRequestEvent, RecentTrafficSnapshot};
@@ -90,6 +90,12 @@ struct ShareEditEventsQuery {
     timestamp_ms: i64,
     nonce: String,
     signature: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShareApiAuthQuery {
+    email: Option<String>,
 }
 
 pub fn router(state: ServerState) -> Router {
@@ -149,6 +155,13 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/auth/email/verify-code", post(verify_email_code))
         .route("/v1/auth/session/refresh", post(refresh_session))
         .route("/v1/auth/session/me", get(session_me))
+        .route("/share-api/context", get(share_api_context))
+        .route("/share-api/share", get(share_api_share))
+        .route("/share-api/auth/me", get(share_api_auth_me))
+        .route(
+            "/share-api/share/settings",
+            patch(share_api_update_settings),
+        )
         .route("/v1/me/api-token", get(get_default_api_token))
         .route("/v1/me/api-token/reset", post(reset_default_api_token))
         .route("/v1/me/shares", get(my_shares))
@@ -674,6 +687,157 @@ async fn dashboard(
     Ok(Json(response))
 }
 
+async fn share_api_context(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<ShareApiContextResponse>, AppError> {
+    let route = share_route_from_headers(&state, &headers).await?;
+    let share_id = route
+        .share_id()
+        .ok_or_else(|| AppError::NotFound("share route not found".into()))?
+        .to_string();
+    Ok(Json(ShareApiContextResponse {
+        mode: "share".to_string(),
+        share_id,
+        subdomain: route.subdomain().to_string(),
+    }))
+}
+
+async fn share_api_auth_me(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<ShareApiAuthQuery>,
+) -> Result<Json<ShareApiAuthResponse>, AppError> {
+    let route = share_route_from_headers(&state, &headers).await?;
+    let share_id = route
+        .share_id()
+        .ok_or_else(|| AppError::NotFound("share route not found".into()))?;
+    Ok(Json(
+        share_api_auth_response(&state, &headers, share_id, query.email.as_deref()).await?,
+    ))
+}
+
+async fn share_api_share(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<ShareApiAuthQuery>,
+) -> Result<Json<ShareApiShareResponse>, AppError> {
+    let route = share_route_from_headers(&state, &headers).await?;
+    let share_id = route
+        .share_id()
+        .ok_or_else(|| AppError::NotFound("share route not found".into()))?
+        .to_string();
+    let auth = share_api_auth_response(&state, &headers, &share_id, query.email.as_deref()).await?;
+    if !auth.authenticated {
+        return Err(AppError::Unauthorized("api token required".into()));
+    }
+    if !auth.can_manage {
+        return Err(AppError::Forbidden(
+            "only share owner api token can view share settings".into(),
+        ));
+    }
+    let viewer_email = auth.user.as_ref().map(|user| user.email.as_str());
+    let share = state
+        .store
+        .share_view_for_share_url(
+            &share_id,
+            &state.proxy.active_subdomains().await.into_iter().collect(),
+            &state.proxy.inflight_by_share().await,
+            viewer_email,
+        )
+        .await?;
+    Ok(Json(ShareApiShareResponse { share, auth }))
+}
+
+async fn share_api_update_settings(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<ShareApiAuthQuery>,
+    Json(input): Json<ShareSettingsUpdateRequest>,
+) -> Result<Json<crate::models::ShareSettingsUpdateResponse>, AppError> {
+    let route = share_route_from_headers(&state, &headers).await?;
+    let share_id = route
+        .share_id()
+        .ok_or_else(|| AppError::NotFound("share route not found".into()))?
+        .to_string();
+    let auth = share_api_auth_response(&state, &headers, &share_id, query.email.as_deref()).await?;
+    if !auth.can_manage {
+        return Err(AppError::Forbidden(
+            "only share owner api token can edit share settings".into(),
+        ));
+    }
+    let email = auth
+        .user
+        .map(|user| user.email)
+        .ok_or_else(|| AppError::Unauthorized("api token required".into()))?;
+    let response = update_share_settings_with_email(&state, &share_id, &email, input.patch).await?;
+    Ok(Json(response))
+}
+
+async fn share_route_from_headers(
+    state: &ServerState,
+    headers: &HeaderMap,
+) -> Result<crate::proxy::RouteEntry, AppError> {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    state
+        .proxy
+        .backend_for_host(host, &state.config.tunnel_domain)
+        .await
+        .filter(|route| route.share_id().is_some())
+        .ok_or_else(|| AppError::NotFound("share route not found".into()))
+}
+
+async fn share_api_auth_response(
+    state: &ServerState,
+    headers: &HeaderMap,
+    share_id: &str,
+    requested_email: Option<&str>,
+) -> Result<ShareApiAuthResponse, AppError> {
+    let Some(token) = extract_router_api_token(headers) else {
+        return Ok(ShareApiAuthResponse {
+            authenticated: false,
+            user: None,
+            can_manage: false,
+        });
+    };
+    let Some(principal) = state
+        .store
+        .resolve_user_api_token(token, "share:write")
+        .await?
+    else {
+        return Ok(ShareApiAuthResponse {
+            authenticated: false,
+            user: None,
+            can_manage: false,
+        });
+    };
+    if let Some(email) = requested_email
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !principal.email.eq_ignore_ascii_case(email) {
+            return Err(AppError::Unauthorized(
+                "api token does not belong to requested email".into(),
+            ));
+        }
+    }
+    let owner = state.store.lookup_share_owner_email(share_id).await?;
+    let can_manage = owner
+        .as_deref()
+        .is_some_and(|owner| owner.eq_ignore_ascii_case(&principal.email));
+    Ok(ShareApiAuthResponse {
+        authenticated: true,
+        user: Some(ShareApiAuthUser {
+            email: principal.email,
+            scopes: principal.scopes,
+        }),
+        can_manage,
+    })
+}
+
 fn confirmed_request_events(
     snapshot: &RecentTrafficSnapshot,
     response: &DashboardResponse,
@@ -990,6 +1154,16 @@ async fn root_handler(
         .await
         .is_some()
     {
+        if matches!(*req.method(), Method::GET | Method::HEAD)
+            && is_router_share_ui_path(req.uri().path())
+        {
+            if let Some(response) = ui_response_for_request_path(req.uri().path()) {
+                return response;
+            }
+            if let Some(response) = ui_response("index.html") {
+                return response;
+            }
+        }
         return proxy_handler(State(state), ConnectInfo(peer), req).await;
     }
 
@@ -1012,6 +1186,16 @@ async fn ui_or_proxy_handler(
     req: Request,
 ) -> Response {
     if should_proxy_host(&state, request_host(&req)).await {
+        if matches!(*req.method(), Method::GET | Method::HEAD)
+            && is_router_share_ui_path(req.uri().path())
+        {
+            if let Some(response) = ui_response_for_request_path(req.uri().path()) {
+                return response;
+            }
+            if let Some(response) = ui_response("index.html") {
+                return response;
+            }
+        }
         return proxy_handler(State(state), ConnectInfo(peer), req).await;
     }
     if matches!(*req.method(), Method::GET | Method::HEAD) {
@@ -1020,6 +1204,14 @@ async fn ui_or_proxy_handler(
         }
     }
     proxy_handler(State(state), ConnectInfo(peer), req).await
+}
+
+fn is_router_share_ui_path(path: &str) -> bool {
+    path == "/"
+        || path == "/favicon.ico"
+        || path == "/router-logo.svg"
+        || path == "/world-map.svg"
+        || path.starts_with("/_next/")
 }
 
 fn request_host(req: &Request) -> String {
@@ -1095,6 +1287,32 @@ mod tests {
             "Bearer bearer-token".parse().unwrap(),
         );
         assert_eq!(extract_router_api_token(&headers), Some("bearer-token"));
+    }
+
+    #[test]
+    fn share_ui_static_paths_do_not_capture_api_requests() {
+        for path in [
+            "/",
+            "/favicon.ico",
+            "/router-logo.svg",
+            "/world-map.svg",
+            "/_next/static/chunks/app.js",
+        ] {
+            assert!(is_router_share_ui_path(path), "{path} should be router UI");
+        }
+
+        for path in [
+            "/v1/messages",
+            "/v1/chat/completions",
+            "/share-api/share",
+            "/api/health",
+            "/assets/index.js",
+        ] {
+            assert!(
+                !is_router_share_ui_path(path),
+                "{path} should not be router UI"
+            );
+        }
     }
 
     #[test]
@@ -1452,9 +1670,21 @@ async fn update_share_settings(
     Json(input): Json<ShareSettingsUpdateRequest>,
 ) -> Result<Json<crate::models::ShareSettingsUpdateResponse>, AppError> {
     let current_user_email = require_user_email(&state, &headers, "share:write").await?;
+    Ok(Json(
+        update_share_settings_with_email(&state, &share_id, &current_user_email, input.patch)
+            .await?,
+    ))
+}
+
+async fn update_share_settings_with_email(
+    state: &ServerState,
+    share_id: &str,
+    current_user_email: &str,
+    patch: ShareSettingsPatch,
+) -> Result<crate::models::ShareSettingsUpdateResponse, AppError> {
     let mut response = state
         .store
-        .create_share_settings_edit(&share_id, &current_user_email, input.patch)
+        .create_share_settings_edit(share_id, current_user_email, patch)
         .await?;
 
     // Happy path: if the owning installation is online and supports the control
@@ -1465,7 +1695,7 @@ async fn update_share_settings(
     // it satisfies the patch. Transport failures fall back to the async path;
     // a client that rejects or under-applies surfaces as a hard error.
     let installation_id = response.edit.installation_id.clone();
-    let route = state.proxy.route_by_share_id(&share_id).await;
+    let route = state.proxy.route_by_share_id(share_id).await;
     let control_secret = state
         .store
         .installation_control_secret(&installation_id)
@@ -1477,7 +1707,7 @@ async fn update_share_settings(
             route.route_target(),
             &installation_id,
             &secret,
-            &share_id,
+            share_id,
             &response.edit.patch,
         )
         .await
@@ -1488,7 +1718,7 @@ async fn update_share_settings(
                     .apply_share_edit_directly(&response.edit.id, returned_share)
                     .await?;
                 response.applied_synchronously = true;
-                return Ok(Json(response));
+                return Ok(response);
             }
             Err(err) if err.is_transport() => {
                 tracing::info!(
@@ -1517,7 +1747,7 @@ async fn update_share_settings(
         revision: response.edit.revision,
     });
     schedule_share_edit_wake_retries(state.clone(), response.edit.clone());
-    Ok(Json(response))
+    Ok(response)
 }
 
 fn schedule_share_edit_wake_retries(state: ServerState, edit: crate::models::ShareEditView) {

@@ -173,6 +173,37 @@ pub struct UserApiTokenResetResponse {
     pub token: UserApiTokenStatus,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareApiAuthUser {
+    pub email: String,
+    pub scopes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareApiAuthResponse {
+    pub authenticated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<ShareApiAuthUser>,
+    pub can_manage: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareApiContextResponse {
+    pub mode: String,
+    pub share_id: String,
+    pub subdomain: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareApiShareResponse {
+    pub share: ShareView,
+    pub auth: ShareApiAuthResponse,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RefreshSessionRequest {

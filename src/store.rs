@@ -1023,6 +1023,77 @@ impl AppStore {
         Ok(UserSharesResponse { shares })
     }
 
+    pub async fn share_view_for_share_url(
+        &self,
+        share_id: &str,
+        active_subdomains: &HashSet<String>,
+        inflight_by_share: &HashMap<String, usize>,
+        viewer_email: Option<&str>,
+    ) -> Result<ShareView, AppError> {
+        let conn = self.conn.lock().await;
+        let (_, share) = list_shares(&conn)?
+            .into_iter()
+            .find(|(_, share)| share.share_id == share_id)
+            .ok_or_else(|| AppError::NotFound("share not found".into()))?;
+        let active_edit = get_active_share_edit(&conn, share_id)?;
+        let can_view_share = share_visible_to_email(&share, viewer_email);
+        let can_manage = can_manage_share(&share, viewer_email);
+        let can_edit_settings = can_manage
+            && active_edit
+                .as_ref()
+                .map(|edit| edit.status != "pending")
+                .unwrap_or(true);
+        let is_online =
+            share.share_status == "active" && active_subdomains.contains(&share.subdomain);
+        let active_requests = inflight_by_share.get(&share.share_id).copied().unwrap_or(0);
+        Ok(ShareView {
+            share_id: share.share_id,
+            share_name: share.share_name,
+            owner_email: share.owner_email,
+            shared_with_emails: if can_view_share {
+                share.shared_with_emails
+            } else {
+                Vec::new()
+            },
+            market_links: Vec::new(),
+            unknown_market_emails: Vec::new(),
+            description: share.description,
+            for_sale: share.for_sale,
+            market_access_mode: share.market_access_mode,
+            for_sale_official_price_percent_by_app: share.for_sale_official_price_percent_by_app,
+            subdomain: share.subdomain,
+            share_token: mask_share_token(&share.share_token),
+            can_view_secret: false,
+            can_manage,
+            can_edit_settings,
+            active_edit,
+            app_type: share.app_type,
+            provider_id: share.provider_id,
+            token_limit: share.token_limit,
+            parallel_limit: share.parallel_limit,
+            tokens_used: share.tokens_used,
+            requests_count: share.requests_count,
+            share_status: share.share_status,
+            created_at: share.created_at,
+            expires_at: share.expires_at,
+            support: share.support,
+            upstream_provider: None,
+            app_runtimes: share.app_runtimes,
+            app_providers: share.app_providers,
+            installation_id: String::new(),
+            is_online,
+            cleanup_at: None,
+            active_requests,
+            online_minutes_24h: 0,
+            online_rate_24h: 0.0,
+            recent_requests: Vec::new(),
+            health_checks: Vec::new(),
+            health_timeline: Vec::new(),
+            recent_model_health_checks: Vec::new(),
+            model_health: ShareModelHealthSummary::default(),
+        })
+    }
+
     pub async fn user_can_invoke_share(
         &self,
         user_email: &str,

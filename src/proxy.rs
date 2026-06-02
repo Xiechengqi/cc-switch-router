@@ -57,6 +57,10 @@ impl RouteEntry {
         self.share_id.as_deref()
     }
 
+    pub(crate) fn subdomain(&self) -> &str {
+        &self.subdomain
+    }
+
     pub(crate) fn connection_id(&self) -> Option<&str> {
         self.connection_id.as_deref()
     }

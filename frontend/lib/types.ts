@@ -113,6 +113,26 @@ export type ShareSettingsPatch = {
   autoStart?: boolean;
 };
 
+export type ShareApiAuthResponse = {
+  authenticated: boolean;
+  user?: {
+    email: string;
+    scopes: string[];
+  };
+  canManage: boolean;
+};
+
+export type ShareApiContextResponse = {
+  mode: "share";
+  shareId: string;
+  subdomain: string;
+};
+
+export type ShareApiShareResponse = {
+  share: ShareView;
+  auth: ShareApiAuthResponse;
+};
+
 export type ShareEditView = {
   id: string;
   shareId: string;
@@ -222,6 +242,22 @@ export type MarketShare = {
   appAvailability?: MarketAppAvailability;
   appRuntimes?: ShareAppRuntimes;
   modelHealth?: ShareModelHealthSummary;
+};
+
+export type PublicMarket = {
+  id: string;
+  displayName: string;
+  email: string;
+  subdomain: string;
+  publicBaseUrl: string;
+  status: string;
+  maintenanceEnabled?: boolean;
+  maintenanceMessage?: string;
+  pricingSummary?: unknown;
+};
+
+export type MarketsResponse = {
+  markets: PublicMarket[];
 };
 
 export type ShareRequestLog = {

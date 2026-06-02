@@ -1,10 +1,5 @@
-import { DashboardPage } from "@/components/dashboard/dashboard-page";
-import { AppShell } from "@/components/layout/app-shell";
+import { RootPage } from "@/components/root-page";
 
 export default function Page() {
-  return (
-    <AppShell active="dashboard">
-      <DashboardPage />
-    </AppShell>
-  );
+  return <RootPage />;
 }
