@@ -84,6 +84,11 @@ export type ShareView = {
   activeEdit?: ShareEditView;
   appType: string;
   providerId?: string;
+  /**
+   * P9: 多 app share 的每个 app_type 当前绑定的 provider id（{app: provider_id}）。
+   * 老 ShareDescriptor 不带这个字段时为 undefined / 空对象。
+   */
+  bindings?: Record<string, string>;
   tokenLimit: number;
   parallelLimit: number;
   tokensUsed: number;

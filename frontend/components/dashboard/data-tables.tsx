@@ -1578,7 +1578,18 @@ export function SharesTable({
                         </div>
                       </td>
                       <td className="px-4 py-3 align-middle text-xs uppercase text-muted-foreground">
-                        {share.appType || "-"}
+                        {/* P9: 多 app share — 优先列出实际绑定的 app slot；空时回退老 appType。 */}
+                        {(() => {
+                          const apps = share.bindings
+                            ? Object.keys(share.bindings).filter(
+                                (k) => share.bindings?.[k],
+                              )
+                            : [];
+                          if (apps.length > 0) {
+                            return apps.sort().join(" · ");
+                          }
+                          return share.appType || "-";
+                        })()}
                       </td>
                       <td className="px-4 py-3 align-middle">
                         <ForSaleCell share={share} t={t} />
@@ -1664,6 +1675,29 @@ export function SharesTable({
                     <DrawerSection label={t("dashboard.providers")}>
                       <ShareProvidersPanel share={selected} />
                     </DrawerSection>
+                    {/* P9: 多 app share 的每槽 provider 绑定快照。client 端事实源；
+                        ShareProvidersPanel 展示的是 runtime/health 视角，与本节互补。 */}
+                    {selected.bindings && Object.keys(selected.bindings).length > 0 ? (
+                      <DrawerSection label={t("dashboard.providerBindings")}>
+                        <ul className="grid gap-1 text-xs">
+                          {Object.entries(selected.bindings)
+                            .sort(([a], [b]) => a.localeCompare(b))
+                            .map(([app, providerId]) => (
+                              <li
+                                key={app}
+                                className="flex items-center gap-2 rounded border border-default/40 px-2 py-1"
+                              >
+                                <span className="uppercase font-mono text-[10px] text-muted-foreground">
+                                  {app}
+                                </span>
+                                <span className="font-mono text-foreground break-all">
+                                  {providerId}
+                                </span>
+                              </li>
+                            ))}
+                        </ul>
+                      </DrawerSection>
+                    ) : null}
                     <DrawerSection label={t("dashboard.requestLogs")}>
                       <ShareRequestLogs logs={selected.recentRequests || []} />
                     </DrawerSection>

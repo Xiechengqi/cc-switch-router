@@ -1069,6 +1069,7 @@ impl AppStore {
             active_edit,
             app_type: share.app_type,
             provider_id: share.provider_id,
+            bindings: share.bindings,
             token_limit: share.token_limit,
             parallel_limit: share.parallel_limit,
             tokens_used: share.tokens_used,
@@ -2342,6 +2343,7 @@ impl AppStore {
                     can_edit_settings,
                     active_edit,
                     provider_id: share.provider_id,
+                    bindings: share.bindings,
                     token_limit: share.token_limit,
                     parallel_limit: share.parallel_limit,
                     tokens_used: share.tokens_used,
@@ -4514,12 +4516,21 @@ fn upsert_share_tx(
         .map_err(|e| AppError::Internal(format!("serialize upstream provider failed: {e}")))?;
     let shared_with_emails_json = serde_json::to_string(&share.shared_with_emails)
         .map_err(|e| AppError::Internal(format!("serialize shared_with_emails failed: {e}")))?;
+    let bindings_json = if share.bindings.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::to_string(&share.bindings).map_err(|e| {
+                AppError::Internal(format!("serialize share bindings failed: {e}"))
+            })?,
+        )
+    };
     conn.execute(
         "INSERT INTO shares (
             share_id, installation_id, share_name, owner_email, shared_with_emails_json, market_access_mode, description, for_sale, subdomain, share_token, app_type, provider_id,
             enabled_claude, enabled_codex, enabled_gemini,
-            token_limit, parallel_limit, tokens_used, requests_count, share_status, created_at, expires_at, upstream_provider_json, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
+            token_limit, parallel_limit, tokens_used, requests_count, share_status, created_at, expires_at, upstream_provider_json, bindings_json, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
         ON CONFLICT(share_id) DO UPDATE SET
             installation_id = excluded.installation_id,
             share_name = excluded.share_name,
@@ -4545,6 +4556,7 @@ fn upsert_share_tx(
             upstream_provider_json = shares.upstream_provider_json,
             app_runtimes_json = shares.app_runtimes_json,
             app_providers_json = shares.app_providers_json,
+            bindings_json = excluded.bindings_json,
             runtime_refreshed_at = shares.runtime_refreshed_at,
             updated_at = excluded.updated_at",
         params![
@@ -4571,6 +4583,7 @@ fn upsert_share_tx(
             share.created_at,
             share.expires_at,
             upstream_provider_json,
+            bindings_json,
             Utc::now().to_rfc3339(),
         ],
     )
@@ -4866,6 +4879,8 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             upstream_provider_json TEXT,
             app_runtimes_json TEXT,
             app_providers_json TEXT,
+            -- P9: 多 app share 的每槽 provider 绑定快照（JSON: {app_type: provider_id}）。
+            bindings_json TEXT,
             runtime_refreshed_at TEXT,
             updated_at TEXT NOT NULL
         );
@@ -5457,6 +5472,14 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             .map_err(|e| {
                 AppError::Internal(format!("add shares app_providers_json failed: {e}"))
             })?;
+    }
+    if !columns.iter().any(|name| name == "bindings_json") {
+        // P9: per-app provider 绑定快照（{"claude": "p-1", "codex": "p-2"}）。
+        // cc-switch 多 app share 改造后，share 不再只挂一个 provider，需要把全量 slot
+        // bindings 推到 router 让 dashboard 可视化。老库迁移后该列为 NULL，路由功能
+        // 不受影响（route 决策仍走 app_runtimes/app_type）。
+        conn.execute("ALTER TABLE shares ADD COLUMN bindings_json TEXT", [])
+            .map_err(|e| AppError::Internal(format!("add shares bindings_json failed: {e}")))?;
     }
     if !columns.iter().any(|name| name == "parallel_limit") {
         conn.execute(
@@ -6059,7 +6082,8 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
         "SELECT s.installation_id, s.share_id, s.share_name, s.description, s.for_sale, s.market_access_mode, COALESCE(s.subdomain, '-'), s.share_token, s.app_type, s.provider_id,
                     s.owner_email, s.shared_with_emails_json,
                     s.enabled_claude, s.enabled_codex, s.enabled_gemini,
-                    s.token_limit, s.parallel_limit, s.tokens_used, s.requests_count, s.share_status, s.created_at, s.expires_at, s.upstream_provider_json, s.app_runtimes_json, s.app_providers_json
+                    s.token_limit, s.parallel_limit, s.tokens_used, s.requests_count, s.share_status, s.created_at, s.expires_at, s.upstream_provider_json, s.app_runtimes_json, s.app_providers_json,
+                    s.bindings_json
              FROM shares s
              ORDER BY s.share_name ASC",
         )
@@ -6079,6 +6103,7 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                     share_token: row.get(7)?,
                     app_type: row.get(8)?,
                     provider_id: row.get(9)?,
+                    bindings: parse_share_bindings(row.get(25)?)?,
                     owner_email: row.get(10)?,
                     shared_with_emails: parse_string_vec(row.get(11)?)?,
                     support: ShareSupport {
@@ -6507,6 +6532,22 @@ fn parse_app_runtimes(value: Option<String>) -> Result<ShareAppRuntimes, rusqlit
     };
     if value.trim().is_empty() {
         return Ok(ShareAppRuntimes::default());
+    }
+    serde_json::from_str(&value).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+    })
+}
+
+/// P9: 反序列化 share_provider_bindings JSON 列 ({app_type: provider_id})。
+/// 空字符串 / NULL → 空 map（老数据或 ShareDescriptor 没带 bindings 字段时的兜底）。
+fn parse_share_bindings(
+    value: Option<String>,
+) -> Result<BTreeMap<String, String>, rusqlite::Error> {
+    let Some(value) = value else {
+        return Ok(BTreeMap::new());
+    };
+    if value.trim().is_empty() {
+        return Ok(BTreeMap::new());
     }
     serde_json::from_str(&value).map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
@@ -10206,6 +10247,7 @@ mod tests {
             share_token: format!("token-{share_id}"),
             app_type: "proxy".into(),
             provider_id: None,
+            bindings: Default::default(),
             token_limit: 1000,
             parallel_limit: 3,
             tokens_used: 0,
@@ -11196,6 +11238,7 @@ mod tests {
             share_token: "token-reserved".into(),
             app_type: "proxy".into(),
             provider_id: None,
+            bindings: Default::default(),
             token_limit: 1000,
             parallel_limit: 3,
             tokens_used: 0,
@@ -11261,6 +11304,7 @@ mod tests {
             share_token: "token-12345678".into(),
             app_type: "proxy".into(),
             provider_id: None,
+            bindings: Default::default(),
             token_limit: 1000,
             parallel_limit: 3,
             tokens_used: 0,
@@ -11542,6 +11586,7 @@ mod tests {
             share_token: "token-minimal-123".into(),
             app_type: "proxy".into(),
             provider_id: None,
+            bindings: Default::default(),
             token_limit: -1,
             parallel_limit: -1,
             tokens_used: 0,
@@ -11620,6 +11665,7 @@ mod tests {
             share_token: "token-mismatch-123".into(),
             app_type: "proxy".into(),
             provider_id: None,
+            bindings: Default::default(),
             token_limit: 1000,
             parallel_limit: 3,
             tokens_used: 0,
@@ -11690,6 +11736,7 @@ mod tests {
             share_token: "token-12345678".into(),
             app_type: "proxy".into(),
             provider_id: None,
+            bindings: Default::default(),
             token_limit: 1000,
             parallel_limit: 3,
             tokens_used: 0,
@@ -11789,6 +11836,7 @@ mod tests {
             share_token: "token-12345678".into(),
             app_type: "proxy".into(),
             provider_id: None,
+            bindings: Default::default(),
             token_limit: 1000,
             parallel_limit: 3,
             tokens_used: 0,
@@ -11861,6 +11909,7 @@ mod tests {
             share_token: "token-12345678".into(),
             app_type: "proxy".into(),
             provider_id: None,
+            bindings: Default::default(),
             token_limit: 1000,
             parallel_limit: 3,
             tokens_used: 0,
@@ -11948,6 +11997,7 @@ mod tests {
             share_token: "token-batch-123".into(),
             app_type: "proxy".into(),
             provider_id: None,
+            bindings: Default::default(),
             token_limit: 2048,
             parallel_limit: 3,
             tokens_used: 12,
