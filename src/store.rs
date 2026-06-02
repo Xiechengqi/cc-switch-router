@@ -2391,22 +2391,15 @@ impl AppStore {
                 recent_requests: share.recent_requests.clone(),
             })
             .collect::<Vec<_>>();
-        let mut share_by_installation = HashMap::<String, ShareView>::new();
-        // 多 share 模式：同 installation 下按 share_id 累积所有 share，给 Clients 表用来显示
-        // share_count 和 share_ids；同时仍 collapse 出一个"代表 share"喂老 clients[*].share 字段。
+        // P7 Step 2：clients 表退化成 installation 维度。share 维度信息走顶层 `shares` 数组；
+        // 这里只为每个 installation 累积 share_ids（用于 ClientsTable 的 #shares 列和抽屉里
+        // 列出该机所有 share），不再 collapse 出"代表 share"，也不再保留 clients[*].share。
         let mut share_ids_by_installation = HashMap::<String, Vec<String>>::new();
         for share in &share_views {
-            let installation_id = share.installation_id.clone();
             share_ids_by_installation
-                .entry(installation_id.clone())
+                .entry(share.installation_id.clone())
                 .or_default()
                 .push(share.share_id.clone());
-            match share_by_installation.get(&installation_id) {
-                Some(existing) if !prefer_dashboard_share(share, existing) => {}
-                _ => {
-                    share_by_installation.insert(installation_id, share.clone());
-                }
-            }
         }
         let mut client_views = installation_views
             .iter()
@@ -2417,36 +2410,27 @@ impl AppStore {
                     .unwrap_or_default();
                 let share_count = share_ids.len();
                 DashboardClientView {
-                    share: share_by_installation.remove(&installation.id),
                     share_count,
                     share_ids,
                     installation,
                 }
             })
-            .filter(|client| client.share.is_some())
+            // 只展示挂了至少一个 share 的机器；otherwise dashboard 会被纯 lease/heartbeat
+            // 但无 share 的 installation 撑满。
+            .filter(|client| !client.share_ids.is_empty())
             .collect::<Vec<_>>();
         client_views.sort_by(|left, right| {
-            let left_owned = left
-                .share
-                .as_ref()
-                .map(|share| share.can_manage)
-                .unwrap_or(false);
-            let right_owned = right
-                .share
-                .as_ref()
-                .map(|share| share.can_manage)
-                .unwrap_or(false);
-            right_owned.cmp(&left_owned).then_with(|| {
-                right
-                    .installation
-                    .last_seen_at
-                    .cmp(&left.installation.last_seen_at)
-            })
+            // P7 Step 2：installation 维度排序。原"can_manage 优先"是 share 字段，已移除；
+            // 退化为按"share 数量降序 + 最近上线时间降序"，让活跃机器在上面。
+            right
+                .share_count
+                .cmp(&left.share_count)
+                .then_with(|| right.installation.last_seen_at.cmp(&left.installation.last_seen_at))
         });
         let clients_count = client_views.len();
-        let active_shares_count = client_views
+        let active_shares_count = share_views
             .iter()
-            .filter(|client| matches!(client.share.as_ref(), Some(share) if share.share_status == "active"))
+            .filter(|share| share.share_status == "active")
             .count();
         let total_active_requests = share_views.iter().map(|share| share.active_requests).sum();
         Ok(DashboardResponse {
@@ -2478,8 +2462,8 @@ impl AppStore {
                 clients: client_map_points,
             },
             clients: client_views,
-            // P7：share 维度全量列表，供新前端 SharesTable 直接消费；
-            // 与 `clients[*].share` 并行存在，老前端继续读 clients。
+            // P7 Step 2：share 维度全量列表，前端 SharesTable 唯一数据源。
+            // clients 数组退化为 installation 维度（只含 share_ids/share_count），不再持有 share 实体。
             shares: share_views.clone(),
             markets,
             ticker_shares,
@@ -5860,21 +5844,6 @@ fn should_refresh_installation_geo(installation: &Installation, next_ip: Option<
     installation.last_seen_ip.as_deref() != Some(next_ip)
         || installation.latitude.is_none()
         || installation.longitude.is_none()
-}
-
-fn prefer_dashboard_share(candidate: &ShareView, existing: &ShareView) -> bool {
-    if candidate.active_requests != existing.active_requests {
-        return candidate.active_requests > existing.active_requests;
-    }
-    let candidate_active = candidate.share_status == "active";
-    let existing_active = existing.share_status == "active";
-    if candidate_active != existing_active {
-        return candidate_active;
-    }
-    if candidate.created_at != existing.created_at {
-        return candidate.created_at > existing.created_at;
-    }
-    candidate.share_id > existing.share_id
 }
 
 fn deduplicate_dashboard_installations(
@@ -12428,9 +12397,9 @@ mod tests {
         assert_eq!(snapshot.stats.total_active_requests, 0);
         assert_eq!(snapshot.clients.len(), 1);
         assert_eq!(
-            snapshot.clients[0]
-                .share
-                .as_ref()
+            snapshot
+                .shares
+                .first()
                 .expect("share view")
                 .share_status,
             "paused"
@@ -12490,15 +12459,7 @@ mod tests {
         assert_eq!(snapshot.stats.total_active_requests, 3);
         assert_eq!(snapshot.map.clients.len(), 1);
         assert_eq!(snapshot.map.clients[0].active_requests, 3);
-        assert_eq!(
-            snapshot.clients[0]
-                .share
-                .as_ref()
-                .expect("selected share")
-                .share_id,
-            "share-old"
-        );
-        // P7：新前端用 shares 顶层数组 + clients[*].share_ids 做 share 维度展示。
+        // P7 Step 2：取消"prefer 出一个代表 share"的合并；两个 share 都在 snapshot.shares 里。
         assert_eq!(snapshot.shares.len(), 2);
         let mut shares_ids: Vec<_> =
             snapshot.shares.iter().map(|s| s.share_id.clone()).collect();
@@ -12537,7 +12498,7 @@ mod tests {
             .await
             .expect("dashboard snapshot");
 
-        let share = snapshot.clients[0].share.as_ref().expect("share view");
+        let share = snapshot.shares.first().expect("share view");
         assert!(!share.can_view_secret);
         assert_eq!(share.for_sale, "Free");
         assert_eq!(share.share_token, "t***4");
@@ -12609,7 +12570,7 @@ mod tests {
             .dashboard_snapshot(&config, &server_geo, &proxy, None)
             .await
             .expect("dashboard snapshot");
-        let share = snapshot.clients[0].share.as_ref().expect("share view");
+        let share = snapshot.shares.first().expect("share view");
 
         assert!(share.shared_with_emails.is_empty());
         assert_eq!(share.market_links.len(), 1);
@@ -12636,7 +12597,7 @@ mod tests {
             .dashboard_snapshot(&config, &server_geo, &proxy, Some("shared@example.com"))
             .await
             .expect("dashboard snapshot for shared viewer");
-        let share = snapshot.clients[0].share.as_ref().expect("share view");
+        let share = snapshot.shares.first().expect("share view");
 
         assert!(!share.can_manage);
         assert!(!share.can_edit_settings);
@@ -12996,7 +12957,7 @@ mod tests {
             .dashboard_snapshot(&config, &server_geo, &proxy, None)
             .await
             .expect("dashboard snapshot");
-        let share = snapshot.clients[0].share.as_ref().expect("share view");
+        let share = snapshot.shares.first().expect("share view");
         assert_eq!(share.online_minutes_24h, ONLINE_WINDOW_MINUTES);
         assert_eq!(share.online_rate_24h, 100.0);
 
@@ -13077,7 +13038,7 @@ mod tests {
             .dashboard_snapshot(&config, &server_geo, &proxy, None)
             .await
             .expect("dashboard snapshot");
-        let share = snapshot.clients[0].share.as_ref().expect("share view");
+        let share = snapshot.shares.first().expect("share view");
 
         assert_eq!(share.recent_model_health_checks.len(), 10);
         assert_eq!(share.recent_model_health_checks[0].checked_at, now);

@@ -164,11 +164,13 @@ function buildRequestMeta(data: DashboardResponse | null) {
       meta.set(log.requestId, { ...log, shareName: share.shareName, shareId: share.shareId, userEmail: log.userEmail || market?.userEmail, apiKeyPrefix: market?.apiKeyPrefix, usageAmountUsd: market?.usageAmountUsd });
     }
   }
-  for (const client of data?.clients || []) {
-    const share = client.share;
-    for (const log of share?.recentRequests || []) {
+  // P7 Step 2：share.recentRequests 现在直接来自顶层 data.shares 数组，
+  // 不再走 clients[*].share。tickerShares 是 router 高频推送的"最近活跃 share"
+  // 子集，先于完整 shares 列表填一遍，再用 shares 兜底补全。
+  for (const share of data?.shares || []) {
+    for (const log of share.recentRequests || []) {
       const market = marketMeta.get(log.requestId);
-      meta.set(log.requestId, { ...log, shareName: share?.shareName || log.shareName, shareId: share?.shareId || log.shareId, userEmail: log.userEmail || market?.userEmail, apiKeyPrefix: market?.apiKeyPrefix, usageAmountUsd: market?.usageAmountUsd });
+      meta.set(log.requestId, { ...log, shareName: share.shareName || log.shareName, shareId: share.shareId || log.shareId, userEmail: log.userEmail || market?.userEmail, apiKeyPrefix: market?.apiKeyPrefix, usageAmountUsd: market?.usageAmountUsd });
     }
   }
   for (const [requestId, log] of marketMeta) {

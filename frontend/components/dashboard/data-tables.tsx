@@ -170,16 +170,21 @@ function formatPlatformVersion(platform?: string, version?: string) {
   return `${platformLabel}/${versionLabel}`;
 }
 
+function clientPlatformLabel(client: DashboardClient) {
+  return formatPlatformVersion(client.installation.platform, client.installation.appVersion);
+}
+
 function sortClients(clients: DashboardClient[]) {
+  // P7 Step 2：installation 维度排序。#shares 降序优先，再按最近上线时间，
+  // 让正在挂多个 share 的活跃机器排在最上。
   return [...clients].sort((left, right) => {
-    const l = left.share;
-    const r = right.share;
     return (
-      Number(!!r?.canManage) - Number(!!l?.canManage) ||
-      compareDesc(l?.onlineMinutes24h || 0, r?.onlineMinutes24h || 0) ||
-      compareDesc(isUnlimited(l?.tokenLimit) ? Infinity : l?.tokenLimit || 0, isUnlimited(r?.tokenLimit) ? Infinity : r?.tokenLimit || 0) ||
-      compareDesc(expirySortValue(l), expirySortValue(r)) ||
-      shareApiUrlKey(l).localeCompare(shareApiUrlKey(r), undefined, { sensitivity: "base" })
+      (right.shareCount || 0) - (left.shareCount || 0) ||
+      compareDesc(
+        Date.parse(left.installation.lastSeenAt) || 0,
+        Date.parse(right.installation.lastSeenAt) || 0,
+      ) ||
+      left.installation.id.localeCompare(right.installation.id, undefined, { sensitivity: "base" })
     );
   });
 }
@@ -1339,12 +1344,26 @@ function ShareStatusCell({ client, share, t, locale }: { client: DashboardClient
   );
 }
 
-export function ClientsTable({ clients, markets, onChanged }: { clients: DashboardClient[]; markets: DashboardMarket[]; onChanged?: () => Promise<void> | void }) {
+export function ClientsTable({ clients, shares, markets, onChanged }: { clients: DashboardClient[]; shares: ShareView[]; markets: DashboardMarket[]; onChanged?: () => Promise<void> | void }) {
   const [selected, setSelected] = React.useState<DashboardClient | null>(null);
   const [editingShare, setEditingShare] = React.useState<ShareView | null>(null);
   const { locale, t } = useLocaleText();
   const sorted = sortClients(clients);
-  const selectedShareApi = shareApiParts(selected?.share);
+
+  // shareId → ShareView，供 drawer 反查该 installation 的 share 摘要。
+  const shareById = React.useMemo(() => {
+    const map = new Map<string, ShareView>();
+    shares.forEach((share) => map.set(share.shareId, share));
+    return map;
+  }, [shares]);
+
+  const selectedShares = React.useMemo(() => {
+    if (!selected) return [] as ShareView[];
+    return (selected.shareIds || [])
+      .map((id) => shareById.get(id))
+      .filter((s): s is ShareView => !!s);
+  }, [selected, shareById]);
+
   return (
     <section className="grid gap-3">
       <div className="flex items-center justify-between font-mono text-[11px] uppercase tracking-[0.14em] text-muted-foreground">
@@ -1353,39 +1372,37 @@ export function ClientsTable({ clients, markets, onChanged }: { clients: Dashboa
       </div>
       <Card className="overflow-hidden rounded-[20px]">
         <Card.Content className="overflow-x-auto p-0">
-          <table className="w-full min-w-[1180px] border-collapse text-sm">
+          <table className="w-full min-w-[960px] border-collapse text-sm">
             <thead className="bg-muted text-left font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground">
               <tr>
-                <th className="w-72 px-4 py-3">{t("dashboard.share")}</th>
-                <th className="px-4 py-3">{t("dashboard.forSale")}</th>
+                <th className="w-80 px-4 py-3">{t("dashboard.installation")}</th>
+                <th className="px-4 py-3">{t("dashboard.platform")}</th>
                 <th className="px-4 py-3">{t("dashboard.region")}</th>
-                <th className="px-4 py-3">{t("dashboard.status")}</th>
-                <th className="px-4 py-3">{t("dashboard.support")}</th>
+                <th className="px-4 py-3">{t("dashboard.lastSeen")}</th>
+                <th className="px-4 py-3 text-right">{t("dashboard.shareCount")}</th>
                 <th className="w-7 px-4 py-3" />
               </tr>
             </thead>
             <tbody>
               {sorted.length ? sorted.map((client) => {
-                const share = client.share;
-                const api = shareApiParts(share);
+                const shareCount = client.shareCount ?? client.shareIds?.length ?? 0;
                 return (
-	                  <tr key={client.installation.id} className="cursor-pointer border-b last:border-0 hover:bg-primary/5" onClick={(event) => { if (shouldOpenRowDrawer(event)) setSelected(client); }}>
-	                    <td className="w-72 break-words px-4 py-3 align-middle">
-	                      <div className="grid min-w-72 gap-1">
-		                        <strong className="break-all font-mono text-xs text-foreground">{share ? api.apiUrl : "-"}</strong>
-	                        <span className="break-all text-xs text-muted-foreground">{share?.ownerEmail || "-"}</span>
-	                        <div className="mt-1 flex flex-wrap items-center gap-2">
-	                          <ShareStatusBadge share={share} t={t} />
-                          <ShareEditAction share={share} onEdit={setEditingShare} t={t} />
-                        </div>
-                      </div>
+                  <tr key={client.installation.id} className="cursor-pointer border-b last:border-0 hover:bg-primary/5" onClick={(event) => { if (shouldOpenRowDrawer(event)) setSelected(client); }}>
+                    <td className="w-80 break-all px-4 py-3 align-middle font-mono text-xs text-foreground">
+                      {client.installation.id}
                     </td>
-                    <td className="px-4 py-3 align-middle"><ForSaleCell share={share} t={t} /></td>
+                    <td className="px-4 py-3 align-middle text-xs text-muted-foreground">
+                      {clientPlatformLabel(client)}
+                    </td>
                     <td className="px-4 py-3 align-middle text-muted-foreground">
                       {client.installation.countryCode || "-"}
                     </td>
-                    <td className="px-4 py-3 align-middle"><ShareStatusCell client={client} share={share} t={t} locale={locale} /></td>
-                    <td className="px-4 py-3 align-middle"><SupportCell share={share} t={t} locale={locale} /></td>
+                    <td className="px-4 py-3 align-middle text-xs text-muted-foreground" title={formatDateTime(client.installation.lastSeenAt)}>
+                      {formatRelativeTime(client.installation.lastSeenAt, locale)}
+                    </td>
+                    <td className="px-4 py-3 align-middle text-right">
+                      <span className="font-semibold text-foreground">{shareCount}</span>
+                    </td>
                     <td className="px-4 py-3 align-middle text-lg text-muted-foreground">›</td>
                   </tr>
                 );
@@ -1401,25 +1418,54 @@ export function ClientsTable({ clients, markets, onChanged }: { clients: Dashboa
           <Drawer.Content placement="right">
             <Drawer.Dialog className={drawerDialogClassName}>
               <Drawer.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
-	              <Drawer.Header>
-	                <div>
-	                  <Drawer.Heading className="break-all font-mono text-base">
-		                    {selected?.share ? selectedShareApi.apiUrl : selected?.installation.id}
-	                  </Drawer.Heading>
-                  <p className="mt-1 break-all text-sm text-muted-foreground">{selected?.share?.ownerEmail || "-"}</p>
-                  {selected?.share?.description ? (
-                    <p className="mt-2 whitespace-pre-wrap break-words text-xs leading-5 text-muted-foreground">{selected.share.description}</p>
-                  ) : null}
+              <Drawer.Header>
+                <div>
+                  <Drawer.Heading className="break-all font-mono text-base">
+                    {selected?.installation.id}
+                  </Drawer.Heading>
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    {selected ? clientPlatformLabel(selected) : ""}
+                    {selected?.installation.countryCode ? ` · ${selected.installation.countryCode}` : ""}
+                  </p>
                 </div>
               </Drawer.Header>
               <Drawer.Body className="overflow-y-auto">
                 {selected ? (
                   <div className="grid gap-5">
-                    <DrawerSection label="24h"><HealthTimelineStrip timeline={selected.share?.healthTimeline} /></DrawerSection>
-                    <DrawerSection label={t("dashboard.markets")}><ShareMarkets share={selected.share} t={t} /></DrawerSection>
-                    <DrawerSection label={t("dashboard.providers")}><ShareProvidersPanel share={selected.share} /></DrawerSection>
-                    <DrawerSection label={t("dashboard.requestLogs")}><ShareRequestLogs logs={selected.share?.recentRequests || []} /></DrawerSection>
-                    <DrawerSection label={t("dashboard.modelHealthChecks")}><ShareModelHealthChecks checks={selected.share?.recentModelHealthChecks || []} /></DrawerSection>
+                    <DrawerSection label={t("dashboard.installation")}>
+                      <div className="grid gap-1 text-xs text-muted-foreground">
+                        <span>{t("dashboard.lastSeen")}: <strong className="text-foreground">{formatDateTime(selected.installation.lastSeenAt)}</strong></span>
+                        <span>{t("dashboard.region")}: <strong className="text-foreground">{selected.installation.countryCode || "-"}</strong></span>
+                        <span className="break-all">id: {selected.installation.id}</span>
+                      </div>
+                    </DrawerSection>
+                    {/* P7 Step 2：抽屉里列出该 installation 的所有 share。深度详情仍走 SharesTable 自己的 drawer。 */}
+                    <DrawerSection label={`${t("dashboard.shares")} (${selectedShares.length})`}>
+                      {selectedShares.length ? (
+                        <ul className="grid gap-2">
+                          {selectedShares.map((share) => {
+                            const api = shareApiParts(share);
+                            return (
+                              <li key={share.shareId} className="rounded-md border border-default p-2">
+                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                  <strong className="break-all font-mono text-xs text-foreground">{api.apiUrl}</strong>
+                                  <ShareStatusBadge share={share} t={t} />
+                                </div>
+                                <div className="mt-1 text-xs text-muted-foreground">
+                                  <span className="break-all">{share.ownerEmail || "-"}</span>
+                                  {share.appType ? <span className="ml-2 uppercase">{share.appType}</span> : null}
+                                </div>
+                                <div className="mt-1 flex items-center gap-2">
+                                  <ShareEditAction share={share} onEdit={setEditingShare} t={t} />
+                                </div>
+                              </li>
+                            );
+                          })}
+                        </ul>
+                      ) : (
+                        <span className="text-xs text-muted-foreground">{t("dashboard.noShares")}</span>
+                      )}
+                    </DrawerSection>
                   </div>
                 ) : null}
               </Drawer.Body>
@@ -1434,8 +1480,7 @@ export function ClientsTable({ clients, markets, onChanged }: { clients: Dashboa
 
 /**
  * P7：share 维度表。每行对应一个 share；installation 维度信息（region / platform）
- * 通过 clients[].shareIds 反查得到。Clients 表保留作"机器维度"概览，
- * 两个表互补存在，避免老前端断裂。
+ * 通过 clients[].shareIds 反查得到。ClientsTable 退化为"机器维度"，share 详情统一在这里看。
  */
 export function SharesTable({
   clients,

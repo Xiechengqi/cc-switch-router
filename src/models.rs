@@ -1298,15 +1298,13 @@ pub struct InstallationView {
 #[serde(rename_all = "camelCase")]
 pub struct DashboardClientView {
     pub installation: InstallationView,
-    /// 单 share 时代字段；多 share 模式下保留一个"代表 share"（按 prefer_dashboard_share
-    /// 排序的 top share）用于老前端兼容，新前端应改用 `shares` 顶层字段做 share 维度展示。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub share: Option<ShareView>,
-    /// 该 installation 名下挂的所有 active share id 列表；新前端 Clients 表用它显示"#shares"
-    /// 列，并在抽屉里展开多 share 详情。
+    /// 该 installation 名下挂的所有 active share id 列表。
+    /// 前端 ClientsTable 用它展示 `#shares` 列，并在抽屉里反查顶层 `shares`
+    /// 渲染该机器的所有 share 摘要。Share 维度的元数据（owner / status / 健康）
+    /// 一律走顶层 `DashboardResponse.shares` 字段，不在 client 上重复。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub share_ids: Vec<String>,
-    /// 与 share_ids.len() 等价的便利字段，避免前端做 length 调用。
+    /// 与 `share_ids.len()` 等价的便利字段，避免前端做长度调用。
     #[serde(default)]
     pub share_count: usize,
 }
