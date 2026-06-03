@@ -27,25 +27,26 @@ use crate::models::{
     ChangeInstallationOwnerEmailRequest, ChangeInstallationOwnerEmailResponse, ClientMetadata,
     DashboardClientView, DashboardMap, DashboardMapPoint, DashboardMarketRequestLogView,
     DashboardMarketView, DashboardPresenceRequest, DashboardResponse, DashboardStats,
-    DashboardTickerShare, GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse,
-    HealthCheckEntry, HealthTimelineBucket, Installation, InstallationView, IssueLeaseRequest,
-    IssueLeaseResponse, LatLonPoint, MarketAppAvailability, MarketAppAvailabilityEntry,
-    MarketDisabledSharesUpdateRequest, MarketDisabledSharesUpdateResponse, MarketLinkedShareView,
-    MarketMaintenanceUpdateRequest, MarketMaintenanceUpdateResponse, MarketRegistryRecord,
-    MarketRequestLogBatchSyncRequest, MarketRequestLogEntry, MarketShareView, ModelHealthSummary,
-    PublicMapClientPoint, PublicMapPointsResponse, PublicMarketConfig, RefreshSessionRequest,
-    RegisterInstallationRequest, RegisterInstallationResponse, RegisterMarketRequest,
-    RequestEmailCodeRequest, RequestEmailCodeResponse, SessionStatusResponse, ShareAppProviders,
-    ShareAppRuntimes, ShareBatchSyncRequest, ShareClaimPayload, ShareClaimSubdomainRequest,
-    ShareDeleteRequest, ShareDescriptor, ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest,
-    ShareMarketLinkView, ShareModelHealthCheckEntry, ShareModelHealthSummary,
-    SharePendingEditsRequest, SharePendingEditsResponse, ShareRequestLogBatchSyncRequest,
-    ShareRequestLogEntry, ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload,
-    ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse, ShareSettingsPatch,
-    ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest,
-    ShareUpstreamProvider, ShareView, TunnelLease, UserApiTokenResetResponse, UserApiTokenResponse,
-    UserApiTokenStatus, UserShareView, UserSharesResponse, VerifyEmailCodeRequest,
-    VerifyEmailCodeResponse,
+    DashboardTickerShare, GatewayRegistryRecord, GetInstallationOwnerEmailQuery,
+    GetInstallationOwnerEmailResponse, HealthCheckEntry, HealthTimelineBucket, Installation,
+    InstallationView, IssueLeaseRequest, IssueLeaseResponse, LatLonPoint, MarketAppAvailability,
+    MarketAppAvailabilityEntry, MarketDisabledSharesUpdateRequest,
+    MarketDisabledSharesUpdateResponse, MarketLinkedShareView, MarketMaintenanceUpdateRequest,
+    MarketMaintenanceUpdateResponse, MarketRegistryRecord, MarketRequestLogBatchSyncRequest,
+    MarketRequestLogEntry, MarketShareView, ModelHealthSummary, PublicMapClientPoint,
+    PublicMapPointsResponse, PublicMarketConfig, RefreshSessionRequest, RegisterGatewayRequest,
+    RegisterGatewayResponse, RegisterInstallationRequest, RegisterInstallationResponse,
+    RegisterMarketRequest, RequestEmailCodeRequest, RequestEmailCodeResponse,
+    SessionStatusResponse, ShareAppProviders, ShareAppRuntimes, ShareBatchSyncRequest,
+    ShareClaimPayload, ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptor,
+    ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest, ShareMarketLinkView,
+    ShareModelHealthCheckEntry, ShareModelHealthSummary, SharePendingEditsRequest,
+    SharePendingEditsResponse, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry,
+    ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload, ShareRuntimeRefreshRequest,
+    ShareRuntimeSnapshotResponse, ShareSettingsPatch, ShareSettingsUpdateResponse, ShareSignals,
+    ShareSupport, ShareSyncRequest, ShareUpstreamProvider, ShareView, TunnelLease,
+    UserApiTokenResetResponse, UserApiTokenResponse, UserApiTokenStatus, UserShareView,
+    UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 #[cfg(test)]
 use crate::models::{ShareAppProvider, ShareUpstreamModel};
@@ -72,6 +73,12 @@ const MARKET_DEFAULT_SCOPES: &[&str] = &[
     "market:proxy:use",
     "market:email:notify",
     "market:request_logs:write",
+];
+const GATEWAY_DEFAULT_SCOPES: &[&str] = &[
+    "gateway:shares:read",
+    "gateway:proxy:use",
+    "gateway:feedback:write",
+    "gateway:request_logs:write",
 ];
 const USER_DEFAULT_API_TOKEN_SCOPES: &[&str] = &["share:read", "share:write", "share:invoke"];
 const USER_DEFAULT_API_TOKEN_NAME: &str = "default";
@@ -2424,10 +2431,12 @@ impl AppStore {
         client_views.sort_by(|left, right| {
             // P7 Step 2：installation 维度排序。原"can_manage 优先"是 share 字段，已移除；
             // 退化为按"share 数量降序 + 最近上线时间降序"，让活跃机器在上面。
-            right
-                .share_count
-                .cmp(&left.share_count)
-                .then_with(|| right.installation.last_seen_at.cmp(&left.installation.last_seen_at))
+            right.share_count.cmp(&left.share_count).then_with(|| {
+                right
+                    .installation
+                    .last_seen_at
+                    .cmp(&left.installation.last_seen_at)
+            })
         });
         let clients_count = client_views.len();
         let active_shares_count = share_views
@@ -2832,7 +2841,9 @@ impl AppStore {
             (
                 CleanupResult {
                     deleted_leases: deleted_leases + deleted_stale_leases,
-                    deleted_shares: deleted_stale_shares + deleted_paused_shares + deleted_old_shares,
+                    deleted_shares: deleted_stale_shares
+                        + deleted_paused_shares
+                        + deleted_old_shares,
                     deleted_installations,
                     removed_routes: 0,
                 },
@@ -3003,6 +3014,167 @@ impl AppStore {
             maintenance_message: existing_market.and_then(|market| market.maintenance_message),
             pricing_summary: input.pricing_summary,
         })
+    }
+
+    pub async fn register_gateway(
+        &self,
+        input: RegisterGatewayRequest,
+    ) -> Result<RegisterGatewayResponse, AppError> {
+        let owner_email = normalize_email(&input.owner_email)?;
+        let display_name = input.display_name.trim();
+        if display_name.is_empty() || display_name.len() > 80 {
+            return Err(AppError::BadRequest("invalid gateway display name".into()));
+        }
+        validate_ed25519_public_key(&input.public_key)?;
+        let public_base_url = input
+            .public_base_url
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty());
+        if let Some(url) = public_base_url
+            && !url.starts_with("http://")
+            && !url.starts_with("https://")
+        {
+            return Err(AppError::BadRequest(
+                "invalid gateway public base url".into(),
+            ));
+        }
+        let app_version = input
+            .app_version
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let scopes_json = serde_json::to_string(GATEWAY_DEFAULT_SCOPES)
+            .map_err(|e| AppError::Internal(format!("serialize gateway scopes failed: {e}")))?;
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        let existing = get_gateway_by_public_key(&conn, &input.public_key)?;
+        let id = existing
+            .as_ref()
+            .map(|gateway| gateway.id.clone())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let created_at = if let Some(gateway) = existing.as_ref() {
+            gateway_created_at(&conn, &gateway.id)?.unwrap_or_else(|| now.clone())
+        } else {
+            now.clone()
+        };
+        conn.execute(
+            "INSERT INTO router_gateways (
+                id, owner_email, display_name, public_key, public_base_url,
+                app_version, scopes_json, status, created_at, updated_at, last_seen_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?9, ?9)
+             ON CONFLICT(public_key) DO UPDATE SET
+                owner_email = excluded.owner_email,
+                display_name = excluded.display_name,
+                public_base_url = excluded.public_base_url,
+                app_version = excluded.app_version,
+                scopes_json = excluded.scopes_json,
+                status = 'active',
+                updated_at = excluded.updated_at,
+                last_seen_at = excluded.last_seen_at",
+            params![
+                id,
+                owner_email,
+                display_name,
+                input.public_key,
+                public_base_url.map(ToOwned::to_owned),
+                app_version,
+                scopes_json.clone(),
+                created_at,
+                now,
+            ],
+        )
+        .map_err(|e| AppError::Internal(format!("register gateway failed: {e}")))?;
+
+        Ok(RegisterGatewayResponse {
+            gateway_id: id,
+            owner_email,
+            display_name: display_name.to_string(),
+            status: "active".to_string(),
+            scopes: GATEWAY_DEFAULT_SCOPES
+                .iter()
+                .map(|scope| scope.to_string())
+                .collect(),
+            created_at,
+            last_seen_at: now,
+        })
+    }
+
+    pub async fn authenticate_gateway_signed_request(
+        &self,
+        gateway_id: &str,
+        required_scope: &str,
+        action: &str,
+        body_sha256_hex: &str,
+        timestamp_ms: i64,
+        nonce: &str,
+        signature: &str,
+    ) -> Result<GatewayRegistryRecord, AppError> {
+        if gateway_id.trim().is_empty() || nonce.trim().is_empty() || signature.trim().is_empty() {
+            return Err(AppError::Unauthorized(
+                "missing gateway signature fields".into(),
+            ));
+        }
+        let conn = self.conn.lock().await;
+        let gateway = get_gateway_by_id(&conn, gateway_id)?
+            .ok_or_else(|| AppError::Unauthorized("gateway is not registered".into()))?;
+        if !gateway.has_scope(required_scope) {
+            return Err(AppError::Unauthorized(
+                "gateway scope is not allowed".into(),
+            ));
+        }
+        verify_signed_gateway_request(
+            &conn,
+            &gateway.public_key,
+            &gateway.id,
+            action,
+            body_sha256_hex,
+            timestamp_ms,
+            nonce,
+            signature,
+        )?;
+        conn.execute(
+            "UPDATE router_gateways SET last_seen_at = ?1 WHERE id = ?2",
+            params![Utc::now().to_rfc3339(), gateway.id],
+        )
+        .map_err(|e| AppError::Internal(format!("touch gateway failed: {e}")))?;
+        Ok(gateway)
+    }
+
+    pub async fn list_gateway_shares(
+        &self,
+        gateway: &GatewayRegistryRecord,
+        router_id: &str,
+        active_subdomains: &HashSet<String>,
+        inflight_by_share: &HashMap<String, usize>,
+    ) -> Result<Vec<MarketShareView>, AppError> {
+        self.list_market_shares(
+            &gateway.owner_email,
+            router_id,
+            active_subdomains,
+            inflight_by_share,
+        )
+        .await
+    }
+
+    pub async fn batch_sync_gateway_request_logs(
+        &self,
+        gateway: &GatewayRegistryRecord,
+        input: MarketRequestLogBatchSyncRequest,
+    ) -> Result<usize, AppError> {
+        let market = MarketRegistryRecord {
+            id: gateway.id.clone(),
+            display_name: gateway.display_name.clone(),
+            email: gateway.owner_email.clone(),
+            subdomain: format!("gateway:{}", gateway.id),
+            public_base_url: gateway.public_base_url.clone().unwrap_or_default(),
+            scopes: gateway.scopes.clone(),
+            status: gateway.status.clone(),
+            maintenance_enabled: false,
+            maintenance_message: None,
+        };
+        self.batch_sync_market_request_logs(&market, input).await
     }
 
     pub async fn list_public_markets(&self) -> Result<Vec<PublicMarketConfig>, AppError> {
@@ -4543,9 +4715,8 @@ fn upsert_share_tx(
         None
     } else {
         Some(
-            serde_json::to_string(&share.bindings).map_err(|e| {
-                AppError::Internal(format!("serialize share bindings failed: {e}"))
-            })?,
+            serde_json::to_string(&share.bindings)
+                .map_err(|e| AppError::Internal(format!("serialize share bindings failed: {e}")))?,
         )
     };
     conn.execute(
@@ -5109,6 +5280,20 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             offline_since TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS router_gateways (
+            id TEXT PRIMARY KEY,
+            owner_email TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            public_key TEXT NOT NULL UNIQUE,
+            public_base_url TEXT,
+            app_version TEXT,
+            scopes_json TEXT NOT NULL DEFAULT '[\"gateway:shares:read\",\"gateway:proxy:use\",\"gateway:feedback:write\",\"gateway:request_logs:write\"]',
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS market_notification_emails (
             id TEXT PRIMARY KEY,
             market_email TEXT NOT NULL,
@@ -5170,6 +5355,8 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         CREATE INDEX IF NOT EXISTS idx_user_sessions_installation ON user_sessions(installation_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_router_markets_status ON router_markets(status, listed, updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_router_markets_subdomain ON router_markets(subdomain);
+        CREATE INDEX IF NOT EXISTS idx_router_gateways_owner ON router_gateways(owner_email, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_router_gateways_status ON router_gateways(status, updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_market_notification_emails_market_created ON market_notification_emails(market_email, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_market_notification_emails_to_created ON market_notification_emails(to_email, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_market_request_logs_market_created ON market_request_logs(market_email, created_at DESC);
@@ -8089,6 +8276,61 @@ fn get_market_by_email(
     .map_err(|e| AppError::Internal(format!("query market by email failed: {e}")))
 }
 
+fn get_gateway_by_id(
+    conn: &Connection,
+    gateway_id: &str,
+) -> Result<Option<GatewayRegistryRecord>, AppError> {
+    conn.query_row(
+        "SELECT id, owner_email, display_name, public_key, public_base_url, app_version,
+                status, scopes_json
+         FROM router_gateways
+         WHERE id = ?1",
+        params![gateway_id],
+        gateway_record_from_row,
+    )
+    .optional()
+    .map_err(|e| AppError::Internal(format!("query gateway by id failed: {e}")))
+}
+
+fn get_gateway_by_public_key(
+    conn: &Connection,
+    public_key: &str,
+) -> Result<Option<GatewayRegistryRecord>, AppError> {
+    conn.query_row(
+        "SELECT id, owner_email, display_name, public_key, public_base_url, app_version,
+                status, scopes_json
+         FROM router_gateways
+         WHERE public_key = ?1",
+        params![public_key],
+        gateway_record_from_row,
+    )
+    .optional()
+    .map_err(|e| AppError::Internal(format!("query gateway by public key failed: {e}")))
+}
+
+fn gateway_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GatewayRegistryRecord> {
+    Ok(GatewayRegistryRecord {
+        id: row.get(0)?,
+        owner_email: row.get(1)?,
+        display_name: row.get(2)?,
+        public_key: row.get(3)?,
+        public_base_url: row.get(4)?,
+        app_version: row.get(5)?,
+        status: row.get(6)?,
+        scopes: parse_string_vec(row.get(7)?)?,
+    })
+}
+
+fn gateway_created_at(conn: &Connection, gateway_id: &str) -> Result<Option<String>, AppError> {
+    conn.query_row(
+        "SELECT created_at FROM router_gateways WHERE id = ?1",
+        params![gateway_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| AppError::Internal(format!("query gateway created_at failed: {e}")))
+}
+
 fn list_dashboard_markets(
     conn: &Connection,
     viewer_email: Option<&str>,
@@ -8609,6 +8851,35 @@ fn verify_signed_share_request<T: Serialize>(
     consume_request_nonce(conn, installation_id, action, nonce, now)
 }
 
+fn verify_signed_gateway_request(
+    conn: &Connection,
+    public_key: &str,
+    gateway_id: &str,
+    action: &str,
+    body_sha256_hex: &str,
+    timestamp_ms: i64,
+    nonce: &str,
+    signature: &str,
+) -> Result<(), AppError> {
+    let now = Utc::now();
+    let skew = (now.timestamp_millis() - timestamp_ms).abs();
+    if skew > SIGNED_REQUEST_MAX_SKEW_MS {
+        return Err(AppError::Unauthorized(
+            "stale signed gateway request".into(),
+        ));
+    }
+    verify_gateway_signature(
+        public_key,
+        gateway_id,
+        action,
+        body_sha256_hex,
+        timestamp_ms,
+        nonce,
+        signature,
+    )?;
+    consume_request_nonce(conn, gateway_id, action, nonce, now)
+}
+
 fn verify_share_claim_request(
     conn: &Connection,
     public_key: &str,
@@ -8731,6 +9002,47 @@ fn verify_signed_payload<T: Serialize>(
     verifying_key
         .verify(payload.as_bytes(), &signature)
         .map_err(|_| AppError::Unauthorized("signature verification failed".into()))
+}
+
+fn verify_gateway_signature(
+    public_key: &str,
+    gateway_id: &str,
+    action: &str,
+    body_sha256_hex: &str,
+    timestamp_ms: i64,
+    nonce: &str,
+    signature: &str,
+) -> Result<(), AppError> {
+    let verifying_key = ed25519_verifying_key(public_key)?;
+    let sig_bytes = base64::engine::general_purpose::STANDARD
+        .decode(signature)
+        .map_err(|_| AppError::Unauthorized("invalid gateway signature".into()))?;
+    let sig_array: [u8; 64] = sig_bytes
+        .try_into()
+        .map_err(|_| AppError::Unauthorized("invalid gateway signature length".into()))?;
+    let signature = Signature::from_bytes(&sig_array);
+    let payload = format!(
+        "{}\n{}\n{}\n{}\n{}",
+        gateway_id, action, body_sha256_hex, timestamp_ms, nonce
+    );
+    verifying_key
+        .verify(payload.as_bytes(), &signature)
+        .map_err(|_| AppError::Unauthorized("gateway signature verification failed".into()))
+}
+
+fn validate_ed25519_public_key(public_key: &str) -> Result<(), AppError> {
+    ed25519_verifying_key(public_key).map(|_| ())
+}
+
+fn ed25519_verifying_key(public_key: &str) -> Result<VerifyingKey, AppError> {
+    let key_bytes = base64::engine::general_purpose::STANDARD
+        .decode(public_key)
+        .map_err(|_| AppError::BadRequest("invalid gateway public key".into()))?;
+    let key_array: [u8; 32] = key_bytes
+        .try_into()
+        .map_err(|_| AppError::BadRequest("invalid gateway public key length".into()))?;
+    VerifyingKey::from_bytes(&key_array)
+        .map_err(|_| AppError::BadRequest("invalid gateway public key".into()))
 }
 
 async fn redeem_verification_token(
@@ -12471,11 +12783,7 @@ mod tests {
         assert_eq!(snapshot.stats.total_active_requests, 0);
         assert_eq!(snapshot.clients.len(), 1);
         assert_eq!(
-            snapshot
-                .shares
-                .first()
-                .expect("share view")
-                .share_status,
+            snapshot.shares.first().expect("share view").share_status,
             "paused"
         );
 
@@ -12535,8 +12843,7 @@ mod tests {
         assert_eq!(snapshot.map.clients[0].active_requests, 3);
         // P7 Step 2：取消"prefer 出一个代表 share"的合并；两个 share 都在 snapshot.shares 里。
         assert_eq!(snapshot.shares.len(), 2);
-        let mut shares_ids: Vec<_> =
-            snapshot.shares.iter().map(|s| s.share_id.clone()).collect();
+        let mut shares_ids: Vec<_> = snapshot.shares.iter().map(|s| s.share_id.clone()).collect();
         shares_ids.sort();
         assert_eq!(shares_ids, vec!["share-new", "share-old"]);
         assert_eq!(snapshot.clients[0].share_count, 2);
@@ -13013,16 +13320,37 @@ mod tests {
         insert_installation(&store, "inst-1").await;
         // 一条活的 share 让 installation 永远不 stale；paused 的那条本应独立计时。
         insert_share(&store, "inst-1", "share-active", "active-sub", "active").await;
-        insert_share(&store, "inst-1", "share-paused-old", "paused-old-sub", "paused").await;
-        insert_share(&store, "inst-1", "share-paused-fresh", "paused-fresh-sub", "paused").await;
-        insert_share(&store, "inst-1", "share-active-old", "active-old-sub", "active").await;
+        insert_share(
+            &store,
+            "inst-1",
+            "share-paused-old",
+            "paused-old-sub",
+            "paused",
+        )
+        .await;
+        insert_share(
+            &store,
+            "inst-1",
+            "share-paused-fresh",
+            "paused-fresh-sub",
+            "paused",
+        )
+        .await;
+        insert_share(
+            &store,
+            "inst-1",
+            "share-active-old",
+            "active-old-sub",
+            "active",
+        )
+        .await;
 
         // 把 share-paused-old 的 updated_at 推到 paused 阈值之外（默认 3600s + 余量）。
         // share-active-old 也推到那个时间，验证 active 状态绝不会被这条分支命中。
         // share-paused-fresh 留在 now，验证窗口内的 paused 不被误删。
         {
-            let stale = (Utc::now() - Duration::seconds(config.paused_share_stale_secs + 600))
-                .to_rfc3339();
+            let stale =
+                (Utc::now() - Duration::seconds(config.paused_share_stale_secs + 600)).to_rfc3339();
             let conn = store.conn.lock().await;
             conn.execute(
                 "UPDATE shares SET updated_at = ?1 WHERE share_id = ?2",

@@ -233,7 +233,7 @@ impl OverrideStore {
 }
 
 /// Request body for `POST /v1/market/shares/feedback`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareFeedbackRequest {
     /// Share whose request triggered the feedback. The router resolves the
@@ -251,7 +251,7 @@ pub struct ShareFeedbackRequest {
     pub ttl_secs: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ShareFeedbackKind {
     RateLimited,
@@ -267,7 +267,7 @@ pub struct ShareFeedbackResponse {
 }
 
 /// Request body for `POST /v1/market/shares/headroom`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareHeadroomRequest {
     pub share_ids: Vec<String>,

@@ -396,7 +396,7 @@ pub struct ShareRequestLogBatchSyncRequest {
     pub logs: Vec<ShareRequestLogEntry>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MarketRequestLogBatchSyncRequest {
     pub logs: Vec<MarketRequestLogEntry>,
@@ -816,6 +816,24 @@ impl MarketRegistryRecord {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct GatewayRegistryRecord {
+    pub id: String,
+    pub owner_email: String,
+    pub display_name: String,
+    pub public_key: String,
+    pub public_base_url: Option<String>,
+    pub app_version: Option<String>,
+    pub status: String,
+    pub scopes: Vec<String>,
+}
+
+impl GatewayRegistryRecord {
+    pub fn has_scope(&self, scope: &str) -> bool {
+        self.status.eq_ignore_ascii_case("active") && self.scopes.iter().any(|value| value == scope)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RegisterMarketRequest {
@@ -824,6 +842,30 @@ pub struct RegisterMarketRequest {
     pub public_base_url: String,
     #[serde(default)]
     pub pricing_summary: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisterGatewayRequest {
+    pub owner_email: String,
+    pub display_name: String,
+    pub public_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_version: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisterGatewayResponse {
+    pub gateway_id: String,
+    pub owner_email: String,
+    pub display_name: String,
+    pub status: String,
+    pub scopes: Vec<String>,
+    pub created_at: String,
+    pub last_seen_at: String,
 }
 
 #[derive(Debug, Deserialize)]

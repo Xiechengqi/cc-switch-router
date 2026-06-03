@@ -12,6 +12,7 @@ use axum::response::{IntoResponse, Response, Sse};
 use axum::routing::{any, delete, get, patch, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::time::{Duration, sleep};
 
 use crate::ServerState;
@@ -37,23 +38,24 @@ use crate::models::{
     BoardMessageListResponse, BoardMessageToggleRequest, BoardMessageView, BoardMetaResponse,
     ChangeInstallationOwnerEmailRequest, ChangeInstallationOwnerEmailResponse,
     DashboardMarketRequestLogView, DashboardPresenceRequest, DashboardPresenceResponse,
-    DashboardResponse, DashboardTickerShare, GetInstallationOwnerEmailQuery,
+    DashboardResponse, DashboardTickerShare, GatewayRegistryRecord, GetInstallationOwnerEmailQuery,
     GetInstallationOwnerEmailResponse, HealthResponse, IssueLeaseRequest, IssueLeaseResponse,
     MarketDisabledSharesUpdateRequest, MarketDisabledSharesUpdateResponse,
     MarketMaintenanceUpdateRequest, MarketMaintenanceUpdateResponse,
     MarketNotificationEmailLogView, MarketNotificationEmailRequest,
     MarketNotificationEmailResponse, MarketRequestLogBatchSyncRequest, MarketShareView,
     MarketsResponse, PostBoardMessageRequest, PublicMapPointsResponse, RefreshSessionRequest,
-    RegisterInstallationRequest, RegisterInstallationResponse, RegisterMarketRequest,
-    RequestEmailCodeRequest, RequestEmailCodeResponse, SessionStatusResponse, ShareApiAuthResponse,
-    ShareApiAuthUser, ShareApiContextResponse, ShareApiShareResponse, ShareBatchSyncRequest,
+    RegisterGatewayRequest, RegisterGatewayResponse, RegisterInstallationRequest,
+    RegisterInstallationResponse, RegisterMarketRequest, RequestEmailCodeRequest,
+    RequestEmailCodeResponse, SessionStatusResponse, ShareApiAuthResponse, ShareApiAuthUser,
+    ShareApiContextResponse, ShareApiShareResponse, ShareBatchSyncRequest,
     ShareClaimSubdomainRequest, ShareDeleteRequest, ShareEditAckRequest, ShareEditAvailableEvent,
     ShareEditEventSignaturePayload, ShareHeartbeatRequest, SharePendingEditsRequest,
     ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRuntimeRefreshRequest,
     ShareSettingsPatch, ShareSettingsUpdateRequest, ShareSyncRequest, UserApiTokenResetResponse,
     UserApiTokenResponse, UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
-use crate::proxy::{market_proxy_handler, proxy_handler};
+use crate::proxy::{gateway_proxy_handler, market_proxy_handler, proxy_handler};
 use crate::recent_traffic::{RecentRequestEvent, RecentTrafficSnapshot};
 use crate::scheduling_signals::{
     ShareFeedbackKind, ShareFeedbackRequest, ShareFeedbackResponse, ShareHeadroomEntry,
@@ -110,6 +112,14 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/market/shares", get(market_shares))
         .route("/v1/market/shares/headroom", post(market_shares_headroom))
         .route("/v1/market/shares/feedback", post(market_shares_feedback))
+        .route("/v1/gateways/register", post(register_gateway))
+        .route("/v1/gateway/shares", get(gateway_shares))
+        .route("/v1/gateway/shares/headroom", post(gateway_shares_headroom))
+        .route("/v1/gateway/shares/feedback", post(gateway_shares_feedback))
+        .route(
+            "/v1/gateway/request-logs/batch",
+            post(batch_sync_gateway_request_logs),
+        )
         .route(
             "/v1/admin/markets/:market_email/linked-shares",
             get(admin_market_linked_shares),
@@ -230,6 +240,10 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/admin/metrics/events", get(admin_metrics_events))
         .route("/v1/admin/metrics", delete(admin_metrics_clear))
         .route("/_market/proxy/:share_id/*path", any(market_proxy_handler))
+        .route(
+            "/_gateway/proxy/:share_id/*path",
+            any(gateway_proxy_handler),
+        )
         .route("/*path", any(ui_or_proxy_handler))
         .layer(middleware::from_fn_with_state(
             middleware_state,
@@ -321,6 +335,13 @@ async fn market_shares_headroom(
     Json(input): Json<ShareHeadroomRequest>,
 ) -> Result<Json<ShareHeadroomResponse>, AppError> {
     let _market = authenticate_market(&state, &headers, "market:shares:read").await?;
+    market_shares_headroom_impl(&state, input).await
+}
+
+async fn market_shares_headroom_impl(
+    state: &ServerState,
+    input: ShareHeadroomRequest,
+) -> Result<Json<ShareHeadroomResponse>, AppError> {
     if input.share_ids.is_empty() {
         return Ok(Json(ShareHeadroomResponse {
             queried_at: chrono::Utc::now().to_rfc3339(),
@@ -369,6 +390,14 @@ async fn market_shares_feedback(
     Json(input): Json<ShareFeedbackRequest>,
 ) -> Result<Json<ShareFeedbackResponse>, AppError> {
     let _market = authenticate_market(&state, &headers, "market:shares:read").await?;
+    apply_share_feedback(&state, input, "market").await
+}
+
+async fn apply_share_feedback(
+    state: &ServerState,
+    input: ShareFeedbackRequest,
+    source: &str,
+) -> Result<Json<ShareFeedbackResponse>, AppError> {
     let owner = state
         .store
         .lookup_share_owner_email(&input.share_id)
@@ -398,7 +427,8 @@ async fn market_shares_feedback(
         owner = %owner_email,
         penalty,
         ttl_secs,
-        "applied market feedback penalty"
+        source,
+        "applied share feedback penalty"
     );
     Ok(Json(ShareFeedbackResponse {
         ok: true,
@@ -406,6 +436,98 @@ async fn market_shares_feedback(
         applied_penalty: penalty.clamp(0.05, 1.0),
         expires_in_secs: ttl_secs,
     }))
+}
+
+async fn register_gateway(
+    State(state): State<ServerState>,
+    Json(input): Json<RegisterGatewayRequest>,
+) -> Result<Json<RegisterGatewayResponse>, AppError> {
+    Ok(Json(state.store.register_gateway(input).await?))
+}
+
+async fn gateway_shares(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<MarketShareView>>, AppError> {
+    let gateway = authenticate_gateway(
+        &state,
+        &headers,
+        "gateway:shares:read",
+        "gateway:shares:read",
+        &empty_body_sha256_hex(),
+    )
+    .await?;
+    let active_subdomains = state.proxy.active_subdomains().await.into_iter().collect();
+    let inflight_by_share = state.proxy.inflight_by_share().await;
+    let mut shares = state
+        .store
+        .list_gateway_shares(&gateway, "main", &active_subdomains, &inflight_by_share)
+        .await?;
+    for share in &mut shares {
+        if let Some(email) = share.owner_email.as_deref()
+            && let Some(penalty) = state.scheduling_overrides.get(email)
+        {
+            share.signals.owner_penalty = (share.signals.owner_penalty * penalty).clamp(0.05, 1.0);
+        }
+    }
+    Ok(Json(shares))
+}
+
+async fn gateway_shares_headroom(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<ShareHeadroomRequest>,
+) -> Result<Json<ShareHeadroomResponse>, AppError> {
+    let body_hash = json_body_sha256_hex(&input)?;
+    let gateway = authenticate_gateway(
+        &state,
+        &headers,
+        "gateway:shares:read",
+        "gateway:shares:headroom",
+        &body_hash,
+    )
+    .await?;
+    drop(gateway);
+    market_shares_headroom_impl(&state, input).await
+}
+
+async fn gateway_shares_feedback(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<ShareFeedbackRequest>,
+) -> Result<Json<ShareFeedbackResponse>, AppError> {
+    let body_hash = json_body_sha256_hex(&input)?;
+    let gateway = authenticate_gateway(
+        &state,
+        &headers,
+        "gateway:feedback:write",
+        "gateway:shares:feedback",
+        &body_hash,
+    )
+    .await?;
+    drop(gateway);
+    apply_share_feedback(&state, input, "gateway").await
+}
+
+async fn batch_sync_gateway_request_logs(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<MarketRequestLogBatchSyncRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let body_hash = json_body_sha256_hex(&input)?;
+    let gateway = authenticate_gateway(
+        &state,
+        &headers,
+        "gateway:request_logs:write",
+        "gateway:request_logs:batch",
+        &body_hash,
+    )
+    .await?;
+    let count = state
+        .store
+        .batch_sync_gateway_request_logs(&gateway, input)
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true, "synced": count })))
 }
 
 async fn admin_market_linked_shares(
@@ -1214,8 +1336,7 @@ async fn ui_or_proxy_handler(
 /// `Config::is_market_subdomain`) catches the common case cheaply; the DB
 /// lookup catches market deployments that registered under another name.
 async fn is_market_host(state: &ServerState, host: &str) -> bool {
-    let Some(subdomain) =
-        crate::proxy::subdomain_for_host(host, &state.config.tunnel_domain)
+    let Some(subdomain) = crate::proxy::subdomain_for_host(host, &state.config.tunnel_domain)
     else {
         return false;
     };
@@ -1961,6 +2082,62 @@ async fn authenticate_market(
         .store
         .authenticate_market_session(token, required_scope)
         .await
+}
+
+async fn authenticate_gateway(
+    state: &ServerState,
+    headers: &HeaderMap,
+    required_scope: &str,
+    action: &str,
+    body_sha256_hex: &str,
+) -> Result<GatewayRegistryRecord, AppError> {
+    let gateway_id = required_header(headers, "x-cc-gateway-id")?;
+    let timestamp_ms = required_header(headers, "x-cc-gateway-timestamp-ms")?
+        .parse::<i64>()
+        .map_err(|_| AppError::Unauthorized("invalid gateway timestamp".into()))?;
+    let nonce = required_header(headers, "x-cc-gateway-nonce")?;
+    let signature = required_header(headers, "x-cc-gateway-signature")?;
+    state
+        .store
+        .authenticate_gateway_signed_request(
+            gateway_id,
+            required_scope,
+            action,
+            body_sha256_hex,
+            timestamp_ms,
+            nonce,
+            signature,
+        )
+        .await
+}
+
+fn required_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, AppError> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::Unauthorized(format!("missing {name} header")))
+}
+
+fn json_body_sha256_hex<T: Serialize>(value: &T) -> Result<String, AppError> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|e| AppError::Internal(format!("serialize signed gateway body failed: {e}")))?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn empty_body_sha256_hex() -> String {
+    sha256_hex(&[])
+}
+
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
 }
 
 async fn extract_session_email(

@@ -670,6 +670,296 @@ pub async fn market_proxy_handler(
     response
 }
 
+pub async fn gateway_proxy_handler(
+    State(state): State<ServerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request,
+) -> Response {
+    let (parts, body) = req.into_parts();
+    let method = parts.method.clone();
+    let host = parts
+        .headers
+        .get("host")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let path = parts.uri.path().to_string();
+    if path.starts_with("/_ctl/") || path == "/_ctl" {
+        return simple_response(StatusCode::NOT_FOUND, "not-found");
+    }
+    let query = parts
+        .uri
+        .query()
+        .map(|query| format!("?{query}"))
+        .unwrap_or_default();
+    let client_metadata = crate::client_meta::extract_client_metadata(&parts.headers, peer);
+    let user_ip = client_metadata
+        .ip
+        .clone()
+        .unwrap_or_else(|| peer.ip().to_string());
+    let user_country = client_metadata.country_code.as_deref().unwrap_or("-");
+    let user_asn = trusted_asn_header(&parts.headers, peer);
+    let user_agent = header_str(&parts.headers, "user-agent");
+
+    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            warn!(
+                method = %method,
+                host = %host,
+                path = %path,
+                client_ip = %user_ip,
+                client_country = %user_country,
+                client_asn = %user_asn,
+                user_agent = %user_agent,
+                error = %err,
+                "gateway proxy request body read failed"
+            );
+            return simple_response(StatusCode::BAD_REQUEST, "failed-to-read-body");
+        }
+    };
+    let body_hash = crate::api::sha256_hex(&body_bytes);
+    let gateway = match authenticate_gateway_proxy(&state, &parts.headers, &body_hash).await {
+        Ok(gateway) => gateway,
+        Err(err) => {
+            warn!(
+                method = %method,
+                host = %host,
+                path = %path,
+                client_ip = %user_ip,
+                client_country = %user_country,
+                client_asn = %user_asn,
+                user_agent = %user_agent,
+                error = %err,
+                "gateway proxy authentication failed"
+            );
+            return simple_response(StatusCode::UNAUTHORIZED, "invalid-gateway-signature");
+        }
+    };
+
+    let Some(rest) = path.strip_prefix("/_gateway/proxy/") else {
+        return simple_response(StatusCode::NOT_FOUND, "invalid-gateway-proxy-path");
+    };
+    let (share_id, forwarded_path) = match rest.split_once('/') {
+        Some((share_id, forwarded_path)) if !share_id.is_empty() => {
+            (share_id.to_string(), format!("/{forwarded_path}"))
+        }
+        _ if !rest.is_empty() => (rest.to_string(), "/".to_string()),
+        _ => return simple_response(StatusCode::NOT_FOUND, "missing-share-id"),
+    };
+    let path_and_query = format!("{forwarded_path}{query}");
+
+    let active_subdomains = state.proxy.active_subdomains().await.into_iter().collect();
+    let inflight_by_share = state.proxy.inflight_by_share().await;
+    let authorized = match state
+        .store
+        .list_gateway_shares(&gateway, "main", &active_subdomains, &inflight_by_share)
+        .await
+    {
+        Ok(shares) => shares.into_iter().any(|share| share.share_id == share_id),
+        Err(err) => {
+            warn!(error = %err, "gateway proxy share authorization lookup failed");
+            return simple_response(StatusCode::SERVICE_UNAVAILABLE, "share-lookup-failed");
+        }
+    };
+    if !authorized {
+        return simple_response(StatusCode::FORBIDDEN, "share-not-authorized-for-gateway");
+    }
+
+    let Some(route) = state.proxy.route_by_share_id(&share_id).await else {
+        return simple_response(StatusCode::NOT_FOUND, "share-offline");
+    };
+    let backend = route.backend.clone();
+    let route_share_token = route.share_token.clone();
+    let target = format!("http://{backend}{path_and_query}");
+
+    let metrics_permit = state.metrics.proxy_request_started();
+    let share_permit = match state
+        .proxy
+        .try_acquire_share_permit(&share_id, route.parallel_limit)
+        .await
+    {
+        Some(permit) => permit,
+        None => {
+            warn!(
+                method = %method,
+                host = %host,
+                path = %path_and_query,
+                share_id = %share_id,
+                parallel_limit = route.parallel_limit,
+                client_ip = %user_ip,
+                client_country = %user_country,
+                client_asn = %user_asn,
+                user_agent = %user_agent,
+                "gateway proxy rejected: share concurrency limit exceeded"
+            );
+            return simple_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "share-concurrency-limit-exceeded",
+            );
+        }
+    };
+    let free_share_ip_permit = if route.is_free_share && state.config.free_share_ip_limit_enabled()
+    {
+        match state
+            .proxy
+            .try_acquire_free_share_ip_permit(&user_ip, state.config.free_share_ip_parallel_limit)
+            .await
+        {
+            Some(permit) => Some(permit),
+            None => {
+                return simple_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "free-share-ip-concurrency-limit-exceeded",
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut builder = state.proxy_http.request(method.clone(), target);
+    for (name, value) in &parts.headers {
+        let n = name.as_str();
+        if n.eq_ignore_ascii_case("host")
+            || n.eq_ignore_ascii_case("authorization")
+            || n.eq_ignore_ascii_case("x-api-key")
+            || n.eq_ignore_ascii_case("x-goog-api-key")
+            || n.eq_ignore_ascii_case("api-key")
+            || n.eq_ignore_ascii_case("x-share-token")
+            || n.starts_with("x-cc-gateway-")
+            || is_hop_by_hop_header(n)
+        {
+            continue;
+        }
+        builder = builder.header(name, value);
+    }
+    if let Some(ref tok) = route_share_token {
+        builder = builder.header("X-Share-Token", tok.as_str());
+    }
+    builder = builder.header("X-CC-Switch-Share-Id", share_id.as_str());
+    builder = builder.header("X-CC-Switch-Share-Subdomain", route.subdomain.as_str());
+
+    let live_request_id = state
+        .recent_traffic
+        .record(
+            share_id.clone(),
+            route.share_name.clone(),
+            Some(route.subdomain.clone()),
+            client_metadata.country_code.clone(),
+            None,
+        )
+        .await;
+    builder = builder.header("X-CC-Switch-Request-Id", live_request_id.as_str());
+    let recent_traffic_guard = RecentTrafficGuard {
+        traffic: state.recent_traffic.clone(),
+        request_id: live_request_id,
+    };
+
+    let upstream = match builder.body(reqwest::Body::from(body_bytes)).send().await {
+        Ok(response) => response,
+        Err(err) => {
+            state.metrics.record_proxy_upstream_error(false);
+            warn!(
+                method = %method,
+                host = %host,
+                path = %path_and_query,
+                backend = %backend,
+                share_id = %share_id,
+                client_ip = %user_ip,
+                client_country = %user_country,
+                client_asn = %user_asn,
+                user_agent = %user_agent,
+                error = %err,
+                "gateway proxy upstream request failed"
+            );
+            return simple_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("connection-lost: {err}"),
+            );
+        }
+    };
+
+    let status = upstream.status();
+    state.metrics.record_proxy_status(status);
+    let response_headers = upstream.headers().clone();
+    let body_stream = {
+        use futures_util::StreamExt;
+
+        upstream.bytes_stream().map(move |chunk| {
+            let _permit = &share_permit;
+            let _free_share_ip_permit = &free_share_ip_permit;
+            let _recent_traffic_guard = &recent_traffic_guard;
+            let _metrics_permit = &metrics_permit;
+            chunk
+        })
+    };
+    let body = Body::from_stream(body_stream);
+
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
+    response.headers_mut().clear();
+    for (name, value) in &response_headers {
+        if is_hop_by_hop_header(name.as_str()) {
+            continue;
+        }
+        response.headers_mut().append(name.clone(), value.clone());
+    }
+    strip_connection_listed_headers(response.headers_mut());
+    info!(
+        method = %method,
+        host = %host,
+        path = %path_and_query,
+        gateway_id = %gateway.id,
+        share_id = %share_id,
+        backend = %backend,
+        status = %status.as_u16(),
+        client_ip = %user_ip,
+        client_country = %user_country,
+        client_asn = %user_asn,
+        user_agent = %user_agent,
+        "gateway proxy request completed"
+    );
+    response
+}
+
+async fn authenticate_gateway_proxy(
+    state: &ServerState,
+    headers: &HeaderMap,
+    body_sha256_hex: &str,
+) -> Result<crate::models::GatewayRegistryRecord, crate::error::AppError> {
+    let gateway_id = gateway_header(headers, "x-cc-gateway-id")?;
+    let timestamp_ms = gateway_header(headers, "x-cc-gateway-timestamp-ms")?
+        .parse::<i64>()
+        .map_err(|_| crate::error::AppError::Unauthorized("invalid gateway timestamp".into()))?;
+    let nonce = gateway_header(headers, "x-cc-gateway-nonce")?;
+    let signature = gateway_header(headers, "x-cc-gateway-signature")?;
+    state
+        .store
+        .authenticate_gateway_signed_request(
+            gateway_id,
+            "gateway:proxy:use",
+            "gateway:proxy",
+            body_sha256_hex,
+            timestamp_ms,
+            nonce,
+            signature,
+        )
+        .await
+}
+
+fn gateway_header<'a>(
+    headers: &'a HeaderMap,
+    name: &str,
+) -> Result<&'a str, crate::error::AppError> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| crate::error::AppError::Unauthorized(format!("missing {name} header")))
+}
+
 pub async fn proxy_handler(
     State(state): State<ServerState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
