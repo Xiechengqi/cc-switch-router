@@ -1350,19 +1350,30 @@ export function ClientsTable({ clients, shares, markets, onChanged }: { clients:
   const { locale, t } = useLocaleText();
   const sorted = sortClients(clients);
 
-  // shareId → ShareView，供 drawer 反查该 installation 的 share 摘要。
+  // shareId → ShareView，让"分享"列内联渲染该 installation 的 share 摘要。
   const shareById = React.useMemo(() => {
     const map = new Map<string, ShareView>();
     shares.forEach((share) => map.set(share.shareId, share));
     return map;
   }, [shares]);
 
-  const selectedShares = React.useMemo(() => {
-    if (!selected) return [] as ShareView[];
-    return (selected.shareIds || [])
-      .map((id) => shareById.get(id))
-      .filter((s): s is ShareView => !!s);
-  }, [selected, shareById]);
+  const sharesForClient = React.useCallback(
+    (client: DashboardClient) =>
+      (client.shareIds || [])
+        .map((id) => shareById.get(id))
+        .filter((s): s is ShareView => !!s),
+    [shareById],
+  );
+
+  // P13：installation 是否被认为"在线" —— 任一挂在其上的 share isOnline 即可。
+  // 没有 share 时回退看 lastSeenAt 是否在 2 分钟内（与 router heartbeat 周期一致）。
+  const ONLINE_FRESH_MS = 2 * 60 * 1000;
+  const isClientOnline = (client: DashboardClient) => {
+    const onShares = sharesForClient(client);
+    if (onShares.length > 0) return onShares.some((s) => s.isOnline);
+    const seen = Date.parse(client.installation.lastSeenAt);
+    return Number.isFinite(seen) && Date.now() - seen <= ONLINE_FRESH_MS;
+  };
 
   return (
     <section className="grid gap-3">
@@ -1375,39 +1386,70 @@ export function ClientsTable({ clients, shares, markets, onChanged }: { clients:
           <table className="w-full min-w-[960px] border-collapse text-sm">
             <thead className="bg-muted text-left font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground">
               <tr>
-                <th className="w-80 px-4 py-3">{t("dashboard.installation")}</th>
-                <th className="px-4 py-3">{t("dashboard.platform")}</th>
-                <th className="px-4 py-3">{t("dashboard.region")}</th>
-                <th className="px-4 py-3">{t("dashboard.lastSeen")}</th>
-                <th className="px-4 py-3 text-right">{t("dashboard.shareCount")}</th>
+                {/* P13：列简化为 Installation / 状态 / 分享 / →。
+                    Platform / Region / LastSeen 合并进"状态"；#Shares 删除，share 列表内联到"分享"列。 */}
+                <th className="w-64 px-4 py-3">{t("dashboard.installation")}</th>
+                <th className="w-64 px-4 py-3">{t("dashboard.status")}</th>
+                <th className="px-4 py-3">{t("dashboard.shares")}</th>
                 <th className="w-7 px-4 py-3" />
               </tr>
             </thead>
             <tbody>
               {sorted.length ? sorted.map((client) => {
-                const shareCount = client.shareCount ?? client.shareIds?.length ?? 0;
+                const online = isClientOnline(client);
+                const clientShares = sharesForClient(client);
                 return (
                   <tr key={client.installation.id} className="cursor-pointer border-b last:border-0 hover:bg-primary/5" onClick={(event) => { if (shouldOpenRowDrawer(event)) setSelected(client); }}>
-                    <td className="w-80 break-all px-4 py-3 align-middle font-mono text-xs text-foreground">
+                    <td className="w-64 break-all px-4 py-3 align-top font-mono text-xs text-foreground">
                       {client.installation.id}
                     </td>
-                    <td className="px-4 py-3 align-middle text-xs text-muted-foreground">
-                      {clientPlatformLabel(client)}
+                    {/* P13：状态列聚合 platform / 区域 / 最近在线 / 在线色点。 */}
+                    <td className="w-64 px-4 py-3 align-top text-xs">
+                      <div className="grid gap-1">
+                        <div className="flex items-center gap-2">
+                          <span
+                            className={`inline-block h-2 w-2 rounded-full ${online ? "bg-emerald-500" : "bg-muted-foreground/40"}`}
+                            aria-label={online ? "online" : "offline"}
+                          />
+                          <strong className="text-foreground">
+                            {online ? t("common.online") : t("common.offline")}
+                          </strong>
+                        </div>
+                        <span className="text-muted-foreground">
+                          {clientPlatformLabel(client)}
+                        </span>
+                        <span className="text-muted-foreground">
+                          {client.installation.countryCode || "-"}
+                        </span>
+                        <span className="text-muted-foreground" title={formatDateTime(client.installation.lastSeenAt)}>
+                          {t("dashboard.lastSeen")}: {formatRelativeTime(client.installation.lastSeenAt, locale)}
+                        </span>
+                      </div>
                     </td>
-                    <td className="px-4 py-3 align-middle text-muted-foreground">
-                      {client.installation.countryCode || "-"}
+                    {/* P13：share 数据直接展开到行内。空列表显式提示，避免误以为 client 无 share。 */}
+                    <td className="px-4 py-3 align-top">
+                      {clientShares.length ? (
+                        <ul className="grid gap-1.5">
+                          {clientShares.map((share) => {
+                            const api = shareApiParts(share);
+                            return (
+                              <li key={share.shareId} className="flex flex-wrap items-center gap-2 rounded-md border border-default/40 px-2 py-1">
+                                <strong className="break-all font-mono text-xs text-foreground">{api.apiUrl}</strong>
+                                <ShareStatusBadge share={share} t={t} />
+                                <ShareEditAction share={share} onEdit={setEditingShare} t={t} />
+                              </li>
+                            );
+                          })}
+                        </ul>
+                      ) : (
+                        <span className="text-xs text-muted-foreground">{t("dashboard.noShares")}</span>
+                      )}
                     </td>
-                    <td className="px-4 py-3 align-middle text-xs text-muted-foreground" title={formatDateTime(client.installation.lastSeenAt)}>
-                      {formatRelativeTime(client.installation.lastSeenAt, locale)}
-                    </td>
-                    <td className="px-4 py-3 align-middle text-right">
-                      <span className="font-semibold text-foreground">{shareCount}</span>
-                    </td>
-                    <td className="px-4 py-3 align-middle text-lg text-muted-foreground">›</td>
+                    <td className="px-4 py-3 align-top text-lg text-muted-foreground">›</td>
                   </tr>
                 );
               }) : (
-                <tr><td colSpan={6} className="px-4 py-10 text-center text-muted-foreground">{t("dashboard.noClients")}</td></tr>
+                <tr><td colSpan={4} className="px-4 py-10 text-center text-muted-foreground">{t("dashboard.noClients")}</td></tr>
               )}
             </tbody>
           </table>
@@ -1432,39 +1474,15 @@ export function ClientsTable({ clients, shares, markets, onChanged }: { clients:
               <Drawer.Body className="overflow-y-auto">
                 {selected ? (
                   <div className="grid gap-5">
+                    {/* P13：drawer 不再重复展示 share 列表（已内联到行内）。
+                        只保留 installation 自己的元信息，需要 share 详情请点 Shares 表。 */}
                     <DrawerSection label={t("dashboard.installation")}>
                       <div className="grid gap-1 text-xs text-muted-foreground">
                         <span>{t("dashboard.lastSeen")}: <strong className="text-foreground">{formatDateTime(selected.installation.lastSeenAt)}</strong></span>
                         <span>{t("dashboard.region")}: <strong className="text-foreground">{selected.installation.countryCode || "-"}</strong></span>
+                        <span>{t("dashboard.platform")}: <strong className="text-foreground">{clientPlatformLabel(selected)}</strong></span>
                         <span className="break-all">id: {selected.installation.id}</span>
                       </div>
-                    </DrawerSection>
-                    {/* P7 Step 2：抽屉里列出该 installation 的所有 share。深度详情仍走 SharesTable 自己的 drawer。 */}
-                    <DrawerSection label={`${t("dashboard.shares")} (${selectedShares.length})`}>
-                      {selectedShares.length ? (
-                        <ul className="grid gap-2">
-                          {selectedShares.map((share) => {
-                            const api = shareApiParts(share);
-                            return (
-                              <li key={share.shareId} className="rounded-md border border-default p-2">
-                                <div className="flex flex-wrap items-center justify-between gap-2">
-                                  <strong className="break-all font-mono text-xs text-foreground">{api.apiUrl}</strong>
-                                  <ShareStatusBadge share={share} t={t} />
-                                </div>
-                                <div className="mt-1 text-xs text-muted-foreground">
-                                  <span className="break-all">{share.ownerEmail || "-"}</span>
-                                  {share.appType ? <span className="ml-2 uppercase">{share.appType}</span> : null}
-                                </div>
-                                <div className="mt-1 flex items-center gap-2">
-                                  <ShareEditAction share={share} onEdit={setEditingShare} t={t} />
-                                </div>
-                              </li>
-                            );
-                          })}
-                        </ul>
-                      ) : (
-                        <span className="text-xs text-muted-foreground">{t("dashboard.noShares")}</span>
-                      )}
                     </DrawerSection>
                   </div>
                 ) : null}
@@ -1538,11 +1556,12 @@ export function SharesTable({
       </div>
       <Card className="overflow-hidden rounded-[20px]">
         <Card.Content className="overflow-x-auto p-0">
-          <table className="w-full min-w-[1180px] border-collapse text-sm">
+          <table className="w-full min-w-[1100px] border-collapse text-sm">
             <thead className="bg-muted text-left font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground">
               <tr>
                 <th className="w-80 px-4 py-3">{t("dashboard.share")}</th>
-                <th className="px-4 py-3">{t("dashboard.appType")}</th>
+                {/* P13：APP 列删除——与 SUPPORT 重复。SUPPORT 单元格按 share.bindings 派生，
+                    哪些 app 绑定了，看 SUPPORT 卡片是否有内容即可。 */}
                 <th className="px-4 py-3">{t("dashboard.forSale")}</th>
                 <th className="px-4 py-3">{t("dashboard.region")}</th>
                 <th className="px-4 py-3">{t("dashboard.status")}</th>
@@ -1577,20 +1596,6 @@ export function SharesTable({
                           </div>
                         </div>
                       </td>
-                      <td className="px-4 py-3 align-middle text-xs uppercase text-muted-foreground">
-                        {/* P9: 多 app share — 优先列出实际绑定的 app slot；空时回退老 appType。 */}
-                        {(() => {
-                          const apps = share.bindings
-                            ? Object.keys(share.bindings).filter(
-                                (k) => share.bindings?.[k],
-                              )
-                            : [];
-                          if (apps.length > 0) {
-                            return apps.sort().join(" · ");
-                          }
-                          return share.appType || "-";
-                        })()}
-                      </td>
                       <td className="px-4 py-3 align-middle">
                         <ForSaleCell share={share} t={t} />
                       </td>
@@ -1613,7 +1618,7 @@ export function SharesTable({
                 })
               ) : (
                 <tr>
-                  <td colSpan={7} className="px-4 py-10 text-center text-muted-foreground">
+                  <td colSpan={6} className="px-4 py-10 text-center text-muted-foreground">
                     {t("dashboard.noShares")}
                   </td>
                 </tr>
