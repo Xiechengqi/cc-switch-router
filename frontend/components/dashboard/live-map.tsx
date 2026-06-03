@@ -95,8 +95,13 @@ function formatTickerTime(value?: string | number, fallbackSeconds?: string | nu
   }).format(date);
 }
 
-function totalTokens(log?: Pick<TickerMeta, "inputTokens" | "outputTokens" | "cacheReadTokens" | "cacheCreationTokens"> | null) {
-  return Number(log?.inputTokens || 0) + Number(log?.outputTokens || 0) + Number(log?.cacheReadTokens || 0) + Number(log?.cacheCreationTokens || 0);
+function tokenCount(value?: string | number | null) {
+  const count = Number(value || 0);
+  return Number.isFinite(count) && count > 0 ? count : 0;
+}
+
+function usageBucketTotalTokens(log?: Pick<TickerMeta, "inputTokens" | "outputTokens" | "cacheReadTokens" | "cacheCreationTokens"> | null) {
+  return tokenCount(log?.inputTokens) + tokenCount(log?.outputTokens) + tokenCount(log?.cacheReadTokens) + tokenCount(log?.cacheCreationTokens);
 }
 
 function compactTickerTokens(value: number) {
@@ -139,7 +144,8 @@ function tickerDetail(meta?: TickerMeta) {
   const modelName = [agent, requested && actual && requested !== actual ? `${requested} -> ${actual}` : actual || requested || "-"].filter(Boolean).join(" · ");
   const status = meta?.statusCode ?? meta?.status ?? "-";
   const latency = formatTickerLatency(meta?.latencyMs);
-  const tokens = `${compactTickerTokens(totalTokens(meta))} token${totalTokens(meta) === 1 ? "" : "s"}`;
+  const tokenTotal = usageBucketTotalTokens(meta);
+  const tokens = `${compactTickerTokens(tokenTotal)} token${tokenTotal === 1 ? "" : "s"}`;
   const fee = formatMarketFee(meta?.usageAmountUsd);
   const parts = [
     meta?.userEmail || "",

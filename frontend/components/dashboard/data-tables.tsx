@@ -139,8 +139,25 @@ function formatUsdExactTrimmed(value?: string | number) {
   return `$${normalized.replace(/(\.\d*?[1-9])0+$/, "$1").replace(/\.0+$/, "")}`;
 }
 
-function totalTokens(log?: Partial<ShareRequestLog | MarketRequestLog>) {
-  return Number(log?.inputTokens || 0) + Number(log?.outputTokens || 0) + Number(log?.cacheReadTokens || 0) + Number(log?.cacheCreationTokens || 0);
+function tokenCount(value?: string | number | null) {
+  const count = Number(value || 0);
+  return Number.isFinite(count) && count > 0 ? count : 0;
+}
+
+function usageBucketTotalTokens(log?: Partial<ShareRequestLog | MarketRequestLog>) {
+  return tokenCount(log?.inputTokens) + tokenCount(log?.outputTokens) + tokenCount(log?.cacheReadTokens) + tokenCount(log?.cacheCreationTokens);
+}
+
+function cacheHitRate(log?: Partial<ShareRequestLog | MarketRequestLog>) {
+  const input = tokenCount(log?.inputTokens);
+  const cacheRead = tokenCount(log?.cacheReadTokens);
+  const denominator = input + cacheRead;
+  return denominator > 0 ? cacheRead / denominator : 0;
+}
+
+function formatPercent(value: number) {
+  const percent = Math.max(0, Math.min(1, Number(value) || 0)) * 100;
+  return `${percent.toFixed(percent >= 10 ? 0 : 1).replace(/\.0$/, "")}%`;
 }
 
 function requestModelRoute(log?: Partial<ShareRequestLog | MarketRequestLog>) {
@@ -2298,17 +2315,18 @@ function ShareModelHealthChecks({ checks }: { checks: ShareModelHealthCheck[] })
 
 function TokenGrid({ log }: { log: ShareRequestLog | MarketRequestLog }) {
   const items = [
-    ["Input", log.inputTokens || 0],
-    ["Output", log.outputTokens || 0],
-    ["Cache R", log.cacheReadTokens || 0],
-    ["Cache W", log.cacheCreationTokens || 0],
-    ["Total", totalTokens(log)],
+    ["Input", tokenCount(log.inputTokens), "Fresh input tokens used for input pricing."],
+    ["Output", tokenCount(log.outputTokens), "Output tokens used for output pricing."],
+    ["Cache R", tokenCount(log.cacheReadTokens), "Cache read tokens used for cache-read pricing."],
+    ["Cache W", tokenCount(log.cacheCreationTokens), "Cache creation tokens used for cache-write pricing."],
+    ["Total", usageBucketTotalTokens(log), "Input + Output + Cache R + Cache W."],
+    ["Hit", formatPercent(cacheHitRate(log)), "Cache R / (Input + Cache R)."],
   ];
   return (
-    <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
-      {items.map(([label, value]) => (
-        <div key={label} className="rounded-md bg-muted/40 px-2 py-1.5 text-xs text-muted-foreground">
-          {label}<span className="ml-2 font-mono font-semibold text-foreground">{formatNumber(Number(value))}</span>
+    <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-6">
+      {items.map(([label, value, title]) => (
+        <div key={label} className="rounded-md bg-muted/40 px-2 py-1.5 text-xs text-muted-foreground" title={String(title)}>
+          {label}<span className="ml-2 font-mono font-semibold text-foreground">{typeof value === "number" ? formatNumber(value) : value}</span>
         </div>
       ))}
     </div>
@@ -2404,7 +2422,7 @@ function MarketRequestLogs({ logs }: { logs: MarketRequestLog[] }) {
           <Card.Content className="gap-3 p-3">
             <div className="min-w-0">
               <div className="truncate font-medium">
-                {[log.userEmail || "-", log.shareSubdomain || log.shareId || "-", requestModelRoute(log), log.statusCode || log.status || "-", log.latencyMs ? `${log.latencyMs}ms` : "", `${compactTokens(totalTokens(log))} tokens`, formatUsdExactTrimmed(log.usageAmountUsd)].filter(Boolean).join(" · ")}
+                {[log.userEmail || "-", log.shareSubdomain || log.shareId || "-", requestModelRoute(log), log.statusCode || log.status || "-", log.latencyMs ? `${log.latencyMs}ms` : "", `${compactTokens(usageBucketTotalTokens(log))} tokens`, formatUsdExactTrimmed(log.usageAmountUsd)].filter(Boolean).join(" · ")}
               </div>
               <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
                 <span title={formatDateTime(log.createdAt)}>{formatRelativeTime(log.createdAt, locale)}</span>
