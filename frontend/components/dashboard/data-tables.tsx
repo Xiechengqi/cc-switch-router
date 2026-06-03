@@ -10,11 +10,6 @@ import type { AppLocale } from "@/lib/i18n";
 import type { DashboardClient, DashboardMarket, HealthCheckEntry, HealthTimelineBucket, MarketAppAvailabilityEntry, MarketRequestLog, MarketShare, ModelHealthSummary, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareModelHealthCheck, ShareRequestLog, ShareSettingsPatch, ShareUpstreamProvider, ShareView } from "@/lib/types";
 import { compactTokens, formatDateTime, formatNumber, formatRelativeTime } from "@/lib/utils";
 
-function compareDesc(left: number, right: number) {
-  if (left === right) return 0;
-  return left > right ? -1 : 1;
-}
-
 function shouldOpenRowDrawer(event: React.MouseEvent<HTMLElement>) {
   const selection = window.getSelection();
   if (selection && !selection.isCollapsed && selection.toString().trim()) {
@@ -175,22 +170,24 @@ function clientPlatformLabel(client: DashboardClient) {
 }
 
 function sortClients(clients: DashboardClient[]) {
-  // P7 Step 2：installation 维度排序。#shares 降序优先，再按最近上线时间，
-  // 让正在挂多个 share 的活跃机器排在最上。
+  // 按注册时间升序（先注册的在前）。lastSeenAt / shareCount 都是高频变化字段，
+  // 用作排序键会让行频繁上下跳动，体验很差。createdAt 一旦写入就稳定。
   return [...clients].sort((left, right) => {
     return (
-      (right.shareCount || 0) - (left.shareCount || 0) ||
-      compareDesc(
-        Date.parse(left.installation.lastSeenAt) || 0,
-        Date.parse(right.installation.lastSeenAt) || 0,
-      ) ||
+      (Date.parse(left.installation.createdAt) || 0) -
+        (Date.parse(right.installation.createdAt) || 0) ||
       left.installation.id.localeCompare(right.installation.id, undefined, { sensitivity: "base" })
     );
   });
 }
 
 function sortMarkets(markets: DashboardMarket[]) {
-  return [...markets].sort((a, b) => Number(b.online) - Number(a.online) || (a.displayName || a.id).localeCompare(b.displayName || b.id));
+  // 同上：按注册时间升序，避免 online 抖动改变行序。
+  return [...markets].sort(
+    (a, b) =>
+      (Date.parse(a.createdAt) || 0) - (Date.parse(b.createdAt) || 0) ||
+      (a.displayName || a.id).localeCompare(b.displayName || b.id),
+  );
 }
 
 type TFn = ReturnType<typeof useLocaleText>["t"];
@@ -1524,21 +1521,15 @@ export function SharesTable({
     return map;
   }, [clients]);
 
-  // 排序：管理权限 > active 状态 > 活跃请求数 > shareName。
+  // 排序：按 createdAt 升序（先注册的 share 在前）。canManage / shareStatus /
+  // activeRequests 都是会动态翻转的字段，作为主排序键会导致行经常上下跳动。
   const sorted = React.useMemo(() => {
     return [...shares].sort((left, right) => {
-      const lOwned = left.canManage ? 1 : 0;
-      const rOwned = right.canManage ? 1 : 0;
-      if (lOwned !== rOwned) return rOwned - lOwned;
-      const lActive = left.shareStatus === "active" ? 1 : 0;
-      const rActive = right.shareStatus === "active" ? 1 : 0;
-      if (lActive !== rActive) return rActive - lActive;
-      if (left.activeRequests !== right.activeRequests)
-        return (right.activeRequests || 0) - (left.activeRequests || 0);
-      return shareApiUrlKey(left).localeCompare(
-        shareApiUrlKey(right),
-        undefined,
-        { sensitivity: "base" },
+      return (
+        (Date.parse(left.createdAt) || 0) - (Date.parse(right.createdAt) || 0) ||
+        shareApiUrlKey(left).localeCompare(shareApiUrlKey(right), undefined, {
+          sensitivity: "base",
+        })
       );
     });
   }, [shares]);
