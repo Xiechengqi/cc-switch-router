@@ -1220,7 +1220,6 @@ pub struct ShareDescriptor {
     #[serde(default = "default_share_for_sale")]
     pub for_sale: String,
     pub subdomain: String,
-    pub share_token: String,
     pub app_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
@@ -1492,7 +1491,6 @@ pub struct ShareView {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub for_sale_official_price_percent_by_app: BTreeMap<String, u16>,
     pub subdomain: String,
-    pub share_token: String,
     pub can_view_secret: bool,
     pub can_manage: bool,
     pub can_edit_settings: bool,

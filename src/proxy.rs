@@ -35,9 +35,6 @@ impl RouteShutdown {
 #[derive(Debug, Clone)]
 pub(crate) struct RouteEntry {
     backend: String,
-    /// Share token to inject as X-Share-Token when proxying.
-    /// None for non-share tunnels.
-    share_token: Option<String>,
     share_id: Option<String>,
     share_name: Option<String>,
     subdomain: String,
@@ -186,7 +183,6 @@ impl ProxyRegistry {
         subdomain: String,
         backend: String,
         connection_id: Option<String>,
-        share_token: Option<String>,
         share_id: Option<String>,
         share_name: Option<String>,
         is_free_share: bool,
@@ -200,7 +196,6 @@ impl ProxyRegistry {
                 subdomain.clone(),
                 RouteEntry {
                     backend,
-                    share_token,
                     share_id,
                     share_name,
                     subdomain,
@@ -483,7 +478,6 @@ pub async fn market_proxy_handler(
         return simple_response(StatusCode::NOT_FOUND, "share-offline");
     };
     let backend = route.backend.clone();
-    let route_share_token = route.share_token.clone();
     let target = format!("http://{backend}{path_and_query}");
 
     let metrics_permit = state.metrics.proxy_request_started();
@@ -492,7 +486,6 @@ pub async fn market_proxy_handler(
         let n = name.as_str();
         if n.eq_ignore_ascii_case("host")
             || n.eq_ignore_ascii_case("authorization")
-            || n.eq_ignore_ascii_case("x-share-token")
             || n.eq_ignore_ascii_case(MARKET_REQUEST_ID_HEADER)
             || is_hop_by_hop_header(n)
         {
@@ -500,14 +493,9 @@ pub async fn market_proxy_handler(
         }
         builder = builder.header(name, value);
     }
-    if let Some(ref tok) = route_share_token {
-        builder = builder.header("X-Share-Token", tok.as_str());
-    }
+    builder = builder.header("X-CC-Switch-Share-Id", share_id.as_str());
 
-    let log_token = route_share_token
-        .as_deref()
-        .map(mask_token)
-        .unwrap_or_else(|| "-".to_string());
+    let log_share_id = mask_token(&share_id);
     let share_permit = match state
         .proxy
         .try_acquire_share_permit(&share_id, route.parallel_limit)
@@ -611,7 +599,7 @@ pub async fn market_proxy_handler(
                 host = %host,
                 path = %path_and_query,
                 backend = %backend,
-                share_token = %log_token,
+                share_id = %log_share_id,
                 client_ip = %user_ip,
                 client_country = %user_country,
                 client_asn = %user_asn,
@@ -660,7 +648,7 @@ pub async fn market_proxy_handler(
         share_id = %share_id,
         backend = %backend,
         status = %status.as_u16(),
-        share_token = %log_token,
+        share_id = %log_share_id,
         client_ip = %user_ip,
         client_country = %user_country,
         client_asn = %user_asn,
@@ -770,7 +758,6 @@ pub async fn gateway_proxy_handler(
         return simple_response(StatusCode::NOT_FOUND, "share-offline");
     };
     let backend = route.backend.clone();
-    let route_share_token = route.share_token.clone();
     let target = format!("http://{backend}{path_and_query}");
 
     let metrics_permit = state.metrics.proxy_request_started();
@@ -826,16 +813,12 @@ pub async fn gateway_proxy_handler(
             || n.eq_ignore_ascii_case("x-api-key")
             || n.eq_ignore_ascii_case("x-goog-api-key")
             || n.eq_ignore_ascii_case("api-key")
-            || n.eq_ignore_ascii_case("x-share-token")
             || n.starts_with("x-cc-gateway-")
             || is_hop_by_hop_header(n)
         {
             continue;
         }
         builder = builder.header(name, value);
-    }
-    if let Some(ref tok) = route_share_token {
-        builder = builder.header("X-Share-Token", tok.as_str());
     }
     builder = builder.header("X-CC-Switch-Share-Id", share_id.as_str());
     builder = builder.header("X-CC-Switch-Share-Subdomain", route.subdomain.as_str());
@@ -1073,22 +1056,22 @@ pub async fn proxy_handler(
         return simple_response(StatusCode::NOT_FOUND, "unregistered-subdomain");
     };
     let backend = route.backend.clone();
-    let route_share_token = route.share_token.clone();
+    let log_share_id = route
+        .share_id
+        .as_deref()
+        .map(mask_token)
+        .unwrap_or_else(|| "-".to_string());
     let is_health_check_request = is_share_router_probe || is_share_model_health_check;
     let is_direct_share_web_request =
         route.share_id.is_some() && is_allowed_direct_share_web_path(&path);
     if is_legacy_share_router_ping {
-        let legacy_log_token = route_share_token
-            .as_deref()
-            .map(mask_token)
-            .unwrap_or_else(|| "-".to_string());
         debug!(
             method = %method,
             host = %host,
             path = %path_and_query,
             backend = %backend,
             status = %StatusCode::NO_CONTENT.as_u16(),
-            share_token = %legacy_log_token,
+            share_id = %log_share_id,
             client_ip = %user_ip,
             client_country = %user_country,
             client_asn = %user_asn,
@@ -1196,8 +1179,6 @@ pub async fn proxy_handler(
             }
         }
     }
-    let effective_token = route_share_token;
-
     let target = format!("http://{backend}{path_and_query}");
 
     let metrics_permit = state.metrics.proxy_request_started();
@@ -1207,11 +1188,9 @@ pub async fn proxy_handler(
         if n.eq_ignore_ascii_case("host") || is_hop_by_hop_header(n) {
             continue;
         }
-        // Skip client-supplied user/share credentials on share routes; router
-        // authenticates them at the edge and injects the internal share secret.
-        if n.eq_ignore_ascii_case("x-share-token") {
-            continue;
-        }
+        // Strip client-supplied user/share credentials on share routes; router
+        // authenticates the caller at the edge (user_api_token + email ACL)
+        // and the cc-switch tunnel only needs the share id we inject below.
         if n.eq_ignore_ascii_case("x-cc-switch-user-email") {
             continue;
         }
@@ -1226,10 +1205,10 @@ pub async fn proxy_handler(
         builder = builder.header(name, value);
     }
 
-    // Inject effective share token so cc-switch can track share usage.
-    if let Some(ref tok) = effective_token {
-        builder = builder.header("X-Share-Token", tok.as_str());
-    }
+    // Inject share id so cc-switch can identify the share on its tunnel side
+    // and attribute usage. There is no longer a separate share_token credential —
+    // tunnel transport itself is the only authority that we are speaking on
+    // behalf of this share.
     if let Some(ref share_id) = route.share_id {
         builder = builder.header("X-CC-Switch-Share-Id", share_id.as_str());
     }
@@ -1238,7 +1217,8 @@ pub async fn proxy_handler(
         builder = builder.header("X-CC-Switch-User-Email", email.as_str());
     }
 
-    let log_token = effective_token
+    let log_share_id = route
+        .share_id
         .as_deref()
         .map(mask_token)
         .unwrap_or_else(|| "-".to_string());
@@ -1286,7 +1266,7 @@ pub async fn proxy_handler(
                 host = %host,
                 path = %path_and_query,
                 backend = %backend,
-                share_token = %log_token,
+                share_id = %log_share_id,
                 client_ip = %user_ip,
                 client_country = %user_country,
                 client_asn = %user_asn,
@@ -1383,7 +1363,7 @@ pub async fn proxy_handler(
                     host = %host,
                     path = %path_and_query,
                     backend = %backend,
-                    share_token = %log_token,
+                    share_id = %log_share_id,
                     client_ip = %user_ip,
                     client_country = %user_country,
                     client_asn = %user_asn,
@@ -1407,7 +1387,7 @@ pub async fn proxy_handler(
                 host = %host,
                 path = %path_and_query,
                 backend = %backend,
-                share_token = %log_token,
+                share_id = %log_share_id,
                 client_ip = %user_ip,
                 client_country = %user_country,
                 client_asn = %user_asn,
@@ -1439,7 +1419,7 @@ pub async fn proxy_handler(
                 path = %path_and_query,
                 backend = %backend,
                 status = %status.as_u16(),
-                share_token = %log_token,
+                share_id = %log_share_id,
                 client_ip = %user_ip,
                 client_country = %user_country,
                 client_asn = %user_asn,
@@ -1487,7 +1467,7 @@ pub async fn proxy_handler(
             path = %path_and_query,
             backend = %backend,
             status = %status.as_u16(),
-            share_token = %log_token,
+            share_id = %log_share_id,
             client_ip = %user_ip,
             client_country = %user_country,
             client_asn = %user_asn,
@@ -1501,7 +1481,7 @@ pub async fn proxy_handler(
             path = %path_and_query,
             backend = %backend,
             status = %status.as_u16(),
-            share_token = %log_token,
+            share_id = %log_share_id,
             client_ip = %user_ip,
             client_country = %user_country,
             client_asn = %user_asn,
@@ -1708,7 +1688,6 @@ mod tests {
                 "demo".into(),
                 "127.0.0.1:3000".into(),
                 None,
-                Some("token-demo".into()),
                 Some("share-1".into()),
                 Some("Demo Share".into()),
                 true,
@@ -1723,7 +1702,6 @@ mod tests {
             .expect("route metadata");
 
         assert_eq!(route.backend, "127.0.0.1:3000");
-        assert_eq!(route.share_token.as_deref(), Some("token-demo"));
         assert_eq!(route.share_id.as_deref(), Some("share-1"));
         assert!(route.is_free_share);
         assert_eq!(route.parallel_limit, 5);
@@ -1736,7 +1714,6 @@ mod tests {
             .set_route(
                 "demo".into(),
                 "127.0.0.1:3000".into(),
-                None,
                 None,
                 Some("share-1".into()),
                 None,
@@ -1768,7 +1745,6 @@ mod tests {
                 "demo".into(),
                 "127.0.0.1:3000".into(),
                 Some("old-connection".into()),
-                Some("token-old".into()),
                 Some("share-1".into()),
                 Some("Demo Share".into()),
                 false,
@@ -1781,7 +1757,6 @@ mod tests {
                 "demo".into(),
                 "127.0.0.1:3001".into(),
                 Some("new-connection".into()),
-                Some("token-new".into()),
                 Some("share-1".into()),
                 Some("Demo Share".into()),
                 false,
@@ -1821,7 +1796,6 @@ mod tests {
                 "demo".into(),
                 "127.0.0.1:3000".into(),
                 Some("old-connection".into()),
-                None,
                 Some("share-1".into()),
                 None,
                 false,
@@ -1836,7 +1810,6 @@ mod tests {
                 "demo".into(),
                 "127.0.0.1:3001".into(),
                 Some("new-connection".into()),
-                None,
                 Some("share-1".into()),
                 None,
                 false,

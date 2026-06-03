@@ -263,7 +263,6 @@ impl server::Handler for ClientHandler {
         let bound_port = listener.local_addr()?.port();
         *port = bound_port as u32;
         let backend = format!("{host}:{port}");
-        let share_token = lease.share.as_ref().map(|s| s.share_token.clone());
         let share_id = lease.share.as_ref().map(|s| s.share_id.clone());
         let is_free_share = lease
             .share
@@ -277,7 +276,6 @@ impl server::Handler for ClientHandler {
                 lease.subdomain.clone(),
                 backend.clone(),
                 Some(lease.connection_id.clone()),
-                share_token,
                 share_id,
                 lease.share.as_ref().map(|s| s.share_name.clone()),
                 is_free_share,

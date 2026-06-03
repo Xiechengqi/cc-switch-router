@@ -1069,7 +1069,6 @@ impl AppStore {
             market_access_mode: share.market_access_mode,
             for_sale_official_price_percent_by_app: share.for_sale_official_price_percent_by_app,
             subdomain: share.subdomain,
-            share_token: mask_share_token(&share.share_token),
             can_view_secret: false,
             can_manage,
             can_edit_settings,
@@ -2339,11 +2338,6 @@ impl AppStore {
                     for_sale_official_price_percent_by_app: share
                         .for_sale_official_price_percent_by_app,
                     subdomain: share.subdomain,
-                    share_token: if can_view_secret {
-                        share.share_token
-                    } else {
-                        mask_share_token(&share.share_token)
-                    },
                     app_type: share.app_type,
                     can_view_secret,
                     can_manage,
@@ -4721,10 +4715,10 @@ fn upsert_share_tx(
     };
     conn.execute(
         "INSERT INTO shares (
-            share_id, installation_id, share_name, owner_email, shared_with_emails_json, market_access_mode, description, for_sale, subdomain, share_token, app_type, provider_id,
+            share_id, installation_id, share_name, owner_email, shared_with_emails_json, market_access_mode, description, for_sale, subdomain, app_type, provider_id,
             enabled_claude, enabled_codex, enabled_gemini,
             token_limit, parallel_limit, tokens_used, requests_count, share_status, created_at, expires_at, upstream_provider_json, bindings_json, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
         ON CONFLICT(share_id) DO UPDATE SET
             installation_id = excluded.installation_id,
             share_name = excluded.share_name,
@@ -4734,7 +4728,6 @@ fn upsert_share_tx(
             description = excluded.description,
             for_sale = excluded.for_sale,
             subdomain = excluded.subdomain,
-            share_token = excluded.share_token,
             app_type = excluded.app_type,
             provider_id = excluded.provider_id,
             enabled_claude = shares.enabled_claude,
@@ -4763,7 +4756,6 @@ fn upsert_share_tx(
             description,
             for_sale,
             share.subdomain,
-            share.share_token,
             share.app_type,
             share.provider_id,
             i64::from(share.support.claude as u8),
@@ -5057,7 +5049,6 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             description TEXT,
             for_sale TEXT NOT NULL DEFAULT 'No',
             subdomain TEXT,
-            share_token TEXT NOT NULL,
             app_type TEXT NOT NULL,
             provider_id TEXT,
             enabled_claude INTEGER NOT NULL DEFAULT 0,
@@ -5705,6 +5696,15 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         )
         .map_err(|e| AppError::Internal(format!("add shares runtime_refreshed_at failed: {e}")))?;
     }
+    // share_token 已废弃：caller 身份在 router 边界由 user_api_token + email ACL 校验，
+    // tunnel→client 用 X-CC-Switch-Share-Id 识别 share。该列对老库可能仍然存在 + 带
+    // NOT NULL 约束，新 INSERT 会因此报错，需要 DROP 掉。
+    if columns.iter().any(|name| name == "share_token") {
+        // 索引必须先删；不然 SQLite 拒绝 DROP COLUMN。
+        let _ = conn.execute("DROP INDEX IF EXISTS idx_shares_token", []);
+        conn.execute("ALTER TABLE shares DROP COLUMN share_token", [])
+            .map_err(|e| AppError::Internal(format!("drop shares.share_token failed: {e}")))?;
+    }
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_shares_subdomain_unique ON shares(subdomain) WHERE subdomain IS NOT NULL",
         [],
@@ -6289,7 +6289,7 @@ fn parse_ip_im_geo(body: &str) -> Option<GeoLookupResult> {
 fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppError> {
     let mut stmt = conn
         .prepare(
-        "SELECT s.installation_id, s.share_id, s.share_name, s.description, s.for_sale, s.market_access_mode, COALESCE(s.subdomain, '-'), s.share_token, s.app_type, s.provider_id,
+        "SELECT s.installation_id, s.share_id, s.share_name, s.description, s.for_sale, s.market_access_mode, COALESCE(s.subdomain, '-'), s.app_type, s.provider_id,
                     s.owner_email, s.shared_with_emails_json,
                     s.enabled_claude, s.enabled_codex, s.enabled_gemini,
                     s.token_limit, s.parallel_limit, s.tokens_used, s.requests_count, s.share_status, s.created_at, s.expires_at, s.upstream_provider_json, s.app_runtimes_json, s.app_providers_json,
@@ -6310,27 +6310,26 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                     market_access_mode: row.get(5)?,
                     for_sale_official_price_percent_by_app: Default::default(),
                     subdomain: row.get(6)?,
-                    share_token: row.get(7)?,
-                    app_type: row.get(8)?,
-                    provider_id: row.get(9)?,
-                    bindings: parse_share_bindings(row.get(25)?)?,
-                    owner_email: row.get(10)?,
-                    shared_with_emails: parse_string_vec(row.get(11)?)?,
+                    app_type: row.get(7)?,
+                    provider_id: row.get(8)?,
+                    bindings: parse_share_bindings(row.get(24)?)?,
+                    owner_email: row.get(9)?,
+                    shared_with_emails: parse_string_vec(row.get(10)?)?,
                     support: ShareSupport {
-                        claude: row.get::<_, i64>(12)? != 0,
-                        codex: row.get::<_, i64>(13)? != 0,
-                        gemini: row.get::<_, i64>(14)? != 0,
+                        claude: row.get::<_, i64>(11)? != 0,
+                        codex: row.get::<_, i64>(12)? != 0,
+                        gemini: row.get::<_, i64>(13)? != 0,
                     },
-                    token_limit: row.get(15)?,
-                    parallel_limit: row.get(16)?,
-                    tokens_used: row.get(17)?,
-                    requests_count: row.get(18)?,
-                    share_status: row.get(19)?,
-                    created_at: row.get(20)?,
-                    expires_at: row.get(21)?,
-                    upstream_provider: parse_upstream_provider(row.get(22)?)?,
-                    app_runtimes: parse_app_runtimes(row.get(23)?)?,
-                    app_providers: parse_app_providers(row.get(24)?)?,
+                    token_limit: row.get(14)?,
+                    parallel_limit: row.get(15)?,
+                    tokens_used: row.get(16)?,
+                    requests_count: row.get(17)?,
+                    share_status: row.get(18)?,
+                    created_at: row.get(19)?,
+                    expires_at: row.get(20)?,
+                    upstream_provider: parse_upstream_provider(row.get(21)?)?,
+                    app_runtimes: parse_app_runtimes(row.get(22)?)?,
+                    app_providers: parse_app_providers(row.get(23)?)?,
                 },
             ))
         })
@@ -7507,15 +7506,6 @@ fn record_market_share_model_failure_state_conn(
     )
     .map_err(|e| AppError::Internal(format!("upsert market failure state failed: {e}")))?;
     Ok(())
-}
-
-fn mask_share_token(token: &str) -> String {
-    let mut chars = token.chars();
-    let Some(first) = chars.next() else {
-        return "***".to_string();
-    };
-    let last = token.chars().last().unwrap_or(first);
-    format!("{first}***{last}")
 }
 
 fn list_recent_share_request_logs(
@@ -10282,10 +10272,10 @@ mod tests {
         conn.execute(
             "INSERT INTO shares (
                 share_id, installation_id, share_name, owner_email, shared_with_emails_json,
-                description, for_sale, subdomain, share_token, app_type, provider_id,
+                description, for_sale, subdomain, app_type, provider_id,
                 enabled_claude, enabled_codex, enabled_gemini, token_limit, parallel_limit,
                 tokens_used, requests_count, share_status, created_at, expires_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, '[]', NULL, 'No', ?5, 'token', 'proxy', NULL, 1, 1, 1, 1000, 3, 0, 0, ?6, ?7, ?8, ?7)",
+             ) VALUES (?1, ?2, ?3, ?4, '[]', NULL, 'No', ?5, 'proxy', NULL, 1, 1, 1, 1000, 3, 0, 0, ?6, ?7, ?8, ?7)",
             params![
                 share_id,
                 installation_id,
@@ -10580,7 +10570,6 @@ mod tests {
             description: None,
             for_sale: "No".into(),
             subdomain: subdomain.into(),
-            share_token: format!("token-{share_id}"),
             app_type: "proxy".into(),
             provider_id: None,
             bindings: Default::default(),
@@ -10768,7 +10757,6 @@ mod tests {
             .set_route(
                 "share-sub".into(),
                 "127.0.0.1:1234".into(),
-                None,
                 None,
                 None,
                 None,
@@ -11328,7 +11316,6 @@ mod tests {
                 "aaa".into(),
                 "127.0.0.1:65530".into(),
                 None,
-                Some("token-share-renew".into()),
                 Some("share-renew".into()),
                 Some("share-share-renew".into()),
                 false,
@@ -11527,7 +11514,6 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
                 false,
                 -1,
                 None,
@@ -11571,7 +11557,6 @@ mod tests {
             description: None,
             for_sale: "No".into(),
             subdomain: "market-a".into(),
-            share_token: "token-reserved".into(),
             app_type: "proxy".into(),
             provider_id: None,
             bindings: Default::default(),
@@ -11637,7 +11622,6 @@ mod tests {
             description: None,
             for_sale: "No".into(),
             subdomain: "signed-sub".into(),
-            share_token: "token-12345678".into(),
             app_type: "proxy".into(),
             provider_id: None,
             bindings: Default::default(),
@@ -11919,7 +11903,6 @@ mod tests {
             description: Some("metadata outside claim signature".into()),
             for_sale: "Yes".into(),
             subdomain: "minimal-sub".into(),
-            share_token: "token-minimal-123".into(),
             app_type: "proxy".into(),
             provider_id: None,
             bindings: Default::default(),
@@ -11998,7 +11981,6 @@ mod tests {
             description: None,
             for_sale: "No".into(),
             subdomain: "mismatch-sub".into(),
-            share_token: "token-mismatch-123".into(),
             app_type: "proxy".into(),
             provider_id: None,
             bindings: Default::default(),
@@ -12069,7 +12051,6 @@ mod tests {
             description: None,
             for_sale: "No".into(),
             subdomain: "owner-sub".into(),
-            share_token: "token-12345678".into(),
             app_type: "proxy".into(),
             provider_id: None,
             bindings: Default::default(),
@@ -12169,7 +12150,6 @@ mod tests {
             description: None,
             for_sale: "No".into(),
             subdomain: "heal-sub".into(),
-            share_token: "token-12345678".into(),
             app_type: "proxy".into(),
             provider_id: None,
             bindings: Default::default(),
@@ -12242,7 +12222,6 @@ mod tests {
             description: None,
             for_sale: "No".into(),
             subdomain: "reused-sub".into(),
-            share_token: "token-12345678".into(),
             app_type: "proxy".into(),
             provider_id: None,
             bindings: Default::default(),
@@ -12330,7 +12309,6 @@ mod tests {
             description: Some("signed batch sync".into()),
             for_sale: "Yes".into(),
             subdomain: "batch-sub".into(),
-            share_token: "token-batch-123".into(),
             app_type: "proxy".into(),
             provider_id: None,
             bindings: Default::default(),
@@ -12808,7 +12786,6 @@ mod tests {
                 "old-sub".into(),
                 "http://127.0.0.1:1".into(),
                 None,
-                Some("token-old".into()),
                 Some("share-old".into()),
                 Some("Old Share".into()),
                 false,
@@ -12821,7 +12798,6 @@ mod tests {
                 "new-sub".into(),
                 "http://127.0.0.1:2".into(),
                 None,
-                Some("token-new".into()),
                 Some("share-new".into()),
                 Some("New Share".into()),
                 false,
@@ -12854,38 +12830,6 @@ mod tests {
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 
-    #[tokio::test]
-    async fn dashboard_snapshot_masks_free_share_token_without_login() {
-        let (store, config) = setup_store("dashboard-free-share-token").await;
-        insert_installation(&store, "inst-1").await;
-        insert_share(&store, "inst-1", "share-free", "free-sub", "active").await;
-
-        {
-            let conn = store.conn.lock().await;
-            conn.execute(
-                "UPDATE shares SET for_sale = 'Free', share_token = 'token-free-1234' WHERE share_id = 'share-free'",
-                [],
-            )
-            .expect("mark share as free");
-        }
-
-        let server_geo = ServerGeo {
-            lat: None,
-            lon: None,
-        };
-        let proxy = ProxyRegistry::default();
-        let snapshot = store
-            .dashboard_snapshot(&config, &server_geo, &proxy, None)
-            .await
-            .expect("dashboard snapshot");
-
-        let share = snapshot.shares.first().expect("share view");
-        assert!(!share.can_view_secret);
-        assert_eq!(share.for_sale, "Free");
-        assert_eq!(share.share_token, "t***4");
-
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
-    }
 
     #[tokio::test]
     async fn public_map_points_returns_total_client_count_alongside_deduplicated_points() {
@@ -12983,7 +12927,6 @@ mod tests {
         assert!(!share.can_manage);
         assert!(!share.can_edit_settings);
         assert_eq!(share.shared_with_emails, vec!["shared@example.com"]);
-        assert_eq!(share.share_token, "token");
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
@@ -13190,7 +13133,6 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
                 false,
                 -1,
                 None,
@@ -13200,7 +13142,6 @@ mod tests {
             .set_route(
                 "fresh-sub".into(),
                 "127.0.0.1:5678".into(),
-                None,
                 None,
                 None,
                 None,
@@ -13267,7 +13208,6 @@ mod tests {
             .set_route(
                 "fresh-sub".into(),
                 "127.0.0.1:5678".into(),
-                None,
                 None,
                 None,
                 None,
@@ -13370,7 +13310,6 @@ mod tests {
             .set_route(
                 "active-sub".into(),
                 "127.0.0.1:5678".into(),
-                None,
                 None,
                 None,
                 None,
