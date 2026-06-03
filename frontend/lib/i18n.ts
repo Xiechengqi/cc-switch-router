@@ -668,7 +668,7 @@ export const messages = {
     "dashboard.share": "Share",
     "dashboard.apiUrlKey": "API URL&KEY",
     "dashboard.forSale": "ForSale",
-    "dashboard.region": "Region",
+    "dashboard.region": "地区",
     "dashboard.status": "状态",
     "dashboard.support": "支持",
     "dashboard.noShare": "无 share",
