@@ -1573,7 +1573,6 @@ export function SharesTable({
   }, [shares]);
 
   const selectedApi = shareApiParts(selected ?? undefined);
-  const selectedClient = selected ? clientByShareId.get(selected.shareId) : undefined;
 
   return (
     <section className="grid gap-3">
@@ -1679,27 +1678,6 @@ export function SharesTable({
                     <DrawerSection label="24h">
                       <HealthTimelineStrip timeline={selected.healthTimeline} />
                     </DrawerSection>
-                    {selectedClient ? (
-                      <DrawerSection label={t("dashboard.installation")}>
-                        <div className="grid gap-1 text-xs text-muted-foreground">
-                          <span>
-                            {t("dashboard.platform")}:{" "}
-                            <strong className="text-foreground">
-                              {selectedClient.installation.platform}
-                            </strong>
-                          </span>
-                          <span>
-                            {t("dashboard.region")}:{" "}
-                            <strong className="text-foreground">
-                              {selectedClient.installation.countryCode || "-"}
-                            </strong>
-                          </span>
-                          <span className="break-all">
-                            id: {selectedClient.installation.id}
-                          </span>
-                        </div>
-                      </DrawerSection>
-                    ) : null}
                     <DrawerSection label={t("dashboard.markets")}>
                       <ShareMarkets share={selected} t={t} />
                     </DrawerSection>
@@ -2228,38 +2206,43 @@ function ProviderCard({
 
 function ShareProvidersPanel({ share }: { share?: ShareView }) {
   const { locale, t } = useLocaleText();
+  const [selectedKey, setSelectedKey] = React.useState<keyof ShareAppProviders>("claude");
   const providers = share?.appProviders;
   const runtimes = share?.appRuntimes;
-  const bindings = share?.bindings || {};
-
-  // 只展示该 share 在每个 slot 实际绑定的 provider（appProviders 含该 client 全量列表，
-  // 但 client 侧边栏才需要全量；这里聚焦 "share 现在跑在谁上"）。
-  const boundEntries = PROVIDER_APP_TABS.flatMap((tab) => {
-    const providerId = bindings[tab.key];
-    if (!providerId) return [];
-    const list = providers?.[tab.key as keyof ShareAppProviders] || [];
-    const provider = list.find((p) => p.id === providerId);
-    if (!provider) return [];
-    return [{ tab, provider }];
-  });
-
-  if (!boundEntries.length) {
-    return <EmptyBlock>{t("dashboard.noProviders")}</EmptyBlock>;
-  }
+  // 老样式：3 个 app 各自一个 tab，切换后展示该 app 的全量 provider。
+  // 当前绑定的 provider 由 ProviderCard 的 `showCurrentBadge` 渲染 "current" 角标。
+  const currentProviders = providers?.[selectedKey] || [];
 
   return (
     <div className="grid gap-3">
-      {boundEntries.map(({ tab, provider }) => {
-        const runtime = mergeStandaloneOAuthRuntime(providerRuntime(provider), runtimes, provider);
-        return (
-          <div key={tab.key} className="grid gap-1.5">
-            <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
+      <Tabs selectedKey={selectedKey} onSelectionChange={(key: React.Key) => setSelectedKey(String(key) as keyof ShareAppProviders)} variant="secondary" className="text-foreground">
+        <Tabs.List className="grid w-full grid-cols-3 text-foreground">
+          {PROVIDER_APP_TABS.map((tab) => (
+            <Tabs.Tab key={tab.key} id={tab.key} className="px-2 text-xs text-muted-foreground data-[selected=true]:text-foreground">
               {tab.label}
-            </div>
-            <ProviderCard provider={provider} runtime={runtime} t={t} locale={locale} showCurrentBadge />
-          </div>
-        );
-      })}
+            </Tabs.Tab>
+          ))}
+        </Tabs.List>
+      </Tabs>
+      {!currentProviders.length ? (
+        <EmptyBlock>{t("dashboard.noProviders")}</EmptyBlock>
+      ) : (
+        <div className="grid gap-2">
+          {currentProviders.map((provider) => {
+            const runtime = mergeStandaloneOAuthRuntime(providerRuntime(provider), runtimes, provider);
+            return (
+              <ProviderCard
+                key={provider.id}
+                provider={provider}
+                runtime={runtime}
+                t={t}
+                locale={locale}
+                showCurrentBadge
+              />
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
