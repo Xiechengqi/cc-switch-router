@@ -1347,7 +1347,7 @@ function ShareStatusCell({ client, share, t, locale }: { client: DashboardClient
   }
   return (
     <div className="grid min-w-52 gap-2 text-sm">
-      <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.platform")}</span><strong className="whitespace-nowrap">{formatPlatformVersion(client.installation.platform, client.installation.appVersion)}</strong></div>
+      <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.region")}</span><strong className="whitespace-nowrap">{client.installation.countryCode || "-"}</strong></div>
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.usage")}</span><div><strong>{compactTokens(share.tokensUsed)} / {isUnlimited(share.tokenLimit) ? "∞" : compactTokens(share.tokenLimit)}</strong><UsageBar used={share.tokensUsed} limit={share.tokenLimit} t={t} /></div></div>
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.expires")}</span><strong title={`${formatDateTime(share.createdAt)} / ${expiryTitle(share.expiresAt)}`}>{shareExpiryProgress(share, locale)}</strong></div>
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.parallel")}</span><strong>{share.activeRequests || 0}<span className="text-muted-foreground">/{limit}</span></strong></div>
@@ -1575,7 +1575,7 @@ export function SharesTable({
                 {/* P13：APP 列删除——与 SUPPORT 重复。SUPPORT 单元格按 share.bindings 派生，
                     哪些 app 绑定了，看 SUPPORT 卡片是否有内容即可。 */}
                 <th className="px-4 py-3">{t("dashboard.forSale")}</th>
-                <th className="px-4 py-3">{t("dashboard.region")}</th>
+                {/* P15：Region 列并入 Status 列首行（client 维度的国别码不值得单独占一列）。 */}
                 <th className="px-4 py-3">{t("dashboard.status")}</th>
                 <th className="px-4 py-3">{t("dashboard.support")}</th>
                 <th className="w-7 px-4 py-3" />
@@ -1611,9 +1611,6 @@ export function SharesTable({
                       <td className="px-4 py-3 align-middle">
                         <ForSaleCell share={share} t={t} />
                       </td>
-                      <td className="px-4 py-3 align-middle text-muted-foreground">
-                        {client?.installation.countryCode || "-"}
-                      </td>
                       <td className="px-4 py-3 align-middle">
                         {client ? (
                           <ShareStatusCell client={client} share={share} t={t} locale={locale} />
@@ -1630,7 +1627,7 @@ export function SharesTable({
                 })
               ) : (
                 <tr>
-                  <td colSpan={6} className="px-4 py-10 text-center text-muted-foreground">
+                  <td colSpan={5} className="px-4 py-10 text-center text-muted-foreground">
                     {t("dashboard.noShares")}
                   </td>
                 </tr>
