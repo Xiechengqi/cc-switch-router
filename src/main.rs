@@ -132,6 +132,7 @@ async fn main() -> Result<()> {
         cleanup_interval_secs = config.cleanup_interval_secs,
         lease_retention_secs = config.lease_retention_secs,
         client_stale_secs = config.client_stale_secs,
+        paused_share_stale_secs = config.paused_share_stale_secs,
         db_exists = config.db_path.exists(),
         host_key_path = %config.host_key_path.display(),
         host_key_exists = config.host_key_path.exists(),
@@ -694,6 +695,7 @@ Environment:
   CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS Cleanup interval, default 300
   CC_SWITCH_ROUTER_LEASE_RETENTION_SECS  Lease retention period, default 604800
   CC_SWITCH_ROUTER_CLIENT_STALE_SECS     Delete clients and shares after no report, default 3600
+  CC_SWITCH_ROUTER_PAUSED_SHARE_STALE_SECS Delete paused shares after no update, default 3600
 Default env file:
   $HOME/.config/cc-switch-router/.env
   The file is auto-created on first start when missing.

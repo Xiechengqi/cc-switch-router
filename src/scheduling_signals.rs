@@ -310,6 +310,9 @@ mod tests {
                 label: "5h".into(),
                 utilization: 90.0,
                 resets_at: Some(ts(300)), // 5 minutes out, below 1h threshold
+                used: None,
+                limit: None,
+                unit: None,
             }],
         };
         // Only short window → fall back to neutral.
@@ -327,11 +330,17 @@ mod tests {
                     label: "weekly".into(),
                     utilization: 10.0,
                     resets_at: Some(ts(7 * 86400)),
+                    used: None,
+                    limit: None,
+                    unit: None,
                 },
                 crate::models::ShareUpstreamQuotaTier {
                     label: "daily".into(),
                     utilization: 95.0,
                     resets_at: Some(ts(86400)),
+                    used: None,
+                    limit: None,
+                    unit: None,
                 },
             ],
         };

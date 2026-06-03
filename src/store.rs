@@ -2598,6 +2598,8 @@ impl AppStore {
         let active_subdomains = proxy.active_subdomains().await;
         let cutoff = (Utc::now() - Duration::seconds(config.lease_retention_secs)).to_rfc3339();
         let stale_cutoff = (Utc::now() - Duration::seconds(config.client_stale_secs)).to_rfc3339();
+        let paused_cutoff =
+            (Utc::now() - Duration::seconds(config.paused_share_stale_secs)).to_rfc3339();
         let market_missing_cutoff =
             (Utc::now() - Duration::seconds(MARKET_ACTIVE_MISSING_GRACE_SECS)).to_rfc3339();
         let market_release_cutoff =
@@ -2717,6 +2719,27 @@ impl AppStore {
 
             let deleted_installations = 0;
 
+            // 已暂停且 updated_at 长期未刷新的 share 自动 GC：installation 维度的清理
+            // 只删整台机器全离线的 share，但用户明确 paused 后只想保留账号、不想留路由的
+            // 也应该到期回收。先清掉 health_checks 再删 share 行，避免 orphan。
+            tx.execute(
+                "DELETE FROM share_health_checks
+                     WHERE share_id IN (
+                         SELECT share_id FROM shares
+                         WHERE share_status = 'paused' AND updated_at < ?1
+                     )",
+                params![paused_cutoff],
+            )
+            .map_err(|e| AppError::Internal(format!("delete paused share health failed: {e}")))?;
+            let deleted_paused_shares = tx
+                .execute(
+                    "DELETE FROM shares
+                     WHERE share_status = 'paused' AND updated_at < ?1",
+                    params![paused_cutoff],
+                )
+                .map_err(|e| AppError::Internal(format!("delete paused shares failed: {e}")))?
+                as usize;
+
             let deleted_old_shares = tx
                 .execute(
                     "DELETE FROM shares
@@ -2809,7 +2832,7 @@ impl AppStore {
             (
                 CleanupResult {
                     deleted_leases: deleted_leases + deleted_stale_leases,
-                    deleted_shares: deleted_stale_shares + deleted_old_shares,
+                    deleted_shares: deleted_stale_shares + deleted_paused_shares + deleted_old_shares,
                     deleted_installations,
                     removed_routes: 0,
                 },
@@ -9796,6 +9819,7 @@ mod tests {
             cleanup_interval_secs: 300,
             lease_retention_secs: 7 * 24 * 60 * 60,
             client_stale_secs: 60 * 60,
+            paused_share_stale_secs: 60 * 60,
             resend_api_key: None,
             resend_from: None,
             resend_from_name: None,
@@ -12977,6 +13001,83 @@ mod tests {
         let active_subdomains = proxy.active_subdomains().await;
         assert!(!active_subdomains.contains(&"stale-sub".to_string()));
         assert!(active_subdomains.contains(&"fresh-sub".to_string()));
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_paused_shares_even_when_installation_is_fresh() {
+        // 回归：当 installation 上还有活动 share（last_seen_at 被持续 bump）时，
+        // 长期 paused 的 share 不应该跟着续命，必须按 paused_share_stale_secs 单独 GC。
+        let (store, config) = setup_store("cleanup-paused-share").await;
+        insert_installation(&store, "inst-1").await;
+        // 一条活的 share 让 installation 永远不 stale；paused 的那条本应独立计时。
+        insert_share(&store, "inst-1", "share-active", "active-sub", "active").await;
+        insert_share(&store, "inst-1", "share-paused-old", "paused-old-sub", "paused").await;
+        insert_share(&store, "inst-1", "share-paused-fresh", "paused-fresh-sub", "paused").await;
+        insert_share(&store, "inst-1", "share-active-old", "active-old-sub", "active").await;
+
+        // 把 share-paused-old 的 updated_at 推到 paused 阈值之外（默认 3600s + 余量）。
+        // share-active-old 也推到那个时间，验证 active 状态绝不会被这条分支命中。
+        // share-paused-fresh 留在 now，验证窗口内的 paused 不被误删。
+        {
+            let stale = (Utc::now() - Duration::seconds(config.paused_share_stale_secs + 600))
+                .to_rfc3339();
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET updated_at = ?1 WHERE share_id = ?2",
+                params![stale, "share-paused-old"],
+            )
+            .expect("backdate paused-old");
+            conn.execute(
+                "UPDATE shares SET updated_at = ?1 WHERE share_id = ?2",
+                params![stale, "share-active-old"],
+            )
+            .expect("backdate active-old");
+        }
+
+        let proxy = ProxyRegistry::default();
+        // active-sub 在 ProxyRegistry 中，installation.last_seen_at 会被 cleanup tick 续命。
+        proxy
+            .set_route(
+                "active-sub".into(),
+                "127.0.0.1:5678".into(),
+                None,
+                None,
+                None,
+                None,
+                false,
+                -1,
+                None,
+            )
+            .await;
+
+        let result = store
+            .cleanup_expired_data(&config, &proxy)
+            .await
+            .expect("cleanup paused shares");
+
+        // 只 share-paused-old 应该被删；installation/active/active-old/paused-fresh 全部留下。
+        assert_eq!(result.deleted_shares, 1);
+        let conn = store.conn.lock().await;
+        let surviving: Vec<String> = conn
+            .prepare("SELECT share_id FROM shares ORDER BY share_id")
+            .expect("prepare surviving shares")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query surviving shares")
+            .collect::<Result<_, _>>()
+            .expect("collect surviving shares");
+        drop(conn);
+
+        assert_eq!(
+            surviving,
+            vec![
+                "share-active".to_string(),
+                "share-active-old".to_string(),
+                "share-paused-fresh".to_string(),
+            ],
+            "only the long-paused share should be deleted",
+        );
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
