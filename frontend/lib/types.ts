@@ -426,6 +426,9 @@ export type ShareUpstreamProvider = {
       label?: string;
       utilization?: number;
       resetsAt?: string;
+      used?: number;
+      limit?: number;
+      unit?: string;
     }>;
   };
   models?: Array<{

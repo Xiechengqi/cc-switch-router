@@ -441,6 +441,14 @@ function quotaTierLabel(label?: string, locale: AppLocale = "en") {
   return label || "";
 }
 
+function formatQuotaAmount(value?: number, locale: AppLocale = "en") {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "";
+  return new Intl.NumberFormat(locale, {
+    maximumFractionDigits: value % 1 === 0 ? 0 : 2,
+    useGrouping: false,
+  }).format(value);
+}
+
 type OAuthRuntimeKey = "kiro" | "cursor" | "antigravity" | "copilot";
 
 const OAUTH_RUNTIME_ROWS: Array<[OAuthRuntimeKey, string]> = [
@@ -490,6 +498,7 @@ function quotaSummary(runtime?: ShareUpstreamProvider, locale: AppLocale = "en")
   const quota = runtime.quota;
   const status = String(quota?.status || "").toLowerCase();
   if (!quota || (status && !["ok", "success", "valid"].includes(status))) return "";
+  const isKiro = oauthRuntimeKeyFromProvider(runtime) === "kiro";
   let tiers = (quota.tiers || [])
     .map((tier) => ({ ...tier, label: tier.label || tier.name }))
     .filter((tier) => tier.label);
@@ -499,7 +508,12 @@ function quotaSummary(runtime?: ShareUpstreamProvider, locale: AppLocale = "en")
     if (preferredTiers.length) tiers = preferredTiers;
   }
   const tierText = tiers
-    .map((tier) => [quotaTierLabel(tier.label, locale), `${Math.round(tier.utilization || 0)}%`, countdownStr(tier.resetsAt)].filter(Boolean).join(" "))
+    .map((tier) => {
+      const used = formatQuotaAmount(tier.used, locale);
+      const limit = formatQuotaAmount(tier.limit, locale);
+      const usage = isKiro && used && limit ? `${used}/${limit}` : quotaTierLabel(tier.label, locale);
+      return [usage, `${Math.round(tier.utilization || 0)}%`, countdownStr(tier.resetsAt)].filter(Boolean).join(" ");
+    })
     .join(" · ");
   return [quota.plan || quota.credentialMessage, tierText].filter(Boolean).join(" · ");
 }
