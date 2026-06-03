@@ -220,8 +220,11 @@ function StatusBadge({ active, label }: { active: boolean; label: string }) {
 
 function ShareStatusBadge({ share, t }: { share?: ShareView; t: TFn }) {
   if (!share) return <StatusBadge active={false} label={t("dashboard.noShare")} />;
-  const active = String(share.shareStatus || "").trim().toLowerCase() === "active";
-  return <StatusBadge active={active} label={active ? t("common.online") : formatShareStatus(share.shareStatus)} />;
+  const status = String(share.shareStatus || "").trim().toLowerCase();
+  if (status === "active") return <Chip color="success" size="sm" variant="soft">{t("dashboard.shareStatus.active")}</Chip>;
+  if (status === "paused") return <Chip color="warning" size="sm" variant="soft">{t("dashboard.shareStatus.paused")}</Chip>;
+  if (status === "expired") return <Chip color="default" size="sm" variant="tertiary">{t("dashboard.shareStatus.expired")}</Chip>;
+  return <StatusBadge active={false} label={formatShareStatus(share.shareStatus)} />;
 }
 
 function UsageBar({ used, limit, t }: { used: number; limit: number; t: TFn }) {
