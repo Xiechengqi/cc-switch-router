@@ -2654,7 +2654,7 @@ impl AppStore {
                 }
             }
 
-            let stale_subdomains = {
+            let mut stale_subdomains = {
                 let mut stmt = tx
                     .prepare(
                         "SELECT DISTINCT subdomain
@@ -2721,6 +2721,91 @@ impl AppStore {
                 })? as usize;
 
             let deleted_installations = 0;
+
+            let stale_active_offline_shares = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT share_id, subdomain
+                         FROM shares
+                         WHERE share_status = 'active'
+                           AND updated_at < ?1
+                           AND subdomain IS NOT NULL
+                           AND subdomain != ''
+                           AND subdomain != '-'",
+                    )
+                    .map_err(|e| {
+                        AppError::Internal(format!(
+                            "prepare stale active offline shares failed: {e}"
+                        ))
+                    })?;
+                let rows = stmt
+                    .query_map(params![stale_cutoff], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(|e| {
+                        AppError::Internal(format!("query stale active offline shares failed: {e}"))
+                    })?;
+                collect_rows(rows)?
+                    .into_iter()
+                    .filter(|(_, subdomain)| !active_subdomains_set.contains(subdomain))
+                    .collect::<Vec<_>>()
+            };
+            let (deleted_stale_active_offline_shares, deleted_stale_active_offline_leases) =
+                if stale_active_offline_shares.is_empty() {
+                    (0, 0)
+                } else {
+                    let stale_active_share_ids = stale_active_offline_shares
+                        .iter()
+                        .map(|(share_id, _)| share_id.clone())
+                        .collect::<Vec<_>>();
+                    let stale_active_subdomains = stale_active_offline_shares
+                        .iter()
+                        .map(|(_, subdomain)| subdomain.clone())
+                        .collect::<Vec<_>>();
+
+                    let share_placeholders = repeat_vars(stale_active_share_ids.len());
+                    tx.execute(
+                        &format!(
+                            "DELETE FROM share_health_checks
+                             WHERE share_id IN ({share_placeholders})"
+                        ),
+                        params_from_iter(stale_active_share_ids.iter()),
+                    )
+                    .map_err(|e| {
+                        AppError::Internal(format!(
+                            "delete stale active offline share health failed: {e}"
+                        ))
+                    })?;
+
+                    let subdomain_placeholders = repeat_vars(stale_active_subdomains.len());
+                    let deleted_leases = tx
+                        .execute(
+                            &format!(
+                                "DELETE FROM leases
+                                 WHERE subdomain IN ({subdomain_placeholders})"
+                            ),
+                            params_from_iter(stale_active_subdomains.iter()),
+                        )
+                        .map_err(|e| {
+                            AppError::Internal(format!(
+                                "delete stale active offline share leases failed: {e}"
+                            ))
+                        })? as usize;
+
+                    let deleted_shares = tx
+                        .execute(
+                            &format!("DELETE FROM shares WHERE share_id IN ({share_placeholders})"),
+                            params_from_iter(stale_active_share_ids.iter()),
+                        )
+                        .map_err(|e| {
+                            AppError::Internal(format!(
+                                "delete stale active offline shares failed: {e}"
+                            ))
+                        })? as usize;
+
+                    stale_subdomains.extend(stale_active_subdomains);
+                    (deleted_shares, deleted_leases)
+                };
 
             // 已暂停且 updated_at 长期未刷新的 share 自动 GC：installation 维度的清理
             // 只删整台机器全离线的 share，但用户明确 paused 后只想保留账号、不想留路由的
@@ -2834,8 +2919,11 @@ impl AppStore {
 
             (
                 CleanupResult {
-                    deleted_leases: deleted_leases + deleted_stale_leases,
+                    deleted_leases: deleted_leases
+                        + deleted_stale_leases
+                        + deleted_stale_active_offline_leases,
                     deleted_shares: deleted_stale_shares
+                        + deleted_stale_active_offline_shares
                         + deleted_paused_shares
                         + deleted_old_shares,
                     deleted_installations,
@@ -12830,7 +12918,6 @@ mod tests {
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 
-
     #[tokio::test]
     async fn public_map_points_returns_total_client_count_alongside_deduplicated_points() {
         let (store, config) = setup_store("public-map-client-count").await;
@@ -13286,8 +13373,7 @@ mod tests {
         .await;
 
         // 把 share-paused-old 的 updated_at 推到 paused 阈值之外（默认 3600s + 余量）。
-        // share-active-old 也推到那个时间，验证 active 状态绝不会被这条分支命中。
-        // share-paused-fresh 留在 now，验证窗口内的 paused 不被误删。
+        // share-paused-fresh 和 active share 留在 now，验证窗口内的 share 不被误删。
         {
             let stale =
                 (Utc::now() - Duration::seconds(config.paused_share_stale_secs + 600)).to_rfc3339();
@@ -13297,11 +13383,6 @@ mod tests {
                 params![stale, "share-paused-old"],
             )
             .expect("backdate paused-old");
-            conn.execute(
-                "UPDATE shares SET updated_at = ?1 WHERE share_id = ?2",
-                params![stale, "share-active-old"],
-            )
-            .expect("backdate active-old");
         }
 
         let proxy = ProxyRegistry::default();
@@ -13345,6 +13426,87 @@ mod tests {
             ],
             "only the long-paused share should be deleted",
         );
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_stale_active_offline_share_even_when_installation_is_fresh() {
+        // 回归：同一台 installation 下只要还有其它 share 在线，旧逻辑就会刷新
+        // installation.last_seen_at，从而让已经掉线很久的 active share 一直留在表里。
+        // active share 也必须按自己的 subdomain/updated_at 独立 GC。
+        let (store, config) = setup_store("cleanup-active-offline-share").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-online", "online-sub", "active").await;
+        insert_share(
+            &store,
+            "inst-1",
+            "share-offline-old",
+            "offline-old-sub",
+            "active",
+        )
+        .await;
+        insert_share(
+            &store,
+            "inst-1",
+            "share-offline-fresh",
+            "offline-fresh-sub",
+            "active",
+        )
+        .await;
+
+        {
+            let stale =
+                (Utc::now() - Duration::seconds(config.client_stale_secs + 600)).to_rfc3339();
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET updated_at = ?1 WHERE share_id = ?2",
+                params![stale, "share-offline-old"],
+            )
+            .expect("backdate offline-old");
+        }
+
+        let proxy = ProxyRegistry::default();
+        proxy
+            .set_route(
+                "online-sub".into(),
+                "127.0.0.1:5678".into(),
+                None,
+                None,
+                None,
+                false,
+                -1,
+                None,
+            )
+            .await;
+
+        let result = store
+            .cleanup_expired_data(&config, &proxy)
+            .await
+            .expect("cleanup stale active offline shares");
+
+        assert_eq!(result.deleted_shares, 1);
+        let conn = store.conn.lock().await;
+        let surviving: Vec<String> = conn
+            .prepare("SELECT share_id FROM shares ORDER BY share_id")
+            .expect("prepare surviving shares")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query surviving shares")
+            .collect::<Result<_, _>>()
+            .expect("collect surviving shares");
+        drop(conn);
+
+        assert_eq!(
+            surviving,
+            vec![
+                "share-offline-fresh".to_string(),
+                "share-online".to_string(),
+            ],
+            "only the stale active share without a live route should be deleted",
+        );
+        let active_subdomains = proxy.active_subdomains().await;
+        assert!(active_subdomains.contains(&"online-sub".to_string()));
+        assert!(!active_subdomains.contains(&"offline-old-sub".to_string()));
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
