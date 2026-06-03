@@ -1394,9 +1394,9 @@ pub struct DashboardMarketView {
     pub usage_amount_usd: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing_summary: Option<serde_json::Value>,
-    /// 10-minute health probe trail aggregated from linked shares — feeds the
-    /// dashboard's STATUS dots. Per-minute "any healthy → healthy" semantics
-    /// are merged on the frontend by [`healthDots`].
+    /// Recent health probe trail aggregated from linked shares for the
+    /// dashboard's STATUS dots. Each minute is healthy when any enabled linked
+    /// share was healthy in that minute.
     #[serde(default)]
     pub health_checks: Vec<HealthCheckEntry>,
     #[serde(default)]

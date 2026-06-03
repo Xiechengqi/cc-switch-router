@@ -6899,6 +6899,13 @@ fn record_runtime_model_health_snapshot_conn(
         .map_err(|e| AppError::Internal(format!("read share subdomain for health failed: {e}")))?
         .unwrap_or_default();
 
+    // Defense in depth: old cc-switch clients (and any future bug on the
+    // sender side) may push model_health entries for app_types that the share
+    // isn't actually bound to. The dashboard treats whatever lands in
+    // share_model_health_checks as authoritative, so we filter on intake by
+    // the canonical binding table to keep the view honest.
+    let bound_app_types = load_share_bound_app_types(conn, &snapshot.share_id)?;
+
     let mut current_models_by_app = HashMap::<String, HashSet<String>>::new();
     for summary in snapshot
         .model_health
@@ -6907,6 +6914,12 @@ fn record_runtime_model_health_snapshot_conn(
         .chain(snapshot.model_health.codex.iter())
         .chain(snapshot.model_health.gemini.iter())
     {
+        if !bound_app_types.contains(summary.app_type.as_str()) {
+            // The share doesn't bind this app right now — drop the entry.
+            // We also wipe any leftover history below, so a previously-bound
+            // app stops showing up in the dashboard once it's unbound.
+            continue;
+        }
         let checked_at = summary.last_checked_at.unwrap_or(snapshot.queried_at);
         let requested_model = if summary.requested_model.trim().is_empty() {
             summary.app_type.clone()
@@ -6990,6 +7003,84 @@ fn record_runtime_model_health_snapshot_conn(
         )
         .map_err(|e| AppError::Internal(format!("delete stale model health state failed: {e}")))?;
     }
+
+    // Clean up any historical rows for app_types this share no longer binds.
+    // Without this the dashboard would keep displaying e.g. codex health
+    // checks long after the user unbound codex (they'd persist until the share
+    // itself is deleted).
+    purge_unbound_model_health(conn, &snapshot.share_id, &bound_app_types)?;
+    Ok(())
+}
+
+/// Read the set of app_types this share currently has a non-empty binding on.
+fn load_share_bound_app_types(
+    conn: &Connection,
+    share_id: &str,
+) -> Result<HashSet<String>, AppError> {
+    let bindings_json: Option<String> = conn
+        .query_row(
+            "SELECT bindings_json FROM shares WHERE share_id = ?1",
+            params![share_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|e| AppError::Internal(format!("read share bindings_json failed: {e}")))?
+        .flatten();
+    let map = parse_share_bindings(bindings_json)
+        .map_err(|e| AppError::Internal(format!("decode share bindings failed: {e}")))?;
+    Ok(map
+        .into_iter()
+        .filter(|(_, provider_id)| !provider_id.trim().is_empty())
+        .map(|(app, _)| app)
+        .collect())
+}
+
+/// Delete model_health rows for apps this share no longer binds. Called on
+/// every snapshot intake so unbinding an app eventually clears its dashboard
+/// history without waiting for the share itself to be deleted.
+fn purge_unbound_model_health(
+    conn: &Connection,
+    share_id: &str,
+    bound_app_types: &HashSet<String>,
+) -> Result<(), AppError> {
+    if bound_app_types.is_empty() {
+        // Share currently has zero bindings — wipe both tables for this share.
+        conn.execute(
+            "DELETE FROM share_model_health_checks WHERE share_id = ?1",
+            params![share_id],
+        )
+        .map_err(|e| AppError::Internal(format!("purge model health checks failed: {e}")))?;
+        conn.execute(
+            "DELETE FROM share_model_health_state WHERE share_id = ?1",
+            params![share_id],
+        )
+        .map_err(|e| AppError::Internal(format!("purge model health state failed: {e}")))?;
+        return Ok(());
+    }
+
+    let placeholders = repeat_vars(bound_app_types.len());
+    let mut values = Vec::<String>::with_capacity(bound_app_types.len() + 1);
+    values.push(share_id.to_string());
+    values.extend(bound_app_types.iter().cloned());
+
+    conn.execute(
+        &format!(
+            "DELETE FROM share_model_health_checks
+             WHERE share_id = ?
+               AND app_type NOT IN ({placeholders})",
+        ),
+        params_from_iter(values.clone()),
+    )
+    .map_err(|e| AppError::Internal(format!("purge unbound model health checks failed: {e}")))?;
+    conn.execute(
+        &format!(
+            "DELETE FROM share_model_health_state
+             WHERE share_id = ?
+               AND app_type NOT IN ({placeholders})",
+        ),
+        params_from_iter(values),
+    )
+    .map_err(|e| AppError::Internal(format!("purge unbound model health state failed: {e}")))?;
     Ok(())
 }
 
@@ -8624,15 +8715,7 @@ fn enrich_dashboard_market(
         .unwrap_or(0);
     market.online_rate_24h =
         ((market.online_minutes_24h as f64 / ONLINE_WINDOW_MINUTES as f64) * 100.0).min(100.0);
-    // Stitch together the recent-10-min health probes from every linked share.
-    // The frontend's healthDots() merges per-minute with OR semantics, so just
-    // concatenating is enough — no extra dedup needed here.
-    market.health_checks = linked_shares
-        .iter()
-        .filter(|share| !share.disabled_by_market)
-        .filter_map(|share| health_by_share.get(&share.share_id))
-        .flat_map(|entries| entries.iter().cloned())
-        .collect();
+    market.health_checks = aggregate_market_health_checks(&linked_shares, health_by_share);
     market.health_timeline = merge_market_health_timeline(
         &linked_shares,
         health_timeline_by_share,
@@ -8644,6 +8727,40 @@ fn enrich_dashboard_market(
         .get(&market.email.to_ascii_lowercase())
         .cloned()
         .unwrap_or_default();
+}
+
+fn aggregate_market_health_checks(
+    linked_shares: &[MarketLinkedShareView],
+    health_by_share: &HashMap<String, Vec<HealthCheckEntry>>,
+) -> Vec<HealthCheckEntry> {
+    let mut by_minute = BTreeMap::<i64, bool>::new();
+    for share in linked_shares
+        .iter()
+        .filter(|share| !share.disabled_by_market)
+    {
+        let Some(entries) = health_by_share.get(&share.share_id) else {
+            continue;
+        };
+        for entry in entries {
+            let minute = entry.checked_at.div_euclid(60);
+            by_minute
+                .entry(minute)
+                .and_modify(|healthy| *healthy |= entry.is_healthy)
+                .or_insert(entry.is_healthy);
+        }
+    }
+    by_minute
+        .into_iter()
+        .rev()
+        .take(10)
+        .map(|(minute, is_healthy)| HealthCheckEntry {
+            checked_at: minute * 60,
+            is_healthy,
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
 }
 
 fn dashboard_market_to_share_link(market: &DashboardMarketView) -> ShareMarketLinkView {
@@ -10354,6 +10471,16 @@ mod tests {
         subdomain: &str,
         share_status: &str,
     ) {
+        // Default to all 3 apps bound so existing tests (which were written
+        // before the per-binding model_health filter landed) keep getting
+        // their snapshot intakes accepted. Tests that exercise the filter
+        // call `set_share_bindings` afterwards to narrow this.
+        let default_bindings = serde_json::json!({
+            "claude": "provider-test",
+            "codex": "provider-test",
+            "gemini": "provider-test",
+        })
+        .to_string();
         let now = Utc::now();
         let expires = now + Duration::hours(1);
         let conn = store.conn.lock().await;
@@ -10362,8 +10489,8 @@ mod tests {
                 share_id, installation_id, share_name, owner_email, shared_with_emails_json,
                 description, for_sale, subdomain, app_type, provider_id,
                 enabled_claude, enabled_codex, enabled_gemini, token_limit, parallel_limit,
-                tokens_used, requests_count, share_status, created_at, expires_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, '[]', NULL, 'No', ?5, 'proxy', NULL, 1, 1, 1, 1000, 3, 0, 0, ?6, ?7, ?8, ?7)",
+                tokens_used, requests_count, share_status, created_at, expires_at, bindings_json, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, '[]', NULL, 'No', ?5, 'proxy', NULL, 1, 1, 1, 1000, 3, 0, 0, ?6, ?7, ?8, ?9, ?7)",
             params![
                 share_id,
                 installation_id,
@@ -10373,9 +10500,27 @@ mod tests {
                 share_status,
                 now.to_rfc3339(),
                 expires.to_rfc3339(),
+                default_bindings,
             ],
         )
         .expect("insert share");
+    }
+
+    /// Override the bindings_json on an existing test share. Use for tests
+    /// that need a specific subset of apps bound (e.g. share with only
+    /// claude bound, to verify the model_health filter drops codex entries).
+    async fn set_share_bindings(store: &AppStore, share_id: &str, apps: &[&str]) {
+        let map: serde_json::Map<String, serde_json::Value> = apps
+            .iter()
+            .map(|app| (app.to_string(), serde_json::Value::String("provider-test".into())))
+            .collect();
+        let bindings = serde_json::Value::Object(map).to_string();
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "UPDATE shares SET bindings_json = ?2 WHERE share_id = ?1",
+            params![share_id, bindings],
+        )
+        .expect("update share bindings_json");
     }
 
     async fn set_share_shared_with_emails(store: &AppStore, share_id: &str, emails: &[&str]) {
@@ -10886,6 +11031,72 @@ mod tests {
         assert_eq!(latest.status, "offline");
         assert_eq!(latest.request_count, 3);
         assert_eq!(latest.failure_count, 3);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn market_dashboard_health_dots_or_merge_linked_share_minutes() {
+        let (store, config) = setup_store("market-health-dots-or-merge").await;
+        let market = test_market();
+        insert_market(&store, &market).await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(
+            &store,
+            "inst-1",
+            "share-failing",
+            "share-failing-sub",
+            "active",
+        )
+        .await;
+        insert_share(
+            &store,
+            "inst-1",
+            "share-healthy",
+            "share-healthy-sub",
+            "active",
+        )
+        .await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET for_sale = 'Yes', market_access_mode = 'all'
+                 WHERE share_id IN ('share-failing', 'share-healthy')",
+                [],
+            )
+            .expect("make shares market visible");
+        }
+
+        let now_minute = Utc::now().timestamp().div_euclid(60) * 60;
+        for offset in (0..10).rev() {
+            let checked_at = now_minute - offset * 60;
+            insert_health_check(&store, "share-failing", checked_at, false).await;
+            insert_health_check(&store, "share-healthy", checked_at + 1, true).await;
+        }
+
+        let server_geo = ServerGeo {
+            lat: None,
+            lon: None,
+        };
+        let proxy = ProxyRegistry::default();
+        let snapshot = store
+            .dashboard_snapshot(&config, &server_geo, &proxy, None)
+            .await
+            .expect("dashboard snapshot");
+        let market_view = snapshot
+            .markets
+            .iter()
+            .find(|item| item.email == market.email)
+            .expect("market view");
+
+        assert_eq!(market_view.health_checks.len(), 10);
+        assert!(
+            market_view
+                .health_checks
+                .iter()
+                .all(|entry| entry.is_healthy),
+            "any healthy linked share in a minute should make the market dot healthy"
+        );
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
@@ -13765,6 +13976,171 @@ mod tests {
 
         assert_eq!(stale_count, 0);
         assert_eq!(current_count, 1);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    /// C-fix: even if a (buggy or pre-fix) cc-switch client pushes
+    /// `model_health.codex` for a share that's only bound to claude, the
+    /// router intake must drop the codex entries so the dashboard doesn't
+    /// surface them.
+    #[tokio::test]
+    async fn runtime_snapshot_drops_model_health_for_unbound_apps() {
+        let (store, config) = setup_store("runtime-drops-unbound-model-health").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-1", "share-sub", "active").await;
+        // Narrow the binding to claude only — codex/gemini summaries pushed
+        // below must be dropped on intake.
+        set_share_bindings(&store, "share-1", &["claude"]).await;
+
+        // The shared `test_model_summary` helper hard-codes app_type="codex";
+        // we need per-app variants for this test so the intake sees one entry
+        // in each of claude / codex / gemini.
+        fn summary_for(app: &str, model: &str) -> ModelHealthSummary {
+            ModelHealthSummary {
+                app_type: app.into(),
+                requested_model: model.into(),
+                actual_model: model.into(),
+                status: "success".into(),
+                recent_results: vec!["success".into()],
+                last_checked_at: Some(Utc::now().timestamp()),
+                last_success_at: None,
+                last_failed_at: None,
+                error_message: None,
+                status_code: None,
+                latency_ms: 0,
+                source: None,
+                provider_id: None,
+                provider_name: None,
+            }
+        }
+
+        let now = Utc::now().timestamp();
+        store
+            .record_share_runtime_snapshot(ShareRuntimeSnapshotResponse {
+                share_id: "share-1".into(),
+                queried_at: now,
+                support: ShareSupport {
+                    claude: true,
+                    codex: false,
+                    gemini: false,
+                },
+                app_runtimes: ShareAppRuntimes::default(),
+                app_providers: ShareAppProviders::default(),
+                token_limit: None,
+                tokens_used: None,
+                requests_count: None,
+                share_status: None,
+                model_health: ShareModelHealthSummary {
+                    claude: vec![summary_for("claude", "claude-haiku")],
+                    codex: vec![summary_for("codex", "gpt-5.5")],
+                    gemini: vec![summary_for("gemini", "gemini-pro")],
+                },
+            })
+            .await
+            .expect("record runtime snapshot");
+
+        let conn = store.conn.lock().await;
+        let codex_checks: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM share_model_health_checks WHERE share_id = 'share-1' AND app_type = 'codex'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count codex checks");
+        let gemini_checks: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM share_model_health_checks WHERE share_id = 'share-1' AND app_type = 'gemini'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count gemini checks");
+        let claude_checks: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM share_model_health_checks WHERE share_id = 'share-1' AND app_type = 'claude'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count claude checks");
+        drop(conn);
+
+        assert_eq!(
+            codex_checks, 0,
+            "codex entries must be dropped because share-1 doesn't bind codex"
+        );
+        assert_eq!(
+            gemini_checks, 0,
+            "gemini entries must be dropped because share-1 doesn't bind gemini"
+        );
+        assert_eq!(claude_checks, 1, "claude is bound — its entry must land");
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    /// C-fix: after a user unbinds an app, any historical model_health rows
+    /// for that app must be purged so the dashboard stops showing them. We
+    /// do this lazily on the next snapshot intake.
+    #[tokio::test]
+    async fn runtime_snapshot_purges_history_for_unbound_apps() {
+        let (store, config) = setup_store("runtime-purges-unbound-history").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-1", "share-sub", "active").await;
+        let now = Utc::now().timestamp();
+
+        // Seed a historical codex check (e.g. while the share was still
+        // bound to codex). After we unbind codex, this row should go.
+        store
+            .record_share_model_health_check(test_health_check(
+                "share-1",
+                "gpt-5.5",
+                "success",
+                now - 100,
+            ))
+            .await
+            .expect("seed historical codex check");
+
+        // Narrow the binding so codex is gone.
+        set_share_bindings(&store, "share-1", &["claude"]).await;
+
+        // Trigger an intake. We don't need codex content — the intake itself
+        // does the cleanup pass.
+        store
+            .record_share_runtime_snapshot(ShareRuntimeSnapshotResponse {
+                share_id: "share-1".into(),
+                queried_at: now,
+                support: ShareSupport {
+                    claude: true,
+                    codex: false,
+                    gemini: false,
+                },
+                app_runtimes: ShareAppRuntimes::default(),
+                app_providers: ShareAppProviders::default(),
+                token_limit: None,
+                tokens_used: None,
+                requests_count: None,
+                share_status: None,
+                model_health: ShareModelHealthSummary {
+                    claude: vec![test_model_summary("claude", &["success"])],
+                    ..ShareModelHealthSummary::default()
+                },
+            })
+            .await
+            .expect("record runtime snapshot");
+
+        let conn = store.conn.lock().await;
+        let codex_remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM share_model_health_checks WHERE share_id = 'share-1' AND app_type = 'codex'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count codex history");
+        drop(conn);
+
+        assert_eq!(
+            codex_remaining, 0,
+            "historical codex rows must be purged once codex is no longer bound"
+        );
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
