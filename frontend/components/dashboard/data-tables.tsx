@@ -1498,6 +1498,10 @@ export function ClientsTable({ clients, shares, markets, onChanged }: { clients:
                         <span className="break-all">id: {selected.installation.id}</span>
                       </div>
                     </DrawerSection>
+                    {/* P14：完整的 provider 列表上移到 client 抽屉；share 抽屉只看 share 自己绑的那部分。 */}
+                    <DrawerSection label={t("dashboard.providers")}>
+                      <ClientProvidersPanel shares={sharesForClient(selected)} />
+                    </DrawerSection>
                   </div>
                 ) : null}
               </Drawer.Body>
@@ -1688,29 +1692,6 @@ export function SharesTable({
                     <DrawerSection label={t("dashboard.providers")}>
                       <ShareProvidersPanel share={selected} />
                     </DrawerSection>
-                    {/* P9: 多 app share 的每槽 provider 绑定快照。client 端事实源；
-                        ShareProvidersPanel 展示的是 runtime/health 视角，与本节互补。 */}
-                    {selected.bindings && Object.keys(selected.bindings).length > 0 ? (
-                      <DrawerSection label={t("dashboard.providerBindings")}>
-                        <ul className="grid gap-1 text-xs">
-                          {Object.entries(selected.bindings)
-                            .sort(([a], [b]) => a.localeCompare(b))
-                            .map(([app, providerId]) => (
-                              <li
-                                key={app}
-                                className="flex items-center gap-2 rounded border border-default/40 px-2 py-1"
-                              >
-                                <span className="uppercase font-mono text-[10px] text-muted-foreground">
-                                  {app}
-                                </span>
-                                <span className="font-mono text-foreground break-all">
-                                  {providerId}
-                                </span>
-                              </li>
-                            ))}
-                        </ul>
-                      </DrawerSection>
-                    ) : null}
                     <DrawerSection label={t("dashboard.requestLogs")}>
                       <ShareRequestLogs logs={selected.recentRequests || []} />
                     </DrawerSection>
@@ -2188,11 +2169,122 @@ function providerMetaLabel(provider: ShareAppProvider) {
   return [provider.kind, provider.providerType].filter(Boolean).join(" · ");
 }
 
+function ProviderCard({
+  provider,
+  runtime,
+  t,
+  locale,
+  showCurrentBadge,
+}: {
+  provider: ShareAppProvider;
+  runtime: ShareUpstreamProvider | undefined;
+  t: TFn;
+  locale: AppLocale;
+  /** false 时不显示 "current" 角标。client 侧边栏跨多 share 看时无意义。 */
+  showCurrentBadge: boolean;
+}) {
+  const endpoint = runtimeEndpointSummary(runtime);
+  const meta = providerMetaLabel(provider);
+  const accountLevel = providerAccountLevel(runtime, locale);
+  const accountIdentity = providerAccountIdentity(runtime);
+  const modelMap = providerModelMap(runtime);
+  return (
+    <div className="rounded-lg border bg-background p-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="truncate text-sm font-semibold">{provider.name || provider.id}</div>
+          <div className="mt-1 truncate font-mono text-[11px] text-muted-foreground">{provider.id}</div>
+        </div>
+        <div className="flex shrink-0 flex-wrap justify-end gap-1">
+          {showCurrentBadge && provider.isCurrent ? <Chip color="success" size="sm" variant="soft">{t("dashboard.current")}</Chip> : null}
+          {showCurrentBadge && provider.isCurrent ? <Chip color={provider.enabled ? "success" : "default"} size="sm" variant="soft">{provider.enabled ? t("dashboard.on") : t("dashboard.off")}</Chip> : null}
+        </div>
+      </div>
+      <div className="mt-2 grid gap-1 text-xs text-muted-foreground">
+        {meta ? <div className="break-words">{meta}</div> : null}
+        {endpoint ? <div className="break-words">{endpoint}</div> : null}
+        {provider.forSaleOfficialPricePercent ? <div>{provider.forSaleOfficialPricePercent}%</div> : null}
+        <div className="break-words">{accountLevel}</div>
+        <div className="break-words">{accountIdentity}</div>
+        <div className="break-words">{modelMap}</div>
+      </div>
+    </div>
+  );
+}
+
 function ShareProvidersPanel({ share }: { share?: ShareView }) {
   const { locale, t } = useLocaleText();
-  const [selectedKey, setSelectedKey] = React.useState<keyof ShareAppProviders>("claude");
   const providers = share?.appProviders;
-  const currentProviders = providers?.[selectedKey] || [];
+  const runtimes = share?.appRuntimes;
+  const bindings = share?.bindings || {};
+
+  // 只展示该 share 在每个 slot 实际绑定的 provider（appProviders 含该 client 全量列表，
+  // 但 client 侧边栏才需要全量；这里聚焦 "share 现在跑在谁上"）。
+  const boundEntries = PROVIDER_APP_TABS.flatMap((tab) => {
+    const providerId = bindings[tab.key];
+    if (!providerId) return [];
+    const list = providers?.[tab.key as keyof ShareAppProviders] || [];
+    const provider = list.find((p) => p.id === providerId);
+    if (!provider) return [];
+    return [{ tab, provider }];
+  });
+
+  if (!boundEntries.length) {
+    return <EmptyBlock>{t("dashboard.noProviders")}</EmptyBlock>;
+  }
+
+  return (
+    <div className="grid gap-3">
+      {boundEntries.map(({ tab, provider }) => {
+        const runtime = mergeStandaloneOAuthRuntime(providerRuntime(provider), runtimes, provider);
+        return (
+          <div key={tab.key} className="grid gap-1.5">
+            <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
+              {tab.label}
+            </div>
+            <ProviderCard provider={provider} runtime={runtime} t={t} locale={locale} showCurrentBadge />
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/**
+ * Client 侧边栏专用：跨该 installation 名下所有 share，列出全量 provider（按 app 分 tab）。
+ * provider 列表是 installation 级数据（每个 share 拷贝同一份），按 (app, providerId) 去重；
+ * "current" 角标在此场景没有单一答案（多个 share 各绑各的），所以隐藏。
+ */
+function ClientProvidersPanel({ shares }: { shares: ShareView[] }) {
+  const { locale, t } = useLocaleText();
+  const [selectedKey, setSelectedKey] = React.useState<keyof ShareAppProviders>("claude");
+
+  const merged = React.useMemo(() => {
+    const out: Record<keyof ShareAppProviders, ShareAppProvider[]> = {
+      claude: [],
+      codex: [],
+      gemini: [],
+    };
+    const seen: Record<keyof ShareAppProviders, Set<string>> = {
+      claude: new Set(),
+      codex: new Set(),
+      gemini: new Set(),
+    };
+    shares.forEach((share) => {
+      (Object.keys(out) as Array<keyof ShareAppProviders>).forEach((app) => {
+        (share.appProviders?.[app] || []).forEach((p) => {
+          if (seen[app].has(p.id)) return;
+          seen[app].add(p.id);
+          out[app].push(p);
+        });
+      });
+    });
+    return out;
+  }, [shares]);
+
+  // appRuntimes 也是 installation 级，取第一个有数据的 share 即可。
+  const runtimes = shares.find((s) => s.appRuntimes)?.appRuntimes;
+  const currentProviders = merged[selectedKey];
 
   return (
     <div className="grid gap-3">
@@ -2210,33 +2302,16 @@ function ShareProvidersPanel({ share }: { share?: ShareView }) {
       ) : (
         <div className="grid gap-2">
           {currentProviders.map((provider) => {
-            const runtime = mergeStandaloneOAuthRuntime(providerRuntime(provider), share?.appRuntimes, provider);
-            const endpoint = runtimeEndpointSummary(runtime);
-            const meta = providerMetaLabel(provider);
-            const accountLevel = providerAccountLevel(runtime, locale);
-            const accountIdentity = providerAccountIdentity(runtime);
-            const modelMap = providerModelMap(runtime);
+            const runtime = mergeStandaloneOAuthRuntime(providerRuntime(provider), runtimes, provider);
             return (
-              <div key={provider.id} className="rounded-lg border bg-background p-3">
-                <div className="flex items-start justify-between gap-3">
-                  <div className="min-w-0">
-                    <div className="truncate text-sm font-semibold">{provider.name || provider.id}</div>
-                    <div className="mt-1 truncate font-mono text-[11px] text-muted-foreground">{provider.id}</div>
-                  </div>
-                  <div className="flex shrink-0 flex-wrap justify-end gap-1">
-                    {provider.isCurrent ? <Chip color="success" size="sm" variant="soft">{t("dashboard.current")}</Chip> : null}
-                    {provider.isCurrent ? <Chip color={provider.enabled ? "success" : "default"} size="sm" variant="soft">{provider.enabled ? t("dashboard.on") : t("dashboard.off")}</Chip> : null}
-                  </div>
-                </div>
-                <div className="mt-2 grid gap-1 text-xs text-muted-foreground">
-                  {meta ? <div className="break-words">{meta}</div> : null}
-                  {endpoint ? <div className="break-words">{endpoint}</div> : null}
-                  {provider.forSaleOfficialPricePercent ? <div>{provider.forSaleOfficialPricePercent}%</div> : null}
-                  <div className="break-words">{accountLevel}</div>
-                  <div className="break-words">{accountIdentity}</div>
-                  <div className="break-words">{modelMap}</div>
-                </div>
-              </div>
+              <ProviderCard
+                key={provider.id}
+                provider={provider}
+                runtime={runtime}
+                t={t}
+                locale={locale}
+                showCurrentBadge={false}
+              />
             );
           })}
         </div>
