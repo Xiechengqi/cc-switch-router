@@ -33,20 +33,21 @@ use crate::models::{
     MarketAppAvailabilityEntry, MarketDisabledSharesUpdateRequest,
     MarketDisabledSharesUpdateResponse, MarketLinkedShareView, MarketMaintenanceUpdateRequest,
     MarketMaintenanceUpdateResponse, MarketRegistryRecord, MarketRequestLogBatchSyncRequest,
-    MarketRequestLogEntry, MarketShareView, ModelHealthSummary, PublicMapClientPoint,
-    PublicMapPointsResponse, PublicMarketConfig, RefreshSessionRequest, RegisterGatewayRequest,
-    RegisterGatewayResponse, RegisterInstallationRequest, RegisterInstallationResponse,
-    RegisterMarketRequest, RequestEmailCodeRequest, RequestEmailCodeResponse,
-    SessionStatusResponse, ShareAppProviders, ShareAppRuntimes, ShareBatchSyncRequest,
-    ShareClaimPayload, ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptor,
-    ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest, ShareMarketLinkView,
-    ShareModelHealthCheckEntry, ShareModelHealthSummary, SharePendingEditsRequest,
-    SharePendingEditsResponse, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry,
-    ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload, ShareRuntimeRefreshRequest,
-    ShareRuntimeSnapshotResponse, ShareSettingsPatch, ShareSettingsUpdateResponse, ShareSignals,
-    ShareSupport, ShareSyncRequest, ShareUpstreamProvider, ShareView, TunnelLease,
-    UserApiTokenResetResponse, UserApiTokenResponse, UserApiTokenStatus, UserShareView,
-    UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    MarketRequestLogEntry, MarketShareRuntimeStateInput, MarketShareRuntimeStateView,
+    MarketShareView, ModelHealthSummary, PublicMapClientPoint, PublicMapPointsResponse,
+    PublicMarketConfig, RefreshSessionRequest, RegisterGatewayRequest, RegisterGatewayResponse,
+    RegisterInstallationRequest, RegisterInstallationResponse, RegisterMarketRequest,
+    RequestEmailCodeRequest, RequestEmailCodeResponse, SessionStatusResponse, ShareAppProviders,
+    ShareAppRuntimes, ShareBatchSyncRequest, ShareClaimPayload, ShareClaimSubdomainRequest,
+    ShareDeleteRequest, ShareDescriptor, ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest,
+    ShareMarketLinkView, ShareModelHealthCheckEntry, ShareModelHealthSummary,
+    SharePendingEditsRequest, SharePendingEditsResponse, ShareRequestLogBatchSyncRequest,
+    ShareRequestLogEntry, ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload,
+    ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse, ShareSettingsPatch,
+    ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest,
+    ShareUpstreamProvider, ShareView, TunnelLease, UserApiTokenResetResponse, UserApiTokenResponse,
+    UserApiTokenStatus, UserShareView, UserSharesResponse, VerifyEmailCodeRequest,
+    VerifyEmailCodeResponse,
 };
 #[cfg(test)]
 use crate::models::{ShareAppProvider, ShareUpstreamModel};
@@ -73,6 +74,7 @@ const MARKET_DEFAULT_SCOPES: &[&str] = &[
     "market:proxy:use",
     "market:email:notify",
     "market:request_logs:write",
+    "market:share_states:write",
 ];
 const GATEWAY_DEFAULT_SCOPES: &[&str] = &[
     "gateway:shares:read",
@@ -3661,6 +3663,114 @@ impl AppStore {
         })
     }
 
+    pub async fn sync_market_share_runtime_states(
+        &self,
+        market_email: &str,
+        replace: bool,
+        states: Vec<MarketShareRuntimeStateInput>,
+    ) -> Result<usize, AppError> {
+        let normalized_market_email = normalize_email(market_email)?;
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        let tx = conn.unchecked_transaction().map_err(|e| {
+            AppError::Internal(format!("begin market share states sync failed: {e}"))
+        })?;
+        tx.execute(
+            "DELETE FROM market_share_runtime_states WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+            params![now],
+        )
+        .map_err(|e| AppError::Internal(format!("delete expired market share states failed: {e}")))?;
+        if replace {
+            tx.execute(
+                "DELETE FROM market_share_runtime_states WHERE lower(market_email) = lower(?1)",
+                params![normalized_market_email],
+            )
+            .map_err(|e| AppError::Internal(format!("replace market share states failed: {e}")))?;
+        }
+
+        let mut synced = 0usize;
+        for state in states {
+            let share_id = state.share_id.trim();
+            if share_id.is_empty() {
+                continue;
+            }
+            let scope = normalize_runtime_state_token(&state.scope, "scope")?;
+            let kind = normalize_runtime_state_token(&state.kind, "kind")?;
+            let router_id = normalize_optional_string(state.router_id);
+            let app_type = normalize_optional_string(state.app_type);
+            let model_id = normalize_optional_string(state.model_id);
+            let model_name = normalize_optional_string(state.model_name);
+            let reason_kind = normalize_optional_string(state.reason_kind);
+            let reason = normalize_optional_string(state.reason).map(|value| {
+                if value.chars().count() > 500 {
+                    value.chars().take(500).collect()
+                } else {
+                    value
+                }
+            });
+            let expires_at = normalize_optional_string(state.expires_at);
+            let failure_count = state.failure_count.map(|value| value.max(0));
+
+            tx.execute(
+                r#"
+                DELETE FROM market_share_runtime_states
+                 WHERE lower(market_email) = lower(?1)
+                   AND share_id = ?2
+                   AND scope = ?3
+                   AND kind = ?4
+                   AND COALESCE(app_type, '') = COALESCE(?5, '')
+                   AND COALESCE(model_id, '') = COALESCE(?6, '')
+                   AND COALESCE(model_name, '') = COALESCE(?7, '')
+                "#,
+                params![
+                    normalized_market_email,
+                    share_id,
+                    scope,
+                    kind,
+                    app_type,
+                    model_id,
+                    model_name
+                ],
+            )
+            .map_err(|e| AppError::Internal(format!("delete market share state failed: {e}")))?;
+
+            if expires_at.as_ref().is_some_and(|value| value <= &now) {
+                synced += 1;
+                continue;
+            }
+
+            tx.execute(
+                r#"
+                INSERT INTO market_share_runtime_states
+                    (market_email, share_id, router_id, scope, kind, app_type, model_id, model_name,
+                     reason_kind, reason, failure_count, expires_at, created_at, updated_at)
+                VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13)
+                "#,
+                params![
+                    normalized_market_email,
+                    share_id,
+                    router_id,
+                    scope,
+                    kind,
+                    app_type,
+                    model_id,
+                    model_name,
+                    reason_kind,
+                    reason,
+                    failure_count,
+                    expires_at,
+                    now
+                ],
+            )
+            .map_err(|e| AppError::Internal(format!("insert market share state failed: {e}")))?;
+            synced += 1;
+        }
+        tx.commit().map_err(|e| {
+            AppError::Internal(format!("commit market share states sync failed: {e}"))
+        })?;
+        Ok(synced)
+    }
+
     pub async fn update_market_maintenance(
         &self,
         market_email: &str,
@@ -5268,6 +5378,23 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             PRIMARY KEY (market_email, share_id, app_type, requested_model)
         );
 
+        CREATE TABLE IF NOT EXISTS market_share_runtime_states (
+            market_email TEXT NOT NULL,
+            share_id TEXT NOT NULL,
+            router_id TEXT,
+            scope TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            app_type TEXT,
+            model_id TEXT,
+            model_name TEXT,
+            reason_kind TEXT,
+            reason TEXT,
+            failure_count INTEGER,
+            expires_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS dashboard_presence (
             session_id TEXT PRIMARY KEY,
             last_seen_at INTEGER NOT NULL
@@ -5442,6 +5569,18 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         CREATE INDEX IF NOT EXISTS idx_market_request_logs_share_created ON market_request_logs(share_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_market_request_logs_created ON market_request_logs(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_market_share_model_failure_state_share ON market_share_model_failure_state(market_email, share_id, app_type, last_status);
+        CREATE INDEX IF NOT EXISTS idx_market_share_runtime_states_market_share ON market_share_runtime_states(market_email, share_id);
+        CREATE INDEX IF NOT EXISTS idx_market_share_runtime_states_expires ON market_share_runtime_states(expires_at);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_market_share_runtime_states_unique
+            ON market_share_runtime_states (
+                market_email,
+                share_id,
+                scope,
+                kind,
+                COALESCE(app_type, ''),
+                COALESCE(model_id, ''),
+                COALESCE(model_name, '')
+            );
 
         CREATE TABLE IF NOT EXISTS board_messages (
             id TEXT PRIMARY KEY,
@@ -5500,6 +5639,13 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         [],
     )
     .map_err(|e| AppError::Internal(format!("backfill market request log scope failed: {e}")))?;
+    conn.execute(
+        "UPDATE router_markets
+            SET scopes_json = replace(scopes_json, ']', ',\"market:share_states:write\"]')
+          WHERE instr(scopes_json, 'market:share_states:write') = 0",
+        [],
+    )
+    .map_err(|e| AppError::Internal(format!("backfill market share state scope failed: {e}")))?;
     let columns = conn
         .prepare("PRAGMA table_info(installations)")
         .and_then(|mut stmt| {
@@ -8574,6 +8720,7 @@ fn list_dashboard_markets(
         .map_err(|e| AppError::Internal(format!("query dashboard markets failed: {e}")))?;
     let mut markets = collect_rows(rows)?;
     let disabled_by_market = list_market_disabled_share_map(conn)?;
+    let runtime_states_by_market = list_market_share_runtime_state_map(conn)?;
     let app_availability_by_market = list_all_market_app_availability(conn)?;
     for market in &mut markets {
         market.can_manage = viewer_email
@@ -8593,6 +8740,7 @@ fn list_dashboard_markets(
             market_request_timeline_by_market,
             health_timeline_start,
             &app_availability_by_market,
+            &runtime_states_by_market,
         );
     }
     Ok(markets)
@@ -8612,10 +8760,12 @@ fn enrich_dashboard_market(
     market_request_timeline_by_market: &HashMap<String, Vec<HealthTimelineBucketStats>>,
     health_timeline_start: i64,
     app_availability_by_market: &HashMap<String, HashMap<String, MarketAppAvailability>>,
+    runtime_states_by_market: &HashMap<String, HashMap<String, Vec<MarketShareRuntimeStateView>>>,
 ) {
     let market_email = market.email.to_ascii_lowercase();
     let disabled_for_market = disabled_by_market.get(&market_email);
     let app_availability_for_market = app_availability_by_market.get(&market_email);
+    let runtime_states_for_market = runtime_states_by_market.get(&market_email);
     let mut linked_shares = shares
         .iter()
         .filter_map(|(_, share)| {
@@ -8651,6 +8801,10 @@ fn enrich_dashboard_market(
                 support: share.support.clone(),
                 app_runtimes: share.app_runtimes.clone(),
                 app_availability: app_availability_for_market
+                    .and_then(|entries| entries.get(&share.share_id))
+                    .cloned()
+                    .unwrap_or_default(),
+                market_states: runtime_states_for_market
                     .and_then(|entries| entries.get(&share.share_id))
                     .cloned()
                     .unwrap_or_default(),
@@ -8798,6 +8952,73 @@ fn list_market_disabled_share_map(
             .entry(market_email)
             .or_default()
             .insert(share_id, created_at);
+    }
+    Ok(result)
+}
+
+fn list_market_share_runtime_state_map(
+    conn: &Connection,
+) -> Result<HashMap<String, HashMap<String, Vec<MarketShareRuntimeStateView>>>, AppError> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "DELETE FROM market_share_runtime_states WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+        params![now],
+    )
+    .map_err(|e| {
+        AppError::Internal(format!(
+            "delete expired market share runtime states failed: {e}"
+        ))
+    })?;
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT lower(market_email), share_id, router_id, scope, kind, app_type, model_id,
+                   model_name, reason_kind, reason, failure_count, expires_at, updated_at
+              FROM market_share_runtime_states
+             WHERE expires_at IS NULL OR expires_at > ?1
+             ORDER BY updated_at DESC
+            "#,
+        )
+        .map_err(|e| {
+            AppError::Internal(format!("prepare market share runtime states failed: {e}"))
+        })?;
+    let rows = stmt
+        .query_map(params![now], |row| {
+            let share_id: String = row.get(1)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                share_id.clone(),
+                MarketShareRuntimeStateView {
+                    share_id,
+                    router_id: row.get(2)?,
+                    scope: row.get(3)?,
+                    kind: row.get(4)?,
+                    app_type: row.get(5)?,
+                    model_id: row.get(6)?,
+                    model_name: row.get(7)?,
+                    reason_kind: row.get(8)?,
+                    reason: row.get(9)?,
+                    failure_count: row.get(10)?,
+                    expires_at: row.get(11)?,
+                    updated_at: row.get(12)?,
+                },
+            ))
+        })
+        .map_err(|e| {
+            AppError::Internal(format!("query market share runtime states failed: {e}"))
+        })?;
+    let mut result: HashMap<String, HashMap<String, Vec<MarketShareRuntimeStateView>>> =
+        HashMap::new();
+    for row in rows {
+        let (market_email, share_id, state) = row.map_err(|e| {
+            AppError::Internal(format!("read market share runtime state failed: {e}"))
+        })?;
+        result
+            .entry(market_email)
+            .or_default()
+            .entry(share_id)
+            .or_default()
+            .push(state);
     }
     Ok(result)
 }
@@ -9297,6 +9518,27 @@ fn normalize_email(value: &str) -> Result<String, AppError> {
         return Err(AppError::BadRequest("invalid email".into()));
     }
     Ok(email)
+}
+
+fn normalize_optional_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn normalize_runtime_state_token(value: &str, field: &str) -> Result<String, AppError> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-')
+    {
+        return Err(AppError::BadRequest(format!(
+            "invalid market share runtime state {field}"
+        )));
+    }
+    Ok(value)
 }
 
 fn normalize_email_list(values: &[String], owner_email: &str) -> Vec<String> {
@@ -10379,7 +10621,10 @@ mod tests {
             email: "market@example.com".into(),
             subdomain: "market-a".into(),
             public_base_url: "https://market-a.example.com".into(),
-            scopes: vec!["market:shares:read".into(), "market:proxy:use".into()],
+            scopes: MARKET_DEFAULT_SCOPES
+                .iter()
+                .map(|scope| (*scope).to_string())
+                .collect(),
             status: "active".into(),
             maintenance_enabled: false,
             maintenance_message: None,
@@ -10512,7 +10757,12 @@ mod tests {
     async fn set_share_bindings(store: &AppStore, share_id: &str, apps: &[&str]) {
         let map: serde_json::Map<String, serde_json::Value> = apps
             .iter()
-            .map(|app| (app.to_string(), serde_json::Value::String("provider-test".into())))
+            .map(|app| {
+                (
+                    app.to_string(),
+                    serde_json::Value::String("provider-test".into()),
+                )
+            })
             .collect();
         let bindings = serde_json::Value::Object(map).to_string();
         let conn = store.conn.lock().await;
@@ -10537,6 +10787,97 @@ mod tests {
             ],
         )
         .expect("update share shared emails");
+    }
+
+    #[tokio::test]
+    async fn dashboard_market_linked_share_includes_runtime_states() {
+        let (store, config) = setup_store("market-runtime-states").await;
+        let market = test_market();
+        insert_market(&store, &market).await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-1", "share-sub", "active").await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET for_sale='Yes', market_access_mode='all' WHERE share_id='share-1'",
+                [],
+            )
+            .expect("enable market share");
+        }
+
+        let expires_at = (Utc::now() + Duration::minutes(10)).to_rfc3339();
+        let synced = store
+            .sync_market_share_runtime_states(
+                &market.email,
+                false,
+                vec![MarketShareRuntimeStateInput {
+                    share_id: "share-1".into(),
+                    router_id: Some("main".into()),
+                    scope: "model".into(),
+                    kind: "model_block".into(),
+                    app_type: Some("codex".into()),
+                    model_id: Some("model-1".into()),
+                    model_name: Some("gpt-5.5*".into()),
+                    reason_kind: Some("model_unsupported".into()),
+                    reason: Some("model is not supported".into()),
+                    failure_count: None,
+                    expires_at: Some(expires_at),
+                }],
+            )
+            .await
+            .expect("sync runtime state");
+        assert_eq!(synced, 1);
+
+        let server_geo = ServerGeo {
+            lat: None,
+            lon: None,
+        };
+        let proxy = ProxyRegistry::default();
+        proxy
+            .set_route(
+                "share-sub".into(),
+                "127.0.0.1:1234".into(),
+                None,
+                None,
+                None,
+                false,
+                -1,
+                None,
+            )
+            .await;
+        let dashboard = store
+            .dashboard_snapshot(&config, &server_geo, &proxy, None)
+            .await
+            .expect("dashboard");
+        let linked_share = dashboard.markets[0]
+            .linked_shares
+            .iter()
+            .find(|share| share.share_id == "share-1")
+            .expect("linked share");
+        assert_eq!(linked_share.market_states.len(), 1);
+        assert_eq!(linked_share.market_states[0].kind, "model_block");
+        assert_eq!(
+            linked_share.market_states[0].model_name.as_deref(),
+            Some("gpt-5.5*")
+        );
+
+        store
+            .sync_market_share_runtime_states(&market.email, true, Vec::new())
+            .await
+            .expect("replace clear runtime states");
+        let dashboard = store
+            .dashboard_snapshot(&config, &server_geo, &proxy, None)
+            .await
+            .expect("dashboard after clear");
+        let linked_share = dashboard.markets[0]
+            .linked_shares
+            .iter()
+            .find(|share| share.share_id == "share-1")
+            .expect("linked share after clear");
+        assert!(linked_share.market_states.is_empty());
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+        let _ = std::fs::remove_file(PathBuf::from(config.metrics.db_path));
     }
 
     #[tokio::test]

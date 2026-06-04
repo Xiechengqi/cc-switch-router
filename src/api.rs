@@ -43,7 +43,8 @@ use crate::models::{
     MarketDisabledSharesUpdateRequest, MarketDisabledSharesUpdateResponse,
     MarketMaintenanceUpdateRequest, MarketMaintenanceUpdateResponse,
     MarketNotificationEmailLogView, MarketNotificationEmailRequest,
-    MarketNotificationEmailResponse, MarketRequestLogBatchSyncRequest, MarketShareView,
+    MarketNotificationEmailResponse, MarketRequestLogBatchSyncRequest,
+    MarketShareRuntimeStateSyncRequest, MarketShareRuntimeStateSyncResponse, MarketShareView,
     MarketsResponse, PostBoardMessageRequest, PublicMapPointsResponse, RefreshSessionRequest,
     RegisterGatewayRequest, RegisterGatewayResponse, RegisterInstallationRequest,
     RegisterInstallationResponse, RegisterMarketRequest, RequestEmailCodeRequest,
@@ -112,6 +113,7 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/market/shares", get(market_shares))
         .route("/v1/market/shares/headroom", post(market_shares_headroom))
         .route("/v1/market/shares/feedback", post(market_shares_feedback))
+        .route("/v1/market/share-states", post(market_share_states))
         .route("/v1/gateways/register", post(register_gateway))
         .route("/v1/gateway/shares", get(gateway_shares))
         .route("/v1/gateway/shares/headroom", post(gateway_shares_headroom))
@@ -391,6 +393,22 @@ async fn market_shares_feedback(
 ) -> Result<Json<ShareFeedbackResponse>, AppError> {
     let _market = authenticate_market(&state, &headers, "market:shares:read").await?;
     apply_share_feedback(&state, input, "market").await
+}
+
+async fn market_share_states(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<MarketShareRuntimeStateSyncRequest>,
+) -> Result<Json<MarketShareRuntimeStateSyncResponse>, AppError> {
+    let market = authenticate_market(&state, &headers, "market:share_states:write").await?;
+    let synced = state
+        .store
+        .sync_market_share_runtime_states(&market.email, input.replace, input.states)
+        .await?;
+    Ok(Json(MarketShareRuntimeStateSyncResponse {
+        ok: true,
+        synced,
+    }))
 }
 
 async fn apply_share_feedback(

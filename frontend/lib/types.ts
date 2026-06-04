@@ -224,6 +224,7 @@ export type DashboardMarket = {
     support?: ShareSupport;
     appRuntimes?: ShareAppRuntimes;
     appAvailability?: MarketAppAvailability;
+    marketStates?: MarketShareRuntimeState[];
   }>;
   recentRequests?: MarketRequestLog[];
 };
@@ -251,6 +252,21 @@ export type MarketShare = {
   appAvailability?: MarketAppAvailability;
   appRuntimes?: ShareAppRuntimes;
   modelHealth?: ShareModelHealthSummary;
+};
+
+export type MarketShareRuntimeState = {
+  shareId: string;
+  routerId?: string;
+  scope: string;
+  kind: string;
+  appType?: string;
+  modelId?: string;
+  modelName?: string;
+  reasonKind?: string;
+  reason?: string;
+  failureCount?: number;
+  expiresAt?: string;
+  updatedAt: string;
 };
 
 export type PublicMarket = {

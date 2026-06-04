@@ -1429,6 +1429,73 @@ pub struct MarketLinkedShareView {
     pub app_runtimes: ShareAppRuntimes,
     #[serde(default)]
     pub app_availability: MarketAppAvailability,
+    #[serde(default)]
+    pub market_states: Vec<MarketShareRuntimeStateView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketShareRuntimeStateView {
+    pub share_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_id: Option<String>,
+    pub scope: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_count: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketShareRuntimeStateSyncRequest {
+    #[serde(default)]
+    pub replace: bool,
+    #[serde(default)]
+    pub states: Vec<MarketShareRuntimeStateInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketShareRuntimeStateInput {
+    pub share_id: String,
+    #[serde(default)]
+    pub router_id: Option<String>,
+    pub scope: String,
+    pub kind: String,
+    #[serde(default)]
+    pub app_type: Option<String>,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub model_name: Option<String>,
+    #[serde(default)]
+    pub reason_kind: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub failure_count: Option<i64>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketShareRuntimeStateSyncResponse {
+    pub ok: bool,
+    pub synced: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

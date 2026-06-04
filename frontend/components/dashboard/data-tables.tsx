@@ -7,7 +7,7 @@ import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getMarketLinkedShares, updateMarketDisabledShares, updateMarketMaintenance, updateShareSettings } from "@/lib/api";
 import type { AppLocale } from "@/lib/i18n";
-import type { DashboardClient, DashboardMarket, HealthCheckEntry, HealthTimelineBucket, MarketAppAvailabilityEntry, MarketRequestLog, MarketShare, ModelHealthSummary, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareModelHealthCheck, ShareRequestLog, ShareSettingsPatch, ShareUpstreamProvider, ShareView } from "@/lib/types";
+import type { DashboardClient, DashboardMarket, HealthCheckEntry, HealthTimelineBucket, MarketAppAvailabilityEntry, MarketRequestLog, MarketShare, MarketShareRuntimeState, ModelHealthSummary, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareModelHealthCheck, ShareRequestLog, ShareSettingsPatch, ShareUpstreamProvider, ShareView } from "@/lib/types";
 import { compactTokens, formatDateTime, formatNumber, formatRelativeTime } from "@/lib/utils";
 
 function shouldOpenRowDrawer(event: React.MouseEvent<HTMLElement>) {
@@ -1894,6 +1894,33 @@ function runtimePriceLabel(share: MarketShare, key: keyof ShareAppRuntimes) {
   return typeof value === "number" ? `${value}%` : "-";
 }
 
+function marketRuntimeStateLabel(state: MarketShareRuntimeState, t: TFn) {
+  if (state.kind === "cooldown") return t("dashboard.marketCooldown");
+  if (state.kind === "model_block") return t("dashboard.modelBlocked");
+  if (state.kind === "capability_block") {
+    return state.appType ? `${state.appType} ${t("dashboard.blocked")}` : t("dashboard.capabilityBlocked");
+  }
+  return state.kind.replace(/_/g, " ");
+}
+
+function marketRuntimeStateTitle(state: MarketShareRuntimeState) {
+  const parts = [
+    `${state.scope}/${state.kind}`,
+    state.appType,
+    state.modelName || state.modelId,
+    state.reasonKind,
+    state.reason,
+    typeof state.failureCount === "number" ? `failures=${state.failureCount}` : undefined,
+    state.expiresAt ? `expires ${formatDateTime(state.expiresAt)}` : undefined,
+    `updated ${formatDateTime(state.updatedAt)}`,
+  ].filter(Boolean);
+  return parts.join(" · ");
+}
+
+function marketRuntimeStateColor(state: MarketShareRuntimeState): "warning" | "danger" {
+  return state.kind === "cooldown" ? "warning" : "danger";
+}
+
 function MarketEditDialog({ market, onClose, onSaved }: { market: DashboardMarket | null; onClose: () => void; onSaved: () => Promise<void> }) {
   const [shares, setShares] = React.useState<MarketShare[]>([]);
   const [disabledIds, setDisabledIds] = React.useState<Set<string>>(new Set());
@@ -2437,6 +2464,26 @@ function MarketLinkedShares({ market, t, locale }: { market: DashboardMarket; t:
               <div className="grid justify-items-end gap-1">
                 <Chip color={share.online ? "success" : "default"} size="sm" variant={share.online ? "soft" : "tertiary"}>{share.online ? t("common.online") : t("common.offline")}</Chip>
                 {share.disabledByMarket ? <Chip color="warning" size="sm" variant="soft">{t("dashboard.disabled")}</Chip> : null}
+                {share.marketStates?.length ? (
+                  <div className="flex flex-wrap justify-end gap-1">
+                    {share.marketStates.slice(0, 4).map((state, index) => (
+                      <Chip
+                        key={`${state.scope}-${state.kind}-${state.appType || ""}-${state.modelId || state.modelName || ""}-${index}`}
+                        color={marketRuntimeStateColor(state)}
+                        size="sm"
+                        title={marketRuntimeStateTitle(state)}
+                        variant="soft"
+                      >
+                        {marketRuntimeStateLabel(state, t)}
+                      </Chip>
+                    ))}
+                    {share.marketStates.length > 4 ? (
+                      <Chip color="warning" size="sm" title={share.marketStates.map((state) => marketRuntimeStateTitle(state)).join("\n")} variant="soft">
+                        +{share.marketStates.length - 4}
+                      </Chip>
+                    ) : null}
+                  </div>
+                ) : null}
                 {supported.length ? (
                   <div className="flex gap-1">
                     {supported.map(([key, label]) => {
