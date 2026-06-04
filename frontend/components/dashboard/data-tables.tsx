@@ -2507,13 +2507,23 @@ function MarketLinkedShares({ market, t }: { market: DashboardMarket; t: TFn }) 
                       const blockedStates = blockedByApp.get(key) || [];
                       const blocked = blockedStates.length > 0;
                       const unavailable = availability?.status === "unavailable";
+                      // P15：把 "degraded" 也单独着色（黄）。后端在 share 命中 429 /
+                      // upstream error 等场景会把 appAvailability.status 设成 degraded
+                      // 但又没到 unavailable 的程度；以前前端只看 "unavailable" 一档，
+                      // 整段 chip 还是灰色，运维看不出 share 是限流降级中。
+                      const degraded =
+                        !blocked && !unavailable && availability?.status === "degraded";
+                      const chipColor: "danger" | "warning" | "default" =
+                        blocked || unavailable ? "danger" : degraded ? "warning" : "default";
+                      const chipVariant: "soft" | "tertiary" =
+                        blocked || unavailable || degraded ? "soft" : "tertiary";
                       return (
                         <Chip
                           key={label}
-                          color={blocked || unavailable ? "danger" : "default"}
+                          color={chipColor}
                           size="sm"
                           title={appTitle(label, availability, blockedStates)}
-                          variant={blocked || unavailable ? "soft" : "tertiary"}
+                          variant={chipVariant}
                         >
                           {label}
                         </Chip>
