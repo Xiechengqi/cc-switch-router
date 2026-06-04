@@ -1207,25 +1207,32 @@ pub async fn proxy_handler(
                     );
                 }
             };
-            let session =
-                match resolve_client_web_bearer(&state, &parts.headers, &owner_email).await {
-                    Ok(Some(session)) => session,
-                    Ok(None) => return simple_response(StatusCode::UNAUTHORIZED, "login-required"),
-                    Err(err) => {
-                        warn!(
-                            method = %method,
-                            host = %host,
-                            path = %path_and_query,
-                            client_ip = %user_ip,
-                            client_country = %user_country,
-                            client_asn = %user_asn,
-                            user_agent = %user_agent,
-                            error = %err,
-                            "proxy request rejected: client web auth lookup failed"
-                        );
-                        return simple_response(StatusCode::UNAUTHORIZED, "login-required");
-                    }
-                };
+            let required_scope = client_web_required_api_token_scope(&path);
+            let session = match resolve_client_web_bearer(
+                &state,
+                &parts.headers,
+                &owner_email,
+                required_scope,
+            )
+            .await
+            {
+                Ok(Some(session)) => session,
+                Ok(None) => return simple_response(StatusCode::UNAUTHORIZED, "login-required"),
+                Err(err) => {
+                    warn!(
+                        method = %method,
+                        host = %host,
+                        path = %path_and_query,
+                        client_ip = %user_ip,
+                        client_country = %user_country,
+                        client_asn = %user_asn,
+                        user_agent = %user_agent,
+                        error = %err,
+                        "proxy request rejected: client web auth lookup failed"
+                    );
+                    return simple_response(StatusCode::UNAUTHORIZED, "login-required");
+                }
+            };
             if session.0 != owner_email && !session.1 {
                 return simple_response(StatusCode::FORBIDDEN, "client-web-forbidden");
             }
@@ -1754,10 +1761,19 @@ fn is_client_web_auth_required_path(path: &str) -> bool {
     path == "/web-api/context" || path.starts_with("/web-api/invoke/")
 }
 
+fn client_web_required_api_token_scope(path: &str) -> &'static str {
+    if path.starts_with("/web-api/invoke/") {
+        "share:write"
+    } else {
+        "share:read"
+    }
+}
+
 async fn resolve_client_web_bearer(
     state: &ServerState,
     headers: &HeaderMap,
     owner_email: &str,
+    required_api_token_scope: &str,
 ) -> Result<Option<(String, bool)>, crate::error::AppError> {
     let Some(token) = client_web_bearer_token(headers) else {
         return Ok(None);
@@ -1769,7 +1785,7 @@ async fn resolve_client_web_bearer(
     }
     if let Some(principal) = state
         .store
-        .resolve_user_api_token(token, "share:read")
+        .resolve_user_api_token(token, required_api_token_scope)
         .await?
     {
         let email = principal.email;
