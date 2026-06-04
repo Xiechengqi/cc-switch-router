@@ -14,6 +14,17 @@ use crate::recent_traffic::RecentTraffic;
 
 const MARKET_REQUEST_ID_HEADER: &str = "x-cc-switch-market-request-id";
 const HEALTH_PROBE_FAILURE_CACHE_TTL: Duration = Duration::from_secs(2);
+const CLIENT_WEB_USER_EMAIL_HEADER: &str = "x-cc-switch-web-user-email";
+const CLIENT_WEB_ROLE_HEADER: &str = "x-cc-switch-web-role";
+const CLIENT_WEB_INSTALLATION_ID_HEADER: &str = "x-cc-switch-installation-id";
+const CLIENT_WEB_SUBDOMAIN_HEADER: &str = "x-cc-switch-client-tunnel-subdomain";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RouteKind {
+    Share,
+    Market,
+    ClientWeb,
+}
 
 #[derive(Debug, Clone)]
 pub struct RouteShutdown {
@@ -35,9 +46,11 @@ impl RouteShutdown {
 #[derive(Debug, Clone)]
 pub(crate) struct RouteEntry {
     backend: String,
+    route_kind: RouteKind,
     share_id: Option<String>,
     share_name: Option<String>,
     subdomain: String,
+    installation_id: Option<String>,
     connection_id: Option<String>,
     is_free_share: bool,
     parallel_limit: i64,
@@ -50,6 +63,14 @@ struct PendingRouteEntry {
 }
 
 impl RouteEntry {
+    pub(crate) fn is_client_web(&self) -> bool {
+        self.route_kind == RouteKind::ClientWeb
+    }
+
+    pub(crate) fn is_share(&self) -> bool {
+        self.route_kind == RouteKind::Share
+    }
+
     pub(crate) fn share_id(&self) -> Option<&str> {
         self.share_id.as_deref()
     }
@@ -60,6 +81,10 @@ impl RouteEntry {
 
     pub(crate) fn connection_id(&self) -> Option<&str> {
         self.connection_id.as_deref()
+    }
+
+    pub(crate) fn installation_id(&self) -> Option<&str> {
+        self.installation_id.as_deref()
     }
 
     /// Local `host:port` the server proxies into to reach this installation's
@@ -189,6 +214,39 @@ impl ProxyRegistry {
         parallel_limit: i64,
         shutdown: Option<RouteShutdown>,
     ) {
+        let route_kind = if share_id.is_some() {
+            RouteKind::Share
+        } else {
+            RouteKind::Market
+        };
+        self.set_route_with_kind(
+            subdomain,
+            backend,
+            route_kind,
+            None,
+            connection_id,
+            share_id,
+            share_name,
+            is_free_share,
+            parallel_limit,
+            shutdown,
+        )
+        .await;
+    }
+
+    pub(crate) async fn set_route_with_kind(
+        &self,
+        subdomain: String,
+        backend: String,
+        route_kind: RouteKind,
+        installation_id: Option<String>,
+        connection_id: Option<String>,
+        share_id: Option<String>,
+        share_name: Option<String>,
+        is_free_share: bool,
+        parallel_limit: i64,
+        shutdown: Option<RouteShutdown>,
+    ) {
         self.pending_routes.write().await.remove(&subdomain);
         let old_route = {
             let mut routes = self.routes.write().await;
@@ -196,9 +254,11 @@ impl ProxyRegistry {
                 subdomain.clone(),
                 RouteEntry {
                     backend,
+                    route_kind,
                     share_id,
                     share_name,
                     subdomain,
+                    installation_id,
                     connection_id,
                     is_free_share,
                     parallel_limit,
@@ -1062,8 +1122,22 @@ pub async fn proxy_handler(
         .map(mask_token)
         .unwrap_or_else(|| "-".to_string());
     let is_health_check_request = is_share_router_probe || is_share_model_health_check;
-    let is_direct_share_web_request =
-        route.share_id.is_some() && is_allowed_direct_share_web_path(&path);
+    let is_direct_share_web_request = route.is_share() && is_allowed_direct_share_web_path(&path);
+    if route.is_client_web() && is_share_router_probe {
+        debug!(
+            method = %method,
+            host = %host,
+            path = %path_and_query,
+            backend = %backend,
+            status = %StatusCode::NO_CONTENT.as_u16(),
+            client_ip = %user_ip,
+            client_country = %user_country,
+            client_asn = %user_asn,
+            user_agent = %user_agent,
+            "proxy client web health probe completed"
+        );
+        return empty_response(StatusCode::NO_CONTENT);
+    }
     if is_legacy_share_router_ping {
         debug!(
             method = %method,
@@ -1080,7 +1154,7 @@ pub async fn proxy_handler(
         );
         return empty_response(StatusCode::NO_CONTENT);
     }
-    if route.share_id.is_some() && !is_allowed_direct_share_proxy_path(&path) {
+    if route.is_share() && !is_allowed_direct_share_proxy_path(&path) {
         debug!(
             method = %method,
             host = %host,
@@ -1092,6 +1166,78 @@ pub async fn proxy_handler(
             "proxy request ignored: non-api direct share path"
         );
         return simple_response(StatusCode::NOT_FOUND, "non-api-path");
+    }
+    let mut client_web_session: Option<(String, bool)> = None;
+    if route.is_client_web() {
+        if !is_allowed_client_web_path(&path) {
+            debug!(
+                method = %method,
+                host = %host,
+                path = %path_and_query,
+                client_ip = %user_ip,
+                client_country = %user_country,
+                client_asn = %user_asn,
+                user_agent = %user_agent,
+                "proxy request ignored: disallowed client web path"
+            );
+            return simple_response(StatusCode::NOT_FOUND, "non-api-path");
+        }
+        let session = match crate::api::resolve_router_session(&state, &parts.headers).await {
+            Ok(Some(session)) => session,
+            Ok(None) => {
+                if matches!(method, axum::http::Method::GET | axum::http::Method::HEAD)
+                    && is_client_web_document_path(&path)
+                {
+                    return client_web_login_redirect(
+                        &state.config.tunnel_domain,
+                        &host,
+                        &path_and_query,
+                    );
+                }
+                return simple_response(StatusCode::UNAUTHORIZED, "login-required");
+            }
+            Err(err) => {
+                warn!(
+                    method = %method,
+                    host = %host,
+                    path = %path_and_query,
+                    client_ip = %user_ip,
+                    client_country = %user_country,
+                    client_asn = %user_asn,
+                    user_agent = %user_agent,
+                    error = %err,
+                    "proxy request rejected: client web session lookup failed"
+                );
+                return simple_response(StatusCode::UNAUTHORIZED, "login-required");
+            }
+        };
+        let owner_email = match state
+            .store
+            .client_tunnel_owner_email(&route.subdomain)
+            .await
+        {
+            Ok(Some(email)) => email,
+            Ok(None) => return simple_response(StatusCode::NOT_FOUND, "client-tunnel-not-found"),
+            Err(err) => {
+                warn!(
+                    method = %method,
+                    host = %host,
+                    path = %path_and_query,
+                    subdomain = %route.subdomain,
+                    error = %err,
+                    "proxy request rejected: client tunnel owner lookup failed"
+                );
+                return simple_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "client-tunnel-lookup-failed",
+                );
+            }
+        };
+        let is_admin = state.dynamic.read().await.is_admin(&session.email);
+        if session.email != owner_email && !is_admin {
+            return simple_response(StatusCode::FORBIDDEN, "client-web-forbidden");
+        }
+        client_web_session = Some((session.email, is_admin));
     }
     if is_health_check_request
         && state
@@ -1194,11 +1340,21 @@ pub async fn proxy_handler(
         if n.eq_ignore_ascii_case("x-cc-switch-user-email") {
             continue;
         }
-        if route.share_id.is_some()
+        if route.is_share()
             && (n.eq_ignore_ascii_case("authorization")
                 || n.eq_ignore_ascii_case("x-api-key")
                 || n.eq_ignore_ascii_case("x-goog-api-key")
                 || n.eq_ignore_ascii_case("api-key"))
+        {
+            continue;
+        }
+        if route.is_client_web()
+            && (n.eq_ignore_ascii_case(CLIENT_WEB_USER_EMAIL_HEADER)
+                || n.eq_ignore_ascii_case(CLIENT_WEB_ROLE_HEADER)
+                || n.eq_ignore_ascii_case(CLIENT_WEB_INSTALLATION_ID_HEADER)
+                || n.eq_ignore_ascii_case(CLIENT_WEB_SUBDOMAIN_HEADER)
+                || n.eq_ignore_ascii_case("authorization")
+                || n.eq_ignore_ascii_case("cookie"))
         {
             continue;
         }
@@ -1215,6 +1371,19 @@ pub async fn proxy_handler(
     builder = builder.header("X-CC-Switch-Share-Subdomain", route.subdomain.as_str());
     if let Some(ref email) = api_user_email {
         builder = builder.header("X-CC-Switch-User-Email", email.as_str());
+    }
+    if let Some((email, is_admin)) = client_web_session.as_ref() {
+        builder = builder
+            .header(CLIENT_WEB_USER_EMAIL_HEADER, email.as_str())
+            .header(
+                CLIENT_WEB_ROLE_HEADER,
+                if *is_admin { "admin" } else { "owner" },
+            )
+            .header(
+                CLIENT_WEB_INSTALLATION_ID_HEADER,
+                route.installation_id().unwrap_or_default(),
+            )
+            .header(CLIENT_WEB_SUBDOMAIN_HEADER, route.subdomain.as_str());
     }
 
     let log_share_id = route
@@ -1572,6 +1741,43 @@ fn is_allowed_direct_share_web_path(path: &str) -> bool {
         || path.starts_with("/assets/")
         || path == "/web-api/context"
         || path.starts_with("/web-api/invoke/")
+}
+
+fn is_allowed_client_web_path(path: &str) -> bool {
+    (path == "/"
+        || path == "/favicon.ico"
+        || path.starts_with("/assets/")
+        || path == "/web-api/context"
+        || path.starts_with("/web-api/invoke/"))
+        && !path.starts_with("/_ctl/")
+        && !path.starts_with("/_share-router/")
+        && !is_allowed_direct_share_api_path(path)
+}
+
+fn is_client_web_document_path(path: &str) -> bool {
+    path == "/" || path == "/index.html"
+}
+
+fn client_web_login_redirect(tunnel_domain: &str, host: &str, path_and_query: &str) -> Response {
+    let scheme = if tunnel_domain.starts_with("localhost")
+        || tunnel_domain.starts_with("127.")
+        || tunnel_domain.starts_with("[::1]")
+    {
+        "http"
+    } else {
+        "https"
+    };
+    let target = format!("{scheme}://{host}{path_and_query}");
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("clientRedirect", &target)
+        .finish();
+    let location = format!("{scheme}://{tunnel_domain}/?{query}");
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::FOUND;
+    if let Ok(value) = HeaderValue::from_str(&location) {
+        response.headers_mut().insert(header::LOCATION, value);
+    }
+    response
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {

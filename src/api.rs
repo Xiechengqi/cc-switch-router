@@ -37,6 +37,7 @@ use crate::models::{
     AuthSession, BindInstallationOwnerEmailRequest, BindInstallationOwnerEmailResponse,
     BoardMessageListResponse, BoardMessageToggleRequest, BoardMessageView, BoardMetaResponse,
     ChangeInstallationOwnerEmailRequest, ChangeInstallationOwnerEmailResponse,
+    ClientTunnelClaimRequest, ClientTunnelQuery, ClientTunnelResponse, ClientTunnelUpdateRequest,
     DashboardMarketRequestLogView, DashboardPresenceRequest, DashboardPresenceResponse,
     DashboardResponse, DashboardTickerShare, GatewayRegistryRecord, GetInstallationOwnerEmailQuery,
     GetInstallationOwnerEmailResponse, HealthResponse, IssueLeaseRequest, IssueLeaseResponse,
@@ -68,6 +69,7 @@ const REGIONS: &str = include_str!("../regions");
 const SHARE_EDIT_WAKE_RETRY_INTERVAL_SECS: u64 = 20;
 const SHARE_EDIT_WAKE_RETRY_ATTEMPTS: usize = 3;
 const DASHBOARD_REQUEST_TICKER_LIMIT: usize = 5;
+const ROUTER_ACCESS_COOKIE: &str = "cc_switch_router_access";
 
 mod ui_assets {
     include!(concat!(env!("OUT_DIR"), "/ui_assets.rs"));
@@ -162,6 +164,14 @@ pub fn router(state: ServerState) -> Router {
         .route(
             "/v1/installations/owner-email",
             get(get_installation_owner_email),
+        )
+        .route(
+            "/v1/installations/client-tunnel",
+            get(get_client_tunnel).patch(update_client_tunnel),
+        )
+        .route(
+            "/v1/installations/client-tunnel/claim",
+            post(claim_client_tunnel),
         )
         .route("/v1/auth/email/request-code", post(request_email_code))
         .route("/v1/auth/email/verify-code", post(verify_email_code))
@@ -760,6 +770,51 @@ async fn get_installation_owner_email(
     ))
 }
 
+async fn get_client_tunnel(
+    State(state): State<ServerState>,
+    Query(query): Query<ClientTunnelQuery>,
+) -> Result<Json<ClientTunnelResponse>, AppError> {
+    Ok(Json(
+        state.store.get_client_tunnel(&state.config, query).await?,
+    ))
+}
+
+async fn claim_client_tunnel(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(input): Json<ClientTunnelClaimRequest>,
+) -> Result<Json<ClientTunnelResponse>, AppError> {
+    Ok(Json(
+        state
+            .store
+            .claim_client_tunnel(
+                &state.config,
+                input,
+                extract_client_metadata(&headers, addr),
+            )
+            .await?,
+    ))
+}
+
+async fn update_client_tunnel(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(input): Json<ClientTunnelUpdateRequest>,
+) -> Result<Json<ClientTunnelResponse>, AppError> {
+    Ok(Json(
+        state
+            .store
+            .update_client_tunnel(
+                &state.config,
+                input,
+                extract_client_metadata(&headers, addr),
+            )
+            .await?,
+    ))
+}
+
 async fn issue_lease(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -1207,19 +1262,17 @@ async fn request_email_code(
 async fn verify_email_code(
     State(state): State<ServerState>,
     Json(input): Json<VerifyEmailCodeRequest>,
-) -> Result<Json<VerifyEmailCodeResponse>, AppError> {
-    Ok(Json(
-        state.store.verify_email_code(&state.config, input).await?,
-    ))
+) -> Result<Response, AppError> {
+    let response = state.store.verify_email_code(&state.config, input).await?;
+    Ok(with_session_cookie(&state, Json(response)))
 }
 
 async fn refresh_session(
     State(state): State<ServerState>,
     Json(input): Json<RefreshSessionRequest>,
-) -> Result<Json<VerifyEmailCodeResponse>, AppError> {
-    Ok(Json(
-        state.store.refresh_session(&state.config, input).await?,
-    ))
+) -> Result<Response, AppError> {
+    let response = state.store.refresh_session(&state.config, input).await?;
+    Ok(with_session_cookie(&state, Json(response)))
 }
 
 async fn session_me(
@@ -1227,13 +1280,13 @@ async fn session_me(
     headers: HeaderMap,
     Query(query): Query<SessionStatusQuery>,
 ) -> Result<Json<SessionStatusResponse>, AppError> {
-    if dev_auth_bypass_enabled() && extract_bearer_token(&headers).is_none() {
+    if dev_auth_bypass_enabled() && extract_session_token(&headers).is_none() {
         return Ok(Json(dev_session_status()));
     }
     let mut response = state
         .store
         .session_status(
-            extract_bearer_token(&headers),
+            extract_session_token(&headers),
             query.installation_id.as_deref(),
         )
         .await?;
@@ -1288,13 +1341,13 @@ async fn root_handler(
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    if state
+    if let Some(route) = state
         .proxy
         .backend_for_host(&host, &state.config.tunnel_domain)
         .await
-        .is_some()
     {
-        if matches!(*req.method(), Method::GET | Method::HEAD)
+        if !route.is_client_web()
+            && matches!(*req.method(), Method::GET | Method::HEAD)
             && is_router_share_ui_path(req.uri().path())
             && !is_market_host(&state, &host).await
         {
@@ -2089,6 +2142,73 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+fn extract_session_token(headers: &HeaderMap) -> Option<&str> {
+    extract_bearer_token(headers).or_else(|| extract_router_access_cookie(headers))
+}
+
+fn extract_router_access_cookie(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookie| {
+            cookie.split(';').find_map(|part| {
+                let (name, value) = part.trim().split_once('=')?;
+                (name == ROUTER_ACCESS_COOKIE)
+                    .then_some(value.trim())
+                    .filter(|value| !value.is_empty())
+            })
+        })
+}
+
+fn with_session_cookie(
+    state: &ServerState,
+    Json(response): Json<VerifyEmailCodeResponse>,
+) -> Response {
+    let cookie = build_session_cookie(
+        &state.config.tunnel_domain,
+        state.config.use_localhost,
+        &response.access_token,
+        response.expires_at,
+    );
+    let mut output = Json(response).into_response();
+    if let Ok(value) = HeaderValue::from_str(&cookie) {
+        output.headers_mut().append(header::SET_COOKIE, value);
+    }
+    output
+}
+
+fn build_session_cookie(
+    tunnel_domain: &str,
+    use_localhost: bool,
+    access_token: &str,
+    expires_at: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let max_age = (expires_at - chrono::Utc::now()).num_seconds().max(0);
+    let mut parts = vec![
+        format!("{ROUTER_ACCESS_COOKIE}={access_token}"),
+        "Path=/".to_string(),
+        "HttpOnly".to_string(),
+        "SameSite=Lax".to_string(),
+        format!("Max-Age={max_age}"),
+    ];
+    if !use_localhost && cookie_domain_allowed(tunnel_domain) {
+        parts.push(format!(
+            "Domain=.{}",
+            tunnel_domain.trim().trim_end_matches('.')
+        ));
+        parts.push("Secure".to_string());
+    }
+    parts.join("; ")
+}
+
+fn cookie_domain_allowed(tunnel_domain: &str) -> bool {
+    let value = tunnel_domain.trim().trim_end_matches('.');
+    if value.eq_ignore_ascii_case("localhost") || value.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    value.contains('.')
+}
+
 async fn authenticate_market(
     state: &ServerState,
     headers: &HeaderMap,
@@ -2162,7 +2282,7 @@ async fn extract_session_email(
     state: &ServerState,
     headers: &HeaderMap,
 ) -> Result<Option<String>, AppError> {
-    let Some(token) = extract_bearer_token(headers) else {
+    let Some(token) = extract_session_token(headers) else {
         return Ok(dev_auth_bypass_enabled().then(dev_auth_email));
     };
     Ok(state
@@ -2221,11 +2341,11 @@ struct BoardListQuery {
     since: Option<String>,
 }
 
-async fn resolve_session(
+pub(crate) async fn resolve_router_session(
     state: &ServerState,
     headers: &HeaderMap,
 ) -> Result<Option<AuthSession>, AppError> {
-    let Some(token) = extract_bearer_token(headers) else {
+    let Some(token) = extract_session_token(headers) else {
         return Ok(dev_auth_bypass_enabled().then(dev_auth_session));
     };
     state.store.resolve_session_by_access_token(token).await
@@ -2305,7 +2425,7 @@ async fn require_admin_session(
     if dev_auth_bypass_enabled() && extract_bearer_token(headers).is_none() {
         return Ok(dev_auth_session());
     }
-    let session = resolve_session(state, headers)
+    let session = resolve_router_session(state, headers)
         .await?
         .ok_or_else(|| AppError::Unauthorized("login required".into()))?;
     if !state.dynamic.read().await.is_admin(&session.email) {
@@ -2319,7 +2439,7 @@ async fn list_board_messages(
     headers: HeaderMap,
     Query(query): Query<BoardListQuery>,
 ) -> Result<Json<BoardMessageListResponse>, AppError> {
-    let session = resolve_session(&state, &headers).await?;
+    let session = resolve_router_session(&state, &headers).await?;
     let guest_id = extract_guest_id(&headers);
     let viewer_user_id = session.as_ref().map(|s| s.user_id.clone());
     let since = query
@@ -2346,7 +2466,7 @@ async fn post_board_message(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(input): Json<PostBoardMessageRequest>,
 ) -> Result<Json<BoardMessageView>, AppError> {
-    let session = resolve_session(&state, &headers).await?;
+    let session = resolve_router_session(&state, &headers).await?;
     let metadata = extract_client_metadata(&headers, addr);
     let client_ip = metadata.ip.clone();
     let (board_settings, telegram_notify_all, is_admin_session) = {
@@ -2427,7 +2547,7 @@ async fn delete_board_message(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let session = resolve_session(&state, &headers).await?;
+    let session = resolve_router_session(&state, &headers).await?;
     let (board_settings, is_admin) = {
         let dynamic = state.dynamic.read().await;
         let admin = session
@@ -2459,7 +2579,7 @@ async fn board_meta(
     State(state): State<ServerState>,
     headers: HeaderMap,
 ) -> Result<Json<BoardMetaResponse>, AppError> {
-    let session = resolve_session(&state, &headers).await?;
+    let session = resolve_router_session(&state, &headers).await?;
     let (board_settings, can_post_as_admin) = {
         let dynamic = state.dynamic.read().await;
         let admin = session
@@ -2586,7 +2706,7 @@ async fn admin_version(
     State(state): State<ServerState>,
     headers: HeaderMap,
 ) -> Result<Json<VersionResponse>, AppError> {
-    let session = resolve_session(&state, &headers).await?;
+    let session = resolve_router_session(&state, &headers).await?;
     let is_admin = match session.as_ref() {
         Some(s) => state.dynamic.read().await.is_admin(&s.email),
         None => false,

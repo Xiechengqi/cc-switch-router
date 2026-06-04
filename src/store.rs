@@ -25,29 +25,30 @@ use crate::models::{
     AuthSession, AuthUser, BindInstallationOwnerEmailRequest, BindInstallationOwnerEmailResponse,
     BoardMessageListResponse, BoardMessageView, BoardMetaResponse,
     ChangeInstallationOwnerEmailRequest, ChangeInstallationOwnerEmailResponse, ClientMetadata,
-    DashboardClientView, DashboardMap, DashboardMapPoint, DashboardMarketRequestLogView,
-    DashboardMarketView, DashboardPresenceRequest, DashboardResponse, DashboardStats,
-    DashboardTickerShare, GatewayRegistryRecord, GetInstallationOwnerEmailQuery,
-    GetInstallationOwnerEmailResponse, HealthCheckEntry, HealthTimelineBucket, Installation,
-    InstallationView, IssueLeaseRequest, IssueLeaseResponse, LatLonPoint, MarketAppAvailability,
-    MarketAppAvailabilityEntry, MarketDisabledSharesUpdateRequest,
-    MarketDisabledSharesUpdateResponse, MarketLinkedShareView, MarketMaintenanceUpdateRequest,
-    MarketMaintenanceUpdateResponse, MarketRegistryRecord, MarketRequestLogBatchSyncRequest,
-    MarketRequestLogEntry, MarketShareRuntimeStateInput, MarketShareRuntimeStateView,
-    MarketShareView, ModelHealthSummary, PublicMapClientPoint, PublicMapPointsResponse,
-    PublicMarketConfig, RefreshSessionRequest, RegisterGatewayRequest, RegisterGatewayResponse,
-    RegisterInstallationRequest, RegisterInstallationResponse, RegisterMarketRequest,
-    RequestEmailCodeRequest, RequestEmailCodeResponse, SessionStatusResponse, ShareAppProviders,
-    ShareAppRuntimes, ShareBatchSyncRequest, ShareClaimPayload, ShareClaimSubdomainRequest,
-    ShareDeleteRequest, ShareDescriptor, ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest,
-    ShareMarketLinkView, ShareModelHealthCheckEntry, ShareModelHealthSummary,
-    SharePendingEditsRequest, SharePendingEditsResponse, ShareRequestLogBatchSyncRequest,
-    ShareRequestLogEntry, ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload,
-    ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse, ShareSettingsPatch,
-    ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest,
-    ShareUpstreamProvider, ShareView, TunnelLease, UserApiTokenResetResponse, UserApiTokenResponse,
-    UserApiTokenStatus, UserShareView, UserSharesResponse, VerifyEmailCodeRequest,
-    VerifyEmailCodeResponse,
+    ClientTunnelClaimRequest, ClientTunnelConfig, ClientTunnelQuery, ClientTunnelResponse,
+    ClientTunnelUpdateRequest, ClientTunnelView, DashboardClientTunnelView, DashboardClientView,
+    DashboardMap, DashboardMapPoint, DashboardMarketRequestLogView, DashboardMarketView,
+    DashboardPresenceRequest, DashboardResponse, DashboardStats, DashboardTickerShare,
+    GatewayRegistryRecord, GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse,
+    HealthCheckEntry, HealthTimelineBucket, Installation, InstallationView, IssueLeaseRequest,
+    IssueLeaseResponse, LatLonPoint, MarketAppAvailability, MarketAppAvailabilityEntry,
+    MarketDisabledSharesUpdateRequest, MarketDisabledSharesUpdateResponse, MarketLinkedShareView,
+    MarketMaintenanceUpdateRequest, MarketMaintenanceUpdateResponse, MarketRegistryRecord,
+    MarketRequestLogBatchSyncRequest, MarketRequestLogEntry, MarketShareRuntimeStateInput,
+    MarketShareRuntimeStateView, MarketShareView, ModelHealthSummary, PublicMapClientPoint,
+    PublicMapPointsResponse, PublicMarketConfig, RefreshSessionRequest, RegisterGatewayRequest,
+    RegisterGatewayResponse, RegisterInstallationRequest, RegisterInstallationResponse,
+    RegisterMarketRequest, RequestEmailCodeRequest, RequestEmailCodeResponse,
+    SessionStatusResponse, ShareAppProviders, ShareAppRuntimes, ShareBatchSyncRequest,
+    ShareClaimPayload, ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptor,
+    ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest, ShareMarketLinkView,
+    ShareModelHealthCheckEntry, ShareModelHealthSummary, SharePendingEditsRequest,
+    SharePendingEditsResponse, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry,
+    ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload, ShareRuntimeRefreshRequest,
+    ShareRuntimeSnapshotResponse, ShareSettingsPatch, ShareSettingsUpdateResponse, ShareSignals,
+    ShareSupport, ShareSyncRequest, ShareUpstreamProvider, ShareView, TunnelLease,
+    UserApiTokenResetResponse, UserApiTokenResponse, UserApiTokenStatus, UserShareView,
+    UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 #[cfg(test)]
 use crate::models::{ShareAppProvider, ShareUpstreamModel};
@@ -890,6 +891,166 @@ impl AppStore {
         })
     }
 
+    pub async fn get_client_tunnel(
+        &self,
+        config: &Config,
+        query: ClientTunnelQuery,
+    ) -> Result<ClientTunnelResponse, AppError> {
+        let conn = self.conn.lock().await;
+        let installation = get_installation(&conn, &query.installation_id)?
+            .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
+        verify_signed_share_request(
+            &conn,
+            &installation.public_key,
+            &query.installation_id,
+            "client_tunnel_get",
+            &serde_json::json!({}),
+            query.timestamp_ms,
+            &query.nonce,
+            &query.signature,
+        )?;
+        let tunnel = get_client_tunnel_by_installation(&conn, &query.installation_id)?
+            .map(|record| record.into_view(config));
+        Ok(ClientTunnelResponse { ok: true, tunnel })
+    }
+
+    pub async fn claim_client_tunnel(
+        &self,
+        config: &Config,
+        input: ClientTunnelClaimRequest,
+        metadata: ClientMetadata,
+    ) -> Result<ClientTunnelResponse, AppError> {
+        self.upsert_client_tunnel(
+            config,
+            input.installation_id,
+            "client_tunnel_claim",
+            input.tunnel,
+            input.timestamp_ms,
+            input.nonce,
+            input.signature,
+            metadata,
+        )
+        .await
+    }
+
+    pub async fn update_client_tunnel(
+        &self,
+        config: &Config,
+        input: ClientTunnelUpdateRequest,
+        metadata: ClientMetadata,
+    ) -> Result<ClientTunnelResponse, AppError> {
+        self.upsert_client_tunnel(
+            config,
+            input.installation_id,
+            "client_tunnel_update",
+            input.tunnel,
+            input.timestamp_ms,
+            input.nonce,
+            input.signature,
+            metadata,
+        )
+        .await
+    }
+
+    async fn upsert_client_tunnel(
+        &self,
+        config: &Config,
+        installation_id: String,
+        action: &str,
+        tunnel: ClientTunnelConfig,
+        timestamp_ms: i64,
+        nonce: String,
+        signature: String,
+        metadata: ClientMetadata,
+    ) -> Result<ClientTunnelResponse, AppError> {
+        let owner_email = normalize_email(&tunnel.owner_email)?;
+        let subdomain = normalize_subdomain(&tunnel.subdomain)?;
+        ensure_subdomain_allowed(&subdomain, config)?;
+        let now = Utc::now();
+
+        let conn = self.conn.lock().await;
+        ensure_subdomain_not_registered_market(&conn, &subdomain)?;
+        ensure_subdomain_not_claimed_by_share(&conn, &subdomain)?;
+        let installation = get_installation(&conn, &installation_id)?
+            .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
+        let installation_owner = installation
+            .owner_email
+            .as_deref()
+            .ok_or_else(|| AppError::Unauthorized("installation owner email is required".into()))?;
+        if installation.owner_verified_at.is_none() {
+            return Err(AppError::Unauthorized(
+                "installation owner email must be verified".into(),
+            ));
+        }
+        if installation_owner != owner_email {
+            return Err(AppError::Forbidden(
+                "client tunnel ownerEmail must equal installation owner email".into(),
+            ));
+        }
+        let signed_payload = ClientTunnelConfig {
+            owner_email,
+            subdomain: subdomain.clone(),
+            enabled: tunnel.enabled,
+        };
+        verify_signed_share_request(
+            &conn,
+            &installation.public_key,
+            &installation_id,
+            action,
+            &signed_payload,
+            timestamp_ms,
+            &nonce,
+            &signature,
+        )?;
+        let should_refresh_geo =
+            should_refresh_installation_geo(&installation, metadata.ip.as_deref());
+        touch_installation_presence(&conn, &installation_id, &metadata, now)?;
+        conn.execute(
+            "INSERT INTO installation_client_tunnels (
+                installation_id, owner_email, subdomain, enabled, created_at, updated_at, last_seen_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?5, NULL)
+             ON CONFLICT(installation_id) DO UPDATE SET
+                owner_email = excluded.owner_email,
+                subdomain = excluded.subdomain,
+                enabled = excluded.enabled,
+                updated_at = excluded.updated_at",
+            params![
+                installation_id,
+                signed_payload.owner_email,
+                signed_payload.subdomain,
+                if signed_payload.enabled { 1 } else { 0 },
+                now.to_rfc3339(),
+            ],
+        )
+        .map_err(map_client_tunnel_constraint_error)?;
+        let record = get_client_tunnel_by_installation(&conn, &installation_id)?
+            .ok_or_else(|| AppError::Internal("client tunnel upsert did not persist".into()))?;
+        drop(conn);
+        if should_refresh_geo {
+            self.refresh_installation_geo(&installation_id, &metadata.ip, false)
+                .await?;
+        }
+        Ok(ClientTunnelResponse {
+            ok: true,
+            tunnel: Some(record.into_view(config)),
+        })
+    }
+
+    pub async fn client_tunnel_owner_email(
+        &self,
+        subdomain: &str,
+    ) -> Result<Option<String>, AppError> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT owner_email FROM installation_client_tunnels
+             WHERE subdomain = ?1 AND enabled = 1",
+            params![subdomain],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| AppError::Internal(format!("query client tunnel owner failed: {e}")))
+    }
+
     pub async fn resolve_session_by_access_token(
         &self,
         access_token: &str,
@@ -1171,9 +1332,15 @@ impl AppStore {
         let installation = installation.0;
 
         let tunnel_type = input.tunnel_type.to_ascii_lowercase();
-        if tunnel_type != "http" {
+        let is_client_web_tunnel = tunnel_type == "client-web-http";
+        if tunnel_type != "http" && !is_client_web_tunnel {
             return Err(AppError::BadRequest(
                 "only http tunnels are supported".into(),
+            ));
+        }
+        if is_client_web_tunnel && input.share.is_some() {
+            return Err(AppError::BadRequest(
+                "client web tunnels cannot include share metadata".into(),
             ));
         }
 
@@ -1182,6 +1349,11 @@ impl AppStore {
         let subdomain = if let Some(share) = input.share.as_ref() {
             let conn = self.conn.lock().await;
             ensure_subdomain_not_registered_market(&conn, &requested_subdomain)?;
+            if get_client_tunnel_by_subdomain(&conn, &requested_subdomain)?.is_some() {
+                return Err(AppError::Conflict(
+                    "subdomain already claimed by client tunnel".into(),
+                ));
+            }
             let owned_subdomain =
                 get_share_owned_subdomain(&conn, &input.installation_id, &share.share_id)?
                     .ok_or_else(|| AppError::Conflict("share subdomain is not claimed".into()))?;
@@ -1191,9 +1363,29 @@ impl AppStore {
                 ));
             }
             owned_subdomain
+        } else if is_client_web_tunnel {
+            let conn = self.conn.lock().await;
+            ensure_subdomain_not_registered_market(&conn, &requested_subdomain)?;
+            ensure_subdomain_not_claimed_by_share(&conn, &requested_subdomain)?;
+            let tunnel = get_client_tunnel_by_installation(&conn, &input.installation_id)?
+                .ok_or_else(|| AppError::Conflict("client tunnel is not claimed".into()))?;
+            if !tunnel.enabled {
+                return Err(AppError::Conflict("client tunnel is disabled".into()));
+            }
+            if tunnel.subdomain != requested_subdomain {
+                return Err(AppError::Conflict(
+                    "requested subdomain does not match claimed client tunnel".into(),
+                ));
+            }
+            requested_subdomain
         } else {
             let conn = self.conn.lock().await;
             ensure_subdomain_not_registered_market(&conn, &requested_subdomain)?;
+            if get_client_tunnel_by_subdomain(&conn, &requested_subdomain)?.is_some() {
+                return Err(AppError::Conflict(
+                    "subdomain already claimed by client tunnel".into(),
+                ));
+            }
             requested_subdomain
         };
         let requested_share_id = input.share.as_ref().map(|share| share.share_id.as_str());
@@ -1203,8 +1395,8 @@ impl AppStore {
                 "DELETE FROM leases
                  WHERE subdomain = ?1
                    AND installation_id = ?2
-                   AND tunnel_type = 'http'",
-                params![subdomain, input.installation_id],
+                   AND tunnel_type = ?3",
+                params![subdomain, input.installation_id, tunnel_type],
             )
             .map_err(|e| AppError::Internal(format!("delete stale client leases failed: {e}")))?;
             let live_lease_exists: bool = conn
@@ -1221,25 +1413,24 @@ impl AppStore {
                 return Err(AppError::Conflict("subdomain already leased".into()));
             }
         }
-        if proxy
+        if let Some(route) = proxy
             .backend_for_host(
                 &format!("{subdomain}.{}", config.tunnel_domain),
                 &config.tunnel_domain,
             )
             .await
-            .is_some()
         {
-            let route = proxy
-                .backend_for_host(
-                    &format!("{subdomain}.{}", config.tunnel_domain),
-                    &config.tunnel_domain,
-                )
-                .await
-                .expect("route existence checked above");
             let is_same_share_route =
                 requested_share_id.is_some() && route.share_id() == requested_share_id;
+            let is_same_client_web_route = is_client_web_tunnel
+                && route.is_client_web()
+                && route.installation_id() == Some(input.installation_id.as_str());
             if !is_same_share_route {
-                return Err(AppError::Conflict("subdomain already in use".into()));
+                if is_same_client_web_route {
+                    proxy.remove_route(&subdomain).await;
+                } else {
+                    return Err(AppError::Conflict("subdomain already in use".into()));
+                }
             }
         }
 
@@ -1262,6 +1453,16 @@ impl AppStore {
 
         if let Some(share) = normalized_share.clone() {
             self.upsert_share(&input.installation_id, share).await?;
+        }
+        if is_client_web_tunnel {
+            let conn = self.conn.lock().await;
+            conn.execute(
+                "UPDATE installation_client_tunnels
+                 SET last_seen_at = ?2, updated_at = ?2
+                 WHERE installation_id = ?1",
+                params![input.installation_id, Utc::now().to_rfc3339()],
+            )
+            .map_err(|e| AppError::Internal(format!("touch client tunnel failed: {e}")))?;
         }
 
         let issued_at = Utc::now();
@@ -1529,6 +1730,11 @@ impl AppStore {
         ensure_subdomain_allowed(&subdomain, config)?;
         let conn = self.conn.lock().await;
         ensure_subdomain_not_registered_market(&conn, &subdomain)?;
+        if get_client_tunnel_by_subdomain(&conn, &subdomain)?.is_some() {
+            return Err(AppError::Conflict(
+                "subdomain already claimed by client tunnel".into(),
+            ));
+        }
         let installation = get_installation(&conn, &input.installation_id)?;
         let Some(installation) = installation else {
             return Err(AppError::Unauthorized("installation not found".into()));
@@ -2117,6 +2323,7 @@ impl AppStore {
             market_logs,
             market_request_timeline_by_market,
             model_health_by_share,
+            client_tunnels,
         ) = {
             let conn = self.conn.lock().await;
             (
@@ -2131,8 +2338,13 @@ impl AppStore {
                 list_recent_market_request_logs(&conn, 200)?,
                 list_market_request_timeline_stats_24h(&conn, now)?,
                 list_model_health_summaries(&conn)?,
+                list_client_tunnels(&conn)?,
             )
         };
+        let client_tunnels_by_installation = client_tunnels
+            .into_iter()
+            .map(|tunnel| (tunnel.installation_id.clone(), tunnel))
+            .collect::<HashMap<_, _>>();
         let market_logs_by_market = market_logs.iter().cloned().fold(
             HashMap::<String, Vec<DashboardMarketRequestLogView>>::new(),
             |mut acc, log| {
@@ -2248,6 +2460,7 @@ impl AppStore {
                 id: installation.id,
                 platform: installation.platform,
                 app_version: installation.app_version,
+                owner_email: installation.owner_email,
                 region: installation.region,
                 country_code: installation.country_code,
                 created_at: installation.created_at,
@@ -2406,6 +2619,28 @@ impl AppStore {
                 .or_default()
                 .push(share.share_id.clone());
         }
+        let mut client_online_minutes_by_installation = HashMap::<String, usize>::new();
+        let mut client_health_by_installation = HashMap::<String, Vec<HealthCheckEntry>>::new();
+        let mut client_timeline_by_installation =
+            HashMap::<String, Vec<HealthTimelineBucket>>::new();
+        for share in &share_views {
+            client_online_minutes_by_installation
+                .entry(share.installation_id.clone())
+                .and_modify(|minutes| *minutes = (*minutes).max(share.online_minutes_24h))
+                .or_insert(share.online_minutes_24h);
+            client_health_by_installation
+                .entry(share.installation_id.clone())
+                .and_modify(|entries| {
+                    *entries = merge_health_checks(entries, &share.health_checks);
+                })
+                .or_insert_with(|| share.health_checks.clone());
+            client_timeline_by_installation
+                .entry(share.installation_id.clone())
+                .and_modify(|timeline| {
+                    *timeline = merge_health_timeline(timeline, &share.health_timeline);
+                })
+                .or_insert_with(|| share.health_timeline.clone());
+        }
         let mut client_views = installation_views
             .iter()
             .cloned()
@@ -2414,15 +2649,42 @@ impl AppStore {
                     .remove(&installation.id)
                     .unwrap_or_default();
                 let share_count = share_ids.len();
+                let online_minutes_24h = client_online_minutes_by_installation
+                    .get(&installation.id)
+                    .copied()
+                    .unwrap_or(0);
+                let online_rate_24h =
+                    ((online_minutes_24h as f64 / ONLINE_WINDOW_MINUTES as f64) * 100.0).min(100.0);
+                let client_tunnel =
+                    client_tunnels_by_installation
+                        .get(&installation.id)
+                        .map(|tunnel| DashboardClientTunnelView {
+                            owner_email: tunnel.owner_email.clone(),
+                            subdomain: tunnel.subdomain.clone(),
+                            tunnel_url: config.tunnel_url(&tunnel.subdomain),
+                            enabled: tunnel.enabled,
+                            online: active_subdomains.contains(&tunnel.subdomain),
+                        });
                 DashboardClientView {
                     share_count,
                     share_ids,
+                    client_tunnel,
+                    online_minutes_24h,
+                    online_rate_24h,
+                    health_checks: client_health_by_installation
+                        .get(&installation.id)
+                        .cloned()
+                        .unwrap_or_default(),
+                    health_timeline: client_timeline_by_installation
+                        .get(&installation.id)
+                        .cloned()
+                        .unwrap_or_default(),
                     installation,
                 }
             })
-            // 只展示挂了至少一个 share 的机器；otherwise dashboard 会被纯 lease/heartbeat
-            // 但无 share 的 installation 撑满。
-            .filter(|client| !client.share_ids.is_empty())
+            // 只展示有 share 或已配置 client tunnel 的机器；otherwise dashboard 会被纯
+            // lease/heartbeat 但无可用入口的 installation 撑满。
+            .filter(|client| !client.share_ids.is_empty() || client.client_tunnel.is_some())
             .collect::<Vec<_>>();
         client_views.sort_by(|left, right| {
             // P7 Step 2：installation 维度排序。原"can_manage 优先"是 share 字段，已移除；
@@ -5268,6 +5530,16 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             updated_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS installation_client_tunnels (
+            installation_id TEXT PRIMARY KEY,
+            owner_email TEXT NOT NULL,
+            subdomain TEXT NOT NULL UNIQUE,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_seen_at TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS share_request_logs (
             request_id TEXT PRIMARY KEY,
             installation_id TEXT NOT NULL,
@@ -5546,6 +5818,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
 
         CREATE INDEX IF NOT EXISTS idx_leases_installation_id ON leases(installation_id);
         CREATE INDEX IF NOT EXISTS idx_leases_subdomain ON leases(subdomain);
+        CREATE INDEX IF NOT EXISTS idx_installation_client_tunnels_owner ON installation_client_tunnels(owner_email, updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_shares_installation_id ON shares(installation_id);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_shares_subdomain_unique ON shares(subdomain) WHERE subdomain IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_share_request_logs_share_id ON share_request_logs(share_id, created_at DESC);
@@ -8551,6 +8824,22 @@ fn ensure_subdomain_not_registered_market(conn: &Connection, value: &str) -> Res
     Ok(())
 }
 
+fn ensure_subdomain_not_claimed_by_share(conn: &Connection, value: &str) -> Result<(), AppError> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM shares WHERE subdomain = ?1)",
+            params![value],
+            |row| row.get(0),
+        )
+        .map_err(|e| AppError::Internal(format!("query share subdomain conflict failed: {e}")))?;
+    if exists {
+        return Err(AppError::Conflict(
+            "subdomain already claimed by share".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn market_subdomain_owner(conn: &Connection, subdomain: &str) -> Result<Option<String>, AppError> {
     conn.query_row(
         "SELECT email FROM router_markets
@@ -8917,6 +9206,75 @@ fn aggregate_market_health_checks(
         .collect()
 }
 
+fn merge_health_checks(
+    left: &[HealthCheckEntry],
+    right: &[HealthCheckEntry],
+) -> Vec<HealthCheckEntry> {
+    let mut by_minute = BTreeMap::<i64, bool>::new();
+    for entry in left.iter().chain(right.iter()) {
+        let minute = entry.checked_at.div_euclid(60);
+        by_minute
+            .entry(minute)
+            .and_modify(|healthy| *healthy |= entry.is_healthy)
+            .or_insert(entry.is_healthy);
+    }
+    by_minute
+        .into_iter()
+        .rev()
+        .take(10)
+        .map(|(minute, is_healthy)| HealthCheckEntry {
+            checked_at: minute * 60,
+            is_healthy,
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+fn merge_health_timeline(
+    left: &[HealthTimelineBucket],
+    right: &[HealthTimelineBucket],
+) -> Vec<HealthTimelineBucket> {
+    let mut by_start = BTreeMap::<String, HealthTimelineBucket>::new();
+    for bucket in left.iter().chain(right.iter()) {
+        by_start
+            .entry(bucket.start_at.clone())
+            .and_modify(|existing| {
+                existing.score = existing.score.max(bucket.score);
+                existing.online_minutes = existing.online_minutes.max(bucket.online_minutes);
+                existing.observed_minutes = existing.observed_minutes.max(bucket.observed_minutes);
+                existing.request_count += bucket.request_count;
+                existing.failure_count += bucket.failure_count;
+                existing.status = stronger_timeline_status(&existing.status, &bucket.status);
+            })
+            .or_insert_with(|| bucket.clone());
+    }
+    by_start
+        .into_values()
+        .rev()
+        .take(48)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+fn stronger_timeline_status(left: &str, right: &str) -> String {
+    let score = |status: &str| match status {
+        "healthy" => 4,
+        "degraded" => 3,
+        "unhealthy" => 2,
+        "offline" => 1,
+        _ => 0,
+    };
+    if score(right) > score(left) {
+        right.to_string()
+    } else {
+        left.to_string()
+    }
+}
+
 fn dashboard_market_to_share_link(market: &DashboardMarketView) -> ShareMarketLinkView {
     ShareMarketLinkView {
         id: market.id.clone(),
@@ -9205,6 +9563,103 @@ fn map_share_constraint_error(err: rusqlite::Error) -> AppError {
         AppError::Conflict("subdomain already claimed".into())
     } else {
         AppError::Internal(format!("upsert share failed: {text}"))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ClientTunnelRecord {
+    installation_id: String,
+    owner_email: String,
+    subdomain: String,
+    enabled: bool,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    last_seen_at: Option<DateTime<Utc>>,
+}
+
+impl ClientTunnelRecord {
+    fn into_view(self, config: &Config) -> ClientTunnelView {
+        ClientTunnelView {
+            installation_id: self.installation_id,
+            owner_email: self.owner_email,
+            subdomain: self.subdomain.clone(),
+            enabled: self.enabled,
+            tunnel_url: config.tunnel_url(&self.subdomain),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            last_seen_at: self.last_seen_at,
+        }
+    }
+}
+
+fn map_client_tunnel_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClientTunnelRecord> {
+    Ok(ClientTunnelRecord {
+        installation_id: row.get(0)?,
+        owner_email: row.get(1)?,
+        subdomain: row.get(2)?,
+        enabled: row.get::<_, i64>(3)? != 0,
+        created_at: parse_dt_sql(&row.get::<_, String>(4)?)?,
+        updated_at: parse_dt_sql(&row.get::<_, String>(5)?)?,
+        last_seen_at: row
+            .get::<_, Option<String>>(6)?
+            .map(|value| parse_dt_sql(&value))
+            .transpose()?,
+    })
+}
+
+fn get_client_tunnel_by_installation(
+    conn: &Connection,
+    installation_id: &str,
+) -> Result<Option<ClientTunnelRecord>, AppError> {
+    conn.query_row(
+        "SELECT installation_id, owner_email, subdomain, enabled, created_at, updated_at, last_seen_at
+         FROM installation_client_tunnels WHERE installation_id = ?1",
+        params![installation_id],
+        map_client_tunnel_row,
+    )
+    .optional()
+    .map_err(|e| AppError::Internal(format!("query client tunnel failed: {e}")))
+}
+
+fn get_client_tunnel_by_subdomain(
+    conn: &Connection,
+    subdomain: &str,
+) -> Result<Option<ClientTunnelRecord>, AppError> {
+    conn.query_row(
+        "SELECT installation_id, owner_email, subdomain, enabled, created_at, updated_at, last_seen_at
+         FROM installation_client_tunnels WHERE subdomain = ?1",
+        params![subdomain],
+        map_client_tunnel_row,
+    )
+    .optional()
+    .map_err(|e| AppError::Internal(format!("query client tunnel by subdomain failed: {e}")))
+}
+
+fn list_client_tunnels(conn: &Connection) -> Result<Vec<ClientTunnelRecord>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT installation_id, owner_email, subdomain, enabled, created_at, updated_at, last_seen_at
+             FROM installation_client_tunnels",
+        )
+        .map_err(|e| AppError::Internal(format!("prepare client tunnels failed: {e}")))?;
+    let rows = stmt
+        .query_map([], map_client_tunnel_row)
+        .map_err(|e| AppError::Internal(format!("query client tunnels failed: {e}")))?;
+    let mut output = Vec::new();
+    for row in rows {
+        output.push(
+            row.map_err(|e| AppError::Internal(format!("read client tunnel row failed: {e}")))?,
+        );
+    }
+    Ok(output)
+}
+
+fn map_client_tunnel_constraint_error(err: rusqlite::Error) -> AppError {
+    let text = err.to_string();
+    if text.contains("UNIQUE constraint failed: installation_client_tunnels.subdomain") {
+        AppError::Conflict("client tunnel subdomain already claimed".into())
+    } else {
+        AppError::Internal(format!("upsert client tunnel failed: {text}"))
     }
 }
 

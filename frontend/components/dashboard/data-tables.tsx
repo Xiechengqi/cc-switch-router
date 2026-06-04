@@ -454,13 +454,6 @@ function formatQuotaAmount(value?: number, locale: AppLocale = "en") {
 
 type OAuthRuntimeKey = "kiro" | "cursor" | "antigravity" | "copilot";
 
-const OAUTH_RUNTIME_ROWS: Array<[OAuthRuntimeKey, string]> = [
-  ["kiro", "Kiro"],
-  ["cursor", "Cursor"],
-  ["antigravity", "Antigravity"],
-  ["copilot", "Copilot"],
-];
-
 function oauthRuntimeKeyFromProvider(value?: Partial<ShareUpstreamProvider & ShareAppProvider>): OAuthRuntimeKey | undefined {
   const text = [
     value?.app,
@@ -1375,6 +1368,65 @@ function ShareStatusCell({ client, share, t, locale }: { client: DashboardClient
   );
 }
 
+function ClientIdentityCell({ client }: { client: DashboardClient }) {
+  const url = client.clientTunnel?.tunnelUrl;
+  const ownerEmail = client.clientTunnel?.ownerEmail || client.installation.ownerEmail || "-";
+  return (
+    <div className="grid min-w-72 gap-1">
+      {url ? (
+        <a
+          href={url}
+          target="_blank"
+          rel="noopener noreferrer"
+          data-no-row-drawer
+          className="inline-flex max-w-full items-center gap-1 font-mono text-xs font-semibold text-foreground underline-offset-4 hover:underline"
+          title={url}
+        >
+          <span className="truncate">{url}</span>
+          <ExternalLink className="h-3 w-3 shrink-0 text-muted-foreground" />
+        </a>
+      ) : (
+        <strong className="font-mono text-xs text-muted-foreground">-</strong>
+      )}
+      <span className="truncate text-xs text-muted-foreground" title={ownerEmail}>
+        {ownerEmail}
+      </span>
+    </div>
+  );
+}
+
+function ClientStatusCell({ client, t, locale }: { client: DashboardClient; t: TFn; locale: AppLocale }) {
+  const rowClass = "grid grid-cols-[76px_minmax(0,1fr)] gap-2";
+  const region = client.installation.countryCode || client.installation.region || "-";
+  const onlineMinutes = client.onlineMinutes24h || 0;
+  const onlineRate = client.onlineRate24h || 0;
+  const onlineTitle = `${onlineMinutes} / 1440 min with successful route probes in last 24h`;
+  return (
+    <div className="grid min-w-52 gap-2 text-sm">
+      <div className={rowClass}>
+        <span className="mono-label text-muted-foreground">{t("dashboard.region")}</span>
+        <strong className="whitespace-nowrap">{region}</strong>
+      </div>
+      <div className={rowClass}>
+        <span className="mono-label text-muted-foreground">{locale.startsWith("zh") ? "版本" : "Version"}</span>
+        <strong className="truncate" title={clientPlatformLabel(client)}>
+          {clientPlatformLabel(client)}
+        </strong>
+      </div>
+      <div className={rowClass}>
+        <span className="mono-label text-muted-foreground">{t("dashboard.online")}</span>
+        <strong title={onlineTitle}>
+          {onlineRate.toFixed(1)}% / {formatMinutesShort(onlineMinutes, locale)}
+        </strong>
+      </div>
+      <div className={rowClass}>
+        <span className="mono-label text-muted-foreground">{t("dashboard.health")}</span>
+        <HealthDots entries={client.healthChecks || []} />
+      </div>
+    </div>
+  );
+}
+
 export function ClientsTable({ clients, shares, markets, onChanged }: { clients: DashboardClient[]; shares: ShareView[]; markets: DashboardMarket[]; onChanged?: () => Promise<void> | void }) {
   const [selected, setSelected] = React.useState<DashboardClient | null>(null);
   const [editingShare, setEditingShare] = React.useState<ShareView | null>(null);
@@ -1396,16 +1448,6 @@ export function ClientsTable({ clients, shares, markets, onChanged }: { clients:
     [shareById],
   );
 
-  // P13：installation 是否被认为"在线" —— 任一挂在其上的 share isOnline 即可。
-  // 没有 share 时回退看 lastSeenAt 是否在 2 分钟内（与 router heartbeat 周期一致）。
-  const ONLINE_FRESH_MS = 2 * 60 * 1000;
-  const isClientOnline = (client: DashboardClient) => {
-    const onShares = sharesForClient(client);
-    if (onShares.length > 0) return onShares.some((s) => s.isOnline);
-    const seen = Date.parse(client.installation.lastSeenAt);
-    return Number.isFinite(seen) && Date.now() - seen <= ONLINE_FRESH_MS;
-  };
-
   return (
     <section className="grid gap-3">
       <div className="flex items-center justify-between font-mono text-[11px] uppercase tracking-[0.14em] text-muted-foreground">
@@ -1417,9 +1459,7 @@ export function ClientsTable({ clients, shares, markets, onChanged }: { clients:
           <table className="w-full min-w-[960px] border-collapse text-sm">
             <thead className="bg-muted text-left font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground">
               <tr>
-                {/* P13：列简化为 Installation / 状态 / 分享 / →。
-                    Platform / Region / LastSeen 合并进"状态"；#Shares 删除，share 列表内联到"分享"列。 */}
-                <th className="w-64 px-4 py-3">{t("dashboard.installation")}</th>
+                <th className="w-80 px-4 py-3">Client</th>
                 <th className="w-64 px-4 py-3">{t("dashboard.status")}</th>
                 <th className="px-4 py-3">{t("dashboard.shares")}</th>
                 <th className="w-7 px-4 py-3" />
@@ -1427,35 +1467,14 @@ export function ClientsTable({ clients, shares, markets, onChanged }: { clients:
             </thead>
             <tbody>
               {sorted.length ? sorted.map((client) => {
-                const online = isClientOnline(client);
                 const clientShares = sharesForClient(client);
                 return (
                   <tr key={client.installation.id} className="cursor-pointer border-b last:border-0 hover:bg-primary/5" onClick={(event) => { if (shouldOpenRowDrawer(event)) setSelected(client); }}>
-                    <td className="w-64 break-all px-4 py-3 align-top font-mono text-xs text-foreground">
-                      {client.installation.id}
+                    <td className="w-80 px-4 py-3 align-top">
+                      <ClientIdentityCell client={client} />
                     </td>
-                    {/* P13：状态列聚合 platform / 区域 / 最近在线 / 在线色点。 */}
-                    <td className="w-64 px-4 py-3 align-top text-xs">
-                      <div className="grid gap-1">
-                        <div className="flex items-center gap-2">
-                          <span
-                            className={`inline-block h-2 w-2 rounded-full ${online ? "bg-emerald-500" : "bg-muted-foreground/40"}`}
-                            aria-label={online ? "online" : "offline"}
-                          />
-                          <strong className="text-foreground">
-                            {online ? t("common.online") : t("common.offline")}
-                          </strong>
-                        </div>
-                        <span className="text-muted-foreground">
-                          {clientPlatformLabel(client)}
-                        </span>
-                        <span className="text-muted-foreground">
-                          {client.installation.countryCode || "-"}
-                        </span>
-                        <span className="text-muted-foreground" title={formatDateTime(client.installation.lastSeenAt)}>
-                          {t("dashboard.lastSeen")}: {formatRelativeTime(client.installation.lastSeenAt, locale)}
-                        </span>
-                      </div>
+                    <td className="w-64 px-4 py-3 align-top">
+                      <ClientStatusCell client={client} t={t} locale={locale} />
                     </td>
                     {/* P13：share 数据直接展开到行内。空列表显式提示，避免误以为 client 无 share。 */}
                     <td className="px-4 py-3 align-top">
@@ -1494,25 +1513,26 @@ export function ClientsTable({ clients, shares, markets, onChanged }: { clients:
               <Drawer.Header>
                 <div>
                   <Drawer.Heading className="break-all font-mono text-base">
-                    {selected?.installation.id}
+                    {selected?.clientTunnel?.tunnelUrl || "-"}
                   </Drawer.Heading>
                   <p className="mt-1 text-sm text-muted-foreground">
-                    {selected ? clientPlatformLabel(selected) : ""}
-                    {selected?.installation.countryCode ? ` · ${selected.installation.countryCode}` : ""}
+                    {selected?.clientTunnel?.ownerEmail || selected?.installation.ownerEmail || "-"}
                   </p>
                 </div>
               </Drawer.Header>
               <Drawer.Body className="overflow-y-auto">
                 {selected ? (
                   <div className="grid gap-5">
-                    {/* P13：drawer 不再重复展示 share 列表（已内联到行内）。
-                        只保留 installation 自己的元信息，需要 share 详情请点 Shares 表。 */}
-                    <DrawerSection label={t("dashboard.installation")}>
+                    <DrawerSection label="24h">
+                      <HealthTimelineStrip timeline={selected.healthTimeline || []} />
+                    </DrawerSection>
+                    <DrawerSection label="Client">
                       <div className="grid gap-1 text-xs text-muted-foreground">
-                        <span>{t("dashboard.lastSeen")}: <strong className="text-foreground">{formatDateTime(selected.installation.lastSeenAt)}</strong></span>
+                        <span>URL: <strong className="break-all text-foreground">{selected.clientTunnel?.tunnelUrl || "-"}</strong></span>
+                        <span>Owner: <strong className="text-foreground">{selected.clientTunnel?.ownerEmail || selected.installation.ownerEmail || "-"}</strong></span>
                         <span>{t("dashboard.region")}: <strong className="text-foreground">{selected.installation.countryCode || "-"}</strong></span>
-                        <span>{t("dashboard.platform")}: <strong className="text-foreground">{clientPlatformLabel(selected)}</strong></span>
-                        <span className="break-all">id: {selected.installation.id}</span>
+                        <span>{locale.startsWith("zh") ? "版本" : "Version"}: <strong className="text-foreground">{clientPlatformLabel(selected)}</strong></span>
+                        <span>{t("dashboard.online")}: <strong className="text-foreground">{(selected.onlineRate24h || 0).toFixed(1)}% / {formatMinutesShort(selected.onlineMinutes24h || 0, locale)}</strong></span>
                       </div>
                     </DrawerSection>
                     {/* P14：完整的 provider 列表上移到 client 抽屉；share 抽屉只看 share 自己绑的那部分。 */}
@@ -1875,7 +1895,7 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
                 {selected ? (
                   <div className="grid gap-4">
                     <DrawerSection label="24h"><HealthTimelineStrip timeline={selected.healthTimeline} /></DrawerSection>
-                    <DrawerSection label={t("dashboard.linkedShares")}><MarketLinkedShares market={selected} t={t} locale={locale} /></DrawerSection>
+                    <DrawerSection label={t("dashboard.linkedShares")}><MarketLinkedShares market={selected} t={t} /></DrawerSection>
                     <DrawerSection label={t("dashboard.recentRequests")}><MarketRequestLogs logs={selected.recentRequests || []} /></DrawerSection>
                   </div>
                 ) : null}
@@ -2143,11 +2163,11 @@ function ShareMarkets({ share, t }: { share?: ShareView; t: TFn }) {
   if (!share) return <EmptyBlock>{t("dashboard.noShare")}</EmptyBlock>;
   if (share.forSale === "Free") return <EmptyBlock>{t("dashboard.publicFreeShare")}</EmptyBlock>;
   if (share.forSale !== "Yes") return <EmptyBlock>{t("dashboard.notForSale")}</EmptyBlock>;
+  if (share.marketAccessMode === "all") return <EmptyBlock>{t("dashboard.authorizedAllMarkets")}</EmptyBlock>;
   const links = share.marketLinks || [];
   const unknown = share.unknownMarketEmails || [];
   return (
     <div className="grid gap-2">
-      {share.marketAccessMode === "all" ? <EmptyBlock>{t("dashboard.authorizedAllMarkets")}</EmptyBlock> : null}
       {links.map((market) => (
         <Card key={market.id || market.email} className="rounded-lg border p-0 shadow-none">
           <Card.Content className="flex-row items-center justify-between gap-3 p-3">
@@ -2236,9 +2256,12 @@ function ShareProvidersPanel({ share }: { share?: ShareView }) {
   const [selectedKey, setSelectedKey] = React.useState<keyof ShareAppProviders>("claude");
   const providers = share?.appProviders;
   const runtimes = share?.appRuntimes;
-  // 老样式：3 个 app 各自一个 tab，切换后展示该 app 的全量 provider。
-  // 当前绑定的 provider 由 ProviderCard 的 `showCurrentBadge` 渲染 "current" 角标。
-  const currentProviders = providers?.[selectedKey] || [];
+  React.useEffect(() => {
+    const firstBound = PROVIDER_APP_TABS.find((tab) => boundProviderIdForApp(share, tab.key));
+    if (firstBound) setSelectedKey(firstBound.key);
+  }, [share?.shareId]);
+  const boundProviderId = boundProviderIdForApp(share, selectedKey);
+  const currentProviders = (providers?.[selectedKey] || []).filter((provider) => provider.id === boundProviderId);
 
   return (
     <div className="grid gap-3">
@@ -2258,20 +2281,17 @@ function ShareProvidersPanel({ share }: { share?: ShareView }) {
           {currentProviders.map((provider) => {
             const runtime = mergeStandaloneOAuthRuntime(providerRuntime(provider), runtimes, provider);
             return (
-              <ProviderCard
-                key={provider.id}
-                provider={provider}
-                runtime={runtime}
-                t={t}
-                locale={locale}
-                showCurrentBadge
-              />
+              <ProviderCard key={provider.id} provider={provider} runtime={runtime} t={t} locale={locale} showCurrentBadge />
             );
           })}
         </div>
       )}
     </div>
   );
+}
+
+function boundProviderIdForApp(share: ShareView | undefined, app: keyof ShareAppProviders) {
+  return share?.bindings?.[app] || (share?.appType === app ? share.providerId : undefined);
 }
 
 /**
@@ -2432,7 +2452,7 @@ function TokenGrid({ log }: { log: ShareRequestLog | MarketRequestLog }) {
   );
 }
 
-function MarketLinkedShares({ market, t, locale }: { market: DashboardMarket; t: TFn; locale: AppLocale }) {
+function MarketLinkedShares({ market, t }: { market: DashboardMarket; t: TFn }) {
   const shares = market.linkedShares || [];
   if (!shares.length) return <EmptyBlock>{t("dashboard.noLinkedShares")}</EmptyBlock>;
   const availabilityTitle = (app: string, availability?: MarketAppAvailabilityEntry) => {
@@ -2453,7 +2473,6 @@ function MarketLinkedShares({ market, t, locale }: { market: DashboardMarket; t:
           ["codex", "Codex"],
           ["gemini", "Gemini"],
         ].filter(([key]) => share.support?.[key as keyof typeof share.support]);
-        const oauthSupported = OAUTH_RUNTIME_ROWS.filter(([key]) => share.appRuntimes?.[key]);
         return (
           <Card key={share.shareId} className={`rounded-lg border p-0 shadow-none ${share.disabledByMarket ? "border-amber-200 bg-amber-50/40" : ""}`}>
             <Card.Content className="flex-row items-center justify-between gap-3 p-3">
@@ -2498,25 +2517,6 @@ function MarketLinkedShares({ market, t, locale }: { market: DashboardMarket; t:
                           variant={unavailable ? "soft" : "tertiary"}
                         >
                           {label}
-                        </Chip>
-                      );
-                    })}
-                  </div>
-                ) : null}
-                {oauthSupported.length ? (
-                  <div className="flex flex-wrap justify-end gap-1">
-                    {oauthSupported.map(([key, label]) => {
-                      const runtime = share.appRuntimes?.[key];
-                      const level = providerAccountLevel(runtime, locale);
-                      return (
-                        <Chip
-                          key={key}
-                          color="default"
-                          size="sm"
-                          title={[label, level, providerAccountIdentity(runtime)].filter(Boolean).join(" · ")}
-                          variant="tertiary"
-                        >
-                          {level && level !== "-" ? `${label} ${level}` : label}
                         </Chip>
                       );
                     })}

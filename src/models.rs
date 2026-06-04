@@ -322,6 +322,70 @@ pub struct GetInstallationOwnerEmailResponse {
     pub owner_email: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientTunnelConfig {
+    pub owner_email: String,
+    pub subdomain: String,
+    #[serde(default = "default_client_tunnel_enabled")]
+    pub enabled: bool,
+}
+
+fn default_client_tunnel_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientTunnelQuery {
+    pub installation_id: String,
+    pub timestamp_ms: i64,
+    pub nonce: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientTunnelClaimRequest {
+    pub installation_id: String,
+    pub timestamp_ms: i64,
+    pub nonce: String,
+    pub signature: String,
+    pub tunnel: ClientTunnelConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientTunnelUpdateRequest {
+    pub installation_id: String,
+    pub timestamp_ms: i64,
+    pub nonce: String,
+    pub signature: String,
+    pub tunnel: ClientTunnelConfig,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientTunnelResponse {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel: Option<ClientTunnelView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientTunnelView {
+    pub installation_id: String,
+    pub owner_email: String,
+    pub subdomain: String,
+    pub enabled: bool,
+    pub tunnel_url: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IssueLeaseRequest {
@@ -1339,6 +1403,8 @@ pub struct InstallationView {
     pub platform: String,
     pub app_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub country_code: Option<String>,
@@ -1350,6 +1416,8 @@ pub struct InstallationView {
 #[serde(rename_all = "camelCase")]
 pub struct DashboardClientView {
     pub installation: InstallationView,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_tunnel: Option<DashboardClientTunnelView>,
     /// 该 installation 名下挂的所有 active share id 列表。
     /// 前端 ClientsTable 用它展示 `#shares` 列，并在抽屉里反查顶层 `shares`
     /// 渲染该机器的所有 share 摘要。Share 维度的元数据（owner / status / 健康）
@@ -1359,6 +1427,24 @@ pub struct DashboardClientView {
     /// 与 `share_ids.len()` 等价的便利字段，避免前端做长度调用。
     #[serde(default)]
     pub share_count: usize,
+    #[serde(default)]
+    pub online_minutes_24h: usize,
+    #[serde(default)]
+    pub online_rate_24h: f64,
+    #[serde(default)]
+    pub health_checks: Vec<HealthCheckEntry>,
+    #[serde(default)]
+    pub health_timeline: Vec<HealthTimelineBucket>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DashboardClientTunnelView {
+    pub owner_email: String,
+    pub subdomain: String,
+    pub tunnel_url: String,
+    pub enabled: bool,
+    pub online: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

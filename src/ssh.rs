@@ -17,7 +17,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::metrics::MetricsRegistry;
-use crate::proxy::{ProxyRegistry, RouteShutdown};
+use crate::proxy::{ProxyRegistry, RouteKind, RouteShutdown};
 use crate::store::AppStore;
 
 #[derive(Clone)]
@@ -270,11 +270,20 @@ impl server::Handler for ClientHandler {
             .map(|s| s.for_sale == "Free")
             .unwrap_or(false);
         let parallel_limit = lease.share.as_ref().map(|s| s.parallel_limit).unwrap_or(-1);
+        let route_kind = if lease.tunnel_type == "client-web-http" {
+            RouteKind::ClientWeb
+        } else if share_id.is_some() {
+            RouteKind::Share
+        } else {
+            RouteKind::Market
+        };
         let (route_shutdown, shutdown_rx) = RouteShutdown::new();
         self.proxy
-            .set_route(
+            .set_route_with_kind(
                 lease.subdomain.clone(),
                 backend.clone(),
+                route_kind,
+                Some(lease.installation_id.clone()),
                 Some(lease.connection_id.clone()),
                 share_id,
                 lease.share.as_ref().map(|s| s.share_name.clone()),

@@ -54,15 +54,27 @@ export type DashboardClient = {
     id: string;
     platform: string;
     appVersion: string;
+    ownerEmail?: string;
     region?: string;
     countryCode?: string;
     createdAt: string;
     lastSeenAt: string;
   };
+  clientTunnel?: {
+    ownerEmail: string;
+    subdomain: string;
+    tunnelUrl: string;
+    enabled: boolean;
+    online: boolean;
+  };
   /** 该 installation 名下所有 share 的 id 集合（多 share 模式）。 */
   shareIds?: string[];
   /** 该 installation 名下 share 总数；等价于 shareIds.length。 */
   shareCount?: number;
+  onlineMinutes24h?: number;
+  onlineRate24h?: number;
+  healthChecks?: HealthCheckEntry[];
+  healthTimeline?: HealthTimelineBucket[];
 };
 
 export type ShareView = {
