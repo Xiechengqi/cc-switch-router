@@ -89,6 +89,25 @@ export async function updateMarketMaintenance(
   );
 }
 
+export async function releaseMarketShareState(
+  marketEmail: string,
+  input: {
+    routerId: string;
+    shareId: string;
+    kind: string;
+    appType?: string;
+    modelId?: string;
+  },
+) {
+  return parseJson<{ ok: boolean; released: number; synced: number }>(
+    await authFetch(`/v1/admin/markets/${encodeURIComponent(marketEmail)}/share-states/release`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    }),
+  );
+}
+
 export async function getSettingsSchema() {
   return parseJson<SettingsSchema>(await authFetch("/v1/admin/settings/schema", { cache: "no-store" }));
 }

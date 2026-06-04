@@ -264,6 +264,7 @@ export type MarketShare = {
   appAvailability?: MarketAppAvailability;
   appRuntimes?: ShareAppRuntimes;
   modelHealth?: ShareModelHealthSummary;
+  marketStates?: MarketShareRuntimeState[];
 };
 
 export type MarketShareRuntimeState = {

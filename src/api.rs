@@ -45,6 +45,7 @@ use crate::models::{
     MarketMaintenanceUpdateRequest, MarketMaintenanceUpdateResponse,
     MarketNotificationEmailLogView, MarketNotificationEmailRequest,
     MarketNotificationEmailResponse, MarketRequestLogBatchSyncRequest,
+    MarketShareRuntimeStateReleaseRequest, MarketShareRuntimeStateReleaseResponse,
     MarketShareRuntimeStateSyncRequest, MarketShareRuntimeStateSyncResponse, MarketShareView,
     MarketsResponse, PostBoardMessageRequest, PublicMapPointsResponse, RefreshSessionRequest,
     RegisterGatewayRequest, RegisterGatewayResponse, RegisterInstallationRequest,
@@ -135,6 +136,10 @@ pub fn router(state: ServerState) -> Router {
         .route(
             "/v1/admin/markets/:market_email/maintenance",
             patch(admin_update_market_maintenance),
+        )
+        .route(
+            "/v1/admin/markets/:market_email/share-states/release",
+            post(admin_release_market_share_state),
         )
         .route(
             "/v1/market/request-logs/batch",
@@ -636,6 +641,89 @@ async fn admin_update_market_maintenance(
         .record_admin_audit(
             Some(&current_user_email),
             "market.maintenance.update",
+            Some(&payload),
+            metadata.ip.as_deref(),
+        )
+        .await;
+    Ok(Json(response))
+}
+
+async fn admin_release_market_share_state(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path(market_email): Path<String>,
+    Json(input): Json<MarketShareRuntimeStateReleaseRequest>,
+) -> Result<Json<MarketShareRuntimeStateReleaseResponse>, AppError> {
+    let current_user_email = require_session_email(&state, &headers).await?;
+    let is_admin = state.dynamic.read().await.is_admin(&current_user_email);
+    let market = state
+        .store
+        .ensure_market_manager(&market_email, &current_user_email, is_admin)
+        .await?;
+    let token = extract_bearer_token(&headers)
+        .ok_or_else(|| AppError::Unauthorized("missing router session bearer token".into()))?;
+    let route = state
+        .proxy
+        .backend_for_host(
+            &format!("{}.{}", market.subdomain, state.config.tunnel_domain),
+            &state.config.tunnel_domain,
+        )
+        .await
+        .ok_or_else(|| AppError::Conflict("market is offline".into()))?;
+    let url = format!(
+        "http://{}/market-api/router/share-states/release",
+        route.route_target()
+    );
+    let response = state
+        .proxy_http
+        .post(&url)
+        .bearer_auth(token)
+        .json(&input)
+        .send()
+        .await
+        .map_err(|err| AppError::Internal(format!("release market share state failed: {err}")))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|err| AppError::Internal(format!("read market release response failed: {err}")))?;
+    if !status.is_success() {
+        let message = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("message")
+                    .and_then(|message| message.as_str())
+                    .or_else(|| {
+                        value
+                            .get("error")
+                            .and_then(|error| error.get("message"))
+                            .and_then(|message| message.as_str())
+                    })
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or(text);
+        return Err(AppError::BadRequest(format!(
+            "market release rejected: {message}"
+        )));
+    }
+    let response: MarketShareRuntimeStateReleaseResponse =
+        serde_json::from_str(&text).map_err(|err| {
+            AppError::Internal(format!("parse market release response failed: {err}"))
+        })?;
+    let metadata = extract_client_metadata(&headers, addr);
+    let payload = serde_json::json!({
+        "marketEmail": market_email,
+        "release": input,
+        "released": response.released,
+        "synced": response.synced,
+    });
+    let _ = state
+        .store
+        .record_admin_audit(
+            Some(&current_user_email),
+            "market.share_state.release",
             Some(&payload),
             metadata.ip.as_deref(),
         )

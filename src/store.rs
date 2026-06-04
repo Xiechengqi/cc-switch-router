@@ -76,6 +76,7 @@ const MARKET_DEFAULT_SCOPES: &[&str] = &[
     "market:email:notify",
     "market:request_logs:write",
     "market:share_states:write",
+    "market:share_states:release",
 ];
 const GATEWAY_DEFAULT_SCOPES: &[&str] = &[
     "gateway:shares:read",
@@ -3765,6 +3766,7 @@ impl AppStore {
                         app_runtimes,
                         model_health,
                         app_availability,
+                        market_states: Vec::new(),
                         signals: ShareSignals {
                             quota_health,
                             stability,
@@ -3862,7 +3864,31 @@ impl AppStore {
     ) -> Result<Vec<MarketShareView>, AppError> {
         self.require_market_manager(market_email, current_user_email, is_admin)
             .await?;
-        self.list_market_shares(market_email, "main", active_subdomains, inflight_by_share)
+        let mut shares = self
+            .list_market_shares(market_email, "main", active_subdomains, inflight_by_share)
+            .await?;
+        let conn = self.conn.lock().await;
+        let states_by_market = list_market_share_runtime_state_map(&conn)?;
+        let states_by_share = states_by_market
+            .get(&normalize_email(market_email)?)
+            .cloned()
+            .unwrap_or_default();
+        for share in &mut shares {
+            share.market_states = states_by_share
+                .get(&share.share_id)
+                .cloned()
+                .unwrap_or_default();
+        }
+        Ok(shares)
+    }
+
+    pub async fn ensure_market_manager(
+        &self,
+        market_email: &str,
+        current_user_email: &str,
+        is_admin: bool,
+    ) -> Result<MarketRegistryRecord, AppError> {
+        self.require_market_manager(market_email, current_user_email, is_admin)
             .await
     }
 
@@ -4089,7 +4115,7 @@ impl AppStore {
         market_email: &str,
         current_user_email: &str,
         is_admin: bool,
-    ) -> Result<(), AppError> {
+    ) -> Result<MarketRegistryRecord, AppError> {
         let normalized_market_email = normalize_email(market_email)?;
         let conn = self.conn.lock().await;
         let market = get_market_by_email(&conn, &normalized_market_email)?
@@ -4099,7 +4125,7 @@ impl AppStore {
                 "only router admin or market owner can manage this market".into(),
             ));
         }
-        Ok(())
+        Ok(market)
     }
 
     pub async fn public_map_points(
@@ -5916,6 +5942,17 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         [],
     )
     .map_err(|e| AppError::Internal(format!("backfill market share state scope failed: {e}")))?;
+    conn.execute(
+        "UPDATE router_markets
+            SET scopes_json = replace(scopes_json, ']', ',\"market:share_states:release\"]')
+          WHERE instr(scopes_json, 'market:share_states:release') = 0",
+        [],
+    )
+    .map_err(|e| {
+        AppError::Internal(format!(
+            "backfill market share state release scope failed: {e}"
+        ))
+    })?;
     let columns = conn
         .prepare("PRAGMA table_info(installations)")
         .and_then(|mut stmt| {

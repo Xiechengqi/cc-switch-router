@@ -5,7 +5,7 @@ import { Button, Card, Checkbox, Chip, Drawer, Input, ListBox, Modal, ProgressBa
 import * as React from "react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { getMarketLinkedShares, updateMarketDisabledShares, updateMarketMaintenance, updateShareSettings } from "@/lib/api";
+import { getMarketLinkedShares, releaseMarketShareState, updateMarketDisabledShares, updateMarketMaintenance, updateShareSettings } from "@/lib/api";
 import type { AppLocale } from "@/lib/i18n";
 import type { DashboardClient, DashboardMarket, HealthCheckEntry, HealthTimelineBucket, MarketAppAvailabilityEntry, MarketRequestLog, MarketShare, MarketShareRuntimeState, ModelHealthSummary, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareModelHealthCheck, ShareRequestLog, ShareSettingsPatch, ShareUpstreamProvider, ShareView } from "@/lib/types";
 import { compactTokens, formatDateTime, formatNumber, formatRelativeTime } from "@/lib/utils";
@@ -1945,6 +1945,21 @@ function isMarketBlockedState(state: MarketShareRuntimeState) {
   return state.kind === "model_block" || state.kind === "capability_block";
 }
 
+function isMarketReleasableState(state: MarketShareRuntimeState) {
+  return state.kind === "cooldown" || isMarketBlockedState(state);
+}
+
+function marketStateKindLabel(state: MarketShareRuntimeState, t: TFn) {
+  if (state.kind === "cooldown") return t("dashboard.cooldown");
+  if (state.kind === "model_block") return t("dashboard.modelBlock");
+  if (state.kind === "capability_block") return t("dashboard.capabilityBlock");
+  return state.kind.replaceAll("_", " ");
+}
+
+function marketStateTargetLabel(state: MarketShareRuntimeState) {
+  return [state.appType, state.modelName || state.modelId].filter(Boolean).join(" / ") || "-";
+}
+
 function marketBlockedStatesByApp(states?: MarketShareRuntimeState[]) {
   const result = new Map<MarketShareAppKey, MarketShareRuntimeState[]>();
   for (const state of states || []) {
@@ -1963,8 +1978,10 @@ function MarketEditDialog({ market, onClose, onSaved }: { market: DashboardMarke
   const [maintenanceEnabled, setMaintenanceEnabled] = React.useState(false);
   const [maintenanceMessage, setMaintenanceMessage] = React.useState("");
   const [busy, setBusy] = React.useState(false);
+  const [releasingKey, setReleasingKey] = React.useState<string | null>(null);
   const [error, setError] = React.useState("");
   const { t } = useLocaleText();
+  const working = busy || !!releasingKey;
 
   const load = React.useCallback(async () => {
     if (!market) return;
@@ -1986,7 +2003,7 @@ function MarketEditDialog({ market, onClose, onSaved }: { market: DashboardMarke
   }, [load]);
 
   async function save(nextIds: Set<string>) {
-    if (!market || busy) return;
+    if (!market || working) return;
     setBusy(true);
     setError("");
     try {
@@ -2003,7 +2020,7 @@ function MarketEditDialog({ market, onClose, onSaved }: { market: DashboardMarke
   }
 
   async function saveMaintenance() {
-    if (!market || busy) return;
+    if (!market || working) return;
     setBusy(true);
     setError("");
     try {
@@ -2021,6 +2038,56 @@ function MarketEditDialog({ market, onClose, onSaved }: { market: DashboardMarke
     }
   }
 
+  const releasableStates = shares.flatMap((share) =>
+    (share.marketStates || [])
+      .filter(isMarketReleasableState)
+      .map((state) => ({ share, state })),
+  );
+
+  async function releaseState(share: MarketShare, state: MarketShareRuntimeState, key: string) {
+    if (!market || working) return;
+    setReleasingKey(key);
+    setError("");
+    try {
+      await releaseMarketShareState(market.email, {
+        routerId: state.routerId || share.routerId || "main",
+        shareId: state.shareId || share.shareId,
+        kind: state.kind,
+        appType: state.appType,
+        modelId: state.modelId,
+      });
+      await load();
+      await onSaved();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setReleasingKey(null);
+    }
+  }
+
+  async function releaseAllStates() {
+    if (!market || working || releasableStates.length === 0) return;
+    setReleasingKey("__all__");
+    setError("");
+    try {
+      for (const { share, state } of releasableStates) {
+        await releaseMarketShareState(market.email, {
+          routerId: state.routerId || share.routerId || "main",
+          shareId: state.shareId || share.shareId,
+          kind: state.kind,
+          appType: state.appType,
+          modelId: state.modelId,
+        });
+      }
+      await load();
+      await onSaved();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setReleasingKey(null);
+    }
+  }
+
   const selectedCount = selectedIds.size;
   const disabledCount = disabledIds.size;
   const disableSelected = () => save(new Set([...Array.from(disabledIds), ...Array.from(selectedIds)]));
@@ -2030,7 +2097,7 @@ function MarketEditDialog({ market, onClose, onSaved }: { market: DashboardMarke
     return save(next);
   };
   return (
-    <Modal isOpen={!!market} onOpenChange={(open) => !open && !busy && onClose()}>
+    <Modal isOpen={!!market} onOpenChange={(open) => !open && !working && onClose()}>
       <Modal.Backdrop>
         <Modal.Container>
           <Modal.Dialog className="share-edit-surface light w-[min(1080px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
@@ -2049,11 +2116,11 @@ function MarketEditDialog({ market, onClose, onSaved }: { market: DashboardMarke
               <Card className="rounded-lg border bg-amber-50/60 p-0 shadow-none">
                 <Card.Content className="grid gap-3 p-3">
                   <div className="flex flex-wrap items-center justify-between gap-3">
-                    <Checkbox isSelected={maintenanceEnabled} onChange={(value: boolean) => setMaintenanceEnabled(value)} isDisabled={busy}>
+                    <Checkbox isSelected={maintenanceEnabled} onChange={(value: boolean) => setMaintenanceEnabled(value)} isDisabled={working}>
                       <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
                       <Checkbox.Content><span className="text-sm font-medium text-slate-900">{t("dashboard.maintenanceMode")}</span></Checkbox.Content>
                     </Checkbox>
-                    <Button size="sm" variant="outline" isDisabled={busy} onClick={saveMaintenance}>
+                    <Button size="sm" variant="outline" isDisabled={working} onClick={saveMaintenance}>
                       {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
                       {t("dashboard.saveMaintenanceMode")}
                     </Button>
@@ -2063,23 +2130,85 @@ function MarketEditDialog({ market, onClose, onSaved }: { market: DashboardMarke
                       value={maintenanceMessage}
                       onChange={(event) => setMaintenanceMessage(event.target.value.slice(0, 240))}
                       placeholder={t("dashboard.maintenancePlaceholder")}
-                      disabled={busy || !maintenanceEnabled}
+                      disabled={working || !maintenanceEnabled}
                     />
                   </FieldGroup>
                 </Card.Content>
               </Card>
+              <Card className="rounded-lg border bg-white p-0 shadow-none">
+                <Card.Content className="grid gap-3 p-3">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-medium text-slate-900">{t("dashboard.blockList")}</div>
+                      <div className="mt-1 text-xs text-muted-foreground">{t("dashboard.blockedStatesCount", { count: releasableStates.length })}</div>
+                    </div>
+                    <Button size="sm" variant="outline" isDisabled={working || releasableStates.length === 0} onClick={releaseAllStates}>
+                      {releasingKey === "__all__" ? <Loader2 className="h-4 w-4 animate-spin" /> : <X className="h-4 w-4" />}
+                      {t("dashboard.releaseAll")}
+                    </Button>
+                  </div>
+                  <div className="overflow-x-auto rounded-lg border">
+                    <table className="w-full min-w-[980px] border-collapse text-sm">
+                      <thead className="bg-muted text-left font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground">
+                        <tr>
+                          <th className="px-3 py-2">{t("dashboard.share")}</th>
+                          <th className="px-3 py-2">{t("dashboard.type")}</th>
+                          <th className="px-3 py-2">{t("dashboard.target")}</th>
+                          <th className="px-3 py-2">{t("dashboard.reason")}</th>
+                          <th className="px-3 py-2">{t("dashboard.expires")}</th>
+                          <th className="px-3 py-2">{t("dashboard.updated")}</th>
+                          <th className="w-28 px-3 py-2"></th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {releasableStates.map(({ share, state }, index) => {
+                          const key = `${state.routerId || share.routerId || "main"}:${state.shareId || share.shareId}:${state.kind}:${state.appType || ""}:${state.modelId || ""}:${index}`;
+                          return (
+                            <tr key={key} className="border-t">
+                              <td className="px-3 py-2 align-middle">
+                                <div className="font-medium">{share.subdomain || share.shareName || "-"}</div>
+                                <div className="font-mono text-[11px] text-muted-foreground">{state.shareId || share.shareId}</div>
+                              </td>
+                              <td className="px-3 py-2 align-middle">
+                                <Chip color={state.kind === "cooldown" ? "warning" : "danger"} size="sm" variant="soft">
+                                  {marketStateKindLabel(state, t)}
+                                </Chip>
+                              </td>
+                              <td className="px-3 py-2 align-middle font-mono text-xs">{marketStateTargetLabel(state)}</td>
+                              <td className="max-w-[260px] px-3 py-2 align-middle">
+                                <div className="truncate" title={marketRuntimeStateTitle(state)}>
+                                  {[state.reasonKind, state.reason, typeof state.failureCount === "number" ? `${state.failureCount}x` : undefined].filter(Boolean).join(" · ") || "-"}
+                                </div>
+                              </td>
+                              <td className="px-3 py-2 align-middle">{state.expiresAt ? formatDateTime(state.expiresAt) : "-"}</td>
+                              <td className="px-3 py-2 align-middle">{formatDateTime(state.updatedAt)}</td>
+                              <td className="px-3 py-2 text-right align-middle">
+                                <Button size="sm" variant="outline" isDisabled={working} onClick={() => releaseState(share, state, key)}>
+                                  {releasingKey === key ? <Loader2 className="h-4 w-4 animate-spin" /> : <X className="h-4 w-4" />}
+                                  {t("dashboard.release")}
+                                </Button>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                        {!releasableStates.length ? <tr><td colSpan={7} className="px-3 py-8 text-center text-muted-foreground">{t("dashboard.noBlockedStates")}</td></tr> : null}
+                      </tbody>
+                    </table>
+                  </div>
+                </Card.Content>
+              </Card>
               <div className="flex flex-wrap items-center gap-2">
-                <Button size="sm" variant="outline" isDisabled={busy || selectedCount === 0} onClick={disableSelected}>
+                <Button size="sm" variant="outline" isDisabled={working || selectedCount === 0} onClick={disableSelected}>
                   {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
                   {t("dashboard.disableSelected")} ({selectedCount})
                 </Button>
-                <Button size="sm" variant="outline" isDisabled={busy || selectedCount === 0} onClick={enableSelected}>
+                <Button size="sm" variant="outline" isDisabled={working || selectedCount === 0} onClick={enableSelected}>
                   {t("dashboard.enableSelected")} ({selectedCount})
                 </Button>
-                <Button size="sm" variant="outline" isDisabled={busy || disabledIds.size === shares.length} onClick={() => save(new Set(shares.map((share) => share.shareId)))}>
+                <Button size="sm" variant="outline" isDisabled={working || disabledIds.size === shares.length} onClick={() => save(new Set(shares.map((share) => share.shareId)))}>
                   {t("dashboard.disableAll")}
                 </Button>
-                <Button size="sm" variant="outline" isDisabled={busy || disabledIds.size === 0} onClick={() => save(new Set())}>
+                <Button size="sm" variant="outline" isDisabled={working || disabledIds.size === 0} onClick={() => save(new Set())}>
                   {t("dashboard.enableAll")}
                 </Button>
               </div>
@@ -2110,7 +2239,7 @@ function MarketEditDialog({ market, onClose, onSaved }: { market: DashboardMarke
                       return (
                         <tr key={share.shareId} className="border-t">
                           <td className="px-3 py-2 align-middle">
-                            <Checkbox isSelected={selected} onChange={() => setSelectedIds(nextSelected)} isDisabled={busy}>
+                            <Checkbox isSelected={selected} onChange={() => setSelectedIds(nextSelected)} isDisabled={working}>
                               <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
                             </Checkbox>
                           </td>
@@ -2141,7 +2270,7 @@ function MarketEditDialog({ market, onClose, onSaved }: { market: DashboardMarke
               </div>
             </Modal.Body>
             <Modal.Footer>
-              <Button variant="outline" onClick={onClose} isDisabled={busy}>{t("common.close")}</Button>
+              <Button variant="outline" onClick={onClose} isDisabled={working}>{t("common.close")}</Button>
             </Modal.Footer>
           </Modal.Dialog>
         </Modal.Container>

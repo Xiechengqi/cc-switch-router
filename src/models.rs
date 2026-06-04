@@ -1008,6 +1008,8 @@ pub struct MarketShareView {
     pub model_health: ShareModelHealthSummary,
     #[serde(default)]
     pub app_availability: MarketAppAvailability,
+    #[serde(default)]
+    pub market_states: Vec<MarketShareRuntimeStateView>,
     /// Router-computed scheduling signals. Markets sort using these directly
     /// (no recomputation) and then layer their profile preferences on top.
     #[serde(default)]
@@ -1581,6 +1583,26 @@ pub struct MarketShareRuntimeStateInput {
 #[serde(rename_all = "camelCase")]
 pub struct MarketShareRuntimeStateSyncResponse {
     pub ok: bool,
+    pub synced: usize,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketShareRuntimeStateReleaseRequest {
+    pub router_id: String,
+    pub share_id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub app_type: Option<String>,
+    #[serde(default)]
+    pub model_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketShareRuntimeStateReleaseResponse {
+    pub ok: bool,
+    pub released: usize,
     pub synced: usize,
 }
 
