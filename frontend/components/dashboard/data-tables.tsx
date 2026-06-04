@@ -121,6 +121,15 @@ function shareApiParts(share?: ShareView) {
   return { apiUrl };
 }
 
+function clientTunnelDisplayUrl(value?: string | null) {
+  const trimmed = String(value || "").trim();
+  if (!trimmed) return "";
+  if (/^http:\/\//i.test(trimmed)) return `https://${trimmed.slice("http://".length)}`;
+  if (/^https:\/\//i.test(trimmed)) return trimmed;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) return trimmed;
+  return `https://${trimmed}`;
+}
+
 function formatUsdOneDecimal(value?: string | number) {
   const amount = Number(value || 0);
   return Number.isFinite(amount) ? `$${amount.toFixed(1)}` : "$0.0";
@@ -1369,7 +1378,7 @@ function ShareStatusCell({ client, share, t, locale }: { client: DashboardClient
 }
 
 function ClientIdentityCell({ client }: { client: DashboardClient }) {
-  const url = client.clientTunnel?.tunnelUrl;
+  const url = clientTunnelDisplayUrl(client.clientTunnel?.tunnelUrl);
   const ownerEmail = client.clientTunnel?.ownerEmail || client.installation.ownerEmail || "-";
   return (
     <div className="grid min-w-72 gap-1">
@@ -1432,6 +1441,7 @@ export function ClientsTable({ clients, shares, markets, onChanged }: { clients:
   const [editingShare, setEditingShare] = React.useState<ShareView | null>(null);
   const { locale, t } = useLocaleText();
   const sorted = sortClients(clients);
+  const selectedClientUrl = clientTunnelDisplayUrl(selected?.clientTunnel?.tunnelUrl);
 
   // shareId → ShareView，让"分享"列内联渲染该 installation 的 share 摘要。
   const shareById = React.useMemo(() => {
@@ -1513,7 +1523,7 @@ export function ClientsTable({ clients, shares, markets, onChanged }: { clients:
               <Drawer.Header>
                 <div>
                   <Drawer.Heading className="break-all font-mono text-base">
-                    {selected?.clientTunnel?.tunnelUrl || "-"}
+                    {selectedClientUrl || "-"}
                   </Drawer.Heading>
                   <p className="mt-1 text-sm text-muted-foreground">
                     {selected?.clientTunnel?.ownerEmail || selected?.installation.ownerEmail || "-"}
@@ -1528,7 +1538,7 @@ export function ClientsTable({ clients, shares, markets, onChanged }: { clients:
                     </DrawerSection>
                     <DrawerSection label="Client">
                       <div className="grid gap-1 text-xs text-muted-foreground">
-                        <span>URL: <strong className="break-all text-foreground">{selected.clientTunnel?.tunnelUrl || "-"}</strong></span>
+                        <span>URL: <strong className="break-all text-foreground">{selectedClientUrl || "-"}</strong></span>
                         <span>Owner: <strong className="text-foreground">{selected.clientTunnel?.ownerEmail || selected.installation.ownerEmail || "-"}</strong></span>
                         <span>{t("dashboard.region")}: <strong className="text-foreground">{selected.installation.countryCode || "-"}</strong></span>
                         <span>{locale.startsWith("zh") ? "版本" : "Version"}: <strong className="text-foreground">{clientPlatformLabel(selected)}</strong></span>
