@@ -9,6 +9,7 @@ import { LoginDialog } from "@/components/auth/login-dialog";
 import { Toast } from "@heroui/react";
 import { AuthProvider, useAuth } from "@/components/auth/auth-provider";
 import { LocaleProvider, useLocaleText } from "@/components/i18n/locale-provider";
+import { refreshAccessToken } from "@/lib/auth";
 import { getDashboard, getUserApiToken, resetUserApiToken } from "@/lib/api";
 import type { AppLocale } from "@/lib/i18n";
 import type { DashboardResponse, UserApiTokenStatus } from "@/lib/types";
@@ -80,6 +81,20 @@ function currentRegionName(regions: RegionOption[]) {
     }
   });
   return matched?.name || "";
+}
+
+function sameRouterDomainClientRedirect(raw: string | null) {
+  if (!raw || typeof window === "undefined") return null;
+  try {
+    const target = new URL(raw);
+    const current = window.location;
+    if (!["http:", "https:"].includes(target.protocol)) return null;
+    if (target.hostname === current.hostname) return null;
+    if (!target.hostname.endsWith(`.${current.hostname}`)) return null;
+    return target.toString();
+  } catch {
+    return null;
+  }
 }
 
 function RouterSwitcher() {
@@ -292,7 +307,28 @@ function Topbar({ active }: { active: "dashboard" | "settings" | "metrics" }) {
   const { t } = useLocaleText();
   const [loginOpen, setLoginOpen] = React.useState(false);
   const [apiTokenOpen, setApiTokenOpen] = React.useState(false);
+  const [clientRedirect, setClientRedirect] = React.useState<string | null>(null);
+  const redirectStartedRef = React.useRef(false);
   const authed = !!session?.authenticated;
+
+  React.useEffect(() => {
+    setClientRedirect(sameRouterDomainClientRedirect(new URLSearchParams(window.location.search).get("clientRedirect")));
+  }, []);
+
+  React.useEffect(() => {
+    if (!clientRedirect || loading || authed) return;
+    setLoginOpen(true);
+  }, [authed, clientRedirect, loading]);
+
+  React.useEffect(() => {
+    if (!clientRedirect || loading || !authed || redirectStartedRef.current) return;
+    redirectStartedRef.current = true;
+    refreshAccessToken()
+      .catch(() => false)
+      .finally(() => {
+        window.location.replace(clientRedirect);
+      });
+  }, [authed, clientRedirect, loading]);
 
   return (
     <header className="mx-auto flex w-[calc(100%-2rem)] max-w-7xl items-center justify-between gap-4 py-5">
