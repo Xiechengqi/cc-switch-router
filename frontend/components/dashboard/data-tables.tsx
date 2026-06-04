@@ -1115,6 +1115,40 @@ function ShareEditDialog({
                   </FieldGroup>
                 </div>
 
+                <div className="grid gap-1.5 text-sm">
+                  <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                    <span className="mono-label text-muted-foreground">{t("dashboard.field.modelPricing")}</span>
+                    <span className="text-xs text-muted-foreground">{t("dashboard.hint.modelPricing")}</span>
+                  </div>
+                  <div className="grid gap-3 sm:grid-cols-3">
+                    {PRICE_APPS.map((app) => {
+                      const supported = !!share?.support?.[app.key];
+                      const hint = providerHint(share?.appRuntimes?.[app.key]);
+                      return (
+                        <div key={app.key} className="grid gap-1">
+                          <span className="mono-label text-muted-foreground">{app.label}</span>
+                          <Input
+                            type="number"
+                            min={1}
+                            max={100}
+                            step={1}
+                            value={priceInputs[app.key]}
+                            disabled={readOnly || !supported}
+                            placeholder={supported ? t("common.unset") : t("dashboard.noCurrentNode")}
+                            onChange={(event) =>
+                              setPriceInputs((current) => ({ ...current, [app.key]: event.target.value }))
+                            }
+                          />
+                          <span className="truncate text-[11px] text-muted-foreground">{hint || "-"}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {pricingInvalid ? (
+                    <span className="text-xs text-red-600">{t("dashboard.fieldInvalid")}</span>
+                  ) : null}
+                </div>
+
                 {forSale === "Yes" && marketAccessMode === "selected" ? (
                   <FieldGroup label={t("dashboard.field.selectedMarkets")} hint={t("dashboard.hint.selectedMarkets")}>
                     {selectedMarketEmails.length ? (
@@ -1179,7 +1213,7 @@ function ShareEditDialog({
 	                  />
                 </FieldGroup>
 
-                <div className="grid gap-3 sm:grid-cols-2">
+                <div className="grid gap-3 md:grid-cols-3">
                   <FieldGroup label={t("dashboard.field.tokenLimit")} invalid={tokenInvalid}>
                     <div className="grid gap-2">
                       <Input
@@ -1231,59 +1265,26 @@ function ShareEditDialog({
                       </Checkbox>
                     </div>
                   </FieldGroup>
-                </div>
 
-                <FieldGroup label={t("dashboard.field.expiresAt")} invalid={expiryInvalid}>
-                  <div className="grid gap-2">
-                    <Input
-                      type="datetime-local"
-	                      value={expiresAtInput}
-	                      disabled={readOnly || expiresPermanent}
-	                      onChange={(event) => setExpiresAtInput(event.target.value)}
-                    />
-                    <Checkbox
-	                      isSelected={expiresPermanent}
-	                      onChange={(value: boolean) => setExpiresPermanent(value)}
-                        isDisabled={readOnly}
-	                    >
-                      <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
-                      <Checkbox.Content><span className="text-xs text-muted-foreground">{t("dashboard.permanent")}</span></Checkbox.Content>
-                    </Checkbox>
-                  </div>
-                </FieldGroup>
-
-                <FieldGroup
-                  label={t("dashboard.field.modelPricing")}
-                  hint={t("dashboard.hint.modelPricing")}
-                  invalid={pricingInvalid}
-                >
-                  <div className="grid gap-3">
-                    <div className="grid gap-3 sm:grid-cols-3">
-                      {PRICE_APPS.map((app) => {
-                        const supported = !!share?.support?.[app.key];
-                        const hint = providerHint(share?.appRuntimes?.[app.key]);
-                        return (
-                          <div key={app.key} className="grid gap-1">
-                            <span className="mono-label text-muted-foreground">{app.label}</span>
-                            <Input
-                              type="number"
-                              min={1}
-                              max={100}
-                              step={1}
-	                              value={priceInputs[app.key]}
-	                              disabled={readOnly || !supported}
-                              placeholder={supported ? t("common.unset") : t("dashboard.noCurrentNode")}
-                              onChange={(event) =>
-                                setPriceInputs((current) => ({ ...current, [app.key]: event.target.value }))
-                              }
-                            />
-                            <span className="truncate text-[11px] text-muted-foreground">{hint || "-"}</span>
-                          </div>
-                        );
-                      })}
+                  <FieldGroup label={t("dashboard.field.expiresAt")} invalid={expiryInvalid}>
+                    <div className="grid gap-2">
+                      <Input
+                        type="datetime-local"
+	                        value={expiresAtInput}
+	                        disabled={readOnly || expiresPermanent}
+	                        onChange={(event) => setExpiresAtInput(event.target.value)}
+                      />
+                      <Checkbox
+	                        isSelected={expiresPermanent}
+	                        onChange={(value: boolean) => setExpiresPermanent(value)}
+                          isDisabled={readOnly}
+	                      >
+                        <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
+                        <Checkbox.Content><span className="text-xs text-muted-foreground">{t("dashboard.permanent")}</span></Checkbox.Content>
+                      </Checkbox>
                     </div>
-                  </div>
-                </FieldGroup>
+                  </FieldGroup>
+                </div>
               </Modal.Body>
               <Modal.Footer>
 	                <Button variant="outline" onClick={onClose} isDisabled={busy}>{readOnly ? t("common.close") : t("common.cancel")}</Button>
