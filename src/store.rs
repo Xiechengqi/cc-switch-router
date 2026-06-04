@@ -973,20 +973,6 @@ impl AppStore {
         ensure_subdomain_not_claimed_by_share(&conn, &subdomain)?;
         let installation = get_installation(&conn, &installation_id)?
             .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
-        let installation_owner = installation
-            .owner_email
-            .as_deref()
-            .ok_or_else(|| AppError::Unauthorized("installation owner email is required".into()))?;
-        if installation.owner_verified_at.is_none() {
-            return Err(AppError::Unauthorized(
-                "installation owner email must be verified".into(),
-            ));
-        }
-        if installation_owner != owner_email {
-            return Err(AppError::Forbidden(
-                "client tunnel ownerEmail must equal installation owner email".into(),
-            ));
-        }
         let signed_payload = ClientTunnelConfig {
             owner_email,
             subdomain: subdomain.clone(),
@@ -1005,6 +991,17 @@ impl AppStore {
         let should_refresh_geo =
             should_refresh_installation_geo(&installation, metadata.ip.as_deref());
         touch_installation_presence(&conn, &installation_id, &metadata, now)?;
+        conn.execute(
+            "UPDATE installations
+                SET owner_email = ?2, owner_verified_at = ?3
+              WHERE id = ?1",
+            params![
+                &installation_id,
+                &signed_payload.owner_email,
+                now.to_rfc3339()
+            ],
+        )
+        .map_err(|e| AppError::Internal(format!("update installation owner email failed: {e}")))?;
         conn.execute(
             "INSERT INTO installation_client_tunnels (
                 installation_id, owner_email, subdomain, enabled, created_at, updated_at, last_seen_at
