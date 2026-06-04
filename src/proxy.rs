@@ -1182,62 +1182,55 @@ pub async fn proxy_handler(
             );
             return simple_response(StatusCode::NOT_FOUND, "non-api-path");
         }
-        let session = match crate::api::resolve_router_session(&state, &parts.headers).await {
-            Ok(Some(session)) => session,
-            Ok(None) => {
-                if matches!(method, axum::http::Method::GET | axum::http::Method::HEAD)
-                    && is_client_web_document_path(&path)
-                {
-                    return client_web_login_redirect(
-                        &state.config.tunnel_domain,
-                        &host,
-                        &path_and_query,
+        if is_client_web_auth_required_path(&path) {
+            let owner_email = match state
+                .store
+                .client_tunnel_owner_email(&route.subdomain)
+                .await
+            {
+                Ok(Some(email)) => email,
+                Ok(None) => {
+                    return simple_response(StatusCode::NOT_FOUND, "client-tunnel-not-found");
+                }
+                Err(err) => {
+                    warn!(
+                        method = %method,
+                        host = %host,
+                        path = %path_and_query,
+                        subdomain = %route.subdomain,
+                        error = %err,
+                        "proxy request rejected: client tunnel owner lookup failed"
+                    );
+                    return simple_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "client-tunnel-lookup-failed",
                     );
                 }
-                return simple_response(StatusCode::UNAUTHORIZED, "login-required");
+            };
+            let session =
+                match resolve_client_web_bearer(&state, &parts.headers, &owner_email).await {
+                    Ok(Some(session)) => session,
+                    Ok(None) => return simple_response(StatusCode::UNAUTHORIZED, "login-required"),
+                    Err(err) => {
+                        warn!(
+                            method = %method,
+                            host = %host,
+                            path = %path_and_query,
+                            client_ip = %user_ip,
+                            client_country = %user_country,
+                            client_asn = %user_asn,
+                            user_agent = %user_agent,
+                            error = %err,
+                            "proxy request rejected: client web auth lookup failed"
+                        );
+                        return simple_response(StatusCode::UNAUTHORIZED, "login-required");
+                    }
+                };
+            if session.0 != owner_email && !session.1 {
+                return simple_response(StatusCode::FORBIDDEN, "client-web-forbidden");
             }
-            Err(err) => {
-                warn!(
-                    method = %method,
-                    host = %host,
-                    path = %path_and_query,
-                    client_ip = %user_ip,
-                    client_country = %user_country,
-                    client_asn = %user_asn,
-                    user_agent = %user_agent,
-                    error = %err,
-                    "proxy request rejected: client web session lookup failed"
-                );
-                return simple_response(StatusCode::UNAUTHORIZED, "login-required");
-            }
-        };
-        let owner_email = match state
-            .store
-            .client_tunnel_owner_email(&route.subdomain)
-            .await
-        {
-            Ok(Some(email)) => email,
-            Ok(None) => return simple_response(StatusCode::NOT_FOUND, "client-tunnel-not-found"),
-            Err(err) => {
-                warn!(
-                    method = %method,
-                    host = %host,
-                    path = %path_and_query,
-                    subdomain = %route.subdomain,
-                    error = %err,
-                    "proxy request rejected: client tunnel owner lookup failed"
-                );
-                return simple_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "client-tunnel-lookup-failed",
-                );
-            }
-        };
-        let is_admin = state.dynamic.read().await.is_admin(&session.email);
-        if session.email != owner_email && !is_admin {
-            return simple_response(StatusCode::FORBIDDEN, "client-web-forbidden");
+            client_web_session = Some(session);
         }
-        client_web_session = Some((session.email, is_admin));
     }
     if is_health_check_request
         && state
@@ -1747,6 +1740,9 @@ fn is_allowed_client_web_path(path: &str) -> bool {
     (path == "/"
         || path == "/favicon.ico"
         || path.starts_with("/assets/")
+        || path == "/web-api/auth/email/request-code"
+        || path == "/web-api/auth/email/verify-code"
+        || path == "/web-api/auth/session/refresh"
         || path == "/web-api/context"
         || path.starts_with("/web-api/invoke/"))
         && !path.starts_with("/_ctl/")
@@ -1754,30 +1750,46 @@ fn is_allowed_client_web_path(path: &str) -> bool {
         && !is_allowed_direct_share_api_path(path)
 }
 
-fn is_client_web_document_path(path: &str) -> bool {
-    path == "/" || path == "/index.html"
+fn is_client_web_auth_required_path(path: &str) -> bool {
+    path == "/web-api/context" || path.starts_with("/web-api/invoke/")
 }
 
-fn client_web_login_redirect(tunnel_domain: &str, host: &str, path_and_query: &str) -> Response {
-    let scheme = if tunnel_domain.starts_with("localhost")
-        || tunnel_domain.starts_with("127.")
-        || tunnel_domain.starts_with("[::1]")
-    {
-        "http"
-    } else {
-        "https"
+async fn resolve_client_web_bearer(
+    state: &ServerState,
+    headers: &HeaderMap,
+    owner_email: &str,
+) -> Result<Option<(String, bool)>, crate::error::AppError> {
+    let Some(token) = client_web_bearer_token(headers) else {
+        return Ok(None);
     };
-    let target = format!("{scheme}://{host}{path_and_query}");
-    let query = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("clientRedirect", &target)
-        .finish();
-    let location = format!("{scheme}://{tunnel_domain}/?{query}");
-    let mut response = Response::new(Body::empty());
-    *response.status_mut() = StatusCode::FOUND;
-    if let Ok(value) = HeaderValue::from_str(&location) {
-        response.headers_mut().insert(header::LOCATION, value);
+    if let Some(session) = state.store.resolve_session_by_access_token(token).await? {
+        let email = session.email;
+        let is_admin = state.dynamic.read().await.is_admin(&email);
+        return Ok(Some((email, is_admin)));
     }
-    response
+    if let Some(principal) = state
+        .store
+        .resolve_user_api_token(token, "share:read")
+        .await?
+    {
+        let email = principal.email;
+        let is_admin = state.dynamic.read().await.is_admin(&email);
+        if email == owner_email || is_admin {
+            return Ok(Some((email, is_admin)));
+        }
+        return Ok(Some((email, false)));
+    }
+    Ok(None)
+}
+
+fn client_web_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    bearer_token(headers).or_else(|| {
+        ["x-api-key", "x-goog-api-key", "api-key"]
+            .iter()
+            .find_map(|name| headers.get(*name).and_then(|value| value.to_str().ok()))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {

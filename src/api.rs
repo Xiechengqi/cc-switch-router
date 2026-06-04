@@ -175,6 +175,10 @@ pub fn router(state: ServerState) -> Router {
         )
         .route("/v1/auth/email/request-code", post(request_email_code))
         .route("/v1/auth/email/verify-code", post(verify_email_code))
+        .route(
+            "/v1/client-web/auth/email/verify-code",
+            post(verify_client_web_email_code),
+        )
         .route("/v1/auth/session/refresh", post(refresh_session))
         .route("/v1/auth/session/me", get(session_me))
         .route("/share-api/context", get(share_api_context))
@@ -1265,6 +1269,15 @@ async fn verify_email_code(
 ) -> Result<Response, AppError> {
     let response = state.store.verify_email_code(&state.config, input).await?;
     Ok(with_session_cookie(&state, Json(response)))
+}
+
+async fn verify_client_web_email_code(
+    State(state): State<ServerState>,
+    Json(input): Json<VerifyEmailCodeRequest>,
+) -> Result<Json<VerifyEmailCodeResponse>, AppError> {
+    Ok(Json(
+        state.store.verify_email_code(&state.config, input).await?,
+    ))
 }
 
 async fn refresh_session(
