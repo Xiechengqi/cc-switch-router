@@ -1914,13 +1914,17 @@ function runtimePriceLabel(share: MarketShare, key: keyof ShareAppRuntimes) {
   return typeof value === "number" ? `${value}%` : "-";
 }
 
-function marketRuntimeStateLabel(state: MarketShareRuntimeState, t: TFn) {
-  if (state.kind === "cooldown") return t("dashboard.marketCooldown");
-  if (state.kind === "model_block") return t("dashboard.modelBlocked");
-  if (state.kind === "capability_block") {
-    return state.appType ? `${state.appType} ${t("dashboard.blocked")}` : t("dashboard.capabilityBlocked");
-  }
-  return state.kind.replace(/_/g, " ");
+const MARKET_SHARE_APPS = [
+  ["claude", "Claude"],
+  ["codex", "Codex"],
+  ["gemini", "Gemini"],
+] as const;
+
+type MarketShareAppKey = (typeof MARKET_SHARE_APPS)[number][0];
+
+function marketShareAppKey(value?: string | null): MarketShareAppKey | null {
+  const normalized = (value || "").trim().toLowerCase();
+  return MARKET_SHARE_APPS.some(([key]) => key === normalized) ? (normalized as MarketShareAppKey) : null;
 }
 
 function marketRuntimeStateTitle(state: MarketShareRuntimeState) {
@@ -1937,8 +1941,19 @@ function marketRuntimeStateTitle(state: MarketShareRuntimeState) {
   return parts.join(" · ");
 }
 
-function marketRuntimeStateColor(state: MarketShareRuntimeState): "warning" | "danger" {
-  return state.kind === "cooldown" ? "warning" : "danger";
+function isMarketBlockedState(state: MarketShareRuntimeState) {
+  return state.kind === "model_block" || state.kind === "capability_block";
+}
+
+function marketBlockedStatesByApp(states?: MarketShareRuntimeState[]) {
+  const result = new Map<MarketShareAppKey, MarketShareRuntimeState[]>();
+  for (const state of states || []) {
+    if (!isMarketBlockedState(state)) continue;
+    const app = marketShareAppKey(state.appType);
+    if (!app) continue;
+    result.set(app, [...(result.get(app) || []), state]);
+  }
+  return result;
 }
 
 function MarketEditDialog({ market, onClose, onSaved }: { market: DashboardMarket | null; onClose: () => void; onSaved: () => Promise<void> }) {
@@ -2465,14 +2480,16 @@ function MarketLinkedShares({ market, t }: { market: DashboardMarket; t: TFn }) 
     ].filter(Boolean);
     return parts.join(" · ");
   };
+  const appTitle = (label: string, availability: MarketAppAvailabilityEntry | undefined, blockedStates: MarketShareRuntimeState[]) => {
+    const lines = [availabilityTitle(label, availability)];
+    blockedStates.forEach((state) => lines.push(marketRuntimeStateTitle(state)));
+    return lines.join("\n");
+  };
   return (
     <div className="grid gap-2">
       {shares.map((share) => {
-        const supported = [
-          ["claude", "Claude"],
-          ["codex", "Codex"],
-          ["gemini", "Gemini"],
-        ].filter(([key]) => share.support?.[key as keyof typeof share.support]);
+        const blockedByApp = marketBlockedStatesByApp(share.marketStates);
+        const visibleApps = MARKET_SHARE_APPS.filter(([key]) => share.support?.[key as keyof typeof share.support] || blockedByApp.has(key));
         return (
           <Card key={share.shareId} className={`rounded-lg border p-0 shadow-none ${share.disabledByMarket ? "border-amber-200 bg-amber-50/40" : ""}`}>
             <Card.Content className="flex-row items-center justify-between gap-3 p-3">
@@ -2483,38 +2500,20 @@ function MarketLinkedShares({ market, t }: { market: DashboardMarket; t: TFn }) 
               <div className="grid justify-items-end gap-1">
                 <Chip color={share.online ? "success" : "default"} size="sm" variant={share.online ? "soft" : "tertiary"}>{share.online ? t("common.online") : t("common.offline")}</Chip>
                 {share.disabledByMarket ? <Chip color="warning" size="sm" variant="soft">{t("dashboard.disabled")}</Chip> : null}
-                {share.marketStates?.length ? (
-                  <div className="flex flex-wrap justify-end gap-1">
-                    {share.marketStates.slice(0, 4).map((state, index) => (
-                      <Chip
-                        key={`${state.scope}-${state.kind}-${state.appType || ""}-${state.modelId || state.modelName || ""}-${index}`}
-                        color={marketRuntimeStateColor(state)}
-                        size="sm"
-                        title={marketRuntimeStateTitle(state)}
-                        variant="soft"
-                      >
-                        {marketRuntimeStateLabel(state, t)}
-                      </Chip>
-                    ))}
-                    {share.marketStates.length > 4 ? (
-                      <Chip color="warning" size="sm" title={share.marketStates.map((state) => marketRuntimeStateTitle(state)).join("\n")} variant="soft">
-                        +{share.marketStates.length - 4}
-                      </Chip>
-                    ) : null}
-                  </div>
-                ) : null}
-                {supported.length ? (
+                {visibleApps.length ? (
                   <div className="flex gap-1">
-                    {supported.map(([key, label]) => {
+                    {visibleApps.map(([key, label]) => {
                       const availability = share.appAvailability?.[key as keyof typeof share.appAvailability];
+                      const blockedStates = blockedByApp.get(key) || [];
+                      const blocked = blockedStates.length > 0;
                       const unavailable = availability?.status === "unavailable";
                       return (
                         <Chip
                           key={label}
-                          color={unavailable ? "danger" : "default"}
+                          color={blocked || unavailable ? "danger" : "default"}
                           size="sm"
-                          title={availabilityTitle(label, availability)}
-                          variant={unavailable ? "soft" : "tertiary"}
+                          title={appTitle(label, availability, blockedStates)}
+                          variant={blocked || unavailable ? "soft" : "tertiary"}
                         >
                           {label}
                         </Chip>
