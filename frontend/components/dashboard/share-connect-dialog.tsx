@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Button, Modal } from "@heroui/react";
+import { Button, Modal, toast } from "@heroui/react";
 import { Copy, ExternalLink, LogIn, Mail } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
@@ -276,10 +276,13 @@ function CopyButton({
       await navigator.clipboard.writeText(value);
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1500);
+      // P18.2: Toast.Provider 已挂在 app-shell 顶层，直接发个 success toast
+      // 让"已复制"反馈从 top-end 划进来，比按钮上的 tooltip 切换更直观。
+      toast.success(t("dashboard.connectDialog.copyOk"));
     } catch {
       // 静默失败：用户可以手动复制——别用 alert 打断。
     }
-  }, [value]);
+  }, [value, t]);
   return (
     <button
       type="button"
