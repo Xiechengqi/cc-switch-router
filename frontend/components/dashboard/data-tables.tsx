@@ -1462,7 +1462,8 @@ function ClientStatusCell({ client, t, locale }: { client: DashboardClient; t: T
   const region = client.installation.countryCode || client.installation.region || "-";
   const onlineMinutes = client.onlineMinutes24h || 0;
   const onlineRate = client.onlineRate24h || 0;
-  const onlineTitle = `${onlineMinutes} / 1440 min with successful route probes in last 24h`;
+  const sinceRegistered = formatAgeDaysOrHours(client.installation.createdAt, locale);
+  const onlineTitle = `${onlineRate.toFixed(1)}% online in last 24h (${onlineMinutes} / 1440 min) · registered ${client.installation.createdAt || "--"}`;
   return (
     <div className="grid min-w-52 gap-2 text-sm">
       <div className={rowClass}>
@@ -1478,7 +1479,7 @@ function ClientStatusCell({ client, t, locale }: { client: DashboardClient; t: T
       <div className={rowClass}>
         <span className="mono-label text-muted-foreground">{t("dashboard.online")}</span>
         <strong title={onlineTitle}>
-          {onlineRate.toFixed(1)}% / {formatMinutesShort(onlineMinutes, locale)}
+          {onlineRate.toFixed(1)}% / {sinceRegistered}
         </strong>
       </div>
       <div className={rowClass}>
@@ -1669,7 +1670,7 @@ export function ClientsTable({ clients, shares, markets, onChanged }: { clients:
                         <span>Owner: <strong className="text-foreground">{selected.clientTunnel?.ownerEmail || selected.installation.ownerEmail || "-"}</strong></span>
                         <span>{t("dashboard.region")}: <strong className="text-foreground">{selected.installation.countryCode || "-"}</strong></span>
                         <span>{locale.startsWith("zh") ? "版本" : "Version"}: <strong className="text-foreground">{clientPlatformLabel(selected)}</strong></span>
-                        <span>{t("dashboard.online")}: <strong className="text-foreground">{(selected.onlineRate24h || 0).toFixed(1)}% / {formatMinutesShort(selected.onlineMinutes24h || 0, locale)}</strong></span>
+                        <span>{t("dashboard.online")}: <strong className="text-foreground">{(selected.onlineRate24h || 0).toFixed(1)}% / {formatAgeDaysOrHours(selected.installation.createdAt, locale)}</strong></span>
                       </div>
                     </DrawerSection>
                     <DrawerSection label={t("dashboard.linkedShares")}>
