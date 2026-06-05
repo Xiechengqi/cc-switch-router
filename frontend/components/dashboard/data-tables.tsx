@@ -1373,15 +1373,25 @@ function ShareStatusCell({ share, t, locale }: { share?: ShareView; t: TFn; loca
   const limit = isUnlimited(share.parallelLimit) ? "∞" : String(share.parallelLimit || 0);
   const averageLatency = averageRecentLatencyMs(share.recentRequests);
   const rowClass = "grid grid-cols-[76px_minmax(0,1fr)] gap-2";
+  const saleValue = share.forSale === "Free" ? t("dashboard.free") : share.forSale === "Yes" ? t("dashboard.yes") : t("dashboard.no");
+  const saleVariant: "soft" | "tertiary" = share.forSale === "No" ? "tertiary" : "soft";
+  const saleRow = (
+    <div className={rowClass}>
+      <span className="mono-label text-muted-foreground">{t("dashboard.forSale")}</span>
+      <div><Chip size="sm" variant={saleVariant}>{saleValue}</Chip></div>
+    </div>
+  );
   if (!share.isOnline) {
     return (
       <div className="grid min-w-52 gap-2 text-sm">
+        {saleRow}
         <Chip size="sm" variant="tertiary">{t("common.offline")}</Chip>
       </div>
     );
   }
   return (
     <div className="grid min-w-52 gap-2 text-sm">
+      {saleRow}
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.usage")}</span><div><strong>{compactTokens(share.tokensUsed)} / {isUnlimited(share.tokenLimit) ? "∞" : compactTokens(share.tokenLimit)}</strong><UsageBar used={share.tokensUsed} limit={share.tokenLimit} t={t} /></div></div>
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.expires")}</span><strong title={`${formatDateTime(share.createdAt)} / ${expiryTitle(share.expiresAt)}`}>{shareExpiryProgress(share, locale)}</strong></div>
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.parallel")}</span><strong>{share.activeRequests || 0}<span className="text-muted-foreground">/{limit}</span></strong></div>
@@ -1482,8 +1492,8 @@ function ClientStatusCell({ client, t, locale }: { client: DashboardClient; t: T
 function ClientReference({
   client,
   t,
-  locale,
-  shareCount,
+  locale: _locale,
+  shareCount: _shareCount,
 }: {
   client?: DashboardClient;
   t: TFn;
@@ -1493,10 +1503,9 @@ function ClientReference({
   if (!client) return <span className="text-xs text-muted-foreground">{t("dashboard.noClient")}</span>;
   const label = clientDisplayLabel(client);
   const url = clientTunnelDisplayUrl(client.clientTunnel?.tunnelUrl);
-  const count = typeof shareCount === "number" ? shareCount : client.shareCount || client.shareIds?.length || 0;
   return (
     <div className="grid min-w-0 gap-1 rounded-md border border-default/40 bg-muted/20 px-2 py-1.5 text-xs">
-      <div className="flex min-w-0 flex-wrap items-center gap-2">
+      <div className="min-w-0">
         {url ? (
           <a
             href={url}
@@ -1512,14 +1521,8 @@ function ClientReference({
         ) : (
           <strong className="min-w-0 truncate font-mono text-foreground" title={label}>{label}</strong>
         )}
-        <Chip size="sm" variant="tertiary">{clientRegionLabel(client)}</Chip>
-        <Chip size="sm" variant="tertiary">{t("dashboard.sharesCount", { count })}</Chip>
       </div>
-      <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-muted-foreground">
-        <span className="truncate" title={clientOwnerEmail(client)}>{clientOwnerEmail(client)}</span>
-        <span className="font-mono">{clientPlatformLabel(client)}</span>
-        <span>{(client.onlineRate24h || 0).toFixed(1)}% / {formatMinutesShort(client.onlineMinutes24h || 0, locale)}</span>
-      </div>
+      <span className="truncate text-muted-foreground" title={clientOwnerEmail(client)}>{clientOwnerEmail(client)}</span>
     </div>
   );
 }
@@ -1755,14 +1758,11 @@ export function SharesTable({
       </div>
       <Card className="overflow-hidden rounded-[20px]">
         <Card.Content className="overflow-x-auto p-0">
-          <table className="w-full min-w-[1100px] border-collapse text-sm">
+          <table className="w-full min-w-[960px] border-collapse text-sm">
             <thead className="bg-muted text-left font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground">
               <tr>
                 <th className="w-80 px-4 py-3">{t("dashboard.share")}</th>
-                {/* P13：APP 列删除——与 SUPPORT 重复。SUPPORT 单元格按 share.bindings 派生，
-                    哪些 app 绑定了，看 SUPPORT 卡片是否有内容即可。 */}
-                <th className="px-4 py-3">{t("dashboard.forSale")}</th>
-                {/* P15：Region 列并入 Status 列首行（client 维度的国别码不值得单独占一列）。 */}
+                {/* P16：FOR SALE 列并入 STATUS 列首行（只保留 Yes/No/Free 摘要）。 */}
                 <th className="px-4 py-3">{t("dashboard.status")}</th>
                 <th className="px-4 py-3">{t("dashboard.support")}</th>
                 <th className="w-7 px-4 py-3" />
@@ -1795,9 +1795,6 @@ export function SharesTable({
                             <ShareEditAction share={share} onEdit={setEditingShare} t={t} />
                           </div>
                         </div>
-                      </td>
-                      <td className="px-4 py-3 align-middle">
-                        <ForSaleCell share={share} t={t} />
                       </td>
                       <td className="px-4 py-3 align-middle">
                         <ShareStatusCell share={share} t={t} locale={locale} />
