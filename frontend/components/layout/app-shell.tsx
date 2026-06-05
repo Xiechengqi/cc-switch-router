@@ -320,6 +320,15 @@ function Topbar({ active }: { active: "dashboard" | "settings" | "metrics" }) {
     setLoginOpen(true);
   }, [authed, clientRedirect, loading]);
 
+  // P18: ShareConnectDialog 在未登录态点击「登录」时派发 router-open-login，
+  // 由 Topbar 统一接住打开 LoginDialog。和 router-auth-changed 同模式（见
+  // AuthProvider）。
+  React.useEffect(() => {
+    const handler = () => setLoginOpen(true);
+    window.addEventListener("router-open-login", handler);
+    return () => window.removeEventListener("router-open-login", handler);
+  }, []);
+
   React.useEffect(() => {
     if (!clientRedirect || loading || !authed || redirectStartedRef.current) return;
     redirectStartedRef.current = true;

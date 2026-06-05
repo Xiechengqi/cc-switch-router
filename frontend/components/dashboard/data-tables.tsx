@@ -1,10 +1,11 @@
 "use client";
 
-import { Eye, ExternalLink, Loader2, Pencil, Save, Crown, X } from "lucide-react";
+import { Eye, ExternalLink, Link2, Loader2, Pencil, Save, Crown, X } from "lucide-react";
 import { Button, Card, Checkbox, Chip, Drawer, Input, ListBox, Modal, ProgressBar, Select, Tabs, TextArea } from "@heroui/react";
 import * as React from "react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog";
 import { getMarketLinkedShares, releaseMarketShareState, updateMarketDisabledShares, updateMarketMaintenance, updateShareSettings } from "@/lib/api";
 import type { AppLocale } from "@/lib/i18n";
 import type { DashboardClient, DashboardMarket, HealthCheckEntry, HealthTimelineBucket, MarketAppAvailabilityEntry, MarketRequestLog, MarketShare, MarketShareRuntimeState, ModelHealthSummary, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareModelHealthCheck, ShareRequestLog, ShareSettingsPatch, ShareUpstreamProvider, ShareView } from "@/lib/types";
@@ -672,6 +673,35 @@ function ShareEditAction({ share, onEdit, t }: { share?: ShareView; onEdit: (sha
     >
       {share.canManage ? <Pencil className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
       {share.canManage ? t("common.edit") : t("common.view")}
+    </button>
+  );
+}
+
+function ShareConnectChip({
+  share,
+  onOpen,
+  t,
+}: {
+  share: ShareView;
+  onOpen: (share: ShareView) => void;
+  t: TFn;
+}) {
+  // data-no-row-drawer 让外层 <tr onClick> 的 shouldOpenRowDrawer 跳过，避免
+  // 点击 chip 又触发 drawer。stopPropagation 已经覆盖了主要路径，data 属性是
+  // 二保险（针对 selection / hover 等边角情况）。
+  const handle = (event: React.MouseEvent) => {
+    event.stopPropagation();
+    onOpen(share);
+  };
+  return (
+    <button
+      type="button"
+      onClick={handle}
+      data-no-row-drawer
+      className="inline-flex h-[22px] items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2.5 text-[11px] font-medium text-emerald-700 transition-colors hover:border-emerald-300 hover:bg-emerald-100"
+    >
+      <Link2 className="h-3 w-3" />
+      {t("dashboard.connect")}
     </button>
   );
 }
@@ -1710,6 +1740,7 @@ export function SharesTable({
   const { locale, t } = useLocaleText();
   const [selected, setSelected] = React.useState<ShareView | null>(null);
   const [editingShare, setEditingShare] = React.useState<ShareView | null>(null);
+  const [connectShare, setConnectShare] = React.useState<ShareView | null>(null);
 
   // shareId → 所属 installation 的 DashboardClient（含 region / platform）。
   const clientByShareId = React.useMemo(() => {
@@ -1792,6 +1823,7 @@ export function SharesTable({
                           </span>
                           <ClientReference client={client} t={t} locale={locale} shareCount={client ? sharesForClient(client).length : 0} />
                           <div className="mt-1 flex flex-wrap items-center gap-2">
+                            <ShareConnectChip share={share} onOpen={setConnectShare} t={t} />
                             <ShareStatusBadge share={share} t={t} />
                             <ShareEditAction share={share} onEdit={setEditingShare} t={t} />
                           </div>
@@ -1881,6 +1913,13 @@ export function SharesTable({
         onClose={() => setEditingShare(null)}
         onSaved={async () => {
           await onChanged?.();
+        }}
+      />
+      <ShareConnectDialog
+        share={connectShare}
+        open={!!connectShare}
+        onOpenChange={(next) => {
+          if (!next) setConnectShare(null);
         }}
       />
     </section>
