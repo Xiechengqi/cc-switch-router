@@ -1,8 +1,8 @@
 "use client";
 
 import * as React from "react";
-import { Button, Modal, toast } from "@heroui/react";
-import { Copy, ExternalLink, LogIn, Mail } from "lucide-react";
+import { Button, Modal } from "@heroui/react";
+import { Check, Copy, ExternalLink, LogIn, Mail } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getUserApiToken } from "@/lib/api";
@@ -269,31 +269,49 @@ function CopyButton({
   t: ReturnType<typeof useLocaleText>["t"];
 }) {
   const [copied, setCopied] = React.useState(false);
-  const copy = React.useCallback(async () => {
-    if (!value) return;
-    try {
-      // 现代浏览器（包括所有支持 Tauri 的版本）都有 navigator.clipboard。
-      await navigator.clipboard.writeText(value);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1500);
-      // P18.2: Toast.Provider 已挂在 app-shell 顶层，直接发个 success toast
-      // 让"已复制"反馈从 top-end 划进来，比按钮上的 tooltip 切换更直观。
-      toast.success(t("dashboard.connectDialog.copyOk"));
-    } catch {
-      // 静默失败：用户可以手动复制——别用 alert 打断。
-    }
-  }, [value, t]);
+  const copy = React.useCallback(
+    async (event: React.MouseEvent<HTMLButtonElement>) => {
+      // 全部局部副作用：clipboard 写入 + 本地 setState。不再走 heroui 全局
+      // Toast.Provider —— 它依赖 react-aria 的 overlay/inert 机制，新 toast
+      // 进出会触发整页 aria-hidden 重算，UI 看起来像"整屏刷新"。
+      event.preventDefault();
+      event.stopPropagation();
+      if (!value) return;
+      try {
+        await navigator.clipboard.writeText(value);
+        setCopied(true);
+        window.setTimeout(() => setCopied(false), 1500);
+      } catch {
+        // 静默失败：用户可以手动复制——别用 alert 打断。
+      }
+    },
+    [value],
+  );
   return (
-    <button
-      type="button"
-      onClick={copy}
-      disabled={!value}
-      title={copied ? t("dashboard.connectDialog.copyOk") : t("dashboard.connectDialog.copy")}
-      aria-label={copied ? t("dashboard.connectDialog.copyOk") : t("dashboard.connectDialog.copy")}
-      className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-40"
-    >
-      <Copy className="h-4 w-4" />
-    </button>
+    <span className="relative inline-flex shrink-0">
+      <button
+        type="button"
+        onClick={copy}
+        disabled={!value}
+        title={copied ? t("dashboard.connectDialog.copyOk") : t("dashboard.connectDialog.copy")}
+        aria-label={copied ? t("dashboard.connectDialog.copyOk") : t("dashboard.connectDialog.copy")}
+        className="inline-flex h-7 w-7 items-center justify-center rounded-md text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-40"
+      >
+        <Copy className="h-4 w-4" />
+      </button>
+      {copied ? (
+        <span
+          role="status"
+          aria-live="polite"
+          // 局部"已复制"小条：绝对定位、淡入、定时移除。完全不依赖全局
+          // Toast.Provider，所以不触发 react-aria 的整页 inert 重算。
+          className="pointer-events-none absolute -top-7 right-0 inline-flex animate-fade-in-up items-center gap-1 rounded-md bg-emerald-600 px-2 py-0.5 text-[11px] font-medium text-white shadow-sm"
+        >
+          <Check className="h-3 w-3" />
+          {t("dashboard.connectDialog.copyOk")}
+        </span>
+      ) : null}
+    </span>
   );
 }
 
