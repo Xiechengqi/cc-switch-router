@@ -352,6 +352,11 @@ function upstreamPercent(apps?: ShareAppRuntimes, key?: keyof ShareAppRuntimes) 
   return Number.isInteger(value) && Number(value) > 0 ? `${value}%` : "-";
 }
 
+function configuredUpstreamPercent(apps?: ShareAppRuntimes, key?: keyof ShareAppRuntimes) {
+  const value = key ? apps?.[key]?.forSaleOfficialPricePercent : undefined;
+  return Number.isInteger(value) && Number(value) > 0 ? `${value}%` : null;
+}
+
 function isOfficialMarker(value?: string) {
   const normalized = String(value || "").trim().toLowerCase();
   return normalized === "official" || normalized === "offical";
@@ -538,17 +543,22 @@ function providerModelMap(runtime?: ShareUpstreamProvider) {
 function ForSaleCell({ share, t }: { share?: ShareView; t: TFn }) {
   if (!share) return <span className="text-muted-foreground">-</span>;
   const value = share.forSale === "Free" ? t("dashboard.free") : share.forSale === "Yes" ? t("dashboard.yes") : t("dashboard.no");
+  const pricingLines = share.forSale === "Yes"
+    ? [
+        ["Claude", configuredUpstreamPercent(share.appRuntimes, "claude")],
+        ["Codex", configuredUpstreamPercent(share.appRuntimes, "codex")],
+        ["Gemini", configuredUpstreamPercent(share.appRuntimes, "gemini")],
+      ].filter(([, percent]) => !!percent)
+    : [];
   const marketLines = share.forSale === "Yes"
     ? share.marketAccessMode === "all" ? [t("dashboard.allMarkets")] : (share.marketLinks || []).map((market) => market.subdomain).filter(Boolean)
     : [];
   return (
     <div className="grid min-w-32 gap-1.5">
       <Chip size="sm" variant={value === "No" ? "tertiary" : "soft"}>{value}</Chip>
-      {share.forSale === "Yes" ? (
+      {pricingLines.length ? (
         <div className="grid gap-0.5 font-mono text-[11px] text-muted-foreground">
-          <div>Claude {upstreamPercent(share.appRuntimes, "claude")}</div>
-          <div>Codex {upstreamPercent(share.appRuntimes, "codex")}</div>
-          <div>Gemini {upstreamPercent(share.appRuntimes, "gemini")}</div>
+          {pricingLines.map(([label, percent]) => <div key={label}>{label} {percent}</div>)}
         </div>
       ) : null}
       {marketLines.length ? <div className="grid gap-0.5 font-mono text-[11px] text-muted-foreground">{marketLines.map((line) => <div key={line}>{line}</div>)}</div> : null}
@@ -1467,13 +1477,19 @@ export function ClientsTable({ clients, shares, markets, onChanged }: { clients:
       </div>
       <Card className="overflow-hidden rounded-[20px]">
         <Card.Content className="overflow-x-auto p-0">
-          <table className="w-full min-w-[960px] border-collapse text-sm">
+          <table className="w-full min-w-[960px] table-fixed border-collapse text-sm">
+            <colgroup>
+              <col className="w-[32%]" />
+              <col className="w-[32%]" />
+              <col className="w-[32%]" />
+              <col className="w-[4%]" />
+            </colgroup>
             <thead className="bg-muted text-left font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground">
               <tr>
-                <th className="w-80 px-4 py-3">Client</th>
-                <th className="w-64 px-4 py-3">{t("dashboard.status")}</th>
+                <th className="px-4 py-3">Client</th>
+                <th className="px-4 py-3">{t("dashboard.status")}</th>
                 <th className="px-4 py-3">{t("dashboard.shares")}</th>
-                <th className="w-7 px-4 py-3" />
+                <th className="px-4 py-3" />
               </tr>
             </thead>
             <tbody>
@@ -1481,10 +1497,10 @@ export function ClientsTable({ clients, shares, markets, onChanged }: { clients:
                 const clientShares = sharesForClient(client);
                 return (
                   <tr key={client.installation.id} className="cursor-pointer border-b last:border-0 hover:bg-primary/5" onClick={(event) => { if (shouldOpenRowDrawer(event)) setSelected(client); }}>
-                    <td className="w-80 px-4 py-3 align-top">
+                    <td className="px-4 py-3 align-top">
                       <ClientIdentityCell client={client} />
                     </td>
-                    <td className="w-64 px-4 py-3 align-top">
+                    <td className="px-4 py-3 align-top">
                       <ClientStatusCell client={client} t={t} locale={locale} />
                     </td>
                     {/* P13：share 数据直接展开到行内。空列表显式提示，避免误以为 client 无 share。 */}
@@ -1494,8 +1510,8 @@ export function ClientsTable({ clients, shares, markets, onChanged }: { clients:
                           {clientShares.map((share) => {
                             const api = shareApiParts(share);
                             return (
-                              <li key={share.shareId} className="flex flex-wrap items-center gap-2 rounded-md border border-default/40 px-2 py-1">
-                                <strong className="break-all font-mono text-xs text-foreground">{api.apiUrl}</strong>
+                              <li key={share.shareId} className="flex max-w-full flex-wrap items-center gap-2 rounded-md border border-default/40 px-2 py-1">
+                                <strong className="min-w-0 break-all font-mono text-xs text-foreground">{api.apiUrl}</strong>
                                 <ShareStatusBadge share={share} t={t} />
                                 <ShareEditAction share={share} onEdit={setEditingShare} t={t} />
                               </li>

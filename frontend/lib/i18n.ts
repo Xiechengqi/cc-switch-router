@@ -686,7 +686,7 @@ export const messages = {
     "dashboard.install": "[install]",
     "dashboard.share": "Share",
     "dashboard.apiUrlKey": "API URL&KEY",
-    "dashboard.forSale": "ForSale",
+    "dashboard.forSale": "出售",
     "dashboard.region": "地区",
     "dashboard.status": "状态",
     "dashboard.support": "支持",
