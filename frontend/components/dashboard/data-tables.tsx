@@ -30,6 +30,11 @@ const MIN_PARALLEL_LIMIT = 3;
 const DEFAULT_PARALLEL_LIMIT = 3;
 const DEFAULT_TOKEN_LIMIT = 100000;
 const PERMANENT_EXPIRES_AT_ISO = "2099-12-31T23:59:59Z";
+const CORE_SHARE_APPS = [
+  ["claude", "Claude"],
+  ["codex", "Codex"],
+  ["gemini", "Gemini"],
+] as const;
 
 function isUnlimitedTokenLimit(value?: number | null) {
   return value === UNLIMITED_TOKEN_LIMIT;
@@ -1363,7 +1368,7 @@ function FieldGroup({
   );
 }
 
-function ShareStatusCell({ client, share, t, locale }: { client: DashboardClient; share?: ShareView; t: TFn; locale: AppLocale }) {
+function ShareStatusCell({ share, t, locale }: { share?: ShareView; t: TFn; locale: AppLocale }) {
   if (!share) return <span className="text-muted-foreground">-</span>;
   const limit = isUnlimited(share.parallelLimit) ? "∞" : String(share.parallelLimit || 0);
   const averageLatency = averageRecentLatencyMs(share.recentRequests);
@@ -1377,7 +1382,6 @@ function ShareStatusCell({ client, share, t, locale }: { client: DashboardClient
   }
   return (
     <div className="grid min-w-52 gap-2 text-sm">
-      <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.region")}</span><strong className="whitespace-nowrap">{client.installation.countryCode || "-"}</strong></div>
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.usage")}</span><div><strong>{compactTokens(share.tokensUsed)} / {isUnlimited(share.tokenLimit) ? "∞" : compactTokens(share.tokenLimit)}</strong><UsageBar used={share.tokensUsed} limit={share.tokenLimit} t={t} /></div></div>
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.expires")}</span><strong title={`${formatDateTime(share.createdAt)} / ${expiryTitle(share.expiresAt)}`}>{shareExpiryProgress(share, locale)}</strong></div>
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.parallel")}</span><strong>{share.activeRequests || 0}<span className="text-muted-foreground">/{limit}</span></strong></div>
@@ -1388,26 +1392,54 @@ function ShareStatusCell({ client, share, t, locale }: { client: DashboardClient
   );
 }
 
-function ClientIdentityCell({ client }: { client: DashboardClient }) {
+function clientOwnerEmail(client?: DashboardClient | null) {
+  return client?.clientTunnel?.ownerEmail || client?.installation.ownerEmail || "-";
+}
+
+function clientRegionLabel(client?: DashboardClient | null) {
+  return client?.installation.countryCode || client?.installation.region || "-";
+}
+
+function clientDisplayLabel(client?: DashboardClient | null) {
+  return clientTunnelDisplayUrl(client?.clientTunnel?.tunnelUrl) || client?.installation.id || "-";
+}
+
+function shareSupportLabel(share: ShareView) {
+  return CORE_SHARE_APPS
+    .filter(([key]) => !!share.support?.[key])
+    .map(([, label]) => label)
+    .join(" / ");
+}
+
+function shareSaleLabel(share: ShareView, t: TFn) {
+  if (share.forSale === "Free") return t("dashboard.free");
+  if (share.forSale === "Yes") return t("dashboard.forSale");
+  return t("dashboard.no");
+}
+
+function ClientIdentityCell({ client, shareCount, t }: { client: DashboardClient; shareCount: number; t: TFn }) {
   const url = clientTunnelDisplayUrl(client.clientTunnel?.tunnelUrl);
-  const ownerEmail = client.clientTunnel?.ownerEmail || client.installation.ownerEmail || "-";
+  const ownerEmail = clientOwnerEmail(client);
   return (
     <div className="grid min-w-72 gap-1">
-      {url ? (
-        <a
-          href={url}
-          target="_blank"
-          rel="noopener noreferrer"
-          data-no-row-drawer
-          className="inline-flex max-w-full items-center gap-1 font-mono text-xs font-semibold text-foreground underline-offset-4 hover:underline"
-          title={url}
-        >
-          <span className="truncate">{url}</span>
-          <ExternalLink className="h-3 w-3 shrink-0 text-muted-foreground" />
-        </a>
-      ) : (
-        <strong className="font-mono text-xs text-muted-foreground">-</strong>
-      )}
+      <div className="flex min-w-0 flex-wrap items-center gap-2">
+        {url ? (
+          <a
+            href={url}
+            target="_blank"
+            rel="noopener noreferrer"
+            data-no-row-drawer
+            className="inline-flex min-w-0 max-w-full items-center gap-1 font-mono text-xs font-semibold text-foreground underline-offset-4 hover:underline"
+            title={url}
+          >
+            <span className="truncate">{url}</span>
+            <ExternalLink className="h-3 w-3 shrink-0 text-muted-foreground" />
+          </a>
+        ) : (
+          <strong className="font-mono text-xs text-muted-foreground">-</strong>
+        )}
+        <Chip size="sm" variant="tertiary">{t("dashboard.sharesCount", { count: shareCount })}</Chip>
+      </div>
       <span className="truncate text-xs text-muted-foreground" title={ownerEmail}>
         {ownerEmail}
       </span>
@@ -1444,6 +1476,81 @@ function ClientStatusCell({ client, t, locale }: { client: DashboardClient; t: T
         <HealthDots entries={client.healthChecks || []} />
       </div>
     </div>
+  );
+}
+
+function ClientReference({
+  client,
+  t,
+  locale,
+  shareCount,
+}: {
+  client?: DashboardClient;
+  t: TFn;
+  locale: AppLocale;
+  shareCount?: number;
+}) {
+  if (!client) return <span className="text-xs text-muted-foreground">{t("dashboard.noClient")}</span>;
+  const label = clientDisplayLabel(client);
+  const url = clientTunnelDisplayUrl(client.clientTunnel?.tunnelUrl);
+  const count = typeof shareCount === "number" ? shareCount : client.shareCount || client.shareIds?.length || 0;
+  return (
+    <div className="grid min-w-0 gap-1 rounded-md border border-default/40 bg-muted/20 px-2 py-1.5 text-xs">
+      <div className="flex min-w-0 flex-wrap items-center gap-2">
+        {url ? (
+          <a
+            href={url}
+            target="_blank"
+            rel="noopener noreferrer"
+            data-no-row-drawer
+            className="inline-flex min-w-0 max-w-full items-center gap-1 font-mono font-semibold text-foreground underline-offset-4 hover:underline"
+            title={url}
+          >
+            <span className="truncate">{label}</span>
+            <ExternalLink className="h-3 w-3 shrink-0 text-muted-foreground" />
+          </a>
+        ) : (
+          <strong className="min-w-0 truncate font-mono text-foreground" title={label}>{label}</strong>
+        )}
+        <Chip size="sm" variant="tertiary">{clientRegionLabel(client)}</Chip>
+        <Chip size="sm" variant="tertiary">{t("dashboard.sharesCount", { count })}</Chip>
+      </div>
+      <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-muted-foreground">
+        <span className="truncate" title={clientOwnerEmail(client)}>{clientOwnerEmail(client)}</span>
+        <span className="font-mono">{clientPlatformLabel(client)}</span>
+        <span>{(client.onlineRate24h || 0).toFixed(1)}% / {formatMinutesShort(client.onlineMinutes24h || 0, locale)}</span>
+      </div>
+    </div>
+  );
+}
+
+function ShareSummaryItem({
+  share,
+  onEdit,
+  t,
+  compact = false,
+}: {
+  share: ShareView;
+  onEdit: (share: ShareView) => void;
+  t: TFn;
+  compact?: boolean;
+}) {
+  const api = shareApiParts(share);
+  const support = shareSupportLabel(share);
+  const owner = share.ownerEmail || "-";
+  return (
+    <li className="grid max-w-full gap-1 rounded-md border border-default/40 bg-white/70 px-2 py-1.5">
+      <div className="flex min-w-0 flex-wrap items-center gap-2">
+        <strong className="min-w-0 break-all font-mono text-xs text-foreground">{api.apiUrl}</strong>
+        <ShareStatusBadge share={share} t={t} />
+        <ShareEditAction share={share} onEdit={onEdit} t={t} />
+      </div>
+      <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
+        {!compact ? <span className="truncate" title={owner}>{owner}</span> : null}
+        <span>{support || t("dashboard.noProviders")}</span>
+        <span>{shareSaleLabel(share, t)}</span>
+      </div>
+    </li>
   );
 }
 
@@ -1495,10 +1602,12 @@ export function ClientsTable({ clients, shares, markets, onChanged }: { clients:
             <tbody>
               {sorted.length ? sorted.map((client) => {
                 const clientShares = sharesForClient(client);
+                const visibleShares = clientShares.slice(0, 4);
+                const hiddenShareCount = Math.max(0, clientShares.length - visibleShares.length);
                 return (
                   <tr key={client.installation.id} className="cursor-pointer border-b last:border-0 hover:bg-primary/5" onClick={(event) => { if (shouldOpenRowDrawer(event)) setSelected(client); }}>
                     <td className="px-4 py-3 align-top">
-                      <ClientIdentityCell client={client} />
+                      <ClientIdentityCell client={client} shareCount={clientShares.length} t={t} />
                     </td>
                     <td className="px-4 py-3 align-top">
                       <ClientStatusCell client={client} t={t} locale={locale} />
@@ -1507,16 +1616,14 @@ export function ClientsTable({ clients, shares, markets, onChanged }: { clients:
                     <td className="px-4 py-3 align-top">
                       {clientShares.length ? (
                         <ul className="grid gap-1.5">
-                          {clientShares.map((share) => {
-                            const api = shareApiParts(share);
-                            return (
-                              <li key={share.shareId} className="flex max-w-full flex-wrap items-center gap-2 rounded-md border border-default/40 px-2 py-1">
-                                <strong className="min-w-0 break-all font-mono text-xs text-foreground">{api.apiUrl}</strong>
-                                <ShareStatusBadge share={share} t={t} />
-                                <ShareEditAction share={share} onEdit={setEditingShare} t={t} />
-                              </li>
-                            );
-                          })}
+                          {visibleShares.map((share) => (
+                            <ShareSummaryItem key={share.shareId} share={share} onEdit={setEditingShare} t={t} compact />
+                          ))}
+                          {hiddenShareCount ? (
+                            <li className="px-2 py-1 text-[11px] text-muted-foreground">
+                              {t("dashboard.moreShares", { count: hiddenShareCount })}
+                            </li>
+                          ) : null}
                         </ul>
                       ) : (
                         <span className="text-xs text-muted-foreground">{t("dashboard.noShares")}</span>
@@ -1562,6 +1669,9 @@ export function ClientsTable({ clients, shares, markets, onChanged }: { clients:
                         <span>{t("dashboard.online")}: <strong className="text-foreground">{(selected.onlineRate24h || 0).toFixed(1)}% / {formatMinutesShort(selected.onlineMinutes24h || 0, locale)}</strong></span>
                       </div>
                     </DrawerSection>
+                    <DrawerSection label={t("dashboard.linkedShares")}>
+                      <ClientLinkedSharesPanel shares={sharesForClient(selected)} onEdit={setEditingShare} t={t} />
+                    </DrawerSection>
                     {/* P14：完整的 provider 列表上移到 client 抽屉；share 抽屉只看 share 自己绑的那部分。 */}
                     <DrawerSection label={t("dashboard.providers")}>
                       <ClientProvidersPanel shares={sharesForClient(selected)} />
@@ -1605,6 +1715,20 @@ export function SharesTable({
     });
     return map;
   }, [clients]);
+
+  const shareById = React.useMemo(() => {
+    const map = new Map<string, ShareView>();
+    shares.forEach((share) => map.set(share.shareId, share));
+    return map;
+  }, [shares]);
+
+  const sharesForClient = React.useCallback(
+    (client?: DashboardClient) =>
+      (client?.shareIds || [])
+        .map((id) => shareById.get(id))
+        .filter((s): s is ShareView => !!s),
+    [shareById],
+  );
 
   // 排序：按 createdAt 升序（先注册的 share 在前）。canManage / shareStatus /
   // activeRequests 都是会动态翻转的字段，作为主排序键会导致行经常上下跳动。
@@ -1665,6 +1789,7 @@ export function SharesTable({
                           <span className="break-all text-xs text-muted-foreground">
                             {share.ownerEmail || "-"}
                           </span>
+                          <ClientReference client={client} t={t} locale={locale} shareCount={client ? sharesForClient(client).length : 0} />
                           <div className="mt-1 flex flex-wrap items-center gap-2">
                             <ShareStatusBadge share={share} t={t} />
                             <ShareEditAction share={share} onEdit={setEditingShare} t={t} />
@@ -1675,11 +1800,7 @@ export function SharesTable({
                         <ForSaleCell share={share} t={t} />
                       </td>
                       <td className="px-4 py-3 align-middle">
-                        {client ? (
-                          <ShareStatusCell client={client} share={share} t={t} locale={locale} />
-                        ) : (
-                          <span className="text-muted-foreground">-</span>
-                        )}
+                        <ShareStatusCell share={share} t={t} locale={locale} />
                       </td>
                       <td className="px-4 py-3 align-middle">
                         <SupportCell share={share} t={t} locale={locale} />
@@ -1724,6 +1845,16 @@ export function SharesTable({
                   <div className="grid gap-5">
                     <DrawerSection label="24h">
                       <HealthTimelineStrip timeline={selected.healthTimeline} />
+                    </DrawerSection>
+                    <DrawerSection label={t("dashboard.client")}>
+                      <ShareClientPanel
+                        client={clientByShareId.get(selected.shareId)}
+                        currentShare={selected}
+                        shares={sharesForClient(clientByShareId.get(selected.shareId))}
+                        onEdit={setEditingShare}
+                        t={t}
+                        locale={locale}
+                      />
                     </DrawerSection>
                     <DrawerSection label={t("dashboard.markets")}>
                       <ShareMarkets share={selected} t={t} />
@@ -2328,6 +2459,51 @@ function DrawerSection({ label, children }: { label: string; children: React.Rea
 
 function EmptyBlock({ children }: { children: React.ReactNode }) {
   return <div className="rounded-lg border bg-muted/20 p-4 text-sm text-muted-foreground">{children}</div>;
+}
+
+function ClientLinkedSharesPanel({ shares, onEdit, t }: { shares: ShareView[]; onEdit: (share: ShareView) => void; t: TFn }) {
+  if (!shares.length) return <EmptyBlock>{t("dashboard.noLinkedShares")}</EmptyBlock>;
+  return (
+    <ul className="grid gap-2">
+      {shares.map((share) => (
+        <ShareSummaryItem key={share.shareId} share={share} onEdit={onEdit} t={t} />
+      ))}
+    </ul>
+  );
+}
+
+function ShareClientPanel({
+  client,
+  currentShare,
+  shares,
+  onEdit,
+  t,
+  locale,
+}: {
+  client?: DashboardClient;
+  currentShare: ShareView;
+  shares: ShareView[];
+  onEdit: (share: ShareView) => void;
+  t: TFn;
+  locale: AppLocale;
+}) {
+  if (!client) return <EmptyBlock>{t("dashboard.noClient")}</EmptyBlock>;
+  const otherShares = shares.filter((share) => share.shareId !== currentShare.shareId);
+  return (
+    <div className="grid gap-3">
+      <ClientReference client={client} t={t} locale={locale} shareCount={shares.length} />
+      {otherShares.length ? (
+        <div className="grid gap-2">
+          <div className="mono-label text-muted-foreground">{t("dashboard.otherShares")}</div>
+          <ul className="grid gap-2">
+            {otherShares.map((share) => (
+              <ShareSummaryItem key={share.shareId} share={share} onEdit={onEdit} t={t} compact />
+            ))}
+          </ul>
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
 function ShareMarkets({ share, t }: { share?: ShareView; t: TFn }) {
