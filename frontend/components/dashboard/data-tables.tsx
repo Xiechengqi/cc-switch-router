@@ -1741,6 +1741,12 @@ export function SharesTable({
   const [selected, setSelected] = React.useState<ShareView | null>(null);
   const [editingShare, setEditingShare] = React.useState<ShareView | null>(null);
   const [connectShare, setConnectShare] = React.useState<ShareView | null>(null);
+  // 让 ShareConnectDialog 的 props 在每次 dashboard 5s 轮询期间保持引用稳定，
+  // 配合 React.memo 阻断不必要的 Modal 重渲染；否则用户在弹窗里点复制时会看到
+  // 轮询正好触发的卡片闪一下，误以为是复制按钮引发的。
+  const closeConnectDialog = React.useCallback((next: boolean) => {
+    if (!next) setConnectShare(null);
+  }, []);
 
   // shareId → 所属 installation 的 DashboardClient（含 region / platform）。
   const clientByShareId = React.useMemo(() => {
@@ -1918,9 +1924,7 @@ export function SharesTable({
       <ShareConnectDialog
         share={connectShare}
         open={!!connectShare}
-        onOpenChange={(next) => {
-          if (!next) setConnectShare(null);
-        }}
+        onOpenChange={closeConnectDialog}
       />
     </section>
   );

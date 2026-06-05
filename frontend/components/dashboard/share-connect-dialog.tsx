@@ -20,7 +20,7 @@ const ROUTER_OPEN_LOGIN_EVENT = "router-open-login";
  *     "去顶部 API Token 面板重置" 提示。后端只在 reset 时返回明文，所以这里
  *     不重复 reset 入口，集中在 <ApiTokenDialog>。
  */
-export function ShareConnectDialog({
+export const ShareConnectDialog = React.memo(function ShareConnectDialog({
   share,
   open,
   onOpenChange,
@@ -156,7 +156,7 @@ export function ShareConnectDialog({
       </Modal.Backdrop>
     </Modal>
   );
-}
+});
 
 function BaseUrlRow({
   t,
