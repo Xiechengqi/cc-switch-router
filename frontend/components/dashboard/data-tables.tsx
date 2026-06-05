@@ -621,7 +621,7 @@ function SupportCell({ share, t, locale }: { share?: ShareView; t: TFn; locale: 
   type CoreAppKey = "claude" | "codex" | "gemini";
   const rows: Array<[CoreAppKey, string]> = [["claude", "Claude"], ["codex", "Codex"], ["gemini", "Gemini"]];
   return (
-    <div className="grid min-w-72 gap-1.5">
+    <div className="grid min-w-0 gap-1.5">
       {rows.map(([key, label]) => {
         const enabled = !!share.support?.[key];
         const runtime = mergeStandaloneOAuthRuntime(share.appRuntimes?.[key], share.appRuntimes);
@@ -1383,14 +1383,14 @@ function ShareStatusCell({ share, t, locale }: { share?: ShareView; t: TFn; loca
   );
   if (!share.isOnline) {
     return (
-      <div className="grid min-w-52 gap-2 text-sm">
+      <div className="grid min-w-0 gap-2 text-sm">
         {saleRow}
         <Chip size="sm" variant="tertiary">{t("common.offline")}</Chip>
       </div>
     );
   }
   return (
-    <div className="grid min-w-52 gap-2 text-sm">
+    <div className="grid min-w-0 gap-2 text-sm">
       {saleRow}
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.usage")}</span><div><strong>{compactTokens(share.tokensUsed)} / {isUnlimited(share.tokenLimit) ? "∞" : compactTokens(share.tokenLimit)}</strong><UsageBar used={share.tokensUsed} limit={share.tokenLimit} t={t} /></div></div>
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.expires")}</span><strong title={`${formatDateTime(share.createdAt)} / ${expiryTitle(share.expiresAt)}`}>{shareExpiryProgress(share, locale)}</strong></div>
@@ -1758,13 +1758,13 @@ export function SharesTable({
       </div>
       <Card className="overflow-hidden rounded-[20px]">
         <Card.Content className="overflow-x-auto p-0">
-          <table className="w-full min-w-[960px] border-collapse text-sm">
+          <table className="w-full min-w-[720px] table-fixed border-collapse text-sm">
             <thead className="bg-muted text-left font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground">
               <tr>
-                <th className="w-80 px-4 py-3">{t("dashboard.share")}</th>
+                <th className="w-1/3 px-4 py-3">{t("dashboard.share")}</th>
                 {/* P16：FOR SALE 列并入 STATUS 列首行（只保留 Yes/No/Free 摘要）。 */}
-                <th className="px-4 py-3">{t("dashboard.status")}</th>
-                <th className="px-4 py-3">{t("dashboard.support")}</th>
+                <th className="w-1/3 px-4 py-3">{t("dashboard.status")}</th>
+                <th className="w-1/3 px-4 py-3">{t("dashboard.support")}</th>
                 <th className="w-7 px-4 py-3" />
               </tr>
             </thead>
@@ -1781,8 +1781,8 @@ export function SharesTable({
                         if (shouldOpenRowDrawer(event)) setSelected(share);
                       }}
                     >
-                      <td className="w-80 break-words px-4 py-3 align-middle">
-                        <div className="grid min-w-72 gap-1">
+                      <td className="break-words px-4 py-3 align-middle">
+                        <div className="grid min-w-0 gap-1">
                           <strong className="break-all font-mono text-xs text-foreground">
                             {api.apiUrl}
                           </strong>
