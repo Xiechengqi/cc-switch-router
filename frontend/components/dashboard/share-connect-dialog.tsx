@@ -43,13 +43,19 @@ export function ShareConnectDialog({
   }, [share?.subdomain]);
 
   const [token, setToken] = React.useState<UserApiTokenStatus | null>(null);
+  // P18.1: 后端 `/v1/me/api-token` 在 user_api_tokens.token_plaintext 列里持久化
+  // 明文（store.rs:10879），任意时刻调用都能拿到 raw token。这里直接展示明文，
+  // 不再加遮罩——share owner 已经过 canViewSecret 校验，复制即用。
+  const [apiTokenPlain, setApiTokenPlain] = React.useState<string>("");
   const [tokenError, setTokenError] = React.useState<string>("");
   const [tokenBusy, setTokenBusy] = React.useState(false);
 
-  // 拉一次 token 前缀；明文不在这里拿，提示用户去 ApiTokenDialog 重置。
+  // 拉一次 token 明文；若后端因为是老库没有 plaintext，apiToken 为空，回落到
+  // prefix 提示去重置。
   React.useEffect(() => {
     if (!open || !authenticated || !canViewSecret) {
       setToken(null);
+      setApiTokenPlain("");
       setTokenError("");
       return;
     }
@@ -60,6 +66,7 @@ export function ShareConnectDialog({
       .then((response) => {
         if (cancelled) return;
         setToken(response.token);
+        setApiTokenPlain(response.apiToken || "");
       })
       .catch((err) => {
         if (cancelled) return;
@@ -74,10 +81,12 @@ export function ShareConnectDialog({
   }, [open, authenticated, canViewSecret]);
 
   const apiKeyDisplay = React.useMemo(() => {
-    if (!token?.prefix) return "";
-    // ApiTokenDialog 默认遮罩格式：prefix + 16 个点。统一显示风格。
-    return `${token.prefix}${"•".repeat(16)}`;
-  }, [token?.prefix]);
+    // 优先明文；缺明文（老库没补 plaintext 列）才回落到 prefix + 遮罩 + 提示。
+    if (apiTokenPlain) return apiTokenPlain;
+    if (token?.prefix) return `${token.prefix}${"•".repeat(16)}`;
+    return "";
+  }, [apiTokenPlain, token?.prefix]);
+  const apiKeyIsPlaintext = !!apiTokenPlain;
 
   const requestLogin = React.useCallback(() => {
     if (typeof window === "undefined") return;
@@ -128,6 +137,7 @@ export function ShareConnectDialog({
                             : "revealable"
                 }
                 apiKeyDisplay={apiKeyDisplay}
+                apiKeyIsPlaintext={apiKeyIsPlaintext}
                 tokenError={tokenError}
                 requestLogin={requestLogin}
                 requestAccessHref={requestAccessHref}
@@ -181,6 +191,7 @@ function ApiKeyRow({
   t,
   state,
   apiKeyDisplay,
+  apiKeyIsPlaintext,
   tokenError,
   requestLogin,
   requestAccessHref,
@@ -188,6 +199,7 @@ function ApiKeyRow({
   t: ReturnType<typeof useLocaleText>["t"];
   state: ApiKeyState;
   apiKeyDisplay: string;
+  apiKeyIsPlaintext: boolean;
   tokenError: string;
   requestLogin: () => void;
   requestAccessHref: string | null;
@@ -237,10 +249,12 @@ function ApiKeyRow({
             </div>
             <CopyButton value={apiKeyDisplay} t={t} />
           </div>
-          <span className="inline-flex items-center gap-1 text-xs text-slate-500">
-            <ExternalLink className="h-3 w-3" />
-            {t("dashboard.connectDialog.maskedHint")}
-          </span>
+          {apiKeyIsPlaintext ? null : (
+            <span className="inline-flex items-center gap-1 text-xs text-slate-500">
+              <ExternalLink className="h-3 w-3" />
+              {t("dashboard.connectDialog.maskedHint")}
+            </span>
+          )}
         </div>
       )}
     </div>
