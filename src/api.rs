@@ -3531,8 +3531,8 @@ fn app_probe(app: &str) -> Option<AppProbe> {
         }),
         "codex" => Some(AppProbe {
             method: "POST",
-            path: "/v1/chat/completions",
-            body: r#"{"model":"gpt-5.5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
+            path: "/v1/responses",
+            body: r#"{"model":"gpt-5.5","input":"hi","max_output_tokens":1}"#,
         }),
         "gemini" => Some(AppProbe {
             method: "POST",

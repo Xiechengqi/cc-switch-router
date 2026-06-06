@@ -22,11 +22,11 @@ const APP_PROBE = {
   },
   codex: {
     method: "POST",
-    path: "/v1/chat/completions",
+    path: "/v1/responses",
     body: JSON.stringify({
       model: "gpt-5.5",
-      max_tokens: 1,
-      messages: [{ role: "user", content: "hi" }],
+      input: "hi",
+      max_output_tokens: 1,
     }),
   },
   gemini: {
