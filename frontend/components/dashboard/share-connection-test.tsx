@@ -25,7 +25,7 @@ const APP_PROBE = {
     path: "/v1/responses",
     body: JSON.stringify({
       model: "gpt-5.5",
-      input: "hi",
+      input: [{ role: "user", content: "hi" }],
       max_output_tokens: 16,
     }),
   },
