@@ -17,7 +17,7 @@ const APP_PROBE = {
     body: JSON.stringify({
       model: "claude-opus-4-7",
       max_tokens: 1,
-      messages: [{ role: "user", content: "hi" }],
+      messages: [{ role: "user", content: "who are you" }],
     }),
   },
   codex: {
@@ -25,7 +25,7 @@ const APP_PROBE = {
     path: "/v1/responses",
     body: JSON.stringify({
       model: "gpt-5.5",
-      input: [{ role: "user", content: "hi" }],
+      input: [{ role: "user", content: "who are you" }],
       max_output_tokens: 16,
     }),
   },
@@ -33,7 +33,7 @@ const APP_PROBE = {
     method: "POST",
     path: "/v1beta/models/gemini-flash-2.5:generateContent",
     body: JSON.stringify({
-      contents: [{ parts: [{ text: "hi" }] }],
+      contents: [{ parts: [{ text: "who are you" }] }],
       generationConfig: { maxOutputTokens: 1 },
     }),
   },

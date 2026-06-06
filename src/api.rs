@@ -3527,7 +3527,7 @@ fn app_probe(app: &str) -> Option<AppProbe> {
         "claude" => Some(AppProbe {
             method: "POST",
             path: "/v1/messages",
-            body: r#"{"model":"claude-opus-4-7","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
+            body: r#"{"model":"claude-opus-4-7","max_tokens":1,"messages":[{"role":"user","content":"who are you"}]}"#,
         }),
         "codex" => Some(AppProbe {
             method: "POST",
@@ -3535,12 +3535,12 @@ fn app_probe(app: &str) -> Option<AppProbe> {
             // gpt-5 系 Responses API：input 必须是 message 数组（"Input must be a
             // list"），不能是裸字符串。max_output_tokens=16 是允许 reasoning trace
             // 启动的最小值。
-            body: r#"{"model":"gpt-5.5","input":[{"role":"user","content":"hi"}],"max_output_tokens":16}"#,
+            body: r#"{"model":"gpt-5.5","input":[{"role":"user","content":"who are you"}],"max_output_tokens":16}"#,
         }),
         "gemini" => Some(AppProbe {
             method: "POST",
             path: "/v1beta/models/gemini-flash-2.5:generateContent",
-            body: r#"{"contents":[{"parts":[{"text":"hi"}]}],"generationConfig":{"maxOutputTokens":1}}"#,
+            body: r#"{"contents":[{"parts":[{"text":"who are you"}]}],"generationConfig":{"maxOutputTokens":1}}"#,
         }),
         _ => None,
     }
