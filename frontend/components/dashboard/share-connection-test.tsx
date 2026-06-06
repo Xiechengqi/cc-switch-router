@@ -200,7 +200,7 @@ export function ShareConnectionTestRow({
             </span>
           </div>
           <div className="relative rounded border border-slate-200 bg-white">
-            <pre className="overflow-x-auto px-3 py-2 text-[11px] leading-relaxed text-slate-800">{curlCmd}</pre>
+            <pre className="whitespace-pre-wrap break-all px-3 py-2 pr-9 text-[11px] leading-relaxed text-slate-800">{curlCmd}</pre>
             <span className="absolute right-1.5 top-1.5">
               <InlineCopyButton value={curlCmd} t={t} />
             </span>
@@ -265,7 +265,7 @@ export function ShareConnectionTestRow({
                   </span>
                   <InlineCopyButton value={result.response.bodyText} t={t} />
                 </div>
-                <pre className="max-h-48 overflow-auto rounded border border-slate-100 bg-slate-50 px-2 py-1.5 text-[11px] leading-relaxed text-slate-800">
+                <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap break-all rounded border border-slate-100 bg-slate-50 px-2 py-1.5 text-[11px] leading-relaxed text-slate-800">
                   {result.response.bodyText || "(empty)"}
                 </pre>
                 {result.response.bodyTruncated ? (
