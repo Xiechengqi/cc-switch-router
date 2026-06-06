@@ -3527,14 +3527,11 @@ fn app_probe(app: &str) -> Option<AppProbe> {
         "claude" => Some(AppProbe {
             method: "POST",
             path: "/v1/messages",
-            // Claude OAuth (claude.ai) gateway 拒绝没有 x-anthropic-billing-header
-            // 系统块 + 签名 cch 的请求（直接 429 with body {"type":"error",...,
-            // "message":"Error"}）。cc-switch 的 forwarder.rs:3199
-            // sign_claude_oauth_messages_body 在 ClaudeOAuth 路径下会把
-            // cch=00000 替换成对 body 的 XxHash64 签名，再转发给 Anthropic。
-            // 对非 OAuth 的 Claude provider（直连 API key / Kiro / Cursor 等）签名是
-            // no-op，system 块只是无害的 prompt 前缀。
-            body: r#"{"model":"claude-opus-4-7","max_tokens":16,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.119.47e; cc_entrypoint=sdk-cli; cch=00000;\n\nYou are Claude Code, Anthropic's official CLI for Claude."}],"messages":[{"role":"user","content":"who are you"}]}"#,
+            // cc-switch client 的 ensure_claude_oauth_billing_header_system 会在
+            // ClaudeOAuth provider 路径下自动注入 x-anthropic-billing-header system
+            // 块 + cch 签名，所以这里用最简形式即可——与 api.anthropic.com 官方文档
+            // 示例完全一致。非 OAuth provider 路径无影响。
+            body: r#"{"model":"claude-opus-4-7","max_tokens":16,"messages":[{"role":"user","content":"who are you"}]}"#,
         }),
         "codex" => Some(AppProbe {
             method: "POST",
