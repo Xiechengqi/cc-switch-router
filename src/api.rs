@@ -3584,12 +3584,15 @@ async fn test_share_connection(
         .api_token
         .ok_or_else(|| AppError::Internal("api token plaintext not available; reset your token first".into()))?;
 
-    // Build URL
-    let base_url = state.config.tunnel_url(&subdomain);
-    let url = format!("{}{}", base_url, probe.path);
+    // Build URLs. `public_url` is what we display in the curl preview / echo
+    // back to the user. `local_url` is what reqwest actually hits — the same
+    // axum HTTP listener as we're running on, addressed by 127.0.0.1, with a
+    // Host header that matches the public subdomain. share proxy routes by
+    // Host, so the routing decision is identical.
+    let public_url = format!("{}{}", state.config.tunnel_url(&subdomain), probe.path);
+    let local_url = format!("http://{}{}", state.config.api_addr, probe.path);
+    let public_host = format!("{}.{}", subdomain, state.config.tunnel_domain);
 
-    // Headers used for the actual request
-    let bearer_header = format!("Bearer {}", api_token);
     // Echo headers with redacted token for response
     let echo_headers = vec![
         ["Authorization".to_string(), format!("Bearer {}...(redacted)", &api_token.chars().take(14).collect::<String>())],
@@ -3600,25 +3603,24 @@ async fn test_share_connection(
     let client = reqwest::Client::builder()
         .user_agent("cc-switch-router/0.1 test-connection")
         .timeout(std::time::Duration::from_millis(timeout_ms))
+        // No redirects: a 3xx mid-flight would otherwise drop Authorization
+        // on the second hop (reqwest's default behaviour for cross-origin).
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| AppError::Internal(format!("create test client failed: {e}")))?;
 
     let request_echo = TestRequestEcho {
         method: probe.method.to_string(),
-        url: url.clone(),
+        url: public_url.clone(),
         headers: echo_headers,
         body: Some(probe.body.to_string()),
     };
 
     let started = std::time::Instant::now();
     let result = client
-        .request(
-            probe.method.parse().map_err(|e: axum::http::method::InvalidMethod| {
-                AppError::Internal(format!("invalid method: {e}"))
-            })?,
-            &url,
-        )
-        .header("Authorization", &bearer_header)
+        .post(&local_url)
+        .header("Host", &public_host)
+        .bearer_auth(&api_token)
         .header("Content-Type", "application/json")
         .body(probe.body)
         .send()
