@@ -17,6 +17,9 @@ const APP_PROBE = {
     body: JSON.stringify({
       model: "claude-opus-4-7",
       max_tokens: 16,
+      // stream:true 与真实 claude-cli 一致——绕开 cc-switch 在非流路径
+      // openai_to_anthropic 转换（GitHub Copilot 这类绑定会因 Empty choices 抛 422）。
+      stream: true,
       messages: [{ role: "user", content: "who are you" }],
     }),
   },

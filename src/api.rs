@@ -3530,8 +3530,14 @@ fn app_probe(app: &str) -> Option<AppProbe> {
             // cc-switch client 的 ensure_claude_oauth_billing_header_system 会在
             // ClaudeOAuth provider 路径下自动注入 x-anthropic-billing-header system
             // 块 + cch 签名，所以这里用最简形式即可——与 api.anthropic.com 官方文档
-            // 示例完全一致。非 OAuth provider 路径无影响。
-            body: r#"{"model":"claude-opus-4-7","max_tokens":16,"messages":[{"role":"user","content":"who are you"}]}"#,
+            // 示例完全一致。
+            //
+            // `stream: true` 是为了兼容 GitHub Copilot 这类 Anthropic-on-OpenAI 绑定：
+            // cc-switch 在非流式路径上会把上游响应做 openai_to_anthropic 转换；如果
+            // 上游碰巧返回 `choices: []`（短回复、Copilot 内部行为等），转换器会抛
+            // "Empty choices array"。claude-cli 真实流量恒为 stream:true，走 SSE
+            // passthrough 不触发这条转换，所以也对齐这一行为。
+            body: r#"{"model":"claude-opus-4-7","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"who are you"}]}"#,
         }),
         "codex" => Some(AppProbe {
             method: "POST",
