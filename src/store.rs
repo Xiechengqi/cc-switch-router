@@ -136,6 +136,14 @@ pub struct AppStore {
     ip_hash_salt: Arc<String>,
 }
 
+/// P18: 测试接続で必要な share の基本情報。
+#[derive(Debug, Clone)]
+pub struct ShareForTest {
+    pub subdomain: String,
+    pub owner_email: String,
+    pub shared_with_emails: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 struct GeoLookupResult {
     country_code: Option<String>,
@@ -1130,6 +1138,28 @@ impl AppStore {
             api_token,
             token: user_api_token_status(record),
         })
+    }
+
+    /// P18: テスト接続用 — share の owner_email / subdomain / shared_with_emails を一度に返す。
+    pub async fn get_share_for_test(
+        &self,
+        share_id: &str,
+    ) -> Result<Option<ShareForTest>, AppError> {
+        let conn = self.conn.lock().await;
+        let row = conn
+            .query_row(
+                "SELECT COALESCE(subdomain, '-'), owner_email, COALESCE(shared_with_emails_json, '[]')
+                 FROM shares WHERE share_id = ?1",
+                params![share_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+            )
+            .optional()
+            .map_err(|e| AppError::Internal(format!("query share for test failed: {e}")))?;
+        let Some((subdomain, owner_email, shared_json)) = row else {
+            return Ok(None);
+        };
+        let shared_with_emails: Vec<String> = serde_json::from_str(&shared_json).unwrap_or_default();
+        Ok(Some(ShareForTest { subdomain, owner_email, shared_with_emails }))
     }
 
     pub async fn list_user_shares(

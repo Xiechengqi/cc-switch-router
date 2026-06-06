@@ -205,6 +205,10 @@ pub fn router(state: ServerState) -> Router {
             "/v1/shares/:share_id/settings",
             patch(update_share_settings),
         )
+        .route(
+            "/v1/shares/:share_id/test-connection",
+            post(test_share_connection),
+        )
         .route("/v1/shares/pending-edits", post(pending_share_edits))
         .route("/v1/shares/edit-ack", post(ack_share_edit))
         .route("/v1/shares/edit-events", get(share_edit_events))
@@ -3463,4 +3467,219 @@ async fn admin_metrics_clear(
         )
         .await;
     Ok(Json(result))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P18: test-connection — dashboard 可以通过 share 的 subdomain + 调用者的 api token
+// 向 claude / codex / gemini 发一个最小探针（max_tokens=1），把原始 HTTP
+// 响应回传给前端展示。后端中转是因为 share subdomain 不同源，CORS 不通。
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShareConnectionTestRequest {
+    /// "claude" | "codex" | "gemini"
+    app: String,
+    /// 可选，毫秒；默认 15000，上限 30000
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ShareConnectionTestResponse {
+    request: TestRequestEcho,
+    response: Option<TestResponseEcho>,
+    duration_ms: u64,
+    /// 网络层错误（DNS / 连接 / 超时）时填写
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TestRequestEcho {
+    method: String,
+    url: String,
+    headers: Vec<[String; 2]>,
+    body: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TestResponseEcho {
+    status_code: u16,
+    status_text: String,
+    headers: Vec<[String; 2]>,
+    body_text: String,
+    body_truncated: bool,
+}
+
+const TEST_BODY_CAP: usize = 64 * 1024;
+
+struct AppProbe {
+    method: &'static str,
+    path: &'static str,
+    body: &'static str,
+}
+
+fn app_probe(app: &str) -> Option<AppProbe> {
+    match app {
+        "claude" => Some(AppProbe {
+            method: "POST",
+            path: "/v1/messages",
+            body: r#"{"model":"claude-opus-4-7","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
+        }),
+        "codex" => Some(AppProbe {
+            method: "POST",
+            path: "/v1/chat/completions",
+            body: r#"{"model":"gpt-5.5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
+        }),
+        "gemini" => Some(AppProbe {
+            method: "POST",
+            path: "/v1beta/models/gemini-flash-2.5:generateContent",
+            body: r#"{"contents":[{"parts":[{"text":"hi"}]}],"generationConfig":{"maxOutputTokens":1}}"#,
+        }),
+        _ => None,
+    }
+}
+
+async fn test_share_connection(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(share_id): Path<String>,
+    Json(input): Json<ShareConnectionTestRequest>,
+) -> Result<Json<ShareConnectionTestResponse>, AppError> {
+    let current_user_email = require_user_email(&state, &headers, "share:read").await?;
+
+    // Validate app name
+    let probe = app_probe(&input.app)
+        .ok_or_else(|| AppError::BadRequest(format!("unsupported app: {}", input.app)))?;
+
+    // Load share — verify caller is owner or admin
+    let share = state
+        .store
+        .get_share_for_test(&share_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("share not found".into()))?;
+
+    let is_admin = state.dynamic.read().await.is_admin(&current_user_email);
+    let is_owner = share.owner_email.eq_ignore_ascii_case(&current_user_email);
+    let is_shared_with = share
+        .shared_with_emails
+        .iter()
+        .any(|e| e.eq_ignore_ascii_case(&current_user_email));
+
+    if !is_admin && !is_owner && !is_shared_with {
+        return Err(AppError::Forbidden("only the share owner, invited users, or admins can test this share".into()));
+    }
+
+    let subdomain = share.subdomain;
+
+    // Fetch the caller's own api token (not the share owner's)
+    let api_token = state
+        .store
+        .get_default_api_token(&current_user_email)
+        .await
+        .map_err(|e| AppError::Internal(format!("fetch api token failed: {e}")))?
+        .api_token
+        .ok_or_else(|| AppError::Internal("api token plaintext not available; reset your token first".into()))?;
+
+    // Build URL
+    let base_url = state.config.tunnel_url(&subdomain);
+    let url = format!("{}{}", base_url, probe.path);
+
+    // Headers used for the actual request
+    let bearer_header = format!("Bearer {}", api_token);
+    // Echo headers with redacted token for response
+    let echo_headers = vec![
+        ["Authorization".to_string(), format!("Bearer {}...(redacted)", &api_token.chars().take(14).collect::<String>())],
+        ["Content-Type".to_string(), "application/json".to_string()],
+    ];
+
+    let timeout_ms = input.timeout_ms.unwrap_or(15_000).min(30_000);
+    let client = reqwest::Client::builder()
+        .user_agent("cc-switch-router/0.1 test-connection")
+        .timeout(std::time::Duration::from_millis(timeout_ms))
+        .build()
+        .map_err(|e| AppError::Internal(format!("create test client failed: {e}")))?;
+
+    let request_echo = TestRequestEcho {
+        method: probe.method.to_string(),
+        url: url.clone(),
+        headers: echo_headers,
+        body: Some(probe.body.to_string()),
+    };
+
+    let started = std::time::Instant::now();
+    let result = client
+        .request(
+            probe.method.parse().map_err(|e: axum::http::method::InvalidMethod| {
+                AppError::Internal(format!("invalid method: {e}"))
+            })?,
+            &url,
+        )
+        .header("Authorization", &bearer_header)
+        .header("Content-Type", "application/json")
+        .body(probe.body)
+        .send()
+        .await;
+    let duration_ms = started.elapsed().as_millis() as u64;
+
+    match result {
+        Err(err) => {
+            tracing::info!(
+                tag = "test-connection",
+                share_id = %share_id,
+                app = %input.app,
+                error = %err,
+                duration_ms,
+                "test-connection network error"
+            );
+            Ok(Json(ShareConnectionTestResponse {
+                request: request_echo,
+                response: None,
+                duration_ms,
+                error: Some(err.to_string()),
+            }))
+        }
+        Ok(resp) => {
+            let status_code = resp.status().as_u16();
+            let status_text = resp.status().canonical_reason().unwrap_or("").to_string();
+            let resp_headers: Vec<[String; 2]> = resp
+                .headers()
+                .iter()
+                .map(|(k, v)| {
+                    [
+                        k.as_str().to_string(),
+                        v.to_str().unwrap_or("").to_string(),
+                    ]
+                })
+                .collect();
+            let body_bytes = resp.bytes().await.unwrap_or_default();
+            let body_truncated = body_bytes.len() > TEST_BODY_CAP;
+            let body_slice = &body_bytes[..body_bytes.len().min(TEST_BODY_CAP)];
+            let body_text = String::from_utf8_lossy(body_slice).into_owned();
+
+            tracing::info!(
+                tag = "test-connection",
+                share_id = %share_id,
+                app = %input.app,
+                status = status_code,
+                duration_ms,
+                "test-connection completed"
+            );
+            Ok(Json(ShareConnectionTestResponse {
+                request: request_echo,
+                response: Some(TestResponseEcho {
+                    status_code,
+                    status_text,
+                    headers: resp_headers,
+                    body_text,
+                    body_truncated,
+                }),
+                duration_ms,
+                error: None,
+            }))
+        }
+    }
 }
