@@ -16,7 +16,7 @@ const APP_PROBE = {
     path: "/v1/messages",
     body: JSON.stringify({
       model: "claude-opus-4-7",
-      max_tokens: 1,
+      max_tokens: 16,
       messages: [{ role: "user", content: "who are you" }],
     }),
   },
@@ -34,7 +34,7 @@ const APP_PROBE = {
     path: "/v1beta/models/gemini-flash-2.5:generateContent",
     body: JSON.stringify({
       contents: [{ parts: [{ text: "who are you" }] }],
-      generationConfig: { maxOutputTokens: 1 },
+      generationConfig: { maxOutputTokens: 16 },
     }),
   },
 } as const;

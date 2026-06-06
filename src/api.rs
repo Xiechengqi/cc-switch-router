@@ -3527,7 +3527,10 @@ fn app_probe(app: &str) -> Option<AppProbe> {
         "claude" => Some(AppProbe {
             method: "POST",
             path: "/v1/messages",
-            body: r#"{"model":"claude-opus-4-7","max_tokens":1,"messages":[{"role":"user","content":"who are you"}]}"#,
+            // Claude.ai OAuth (claude_oauth) 网关对 max_tokens=1 + 极短 prompt 的探针
+            // 型请求会直接 429（即便账号 quota 没耗尽），所以这里给 16，跟 codex 对齐。
+            // OAuth Pro/Max 账号是 subscription-flat-rate，多几个 token 成本可忽略。
+            body: r#"{"model":"claude-opus-4-7","max_tokens":16,"messages":[{"role":"user","content":"who are you"}]}"#,
         }),
         "codex" => Some(AppProbe {
             method: "POST",
@@ -3540,7 +3543,9 @@ fn app_probe(app: &str) -> Option<AppProbe> {
         "gemini" => Some(AppProbe {
             method: "POST",
             path: "/v1beta/models/gemini-flash-2.5:generateContent",
-            body: r#"{"contents":[{"parts":[{"text":"who are you"}]}],"generationConfig":{"maxOutputTokens":1}}"#,
+            // 同 claude/codex 思路：避免极小 maxOutputTokens 触发上游 OAuth 网关的
+            // 探针检测。Gemini 2.5 Flash 也是 reasoning model。
+            body: r#"{"contents":[{"parts":[{"text":"who are you"}]}],"generationConfig":{"maxOutputTokens":16}}"#,
         }),
         _ => None,
     }
