@@ -26,7 +26,7 @@ const APP_PROBE = {
     body: JSON.stringify({
       model: "gpt-5.5",
       input: "hi",
-      max_output_tokens: 1,
+      max_output_tokens: 16,
     }),
   },
   gemini: {

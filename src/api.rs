@@ -3532,7 +3532,9 @@ fn app_probe(app: &str) -> Option<AppProbe> {
         "codex" => Some(AppProbe {
             method: "POST",
             path: "/v1/responses",
-            body: r#"{"model":"gpt-5.5","input":"hi","max_output_tokens":1}"#,
+            // gpt-5 系 reasoning model 用 max_output_tokens=1 会被拒绝（reasoning
+            // tokens 还没开跑就到上限），16 是一个能跑通且成本可忽略的最小值。
+            body: r#"{"model":"gpt-5.5","input":"hi","max_output_tokens":16}"#,
         }),
         "gemini" => Some(AppProbe {
             method: "POST",
