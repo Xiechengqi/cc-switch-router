@@ -14,9 +14,20 @@ const APP_PROBE = {
   claude: {
     method: "POST",
     path: "/v1/messages",
+    // Claude OAuth gateway 需要 x-anthropic-billing-header system 块 + cch 签名；
+    // cc-switch 的 sign_claude_oauth_messages_body 会自动把 cch=00000 换成
+    // body 的 XxHash64 签名，所以这里只要带占位即可。非 OAuth 的直连 API key /
+    // Kiro / Cursor provider 不会触发签名，system 块只是无害的额外 prompt 前缀。
     body: JSON.stringify({
       model: "claude-opus-4-7",
       max_tokens: 16,
+      system: [
+        {
+          type: "text",
+          text:
+            "x-anthropic-billing-header: cc_version=2.1.119.47e; cc_entrypoint=sdk-cli; cch=00000;\n\nYou are Claude Code, Anthropic's official CLI for Claude.",
+        },
+      ],
       messages: [{ role: "user", content: "who are you" }],
     }),
   },
