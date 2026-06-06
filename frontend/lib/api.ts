@@ -11,6 +11,8 @@ import type {
   SettingsValuesResponse,
   ShareSettingsPatch,
   ShareEditView,
+  ShareConnectionTestRequest,
+  ShareConnectionTestResponse,
   UserApiTokenResponse,
   UserApiTokenResetResponse,
   VersionResponse,
@@ -279,6 +281,20 @@ export async function deleteBoardMessage(id: string) {
   return parseJson<unknown>(
     await boardFetch(`/v1/board/messages/${encodeURIComponent(id)}`, {
       method: "DELETE",
+    }),
+  );
+}
+
+// P18: test-connection
+export async function testShareConnection(
+  shareId: string,
+  req: ShareConnectionTestRequest,
+): Promise<ShareConnectionTestResponse> {
+  return parseJson<ShareConnectionTestResponse>(
+    await authFetch(`/v1/shares/${encodeURIComponent(shareId)}/test-connection`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(req),
     }),
   );
 }

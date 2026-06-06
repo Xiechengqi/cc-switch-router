@@ -6,6 +6,7 @@ import { Check, Copy, ExternalLink, LogIn, Mail } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getUserApiToken } from "@/lib/api";
+import { ShareConnectionTestRow } from "@/components/dashboard/share-connection-test";
 import type { ShareView, UserApiTokenStatus } from "@/lib/types";
 
 const ROUTER_OPEN_LOGIN_EVENT = "router-open-login";
@@ -142,6 +143,22 @@ export const ShareConnectDialog = React.memo(function ShareConnectDialog({
                 requestLogin={requestLogin}
                 requestAccessHref={requestAccessHref}
               />
+              {/* P18: test rows — always render (disabled states show explanatory text) */}
+              <div className="grid gap-2">
+                <span className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                  {t("dashboard.connectDialog.test.section")}
+                </span>
+                {(["claude", "codex", "gemini"] as const).map((app) => (
+                  <ShareConnectionTestRow
+                    key={app}
+                    share={share}
+                    app={app}
+                    apiToken={apiTokenPlain}
+                    baseUrl={baseUrl}
+                    canExecute={authenticated && canViewSecret}
+                  />
+                ))}
+              </div>
             </Modal.Body>
             <Modal.Footer>
               <Button

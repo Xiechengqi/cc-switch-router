@@ -786,3 +786,27 @@ export type BoardMeta = {
   maxBodyLength: number;
   guestSelfDeleteSecs: number;
 };
+
+// P18: test-connection types
+export type ShareConnectionTestRequest = {
+  app: "claude" | "codex" | "gemini";
+  timeoutMs?: number;
+};
+
+export type ShareConnectionTestResponse = {
+  request: {
+    method: string;
+    url: string;
+    headers: [string, string][];
+    body: string | null;
+  };
+  response: {
+    statusCode: number;
+    statusText: string;
+    headers: [string, string][];
+    bodyText: string;
+    bodyTruncated: boolean;
+  } | null;
+  durationMs: number;
+  error: string | null;
+};
