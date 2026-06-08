@@ -419,7 +419,7 @@ function relevantModelHealthEntries(share: ShareView, key: "claude" | "codex" | 
   const entries = share.modelHealth?.[key] || [];
   const currentModels = runtimeModelKeys(share.appRuntimes?.[key]);
   if (currentModels.size === 0) return entries;
-  return entries.filter((entry) => currentModels.has(modelHealthKey(entry.requestedModel)) || currentModels.has(modelHealthKey(entry.actualModel)));
+  return entries.filter((entry) => isAppLevelQuotaBlockedModelHealth(entry, key) || currentModels.has(modelHealthKey(entry.requestedModel)) || currentModels.has(modelHealthKey(entry.actualModel)));
 }
 
 function modelHealthFailureReason(entries: ModelHealthSummary[]) {
@@ -436,6 +436,23 @@ function modelHealthFailureReason(entries: ModelHealthSummary[]) {
   if (message.includes("oauth") || message.includes("refresh token")) return "Auth Failed";
   if (code >= 500 || message.includes("server error")) return "Provider Error";
   return "Failed";
+}
+
+function isQuotaBlockedModelHealth(entry: ModelHealthSummary) {
+  const message = String(entry.errorMessage || "").toLowerCase();
+  return entry.status === "quota_blocked"
+    || message.includes("quota exhausted")
+    || message.includes("quota_exhausted")
+    || message.includes("usage limit")
+    || message.includes("usage_limit")
+    || message.includes("weekly limit")
+    || message.includes("monthly limit");
+}
+
+function isAppLevelQuotaBlockedModelHealth(entry: ModelHealthSummary, key: "claude" | "codex" | "gemini") {
+  return modelHealthKey(entry.requestedModel) === key
+    && modelHealthKey(entry.actualModel) === key
+    && isQuotaBlockedModelHealth(entry);
 }
 
 function runtimeEndpointSummary(runtime?: ShareUpstreamProvider) {
@@ -574,6 +591,12 @@ function ForSaleCell({ share, t }: { share?: ShareView; t: TFn }) {
 
 function modelHealthTone(share: ShareView, key: "claude" | "codex" | "gemini") {
   const entries = relevantModelHealthEntries(share, key);
+  if (entries.some((entry) => isAppLevelQuotaBlockedModelHealth(entry, key))) {
+    return {
+      className: "border-red-200 bg-red-50 text-red-700",
+      label: modelHealthFailureReason(entries),
+    };
+  }
   const results = entries.flatMap((entry) => (entry.recentResults || []).slice(0, 3));
   if (!results.length) {
     return {
