@@ -344,7 +344,7 @@ export type ShareUsageDailyBucket = {
 
 export type ShareUsageEmailRow = {
   email: string;
-  role: "owner" | "shareto" | string;
+  role: "owner" | "shareto" | "market" | string;
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;

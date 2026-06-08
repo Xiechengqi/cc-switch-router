@@ -1,6 +1,6 @@
 "use client";
 
-import { Eye, ExternalLink, Link2, Loader2, Pencil, Save, Crown, X } from "lucide-react";
+import { Eye, ExternalLink, Link2, Loader2, Maximize2, Pencil, Save, Crown, X } from "lucide-react";
 import { Button, Card, Checkbox, Chip, Drawer, Input, ListBox, Modal, ProgressBar, Select, Tabs, TextArea } from "@heroui/react";
 import * as React from "react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
@@ -2837,7 +2837,7 @@ function ShareUsageTable({ usage, t }: { usage: ShareUsageByEmailResponse; t: TF
   const roleLabel = (role: string) => {
     if (role === "owner") return t("dashboard.usageEmail.role.owner");
     if (role === "shareto") return t("dashboard.usageEmail.role.shareto");
-    if (role === "caller") return t("dashboard.usageEmail.role.caller");
+    if (role === "market") return t("dashboard.usageEmail.role.market");
     return role || "-";
   };
   return (
@@ -2852,7 +2852,7 @@ function ShareUsageTable({ usage, t }: { usage: ShareUsageByEmailResponse; t: TF
             <th className="px-2 py-2 text-right">{t("dashboard.usageEmail.cacheRead")}</th>
             <th className="px-2 py-2 text-right">{t("dashboard.usageEmail.cacheWrite")}</th>
             <th className="px-2 py-2 text-right">{t("dashboard.usageEmail.total")}</th>
-            <th className="px-2 py-2 text-right">{t("dashboard.usageEmail.share")}</th>
+            <th className="px-2 py-2 text-right">{t("dashboard.usageEmail.percent")}</th>
           </tr>
         </thead>
         <tbody>
@@ -2865,7 +2865,7 @@ function ShareUsageTable({ usage, t }: { usage: ShareUsageByEmailResponse; t: TF
               <td className="px-2 py-2 text-right font-mono">{compactTokens(row.cacheReadTokens)}</td>
               <td className="px-2 py-2 text-right font-mono">{compactTokens(row.cacheCreationTokens)}</td>
               <td className="px-2 py-2 text-right font-mono font-semibold">{compactTokens(row.totalTokens)}</td>
-              <td className="px-2 py-2 text-right font-mono">{row.percent.toFixed(row.percent >= 10 ? 1 : 2)}%</td>
+              <td className="px-2 py-2 text-right font-mono">{Math.round(row.percent)}%</td>
             </tr>
           ))}
         </tbody>
@@ -2876,44 +2876,23 @@ function ShareUsageTable({ usage, t }: { usage: ShareUsageByEmailResponse; t: TF
 
 function ShareUsageTrend({ usage, t }: { usage: ShareUsageByEmailResponse; t: TFn }) {
   const rows = usage.rows.filter((row) => row.totalTokens > 0).slice(0, 5);
+  const [expanded, setExpanded] = React.useState(false);
   if (!rows.length) return <EmptyBlock>{t("dashboard.usageEmail.noData")}</EmptyBlock>;
-  const width = 620;
-  const height = 220;
-  const padding = { left: 34, right: 12, top: 12, bottom: 28 };
-  const dates = usage.rows[0]?.daily.map((bucket) => bucket.date) ?? [];
-  const maxY = Math.max(1, ...rows.flatMap((row) => row.daily.map((bucket) => bucket.totalTokens)));
-  const chartWidth = width - padding.left - padding.right;
-  const chartHeight = height - padding.top - padding.bottom;
   const colors = ["#2563eb", "#16a34a", "#d97706", "#9333ea", "#dc2626"];
-  const point = (value: number, idx: number) => {
-    const x = padding.left + (dates.length <= 1 ? 0 : (idx / (dates.length - 1)) * chartWidth);
-    const y = padding.top + chartHeight - (value / maxY) * chartHeight;
-    return `${x.toFixed(1)},${y.toFixed(1)}`;
-  };
   return (
     <div className="grid gap-2">
-      <div className="overflow-x-auto rounded-md border bg-muted/10 p-2">
-        <svg viewBox={`0 0 ${width} ${height}`} className="h-[220px] min-w-[620px] w-full" role="img" aria-label={t("dashboard.usageEmail.trendAria")}>
-          <line x1={padding.left} y1={padding.top} x2={padding.left} y2={padding.top + chartHeight} stroke="currentColor" className="text-border" />
-          <line x1={padding.left} y1={padding.top + chartHeight} x2={padding.left + chartWidth} y2={padding.top + chartHeight} stroke="currentColor" className="text-border" />
-          <text x={padding.left - 6} y={padding.top + 8} textAnchor="end" className="fill-muted-foreground text-[10px]">{compactTokens(maxY)}</text>
-          <text x={padding.left - 6} y={padding.top + chartHeight} textAnchor="end" className="fill-muted-foreground text-[10px]">0</text>
-          {dates.map((date, idx) => {
-            if (idx !== 0 && idx !== dates.length - 1 && dates.length > 10 && idx % 7 !== 0) return null;
-            const x = padding.left + (dates.length <= 1 ? 0 : (idx / (dates.length - 1)) * chartWidth);
-            return (
-              <text key={date} x={x} y={height - 8} textAnchor={idx === 0 ? "start" : idx === dates.length - 1 ? "end" : "middle"} className="fill-muted-foreground text-[10px]">
-                {date.slice(5)}
-              </text>
-            );
-          })}
-          {rows.map((row, rowIdx) => {
-            const points = row.daily.map((bucket, idx) => point(bucket.totalTokens, idx)).join(" ");
-            return (
-              <polyline key={row.email} points={points} fill="none" stroke={colors[rowIdx % colors.length]} strokeWidth="2.5" strokeLinejoin="round" strokeLinecap="round" />
-            );
-          })}
-        </svg>
+      <div className="relative overflow-x-auto rounded-md border bg-muted/10 p-2">
+        <Button
+          variant="outline"
+          size="sm"
+          isIconOnly
+          className="absolute right-2 top-2 z-10 h-7 w-7 min-w-0 rounded-md bg-background/90 p-0"
+          aria-label={t("dashboard.usageEmail.expandTrend")}
+          onClick={() => setExpanded(true)}
+        >
+          <Maximize2 className="h-3.5 w-3.5" />
+        </Button>
+        <ShareUsageTrendChart usage={usage} rows={rows} colors={colors} t={t} size="compact" />
       </div>
       <div className="flex flex-wrap gap-2">
         {rows.map((row, idx) => (
@@ -2924,7 +2903,133 @@ function ShareUsageTrend({ usage, t }: { usage: ShareUsageByEmailResponse; t: TF
           </div>
         ))}
       </div>
+      <Modal isOpen={expanded} onOpenChange={setExpanded}>
+        <Modal.Backdrop>
+          <Modal.Container placement="center">
+            <Modal.Dialog className="light w-[min(1120px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900 [--foreground:rgb(15,23,42)] [--muted:rgb(100,116,139)] [--overlay:#fff] [--overlay-foreground:rgb(15,23,42)] [--surface:#fff] [--surface-foreground:rgb(15,23,42)]">
+              <Modal.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
+              <Modal.Header>
+                <Modal.Heading>{t("dashboard.usageEmail.trendTitle")}</Modal.Heading>
+              </Modal.Header>
+              <Modal.Body className="grid gap-3">
+                <div className="overflow-x-auto rounded-md border bg-muted/10 p-3">
+                  <ShareUsageTrendChart usage={usage} rows={rows} colors={colors} t={t} size="expanded" />
+                </div>
+              </Modal.Body>
+            </Modal.Dialog>
+          </Modal.Container>
+        </Modal.Backdrop>
+      </Modal>
     </div>
+  );
+}
+
+function ShareUsageTrendChart({
+  usage,
+  rows,
+  colors,
+  t,
+  size,
+}: {
+  usage: ShareUsageByEmailResponse;
+  rows: ShareUsageByEmailResponse["rows"];
+  colors: string[];
+  t: TFn;
+  size: "compact" | "expanded";
+}) {
+  const [hover, setHover] = React.useState<{ rowIdx: number; bucketIdx: number } | null>(null);
+  const width = 620;
+  const height = 220;
+  const padding = { left: 34, right: 12, top: 12, bottom: 28 };
+  const dates = usage.rows[0]?.daily.map((bucket) => bucket.date) ?? [];
+  const maxY = Math.max(1, ...rows.flatMap((row) => row.daily.map((bucket) => bucket.totalTokens)));
+  const chartWidth = width - padding.left - padding.right;
+  const chartHeight = height - padding.top - padding.bottom;
+  const pointPosition = (value: number, idx: number) => {
+    const x = padding.left + (dates.length <= 1 ? 0 : (idx / (dates.length - 1)) * chartWidth);
+    const y = padding.top + chartHeight - (value / maxY) * chartHeight;
+    return { x, y };
+  };
+  const point = (value: number, idx: number) => {
+    const { x, y } = pointPosition(value, idx);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  };
+  const hoverPoint = hover ? pointPosition(rows[hover.rowIdx]?.daily[hover.bucketIdx]?.totalTokens ?? 0, hover.bucketIdx) : null;
+  const hoverBucket = hover ? rows[hover.rowIdx]?.daily[hover.bucketIdx] : null;
+  const tooltipWidth = 214;
+  const tooltipHeight = 86;
+  const tooltipX = hoverPoint ? Math.max(4, Math.min(width - tooltipWidth - 4, hoverPoint.x + 10)) : 0;
+  const tooltipY = hoverPoint ? Math.max(4, Math.min(height - tooltipHeight - 4, hoverPoint.y - tooltipHeight - 8)) : 0;
+  const tooltipEmail = hover ? rows[hover.rowIdx]?.email ?? "" : "";
+  const shortEmail = tooltipEmail.length > 30 ? `${tooltipEmail.slice(0, 27)}...` : tooltipEmail;
+  const updateHover = (event: React.PointerEvent<SVGPolylineElement>, rowIdx: number) => {
+    const svg = event.currentTarget.ownerSVGElement;
+    if (!svg || !dates.length) return;
+    const rect = svg.getBoundingClientRect();
+    const x = ((event.clientX - rect.left) / rect.width) * width;
+    const ratio = dates.length <= 1 ? 0 : (x - padding.left) / chartWidth;
+    const bucketIdx = Math.max(0, Math.min(dates.length - 1, Math.round(ratio * (dates.length - 1))));
+    setHover({ rowIdx, bucketIdx });
+  };
+  const shouldShowDateLabel = (idx: number) => {
+    if (dates.length <= 10) return true;
+    if (idx === 0 || idx === dates.length - 1) return true;
+    if (dates.length - 1 - idx < 4) return false;
+    return idx % 7 === 0;
+  };
+  return (
+        <svg viewBox={`0 0 ${width} ${height}`} className={`${size === "expanded" ? "h-[520px]" : "h-[220px]"} min-w-[620px] w-full`} role="img" aria-label={t("dashboard.usageEmail.trendAria")} onPointerLeave={() => setHover(null)}>
+          <line x1={padding.left} y1={padding.top} x2={padding.left} y2={padding.top + chartHeight} stroke="currentColor" className="text-border" />
+          <line x1={padding.left} y1={padding.top + chartHeight} x2={padding.left + chartWidth} y2={padding.top + chartHeight} stroke="currentColor" className="text-border" />
+          <text x={padding.left - 6} y={padding.top + 8} textAnchor="end" className="fill-muted-foreground text-[10px]">{compactTokens(maxY)}</text>
+          <text x={padding.left - 6} y={padding.top + chartHeight} textAnchor="end" className="fill-muted-foreground text-[10px]">0</text>
+          {dates.map((date, idx) => {
+            if (!shouldShowDateLabel(idx)) return null;
+            const x = padding.left + (dates.length <= 1 ? 0 : (idx / (dates.length - 1)) * chartWidth);
+            return (
+              <text key={date} x={x} y={height - 8} textAnchor={idx === 0 ? "start" : idx === dates.length - 1 ? "end" : "middle"} className="fill-muted-foreground text-[10px]">
+                {date.slice(5)}
+              </text>
+            );
+          })}
+          {rows.map((row, rowIdx) => {
+            const points = row.daily.map((bucket, idx) => point(bucket.totalTokens, idx)).join(" ");
+            return (
+              <React.Fragment key={row.email}>
+                <polyline points={points} fill="none" stroke={colors[rowIdx % colors.length]} strokeWidth="2.5" strokeLinejoin="round" strokeLinecap="round" />
+                <polyline
+                  points={points}
+                  fill="none"
+                  stroke="transparent"
+                  strokeWidth="14"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="cursor-crosshair"
+                  pointerEvents="stroke"
+                  onPointerMove={(event) => updateHover(event, rowIdx)}
+                  onFocus={() => setHover({ rowIdx, bucketIdx: row.daily.length - 1 })}
+                  tabIndex={0}
+                />
+              </React.Fragment>
+            );
+          })}
+          {hover && hoverPoint && hoverBucket ? (
+            <g pointerEvents="none">
+              <line x1={hoverPoint.x} y1={padding.top} x2={hoverPoint.x} y2={padding.top + chartHeight} stroke="currentColor" strokeDasharray="3 3" className="text-muted-foreground/60" />
+              <circle cx={hoverPoint.x} cy={hoverPoint.y} r="4" fill={colors[hover.rowIdx % colors.length]} stroke="white" strokeWidth="1.5" />
+              <rect x={tooltipX} y={tooltipY} width={tooltipWidth} height={tooltipHeight} rx="6" className="fill-background stroke-border" />
+              <text x={tooltipX + 10} y={tooltipY + 18} className="fill-foreground text-[11px] font-semibold">{shortEmail}</text>
+              <text x={tooltipX + 10} y={tooltipY + 34} className="fill-muted-foreground text-[10px]">{hoverBucket.date}</text>
+              <text x={tooltipX + 10} y={tooltipY + 52} className="fill-foreground text-[10px]">{t("dashboard.usageEmail.total")}: {compactTokens(hoverBucket.totalTokens)}</text>
+              <text x={tooltipX + 10} y={tooltipY + 68} className="fill-muted-foreground text-[10px]">
+                {t("dashboard.usageEmail.input")} {compactTokens(hoverBucket.inputTokens)} · {t("dashboard.usageEmail.output")} {compactTokens(hoverBucket.outputTokens)}
+              </text>
+              <text x={tooltipX + 10} y={tooltipY + 80} className="fill-muted-foreground text-[10px]">
+                {t("dashboard.usageEmail.cacheRead")} {compactTokens(hoverBucket.cacheReadTokens)} · {t("dashboard.usageEmail.cacheWrite")} {compactTokens(hoverBucket.cacheCreationTokens)}
+              </text>
+            </g>
+          ) : null}
+        </svg>
   );
 }
 

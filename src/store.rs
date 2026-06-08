@@ -1497,7 +1497,7 @@ impl AppStore {
             if include_actual_usage_emails {
                 rows_by_email
                     .entry(email.clone())
-                    .or_insert_with(|| make_usage_row(&email, "caller"));
+                    .or_insert_with(|| make_usage_row(&email, "market"));
             }
             let Some(row) = rows_by_email.get_mut(&email) else {
                 continue;
@@ -1563,7 +1563,7 @@ impl AppStore {
             if include_actual_usage_emails {
                 rows_by_email
                     .entry(email.clone())
-                    .or_insert_with(|| make_usage_row(&email, "caller"));
+                    .or_insert_with(|| make_usage_row(&email, "market"));
             }
             let Some(row) = rows_by_email.get_mut(&email) else {
                 continue;
@@ -12715,7 +12715,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn share_usage_by_email_uses_market_request_logs_for_shareto_usage() {
+    async fn share_usage_by_email_uses_market_request_logs_for_market_usage() {
         let (store, config) = setup_store("share-usage-by-email-market").await;
         insert_installation(&store, "inst-1").await;
         insert_share(&store, "inst-1", "share-usage", "usage-sub", "active").await;
@@ -12740,7 +12740,7 @@ mod tests {
             .expect("set access_by_app");
 
             let mut market_log = test_market_request_log("req_usage_market", "share-usage");
-            market_log.user_email = Some("caller@example.com".into());
+            market_log.user_email = Some("market@example.com".into());
             market_log.input_tokens = 120;
             market_log.output_tokens = 180;
             upsert_market_request_log_tx(&conn, &market, market_log).expect("insert market log");
@@ -12749,7 +12749,7 @@ mod tests {
             let mut duplicate_share_log =
                 test_share_request_log_entry("req_usage_market", "share-usage", now);
             duplicate_share_log.app_type = "codex".into();
-            duplicate_share_log.user_email = Some("caller@example.com".into());
+            duplicate_share_log.user_email = Some("market@example.com".into());
             duplicate_share_log.input_tokens = 900;
             upsert_share_request_log_tx(&conn, "inst-1", duplicate_share_log)
                 .expect("insert duplicate share log");
@@ -12769,13 +12769,13 @@ mod tests {
             .await
             .expect("usage");
         assert_eq!(usage.total_tokens, 350);
-        let caller = usage
+        let market = usage
             .rows
             .iter()
-            .find(|row| row.email == "caller@example.com")
-            .expect("caller row");
-        assert_eq!(caller.role, "caller");
-        assert_eq!(caller.total_tokens, 300);
+            .find(|row| row.email == "market@example.com")
+            .expect("market row");
+        assert_eq!(market.role, "market");
+        assert_eq!(market.total_tokens, 300);
         let owner = usage
             .rows
             .iter()
