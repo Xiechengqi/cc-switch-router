@@ -3827,8 +3827,10 @@ impl AppStore {
         let locale = normalize_market_notification_locale(input.locale.as_deref());
         let payload = validate_market_notification_payload(&kind, &input.data)?;
         let resend = resend.ok_or_else(|| AppError::Internal("resend is not configured".into()))?;
-        let subject = market_notification_subject(&kind, locale);
-        let html = render_market_notification_html(&kind, locale, market, &payload);
+        // 渲染恒用英文，与 send_login_code_email 保持一致。`locale` 仍写入 DB（见
+        // market_notification_emails.locale 列），便于审计客户端原始请求。
+        let subject = market_notification_subject(&kind);
+        let html = render_market_notification_html(&kind, market, &payload);
         let provider_message_id =
             send_market_template_email(resend, config, &to, &subject, &html).await?;
         let now = Utc::now().to_rfc3339();
@@ -10637,31 +10639,25 @@ fn validate_market_notification_payload(
     Ok(data.clone())
 }
 
-fn market_notification_subject(kind: &str, locale: &str) -> String {
-    match (kind, locale) {
-        ("topup_paid", "en") => "Top-up received · cc-switch Market".into(),
-        ("topup_refunded", "en") => "Top-up refunded · cc-switch Market".into(),
-        ("topup_chargeback", "en") => "Top-up chargeback notice · cc-switch Market".into(),
-        ("payout_submitted", "en") => "Payout submitted · cc-switch Market".into(),
-        ("payout_paid", "en") => "Payout completed · cc-switch Market".into(),
-        ("payout_failed", "en") => "Payout failed · cc-switch Market".into(),
-        ("payout_review", "en") => "Payout under review · cc-switch Market".into(),
-        ("payout_cancelled", "en") => "Payout cancelled · cc-switch Market".into(),
-        ("topup_paid", _) => "充值已到账 · cc-switch Market".into(),
-        ("topup_refunded", _) => "充值已退款 · cc-switch Market".into(),
-        ("topup_chargeback", _) => "充值争议/拒付提醒 · cc-switch Market".into(),
-        ("payout_submitted", _) => "提现请求已提交 · cc-switch Market".into(),
-        ("payout_paid", _) => "提现已完成 · cc-switch Market".into(),
-        ("payout_failed", _) => "提现失败 · cc-switch Market".into(),
-        ("payout_review", _) => "提现正在复核 · cc-switch Market".into(),
-        ("payout_cancelled", _) => "提现已取消 · cc-switch Market".into(),
+fn market_notification_subject(kind: &str) -> String {
+    // 所有 router 发出的邮件均为纯英文，与 send_login_code_email 一致。`locale`
+    // 字段仍按客户端请求写入 DB（market_notification_emails.locale），但渲染恒用
+    // 英文，避免按用户偏好回退到中文。
+    match kind {
+        "topup_paid" => "Top-up received · cc-switch Market".into(),
+        "topup_refunded" => "Top-up refunded · cc-switch Market".into(),
+        "topup_chargeback" => "Top-up chargeback notice · cc-switch Market".into(),
+        "payout_submitted" => "Payout submitted · cc-switch Market".into(),
+        "payout_paid" => "Payout completed · cc-switch Market".into(),
+        "payout_failed" => "Payout failed · cc-switch Market".into(),
+        "payout_review" => "Payout under review · cc-switch Market".into(),
+        "payout_cancelled" => "Payout cancelled · cc-switch Market".into(),
         _ => "cc-switch Market notification".into(),
     }
 }
 
 fn render_market_notification_html(
     kind: &str,
-    locale: &str,
     market: &MarketRegistryRecord,
     payload: &serde_json::Value,
 ) -> String {
@@ -10675,14 +10671,6 @@ fn render_market_notification_html(
             ("Net", format!("${}", get("netAmountUsd"))),
         ]
     };
-    let topup_details_zh = || {
-        vec![
-            ("充值 ID", get("topupId").to_string()),
-            ("总额", format!("${}", get("grossAmountUsd"))),
-            ("手续费", format!("${}", get("feeAmountUsd"))),
-            ("净额", format!("${}", get("netAmountUsd"))),
-        ]
-    };
     let payout_details = || {
         vec![
             ("Payout ID", get("payoutId").to_string()),
@@ -10691,59 +10679,51 @@ fn render_market_notification_html(
             ("Net", format!("${}", get("netPayoutUsd"))),
         ]
     };
-    let payout_details_zh = || {
-        vec![
-            ("提现 ID", get("payoutId").to_string()),
-            ("提现金额", format!("${}", get("amountUsd"))),
-            ("手续费", format!("${}", get("feeUsd"))),
-            ("预计到账", format!("${}", get("netPayoutUsd"))),
-        ]
-    };
 
-    match (kind, locale) {
-        ("topup_paid", "en") => render_market_notification_card(
+    match kind {
+        "topup_paid" => render_market_notification_card(
             "Top-up received",
             &format!("Your balance has been credited on {market_name}."),
             "Open dashboard",
             get("dashboardUrl"),
             topup_details(),
         ),
-        ("topup_refunded", "en") => render_market_notification_card(
+        "topup_refunded" => render_market_notification_card(
             "Top-up refunded",
             &format!("Your top-up has been refunded on {market_name}."),
             "Open dashboard",
             get("dashboardUrl"),
             topup_details(),
         ),
-        ("topup_chargeback", "en") => render_market_notification_card(
+        "topup_chargeback" => render_market_notification_card(
             "Top-up chargeback notice",
             &format!("A chargeback or dispute has been recorded on {market_name}."),
             "Open dashboard",
             get("dashboardUrl"),
             topup_details(),
         ),
-        ("payout_submitted", "en") => render_market_notification_card(
+        "payout_submitted" => render_market_notification_card(
             "Payout submitted",
             &format!("Your payout request has been created on {market_name}."),
             "Open claim page",
             get("claimUrl"),
             payout_details(),
         ),
-        ("payout_paid", "en") => render_market_notification_card(
+        "payout_paid" => render_market_notification_card(
             "Payout completed",
             &format!("Your payout has been completed on {market_name}."),
             "Open claim page",
             get("claimUrl"),
             payout_details(),
         ),
-        ("payout_failed", "en") => render_market_notification_card(
+        "payout_failed" => render_market_notification_card(
             "Payout failed",
             &format!("Your payout could not be completed on {market_name}."),
             "Open claim page",
             get("claimUrl"),
             payout_details(),
         ),
-        ("payout_review", "en") => render_market_notification_card(
+        "payout_review" => render_market_notification_card(
             "Payout under review",
             &format!(
                 "Your payout is being reviewed on {market_name}. Please do not submit another payout."
@@ -10752,68 +10732,12 @@ fn render_market_notification_html(
             get("claimUrl"),
             payout_details(),
         ),
-        ("payout_cancelled", "en") => render_market_notification_card(
+        "payout_cancelled" => render_market_notification_card(
             "Payout cancelled",
             &format!("Your payout was cancelled on {market_name}."),
             "Open claim page",
             get("claimUrl"),
             payout_details(),
-        ),
-        ("topup_paid", _) => render_market_notification_card(
-            "充值已到账",
-            &format!("你在 {market_name} 的充值已经到账。"),
-            "前往控制台",
-            get("dashboardUrl"),
-            topup_details_zh(),
-        ),
-        ("topup_refunded", _) => render_market_notification_card(
-            "充值已退款",
-            &format!("你在 {market_name} 的充值已被退款。"),
-            "前往控制台",
-            get("dashboardUrl"),
-            topup_details_zh(),
-        ),
-        ("topup_chargeback", _) => render_market_notification_card(
-            "充值争议/拒付提醒",
-            &format!("你在 {market_name} 的一笔充值出现争议或拒付。"),
-            "前往控制台",
-            get("dashboardUrl"),
-            topup_details_zh(),
-        ),
-        ("payout_submitted", _) => render_market_notification_card(
-            "提现请求已提交",
-            &format!("你在 {market_name} 的提现请求已创建。"),
-            "前往收益页",
-            get("claimUrl"),
-            payout_details_zh(),
-        ),
-        ("payout_paid", _) => render_market_notification_card(
-            "提现已完成",
-            &format!("你在 {market_name} 的提现已完成。"),
-            "前往收益页",
-            get("claimUrl"),
-            payout_details_zh(),
-        ),
-        ("payout_failed", _) => render_market_notification_card(
-            "提现失败",
-            &format!("你在 {market_name} 的提现未能完成。"),
-            "前往收益页",
-            get("claimUrl"),
-            payout_details_zh(),
-        ),
-        ("payout_review", _) => render_market_notification_card(
-            "提现正在复核",
-            &format!("你在 {market_name} 的提现正在人工复核，请不要重复提交。"),
-            "前往收益页",
-            get("claimUrl"),
-            payout_details_zh(),
-        ),
-        ("payout_cancelled", _) => render_market_notification_card(
-            "提现已取消",
-            &format!("你在 {market_name} 的提现已取消。"),
-            "前往收益页",
-            get("claimUrl"),
-            payout_details_zh(),
         ),
         _ => render_market_notification_card(
             "Notification",
