@@ -358,6 +358,7 @@ export type ShareUsageByEmailResponse = {
   shareId: string;
   app: "claude" | "codex" | "gemini" | string;
   period: "24h" | "1w" | "30d" | string;
+  bucketGranularity?: "hour" | "day" | string;
   days: number;
   totalTokens: number;
   rows: ShareUsageEmailRow[];

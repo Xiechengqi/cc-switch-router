@@ -839,6 +839,7 @@ pub struct ShareUsageByEmailResponse {
     pub share_id: String,
     pub app: String,
     pub period: String,
+    pub bucket_granularity: String,
     pub days: u32,
     pub total_tokens: u64,
     pub rows: Vec<ShareUsageEmailRow>,

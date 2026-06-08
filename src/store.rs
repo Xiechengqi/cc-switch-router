@@ -1383,6 +1383,7 @@ impl AppStore {
         let app = normalize_share_acl_app(app_type)?;
         let window = normalize_usage_period(period)?;
         let period = window.period.clone();
+        let bucket_granularity = window.bucket_granularity.clone();
         let days = window.days;
         let conn = self.conn.lock().await;
         let Some((
@@ -1437,7 +1438,7 @@ impl AppStore {
         let start_dt = window.start_at;
         let start_ts = start_dt.timestamp();
         let start_rfc3339 = start_dt.to_rfc3339();
-        let date_keys = window.date_keys;
+        let bucket_keys = window.bucket_keys;
         let make_usage_row = |email: &str, role: &str| ShareUsageEmailRow {
             email: email.to_string(),
             role: role.to_string(),
@@ -1447,10 +1448,10 @@ impl AppStore {
             cache_creation_tokens: 0,
             total_tokens: 0,
             percent: 0.0,
-            daily: date_keys
+            daily: bucket_keys
                 .iter()
-                .map(|date| ShareUsageDailyBucket {
-                    date: date.clone(),
+                .map(|bucket| ShareUsageDailyBucket {
+                    date: bucket.clone(),
                     input_tokens: 0,
                     output_tokens: 0,
                     cache_read_tokens: 0,
@@ -1463,31 +1464,35 @@ impl AppStore {
             .iter()
             .map(|(email, role)| (email.clone(), make_usage_row(email, role)))
             .collect::<BTreeMap<_, _>>();
-        let date_index = date_keys
+        let bucket_index = bucket_keys
             .iter()
             .enumerate()
-            .map(|(idx, date)| (date.clone(), idx))
+            .map(|(idx, bucket)| (bucket.clone(), idx))
             .collect::<BTreeMap<_, _>>();
 
-        let mut market_stmt = conn
-            .prepare(
-                "SELECT lower(trim(user_email)),
-                        date(created_at) AS usage_date,
-                        COALESCE(SUM(input_tokens), 0),
-                        COALESCE(SUM(output_tokens), 0),
-                        COALESCE(SUM(cache_read_tokens), 0),
-                        COALESCE(SUM(cache_creation_tokens), 0)
-                 FROM market_request_logs
-                 WHERE share_id = ?1
-                   AND lower(request_agent) = lower(?2)
-                   AND created_at >= ?3
-                   AND user_email IS NOT NULL
-                   AND trim(user_email) != ''
-                 GROUP BY lower(trim(user_email)), usage_date",
-            )
-            .map_err(|e| {
-                AppError::Internal(format!("prepare market share usage query failed: {e}"))
-            })?;
+        let market_bucket_expr = if bucket_granularity == "hour" {
+            "strftime('%Y-%m-%dT%H:00:00Z', created_at)"
+        } else {
+            "date(created_at)"
+        };
+        let market_usage_sql = format!(
+            "SELECT lower(trim(user_email)),
+                    {market_bucket_expr} AS usage_bucket,
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(cache_read_tokens), 0),
+                    COALESCE(SUM(cache_creation_tokens), 0)
+             FROM market_request_logs
+             WHERE share_id = ?1
+               AND lower(request_agent) = lower(?2)
+               AND created_at >= ?3
+               AND user_email IS NOT NULL
+               AND trim(user_email) != ''
+             GROUP BY lower(trim(user_email)), usage_bucket"
+        );
+        let mut market_stmt = conn.prepare(&market_usage_sql).map_err(|e| {
+            AppError::Internal(format!("prepare market share usage query failed: {e}"))
+        })?;
         let market_rows = market_stmt
             .query_map(params![share_id, app, start_rfc3339], |row| {
                 Ok((
@@ -1501,7 +1506,7 @@ impl AppStore {
             })
             .map_err(|e| AppError::Internal(format!("query market share usage failed: {e}")))?;
         for row in market_rows {
-            let (email, date, input, output, cache_read, cache_creation) = row.map_err(|e| {
+            let (email, bucket, input, output, cache_read, cache_creation) = row.map_err(|e| {
                 AppError::Internal(format!("read market share usage row failed: {e}"))
             })?;
             if include_actual_usage_emails {
@@ -1518,7 +1523,7 @@ impl AppStore {
             row.cache_read_tokens += cache_read;
             row.cache_creation_tokens += cache_creation;
             row.total_tokens += total;
-            if let Some(idx) = date_index.get(&date).copied() {
+            if let Some(idx) = bucket_index.get(&bucket).copied() {
                 if let Some(bucket) = row.daily.get_mut(idx) {
                     bucket.input_tokens += input;
                     bucket.output_tokens += output;
@@ -1529,31 +1534,37 @@ impl AppStore {
             }
         }
 
+        let share_bucket_expr = if bucket_granularity == "hour" {
+            "strftime('%Y-%m-%dT%H:00:00Z', created_at, 'unixepoch')"
+        } else {
+            "date(created_at, 'unixepoch')"
+        };
+        let share_usage_sql = format!(
+            "SELECT lower(trim(user_email)),
+                    {share_bucket_expr} AS usage_bucket,
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(cache_read_tokens), 0),
+                    COALESCE(SUM(cache_creation_tokens), 0)
+             FROM share_request_logs
+             WHERE share_id = ?1
+               AND lower(app_type) = lower(?2)
+               AND created_at >= ?3
+               AND is_health_check = 0
+               AND user_email IS NOT NULL
+               AND trim(user_email) != ''
+               AND NOT EXISTS (
+                    SELECT 1
+                    FROM market_request_logs ml
+                    WHERE ml.request_id = share_request_logs.request_id
+                      AND COALESCE(ml.share_id, '') = share_request_logs.share_id
+                      AND ml.user_email IS NOT NULL
+                      AND trim(ml.user_email) != ''
+               )
+             GROUP BY lower(trim(user_email)), usage_bucket"
+        );
         let mut stmt = conn
-            .prepare(
-                "SELECT lower(trim(user_email)),
-                        date(created_at, 'unixepoch') AS usage_date,
-                        COALESCE(SUM(input_tokens), 0),
-                        COALESCE(SUM(output_tokens), 0),
-                        COALESCE(SUM(cache_read_tokens), 0),
-                        COALESCE(SUM(cache_creation_tokens), 0)
-                 FROM share_request_logs
-                 WHERE share_id = ?1
-                   AND lower(app_type) = lower(?2)
-                   AND created_at >= ?3
-                   AND is_health_check = 0
-                   AND user_email IS NOT NULL
-                   AND trim(user_email) != ''
-                   AND NOT EXISTS (
-                        SELECT 1
-                        FROM market_request_logs ml
-                        WHERE ml.request_id = share_request_logs.request_id
-                          AND COALESCE(ml.share_id, '') = share_request_logs.share_id
-                          AND ml.user_email IS NOT NULL
-                          AND trim(ml.user_email) != ''
-                   )
-                 GROUP BY lower(trim(user_email)), usage_date",
-            )
+            .prepare(&share_usage_sql)
             .map_err(|e| AppError::Internal(format!("prepare share usage query failed: {e}")))?;
         let rows = stmt
             .query_map(params![share_id, app, start_ts], |row| {
@@ -1568,7 +1579,7 @@ impl AppStore {
             })
             .map_err(|e| AppError::Internal(format!("query share usage failed: {e}")))?;
         for row in rows {
-            let (email, date, input, output, cache_read, cache_creation) =
+            let (email, bucket, input, output, cache_read, cache_creation) =
                 row.map_err(|e| AppError::Internal(format!("read share usage row failed: {e}")))?;
             if include_actual_usage_emails {
                 rows_by_email
@@ -1584,7 +1595,7 @@ impl AppStore {
             row.cache_read_tokens += cache_read;
             row.cache_creation_tokens += cache_creation;
             row.total_tokens += total;
-            if let Some(idx) = date_index.get(&date).copied() {
+            if let Some(idx) = bucket_index.get(&bucket).copied() {
                 if let Some(bucket) = row.daily.get_mut(idx) {
                     bucket.input_tokens += input;
                     bucket.output_tokens += output;
@@ -1618,6 +1629,7 @@ impl AppStore {
             share_id: share_id.to_string(),
             app,
             period,
+            bucket_granularity,
             days,
             total_tokens,
             rows,
@@ -7681,9 +7693,10 @@ fn normalize_share_acl_app(value: &str) -> Result<String, AppError> {
 
 struct UsagePeriodWindow {
     period: String,
+    bucket_granularity: String,
     days: u32,
     start_at: DateTime<Utc>,
-    date_keys: Vec<String>,
+    bucket_keys: Vec<String>,
 }
 
 fn normalize_usage_period(value: &str) -> Result<UsagePeriodWindow, AppError> {
@@ -7691,12 +7704,13 @@ fn normalize_usage_period(value: &str) -> Result<UsagePeriodWindow, AppError> {
     match value.trim().to_ascii_lowercase().as_str() {
         "" | "24h" | "1d" | "1天" => {
             let start_at = now - Duration::hours(24);
-            let date_keys = usage_date_keys(start_at, now);
+            let bucket_keys = usage_hour_keys(start_at, now);
             Ok(UsagePeriodWindow {
                 period: "24h".to_string(),
-                days: date_keys.len() as u32,
+                bucket_granularity: "hour".to_string(),
+                days: usage_date_keys(start_at, now).len() as u32,
                 start_at,
-                date_keys,
+                bucket_keys,
             })
         }
         "1w" | "7d" => usage_day_window("1w", 7, now),
@@ -7727,10 +7741,28 @@ fn usage_day_window(
         .collect::<Vec<_>>();
     Ok(UsagePeriodWindow {
         period: period.to_string(),
+        bucket_granularity: "day".to_string(),
         days,
         start_at,
-        date_keys,
+        bucket_keys: date_keys,
     })
+}
+
+fn usage_hour_keys(start_at: DateTime<Utc>, end_at: DateTime<Utc>) -> Vec<String> {
+    let mut bucket = floor_to_utc_hour(start_at);
+    let end = floor_to_utc_hour(end_at);
+    let mut keys = Vec::new();
+    while bucket <= end {
+        keys.push(bucket.format("%Y-%m-%dT%H:00:00Z").to_string());
+        bucket += Duration::hours(1);
+    }
+    keys
+}
+
+fn floor_to_utc_hour(value: DateTime<Utc>) -> DateTime<Utc> {
+    let timestamp = value.timestamp();
+    let floored = timestamp - timestamp.rem_euclid(3600);
+    DateTime::<Utc>::from_timestamp(floored, 0).unwrap_or(value)
 }
 
 fn usage_date_keys(start_at: DateTime<Utc>, end_at: DateTime<Utc>) -> Vec<String> {
@@ -13030,6 +13062,7 @@ mod tests {
             .await
             .expect("usage");
         assert_eq!(usage.period, "24h");
+        assert_eq!(usage.bucket_granularity, "hour");
         assert!((1..=2).contains(&usage.days));
         assert_eq!(usage.total_tokens, 25);
         let owner = usage
@@ -13038,6 +13071,8 @@ mod tests {
             .find(|row| row.email == "owner@example.com")
             .expect("owner row");
         assert_eq!(owner.total_tokens, 25);
+        assert!(owner.daily.len() >= 24);
+        assert!(owner.daily.iter().all(|bucket| bucket.date.contains('T')));
         assert_eq!(
             owner
                 .daily

@@ -2976,6 +2976,7 @@ function ShareUsageTrendChart({
   const height = 220;
   const padding = { left: 34, right: 12, top: 12, bottom: 28 };
   const dates = usage.rows[0]?.daily.map((bucket) => bucket.date) ?? [];
+  const bucketGranularity = usage.bucketGranularity ?? (usage.period === "24h" ? "hour" : "day");
   const maxY = Math.max(1, ...rows.flatMap((row) => row.daily.map((bucket) => bucket.totalTokens)));
   const chartWidth = width - padding.left - padding.right;
   const chartHeight = height - padding.top - padding.bottom;
@@ -2996,6 +2997,14 @@ function ShareUsageTrendChart({
   const tooltipY = hoverPoint ? Math.max(4, Math.min(height - tooltipHeight - 4, hoverPoint.y - tooltipHeight - 8)) : 0;
   const tooltipEmail = hover ? rows[hover.rowIdx]?.email ?? "" : "";
   const shortEmail = tooltipEmail.length > 30 ? `${tooltipEmail.slice(0, 27)}...` : tooltipEmail;
+  const formatBucketLabel = (bucket: string, detail = false) => {
+    if (bucketGranularity === "hour") {
+      const date = bucket.slice(5, 10);
+      const hour = bucket.slice(11, 13);
+      return detail ? `${date} ${hour}:00 UTC` : `${hour}:00`;
+    }
+    return detail ? bucket : bucket.slice(5);
+  };
   const updateHover = (event: React.PointerEvent<SVGPolylineElement>, rowIdx: number) => {
     const svg = event.currentTarget.ownerSVGElement;
     if (!svg || !dates.length) return;
@@ -3006,6 +3015,10 @@ function ShareUsageTrendChart({
     setHover({ rowIdx, bucketIdx });
   };
   const shouldShowDateLabel = (idx: number) => {
+    if (bucketGranularity === "hour") {
+      if (idx === 0 || idx === dates.length - 1) return true;
+      return idx % 4 === 0;
+    }
     if (dates.length <= 10) return true;
     if (idx === 0 || idx === dates.length - 1) return true;
     if (dates.length - 1 - idx < 4) return false;
@@ -3022,7 +3035,7 @@ function ShareUsageTrendChart({
             const x = padding.left + (dates.length <= 1 ? 0 : (idx / (dates.length - 1)) * chartWidth);
             return (
               <text key={date} x={x} y={height - 8} textAnchor={idx === 0 ? "start" : idx === dates.length - 1 ? "end" : "middle"} className="fill-muted-foreground text-[10px]">
-                {date.slice(5)}
+                {formatBucketLabel(date)}
               </text>
             );
           })}
@@ -3053,7 +3066,7 @@ function ShareUsageTrendChart({
               <circle cx={hoverPoint.x} cy={hoverPoint.y} r="4" fill={colors[hover.rowIdx % colors.length]} stroke="white" strokeWidth="1.5" />
               <rect x={tooltipX} y={tooltipY} width={tooltipWidth} height={tooltipHeight} rx="6" className="fill-background stroke-border" />
               <text x={tooltipX + 10} y={tooltipY + 18} className="fill-foreground text-[11px] font-semibold">{shortEmail}</text>
-              <text x={tooltipX + 10} y={tooltipY + 34} className="fill-muted-foreground text-[10px]">{hoverBucket.date}</text>
+              <text x={tooltipX + 10} y={tooltipY + 34} className="fill-muted-foreground text-[10px]">{formatBucketLabel(hoverBucket.date, true)}</text>
               <text x={tooltipX + 10} y={tooltipY + 52} className="fill-foreground text-[10px]">{t("dashboard.usageEmail.total")}: {compactTokens(hoverBucket.totalTokens)}</text>
               <text x={tooltipX + 10} y={tooltipY + 68} className="fill-muted-foreground text-[10px]">
                 {t("dashboard.usageEmail.input")} {compactTokens(hoverBucket.inputTokens)} · {t("dashboard.usageEmail.output")} {compactTokens(hoverBucket.outputTokens)}
