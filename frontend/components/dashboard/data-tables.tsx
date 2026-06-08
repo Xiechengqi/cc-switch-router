@@ -2834,6 +2834,12 @@ function ShareEmailUsagePanel({
 }
 
 function ShareUsageTable({ usage, t }: { usage: ShareUsageByEmailResponse; t: TFn }) {
+  const roleLabel = (role: string) => {
+    if (role === "owner") return t("dashboard.usageEmail.role.owner");
+    if (role === "shareto") return t("dashboard.usageEmail.role.shareto");
+    if (role === "caller") return t("dashboard.usageEmail.role.caller");
+    return role || "-";
+  };
   return (
     <div className="overflow-x-auto rounded-md border">
       <table className="w-full min-w-[760px] border-collapse text-xs">
@@ -2853,7 +2859,7 @@ function ShareUsageTable({ usage, t }: { usage: ShareUsageByEmailResponse; t: TF
           {usage.rows.map((row) => (
             <tr key={row.email} className="border-t">
               <td className="max-w-[220px] truncate px-2 py-2 font-medium">{row.email}</td>
-              <td className="px-2 py-2 text-muted-foreground">{row.role === "owner" ? t("dashboard.usageEmail.role.owner") : t("dashboard.usageEmail.role.shareto")}</td>
+              <td className="px-2 py-2 text-muted-foreground">{roleLabel(row.role)}</td>
               <td className="px-2 py-2 text-right font-mono">{compactTokens(row.inputTokens)}</td>
               <td className="px-2 py-2 text-right font-mono">{compactTokens(row.outputTokens)}</td>
               <td className="px-2 py-2 text-right font-mono">{compactTokens(row.cacheReadTokens)}</td>

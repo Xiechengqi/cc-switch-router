@@ -1364,17 +1364,18 @@ impl AppStore {
         let app = normalize_share_acl_app(app_type)?;
         let (period, days) = normalize_usage_period(period)?;
         let conn = self.conn.lock().await;
-        let Some((owner_email, shared_with_emails_json, access_by_app_json)): Option<(
-            Option<String>,
-            String,
-            String,
-        )> = conn
+        let Some((
+            owner_email,
+            shared_with_emails_json,
+            access_by_app_json,
+            market_access_mode,
+        )): Option<(Option<String>, String, String, String)> = conn
             .query_row(
-                "SELECT owner_email, shared_with_emails_json, COALESCE(access_by_app_json, '{}')
+                "SELECT owner_email, shared_with_emails_json, COALESCE(access_by_app_json, '{}'), market_access_mode
                  FROM shares
                  WHERE share_id = ?1",
                 params![share_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(|e| AppError::Internal(format!("query share usage acl failed: {e}")))?
@@ -1392,14 +1393,20 @@ impl AppStore {
         if let Some(owner) = owner_email.as_deref().and_then(normalize_usage_email) {
             roles.insert(owner, "owner".to_string());
         }
-        let shareto_emails = if access_by_app.is_empty() {
-            shared_with_emails
+        let (shareto_emails, app_market_access_mode) = if access_by_app.is_empty() {
+            (shared_with_emails, market_access_mode.clone())
         } else {
-            access_by_app
-                .get(&app)
-                .map(|access| access.shared_with_emails.clone())
-                .unwrap_or_default()
+            let access = access_by_app.get(&app);
+            (
+                access
+                    .map(|access| access.shared_with_emails.clone())
+                    .unwrap_or_default(),
+                access
+                    .map(|access| access.market_access_mode.clone())
+                    .unwrap_or_else(|| "selected".to_string()),
+            )
         };
+        let include_actual_usage_emails = app_market_access_mode.eq_ignore_ascii_case("all");
         for email in shareto_emails {
             if let Some(email) = normalize_usage_email(&email) {
                 roles.entry(email).or_insert_with(|| "shareto".to_string());
@@ -1421,34 +1428,30 @@ impl AppStore {
                     .to_string()
             })
             .collect::<Vec<_>>();
+        let make_usage_row = |email: &str, role: &str| ShareUsageEmailRow {
+            email: email.to_string(),
+            role: role.to_string(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            total_tokens: 0,
+            percent: 0.0,
+            daily: date_keys
+                .iter()
+                .map(|date| ShareUsageDailyBucket {
+                    date: date.clone(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    total_tokens: 0,
+                })
+                .collect(),
+        };
         let mut rows_by_email = roles
             .iter()
-            .map(|(email, role)| {
-                (
-                    email.clone(),
-                    ShareUsageEmailRow {
-                        email: email.clone(),
-                        role: role.clone(),
-                        input_tokens: 0,
-                        output_tokens: 0,
-                        cache_read_tokens: 0,
-                        cache_creation_tokens: 0,
-                        total_tokens: 0,
-                        percent: 0.0,
-                        daily: date_keys
-                            .iter()
-                            .map(|date| ShareUsageDailyBucket {
-                                date: date.clone(),
-                                input_tokens: 0,
-                                output_tokens: 0,
-                                cache_read_tokens: 0,
-                                cache_creation_tokens: 0,
-                                total_tokens: 0,
-                            })
-                            .collect(),
-                    },
-                )
-            })
+            .map(|(email, role)| (email.clone(), make_usage_row(email, role)))
             .collect::<BTreeMap<_, _>>();
         let date_index = date_keys
             .iter()
@@ -1491,6 +1494,11 @@ impl AppStore {
             let (email, date, input, output, cache_read, cache_creation) = row.map_err(|e| {
                 AppError::Internal(format!("read market share usage row failed: {e}"))
             })?;
+            if include_actual_usage_emails {
+                rows_by_email
+                    .entry(email.clone())
+                    .or_insert_with(|| make_usage_row(&email, "caller"));
+            }
             let Some(row) = rows_by_email.get_mut(&email) else {
                 continue;
             };
@@ -1552,6 +1560,11 @@ impl AppStore {
         for row in rows {
             let (email, date, input, output, cache_read, cache_creation) =
                 row.map_err(|e| AppError::Internal(format!("read share usage row failed: {e}")))?;
+            if include_actual_usage_emails {
+                rows_by_email
+                    .entry(email.clone())
+                    .or_insert_with(|| make_usage_row(&email, "caller"));
+            }
             let Some(row) = rows_by_email.get_mut(&email) else {
                 continue;
             };
@@ -12713,8 +12726,8 @@ mod tests {
             let access_by_app = BTreeMap::from([(
                 "codex".to_string(),
                 ShareAppAccess {
-                    shared_with_emails: vec!["shareto@example.com".to_string()],
-                    market_access_mode: "selected".to_string(),
+                    shared_with_emails: vec![],
+                    market_access_mode: "all".to_string(),
                 },
             )]);
             conn.execute(
@@ -12727,7 +12740,7 @@ mod tests {
             .expect("set access_by_app");
 
             let mut market_log = test_market_request_log("req_usage_market", "share-usage");
-            market_log.user_email = Some("shareto@example.com".into());
+            market_log.user_email = Some("caller@example.com".into());
             market_log.input_tokens = 120;
             market_log.output_tokens = 180;
             upsert_market_request_log_tx(&conn, &market, market_log).expect("insert market log");
@@ -12736,7 +12749,7 @@ mod tests {
             let mut duplicate_share_log =
                 test_share_request_log_entry("req_usage_market", "share-usage", now);
             duplicate_share_log.app_type = "codex".into();
-            duplicate_share_log.user_email = Some("shareto@example.com".into());
+            duplicate_share_log.user_email = Some("caller@example.com".into());
             duplicate_share_log.input_tokens = 900;
             upsert_share_request_log_tx(&conn, "inst-1", duplicate_share_log)
                 .expect("insert duplicate share log");
@@ -12756,12 +12769,13 @@ mod tests {
             .await
             .expect("usage");
         assert_eq!(usage.total_tokens, 350);
-        let shareto = usage
+        let caller = usage
             .rows
             .iter()
-            .find(|row| row.email == "shareto@example.com")
-            .expect("shareto row");
-        assert_eq!(shareto.total_tokens, 300);
+            .find(|row| row.email == "caller@example.com")
+            .expect("caller row");
+        assert_eq!(caller.role, "caller");
+        assert_eq!(caller.total_tokens, 300);
         let owner = usage
             .rows
             .iter()
