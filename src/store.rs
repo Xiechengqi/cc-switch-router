@@ -2872,6 +2872,7 @@ impl AppStore {
                     .get(&share.share_id)
                     .cloned()
                     .unwrap_or_default();
+                let support = apply_support_model_health_blocks(share.support, &model_health);
                 ShareView {
                     share_id: share.share_id,
                     share_name: share.share_name,
@@ -2908,7 +2909,7 @@ impl AppStore {
                     share_status: share.share_status,
                     created_at: share.created_at,
                     expires_at: share.expires_at,
-                    support: share.support,
+                    support,
                     upstream_provider: share.upstream_provider,
                     app_runtimes: share.app_runtimes,
                     app_providers: share.app_providers,
@@ -4108,11 +4109,14 @@ impl AppStore {
                         share_created_at: row.get(20)?,
                         disabled_by_market: row.get::<_, Option<String>>(19)?.is_some(),
                         market_disabled_at: row.get(19)?,
-                        support: ShareSupport {
-                            claude: row.get::<_, i64>(14)? != 0,
-                            codex: row.get::<_, i64>(15)? != 0,
-                            gemini: row.get::<_, i64>(16)? != 0,
-                        },
+                        support: apply_support_model_health_blocks(
+                            ShareSupport {
+                                claude: row.get::<_, i64>(14)? != 0,
+                                codex: row.get::<_, i64>(15)? != 0,
+                                gemini: row.get::<_, i64>(16)? != 0,
+                            },
+                            &model_health,
+                        ),
                         upstream_provider,
                         app_runtimes,
                         model_health,
@@ -8330,9 +8334,12 @@ fn filter_app_runtimes_by_model_health(
     mut runtimes: ShareAppRuntimes,
     health: &ShareModelHealthSummary,
 ) -> ShareAppRuntimes {
-    runtimes.claude = filter_provider_models_by_health(runtimes.claude, &health.claude);
-    runtimes.codex = filter_provider_models_by_health(runtimes.codex, &health.codex);
-    runtimes.gemini = filter_provider_models_by_health(runtimes.gemini, &health.gemini);
+    runtimes.claude = filter_provider_by_app_health(runtimes.claude, &health.claude, "claude")
+        .and_then(|provider| filter_provider_models_by_health(Some(provider), &health.claude));
+    runtimes.codex = filter_provider_by_app_health(runtimes.codex, &health.codex, "codex")
+        .and_then(|provider| filter_provider_models_by_health(Some(provider), &health.codex));
+    runtimes.gemini = filter_provider_by_app_health(runtimes.gemini, &health.gemini, "gemini")
+        .and_then(|provider| filter_provider_models_by_health(Some(provider), &health.gemini));
     // OAuth-only providers have no model-level health entries; pass through as-is.
     runtimes.kiro = filter_provider_models_by_health(runtimes.kiro, &[]);
     runtimes.cursor = filter_provider_models_by_health(runtimes.cursor, &[]);
@@ -8386,6 +8393,62 @@ fn quota_block_is_active(quota: &ShareUpstreamQuota, now: DateTime<Utc>) -> bool
     DateTime::parse_from_rfc3339(blocked_until)
         .map(|dt| dt.with_timezone(&Utc) > now)
         .unwrap_or(true)
+}
+
+fn apply_support_model_health_blocks(
+    mut support: ShareSupport,
+    health: &ShareModelHealthSummary,
+) -> ShareSupport {
+    if app_health_blocks_runtime(&health.claude, "claude") {
+        support.claude = false;
+    }
+    if app_health_blocks_runtime(&health.codex, "codex") {
+        support.codex = false;
+    }
+    if app_health_blocks_runtime(&health.gemini, "gemini") {
+        support.gemini = false;
+    }
+    support
+}
+
+fn filter_provider_by_app_health(
+    provider: Option<ShareUpstreamProvider>,
+    health: &[ModelHealthSummary],
+    app_type: &str,
+) -> Option<ShareUpstreamProvider> {
+    let provider = provider?;
+    if app_health_blocks_runtime(health, app_type) {
+        None
+    } else {
+        Some(provider)
+    }
+}
+
+fn app_health_blocks_runtime(health: &[ModelHealthSummary], app_type: &str) -> bool {
+    health.iter().any(|entry| {
+        entry.status.eq_ignore_ascii_case("quota_blocked")
+            || (is_app_level_model_health(entry, app_type)
+                && entry.status.eq_ignore_ascii_case("failed")
+                && model_health_error_is_quota_block(entry.error_message.as_deref()))
+    })
+}
+
+fn is_app_level_model_health(entry: &ModelHealthSummary, app_type: &str) -> bool {
+    model_health_key(&entry.requested_model) == app_type
+        && model_health_key(&entry.actual_model) == app_type
+}
+
+fn model_health_error_is_quota_block(error: Option<&str>) -> bool {
+    let Some(error) = error else {
+        return false;
+    };
+    let lower = error.to_ascii_lowercase();
+    lower.contains("quota exhausted")
+        || lower.contains("quota_exhausted")
+        || lower.contains("usage limit")
+        || lower.contains("usage_limit")
+        || lower.contains("weekly limit")
+        || lower.contains("monthly limit")
 }
 
 #[cfg(test)]
@@ -15455,6 +15518,49 @@ mod tests {
         let filtered = filter_app_runtimes_by_model_health(runtimes, &health);
 
         assert!(filtered.codex.is_none());
+    }
+
+    #[test]
+    fn market_runtime_filter_removes_app_for_quota_blocked_health() {
+        let runtimes = ShareAppRuntimes {
+            codex: Some(test_upstream_provider("gpt-5.5")),
+            ..ShareAppRuntimes::default()
+        };
+        let mut quota_health = test_model_summary("codex", &["failed"]);
+        quota_health.actual_model = "codex".into();
+        quota_health.error_message =
+            Some("long window quota exhausted until 2026-07-08T04:25:06+00:00".into());
+        let health = ShareModelHealthSummary {
+            codex: vec![quota_health],
+            ..ShareModelHealthSummary::default()
+        };
+
+        let filtered = filter_app_runtimes_by_model_health(runtimes, &health);
+
+        assert!(filtered.codex.is_none());
+    }
+
+    #[test]
+    fn support_is_disabled_for_quota_blocked_app_health() {
+        let mut quota_health = test_model_summary("codex", &["failed"]);
+        quota_health.actual_model = "codex".into();
+        quota_health.error_message =
+            Some("weekly quota exhausted until 2026-06-09T11:01:01.198+00:00".into());
+        let support = apply_support_model_health_blocks(
+            ShareSupport {
+                claude: true,
+                codex: true,
+                gemini: true,
+            },
+            &ShareModelHealthSummary {
+                codex: vec![quota_health],
+                ..ShareModelHealthSummary::default()
+            },
+        );
+
+        assert!(support.claude);
+        assert!(!support.codex);
+        assert!(support.gemini);
     }
 
     #[test]
