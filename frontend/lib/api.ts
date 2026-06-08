@@ -54,7 +54,7 @@ export async function updateShareSettings(shareId: string, patch: ShareSettingsP
 export async function getShareUsageByEmail(
   shareId: string,
   app: "claude" | "codex" | "gemini",
-  period: "1w" | "30d",
+  period: "24h" | "1w" | "30d",
 ) {
   const params = new URLSearchParams({ app, period });
   return parseJson<ShareUsageByEmailResponse>(

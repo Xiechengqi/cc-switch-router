@@ -2065,7 +2065,7 @@ async fn share_usage_by_email(
             .share_usage_by_email(
                 &share_id,
                 query.app.as_deref().unwrap_or("claude"),
-                query.period.as_deref().unwrap_or("1w"),
+                query.period.as_deref().unwrap_or("24h"),
             )
             .await?,
     ))

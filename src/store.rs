@@ -1381,7 +1381,9 @@ impl AppStore {
         period: &str,
     ) -> Result<ShareUsageByEmailResponse, AppError> {
         let app = normalize_share_acl_app(app_type)?;
-        let (period, days) = normalize_usage_period(period)?;
+        let window = normalize_usage_period(period)?;
+        let period = window.period.clone();
+        let days = window.days;
         let conn = self.conn.lock().await;
         let Some((
             owner_email,
@@ -1432,21 +1434,10 @@ impl AppStore {
             }
         }
 
-        let today = Utc::now().date_naive();
-        let start_date = today - Duration::days(i64::from(days.saturating_sub(1)));
-        let start_dt = start_date
-            .and_hms_opt(0, 0, 0)
-            .ok_or_else(|| AppError::Internal("invalid usage start date".into()))?
-            .and_utc();
+        let start_dt = window.start_at;
         let start_ts = start_dt.timestamp();
         let start_rfc3339 = start_dt.to_rfc3339();
-        let date_keys = (0..days)
-            .map(|offset| {
-                (start_date + Duration::days(i64::from(offset)))
-                    .format("%Y-%m-%d")
-                    .to_string()
-            })
-            .collect::<Vec<_>>();
+        let date_keys = window.date_keys;
         let make_usage_row = |email: &str, role: &str| ShareUsageEmailRow {
             email: email.to_string(),
             role: role.to_string(),
@@ -7688,14 +7679,69 @@ fn normalize_share_acl_app(value: &str) -> Result<String, AppError> {
     }
 }
 
-fn normalize_usage_period(value: &str) -> Result<(String, u32), AppError> {
+struct UsagePeriodWindow {
+    period: String,
+    days: u32,
+    start_at: DateTime<Utc>,
+    date_keys: Vec<String>,
+}
+
+fn normalize_usage_period(value: &str) -> Result<UsagePeriodWindow, AppError> {
+    let now = Utc::now();
     match value.trim().to_ascii_lowercase().as_str() {
-        "" | "1w" | "7d" => Ok(("1w".to_string(), 7)),
-        "30d" | "30天" => Ok(("30d".to_string(), 30)),
+        "" | "24h" | "1d" | "1天" => {
+            let start_at = now - Duration::hours(24);
+            let date_keys = usage_date_keys(start_at, now);
+            Ok(UsagePeriodWindow {
+                period: "24h".to_string(),
+                days: date_keys.len() as u32,
+                start_at,
+                date_keys,
+            })
+        }
+        "1w" | "7d" => usage_day_window("1w", 7, now),
+        "30d" | "30天" => usage_day_window("30d", 30, now),
         _ => Err(AppError::BadRequest(
-            "usage period must be 1w or 30d".into(),
+            "usage period must be 24h, 1w, or 30d".into(),
         )),
     }
+}
+
+fn usage_day_window(
+    period: &str,
+    days: u32,
+    now: DateTime<Utc>,
+) -> Result<UsagePeriodWindow, AppError> {
+    let today = now.date_naive();
+    let start_date = today - Duration::days(i64::from(days.saturating_sub(1)));
+    let start_at = start_date
+        .and_hms_opt(0, 0, 0)
+        .ok_or_else(|| AppError::Internal("invalid usage start date".into()))?
+        .and_utc();
+    let date_keys = (0..days)
+        .map(|offset| {
+            (start_date + Duration::days(i64::from(offset)))
+                .format("%Y-%m-%d")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    Ok(UsagePeriodWindow {
+        period: period.to_string(),
+        days,
+        start_at,
+        date_keys,
+    })
+}
+
+fn usage_date_keys(start_at: DateTime<Utc>, end_at: DateTime<Utc>) -> Vec<String> {
+    let mut date = start_at.date_naive();
+    let end = end_at.date_naive();
+    let mut keys = Vec::new();
+    while date <= end {
+        keys.push(date.format("%Y-%m-%d").to_string());
+        date += Duration::days(1);
+    }
+    keys
 }
 
 fn normalize_usage_email(value: &str) -> Option<String> {
@@ -12949,6 +12995,57 @@ mod tests {
             .find(|row| row.email == "owner@example.com")
             .expect("owner row");
         assert_eq!(owner.total_tokens, 50);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn share_usage_by_email_defaults_to_rolling_24h() {
+        let (store, config) = setup_store("share-usage-by-email-24h").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-usage", "usage-sub", "active").await;
+        {
+            let conn = store.conn.lock().await;
+            let now = Utc::now().timestamp();
+
+            let mut recent_log =
+                test_share_request_log_entry("req-usage-recent", "share-usage", now - 23 * 3600);
+            recent_log.app_type = "codex".into();
+            recent_log.user_email = Some("owner@example.com".into());
+            recent_log.input_tokens = 20;
+            recent_log.output_tokens = 5;
+            upsert_share_request_log_tx(&conn, "inst-1", recent_log).expect("insert recent log");
+
+            let mut old_log =
+                test_share_request_log_entry("req-usage-old", "share-usage", now - 25 * 3600);
+            old_log.app_type = "codex".into();
+            old_log.user_email = Some("owner@example.com".into());
+            old_log.input_tokens = 900;
+            old_log.output_tokens = 100;
+            upsert_share_request_log_tx(&conn, "inst-1", old_log).expect("insert old log");
+        }
+
+        let usage = store
+            .share_usage_by_email("share-usage", "codex", "")
+            .await
+            .expect("usage");
+        assert_eq!(usage.period, "24h");
+        assert!((1..=2).contains(&usage.days));
+        assert_eq!(usage.total_tokens, 25);
+        let owner = usage
+            .rows
+            .iter()
+            .find(|row| row.email == "owner@example.com")
+            .expect("owner row");
+        assert_eq!(owner.total_tokens, 25);
+        assert_eq!(
+            owner
+                .daily
+                .iter()
+                .map(|bucket| bucket.total_tokens)
+                .sum::<u64>(),
+            25
+        );
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }

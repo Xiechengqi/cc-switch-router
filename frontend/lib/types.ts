@@ -357,7 +357,7 @@ export type ShareUsageEmailRow = {
 export type ShareUsageByEmailResponse = {
   shareId: string;
   app: "claude" | "codex" | "gemini" | string;
-  period: "1w" | "30d" | string;
+  period: "24h" | "1w" | "30d" | string;
   days: number;
   totalTokens: number;
   rows: ShareUsageEmailRow[];

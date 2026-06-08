@@ -2773,8 +2773,9 @@ function ShareProvidersPanel({ share }: { share?: ShareView }) {
   );
 }
 
-type ShareUsagePeriod = "1w" | "30d";
+type ShareUsagePeriod = "24h" | "1w" | "30d";
 type ShareUsageViewMode = "table" | "trend";
+const SHARE_USAGE_PERIODS: readonly ShareUsagePeriod[] = ["24h", "1w", "30d"];
 
 function ShareEmailUsagePanel({
   share,
@@ -2784,7 +2785,7 @@ function ShareEmailUsagePanel({
   app: keyof ShareAppProviders;
 }) {
   const { t } = useLocaleText();
-  const [period, setPeriod] = React.useState<ShareUsagePeriod>("1w");
+  const [period, setPeriod] = React.useState<ShareUsagePeriod>("24h");
   const [mode, setMode] = React.useState<ShareUsageViewMode>("table");
   const [usage, setUsage] = React.useState<ShareUsageByEmailResponse | null>(null);
   const [loading, setLoading] = React.useState(false);
@@ -2821,14 +2822,14 @@ function ShareEmailUsagePanel({
           <div className="text-xs text-muted-foreground">{t("dashboard.emailTokenUsageSubtitle", { app: PROVIDER_APP_TABS.find((tab) => tab.key === app)?.label ?? app, total: compactTokens(total) })}</div>
         </div>
         <div className="flex flex-wrap items-center gap-1">
-          {(["1w", "30d"] as const).map((item) => (
+          {SHARE_USAGE_PERIODS.map((item) => (
             <button
               key={item}
               type="button"
               className={`rounded-md border px-2 py-1 text-xs transition-colors ${period === item ? "border-primary/40 bg-primary/10 text-primary" : "border-border bg-muted/20 text-muted-foreground hover:bg-muted/40"}`}
               onClick={() => setPeriod(item)}
             >
-              {item === "1w" ? t("dashboard.usagePeriod.1w") : t("dashboard.usagePeriod.30d")}
+              {t(`dashboard.usagePeriod.${item}`)}
             </button>
           ))}
           {(["table", "trend"] as const).map((item) => (
