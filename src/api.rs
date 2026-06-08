@@ -104,6 +104,13 @@ struct ShareApiAuthQuery {
     email: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShareUsageByEmailQuery {
+    app: Option<String>,
+    period: Option<String>,
+}
+
 pub fn router(state: ServerState) -> Router {
     let middleware_state = state.clone();
     Router::new()
@@ -204,6 +211,10 @@ pub fn router(state: ServerState) -> Router {
         .route(
             "/v1/shares/:share_id/settings",
             patch(update_share_settings),
+        )
+        .route(
+            "/v1/shares/:share_id/usage-by-email",
+            get(share_usage_by_email),
         )
         .route(
             "/v1/shares/:share_id/test-connection",
@@ -1992,6 +2003,23 @@ async fn update_share_settings(
     let current_user_email = require_user_email(&state, &headers, "share:write").await?;
     Ok(Json(
         update_share_settings_with_email(&state, &share_id, &current_user_email, input.patch)
+            .await?,
+    ))
+}
+
+async fn share_usage_by_email(
+    State(state): State<ServerState>,
+    Path(share_id): Path<String>,
+    Query(query): Query<ShareUsageByEmailQuery>,
+) -> Result<Json<crate::models::ShareUsageByEmailResponse>, AppError> {
+    Ok(Json(
+        state
+            .store
+            .share_usage_by_email(
+                &share_id,
+                query.app.as_deref().unwrap_or("claude"),
+                query.period.as_deref().unwrap_or("1w"),
+            )
             .await?,
     ))
 }

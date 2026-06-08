@@ -47,9 +47,9 @@ use crate::models::{
     ShareRequestLogEntry, ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload,
     ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse, ShareSettingsPatch,
     ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest,
-    ShareUpstreamProvider, ShareView, TunnelLease, UserApiTokenResetResponse, UserApiTokenResponse,
-    UserApiTokenStatus, UserShareView, UserSharesResponse, VerifyEmailCodeRequest,
-    VerifyEmailCodeResponse,
+    ShareUpstreamProvider, ShareUsageByEmailResponse, ShareUsageDailyBucket, ShareUsageEmailRow,
+    ShareView, TunnelLease, UserApiTokenResetResponse, UserApiTokenResponse, UserApiTokenStatus,
+    UserShareView, UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 #[cfg(test)]
 use crate::models::{ShareAppProvider, ShareUpstreamModel};
@@ -1353,6 +1353,188 @@ impl AppStore {
         Ok(shared_with_emails
             .iter()
             .any(|shared| shared.eq_ignore_ascii_case(&email)))
+    }
+
+    pub async fn share_usage_by_email(
+        &self,
+        share_id: &str,
+        app_type: &str,
+        period: &str,
+    ) -> Result<ShareUsageByEmailResponse, AppError> {
+        let app = normalize_share_acl_app(app_type)?;
+        let (period, days) = normalize_usage_period(period)?;
+        let conn = self.conn.lock().await;
+        let Some((owner_email, shared_with_emails_json, access_by_app_json)): Option<(
+            Option<String>,
+            String,
+            String,
+        )> = conn
+            .query_row(
+                "SELECT owner_email, shared_with_emails_json, COALESCE(access_by_app_json, '{}')
+                 FROM shares
+                 WHERE share_id = ?1",
+                params![share_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|e| AppError::Internal(format!("query share usage acl failed: {e}")))?
+        else {
+            return Err(AppError::NotFound("share not found".into()));
+        };
+
+        let shared_with_emails = parse_string_vec(Some(shared_with_emails_json))
+            .map_err(|e| AppError::Internal(format!("parse share usage acl failed: {e}")))?;
+        let access_by_app = parse_share_access_by_app(Some(access_by_app_json)).map_err(|e| {
+            AppError::Internal(format!("parse share usage access_by_app failed: {e}"))
+        })?;
+
+        let mut roles = BTreeMap::<String, String>::new();
+        if let Some(owner) = owner_email.as_deref().and_then(normalize_usage_email) {
+            roles.insert(owner, "owner".to_string());
+        }
+        let shareto_emails = if access_by_app.is_empty() {
+            shared_with_emails
+        } else {
+            access_by_app
+                .get(&app)
+                .map(|access| access.shared_with_emails.clone())
+                .unwrap_or_default()
+        };
+        for email in shareto_emails {
+            if let Some(email) = normalize_usage_email(&email) {
+                roles.entry(email).or_insert_with(|| "shareto".to_string());
+            }
+        }
+
+        let today = Utc::now().date_naive();
+        let start_date = today - Duration::days(i64::from(days.saturating_sub(1)));
+        let start_ts = start_date
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| AppError::Internal("invalid usage start date".into()))?
+            .and_utc()
+            .timestamp();
+        let date_keys = (0..days)
+            .map(|offset| {
+                (start_date + Duration::days(i64::from(offset)))
+                    .format("%Y-%m-%d")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        let mut rows_by_email = roles
+            .iter()
+            .map(|(email, role)| {
+                (
+                    email.clone(),
+                    ShareUsageEmailRow {
+                        email: email.clone(),
+                        role: role.clone(),
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cache_read_tokens: 0,
+                        cache_creation_tokens: 0,
+                        total_tokens: 0,
+                        percent: 0.0,
+                        daily: date_keys
+                            .iter()
+                            .map(|date| ShareUsageDailyBucket {
+                                date: date.clone(),
+                                input_tokens: 0,
+                                output_tokens: 0,
+                                cache_read_tokens: 0,
+                                cache_creation_tokens: 0,
+                                total_tokens: 0,
+                            })
+                            .collect(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let date_index = date_keys
+            .iter()
+            .enumerate()
+            .map(|(idx, date)| (date.clone(), idx))
+            .collect::<BTreeMap<_, _>>();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT lower(user_email),
+                        date(created_at, 'unixepoch') AS usage_date,
+                        COALESCE(SUM(input_tokens), 0),
+                        COALESCE(SUM(output_tokens), 0),
+                        COALESCE(SUM(cache_read_tokens), 0),
+                        COALESCE(SUM(cache_creation_tokens), 0)
+                 FROM share_request_logs
+                 WHERE share_id = ?1
+                   AND lower(app_type) = lower(?2)
+                   AND created_at >= ?3
+                   AND is_health_check = 0
+                   AND user_email IS NOT NULL
+                   AND user_email != ''
+                 GROUP BY lower(user_email), usage_date",
+            )
+            .map_err(|e| AppError::Internal(format!("prepare share usage query failed: {e}")))?;
+        let rows = stmt
+            .query_map(params![share_id, app, start_ts], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?.max(0) as u64,
+                    row.get::<_, i64>(3)?.max(0) as u64,
+                    row.get::<_, i64>(4)?.max(0) as u64,
+                    row.get::<_, i64>(5)?.max(0) as u64,
+                ))
+            })
+            .map_err(|e| AppError::Internal(format!("query share usage failed: {e}")))?;
+        for row in rows {
+            let (email, date, input, output, cache_read, cache_creation) =
+                row.map_err(|e| AppError::Internal(format!("read share usage row failed: {e}")))?;
+            let Some(row) = rows_by_email.get_mut(&email) else {
+                continue;
+            };
+            let total = input + output + cache_read + cache_creation;
+            row.input_tokens += input;
+            row.output_tokens += output;
+            row.cache_read_tokens += cache_read;
+            row.cache_creation_tokens += cache_creation;
+            row.total_tokens += total;
+            if let Some(idx) = date_index.get(&date).copied() {
+                if let Some(bucket) = row.daily.get_mut(idx) {
+                    bucket.input_tokens += input;
+                    bucket.output_tokens += output;
+                    bucket.cache_read_tokens += cache_read;
+                    bucket.cache_creation_tokens += cache_creation;
+                    bucket.total_tokens += total;
+                }
+            }
+        }
+
+        let total_tokens = rows_by_email
+            .values()
+            .map(|row| row.total_tokens)
+            .sum::<u64>();
+        let mut rows = rows_by_email.into_values().collect::<Vec<_>>();
+        for row in &mut rows {
+            row.percent = if total_tokens > 0 {
+                (row.total_tokens as f64 / total_tokens as f64) * 100.0
+            } else {
+                0.0
+            };
+        }
+        rows.sort_by(|a, b| {
+            b.total_tokens
+                .cmp(&a.total_tokens)
+                .then_with(|| a.role.cmp(&b.role))
+                .then_with(|| a.email.cmp(&b.email))
+        });
+
+        Ok(ShareUsageByEmailResponse {
+            share_id: share_id.to_string(),
+            app,
+            period,
+            days,
+            total_tokens,
+            rows,
+        })
     }
 
     pub async fn issue_lease(
@@ -7405,6 +7587,20 @@ fn normalize_share_acl_app(value: &str) -> Result<String, AppError> {
     }
 }
 
+fn normalize_usage_period(value: &str) -> Result<(String, u32), AppError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "1w" | "7d" => Ok(("1w".to_string(), 7)),
+        "30d" | "30天" => Ok(("30d".to_string(), 30)),
+        _ => Err(AppError::BadRequest(
+            "usage period must be 1w or 30d".into(),
+        )),
+    }
+}
+
+fn normalize_usage_email(value: &str) -> Option<String> {
+    normalize_email(value).ok()
+}
+
 fn parse_upstream_provider(
     value: Option<String>,
 ) -> Result<Option<ShareUpstreamProvider>, rusqlite::Error> {
@@ -12434,6 +12630,87 @@ mod tests {
             created_at,
             is_health_check: false,
         }
+    }
+
+    #[tokio::test]
+    async fn share_usage_by_email_is_public_app_scoped_and_limited_to_acl_emails() {
+        let (store, config) = setup_store("share-usage-by-email").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-usage", "usage-sub", "active").await;
+        {
+            let conn = store.conn.lock().await;
+            let access_by_app = BTreeMap::from([(
+                "claude".to_string(),
+                ShareAppAccess {
+                    shared_with_emails: vec!["shareto@example.com".to_string()],
+                    market_access_mode: "selected".to_string(),
+                },
+            )]);
+            conn.execute(
+                "UPDATE shares SET access_by_app_json = ?2 WHERE share_id = ?1",
+                params![
+                    "share-usage",
+                    serde_json::to_string(&access_by_app).expect("serialize access_by_app")
+                ],
+            )
+            .expect("set access_by_app");
+
+            let now = Utc::now().timestamp();
+            let mut owner_log = test_share_request_log_entry("req-usage-owner", "share-usage", now);
+            owner_log.app_type = "claude".into();
+            owner_log.user_email = Some("owner@example.com".into());
+            owner_log.input_tokens = 70;
+            owner_log.output_tokens = 30;
+            upsert_share_request_log_tx(&conn, "inst-1", owner_log).expect("insert owner log");
+
+            let mut shareto_log =
+                test_share_request_log_entry("req-usage-shareto", "share-usage", now);
+            shareto_log.app_type = "claude".into();
+            shareto_log.user_email = Some("shareto@example.com".into());
+            shareto_log.input_tokens = 20;
+            shareto_log.output_tokens = 30;
+            upsert_share_request_log_tx(&conn, "inst-1", shareto_log).expect("insert shareto log");
+
+            let mut unknown_log =
+                test_share_request_log_entry("req-usage-unknown", "share-usage", now);
+            unknown_log.app_type = "claude".into();
+            unknown_log.user_email = Some("unknown@example.com".into());
+            unknown_log.input_tokens = 900;
+            unknown_log.output_tokens = 99;
+            upsert_share_request_log_tx(&conn, "inst-1", unknown_log).expect("insert unknown log");
+
+            let mut codex_log = test_share_request_log_entry("req-usage-codex", "share-usage", now);
+            codex_log.app_type = "codex".into();
+            codex_log.user_email = Some("owner@example.com".into());
+            codex_log.input_tokens = 500;
+            codex_log.output_tokens = 500;
+            upsert_share_request_log_tx(&conn, "inst-1", codex_log).expect("insert codex log");
+        }
+
+        let usage = store
+            .share_usage_by_email("share-usage", "claude", "1w")
+            .await
+            .expect("usage");
+        assert_eq!(usage.total_tokens, 150);
+        assert_eq!(usage.rows.len(), 2);
+        let owner = usage
+            .rows
+            .iter()
+            .find(|row| row.email == "owner@example.com")
+            .expect("owner row");
+        assert_eq!(owner.role, "owner");
+        assert_eq!(owner.total_tokens, 100);
+        assert!((owner.percent - 66.666).abs() < 0.1);
+        let shareto = usage
+            .rows
+            .iter()
+            .find(|row| row.email == "shareto@example.com")
+            .expect("shareto row");
+        assert_eq!(shareto.role, "shareto");
+        assert_eq!(shareto.total_tokens, 50);
+        assert_eq!(shareto.daily.len(), 7);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 
     #[test]

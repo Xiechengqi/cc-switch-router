@@ -6,9 +6,9 @@ import * as React from "react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog";
-import { getMarketLinkedShares, releaseMarketShareState, updateMarketDisabledShares, updateMarketMaintenance, updateShareSettings } from "@/lib/api";
+import { getMarketLinkedShares, getShareUsageByEmail, releaseMarketShareState, updateMarketDisabledShares, updateMarketMaintenance, updateShareSettings } from "@/lib/api";
 import type { AppLocale } from "@/lib/i18n";
-import type { DashboardClient, DashboardMarket, HealthCheckEntry, HealthTimelineBucket, MarketAppAvailabilityEntry, MarketRequestLog, MarketShare, MarketShareRuntimeState, ModelHealthSummary, ShareAccessByApp, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareModelHealthCheck, ShareRequestLog, ShareSettingsPatch, ShareUpstreamProvider, ShareView } from "@/lib/types";
+import type { DashboardClient, DashboardMarket, HealthCheckEntry, HealthTimelineBucket, MarketAppAvailabilityEntry, MarketRequestLog, MarketShare, MarketShareRuntimeState, ModelHealthSummary, ShareAccessByApp, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareModelHealthCheck, ShareRequestLog, ShareSettingsPatch, ShareUpstreamProvider, ShareUsageByEmailResponse, ShareView } from "@/lib/types";
 import { compactTokens, formatDateTime, formatNumber, formatRelativeTime } from "@/lib/utils";
 
 function shouldOpenRowDrawer(event: React.MouseEvent<HTMLElement>) {
@@ -2723,7 +2723,11 @@ function ShareProvidersPanel({ share }: { share?: ShareView }) {
       <Tabs selectedKey={selectedKey} onSelectionChange={(key: React.Key) => setSelectedKey(String(key) as keyof ShareAppProviders)} variant="secondary" className="text-foreground">
         <Tabs.List className="grid w-full grid-cols-3 text-foreground">
           {PROVIDER_APP_TABS.map((tab) => (
-            <Tabs.Tab key={tab.key} id={tab.key} className="px-2 text-xs text-muted-foreground data-[selected=true]:text-foreground">
+            <Tabs.Tab
+              key={tab.key}
+              id={tab.key}
+              className="rounded-md border border-transparent px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors data-[selected=true]:border-primary/30 data-[selected=true]:bg-primary/10 data-[selected=true]:text-primary"
+            >
               {tab.label}
             </Tabs.Tab>
           ))}
@@ -2741,6 +2745,178 @@ function ShareProvidersPanel({ share }: { share?: ShareView }) {
           })}
         </div>
       )}
+      {share ? <ShareEmailUsagePanel share={share} app={selectedKey} /> : null}
+    </div>
+  );
+}
+
+type ShareUsagePeriod = "1w" | "30d";
+type ShareUsageViewMode = "table" | "trend";
+
+function ShareEmailUsagePanel({
+  share,
+  app,
+}: {
+  share: ShareView;
+  app: keyof ShareAppProviders;
+}) {
+  const [period, setPeriod] = React.useState<ShareUsagePeriod>("1w");
+  const [mode, setMode] = React.useState<ShareUsageViewMode>("table");
+  const [usage, setUsage] = React.useState<ShareUsageByEmailResponse | null>(null);
+  const [loading, setLoading] = React.useState(false);
+  const [error, setError] = React.useState("");
+
+  React.useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError("");
+    getShareUsageByEmail(share.shareId, app, period)
+      .then((data) => {
+        if (!cancelled) setUsage(data);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setUsage(null);
+          setError(err instanceof Error ? err.message : String(err));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [share.shareId, app, period]);
+
+  const total = usage?.totalTokens ?? 0;
+  return (
+    <div className="grid gap-3 rounded-lg border bg-background p-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <div className="text-sm font-semibold">Email token usage</div>
+          <div className="text-xs text-muted-foreground">{PROVIDER_APP_TABS.find((tab) => tab.key === app)?.label ?? app} · {compactTokens(total)} tokens</div>
+        </div>
+        <div className="flex flex-wrap items-center gap-1">
+          {(["1w", "30d"] as const).map((item) => (
+            <button
+              key={item}
+              type="button"
+              className={`rounded-md border px-2 py-1 text-xs transition-colors ${period === item ? "border-primary/40 bg-primary/10 text-primary" : "border-border bg-muted/20 text-muted-foreground hover:bg-muted/40"}`}
+              onClick={() => setPeriod(item)}
+            >
+              {item === "1w" ? "1w" : "30d"}
+            </button>
+          ))}
+          {(["table", "trend"] as const).map((item) => (
+            <button
+              key={item}
+              type="button"
+              className={`rounded-md border px-2 py-1 text-xs transition-colors ${mode === item ? "border-primary/40 bg-primary/10 text-primary" : "border-border bg-muted/20 text-muted-foreground hover:bg-muted/40"}`}
+              onClick={() => setMode(item)}
+            >
+              {item === "table" ? "Table" : "Trend"}
+            </button>
+          ))}
+        </div>
+      </div>
+      {loading ? <EmptyBlock>Loading usage...</EmptyBlock> : null}
+      {error ? <EmptyBlock>{error}</EmptyBlock> : null}
+      {!loading && !error && usage ? (
+        usage.rows.length ? (
+          mode === "table" ? <ShareUsageTable usage={usage} /> : <ShareUsageTrend usage={usage} />
+        ) : (
+          <EmptyBlock>No owner/shareto emails.</EmptyBlock>
+        )
+      ) : null}
+    </div>
+  );
+}
+
+function ShareUsageTable({ usage }: { usage: ShareUsageByEmailResponse }) {
+  return (
+    <div className="overflow-x-auto rounded-md border">
+      <table className="w-full min-w-[760px] border-collapse text-xs">
+        <thead className="bg-muted/50 text-left font-mono uppercase tracking-[0.08em] text-muted-foreground">
+          <tr>
+            <th className="px-2 py-2">Email</th>
+            <th className="px-2 py-2">Role</th>
+            <th className="px-2 py-2 text-right">Input</th>
+            <th className="px-2 py-2 text-right">Output</th>
+            <th className="px-2 py-2 text-right">Cache R</th>
+            <th className="px-2 py-2 text-right">Cache W</th>
+            <th className="px-2 py-2 text-right">Total</th>
+            <th className="px-2 py-2 text-right">Share</th>
+          </tr>
+        </thead>
+        <tbody>
+          {usage.rows.map((row) => (
+            <tr key={row.email} className="border-t">
+              <td className="max-w-[220px] truncate px-2 py-2 font-medium">{row.email}</td>
+              <td className="px-2 py-2 text-muted-foreground">{row.role}</td>
+              <td className="px-2 py-2 text-right font-mono">{compactTokens(row.inputTokens)}</td>
+              <td className="px-2 py-2 text-right font-mono">{compactTokens(row.outputTokens)}</td>
+              <td className="px-2 py-2 text-right font-mono">{compactTokens(row.cacheReadTokens)}</td>
+              <td className="px-2 py-2 text-right font-mono">{compactTokens(row.cacheCreationTokens)}</td>
+              <td className="px-2 py-2 text-right font-mono font-semibold">{compactTokens(row.totalTokens)}</td>
+              <td className="px-2 py-2 text-right font-mono">{row.percent.toFixed(row.percent >= 10 ? 1 : 2)}%</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function ShareUsageTrend({ usage }: { usage: ShareUsageByEmailResponse }) {
+  const rows = usage.rows.filter((row) => row.totalTokens > 0).slice(0, 5);
+  if (!rows.length) return <EmptyBlock>No token usage in this period.</EmptyBlock>;
+  const width = 620;
+  const height = 220;
+  const padding = { left: 34, right: 12, top: 12, bottom: 28 };
+  const dates = usage.rows[0]?.daily.map((bucket) => bucket.date) ?? [];
+  const maxY = Math.max(1, ...rows.flatMap((row) => row.daily.map((bucket) => bucket.totalTokens)));
+  const chartWidth = width - padding.left - padding.right;
+  const chartHeight = height - padding.top - padding.bottom;
+  const colors = ["#2563eb", "#16a34a", "#d97706", "#9333ea", "#dc2626"];
+  const point = (value: number, idx: number) => {
+    const x = padding.left + (dates.length <= 1 ? 0 : (idx / (dates.length - 1)) * chartWidth);
+    const y = padding.top + chartHeight - (value / maxY) * chartHeight;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  };
+  return (
+    <div className="grid gap-2">
+      <div className="overflow-x-auto rounded-md border bg-muted/10 p-2">
+        <svg viewBox={`0 0 ${width} ${height}`} className="h-[220px] min-w-[620px] w-full" role="img" aria-label="Email token usage trend">
+          <line x1={padding.left} y1={padding.top} x2={padding.left} y2={padding.top + chartHeight} stroke="currentColor" className="text-border" />
+          <line x1={padding.left} y1={padding.top + chartHeight} x2={padding.left + chartWidth} y2={padding.top + chartHeight} stroke="currentColor" className="text-border" />
+          <text x={padding.left - 6} y={padding.top + 8} textAnchor="end" className="fill-muted-foreground text-[10px]">{compactTokens(maxY)}</text>
+          <text x={padding.left - 6} y={padding.top + chartHeight} textAnchor="end" className="fill-muted-foreground text-[10px]">0</text>
+          {dates.map((date, idx) => {
+            if (idx !== 0 && idx !== dates.length - 1 && dates.length > 10 && idx % 7 !== 0) return null;
+            const x = padding.left + (dates.length <= 1 ? 0 : (idx / (dates.length - 1)) * chartWidth);
+            return (
+              <text key={date} x={x} y={height - 8} textAnchor={idx === 0 ? "start" : idx === dates.length - 1 ? "end" : "middle"} className="fill-muted-foreground text-[10px]">
+                {date.slice(5)}
+              </text>
+            );
+          })}
+          {rows.map((row, rowIdx) => {
+            const points = row.daily.map((bucket, idx) => point(bucket.totalTokens, idx)).join(" ");
+            return (
+              <polyline key={row.email} points={points} fill="none" stroke={colors[rowIdx % colors.length]} strokeWidth="2.5" strokeLinejoin="round" strokeLinecap="round" />
+            );
+          })}
+        </svg>
+      </div>
+      <div className="flex flex-wrap gap-2">
+        {rows.map((row, idx) => (
+          <div key={row.email} className="flex max-w-full items-center gap-1.5 text-xs text-muted-foreground">
+            <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: colors[idx % colors.length] }} />
+            <span className="truncate">{row.email}</span>
+            <span className="font-mono">{compactTokens(row.totalTokens)}</span>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
@@ -2790,7 +2966,11 @@ function ClientProvidersPanel({ shares }: { shares: ShareView[] }) {
       <Tabs selectedKey={selectedKey} onSelectionChange={(key: React.Key) => setSelectedKey(String(key) as keyof ShareAppProviders)} variant="secondary" className="text-foreground">
         <Tabs.List className="grid w-full grid-cols-3 text-foreground">
           {PROVIDER_APP_TABS.map((tab) => (
-            <Tabs.Tab key={tab.key} id={tab.key} className="px-2 text-xs text-muted-foreground data-[selected=true]:text-foreground">
+            <Tabs.Tab
+              key={tab.key}
+              id={tab.key}
+              className="rounded-md border border-transparent px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors data-[selected=true]:border-primary/30 data-[selected=true]:bg-primary/10 data-[selected=true]:text-primary"
+            >
               {tab.label}
             </Tabs.Tab>
           ))}

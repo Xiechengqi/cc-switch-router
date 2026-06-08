@@ -13,6 +13,7 @@ import type {
   ShareEditView,
   ShareConnectionTestRequest,
   ShareConnectionTestResponse,
+  ShareUsageByEmailResponse,
   UserApiTokenResponse,
   UserApiTokenResetResponse,
   VersionResponse,
@@ -46,6 +47,19 @@ export async function updateShareSettings(shareId: string, patch: ShareSettingsP
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ patch }),
+    }),
+  );
+}
+
+export async function getShareUsageByEmail(
+  shareId: string,
+  app: "claude" | "codex" | "gemini",
+  period: "1w" | "30d",
+) {
+  const params = new URLSearchParams({ app, period });
+  return parseJson<ShareUsageByEmailResponse>(
+    await fetch(`/v1/shares/${encodeURIComponent(shareId)}/usage-by-email?${params}`, {
+      cache: "no-store",
     }),
   );
 }

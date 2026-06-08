@@ -333,6 +333,36 @@ export type ShareRequestLog = {
   createdAt: number;
 };
 
+export type ShareUsageDailyBucket = {
+  date: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  totalTokens: number;
+};
+
+export type ShareUsageEmailRow = {
+  email: string;
+  role: "owner" | "shareto" | string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  totalTokens: number;
+  percent: number;
+  daily: ShareUsageDailyBucket[];
+};
+
+export type ShareUsageByEmailResponse = {
+  shareId: string;
+  app: "claude" | "codex" | "gemini" | string;
+  period: "1w" | "30d" | string;
+  days: number;
+  totalTokens: number;
+  rows: ShareUsageEmailRow[];
+};
+
 export type ShareModelHealthCheck = {
   requestId: string;
   shareId: string;

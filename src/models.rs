@@ -808,6 +808,42 @@ pub struct ShareRequestLogFetchResponse {
     pub logs: Vec<ShareRequestLogEntry>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareUsageDailyBucket {
+    pub date: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub total_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareUsageEmailRow {
+    pub email: String,
+    pub role: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub total_tokens: u64,
+    pub percent: f64,
+    pub daily: Vec<ShareUsageDailyBucket>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareUsageByEmailResponse {
+    pub share_id: String,
+    pub app: String,
+    pub period: String,
+    pub days: u32,
+    pub total_tokens: u64,
+    pub rows: Vec<ShareUsageEmailRow>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IssueLeaseResponse {
