@@ -199,6 +199,15 @@ export async function sessionStatus(): Promise<SessionStatus> {
   return response.json();
 }
 
+export async function logoutSession() {
+  const headers = new Headers();
+  Object.entries(authBearerHeaders()).forEach(([key, value]) => headers.set(key, value));
+  await fetch("/v1/auth/session/logout", {
+    method: "POST",
+    headers,
+  }).catch(() => undefined);
+}
+
 export async function requestEmailCode(email: string) {
   const signed = await signAuthPayload("auth_request_code", { email, purpose: "login" });
   const response = await fetch("/v1/auth/email/request-code", {

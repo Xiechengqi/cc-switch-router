@@ -878,6 +878,24 @@ impl AppStore {
         })
     }
 
+    pub async fn revoke_session_by_access_token(&self, access_token: &str) -> Result<(), AppError> {
+        let access_token = access_token.trim();
+        if access_token.is_empty() {
+            return Ok(());
+        }
+        let now = Utc::now();
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE user_sessions
+             SET revoked_at = ?2,
+                 last_used_at = ?2
+             WHERE access_token_hash = ?1 AND revoked_at IS NULL",
+            params![hash_token(access_token), now.to_rfc3339()],
+        )
+        .map_err(|e| AppError::Internal(format!("revoke session failed: {e}")))?;
+        Ok(())
+    }
+
     pub async fn get_installation_owner_email_status(
         &self,
         query: GetInstallationOwnerEmailQuery,

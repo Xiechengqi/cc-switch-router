@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { clearSessionTokens, ensureInstallationIdentity, sessionStatus } from "@/lib/auth";
+import { clearSessionTokens, ensureInstallationIdentity, logoutSession, sessionStatus } from "@/lib/auth";
 import type { SessionStatus } from "@/lib/types";
 
 type AuthContextValue = {
@@ -35,6 +35,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [refresh]);
 
   const logout = React.useCallback(async () => {
+    await logoutSession();
     clearSessionTokens();
     setSession(await sessionStatus());
   }, []);

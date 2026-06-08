@@ -2841,31 +2841,41 @@ function ShareUsageTable({ usage, t }: { usage: ShareUsageByEmailResponse; t: TF
     return role || "-";
   };
   return (
-    <div className="overflow-x-auto rounded-md border">
-      <table className="w-full min-w-[760px] border-collapse text-xs">
+    <div className="overflow-hidden rounded-md border">
+      <table className="w-full table-fixed border-collapse text-[11px]">
+        <colgroup>
+          <col className="w-[31%]" />
+          <col className="w-[13%]" />
+          <col className="w-[9%]" />
+          <col className="w-[9%]" />
+          <col className="w-[10%]" />
+          <col className="w-[10%]" />
+          <col className="w-[10%]" />
+          <col className="w-[8%]" />
+        </colgroup>
         <thead className="bg-muted/50 text-left font-mono uppercase tracking-[0.08em] text-muted-foreground">
           <tr>
-            <th className="px-2 py-2">{t("dashboard.usageEmail.email")}</th>
-            <th className="px-2 py-2">{t("dashboard.usageEmail.role")}</th>
-            <th className="px-2 py-2 text-right">{t("dashboard.usageEmail.input")}</th>
-            <th className="px-2 py-2 text-right">{t("dashboard.usageEmail.output")}</th>
-            <th className="px-2 py-2 text-right">{t("dashboard.usageEmail.cacheRead")}</th>
-            <th className="px-2 py-2 text-right">{t("dashboard.usageEmail.cacheWrite")}</th>
-            <th className="px-2 py-2 text-right">{t("dashboard.usageEmail.total")}</th>
-            <th className="px-2 py-2 text-right">{t("dashboard.usageEmail.percent")}</th>
+            <th className="px-1.5 py-2">{t("dashboard.usageEmail.email")}</th>
+            <th className="px-1.5 py-2">{t("dashboard.usageEmail.role")}</th>
+            <th className="px-1.5 py-2 text-right">{t("dashboard.usageEmail.input")}</th>
+            <th className="px-1.5 py-2 text-right">{t("dashboard.usageEmail.output")}</th>
+            <th className="px-1.5 py-2 text-right">{t("dashboard.usageEmail.cacheRead")}</th>
+            <th className="px-1.5 py-2 text-right">{t("dashboard.usageEmail.cacheWrite")}</th>
+            <th className="px-1.5 py-2 text-right">{t("dashboard.usageEmail.total")}</th>
+            <th className="px-1.5 py-2 text-right">{t("dashboard.usageEmail.percent")}</th>
           </tr>
         </thead>
         <tbody>
           {usage.rows.map((row) => (
             <tr key={row.email} className="border-t">
-              <td className="max-w-[220px] truncate px-2 py-2 font-medium">{row.email}</td>
-              <td className="px-2 py-2 text-muted-foreground">{roleLabel(row.role)}</td>
-              <td className="px-2 py-2 text-right font-mono">{compactTokens(row.inputTokens)}</td>
-              <td className="px-2 py-2 text-right font-mono">{compactTokens(row.outputTokens)}</td>
-              <td className="px-2 py-2 text-right font-mono">{compactTokens(row.cacheReadTokens)}</td>
-              <td className="px-2 py-2 text-right font-mono">{compactTokens(row.cacheCreationTokens)}</td>
-              <td className="px-2 py-2 text-right font-mono font-semibold">{compactTokens(row.totalTokens)}</td>
-              <td className="px-2 py-2 text-right font-mono">{Math.round(row.percent)}%</td>
+              <td className="whitespace-normal break-all px-1.5 py-2 font-medium leading-4">{row.email}</td>
+              <td className="break-words px-1.5 py-2 text-muted-foreground">{roleLabel(row.role)}</td>
+              <td className="overflow-hidden px-1.5 py-2 text-right font-mono">{compactTokens(row.inputTokens)}</td>
+              <td className="overflow-hidden px-1.5 py-2 text-right font-mono">{compactTokens(row.outputTokens)}</td>
+              <td className="overflow-hidden px-1.5 py-2 text-right font-mono">{compactTokens(row.cacheReadTokens)}</td>
+              <td className="overflow-hidden px-1.5 py-2 text-right font-mono">{compactTokens(row.cacheCreationTokens)}</td>
+              <td className="overflow-hidden px-1.5 py-2 text-right font-mono font-semibold">{compactTokens(row.totalTokens)}</td>
+              <td className="overflow-hidden px-1.5 py-2 text-right font-mono">{Math.round(row.percent)}%</td>
             </tr>
           ))}
         </tbody>

@@ -192,6 +192,7 @@ pub fn router(state: ServerState) -> Router {
             post(verify_client_web_email_code),
         )
         .route("/v1/auth/session/refresh", post(refresh_session))
+        .route("/v1/auth/session/logout", post(logout_session))
         .route("/v1/auth/session/me", get(session_me))
         .route("/share-api/context", get(share_api_context))
         .route("/share-api/share", get(share_api_share))
@@ -1391,6 +1392,28 @@ async fn refresh_session(
     Ok(with_session_cookie(&state, Json(response)))
 }
 
+async fn logout_session(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    if let Some(access_token) = extract_bearer_token(&headers) {
+        state
+            .store
+            .revoke_session_by_access_token(access_token)
+            .await?;
+    }
+    if let Some(access_token) = extract_router_access_cookie(&headers) {
+        state
+            .store
+            .revoke_session_by_access_token(access_token)
+            .await?;
+    }
+    Ok(with_clear_session_cookie(
+        &state,
+        Json(serde_json::json!({ "ok": true })),
+    ))
+}
+
 async fn session_me(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -1640,6 +1663,25 @@ mod tests {
                 "{path} should not be router UI"
             );
         }
+    }
+
+    #[test]
+    fn clear_session_cookie_covers_host_and_domain_cookie() {
+        let cookies = build_clear_session_cookies("jptokenswitch.cc", false);
+        assert_eq!(cookies.len(), 2);
+        assert!(cookies[0].contains("cc_switch_router_access="));
+        assert!(cookies[0].contains("Max-Age=0"));
+        assert!(!cookies[0].contains("Domain="));
+        assert!(cookies[1].contains("Domain=.jptokenswitch.cc"));
+        assert!(cookies[1].contains("Secure"));
+    }
+
+    #[test]
+    fn clear_session_cookie_omits_domain_for_localhost() {
+        let cookies = build_clear_session_cookies("localhost", true);
+        assert_eq!(cookies.len(), 1);
+        assert!(cookies[0].contains("Max-Age=0"));
+        assert!(!cookies[0].contains("Domain="));
     }
 
     #[test]
@@ -2310,6 +2352,21 @@ fn with_session_cookie(
     output
 }
 
+fn with_clear_session_cookie<T: Serialize>(
+    state: &ServerState,
+    Json(response): Json<T>,
+) -> Response {
+    let cookies =
+        build_clear_session_cookies(&state.config.tunnel_domain, state.config.use_localhost);
+    let mut output = Json(response).into_response();
+    for cookie in cookies {
+        if let Ok(value) = HeaderValue::from_str(&cookie) {
+            output.headers_mut().append(header::SET_COOKIE, value);
+        }
+    }
+    output
+}
+
 fn build_session_cookie(
     tunnel_domain: &str,
     use_localhost: bool,
@@ -2332,6 +2389,28 @@ fn build_session_cookie(
         parts.push("Secure".to_string());
     }
     parts.join("; ")
+}
+
+fn build_clear_session_cookies(tunnel_domain: &str, use_localhost: bool) -> Vec<String> {
+    let base = vec![
+        format!("{ROUTER_ACCESS_COOKIE}="),
+        "Path=/".to_string(),
+        "HttpOnly".to_string(),
+        "SameSite=Lax".to_string(),
+        "Max-Age=0".to_string(),
+        "Expires=Thu, 01 Jan 1970 00:00:00 GMT".to_string(),
+    ];
+    let mut cookies = vec![base.join("; ")];
+    if !use_localhost && cookie_domain_allowed(tunnel_domain) {
+        let mut domain_cookie = base;
+        domain_cookie.push(format!(
+            "Domain=.{}",
+            tunnel_domain.trim().trim_end_matches('.')
+        ));
+        domain_cookie.push("Secure".to_string());
+        cookies.push(domain_cookie.join("; "));
+    }
+    cookies
 }
 
 fn cookie_domain_allowed(tunnel_domain: &str) -> bool {
