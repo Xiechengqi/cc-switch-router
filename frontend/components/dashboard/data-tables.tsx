@@ -2760,6 +2760,7 @@ function ShareEmailUsagePanel({
   share: ShareView;
   app: keyof ShareAppProviders;
 }) {
+  const { t } = useLocaleText();
   const [period, setPeriod] = React.useState<ShareUsagePeriod>("1w");
   const [mode, setMode] = React.useState<ShareUsageViewMode>("table");
   const [usage, setUsage] = React.useState<ShareUsageByEmailResponse | null>(null);
@@ -2793,8 +2794,8 @@ function ShareEmailUsagePanel({
     <div className="grid gap-3 rounded-lg border bg-background p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
-          <div className="text-sm font-semibold">Email token usage</div>
-          <div className="text-xs text-muted-foreground">{PROVIDER_APP_TABS.find((tab) => tab.key === app)?.label ?? app} · {compactTokens(total)} tokens</div>
+          <div className="text-sm font-semibold">{t("dashboard.emailTokenUsage")}</div>
+          <div className="text-xs text-muted-foreground">{t("dashboard.emailTokenUsageSubtitle", { app: PROVIDER_APP_TABS.find((tab) => tab.key === app)?.label ?? app, total: compactTokens(total) })}</div>
         </div>
         <div className="flex flex-wrap items-center gap-1">
           {(["1w", "30d"] as const).map((item) => (
@@ -2804,7 +2805,7 @@ function ShareEmailUsagePanel({
               className={`rounded-md border px-2 py-1 text-xs transition-colors ${period === item ? "border-primary/40 bg-primary/10 text-primary" : "border-border bg-muted/20 text-muted-foreground hover:bg-muted/40"}`}
               onClick={() => setPeriod(item)}
             >
-              {item === "1w" ? "1w" : "30d"}
+              {item === "1w" ? t("dashboard.usagePeriod.1w") : t("dashboard.usagePeriod.30d")}
             </button>
           ))}
           {(["table", "trend"] as const).map((item) => (
@@ -2814,45 +2815,45 @@ function ShareEmailUsagePanel({
               className={`rounded-md border px-2 py-1 text-xs transition-colors ${mode === item ? "border-primary/40 bg-primary/10 text-primary" : "border-border bg-muted/20 text-muted-foreground hover:bg-muted/40"}`}
               onClick={() => setMode(item)}
             >
-              {item === "table" ? "Table" : "Trend"}
+              {item === "table" ? t("dashboard.usageView.table") : t("dashboard.usageView.trend")}
             </button>
           ))}
         </div>
       </div>
-      {loading ? <EmptyBlock>Loading usage...</EmptyBlock> : null}
+      {loading ? <EmptyBlock>{t("dashboard.usageEmail.loading")}</EmptyBlock> : null}
       {error ? <EmptyBlock>{error}</EmptyBlock> : null}
       {!loading && !error && usage ? (
         usage.rows.length ? (
-          mode === "table" ? <ShareUsageTable usage={usage} /> : <ShareUsageTrend usage={usage} />
+          mode === "table" ? <ShareUsageTable usage={usage} t={t} /> : <ShareUsageTrend usage={usage} t={t} />
         ) : (
-          <EmptyBlock>No owner/shareto emails.</EmptyBlock>
+          <EmptyBlock>{t("dashboard.usageEmail.noAclEmails")}</EmptyBlock>
         )
       ) : null}
     </div>
   );
 }
 
-function ShareUsageTable({ usage }: { usage: ShareUsageByEmailResponse }) {
+function ShareUsageTable({ usage, t }: { usage: ShareUsageByEmailResponse; t: TFn }) {
   return (
     <div className="overflow-x-auto rounded-md border">
       <table className="w-full min-w-[760px] border-collapse text-xs">
         <thead className="bg-muted/50 text-left font-mono uppercase tracking-[0.08em] text-muted-foreground">
           <tr>
-            <th className="px-2 py-2">Email</th>
-            <th className="px-2 py-2">Role</th>
-            <th className="px-2 py-2 text-right">Input</th>
-            <th className="px-2 py-2 text-right">Output</th>
-            <th className="px-2 py-2 text-right">Cache R</th>
-            <th className="px-2 py-2 text-right">Cache W</th>
-            <th className="px-2 py-2 text-right">Total</th>
-            <th className="px-2 py-2 text-right">Share</th>
+            <th className="px-2 py-2">{t("dashboard.usageEmail.email")}</th>
+            <th className="px-2 py-2">{t("dashboard.usageEmail.role")}</th>
+            <th className="px-2 py-2 text-right">{t("dashboard.usageEmail.input")}</th>
+            <th className="px-2 py-2 text-right">{t("dashboard.usageEmail.output")}</th>
+            <th className="px-2 py-2 text-right">{t("dashboard.usageEmail.cacheRead")}</th>
+            <th className="px-2 py-2 text-right">{t("dashboard.usageEmail.cacheWrite")}</th>
+            <th className="px-2 py-2 text-right">{t("dashboard.usageEmail.total")}</th>
+            <th className="px-2 py-2 text-right">{t("dashboard.usageEmail.share")}</th>
           </tr>
         </thead>
         <tbody>
           {usage.rows.map((row) => (
             <tr key={row.email} className="border-t">
               <td className="max-w-[220px] truncate px-2 py-2 font-medium">{row.email}</td>
-              <td className="px-2 py-2 text-muted-foreground">{row.role}</td>
+              <td className="px-2 py-2 text-muted-foreground">{row.role === "owner" ? t("dashboard.usageEmail.role.owner") : t("dashboard.usageEmail.role.shareto")}</td>
               <td className="px-2 py-2 text-right font-mono">{compactTokens(row.inputTokens)}</td>
               <td className="px-2 py-2 text-right font-mono">{compactTokens(row.outputTokens)}</td>
               <td className="px-2 py-2 text-right font-mono">{compactTokens(row.cacheReadTokens)}</td>
@@ -2867,9 +2868,9 @@ function ShareUsageTable({ usage }: { usage: ShareUsageByEmailResponse }) {
   );
 }
 
-function ShareUsageTrend({ usage }: { usage: ShareUsageByEmailResponse }) {
+function ShareUsageTrend({ usage, t }: { usage: ShareUsageByEmailResponse; t: TFn }) {
   const rows = usage.rows.filter((row) => row.totalTokens > 0).slice(0, 5);
-  if (!rows.length) return <EmptyBlock>No token usage in this period.</EmptyBlock>;
+  if (!rows.length) return <EmptyBlock>{t("dashboard.usageEmail.noData")}</EmptyBlock>;
   const width = 620;
   const height = 220;
   const padding = { left: 34, right: 12, top: 12, bottom: 28 };
@@ -2886,7 +2887,7 @@ function ShareUsageTrend({ usage }: { usage: ShareUsageByEmailResponse }) {
   return (
     <div className="grid gap-2">
       <div className="overflow-x-auto rounded-md border bg-muted/10 p-2">
-        <svg viewBox={`0 0 ${width} ${height}`} className="h-[220px] min-w-[620px] w-full" role="img" aria-label="Email token usage trend">
+        <svg viewBox={`0 0 ${width} ${height}`} className="h-[220px] min-w-[620px] w-full" role="img" aria-label={t("dashboard.usageEmail.trendAria")}>
           <line x1={padding.left} y1={padding.top} x2={padding.left} y2={padding.top + chartHeight} stroke="currentColor" className="text-border" />
           <line x1={padding.left} y1={padding.top + chartHeight} x2={padding.left + chartWidth} y2={padding.top + chartHeight} stroke="currentColor" className="text-border" />
           <text x={padding.left - 6} y={padding.top + 8} textAnchor="end" className="fill-muted-foreground text-[10px]">{compactTokens(maxY)}</text>

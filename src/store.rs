@@ -1408,11 +1408,12 @@ impl AppStore {
 
         let today = Utc::now().date_naive();
         let start_date = today - Duration::days(i64::from(days.saturating_sub(1)));
-        let start_ts = start_date
+        let start_dt = start_date
             .and_hms_opt(0, 0, 0)
             .ok_or_else(|| AppError::Internal("invalid usage start date".into()))?
-            .and_utc()
-            .timestamp();
+            .and_utc();
+        let start_ts = start_dt.timestamp();
+        let start_rfc3339 = start_dt.to_rfc3339();
         let date_keys = (0..days)
             .map(|offset| {
                 (start_date + Duration::days(i64::from(offset)))
@@ -1455,9 +1456,64 @@ impl AppStore {
             .map(|(idx, date)| (date.clone(), idx))
             .collect::<BTreeMap<_, _>>();
 
+        let mut market_stmt = conn
+            .prepare(
+                "SELECT lower(trim(user_email)),
+                        date(created_at) AS usage_date,
+                        COALESCE(SUM(input_tokens), 0),
+                        COALESCE(SUM(output_tokens), 0),
+                        COALESCE(SUM(cache_read_tokens), 0),
+                        COALESCE(SUM(cache_creation_tokens), 0)
+                 FROM market_request_logs
+                 WHERE share_id = ?1
+                   AND lower(request_agent) = lower(?2)
+                   AND created_at >= ?3
+                   AND user_email IS NOT NULL
+                   AND trim(user_email) != ''
+                 GROUP BY lower(trim(user_email)), usage_date",
+            )
+            .map_err(|e| {
+                AppError::Internal(format!("prepare market share usage query failed: {e}"))
+            })?;
+        let market_rows = market_stmt
+            .query_map(params![share_id, app, start_rfc3339], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?.max(0) as u64,
+                    row.get::<_, i64>(3)?.max(0) as u64,
+                    row.get::<_, i64>(4)?.max(0) as u64,
+                    row.get::<_, i64>(5)?.max(0) as u64,
+                ))
+            })
+            .map_err(|e| AppError::Internal(format!("query market share usage failed: {e}")))?;
+        for row in market_rows {
+            let (email, date, input, output, cache_read, cache_creation) = row.map_err(|e| {
+                AppError::Internal(format!("read market share usage row failed: {e}"))
+            })?;
+            let Some(row) = rows_by_email.get_mut(&email) else {
+                continue;
+            };
+            let total = input + output + cache_read + cache_creation;
+            row.input_tokens += input;
+            row.output_tokens += output;
+            row.cache_read_tokens += cache_read;
+            row.cache_creation_tokens += cache_creation;
+            row.total_tokens += total;
+            if let Some(idx) = date_index.get(&date).copied() {
+                if let Some(bucket) = row.daily.get_mut(idx) {
+                    bucket.input_tokens += input;
+                    bucket.output_tokens += output;
+                    bucket.cache_read_tokens += cache_read;
+                    bucket.cache_creation_tokens += cache_creation;
+                    bucket.total_tokens += total;
+                }
+            }
+        }
+
         let mut stmt = conn
             .prepare(
-                "SELECT lower(user_email),
+                "SELECT lower(trim(user_email)),
                         date(created_at, 'unixepoch') AS usage_date,
                         COALESCE(SUM(input_tokens), 0),
                         COALESCE(SUM(output_tokens), 0),
@@ -1469,8 +1525,16 @@ impl AppStore {
                    AND created_at >= ?3
                    AND is_health_check = 0
                    AND user_email IS NOT NULL
-                   AND user_email != ''
-                 GROUP BY lower(user_email), usage_date",
+                   AND trim(user_email) != ''
+                   AND NOT EXISTS (
+                        SELECT 1
+                        FROM market_request_logs ml
+                        WHERE ml.request_id = share_request_logs.request_id
+                          AND COALESCE(ml.share_id, '') = share_request_logs.share_id
+                          AND ml.user_email IS NOT NULL
+                          AND trim(ml.user_email) != ''
+                   )
+                 GROUP BY lower(trim(user_email)), usage_date",
             )
             .map_err(|e| AppError::Internal(format!("prepare share usage query failed: {e}")))?;
         let rows = stmt
@@ -12633,6 +12697,77 @@ mod tests {
         assert_eq!(shareto.role, "shareto");
         assert_eq!(shareto.total_tokens, 50);
         assert_eq!(shareto.daily.len(), 7);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn share_usage_by_email_uses_market_request_logs_for_shareto_usage() {
+        let (store, config) = setup_store("share-usage-by-email-market").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-usage", "usage-sub", "active").await;
+        let market = test_market();
+        insert_market(&store, &market).await;
+        {
+            let conn = store.conn.lock().await;
+            let access_by_app = BTreeMap::from([(
+                "codex".to_string(),
+                ShareAppAccess {
+                    shared_with_emails: vec!["shareto@example.com".to_string()],
+                    market_access_mode: "selected".to_string(),
+                },
+            )]);
+            conn.execute(
+                "UPDATE shares SET access_by_app_json = ?2 WHERE share_id = ?1",
+                params![
+                    "share-usage",
+                    serde_json::to_string(&access_by_app).expect("serialize access_by_app")
+                ],
+            )
+            .expect("set access_by_app");
+
+            let mut market_log = test_market_request_log("req_usage_market", "share-usage");
+            market_log.user_email = Some("shareto@example.com".into());
+            market_log.input_tokens = 120;
+            market_log.output_tokens = 180;
+            upsert_market_request_log_tx(&conn, &market, market_log).expect("insert market log");
+
+            let now = Utc::now().timestamp();
+            let mut duplicate_share_log =
+                test_share_request_log_entry("req_usage_market", "share-usage", now);
+            duplicate_share_log.app_type = "codex".into();
+            duplicate_share_log.user_email = Some("shareto@example.com".into());
+            duplicate_share_log.input_tokens = 900;
+            upsert_share_request_log_tx(&conn, "inst-1", duplicate_share_log)
+                .expect("insert duplicate share log");
+
+            let mut direct_owner_log =
+                test_share_request_log_entry("req_usage_direct", "share-usage", now);
+            direct_owner_log.app_type = "codex".into();
+            direct_owner_log.user_email = Some("owner@example.com".into());
+            direct_owner_log.input_tokens = 40;
+            direct_owner_log.output_tokens = 10;
+            upsert_share_request_log_tx(&conn, "inst-1", direct_owner_log)
+                .expect("insert direct owner log");
+        }
+
+        let usage = store
+            .share_usage_by_email("share-usage", "codex", "1w")
+            .await
+            .expect("usage");
+        assert_eq!(usage.total_tokens, 350);
+        let shareto = usage
+            .rows
+            .iter()
+            .find(|row| row.email == "shareto@example.com")
+            .expect("shareto row");
+        assert_eq!(shareto.total_tokens, 300);
+        let owner = usage
+            .rows
+            .iter()
+            .find(|row| row.email == "owner@example.com")
+            .expect("owner row");
+        assert_eq!(owner.total_tokens, 50);
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
