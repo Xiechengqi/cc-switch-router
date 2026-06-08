@@ -1,4 +1,4 @@
-import type { ShareSettingsPatch, ShareView } from "@/lib/types";
+import type { ShareAccessByApp, ShareSettingsPatch, ShareView } from "@/lib/types";
 
 export const UNLIMITED_TOKEN_LIMIT = -1;
 export const UNLIMITED_PARALLEL_LIMIT = -1;
@@ -10,6 +10,7 @@ export type ShareSettingsDraft = {
   forSale: "Yes" | "No" | "Free";
   marketAccessMode: "selected" | "all";
   sharedWithEmails: string[];
+  accessByApp: ShareAccessByApp;
   tokenLimit: number;
   parallelLimit: number;
   expiresAt: string;
@@ -49,11 +50,13 @@ export function fromDateTimeLocal(value: string) {
 }
 
 export function draftFromShare(share: ShareView): ShareSettingsDraft {
+  const accessByApp = effectiveShareAccessByApp(share);
   return {
     description: share.description || "",
     forSale: (["Yes", "No", "Free"].includes(share.forSale) ? share.forSale : "No") as "Yes" | "No" | "Free",
     marketAccessMode: share.marketAccessMode === "all" ? "all" : "selected",
     sharedWithEmails: normalizeEmailList(share.sharedWithEmails || []),
+    accessByApp,
     tokenLimit: Number.isFinite(share.tokenLimit) ? share.tokenLimit : UNLIMITED_TOKEN_LIMIT,
     parallelLimit: Number.isFinite(share.parallelLimit) ? share.parallelLimit : UNLIMITED_PARALLEL_LIMIT,
     expiresAt: share.expiresAt || PERMANENT_EXPIRES_AT_ISO,
@@ -67,11 +70,30 @@ export function buildShareSettingsPatch(draft: ShareSettingsDraft): ShareSetting
     forSale: draft.forSale,
     marketAccessMode: draft.marketAccessMode,
     sharedWithEmails: normalizeEmailList(draft.sharedWithEmails),
+    accessByApp: draft.accessByApp,
     tokenLimit: draft.tokenLimit,
     parallelLimit: draft.parallelLimit,
     expiresAt: draft.expiresAt,
     forSaleOfficialPricePercentByApp: draft.pricing,
   };
+}
+
+function shareAccessApps(share: ShareView): Array<"claude" | "codex" | "gemini"> {
+  const apps: Array<"claude" | "codex" | "gemini"> = ["claude", "codex", "gemini"];
+  const bound = apps.filter((app) => Boolean(share.bindings?.[app]));
+  return bound.length ? bound : apps;
+}
+
+function effectiveShareAccessByApp(share: ShareView): ShareAccessByApp {
+  if (share.accessByApp && Object.keys(share.accessByApp).length > 0) return share.accessByApp;
+  const result: ShareAccessByApp = {};
+  for (const app of shareAccessApps(share)) {
+    result[app] = {
+      sharedWithEmails: normalizeEmailList(share.sharedWithEmails || []),
+      marketAccessMode: share.marketAccessMode === "all" ? "all" : "selected",
+    };
+  }
+  return result;
 }
 
 export function validateShareSettingsDraft(draft: ShareSettingsDraft) {

@@ -4,7 +4,7 @@ import * as React from "react";
 import { Alert, Button, Checkbox, Chip, Input, TextArea } from "@heroui/react";
 import { KeyRound, Loader2, LogOut, Save } from "lucide-react";
 import { getPublicMarkets, getShareApiAuth, getShareContext, getSharePageShare, updateSharePageSettings, readShareApiCredentials, writeShareApiCredentials, clearShareApiCredentials, ShareApiError } from "@/lib/share-api";
-import type { PublicMarket, ShareApiAuthResponse, ShareApiContextResponse, ShareView } from "@/lib/types";
+import type { PublicMarket, ShareAccessByApp, ShareApiAuthResponse, ShareApiContextResponse, ShareView } from "@/lib/types";
 import {
   buildShareSettingsPatch,
   draftFromShare,
@@ -25,6 +25,7 @@ const PRICE_APPS = [
   { key: "codex", label: "Codex" },
   { key: "gemini", label: "Gemini" },
 ] as const;
+type ShareAppKey = (typeof PRICE_APPS)[number]["key"];
 
 function statusTone(online: boolean) {
   return online ? "success" : "default";
@@ -32,6 +33,24 @@ function statusTone(online: boolean) {
 
 function tokenLabel(value: number) {
   return value < 0 ? "∞" : compactTokens(value);
+}
+
+function shareAccessApps(share: ShareView): ShareAppKey[] {
+  const apps = PRICE_APPS.map((app) => app.key);
+  const bound = apps.filter((app) => Boolean(share.bindings?.[app]));
+  return bound.length ? bound : [...apps];
+}
+
+function accessByAppFromShare(share: ShareView): ShareAccessByApp {
+  if (share.accessByApp && Object.keys(share.accessByApp).length > 0) return share.accessByApp;
+  const result: ShareAccessByApp = {};
+  for (const app of shareAccessApps(share)) {
+    result[app] = {
+      sharedWithEmails: share.sharedWithEmails || [],
+      marketAccessMode: share.marketAccessMode === "all" ? "all" : "selected",
+    };
+  }
+  return result;
 }
 
 function AuthPanel({
@@ -131,7 +150,14 @@ function ShareSettingsForm({
   onSaved: () => Promise<void>;
 }) {
   const [draft, setDraft] = React.useState<ShareSettingsDraft>(() => draftFromShare(share));
-  const [sharedText, setSharedText] = React.useState((share.sharedWithEmails || []).join(", "));
+  const [sharedTextByApp, setSharedTextByApp] = React.useState<Record<ShareAppKey, string>>(() => {
+    const access = accessByAppFromShare(share);
+    return {
+      claude: (access.claude?.sharedWithEmails || []).join(", "),
+      codex: (access.codex?.sharedWithEmails || []).join(", "),
+      gemini: (access.gemini?.sharedWithEmails || []).join(", "),
+    };
+  });
   const [expiryPermanent, setExpiryPermanent] = React.useState(() => draft.expiresAt === PERMANENT_EXPIRES_AT_ISO || new Date(draft.expiresAt).getUTCFullYear() >= 2099);
   const [expiryLocal, setExpiryLocal] = React.useState(() => toDateTimeLocal(draft.expiresAt));
   const [tokenUnlimited, setTokenUnlimited] = React.useState(draft.tokenLimit === UNLIMITED_TOKEN_LIMIT);
@@ -142,8 +168,13 @@ function ShareSettingsForm({
 
   React.useEffect(() => {
     const next = draftFromShare(share);
+    const access = accessByAppFromShare(share);
     setDraft(next);
-    setSharedText((share.sharedWithEmails || []).join(", "));
+    setSharedTextByApp({
+      claude: (access.claude?.sharedWithEmails || []).join(", "),
+      codex: (access.codex?.sharedWithEmails || []).join(", "),
+      gemini: (access.gemini?.sharedWithEmails || []).join(", "),
+    });
     setExpiryPermanent(next.expiresAt === PERMANENT_EXPIRES_AT_ISO || new Date(next.expiresAt).getUTCFullYear() >= 2099);
     setExpiryLocal(toDateTimeLocal(next.expiresAt));
     setTokenUnlimited(next.tokenLimit === UNLIMITED_TOKEN_LIMIT);
@@ -152,14 +183,25 @@ function ShareSettingsForm({
 
   const effectiveDraft = React.useMemo<ShareSettingsDraft>(() => {
     const expiresAt = expiryPermanent ? PERMANENT_EXPIRES_AT_ISO : fromDateTimeLocal(expiryLocal);
+    const accessByApp: ShareAccessByApp = {};
+    for (const app of shareAccessApps(share)) {
+      accessByApp[app] = {
+        sharedWithEmails: normalizeEmailList(sharedTextByApp[app] || ""),
+        marketAccessMode: draft.marketAccessMode,
+      };
+    }
+    const sharedWithEmails = normalizeEmailList(
+      Object.values(accessByApp).flatMap((access) => access?.sharedWithEmails ?? []),
+    );
     return {
       ...draft,
-      sharedWithEmails: normalizeEmailList(sharedText),
+      sharedWithEmails,
+      accessByApp,
       tokenLimit: tokenUnlimited ? UNLIMITED_TOKEN_LIMIT : draft.tokenLimit,
       parallelLimit: parallelUnlimited ? UNLIMITED_PARALLEL_LIMIT : draft.parallelLimit,
       expiresAt,
     };
-  }, [draft, expiryLocal, expiryPermanent, parallelUnlimited, sharedText, tokenUnlimited]);
+  }, [draft, expiryLocal, expiryPermanent, parallelUnlimited, share, sharedTextByApp, tokenUnlimited]);
   const validationErrors = validateShareSettingsDraft(effectiveDraft);
 
   const save = async () => {
@@ -178,7 +220,11 @@ function ShareSettingsForm({
     }
   };
 
-  const selectedMarketEmails = new Set(effectiveDraft.sharedWithEmails.map((email) => email.toLowerCase()));
+  const selectedMarketEmails = new Set(
+    Object.values(effectiveDraft.accessByApp).flatMap((access) =>
+      (access?.sharedWithEmails ?? []).map((email) => email.toLowerCase()),
+    ),
+  );
 
   return (
     <div className="grid gap-4">
@@ -248,7 +294,16 @@ function ShareSettingsForm({
                       const next = new Set(selectedMarketEmails);
                       if (event.target.checked) next.add(market.email.toLowerCase());
                       else next.delete(market.email.toLowerCase());
-                      setSharedText(Array.from(next).sort().join(", "));
+                      setSharedTextByApp((current) => {
+                        const result = { ...current };
+                        for (const app of shareAccessApps(share)) {
+                          const appEmails = new Set(normalizeEmailList(current[app] || ""));
+                          if (event.target.checked) appEmails.add(market.email.toLowerCase());
+                          else appEmails.delete(market.email.toLowerCase());
+                          result[app] = Array.from(appEmails).sort().join(", ");
+                        }
+                        return result;
+                      });
                     }}
                   />
                   {market.displayName || market.subdomain}
@@ -259,15 +314,25 @@ function ShareSettingsForm({
         </div>
       ) : null}
 
-      <label className="grid gap-1 text-sm">
-        <span className="font-medium text-foreground">Shared with emails</span>
-        <Input
-          value={sharedText}
-          disabled={!editable}
-          placeholder="friend@example.com, teammate@example.com"
-          onChange={(event) => setSharedText(event.target.value)}
-        />
-      </label>
+      <div className="grid gap-2">
+        <span className="text-sm font-medium text-foreground">Shared with emails</span>
+        {shareAccessApps(share).map((app) => {
+          const label = PRICE_APPS.find((item) => item.key === app)?.label ?? app;
+          return (
+            <label key={app} className="grid gap-1 text-sm">
+              <span className="text-xs text-muted-foreground">{label}</span>
+              <Input
+                value={sharedTextByApp[app] || ""}
+                disabled={!editable}
+                placeholder="friend@example.com, teammate@example.com"
+                onChange={(event) =>
+                  setSharedTextByApp((current) => ({ ...current, [app]: event.target.value }))
+                }
+              />
+            </label>
+          );
+        })}
+      </div>
 
       <div className="grid gap-4 lg:grid-cols-3">
         <label className="grid gap-1 text-sm">

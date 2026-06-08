@@ -39,16 +39,17 @@ use crate::models::{
     PublicMapPointsResponse, PublicMarketConfig, RefreshSessionRequest, RegisterGatewayRequest,
     RegisterGatewayResponse, RegisterInstallationRequest, RegisterInstallationResponse,
     RegisterMarketRequest, RequestEmailCodeRequest, RequestEmailCodeResponse,
-    SessionStatusResponse, ShareAppProviders, ShareAppRuntimes, ShareBatchSyncRequest,
-    ShareClaimPayload, ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptor,
-    ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest, ShareMarketLinkView,
-    ShareModelHealthCheckEntry, ShareModelHealthSummary, SharePendingEditsRequest,
-    SharePendingEditsResponse, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry,
-    ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload, ShareRuntimeRefreshRequest,
-    ShareRuntimeSnapshotResponse, ShareSettingsPatch, ShareSettingsUpdateResponse, ShareSignals,
-    ShareSupport, ShareSyncRequest, ShareUpstreamProvider, ShareView, TunnelLease,
-    UserApiTokenResetResponse, UserApiTokenResponse, UserApiTokenStatus, UserShareView,
-    UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    SessionStatusResponse, ShareAppAccess, ShareAppProviders, ShareAppRuntimes,
+    ShareBatchSyncRequest, ShareClaimPayload, ShareClaimSubdomainRequest, ShareDeleteRequest,
+    ShareDescriptor, ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest,
+    ShareMarketLinkView, ShareModelHealthCheckEntry, ShareModelHealthSummary,
+    SharePendingEditsRequest, SharePendingEditsResponse, ShareRequestLogBatchSyncRequest,
+    ShareRequestLogEntry, ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload,
+    ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse, ShareSettingsPatch,
+    ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest,
+    ShareUpstreamProvider, ShareView, TunnelLease, UserApiTokenResetResponse, UserApiTokenResponse,
+    UserApiTokenStatus, UserShareView, UserSharesResponse, VerifyEmailCodeRequest,
+    VerifyEmailCodeResponse,
 };
 #[cfg(test)]
 use crate::models::{ShareAppProvider, ShareUpstreamModel};
@@ -1158,8 +1159,13 @@ impl AppStore {
         let Some((subdomain, owner_email, shared_json)) = row else {
             return Ok(None);
         };
-        let shared_with_emails: Vec<String> = serde_json::from_str(&shared_json).unwrap_or_default();
-        Ok(Some(ShareForTest { subdomain, owner_email, shared_with_emails }))
+        let shared_with_emails: Vec<String> =
+            serde_json::from_str(&shared_json).unwrap_or_default();
+        Ok(Some(ShareForTest {
+            subdomain,
+            owner_email,
+            shared_with_emails,
+        }))
     }
 
     pub async fn list_user_shares(
@@ -1253,6 +1259,11 @@ impl AppStore {
             } else {
                 Vec::new()
             },
+            access_by_app: if can_view_share {
+                share.access_by_app
+            } else {
+                BTreeMap::new()
+            },
             market_links: Vec::new(),
             unknown_market_emails: Vec::new(),
             description: share.description,
@@ -1296,18 +1307,20 @@ impl AppStore {
         &self,
         user_email: &str,
         share_id: &str,
+        app_type: Option<&str>,
     ) -> Result<bool, AppError> {
         let email = normalize_email(user_email)?;
         let conn = self.conn.lock().await;
-        let Some((owner_email, shared_with_emails_json, for_sale)): Option<(
+        let Some((owner_email, shared_with_emails_json, access_by_app_json, for_sale)): Option<(
             Option<String>,
+            String,
             String,
             String,
         )> = conn
             .query_row(
-                "SELECT owner_email, shared_with_emails_json, for_sale FROM shares WHERE share_id = ?1",
+                "SELECT owner_email, shared_with_emails_json, COALESCE(access_by_app_json, '{}'), for_sale FROM shares WHERE share_id = ?1",
                 params![share_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(|e| AppError::Internal(format!("query share invoke acl failed: {e}")))?
@@ -1322,6 +1335,18 @@ impl AppStore {
             .is_some_and(|owner| owner.eq_ignore_ascii_case(&email))
         {
             return Ok(true);
+        }
+        let access_by_app: BTreeMap<String, ShareAppAccess> =
+            serde_json::from_str(&access_by_app_json).unwrap_or_default();
+        if let Some(app_type) = app_type.map(|value| value.trim().to_ascii_lowercase()) {
+            if !access_by_app.is_empty() {
+                return Ok(access_by_app.get(&app_type).is_some_and(|access| {
+                    access
+                        .shared_with_emails
+                        .iter()
+                        .any(|shared| shared.eq_ignore_ascii_case(&email))
+                }));
+            }
         }
         let shared_with_emails = parse_string_vec(Some(shared_with_emails_json))
             .map_err(|e| AppError::Internal(format!("parse share invoke acl failed: {e}")))?;
@@ -2537,22 +2562,27 @@ impl AppStore {
                         .as_ref()
                         .map(|edit| edit.status != "pending")
                         .unwrap_or(true);
-                let market_links = if share.market_access_mode == "all" {
+                let market_links = if share.market_access_mode == "all"
+                    || share
+                        .access_by_app
+                        .values()
+                        .any(|access| access.market_access_mode == "all")
+                {
                     markets
                         .iter()
                         .map(dashboard_market_to_share_link)
                         .collect::<Vec<_>>()
                 } else {
-                    share
-                        .shared_with_emails
+                    let market_emails = share_acl_emails(&share);
+                    market_emails
                         .iter()
                         .filter_map(|email| market_by_email.get(&email.to_ascii_lowercase()))
                         .map(dashboard_market_to_share_link)
                         .collect::<Vec<_>>()
                 };
                 let unknown_market_emails = if can_manage {
-                    share
-                        .shared_with_emails
+                    let market_emails = share_acl_emails(&share);
+                    market_emails
                         .iter()
                         .filter(|email| !market_by_email.contains_key(&email.to_ascii_lowercase()))
                         .cloned()
@@ -2572,6 +2602,11 @@ impl AppStore {
                         share.shared_with_emails
                     } else {
                         Vec::new()
+                    },
+                    access_by_app: if can_view_share {
+                        share.access_by_app
+                    } else {
+                        BTreeMap::new()
                     },
                     market_links,
                     unknown_market_emails,
@@ -3711,7 +3746,8 @@ impl AppStore {
         let mut stmt = conn
             .prepare(
                 "SELECT s.share_id, s.installation_id, s.share_name, s.owner_email,
-                        i.owner_email, s.shared_with_emails_json, s.market_access_mode, s.app_type, s.for_sale,
+                        i.owner_email, s.shared_with_emails_json, COALESCE(s.access_by_app_json, '{}'),
+                        s.market_access_mode, s.app_type, s.for_sale,
                         s.share_status, COALESCE(s.subdomain, ''), s.parallel_limit,
                         i.last_seen_at, s.enabled_claude, s.enabled_codex, s.enabled_gemini,
                         s.upstream_provider_json, s.app_runtimes_json,
@@ -3733,8 +3769,9 @@ impl AppStore {
             .query_map(params![market_email_lower], |row| {
                 let share_id: String = row.get(0)?;
                 let shared_with_emails = parse_string_vec(row.get(5)?)?;
-                let subdomain: String = row.get(10)?;
-                let parallel_limit: i64 = row.get(11)?;
+                let access_by_app = parse_share_access_by_app(row.get(6)?)?;
+                let subdomain: String = row.get(11)?;
+                let parallel_limit: i64 = row.get(12)?;
                 let active_requests = *inflight_by_share.get(&share_id).unwrap_or(&0);
                 let online_rate_24h = online_minutes
                     .get(&share_id)
@@ -3742,13 +3779,13 @@ impl AppStore {
                     .unwrap_or(0.0);
                 let samples = samples_10m.get(&share_id).copied().unwrap_or(0);
                 let upstream_provider: Option<ShareUpstreamProvider> =
-                    parse_upstream_provider(row.get(16)?)?;
+                    parse_upstream_provider(row.get(17)?)?;
                 let model_health = model_health_by_share
                     .get(&share_id)
                     .cloned()
                     .unwrap_or_default();
                 let app_runtimes = filter_app_runtimes_by_model_health(
-                    parse_app_runtimes(row.get(17)?)?,
+                    parse_app_runtimes(row.get(18)?)?,
                     &model_health,
                 );
                 let quota_health = crate::scheduling_signals::compute_quota_health(
@@ -3766,6 +3803,7 @@ impl AppStore {
                 let market_failure_penalty = market_app_availability_penalty(&app_availability);
                 Ok((
                     shared_with_emails,
+                    access_by_app,
                     subdomain.clone(),
                     MarketShareView {
                         router_id: router_id.to_string(),
@@ -3775,22 +3813,22 @@ impl AppStore {
                         share_name: row.get(2)?,
                         owner_email: row.get(3)?,
                         installation_owner_email: row.get(4)?,
-                        market_access_mode: row.get(6)?,
-                        app_type: row.get(7)?,
-                        for_sale: row.get(8)?,
-                        share_status: row.get(9)?,
+                        market_access_mode: row.get(7)?,
+                        app_type: row.get(8)?,
+                        for_sale: row.get(9)?,
+                        share_status: row.get(10)?,
                         online: false,
                         active_requests,
                         parallel_limit,
                         online_rate_24h,
-                        last_seen_at: row.get(12)?,
-                        share_created_at: row.get(19)?,
-                        disabled_by_market: row.get::<_, Option<String>>(18)?.is_some(),
-                        market_disabled_at: row.get(18)?,
+                        last_seen_at: row.get(13)?,
+                        share_created_at: row.get(20)?,
+                        disabled_by_market: row.get::<_, Option<String>>(19)?.is_some(),
+                        market_disabled_at: row.get(19)?,
                         support: ShareSupport {
-                            claude: row.get::<_, i64>(13)? != 0,
-                            codex: row.get::<_, i64>(14)? != 0,
-                            gemini: row.get::<_, i64>(15)? != 0,
+                            claude: row.get::<_, i64>(14)? != 0,
+                            codex: row.get::<_, i64>(15)? != 0,
+                            gemini: row.get::<_, i64>(16)? != 0,
                         },
                         upstream_provider,
                         app_runtimes,
@@ -3811,12 +3849,14 @@ impl AppStore {
 
         let mut shares = Vec::new();
         for row in rows {
-            let (shared_with_emails, subdomain, mut share) =
+            let (shared_with_emails, access_by_app, subdomain, mut share) =
                 row.map_err(|e| AppError::Internal(format!("read market share row failed: {e}")))?;
-            let authorized = share.market_access_mode == "all"
-                || shared_with_emails
-                    .iter()
-                    .any(|email| email.eq_ignore_ascii_case(market_email));
+            let authorized = market_visible_by_acl(
+                &shared_with_emails,
+                &share.market_access_mode,
+                &access_by_app,
+                market_email,
+            );
             if !authorized {
                 continue;
             }
@@ -5218,6 +5258,8 @@ fn upsert_share_tx(
         .map_err(|e| AppError::Internal(format!("serialize upstream provider failed: {e}")))?;
     let shared_with_emails_json = serde_json::to_string(&share.shared_with_emails)
         .map_err(|e| AppError::Internal(format!("serialize shared_with_emails failed: {e}")))?;
+    let access_by_app_json = serde_json::to_string(&share.access_by_app)
+        .map_err(|e| AppError::Internal(format!("serialize access_by_app failed: {e}")))?;
     let bindings_json = if share.bindings.is_empty() {
         None
     } else {
@@ -5228,16 +5270,17 @@ fn upsert_share_tx(
     };
     conn.execute(
         "INSERT INTO shares (
-            share_id, installation_id, share_name, owner_email, shared_with_emails_json, market_access_mode, description, for_sale, subdomain, app_type, provider_id,
+            share_id, installation_id, share_name, owner_email, shared_with_emails_json, market_access_mode, access_by_app_json, description, for_sale, subdomain, app_type, provider_id,
             enabled_claude, enabled_codex, enabled_gemini,
             token_limit, parallel_limit, tokens_used, requests_count, share_status, created_at, expires_at, upstream_provider_json, bindings_json, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
         ON CONFLICT(share_id) DO UPDATE SET
             installation_id = excluded.installation_id,
             share_name = excluded.share_name,
             owner_email = excluded.owner_email,
             shared_with_emails_json = excluded.shared_with_emails_json,
             market_access_mode = excluded.market_access_mode,
+            access_by_app_json = excluded.access_by_app_json,
             description = excluded.description,
             for_sale = excluded.for_sale,
             subdomain = excluded.subdomain,
@@ -5266,6 +5309,7 @@ fn upsert_share_tx(
             share.owner_email,
             shared_with_emails_json,
             market_access_mode,
+            access_by_app_json,
             description,
             for_sale,
             share.subdomain,
@@ -5559,6 +5603,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             owner_email TEXT,
             shared_with_emails_json TEXT NOT NULL DEFAULT '[]',
             market_access_mode TEXT NOT NULL DEFAULT 'selected',
+            access_by_app_json TEXT NOT NULL DEFAULT '{}',
             description TEXT,
             for_sale TEXT NOT NULL DEFAULT 'No',
             subdomain TEXT,
@@ -6179,6 +6224,13 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             [],
         )
         .map_err(|e| AppError::Internal(format!("add shares market_access_mode failed: {e}")))?;
+    }
+    if !columns.iter().any(|name| name == "access_by_app_json") {
+        conn.execute(
+            "ALTER TABLE shares ADD COLUMN access_by_app_json TEXT NOT NULL DEFAULT '{}'",
+            [],
+        )
+        .map_err(|e| AppError::Internal(format!("add shares access_by_app_json failed: {e}")))?;
     }
     if !columns.iter().any(|name| name == "for_sale") {
         conn.execute(
@@ -6860,7 +6912,7 @@ fn parse_ip_im_geo(body: &str) -> Option<GeoLookupResult> {
 fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppError> {
     let mut stmt = conn
         .prepare(
-        "SELECT s.installation_id, s.share_id, s.share_name, s.description, s.for_sale, s.market_access_mode, COALESCE(s.subdomain, '-'), s.app_type, s.provider_id,
+        "SELECT s.installation_id, s.share_id, s.share_name, s.description, s.for_sale, s.market_access_mode, COALESCE(s.access_by_app_json, '{}'), COALESCE(s.subdomain, '-'), s.app_type, s.provider_id,
                     s.owner_email, s.shared_with_emails_json,
                     s.enabled_claude, s.enabled_codex, s.enabled_gemini,
                     s.token_limit, s.parallel_limit, s.tokens_used, s.requests_count, s.share_status, s.created_at, s.expires_at, s.upstream_provider_json, s.app_runtimes_json, s.app_providers_json,
@@ -6879,28 +6931,29 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                     description: row.get(3)?,
                     for_sale: row.get(4)?,
                     market_access_mode: row.get(5)?,
+                    access_by_app: parse_share_access_by_app(row.get(6)?)?,
                     for_sale_official_price_percent_by_app: Default::default(),
-                    subdomain: row.get(6)?,
-                    app_type: row.get(7)?,
-                    provider_id: row.get(8)?,
-                    bindings: parse_share_bindings(row.get(24)?)?,
-                    owner_email: row.get(9)?,
-                    shared_with_emails: parse_string_vec(row.get(10)?)?,
+                    subdomain: row.get(7)?,
+                    app_type: row.get(8)?,
+                    provider_id: row.get(9)?,
+                    bindings: parse_share_bindings(row.get(25)?)?,
+                    owner_email: row.get(10)?,
+                    shared_with_emails: parse_string_vec(row.get(11)?)?,
                     support: ShareSupport {
-                        claude: row.get::<_, i64>(11)? != 0,
-                        codex: row.get::<_, i64>(12)? != 0,
-                        gemini: row.get::<_, i64>(13)? != 0,
+                        claude: row.get::<_, i64>(12)? != 0,
+                        codex: row.get::<_, i64>(13)? != 0,
+                        gemini: row.get::<_, i64>(14)? != 0,
                     },
-                    token_limit: row.get(14)?,
-                    parallel_limit: row.get(15)?,
-                    tokens_used: row.get(16)?,
-                    requests_count: row.get(17)?,
-                    share_status: row.get(18)?,
-                    created_at: row.get(19)?,
-                    expires_at: row.get(20)?,
-                    upstream_provider: parse_upstream_provider(row.get(21)?)?,
-                    app_runtimes: parse_app_runtimes(row.get(22)?)?,
-                    app_providers: parse_app_providers(row.get(23)?)?,
+                    token_limit: row.get(15)?,
+                    parallel_limit: row.get(16)?,
+                    tokens_used: row.get(17)?,
+                    requests_count: row.get(18)?,
+                    share_status: row.get(19)?,
+                    created_at: row.get(20)?,
+                    expires_at: row.get(21)?,
+                    upstream_provider: parse_upstream_provider(row.get(22)?)?,
+                    app_runtimes: parse_app_runtimes(row.get(23)?)?,
+                    app_providers: parse_app_providers(row.get(24)?)?,
                 },
             ))
         })
@@ -7036,6 +7089,7 @@ fn share_settings_patch_is_empty(patch: &ShareSettingsPatch) -> bool {
         && patch.for_sale.is_none()
         && patch.market_access_mode.is_none()
         && patch.shared_with_emails.is_none()
+        && patch.access_by_app.is_none()
         && patch.for_sale_official_price_percent_by_app.is_none()
         && patch.token_limit.is_none()
         && patch.parallel_limit.is_none()
@@ -7077,6 +7131,26 @@ fn validate_returned_share_against_patch(
             if let Ok(normalized) = normalize_email(email) {
                 if !got.contains(&normalized) {
                     return Err("sharedWithEmails");
+                }
+            }
+        }
+    }
+    if let Some(access_by_app) = patch.access_by_app.as_ref() {
+        for (app, access) in access_by_app {
+            let got = share.access_by_app.get(app).ok_or("accessByApp")?;
+            if got.market_access_mode != access.market_access_mode {
+                return Err("accessByApp");
+            }
+            let got_emails: std::collections::HashSet<String> = got
+                .shared_with_emails
+                .iter()
+                .filter_map(|value| normalize_email(value).ok())
+                .collect();
+            for email in &access.shared_with_emails {
+                if let Ok(normalized) = normalize_email(email) {
+                    if !got_emails.contains(&normalized) {
+                        return Err("accessByApp");
+                    }
                 }
             }
         }
@@ -7187,6 +7261,34 @@ fn normalize_share_settings_patch(
         }
         None => None,
     };
+    let access_by_app = match patch.access_by_app {
+        Some(values) => {
+            let mut normalized = BTreeMap::new();
+            for (app, access) in values {
+                let app = normalize_share_acl_app(&app)?;
+                let mut emails =
+                    normalize_email_list(&access.shared_with_emails, effective_owner_email);
+                if next_owner_email.is_some()
+                    && !current_owner_email.is_empty()
+                    && !emails.iter().any(|email| email == current_owner_email)
+                {
+                    emails.push(current_owner_email.to_string());
+                    emails.sort();
+                }
+                normalized.insert(
+                    app,
+                    ShareAppAccess {
+                        shared_with_emails: emails,
+                        market_access_mode: normalize_market_access_mode(
+                            &access.market_access_mode,
+                        )?,
+                    },
+                );
+            }
+            Some(normalized)
+        }
+        None => None,
+    };
     let pricing = match patch.for_sale_official_price_percent_by_app {
         Some(values) => {
             let mut normalized = BTreeMap::new();
@@ -7247,6 +7349,7 @@ fn normalize_share_settings_patch(
             None => None,
         },
         shared_with_emails,
+        access_by_app,
         for_sale_official_price_percent_by_app: pricing,
         token_limit: patch.token_limit,
         parallel_limit: patch.parallel_limit,
@@ -7292,6 +7395,16 @@ fn normalize_market_access_mode(value: &str) -> Result<String, AppError> {
     }
 }
 
+fn normalize_share_acl_app(value: &str) -> Result<String, AppError> {
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "claude" | "codex" | "gemini" => Ok(value),
+        _ => Err(AppError::BadRequest(
+            "share accessByApp key must be claude, codex, or gemini".into(),
+        )),
+    }
+}
+
 fn parse_upstream_provider(
     value: Option<String>,
 ) -> Result<Option<ShareUpstreamProvider>, rusqlite::Error> {
@@ -7323,6 +7436,20 @@ fn parse_app_runtimes(value: Option<String>) -> Result<ShareAppRuntimes, rusqlit
 fn parse_share_bindings(
     value: Option<String>,
 ) -> Result<BTreeMap<String, String>, rusqlite::Error> {
+    let Some(value) = value else {
+        return Ok(BTreeMap::new());
+    };
+    if value.trim().is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    serde_json::from_str(&value).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+    })
+}
+
+fn parse_share_access_by_app(
+    value: Option<String>,
+) -> Result<BTreeMap<String, ShareAppAccess>, rusqlite::Error> {
     let Some(value) = value else {
         return Ok(BTreeMap::new());
     };
@@ -9451,7 +9578,7 @@ fn list_market_visible_share_ids(
 ) -> Result<HashSet<String>, AppError> {
     let mut stmt = conn
         .prepare(
-            "SELECT share_id, shared_with_emails_json, market_access_mode
+            "SELECT share_id, shared_with_emails_json, market_access_mode, COALESCE(access_by_app_json, '{}')
              FROM shares
              WHERE for_sale = 'Yes'
                AND share_status = 'active'
@@ -9466,18 +9593,20 @@ fn list_market_visible_share_ids(
                 row.get::<_, String>(0)?,
                 parse_string_vec(row.get(1)?)?,
                 row.get::<_, String>(2)?,
+                parse_share_access_by_app(row.get(3)?)?,
             ))
         })
         .map_err(|e| AppError::Internal(format!("query visible market shares failed: {e}")))?;
     let mut result = HashSet::new();
     for row in rows {
-        let (share_id, shared_with_emails, market_access_mode) =
+        let (share_id, shared_with_emails, market_access_mode, access_by_app) =
             row.map_err(|e| AppError::Internal(format!("read visible market share failed: {e}")))?;
-        if market_access_mode == "all"
-            || shared_with_emails
-                .iter()
-                .any(|email| email.eq_ignore_ascii_case(market_email))
-        {
+        if market_visible_by_acl(
+            &shared_with_emails,
+            &market_access_mode,
+            &access_by_app,
+            market_email,
+        ) {
             result.insert(share_id);
         }
     }
@@ -9563,6 +9692,18 @@ fn normalize_self_reported_share_owner(share: &mut ShareDescriptor) -> Result<()
     share.owner_email = Some(owner_email.clone());
     share.share_name = owner_email.clone();
     share.shared_with_emails = normalize_email_list(&share.shared_with_emails, &owner_email);
+    let mut access_by_app = BTreeMap::new();
+    for (app, access) in std::mem::take(&mut share.access_by_app) {
+        let app = normalize_share_acl_app(&app)?;
+        access_by_app.insert(
+            app,
+            ShareAppAccess {
+                shared_with_emails: normalize_email_list(&access.shared_with_emails, &owner_email),
+                market_access_mode: normalize_market_access_mode(&access.market_access_mode)?,
+            },
+        );
+    }
+    share.access_by_app = access_by_app;
     Ok(())
 }
 
@@ -10980,6 +11121,12 @@ fn share_visible_to_email(share: &ShareDescriptor, viewer_email: Option<&str>) -
             .shared_with_emails
             .iter()
             .any(|email| email == viewer_email)
+        || share.access_by_app.values().any(|access| {
+            access
+                .shared_with_emails
+                .iter()
+                .any(|email| email == viewer_email)
+        })
 }
 
 fn can_manage_share(share: &ShareDescriptor, viewer_email: Option<&str>) -> bool {
@@ -10987,6 +11134,35 @@ fn can_manage_share(share: &ShareDescriptor, viewer_email: Option<&str>) -> bool
         return false;
     };
     share.owner_email.as_deref() == Some(viewer_email)
+}
+
+fn share_acl_emails(share: &ShareDescriptor) -> Vec<String> {
+    let mut emails = share.shared_with_emails.clone();
+    for access in share.access_by_app.values() {
+        emails.extend(access.shared_with_emails.iter().cloned());
+    }
+    emails.sort();
+    emails.dedup();
+    emails
+}
+
+fn market_visible_by_acl(
+    shared_with_emails: &[String],
+    market_access_mode: &str,
+    access_by_app: &BTreeMap<String, ShareAppAccess>,
+    market_email: &str,
+) -> bool {
+    market_access_mode == "all"
+        || shared_with_emails
+            .iter()
+            .any(|email| email.eq_ignore_ascii_case(market_email))
+        || access_by_app.values().any(|access| {
+            access.market_access_mode == "all"
+                || access
+                    .shared_with_emails
+                    .iter()
+                    .any(|email| email.eq_ignore_ascii_case(market_email))
+        })
 }
 
 #[cfg(test)]
@@ -11493,27 +11669,89 @@ mod tests {
 
         assert!(
             store
-                .user_can_invoke_share("OWNER@example.com", "share-acl")
+                .user_can_invoke_share("OWNER@example.com", "share-acl", None)
                 .await
                 .expect("owner acl")
         );
         assert!(
             store
-                .user_can_invoke_share("shared@example.com", "share-acl")
+                .user_can_invoke_share("shared@example.com", "share-acl", None)
                 .await
                 .expect("shared acl")
         );
         assert!(
             !store
-                .user_can_invoke_share("other@example.com", "share-acl")
+                .user_can_invoke_share("other@example.com", "share-acl", None)
                 .await
                 .expect("other acl")
         );
         assert!(
             !store
-                .user_can_invoke_share("owner@example.com", "missing-share")
+                .user_can_invoke_share("owner@example.com", "missing-share", None)
                 .await
                 .expect("missing share acl")
+        );
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn user_api_token_share_invoke_acl_is_app_scoped_when_available() {
+        let (store, config) = setup_store("user-api-token-share-app-acl").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-app-acl", "app-acl-sub", "active").await;
+        set_share_shared_with_emails(&store, "share-app-acl", &["legacy@example.com"]).await;
+        {
+            let conn = store.conn.lock().await;
+            let access_by_app = BTreeMap::from([
+                (
+                    "claude".to_string(),
+                    ShareAppAccess {
+                        shared_with_emails: vec!["claude@example.com".to_string()],
+                        market_access_mode: "selected".to_string(),
+                    },
+                ),
+                (
+                    "codex".to_string(),
+                    ShareAppAccess {
+                        shared_with_emails: vec!["codex@example.com".to_string()],
+                        market_access_mode: "selected".to_string(),
+                    },
+                ),
+            ]);
+            conn.execute(
+                "UPDATE shares SET access_by_app_json = ?2 WHERE share_id = ?1",
+                params![
+                    "share-app-acl",
+                    serde_json::to_string(&access_by_app).expect("serialize app acl")
+                ],
+            )
+            .expect("set app acl");
+        }
+
+        assert!(
+            store
+                .user_can_invoke_share("claude@example.com", "share-app-acl", Some("claude"))
+                .await
+                .expect("claude app acl")
+        );
+        assert!(
+            !store
+                .user_can_invoke_share("claude@example.com", "share-app-acl", Some("codex"))
+                .await
+                .expect("claude denied on codex")
+        );
+        assert!(
+            store
+                .user_can_invoke_share("legacy@example.com", "share-app-acl", None)
+                .await
+                .expect("legacy fallback acl")
+        );
+        assert!(
+            !store
+                .user_can_invoke_share("legacy@example.com", "share-app-acl", Some("claude"))
+                .await
+                .expect("legacy denied with app acl")
         );
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
@@ -11536,7 +11774,7 @@ mod tests {
 
         assert!(
             store
-                .user_can_invoke_share("other@example.com", "share-free")
+                .user_can_invoke_share("other@example.com", "share-free", None)
                 .await
                 .expect("free share acl")
         );
@@ -11552,7 +11790,7 @@ mod tests {
 
         assert!(
             !store
-                .user_can_invoke_share("other@example.com", "share-free")
+                .user_can_invoke_share("other@example.com", "share-free", None)
                 .await
                 .expect("private share acl")
         );
@@ -11659,6 +11897,7 @@ mod tests {
             owner_email: Some("owner@example.com".into()),
             shared_with_emails: vec![],
             market_access_mode: "selected".into(),
+            access_by_app: Default::default(),
             for_sale_official_price_percent_by_app: Default::default(),
             description: None,
             for_sale: "No".into(),
@@ -12712,6 +12951,7 @@ mod tests {
             owner_email: Some("owner@example.com".into()),
             shared_with_emails: vec![],
             market_access_mode: "selected".into(),
+            access_by_app: Default::default(),
             for_sale_official_price_percent_by_app: Default::default(),
             description: None,
             for_sale: "No".into(),
@@ -12777,6 +13017,7 @@ mod tests {
             owner_email: Some("owner@example.com".into()),
             shared_with_emails: vec![],
             market_access_mode: "selected".into(),
+            access_by_app: Default::default(),
             for_sale_official_price_percent_by_app: Default::default(),
             description: None,
             for_sale: "No".into(),
@@ -13055,6 +13296,7 @@ mod tests {
             owner_email: Some("owner@example.com".into()),
             shared_with_emails: vec![],
             market_access_mode: "all".into(),
+            access_by_app: Default::default(),
             for_sale_official_price_percent_by_app: std::collections::BTreeMap::from([
                 ("claude".to_string(), 5),
                 ("codex".to_string(), 5),
@@ -13136,6 +13378,7 @@ mod tests {
             owner_email: Some("owner@example.com".into()),
             shared_with_emails: vec![],
             market_access_mode: "selected".into(),
+            access_by_app: Default::default(),
             for_sale_official_price_percent_by_app: Default::default(),
             description: None,
             for_sale: "No".into(),
@@ -13206,6 +13449,7 @@ mod tests {
             owner_email: Some("owner@example.com".into()),
             shared_with_emails: vec![],
             market_access_mode: "selected".into(),
+            access_by_app: Default::default(),
             for_sale_official_price_percent_by_app: Default::default(),
             description: None,
             for_sale: "No".into(),
@@ -13305,6 +13549,7 @@ mod tests {
             owner_email: Some("router@example.com".into()),
             shared_with_emails: vec![],
             market_access_mode: "selected".into(),
+            access_by_app: Default::default(),
             for_sale_official_price_percent_by_app: Default::default(),
             description: None,
             for_sale: "No".into(),
@@ -13377,6 +13622,7 @@ mod tests {
             owner_email: Some("different@example.com".into()),
             shared_with_emails: vec![],
             market_access_mode: "selected".into(),
+            access_by_app: Default::default(),
             for_sale_official_price_percent_by_app: Default::default(),
             description: None,
             for_sale: "No".into(),
@@ -13461,6 +13707,7 @@ mod tests {
             owner_email: Some("owner@example.com".into()),
             shared_with_emails: vec![],
             market_access_mode: "all".into(),
+            access_by_app: Default::default(),
             for_sale_official_price_percent_by_app: std::collections::BTreeMap::from([
                 ("claude".to_string(), 10),
                 ("codex".to_string(), 20),

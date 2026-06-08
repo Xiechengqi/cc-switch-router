@@ -8,7 +8,7 @@ import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog";
 import { getMarketLinkedShares, releaseMarketShareState, updateMarketDisabledShares, updateMarketMaintenance, updateShareSettings } from "@/lib/api";
 import type { AppLocale } from "@/lib/i18n";
-import type { DashboardClient, DashboardMarket, HealthCheckEntry, HealthTimelineBucket, MarketAppAvailabilityEntry, MarketRequestLog, MarketShare, MarketShareRuntimeState, ModelHealthSummary, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareModelHealthCheck, ShareRequestLog, ShareSettingsPatch, ShareUpstreamProvider, ShareView } from "@/lib/types";
+import type { DashboardClient, DashboardMarket, HealthCheckEntry, HealthTimelineBucket, MarketAppAvailabilityEntry, MarketRequestLog, MarketShare, MarketShareRuntimeState, ModelHealthSummary, ShareAccessByApp, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareModelHealthCheck, ShareRequestLog, ShareSettingsPatch, ShareUpstreamProvider, ShareView } from "@/lib/types";
 import { compactTokens, formatDateTime, formatNumber, formatRelativeTime } from "@/lib/utils";
 
 function shouldOpenRowDrawer(event: React.MouseEvent<HTMLElement>) {
@@ -838,6 +838,28 @@ const PRICE_APPS: Array<{ key: PriceApp; label: string }> = [
   { key: "gemini", label: "Gemini" },
 ];
 
+function shareAccessApps(share: ShareView | null): PriceApp[] {
+  if (!share) return ["claude", "codex", "gemini"];
+  const bound = PRICE_APPS.map((app) => app.key).filter((app) => Boolean(share.bindings?.[app]));
+  return bound.length ? bound : ["claude", "codex", "gemini"];
+}
+
+function effectiveShareAccessByApp(share: ShareView): ShareAccessByApp {
+  if (share.accessByApp && Object.keys(share.accessByApp).length > 0) return share.accessByApp;
+  const result: ShareAccessByApp = {};
+  for (const app of shareAccessApps(share)) {
+    result[app] = {
+      sharedWithEmails: share.sharedWithEmails ?? [],
+      marketAccessMode: share.marketAccessMode === "all" ? "all" : "selected",
+    };
+  }
+  return result;
+}
+
+function normalizedUniqueEmails(values: string[]) {
+  return Array.from(new Set(values.map((value) => value.trim().toLowerCase()).filter(Boolean))).sort();
+}
+
 function ShareEditDialog({
   share,
   markets,
@@ -853,7 +875,7 @@ function ShareEditDialog({
   const [forSale, setForSale] = React.useState<"Yes" | "No" | "Free">("No");
   const [marketAccessMode, setMarketAccessMode] = React.useState<"selected" | "all">("selected");
   const [selectedMarketEmails, setSelectedMarketEmails] = React.useState<string[]>([]);
-  const [sharedWithEmails, setSharedWithEmails] = React.useState<string[]>([]);
+  const [shareToEmailsByApp, setShareToEmailsByApp] = React.useState<Record<PriceApp, string[]>>({ claude: [], codex: [], gemini: [] });
   const [tokenLimitInput, setTokenLimitInput] = React.useState(String(DEFAULT_TOKEN_LIMIT));
   const [tokenLimitUnlimited, setTokenLimitUnlimited] = React.useState(false);
   const [lastFiniteTokenLimit, setLastFiniteTokenLimit] = React.useState(DEFAULT_TOKEN_LIMIT);
@@ -871,7 +893,11 @@ function ShareEditDialog({
   const [marketSelectKey, setMarketSelectKey] = React.useState(0);
   const { t } = useLocaleText();
   const readOnly = !!share && !share.canManage;
-  const transferableShareEmails = splitEmails((share?.sharedWithEmails || []).join("\n"));
+  const activeShareApps = React.useMemo(() => shareAccessApps(share), [share]);
+  const transferableShareEmails = React.useMemo(
+    () => normalizedUniqueEmails(Object.values(shareToEmailsByApp).flat()),
+    [shareToEmailsByApp],
+  );
 
   React.useEffect(() => {
     if (!share) return;
@@ -897,7 +923,12 @@ function ShareEditDialog({
         ? (share.marketLinks || []).map((link) => (link.email || "").toLowerCase()).filter(Boolean)
         : [],
     );
-    setSharedWithEmails(splitEmails((share.sharedWithEmails || []).join("\n")));
+    const accessByApp = effectiveShareAccessByApp(share);
+    setShareToEmailsByApp({
+      claude: splitEmails((accessByApp.claude?.sharedWithEmails || []).join("\n")),
+      codex: splitEmails((accessByApp.codex?.sharedWithEmails || []).join("\n")),
+      gemini: splitEmails((accessByApp.gemini?.sharedWithEmails || []).join("\n")),
+    });
 
     const initialToken = share.tokenLimit ?? UNLIMITED_TOKEN_LIMIT;
     const tokenUnlimited = isUnlimitedTokenLimit(initialToken);
@@ -1023,11 +1054,25 @@ function ShareEditDialog({
       const expiresIso = expiresPermanent
         ? PERMANENT_EXPIRES_AT_ISO
         : fromLocalDateTimeValue(expiresAtInput);
+      const accessByApp: ShareAccessByApp = {};
+      for (const app of activeShareApps) {
+        accessByApp[app] = {
+          sharedWithEmails: normalizedUniqueEmails([
+            ...(shareToEmailsByApp[app] ?? []),
+            ...(marketAccessMode === "all" ? [] : selectedMarketEmails),
+          ]),
+          marketAccessMode,
+        };
+      }
+      const sharedWithEmails = normalizedUniqueEmails(
+        Object.values(accessByApp).flatMap((access) => access?.sharedWithEmails ?? []),
+      );
       const patch: ShareSettingsPatch = {
         description: description.trim() || null,
         forSale,
         marketAccessMode,
-        sharedWithEmails: sharedWithEmails,
+        sharedWithEmails,
+        accessByApp,
         tokenLimit: tokenLimitUnlimited ? UNLIMITED_TOKEN_LIMIT : tokenParsed,
         parallelLimit: parallelLimitUnlimited ? UNLIMITED_PARALLEL_LIMIT : parallelParsed,
       };
@@ -1054,14 +1099,24 @@ function ShareEditDialog({
     setNotice("");
     try {
       const targetEmail = transferTargetEmail.toLowerCase();
-      const shared = sharedWithEmails;
-      const nextShared = Array.from(new Set([
-        ...shared.filter((email) => email !== targetEmail),
-        share.ownerEmail || "",
-      ].filter(Boolean))).sort();
+      const accessByApp: ShareAccessByApp = {};
+      for (const app of activeShareApps) {
+        accessByApp[app] = {
+          sharedWithEmails: normalizedUniqueEmails([
+            ...(shareToEmailsByApp[app] ?? []).filter((email) => email !== targetEmail),
+            share.ownerEmail || "",
+            ...(marketAccessMode === "all" ? [] : selectedMarketEmails),
+          ]),
+          marketAccessMode,
+        };
+      }
+      const nextShared = normalizedUniqueEmails(
+        Object.values(accessByApp).flatMap((access) => access?.sharedWithEmails ?? []),
+      );
       const res = await updateShareSettings(share.shareId, {
         ownerEmail: targetEmail,
         sharedWithEmails: nextShared,
+        accessByApp,
       });
       await onSaved();
       setTransferTargetEmail("");
@@ -1247,15 +1302,27 @@ function ShareEditDialog({
                 ) : null}
 
 	                <FieldGroup label={t("dashboard.field.sharedWith")} hint={readOnly ? t("dashboard.hint.sharedWithReadOnly") : t("dashboard.hint.sharedWith")}>
-	                  <EmailTagsField
-	                    value={sharedWithEmails}
-	                    placeholder="friend@example.com, teammate@example.com"
-                      disabled={readOnly}
-	                    onChange={setSharedWithEmails}
-	                    onPromote={(email) => setTransferTargetEmail(email)}
-	                    promotableEmails={transferableShareEmails}
-	                    promoteLabel={t("dashboard.setAsOwner")}
-	                  />
+                    <div className="grid gap-3">
+                      {activeShareApps.map((app) => {
+                        const label = PRICE_APPS.find((item) => item.key === app)?.label ?? app;
+                        return (
+                          <div key={app} className="grid gap-1.5">
+                            <span className="mono-label text-muted-foreground">{label}</span>
+                            <EmailTagsField
+                              value={shareToEmailsByApp[app] ?? []}
+                              placeholder="friend@example.com, teammate@example.com"
+                              disabled={readOnly}
+                              onChange={(emails) =>
+                                setShareToEmailsByApp((current) => ({ ...current, [app]: emails }))
+                              }
+                              onPromote={(email) => setTransferTargetEmail(email)}
+                              promotableEmails={transferableShareEmails}
+                              promoteLabel={t("dashboard.setAsOwner")}
+                            />
+                          </div>
+                        );
+                      })}
+                    </div>
                 </FieldGroup>
 
                 <div className="grid gap-3 md:grid-cols-3">

@@ -1298,7 +1298,11 @@ pub async fn proxy_handler(
             };
             match state
                 .store
-                .user_can_invoke_share(&principal.email, share_id)
+                .user_can_invoke_share(
+                    &principal.email,
+                    share_id,
+                    infer_share_request_app(&path, &parts.headers).as_deref(),
+                )
                 .await
             {
                 Ok(true) => {
@@ -1659,6 +1663,40 @@ pub async fn proxy_handler(
         );
     }
     response
+}
+
+fn infer_share_request_app(path: &str, headers: &HeaderMap) -> Option<String> {
+    for name in [
+        "x-cc-switch-app",
+        "x-cc-switch-app-type",
+        "x-request-agent",
+        "x-share-app",
+    ] {
+        if let Some(value) = headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| matches!(value.as_str(), "claude" | "codex" | "gemini"))
+        {
+            return Some(value);
+        }
+    }
+    let path = path.trim_start_matches('/').to_ascii_lowercase();
+    if path.starts_with("gemini/") || path.starts_with("v1beta/") {
+        return Some("gemini".to_string());
+    }
+    if path.starts_with("anthropic/") || path.starts_with("v1/messages") {
+        return Some("claude".to_string());
+    }
+    if path.starts_with("codex/")
+        || path.starts_with("openai/")
+        || path.starts_with("v1/chat/")
+        || path.starts_with("v1/responses")
+        || path.starts_with("responses/")
+    {
+        return Some("codex".to_string());
+    }
+    None
 }
 
 fn simple_response(status: StatusCode, reason: &str) -> Response {
