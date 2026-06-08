@@ -1776,6 +1776,7 @@ fn is_allowed_direct_share_api_path(path: &str) -> bool {
 fn is_allowed_direct_share_web_path(path: &str) -> bool {
     path == "/"
         || path == "/favicon.ico"
+        || path == "/favicon.png"
         || path.starts_with("/assets/")
         || path == "/web-api/context"
         || path.starts_with("/web-api/invoke/")
@@ -1784,6 +1785,7 @@ fn is_allowed_direct_share_web_path(path: &str) -> bool {
 fn is_allowed_client_web_path(path: &str) -> bool {
     (path == "/"
         || path == "/favicon.ico"
+        || path == "/favicon.png"
         || path.starts_with("/assets/")
         || path == "/web-api/auth/email/request-code"
         || path == "/web-api/auth/email/verify-code"
@@ -2146,11 +2148,20 @@ mod tests {
     fn direct_share_proxy_path_allows_web_shell_paths() {
         assert!(is_allowed_direct_share_proxy_path("/"));
         assert!(is_allowed_direct_share_proxy_path("/favicon.ico"));
+        assert!(is_allowed_direct_share_proxy_path("/favicon.png"));
         assert!(is_allowed_direct_share_proxy_path("/assets/index-abc.js"));
         assert!(is_allowed_direct_share_proxy_path("/web-api/context"));
         assert!(is_allowed_direct_share_proxy_path(
             "/web-api/invoke/list_shares"
         ));
+    }
+
+    #[test]
+    fn client_web_path_allows_favicon_png() {
+        assert!(is_allowed_client_web_path("/"));
+        assert!(is_allowed_client_web_path("/favicon.ico"));
+        assert!(is_allowed_client_web_path("/favicon.png"));
+        assert!(is_allowed_client_web_path("/assets/index-abc.js"));
     }
 
     #[test]
