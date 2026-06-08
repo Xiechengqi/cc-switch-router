@@ -47,9 +47,10 @@ use crate::models::{
     ShareRequestLogEntry, ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload,
     ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse, ShareSettingsPatch,
     ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest,
-    ShareUpstreamProvider, ShareUsageByEmailResponse, ShareUsageDailyBucket, ShareUsageEmailRow,
-    ShareView, TunnelLease, UserApiTokenResetResponse, UserApiTokenResponse, UserApiTokenStatus,
-    UserShareView, UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    ShareUpstreamProvider, ShareUpstreamQuota, ShareUsageByEmailResponse, ShareUsageDailyBucket,
+    ShareUsageEmailRow, ShareView, TunnelLease, UserApiTokenResetResponse, UserApiTokenResponse,
+    UserApiTokenStatus, UserShareView, UserSharesResponse, VerifyEmailCodeRequest,
+    VerifyEmailCodeResponse,
 };
 #[cfg(test)]
 use crate::models::{ShareAppProvider, ShareUpstreamModel};
@@ -4063,9 +4064,12 @@ impl AppStore {
                     .get(&share_id)
                     .cloned()
                     .unwrap_or_default();
-                let app_runtimes = filter_app_runtimes_by_model_health(
-                    parse_app_runtimes(row.get(18)?)?,
-                    &model_health,
+                let app_runtimes = filter_app_runtimes_by_quota(
+                    filter_app_runtimes_by_model_health(
+                        parse_app_runtimes(row.get(18)?)?,
+                        &model_health,
+                    ),
+                    now,
                 );
                 let quota_health = crate::scheduling_signals::compute_quota_health(
                     upstream_provider.as_ref().and_then(|p| p.quota.as_ref()),
@@ -8335,6 +8339,108 @@ fn filter_app_runtimes_by_model_health(
     runtimes.antigravity = filter_provider_models_by_health(runtimes.antigravity, &[]);
     runtimes.copilot = filter_provider_models_by_health(runtimes.copilot, &[]);
     runtimes
+}
+
+fn filter_app_runtimes_by_quota(
+    mut runtimes: ShareAppRuntimes,
+    now: DateTime<Utc>,
+) -> ShareAppRuntimes {
+    runtimes.claude = filter_provider_by_quota(runtimes.claude, now);
+    runtimes.codex = filter_provider_by_quota(runtimes.codex, now);
+    runtimes.gemini = filter_provider_by_quota(runtimes.gemini, now);
+    runtimes.kiro = filter_provider_by_quota(runtimes.kiro, now);
+    runtimes.cursor = filter_provider_by_quota(runtimes.cursor, now);
+    runtimes.antigravity = filter_provider_by_quota(runtimes.antigravity, now);
+    runtimes.copilot = filter_provider_by_quota(runtimes.copilot, now);
+    runtimes
+}
+
+fn filter_provider_by_quota(
+    provider: Option<ShareUpstreamProvider>,
+    now: DateTime<Utc>,
+) -> Option<ShareUpstreamProvider> {
+    let provider = provider?;
+    if provider
+        .quota
+        .as_ref()
+        .map(|quota| quota_block_is_active(quota, now))
+        .unwrap_or(false)
+    {
+        None
+    } else {
+        Some(provider)
+    }
+}
+
+fn quota_block_is_active(quota: &ShareUpstreamQuota, now: DateTime<Utc>) -> bool {
+    let availability = quota.availability.as_deref().unwrap_or("available");
+    if !matches!(
+        availability,
+        "short_window_exhausted" | "long_window_exhausted"
+    ) {
+        return false;
+    }
+    let Some(blocked_until) = quota.blocked_until.as_deref() else {
+        return true;
+    };
+    DateTime::parse_from_rfc3339(blocked_until)
+        .map(|dt| dt.with_timezone(&Utc) > now)
+        .unwrap_or(true)
+}
+
+#[cfg(test)]
+mod quota_runtime_filter_tests {
+    use super::*;
+
+    fn provider_with_quota(blocked_until: Option<String>) -> ShareUpstreamProvider {
+        ShareUpstreamProvider {
+            kind: "official_oauth".to_string(),
+            app: "codex".to_string(),
+            provider_name: Some("Codex".to_string()),
+            for_sale_official_price_percent: None,
+            account_email: None,
+            api_url: None,
+            quota: Some(ShareUpstreamQuota {
+                status: "ok".to_string(),
+                plan: None,
+                queried_at: None,
+                availability: Some("short_window_exhausted".to_string()),
+                blocked_until,
+                blocked_reason: Some("five hour quota exhausted".to_string()),
+                blocked_scope: Some("five_hour".to_string()),
+                tiers: Vec::new(),
+            }),
+            models: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn quota_blocked_runtime_is_filtered_until_reset() {
+        let now = Utc::now();
+        let runtimes = ShareAppRuntimes {
+            codex: Some(provider_with_quota(Some(
+                (now + Duration::minutes(30)).to_rfc3339(),
+            ))),
+            ..Default::default()
+        };
+
+        let filtered = filter_app_runtimes_by_quota(runtimes, now);
+        assert!(filtered.codex.is_none());
+    }
+
+    #[test]
+    fn expired_quota_block_runtime_is_kept() {
+        let now = Utc::now();
+        let runtimes = ShareAppRuntimes {
+            codex: Some(provider_with_quota(Some(
+                (now - Duration::minutes(1)).to_rfc3339(),
+            ))),
+            ..Default::default()
+        };
+
+        let filtered = filter_app_runtimes_by_quota(runtimes, now);
+        assert!(filtered.codex.is_some());
+    }
 }
 
 fn filter_provider_models_by_health(

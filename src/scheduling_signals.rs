@@ -239,8 +239,8 @@ pub struct ShareFeedbackRequest {
     /// Share whose request triggered the feedback. The router resolves the
     /// owner email and applies the penalty to all shares of that owner.
     pub share_id: String,
-    /// `rate_limited` is the only kind handled today. Future kinds (e.g.
-    /// `auth_failed`) are reserved.
+    /// `rate_limited` is a short transient upstream pressure signal;
+    /// `quota_exhausted` is a longer hard block derived from provider quota.
     pub kind: ShareFeedbackKind,
     /// Optional explicit penalty override; clamped to `(0.05, 1.0]`. Defaults
     /// to `0.5` for `rate_limited`.
@@ -255,6 +255,7 @@ pub struct ShareFeedbackRequest {
 #[serde(rename_all = "snake_case")]
 pub enum ShareFeedbackKind {
     RateLimited,
+    QuotaExhausted,
 }
 
 #[derive(Debug, Serialize)]
@@ -306,6 +307,10 @@ mod tests {
             status: "ok".into(),
             plan: None,
             queried_at: None,
+            availability: None,
+            blocked_until: None,
+            blocked_reason: None,
+            blocked_scope: None,
             tiers: vec![crate::models::ShareUpstreamQuotaTier {
                 label: "5h".into(),
                 utilization: 90.0,
@@ -325,6 +330,10 @@ mod tests {
             status: "ok".into(),
             plan: None,
             queried_at: None,
+            availability: None,
+            blocked_until: None,
+            blocked_reason: None,
+            blocked_scope: None,
             tiers: vec![
                 crate::models::ShareUpstreamQuotaTier {
                     label: "weekly".into(),

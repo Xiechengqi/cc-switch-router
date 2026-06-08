@@ -466,9 +466,14 @@ async fn apply_share_feedback(
 
     let (default_penalty, default_ttl_secs) = match input.kind {
         ShareFeedbackKind::RateLimited => (0.5_f64, 30 * 60_u64),
+        ShareFeedbackKind::QuotaExhausted => (0.05_f64, 7 * 24 * 60 * 60_u64),
     };
     let penalty = input.penalty.unwrap_or(default_penalty);
-    let ttl_secs = input.ttl_secs.unwrap_or(default_ttl_secs).min(24 * 60 * 60);
+    let ttl_cap = match input.kind {
+        ShareFeedbackKind::RateLimited => 24 * 60 * 60,
+        ShareFeedbackKind::QuotaExhausted => 31 * 24 * 60 * 60,
+    };
+    let ttl_secs = input.ttl_secs.unwrap_or(default_ttl_secs).min(ttl_cap);
     state.scheduling_overrides.set(
         &owner_email,
         penalty,
@@ -3692,7 +3697,9 @@ async fn test_share_connection(
         .any(|e| e.eq_ignore_ascii_case(&current_user_email));
 
     if !is_admin && !is_owner && !is_shared_with {
-        return Err(AppError::Forbidden("only the share owner, invited users, or admins can test this share".into()));
+        return Err(AppError::Forbidden(
+            "only the share owner, invited users, or admins can test this share".into(),
+        ));
     }
 
     let subdomain = share.subdomain;
@@ -3704,7 +3711,9 @@ async fn test_share_connection(
         .await
         .map_err(|e| AppError::Internal(format!("fetch api token failed: {e}")))?
         .api_token
-        .ok_or_else(|| AppError::Internal("api token plaintext not available; reset your token first".into()))?;
+        .ok_or_else(|| {
+            AppError::Internal("api token plaintext not available; reset your token first".into())
+        })?;
 
     // Build URLs. `public_url` is what we display in the curl preview / echo
     // back to the user. `local_url` is what reqwest actually hits — the same
@@ -3717,7 +3726,13 @@ async fn test_share_connection(
 
     // Echo headers with redacted token for response
     let echo_headers = vec![
-        ["Authorization".to_string(), format!("Bearer {}...(redacted)", &api_token.chars().take(14).collect::<String>())],
+        [
+            "Authorization".to_string(),
+            format!(
+                "Bearer {}...(redacted)",
+                &api_token.chars().take(14).collect::<String>()
+            ),
+        ],
         ["Content-Type".to_string(), "application/json".to_string()],
     ];
 
@@ -3772,12 +3787,7 @@ async fn test_share_connection(
             let resp_headers: Vec<[String; 2]> = resp
                 .headers()
                 .iter()
-                .map(|(k, v)| {
-                    [
-                        k.as_str().to_string(),
-                        v.to_str().unwrap_or("").to_string(),
-                    ]
-                })
+                .map(|(k, v)| [k.as_str().to_string(), v.to_str().unwrap_or("").to_string()])
                 .collect();
             let body_bytes = resp.bytes().await.unwrap_or_default();
             let body_truncated = body_bytes.len() > TEST_BODY_CAP;
