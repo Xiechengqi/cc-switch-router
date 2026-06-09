@@ -34,7 +34,7 @@ const APP_PROBE = {
   },
   gemini: {
     method: "POST",
-    path: "/v1beta/models/gemini-flash-2.5:generateContent",
+    path: "/v1beta/models/gemini-2.5-flash:generateContent",
     body: JSON.stringify({
       contents: [{ parts: [{ text: "who are you" }] }],
       generationConfig: { maxOutputTokens: 16 },

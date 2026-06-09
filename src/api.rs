@@ -1969,6 +1969,16 @@ mod tests {
         let status = std::sync::Arc::new(tokio::sync::Mutex::new(UpgradeStatus::Running));
         assert!(emit_done_if_finished(&status).await.is_none());
     }
+
+    #[test]
+    fn gemini_app_probe_uses_canonical_model_name() {
+        let probe = app_probe("gemini").expect("gemini probe should exist");
+
+        assert_eq!(
+            probe.path,
+            "/v1beta/models/gemini-2.5-flash:generateContent"
+        );
+    }
 }
 
 async fn sync_share(
@@ -3661,7 +3671,7 @@ fn app_probe(app: &str) -> Option<AppProbe> {
         }),
         "gemini" => Some(AppProbe {
             method: "POST",
-            path: "/v1beta/models/gemini-flash-2.5:generateContent",
+            path: "/v1beta/models/gemini-2.5-flash:generateContent",
             // 同 claude/codex 思路：避免极小 maxOutputTokens 触发上游 OAuth 网关的
             // 探针检测。Gemini 2.5 Flash 也是 reasoning model。
             body: r#"{"contents":[{"parts":[{"text":"who are you"}]}],"generationConfig":{"maxOutputTokens":16}}"#,
