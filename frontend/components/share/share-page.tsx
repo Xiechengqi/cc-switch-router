@@ -53,6 +53,14 @@ function accessByAppFromShare(share: ShareView): ShareAccessByApp {
   return result;
 }
 
+function isShareMarket(market: PublicMarket) {
+  return market.marketKind === "share";
+}
+
+function marketLabel(market: PublicMarket) {
+  return market.displayName || market.subdomain || market.email;
+}
+
 function AuthPanel({
   auth,
   ownerEmail,
@@ -165,6 +173,20 @@ function ShareSettingsForm({
   const [busy, setBusy] = React.useState(false);
   const [notice, setNotice] = React.useState("");
   const [error, setError] = React.useState("");
+  const tokenMarkets = React.useMemo(() => markets.filter((market) => !isShareMarket(market)), [markets]);
+  const shareMarkets = React.useMemo(() => markets.filter(isShareMarket), [markets]);
+  const publicMarketEmails = React.useMemo(
+    () => new Set(markets.map((market) => market.email.toLowerCase()).filter(Boolean)),
+    [markets],
+  );
+  const tokenMarketEmails = React.useMemo(
+    () => new Set(tokenMarkets.map((market) => market.email.toLowerCase()).filter(Boolean)),
+    [tokenMarkets],
+  );
+  const shareMarketEmails = React.useMemo(
+    () => new Set(shareMarkets.map((market) => market.email.toLowerCase()).filter(Boolean)),
+    [shareMarkets],
+  );
 
   React.useEffect(() => {
     const next = draftFromShare(share);
@@ -183,11 +205,34 @@ function ShareSettingsForm({
 
   const effectiveDraft = React.useMemo<ShareSettingsDraft>(() => {
     const expiresAt = expiryPermanent ? PERMANENT_EXPIRES_AT_ISO : fromDateTimeLocal(expiryLocal);
+    const rawEmailsByApp: Record<ShareAppKey, string[]> = {
+      claude: normalizeEmailList(sharedTextByApp.claude || ""),
+      codex: normalizeEmailList(sharedTextByApp.codex || ""),
+      gemini: normalizeEmailList(sharedTextByApp.gemini || ""),
+    };
+    const selectedTokenEmails = new Set(
+      Object.values(rawEmailsByApp)
+        .flat()
+        .filter((email) => tokenMarketEmails.has(email)),
+    );
+    const selectedShareMarketEmail =
+      Object.values(rawEmailsByApp)
+        .flat()
+        .find((email) => shareMarketEmails.has(email)) || "";
+    const saleMarketKind = draft.forSale === "Yes" ? draft.saleMarketKind : "token";
+    const effectiveMarketAccessMode = saleMarketKind === "share" ? "selected" : draft.marketAccessMode;
     const accessByApp: ShareAccessByApp = {};
     for (const app of shareAccessApps(share)) {
+      const nonMarketEmails = rawEmailsByApp[app].filter((email) => !publicMarketEmails.has(email));
+      const marketEmails =
+        draft.forSale === "Yes" && saleMarketKind === "token" && effectiveMarketAccessMode === "selected"
+          ? Array.from(selectedTokenEmails)
+          : draft.forSale === "Yes" && saleMarketKind === "share" && selectedShareMarketEmail
+            ? [selectedShareMarketEmail]
+            : [];
       accessByApp[app] = {
-        sharedWithEmails: normalizeEmailList(sharedTextByApp[app] || ""),
-        marketAccessMode: draft.marketAccessMode,
+        sharedWithEmails: normalizeEmailList([...nonMarketEmails, ...marketEmails]),
+        marketAccessMode: effectiveMarketAccessMode,
       };
     }
     const sharedWithEmails = normalizeEmailList(
@@ -195,14 +240,31 @@ function ShareSettingsForm({
     );
     return {
       ...draft,
+      saleMarketKind,
+      marketAccessMode: effectiveMarketAccessMode,
       sharedWithEmails,
       accessByApp,
       tokenLimit: tokenUnlimited ? UNLIMITED_TOKEN_LIMIT : draft.tokenLimit,
       parallelLimit: parallelUnlimited ? UNLIMITED_PARALLEL_LIMIT : draft.parallelLimit,
       expiresAt,
+      pricing: saleMarketKind === "share" ? {} : draft.pricing,
     };
-  }, [draft, expiryLocal, expiryPermanent, parallelUnlimited, share, sharedTextByApp, tokenUnlimited]);
-  const validationErrors = validateShareSettingsDraft(effectiveDraft);
+  }, [draft, expiryLocal, expiryPermanent, parallelUnlimited, publicMarketEmails, share, sharedTextByApp, shareMarketEmails, tokenMarketEmails, tokenUnlimited]);
+  const selectedTokenMarketEmails = new Set(
+    Object.values(effectiveDraft.accessByApp).flatMap((access) =>
+      (access?.sharedWithEmails ?? []).filter((email) => tokenMarketEmails.has(email.toLowerCase())).map((email) => email.toLowerCase()),
+    ),
+  );
+  const selectedShareMarketEmail =
+    Object.values(effectiveDraft.accessByApp)
+      .flatMap((access) => access?.sharedWithEmails ?? [])
+      .find((email) => shareMarketEmails.has(email.toLowerCase())) || "";
+  const validationErrors = [
+    ...validateShareSettingsDraft(effectiveDraft),
+    ...(effectiveDraft.forSale === "Yes" && effectiveDraft.saleMarketKind === "share" && !selectedShareMarketEmail
+      ? ["Select one Share Market."]
+      : []),
+  ];
 
   const save = async () => {
     if (!editable || busy || validationErrors.length) return;
@@ -220,11 +282,32 @@ function ShareSettingsForm({
     }
   };
 
-  const selectedMarketEmails = new Set(
-    Object.values(effectiveDraft.accessByApp).flatMap((access) =>
-      (access?.sharedWithEmails ?? []).map((email) => email.toLowerCase()),
-    ),
-  );
+  const setMarketEmailForAllApps = (email: string, checked: boolean) => {
+    const normalized = email.toLowerCase();
+    setSharedTextByApp((current) => {
+      const result = { ...current };
+      for (const app of shareAccessApps(share)) {
+        const appEmails = new Set(normalizeEmailList(current[app] || "").filter((item) => !shareMarketEmails.has(item)));
+        if (checked) appEmails.add(normalized);
+        else appEmails.delete(normalized);
+        result[app] = Array.from(appEmails).sort().join(", ");
+      }
+      return result;
+    });
+  };
+
+  const setShareMarketForAllApps = (email: string) => {
+    const normalized = email.toLowerCase();
+    setSharedTextByApp((current) => {
+      const result = { ...current };
+      for (const app of shareAccessApps(share)) {
+        const appEmails = new Set(normalizeEmailList(current[app] || "").filter((item) => !shareMarketEmails.has(item) && !tokenMarketEmails.has(item)));
+        if (normalized) appEmails.add(normalized);
+        result[app] = Array.from(appEmails).sort().join(", ");
+      }
+      return result;
+    });
+  };
 
   return (
     <div className="grid gap-4">
@@ -264,12 +347,37 @@ function ShareSettingsForm({
           </select>
         </label>
 
+        {draft.forSale === "Yes" ? (
+          <label className="grid gap-1 text-sm">
+            <span className="font-medium text-foreground">Market type</span>
+            <select
+              className="h-10 rounded-lg border border-border bg-white px-3 text-sm"
+              value={draft.saleMarketKind}
+              disabled={!editable}
+              onChange={(event) => {
+                const next = event.target.value as "token" | "share";
+                if (next === "share" && !selectedShareMarketEmail && shareMarkets[0]) {
+                  setShareMarketForAllApps(shareMarkets[0].email);
+                }
+                setDraft((current) => ({
+                  ...current,
+                  saleMarketKind: next,
+                  marketAccessMode: next === "share" ? "selected" : current.marketAccessMode,
+                }));
+              }}
+            >
+              <option value="token">Token Market</option>
+              <option value="share">Share Market</option>
+            </select>
+          </label>
+        ) : null}
+
         <label className="grid gap-1 text-sm">
           <span className="font-medium text-foreground">Market access</span>
           <select
             className="h-10 rounded-lg border border-border bg-white px-3 text-sm"
             value={draft.marketAccessMode}
-            disabled={!editable || draft.forSale !== "Yes"}
+            disabled={!editable || draft.forSale !== "Yes" || draft.saleMarketKind === "share"}
             onChange={(event) => setDraft((current) => ({ ...current, marketAccessMode: event.target.value as "selected" | "all" }))}
           >
             <option value="selected">Selected markets</option>
@@ -278,40 +386,45 @@ function ShareSettingsForm({
         </label>
       </div>
 
-      {draft.forSale === "Yes" && draft.marketAccessMode === "selected" ? (
+      {draft.forSale === "Yes" && draft.saleMarketKind === "token" && draft.marketAccessMode === "selected" ? (
         <div className="grid gap-2">
-          <div className="text-sm font-medium text-foreground">Authorized markets</div>
+          <div className="text-sm font-medium text-foreground">Authorized Token Markets</div>
           <div className="flex flex-wrap gap-2">
-            {markets.map((market) => {
-              const checked = selectedMarketEmails.has(market.email.toLowerCase());
+            {tokenMarkets.map((market) => {
+              const checked = selectedTokenMarketEmails.has(market.email.toLowerCase());
               return (
                 <label key={market.id} className="inline-flex items-center gap-2 rounded-full border border-border px-3 py-1.5 text-xs">
                   <input
                     type="checkbox"
                     checked={checked}
                     disabled={!editable}
-                    onChange={(event) => {
-                      const next = new Set(selectedMarketEmails);
-                      if (event.target.checked) next.add(market.email.toLowerCase());
-                      else next.delete(market.email.toLowerCase());
-                      setSharedTextByApp((current) => {
-                        const result = { ...current };
-                        for (const app of shareAccessApps(share)) {
-                          const appEmails = new Set(normalizeEmailList(current[app] || ""));
-                          if (event.target.checked) appEmails.add(market.email.toLowerCase());
-                          else appEmails.delete(market.email.toLowerCase());
-                          result[app] = Array.from(appEmails).sort().join(", ");
-                        }
-                        return result;
-                      });
-                    }}
+                    onChange={(event) => setMarketEmailForAllApps(market.email, event.target.checked)}
                   />
-                  {market.displayName || market.subdomain}
+                  {marketLabel(market)}
                 </label>
               );
             })}
           </div>
         </div>
+      ) : null}
+
+      {draft.forSale === "Yes" && draft.saleMarketKind === "share" ? (
+        <label className="grid gap-1 text-sm">
+          <span className="font-medium text-foreground">Share Market</span>
+          <select
+            className="h-10 rounded-lg border border-border bg-white px-3 text-sm"
+            value={selectedShareMarketEmail}
+            disabled={!editable}
+            onChange={(event) => setShareMarketForAllApps(event.target.value)}
+          >
+            <option value="">Select one Share Market</option>
+            {shareMarkets.map((market) => (
+              <option key={market.id} value={market.email.toLowerCase()}>
+                {marketLabel(market)} · {market.email}
+              </option>
+            ))}
+          </select>
+        </label>
       ) : null}
 
       <div className="grid gap-2">
@@ -381,6 +494,7 @@ function ShareSettingsForm({
         </label>
       </div>
 
+      {draft.forSale === "Yes" && draft.saleMarketKind === "token" ? (
       <div className="grid gap-3">
         <div className="text-sm font-medium text-foreground">Model pricing percent</div>
         <div className="grid gap-3 sm:grid-cols-3">
@@ -411,6 +525,7 @@ function ShareSettingsForm({
           })}
         </div>
       </div>
+      ) : null}
 
       {editable ? (
         <div className="flex justify-end">

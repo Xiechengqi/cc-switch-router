@@ -77,6 +77,8 @@ export type DashboardClient = {
   healthTimeline?: HealthTimelineBucket[];
 };
 
+export type ShareSaleMarketKind = "token" | "share";
+
 export type ShareView = {
   shareId: string;
   shareName: string;
@@ -87,6 +89,7 @@ export type ShareView = {
   unknownMarketEmails?: string[];
   description?: string;
   forSale: string;
+  saleMarketKind?: ShareSaleMarketKind;
   marketAccessMode: string;
   forSaleOfficialPricePercentByApp?: Record<string, number>;
   subdomain: string;
@@ -133,6 +136,7 @@ export type ShareSettingsPatch = {
   ownerEmail?: string;
   description?: string | null;
   forSale?: "Yes" | "No" | "Free";
+  saleMarketKind?: ShareSaleMarketKind;
   marketAccessMode?: "selected" | "all";
   sharedWithEmails?: string[];
   accessByApp?: ShareAccessByApp;
@@ -210,6 +214,7 @@ export type DashboardMarket = {
   email: string;
   subdomain: string;
   publicBaseUrl: string;
+  marketKind?: string;
   status: string;
   online: boolean;
   canManage?: boolean;
@@ -260,6 +265,7 @@ export type MarketShare = {
   installationOwnerEmail?: string;
   appType: string;
   forSale: string;
+  saleMarketKind?: ShareSaleMarketKind;
   marketAccessMode: string;
   shareStatus: string;
   online: boolean;
@@ -297,6 +303,7 @@ export type PublicMarket = {
   email: string;
   subdomain: string;
   publicBaseUrl: string;
+  marketKind?: string;
   status: string;
   maintenanceEnabled?: boolean;
   maintenanceMessage?: string;

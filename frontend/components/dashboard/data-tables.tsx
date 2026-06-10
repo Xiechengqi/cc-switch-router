@@ -222,6 +222,14 @@ function sortMarkets(markets: DashboardMarket[]) {
   );
 }
 
+function isShareMarket(market: DashboardMarket) {
+  return market.marketKind === "share";
+}
+
+function marketLabel(market: DashboardMarket) {
+  return market.displayName || market.subdomain || market.email;
+}
+
 type TFn = ReturnType<typeof useLocaleText>["t"];
 const drawerDialogClassName =
   "router-drawer-light light !w-[min(760px,calc(100vw-16px))] !max-w-[calc(100vw-16px)] !bg-white !text-slate-900 " +
@@ -566,7 +574,8 @@ function providerModelMap(runtime?: ShareUpstreamProvider) {
 function ForSaleCell({ share, t }: { share?: ShareView; t: TFn }) {
   if (!share) return <span className="text-muted-foreground">-</span>;
   const value = share.forSale === "Free" ? t("dashboard.free") : share.forSale === "Yes" ? t("dashboard.yes") : t("dashboard.no");
-  const pricingLines = share.forSale === "Yes"
+  const saleMarketKind = share.saleMarketKind === "share" ? "share" : "token";
+  const pricingLines = share.forSale === "Yes" && saleMarketKind === "token"
     ? [
         ["Claude", configuredUpstreamPercent(share.appRuntimes, "claude")],
         ["Codex", configuredUpstreamPercent(share.appRuntimes, "codex")],
@@ -574,7 +583,9 @@ function ForSaleCell({ share, t }: { share?: ShareView; t: TFn }) {
       ].filter(([, percent]) => !!percent)
     : [];
   const marketLines = share.forSale === "Yes"
-    ? share.marketAccessMode === "all" ? [t("dashboard.allMarkets")] : (share.marketLinks || []).map((market) => market.subdomain).filter(Boolean)
+    ? saleMarketKind === "share"
+      ? [t("dashboard.shareMarket"), ...(share.marketLinks || []).map((market) => market.subdomain || market.email).filter(Boolean)]
+      : [t("dashboard.tokenMarket"), ...(share.marketAccessMode === "all" ? [t("dashboard.allMarkets")] : (share.marketLinks || []).map((market) => market.subdomain || market.email).filter(Boolean))]
     : [];
   return (
     <div className="grid min-w-32 gap-1.5">
@@ -896,8 +907,10 @@ function ShareEditDialog({
 }) {
   const [description, setDescription] = React.useState("");
   const [forSale, setForSale] = React.useState<"Yes" | "No" | "Free">("No");
+  const [saleMarketKind, setSaleMarketKind] = React.useState<"token" | "share">("token");
   const [marketAccessMode, setMarketAccessMode] = React.useState<"selected" | "all">("selected");
   const [selectedMarketEmails, setSelectedMarketEmails] = React.useState<string[]>([]);
+  const [selectedShareMarketEmail, setSelectedShareMarketEmail] = React.useState("");
   const [shareToEmailsByApp, setShareToEmailsByApp] = React.useState<Record<PriceApp, string[]>>({ claude: [], codex: [], gemini: [] });
   const [tokenLimitInput, setTokenLimitInput] = React.useState(String(DEFAULT_TOKEN_LIMIT));
   const [tokenLimitUnlimited, setTokenLimitUnlimited] = React.useState(false);
@@ -917,9 +930,23 @@ function ShareEditDialog({
   const { t } = useLocaleText();
   const readOnly = !!share && !share.canManage;
   const activeShareApps = React.useMemo(() => shareAccessApps(share), [share]);
+  const tokenMarkets = React.useMemo(() => markets.filter((market) => !isShareMarket(market)), [markets]);
+  const shareMarkets = React.useMemo(() => markets.filter(isShareMarket), [markets]);
+  const publicMarketEmails = React.useMemo(
+    () => new Set(markets.map((market) => (market.email || "").toLowerCase()).filter(Boolean)),
+    [markets],
+  );
+  const tokenMarketEmails = React.useMemo(
+    () => new Set(tokenMarkets.map((market) => (market.email || "").toLowerCase()).filter(Boolean)),
+    [tokenMarkets],
+  );
+  const shareMarketEmails = React.useMemo(
+    () => new Set(shareMarkets.map((market) => (market.email || "").toLowerCase()).filter(Boolean)),
+    [shareMarkets],
+  );
   const transferableShareEmails = React.useMemo(
-    () => normalizedUniqueEmails(Object.values(shareToEmailsByApp).flat()),
-    [shareToEmailsByApp],
+    () => normalizedUniqueEmails(Object.values(shareToEmailsByApp).flat().filter((email) => !publicMarketEmails.has(email))),
+    [publicMarketEmails, shareToEmailsByApp],
   );
 
   React.useEffect(() => {
@@ -939,18 +966,30 @@ function ShareEditDialog({
 
     setDescription(share.description || "");
     setForSale((share.forSale as "Yes" | "No" | "Free") || "No");
+    const initialSaleMarketKind = share.saleMarketKind === "share" ? "share" : "token";
+    setSaleMarketKind(initialSaleMarketKind);
     const initialMode = (share.marketAccessMode as "selected" | "all") || "selected";
-    setMarketAccessMode(initialMode);
+    setMarketAccessMode(initialSaleMarketKind === "share" ? "selected" : initialMode);
+    const marketLinks = share.marketLinks || [];
     setSelectedMarketEmails(
-      initialMode === "selected"
-        ? (share.marketLinks || []).map((link) => (link.email || "").toLowerCase()).filter(Boolean)
+      initialSaleMarketKind === "token" && initialMode === "selected"
+        ? marketLinks
+            .map((link) => (link.email || "").toLowerCase())
+            .filter((email) => email && !shareMarketEmails.has(email))
         : [],
+    );
+    setSelectedShareMarketEmail(
+      initialSaleMarketKind === "share"
+        ? marketLinks
+            .map((link) => (link.email || "").toLowerCase())
+            .find((email) => email && !tokenMarketEmails.has(email)) || ""
+        : "",
     );
     const accessByApp = effectiveShareAccessByApp(share);
     setShareToEmailsByApp({
-      claude: splitEmails((accessByApp.claude?.sharedWithEmails || []).join("\n")),
-      codex: splitEmails((accessByApp.codex?.sharedWithEmails || []).join("\n")),
-      gemini: splitEmails((accessByApp.gemini?.sharedWithEmails || []).join("\n")),
+      claude: splitEmails((accessByApp.claude?.sharedWithEmails || []).join("\n")).filter((email) => !publicMarketEmails.has(email)),
+      codex: splitEmails((accessByApp.codex?.sharedWithEmails || []).join("\n")).filter((email) => !publicMarketEmails.has(email)),
+      gemini: splitEmails((accessByApp.gemini?.sharedWithEmails || []).join("\n")).filter((email) => !publicMarketEmails.has(email)),
     });
 
     const initialToken = share.tokenLimit ?? UNLIMITED_TOKEN_LIMIT;
@@ -975,7 +1014,7 @@ function ShareEditDialog({
     setConfirmFreeOpen(false);
     setTransferTargetEmail("");
     setMarketSelectKey((current) => current + 1);
-  }, [share, t]);
+  }, [publicMarketEmails, share, shareMarketEmails, t, tokenMarketEmails]);
 
   const handleForSaleChange = (next: "Yes" | "No" | "Free") => {
     if (next === "Free" && forSale !== "Free") {
@@ -983,6 +1022,18 @@ function ShareEditDialog({
       return;
     }
     setForSale(next);
+  };
+
+  const handleSaleMarketKindChange = (next: "token" | "share") => {
+    setSaleMarketKind(next);
+    if (next === "share") {
+      setMarketAccessMode("selected");
+      setSelectedMarketEmails([]);
+      setSelectedShareMarketEmail((current) => current || shareMarkets[0]?.email.toLowerCase() || "");
+      setPriceInputs({ claude: "", codex: "", gemini: "" });
+    } else {
+      setSelectedShareMarketEmail("");
+    }
   };
 
   const handleTokenUnlimited = (checked: boolean) => {
@@ -1027,10 +1078,10 @@ function ShareEditDialog({
 
   const availableMarkets = React.useMemo(() => {
     const blocked = new Set(selectedMarketEmails);
-    return markets
+    return tokenMarkets
       .filter((market) => market.email && !blocked.has(market.email.toLowerCase()))
       .sort((a, b) => (a.displayName || a.email).localeCompare(b.displayName || b.email));
-  }, [markets, selectedMarketEmails]);
+  }, [selectedMarketEmails, tokenMarkets]);
 
   const descriptionLength = description.trim().length;
   const descriptionInvalid = descriptionLength > 200;
@@ -1045,6 +1096,7 @@ function ShareEditDialog({
   const expiryInvalid = !expiresPermanent && !expiresAtInput.trim();
 
   const pricingPayload = React.useMemo<Record<string, number>>(() => {
+    if (saleMarketKind === "share") return {};
     const result: Record<string, number> = {};
     for (const app of PRICE_APPS) {
       if (!share?.support?.[app.key]) continue;
@@ -1054,19 +1106,22 @@ function ShareEditDialog({
       if (Number.isFinite(value) && value >= 1 && value <= 100) result[app.key] = value;
     }
     return result;
-  }, [priceInputs, share]);
+  }, [priceInputs, saleMarketKind, share]);
 
   const pricingInvalid = React.useMemo(() => {
+    if (saleMarketKind === "share") return false;
     const check = (raw: string) => {
       if (!raw || !raw.trim()) return false;
       const value = Number.parseInt(raw, 10);
       return !(Number.isFinite(value) && value >= 1 && value <= 100);
     };
     return PRICE_APPS.some((app) => check(priceInputs[app.key]));
-  }, [priceInputs]);
+  }, [priceInputs, saleMarketKind]);
+
+  const shareMarketInvalid = forSale === "Yes" && saleMarketKind === "share" && !selectedShareMarketEmail;
 
   const formInvalid =
-    descriptionInvalid || tokenInvalid || parallelInvalid || expiryInvalid || pricingInvalid;
+    descriptionInvalid || tokenInvalid || parallelInvalid || expiryInvalid || pricingInvalid || shareMarketInvalid;
 
   const save = async () => {
     if (!share || readOnly || busy || formInvalid) return;
@@ -1077,14 +1132,23 @@ function ShareEditDialog({
       const expiresIso = expiresPermanent
         ? PERMANENT_EXPIRES_AT_ISO
         : fromLocalDateTimeValue(expiresAtInput);
+      const effectiveSaleMarketKind = forSale === "Yes" ? saleMarketKind : "token";
+      const effectiveMarketAccessMode = effectiveSaleMarketKind === "share" ? "selected" : marketAccessMode;
       const accessByApp: ShareAccessByApp = {};
       for (const app of activeShareApps) {
+        const shareToEmails = (shareToEmailsByApp[app] ?? []).filter((email) => !publicMarketEmails.has(email));
+        const saleEmails =
+          forSale === "Yes" && effectiveSaleMarketKind === "token" && effectiveMarketAccessMode === "selected"
+            ? selectedMarketEmails
+            : forSale === "Yes" && effectiveSaleMarketKind === "share" && selectedShareMarketEmail
+              ? [selectedShareMarketEmail]
+              : [];
         accessByApp[app] = {
           sharedWithEmails: normalizedUniqueEmails([
-            ...(shareToEmailsByApp[app] ?? []),
-            ...(marketAccessMode === "all" ? [] : selectedMarketEmails),
+            ...shareToEmails,
+            ...saleEmails,
           ]),
-          marketAccessMode,
+          marketAccessMode: effectiveMarketAccessMode,
         };
       }
       const sharedWithEmails = normalizedUniqueEmails(
@@ -1093,7 +1157,8 @@ function ShareEditDialog({
       const patch: ShareSettingsPatch = {
         description: description.trim() || null,
         forSale,
-        marketAccessMode,
+        saleMarketKind: effectiveSaleMarketKind,
+        marketAccessMode: effectiveMarketAccessMode,
         sharedWithEmails,
         accessByApp,
         tokenLimit: tokenLimitUnlimited ? UNLIMITED_TOKEN_LIMIT : tokenParsed,
@@ -1122,15 +1187,24 @@ function ShareEditDialog({
     setNotice("");
     try {
       const targetEmail = transferTargetEmail.toLowerCase();
+      const effectiveSaleMarketKind = forSale === "Yes" ? saleMarketKind : "token";
+      const effectiveMarketAccessMode = effectiveSaleMarketKind === "share" ? "selected" : marketAccessMode;
       const accessByApp: ShareAccessByApp = {};
       for (const app of activeShareApps) {
+        const shareToEmails = (shareToEmailsByApp[app] ?? []).filter((email) => !publicMarketEmails.has(email));
+        const saleEmails =
+          forSale === "Yes" && effectiveSaleMarketKind === "token" && effectiveMarketAccessMode === "selected"
+            ? selectedMarketEmails
+            : forSale === "Yes" && effectiveSaleMarketKind === "share" && selectedShareMarketEmail
+              ? [selectedShareMarketEmail]
+              : [];
         accessByApp[app] = {
           sharedWithEmails: normalizedUniqueEmails([
-            ...(shareToEmailsByApp[app] ?? []).filter((email) => email !== targetEmail),
+            ...shareToEmails.filter((email) => email !== targetEmail),
             share.ownerEmail || "",
-            ...(marketAccessMode === "all" ? [] : selectedMarketEmails),
+            ...saleEmails,
           ]),
-          marketAccessMode,
+          marketAccessMode: effectiveMarketAccessMode,
         };
       }
       const nextShared = normalizedUniqueEmails(
@@ -1140,6 +1214,8 @@ function ShareEditDialog({
         ownerEmail: targetEmail,
         sharedWithEmails: nextShared,
         accessByApp,
+        saleMarketKind: effectiveSaleMarketKind,
+        marketAccessMode: effectiveMarketAccessMode,
       });
       await onSaved();
       setTransferTargetEmail("");
@@ -1189,7 +1265,7 @@ function ShareEditDialog({
 	                  />
                 </FieldGroup>
 
-                <div className="grid gap-3 sm:grid-cols-2">
+                <div className="grid gap-3 sm:grid-cols-3">
                   <FieldGroup label={t("dashboard.field.forSale")}>
 	                    <Select
 	                      selectedKey={forSale}
@@ -1210,16 +1286,39 @@ function ShareEditDialog({
                     </Select>
                   </FieldGroup>
 
+                  {forSale === "Yes" ? (
+                    <FieldGroup label={t("dashboard.field.marketType")}>
+                      <Select
+                        selectedKey={saleMarketKind}
+                        onSelectionChange={(key) => handleSaleMarketKindChange(String(key || "token") as "token" | "share")}
+                        isDisabled={readOnly}
+                      >
+                        <Select.Trigger>
+                          <Select.Value>{saleMarketKind === "share" ? t("dashboard.shareMarket") : t("dashboard.tokenMarket")}</Select.Value>
+                          <Select.Indicator />
+                        </Select.Trigger>
+                        <Select.Popover className="share-edit-popover light !bg-white !text-slate-900">
+                          <ListBox>
+                            <ListBox.Item id="token">{t("dashboard.tokenMarket")}</ListBox.Item>
+                            <ListBox.Item id="share">{t("dashboard.shareMarket")}</ListBox.Item>
+                          </ListBox>
+                        </Select.Popover>
+                      </Select>
+                    </FieldGroup>
+                  ) : null}
+
                   <FieldGroup label={t("dashboard.field.marketAccess")} hint={forSale === "Yes" ? undefined : t("dashboard.hint.forSaleOnly")}>
                     <Select
                       key={marketSelectKey}
 	                      selectedKey={null}
 	                      onSelectionChange={(key) => onMarketPicked(String(key || ""))}
-	                      isDisabled={readOnly || forSale !== "Yes"}
+	                      isDisabled={readOnly || forSale !== "Yes" || saleMarketKind === "share"}
 	                    >
                       <Select.Trigger>
                         <Select.Value>
-                          {marketAccessMode === "all" ? t("dashboard.allMarkets") : "Add a market..."}
+                          {saleMarketKind === "share"
+                            ? t("dashboard.selectedShareMarketOnly")
+                            : marketAccessMode === "all" ? t("dashboard.allMarkets") : t("dashboard.addMarket")}
                         </Select.Value>
                         <Select.Indicator />
                       </Select.Trigger>
@@ -1228,7 +1327,7 @@ function ShareEditDialog({
                           <ListBox.Item id="__all__">{t("dashboard.allMarkets")}</ListBox.Item>
                           {availableMarkets.map((market) => (
                             <ListBox.Item key={market.email} id={market.email}>
-                              {(market.displayName || market.subdomain || market.email)}
+                              {marketLabel(market)}
                               <span className="ml-1 text-muted-foreground">· {market.email}</span>
                             </ListBox.Item>
                           ))}
@@ -1238,6 +1337,39 @@ function ShareEditDialog({
                   </FieldGroup>
                 </div>
 
+                {forSale === "Yes" && saleMarketKind === "share" ? (
+                  <FieldGroup label={t("dashboard.shareMarket")} hint={t("dashboard.hint.shareMarketSingle")} invalid={shareMarketInvalid}>
+                    <Select
+                      selectedKey={selectedShareMarketEmail || null}
+                      onSelectionChange={(key) => setSelectedShareMarketEmail(String(key || "").toLowerCase())}
+                      isDisabled={readOnly}
+                    >
+                      <Select.Trigger>
+                        <Select.Value>
+                          {selectedShareMarketEmail
+                            ? shareMarkets.find((market) => market.email.toLowerCase() === selectedShareMarketEmail)?.displayName ||
+                              shareMarkets.find((market) => market.email.toLowerCase() === selectedShareMarketEmail)?.subdomain ||
+                              selectedShareMarketEmail
+                            : t("dashboard.selectShareMarket")}
+                        </Select.Value>
+                        <Select.Indicator />
+                      </Select.Trigger>
+                      <Select.Popover className="share-edit-popover light !bg-white !text-slate-900">
+                        <ListBox>
+                          {shareMarkets.map((market) => (
+                            <ListBox.Item key={market.email} id={market.email.toLowerCase()}>
+                              {marketLabel(market)}
+                              <span className="ml-1 text-muted-foreground">· {market.email}</span>
+                            </ListBox.Item>
+                          ))}
+                        </ListBox>
+                      </Select.Popover>
+                    </Select>
+                    {shareMarketInvalid ? <span className="text-xs text-red-600">{t("dashboard.fieldInvalid")}</span> : null}
+                  </FieldGroup>
+                ) : null}
+
+                {forSale === "Yes" && saleMarketKind === "token" ? (
                 <div className="grid gap-1.5 text-sm">
                   <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
                     <span className="mono-label text-muted-foreground">{t("dashboard.field.modelPricing")}</span>
@@ -1271,14 +1403,15 @@ function ShareEditDialog({
                     <span className="text-xs text-red-600">{t("dashboard.fieldInvalid")}</span>
                   ) : null}
                 </div>
+                ) : null}
 
-                {forSale === "Yes" && marketAccessMode === "selected" ? (
+                {forSale === "Yes" && saleMarketKind === "token" && marketAccessMode === "selected" ? (
                   <FieldGroup label={t("dashboard.field.selectedMarkets")} hint={t("dashboard.hint.selectedMarkets")}>
                     {selectedMarketEmails.length ? (
                       <div className="flex flex-wrap gap-1.5">
                         {selectedMarketEmails.map((email) => {
-                          const meta = markets.find((market) => (market.email || "").toLowerCase() === email);
-                          const label = meta?.displayName || meta?.subdomain || email;
+                          const meta = tokenMarkets.find((market) => (market.email || "").toLowerCase() === email);
+                          const label = meta ? marketLabel(meta) : email;
                           return (
                             <span
                               key={email}
@@ -1307,7 +1440,7 @@ function ShareEditDialog({
                   </FieldGroup>
                 ) : null}
 
-                {forSale === "Yes" && marketAccessMode === "all" ? (
+                {forSale === "Yes" && saleMarketKind === "token" && marketAccessMode === "all" ? (
                   <div className="rounded-lg border border-primary/20 bg-primary/5 px-3 py-2 text-xs text-primary">
                     {t("dashboard.allMarketsSelected")}
 	                    <button
@@ -2641,11 +2774,13 @@ function ShareMarkets({ share, t }: { share?: ShareView; t: TFn }) {
   if (!share) return <EmptyBlock>{t("dashboard.noShare")}</EmptyBlock>;
   if (share.forSale === "Free") return <EmptyBlock>{t("dashboard.publicFreeShare")}</EmptyBlock>;
   if (share.forSale !== "Yes") return <EmptyBlock>{t("dashboard.notForSale")}</EmptyBlock>;
-  if (share.marketAccessMode === "all") return <EmptyBlock>{t("dashboard.authorizedAllMarkets")}</EmptyBlock>;
+  const saleMarketKind = share.saleMarketKind === "share" ? "share" : "token";
+  if (saleMarketKind === "token" && share.marketAccessMode === "all") return <EmptyBlock>{t("dashboard.authorizedAllMarkets")}</EmptyBlock>;
   const links = share.marketLinks || [];
   const unknown = share.unknownMarketEmails || [];
   return (
     <div className="grid gap-2">
+      <Chip size="sm" variant="tertiary">{saleMarketKind === "share" ? t("dashboard.shareMarket") : t("dashboard.tokenMarket")}</Chip>
       {links.map((market) => (
         <Card key={market.id || market.email} className="rounded-lg border p-0 shadow-none">
           <Card.Content className="flex-row items-center justify-between gap-3 p-3">

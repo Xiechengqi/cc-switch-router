@@ -8,6 +8,7 @@ export const PERMANENT_EXPIRES_AT_ISO = "2099-12-31T23:59:59Z";
 export type ShareSettingsDraft = {
   description: string;
   forSale: "Yes" | "No" | "Free";
+  saleMarketKind: "token" | "share";
   marketAccessMode: "selected" | "all";
   sharedWithEmails: string[];
   accessByApp: ShareAccessByApp;
@@ -54,6 +55,7 @@ export function draftFromShare(share: ShareView): ShareSettingsDraft {
   return {
     description: share.description || "",
     forSale: (["Yes", "No", "Free"].includes(share.forSale) ? share.forSale : "No") as "Yes" | "No" | "Free",
+    saleMarketKind: share.saleMarketKind === "share" ? "share" : "token",
     marketAccessMode: share.marketAccessMode === "all" ? "all" : "selected",
     sharedWithEmails: normalizeEmailList(share.sharedWithEmails || []),
     accessByApp,
@@ -68,13 +70,14 @@ export function buildShareSettingsPatch(draft: ShareSettingsDraft): ShareSetting
   return {
     description: draft.description.trim() || null,
     forSale: draft.forSale,
+    saleMarketKind: draft.saleMarketKind,
     marketAccessMode: draft.marketAccessMode,
     sharedWithEmails: normalizeEmailList(draft.sharedWithEmails),
     accessByApp: draft.accessByApp,
     tokenLimit: draft.tokenLimit,
     parallelLimit: draft.parallelLimit,
     expiresAt: draft.expiresAt,
-    forSaleOfficialPricePercentByApp: draft.pricing,
+    forSaleOfficialPricePercentByApp: draft.saleMarketKind === "share" ? {} : draft.pricing,
   };
 }
 
@@ -110,10 +113,12 @@ export function validateShareSettingsDraft(draft: ShareSettingsDraft) {
   }
   const expires = new Date(draft.expiresAt).getTime();
   if (!draft.expiresAt || !Number.isFinite(expires)) errors.push("Expiration time is invalid.");
-  for (const value of Object.values(draft.pricing)) {
-    if (!Number.isFinite(value) || value < 1 || value > 100) {
-      errors.push("Model pricing must be between 1 and 100.");
-      break;
+  if (draft.saleMarketKind === "token") {
+    for (const value of Object.values(draft.pricing)) {
+      if (!Number.isFinite(value) || value < 1 || value > 100) {
+        errors.push("Model pricing must be between 1 and 100.");
+        break;
+      }
     }
   }
   return errors;
