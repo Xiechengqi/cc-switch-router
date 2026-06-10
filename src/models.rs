@@ -891,6 +891,7 @@ pub struct PublicMarketConfig {
     pub email: String,
     pub subdomain: String,
     pub public_base_url: String,
+    pub market_kind: String,
     pub status: String,
     #[serde(default)]
     pub maintenance_enabled: bool,
@@ -907,6 +908,7 @@ pub struct MarketRegistryRecord {
     pub email: String,
     pub subdomain: String,
     pub public_base_url: String,
+    pub market_kind: String,
     pub scopes: Vec<String>,
     pub status: String,
     pub maintenance_enabled: bool,
@@ -943,6 +945,8 @@ pub struct RegisterMarketRequest {
     pub subdomain: String,
     pub display_name: String,
     pub public_base_url: String,
+    #[serde(default)]
+    pub market_kind: Option<String>,
     #[serde(default)]
     pub pricing_summary: Option<serde_json::Value>,
 }
@@ -1053,6 +1057,32 @@ pub struct MarketShareView {
     /// (no recomputation) and then layer their profile preferences on top.
     #[serde(default)]
     pub signals: ShareSignals,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareMarketGrantRequest {
+    pub grant_id: String,
+    pub action: String,
+    #[serde(default)]
+    pub buyer_emails: Vec<String>,
+    #[serde(default)]
+    pub order_ids: Vec<String>,
+    #[serde(default)]
+    pub listing_id: Option<String>,
+    #[serde(default)]
+    pub carpool_group_id: Option<String>,
+    #[serde(default)]
+    pub seat_count: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareMarketGrantResponse {
+    pub ok: bool,
+    pub grant_id: String,
+    pub router_edit_id: String,
+    pub status: String,
 }
 
 /// Router-computed scheduling signals shipped to markets in every

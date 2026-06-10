@@ -513,6 +513,7 @@ pub async fn market_proxy_handler(
             "main",
             &active_subdomains,
             &inflight_by_share,
+            true,
         )
         .await
     {
