@@ -54,10 +54,10 @@ use crate::models::{
     ShareApiContextResponse, ShareApiShareResponse, ShareBatchSyncRequest,
     ShareClaimSubdomainRequest, ShareDeleteRequest, ShareEditAckRequest, ShareEditAvailableEvent,
     ShareEditEventSignaturePayload, ShareHeartbeatRequest, ShareMarketGrantRequest,
-    ShareMarketGrantResponse, SharePendingEditsRequest, ShareRequestLogBatchSyncRequest,
-    ShareRequestLogEntry, ShareRuntimeRefreshRequest, ShareSettingsPatch,
-    ShareSettingsUpdateRequest, ShareSyncRequest, UserApiTokenResetResponse, UserApiTokenResponse,
-    UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    ShareMarketGrantResponse, ShareMarketGrantStatusResponse, SharePendingEditsRequest,
+    ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRuntimeRefreshRequest,
+    ShareSettingsPatch, ShareSettingsUpdateRequest, ShareSyncRequest, UserApiTokenResetResponse,
+    UserApiTokenResponse, UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 use crate::proxy::{gateway_proxy_handler, market_proxy_handler, proxy_handler};
 use crate::recent_traffic::{RecentRequestEvent, RecentTrafficSnapshot};
@@ -126,6 +126,10 @@ pub fn router(state: ServerState) -> Router {
         .route(
             "/v1/share-market/shares/:share_id/grants",
             post(share_market_create_grant),
+        )
+        .route(
+            "/v1/share-market/shares/:share_id/grants/:router_edit_id",
+            get(share_market_grant_status),
         )
         .route("/v1/market/shares/headroom", post(market_shares_headroom))
         .route("/v1/market/shares/feedback", post(market_shares_feedback))
@@ -414,6 +418,25 @@ async fn share_market_create_grant(
         state
             .store
             .create_share_market_grant(&market.email, &share_id, input)
+            .await?,
+    ))
+}
+
+async fn share_market_grant_status(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path((share_id, router_edit_id)): Path<(String, String)>,
+) -> Result<Json<ShareMarketGrantStatusResponse>, AppError> {
+    let market = authenticate_market(&state, &headers, "market:share_grants:write").await?;
+    if market.market_kind != "share" {
+        return Err(AppError::Forbidden(
+            "share-market grants API is only available to share markets".into(),
+        ));
+    }
+    Ok(Json(
+        state
+            .store
+            .share_market_grant_status(&market.email, &share_id, &router_edit_id)
             .await?,
     ))
 }

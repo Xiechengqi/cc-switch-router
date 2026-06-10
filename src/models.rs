@@ -1095,6 +1095,18 @@ pub struct ShareMarketGrantResponse {
     pub status: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareMarketGrantStatusResponse {
+    pub ok: bool,
+    pub router_edit_id: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_at: Option<DateTime<Utc>>,
+}
+
 /// Router-computed scheduling signals shipped to markets in every
 /// `/v1/market/shares` response. All values are normalized so a higher number
 /// is preferred. `samples_10m` is included so the market can decide whether

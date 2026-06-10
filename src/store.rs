@@ -42,15 +42,16 @@ use crate::models::{
     SessionStatusResponse, ShareAppAccess, ShareAppProviders, ShareAppRuntimes,
     ShareBatchSyncRequest, ShareClaimPayload, ShareClaimSubdomainRequest, ShareDeleteRequest,
     ShareDescriptor, ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest,
-    ShareMarketGrantRequest, ShareMarketGrantResponse, ShareMarketLinkView,
-    ShareModelHealthCheckEntry, ShareModelHealthSummary, SharePendingEditsRequest,
-    SharePendingEditsResponse, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry,
-    ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload, ShareRuntimeRefreshRequest,
-    ShareRuntimeSnapshotResponse, ShareSettingsPatch, ShareSettingsUpdateResponse, ShareSignals,
-    ShareSupport, ShareSyncRequest, ShareUpstreamProvider, ShareUpstreamQuota,
-    ShareUsageByEmailResponse, ShareUsageDailyBucket, ShareUsageEmailRow, ShareView, TunnelLease,
-    UserApiTokenResetResponse, UserApiTokenResponse, UserApiTokenStatus, UserShareView,
-    UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    ShareMarketGrantRequest, ShareMarketGrantResponse, ShareMarketGrantStatusResponse,
+    ShareMarketLinkView, ShareModelHealthCheckEntry, ShareModelHealthSummary,
+    SharePendingEditsRequest, SharePendingEditsResponse, ShareRequestLogBatchSyncRequest,
+    ShareRequestLogEntry, ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload,
+    ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse, ShareSettingsPatch,
+    ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest,
+    ShareUpstreamProvider, ShareUpstreamQuota, ShareUsageByEmailResponse, ShareUsageDailyBucket,
+    ShareUsageEmailRow, ShareView, TunnelLease, UserApiTokenResetResponse, UserApiTokenResponse,
+    UserApiTokenStatus, UserShareView, UserSharesResponse, VerifyEmailCodeRequest,
+    VerifyEmailCodeResponse,
 };
 #[cfg(test)]
 use crate::models::{ShareAppProvider, ShareUpstreamModel};
@@ -4334,6 +4335,42 @@ impl AppStore {
             grant_id: input.grant_id,
             router_edit_id: edit_id,
             status: "pending".into(),
+        })
+    }
+
+    pub async fn share_market_grant_status(
+        &self,
+        market_email: &str,
+        share_id: &str,
+        router_edit_id: &str,
+    ) -> Result<ShareMarketGrantStatusResponse, AppError> {
+        let market_email = normalize_email(market_email)?;
+        if router_edit_id.starts_with("noop:") {
+            let noop_share_id = router_edit_id.trim_start_matches("noop:");
+            if noop_share_id != share_id {
+                return Err(AppError::NotFound("share grant edit not found".into()));
+            }
+            return Ok(ShareMarketGrantStatusResponse {
+                ok: true,
+                router_edit_id: router_edit_id.to_string(),
+                status: "applied".into(),
+                error_message: None,
+                applied_at: Some(Utc::now()),
+            });
+        }
+
+        let conn = self.conn.lock().await;
+        let edit = get_share_edit_by_id(&conn, router_edit_id)?
+            .ok_or_else(|| AppError::NotFound("share grant edit not found".into()))?;
+        if edit.share_id != share_id || normalize_email(&edit.created_by_email)? != market_email {
+            return Err(AppError::NotFound("share grant edit not found".into()));
+        }
+        Ok(ShareMarketGrantStatusResponse {
+            ok: true,
+            router_edit_id: router_edit_id.to_string(),
+            status: edit.status,
+            error_message: edit.error_message,
+            applied_at: edit.applied_at,
         })
     }
 
@@ -13509,6 +13546,34 @@ mod tests {
             .await
             .expect("explicitly delegated share market can create grant");
         assert_eq!(granted.status, "pending");
+        let grant_status = store
+            .share_market_grant_status(
+                "share-market@example.com",
+                "share-market-all-only",
+                &granted.router_edit_id,
+            )
+            .await
+            .expect("share market can query its own grant edit");
+        assert_eq!(grant_status.status, "pending");
+
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE share_edit_requests SET status = 'applied', applied_at = updated_at WHERE id = ?1",
+                params![granted.router_edit_id],
+            )
+            .expect("mark grant edit applied");
+        }
+        let applied_status = store
+            .share_market_grant_status(
+                "share-market@example.com",
+                "share-market-all-only",
+                &granted.router_edit_id,
+            )
+            .await
+            .expect("share market sees applied grant edit");
+        assert_eq!(applied_status.status, "applied");
+        assert!(applied_status.applied_at.is_some());
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }

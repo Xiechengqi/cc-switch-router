@@ -9,7 +9,7 @@ import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog"
 import { getMarketLinkedShares, getShareUsageByEmail, releaseMarketShareState, updateMarketDisabledShares, updateMarketMaintenance, updateShareSettings } from "@/lib/api";
 import type { AppLocale } from "@/lib/i18n";
 import type { DashboardClient, DashboardMarket, HealthCheckEntry, HealthTimelineBucket, MarketAppAvailabilityEntry, MarketRequestLog, MarketShare, MarketShareRuntimeState, ModelHealthSummary, ShareAccessByApp, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareModelHealthCheck, ShareRequestLog, ShareSettingsPatch, ShareUpstreamProvider, ShareUsageByEmailResponse, ShareView } from "@/lib/types";
-import { compactTokens, formatDateTime, formatNumber, formatRelativeTime } from "@/lib/utils";
+import { cn, compactTokens, formatDateTime, formatNumber, formatRelativeTime } from "@/lib/utils";
 
 function shouldOpenRowDrawer(event: React.MouseEvent<HTMLElement>) {
   const selection = window.getSelection();
@@ -224,6 +224,14 @@ function sortMarkets(markets: DashboardMarket[]) {
 
 function isShareMarket(market: DashboardMarket) {
   return market.marketKind === "share";
+}
+
+function isUsageMarket(market: DashboardMarket) {
+  return !isShareMarket(market);
+}
+
+function canShowMarketSharePriority(market: DashboardMarket) {
+  return isUsageMarket(market) && Boolean(market.canManage);
 }
 
 function marketLabel(market: DashboardMarket) {
@@ -2317,7 +2325,9 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
                 {selected ? (
                   <div className="grid gap-4">
                     <DrawerSection label="24h"><HealthTimelineStrip timeline={selected.healthTimeline} /></DrawerSection>
-                    <DrawerSection label={t("dashboard.linkedShares")}><MarketLinkedShares market={selected} t={t} /></DrawerSection>
+                    <DrawerSection label={canShowMarketSharePriority(selected) ? t("dashboard.sharePriority") : t("dashboard.linkedShares")}>
+                      {canShowMarketSharePriority(selected) ? <MarketSharePriorityPanel market={selected} t={t} /> : <MarketLinkedShares market={selected} t={t} />}
+                    </DrawerSection>
                     <DrawerSection label={t("dashboard.recentRequests")}><MarketRequestLogs logs={selected.recentRequests || []} /></DrawerSection>
                   </div>
                 ) : null}
@@ -3452,6 +3462,224 @@ function MarketLinkedShares({ market, t }: { market: DashboardMarket; t: TFn }) 
       })}
     </div>
   );
+}
+
+type MarketSharePriorityItem = {
+  share: MarketShare;
+  score: number;
+  schedulable: boolean;
+  degraded: boolean;
+  reasons: string[];
+  signalTitle: string;
+};
+
+function MarketSharePriorityPanel({ market, t }: { market: DashboardMarket; t: TFn }) {
+  const [activeApp, setActiveApp] = React.useState<MarketShareAppKey>("claude");
+  const [shares, setShares] = React.useState<MarketShare[] | null>(null);
+  const [error, setError] = React.useState("");
+
+  React.useEffect(() => {
+    let cancelled = false;
+    setShares(null);
+    setError("");
+    getMarketLinkedShares(market.email)
+      .then((nextShares) => {
+        if (!cancelled) setShares(nextShares);
+      })
+      .catch((err) => {
+        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [market.email]);
+
+  const ranked = React.useMemo(
+    () => rankMarketSharesForApp(shares || [], activeApp, t),
+    [shares, activeApp, t],
+  );
+
+  return (
+    <div className="grid gap-3">
+      <div className="text-xs leading-5 text-muted-foreground">{t("dashboard.sharePriorityHint")}</div>
+      <div className="inline-flex w-fit gap-1 rounded-xl bg-muted p-1">
+        {MARKET_SHARE_APPS.map(([key, label]) => {
+          const active = activeApp === key;
+          return (
+            <button
+              key={key}
+              type="button"
+              onClick={() => setActiveApp(key)}
+              className={cn(
+                "rounded-md px-3 py-1.5 text-sm font-semibold transition",
+                active ? "bg-white text-foreground shadow-sm" : "text-muted-foreground hover:bg-white/70 hover:text-foreground",
+              )}
+            >
+              {label}
+            </button>
+          );
+        })}
+      </div>
+      {error ? <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{t("dashboard.sharePriorityLoadFailed")}: {error}</div> : null}
+      {!shares && !error ? (
+        <div className="flex items-center gap-2 rounded-lg border bg-muted/30 px-3 py-4 text-sm text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          {t("dashboard.sharePriorityLoading")}
+        </div>
+      ) : null}
+      {shares && ranked.length === 0 ? <EmptyBlock>{t("dashboard.sharePriorityUnavailable")}</EmptyBlock> : null}
+      {shares && ranked.length ? (
+        <div className="grid gap-2">
+          {ranked.map((item, index) => (
+            <MarketSharePriorityCard key={item.share.shareId} item={item} rank={index + 1} t={t} />
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function MarketSharePriorityCard({ item, rank, t }: { item: MarketSharePriorityItem; rank: number; t: TFn }) {
+  const share = item.share;
+  const statusColor = item.schedulable ? (item.degraded ? "warning" : "success") : "default";
+  const statusLabel = item.schedulable
+    ? item.degraded
+      ? t("dashboard.sharePriorityDegraded")
+      : t("dashboard.sharePrioritySchedulable")
+    : item.reasons[0] || t("dashboard.sharePriorityUnavailableState");
+  return (
+    <Card className={cn("rounded-lg border p-0 shadow-none", !item.schedulable ? "bg-muted/30 opacity-80" : item.degraded ? "border-amber-200 bg-amber-50/40" : "")}>
+      <Card.Content className="grid gap-3 p-3">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <Chip color={item.schedulable ? "success" : "default"} size="sm" variant={item.schedulable ? "soft" : "tertiary"}>
+                {t("dashboard.sharePriorityRank", { rank })}
+              </Chip>
+              <div className="truncate font-medium">{share.subdomain || share.shareName || "-"}</div>
+            </div>
+            <div className="mt-1 truncate font-mono text-[11px] text-muted-foreground">{share.shareId}</div>
+            <div className="mt-1 truncate text-xs text-muted-foreground">{share.ownerEmail || share.installationOwnerEmail || "-"}</div>
+          </div>
+          <div className="grid shrink-0 justify-items-end gap-1">
+            <Chip color={statusColor} size="sm" variant={item.schedulable ? "soft" : "tertiary"}>{statusLabel}</Chip>
+            <div className="font-mono text-[11px] text-muted-foreground">
+              {t("dashboard.sharePriorityScore")} {item.score.toFixed(3)}
+            </div>
+          </div>
+        </div>
+        {item.reasons.length > 1 || (!item.schedulable && item.reasons.length) ? (
+          <div className="flex flex-wrap gap-1">
+            {item.reasons.map((reason) => <Chip key={reason} size="sm" variant="tertiary">{reason}</Chip>)}
+          </div>
+        ) : null}
+        <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted-foreground">
+          <span title={item.signalTitle}>{t("dashboard.sharePrioritySignals")}: {item.signalTitle}</span>
+          <span className="font-mono">{share.activeRequests || 0}/{isUnlimited(share.parallelLimit) ? "∞" : share.parallelLimit}</span>
+        </div>
+      </Card.Content>
+    </Card>
+  );
+}
+
+function rankMarketSharesForApp(shares: MarketShare[], app: MarketShareAppKey, t: TFn): MarketSharePriorityItem[] {
+  return shares
+    .filter((share) => isShareRelevantForApp(share, app))
+    .map((share) => marketSharePriorityItem(share, app, t))
+    .sort((left, right) => {
+      return (
+        Number(right.schedulable) - Number(left.schedulable) ||
+        Number(left.degraded) - Number(right.degraded) ||
+        right.score - left.score ||
+        (left.share.activeRequests || 0) - (right.share.activeRequests || 0) ||
+        (left.share.subdomain || left.share.shareName || left.share.shareId).localeCompare(
+          right.share.subdomain || right.share.shareName || right.share.shareId,
+          undefined,
+          { sensitivity: "base" },
+        )
+      );
+    });
+}
+
+function isShareRelevantForApp(share: MarketShare, app: MarketShareAppKey) {
+  return Boolean(
+    share.support?.[app] ||
+      share.appRuntimes?.[app] ||
+      share.appAvailability?.[app] ||
+      marketBlockedStatesByApp(share.marketStates).has(app),
+  );
+}
+
+function marketSharePriorityItem(share: MarketShare, app: MarketShareAppKey, t: TFn): MarketSharePriorityItem {
+  const supported = Boolean(share.support?.[app] || share.appRuntimes?.[app]);
+  const blockedStates = marketBlockedStatesByApp(share.marketStates).get(app) || [];
+  const cooldownStates = (share.marketStates || []).filter((state) => {
+    if (state.kind !== "cooldown") return false;
+    const stateApp = marketShareAppKey(state.appType);
+    return !stateApp || stateApp === app;
+  });
+  const availability = share.appAvailability?.[app];
+  const parallelFull = !isUnlimited(share.parallelLimit) && Number(share.parallelLimit || 0) > 0 && Number(share.activeRequests || 0) >= Number(share.parallelLimit || 0);
+  const reasons = [
+    !supported ? t("dashboard.sharePriorityUnsupported") : undefined,
+    !share.online ? t("dashboard.sharePriorityOffline") : undefined,
+    share.disabledByMarket ? t("dashboard.sharePriorityDisabled") : undefined,
+    parallelFull ? t("dashboard.sharePriorityParallelFull") : undefined,
+    cooldownStates.length ? t("dashboard.sharePriorityCooldown") : undefined,
+    blockedStates.length ? t("dashboard.sharePriorityBlocked") : undefined,
+    availability?.status === "unavailable" ? t("dashboard.sharePriorityUnavailableState") : undefined,
+    availability?.status === "degraded" ? t("dashboard.sharePriorityDegraded") : undefined,
+  ].filter(Boolean) as string[];
+  const schedulable =
+    supported &&
+    Boolean(share.online) &&
+    !share.disabledByMarket &&
+    !parallelFull &&
+    cooldownStates.length === 0 &&
+    blockedStates.length === 0 &&
+    availability?.status !== "unavailable";
+  const score = defaultMarketSharePriorityScore(share);
+  const signalTitle = marketShareSignalTitle(share, t);
+  return {
+    share,
+    score,
+    schedulable,
+    degraded: availability?.status === "degraded",
+    reasons,
+    signalTitle,
+  };
+}
+
+function defaultMarketSharePriorityScore(share: MarketShare) {
+  const stability = signalValue(share.signals?.stability, 1);
+  const quota = signalValue(share.signals?.quotaHealth, 0.5);
+  const headroom = effectiveShareHeadroom(share);
+  const owner = signalValue(share.signals?.ownerPenalty, 1);
+  return (0.35 * stability + 0.30 * quota + 0.25 * headroom + 0.10) * owner;
+}
+
+function signalValue(value: unknown, fallback: number) {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function effectiveShareHeadroom(share: MarketShare) {
+  if (isUnlimited(share.parallelLimit)) return 1;
+  const limit = Number(share.parallelLimit || 0);
+  if (limit <= 0) return 0;
+  return Math.max(0, Math.min(1, 1 - Number(share.activeRequests || 0) / limit));
+}
+
+function marketShareSignalTitle(share: MarketShare, t: TFn) {
+  const stability = signalValue(share.signals?.stability, 1);
+  const quota = signalValue(share.signals?.quotaHealth, 0.5);
+  const headroom = effectiveShareHeadroom(share);
+  const owner = signalValue(share.signals?.ownerPenalty, 1);
+  return t("dashboard.sharePrioritySignalsTitle", {
+    stability: stability.toFixed(2),
+    quota: quota.toFixed(2),
+    headroom: headroom.toFixed(2),
+    owner: owner.toFixed(2),
+  });
 }
 
 function MarketRequestLogs({ logs }: { logs: MarketRequestLog[] }) {

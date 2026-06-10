@@ -273,6 +273,7 @@ export type MarketShare = {
   parallelLimit: number;
   onlineRate24h: number;
   lastSeenAt: string;
+  shareCreatedAt?: string;
   disabledByMarket?: boolean;
   marketDisabledAt?: string;
   support?: ShareSupport;
@@ -280,6 +281,15 @@ export type MarketShare = {
   appRuntimes?: ShareAppRuntimes;
   modelHealth?: ShareModelHealthSummary;
   marketStates?: MarketShareRuntimeState[];
+  signals?: ShareSignals;
+};
+
+export type ShareSignals = {
+  quotaHealth?: number;
+  stability?: number;
+  headroom?: number;
+  samples10m?: number;
+  ownerPenalty?: number;
 };
 
 export type MarketShareRuntimeState = {
