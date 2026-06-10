@@ -10,6 +10,10 @@ fn default_market_access_mode() -> String {
     "selected".to_string()
 }
 
+fn default_sale_market_kind() -> String {
+    "token".to_string()
+}
+
 pub fn default_share_parallel_limit() -> i64 {
     3
 }
@@ -241,6 +245,8 @@ pub struct UserShareView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub for_sale: String,
+    #[serde(default = "default_sale_market_kind")]
+    pub sale_market_kind: String,
     pub market_access_mode: String,
     pub subdomain: String,
     pub tunnel_url: String,
@@ -583,6 +589,8 @@ pub struct ShareSettingsPatch {
     pub description: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub for_sale: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sale_market_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub market_access_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1025,6 +1033,8 @@ pub struct MarketShareView {
     pub installation_owner_email: Option<String>,
     pub app_type: String,
     pub for_sale: String,
+    #[serde(default = "default_sale_market_kind")]
+    pub sale_market_kind: String,
     #[serde(default = "default_market_access_mode")]
     pub market_access_mode: String,
     pub share_status: String,
@@ -1364,6 +1374,8 @@ pub struct ShareDescriptor {
     pub description: Option<String>,
     #[serde(default = "default_share_for_sale")]
     pub for_sale: String,
+    #[serde(default = "default_sale_market_kind")]
+    pub sale_market_kind: String,
     pub subdomain: String,
     pub app_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1751,6 +1763,8 @@ pub struct ShareView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub for_sale: String,
+    #[serde(default = "default_sale_market_kind")]
+    pub sale_market_kind: String,
     #[serde(default = "default_market_access_mode")]
     pub market_access_mode: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
