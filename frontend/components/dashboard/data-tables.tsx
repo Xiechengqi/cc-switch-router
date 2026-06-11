@@ -2302,9 +2302,6 @@ export function SharesTable({
                     <DrawerSection label={t("dashboard.providers")}>
                       <ShareProvidersPanel share={selected} />
                     </DrawerSection>
-                    <DrawerSection label={t("dashboard.activityLogs")}>
-                      <ShareActivityLogs share={selected} />
-                    </DrawerSection>
                     <DrawerSection label={t("dashboard.modelHealthChecks")}>
                       <ShareModelHealthChecks
                         checks={selected.recentModelHealthChecks || []}
@@ -3579,30 +3576,6 @@ function ClientProvidersPanel({ shares }: { shares: ShareView[] }) {
 }
 
 type RequestLogTab = "text" | "image";
-
-function ShareActivityLogs({ share }: { share: ShareView }) {
-  const { t } = useLocaleText();
-  const [selectedKey, setSelectedKey] = React.useState<RequestLogTab>("text");
-  return (
-    <div className="grid gap-3">
-      <Tabs selectedKey={selectedKey} onSelectionChange={(key: React.Key) => setSelectedKey(String(key) as RequestLogTab)} variant="secondary" className="text-foreground">
-        <Tabs.List className="grid w-full grid-cols-2 text-foreground">
-          <Tabs.Tab id="text" className="rounded-md border border-transparent px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors data-[selected=true]:border-primary/30 data-[selected=true]:bg-primary/10 data-[selected=true]:text-primary">
-            {t("dashboard.textRequests")}
-          </Tabs.Tab>
-          <Tabs.Tab id="image" className="rounded-md border border-transparent px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors data-[selected=true]:border-primary/30 data-[selected=true]:bg-primary/10 data-[selected=true]:text-primary">
-            {t("dashboard.imageJobs")}
-          </Tabs.Tab>
-        </Tabs.List>
-      </Tabs>
-      {selectedKey === "text" ? (
-        <ShareRequestLogs logs={share.recentRequests || []} />
-      ) : (
-        <ShareImageJobLogs shareId={share.shareId} />
-      )}
-    </div>
-  );
-}
 
 function ShareProviderRequestsPanel({
   share,
