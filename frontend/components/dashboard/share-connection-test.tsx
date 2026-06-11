@@ -49,13 +49,15 @@ const APP_PROBE: Record<TestApp, Partial<Record<TestKind, AppProbe>>> = {
     image: {
       labelKey: "dashboard.connectDialog.test.imageApiCall",
       method: "POST",
-      path: "/v1/images/generations/async",
+      path: "/v1/images/generations",
       body: JSON.stringify({
         model: "gpt-5.5",
         prompt: "A small robot painting a sunrise",
         size: "1024x1024",
         response_format: "b64_json",
         output_format: "png",
+        stream: true,
+        partial_images: 0,
       }),
     },
   },
@@ -84,9 +86,10 @@ function buildCurlCommand(baseUrl: string, app: TestApp, kind: TestKind, apiToke
     ? `Bearer ${apiToken}`
     : "Bearer <your-api-token>";
   return [
-    `curl -sS -X ${probe.method} \\`,
+    `curl ${kind === "image" ? "-N " : ""}-sS -X ${probe.method} \\`,
     `  '${url}' \\`,
     `  -H 'Authorization: ${bearer}' \\`,
+    ...(kind === "image" ? [`  -H 'Accept: text/event-stream' \\`] : []),
     `  -H 'Content-Type: application/json' \\`,
     `  -d '${probe.body}'`,
   ].join("\n");

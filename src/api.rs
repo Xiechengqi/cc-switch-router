@@ -11,6 +11,7 @@ use axum::response::sse::Event;
 use axum::response::{IntoResponse, Response, Sse};
 use axum::routing::{any, delete, get, patch, post};
 use axum::{Json, Router};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::time::{Duration, sleep};
@@ -3834,8 +3835,8 @@ fn app_probe_for_kind(app: &str, kind: &str) -> Option<AppProbe> {
         }),
         ("codex", "image") => Some(AppProbe {
             method: "POST",
-            path: "/v1/images/generations/async",
-            body: r#"{"model":"gpt-5.5","prompt":"A small robot painting a sunrise","size":"1024x1024","response_format":"b64_json","output_format":"png"}"#,
+            path: "/v1/images/generations",
+            body: r#"{"model":"gpt-5.5","prompt":"A small robot painting a sunrise","size":"1024x1024","response_format":"b64_json","output_format":"png","stream":true,"partial_images":0}"#,
         }),
         ("gemini", "text") => Some(AppProbe {
             method: "POST",
@@ -4108,7 +4109,17 @@ async fn test_share_connection(
                 .iter()
                 .map(|(k, v)| [k.as_str().to_string(), v.to_str().unwrap_or("").to_string()])
                 .collect();
-            let body_bytes = resp.bytes().await.unwrap_or_default();
+            let body_bytes = if input.app == "codex" && probe_kind == "image" {
+                let mut stream = resp.bytes_stream();
+                match tokio::time::timeout(std::time::Duration::from_secs(5), stream.next()).await {
+                    Ok(Some(Ok(bytes))) => bytes,
+                    Ok(Some(Err(err))) => bytes::Bytes::from(format!("stream read error: {err}")),
+                    Ok(None) => bytes::Bytes::new(),
+                    Err(_) => bytes::Bytes::from("stream did not produce a first event within 5s"),
+                }
+            } else {
+                resp.bytes().await.unwrap_or_default()
+            };
             let body_truncated = body_bytes.len() > TEST_BODY_CAP;
             let body_slice = &body_bytes[..body_bytes.len().min(TEST_BODY_CAP)];
             let body_text = String::from_utf8_lossy(body_slice).into_owned();

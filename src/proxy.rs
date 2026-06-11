@@ -3,6 +3,7 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use base64::Engine;
+use bytes::Bytes;
 use rand::distributions::{Alphanumeric, DistString};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -197,6 +198,7 @@ pub struct ProxyRegistry {
     health_probe_failures: Mutex<HashMap<String, Instant>>,
     share_limiter: Arc<KeyedConcurrencyLimiter>,
     free_share_ip_limiter: Arc<KeyedConcurrencyLimiter>,
+    image_limiter: Arc<KeyedConcurrencyLimiter>,
     /// Tracks requests that actually traversed the market proxy path, keyed by
     /// lowercased market email. Independent from `share_limiter` so a request
     /// that hits a share's own subdomain directly is not counted against the
@@ -425,6 +427,16 @@ impl ProxyRegistry {
     ) -> Option<KeyedConcurrencyPermit> {
         self.free_share_ip_limiter
             .try_acquire(user_ip, parallel_limit)
+            .await
+    }
+
+    async fn try_acquire_image_permit(
+        &self,
+        share_id: &str,
+        parallel_limit: i64,
+    ) -> Option<KeyedConcurrencyPermit> {
+        self.image_limiter
+            .try_acquire(share_id, parallel_limit)
             .await
     }
 }
@@ -1018,7 +1030,7 @@ pub async fn proxy_handler(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     req: Request,
 ) -> Response {
-    let (parts, body) = req.into_parts();
+    let (parts, mut body) = req.into_parts();
     let method = parts.method.clone();
     let host = parts
         .headers
@@ -1385,6 +1397,44 @@ pub async fn proxy_handler(
         )
         .await;
     }
+    if route.is_share()
+        && method == axum::http::Method::POST
+        && is_image_generation_submit_path(&path)
+    {
+        let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+            Ok(body) => body,
+            Err(err) => {
+                warn!(
+                    method = %method,
+                    host = %host,
+                    path = %path_and_query,
+                    backend = %backend,
+                    client_ip = %user_ip,
+                    client_country = %user_country,
+                    client_asn = %user_asn,
+                    user_agent = %user_agent,
+                    error = %err,
+                    "image generation request body read failed"
+                );
+                return json_error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("failed-to-read-body: {err}"),
+                );
+            }
+        };
+        if image_generation_request_wants_stream(&body_bytes) {
+            return handle_image_generation_stream_submit(
+                &state,
+                &route,
+                body_bytes,
+                api_user_email,
+                user_ip,
+                user_country.to_string(),
+            )
+            .await;
+        }
+        body = Body::from(body_bytes);
+    }
     let target = format!("http://{backend}{path_and_query}");
 
     let metrics_permit = state.metrics.proxy_request_started();
@@ -1730,8 +1780,22 @@ fn image_generation_async_submit_path(path: &str) -> Option<&'static str> {
     }
 }
 
+fn is_image_generation_submit_path(path: &str) -> bool {
+    matches!(
+        path.trim_start_matches('/'),
+        "v1/images/generations" | "images/generations"
+    )
+}
+
 fn is_image_generation_async_submit_path(path: &str) -> bool {
     image_generation_async_submit_path(path).is_some()
+}
+
+fn image_generation_request_wants_stream(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| value.get("stream").and_then(Value::as_bool))
+        .unwrap_or(false)
 }
 
 fn image_generation_job_path_tail<'a>(path: &'a str, suffix: &str) -> Option<&'a str> {
@@ -1832,6 +1896,7 @@ async fn handle_image_generation_async_submit(
         .filter(|value| !value.is_empty())
         .unwrap_or("gpt-5.5")
         .to_string();
+    payload.insert("stream".into(), Value::Bool(false));
     payload.insert("response_format".into(), Value::String("b64_json".into()));
     let prompt_preview = payload
         .get("prompt")
@@ -1910,6 +1975,183 @@ async fn handle_image_generation_async_submit(
             "expiresInSeconds": IMAGE_JOB_RESULT_TTL_SECS
         }),
     )
+}
+
+async fn handle_image_generation_stream_submit(
+    state: &ServerState,
+    route: &RouteEntry,
+    body: axum::body::Bytes,
+    api_user_email: Option<String>,
+    user_ip: String,
+    user_country: String,
+) -> Response {
+    let Some(share_id) = route.share_id.as_deref() else {
+        return json_error_response(StatusCode::NOT_FOUND, "share-not-found");
+    };
+    let share = match state.store.get_share_for_test(share_id).await {
+        Ok(Some(share)) => share,
+        Ok(None) => return json_error_response(StatusCode::NOT_FOUND, "share-not-found"),
+        Err(err) => {
+            warn!(share_id = %share_id, error = %err, "image generation share lookup failed");
+            return json_error_response(StatusCode::SERVICE_UNAVAILABLE, "share-lookup-failed");
+        }
+    };
+    if codex_image_generation_provider(&share).is_none() {
+        return json_error_response(
+            StatusCode::BAD_REQUEST,
+            "codex image generation is not enabled for the bound provider",
+        );
+    }
+    let (running, active) = match state
+        .store
+        .count_active_image_generation_jobs_for_share(share_id)
+        .await
+    {
+        Ok(counts) => counts,
+        Err(err) => {
+            warn!(share_id = %share_id, error = %err, "image generation active job count failed");
+            return json_error_response(StatusCode::SERVICE_UNAVAILABLE, "image-job-count-failed");
+        }
+    };
+    if running >= IMAGE_JOB_MAX_RUNNING_PER_SHARE || active >= IMAGE_JOB_MAX_ACTIVE_PER_SHARE {
+        return json_error_response(StatusCode::TOO_MANY_REQUESTS, "image-generation-queue-full");
+    }
+    let Some(image_permit) = state
+        .proxy
+        .try_acquire_image_permit(share_id, IMAGE_JOB_MAX_RUNNING_PER_SHARE as i64)
+        .await
+    else {
+        return json_error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "image-generation-stream-busy",
+        );
+    };
+
+    let mut payload = match serde_json::from_slice::<Value>(&body) {
+        Ok(Value::Object(map)) => map,
+        Ok(_) => {
+            return json_error_response(
+                StatusCode::BAD_REQUEST,
+                "image request body must be a JSON object",
+            );
+        }
+        Err(err) => {
+            return json_error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid image request json: {err}"),
+            );
+        }
+    };
+    payload.insert("stream".into(), Value::Bool(true));
+    payload.insert("response_format".into(), Value::String("b64_json".into()));
+    let upstream_body = match serde_json::to_vec(&Value::Object(payload)) {
+        Ok(body) => body,
+        Err(err) => {
+            return json_error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("serialize image request failed: {err}"),
+            );
+        }
+    };
+
+    let target = format!("http://{}/v1/images/generations", route.backend);
+    let mut builder = state
+        .proxy_http
+        .post(target)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "text/event-stream")
+        .header("X-CC-Switch-Share-Subdomain", route.subdomain.as_str());
+    if let Some(share_id) = route.share_id.as_deref() {
+        builder = builder.header("X-CC-Switch-Share-Id", share_id);
+    }
+    if let Some(email) = api_user_email.as_deref() {
+        builder = builder.header("X-CC-Switch-User-Email", email);
+    }
+
+    let metrics_permit = state.metrics.proxy_request_started();
+    let recent_traffic_guard = Some(RecentTrafficGuard {
+        traffic: state.recent_traffic.clone(),
+        request_id: state
+            .recent_traffic
+            .record(
+                share_id.to_string(),
+                route.share_name.clone(),
+                Some(route.subdomain.clone()),
+                Some(user_country.clone()),
+                None,
+            )
+            .await,
+    });
+
+    let upstream = match builder.body(upstream_body).send().await {
+        Ok(response) => response,
+        Err(err) => {
+            state.metrics.record_proxy_upstream_error(false);
+            warn!(
+                share_id = %share_id,
+                client_ip = %user_ip,
+                client_country = %user_country,
+                error = %err,
+                "image generation stream upstream request failed"
+            );
+            return json_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("connection-lost: {err}"),
+            );
+        }
+    };
+    let status = upstream.status();
+    state.metrics.record_proxy_status(status);
+    if !status.is_success() {
+        let status_code = status;
+        let text = upstream
+            .text()
+            .await
+            .unwrap_or_else(|err| format!("failed to read upstream error: {err}"));
+        return json_error_response(status_code, &compact_prompt_preview(&text, 1000));
+    }
+
+    let mut upstream_stream = upstream.bytes_stream();
+    let stream = async_stream::stream! {
+        use futures_util::StreamExt;
+
+        let _image_permit = image_permit;
+        let _metrics_permit = metrics_permit;
+        let _recent_traffic_guard = recent_traffic_guard;
+        let mut keepalive = tokio::time::interval(Duration::from_secs(15));
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                chunk = upstream_stream.next() => {
+                    match chunk {
+                        Some(Ok(bytes)) => yield Ok::<Bytes, std::io::Error>(bytes),
+                        Some(Err(err)) => {
+                            yield Err(std::io::Error::other(err.to_string()));
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+                _ = keepalive.tick() => {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b": keepalive\n\n"));
+                }
+            }
+        }
+    };
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-transform"),
+    );
+    response
+        .headers_mut()
+        .insert("X-Accel-Buffering", HeaderValue::from_static("no"));
+    response
 }
 
 async fn handle_image_generation_status_request(
@@ -2049,6 +2291,34 @@ fn spawn_image_generation_job(
                 }
             }
         }
+        let Some(job_share_id) = route.share_id.as_deref() else {
+            let _ = state
+                .store
+                .fail_image_generation_job(
+                    &job_id,
+                    None,
+                    queued_started.elapsed().as_millis() as u64,
+                    "image generation share route is missing share id",
+                )
+                .await;
+            return;
+        };
+        let Some(_image_permit) = state
+            .proxy
+            .try_acquire_image_permit(job_share_id, IMAGE_JOB_MAX_RUNNING_PER_SHARE as i64)
+            .await
+        else {
+            let _ = state
+                .store
+                .fail_image_generation_job(
+                    &job_id,
+                    None,
+                    queued_started.elapsed().as_millis() as u64,
+                    "image generation stream is already running for this share",
+                )
+                .await;
+            return;
+        };
         let started = Instant::now();
         let target = format!("http://{}/v1/images/generations", route.backend);
         let mut builder = state
@@ -2543,6 +2813,22 @@ mod tests {
             infer_share_request_app("/images/generations", &headers).as_deref(),
             Some("codex")
         );
+    }
+
+    #[test]
+    fn image_generation_stream_detection_is_strict() {
+        assert!(is_image_generation_submit_path("/v1/images/generations"));
+        assert!(is_image_generation_submit_path("/images/generations"));
+        assert!(!is_image_generation_submit_path(
+            "/v1/images/generations/async"
+        ));
+        assert!(image_generation_request_wants_stream(
+            br#"{"stream":true,"prompt":"draw"}"#
+        ));
+        assert!(!image_generation_request_wants_stream(
+            br#"{"stream":false,"prompt":"draw"}"#
+        ));
+        assert!(!image_generation_request_wants_stream(b"not json"));
     }
 
     #[tokio::test]
