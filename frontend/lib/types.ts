@@ -373,6 +373,7 @@ export type ImageGenerationJob = {
   resultMimeType?: string;
   resultSizeBytes?: number;
   resultStorageKey?: string;
+  resultUrl?: string;
   createdByEmail?: string;
   userCountry?: string;
 };

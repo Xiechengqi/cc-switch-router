@@ -1,12 +1,13 @@
 "use client";
 
-import { Eye, ExternalLink, Link2, Loader2, Maximize2, Pencil, RotateCcw, Save, Crown, X } from "lucide-react";
+import { Copy, Eye, ExternalLink, Link2, Loader2, Maximize2, Pencil, RotateCcw, Save, Crown, X } from "lucide-react";
 import { Button, Card, Checkbox, Chip, Drawer, Input, ListBox, Modal, ProgressBar, Select, Tabs, TextArea } from "@heroui/react";
 import * as React from "react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog";
 import { getMarketLinkedShares, getShareImageGenerationJobs, getShareUsageByEmail, releaseMarketShareState, updateMarketDisabledShares, updateMarketMaintenance, updateShareSettings } from "@/lib/api";
+import { authFetch } from "@/lib/auth";
 import type { AppLocale } from "@/lib/i18n";
 import type { DashboardClient, DashboardMarket, HealthCheckEntry, HealthTimelineBucket, ImageGenerationJob, MarketAppAvailabilityEntry, MarketRequestLog, MarketShare, MarketShareRuntimeState, ModelHealthSummary, ShareAccessByApp, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareModelHealthCheck, ShareRequestLog, ShareSettingsPatch, ShareUpstreamProvider, ShareUsageByEmailResponse, ShareView } from "@/lib/types";
 import { cn, compactTokens, formatDateTime, formatNumber, formatRelativeTime } from "@/lib/utils";
@@ -3651,16 +3652,23 @@ function ShareImageJobLogs({ shareId }: { shareId: string }) {
       {jobs.slice(0, 20).map((job) => {
         const ok = job.status === "succeeded";
         const failed = job.status === "failed" || job.status === "expired" || job.status === "cancelled";
+        const resultUrl = job.resultUrl || (ok ? `/v1/shares/${encodeURIComponent(shareId)}/image-jobs/${encodeURIComponent(job.jobId)}/result` : "");
         return (
           <Card key={job.jobId} className="rounded-lg border p-0 shadow-none">
             <Card.Content className="gap-3 p-3">
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
-                  <div className="truncate font-medium">{job.model || "-"}</div>
+                  <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+                    <span className="truncate font-medium">{job.model || "-"}</span>
+                    <span className="font-mono text-[11px] text-muted-foreground">{job.jobId}</span>
+                  </div>
                   <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
                     {job.createdByEmail ? <span>{job.createdByEmail}</span> : null}
                     <span>{job.providerName || job.providerId || "-"}</span>
-                    <span title={formatDateTime(job.queuedAt * 1000)}>{formatRelativeTime(job.queuedAt * 1000, locale)}</span>
+                    <span title={formatDateTime(job.queuedAt * 1000)}>queued {formatRelativeTime(job.queuedAt * 1000, locale)}</span>
+                    {job.startedAt ? <span title={formatDateTime(job.startedAt * 1000)}>started {formatRelativeTime(job.startedAt * 1000, locale)}</span> : null}
+                    {job.completedAt ? <span title={formatDateTime(job.completedAt * 1000)}>done {formatRelativeTime(job.completedAt * 1000, locale)}</span> : null}
+                    {job.expiresAt ? <span title={formatDateTime(job.expiresAt * 1000)}>expires {formatRelativeTime(job.expiresAt * 1000, locale)}</span> : null}
                     {job.resultMimeType ? <span>{job.resultMimeType}</span> : null}
                     {typeof job.resultSizeBytes === "number" ? <span>{formatNumber(job.resultSizeBytes)} B</span> : null}
                   </div>
@@ -3671,6 +3679,25 @@ function ShareImageJobLogs({ shareId }: { shareId: string }) {
                   {job.latencyMs ? <span>{job.latencyMs}ms</span> : null}
                 </div>
               </div>
+              {resultUrl ? (
+                <div className="grid gap-1 rounded-md border border-border bg-muted/40 px-2 py-1.5 text-xs">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="mono-label text-muted-foreground">{t("dashboard.imageResultUrl")}</span>
+                    <div className="flex shrink-0 items-center gap-1">
+                      <button
+                        type="button"
+                        onClick={() => openAuthenticatedImageUrl(resultUrl)}
+                        className="inline-flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-background hover:text-foreground"
+                        title={t("dashboard.openImage")}
+                      >
+                        <ExternalLink className="h-3.5 w-3.5" />
+                      </button>
+                      <InlineCopyIconButton value={absoluteDashboardUrl(resultUrl)} label={t("dashboard.copyImageUrl")} />
+                    </div>
+                  </div>
+                  <div className="break-all font-mono text-[11px] text-muted-foreground">{absoluteDashboardUrl(resultUrl)}</div>
+                </div>
+              ) : null}
               {job.promptPreview ? <div className="truncate rounded-md bg-muted px-2 py-1.5 text-xs text-muted-foreground" title={job.promptPreview}>{job.promptPreview}</div> : null}
               {job.errorMessage ? <div className="truncate rounded-md bg-danger-50 px-2 py-1.5 text-xs text-danger-700" title={job.errorMessage}>{job.errorMessage}</div> : null}
             </Card.Content>
@@ -3678,6 +3705,51 @@ function ShareImageJobLogs({ shareId }: { shareId: string }) {
         );
       })}
     </div>
+  );
+}
+
+function absoluteDashboardUrl(path: string) {
+  if (!path) return "";
+  if (/^https?:\/\//i.test(path)) return path;
+  if (typeof window === "undefined") return path;
+  return `${window.location.origin}${path}`;
+}
+
+async function openAuthenticatedImageUrl(path: string) {
+  if (!path || typeof window === "undefined") return;
+  try {
+    const response = await authFetch(path, { cache: "no-store" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    window.open(url, "_blank", "noopener,noreferrer");
+    window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  } catch {
+    window.open(absoluteDashboardUrl(path), "_blank", "noopener,noreferrer");
+  }
+}
+
+function InlineCopyIconButton({ value, label }: { value: string; label: string }) {
+  const [copied, setCopied] = React.useState(false);
+  const copy = React.useCallback(async () => {
+    if (!value) return;
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1200);
+    } catch {
+      // Ignore clipboard failures; the URL remains visible for manual copy.
+    }
+  }, [value]);
+  return (
+    <button
+      type="button"
+      onClick={copy}
+      className="inline-flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-background hover:text-foreground"
+      title={copied ? "Copied" : label}
+    >
+      <Copy className="h-3.5 w-3.5" />
+    </button>
   );
 }
 
