@@ -1569,6 +1569,7 @@ pub struct DashboardMarketView {
     pub email: String,
     pub subdomain: String,
     pub public_base_url: String,
+    pub market_kind: String,
     pub status: String,
     pub online: bool,
     #[serde(default)]
@@ -1753,6 +1754,7 @@ pub struct ShareMarketLinkView {
     pub email: String,
     pub subdomain: String,
     pub public_base_url: String,
+    pub market_kind: String,
     pub status: String,
     pub online: bool,
 }
@@ -1760,6 +1762,7 @@ pub struct ShareMarketLinkView {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareView {
+    pub router_id: String,
     pub share_id: String,
     pub share_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

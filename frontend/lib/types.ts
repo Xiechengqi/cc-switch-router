@@ -80,6 +80,7 @@ export type DashboardClient = {
 export type ShareSaleMarketKind = "token" | "share";
 
 export type ShareView = {
+  routerId?: string;
   shareId: string;
   shareName: string;
   ownerEmail?: string;
@@ -204,6 +205,7 @@ export type ShareMarketLink = {
   email: string;
   subdomain: string;
   publicBaseUrl: string;
+  marketKind?: string;
   status: string;
   online: boolean;
 };

@@ -230,6 +230,16 @@ function isUsageMarket(market: DashboardMarket) {
   return !isShareMarket(market);
 }
 
+function marketKindLabel(market: DashboardMarket, t: TFn) {
+  return isShareMarket(market) ? t("dashboard.shareMarket") : t("dashboard.tokenMarket");
+}
+
+function marketKindDescription(market: DashboardMarket, t: TFn) {
+  return isShareMarket(market)
+    ? t("dashboard.shareMarketTooltip")
+    : t("dashboard.tokenMarketTooltip");
+}
+
 function canShowMarketSharePriority(market: DashboardMarket) {
   return isUsageMarket(market) && Boolean(market.canManage);
 }
@@ -1634,12 +1644,38 @@ function ShareStatusCell({ share, t, locale }: { share?: ShareView; t: TFn; loca
   const limit = isUnlimited(share.parallelLimit) ? "∞" : String(share.parallelLimit || 0);
   const averageLatency = averageRecentLatencyMs(share.recentRequests);
   const rowClass = "grid grid-cols-[76px_minmax(0,1fr)] gap-2";
-  const saleValue = share.forSale === "Free" ? t("dashboard.free") : share.forSale === "Yes" ? t("dashboard.yes") : t("dashboard.no");
+  const shareMarketListingUrl = shareStatusShareMarketUrl(share);
+  const saleValue =
+    share.forSale === "Free"
+      ? t("dashboard.free")
+      : share.forSale === "Yes"
+        ? share.saleMarketKind === "share"
+          ? t("dashboard.shareMarket")
+          : t("dashboard.tokenMarket")
+        : t("dashboard.no");
   const saleVariant: "soft" | "tertiary" = share.forSale === "No" ? "tertiary" : "soft";
   const saleRow = (
     <div className={rowClass}>
       <span className="mono-label text-muted-foreground">{t("dashboard.forSale")}</span>
-      <div><Chip size="sm" variant={saleVariant}>{saleValue}</Chip></div>
+      <div>
+        {shareMarketListingUrl ? (
+          <a
+            href={shareMarketListingUrl}
+            target="_blank"
+            rel="noreferrer"
+            data-no-row-drawer
+            className="inline-flex items-center gap-1"
+            title={shareMarketListingUrl}
+          >
+            <Chip size="sm" variant={saleVariant}>
+              {saleValue}
+              <ExternalLink className="ml-1 inline h-3 w-3" />
+            </Chip>
+          </a>
+        ) : (
+          <Chip size="sm" variant={saleVariant}>{saleValue}</Chip>
+        )}
+      </div>
     </div>
   );
   if (!share.isOnline) {
@@ -1661,6 +1697,17 @@ function ShareStatusCell({ share, t, locale }: { share?: ShareView; t: TFn; loca
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.health")}</span><HealthDots entries={share.healthChecks} /></div>
     </div>
   );
+}
+
+function shareStatusShareMarketUrl(share: ShareView) {
+  if (share.forSale !== "Yes" || share.saleMarketKind !== "share") return null;
+  const market = (share.marketLinks || []).find(
+    (item) => item.marketKind === "share" && item.publicBaseUrl,
+  );
+  if (!market?.publicBaseUrl) return null;
+  const base = market.publicBaseUrl.replace(/\/+$/, "");
+  const routerId = share.routerId || "main";
+  return `${base}/listing/share?router_id=${encodeURIComponent(routerId)}&share_id=${encodeURIComponent(share.shareId)}`;
 }
 
 function clientOwnerEmail(client?: DashboardClient | null) {
@@ -2208,7 +2255,7 @@ function formatAgeDaysOrHours(value?: string, locale: AppLocale = "en") {
 }
 
 function MarketEditAction({ market, onEdit, t }: { market: DashboardMarket; onEdit: (market: DashboardMarket) => void; t: TFn }) {
-  if (!market.canManage) return null;
+  if (!market.canManage || isShareMarket(market)) return null;
   return (
     <button
       type="button"
@@ -2239,11 +2286,102 @@ function MarketPricingCell({ market, t }: { market: DashboardMarket; t: TFn }) {
   );
 }
 
+function MarketTypeChip({ market, t }: { market: DashboardMarket; t: TFn }) {
+  return (
+    <Chip
+      size="sm"
+      variant="soft"
+      title={marketKindDescription(market, t)}
+    >
+      {marketKindLabel(market, t)}
+    </Chip>
+  );
+}
+
+function MarketIdentityCell({
+  market,
+  onEdit,
+  t,
+}: {
+  market: DashboardMarket;
+  onEdit: (market: DashboardMarket) => void;
+  t: TFn;
+}) {
+  return (
+    <div className="grid min-w-72 gap-1.5">
+      <div className="flex min-w-0 flex-wrap items-center gap-2">
+        <strong className="min-w-0 truncate font-medium" title={market.displayName || market.id}>
+          {market.displayName || market.id}
+        </strong>
+        <MarketTypeChip market={market} t={t} />
+        <StatusBadge active={market.online} label={marketStatusLabel(market, t)} />
+        {market.maintenanceEnabled ? (
+          <Chip color="warning" size="sm" variant="soft">
+            {t("dashboard.maintenance")}
+          </Chip>
+        ) : null}
+        <MarketEditAction market={market} onEdit={onEdit} t={t} />
+      </div>
+      <span className="break-all text-xs text-muted-foreground">{market.email}</span>
+      <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+        {market.publicBaseUrl ? (
+          <a
+            href={market.publicBaseUrl}
+            target="_blank"
+            rel="noreferrer"
+            onClick={(event) => event.stopPropagation()}
+            className="inline-flex min-w-0 max-w-full items-center gap-1 font-mono text-foreground underline-offset-4 hover:underline"
+            title={market.publicBaseUrl}
+          >
+            <span className="truncate">{market.publicBaseUrl}</span>
+            <ExternalLink className="h-3 w-3 shrink-0" />
+          </a>
+        ) : (
+          <span className="font-mono">-</span>
+        )}
+        {market.subdomain ? (
+          <span className="font-mono" title={market.subdomain}>
+            {market.subdomain}
+          </span>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 function MarketStatusCell({ market, t, locale }: { market: DashboardMarket; t: TFn; locale: AppLocale }) {
-  const limit = isUnlimited(market.parallelCapacity) ? "∞" : String(market.parallelCapacity || 0);
   const ageValue = formatAgeDaysOrHours(market.createdAt, locale);
-  const onlineValue = market.online ? `${(market.onlineRate24h || 0).toFixed(1)}% / ${ageValue}` : ageValue;
   const rowClass = "grid grid-cols-[76px_minmax(0,1fr)] gap-2";
+  if (isShareMarket(market)) {
+    return (
+      <div className="grid min-w-52 gap-2 text-sm">
+        <div className={rowClass}>
+          <span className="mono-label text-muted-foreground">{t("dashboard.online")}</span>
+          <strong>{market.online ? t("common.online") : t("common.offline")}</strong>
+        </div>
+        <div className={rowClass}>
+          <span className="mono-label text-muted-foreground">{t("dashboard.lastSeen")}</span>
+          <strong title={formatDateTime(market.lastSeenAt)}>
+            {formatRelativeTime(market.lastSeenAt, locale)}
+          </strong>
+        </div>
+        {!market.online && market.offlineSince ? (
+          <div className={rowClass}>
+            <span className="mono-label text-muted-foreground">{t("dashboard.offlineSince")}</span>
+            <strong title={formatDateTime(market.offlineSince)}>
+              {formatRelativeTime(market.offlineSince, locale)}
+            </strong>
+          </div>
+        ) : null}
+        <div className={rowClass}>
+          <span className="mono-label text-muted-foreground">{t("dashboard.shares")}</span>
+          <strong>{market.onlineShareCount || 0} / {market.shareCount || 0}</strong>
+        </div>
+      </div>
+    );
+  }
+  const limit = isUnlimited(market.parallelCapacity) ? "∞" : String(market.parallelCapacity || 0);
+  const onlineValue = market.online ? `${(market.onlineRate24h || 0).toFixed(1)}% / ${ageValue}` : ageValue;
   return (
     <div className="grid min-w-52 gap-2 text-sm">
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.shares")}</span><strong>{market.onlineShareCount || 0} / {market.shareCount || 0}</strong></div>
@@ -2251,6 +2389,21 @@ function MarketStatusCell({ market, t, locale }: { market: DashboardMarket; t: T
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.parallel")}</span><strong>{market.activeRequests || 0}<span className="text-muted-foreground">/{limit}</span></strong></div>
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.usage")}</span><strong>{compactTokens(market.usageTokens)} / {formatUsdOneDecimal(market.usageAmountUsd)}</strong></div>
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.health")}</span><HealthDots entries={market.healthChecks} /></div>
+    </div>
+  );
+}
+
+function MarketBasicInfoPanel({ market, t, locale }: { market: DashboardMarket; t: TFn; locale: AppLocale }) {
+  return (
+    <div className="grid gap-3 sm:grid-cols-2">
+      <Info label={t("dashboard.marketType")} value={<MarketTypeChip market={market} t={t} />} />
+      <Info label={t("dashboard.status")} value={marketStatusLabel(market, t)} />
+      <Info label={t("dashboard.publicUrl")} value={market.publicBaseUrl || "-"} />
+      <Info label={t("dashboard.subdomain")} value={market.subdomain || "-"} />
+      <Info label={t("dashboard.lastSeen")} value={formatRelativeTime(market.lastSeenAt, locale)} />
+      {!market.online && market.offlineSince ? (
+        <Info label={t("dashboard.offlineSince")} value={formatRelativeTime(market.offlineSince, locale)} />
+      ) : null}
     </div>
   );
 }
@@ -2268,12 +2421,10 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
       </div>
       <Card className="overflow-hidden rounded-[20px]">
         <Card.Content className="overflow-x-auto p-0">
-          <table className="w-full min-w-[900px] border-collapse text-sm">
+          <table className="w-full min-w-[760px] border-collapse text-sm">
             <thead className="bg-muted text-left font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground">
               <tr>
-                <th className="w-44 px-4 py-3">{t("dashboard.market")}</th>
-                <th className="px-4 py-3">{t("dashboard.publicUrl")}</th>
-                <th className="px-4 py-3">{t("dashboard.officialPrice")}</th>
+                <th className="w-[48%] px-4 py-3">{t("dashboard.market")}</th>
                 <th className="px-4 py-3">{t("dashboard.status")}</th>
                 <th className="w-7 px-4 py-3" />
               </tr>
@@ -2281,29 +2432,14 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
             <tbody>
               {sorted.length ? sorted.map((market) => (
                 <tr key={market.id} className="cursor-pointer border-b last:border-0 hover:bg-primary/5" onClick={(event) => { if (shouldOpenRowDrawer(event)) setSelected(market); }}>
-                  <td className="w-44 break-words px-4 py-3 align-middle">
-                    <div className="min-w-0">
-                      <div className="font-medium">{market.displayName || market.id}</div>
-                      <div className="text-xs text-muted-foreground">{market.email}</div>
-                      <div className="mt-1 flex flex-wrap items-center gap-2">
-                        <StatusBadge active={market.online} label={marketStatusLabel(market, t)} />
-                        {market.maintenanceEnabled ? <Chip color="warning" size="sm" variant="soft">{t("dashboard.maintenance")}</Chip> : null}
-                        <MarketEditAction market={market} onEdit={setEditingMarket} t={t} />
-                      </div>
-                    </div>
+                  <td className="break-words px-4 py-3 align-middle">
+                    <MarketIdentityCell market={market} onEdit={setEditingMarket} t={t} />
                   </td>
-                  <td className="px-4 py-3 align-middle">
-                    <a href={market.publicBaseUrl} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()} className="inline-flex items-center gap-1 font-semibold hover:text-primary">
-                      {market.publicBaseUrl || "-"}
-                      <ExternalLink className="h-3 w-3" />
-                    </a>
-                  </td>
-                  <td className="px-4 py-3 align-middle"><MarketPricingCell market={market} t={t} /></td>
                   <td className="px-4 py-3 align-middle"><MarketStatusCell market={market} t={t} locale={locale} /></td>
                   <td className="px-4 py-3 align-middle text-lg text-muted-foreground">›</td>
                 </tr>
               )) : (
-                <tr><td colSpan={5} className="px-4 py-10 text-center text-muted-foreground">{t("dashboard.noMarkets")}</td></tr>
+                <tr><td colSpan={3} className="px-4 py-10 text-center text-muted-foreground">{t("dashboard.noMarkets")}</td></tr>
               )}
             </tbody>
           </table>
@@ -2324,11 +2460,23 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
               <Drawer.Body className="overflow-y-auto">
                 {selected ? (
                   <div className="grid gap-4">
-                    <DrawerSection label="24h"><HealthTimelineStrip timeline={selected.healthTimeline} /></DrawerSection>
+                    <DrawerSection label={t("dashboard.details")}>
+                      <MarketBasicInfoPanel market={selected} t={t} locale={locale} />
+                    </DrawerSection>
+                    {isUsageMarket(selected) ? (
+                      <>
+                        <DrawerSection label={t("dashboard.officialPrice")}>
+                          <MarketPricingCell market={selected} t={t} />
+                        </DrawerSection>
+                        <DrawerSection label="24h"><HealthTimelineStrip timeline={selected.healthTimeline} /></DrawerSection>
+                      </>
+                    ) : null}
                     <DrawerSection label={canShowMarketSharePriority(selected) ? t("dashboard.sharePriority") : t("dashboard.linkedShares")}>
                       {canShowMarketSharePriority(selected) ? <MarketSharePriorityPanel market={selected} t={t} /> : <MarketLinkedShares market={selected} t={t} />}
                     </DrawerSection>
-                    <DrawerSection label={t("dashboard.recentRequests")}><MarketRequestLogs logs={selected.recentRequests || []} /></DrawerSection>
+                    {isUsageMarket(selected) ? (
+                      <DrawerSection label={t("dashboard.recentRequests")}><MarketRequestLogs logs={selected.recentRequests || []} /></DrawerSection>
+                    ) : null}
                   </div>
                 ) : null}
               </Drawer.Body>

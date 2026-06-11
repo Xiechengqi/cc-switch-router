@@ -1273,6 +1273,7 @@ impl AppStore {
             share.share_status == "active" && active_subdomains.contains(&share.subdomain);
         let active_requests = inflight_by_share.get(&share.share_id).copied().unwrap_or(0);
         Ok(ShareView {
+            router_id: "main".to_string(),
             share_id: share.share_id,
             share_name: share.share_name,
             owner_email: share.owner_email,
@@ -2847,7 +2848,15 @@ impl AppStore {
                         .as_ref()
                         .map(|edit| edit.status != "pending")
                         .unwrap_or(true);
-                let market_links = if share.market_access_mode == "all"
+                let market_links = if share.sale_market_kind == "share" {
+                    let market_emails = share_acl_emails(&share);
+                    market_emails
+                        .iter()
+                        .filter_map(|email| market_by_email.get(&email.to_ascii_lowercase()))
+                        .filter(|market| market.market_kind == "share")
+                        .map(dashboard_market_to_share_link)
+                        .collect::<Vec<_>>()
+                } else if share.market_access_mode == "all"
                     || share
                         .access_by_app
                         .values()
@@ -2855,6 +2864,7 @@ impl AppStore {
                 {
                     markets
                         .iter()
+                        .filter(|market| market.market_kind != "share")
                         .map(dashboard_market_to_share_link)
                         .collect::<Vec<_>>()
                 } else {
@@ -2862,6 +2872,7 @@ impl AppStore {
                     market_emails
                         .iter()
                         .filter_map(|email| market_by_email.get(&email.to_ascii_lowercase()))
+                        .filter(|market| market.market_kind != "share")
                         .map(dashboard_market_to_share_link)
                         .collect::<Vec<_>>()
                 };
@@ -2880,6 +2891,7 @@ impl AppStore {
                     .cloned()
                     .unwrap_or_default();
                 ShareView {
+                    router_id: "main".to_string(),
                     share_id: share.share_id,
                     share_name: share.share_name,
                     owner_email: share.owner_email,
@@ -9950,7 +9962,8 @@ fn list_dashboard_markets(
 ) -> Result<Vec<DashboardMarketView>, AppError> {
     let mut stmt = conn
         .prepare(
-            "SELECT rm.id, rm.display_name, rm.email, rm.subdomain, rm.public_base_url, rm.status,
+            "SELECT rm.id, rm.display_name, rm.email, rm.subdomain, rm.public_base_url,
+                    COALESCE(rm.market_kind, 'usage') AS market_kind, rm.status,
                     rm.created_at, rm.updated_at, rm.last_seen_at, rm.offline_since,
                     rm.pricing_json,
                     COALESCE(rm.maintenance_enabled, 0) AS maintenance_enabled,
@@ -9966,7 +9979,7 @@ fn list_dashboard_markets(
              FROM router_markets rm
              LEFT JOIN market_request_logs ml ON lower(ml.market_email) = lower(rm.email)
              WHERE rm.status IN ('active', 'offline', 'disabled')
-             GROUP BY rm.id, rm.display_name, rm.email, rm.subdomain, rm.public_base_url, rm.status,
+             GROUP BY rm.id, rm.display_name, rm.email, rm.subdomain, rm.public_base_url, rm.market_kind, rm.status,
                       rm.created_at, rm.updated_at, rm.last_seen_at, rm.offline_since, rm.pricing_json,
                       rm.maintenance_enabled, rm.maintenance_message
              ORDER BY rm.display_name ASC, rm.subdomain ASC",
@@ -9980,24 +9993,25 @@ fn list_dashboard_markets(
                 display_name: row.get(1)?,
                 email: row.get(2)?,
                 public_base_url: row.get(4)?,
-                status: row.get(5)?,
+                market_kind: row.get(5)?,
+                status: row.get(6)?,
                 online: active_subdomains.contains(&subdomain),
                 can_manage: false,
-                maintenance_enabled: row.get::<_, i64>(11)? != 0,
-                maintenance_message: row.get(12)?,
-                created_at: row.get(6)?,
-                updated_at: row.get(7)?,
-                last_seen_at: row.get(8)?,
-                offline_since: row.get(9)?,
+                maintenance_enabled: row.get::<_, i64>(12)? != 0,
+                maintenance_message: row.get(13)?,
+                created_at: row.get(7)?,
+                updated_at: row.get(8)?,
+                last_seen_at: row.get(9)?,
+                offline_since: row.get(10)?,
                 share_count: 0,
                 online_share_count: 0,
                 active_requests: 0,
                 parallel_capacity: 0,
                 online_minutes_24h: 0,
                 online_rate_24h: 0.0,
-                usage_tokens: row.get::<_, i64>(13)?.max(0) as u64,
-                usage_amount_usd: format!("{:.8}", row.get::<_, f64>(14)?.max(0.0)),
-                pricing_summary: parse_json_value(row.get(10)?)?,
+                usage_tokens: row.get::<_, i64>(14)?.max(0) as u64,
+                usage_amount_usd: format!("{:.8}", row.get::<_, f64>(15)?.max(0.0)),
+                pricing_summary: parse_json_value(row.get(11)?)?,
                 health_checks: Vec::new(),
                 health_timeline: Vec::new(),
                 linked_shares: Vec::new(),
@@ -10051,19 +10065,24 @@ fn enrich_dashboard_market(
     runtime_states_by_market: &HashMap<String, HashMap<String, Vec<MarketShareRuntimeStateView>>>,
 ) {
     let market_email = market.email.to_ascii_lowercase();
+    let is_share_market = market.market_kind == "share";
     let disabled_for_market = disabled_by_market.get(&market_email);
     let app_availability_for_market = app_availability_by_market.get(&market_email);
     let runtime_states_for_market = runtime_states_by_market.get(&market_email);
     let mut linked_shares = shares
         .iter()
         .filter_map(|(_, share)| {
-            if share.for_sale != "Yes"
-                || (share.market_access_mode != "all"
-                    && !share
-                        .shared_with_emails
-                        .iter()
-                        .any(|email| email.eq_ignore_ascii_case(&market_email)))
-            {
+            let explicit_market_match = share
+                .shared_with_emails
+                .iter()
+                .any(|email| email.eq_ignore_ascii_case(&market_email));
+            let visible_to_market = if is_share_market {
+                share.sale_market_kind == "share" && explicit_market_match
+            } else {
+                share.sale_market_kind != "share"
+                    && (share.market_access_mode == "all" || explicit_market_match)
+            };
+            if share.for_sale != "Yes" || !visible_to_market {
                 return None;
             }
             let active_requests = inflight_by_share.get(&share.share_id).copied().unwrap_or(0);
@@ -10281,6 +10300,7 @@ fn dashboard_market_to_share_link(market: &DashboardMarketView) -> ShareMarketLi
         email: market.email.clone(),
         subdomain: market.subdomain.clone(),
         public_base_url: market.public_base_url.clone(),
+        market_kind: market.market_kind.clone(),
         status: market.status.clone(),
         online: market.online,
     }
@@ -13480,6 +13500,67 @@ mod tests {
             .await
             .expect("list usage market shares");
         assert!(shares.is_empty());
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn dashboard_share_market_sale_links_only_explicit_share_market() {
+        let (store, config) = setup_store("dashboard-share-market-link").await;
+        let usage_market = test_market();
+        insert_market(&store, &usage_market).await;
+        let mut share_market = test_market();
+        share_market.id = "share-market".into();
+        share_market.display_name = "Share Market".into();
+        share_market.email = "share-market@example.com".into();
+        share_market.subdomain = "share-market".into();
+        share_market.public_base_url = "https://share-market.example.com".into();
+        share_market.market_kind = "share".into();
+        insert_market(&store, &share_market).await;
+        insert_installation(&store, "inst-share-market-link").await;
+        insert_share(
+            &store,
+            "inst-share-market-link",
+            "share-market-link",
+            "share-market-link-sub",
+            "active",
+        )
+        .await;
+        set_share_shared_with_emails(&store, "share-market-link", &["share-market@example.com"])
+            .await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET for_sale = 'Yes', sale_market_kind = 'share', market_access_mode = 'all' WHERE share_id = ?1",
+                params!["share-market-link"],
+            )
+            .expect("enable share market sale");
+        }
+
+        let server_geo = ServerGeo {
+            lat: None,
+            lon: None,
+        };
+        let proxy = ProxyRegistry::default();
+        let dashboard = store
+            .dashboard_snapshot(&config, &server_geo, &proxy, None)
+            .await
+            .expect("dashboard");
+        let share = dashboard
+            .shares
+            .iter()
+            .find(|share| share.share_id == "share-market-link")
+            .expect("share view");
+
+        assert_eq!(share.router_id, "main");
+        assert_eq!(share.sale_market_kind, "share");
+        assert_eq!(share.market_links.len(), 1);
+        assert_eq!(share.market_links[0].email, "share-market@example.com");
+        assert_eq!(share.market_links[0].market_kind, "share");
+        assert_eq!(
+            share.market_links[0].public_base_url,
+            "https://share-market.example.com"
+        );
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
