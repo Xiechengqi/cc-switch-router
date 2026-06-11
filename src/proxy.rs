@@ -1693,6 +1693,8 @@ fn infer_share_request_app(path: &str, headers: &HeaderMap) -> Option<String> {
         || path.starts_with("openai/")
         || path.starts_with("v1/chat/")
         || path.starts_with("v1/responses")
+        || path.starts_with("v1/images/generations")
+        || path.starts_with("images/generations")
         || path.starts_with("responses/")
     {
         return Some("codex".to_string());
@@ -1891,6 +1893,20 @@ fn strip_connection_listed_headers(headers: &mut HeaderMap) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_generation_paths_infer_codex_app() {
+        let headers = HeaderMap::new();
+
+        assert_eq!(
+            infer_share_request_app("/v1/images/generations", &headers).as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            infer_share_request_app("/images/generations", &headers).as_deref(),
+            Some("codex")
+        );
+    }
 
     #[tokio::test]
     async fn share_concurrency_limiter_enforces_limit_and_releases_on_drop() {

@@ -65,7 +65,7 @@ use crate::scheduling_signals::{
     ShareFeedbackKind, ShareFeedbackRequest, ShareFeedbackResponse, ShareHeadroomEntry,
     ShareHeadroomRequest, ShareHeadroomResponse,
 };
-use crate::store::BoardAuthor;
+use crate::store::{BoardAuthor, ShareForTest};
 
 const REGIONS: &str = include_str!("../regions");
 const SHARE_EDIT_WAKE_RETRY_INTERVAL_SECS: u64 = 20;
@@ -2052,12 +2052,72 @@ mod tests {
 
     #[test]
     fn gemini_app_probe_uses_canonical_model_name() {
-        let probe = app_probe("gemini").expect("gemini probe should exist");
+        let probe = app_probe_for_kind("gemini", "text").expect("gemini probe should exist");
 
         assert_eq!(
             probe.path,
             "/v1beta/models/gemini-2.5-flash:generateContent"
         );
+    }
+
+    #[test]
+    fn codex_image_test_requires_enabled_bound_provider() {
+        let share = ShareForTest {
+            subdomain: "share-sub".into(),
+            owner_email: "owner@example.com".into(),
+            shared_with_emails: Vec::new(),
+            bindings: std::collections::BTreeMap::from([("codex".into(), "provider-1".into())]),
+            app_providers: crate::models::ShareAppProviders {
+                codex: vec![crate::models::ShareAppProvider {
+                    id: "provider-1".into(),
+                    name: "OpenAI Official".into(),
+                    app: "codex".into(),
+                    kind: Some("official_oauth".into()),
+                    provider_type: Some("codex_oauth".into()),
+                    is_current: true,
+                    enabled: true,
+                    codex_image_generation_enabled: true,
+                    for_sale_official_price_percent: None,
+                    account_email: None,
+                    api_url: None,
+                    quota: None,
+                    models: Vec::new(),
+                }],
+                ..crate::models::ShareAppProviders::default()
+            },
+        };
+
+        assert!(share_codex_image_generation_enabled(&share));
+    }
+
+    #[test]
+    fn codex_image_test_rejects_unbound_provider_capability() {
+        let share = ShareForTest {
+            subdomain: "share-sub".into(),
+            owner_email: "owner@example.com".into(),
+            shared_with_emails: Vec::new(),
+            bindings: std::collections::BTreeMap::from([("codex".into(), "provider-1".into())]),
+            app_providers: crate::models::ShareAppProviders {
+                codex: vec![crate::models::ShareAppProvider {
+                    id: "provider-2".into(),
+                    name: "Other Codex".into(),
+                    app: "codex".into(),
+                    kind: Some("official_oauth".into()),
+                    provider_type: Some("codex_oauth".into()),
+                    is_current: false,
+                    enabled: true,
+                    codex_image_generation_enabled: true,
+                    for_sale_official_price_percent: None,
+                    account_email: None,
+                    api_url: None,
+                    quota: None,
+                    models: Vec::new(),
+                }],
+                ..crate::models::ShareAppProviders::default()
+            },
+        };
+
+        assert!(!share_codex_image_generation_enabled(&share));
     }
 }
 
@@ -3682,6 +3742,9 @@ async fn admin_metrics_clear(
 struct ShareConnectionTestRequest {
     /// "claude" | "codex" | "gemini"
     app: String,
+    /// "text" | "image"; image is only supported for codex shares.
+    #[serde(default)]
+    kind: Option<String>,
     /// 可选，毫秒；默认 15000，上限 30000
     #[serde(default)]
     timeout_ms: Option<u64>,
@@ -3724,9 +3787,9 @@ struct AppProbe {
     body: &'static str,
 }
 
-fn app_probe(app: &str) -> Option<AppProbe> {
-    match app {
-        "claude" => Some(AppProbe {
+fn app_probe_for_kind(app: &str, kind: &str) -> Option<AppProbe> {
+    match (app, kind) {
+        ("claude", "text") => Some(AppProbe {
             method: "POST",
             path: "/v1/messages",
             // cc-switch client 的 ensure_claude_oauth_billing_header_system 会在
@@ -3741,7 +3804,7 @@ fn app_probe(app: &str) -> Option<AppProbe> {
             // passthrough 不触发这条转换，所以也对齐这一行为。
             body: r#"{"model":"claude-opus-4-7","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"who are you"}]}"#,
         }),
-        "codex" => Some(AppProbe {
+        ("codex", "text") => Some(AppProbe {
             method: "POST",
             path: "/v1/responses",
             // gpt-5 系 Responses API：input 必须是 message 数组（"Input must be a
@@ -3749,7 +3812,12 @@ fn app_probe(app: &str) -> Option<AppProbe> {
             // 启动的最小值。
             body: r#"{"model":"gpt-5.5","input":[{"role":"user","content":"who are you"}],"max_output_tokens":16}"#,
         }),
-        "gemini" => Some(AppProbe {
+        ("codex", "image") => Some(AppProbe {
+            method: "POST",
+            path: "/v1/images/generations",
+            body: r#"{"model":"gpt-5.5","prompt":"A small robot painting a sunrise","size":"1024x1024","response_format":"b64_json","output_format":"png"}"#,
+        }),
+        ("gemini", "text") => Some(AppProbe {
             method: "POST",
             path: "/v1beta/models/gemini-2.5-flash:generateContent",
             // 同 claude/codex 思路：避免极小 maxOutputTokens 触发上游 OAuth 网关的
@@ -3760,6 +3828,23 @@ fn app_probe(app: &str) -> Option<AppProbe> {
     }
 }
 
+fn share_codex_image_generation_enabled(share: &ShareForTest) -> bool {
+    let Some(bound_provider_id) = share
+        .bindings
+        .get("codex")
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+
+    share.app_providers.codex.iter().any(|provider| {
+        provider.id == bound_provider_id
+            && provider.enabled
+            && provider.codex_image_generation_enabled
+    })
+}
+
 async fn test_share_connection(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -3768,9 +3853,18 @@ async fn test_share_connection(
 ) -> Result<Json<ShareConnectionTestResponse>, AppError> {
     let current_user_email = require_user_email(&state, &headers, "share:read").await?;
 
-    // Validate app name
-    let probe = app_probe(&input.app)
-        .ok_or_else(|| AppError::BadRequest(format!("unsupported app: {}", input.app)))?;
+    let probe_kind = input
+        .kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("text");
+    let probe = app_probe_for_kind(&input.app, probe_kind).ok_or_else(|| {
+        AppError::BadRequest(format!(
+            "unsupported app probe: app={} kind={probe_kind}",
+            input.app
+        ))
+    })?;
 
     // Load share — verify caller is owner or admin
     let share = state
@@ -3789,6 +3883,15 @@ async fn test_share_connection(
     if !is_admin && !is_owner && !is_shared_with {
         return Err(AppError::Forbidden(
             "only the share owner, invited users, or admins can test this share".into(),
+        ));
+    }
+
+    if input.app == "codex"
+        && probe_kind == "image"
+        && !share_codex_image_generation_enabled(&share)
+    {
+        return Err(AppError::BadRequest(
+            "codex image generation is not enabled for the bound provider".into(),
         ));
     }
 

@@ -1,6 +1,6 @@
 "use client";
 
-import { Eye, ExternalLink, Link2, Loader2, Maximize2, Pencil, Save, Crown, X } from "lucide-react";
+import { Eye, ExternalLink, Link2, Loader2, Maximize2, Pencil, RotateCcw, Save, Crown, X } from "lucide-react";
 import { Button, Card, Checkbox, Chip, Drawer, Input, ListBox, Modal, ProgressBar, Select, Tabs, TextArea } from "@heroui/react";
 import * as React from "react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
@@ -912,6 +912,147 @@ function normalizedUniqueEmails(values: string[]) {
   return Array.from(new Set(values.map((value) => value.trim().toLowerCase()).filter(Boolean))).sort();
 }
 
+type ShareEditDraft = {
+  description: string;
+  forSale: "Yes" | "No" | "Free";
+  saleMarketKind: "token" | "share";
+  marketAccessMode: "selected" | "all";
+  selectedMarketEmails: string[];
+  selectedShareMarketEmail: string;
+  shareToEmailsByApp: Record<PriceApp, string[]>;
+  tokenLimitInput: string;
+  tokenLimitUnlimited: boolean;
+  lastFiniteTokenLimit: number;
+  parallelLimitInput: string;
+  parallelLimitUnlimited: boolean;
+  lastFiniteParallelLimit: number;
+  expiresAtInput: string;
+  expiresPermanent: boolean;
+  priceInputs: Record<PriceApp, string>;
+};
+
+function buildShareEditDraft(
+  share: ShareView,
+  publicMarketEmails: ReadonlySet<string>,
+  tokenMarketEmails: ReadonlySet<string>,
+  shareMarketEmails: ReadonlySet<string>,
+): ShareEditDraft {
+  const pendingPricing =
+    share.activeEdit?.status === "rejected"
+      ? share.activeEdit.patch.forSaleOfficialPricePercentByApp || {}
+      : {};
+  const sharePricing = share.forSaleOfficialPricePercentByApp || {};
+  const priceInputs: Record<PriceApp, string> = { claude: "", codex: "", gemini: "" };
+  for (const app of PRICE_APPS) {
+    const pending = pendingPricing[app.key];
+    const fallback = sharePricing[app.key];
+    const value = typeof pending === "number" ? pending : fallback;
+    priceInputs[app.key] = typeof value === "number" && value > 0 ? String(value) : "";
+  }
+
+  const saleMarketKind = share.saleMarketKind === "share" ? "share" : "token";
+  const initialMode = (share.marketAccessMode as "selected" | "all") || "selected";
+  const marketLinks = share.marketLinks || [];
+  const accessByApp = effectiveShareAccessByApp(share);
+  const tokenLimit = share.tokenLimit ?? UNLIMITED_TOKEN_LIMIT;
+  const tokenLimitUnlimited = isUnlimitedTokenLimit(tokenLimit);
+  const parallelLimit = share.parallelLimit ?? DEFAULT_PARALLEL_LIMIT;
+  const parallelLimitUnlimited = isUnlimitedParallelLimit(parallelLimit);
+  const expiresPermanent = isPermanentExpiryDate(share.expiresAt) || isUnlimitedExpiry(share.expiresAt);
+
+  return {
+    description: share.description || "",
+    forSale: (share.forSale as "Yes" | "No" | "Free") || "No",
+    saleMarketKind,
+    marketAccessMode: saleMarketKind === "share" ? "selected" : initialMode,
+    selectedMarketEmails:
+      saleMarketKind === "token" && initialMode === "selected"
+        ? normalizedUniqueEmails(
+            marketLinks
+              .map((link) => (link.email || "").toLowerCase())
+              .filter((email) => email && !shareMarketEmails.has(email)),
+          )
+        : [],
+    selectedShareMarketEmail:
+      saleMarketKind === "share"
+        ? marketLinks
+            .map((link) => (link.email || "").toLowerCase())
+            .find((email) => email && !tokenMarketEmails.has(email)) || ""
+        : "",
+    shareToEmailsByApp: {
+      claude: splitEmails((accessByApp.claude?.sharedWithEmails || []).join("\n")).filter((email) => !publicMarketEmails.has(email)),
+      codex: splitEmails((accessByApp.codex?.sharedWithEmails || []).join("\n")).filter((email) => !publicMarketEmails.has(email)),
+      gemini: splitEmails((accessByApp.gemini?.sharedWithEmails || []).join("\n")).filter((email) => !publicMarketEmails.has(email)),
+    },
+    tokenLimitInput: tokenLimitUnlimited ? String(UNLIMITED_TOKEN_LIMIT) : String(tokenLimit),
+    tokenLimitUnlimited,
+    lastFiniteTokenLimit: !tokenLimitUnlimited && tokenLimit > 0 ? tokenLimit : DEFAULT_TOKEN_LIMIT,
+    parallelLimitInput: parallelLimitUnlimited ? String(UNLIMITED_PARALLEL_LIMIT) : String(parallelLimit),
+    parallelLimitUnlimited,
+    lastFiniteParallelLimit: !parallelLimitUnlimited && parallelLimit >= MIN_PARALLEL_LIMIT ? parallelLimit : DEFAULT_PARALLEL_LIMIT,
+    expiresAtInput: expiresPermanent ? "" : toLocalDateTimeValue(share.expiresAt),
+    expiresPermanent,
+    priceInputs,
+  };
+}
+
+function buildShareEditPricingPayload(draft: ShareEditDraft, share?: ShareView | null) {
+  if (draft.saleMarketKind === "share") return {};
+  const result: Record<string, number> = {};
+  for (const app of PRICE_APPS) {
+    if (!share?.support?.[app.key]) continue;
+    const raw = draft.priceInputs[app.key];
+    if (!raw || !raw.trim()) continue;
+    const value = Number.parseInt(raw, 10);
+    if (Number.isFinite(value) && value >= 1 && value <= 100) result[app.key] = value;
+  }
+  return result;
+}
+
+function buildShareEditPatch(
+  draft: ShareEditDraft,
+  share: ShareView,
+  activeShareApps: PriceApp[],
+  publicMarketEmails: ReadonlySet<string>,
+): ShareSettingsPatch {
+  const effectiveSaleMarketKind = draft.forSale === "Yes" ? draft.saleMarketKind : "token";
+  const effectiveMarketAccessMode = effectiveSaleMarketKind === "share" ? "selected" : draft.marketAccessMode;
+  const accessByApp: ShareAccessByApp = {};
+  for (const app of activeShareApps) {
+    const shareToEmails = (draft.shareToEmailsByApp[app] ?? []).filter((email) => !publicMarketEmails.has(email));
+    const saleEmails =
+      draft.forSale === "Yes" && effectiveSaleMarketKind === "token" && effectiveMarketAccessMode === "selected"
+        ? draft.selectedMarketEmails
+        : draft.forSale === "Yes" && effectiveSaleMarketKind === "share" && draft.selectedShareMarketEmail
+          ? [draft.selectedShareMarketEmail]
+          : [];
+    accessByApp[app] = {
+      sharedWithEmails: normalizedUniqueEmails([...shareToEmails, ...saleEmails]),
+      marketAccessMode: effectiveMarketAccessMode,
+    };
+  }
+  const patch: ShareSettingsPatch = {
+    description: draft.description.trim() || null,
+    forSale: draft.forSale,
+    saleMarketKind: effectiveSaleMarketKind,
+    marketAccessMode: effectiveMarketAccessMode,
+    sharedWithEmails: normalizedUniqueEmails(
+      Object.values(accessByApp).flatMap((access) => access?.sharedWithEmails ?? []),
+    ),
+    accessByApp,
+    tokenLimit: draft.tokenLimitUnlimited ? UNLIMITED_TOKEN_LIMIT : Number.parseInt(draft.tokenLimitInput, 10),
+    parallelLimit: draft.parallelLimitUnlimited ? UNLIMITED_PARALLEL_LIMIT : Number.parseInt(draft.parallelLimitInput, 10),
+    forSaleOfficialPricePercentByApp: buildShareEditPricingPayload(draft, share),
+  };
+  const expiresIso = draft.expiresPermanent ? PERMANENT_EXPIRES_AT_ISO : fromLocalDateTimeValue(draft.expiresAtInput);
+  if (expiresIso) patch.expiresAt = expiresIso;
+  return patch;
+}
+
+function shareEditPatchFingerprint(patch: ShareSettingsPatch) {
+  return JSON.stringify(patch);
+}
+
 function ShareEditDialog({
   share,
   markets,
@@ -945,9 +1086,12 @@ function ShareEditDialog({
   const [confirmFreeOpen, setConfirmFreeOpen] = React.useState(false);
   const [transferTargetEmail, setTransferTargetEmail] = React.useState("");
   const [marketSelectKey, setMarketSelectKey] = React.useState(0);
+  const [baseShare, setBaseShare] = React.useState<ShareView | null>(null);
+  const [baseDraft, setBaseDraft] = React.useState<ShareEditDraft | null>(null);
   const { t } = useLocaleText();
   const readOnly = !!share && !share.canManage;
-  const activeShareApps = React.useMemo(() => shareAccessApps(share), [share]);
+  const editShare = baseShare || share;
+  const activeShareApps = React.useMemo(() => shareAccessApps(editShare), [editShare]);
   const tokenMarkets = React.useMemo(() => markets.filter((market) => !isShareMarket(market)), [markets]);
   const shareMarkets = React.useMemo(() => markets.filter(isShareMarket), [markets]);
   const publicMarketEmails = React.useMemo(
@@ -967,72 +1111,42 @@ function ShareEditDialog({
     [publicMarketEmails, shareToEmailsByApp],
   );
 
+  const applyDraft = React.useCallback((draft: ShareEditDraft) => {
+    setDescription(draft.description);
+    setForSale(draft.forSale);
+    setSaleMarketKind(draft.saleMarketKind);
+    setMarketAccessMode(draft.marketAccessMode);
+    setSelectedMarketEmails(draft.selectedMarketEmails);
+    setSelectedShareMarketEmail(draft.selectedShareMarketEmail);
+    setShareToEmailsByApp(draft.shareToEmailsByApp);
+    setTokenLimitInput(draft.tokenLimitInput);
+    setTokenLimitUnlimited(draft.tokenLimitUnlimited);
+    setLastFiniteTokenLimit(draft.lastFiniteTokenLimit);
+    setParallelLimitInput(draft.parallelLimitInput);
+    setParallelLimitUnlimited(draft.parallelLimitUnlimited);
+    setLastFiniteParallelLimit(draft.lastFiniteParallelLimit);
+    setExpiresAtInput(draft.expiresAtInput);
+    setExpiresPermanent(draft.expiresPermanent);
+    setPriceInputs(draft.priceInputs);
+    setMarketSelectKey((current) => current + 1);
+  }, []);
+
   React.useEffect(() => {
-    if (!share) return;
-    const pendingPricing =
-      share.activeEdit?.status === "rejected"
-        ? share.activeEdit.patch.forSaleOfficialPricePercentByApp || {}
-        : {};
-    const sharePricing = share.forSaleOfficialPricePercentByApp || {};
-    const initialPricing: Record<PriceApp, string> = { claude: "", codex: "", gemini: "" };
-    for (const app of PRICE_APPS) {
-      const pending = pendingPricing[app.key];
-      const fallback = sharePricing[app.key];
-      const value = typeof pending === "number" ? pending : fallback;
-      initialPricing[app.key] = typeof value === "number" && value > 0 ? String(value) : "";
+    if (!share) {
+      setBaseShare(null);
+      setBaseDraft(null);
+      return;
     }
-
-    setDescription(share.description || "");
-    setForSale((share.forSale as "Yes" | "No" | "Free") || "No");
-    const initialSaleMarketKind = share.saleMarketKind === "share" ? "share" : "token";
-    setSaleMarketKind(initialSaleMarketKind);
-    const initialMode = (share.marketAccessMode as "selected" | "all") || "selected";
-    setMarketAccessMode(initialSaleMarketKind === "share" ? "selected" : initialMode);
-    const marketLinks = share.marketLinks || [];
-    setSelectedMarketEmails(
-      initialSaleMarketKind === "token" && initialMode === "selected"
-        ? marketLinks
-            .map((link) => (link.email || "").toLowerCase())
-            .filter((email) => email && !shareMarketEmails.has(email))
-        : [],
-    );
-    setSelectedShareMarketEmail(
-      initialSaleMarketKind === "share"
-        ? marketLinks
-            .map((link) => (link.email || "").toLowerCase())
-            .find((email) => email && !tokenMarketEmails.has(email)) || ""
-        : "",
-    );
-    const accessByApp = effectiveShareAccessByApp(share);
-    setShareToEmailsByApp({
-      claude: splitEmails((accessByApp.claude?.sharedWithEmails || []).join("\n")).filter((email) => !publicMarketEmails.has(email)),
-      codex: splitEmails((accessByApp.codex?.sharedWithEmails || []).join("\n")).filter((email) => !publicMarketEmails.has(email)),
-      gemini: splitEmails((accessByApp.gemini?.sharedWithEmails || []).join("\n")).filter((email) => !publicMarketEmails.has(email)),
-    });
-
-    const initialToken = share.tokenLimit ?? UNLIMITED_TOKEN_LIMIT;
-    const tokenUnlimited = isUnlimitedTokenLimit(initialToken);
-    setTokenLimitUnlimited(tokenUnlimited);
-    setTokenLimitInput(tokenUnlimited ? String(UNLIMITED_TOKEN_LIMIT) : String(initialToken));
-    if (!tokenUnlimited && initialToken > 0) setLastFiniteTokenLimit(initialToken);
-
-    const initialParallel = share.parallelLimit ?? DEFAULT_PARALLEL_LIMIT;
-    const parallelUnlimited = isUnlimitedParallelLimit(initialParallel);
-    setParallelLimitUnlimited(parallelUnlimited);
-    setParallelLimitInput(parallelUnlimited ? String(UNLIMITED_PARALLEL_LIMIT) : String(initialParallel));
-    if (!parallelUnlimited && initialParallel >= MIN_PARALLEL_LIMIT) setLastFiniteParallelLimit(initialParallel);
-
-    const permanent = isPermanentExpiryDate(share.expiresAt) || isUnlimitedExpiry(share.expiresAt);
-    setExpiresPermanent(permanent);
-    setExpiresAtInput(permanent ? "" : toLocalDateTimeValue(share.expiresAt));
-
-    setPriceInputs(initialPricing);
+    if (baseShare?.shareId === share.shareId) return;
+    const draft = buildShareEditDraft(share, publicMarketEmails, tokenMarketEmails, shareMarketEmails);
+    setBaseShare(share);
+    setBaseDraft(draft);
+    applyDraft(draft);
     setError(share.activeEdit?.status === "rejected" ? share.activeEdit.errorMessage || t("dashboard.applyFailedFallback") : "");
     setNotice("");
     setConfirmFreeOpen(false);
     setTransferTargetEmail("");
-    setMarketSelectKey((current) => current + 1);
-  }, [publicMarketEmails, share, shareMarketEmails, t, tokenMarketEmails]);
+  }, [applyDraft, baseShare?.shareId, publicMarketEmails, share, shareMarketEmails, t, tokenMarketEmails]);
 
   const handleForSaleChange = (next: "Yes" | "No" | "Free") => {
     if (next === "Free" && forSale !== "Free") {
@@ -1101,6 +1215,42 @@ function ShareEditDialog({
       .sort((a, b) => (a.displayName || a.email).localeCompare(b.displayName || b.email));
   }, [selectedMarketEmails, tokenMarkets]);
 
+  const currentDraft = React.useMemo<ShareEditDraft>(() => ({
+    description,
+    forSale,
+    saleMarketKind,
+    marketAccessMode,
+    selectedMarketEmails,
+    selectedShareMarketEmail,
+    shareToEmailsByApp,
+    tokenLimitInput,
+    tokenLimitUnlimited,
+    lastFiniteTokenLimit,
+    parallelLimitInput,
+    parallelLimitUnlimited,
+    lastFiniteParallelLimit,
+    expiresAtInput,
+    expiresPermanent,
+    priceInputs,
+  }), [
+    description,
+    forSale,
+    saleMarketKind,
+    marketAccessMode,
+    selectedMarketEmails,
+    selectedShareMarketEmail,
+    shareToEmailsByApp,
+    tokenLimitInput,
+    tokenLimitUnlimited,
+    lastFiniteTokenLimit,
+    parallelLimitInput,
+    parallelLimitUnlimited,
+    lastFiniteParallelLimit,
+    expiresAtInput,
+    expiresPermanent,
+    priceInputs,
+  ]);
+
   const descriptionLength = description.trim().length;
   const descriptionInvalid = descriptionLength > 200;
 
@@ -1112,19 +1262,6 @@ function ShareEditDialog({
     !parallelLimitUnlimited && (!Number.isFinite(parallelParsed) || parallelParsed < MIN_PARALLEL_LIMIT);
 
   const expiryInvalid = !expiresPermanent && !expiresAtInput.trim();
-
-  const pricingPayload = React.useMemo<Record<string, number>>(() => {
-    if (saleMarketKind === "share") return {};
-    const result: Record<string, number> = {};
-    for (const app of PRICE_APPS) {
-      if (!share?.support?.[app.key]) continue;
-      const raw = priceInputs[app.key];
-      if (!raw || !raw.trim()) continue;
-      const value = Number.parseInt(raw, 10);
-      if (Number.isFinite(value) && value >= 1 && value <= 100) result[app.key] = value;
-    }
-    return result;
-  }, [priceInputs, saleMarketKind, share]);
 
   const pricingInvalid = React.useMemo(() => {
     if (saleMarketKind === "share") return false;
@@ -1141,54 +1278,38 @@ function ShareEditDialog({
   const formInvalid =
     descriptionInvalid || tokenInvalid || parallelInvalid || expiryInvalid || pricingInvalid || shareMarketInvalid;
 
+  const currentPatch = React.useMemo(
+    () => (editShare ? buildShareEditPatch(currentDraft, editShare, activeShareApps, publicMarketEmails) : null),
+    [activeShareApps, currentDraft, editShare, publicMarketEmails],
+  );
+  const basePatch = React.useMemo(
+    () => (editShare && baseDraft ? buildShareEditPatch(baseDraft, editShare, activeShareApps, publicMarketEmails) : null),
+    [activeShareApps, baseDraft, editShare, publicMarketEmails],
+  );
+  const isDirty = !!currentPatch && !!basePatch && shareEditPatchFingerprint(currentPatch) !== shareEditPatchFingerprint(basePatch);
+
+  const resetDraft = () => {
+    if (!baseDraft || busy) return;
+    applyDraft(baseDraft);
+    setError("");
+    setNotice("");
+    setConfirmFreeOpen(false);
+    setTransferTargetEmail("");
+  };
+
   const save = async () => {
-    if (!share || readOnly || busy || formInvalid) return;
+    if (!share || !currentPatch || readOnly || busy || formInvalid || !isDirty) return;
     setBusy(true);
     setError("");
     setNotice("");
     try {
-      const expiresIso = expiresPermanent
-        ? PERMANENT_EXPIRES_AT_ISO
-        : fromLocalDateTimeValue(expiresAtInput);
-      const effectiveSaleMarketKind = forSale === "Yes" ? saleMarketKind : "token";
-      const effectiveMarketAccessMode = effectiveSaleMarketKind === "share" ? "selected" : marketAccessMode;
-      const accessByApp: ShareAccessByApp = {};
-      for (const app of activeShareApps) {
-        const shareToEmails = (shareToEmailsByApp[app] ?? []).filter((email) => !publicMarketEmails.has(email));
-        const saleEmails =
-          forSale === "Yes" && effectiveSaleMarketKind === "token" && effectiveMarketAccessMode === "selected"
-            ? selectedMarketEmails
-            : forSale === "Yes" && effectiveSaleMarketKind === "share" && selectedShareMarketEmail
-              ? [selectedShareMarketEmail]
-              : [];
-        accessByApp[app] = {
-          sharedWithEmails: normalizedUniqueEmails([
-            ...shareToEmails,
-            ...saleEmails,
-          ]),
-          marketAccessMode: effectiveMarketAccessMode,
-        };
-      }
-      const sharedWithEmails = normalizedUniqueEmails(
-        Object.values(accessByApp).flatMap((access) => access?.sharedWithEmails ?? []),
-      );
-      const patch: ShareSettingsPatch = {
-        description: description.trim() || null,
-        forSale,
-        saleMarketKind: effectiveSaleMarketKind,
-        marketAccessMode: effectiveMarketAccessMode,
-        sharedWithEmails,
-        accessByApp,
-        tokenLimit: tokenLimitUnlimited ? UNLIMITED_TOKEN_LIMIT : tokenParsed,
-        parallelLimit: parallelLimitUnlimited ? UNLIMITED_PARALLEL_LIMIT : parallelParsed,
-      };
-      if (expiresIso) patch.expiresAt = expiresIso;
-      patch.forSaleOfficialPricePercentByApp = pricingPayload;
-      const res = await updateShareSettings(share.shareId, patch);
+      const res = await updateShareSettings(share.shareId, currentPatch);
       await onSaved();
       if (res.appliedSynchronously) {
         onClose();
       } else {
+        setBaseDraft(currentDraft);
+        if (editShare) setBaseShare(editShare);
         setNotice(t("dashboard.shareEditQueued"));
       }
     } catch (err) {
@@ -1573,9 +1694,15 @@ function ShareEditDialog({
                 </div>
               </Modal.Body>
               <Modal.Footer>
+	                {readOnly ? null : (
+	                  <Button variant="outline" onClick={resetDraft} isDisabled={busy || !isDirty}>
+	                    <RotateCcw className="h-4 w-4" />
+	                    {t("common.reset")}
+	                  </Button>
+	                )}
 	                <Button variant="outline" onClick={onClose} isDisabled={busy}>{readOnly ? t("common.close") : t("common.cancel")}</Button>
 	                {readOnly ? null : (
-	                  <Button variant="primary" onClick={save} isDisabled={busy || formInvalid}>
+	                  <Button variant="primary" onClick={save} isDisabled={busy || formInvalid || !isDirty}>
 	                    {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
 	                    {t("common.save")}
 	                  </Button>
@@ -1681,7 +1808,6 @@ function ShareStatusCell({ share, t, locale }: { share?: ShareView; t: TFn; loca
   if (!share.isOnline) {
     return (
       <div className="grid min-w-0 gap-2 text-sm">
-        {saleRow}
         <Chip size="sm" variant="tertiary">{t("common.offline")}</Chip>
       </div>
     );

@@ -536,6 +536,7 @@ export type ShareAppProvider = {
   providerType?: string;
   isCurrent?: boolean;
   enabled?: boolean;
+  codexImageGenerationEnabled?: boolean;
   forSaleOfficialPricePercent?: number;
   accountEmail?: string;
   apiUrl?: string;
@@ -853,6 +854,7 @@ export type BoardMeta = {
 // P18: test-connection types
 export type ShareConnectionTestRequest = {
   app: "claude" | "codex" | "gemini";
+  kind?: "text" | "image";
   timeoutMs?: number;
 };
 

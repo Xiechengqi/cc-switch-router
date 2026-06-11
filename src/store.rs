@@ -146,6 +146,8 @@ pub struct ShareForTest {
     pub subdomain: String,
     pub owner_email: String,
     pub shared_with_emails: Vec<String>,
+    pub bindings: BTreeMap<String, String>,
+    pub app_providers: ShareAppProviders,
 }
 
 #[derive(Debug, Clone)]
@@ -1170,14 +1172,22 @@ impl AppStore {
         let conn = self.conn.lock().await;
         let row = conn
             .query_row(
-                "SELECT COALESCE(subdomain, '-'), owner_email, COALESCE(shared_with_emails_json, '[]')
+                "SELECT COALESCE(subdomain, '-'), owner_email, COALESCE(shared_with_emails_json, '[]'), bindings_json, app_providers_json
                  FROM shares WHERE share_id = ?1",
                 params![share_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        parse_share_bindings(row.get(3)?)?,
+                        parse_app_providers(row.get(4)?)?,
+                    ))
+                },
             )
             .optional()
             .map_err(|e| AppError::Internal(format!("query share for test failed: {e}")))?;
-        let Some((subdomain, owner_email, shared_json)) = row else {
+        let Some((subdomain, owner_email, shared_json, bindings, app_providers)) = row else {
             return Ok(None);
         };
         let shared_with_emails: Vec<String> =
@@ -1186,6 +1196,8 @@ impl AppStore {
             subdomain,
             owner_email,
             shared_with_emails,
+            bindings,
+            app_providers,
         }))
     }
 
@@ -16530,6 +16542,7 @@ mod tests {
                         provider_type: Some("codex_oauth".into()),
                         is_current: true,
                         enabled: true,
+                        codex_image_generation_enabled: false,
                         for_sale_official_price_percent: Some(80),
                         account_email: Some("account@example.com".into()),
                         api_url: None,

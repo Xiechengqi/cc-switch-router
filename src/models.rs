@@ -1303,6 +1303,8 @@ pub struct ShareAppProvider {
     pub is_current: bool,
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
+    pub codex_image_generation_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub for_sale_official_price_percent: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

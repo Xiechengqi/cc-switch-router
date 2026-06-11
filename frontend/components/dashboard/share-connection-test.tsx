@@ -5,45 +5,80 @@ import { Button } from "@heroui/react";
 import { Check, ChevronDown, ChevronRight, Copy, Loader2 } from "lucide-react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { testShareConnection } from "@/lib/api";
+import type { MessageKey } from "@/lib/i18n";
 import type { ShareConnectionTestResponse, ShareView } from "@/lib/types";
 
 type TFn = ReturnType<typeof useLocaleText>["t"];
+type TestApp = "claude" | "codex" | "gemini";
+type TestKind = "text" | "image";
+type AppProbe = {
+  labelKey: MessageKey;
+  method: "POST";
+  path: string;
+  body: string;
+};
 
 /** 每 app 写死的 curl 参数 */
-const APP_PROBE = {
+const APP_PROBE: Record<TestApp, Partial<Record<TestKind, AppProbe>>> = {
   claude: {
-    method: "POST",
-    path: "/v1/messages",
-    body: JSON.stringify({
-      model: "claude-opus-4-7",
-      max_tokens: 16,
-      // stream:true 与真实 claude-cli 一致——绕开 cc-switch 在非流路径
-      // openai_to_anthropic 转换（GitHub Copilot 这类绑定会因 Empty choices 抛 422）。
-      stream: true,
-      messages: [{ role: "user", content: "who are you" }],
-    }),
+    text: {
+      labelKey: "dashboard.connectDialog.test.textApiCall",
+      method: "POST",
+      path: "/v1/messages",
+      body: JSON.stringify({
+        model: "claude-opus-4-7",
+        max_tokens: 16,
+        // stream:true 与真实 claude-cli 一致——绕开 cc-switch 在非流路径
+        // openai_to_anthropic 转换（GitHub Copilot 这类绑定会因 Empty choices 抛 422）。
+        stream: true,
+        messages: [{ role: "user", content: "who are you" }],
+      }),
+    },
   },
   codex: {
-    method: "POST",
-    path: "/v1/responses",
-    body: JSON.stringify({
-      model: "gpt-5.5",
-      input: [{ role: "user", content: "who are you" }],
-      max_output_tokens: 16,
-    }),
+    text: {
+      labelKey: "dashboard.connectDialog.test.textApiCall",
+      method: "POST",
+      path: "/v1/responses",
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        input: [{ role: "user", content: "who are you" }],
+        max_output_tokens: 16,
+      }),
+    },
+    image: {
+      labelKey: "dashboard.connectDialog.test.imageApiCall",
+      method: "POST",
+      path: "/v1/images/generations",
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        prompt: "A small robot painting a sunrise",
+        size: "1024x1024",
+        response_format: "b64_json",
+        output_format: "png",
+      }),
+    },
   },
   gemini: {
-    method: "POST",
-    path: "/v1beta/models/gemini-2.5-flash:generateContent",
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: "who are you" }] }],
-      generationConfig: { maxOutputTokens: 16 },
-    }),
+    text: {
+      labelKey: "dashboard.connectDialog.test.textApiCall",
+      method: "POST",
+      path: "/v1beta/models/gemini-2.5-flash:generateContent",
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: "who are you" }] }],
+        generationConfig: { maxOutputTokens: 16 },
+      }),
+    },
   },
 } as const;
 
-function buildCurlCommand(baseUrl: string, app: keyof typeof APP_PROBE, apiToken: string) {
-  const probe = APP_PROBE[app];
+function getAppProbe(app: TestApp, kind: TestKind) {
+  return APP_PROBE[app][kind] ?? null;
+}
+
+function buildCurlCommand(baseUrl: string, app: TestApp, kind: TestKind, apiToken: string) {
+  const probe = getAppProbe(app, kind);
+  if (!probe) return "";
   const url = `${baseUrl}${probe.path}`;
   const bearer = apiToken
     ? `Bearer ${apiToken}`
@@ -104,12 +139,14 @@ type TestState = "idle" | "running" | "done" | "error";
 export function ShareConnectionTestRow({
   share,
   app,
+  kind = "text",
   apiToken,
   baseUrl,
   canExecute,
 }: {
   share: ShareView;
-  app: "claude" | "codex" | "gemini";
+  app: TestApp;
+  kind?: TestKind;
   apiToken: string;
   baseUrl: string;
   canExecute: boolean;
@@ -121,17 +158,18 @@ export function ShareConnectionTestRow({
   const [resultOpen, setResultOpen] = React.useState(false);
 
   const isBound = !!(share.bindings?.[app]);
+  const probe = getAppProbe(app, kind);
   const curlCmd = React.useMemo(
-    () => (baseUrl ? buildCurlCommand(baseUrl, app, apiToken) : ""),
-    [baseUrl, app, apiToken],
+    () => (baseUrl ? buildCurlCommand(baseUrl, app, kind, apiToken) : ""),
+    [baseUrl, app, kind, apiToken],
   );
 
   const runTest = React.useCallback(async () => {
-    if (!canExecute || !isBound || testState === "running") return;
+    if (!canExecute || !isBound || !probe || testState === "running") return;
     setTestState("running");
     setErrorMsg("");
     try {
-      const response = await testShareConnection(share.shareId, { app, timeoutMs: 15000 });
+      const response = await testShareConnection(share.shareId, { app, kind, timeoutMs: 15000 });
       setResult(response);
       setResultOpen(true);
       setTestState("done");
@@ -139,7 +177,7 @@ export function ShareConnectionTestRow({
       setErrorMsg(err instanceof Error ? err.message : String(err));
       setTestState("error");
     }
-  }, [canExecute, isBound, testState, share.shareId, app]);
+  }, [canExecute, isBound, probe, testState, share.shareId, app, kind]);
 
   const running = testState === "running";
 
@@ -159,9 +197,16 @@ export function ShareConnectionTestRow({
     <div className={`grid gap-2 rounded-lg border px-3 py-2.5 text-sm ${isBound ? "border-slate-200 bg-slate-50" : "border-slate-100 bg-slate-50/40 opacity-60"}`}>
       {/* Header row: app label + disabled reason or test button */}
       <div className="flex items-center justify-between gap-2">
-        <span className="font-mono text-xs font-semibold uppercase tracking-wide text-slate-600">
-          {app}
-        </span>
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="shrink-0 font-mono text-xs font-semibold uppercase tracking-wide text-slate-600">
+            {app}
+          </span>
+          {probe ? (
+            <span className="min-w-0 truncate text-xs text-slate-500">
+              {t(probe.labelKey)}
+            </span>
+          ) : null}
+        </div>
         {disabledReason ? (
           <span className="text-[11px] text-slate-400">{disabledReason}</span>
         ) : (

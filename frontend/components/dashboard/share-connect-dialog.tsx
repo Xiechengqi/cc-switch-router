@@ -11,6 +11,17 @@ import type { ShareView, UserApiTokenStatus } from "@/lib/types";
 
 const ROUTER_OPEN_LOGIN_EVENT = "router-open-login";
 
+function shareCodexImageGenerationEnabled(share: ShareView | null) {
+  const providerId = share?.bindings?.codex;
+  if (!providerId) return false;
+  return !!share?.appProviders?.codex?.some(
+    (provider) =>
+      provider.id === providerId &&
+      provider.enabled === true &&
+      provider.codexImageGenerationEnabled === true,
+  );
+}
+
 /**
  * P18: 让 dashboard ShareTable 行点击「连接」时打开这个弹窗。
  *
@@ -34,6 +45,10 @@ export const ShareConnectDialog = React.memo(function ShareConnectDialog({
   const { session, loading } = useAuth();
   const authenticated = !!session?.authenticated;
   const canViewSecret = !!share?.canViewSecret;
+  const codexImageGenerationEnabled = React.useMemo(
+    () => shareCodexImageGenerationEnabled(share),
+    [share],
+  );
 
   const baseUrl = React.useMemo(() => {
     if (!share?.subdomain) return "";
@@ -158,6 +173,17 @@ export const ShareConnectDialog = React.memo(function ShareConnectDialog({
                     canExecute={authenticated && canViewSecret}
                   />
                 ))}
+                {codexImageGenerationEnabled ? (
+                  <ShareConnectionTestRow
+                    key="codex-image"
+                    share={share}
+                    app="codex"
+                    kind="image"
+                    apiToken={apiTokenPlain}
+                    baseUrl={baseUrl}
+                    canExecute={authenticated && canViewSecret}
+                  />
+                ) : null}
               </div>
             </Modal.Body>
             <Modal.Footer>
