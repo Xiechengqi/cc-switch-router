@@ -6,9 +6,9 @@ import * as React from "react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog";
-import { getMarketLinkedShares, getShareUsageByEmail, releaseMarketShareState, updateMarketDisabledShares, updateMarketMaintenance, updateShareSettings } from "@/lib/api";
+import { getMarketLinkedShares, getShareImageGenerationJobs, getShareUsageByEmail, releaseMarketShareState, updateMarketDisabledShares, updateMarketMaintenance, updateShareSettings } from "@/lib/api";
 import type { AppLocale } from "@/lib/i18n";
-import type { DashboardClient, DashboardMarket, HealthCheckEntry, HealthTimelineBucket, MarketAppAvailabilityEntry, MarketRequestLog, MarketShare, MarketShareRuntimeState, ModelHealthSummary, ShareAccessByApp, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareModelHealthCheck, ShareRequestLog, ShareSettingsPatch, ShareUpstreamProvider, ShareUsageByEmailResponse, ShareView } from "@/lib/types";
+import type { DashboardClient, DashboardMarket, HealthCheckEntry, HealthTimelineBucket, ImageGenerationJob, MarketAppAvailabilityEntry, MarketRequestLog, MarketShare, MarketShareRuntimeState, ModelHealthSummary, ShareAccessByApp, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareModelHealthCheck, ShareRequestLog, ShareSettingsPatch, ShareUpstreamProvider, ShareUsageByEmailResponse, ShareView } from "@/lib/types";
 import { cn, compactTokens, formatDateTime, formatNumber, formatRelativeTime } from "@/lib/utils";
 
 function shouldOpenRowDrawer(event: React.MouseEvent<HTMLElement>) {
@@ -2302,8 +2302,8 @@ export function SharesTable({
                     <DrawerSection label={t("dashboard.providers")}>
                       <ShareProvidersPanel share={selected} />
                     </DrawerSection>
-                    <DrawerSection label={t("dashboard.requestLogs")}>
-                      <ShareRequestLogs logs={selected.recentRequests || []} />
+                    <DrawerSection label={t("dashboard.activityLogs")}>
+                      <ShareActivityLogs share={selected} />
                     </DrawerSection>
                     <DrawerSection label={t("dashboard.modelHealthChecks")}>
                       <ShareModelHealthChecks
@@ -3188,6 +3188,7 @@ function ShareProvidersPanel({ share }: { share?: ShareView }) {
         </div>
       )}
       {share ? <ShareEmailUsagePanel share={share} app={selectedKey} /> : null}
+      {share ? <ShareProviderRequestsPanel share={share} app={selectedKey} /> : null}
     </div>
   );
 }
@@ -3573,6 +3574,136 @@ function ClientProvidersPanel({ shares }: { shares: ShareView[] }) {
           })}
         </div>
       )}
+    </div>
+  );
+}
+
+type RequestLogTab = "text" | "image";
+
+function ShareActivityLogs({ share }: { share: ShareView }) {
+  const { t } = useLocaleText();
+  const [selectedKey, setSelectedKey] = React.useState<RequestLogTab>("text");
+  return (
+    <div className="grid gap-3">
+      <Tabs selectedKey={selectedKey} onSelectionChange={(key: React.Key) => setSelectedKey(String(key) as RequestLogTab)} variant="secondary" className="text-foreground">
+        <Tabs.List className="grid w-full grid-cols-2 text-foreground">
+          <Tabs.Tab id="text" className="rounded-md border border-transparent px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors data-[selected=true]:border-primary/30 data-[selected=true]:bg-primary/10 data-[selected=true]:text-primary">
+            {t("dashboard.textRequests")}
+          </Tabs.Tab>
+          <Tabs.Tab id="image" className="rounded-md border border-transparent px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors data-[selected=true]:border-primary/30 data-[selected=true]:bg-primary/10 data-[selected=true]:text-primary">
+            {t("dashboard.imageJobs")}
+          </Tabs.Tab>
+        </Tabs.List>
+      </Tabs>
+      {selectedKey === "text" ? (
+        <ShareRequestLogs logs={share.recentRequests || []} />
+      ) : (
+        <ShareImageJobLogs shareId={share.shareId} />
+      )}
+    </div>
+  );
+}
+
+function ShareProviderRequestsPanel({
+  share,
+  app,
+}: {
+  share: ShareView;
+  app: keyof ShareAppProviders;
+}) {
+  const { t } = useLocaleText();
+  const [selectedKey, setSelectedKey] = React.useState<RequestLogTab>("text");
+  const textLogs = React.useMemo(
+    () => (share.recentRequests || []).filter((log) => (log.appType || "").toLowerCase() === app),
+    [share.recentRequests, app],
+  );
+  return (
+    <div className="grid gap-3">
+      <div className="mono-label text-muted-foreground">{t("dashboard.requestLogs")}</div>
+      <Tabs selectedKey={selectedKey} onSelectionChange={(key: React.Key) => setSelectedKey(String(key) as RequestLogTab)} variant="secondary" className="text-foreground">
+        <Tabs.List className="grid w-full grid-cols-2 text-foreground">
+          <Tabs.Tab id="text" className="rounded-md border border-transparent px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors data-[selected=true]:border-primary/30 data-[selected=true]:bg-primary/10 data-[selected=true]:text-primary">
+            {t("dashboard.textRequests")}
+          </Tabs.Tab>
+          <Tabs.Tab id="image" className="rounded-md border border-transparent px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors data-[selected=true]:border-primary/30 data-[selected=true]:bg-primary/10 data-[selected=true]:text-primary">
+            {t("dashboard.imageJobs")}
+          </Tabs.Tab>
+        </Tabs.List>
+      </Tabs>
+      {selectedKey === "text" ? (
+        <ShareRequestLogs logs={textLogs} />
+      ) : app === "codex" ? (
+        <ShareImageJobLogs shareId={share.shareId} />
+      ) : (
+        <EmptyBlock>{t("dashboard.noImageJobs")}</EmptyBlock>
+      )}
+    </div>
+  );
+}
+
+function ShareImageJobLogs({ shareId }: { shareId: string }) {
+  const { locale, t } = useLocaleText();
+  const [jobs, setJobs] = React.useState<ImageGenerationJob[]>([]);
+  const [loading, setLoading] = React.useState(false);
+  const [error, setError] = React.useState("");
+
+  React.useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError("");
+    getShareImageGenerationJobs(shareId, 50)
+      .then((nextJobs) => {
+        if (!cancelled) setJobs(nextJobs);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setJobs([]);
+          setError(err instanceof Error ? err.message : String(err));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [shareId]);
+
+  if (loading) return <EmptyBlock>{t("dashboard.usageEmail.loading")}</EmptyBlock>;
+  if (error) return <EmptyBlock>{error}</EmptyBlock>;
+  if (!jobs.length) return <EmptyBlock>{t("dashboard.noImageJobs")}</EmptyBlock>;
+
+  return (
+    <div className="grid gap-2">
+      {jobs.slice(0, 20).map((job) => {
+        const ok = job.status === "succeeded";
+        const failed = job.status === "failed" || job.status === "expired" || job.status === "cancelled";
+        return (
+          <Card key={job.jobId} className="rounded-lg border p-0 shadow-none">
+            <Card.Content className="gap-3 p-3">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="truncate font-medium">{job.model || "-"}</div>
+                  <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                    {job.createdByEmail ? <span>{job.createdByEmail}</span> : null}
+                    <span>{job.providerName || job.providerId || "-"}</span>
+                    <span title={formatDateTime(job.queuedAt * 1000)}>{formatRelativeTime(job.queuedAt * 1000, locale)}</span>
+                    {job.resultMimeType ? <span>{job.resultMimeType}</span> : null}
+                    {typeof job.resultSizeBytes === "number" ? <span>{formatNumber(job.resultSizeBytes)} B</span> : null}
+                  </div>
+                </div>
+                <div className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground">
+                  <Chip color={ok ? "success" : failed ? "danger" : "warning"} size="sm" variant="soft">{job.status}</Chip>
+                  {typeof job.statusCode === "number" ? <Chip color={job.statusCode >= 200 && job.statusCode < 400 ? "success" : "danger"} size="sm" variant="soft">{job.statusCode}</Chip> : null}
+                  {job.latencyMs ? <span>{job.latencyMs}ms</span> : null}
+                </div>
+              </div>
+              {job.promptPreview ? <div className="truncate rounded-md bg-muted px-2 py-1.5 text-xs text-muted-foreground" title={job.promptPreview}>{job.promptPreview}</div> : null}
+              {job.errorMessage ? <div className="truncate rounded-md bg-danger-50 px-2 py-1.5 text-xs text-danger-700" title={job.errorMessage}>{job.errorMessage}</div> : null}
+            </Card.Content>
+          </Card>
+        );
+      })}
     </div>
   );
 }

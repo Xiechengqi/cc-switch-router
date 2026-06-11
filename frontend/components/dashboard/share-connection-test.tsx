@@ -49,7 +49,7 @@ const APP_PROBE: Record<TestApp, Partial<Record<TestKind, AppProbe>>> = {
     image: {
       labelKey: "dashboard.connectDialog.test.imageApiCall",
       method: "POST",
-      path: "/v1/images/generations",
+      path: "/v1/images/generations/async",
       body: JSON.stringify({
         model: "gpt-5.5",
         prompt: "A small robot painting a sunrise",

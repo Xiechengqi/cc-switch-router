@@ -40,8 +40,8 @@ use crate::models::{
     ClientTunnelClaimRequest, ClientTunnelQuery, ClientTunnelResponse, ClientTunnelUpdateRequest,
     DashboardMarketRequestLogView, DashboardPresenceRequest, DashboardPresenceResponse,
     DashboardResponse, DashboardTickerShare, GatewayRegistryRecord, GetInstallationOwnerEmailQuery,
-    GetInstallationOwnerEmailResponse, HealthResponse, IssueLeaseRequest, IssueLeaseResponse,
-    MarketDisabledSharesUpdateRequest, MarketDisabledSharesUpdateResponse,
+    GetInstallationOwnerEmailResponse, HealthResponse, ImageGenerationJobEntry, IssueLeaseRequest,
+    IssueLeaseResponse, MarketDisabledSharesUpdateRequest, MarketDisabledSharesUpdateResponse,
     MarketMaintenanceUpdateRequest, MarketMaintenanceUpdateResponse,
     MarketNotificationEmailLogView, MarketNotificationEmailRequest,
     MarketNotificationEmailResponse, MarketRequestLogBatchSyncRequest,
@@ -230,6 +230,10 @@ pub fn router(state: ServerState) -> Router {
         .route(
             "/v1/shares/:share_id/test-connection",
             post(test_share_connection),
+        )
+        .route(
+            "/v1/shares/:share_id/image-jobs",
+            get(list_share_image_generation_jobs),
         )
         .route("/v1/shares/pending-edits", post(pending_share_edits))
         .route("/v1/shares/edit-ack", post(ack_share_edit))
@@ -3760,6 +3764,18 @@ struct ShareConnectionTestResponse {
     error: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ImageGenerationJobsQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageGenerationJobsResponse {
+    jobs: Vec<ImageGenerationJobEntry>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TestRequestEcho {
@@ -3814,7 +3830,7 @@ fn app_probe_for_kind(app: &str, kind: &str) -> Option<AppProbe> {
         }),
         ("codex", "image") => Some(AppProbe {
             method: "POST",
-            path: "/v1/images/generations",
+            path: "/v1/images/generations/async",
             body: r#"{"model":"gpt-5.5","prompt":"A small robot painting a sunrise","size":"1024x1024","response_format":"b64_json","output_format":"png"}"#,
         }),
         ("gemini", "text") => Some(AppProbe {
@@ -3843,6 +3859,39 @@ fn share_codex_image_generation_enabled(share: &ShareForTest) -> bool {
             && provider.enabled
             && provider.codex_image_generation_enabled
     })
+}
+
+async fn list_share_image_generation_jobs(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(share_id): Path<String>,
+    Query(query): Query<ImageGenerationJobsQuery>,
+) -> Result<Json<ImageGenerationJobsResponse>, AppError> {
+    let current_user_email = require_user_email(&state, &headers, "share:read").await?;
+    let share = state
+        .store
+        .get_share_for_test(&share_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("share not found".into()))?;
+
+    let is_admin = state.dynamic.read().await.is_admin(&current_user_email);
+    let is_owner = share.owner_email.eq_ignore_ascii_case(&current_user_email);
+    let is_shared_with = share
+        .shared_with_emails
+        .iter()
+        .any(|email| email.eq_ignore_ascii_case(&current_user_email));
+
+    if !is_admin && !is_owner && !is_shared_with {
+        return Err(AppError::Forbidden(
+            "only the share owner, invited users, or admins can view image jobs".into(),
+        ));
+    }
+
+    let jobs = state
+        .store
+        .list_image_generation_jobs_for_share(&share_id, query.limit.unwrap_or(50))
+        .await?;
+    Ok(Json(ImageGenerationJobsResponse { jobs }))
 }
 
 async fn test_share_connection(

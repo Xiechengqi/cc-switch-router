@@ -2,15 +2,21 @@ use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
+use base64::Engine;
+use rand::distributions::{Alphanumeric, DistString};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, watch};
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use crate::ServerState;
 use crate::recent_traffic::RecentTraffic;
+use crate::store::{NewImageGenerationJob, ShareForTest};
 
 const MARKET_REQUEST_ID_HEADER: &str = "x-cc-switch-market-request-id";
 const HEALTH_PROBE_FAILURE_CACHE_TTL: Duration = Duration::from_secs(2);
@@ -18,6 +24,9 @@ const CLIENT_WEB_USER_EMAIL_HEADER: &str = "x-cc-switch-web-user-email";
 const CLIENT_WEB_ROLE_HEADER: &str = "x-cc-switch-web-role";
 const CLIENT_WEB_INSTALLATION_ID_HEADER: &str = "x-cc-switch-installation-id";
 const CLIENT_WEB_SUBDOMAIN_HEADER: &str = "x-cc-switch-client-tunnel-subdomain";
+const IMAGE_JOB_RESULT_TTL_SECS: i64 = 60 * 60;
+const IMAGE_JOB_MAX_ACTIVE_PER_SHARE: usize = 3;
+const IMAGE_JOB_MAX_RUNNING_PER_SHARE: usize = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RouteKind {
@@ -1168,6 +1177,13 @@ pub async fn proxy_handler(
         );
         return simple_response(StatusCode::NOT_FOUND, "non-api-path");
     }
+    if route.is_share()
+        && matches!(method, axum::http::Method::GET | axum::http::Method::HEAD)
+        && is_image_generation_job_result_path(&path)
+    {
+        return handle_image_generation_result_request(&state, &route, &path, parts.uri.query())
+            .await;
+    }
     let mut client_web_session: Option<(String, bool)> = None;
     if route.is_client_web() {
         if !is_allowed_client_web_path(&path) {
@@ -1329,6 +1345,45 @@ pub async fn proxy_handler(
                 }
             }
         }
+    }
+    if route.is_share() && is_image_generation_job_status_path(&path) {
+        return handle_image_generation_status_request(&state, &route, &path).await;
+    }
+    if route.is_share()
+        && method == axum::http::Method::POST
+        && is_image_generation_async_submit_path(&path)
+    {
+        let body = match axum::body::to_bytes(body, usize::MAX).await {
+            Ok(body) => body,
+            Err(err) => {
+                warn!(
+                    method = %method,
+                    host = %host,
+                    path = %path_and_query,
+                    backend = %backend,
+                    client_ip = %user_ip,
+                    client_country = %user_country,
+                    client_asn = %user_asn,
+                    user_agent = %user_agent,
+                    error = %err,
+                    "image generation async request body read failed"
+                );
+                return json_error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("failed-to-read-body: {err}"),
+                );
+            }
+        };
+        return handle_image_generation_async_submit(
+            &state,
+            &route,
+            body,
+            api_user_email,
+            user_ip,
+            user_country.to_string(),
+            parts.headers,
+        )
+        .await;
     }
     let target = format!("http://{backend}{path_and_query}");
 
@@ -1662,6 +1717,588 @@ pub async fn proxy_handler(
             user_agent = %user_agent,
             "proxy request completed"
         );
+    }
+    response
+}
+
+fn image_generation_async_submit_path(path: &str) -> Option<&'static str> {
+    let path = path.trim_start_matches('/');
+    match path {
+        "v1/images/generations/async" => Some("v1"),
+        "images/generations/async" => Some("legacy"),
+        _ => None,
+    }
+}
+
+fn is_image_generation_async_submit_path(path: &str) -> bool {
+    image_generation_async_submit_path(path).is_some()
+}
+
+fn image_generation_job_path_tail<'a>(path: &'a str, suffix: &str) -> Option<&'a str> {
+    let path = path.trim_start_matches('/');
+    for prefix in ["v1/images/generations/jobs/", "images/generations/jobs/"] {
+        let Some(rest) = path.strip_prefix(prefix) else {
+            continue;
+        };
+        if suffix.is_empty() && !rest.contains('/') && !rest.is_empty() {
+            return Some(rest);
+        }
+        if let Some(job_id) = rest.strip_suffix(suffix) {
+            let job_id = job_id.trim_matches('/');
+            if !job_id.is_empty() {
+                return Some(job_id);
+            }
+        }
+    }
+    None
+}
+
+fn image_generation_job_id_from_status_path(path: &str) -> Option<&str> {
+    image_generation_job_path_tail(path, "")
+}
+
+fn image_generation_job_id_from_result_path(path: &str) -> Option<&str> {
+    image_generation_job_path_tail(path, "/result")
+}
+
+fn is_image_generation_job_status_path(path: &str) -> bool {
+    image_generation_job_id_from_status_path(path).is_some()
+}
+
+fn is_image_generation_job_result_path(path: &str) -> bool {
+    image_generation_job_id_from_result_path(path).is_some()
+}
+
+async fn handle_image_generation_async_submit(
+    state: &ServerState,
+    route: &RouteEntry,
+    body: axum::body::Bytes,
+    api_user_email: Option<String>,
+    user_ip: String,
+    user_country: String,
+    headers: HeaderMap,
+) -> Response {
+    let Some(share_id) = route.share_id.as_deref() else {
+        return json_error_response(StatusCode::NOT_FOUND, "share-not-found");
+    };
+    let share = match state.store.get_share_for_test(share_id).await {
+        Ok(Some(share)) => share,
+        Ok(None) => return json_error_response(StatusCode::NOT_FOUND, "share-not-found"),
+        Err(err) => {
+            warn!(share_id = %share_id, error = %err, "image generation share lookup failed");
+            return json_error_response(StatusCode::SERVICE_UNAVAILABLE, "share-lookup-failed");
+        }
+    };
+    let Some((provider_id, provider_name)) = codex_image_generation_provider(&share) else {
+        return json_error_response(
+            StatusCode::BAD_REQUEST,
+            "codex image generation is not enabled for the bound provider",
+        );
+    };
+    let (running, active) = match state
+        .store
+        .count_active_image_generation_jobs_for_share(share_id)
+        .await
+    {
+        Ok(counts) => counts,
+        Err(err) => {
+            warn!(share_id = %share_id, error = %err, "image generation active job count failed");
+            return json_error_response(StatusCode::SERVICE_UNAVAILABLE, "image-job-count-failed");
+        }
+    };
+    if running >= IMAGE_JOB_MAX_RUNNING_PER_SHARE || active >= IMAGE_JOB_MAX_ACTIVE_PER_SHARE {
+        return json_error_response(StatusCode::TOO_MANY_REQUESTS, "image-generation-queue-full");
+    }
+
+    let mut payload = match serde_json::from_slice::<Value>(&body) {
+        Ok(Value::Object(map)) => map,
+        Ok(_) => {
+            return json_error_response(
+                StatusCode::BAD_REQUEST,
+                "image request body must be a JSON object",
+            );
+        }
+        Err(err) => {
+            return json_error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid image request json: {err}"),
+            );
+        }
+    };
+    let model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("gpt-5.5")
+        .to_string();
+    payload.insert("response_format".into(), Value::String("b64_json".into()));
+    let prompt_preview = payload
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(|value| compact_prompt_preview(value, 180));
+    let output_format = payload
+        .get("output_format")
+        .or_else(|| payload.get("format"))
+        .and_then(Value::as_str)
+        .map(normalize_image_output_format)
+        .unwrap_or_else(|| "png".to_string());
+    let upstream_body = match serde_json::to_vec(&Value::Object(payload)) {
+        Ok(body) => body,
+        Err(err) => {
+            return json_error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("serialize image request failed: {err}"),
+            );
+        }
+    };
+
+    let job_id = format!("imgjob_{}", Uuid::new_v4().simple());
+    let result_token = generate_result_token();
+    let public_base = state.config.tunnel_url(&route.subdomain);
+    let poll_url = format!("{public_base}/v1/images/generations/jobs/{job_id}");
+    let result_url =
+        format!("{public_base}/v1/images/generations/jobs/{job_id}/result?token={result_token}");
+    let job = NewImageGenerationJob {
+        job_id: job_id.clone(),
+        share_id: share_id.to_string(),
+        installation_id: route.installation_id().unwrap_or_default().to_string(),
+        share_name: route
+            .share_name
+            .clone()
+            .unwrap_or_else(|| share_id.to_string()),
+        provider_id,
+        provider_name,
+        app_type: "codex".into(),
+        model,
+        queued_at: chrono::Utc::now().timestamp(),
+        prompt_preview,
+        created_by_email: api_user_email.clone(),
+        client_ip: Some(user_ip),
+        user_country: Some(user_country),
+        idempotency_key: headers
+            .get("idempotency-key")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+    };
+    let created = match state.store.create_image_generation_job(job).await {
+        Ok(job) => job,
+        Err(err) => {
+            warn!(share_id = %share_id, error = %err, "create image generation job failed");
+            return json_error_response(StatusCode::SERVICE_UNAVAILABLE, "create-image-job-failed");
+        }
+    };
+    spawn_image_generation_job(
+        state.clone(),
+        route.clone(),
+        job_id,
+        upstream_body,
+        output_format,
+        result_token,
+        api_user_email,
+    );
+    json_response(
+        StatusCode::ACCEPTED,
+        serde_json::json!({
+            "jobId": created.job_id,
+            "status": created.status,
+            "queuedAt": created.queued_at,
+            "pollUrl": poll_url,
+            "resultUrl": result_url,
+            "expiresInSeconds": IMAGE_JOB_RESULT_TTL_SECS
+        }),
+    )
+}
+
+async fn handle_image_generation_status_request(
+    state: &ServerState,
+    route: &RouteEntry,
+    path: &str,
+) -> Response {
+    let Some(job_id) = image_generation_job_id_from_status_path(path) else {
+        return json_error_response(StatusCode::NOT_FOUND, "image-job-not-found");
+    };
+    let Some(route_share_id) = route.share_id.as_deref() else {
+        return json_error_response(StatusCode::NOT_FOUND, "share-not-found");
+    };
+    let job = match state.store.get_image_generation_job(job_id).await {
+        Ok(Some(job)) => job,
+        Ok(None) => return json_error_response(StatusCode::NOT_FOUND, "image-job-not-found"),
+        Err(err) => {
+            warn!(job_id = %job_id, error = %err, "query image generation job failed");
+            return json_error_response(StatusCode::SERVICE_UNAVAILABLE, "image-job-query-failed");
+        }
+    };
+    if job.share_id != route_share_id {
+        return json_error_response(StatusCode::NOT_FOUND, "image-job-not-found");
+    }
+    json_response(StatusCode::OK, serde_json::json!({ "job": job }))
+}
+
+async fn handle_image_generation_result_request(
+    state: &ServerState,
+    route: &RouteEntry,
+    path: &str,
+    query: Option<&str>,
+) -> Response {
+    let Some(job_id) = image_generation_job_id_from_result_path(path) else {
+        return json_error_response(StatusCode::NOT_FOUND, "image-job-not-found");
+    };
+    let token = query
+        .and_then(|query| {
+            query.split('&').find_map(|part| {
+                let (key, value) = part.split_once('=')?;
+                (key == "token" && !value.is_empty()).then(|| value.to_string())
+            })
+        })
+        .unwrap_or_default();
+    if token.is_empty() {
+        return json_error_response(StatusCode::UNAUTHORIZED, "missing-result-token");
+    }
+    let job = match state
+        .store
+        .get_image_generation_job_for_result(job_id, &token)
+        .await
+    {
+        Ok(Some(job)) => job,
+        Ok(None) => return json_error_response(StatusCode::NOT_FOUND, "image-job-not-found"),
+        Err(err) => {
+            warn!(job_id = %job_id, error = %err, "query image generation result failed");
+            return json_error_response(StatusCode::SERVICE_UNAVAILABLE, "image-job-query-failed");
+        }
+    };
+    if Some(job.share_id.as_str()) != route.share_id.as_deref() {
+        return json_error_response(StatusCode::NOT_FOUND, "image-job-not-found");
+    }
+    if job.status != "succeeded" {
+        return json_error_response(StatusCode::CONFLICT, "image-job-not-ready");
+    }
+    if job
+        .expires_at
+        .map(|expires_at| expires_at < chrono::Utc::now().timestamp())
+        .unwrap_or(true)
+    {
+        return json_error_response(StatusCode::GONE, "image-job-result-expired");
+    }
+    let Some(key) = job
+        .result_storage_key
+        .as_deref()
+        .filter(|key| is_safe_image_result_key(key))
+    else {
+        return json_error_response(StatusCode::NOT_FOUND, "image-result-not-found");
+    };
+    let path = image_result_path(&state.config, key);
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            warn!(job_id = %job_id, path = %path.display(), error = %err, "read image result failed");
+            return json_error_response(StatusCode::NOT_FOUND, "image-result-not-found");
+        }
+    };
+    let mime = job
+        .result_mime_type
+        .as_deref()
+        .unwrap_or("image/png")
+        .to_string();
+    let mut response = Response::new(Body::from(bytes));
+    *response.status_mut() = StatusCode::OK;
+    if let Ok(value) = HeaderValue::from_str(&mime) {
+        response.headers_mut().insert(header::CONTENT_TYPE, value);
+    }
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=3600"),
+    );
+    response
+}
+
+fn spawn_image_generation_job(
+    state: ServerState,
+    route: RouteEntry,
+    job_id: String,
+    upstream_body: Vec<u8>,
+    output_format: String,
+    result_token: String,
+    api_user_email: Option<String>,
+) {
+    tokio::spawn(async move {
+        let queued_started = Instant::now();
+        loop {
+            match state.store.mark_image_generation_job_running(&job_id).await {
+                Ok(true) => break,
+                Ok(false) if queued_started.elapsed() < Duration::from_secs(3600) => {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+                Ok(false) => {
+                    let _ = state
+                        .store
+                        .fail_image_generation_job(
+                            &job_id,
+                            None,
+                            queued_started.elapsed().as_millis() as u64,
+                            "image generation queue wait timed out",
+                        )
+                        .await;
+                    return;
+                }
+                Err(err) => {
+                    warn!(job_id = %job_id, error = %err, "mark image job running failed");
+                    return;
+                }
+            }
+        }
+        let started = Instant::now();
+        let target = format!("http://{}/v1/images/generations", route.backend);
+        let mut builder = state
+            .proxy_http
+            .post(target)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("X-CC-Switch-Share-Subdomain", route.subdomain.as_str());
+        if let Some(share_id) = route.share_id.as_deref() {
+            builder = builder.header("X-CC-Switch-Share-Id", share_id);
+        }
+        if let Some(email) = api_user_email.as_deref() {
+            builder = builder.header("X-CC-Switch-User-Email", email);
+        }
+        let response = match builder.body(upstream_body).send().await {
+            Ok(response) => response,
+            Err(err) => {
+                let _ = state
+                    .store
+                    .fail_image_generation_job(
+                        &job_id,
+                        None,
+                        started.elapsed().as_millis() as u64,
+                        &format!("upstream request failed: {err}"),
+                    )
+                    .await;
+                return;
+            }
+        };
+        let status = response.status();
+        let status_code = status.as_u16();
+        let text = match response.text().await {
+            Ok(text) => text,
+            Err(err) => {
+                let _ = state
+                    .store
+                    .fail_image_generation_job(
+                        &job_id,
+                        Some(status_code),
+                        started.elapsed().as_millis() as u64,
+                        &format!("read upstream response failed: {err}"),
+                    )
+                    .await;
+                return;
+            }
+        };
+        if !status.is_success() {
+            let _ = state
+                .store
+                .fail_image_generation_job(
+                    &job_id,
+                    Some(status_code),
+                    started.elapsed().as_millis() as u64,
+                    &compact_prompt_preview(&text, 1000),
+                )
+                .await;
+            return;
+        }
+        let value = match serde_json::from_str::<Value>(&text) {
+            Ok(value) => value,
+            Err(err) => {
+                let _ = state
+                    .store
+                    .fail_image_generation_job(
+                        &job_id,
+                        Some(status_code),
+                        started.elapsed().as_millis() as u64,
+                        &format!("parse upstream image response failed: {err}"),
+                    )
+                    .await;
+                return;
+            }
+        };
+        let Some(b64) = value
+            .get("data")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("b64_json"))
+            .and_then(Value::as_str)
+        else {
+            let _ = state
+                .store
+                .fail_image_generation_job(
+                    &job_id,
+                    Some(status_code),
+                    started.elapsed().as_millis() as u64,
+                    "upstream image response did not contain data[0].b64_json",
+                )
+                .await;
+            return;
+        };
+        let image_bytes = match base64::engine::general_purpose::STANDARD.decode(b64) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                let _ = state
+                    .store
+                    .fail_image_generation_job(
+                        &job_id,
+                        Some(status_code),
+                        started.elapsed().as_millis() as u64,
+                        &format!("decode upstream image failed: {err}"),
+                    )
+                    .await;
+                return;
+            }
+        };
+        let (mime, ext) = image_mime_and_ext(&image_bytes, &output_format);
+        let key = format!("{job_id}.{ext}");
+        let path = image_result_path(&state.config, &key);
+        if let Some(parent) = path.parent()
+            && let Err(err) = tokio::fs::create_dir_all(parent).await
+        {
+            let _ = state
+                .store
+                .fail_image_generation_job(
+                    &job_id,
+                    Some(status_code),
+                    started.elapsed().as_millis() as u64,
+                    &format!("create image result dir failed: {err}"),
+                )
+                .await;
+            return;
+        }
+        if let Err(err) = tokio::fs::write(&path, &image_bytes).await {
+            let _ = state
+                .store
+                .fail_image_generation_job(
+                    &job_id,
+                    Some(status_code),
+                    started.elapsed().as_millis() as u64,
+                    &format!("write image result failed: {err}"),
+                )
+                .await;
+            return;
+        }
+        let expires_at = chrono::Utc::now().timestamp() + IMAGE_JOB_RESULT_TTL_SECS;
+        if let Err(err) = state
+            .store
+            .complete_image_generation_job(
+                &job_id,
+                status_code,
+                started.elapsed().as_millis() as u64,
+                mime,
+                image_bytes.len() as u64,
+                &key,
+                &result_token,
+                expires_at,
+            )
+            .await
+        {
+            warn!(job_id = %job_id, error = %err, "complete image job failed");
+        }
+    });
+}
+
+fn codex_image_generation_provider(share: &ShareForTest) -> Option<(String, String)> {
+    let bound_provider_id = share
+        .bindings
+        .get("codex")
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())?;
+    share
+        .app_providers
+        .codex
+        .iter()
+        .find(|provider| {
+            provider.id == bound_provider_id
+                && provider.enabled
+                && provider.codex_image_generation_enabled
+        })
+        .map(|provider| (provider.id.clone(), provider.name.clone()))
+}
+
+fn compact_prompt_preview(value: &str, max_chars: usize) -> String {
+    let mut output = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        output.push_str("...");
+    }
+    output
+}
+
+fn normalize_image_output_format(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => "jpg".into(),
+        "webp" => "webp".into(),
+        _ => "png".into(),
+    }
+}
+
+fn image_mime_and_ext(bytes: &[u8], requested_format: &str) -> (&'static str, &'static str) {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return ("image/jpeg", "jpg");
+    }
+    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        return ("image/webp", "webp");
+    }
+    match requested_format {
+        "jpg" | "jpeg" => ("image/jpeg", "jpg"),
+        "webp" => ("image/webp", "webp"),
+        _ => ("image/png", "png"),
+    }
+}
+
+fn image_result_path(config: &crate::config::Config, key: &str) -> PathBuf {
+    image_result_dir(config).join(key)
+}
+
+fn image_result_dir(config: &crate::config::Config) -> PathBuf {
+    config
+        .db_path
+        .parent()
+        .map(|path| path.join("image-results"))
+        .unwrap_or_else(|| Path::new("image-results").to_path_buf())
+}
+
+fn is_safe_image_result_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 160
+        && key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+}
+
+fn generate_result_token() -> String {
+    format!(
+        "{}{}",
+        Uuid::new_v4().simple(),
+        Alphanumeric.sample_string(&mut rand::thread_rng(), 24)
+    )
+}
+
+fn json_response(status: StatusCode, value: Value) -> Response {
+    let body = serde_json::to_vec(&value).unwrap_or_else(|_| b"{}".to_vec());
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
+}
+
+fn json_error_response(status: StatusCode, message: &str) -> Response {
+    let mut response = json_response(status, serde_json::json!({ "message": message }));
+    response
+        .headers_mut()
+        .insert("x-share-router-error", HeaderValue::from_static("true"));
+    if let Ok(value) = HeaderValue::from_str(message) {
+        response
+            .headers_mut()
+            .insert("x-share-router-error-reason", value);
     }
     response
 }

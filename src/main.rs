@@ -221,6 +221,16 @@ async fn main() -> Result<()> {
     info!("ssh listener bound on {}", config.ssh_addr);
     state.store.clear_share_model_health_checks().await?;
     info!("cleared previous share model health checks");
+    let failed_image_jobs = state
+        .store
+        .fail_incomplete_image_generation_jobs_on_startup()
+        .await?;
+    if failed_image_jobs > 0 {
+        info!(
+            image_jobs = failed_image_jobs,
+            "marked incomplete image generation jobs failed after startup"
+        );
+    }
 
     let ip_blacklist_log_task = tokio::spawn(async move {
         loop {
@@ -249,11 +259,26 @@ async fn main() -> Result<()> {
                 .await
             {
                 Ok(result) if result.has_changes() => {
+                    for key in &result.expired_image_result_keys {
+                        if is_safe_image_result_key(key) {
+                            let path = image_result_dir(&cleanup_config).join(key);
+                            if let Err(err) = tokio::fs::remove_file(&path).await
+                                && err.kind() != std::io::ErrorKind::NotFound
+                            {
+                                tracing::warn!(
+                                    path = %path.display(),
+                                    error = %err,
+                                    "cleanup failed to remove expired image result"
+                                );
+                            }
+                        }
+                    }
                     info!(
                         leases = result.deleted_leases,
                         shares = result.deleted_shares,
                         installations = result.deleted_installations,
                         routes = result.removed_routes,
+                        image_results = result.expired_image_result_keys.len(),
                         "cleanup removed stale data"
                     );
                 }
@@ -667,6 +692,22 @@ fn try_handle_cli() -> Result<bool> {
         }
         other => anyhow::bail!("unknown command: {other}\n\nRun `{APP_NAME} help` for usage."),
     }
+}
+
+fn image_result_dir(config: &Config) -> PathBuf {
+    config
+        .db_path
+        .parent()
+        .map(|path| path.join("image-results"))
+        .unwrap_or_else(|| PathBuf::from("image-results"))
+}
+
+fn is_safe_image_result_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 160
+        && key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
 }
 
 fn print_help() {

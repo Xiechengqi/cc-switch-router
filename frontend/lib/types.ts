@@ -352,6 +352,31 @@ export type ShareRequestLog = {
   createdAt: number;
 };
 
+export type ImageGenerationJob = {
+  jobId: string;
+  shareId: string;
+  shareName: string;
+  installationId: string;
+  providerId: string;
+  providerName: string;
+  appType: string;
+  model: string;
+  status: "queued" | "running" | "succeeded" | "failed" | "expired" | "cancelled" | string;
+  statusCode?: number;
+  latencyMs: number;
+  queuedAt: number;
+  startedAt?: number;
+  completedAt?: number;
+  expiresAt?: number;
+  promptPreview?: string;
+  errorMessage?: string;
+  resultMimeType?: string;
+  resultSizeBytes?: number;
+  resultStorageKey?: string;
+  createdByEmail?: string;
+  userCountry?: string;
+};
+
 export type ShareUsageDailyBucket = {
   date: string;
   inputTokens: number;
