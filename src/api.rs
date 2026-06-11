@@ -237,6 +237,10 @@ pub fn router(state: ServerState) -> Router {
             "/v1/shares/:share_id/image-request-logs",
             get(list_share_image_generation_request_logs),
         )
+        .route(
+            "/v1/shares/:share_id/image-jobs",
+            get(list_share_image_generation_jobs_compat),
+        )
         .route("/v1/shares/pending-edits", post(pending_share_edits))
         .route("/v1/shares/edit-ack", post(ack_share_edit))
         .route("/v1/shares/edit-events", get(share_edit_events))
@@ -3780,6 +3784,44 @@ struct ImageGenerationRequestLogsResponse {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct ImageGenerationJobsCompatResponse {
+    jobs: Vec<ImageGenerationJobCompatEntry>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageGenerationJobCompatEntry {
+    job_id: String,
+    share_id: String,
+    share_name: String,
+    installation_id: String,
+    provider_id: String,
+    provider_name: String,
+    app_type: String,
+    model: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status_code: Option<u16>,
+    latency_ms: u64,
+    queued_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completed_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result_mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result_size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created_by_email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_country: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct TestRequestEcho {
     method: String,
     url: String,
@@ -3876,6 +3918,45 @@ async fn list_share_image_generation_request_logs(
         .list_image_generation_request_logs_for_share(&share_id, query.limit.unwrap_or(50))
         .await?;
     Ok(Json(ImageGenerationRequestLogsResponse { logs }))
+}
+
+async fn list_share_image_generation_jobs_compat(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(share_id): Path<String>,
+    Query(query): Query<ImageGenerationRequestLogsQuery>,
+) -> Result<Json<ImageGenerationJobsCompatResponse>, AppError> {
+    require_share_image_request_log_view_access(&state, &headers, &share_id).await?;
+
+    let logs = state
+        .store
+        .list_image_generation_request_logs_for_share(&share_id, query.limit.unwrap_or(50))
+        .await?;
+    let jobs = logs
+        .into_iter()
+        .map(|log| ImageGenerationJobCompatEntry {
+            job_id: log.request_id,
+            share_id: log.share_id,
+            share_name: log.share_name,
+            installation_id: log.installation_id,
+            provider_id: log.provider_id,
+            provider_name: log.provider_name,
+            app_type: log.app_type,
+            model: log.model,
+            status: log.status,
+            status_code: log.status_code,
+            latency_ms: log.latency_ms,
+            queued_at: log.created_at,
+            completed_at: log.completed_at,
+            prompt_preview: log.prompt_preview,
+            error_message: log.error_message,
+            result_mime_type: log.result_mime_type,
+            result_size_bytes: log.result_size_bytes,
+            created_by_email: log.created_by_email,
+            user_country: log.user_country,
+        })
+        .collect();
+    Ok(Json(ImageGenerationJobsCompatResponse { jobs }))
 }
 
 async fn require_share_image_request_log_view_access(
