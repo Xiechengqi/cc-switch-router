@@ -748,8 +748,8 @@ pub struct ShareRequestLogEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ImageGenerationJobEntry {
-    pub job_id: String,
+pub struct ImageGenerationRequestLogEntry {
+    pub request_id: String,
     pub share_id: String,
     pub share_name: String,
     pub installation_id: String,
@@ -761,13 +761,9 @@ pub struct ImageGenerationJobEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_code: Option<u16>,
     pub latency_ms: u64,
-    pub queued_at: i64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub started_at: Option<i64>,
+    pub created_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_preview: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -776,8 +772,6 @@ pub struct ImageGenerationJobEntry {
     pub result_mime_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_size_bytes: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result_storage_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by_email: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

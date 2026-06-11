@@ -41,24 +41,25 @@ use crate::models::{
     ClientTunnelClaimRequest, ClientTunnelQuery, ClientTunnelResponse, ClientTunnelUpdateRequest,
     DashboardMarketRequestLogView, DashboardPresenceRequest, DashboardPresenceResponse,
     DashboardResponse, DashboardTickerShare, GatewayRegistryRecord, GetInstallationOwnerEmailQuery,
-    GetInstallationOwnerEmailResponse, HealthResponse, ImageGenerationJobEntry, IssueLeaseRequest,
-    IssueLeaseResponse, MarketDisabledSharesUpdateRequest, MarketDisabledSharesUpdateResponse,
-    MarketMaintenanceUpdateRequest, MarketMaintenanceUpdateResponse,
-    MarketNotificationEmailLogView, MarketNotificationEmailRequest,
-    MarketNotificationEmailResponse, MarketRequestLogBatchSyncRequest,
-    MarketShareRuntimeStateReleaseRequest, MarketShareRuntimeStateReleaseResponse,
-    MarketShareRuntimeStateSyncRequest, MarketShareRuntimeStateSyncResponse, MarketShareView,
-    MarketsResponse, PostBoardMessageRequest, PublicMapPointsResponse, RefreshSessionRequest,
-    RegisterGatewayRequest, RegisterGatewayResponse, RegisterInstallationRequest,
-    RegisterInstallationResponse, RegisterMarketRequest, RequestEmailCodeRequest,
-    RequestEmailCodeResponse, SessionStatusResponse, ShareApiAuthResponse, ShareApiAuthUser,
-    ShareApiContextResponse, ShareApiShareResponse, ShareBatchSyncRequest,
-    ShareClaimSubdomainRequest, ShareDeleteRequest, ShareEditAckRequest, ShareEditAvailableEvent,
-    ShareEditEventSignaturePayload, ShareHeartbeatRequest, ShareMarketGrantRequest,
-    ShareMarketGrantResponse, ShareMarketGrantStatusResponse, SharePendingEditsRequest,
-    ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRuntimeRefreshRequest,
-    ShareSettingsPatch, ShareSettingsUpdateRequest, ShareSyncRequest, UserApiTokenResetResponse,
-    UserApiTokenResponse, UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    GetInstallationOwnerEmailResponse, HealthResponse, ImageGenerationRequestLogEntry,
+    IssueLeaseRequest, IssueLeaseResponse, MarketDisabledSharesUpdateRequest,
+    MarketDisabledSharesUpdateResponse, MarketMaintenanceUpdateRequest,
+    MarketMaintenanceUpdateResponse, MarketNotificationEmailLogView,
+    MarketNotificationEmailRequest, MarketNotificationEmailResponse,
+    MarketRequestLogBatchSyncRequest, MarketShareRuntimeStateReleaseRequest,
+    MarketShareRuntimeStateReleaseResponse, MarketShareRuntimeStateSyncRequest,
+    MarketShareRuntimeStateSyncResponse, MarketShareView, MarketsResponse, PostBoardMessageRequest,
+    PublicMapPointsResponse, RefreshSessionRequest, RegisterGatewayRequest,
+    RegisterGatewayResponse, RegisterInstallationRequest, RegisterInstallationResponse,
+    RegisterMarketRequest, RequestEmailCodeRequest, RequestEmailCodeResponse,
+    SessionStatusResponse, ShareApiAuthResponse, ShareApiAuthUser, ShareApiContextResponse,
+    ShareApiShareResponse, ShareBatchSyncRequest, ShareClaimSubdomainRequest, ShareDeleteRequest,
+    ShareEditAckRequest, ShareEditAvailableEvent, ShareEditEventSignaturePayload,
+    ShareHeartbeatRequest, ShareMarketGrantRequest, ShareMarketGrantResponse,
+    ShareMarketGrantStatusResponse, SharePendingEditsRequest, ShareRequestLogBatchSyncRequest,
+    ShareRequestLogEntry, ShareRuntimeRefreshRequest, ShareSettingsPatch,
+    ShareSettingsUpdateRequest, ShareSyncRequest, UserApiTokenResetResponse, UserApiTokenResponse,
+    UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 use crate::proxy::{gateway_proxy_handler, market_proxy_handler, proxy_handler};
 use crate::recent_traffic::{RecentRequestEvent, RecentTrafficSnapshot};
@@ -233,12 +234,8 @@ pub fn router(state: ServerState) -> Router {
             post(test_share_connection),
         )
         .route(
-            "/v1/shares/:share_id/image-jobs",
-            get(list_share_image_generation_jobs),
-        )
-        .route(
-            "/v1/shares/:share_id/image-jobs/:job_id/result",
-            get(get_share_image_generation_job_result),
+            "/v1/shares/:share_id/image-request-logs",
+            get(list_share_image_generation_request_logs),
         )
         .route("/v1/shares/pending-edits", post(pending_share_edits))
         .route("/v1/shares/edit-ack", post(ack_share_edit))
@@ -3770,15 +3767,15 @@ struct ShareConnectionTestResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct ImageGenerationJobsQuery {
+struct ImageGenerationRequestLogsQuery {
     #[serde(default)]
     limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ImageGenerationJobsResponse {
-    jobs: Vec<ImageGenerationJobEntry>,
+struct ImageGenerationRequestLogsResponse {
+    logs: Vec<ImageGenerationRequestLogEntry>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3866,69 +3863,22 @@ fn share_codex_image_generation_enabled(share: &ShareForTest) -> bool {
     })
 }
 
-async fn list_share_image_generation_jobs(
+async fn list_share_image_generation_request_logs(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Path(share_id): Path<String>,
-    Query(query): Query<ImageGenerationJobsQuery>,
-) -> Result<Json<ImageGenerationJobsResponse>, AppError> {
-    require_share_image_job_view_access(&state, &headers, &share_id).await?;
+    Query(query): Query<ImageGenerationRequestLogsQuery>,
+) -> Result<Json<ImageGenerationRequestLogsResponse>, AppError> {
+    require_share_image_request_log_view_access(&state, &headers, &share_id).await?;
 
-    let jobs = state
+    let logs = state
         .store
-        .list_image_generation_jobs_for_share(&share_id, query.limit.unwrap_or(50))
+        .list_image_generation_request_logs_for_share(&share_id, query.limit.unwrap_or(50))
         .await?;
-    Ok(Json(ImageGenerationJobsResponse { jobs }))
+    Ok(Json(ImageGenerationRequestLogsResponse { logs }))
 }
 
-async fn get_share_image_generation_job_result(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Path((share_id, job_id)): Path<(String, String)>,
-) -> Result<Response, AppError> {
-    require_share_image_job_view_access(&state, &headers, &share_id).await?;
-    let job = state
-        .store
-        .get_image_generation_job(&job_id)
-        .await?
-        .ok_or_else(|| AppError::NotFound("image job not found".into()))?;
-    if job.share_id != share_id {
-        return Err(AppError::NotFound("image job not found".into()));
-    }
-    if job.status != "succeeded" {
-        return Err(AppError::Conflict("image job result is not ready".into()));
-    }
-    if job
-        .expires_at
-        .map(|expires_at| expires_at < chrono::Utc::now().timestamp())
-        .unwrap_or(true)
-    {
-        return Err(AppError::NotFound("image job result expired".into()));
-    }
-    let key = job
-        .result_storage_key
-        .as_deref()
-        .filter(|key| is_safe_image_result_key(key))
-        .ok_or_else(|| AppError::NotFound("image result not found".into()))?;
-    let path = image_result_path(&state.config, key);
-    let bytes = tokio::fs::read(&path)
-        .await
-        .map_err(|_| AppError::NotFound("image result not found".into()))?;
-    let mut response = Response::new(Body::from(bytes));
-    *response.status_mut() = StatusCode::OK;
-    if let Some(mime) = job.result_mime_type.as_deref()
-        && let Ok(value) = HeaderValue::from_str(mime)
-    {
-        response.headers_mut().insert(header::CONTENT_TYPE, value);
-    }
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("private, max-age=300"),
-    );
-    Ok(response)
-}
-
-async fn require_share_image_job_view_access(
+async fn require_share_image_request_log_view_access(
     state: &ServerState,
     headers: &HeaderMap,
     share_id: &str,
@@ -3949,27 +3899,10 @@ async fn require_share_image_job_view_access(
 
     if !is_admin && !is_owner && !is_shared_with {
         return Err(AppError::Forbidden(
-            "only the share owner, invited users, or admins can view image jobs".into(),
+            "only the share owner, invited users, or admins can view image request logs".into(),
         ));
     }
     Ok(())
-}
-
-fn image_result_path(config: &crate::config::Config, key: &str) -> std::path::PathBuf {
-    config
-        .db_path
-        .parent()
-        .map(|path| path.join("image-results"))
-        .unwrap_or_else(|| std::path::PathBuf::from("image-results"))
-        .join(key)
-}
-
-fn is_safe_image_result_key(key: &str) -> bool {
-    !key.is_empty()
-        && key.len() <= 160
-        && key
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
 }
 
 async fn test_share_connection(

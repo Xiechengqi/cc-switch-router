@@ -13,7 +13,7 @@ import type {
   ShareEditView,
   ShareConnectionTestRequest,
   ShareConnectionTestResponse,
-  ImageGenerationJob,
+  ImageGenerationRequestLog,
   ShareUsageByEmailResponse,
   UserApiTokenResponse,
   UserApiTokenResetResponse,
@@ -314,15 +314,15 @@ export async function testShareConnection(
   );
 }
 
-export async function getShareImageGenerationJobs(
+export async function getShareImageGenerationRequestLogs(
   shareId: string,
   limit = 50,
-): Promise<ImageGenerationJob[]> {
+): Promise<ImageGenerationRequestLog[]> {
   const params = new URLSearchParams({ limit: String(limit) });
-  const data = await parseJson<{ jobs: ImageGenerationJob[] }>(
-    await authFetch(`/v1/shares/${encodeURIComponent(shareId)}/image-jobs?${params}`, {
+  const data = await parseJson<{ logs: ImageGenerationRequestLog[] }>(
+    await authFetch(`/v1/shares/${encodeURIComponent(shareId)}/image-request-logs?${params}`, {
       cache: "no-store",
     }),
   );
-  return data.jobs || [];
+  return data.logs || [];
 }

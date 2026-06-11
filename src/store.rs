@@ -30,7 +30,7 @@ use crate::models::{
     DashboardMap, DashboardMapPoint, DashboardMarketRequestLogView, DashboardMarketView,
     DashboardPresenceRequest, DashboardResponse, DashboardStats, DashboardTickerShare,
     GatewayRegistryRecord, GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse,
-    HealthCheckEntry, HealthTimelineBucket, ImageGenerationJobEntry, Installation,
+    HealthCheckEntry, HealthTimelineBucket, ImageGenerationRequestLogEntry, Installation,
     InstallationView, IssueLeaseRequest, IssueLeaseResponse, LatLonPoint, MarketAppAvailability,
     MarketAppAvailabilityEntry, MarketDisabledSharesUpdateRequest,
     MarketDisabledSharesUpdateResponse, MarketLinkedShareView, MarketMaintenanceUpdateRequest,
@@ -151,8 +151,8 @@ pub struct ShareForTest {
 }
 
 #[derive(Debug, Clone)]
-pub struct NewImageGenerationJob {
-    pub job_id: String,
+pub struct NewImageGenerationRequestLog {
+    pub request_id: String,
     pub share_id: String,
     pub installation_id: String,
     pub share_name: String,
@@ -160,12 +160,18 @@ pub struct NewImageGenerationJob {
     pub provider_name: String,
     pub app_type: String,
     pub model: String,
-    pub queued_at: i64,
+    pub status: String,
+    pub status_code: Option<u16>,
+    pub latency_ms: u64,
+    pub created_at: i64,
+    pub completed_at: Option<i64>,
     pub prompt_preview: Option<String>,
+    pub error_message: Option<String>,
+    pub result_mime_type: Option<String>,
+    pub result_size_bytes: Option<u64>,
     pub created_by_email: Option<String>,
     pub client_ip: Option<String>,
     pub user_country: Option<String>,
-    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -213,7 +219,6 @@ pub struct CleanupResult {
     pub deleted_shares: usize,
     pub deleted_installations: usize,
     pub removed_routes: usize,
-    pub expired_image_result_keys: Vec<String>,
 }
 
 impl CleanupResult {
@@ -222,7 +227,6 @@ impl CleanupResult {
             || self.deleted_shares > 0
             || self.deleted_installations > 0
             || self.removed_routes > 0
-            || !self.expired_image_result_keys.is_empty()
     }
 }
 
@@ -1221,228 +1225,82 @@ impl AppStore {
         }))
     }
 
-    pub async fn count_active_image_generation_jobs_for_share(
+    pub async fn record_image_generation_request_log(
         &self,
-        share_id: &str,
-    ) -> Result<(usize, usize), AppError> {
-        let conn = self.conn.lock().await;
-        let running: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM image_generation_jobs
-                 WHERE share_id = ?1 AND status = 'running'",
-                params![share_id],
-                |row| row.get(0),
-            )
-            .map_err(|e| AppError::Internal(format!("count running image jobs failed: {e}")))?;
-        let active: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM image_generation_jobs
-                 WHERE share_id = ?1 AND status IN ('queued', 'running')",
-                params![share_id],
-                |row| row.get(0),
-            )
-            .map_err(|e| AppError::Internal(format!("count active image jobs failed: {e}")))?;
-        Ok((running.max(0) as usize, active.max(0) as usize))
-    }
-
-    pub async fn fail_incomplete_image_generation_jobs_on_startup(
-        &self,
-    ) -> Result<usize, AppError> {
-        let conn = self.conn.lock().await;
-        let now = Utc::now().timestamp();
-        let updated = conn
-            .execute(
-                "UPDATE image_generation_jobs
-                 SET status = 'failed',
-                     completed_at = ?1,
-                     error_message = 'router restarted before image generation completed'
-                 WHERE status IN ('queued', 'running')",
-                params![now],
-            )
-            .map_err(|e| {
-                AppError::Internal(format!("fail incomplete startup image jobs failed: {e}"))
-            })?;
-        Ok(updated)
-    }
-
-    pub async fn create_image_generation_job(
-        &self,
-        job: NewImageGenerationJob,
-    ) -> Result<ImageGenerationJobEntry, AppError> {
+        log: NewImageGenerationRequestLog,
+    ) -> Result<(), AppError> {
         let conn = self.conn.lock().await;
         conn.execute(
-            "INSERT INTO image_generation_jobs (
-                job_id, share_id, installation_id, share_name, provider_id, provider_name,
-                app_type, model, status, latency_ms, queued_at, prompt_preview,
-                created_by_email, client_ip, user_country, idempotency_key
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', 0, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT INTO image_generation_request_logs (
+                request_id, share_id, installation_id, share_name, provider_id, provider_name,
+                app_type, model, status, status_code, latency_ms, created_at, completed_at,
+                prompt_preview, error_message, result_mime_type, result_size_bytes,
+                created_by_email, client_ip, user_country
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+             ON CONFLICT(request_id) DO UPDATE SET
+                status = excluded.status,
+                status_code = excluded.status_code,
+                latency_ms = excluded.latency_ms,
+                completed_at = excluded.completed_at,
+                error_message = excluded.error_message,
+                result_mime_type = excluded.result_mime_type,
+                result_size_bytes = excluded.result_size_bytes",
             params![
-                job.job_id,
-                job.share_id,
-                job.installation_id,
-                job.share_name,
-                job.provider_id,
-                job.provider_name,
-                job.app_type,
-                job.model,
-                job.queued_at,
-                job.prompt_preview,
-                job.created_by_email,
-                job.client_ip,
-                job.user_country,
-                job.idempotency_key,
+                log.request_id,
+                log.share_id,
+                log.installation_id,
+                log.share_name,
+                log.provider_id,
+                log.provider_name,
+                log.app_type,
+                log.model,
+                log.status,
+                log.status_code.map(i64::from),
+                log.latency_ms as i64,
+                log.created_at,
+                log.completed_at,
+                log.prompt_preview,
+                log.error_message
+                    .as_deref()
+                    .map(|value| truncate_error(value, 1000)),
+                log.result_mime_type,
+                log.result_size_bytes.map(|value| value as i64),
+                log.created_by_email,
+                log.client_ip,
+                log.user_country,
             ],
         )
-        .map_err(|e| AppError::Internal(format!("create image generation job failed: {e}")))?;
-        get_image_generation_job_tx(&conn, &job.job_id)?
-            .ok_or_else(|| AppError::Internal("created image generation job missing".into()))
+        .map_err(|e| AppError::Internal(format!("record image request log failed: {e}")))?;
+        Ok(())
     }
 
-    pub async fn get_image_generation_job(
-        &self,
-        job_id: &str,
-    ) -> Result<Option<ImageGenerationJobEntry>, AppError> {
-        let conn = self.conn.lock().await;
-        get_image_generation_job_tx(&conn, job_id)
-    }
-
-    pub async fn get_image_generation_job_for_result(
-        &self,
-        job_id: &str,
-        result_token: &str,
-    ) -> Result<Option<ImageGenerationJobEntry>, AppError> {
-        let conn = self.conn.lock().await;
-        let token_hash = hash_token(result_token);
-        conn.query_row(
-            "SELECT job_id, share_id, share_name, installation_id, provider_id, provider_name,
-                    app_type, model, status, status_code, latency_ms, queued_at, started_at,
-                    completed_at, expires_at, prompt_preview, error_message, result_mime_type,
-                    result_size_bytes, result_storage_key, created_by_email, user_country
-             FROM image_generation_jobs
-             WHERE job_id = ?1 AND result_token_hash = ?2",
-            params![job_id, token_hash],
-            map_image_generation_job_row,
-        )
-        .optional()
-        .map_err(|e| AppError::Internal(format!("query image generation result job failed: {e}")))
-    }
-
-    pub async fn list_image_generation_jobs_for_share(
+    pub async fn list_image_generation_request_logs_for_share(
         &self,
         share_id: &str,
         limit: usize,
-    ) -> Result<Vec<ImageGenerationJobEntry>, AppError> {
+    ) -> Result<Vec<ImageGenerationRequestLogEntry>, AppError> {
         let conn = self.conn.lock().await;
         let mut stmt = conn
             .prepare(
-                "SELECT job_id, share_id, share_name, installation_id, provider_id, provider_name,
-                        app_type, model, status, status_code, latency_ms, queued_at, started_at,
-                        completed_at, expires_at, prompt_preview, error_message, result_mime_type,
-                        result_size_bytes, result_storage_key, created_by_email, user_country
-                 FROM image_generation_jobs
+                "SELECT request_id, share_id, share_name, installation_id, provider_id, provider_name,
+                        app_type, model, status, status_code, latency_ms, created_at, completed_at,
+                        prompt_preview, error_message, result_mime_type, result_size_bytes,
+                        created_by_email, user_country
+                 FROM image_generation_request_logs
                  WHERE share_id = ?1
-                 ORDER BY queued_at DESC
+                 ORDER BY created_at DESC
                  LIMIT ?2",
             )
-            .map_err(|e| AppError::Internal(format!("prepare image jobs list failed: {e}")))?;
+            .map_err(|e| AppError::Internal(format!("prepare image request logs list failed: {e}")))?;
         let rows = stmt
             .query_map(
                 params![share_id, limit.min(200) as i64],
-                map_image_generation_job_row,
+                map_image_generation_request_log_row,
             )
-            .map_err(|e| AppError::Internal(format!("query image jobs list failed: {e}")))?;
+            .map_err(|e| {
+                AppError::Internal(format!("query image request logs list failed: {e}"))
+            })?;
         collect_rows(rows)
-    }
-
-    pub async fn mark_image_generation_job_running(&self, job_id: &str) -> Result<bool, AppError> {
-        let conn = self.conn.lock().await;
-        let now = Utc::now().timestamp();
-        let updated = conn
-            .execute(
-                "UPDATE image_generation_jobs
-             SET status = 'running', started_at = COALESCE(started_at, ?2)
-             WHERE job_id = ?1
-               AND status = 'queued'
-               AND NOT EXISTS (
-                   SELECT 1 FROM image_generation_jobs running
-                   WHERE running.share_id = image_generation_jobs.share_id
-                     AND running.status = 'running'
-               )",
-                params![job_id, now],
-            )
-            .map_err(|e| AppError::Internal(format!("mark image job running failed: {e}")))?;
-        Ok(updated > 0)
-    }
-
-    pub async fn complete_image_generation_job(
-        &self,
-        job_id: &str,
-        status_code: u16,
-        latency_ms: u64,
-        result_mime_type: &str,
-        result_size_bytes: u64,
-        result_storage_key: &str,
-        result_token: &str,
-        expires_at: i64,
-    ) -> Result<(), AppError> {
-        let conn = self.conn.lock().await;
-        let now = Utc::now().timestamp();
-        conn.execute(
-            "UPDATE image_generation_jobs
-             SET status = 'succeeded',
-                 status_code = ?2,
-                 latency_ms = ?3,
-                 completed_at = ?4,
-                 expires_at = ?5,
-                 result_mime_type = ?6,
-                 result_size_bytes = ?7,
-                 result_storage_key = ?8,
-                 result_token_hash = ?9,
-                 error_message = NULL
-             WHERE job_id = ?1",
-            params![
-                job_id,
-                i64::from(status_code),
-                latency_ms as i64,
-                now,
-                expires_at,
-                result_mime_type,
-                result_size_bytes as i64,
-                result_storage_key,
-                hash_token(result_token),
-            ],
-        )
-        .map_err(|e| AppError::Internal(format!("complete image job failed: {e}")))?;
-        Ok(())
-    }
-
-    pub async fn fail_image_generation_job(
-        &self,
-        job_id: &str,
-        status_code: Option<u16>,
-        latency_ms: u64,
-        error_message: &str,
-    ) -> Result<(), AppError> {
-        let conn = self.conn.lock().await;
-        let now = Utc::now().timestamp();
-        conn.execute(
-            "UPDATE image_generation_jobs
-             SET status = 'failed',
-                 status_code = ?2,
-                 latency_ms = ?3,
-                 completed_at = ?4,
-                 error_message = ?5
-             WHERE job_id = ?1",
-            params![
-                job_id,
-                status_code.map(i64::from),
-                latency_ms as i64,
-                now,
-                truncate_error(error_message, 1000),
-            ],
-        )
-        .map_err(|e| AppError::Internal(format!("fail image job failed: {e}")))?;
-        Ok(())
     }
 
     pub async fn list_user_shares(
@@ -3733,50 +3591,18 @@ impl AppStore {
                     AppError::Internal(format!("delete stale request logs failed: {e}"))
                 })?;
 
-            let now_ts = Utc::now().timestamp();
-            let expired_image_result_keys = {
-                let mut stmt = tx
-                    .prepare(
-                        "SELECT result_storage_key
-                         FROM image_generation_jobs
-                         WHERE status = 'succeeded'
-                           AND expires_at IS NOT NULL
-                           AND expires_at < ?1
-                           AND result_storage_key IS NOT NULL
-                           AND result_storage_key != ''",
-                    )
-                    .map_err(|e| {
-                        AppError::Internal(format!("prepare expired image jobs failed: {e}"))
-                    })?;
-                let rows = stmt
-                    .query_map(params![now_ts], |row| row.get::<_, String>(0))
-                    .map_err(|e| {
-                        AppError::Internal(format!("query expired image jobs failed: {e}"))
-                    })?;
-                collect_rows(rows)?
-            };
             tx.execute(
-                "UPDATE image_generation_jobs
-                 SET status = 'expired',
-                     result_token_hash = NULL,
-                     result_storage_key = NULL
-                 WHERE status = 'succeeded'
-                   AND expires_at IS NOT NULL
-                   AND expires_at < ?1",
-                params![now_ts],
-            )
-            .map_err(|e| AppError::Internal(format!("mark expired image jobs failed: {e}")))?;
-            tx.execute(
-                "DELETE FROM image_generation_jobs
-                 WHERE queued_at < ?1
-                   AND status IN ('failed', 'expired', 'cancelled')",
+                "DELETE FROM image_generation_request_logs
+                 WHERE created_at < ?1",
                 params![
                     DateTime::parse_from_rfc3339(&cutoff)
                         .map(|dt| dt.timestamp())
                         .unwrap_or_default()
                 ],
             )
-            .map_err(|e| AppError::Internal(format!("delete stale image jobs failed: {e}")))?;
+            .map_err(|e| {
+                AppError::Internal(format!("delete stale image request logs failed: {e}"))
+            })?;
 
             tx.execute(
                 "DELETE FROM request_nonces
@@ -3854,7 +3680,6 @@ impl AppStore {
                         + deleted_old_shares,
                     deleted_installations,
                     removed_routes: 0,
-                    expired_image_result_keys,
                 },
                 stale_subdomains,
             )
@@ -6528,6 +6353,29 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             idempotency_key TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS image_generation_request_logs (
+            request_id TEXT PRIMARY KEY,
+            share_id TEXT NOT NULL,
+            installation_id TEXT NOT NULL,
+            share_name TEXT NOT NULL,
+            provider_id TEXT NOT NULL,
+            provider_name TEXT NOT NULL,
+            app_type TEXT NOT NULL,
+            model TEXT NOT NULL,
+            status TEXT NOT NULL,
+            status_code INTEGER,
+            latency_ms INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            completed_at INTEGER,
+            prompt_preview TEXT,
+            error_message TEXT,
+            result_mime_type TEXT,
+            result_size_bytes INTEGER,
+            created_by_email TEXT,
+            client_ip TEXT,
+            user_country TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS share_health_checks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             share_id TEXT NOT NULL,
@@ -6786,6 +6634,9 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         CREATE INDEX IF NOT EXISTS idx_image_jobs_installation_queued ON image_generation_jobs(installation_id, queued_at DESC);
         CREATE INDEX IF NOT EXISTS idx_image_jobs_status_queued ON image_generation_jobs(status, queued_at DESC);
         CREATE INDEX IF NOT EXISTS idx_image_jobs_expires ON image_generation_jobs(expires_at);
+        CREATE INDEX IF NOT EXISTS idx_image_request_logs_share_created ON image_generation_request_logs(share_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_image_request_logs_provider_created ON image_generation_request_logs(provider_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_image_request_logs_status_created ON image_generation_request_logs(status, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_share_health_checks ON share_health_checks(share_id, checked_at DESC);
         CREATE INDEX IF NOT EXISTS idx_share_model_health_checks_share ON share_model_health_checks(share_id, app_type, requested_model, checked_at DESC);
         CREATE INDEX IF NOT EXISTS idx_share_model_health_state_share ON share_model_health_state(share_id, app_type, last_status);
@@ -9498,27 +9349,11 @@ fn list_recent_share_request_logs(
     Ok(deduplicate_recent_share_request_logs(logs))
 }
 
-fn get_image_generation_job_tx(
-    conn: &Connection,
-    job_id: &str,
-) -> Result<Option<ImageGenerationJobEntry>, AppError> {
-    conn.query_row(
-        "SELECT job_id, share_id, share_name, installation_id, provider_id, provider_name,
-                app_type, model, status, status_code, latency_ms, queued_at, started_at,
-                completed_at, expires_at, prompt_preview, error_message, result_mime_type,
-                result_size_bytes, result_storage_key, created_by_email, user_country
-         FROM image_generation_jobs
-         WHERE job_id = ?1",
-        params![job_id],
-        map_image_generation_job_row,
-    )
-    .optional()
-    .map_err(|e| AppError::Internal(format!("query image generation job failed: {e}")))
-}
-
-fn map_image_generation_job_row(row: &Row<'_>) -> Result<ImageGenerationJobEntry, rusqlite::Error> {
-    Ok(ImageGenerationJobEntry {
-        job_id: row.get(0)?,
+fn map_image_generation_request_log_row(
+    row: &Row<'_>,
+) -> Result<ImageGenerationRequestLogEntry, rusqlite::Error> {
+    Ok(ImageGenerationRequestLogEntry {
+        request_id: row.get(0)?,
         share_id: row.get(1)?,
         share_name: row.get(2)?,
         installation_id: row.get(3)?,
@@ -9529,19 +9364,16 @@ fn map_image_generation_job_row(row: &Row<'_>) -> Result<ImageGenerationJobEntry
         status: row.get(8)?,
         status_code: row.get::<_, Option<i64>>(9)?.map(|value| value as u16),
         latency_ms: row.get::<_, i64>(10)?.max(0) as u64,
-        queued_at: row.get(11)?,
-        started_at: row.get(12)?,
-        completed_at: row.get(13)?,
-        expires_at: row.get(14)?,
-        prompt_preview: row.get(15)?,
-        error_message: row.get(16)?,
-        result_mime_type: row.get(17)?,
+        created_at: row.get(11)?,
+        completed_at: row.get(12)?,
+        prompt_preview: row.get(13)?,
+        error_message: row.get(14)?,
+        result_mime_type: row.get(15)?,
         result_size_bytes: row
-            .get::<_, Option<i64>>(18)?
+            .get::<_, Option<i64>>(16)?
             .map(|value| value.max(0) as u64),
-        result_storage_key: row.get(19)?,
-        created_by_email: row.get(20)?,
-        user_country: row.get(21)?,
+        created_by_email: row.get(17)?,
+        user_country: row.get(18)?,
     })
 }
 

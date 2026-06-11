@@ -1,15 +1,14 @@
 "use client";
 
-import { Copy, Eye, ExternalLink, Link2, Loader2, Maximize2, Pencil, RotateCcw, Save, Crown, X } from "lucide-react";
+import { Eye, ExternalLink, Link2, Loader2, Maximize2, Pencil, RotateCcw, Save, Crown, X } from "lucide-react";
 import { Button, Card, Checkbox, Chip, Drawer, Input, ListBox, Modal, ProgressBar, Select, Tabs, TextArea } from "@heroui/react";
 import * as React from "react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog";
-import { getMarketLinkedShares, getShareImageGenerationJobs, getShareUsageByEmail, releaseMarketShareState, updateMarketDisabledShares, updateMarketMaintenance, updateShareSettings } from "@/lib/api";
-import { authFetch } from "@/lib/auth";
+import { getMarketLinkedShares, getShareImageGenerationRequestLogs, getShareUsageByEmail, releaseMarketShareState, updateMarketDisabledShares, updateMarketMaintenance, updateShareSettings } from "@/lib/api";
 import type { AppLocale } from "@/lib/i18n";
-import type { DashboardClient, DashboardMarket, HealthCheckEntry, HealthTimelineBucket, ImageGenerationJob, MarketAppAvailabilityEntry, MarketRequestLog, MarketShare, MarketShareRuntimeState, ModelHealthSummary, ShareAccessByApp, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareModelHealthCheck, ShareRequestLog, ShareSettingsPatch, ShareUpstreamProvider, ShareUsageByEmailResponse, ShareView } from "@/lib/types";
+import type { DashboardClient, DashboardMarket, HealthCheckEntry, HealthTimelineBucket, ImageGenerationRequestLog, MarketAppAvailabilityEntry, MarketRequestLog, MarketShare, MarketShareRuntimeState, ModelHealthSummary, ShareAccessByApp, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareModelHealthCheck, ShareRequestLog, ShareSettingsPatch, ShareUpstreamProvider, ShareUsageByEmailResponse, ShareView } from "@/lib/types";
 import { cn, compactTokens, formatDateTime, formatNumber, formatRelativeTime } from "@/lib/utils";
 
 function shouldOpenRowDrawer(event: React.MouseEvent<HTMLElement>) {
@@ -3607,7 +3606,7 @@ function ShareProviderRequestsPanel({
       {selectedKey === "text" ? (
         <ShareRequestLogs logs={textLogs} />
       ) : app === "codex" ? (
-        <ShareImageJobLogs shareId={share.shareId} />
+        <ShareImageRequestLogs shareId={share.shareId} />
       ) : (
         <EmptyBlock>{t("dashboard.noImageJobs")}</EmptyBlock>
       )}
@@ -3615,9 +3614,9 @@ function ShareProviderRequestsPanel({
   );
 }
 
-function ShareImageJobLogs({ shareId }: { shareId: string }) {
+function ShareImageRequestLogs({ shareId }: { shareId: string }) {
   const { locale, t } = useLocaleText();
-  const [jobs, setJobs] = React.useState<ImageGenerationJob[]>([]);
+  const [logs, setLogs] = React.useState<ImageGenerationRequestLog[]>([]);
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState("");
 
@@ -3625,13 +3624,13 @@ function ShareImageJobLogs({ shareId }: { shareId: string }) {
     let cancelled = false;
     setLoading(true);
     setError("");
-    getShareImageGenerationJobs(shareId, 50)
-      .then((nextJobs) => {
-        if (!cancelled) setJobs(nextJobs);
+    getShareImageGenerationRequestLogs(shareId, 50)
+      .then((nextLogs) => {
+        if (!cancelled) setLogs(nextLogs);
       })
       .catch((err) => {
         if (!cancelled) {
-          setJobs([]);
+          setLogs([]);
           setError(err instanceof Error ? err.message : String(err));
         }
       })
@@ -3645,111 +3644,45 @@ function ShareImageJobLogs({ shareId }: { shareId: string }) {
 
   if (loading) return <EmptyBlock>{t("dashboard.usageEmail.loading")}</EmptyBlock>;
   if (error) return <EmptyBlock>{error}</EmptyBlock>;
-  if (!jobs.length) return <EmptyBlock>{t("dashboard.noImageJobs")}</EmptyBlock>;
+  if (!logs.length) return <EmptyBlock>{t("dashboard.noImageJobs")}</EmptyBlock>;
 
   return (
     <div className="grid gap-2">
-      {jobs.slice(0, 20).map((job) => {
-        const ok = job.status === "succeeded";
-        const failed = job.status === "failed" || job.status === "expired" || job.status === "cancelled";
-        const resultUrl = job.resultUrl || (ok ? `/v1/shares/${encodeURIComponent(shareId)}/image-jobs/${encodeURIComponent(job.jobId)}/result` : "");
+      {logs.slice(0, 20).map((log) => {
+        const ok = log.status === "succeeded";
+        const failed = log.status === "failed";
         return (
-          <Card key={job.jobId} className="rounded-lg border p-0 shadow-none">
+          <Card key={log.requestId} className="rounded-lg border p-0 shadow-none">
             <Card.Content className="gap-3 p-3">
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
                   <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
-                    <span className="truncate font-medium">{job.model || "-"}</span>
-                    <span className="font-mono text-[11px] text-muted-foreground">{job.jobId}</span>
+                    <span className="truncate font-medium">{log.model || "-"}</span>
+                    <span className="font-mono text-[11px] text-muted-foreground">{log.requestId}</span>
                   </div>
                   <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
-                    {job.createdByEmail ? <span>{job.createdByEmail}</span> : null}
-                    <span>{job.providerName || job.providerId || "-"}</span>
-                    <span title={formatDateTime(job.queuedAt * 1000)}>queued {formatRelativeTime(job.queuedAt * 1000, locale)}</span>
-                    {job.startedAt ? <span title={formatDateTime(job.startedAt * 1000)}>started {formatRelativeTime(job.startedAt * 1000, locale)}</span> : null}
-                    {job.completedAt ? <span title={formatDateTime(job.completedAt * 1000)}>done {formatRelativeTime(job.completedAt * 1000, locale)}</span> : null}
-                    {job.expiresAt ? <span title={formatDateTime(job.expiresAt * 1000)}>expires {formatRelativeTime(job.expiresAt * 1000, locale)}</span> : null}
-                    {job.resultMimeType ? <span>{job.resultMimeType}</span> : null}
-                    {typeof job.resultSizeBytes === "number" ? <span>{formatNumber(job.resultSizeBytes)} B</span> : null}
+                    {log.createdByEmail ? <span>{log.createdByEmail}</span> : null}
+                    <span>{log.providerName || log.providerId || "-"}</span>
+                    <span title={formatDateTime(log.createdAt * 1000)}>created {formatRelativeTime(log.createdAt * 1000, locale)}</span>
+                    {log.completedAt ? <span title={formatDateTime(log.completedAt * 1000)}>done {formatRelativeTime(log.completedAt * 1000, locale)}</span> : null}
+                    {log.resultMimeType ? <span>{log.resultMimeType}</span> : null}
+                    {typeof log.resultSizeBytes === "number" ? <span>{formatNumber(log.resultSizeBytes)} B</span> : null}
+                    {log.userCountry ? <span>{log.userCountry}</span> : null}
                   </div>
                 </div>
                 <div className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground">
-                  <Chip color={ok ? "success" : failed ? "danger" : "warning"} size="sm" variant="soft">{job.status}</Chip>
-                  {typeof job.statusCode === "number" ? <Chip color={job.statusCode >= 200 && job.statusCode < 400 ? "success" : "danger"} size="sm" variant="soft">{job.statusCode}</Chip> : null}
-                  {job.latencyMs ? <span>{job.latencyMs}ms</span> : null}
+                  <Chip color={ok ? "success" : failed ? "danger" : "warning"} size="sm" variant="soft">{log.status}</Chip>
+                  {typeof log.statusCode === "number" ? <Chip color={log.statusCode >= 200 && log.statusCode < 400 ? "success" : "danger"} size="sm" variant="soft">{log.statusCode}</Chip> : null}
+                  {log.latencyMs ? <span>{log.latencyMs}ms</span> : null}
                 </div>
               </div>
-              {resultUrl ? (
-                <div className="grid gap-1 rounded-md border border-border bg-muted/40 px-2 py-1.5 text-xs">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="mono-label text-muted-foreground">{t("dashboard.imageResultUrl")}</span>
-                    <div className="flex shrink-0 items-center gap-1">
-                      <button
-                        type="button"
-                        onClick={() => openAuthenticatedImageUrl(resultUrl)}
-                        className="inline-flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-background hover:text-foreground"
-                        title={t("dashboard.openImage")}
-                      >
-                        <ExternalLink className="h-3.5 w-3.5" />
-                      </button>
-                      <InlineCopyIconButton value={absoluteDashboardUrl(resultUrl)} label={t("dashboard.copyImageUrl")} />
-                    </div>
-                  </div>
-                  <div className="break-all font-mono text-[11px] text-muted-foreground">{absoluteDashboardUrl(resultUrl)}</div>
-                </div>
-              ) : null}
-              {job.promptPreview ? <div className="truncate rounded-md bg-muted px-2 py-1.5 text-xs text-muted-foreground" title={job.promptPreview}>{job.promptPreview}</div> : null}
-              {job.errorMessage ? <div className="truncate rounded-md bg-danger-50 px-2 py-1.5 text-xs text-danger-700" title={job.errorMessage}>{job.errorMessage}</div> : null}
+              {log.promptPreview ? <div className="truncate rounded-md bg-muted px-2 py-1.5 text-xs text-muted-foreground" title={log.promptPreview}>{log.promptPreview}</div> : null}
+              {log.errorMessage ? <div className="truncate rounded-md bg-danger-50 px-2 py-1.5 text-xs text-danger-700" title={log.errorMessage}>{log.errorMessage}</div> : null}
             </Card.Content>
           </Card>
         );
       })}
     </div>
-  );
-}
-
-function absoluteDashboardUrl(path: string) {
-  if (!path) return "";
-  if (/^https?:\/\//i.test(path)) return path;
-  if (typeof window === "undefined") return path;
-  return `${window.location.origin}${path}`;
-}
-
-async function openAuthenticatedImageUrl(path: string) {
-  if (!path || typeof window === "undefined") return;
-  try {
-    const response = await authFetch(path, { cache: "no-store" });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const blob = await response.blob();
-    const url = URL.createObjectURL(blob);
-    window.open(url, "_blank", "noopener,noreferrer");
-    window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
-  } catch {
-    window.open(absoluteDashboardUrl(path), "_blank", "noopener,noreferrer");
-  }
-}
-
-function InlineCopyIconButton({ value, label }: { value: string; label: string }) {
-  const [copied, setCopied] = React.useState(false);
-  const copy = React.useCallback(async () => {
-    if (!value) return;
-    try {
-      await navigator.clipboard.writeText(value);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1200);
-    } catch {
-      // Ignore clipboard failures; the URL remains visible for manual copy.
-    }
-  }, [value]);
-  return (
-    <button
-      type="button"
-      onClick={copy}
-      className="inline-flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-background hover:text-foreground"
-      title={copied ? "Copied" : label}
-    >
-      <Copy className="h-3.5 w-3.5" />
-    </button>
   );
 }
 

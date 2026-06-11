@@ -352,8 +352,8 @@ export type ShareRequestLog = {
   createdAt: number;
 };
 
-export type ImageGenerationJob = {
-  jobId: string;
+export type ImageGenerationRequestLog = {
+  requestId: string;
   shareId: string;
   shareName: string;
   installationId: string;
@@ -361,19 +361,15 @@ export type ImageGenerationJob = {
   providerName: string;
   appType: string;
   model: string;
-  status: "queued" | "running" | "succeeded" | "failed" | "expired" | "cancelled" | string;
+  status: "running" | "succeeded" | "failed" | string;
   statusCode?: number;
   latencyMs: number;
-  queuedAt: number;
-  startedAt?: number;
+  createdAt: number;
   completedAt?: number;
-  expiresAt?: number;
   promptPreview?: string;
   errorMessage?: string;
   resultMimeType?: string;
   resultSizeBytes?: number;
-  resultStorageKey?: string;
-  resultUrl?: string;
   createdByEmail?: string;
   userCountry?: string;
 };
