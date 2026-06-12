@@ -58,7 +58,7 @@ function isShareMarket(market: PublicMarket) {
 }
 
 function marketLabel(market: PublicMarket) {
-  return market.displayName || market.subdomain || market.email;
+  return market.publicBaseUrl || market.email || market.subdomain;
 }
 
 function AuthPanel({

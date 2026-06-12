@@ -250,7 +250,7 @@ function sortMarkets(markets: DashboardMarket[]) {
   return [...markets].sort(
     (a, b) =>
       (Date.parse(a.createdAt) || 0) - (Date.parse(b.createdAt) || 0) ||
-      (a.displayName || a.id).localeCompare(b.displayName || b.id),
+      (a.publicBaseUrl || a.email || a.id).localeCompare(b.publicBaseUrl || b.email || b.id),
   );
 }
 
@@ -276,8 +276,8 @@ function canShowMarketSharePriority(market: DashboardMarket) {
   return isUsageMarket(market);
 }
 
-function marketLabel(market: DashboardMarket) {
-  return market.displayName || market.subdomain || market.email;
+function marketLabel(market: Pick<DashboardMarket, "publicBaseUrl" | "email" | "subdomain">) {
+  return market.publicBaseUrl || market.email || market.subdomain;
 }
 
 type TFn = ReturnType<typeof useLocaleText>["t"];
@@ -1228,6 +1228,14 @@ function ShareEditDialog({
 
   const onMarketPicked = (raw: string) => {
     if (!raw) return;
+    if (saleMarketKind === "share") {
+      const normalized = raw.toLowerCase();
+      if (!shareMarketEmails.has(normalized)) return;
+      setMarketAccessMode("selected");
+      setSelectedShareMarketEmail(normalized);
+      setMarketSelectKey((current) => current + 1);
+      return;
+    }
     if (raw === "__all__") {
       setMarketAccessMode("all");
       setSelectedMarketEmails([]);
@@ -1241,11 +1249,14 @@ function ShareEditDialog({
   };
 
   const availableMarkets = React.useMemo(() => {
+    if (saleMarketKind === "share") {
+      return [...shareMarkets].sort((a, b) => marketLabel(a).localeCompare(marketLabel(b)));
+    }
     const blocked = new Set(selectedMarketEmails);
     return tokenMarkets
       .filter((market) => market.email && !blocked.has(market.email.toLowerCase()))
-      .sort((a, b) => (a.displayName || a.email).localeCompare(b.displayName || b.email));
-  }, [selectedMarketEmails, tokenMarkets]);
+      .sort((a, b) => marketLabel(a).localeCompare(marketLabel(b)));
+  }, [saleMarketKind, selectedMarketEmails, shareMarkets, tokenMarkets]);
 
   const currentDraft = React.useMemo<ShareEditDraft>(() => ({
     description,
@@ -1478,56 +1489,43 @@ function ShareEditDialog({
                     </FieldGroup>
                   ) : null}
 
-                  <FieldGroup label={t("dashboard.field.marketAccess")} hint={forSale === "Yes" ? undefined : t("dashboard.hint.forSaleOnly")}>
+                  <FieldGroup
+                    label={t("dashboard.field.marketAccess")}
+                    hint={
+                      forSale !== "Yes"
+                        ? t("dashboard.hint.forSaleOnly")
+                        : saleMarketKind === "share"
+                          ? t("dashboard.hint.shareMarketSingle")
+                          : undefined
+                    }
+                    invalid={shareMarketInvalid}
+                  >
                     <Select
                       key={marketSelectKey}
 	                      selectedKey={null}
 	                      onSelectionChange={(key) => onMarketPicked(String(key || ""))}
-	                      isDisabled={readOnly || forSale !== "Yes" || saleMarketKind === "share"}
+	                      isDisabled={readOnly || forSale !== "Yes" || (saleMarketKind === "share" && shareMarkets.length === 0)}
 	                    >
                       <Select.Trigger>
                         <Select.Value>
                           {saleMarketKind === "share"
-                            ? t("dashboard.selectedShareMarketOnly")
+                            ? selectedShareMarketEmail
+                              ? marketLabel(shareMarkets.find((market) => market.email.toLowerCase() === selectedShareMarketEmail) || {
+                                  email: selectedShareMarketEmail,
+                                  publicBaseUrl: "",
+                                  subdomain: "",
+                                })
+                              : t("dashboard.selectShareMarket")
                             : marketAccessMode === "all" ? t("dashboard.allMarkets") : t("dashboard.addMarket")}
                         </Select.Value>
                         <Select.Indicator />
                       </Select.Trigger>
                       <Select.Popover className="share-edit-popover light !bg-white !text-slate-900">
                         <ListBox>
-                          <ListBox.Item id="__all__">{t("dashboard.allMarkets")}</ListBox.Item>
+                          {saleMarketKind === "token" ? (
+                            <ListBox.Item id="__all__">{t("dashboard.allMarkets")}</ListBox.Item>
+                          ) : null}
                           {availableMarkets.map((market) => (
-                            <ListBox.Item key={market.email} id={market.email}>
-                              {marketLabel(market)}
-                              <span className="ml-1 text-muted-foreground">· {market.email}</span>
-                            </ListBox.Item>
-                          ))}
-                        </ListBox>
-                      </Select.Popover>
-                    </Select>
-                  </FieldGroup>
-                </div>
-
-                {forSale === "Yes" && saleMarketKind === "share" ? (
-                  <FieldGroup label={t("dashboard.shareMarket")} hint={t("dashboard.hint.shareMarketSingle")} invalid={shareMarketInvalid}>
-                    <Select
-                      selectedKey={selectedShareMarketEmail || null}
-                      onSelectionChange={(key) => setSelectedShareMarketEmail(String(key || "").toLowerCase())}
-                      isDisabled={readOnly}
-                    >
-                      <Select.Trigger>
-                        <Select.Value>
-                          {selectedShareMarketEmail
-                            ? shareMarkets.find((market) => market.email.toLowerCase() === selectedShareMarketEmail)?.displayName ||
-                              shareMarkets.find((market) => market.email.toLowerCase() === selectedShareMarketEmail)?.subdomain ||
-                              selectedShareMarketEmail
-                            : t("dashboard.selectShareMarket")}
-                        </Select.Value>
-                        <Select.Indicator />
-                      </Select.Trigger>
-                      <Select.Popover className="share-edit-popover light !bg-white !text-slate-900">
-                        <ListBox>
-                          {shareMarkets.map((market) => (
                             <ListBox.Item key={market.email} id={market.email.toLowerCase()}>
                               {marketLabel(market)}
                               <span className="ml-1 text-muted-foreground">· {market.email}</span>
@@ -1538,7 +1536,7 @@ function ShareEditDialog({
                     </Select>
                     {shareMarketInvalid ? <span className="text-xs text-red-600">{t("dashboard.fieldInvalid")}</span> : null}
                   </FieldGroup>
-                ) : null}
+                </div>
 
                 {forSale === "Yes" && saleMarketKind === "token" ? (
                 <div className="grid gap-1.5 text-sm">
@@ -2465,10 +2463,23 @@ function MarketIdentityCell({
 }) {
   return (
     <div className="grid min-w-72 gap-1.5">
+      {market.publicBaseUrl ? (
+        <a
+          href={market.publicBaseUrl}
+          target="_blank"
+          rel="noreferrer"
+          onClick={(event) => event.stopPropagation()}
+          className="inline-flex min-w-0 max-w-full items-center gap-1 break-all font-mono font-medium text-foreground underline-offset-4 hover:underline"
+          title={market.publicBaseUrl}
+        >
+          <span className="min-w-0 break-all">{market.publicBaseUrl}</span>
+          <ExternalLink className="h-3 w-3 shrink-0" />
+        </a>
+      ) : (
+        <strong className="min-w-0 break-all font-mono font-medium">{market.id}</strong>
+      )}
+      <span className="break-all text-xs text-muted-foreground">{market.email}</span>
       <div className="flex min-w-0 flex-wrap items-center gap-2">
-        <strong className="min-w-0 truncate font-medium" title={market.displayName || market.id}>
-          {market.displayName || market.id}
-        </strong>
         <MarketTypeChip market={market} t={t} />
         <StatusBadge active={market.online} label={marketStatusLabel(market, t)} />
         {market.maintenanceEnabled ? (
@@ -2477,29 +2488,6 @@ function MarketIdentityCell({
           </Chip>
         ) : null}
         <MarketEditAction market={market} onEdit={onEdit} t={t} />
-      </div>
-      <span className="break-all text-xs text-muted-foreground">{market.email}</span>
-      <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
-        {market.publicBaseUrl ? (
-          <a
-            href={market.publicBaseUrl}
-            target="_blank"
-            rel="noreferrer"
-            onClick={(event) => event.stopPropagation()}
-            className="inline-flex min-w-0 max-w-full items-center gap-1 font-mono text-foreground underline-offset-4 hover:underline"
-            title={market.publicBaseUrl}
-          >
-            <span className="truncate">{market.publicBaseUrl}</span>
-            <ExternalLink className="h-3 w-3 shrink-0" />
-          </a>
-        ) : (
-          <span className="font-mono">-</span>
-        )}
-        {market.subdomain ? (
-          <span className="font-mono" title={market.subdomain}>
-            {market.subdomain}
-          </span>
-        ) : null}
       </div>
     </div>
   );
@@ -2608,7 +2596,7 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
               <Drawer.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
               <Drawer.Header>
                 <div>
-                  <Drawer.Heading>{selected?.displayName || selected?.id}</Drawer.Heading>
+                  <Drawer.Heading className="break-all font-mono text-base">{selected?.publicBaseUrl || selected?.id}</Drawer.Heading>
                   <p className="mt-1 text-sm text-muted-foreground">{selected?.email}</p>
                   <p className="mt-1 break-all font-mono text-[11px] text-muted-foreground">{selected?.id}</p>
                 </div>
@@ -2836,7 +2824,7 @@ function MarketEditDialog({ market, onClose, onSaved }: { market: DashboardMarke
           <Modal.Dialog className="share-edit-surface light w-[min(1080px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
             <Modal.Header>
               <Modal.Heading>{t("dashboard.editMarketShares")}</Modal.Heading>
-              <p className="mt-1 break-all text-sm text-muted-foreground">{market?.displayName || market?.email} · {market?.subdomain}</p>
+              <p className="mt-1 break-all text-sm text-muted-foreground">{market?.publicBaseUrl || market?.email}</p>
             </Modal.Header>
             <Modal.Body className="grid max-h-[72vh] gap-4 overflow-y-auto">
               {error ? <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div> : null}
@@ -3096,8 +3084,8 @@ function ShareMarkets({ share, t }: { share?: ShareView; t: TFn }) {
         <Card key={market.id || market.email} className="rounded-lg border p-0 shadow-none">
           <Card.Content className="flex-row items-center justify-between gap-3 p-3">
             <div className="min-w-0">
-              <div className="truncate font-medium">{market.displayName || market.subdomain || market.email}</div>
-              <div className="truncate text-xs text-muted-foreground">{market.subdomain || "-"} · {market.email || "-"}</div>
+              <div className="truncate font-medium">{market.publicBaseUrl || market.email || "-"}</div>
+              <div className="truncate text-xs text-muted-foreground">{market.email || "-"}</div>
             </div>
             <Chip color={market.online ? "success" : "default"} size="sm" variant={market.online ? "soft" : "tertiary"}>{market.online ? t("common.online") : t("common.offline")}</Chip>
           </Card.Content>

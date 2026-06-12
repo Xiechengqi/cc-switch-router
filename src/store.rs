@@ -3915,16 +3915,13 @@ impl AppStore {
         let email = normalize_email(email)?;
         let subdomain = normalize_subdomain(&input.subdomain)?;
         ensure_subdomain_not_reserved_word(&subdomain)?;
-        let display_name = input.display_name.trim();
-        if display_name.is_empty() || display_name.len() > 80 {
-            return Err(AppError::BadRequest("invalid market display name".into()));
-        }
         let public_base_url = input.public_base_url.trim();
         if !public_base_url.starts_with("http://") && !public_base_url.starts_with("https://") {
             return Err(AppError::BadRequest(
                 "invalid market public base url".into(),
             ));
         }
+        let display_name = market_display_name_from_url(public_base_url);
         let market_kind = normalize_market_kind(input.market_kind.as_deref())?;
 
         let conn = self.conn.lock().await;
@@ -10361,6 +10358,10 @@ fn market_subdomain_owner(conn: &Connection, subdomain: &str) -> Result<Option<S
     .map_err(|e| AppError::Internal(format!("query market subdomain owner failed: {e}")))
 }
 
+fn market_display_name_from_url(public_base_url: &str) -> String {
+    public_base_url.trim().trim_end_matches('/').to_string()
+}
+
 fn get_market_by_email(
     conn: &Connection,
     email: &str,
@@ -12586,7 +12587,7 @@ mod tests {
     fn test_market() -> MarketRegistryRecord {
         MarketRegistryRecord {
             id: "main-market".into(),
-            display_name: "Main Market".into(),
+            display_name: "https://market-a.example.com".into(),
             email: "market@example.com".into(),
             subdomain: "market-a".into(),
             public_base_url: "https://market-a.example.com".into(),
@@ -14664,7 +14665,7 @@ mod tests {
                 "market@example.com",
                 RegisterMarketRequest {
                     subdomain: "market-a".into(),
-                    display_name: "Main".into(),
+                    display_name: None,
                     public_base_url: "https://market-a.example.com".into(),
                     market_kind: None,
                     pricing_summary: None,
@@ -14698,7 +14699,7 @@ mod tests {
                 "market@example.com",
                 RegisterMarketRequest {
                     subdomain: "market-a".into(),
-                    display_name: "Main Market".into(),
+                    display_name: None,
                     public_base_url: "https://market-a.example.com".into(),
                     market_kind: None,
                     pricing_summary: None,
@@ -14714,7 +14715,7 @@ mod tests {
                 "market@example.com",
                 RegisterMarketRequest {
                     subdomain: "market-b".into(),
-                    display_name: "Renamed Market".into(),
+                    display_name: Some("Renamed Market".into()),
                     public_base_url: "https://market-b.example.com".into(),
                     market_kind: None,
                     pricing_summary: None,
@@ -14722,7 +14723,7 @@ mod tests {
             )
             .await
             .expect("upsert same market email");
-        assert_eq!(updated.display_name, "Renamed Market");
+        assert_eq!(updated.display_name, "https://market-b.example.com");
         assert_eq!(updated.subdomain, "market-b");
 
         let err = store
@@ -14730,7 +14731,7 @@ mod tests {
                 "other@example.com",
                 RegisterMarketRequest {
                     subdomain: "market-b".into(),
-                    display_name: "Other Market".into(),
+                    display_name: None,
                     public_base_url: "https://market-b.example.com".into(),
                     market_kind: None,
                     pricing_summary: None,
@@ -16166,7 +16167,10 @@ mod tests {
 
         assert!(share.shared_with_emails.is_empty());
         assert_eq!(share.market_links.len(), 1);
-        assert_eq!(share.market_links[0].display_name, "Main Market");
+        assert_eq!(
+            share.market_links[0].display_name,
+            "https://market-a.example.com"
+        );
         assert_eq!(share.market_links[0].email, "market@example.com");
         assert!(share.unknown_market_emails.is_empty());
 

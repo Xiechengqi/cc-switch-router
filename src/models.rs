@@ -989,7 +989,8 @@ impl GatewayRegistryRecord {
 #[serde(rename_all = "camelCase")]
 pub struct RegisterMarketRequest {
     pub subdomain: String,
-    pub display_name: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
     pub public_base_url: String,
     #[serde(default)]
     pub market_kind: Option<String>,
