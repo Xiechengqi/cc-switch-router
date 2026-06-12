@@ -773,6 +773,12 @@ pub struct ImageGenerationRequestLogEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_size_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_url: Option<String>,
+    #[serde(skip)]
+    pub result_storage_key: Option<String>,
+    #[serde(skip)]
+    pub result_access_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by_email: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_country: Option<String>,

@@ -6,7 +6,7 @@ import * as React from "react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog";
-import { getMarketLinkedShares, getShareImageGenerationRequestLogs, getShareUsageByEmail, releaseMarketShareState, updateMarketDisabledShares, updateMarketMaintenance, updateShareSettings } from "@/lib/api";
+import { getMarketLinkedShares, getMarketSharePriority, getShareImageGenerationRequestLogs, getShareUsageByEmail, releaseMarketShareState, updateMarketDisabledShares, updateMarketMaintenance, updateShareSettings } from "@/lib/api";
 import type { AppLocale } from "@/lib/i18n";
 import type { DashboardClient, DashboardMarket, HealthCheckEntry, HealthTimelineBucket, ImageGenerationRequestLog, MarketAppAvailabilityEntry, MarketRequestLog, MarketShare, MarketShareRuntimeState, ModelHealthSummary, ShareAccessByApp, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareModelHealthCheck, ShareRequestLog, ShareSettingsPatch, ShareUpstreamProvider, ShareUsageByEmailResponse, ShareView } from "@/lib/types";
 import { cn, compactTokens, formatDateTime, formatNumber, formatRelativeTime } from "@/lib/utils";
@@ -107,6 +107,25 @@ function formatLatencySeconds(latencyMs: number | null) {
   if (latencyMs == null || !Number.isFinite(latencyMs) || latencyMs <= 0) return "-";
   const seconds = latencyMs / 1000;
   return `${seconds < 1 ? seconds.toFixed(2) : seconds.toFixed(1)}s`;
+}
+
+function formatImageLogTimestamp(value?: number | null) {
+  if (!value) return "-";
+  const date = new Date(value * 1000);
+  if (!Number.isFinite(date.getTime())) return "-";
+  const pad = (next: number) => String(next).padStart(2, "0");
+  return `${pad(date.getMonth() + 1)}${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+function formatImageLogSpendSeconds(latencyMs?: number | null) {
+  if (latencyMs == null || !Number.isFinite(latencyMs) || latencyMs <= 0) return "-";
+  const seconds = latencyMs / 1000;
+  return `${seconds < 10 ? seconds.toFixed(2) : seconds < 100 ? seconds.toFixed(1) : Math.round(seconds)}s`;
+}
+
+function formatImageLogSizeMb(bytes?: number | null) {
+  if (bytes == null || !Number.isFinite(bytes) || bytes <= 0) return "-";
+  return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
 }
 
 function expirySortValue(share?: ShareView) {
@@ -241,7 +260,7 @@ function marketKindDescription(market: DashboardMarket, t: TFn) {
 }
 
 function canShowMarketSharePriority(market: DashboardMarket) {
-  return isUsageMarket(market) && Boolean(market.canManage);
+  return isUsageMarket(market);
 }
 
 function marketLabel(market: DashboardMarket) {
@@ -3615,7 +3634,7 @@ function ShareProviderRequestsPanel({
 }
 
 function ShareImageRequestLogs({ shareId }: { shareId: string }) {
-  const { locale, t } = useLocaleText();
+  const { t } = useLocaleText();
   const [logs, setLogs] = React.useState<ImageGenerationRequestLog[]>([]);
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState("");
@@ -3649,32 +3668,51 @@ function ShareImageRequestLogs({ shareId }: { shareId: string }) {
   return (
     <div className="grid gap-2">
       {logs.slice(0, 20).map((log) => {
-        const ok = log.status === "succeeded";
         const failed = log.status === "failed";
         return (
           <Card key={log.requestId} className="rounded-lg border p-0 shadow-none">
             <Card.Content className="gap-3 p-3">
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
-                    <span className="truncate font-medium">{log.model || "-"}</span>
-                    <span className="font-mono text-[11px] text-muted-foreground">{log.requestId}</span>
-                  </div>
-                  <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
-                    {log.createdByEmail ? <span>{log.createdByEmail}</span> : null}
-                    <span>{log.providerName || log.providerId || "-"}</span>
-                    <span title={formatDateTime(log.createdAt * 1000)}>created {formatRelativeTime(log.createdAt * 1000, locale)}</span>
-                    {log.completedAt ? <span title={formatDateTime(log.completedAt * 1000)}>done {formatRelativeTime(log.completedAt * 1000, locale)}</span> : null}
-                    {log.resultMimeType ? <span>{log.resultMimeType}</span> : null}
-                    {typeof log.resultSizeBytes === "number" ? <span>{formatNumber(log.resultSizeBytes)} B</span> : null}
-                    {log.userCountry ? <span>{log.userCountry}</span> : null}
-                  </div>
+              <div className="min-w-0">
+                <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+                  <span className="truncate font-medium">{log.model || "-"}</span>
+                  <span className="font-mono text-[11px] text-muted-foreground">{log.requestId}</span>
                 </div>
-                <div className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground">
-                  <Chip color={ok ? "success" : failed ? "danger" : "warning"} size="sm" variant="soft">{log.status}</Chip>
-                  {typeof log.statusCode === "number" ? <Chip color={log.statusCode >= 200 && log.statusCode < 400 ? "success" : "danger"} size="sm" variant="soft">{log.statusCode}</Chip> : null}
-                  {log.latencyMs ? <span>{log.latencyMs}ms</span> : null}
-                </div>
+              </div>
+              <div className="overflow-x-auto rounded-md border border-default-200">
+                <table className="w-full min-w-[840px] table-fixed text-left text-xs">
+                  <thead className="bg-muted/50 text-[11px] uppercase text-muted-foreground">
+                    <tr>
+                      <th className="w-[11%] px-2 py-1.5 font-medium">{t("dashboard.imageLog.preview")}</th>
+                      <th className="w-[16%] px-2 py-1.5 font-medium">{t("dashboard.imageLog.user")}</th>
+                      <th className="w-[16%] px-2 py-1.5 font-medium">{t("dashboard.imageLog.provider")}</th>
+                      <th className="w-[14%] px-2 py-1.5 font-medium">{t("dashboard.imageLog.created")}</th>
+                      <th className="w-[10%] px-2 py-1.5 font-medium">{t("dashboard.imageLog.spend")}</th>
+                      <th className="w-[12%] px-2 py-1.5 font-medium">{t("dashboard.imageLog.type")}</th>
+                      <th className="w-[9%] px-2 py-1.5 font-medium">{t("dashboard.imageLog.size")}</th>
+                      <th className="w-[6%] px-2 py-1.5 font-medium">{t("dashboard.imageLog.country")}</th>
+                      <th className="w-[6%] px-2 py-1.5 font-medium">{t("dashboard.imageLog.status")}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr className="text-muted-foreground">
+                      <td className="px-2 py-2">
+                        {log.resultUrl ? (
+                          <a href={log.resultUrl} target="_blank" rel="noopener noreferrer" className="block h-12 w-12 overflow-hidden rounded-md border border-default-200 bg-muted">
+                            <img src={log.resultUrl} alt="" className="h-full w-full object-cover" loading="lazy" />
+                          </a>
+                        ) : "-"}
+                      </td>
+                      <td className="truncate px-2 py-2" title={log.createdByEmail || "-"}>{log.createdByEmail || "-"}</td>
+                      <td className="truncate px-2 py-2" title={log.providerName || log.providerId || "-"}>{log.providerName || log.providerId || "-"}</td>
+                      <td className="truncate px-2 py-2 font-mono" title={formatDateTime(log.createdAt * 1000)}>{formatImageLogTimestamp(log.createdAt)}</td>
+                      <td className="truncate px-2 py-2 font-mono">{formatImageLogSpendSeconds(log.latencyMs)}</td>
+                      <td className="truncate px-2 py-2" title={log.resultMimeType || "-"}>{log.resultMimeType || "-"}</td>
+                      <td className="truncate px-2 py-2 font-mono">{formatImageLogSizeMb(log.resultSizeBytes)}</td>
+                      <td className="truncate px-2 py-2">{log.userCountry || "-"}</td>
+                      <td className="truncate px-2 py-2 font-mono">{typeof log.statusCode === "number" ? log.statusCode : failed ? log.status : "-"}</td>
+                    </tr>
+                  </tbody>
+                </table>
               </div>
               {log.promptPreview ? <div className="truncate rounded-md bg-muted px-2 py-1.5 text-xs text-muted-foreground" title={log.promptPreview}>{log.promptPreview}</div> : null}
               {log.errorMessage ? <div className="truncate rounded-md bg-danger-50 px-2 py-1.5 text-xs text-danger-700" title={log.errorMessage}>{log.errorMessage}</div> : null}
@@ -3865,7 +3903,7 @@ function MarketSharePriorityPanel({ market, t }: { market: DashboardMarket; t: T
     let cancelled = false;
     setShares(null);
     setError("");
-    getMarketLinkedShares(market.email)
+    getMarketSharePriority(market.email)
       .then((nextShares) => {
         if (!cancelled) setShares(nextShares);
       })
@@ -3885,24 +3923,19 @@ function MarketSharePriorityPanel({ market, t }: { market: DashboardMarket; t: T
   return (
     <div className="grid gap-3">
       <div className="text-xs leading-5 text-muted-foreground">{t("dashboard.sharePriorityHint")}</div>
-      <div className="inline-flex w-fit gap-1 rounded-xl bg-muted p-1">
-        {MARKET_SHARE_APPS.map(([key, label]) => {
-          const active = activeApp === key;
-          return (
-            <button
+      <Tabs selectedKey={activeApp} onSelectionChange={(key: React.Key) => setActiveApp(String(key) as MarketShareAppKey)} variant="secondary" className="text-foreground">
+        <Tabs.List className="grid w-full grid-cols-3 text-foreground">
+          {MARKET_SHARE_APPS.map(([key, label]) => (
+            <Tabs.Tab
               key={key}
-              type="button"
-              onClick={() => setActiveApp(key)}
-              className={cn(
-                "rounded-md px-3 py-1.5 text-sm font-semibold transition",
-                active ? "bg-white text-foreground shadow-sm" : "text-muted-foreground hover:bg-white/70 hover:text-foreground",
-              )}
+              id={key}
+              className="rounded-md border border-transparent px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors data-[selected=true]:border-primary/30 data-[selected=true]:bg-primary/10 data-[selected=true]:text-primary"
             >
               {label}
-            </button>
-          );
-        })}
-      </div>
+            </Tabs.Tab>
+          ))}
+        </Tabs.List>
+      </Tabs>
       {error ? <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{t("dashboard.sharePriorityLoadFailed")}: {error}</div> : null}
       {!shares && !error ? (
         <div className="flex items-center gap-2 rounded-lg border bg-muted/30 px-3 py-4 text-sm text-muted-foreground">

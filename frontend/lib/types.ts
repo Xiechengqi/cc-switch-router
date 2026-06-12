@@ -370,6 +370,7 @@ export type ImageGenerationRequestLog = {
   errorMessage?: string;
   resultMimeType?: string;
   resultSizeBytes?: number;
+  resultUrl?: string;
   createdByEmail?: string;
   userCountry?: string;
 };

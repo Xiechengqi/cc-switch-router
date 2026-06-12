@@ -17,8 +17,12 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::ServerState;
+use crate::config::Config;
 use crate::recent_traffic::RecentTraffic;
-use crate::store::{AppStore, NewImageGenerationRequestLog, ShareForTest};
+use crate::store::{
+    AppStore, IMAGE_GENERATION_REQUEST_LOG_RETAIN_PER_SHARE, NewImageGenerationRequestLog,
+    ShareForTest, image_result_path,
+};
 
 const MARKET_REQUEST_ID_HEADER: &str = "x-cc-switch-market-request-id";
 const HEALTH_PROBE_FAILURE_CACHE_TTL: Duration = Duration::from_secs(2);
@@ -1838,6 +1842,7 @@ async fn handle_image_generation_stream_submit(
     };
     if let Err(err) = record_image_stream_log(
         &state.store,
+        &state.config,
         &log_meta,
         ImageStreamLogOutcome {
             status: "running",
@@ -1847,6 +1852,8 @@ async fn handle_image_generation_stream_submit(
             error_message: None,
             result_mime_type: None,
             result_size_bytes: None,
+            result_storage_key: None,
+            result_access_token: None,
         },
     )
     .await
@@ -1897,6 +1904,7 @@ async fn handle_image_generation_stream_submit(
             );
             if let Err(log_err) = record_image_stream_log(
                 &state.store,
+                &state.config,
                 &log_meta,
                 ImageStreamLogOutcome {
                     status: "failed",
@@ -1906,6 +1914,8 @@ async fn handle_image_generation_stream_submit(
                     error_message: Some(format!("connection-lost: {err}")),
                     result_mime_type: None,
                     result_size_bytes: None,
+                    result_storage_key: None,
+                    result_access_token: None,
                 },
             )
             .await
@@ -1928,6 +1938,7 @@ async fn handle_image_generation_stream_submit(
             .unwrap_or_else(|err| format!("failed to read upstream error: {err}"));
         if let Err(err) = record_image_stream_log(
             &state.store,
+            &state.config,
             &log_meta,
             ImageStreamLogOutcome {
                 status: "failed",
@@ -1937,6 +1948,8 @@ async fn handle_image_generation_stream_submit(
                 error_message: Some(compact_prompt_preview(&text, 1000)),
                 result_mime_type: None,
                 result_size_bytes: None,
+                result_storage_key: None,
+                result_access_token: None,
             },
         )
         .await
@@ -1948,6 +1961,7 @@ async fn handle_image_generation_stream_submit(
 
     let mut upstream_stream = upstream.bytes_stream();
     let log_store = state.store.clone();
+    let result_config = state.config.clone();
     let stream = async_stream::stream! {
         use futures_util::StreamExt;
 
@@ -1958,6 +1972,7 @@ async fn handle_image_generation_stream_submit(
         let mut terminal_logged = false;
         let completion_guard = ImageStreamCompletionGuard::new(
             log_store.clone(),
+            result_config.clone(),
             log_meta.clone(),
             request_started,
             status.as_u16(),
@@ -1972,8 +1987,34 @@ async fn handle_image_generation_stream_submit(
                             if !terminal_logged {
                                 if let Some(event) = parser.feed(&bytes, &output_format) {
                                     terminal_logged = true;
+                                    let mut result_storage_key = None;
+                                    let mut result_access_token = None;
+                                    if event.status == "succeeded" {
+                                        if let (Some(image_bytes), Some(ext)) =
+                                            (event.image_bytes.as_deref(), event.result_ext)
+                                        {
+                                            match write_image_result(
+                                                &result_config,
+                                                &log_meta.share_id,
+                                                &log_meta.request_id,
+                                                ext,
+                                                image_bytes,
+                                            )
+                                            .await
+                                            {
+                                                Ok(saved) => {
+                                                    result_storage_key = Some(saved.storage_key);
+                                                    result_access_token = Some(saved.access_token);
+                                                }
+                                                Err(err) => {
+                                                    warn!(request_id = %log_meta.request_id, error = %err, "write image result file failed");
+                                                }
+                                            }
+                                        }
+                                    }
                                     if let Err(err) = record_image_stream_log(
                                         &log_store,
+                                        &result_config,
                                         &log_meta,
                                         ImageStreamLogOutcome {
                                             status: event.status,
@@ -1983,6 +2024,8 @@ async fn handle_image_generation_stream_submit(
                                             error_message: event.error_message,
                                             result_mime_type: event.result_mime_type,
                                             result_size_bytes: event.result_size_bytes,
+                                            result_storage_key,
+                                            result_access_token,
                                         },
                                     )
                                     .await
@@ -1998,6 +2041,7 @@ async fn handle_image_generation_stream_submit(
                             if !terminal_logged {
                                 if let Err(log_err) = record_image_stream_log(
                                     &log_store,
+                                    &result_config,
                                     &log_meta,
                                     ImageStreamLogOutcome {
                                         status: "failed",
@@ -2007,6 +2051,8 @@ async fn handle_image_generation_stream_submit(
                                         error_message: Some(format!("read upstream stream failed: {err}")),
                                         result_mime_type: None,
                                         result_size_bytes: None,
+                                        result_storage_key: None,
+                                        result_access_token: None,
                                     },
                                 )
                                 .await
@@ -2022,6 +2068,7 @@ async fn handle_image_generation_stream_submit(
                             if !terminal_logged {
                                 if let Err(err) = record_image_stream_log(
                                     &log_store,
+                                    &result_config,
                                     &log_meta,
                                     ImageStreamLogOutcome {
                                         status: "failed",
@@ -2031,6 +2078,8 @@ async fn handle_image_generation_stream_submit(
                                         error_message: Some("stream ended before image_generation.completed".into()),
                                         result_mime_type: None,
                                         result_size_bytes: None,
+                                        result_storage_key: None,
+                                        result_access_token: None,
                                     },
                                 )
                                 .await
@@ -2090,10 +2139,13 @@ struct ImageStreamLogOutcome {
     error_message: Option<String>,
     result_mime_type: Option<String>,
     result_size_bytes: Option<u64>,
+    result_storage_key: Option<String>,
+    result_access_token: Option<String>,
 }
 
 struct ImageStreamCompletionGuard {
     store: AppStore,
+    config: Config,
     meta: ImageStreamLogMeta,
     started: Instant,
     status_code: u16,
@@ -2101,9 +2153,16 @@ struct ImageStreamCompletionGuard {
 }
 
 impl ImageStreamCompletionGuard {
-    fn new(store: AppStore, meta: ImageStreamLogMeta, started: Instant, status_code: u16) -> Self {
+    fn new(
+        store: AppStore,
+        config: Config,
+        meta: ImageStreamLogMeta,
+        started: Instant,
+        status_code: u16,
+    ) -> Self {
         Self {
             store,
+            config,
             meta,
             started,
             status_code,
@@ -2122,12 +2181,14 @@ impl Drop for ImageStreamCompletionGuard {
             return;
         }
         let store = self.store.clone();
+        let config = self.config.clone();
         let meta = self.meta.clone();
         let status_code = self.status_code;
         let latency_ms = self.started.elapsed().as_millis() as u64;
         tokio::spawn(async move {
             if let Err(err) = record_image_stream_log(
                 &store,
+                &config,
                 &meta,
                 ImageStreamLogOutcome {
                     status: "failed",
@@ -2139,6 +2200,8 @@ impl Drop for ImageStreamCompletionGuard {
                     ),
                     result_mime_type: None,
                     result_size_bytes: None,
+                    result_storage_key: None,
+                    result_access_token: None,
                 },
             )
             .await
@@ -2151,6 +2214,7 @@ impl Drop for ImageStreamCompletionGuard {
 
 async fn record_image_stream_log(
     store: &AppStore,
+    config: &Config,
     meta: &ImageStreamLogMeta,
     outcome: ImageStreamLogOutcome,
 ) -> Result<(), crate::error::AppError> {
@@ -2173,11 +2237,92 @@ async fn record_image_stream_log(
             error_message: outcome.error_message,
             result_mime_type: outcome.result_mime_type,
             result_size_bytes: outcome.result_size_bytes,
+            result_storage_key: outcome.result_storage_key,
+            result_access_token: outcome.result_access_token,
             created_by_email: meta.created_by_email.clone(),
             client_ip: meta.client_ip.clone(),
             user_country: meta.user_country.clone(),
         })
-        .await
+        .await?;
+    let stale_storage_keys = store
+        .prune_image_generation_request_logs_for_share(
+            &meta.share_id,
+            IMAGE_GENERATION_REQUEST_LOG_RETAIN_PER_SHARE,
+        )
+        .await?;
+    delete_image_result_files(config, stale_storage_keys).await;
+    Ok(())
+}
+
+struct SavedImageResult {
+    storage_key: String,
+    access_token: String,
+}
+
+async fn write_image_result(
+    config: &Config,
+    share_id: &str,
+    request_id: &str,
+    ext: &str,
+    bytes: &[u8],
+) -> Result<SavedImageResult, std::io::Error> {
+    let share_segment = storage_key_segment(share_id);
+    let file_name = format!("{}.{}", storage_key_segment(request_id), ext);
+    let storage_key = format!("{share_segment}/{file_name}");
+    let Some(path) = image_result_path(config, &storage_key) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid image result storage key",
+        ));
+    };
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(&path, bytes).await?;
+    Ok(SavedImageResult {
+        storage_key,
+        access_token: image_result_access_token(),
+    })
+}
+
+async fn delete_image_result_files(config: &Config, storage_keys: Vec<String>) {
+    for storage_key in storage_keys {
+        let Some(path) = image_result_path(config, &storage_key) else {
+            continue;
+        };
+        if let Err(err) = tokio::fs::remove_file(&path).await {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    storage_key = %storage_key,
+                    path = %path.display(),
+                    error = %err,
+                    "delete pruned image result file failed"
+                );
+            }
+        }
+    }
+}
+
+fn storage_key_segment(value: &str) -> String {
+    let output = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if output.is_empty() {
+        Uuid::new_v4().simple().to_string()
+    } else {
+        output
+    }
+}
+
+fn image_result_access_token() -> String {
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
 #[derive(Debug)]
@@ -2186,6 +2331,8 @@ struct ImageStreamTerminalEvent {
     error_message: Option<String>,
     result_mime_type: Option<String>,
     result_size_bytes: Option<u64>,
+    result_ext: Option<&'static str>,
+    image_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Default)]
@@ -2261,6 +2408,8 @@ fn parse_image_stream_sse_block(
             ),
             result_mime_type: None,
             result_size_bytes: None,
+            result_ext: None,
+            image_bytes: None,
         });
     }
     let Some(value) = value else {
@@ -2272,6 +2421,8 @@ fn parse_image_stream_sse_block(
             error_message: Some(error),
             result_mime_type: None,
             result_size_bytes: None,
+            result_ext: None,
+            image_bytes: None,
         });
     }
     let b64 = value
@@ -2283,12 +2434,15 @@ fn parse_image_stream_sse_block(
     if let Some(b64) = b64 {
         return match base64::engine::general_purpose::STANDARD.decode(b64) {
             Ok(image_bytes) => {
-                let (mime, _) = image_mime_and_ext(&image_bytes, output_format);
+                let (mime, ext) = image_mime_and_ext(&image_bytes, output_format);
+                let result_size = image_bytes.len() as u64;
                 Some(ImageStreamTerminalEvent {
                     status: "succeeded",
                     error_message: None,
                     result_mime_type: Some(mime.into()),
-                    result_size_bytes: Some(image_bytes.len() as u64),
+                    result_size_bytes: Some(result_size),
+                    result_ext: Some(ext),
+                    image_bytes: Some(image_bytes),
                 })
             }
             Err(err) => Some(ImageStreamTerminalEvent {
@@ -2296,6 +2450,8 @@ fn parse_image_stream_sse_block(
                 error_message: Some(format!("decode upstream image failed: {err}")),
                 result_mime_type: None,
                 result_size_bytes: None,
+                result_ext: None,
+                image_bytes: None,
             }),
         };
     }
@@ -2307,6 +2463,8 @@ fn parse_image_stream_sse_block(
             ),
             result_mime_type: None,
             result_size_bytes: None,
+            result_ext: None,
+            image_bytes: None,
         });
     }
     None
@@ -2653,6 +2811,27 @@ mod tests {
             br#"{"stream":false,"prompt":"draw"}"#
         ));
         assert!(!image_generation_request_wants_stream(b"not json"));
+    }
+
+    #[test]
+    fn image_generation_completed_event_keeps_result_bytes_for_preview_storage() {
+        let event = parse_image_stream_sse_block(
+            br#"event: image_generation.completed
+data: {"data":[{"b64_json":"iVBORw0KGgo="}]}
+
+"#,
+            "png",
+        )
+        .expect("terminal event");
+
+        assert_eq!(event.status, "succeeded");
+        assert_eq!(event.result_mime_type.as_deref(), Some("image/png"));
+        assert_eq!(event.result_ext, Some("png"));
+        assert_eq!(event.result_size_bytes, Some(8));
+        assert_eq!(
+            event.image_bytes.as_deref(),
+            Some(&b"\x89PNG\r\n\x1a\n"[..])
+        );
     }
 
     #[tokio::test]

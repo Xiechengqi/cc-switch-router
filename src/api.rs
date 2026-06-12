@@ -67,7 +67,7 @@ use crate::scheduling_signals::{
     ShareFeedbackKind, ShareFeedbackRequest, ShareFeedbackResponse, ShareHeadroomEntry,
     ShareHeadroomRequest, ShareHeadroomResponse,
 };
-use crate::store::{BoardAuthor, ShareForTest};
+use crate::store::{BoardAuthor, ShareForTest, image_result_path};
 
 const REGIONS: &str = include_str!("../regions");
 const SHARE_EDIT_WAKE_RETRY_INTERVAL_SECS: u64 = 20;
@@ -147,6 +147,10 @@ pub fn router(state: ServerState) -> Router {
         .route(
             "/v1/admin/markets/:market_email/linked-shares",
             get(admin_market_linked_shares),
+        )
+        .route(
+            "/v1/markets/:market_email/share-priority",
+            get(public_market_share_priority),
         )
         .route(
             "/v1/admin/markets/:market_email/disabled-shares",
@@ -240,6 +244,10 @@ pub fn router(state: ServerState) -> Router {
         .route(
             "/v1/shares/:share_id/image-jobs",
             get(list_share_image_generation_jobs_compat),
+        )
+        .route(
+            "/v1/image-results/:request_id",
+            get(get_image_generation_result),
         )
         .route("/v1/shares/pending-edits", post(pending_share_edits))
         .route("/v1/shares/edit-ack", post(ack_share_edit))
@@ -692,6 +700,22 @@ async fn admin_market_linked_shares(
                 &market_email,
                 &current_user_email,
                 is_admin,
+                &state.proxy.active_subdomains().await.into_iter().collect(),
+                &state.proxy.inflight_by_share().await,
+            )
+            .await?,
+    ))
+}
+
+async fn public_market_share_priority(
+    State(state): State<ServerState>,
+    Path(market_email): Path<String>,
+) -> Result<Json<Vec<MarketShareView>>, AppError> {
+    Ok(Json(
+        state
+            .store
+            .list_public_market_share_priority(
+                &market_email,
                 &state.proxy.active_subdomains().await.into_iter().collect(),
                 &state.proxy.inflight_by_share().await,
             )
@@ -2030,6 +2054,67 @@ mod tests {
             user_email: None,
             created_at,
             is_health_check: false,
+        }
+    }
+
+    #[test]
+    fn image_generation_prompt_redaction_keeps_owner_prompt_only() {
+        let mut owner_logs = vec![image_generation_log("owner-log")];
+        apply_image_generation_log_visibility(
+            &mut owner_logs,
+            &ImageRequestLogViewContext {
+                can_view_prompt: true,
+                can_view_result_url: true,
+            },
+        );
+        assert_eq!(
+            owner_logs[0].prompt_preview.as_deref(),
+            Some("private prompt")
+        );
+        assert_eq!(
+            owner_logs[0].result_url.as_deref(),
+            Some("/v1/image-results/owner-log?token=owner-token")
+        );
+
+        let mut public_logs = vec![image_generation_log("public-log")];
+        apply_image_generation_log_visibility(
+            &mut public_logs,
+            &ImageRequestLogViewContext {
+                can_view_prompt: false,
+                can_view_result_url: false,
+            },
+        );
+        assert_eq!(public_logs[0].prompt_preview, None);
+        assert_eq!(public_logs[0].result_url, None);
+        assert_eq!(public_logs[0].model, "gpt-5.5");
+        assert_eq!(public_logs[0].status_code, Some(200));
+        assert_eq!(public_logs[0].result_size_bytes, Some(1024));
+    }
+
+    fn image_generation_log(request_id: &str) -> crate::models::ImageGenerationRequestLogEntry {
+        crate::models::ImageGenerationRequestLogEntry {
+            request_id: request_id.into(),
+            share_id: "share-1".into(),
+            share_name: "Share".into(),
+            installation_id: "inst-1".into(),
+            provider_id: "provider-1".into(),
+            provider_name: "OpenAI Official".into(),
+            app_type: "codex".into(),
+            model: "gpt-5.5".into(),
+            status: "succeeded".into(),
+            status_code: Some(200),
+            latency_ms: 1,
+            created_at: 1,
+            completed_at: Some(2),
+            prompt_preview: Some("private prompt".into()),
+            error_message: None,
+            result_mime_type: Some("image/png".into()),
+            result_size_bytes: Some(1024),
+            result_url: None,
+            result_storage_key: Some("share-1/owner-log.png".into()),
+            result_access_token: Some("owner-token".into()),
+            created_by_email: Some("user@example.com".into()),
+            user_country: Some("US".into()),
         }
     }
 
@@ -3776,6 +3861,11 @@ struct ImageGenerationRequestLogsQuery {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ImageGenerationResultQuery {
+    token: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ImageGenerationRequestLogsResponse {
@@ -3911,12 +4001,13 @@ async fn list_share_image_generation_request_logs(
     Path(share_id): Path<String>,
     Query(query): Query<ImageGenerationRequestLogsQuery>,
 ) -> Result<Json<ImageGenerationRequestLogsResponse>, AppError> {
-    require_share_image_request_log_view_access(&state, &headers, &share_id).await?;
+    let view = image_request_log_view_context(&state, &headers, &share_id).await?;
 
-    let logs = state
+    let mut logs = state
         .store
-        .list_image_generation_request_logs_for_share(&share_id, query.limit.unwrap_or(50))
+        .list_image_generation_request_logs_for_share(&share_id, query.limit.unwrap_or(10).min(10))
         .await?;
+    apply_image_generation_log_visibility(&mut logs, &view);
     Ok(Json(ImageGenerationRequestLogsResponse { logs }))
 }
 
@@ -3926,12 +4017,13 @@ async fn list_share_image_generation_jobs_compat(
     Path(share_id): Path<String>,
     Query(query): Query<ImageGenerationRequestLogsQuery>,
 ) -> Result<Json<ImageGenerationJobsCompatResponse>, AppError> {
-    require_share_image_request_log_view_access(&state, &headers, &share_id).await?;
+    let view = image_request_log_view_context(&state, &headers, &share_id).await?;
 
-    let logs = state
+    let mut logs = state
         .store
-        .list_image_generation_request_logs_for_share(&share_id, query.limit.unwrap_or(50))
+        .list_image_generation_request_logs_for_share(&share_id, query.limit.unwrap_or(10).min(10))
         .await?;
+    apply_image_generation_log_visibility(&mut logs, &view);
     let jobs = logs
         .into_iter()
         .map(|log| ImageGenerationJobCompatEntry {
@@ -3959,31 +4051,94 @@ async fn list_share_image_generation_jobs_compat(
     Ok(Json(ImageGenerationJobsCompatResponse { jobs }))
 }
 
-async fn require_share_image_request_log_view_access(
+struct ImageRequestLogViewContext {
+    can_view_prompt: bool,
+    can_view_result_url: bool,
+}
+
+async fn image_request_log_view_context(
     state: &ServerState,
     headers: &HeaderMap,
     share_id: &str,
-) -> Result<(), AppError> {
-    let current_user_email = require_user_email(state, headers, "share:read").await?;
+) -> Result<ImageRequestLogViewContext, AppError> {
+    let current_user_email = extract_session_email(state, headers).await?;
     let share = state
         .store
         .get_share_for_test(share_id)
         .await?
         .ok_or_else(|| AppError::NotFound("share not found".into()))?;
 
-    let is_admin = state.dynamic.read().await.is_admin(&current_user_email);
-    let is_owner = share.owner_email.eq_ignore_ascii_case(&current_user_email);
-    let is_shared_with = share
-        .shared_with_emails
-        .iter()
-        .any(|email| email.eq_ignore_ascii_case(&current_user_email));
+    let is_owner = current_user_email
+        .as_deref()
+        .map(|email| share.owner_email.eq_ignore_ascii_case(email))
+        .unwrap_or(false);
+    Ok(ImageRequestLogViewContext {
+        can_view_prompt: is_owner,
+        can_view_result_url: is_owner,
+    })
+}
 
-    if !is_admin && !is_owner && !is_shared_with {
-        return Err(AppError::Forbidden(
-            "only the share owner, invited users, or admins can view image request logs".into(),
-        ));
+fn apply_image_generation_log_visibility(
+    logs: &mut [ImageGenerationRequestLogEntry],
+    view: &ImageRequestLogViewContext,
+) {
+    for log in logs {
+        if !view.can_view_prompt {
+            log.prompt_preview = None;
+        }
+        if view.can_view_result_url {
+            if let (Some(_storage_key), Some(token)) = (
+                log.result_storage_key.as_deref(),
+                log.result_access_token.as_deref(),
+            ) {
+                log.result_url = Some(format!(
+                    "/v1/image-results/{}?token={}",
+                    log.request_id, token
+                ));
+            }
+        } else {
+            log.result_url = None;
+        }
     }
-    Ok(())
+}
+
+async fn get_image_generation_result(
+    State(state): State<ServerState>,
+    Path(request_id): Path<String>,
+    Query(query): Query<ImageGenerationResultQuery>,
+) -> Result<Response, AppError> {
+    let Some(token) = query
+        .token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(AppError::NotFound("image result not found".into()));
+    };
+    let Some(access) = state
+        .store
+        .get_image_generation_result_for_access(&request_id, token)
+        .await?
+    else {
+        return Err(AppError::NotFound("image result not found".into()));
+    };
+    let Some(path) = image_result_path(&state.config, &access.storage_key) else {
+        return Err(AppError::NotFound("image result not found".into()));
+    };
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|_| AppError::NotFound("image result not found".into()))?;
+    let content_type = access
+        .mime_type
+        .as_deref()
+        .filter(|value| value.starts_with("image/"))
+        .unwrap_or("application/octet-stream");
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, "private, max-age=3600")
+        .body(Body::from(bytes))
+        .map_err(|e| AppError::Internal(format!("build image result response failed: {e}")))
 }
 
 async fn test_share_connection(

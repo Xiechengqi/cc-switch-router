@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
+use std::path::{Component, PathBuf};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
@@ -58,6 +59,7 @@ use crate::models::{ShareAppProvider, ShareUpstreamModel};
 use crate::proxy::ProxyRegistry;
 
 const SHARE_REQUEST_LOG_RECOVERY_LIMIT: usize = 10;
+pub const IMAGE_GENERATION_REQUEST_LOG_RETAIN_PER_SHARE: usize = 10;
 const SHARE_MODEL_HEALTH_CHECK_LIMIT: usize = 10;
 const SHARE_REQUEST_LOG_RECOVERY_STALE_SECS: i64 = 10 * 60;
 const SHARE_REQUEST_LOG_RECOVERY_COOLDOWN_SECS: i64 = 5 * 60;
@@ -169,9 +171,40 @@ pub struct NewImageGenerationRequestLog {
     pub error_message: Option<String>,
     pub result_mime_type: Option<String>,
     pub result_size_bytes: Option<u64>,
+    pub result_storage_key: Option<String>,
+    pub result_access_token: Option<String>,
     pub created_by_email: Option<String>,
     pub client_ip: Option<String>,
     pub user_country: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImageGenerationResultAccess {
+    pub storage_key: String,
+    pub mime_type: Option<String>,
+}
+
+pub fn image_results_root(config: &Config) -> PathBuf {
+    config
+        .db_path
+        .parent()
+        .map(|parent| parent.join("image-results"))
+        .unwrap_or_else(|| PathBuf::from("./image-results"))
+}
+
+pub fn image_result_path(config: &Config, storage_key: &str) -> Option<PathBuf> {
+    let relative = std::path::Path::new(storage_key);
+    if storage_key.trim().is_empty()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::Prefix(_) | Component::RootDir | Component::ParentDir
+            )
+        })
+    {
+        return None;
+    }
+    Some(image_results_root(config).join(relative))
 }
 
 #[derive(Debug, Clone)]
@@ -1235,8 +1268,8 @@ impl AppStore {
                 request_id, share_id, installation_id, share_name, provider_id, provider_name,
                 app_type, model, status, status_code, latency_ms, created_at, completed_at,
                 prompt_preview, error_message, result_mime_type, result_size_bytes,
-                created_by_email, client_ip, user_country
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+                result_storage_key, result_access_token, created_by_email, client_ip, user_country
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
              ON CONFLICT(request_id) DO UPDATE SET
                 status = excluded.status,
                 status_code = excluded.status_code,
@@ -1244,7 +1277,9 @@ impl AppStore {
                 completed_at = excluded.completed_at,
                 error_message = excluded.error_message,
                 result_mime_type = excluded.result_mime_type,
-                result_size_bytes = excluded.result_size_bytes",
+                result_size_bytes = excluded.result_size_bytes,
+                result_storage_key = COALESCE(excluded.result_storage_key, image_generation_request_logs.result_storage_key),
+                result_access_token = COALESCE(excluded.result_access_token, image_generation_request_logs.result_access_token)",
             params![
                 log.request_id,
                 log.share_id,
@@ -1265,6 +1300,8 @@ impl AppStore {
                     .map(|value| truncate_error(value, 1000)),
                 log.result_mime_type,
                 log.result_size_bytes.map(|value| value as i64),
+                log.result_storage_key,
+                log.result_access_token,
                 log.created_by_email,
                 log.client_ip,
                 log.user_country,
@@ -1285,7 +1322,7 @@ impl AppStore {
                 "SELECT request_id, share_id, share_name, installation_id, provider_id, provider_name,
                         app_type, model, status, status_code, latency_ms, created_at, completed_at,
                         prompt_preview, error_message, result_mime_type, result_size_bytes,
-                        created_by_email, user_country
+                        result_storage_key, result_access_token, created_by_email, user_country
                  FROM image_generation_request_logs
                  WHERE share_id = ?1
                  ORDER BY created_at DESC
@@ -1301,6 +1338,79 @@ impl AppStore {
                 AppError::Internal(format!("query image request logs list failed: {e}"))
             })?;
         collect_rows(rows)
+    }
+
+    pub async fn get_image_generation_result_for_access(
+        &self,
+        request_id: &str,
+        access_token: &str,
+    ) -> Result<Option<ImageGenerationResultAccess>, AppError> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT result_storage_key, result_mime_type
+             FROM image_generation_request_logs
+             WHERE request_id = ?1
+               AND result_access_token = ?2
+               AND result_storage_key IS NOT NULL
+               AND result_storage_key != ''",
+            params![request_id, access_token],
+            |row| {
+                Ok(ImageGenerationResultAccess {
+                    storage_key: row.get(0)?,
+                    mime_type: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| AppError::Internal(format!("query image result access failed: {e}")))
+    }
+
+    pub async fn prune_image_generation_request_logs_for_share(
+        &self,
+        share_id: &str,
+        keep: usize,
+    ) -> Result<Vec<String>, AppError> {
+        let conn = self.conn.lock().await;
+        let stale = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT request_id, result_storage_key
+                     FROM image_generation_request_logs
+                     WHERE share_id = ?1
+                     ORDER BY created_at DESC, request_id DESC
+                     LIMIT -1 OFFSET ?2",
+                )
+                .map_err(|e| {
+                    AppError::Internal(format!("prepare stale image request logs failed: {e}"))
+                })?;
+            let rows = stmt
+                .query_map(params![share_id, keep as i64], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })
+                .map_err(|e| {
+                    AppError::Internal(format!("query stale image request logs failed: {e}"))
+                })?;
+            collect_rows(rows)?
+        };
+        if stale.is_empty() {
+            return Ok(Vec::new());
+        }
+        let request_ids = stale
+            .iter()
+            .map(|(request_id, _)| request_id.clone())
+            .collect::<Vec<_>>();
+        let placeholders = repeat_vars(request_ids.len());
+        conn.execute(
+            &format!(
+                "DELETE FROM image_generation_request_logs WHERE request_id IN ({placeholders})"
+            ),
+            params_from_iter(request_ids.iter()),
+        )
+        .map_err(|e| AppError::Internal(format!("delete stale image request logs failed: {e}")))?;
+        Ok(stale
+            .into_iter()
+            .filter_map(|(_, storage_key)| storage_key)
+            .collect())
     }
 
     pub async fn list_user_shares(
@@ -3339,6 +3449,9 @@ impl AppStore {
     ) -> Result<CleanupResult, AppError> {
         let active_subdomains = proxy.active_subdomains().await;
         let cutoff = (Utc::now() - Duration::seconds(config.lease_retention_secs)).to_rfc3339();
+        let log_cutoff_ts = DateTime::parse_from_rfc3339(&cutoff)
+            .map(|dt| dt.timestamp())
+            .unwrap_or_default();
         let stale_cutoff = (Utc::now() - Duration::seconds(config.client_stale_secs)).to_rfc3339();
         let paused_cutoff =
             (Utc::now() - Duration::seconds(config.paused_share_stale_secs)).to_rfc3339();
@@ -3347,7 +3460,7 @@ impl AppStore {
         let market_release_cutoff =
             (Utc::now() - Duration::seconds(MARKET_OFFLINE_GRACE_SECS)).to_rfc3339();
         let active_subdomains_set = active_subdomains.iter().cloned().collect::<HashSet<_>>();
-        let (mut result, stale_subdomains) = {
+        let (mut result, stale_subdomains, stale_image_storage_keys) = {
             let conn = self.conn.lock().await;
             let tx = conn
                 .unchecked_transaction()
@@ -3581,24 +3694,39 @@ impl AppStore {
                 .execute(
                     "DELETE FROM share_request_logs
                      WHERE created_at < ?1",
-                    params![
-                        DateTime::parse_from_rfc3339(&cutoff)
-                            .map(|dt| dt.timestamp())
-                            .unwrap_or_default()
-                    ],
+                    params![log_cutoff_ts],
                 )
                 .map_err(|e| {
                     AppError::Internal(format!("delete stale request logs failed: {e}"))
                 })?;
 
+            let stale_image_storage_keys = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT result_storage_key
+                         FROM image_generation_request_logs
+                         WHERE created_at < ?1
+                           AND result_storage_key IS NOT NULL
+                           AND result_storage_key != ''",
+                    )
+                    .map_err(|e| {
+                        AppError::Internal(format!(
+                            "prepare stale image request result files failed: {e}"
+                        ))
+                    })?;
+                let rows = stmt
+                    .query_map(params![log_cutoff_ts], |row| row.get::<_, String>(0))
+                    .map_err(|e| {
+                        AppError::Internal(format!(
+                            "query stale image request result files failed: {e}"
+                        ))
+                    })?;
+                collect_rows(rows)?
+            };
             tx.execute(
                 "DELETE FROM image_generation_request_logs
                  WHERE created_at < ?1",
-                params![
-                    DateTime::parse_from_rfc3339(&cutoff)
-                        .map(|dt| dt.timestamp())
-                        .unwrap_or_default()
-                ],
+                params![log_cutoff_ts],
             )
             .map_err(|e| {
                 AppError::Internal(format!("delete stale image request logs failed: {e}"))
@@ -3682,6 +3810,7 @@ impl AppStore {
                     removed_routes: 0,
                 },
                 stale_subdomains,
+                stale_image_storage_keys,
             )
         };
 
@@ -3694,6 +3823,21 @@ impl AppStore {
             removed_routes += 1;
         }
         result.removed_routes = removed_routes;
+
+        for storage_key in stale_image_storage_keys {
+            if let Some(path) = image_result_path(config, &storage_key) {
+                if let Err(err) = std::fs::remove_file(&path) {
+                    if err.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            storage_key = %storage_key,
+                            path = %path.display(),
+                            error = %err,
+                            "delete stale image result file failed"
+                        );
+                    }
+                }
+            }
+        }
 
         Ok(result)
     }
@@ -4601,6 +4745,53 @@ impl AppStore {
                 .get(&share.share_id)
                 .cloned()
                 .unwrap_or_default();
+        }
+        Ok(shares)
+    }
+
+    pub async fn list_public_market_share_priority(
+        &self,
+        market_email: &str,
+        active_subdomains: &HashSet<String>,
+        inflight_by_share: &HashMap<String, usize>,
+    ) -> Result<Vec<MarketShareView>, AppError> {
+        let normalized_market_email = normalize_email(market_email)?;
+        {
+            let conn = self.conn.lock().await;
+            let market = get_market_by_email(&conn, &normalized_market_email)?
+                .ok_or_else(|| AppError::NotFound("market not found".into()))?;
+            if market.market_kind == "share" {
+                return Err(AppError::BadRequest(
+                    "share priority is only available for token markets".into(),
+                ));
+            }
+        }
+
+        let mut shares = self
+            .list_market_shares(
+                &normalized_market_email,
+                "main",
+                active_subdomains,
+                inflight_by_share,
+                true,
+            )
+            .await?;
+        let conn = self.conn.lock().await;
+        let states_by_market = list_market_share_runtime_state_map(&conn)?;
+        let states_by_share = states_by_market
+            .get(&normalized_market_email)
+            .cloned()
+            .unwrap_or_default();
+        for share in &mut shares {
+            share.market_states = states_by_share
+                .get(&share.share_id)
+                .cloned()
+                .unwrap_or_default();
+            share.installation_id.clear();
+            share.installation_owner_email = None;
+            share.upstream_provider = None;
+            share.app_runtimes = Default::default();
+            share.model_health = Default::default();
         }
         Ok(shares)
     }
@@ -6371,6 +6562,8 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             error_message TEXT,
             result_mime_type TEXT,
             result_size_bytes INTEGER,
+            result_storage_key TEXT,
+            result_access_token TEXT,
             created_by_email TEXT,
             client_ip TEXT,
             user_country TEXT
@@ -7164,6 +7357,18 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
     add_column_if_missing(conn, "market_request_logs", "error_message", "TEXT")?;
     add_column_if_missing(conn, "market_request_logs", "user_country", "TEXT")?;
     add_column_if_missing(conn, "market_request_logs", "user_country_iso3", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "image_generation_request_logs",
+        "result_storage_key",
+        "TEXT",
+    )?;
+    add_column_if_missing(
+        conn,
+        "image_generation_request_logs",
+        "result_access_token",
+        "TEXT",
+    )?;
     add_column_if_missing(
         conn,
         "router_markets",
@@ -9372,8 +9577,11 @@ fn map_image_generation_request_log_row(
         result_size_bytes: row
             .get::<_, Option<i64>>(16)?
             .map(|value| value.max(0) as u64),
-        created_by_email: row.get(17)?,
-        user_country: row.get(18)?,
+        result_url: None,
+        result_storage_key: row.get(17)?,
+        result_access_token: row.get(18)?,
+        created_by_email: row.get(19)?,
+        user_country: row.get(20)?,
     })
 }
 
@@ -13426,6 +13634,69 @@ mod tests {
             created_at,
             is_health_check: false,
         }
+    }
+
+    fn test_image_request_log(index: usize) -> NewImageGenerationRequestLog {
+        NewImageGenerationRequestLog {
+            request_id: format!("imgreq-{index}"),
+            share_id: "share-img".into(),
+            installation_id: "inst-img".into(),
+            share_name: "Image Share".into(),
+            provider_id: "provider-img".into(),
+            provider_name: "Image Provider".into(),
+            app_type: "codex".into(),
+            model: "gpt-5.5".into(),
+            status: "succeeded".into(),
+            status_code: Some(200),
+            latency_ms: 1000,
+            created_at: index as i64,
+            completed_at: Some(index as i64 + 1),
+            prompt_preview: Some("draw".into()),
+            error_message: None,
+            result_mime_type: Some("image/png".into()),
+            result_size_bytes: Some(8),
+            result_storage_key: Some(format!("share-img/imgreq-{index}.png")),
+            result_access_token: Some(format!("token-{index}")),
+            created_by_email: Some("owner@example.com".into()),
+            client_ip: None,
+            user_country: Some("US".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn image_generation_request_log_prune_keeps_recent_ten() {
+        let (store, config) = setup_store("image-log-prune").await;
+        for index in 0..12 {
+            store
+                .record_image_generation_request_log(test_image_request_log(index))
+                .await
+                .expect("record image log");
+        }
+
+        let stale = store
+            .prune_image_generation_request_logs_for_share(
+                "share-img",
+                IMAGE_GENERATION_REQUEST_LOG_RETAIN_PER_SHARE,
+            )
+            .await
+            .expect("prune image logs");
+        assert_eq!(
+            stale,
+            vec![
+                "share-img/imgreq-1.png".to_string(),
+                "share-img/imgreq-0.png".to_string()
+            ]
+        );
+
+        let logs = store
+            .list_image_generation_request_logs_for_share("share-img", 50)
+            .await
+            .expect("list image logs");
+        assert_eq!(logs.len(), 10);
+        assert_eq!(logs[0].request_id, "imgreq-11");
+        assert_eq!(logs[9].request_id, "imgreq-2");
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 
     #[tokio::test]

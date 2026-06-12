@@ -83,6 +83,14 @@ export async function getMarketLinkedShares(marketEmail: string) {
   );
 }
 
+export async function getMarketSharePriority(marketEmail: string) {
+  return parseJson<MarketShare[]>(
+    await fetch(`/v1/markets/${encodeURIComponent(marketEmail)}/share-priority`, {
+      cache: "no-store",
+    }),
+  );
+}
+
 export async function updateMarketDisabledShares(marketEmail: string, disabledShareIds: string[]) {
   return parseJson<{ ok: boolean; disabledShareIds: string[] }>(
     await authFetch(`/v1/admin/markets/${encodeURIComponent(marketEmail)}/disabled-shares`, {
