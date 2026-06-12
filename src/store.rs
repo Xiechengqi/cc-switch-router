@@ -2460,11 +2460,16 @@ impl AppStore {
         let current_user_email = normalize_email(current_user_email)?;
         let now = Utc::now();
         let conn = self.conn.lock().await;
-        let (installation_id, owner_email, shared_with_emails_json): (String, String, String) = conn
+        let (installation_id, owner_email, shared_with_emails_json, current_sale_market_kind): (
+            String,
+            String,
+            String,
+            String,
+        ) = conn
             .query_row(
-                "SELECT installation_id, owner_email, shared_with_emails_json FROM shares WHERE share_id = ?1",
+                "SELECT installation_id, owner_email, shared_with_emails_json, sale_market_kind FROM shares WHERE share_id = ?1",
                 params![share_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(|e| AppError::Internal(format!("query share owner failed: {e}")))?
@@ -2472,8 +2477,12 @@ impl AppStore {
         let owner_email = normalize_email(&owner_email)?;
         let shared_with_emails = parse_string_vec(Some(shared_with_emails_json))
             .map_err(|e| AppError::Internal(format!("parse share acl failed: {e}")))?;
-        let patch =
-            normalize_share_settings_patch(patch, Some(&owner_email), Some(&shared_with_emails))?;
+        let patch = normalize_share_settings_patch(
+            patch,
+            Some(&owner_email),
+            Some(&shared_with_emails),
+            Some(&current_sale_market_kind),
+        )?;
         if share_settings_patch_is_empty(&patch) {
             return Err(AppError::BadRequest("share settings patch is empty".into()));
         }
@@ -4590,6 +4599,7 @@ impl AppStore {
             },
             Some(&owner_email),
             Some(&current_shared),
+            Some(&sale_market_kind),
         )?;
         let revision = next_share_edit_revision(&conn, share_id)?;
         let edit_id = Uuid::new_v4().to_string();
@@ -8158,12 +8168,24 @@ fn normalize_share_settings_patch(
     patch: ShareSettingsPatch,
     owner_email: Option<&str>,
     current_shared_with_emails: Option<&[String]>,
+    current_sale_market_kind: Option<&str>,
 ) -> Result<ShareSettingsPatch, AppError> {
     let current_owner_email = owner_email.unwrap_or("");
     let next_owner_email = match patch.owner_email {
         Some(value) => Some(normalize_email(&value)?),
         None => None,
     };
+    let sale_market_kind = match patch.sale_market_kind {
+        Some(value) => Some(normalize_sale_market_kind(&value)?),
+        None => None,
+    };
+    let current_sale_market_kind = current_sale_market_kind
+        .map(normalize_sale_market_kind)
+        .transpose()?;
+    let allow_owner_in_acl = sale_market_kind
+        .as_deref()
+        .or(current_sale_market_kind.as_deref())
+        == Some("share");
     let effective_owner_email = next_owner_email.as_deref().unwrap_or(current_owner_email);
     if let Some(next_owner_email) = next_owner_email.as_deref() {
         if next_owner_email == current_owner_email {
@@ -8186,7 +8208,11 @@ fn normalize_share_settings_patch(
     }
     let shared_with_emails = match patch.shared_with_emails {
         Some(values) => {
-            let mut normalized = normalize_email_list(&values, effective_owner_email);
+            let mut normalized = normalize_email_list_with_options(
+                &values,
+                effective_owner_email,
+                allow_owner_in_acl,
+            );
             if next_owner_email.is_some()
                 && !current_owner_email.is_empty()
                 && !normalized.iter().any(|email| email == current_owner_email)
@@ -8216,8 +8242,11 @@ fn normalize_share_settings_patch(
             let mut normalized = BTreeMap::new();
             for (app, access) in values {
                 let app = normalize_share_acl_app(&app)?;
-                let mut emails =
-                    normalize_email_list(&access.shared_with_emails, effective_owner_email);
+                let mut emails = normalize_email_list_with_options(
+                    &access.shared_with_emails,
+                    effective_owner_email,
+                    allow_owner_in_acl,
+                );
                 if next_owner_email.is_some()
                     && !current_owner_email.is_empty()
                     && !emails.iter().any(|email| email == current_owner_email)
@@ -8294,10 +8323,7 @@ fn normalize_share_settings_patch(
             Some(value) => Some(normalize_share_for_sale(&value)?),
             None => None,
         },
-        sale_market_kind: match patch.sale_market_kind {
-            Some(value) => Some(normalize_sale_market_kind(&value)?),
-            None => None,
-        },
+        sale_market_kind,
         market_access_mode: match patch.market_access_mode {
             Some(value) => Some(normalize_market_access_mode(&value)?),
             None => None,
@@ -11066,14 +11092,23 @@ fn normalize_self_reported_share_owner(share: &mut ShareDescriptor) -> Result<()
         .and_then(normalize_email)?;
     share.owner_email = Some(owner_email.clone());
     share.share_name = owner_email.clone();
-    share.shared_with_emails = normalize_email_list(&share.shared_with_emails, &owner_email);
+    let allow_owner_in_acl = share.sale_market_kind == "share";
+    share.shared_with_emails = normalize_email_list_with_options(
+        &share.shared_with_emails,
+        &owner_email,
+        allow_owner_in_acl,
+    );
     let mut access_by_app = BTreeMap::new();
     for (app, access) in std::mem::take(&mut share.access_by_app) {
         let app = normalize_share_acl_app(&app)?;
         access_by_app.insert(
             app,
             ShareAppAccess {
-                shared_with_emails: normalize_email_list(&access.shared_with_emails, &owner_email),
+                shared_with_emails: normalize_email_list_with_options(
+                    &access.shared_with_emails,
+                    &owner_email,
+                    allow_owner_in_acl,
+                ),
                 market_access_mode: normalize_market_access_mode(&access.market_access_mode)?,
             },
         );
@@ -11577,10 +11612,18 @@ fn normalize_runtime_state_token(value: &str, field: &str) -> Result<String, App
 }
 
 fn normalize_email_list(values: &[String], owner_email: &str) -> Vec<String> {
+    normalize_email_list_with_options(values, owner_email, false)
+}
+
+fn normalize_email_list_with_options(
+    values: &[String],
+    owner_email: &str,
+    allow_owner: bool,
+) -> Vec<String> {
     let mut result = Vec::new();
     for value in values {
         if let Ok(email) = normalize_email(value) {
-            if email == owner_email || result.contains(&email) {
+            if (!allow_owner && email == owner_email) || result.contains(&email) {
                 continue;
             }
             result.push(email);
@@ -12566,6 +12609,74 @@ mod tests {
         assert!(html.contains("border-radius:18px 18px 0 0"));
         assert!(html.contains("border-radius:0 0 18px 18px"));
         assert!(html.contains("<span translate=\"no\">TokenSwitch</span> router notification"));
+    }
+
+    #[test]
+    fn share_market_settings_patch_keeps_owner_email_as_market_delegate() {
+        let owner = "router@jptokenswitch.cc";
+        let patch = ShareSettingsPatch {
+            sale_market_kind: Some("share".into()),
+            market_access_mode: Some("selected".into()),
+            shared_with_emails: Some(vec![owner.into()]),
+            access_by_app: Some(BTreeMap::from([(
+                "codex".into(),
+                ShareAppAccess {
+                    shared_with_emails: vec![owner.into()],
+                    market_access_mode: "selected".into(),
+                },
+            )])),
+            ..Default::default()
+        };
+
+        let normalized =
+            normalize_share_settings_patch(patch, Some(owner), Some(&[]), None).expect("normalize");
+
+        assert_eq!(normalized.sale_market_kind.as_deref(), Some("share"));
+        assert_eq!(
+            normalized.shared_with_emails.as_deref(),
+            Some(&[owner.to_string()][..])
+        );
+        assert_eq!(
+            normalized
+                .access_by_app
+                .as_ref()
+                .and_then(|access| access.get("codex"))
+                .map(|access| access.shared_with_emails.as_slice()),
+            Some(&[owner.to_string()][..])
+        );
+    }
+
+    #[test]
+    fn existing_share_market_settings_patch_keeps_owner_email_as_market_delegate() {
+        let owner = "router@jptokenswitch.cc";
+        let patch = ShareSettingsPatch {
+            shared_with_emails: Some(vec![owner.into()]),
+            access_by_app: Some(BTreeMap::from([(
+                "codex".into(),
+                ShareAppAccess {
+                    shared_with_emails: vec![owner.into()],
+                    market_access_mode: "selected".into(),
+                },
+            )])),
+            ..Default::default()
+        };
+
+        let normalized =
+            normalize_share_settings_patch(patch, Some(owner), Some(&[]), Some("share"))
+                .expect("normalize");
+
+        assert_eq!(
+            normalized.shared_with_emails.as_deref(),
+            Some(&[owner.to_string()][..])
+        );
+        assert_eq!(
+            normalized
+                .access_by_app
+                .as_ref()
+                .and_then(|access| access.get("codex"))
+                .map(|access| access.shared_with_emails.as_slice()),
+            Some(&[owner.to_string()][..])
+        );
     }
 
     fn test_config(name: &str) -> Config {
