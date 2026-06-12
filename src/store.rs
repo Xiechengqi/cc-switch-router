@@ -10646,6 +10646,7 @@ fn enrich_dashboard_market(
         .iter()
         .filter(|share| !share.disabled_by_market)
         .collect::<Vec<_>>();
+    let enabled_linked_share_count = enabled_linked_shares.len();
     market.active_requests = if is_share_market {
         enabled_linked_shares
             .iter()
@@ -10691,9 +10692,17 @@ fn enrich_dashboard_market(
         })
         .max()
         .unwrap_or(0);
+    if is_share_market && market.online_minutes_24h == 0 && enabled_linked_share_count > 0 {
+        market.online_minutes_24h = (market.online_share_count * ONLINE_WINDOW_MINUTES
+            + enabled_linked_share_count / 2)
+            / enabled_linked_share_count;
+    }
     market.online_rate_24h =
         ((market.online_minutes_24h as f64 / ONLINE_WINDOW_MINUTES as f64) * 100.0).min(100.0);
     market.health_checks = aggregate_market_health_checks(&linked_shares, health_by_share);
+    if is_share_market && market.online_share_count > 0 {
+        append_current_online_health_check(&mut market.health_checks);
+    }
     market.health_timeline = merge_market_health_timeline(
         &linked_shares,
         health_timeline_by_share,
@@ -10705,6 +10714,27 @@ fn enrich_dashboard_market(
         .get(&market.email.to_ascii_lowercase())
         .cloned()
         .unwrap_or_default();
+}
+
+fn append_current_online_health_check(entries: &mut Vec<HealthCheckEntry>) {
+    let current_minute = Utc::now().timestamp().div_euclid(60);
+    let checked_at = current_minute * 60;
+    if let Some(existing) = entries
+        .iter_mut()
+        .find(|entry| entry.checked_at.div_euclid(60) == current_minute)
+    {
+        existing.is_healthy = true;
+        return;
+    }
+    entries.push(HealthCheckEntry {
+        checked_at,
+        is_healthy: true,
+    });
+    entries.sort_by_key(|entry| entry.checked_at);
+    if entries.len() > 10 {
+        let drop_count = entries.len() - 10;
+        entries.drain(0..drop_count);
+    }
 }
 
 fn aggregate_market_health_checks(
@@ -13286,6 +13316,15 @@ mod tests {
         assert_eq!(market.parallel_capacity, 9);
         assert_eq!(market.usage_tokens, 987_654);
         assert_eq!(market.usage_amount_usd, "0.00000000");
+        assert_eq!(market.online_minutes_24h, ONLINE_WINDOW_MINUTES);
+        assert_eq!(market.online_rate_24h, 100.0);
+        assert!(
+            market
+                .health_checks
+                .last()
+                .map(|entry| entry.is_healthy)
+                .unwrap_or(false)
+        );
     }
 
     fn test_market_request_log(request_id: &str, share_id: &str) -> MarketRequestLogEntry {
