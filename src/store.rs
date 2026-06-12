@@ -10570,6 +10570,7 @@ fn enrich_dashboard_market(
     let disabled_for_market = disabled_by_market.get(&market_email);
     let app_availability_for_market = app_availability_by_market.get(&market_email);
     let runtime_states_for_market = runtime_states_by_market.get(&market_email);
+    let mut share_market_usage_tokens = 0_u64;
     let mut linked_shares = shares
         .iter()
         .filter_map(|(_, share)| {
@@ -10585,6 +10586,10 @@ fn enrich_dashboard_market(
             };
             if share.for_sale != "Yes" || !visible_to_market {
                 return None;
+            }
+            if is_share_market {
+                share_market_usage_tokens =
+                    share_market_usage_tokens.saturating_add(share.tokens_used.max(0) as u64);
             }
             let active_requests = inflight_by_share.get(&share.share_id).copied().unwrap_or(0);
             let online =
@@ -10637,17 +10642,24 @@ fn enrich_dashboard_market(
         .iter()
         .filter(|share| share.online && !share.disabled_by_market)
         .count();
-    // Count only requests that actually traversed the market proxy. Direct
-    // share-subdomain traffic stays out of this number even though it shows up
-    // in the share-keyed limiter.
-    market.active_requests = inflight_by_market_email
-        .get(&market_email)
-        .copied()
-        .unwrap_or(0);
     let enabled_linked_shares = linked_shares
         .iter()
         .filter(|share| !share.disabled_by_market)
         .collect::<Vec<_>>();
+    market.active_requests = if is_share_market {
+        enabled_linked_shares
+            .iter()
+            .map(|share| share.active_requests)
+            .sum()
+    } else {
+        // Count only requests that actually traversed the market proxy. Direct
+        // share-subdomain traffic stays out of this number even though it shows up
+        // in the share-keyed limiter.
+        inflight_by_market_email
+            .get(&market_email)
+            .copied()
+            .unwrap_or(0)
+    };
     market.parallel_capacity = if enabled_linked_shares
         .iter()
         .any(|share| share.parallel_limit < 0)
@@ -10659,6 +10671,10 @@ fn enrich_dashboard_market(
             .map(|share| share.parallel_limit.max(0))
             .sum()
     };
+    if is_share_market {
+        market.usage_tokens = share_market_usage_tokens;
+        market.usage_amount_usd = "0.00000000".to_string();
+    }
     // Online minutes: take the max across linked shares — i.e. the best path
     // the market could route through. Approximates the union of healthy
     // minutes without an additional per-minute SQL pass; stays exact when the
@@ -13202,6 +13218,76 @@ mod tests {
         }
     }
 
+    #[test]
+    fn share_market_dashboard_status_aggregates_hosted_share_runtime() {
+        let market_email = "share-market@example.com";
+        let mut share = test_share_descriptor("share-1", "share-sub");
+        share.for_sale = "Yes".into();
+        share.sale_market_kind = "share".into();
+        share.shared_with_emails = vec![market_email.into()];
+        share.parallel_limit = 9;
+        share.tokens_used = 987_654;
+
+        let shares = vec![("inst-1".into(), share)];
+        let active_subdomains = HashSet::from(["share-sub".to_string()]);
+        let inflight_by_share = HashMap::from([("share-1".to_string(), 4_usize)]);
+        let inflight_by_market_email = HashMap::from([(market_email.to_string(), 99_usize)]);
+        let mut market = DashboardMarketView {
+            id: "market-1".into(),
+            display_name: "Share Market".into(),
+            email: market_email.into(),
+            subdomain: "share-market".into(),
+            public_base_url: "https://share-market.example.com".into(),
+            market_kind: "share".into(),
+            status: "active".into(),
+            online: true,
+            can_manage: false,
+            maintenance_enabled: false,
+            maintenance_message: None,
+            created_at: Utc::now().to_rfc3339(),
+            updated_at: Utc::now().to_rfc3339(),
+            last_seen_at: Utc::now().to_rfc3339(),
+            offline_since: None,
+            share_count: 0,
+            online_share_count: 0,
+            active_requests: 0,
+            parallel_capacity: 0,
+            online_minutes_24h: 0,
+            online_rate_24h: 0.0,
+            usage_tokens: 0,
+            usage_amount_usd: "12.34000000".into(),
+            pricing_summary: None,
+            health_checks: Vec::new(),
+            health_timeline: Vec::new(),
+            linked_shares: Vec::new(),
+            recent_requests: Vec::new(),
+        };
+
+        enrich_dashboard_market(
+            &mut market,
+            &shares,
+            &HashMap::new(),
+            &active_subdomains,
+            &inflight_by_share,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &inflight_by_market_email,
+            &HashMap::new(),
+            &HashMap::new(),
+            Utc::now().timestamp(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        assert_eq!(market.share_count, 1);
+        assert_eq!(market.online_share_count, 1);
+        assert_eq!(market.active_requests, 4);
+        assert_eq!(market.parallel_capacity, 9);
+        assert_eq!(market.usage_tokens, 987_654);
+        assert_eq!(market.usage_amount_usd, "0.00000000");
+    }
+
     fn test_market_request_log(request_id: &str, share_id: &str) -> MarketRequestLogEntry {
         MarketRequestLogEntry {
             request_id: request_id.into(),
@@ -14166,7 +14252,13 @@ mod tests {
         {
             let conn = store.conn.lock().await;
             conn.execute(
-                "UPDATE shares SET for_sale = 'Yes', sale_market_kind = 'share', market_access_mode = 'all' WHERE share_id = ?1",
+                "UPDATE shares
+                    SET for_sale = 'Yes',
+                        sale_market_kind = 'share',
+                        market_access_mode = 'all',
+                        parallel_limit = 7,
+                        tokens_used = 123456
+                  WHERE share_id = ?1",
                 params!["share-market-link"],
             )
             .expect("enable share market sale");
@@ -14196,6 +14288,15 @@ mod tests {
             share.market_links[0].public_base_url,
             "https://share-market.example.com"
         );
+        let dashboard_share_market = dashboard
+            .markets
+            .iter()
+            .find(|market| market.email == "share-market@example.com")
+            .expect("share market dashboard view");
+        assert_eq!(dashboard_share_market.share_count, 1);
+        assert_eq!(dashboard_share_market.parallel_capacity, 7);
+        assert_eq!(dashboard_share_market.usage_tokens, 123456);
+        assert_eq!(dashboard_share_market.usage_amount_usd, "0.00000000");
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }

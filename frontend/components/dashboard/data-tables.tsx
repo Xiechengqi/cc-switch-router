@@ -2496,42 +2496,17 @@ function MarketIdentityCell({
 function MarketStatusCell({ market, t, locale }: { market: DashboardMarket; t: TFn; locale: AppLocale }) {
   const ageValue = formatAgeDaysOrHours(market.createdAt, locale);
   const rowClass = "grid grid-cols-[76px_minmax(0,1fr)] gap-2";
-  if (isShareMarket(market)) {
-    return (
-      <div className="grid min-w-52 gap-2 text-sm">
-        <div className={rowClass}>
-          <span className="mono-label text-muted-foreground">{t("dashboard.online")}</span>
-          <strong>{market.online ? t("common.online") : t("common.offline")}</strong>
-        </div>
-        <div className={rowClass}>
-          <span className="mono-label text-muted-foreground">{t("dashboard.lastSeen")}</span>
-          <strong title={formatDateTime(market.lastSeenAt)}>
-            {formatRelativeTime(market.lastSeenAt, locale)}
-          </strong>
-        </div>
-        {!market.online && market.offlineSince ? (
-          <div className={rowClass}>
-            <span className="mono-label text-muted-foreground">{t("dashboard.offlineSince")}</span>
-            <strong title={formatDateTime(market.offlineSince)}>
-              {formatRelativeTime(market.offlineSince, locale)}
-            </strong>
-          </div>
-        ) : null}
-        <div className={rowClass}>
-          <span className="mono-label text-muted-foreground">{t("dashboard.shares")}</span>
-          <strong>{market.onlineShareCount || 0} / {market.shareCount || 0}</strong>
-        </div>
-      </div>
-    );
-  }
   const limit = isUnlimited(market.parallelCapacity) ? "∞" : String(market.parallelCapacity || 0);
   const onlineValue = market.online ? `${(market.onlineRate24h || 0).toFixed(1)}% / ${ageValue}` : ageValue;
+  const usageValue = isShareMarket(market)
+    ? compactTokens(market.usageTokens)
+    : `${compactTokens(market.usageTokens)} / ${formatUsdOneDecimal(market.usageAmountUsd)}`;
   return (
     <div className="grid min-w-52 gap-2 text-sm">
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.shares")}</span><strong>{market.onlineShareCount || 0} / {market.shareCount || 0}</strong></div>
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.online")}</span><strong title={`${market.onlineMinutes24h || 0} / 1440 min · ${formatDateTime(market.createdAt)}`}>{onlineValue}</strong></div>
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.parallel")}</span><strong>{market.activeRequests || 0}<span className="text-muted-foreground">/{limit}</span></strong></div>
-      <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.usage")}</span><strong>{compactTokens(market.usageTokens)} / {formatUsdOneDecimal(market.usageAmountUsd)}</strong></div>
+      <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.usage")}</span><strong>{usageValue}</strong></div>
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.health")}</span><HealthDots entries={market.healthChecks} /></div>
     </div>
   );
