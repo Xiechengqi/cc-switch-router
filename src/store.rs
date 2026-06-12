@@ -10718,16 +10718,24 @@ fn enrich_dashboard_market(
         })
         .max()
         .unwrap_or(0);
-    if is_share_market && market.online_minutes_24h == 0 && enabled_linked_share_count > 0 {
-        market.online_minutes_24h = (market.online_share_count * ONLINE_WINDOW_MINUTES
-            + enabled_linked_share_count / 2)
-            / enabled_linked_share_count;
+    if is_share_market && market.online_minutes_24h == 0 {
+        if enabled_linked_share_count > 0 {
+            market.online_minutes_24h = (market.online_share_count * ONLINE_WINDOW_MINUTES
+                + enabled_linked_share_count / 2)
+                / enabled_linked_share_count;
+        } else if market.online {
+            market.online_minutes_24h = ONLINE_WINDOW_MINUTES;
+        }
     }
     market.online_rate_24h =
         ((market.online_minutes_24h as f64 / ONLINE_WINDOW_MINUTES as f64) * 100.0).min(100.0);
     market.health_checks = aggregate_market_health_checks(&linked_shares, health_by_share);
     if is_share_market && (market.online || market.online_share_count > 0) {
-        append_current_online_health_check(&mut market.health_checks);
+        if market.health_checks.is_empty() {
+            append_recent_online_health_checks(&mut market.health_checks, 10);
+        } else {
+            append_current_online_health_check(&mut market.health_checks);
+        }
     }
     market.health_timeline = merge_market_health_timeline(
         &linked_shares,
@@ -10759,6 +10767,29 @@ fn append_current_online_health_check(entries: &mut Vec<HealthCheckEntry>) {
     entries.sort_by_key(|entry| entry.checked_at);
     if entries.len() > 10 {
         let drop_count = entries.len() - 10;
+        entries.drain(0..drop_count);
+    }
+}
+
+fn append_recent_online_health_checks(entries: &mut Vec<HealthCheckEntry>, count: usize) {
+    let current_minute = Utc::now().timestamp().div_euclid(60);
+    for offset in (0..count).rev() {
+        let checked_at = (current_minute - offset as i64) * 60;
+        if let Some(existing) = entries
+            .iter_mut()
+            .find(|entry| entry.checked_at.div_euclid(60) == current_minute - offset as i64)
+        {
+            existing.is_healthy = true;
+        } else {
+            entries.push(HealthCheckEntry {
+                checked_at,
+                is_healthy: true,
+            });
+        }
+    }
+    entries.sort_by_key(|entry| entry.checked_at);
+    if entries.len() > count {
+        let drop_count = entries.len() - count;
         entries.drain(0..drop_count);
     }
 }
@@ -13491,13 +13522,12 @@ mod tests {
 
         assert_eq!(market.share_count, 0);
         assert_eq!(market.online_share_count, 0);
+        assert_eq!(market.online_minutes_24h, ONLINE_WINDOW_MINUTES);
+        assert_eq!(market.online_rate_24h, 100.0);
+        assert_eq!(market.health_checks.len(), 10);
         assert!(
-            market
-                .health_checks
-                .last()
-                .map(|entry| entry.is_healthy)
-                .unwrap_or(false),
-            "online share market should show a current healthy dashboard dot even before shares are linked"
+            market.health_checks.iter().all(|entry| entry.is_healthy),
+            "online share market should show recent healthy dashboard dots even before shares are linked"
         );
     }
 
