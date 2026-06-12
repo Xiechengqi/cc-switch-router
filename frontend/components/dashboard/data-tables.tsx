@@ -194,6 +194,19 @@ function formatPercent(value: number) {
   return `${percent.toFixed(percent >= 10 ? 0 : 1).replace(/\.0$/, "")}%`;
 }
 
+function formatOfficialPriceMultiplier(value: string | number | null | undefined, label: string, t: TFn) {
+  if (typeof value === "string" && value.trim().toLowerCase() === "mixed") {
+    return `${t("dashboard.mixed")} x ${label}`;
+  }
+  const percent = Number(value);
+  if (!Number.isFinite(percent) || percent <= 0) return `- x ${label}`;
+  const multiplier = percent / 100;
+  const text = multiplier >= 1
+    ? multiplier.toFixed(2)
+    : multiplier.toFixed(3);
+  return `${text.replace(/(\.\d*?[1-9])0+$/, "$1").replace(/\.0+$/, "")} x ${label}`;
+}
+
 function requestModelRoute(log?: Partial<ShareRequestLog | MarketRequestLog>) {
   const record = (log || {}) as Partial<ShareRequestLog & MarketRequestLog>;
   const agent = record.requestAgent || "";
@@ -2114,9 +2127,7 @@ export function ClientsTable({ clients, shares, markets, onChanged }: { clients:
               <Drawer.Body className="overflow-y-auto">
                 {selected ? (
                   <div className="grid gap-5">
-                    <DrawerSection label="24h">
-                      <HealthTimelineStrip timeline={selected.healthTimeline || []} />
-                    </DrawerSection>
+                    <HealthTimelineStrip timeline={selected.healthTimeline || []} />
                     <DrawerSection label="Client">
                       <div className="grid gap-1 text-xs text-muted-foreground">
                         <span>URL: <strong className="break-all text-foreground">{selectedClientUrl || "-"}</strong></span>
@@ -2302,9 +2313,7 @@ export function SharesTable({
               <Drawer.Body className="overflow-y-auto">
                 {selected ? (
                   <div className="grid gap-5">
-                    <DrawerSection label="24h">
-                      <HealthTimelineStrip timeline={selected.healthTimeline} />
-                    </DrawerSection>
+                    <HealthTimelineStrip timeline={selected.healthTimeline} />
                     <DrawerSection label={t("dashboard.client")}>
                       <ShareClientPanel
                         client={clientByShareId.get(selected.shareId)}
@@ -2417,13 +2426,18 @@ function MarketPricingCell({ market, t }: { market: DashboardMarket; t: TFn }) {
   const summary = market.pricingSummary || {};
   const entries = [["Claude", summary.claude], ["Codex", summary.codex], ["Gemini", summary.gemini], ["DeepSeek", summary.deepseek]];
   return (
-    <div className="grid min-w-44 gap-2">
-      {entries.map(([label, value]) => (
-        <div key={label as string} className="grid grid-cols-[66px_1fr] gap-2 text-sm">
-          <span className="mono-label text-muted-foreground">{label as string}</span>
-          <strong>{typeof value === "number" ? `${value}%` : typeof value === "string" && value ? (value.toLowerCase() === "mixed" ? t("dashboard.mixed") : `${value}%`) : "-"}</strong>
-        </div>
-      ))}
+    <div className="overflow-hidden rounded-lg border border-default-200">
+      <table className="w-full table-fixed text-left text-xs">
+        <tbody>
+          <tr>
+            {entries.map(([label, value]) => (
+              <td key={label as string} className="border-r border-default-200 px-2.5 py-2 font-mono text-foreground last:border-r-0">
+                {formatOfficialPriceMultiplier(value, label as string, t)}
+              </td>
+            ))}
+          </tr>
+        </tbody>
+      </table>
     </div>
   );
 }
@@ -2602,15 +2616,12 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
               <Drawer.Body className="overflow-y-auto">
                 {selected ? (
                   <div className="grid gap-4">
-                    <DrawerSection label={t("dashboard.details")}>
-                      <MarketBasicInfoPanel market={selected} t={t} locale={locale} />
-                    </DrawerSection>
                     {isUsageMarket(selected) ? (
                       <>
+                        <HealthTimelineStrip timeline={selected.healthTimeline} />
                         <DrawerSection label={t("dashboard.officialPrice")}>
                           <MarketPricingCell market={selected} t={t} />
                         </DrawerSection>
-                        <DrawerSection label="24h"><HealthTimelineStrip timeline={selected.healthTimeline} /></DrawerSection>
                       </>
                     ) : null}
                     <DrawerSection label={canShowMarketSharePriority(selected) ? t("dashboard.sharePriority") : t("dashboard.linkedShares")}>

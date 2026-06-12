@@ -4364,11 +4364,9 @@ impl AppStore {
                     .get(&share_id)
                     .cloned()
                     .unwrap_or_default();
+                let raw_app_runtimes = parse_app_runtimes(row.get(19)?)?;
                 let app_runtimes = filter_app_runtimes_by_quota(
-                    filter_app_runtimes_by_model_health(
-                        parse_app_runtimes(row.get(19)?)?,
-                        &model_health,
-                    ),
+                    filter_app_runtimes_by_model_health(raw_app_runtimes.clone(), &model_health),
                     now,
                 );
                 let quota_health = crate::scheduling_signals::compute_quota_health(
@@ -4379,10 +4377,16 @@ impl AppStore {
                     crate::scheduling_signals::compute_stability(samples, online_rate_24h);
                 let headroom =
                     crate::scheduling_signals::compute_headroom(active_requests, parallel_limit);
-                let app_availability = market_availability_by_share
+                let mut app_availability = market_availability_by_share
                     .get(&share_id)
                     .cloned()
                     .unwrap_or_default();
+                apply_quota_blocks_to_app_availability(
+                    &mut app_availability,
+                    &raw_app_runtimes,
+                    &model_health,
+                    now,
+                );
                 let market_failure_penalty = market_app_availability_penalty(&app_availability);
                 Ok((
                     shared_with_emails,
@@ -8927,6 +8931,80 @@ fn set_market_app_availability_entry(
     if should_replace_market_app_availability(slot.as_ref(), &entry) {
         *slot = Some(entry);
     }
+}
+
+fn apply_quota_blocks_to_app_availability(
+    availability: &mut MarketAppAvailability,
+    runtimes: &ShareAppRuntimes,
+    model_health: &ShareModelHealthSummary,
+    now: DateTime<Utc>,
+) {
+    for (app_type, provider, health) in [
+        (
+            "claude",
+            runtimes.claude.as_ref(),
+            model_health.claude.as_slice(),
+        ),
+        (
+            "codex",
+            runtimes.codex.as_ref(),
+            model_health.codex.as_slice(),
+        ),
+        (
+            "gemini",
+            runtimes.gemini.as_ref(),
+            model_health.gemini.as_slice(),
+        ),
+    ] {
+        if let Some(entry) = quota_blocked_app_availability(app_type, provider, health, now) {
+            set_market_app_availability_entry(availability, app_type, entry);
+        }
+    }
+}
+
+fn quota_blocked_app_availability(
+    app_type: &str,
+    provider: Option<&ShareUpstreamProvider>,
+    health: &[ModelHealthSummary],
+    now: DateTime<Utc>,
+) -> Option<MarketAppAvailabilityEntry> {
+    if let Some(quota) = provider.and_then(|provider| provider.quota.as_ref()) {
+        if quota_block_is_active(quota, now) {
+            return Some(MarketAppAvailabilityEntry {
+                status: "unavailable".to_string(),
+                reason: quota
+                    .blocked_reason
+                    .clone()
+                    .or_else(|| quota.availability.clone())
+                    .or_else(|| Some("quota exhausted".to_string())),
+                requested_model: Some(app_type.to_string()),
+                actual_model: Some(app_type.to_string()),
+                last_checked_at: Some(now.timestamp()),
+                recent_results: vec!["quota_blocked".to_string()],
+            });
+        }
+    }
+
+    health
+        .iter()
+        .filter(|entry| {
+            entry.status.eq_ignore_ascii_case("quota_blocked")
+                || (is_app_level_model_health(entry, app_type)
+                    && entry.status.eq_ignore_ascii_case("failed")
+                    && model_health_error_is_quota_block(entry.error_message.as_deref()))
+        })
+        .max_by_key(|entry| entry.last_checked_at.unwrap_or_default())
+        .map(|entry| MarketAppAvailabilityEntry {
+            status: "unavailable".to_string(),
+            reason: entry
+                .error_message
+                .clone()
+                .or_else(|| Some("quota exhausted".to_string())),
+            requested_model: Some(entry.requested_model.clone()),
+            actual_model: Some(entry.actual_model.clone()),
+            last_checked_at: Some(now.timestamp()),
+            recent_results: vec!["quota_blocked".to_string()],
+        })
 }
 
 fn market_app_availability_penalty(availability: &MarketAppAvailability) -> f64 {
@@ -13597,6 +13675,69 @@ mod tests {
 
         assert!(shares[0].app_availability.claude.is_none());
         assert!((shares[0].signals.owner_penalty - 1.0).abs() < 1e-9);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn market_share_quota_block_overrides_stale_success_availability() {
+        let (store, config) = setup_store("market-quota-block-availability").await;
+        let market = test_market();
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-1", "share-sub", "active").await;
+        let now = Utc::now();
+        let mut codex_provider = test_upstream_provider("gpt-5.5");
+        codex_provider.quota = Some(ShareUpstreamQuota {
+            status: "ok".into(),
+            plan: Some("ChatGPT Plus".into()),
+            queried_at: Some(now.timestamp_millis()),
+            availability: Some("long_window_exhausted".into()),
+            blocked_until: Some((now + Duration::days(4)).to_rfc3339()),
+            blocked_reason: Some("weekly quota exhausted".into()),
+            blocked_scope: Some("weekly".into()),
+            tiers: Vec::new(),
+        });
+        let runtimes_json = serde_json::to_string(&ShareAppRuntimes {
+            codex: Some(codex_provider),
+            ..ShareAppRuntimes::default()
+        })
+        .expect("serialize runtimes");
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares
+                    SET for_sale = 'Yes', market_access_mode = 'all', app_runtimes_json = ?1
+                  WHERE share_id = 'share-1'",
+                params![runtimes_json],
+            )
+            .expect("make share visible with blocked codex runtime");
+            conn.execute(
+                "INSERT INTO market_share_model_failure_state (
+                    market_email, share_id, app_type, requested_model, actual_model, last_status,
+                    last_success_at, last_checked_at, recent_results_json, error_message, updated_at
+                 ) VALUES (?1, 'share-1', 'codex', 'gpt-5.5', 'gpt-5.5',
+                    'success', ?2, ?2, '[\"success\",\"success\",\"success\"]', NULL, ?2)",
+                params![market.email.to_ascii_lowercase(), now.timestamp()],
+            )
+            .expect("insert stale success");
+        }
+
+        let active = HashSet::from(["share-sub".to_string()]);
+        let shares = store
+            .list_market_shares(&market.email, "main", &active, &HashMap::new(), true)
+            .await
+            .expect("list market shares");
+
+        assert_eq!(shares.len(), 1);
+        assert!(shares[0].app_runtimes.codex.is_none());
+        let codex = shares[0]
+            .app_availability
+            .codex
+            .as_ref()
+            .expect("codex availability");
+        assert_eq!(codex.status, "unavailable");
+        assert_eq!(codex.reason.as_deref(), Some("weekly quota exhausted"));
+        assert!((shares[0].signals.owner_penalty - 0.25).abs() < 1e-9);
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
