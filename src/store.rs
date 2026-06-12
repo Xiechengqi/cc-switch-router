@@ -10700,7 +10700,7 @@ fn enrich_dashboard_market(
     market.online_rate_24h =
         ((market.online_minutes_24h as f64 / ONLINE_WINDOW_MINUTES as f64) * 100.0).min(100.0);
     market.health_checks = aggregate_market_health_checks(&linked_shares, health_by_share);
-    if is_share_market && market.online_share_count > 0 {
+    if is_share_market && (market.online || market.online_share_count > 0) {
         append_current_online_health_check(&mut market.health_checks);
     }
     market.health_timeline = merge_market_health_timeline(
@@ -13324,6 +13324,69 @@ mod tests {
                 .last()
                 .map(|entry| entry.is_healthy)
                 .unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn share_market_dashboard_health_uses_market_online_fallback() {
+        let market_email = "share-market@example.com";
+        let mut market = DashboardMarketView {
+            id: "market-1".into(),
+            display_name: "Share Market".into(),
+            email: market_email.into(),
+            subdomain: "share-market".into(),
+            public_base_url: "https://share-market.example.com".into(),
+            market_kind: "share".into(),
+            status: "active".into(),
+            online: true,
+            can_manage: false,
+            maintenance_enabled: false,
+            maintenance_message: None,
+            created_at: Utc::now().to_rfc3339(),
+            updated_at: Utc::now().to_rfc3339(),
+            last_seen_at: Utc::now().to_rfc3339(),
+            offline_since: None,
+            share_count: 0,
+            online_share_count: 0,
+            active_requests: 0,
+            parallel_capacity: 0,
+            online_minutes_24h: 0,
+            online_rate_24h: 0.0,
+            usage_tokens: 0,
+            usage_amount_usd: "0.00000000".into(),
+            pricing_summary: None,
+            health_checks: Vec::new(),
+            health_timeline: Vec::new(),
+            linked_shares: Vec::new(),
+            recent_requests: Vec::new(),
+        };
+
+        enrich_dashboard_market(
+            &mut market,
+            &[],
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            Utc::now().timestamp(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        assert_eq!(market.share_count, 0);
+        assert_eq!(market.online_share_count, 0);
+        assert!(
+            market
+                .health_checks
+                .last()
+                .map(|entry| entry.is_healthy)
+                .unwrap_or(false),
+            "online share market should show a current healthy dashboard dot even before shares are linked"
         );
     }
 
