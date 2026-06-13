@@ -708,21 +708,97 @@ function SupportCell({ share, t, locale }: { share?: ShareView; t: TFn; locale: 
   return (
     <div className="grid min-w-0 gap-1.5">
       {rows.map(([key, label]) => {
-        const enabled = !!share.support?.[key];
-        const runtime = mergeStandaloneOAuthRuntime(share.appRuntimes?.[key], share.appRuntimes);
-        const tone = enabled ? modelHealthTone(share, key) : { className: "bg-slate-50 text-muted-foreground", label: "" };
-        return (
-          <div key={key} title={enabled ? modelHealthTitle(share, key) : undefined} className={`grid grid-cols-[56px_1fr] gap-2 rounded-lg border px-2 py-1.5 text-[11px] ${tone.className}`}>
-            <span className="font-mono uppercase">{label}</span>
-            <span className="grid min-w-0 gap-0.5 text-right">
-              <span className="whitespace-normal break-words font-semibold">{enabled ? providerAccountLevel(runtime, locale) : ""}</span>
-              <span className="whitespace-normal break-words text-[10px] font-medium opacity-75">{enabled ? providerAccountIdentity(runtime) : ""}</span>
-              <span className="whitespace-normal break-words text-[10px] font-medium opacity-75">{enabled ? providerModelMap(runtime) : ""}</span>
-              <span className="text-[10px] font-semibold opacity-70">{enabled ? tone.label : ""}</span>
-            </span>
-          </div>
-        );
+        return <ShareAppSupportCard key={key} share={share} app={key} label={label} locale={locale} />;
       })}
+    </div>
+  );
+}
+
+type CoreShareApp = "claude" | "codex" | "gemini";
+
+function ShareAppSupportCard({
+  share,
+  app,
+  label,
+  locale,
+}: {
+  share: ShareView;
+  app: CoreShareApp;
+  label: string;
+  locale: AppLocale;
+}) {
+  const enabled = !!share.support?.[app];
+  const runtime = mergeStandaloneOAuthRuntime(share.appRuntimes?.[app], share.appRuntimes);
+  const tone = enabled ? modelHealthTone(share, app) : { className: "bg-slate-50 text-muted-foreground", label: "" };
+  return (
+    <div title={enabled ? modelHealthTitle(share, app) : undefined} className={`grid grid-cols-[56px_1fr] gap-2 rounded-lg border px-2 py-1.5 text-[11px] ${tone.className}`}>
+      <span className="font-mono uppercase">{label}</span>
+      <span className="grid min-w-0 gap-0.5 text-right">
+        <span className="whitespace-normal break-words font-semibold">{enabled ? providerAccountLevel(runtime, locale) : ""}</span>
+        <span className="whitespace-normal break-words text-[10px] font-medium opacity-75">{enabled ? providerAccountIdentity(runtime) : ""}</span>
+        <span className="whitespace-normal break-words text-[10px] font-medium opacity-75">{enabled ? providerModelMap(runtime) : ""}</span>
+        <span className="text-[10px] font-semibold opacity-70">{enabled ? tone.label : ""}</span>
+      </span>
+    </div>
+  );
+}
+
+function shareAppSettings(share: ShareView, app: CoreShareApp) {
+  const access = share.accessByApp?.[app];
+  return {
+    forSale: share.appSettings?.[app]?.forSale ?? share.forSale,
+    saleMarketKind: share.appSettings?.[app]?.saleMarketKind ?? share.saleMarketKind ?? "token",
+    marketAccessMode: share.appSettings?.[app]?.marketAccessMode ?? access?.marketAccessMode ?? share.marketAccessMode,
+    sharedWithEmails: share.appSettings?.[app]?.sharedWithEmails ?? access?.sharedWithEmails ?? share.sharedWithEmails ?? [],
+    tokenLimit: share.appSettings?.[app]?.tokenLimit ?? share.tokenLimit,
+    parallelLimit: share.appSettings?.[app]?.parallelLimit ?? share.parallelLimit,
+    expiresAt: share.appSettings?.[app]?.expiresAt || share.expiresAt,
+  };
+}
+
+function ShareAppColumn({ share, app, label, t, locale }: { share: ShareView; app: CoreShareApp; label: string; t: TFn; locale: AppLocale }) {
+  const supported = !!share.support?.[app];
+  const settings = shareAppSettings(share, app);
+  const saleValue =
+    settings.forSale === "Free"
+      ? t("dashboard.free")
+      : settings.forSale === "Yes"
+        ? settings.saleMarketKind === "share"
+          ? t("dashboard.shareMarket")
+          : t("dashboard.tokenMarket")
+        : t("dashboard.no");
+  const limit = isUnlimited(settings.parallelLimit) ? "∞" : String(settings.parallelLimit || 0);
+  const tokenLimit = settings.tokenLimit ?? share.tokenLimit;
+  const averageLatency = averageRecentLatencyMs(
+    (share.recentRequests || []).filter((request) => !request.appType || request.appType === app),
+  );
+  const rowClass = "grid grid-cols-[52px_minmax(0,1fr)] gap-2";
+  return (
+    <div className="grid min-w-0 gap-2 text-sm">
+      <ShareAppSupportCard share={share} app={app} label={label} locale={locale} />
+      {!supported ? (
+        <span className="text-xs text-muted-foreground">{t("dashboard.sharePriorityUnsupported")}</span>
+      ) : null}
+      <div className={rowClass}>
+        <span className="mono-label text-muted-foreground">{t("dashboard.forSale")}</span>
+        <Chip size="sm" variant={settings.forSale === "No" ? "tertiary" : "soft"}>{saleValue}</Chip>
+      </div>
+      <div className={rowClass}>
+        <span className="mono-label text-muted-foreground">{t("dashboard.usage")}</span>
+        <div><strong>{compactTokens(share.tokensUsed)} / {isUnlimited(tokenLimit) ? "∞" : compactTokens(tokenLimit)}</strong><UsageBar used={share.tokensUsed} limit={tokenLimit} t={t} /></div>
+      </div>
+      <div className={rowClass}>
+        <span className="mono-label text-muted-foreground">{t("dashboard.expires")}</span>
+        <strong title={expiryTitle(settings.expiresAt)}>{shareExpiryProgress({ ...share, expiresAt: settings.expiresAt }, locale)}</strong>
+      </div>
+      <div className={rowClass}>
+        <span className="mono-label text-muted-foreground">{t("dashboard.parallel")}</span>
+        <strong>{share.activeRequests || 0}<span className="text-muted-foreground">/{limit}</span></strong>
+      </div>
+      <div className={rowClass}>
+        <span className="mono-label text-muted-foreground">{t("dashboard.response")}</span>
+        <strong>{formatLatencySeconds(averageLatency)}</strong>
+      </div>
     </div>
   );
 }
@@ -2228,13 +2304,13 @@ export function SharesTable({
       </div>
       <Card className="overflow-hidden rounded-[20px]">
         <Card.Content className="overflow-x-auto p-0">
-          <table className="w-full min-w-[720px] table-fixed border-collapse text-sm">
+          <table className="w-full min-w-[1040px] table-fixed border-collapse text-sm">
             <thead className="bg-muted text-left font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground">
               <tr>
-                <th className="w-1/3 px-4 py-3">{t("dashboard.share")}</th>
-                {/* P16：FOR SALE 列并入 STATUS 列首行（只保留 Yes/No/Free 摘要）。 */}
-                <th className="w-1/3 px-4 py-3">{t("dashboard.status")}</th>
-                <th className="w-1/3 px-4 py-3">{t("dashboard.support")}</th>
+                <th className="w-[28%] px-4 py-3">{t("dashboard.share")}</th>
+                <th className="w-[24%] px-4 py-3">Claude</th>
+                <th className="w-[24%] px-4 py-3">Codex</th>
+                <th className="w-[24%] px-4 py-3">Gemini</th>
                 <th className="w-7 px-4 py-3" />
               </tr>
             </thead>
@@ -2267,11 +2343,14 @@ export function SharesTable({
                           </div>
                         </div>
                       </td>
-                      <td className="px-4 py-3 align-middle">
-                        <ShareStatusCell share={share} t={t} locale={locale} />
+                      <td className="px-4 py-3 align-top">
+                        <ShareAppColumn share={share} app="claude" label="Claude" t={t} locale={locale} />
                       </td>
-                      <td className="px-4 py-3 align-middle">
-                        <SupportCell share={share} t={t} locale={locale} />
+                      <td className="px-4 py-3 align-top">
+                        <ShareAppColumn share={share} app="codex" label="Codex" t={t} locale={locale} />
+                      </td>
+                      <td className="px-4 py-3 align-top">
+                        <ShareAppColumn share={share} app="gemini" label="Gemini" t={t} locale={locale} />
                       </td>
                       <td className="px-4 py-3 align-middle text-lg text-muted-foreground">›</td>
                     </tr>

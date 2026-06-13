@@ -598,6 +598,8 @@ pub struct ShareSettingsPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_by_app: Option<BTreeMap<String, ShareAppAccess>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_settings: Option<BTreeMap<String, ShareAppSettings>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub for_sale_official_price_percent_by_app: Option<BTreeMap<String, u16>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_limit: Option<i64>,
@@ -1060,6 +1062,17 @@ pub struct MarketNotificationEmailLogView {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MarketShareAppView {
+    pub app: String,
+    pub supported: bool,
+    pub visible: bool,
+    pub for_sale: String,
+    pub sale_market_kind: String,
+    pub market_access_mode: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MarketShareView {
     pub router_id: String,
     pub share_id: String,
@@ -1100,6 +1113,8 @@ pub struct MarketShareView {
     pub model_health: ShareModelHealthSummary,
     #[serde(default)]
     pub app_availability: MarketAppAvailability,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub market_apps: BTreeMap<String, MarketShareAppView>,
     #[serde(default)]
     pub market_states: Vec<MarketShareRuntimeStateView>,
     /// Router-computed scheduling signals. Markets sort using these directly
@@ -1113,6 +1128,8 @@ pub struct MarketShareView {
 pub struct ShareMarketGrantRequest {
     pub grant_id: String,
     pub action: String,
+    #[serde(default)]
+    pub app_type: Option<String>,
     #[serde(default)]
     pub buyer_emails: Vec<String>,
     #[serde(default)]
@@ -1422,6 +1439,8 @@ pub struct ShareDescriptor {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub access_by_app: BTreeMap<String, ShareAppAccess>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub app_settings: BTreeMap<String, ShareAppSettings>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub for_sale_official_price_percent_by_app: BTreeMap<String, u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -1463,6 +1482,39 @@ pub struct ShareAppAccess {
     pub shared_with_emails: Vec<String>,
     #[serde(default = "default_market_access_mode")]
     pub market_access_mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareAppSettings {
+    #[serde(default = "default_share_for_sale")]
+    pub for_sale: String,
+    #[serde(default = "default_sale_market_kind")]
+    pub sale_market_kind: String,
+    #[serde(default = "default_market_access_mode")]
+    pub market_access_mode: String,
+    #[serde(default)]
+    pub shared_with_emails: Vec<String>,
+    #[serde(default)]
+    pub token_limit: i64,
+    #[serde(default = "default_share_parallel_limit")]
+    pub parallel_limit: i64,
+    #[serde(default)]
+    pub expires_at: String,
+}
+
+impl Default for ShareAppSettings {
+    fn default() -> Self {
+        Self {
+            for_sale: default_share_for_sale(),
+            sale_market_kind: default_sale_market_kind(),
+            market_access_mode: default_market_access_mode(),
+            shared_with_emails: Vec::new(),
+            token_limit: -1,
+            parallel_limit: default_share_parallel_limit(),
+            expires_at: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1812,6 +1864,8 @@ pub struct ShareView {
     pub shared_with_emails: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub access_by_app: BTreeMap<String, ShareAppAccess>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub app_settings: BTreeMap<String, ShareAppSettings>,
     #[serde(default)]
     pub market_links: Vec<ShareMarketLinkView>,
     #[serde(default)]

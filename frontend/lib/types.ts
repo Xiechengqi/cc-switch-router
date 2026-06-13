@@ -86,6 +86,7 @@ export type ShareView = {
   ownerEmail?: string;
   sharedWithEmails?: string[];
   accessByApp?: ShareAccessByApp;
+  appSettings?: ShareAppSettingsByApp;
   marketLinks?: ShareMarketLink[];
   unknownMarketEmails?: string[];
   description?: string;
@@ -133,6 +134,18 @@ export type ShareAppAccess = {
 
 export type ShareAccessByApp = Partial<Record<"claude" | "codex" | "gemini", ShareAppAccess>>;
 
+export type ShareAppSettings = {
+  forSale?: "Yes" | "No" | "Free";
+  saleMarketKind?: ShareSaleMarketKind;
+  marketAccessMode?: "selected" | "all";
+  sharedWithEmails?: string[];
+  tokenLimit?: number;
+  parallelLimit?: number;
+  expiresAt?: string;
+};
+
+export type ShareAppSettingsByApp = Partial<Record<"claude" | "codex" | "gemini", ShareAppSettings>>;
+
 export type ShareSettingsPatch = {
   ownerEmail?: string;
   description?: string | null;
@@ -141,6 +154,7 @@ export type ShareSettingsPatch = {
   marketAccessMode?: "selected" | "all";
   sharedWithEmails?: string[];
   accessByApp?: ShareAccessByApp;
+  appSettings?: ShareAppSettingsByApp;
   forSaleOfficialPricePercentByApp?: Record<string, number>;
   tokenLimit?: number;
   parallelLimit?: number;
