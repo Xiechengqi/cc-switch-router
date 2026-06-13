@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
 use std::path::{Component, PathBuf};
 use std::sync::Arc;
@@ -4322,6 +4323,26 @@ impl AppStore {
         inflight_by_share: &HashMap<String, usize>,
         allow_all_market_access: bool,
     ) -> Result<Vec<MarketShareView>, AppError> {
+        self.list_market_shares_with_signal_app(
+            market_email,
+            router_id,
+            active_subdomains,
+            inflight_by_share,
+            allow_all_market_access,
+            None,
+        )
+        .await
+    }
+
+    async fn list_market_shares_with_signal_app(
+        &self,
+        market_email: &str,
+        router_id: &str,
+        active_subdomains: &HashSet<String>,
+        inflight_by_share: &HashMap<String, usize>,
+        allow_all_market_access: bool,
+        signal_app: Option<&str>,
+    ) -> Result<Vec<MarketShareView>, AppError> {
         let conn = self.conn.lock().await;
         let online_minutes = list_online_minutes_24h(&conn)?;
         let samples_10m = list_online_minutes_10m(&conn)?;
@@ -4375,8 +4396,10 @@ impl AppStore {
                     filter_app_runtimes_by_model_health(raw_app_runtimes.clone(), &model_health),
                     now,
                 );
-                let quota_health = crate::scheduling_signals::compute_quota_health(
-                    upstream_provider.as_ref().and_then(|p| p.quota.as_ref()),
+                let quota_health = compute_market_share_quota_health(
+                    signal_app,
+                    &raw_app_runtimes,
+                    upstream_provider.as_ref(),
                     now,
                 );
                 let stability =
@@ -4763,10 +4786,12 @@ impl AppStore {
     pub async fn list_public_market_share_priority(
         &self,
         market_email: &str,
+        app: Option<&str>,
         active_subdomains: &HashSet<String>,
         inflight_by_share: &HashMap<String, usize>,
     ) -> Result<Vec<MarketShareView>, AppError> {
         let normalized_market_email = normalize_email(market_email)?;
+        let signal_app = app.map(normalize_market_share_priority_app).transpose()?;
         {
             let conn = self.conn.lock().await;
             let market = get_market_by_email(&conn, &normalized_market_email)?
@@ -4779,12 +4804,13 @@ impl AppStore {
         }
 
         let mut shares = self
-            .list_market_shares(
+            .list_market_shares_with_signal_app(
                 &normalized_market_email,
                 "main",
                 active_subdomains,
                 inflight_by_share,
                 true,
+                signal_app.as_deref(),
             )
             .await?;
         let conn = self.conn.lock().await;
@@ -4798,6 +4824,11 @@ impl AppStore {
                 .get(&share.share_id)
                 .cloned()
                 .unwrap_or_default();
+        }
+        if let Some(app) = signal_app.as_deref() {
+            sort_market_shares_for_app(&mut shares, app);
+        }
+        for share in &mut shares {
             share.installation_id.clear();
             share.installation_owner_email = None;
             share.upstream_provider = None;
@@ -8956,6 +8987,199 @@ fn set_market_app_availability_entry(
     }
 }
 
+fn normalize_market_share_priority_app(app: &str) -> Result<String, AppError> {
+    let normalized = app.trim().to_ascii_lowercase();
+    if matches!(normalized.as_str(), "claude" | "codex" | "gemini") {
+        Ok(normalized)
+    } else {
+        Err(AppError::BadRequest(
+            "app must be one of claude, codex, gemini".into(),
+        ))
+    }
+}
+
+fn compute_market_share_quota_health(
+    signal_app: Option<&str>,
+    runtimes: &ShareAppRuntimes,
+    upstream_provider: Option<&ShareUpstreamProvider>,
+    now: DateTime<Utc>,
+) -> f64 {
+    if let Some(app) = signal_app {
+        return runtime_quota_for_app(runtimes, app)
+            .or_else(|| upstream_provider.and_then(|provider| provider.quota.as_ref()))
+            .map(|quota| market_quota_health(quota, now))
+            .unwrap_or_else(|| crate::scheduling_signals::compute_quota_health(None, now));
+    }
+
+    let runtime_healths = runtime_quota_healths(runtimes, now);
+    if !runtime_healths.is_empty() {
+        return runtime_healths
+            .into_iter()
+            .fold(f64::INFINITY, f64::min)
+            .clamp(0.0, 1.5);
+    }
+
+    upstream_provider
+        .and_then(|provider| provider.quota.as_ref())
+        .map(|quota| market_quota_health(quota, now))
+        .unwrap_or_else(|| crate::scheduling_signals::compute_quota_health(None, now))
+}
+
+fn runtime_quota_for_app<'a>(
+    runtimes: &'a ShareAppRuntimes,
+    app: &str,
+) -> Option<&'a ShareUpstreamQuota> {
+    match app {
+        "claude" => runtimes.claude.as_ref(),
+        "codex" => runtimes.codex.as_ref(),
+        "gemini" => runtimes.gemini.as_ref(),
+        "kiro" => runtimes.kiro.as_ref(),
+        "cursor" => runtimes.cursor.as_ref(),
+        "antigravity" => runtimes.antigravity.as_ref(),
+        "copilot" => runtimes.copilot.as_ref(),
+        _ => None,
+    }
+    .and_then(|provider| provider.quota.as_ref())
+}
+
+fn runtime_quota_healths(runtimes: &ShareAppRuntimes, now: DateTime<Utc>) -> Vec<f64> {
+    [
+        runtimes.claude.as_ref(),
+        runtimes.codex.as_ref(),
+        runtimes.gemini.as_ref(),
+        runtimes.kiro.as_ref(),
+        runtimes.cursor.as_ref(),
+        runtimes.antigravity.as_ref(),
+        runtimes.copilot.as_ref(),
+    ]
+    .into_iter()
+    .filter_map(|provider| provider.and_then(|provider| provider.quota.as_ref()))
+    .map(|quota| market_quota_health(quota, now))
+    .collect()
+}
+
+fn market_quota_health(quota: &ShareUpstreamQuota, now: DateTime<Utc>) -> f64 {
+    if quota_block_is_active(quota, now) {
+        0.0
+    } else {
+        crate::scheduling_signals::compute_quota_health(Some(quota), now)
+    }
+}
+
+fn sort_market_shares_for_app(shares: &mut [MarketShareView], app: &str) {
+    shares.sort_by(|left, right| {
+        let left_item = market_share_priority_sort_item(left, app);
+        let right_item = market_share_priority_sort_item(right, app);
+        right_item
+            .schedulable
+            .cmp(&left_item.schedulable)
+            .then_with(|| left_item.degraded.cmp(&right_item.degraded))
+            .then_with(|| {
+                right_item
+                    .score
+                    .partial_cmp(&left_item.score)
+                    .unwrap_or(Ordering::Equal)
+            })
+            .then_with(|| left.active_requests.cmp(&right.active_requests))
+            .then_with(|| {
+                market_share_sort_name(left)
+                    .to_ascii_lowercase()
+                    .cmp(&market_share_sort_name(right).to_ascii_lowercase())
+            })
+    });
+}
+
+struct MarketSharePrioritySortItem {
+    schedulable: bool,
+    degraded: bool,
+    score: f64,
+}
+
+fn market_share_priority_sort_item(
+    share: &MarketShareView,
+    app: &str,
+) -> MarketSharePrioritySortItem {
+    let supported = market_share_supports_app(share, app);
+    let availability = market_app_availability_for_app(&share.app_availability, app);
+    let parallel_full =
+        share.parallel_limit > 0 && share.active_requests as i64 >= share.parallel_limit;
+    let blocked_by_market_state = share
+        .market_states
+        .iter()
+        .any(|state| market_state_blocks_app(state, app));
+    let schedulable = supported
+        && share.online
+        && !share.disabled_by_market
+        && !parallel_full
+        && !blocked_by_market_state
+        && availability
+            .map(|entry| !entry.status.eq_ignore_ascii_case("unavailable"))
+            .unwrap_or(true);
+    MarketSharePrioritySortItem {
+        schedulable,
+        degraded: availability
+            .map(|entry| entry.status.eq_ignore_ascii_case("degraded"))
+            .unwrap_or(false),
+        score: market_share_priority_score(share),
+    }
+}
+
+fn market_share_supports_app(share: &MarketShareView, app: &str) -> bool {
+    match app {
+        "claude" => share.support.claude || share.app_runtimes.claude.is_some(),
+        "codex" => share.support.codex || share.app_runtimes.codex.is_some(),
+        "gemini" => share.support.gemini || share.app_runtimes.gemini.is_some(),
+        _ => false,
+    }
+}
+
+fn market_app_availability_for_app<'a>(
+    availability: &'a MarketAppAvailability,
+    app: &str,
+) -> Option<&'a MarketAppAvailabilityEntry> {
+    match app {
+        "claude" => availability.claude.as_ref(),
+        "codex" => availability.codex.as_ref(),
+        "gemini" => availability.gemini.as_ref(),
+        _ => None,
+    }
+}
+
+fn market_state_blocks_app(state: &MarketShareRuntimeStateView, app: &str) -> bool {
+    if state.kind == "cooldown" && state.app_type.is_none() {
+        return true;
+    }
+    state
+        .app_type
+        .as_deref()
+        .map(|state_app| state_app.eq_ignore_ascii_case(app))
+        .unwrap_or(false)
+        && matches!(
+            state.kind.as_str(),
+            "cooldown" | "model_block" | "capability_block"
+        )
+}
+
+fn market_share_priority_score(share: &MarketShareView) -> f64 {
+    let headroom = if share.parallel_limit <= 0 {
+        1.0
+    } else {
+        (1.0 - share.active_requests as f64 / share.parallel_limit as f64).clamp(0.0, 1.0)
+    };
+    (0.35 * share.signals.stability + 0.30 * share.signals.quota_health + 0.25 * headroom + 0.10)
+        * share.signals.owner_penalty
+}
+
+fn market_share_sort_name(share: &MarketShareView) -> &str {
+    if !share.subdomain.is_empty() {
+        &share.subdomain
+    } else if !share.share_name.is_empty() {
+        &share.share_name
+    } else {
+        &share.share_id
+    }
+}
+
 fn apply_quota_blocks_to_app_availability(
     availability: &mut MarketAppAvailability,
     runtimes: &ShareAppRuntimes,
@@ -9313,6 +9537,35 @@ mod quota_runtime_filter_tests {
         }
     }
 
+    fn provider_with_quota_tier(utilization: f64, resets_at: String) -> ShareUpstreamProvider {
+        ShareUpstreamProvider {
+            kind: "official_oauth".to_string(),
+            app: "codex".to_string(),
+            provider_name: Some("Codex".to_string()),
+            for_sale_official_price_percent: None,
+            account_email: None,
+            api_url: None,
+            quota: Some(ShareUpstreamQuota {
+                status: "ok".to_string(),
+                plan: Some("ChatGPT Plus".to_string()),
+                queried_at: None,
+                availability: Some("available".to_string()),
+                blocked_until: None,
+                blocked_reason: None,
+                blocked_scope: None,
+                tiers: vec![crate::models::ShareUpstreamQuotaTier {
+                    label: "1w".to_string(),
+                    utilization,
+                    resets_at: Some(resets_at),
+                    used: None,
+                    limit: None,
+                    unit: None,
+                }],
+            }),
+            models: Vec::new(),
+        }
+    }
+
     #[test]
     fn quota_blocked_runtime_is_filtered_until_reset() {
         let now = Utc::now();
@@ -9339,6 +9592,46 @@ mod quota_runtime_filter_tests {
 
         let filtered = filter_app_runtimes_by_quota(runtimes, now);
         assert!(filtered.codex.is_some());
+    }
+
+    #[test]
+    fn market_share_quota_health_uses_requested_app_runtime_quota() {
+        let now = Utc::now();
+        let runtimes = ShareAppRuntimes {
+            codex: Some(provider_with_quota_tier(
+                95.0,
+                (now + Duration::days(2)).to_rfc3339(),
+            )),
+            ..Default::default()
+        };
+        let health = compute_market_share_quota_health(Some("codex"), &runtimes, None, now);
+
+        assert!(
+            health < 0.2,
+            "high-utilization runtime quota should down-rank codex, got {health}"
+        );
+    }
+
+    #[test]
+    fn market_share_quota_health_without_app_uses_worst_runtime_quota() {
+        let now = Utc::now();
+        let runtimes = ShareAppRuntimes {
+            claude: Some(provider_with_quota_tier(
+                5.0,
+                (now + Duration::days(2)).to_rfc3339(),
+            )),
+            codex: Some(provider_with_quota_tier(
+                95.0,
+                (now + Duration::days(2)).to_rfc3339(),
+            )),
+            ..Default::default()
+        };
+        let health = compute_market_share_quota_health(None, &runtimes, None, now);
+
+        assert!(
+            health < 0.2,
+            "generic market sync should conservatively use the worst runtime quota, got {health}"
+        );
     }
 }
 

@@ -83,9 +83,10 @@ export async function getMarketLinkedShares(marketEmail: string) {
   );
 }
 
-export async function getMarketSharePriority(marketEmail: string) {
+export async function getMarketSharePriority(marketEmail: string, app?: string) {
+  const query = app ? `?${new URLSearchParams({ app }).toString()}` : "";
   return parseJson<MarketShare[]>(
-    await fetch(`/v1/markets/${encodeURIComponent(marketEmail)}/share-priority`, {
+    await fetch(`/v1/markets/${encodeURIComponent(marketEmail)}/share-priority${query}`, {
       cache: "no-store",
     }),
   );

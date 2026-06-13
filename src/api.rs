@@ -710,17 +710,24 @@ async fn admin_market_linked_shares(
 async fn public_market_share_priority(
     State(state): State<ServerState>,
     Path(market_email): Path<String>,
+    Query(query): Query<PublicMarketSharePriorityQuery>,
 ) -> Result<Json<Vec<MarketShareView>>, AppError> {
     Ok(Json(
         state
             .store
             .list_public_market_share_priority(
                 &market_email,
+                query.app.as_deref(),
                 &state.proxy.active_subdomains().await.into_iter().collect(),
                 &state.proxy.inflight_by_share().await,
             )
             .await?,
     ))
+}
+
+#[derive(Debug, Deserialize)]
+struct PublicMarketSharePriorityQuery {
+    app: Option<String>,
 }
 
 async fn admin_update_market_disabled_shares(

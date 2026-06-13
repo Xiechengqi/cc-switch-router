@@ -3877,7 +3877,7 @@ function MarketSharePriorityPanel({ market, t }: { market: DashboardMarket; t: T
     let cancelled = false;
     setShares(null);
     setError("");
-    getMarketSharePriority(market.email)
+    getMarketSharePriority(market.email, activeApp)
       .then((nextShares) => {
         if (!cancelled) setShares(nextShares);
       })
@@ -3887,7 +3887,7 @@ function MarketSharePriorityPanel({ market, t }: { market: DashboardMarket; t: T
     return () => {
       cancelled = true;
     };
-  }, [market.email]);
+  }, [market.email, activeApp]);
 
   const ranked = React.useMemo(
     () => rankMarketSharesForApp(shares || [], activeApp, t),
@@ -3975,20 +3975,7 @@ function MarketSharePriorityCard({ item, rank, t }: { item: MarketSharePriorityI
 function rankMarketSharesForApp(shares: MarketShare[], app: MarketShareAppKey, t: TFn): MarketSharePriorityItem[] {
   return shares
     .filter((share) => isShareRelevantForApp(share, app))
-    .map((share) => marketSharePriorityItem(share, app, t))
-    .sort((left, right) => {
-      return (
-        Number(right.schedulable) - Number(left.schedulable) ||
-        Number(left.degraded) - Number(right.degraded) ||
-        right.score - left.score ||
-        (left.share.activeRequests || 0) - (right.share.activeRequests || 0) ||
-        (left.share.subdomain || left.share.shareName || left.share.shareId).localeCompare(
-          right.share.subdomain || right.share.shareName || right.share.shareId,
-          undefined,
-          { sensitivity: "base" },
-        )
-      );
-    });
+    .map((share) => marketSharePriorityItem(share, app, t));
 }
 
 function isShareRelevantForApp(share: MarketShare, app: MarketShareAppKey) {
