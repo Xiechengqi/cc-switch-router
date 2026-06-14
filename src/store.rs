@@ -4386,7 +4386,8 @@ impl AppStore {
                         s.share_status, COALESCE(s.subdomain, ''), s.parallel_limit,
                         i.last_seen_at, s.enabled_claude, s.enabled_codex, s.enabled_gemini,
                         s.upstream_provider_json, s.app_runtimes_json,
-                        mds.created_at, s.created_at
+                        mds.created_at, s.created_at,
+                        s.token_limit, s.tokens_used, s.requests_count, s.expires_at
                  FROM shares s
                  LEFT JOIN installations i ON i.id = s.installation_id
                  LEFT JOIN market_disabled_shares mds
@@ -4420,10 +4421,15 @@ impl AppStore {
                     .cloned()
                     .unwrap_or_default();
                 let raw_app_runtimes = parse_app_runtimes(row.get(20)?)?;
-                let app_runtimes = filter_app_runtimes_by_quota(
+                let available_app_runtimes = filter_app_runtimes_by_quota(
                     filter_app_runtimes_by_model_health(raw_app_runtimes.clone(), &model_health),
                     now,
                 );
+                let app_runtimes = if allow_all_market_access {
+                    available_app_runtimes
+                } else {
+                    raw_app_runtimes.clone()
+                };
                 let quota_health = compute_market_share_quota_health(
                     signal_app,
                     &raw_app_runtimes,
@@ -4464,7 +4470,11 @@ impl AppStore {
                         share_status: row.get(12)?,
                         online: false,
                         active_requests,
+                        token_limit: row.get(23)?,
+                        tokens_used: row.get(24)?,
+                        requests_count: row.get(25)?,
                         parallel_limit,
+                        expires_at: row.get(26)?,
                         online_rate_24h,
                         last_seen_at: row.get(15)?,
                         share_created_at: row.get(22)?,
@@ -10367,8 +10377,8 @@ fn list_share_usage_by_app(
         .map_err(|e| AppError::Internal(format!("query share usage by app failed: {e}")))?;
     let mut result = HashMap::<String, (BTreeMap<String, i64>, BTreeMap<String, i64>)>::new();
     for row in rows {
-        let (share_id, app, requests_count, total_tokens) =
-            row.map_err(|e| AppError::Internal(format!("read share usage by app row failed: {e}")))?;
+        let (share_id, app, requests_count, total_tokens) = row
+            .map_err(|e| AppError::Internal(format!("read share usage by app row failed: {e}")))?;
         if !matches!(app.as_str(), "claude" | "codex" | "gemini") {
             continue;
         }

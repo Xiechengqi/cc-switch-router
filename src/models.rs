@@ -1092,7 +1092,11 @@ pub struct MarketShareView {
     pub share_status: String,
     pub online: bool,
     pub active_requests: usize,
+    pub token_limit: i64,
+    pub tokens_used: i64,
+    pub requests_count: i64,
     pub parallel_limit: i64,
+    pub expires_at: String,
     pub online_rate_24h: f64,
     pub last_seen_at: String,
     /// RFC3339 timestamp from `shares.created_at`. Used by markets as a
