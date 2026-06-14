@@ -1914,6 +1914,12 @@ pub struct ShareView {
     /// the same counter the parallel-limit gate increments, so it is directly
     /// comparable to `parallel_limit`.
     pub active_requests: usize,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub active_requests_by_app: BTreeMap<String, usize>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tokens_used_by_app: BTreeMap<String, i64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub requests_count_by_app: BTreeMap<String, i64>,
     pub online_minutes_24h: usize,
     pub online_rate_24h: f64,
     pub recent_requests: Vec<ShareRequestLogEntry>,

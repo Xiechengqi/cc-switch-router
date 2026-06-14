@@ -5,7 +5,7 @@ use axum::response::Response;
 use base64::Engine;
 use bytes::Bytes;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::{
     Arc,
@@ -119,6 +119,12 @@ struct KeyedConcurrencyPermit {
     key: String,
 }
 
+#[derive(Debug)]
+struct ShareConcurrencyPermit {
+    _share: KeyedConcurrencyPermit,
+    _app: Option<KeyedConcurrencyPermit>,
+}
+
 impl Drop for KeyedConcurrencyPermit {
     fn drop(&mut self) {
         let limiter = self.limiter.clone();
@@ -200,6 +206,7 @@ pub struct ProxyRegistry {
     pending_routes: RwLock<HashMap<String, PendingRouteEntry>>,
     health_probe_failures: Mutex<HashMap<String, Instant>>,
     share_limiter: Arc<KeyedConcurrencyLimiter>,
+    share_app_limiter: Arc<KeyedConcurrencyLimiter>,
     free_share_ip_limiter: Arc<KeyedConcurrencyLimiter>,
     image_limiter: Arc<KeyedConcurrencyLimiter>,
     /// Tracks requests that actually traversed the market proxy path, keyed by
@@ -366,6 +373,24 @@ impl ProxyRegistry {
         self.share_limiter.snapshot().await
     }
 
+    /// Snapshot of in-flight request counts per share_id and app_type. Unknown
+    /// app requests are intentionally omitted from this app-level view while
+    /// still counted by `inflight_by_share`.
+    pub async fn inflight_by_share_app(&self) -> HashMap<String, BTreeMap<String, usize>> {
+        let snapshot = self.share_app_limiter.snapshot().await;
+        let mut result = HashMap::<String, BTreeMap<String, usize>>::new();
+        for (key, count) in snapshot {
+            let Some((share_id, app)) = key.split_once(':') else {
+                continue;
+            };
+            result
+                .entry(share_id.to_string())
+                .or_default()
+                .insert(app.to_string(), count);
+        }
+        result
+    }
+
     /// Snapshot of in-flight request counts per market email (lowercased).
     /// Only requests that came through the market proxy handler are counted —
     /// direct share-subdomain traffic is not.
@@ -394,7 +419,7 @@ impl ProxyRegistry {
     #[cfg(test)]
     pub async fn set_share_inflight_for_test(&self, share_id: &str, count: usize) {
         for _ in 0..count {
-            if let Some(permit) = self.try_acquire_share_permit(share_id, -1).await {
+            if let Some(permit) = self.try_acquire_share_permit(share_id, None, -1).await {
                 std::mem::forget(permit);
             }
         }
@@ -416,11 +441,28 @@ impl ProxyRegistry {
     async fn try_acquire_share_permit(
         &self,
         share_id: &str,
+        app_type: Option<&str>,
         parallel_limit: i64,
-    ) -> Option<KeyedConcurrencyPermit> {
-        self.share_limiter
+    ) -> Option<ShareConcurrencyPermit> {
+        let share = self
+            .share_limiter
             .try_acquire(share_id, parallel_limit)
-            .await
+            .await?;
+        let app = app_type
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .filter(|value| matches!(value.as_str(), "claude" | "codex" | "gemini"));
+        let app = match app {
+            Some(app) => {
+                let key = format!("{share_id}:{app}");
+                self.share_app_limiter.try_acquire(&key, -1).await
+            }
+            None => None,
+        };
+        Some(ShareConcurrencyPermit {
+            _share: share,
+            _app: app,
+        })
     }
 
     async fn try_acquire_free_share_ip_permit(
@@ -581,9 +623,10 @@ pub async fn market_proxy_handler(
     builder = builder.header("X-CC-Switch-Share-Id", share_id.as_str());
 
     let log_share_id = mask_token(&share_id);
+    let request_app = infer_share_request_app(&path_and_query, &parts.headers);
     let share_permit = match state
         .proxy
-        .try_acquire_share_permit(&share_id, route.parallel_limit)
+        .try_acquire_share_permit(&share_id, request_app.as_deref(), route.parallel_limit)
         .await
     {
         Some(permit) => permit,
@@ -846,9 +889,10 @@ pub async fn gateway_proxy_handler(
     let target = format!("http://{backend}{path_and_query}");
 
     let metrics_permit = state.metrics.proxy_request_started();
+    let request_app = infer_share_request_app(&path_and_query, &parts.headers);
     let share_permit = match state
         .proxy
-        .try_acquire_share_permit(&share_id, route.parallel_limit)
+        .try_acquire_share_permit(&share_id, request_app.as_deref(), route.parallel_limit)
         .await
     {
         Some(permit) => permit,
@@ -1465,9 +1509,10 @@ pub async fn proxy_handler(
     {
         None
     } else if let Some(share_id) = route.share_id.as_deref() {
+        let request_app = infer_share_request_app(&path, &parts.headers);
         match state
             .proxy
-            .try_acquire_share_permit(share_id, route.parallel_limit)
+            .try_acquire_share_permit(share_id, request_app.as_deref(), route.parallel_limit)
             .await
         {
             Some(permit) => Some(permit),

@@ -756,9 +756,41 @@ function shareAppSettings(share: ShareView, app: CoreShareApp) {
   };
 }
 
+function shareAppExists(share: ShareView, app: CoreShareApp) {
+  return Boolean(
+    share.bindings?.[app] ||
+      share.support?.[app] ||
+      share.appSettings?.[app] ||
+      share.accessByApp?.[app] ||
+      share.appRuntimes?.[app] ||
+      share.modelHealth?.[app]?.length ||
+      share.appType === app,
+  );
+}
+
+function requestBelongsToApp(request: ShareRequestLog, app: CoreShareApp) {
+  const appType = (request.appType || "").trim().toLowerCase();
+  if (appType) return appType === app;
+  const agent = (request.requestAgent || "").trim().toLowerCase();
+  return agent === app;
+}
+
+function shareAppTokensUsed(share: ShareView, app: CoreShareApp) {
+  const value = share.tokensUsedByApp?.[app];
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  const appCount = CORE_SHARE_APPS.filter(([key]) => shareAppExists(share, key)).length;
+  return appCount <= 1 && share.appType === app ? share.tokensUsed || 0 : 0;
+}
+
 function ShareAppColumn({ share, app, label, t, locale }: { share: ShareView; app: CoreShareApp; label: string; t: TFn; locale: AppLocale }) {
+  if (!shareAppExists(share, app)) {
+    return <div className="min-h-24" />;
+  }
   const supported = !!share.support?.[app];
   const settings = shareAppSettings(share, app);
+  const appRequests = (share.recentRequests || []).filter((request) => requestBelongsToApp(request, app));
+  const appTokensUsed = shareAppTokensUsed(share, app);
+  const appActiveRequests = share.activeRequestsByApp?.[app] ?? 0;
   const saleValue =
     settings.forSale === "Free"
       ? t("dashboard.free")
@@ -769,9 +801,7 @@ function ShareAppColumn({ share, app, label, t, locale }: { share: ShareView; ap
         : t("dashboard.no");
   const limit = isUnlimited(settings.parallelLimit) ? "∞" : String(settings.parallelLimit || 0);
   const tokenLimit = settings.tokenLimit ?? share.tokenLimit;
-  const averageLatency = averageRecentLatencyMs(
-    (share.recentRequests || []).filter((request) => !request.appType || request.appType === app),
-  );
+  const averageLatency = averageRecentLatencyMs(appRequests);
   const rowClass = "grid grid-cols-[52px_minmax(0,1fr)] gap-2";
   return (
     <div className="grid min-w-0 gap-2 text-sm">
@@ -785,7 +815,7 @@ function ShareAppColumn({ share, app, label, t, locale }: { share: ShareView; ap
       </div>
       <div className={rowClass}>
         <span className="mono-label text-muted-foreground">{t("dashboard.usage")}</span>
-        <div><strong>{compactTokens(share.tokensUsed)} / {isUnlimited(tokenLimit) ? "∞" : compactTokens(tokenLimit)}</strong><UsageBar used={share.tokensUsed} limit={tokenLimit} t={t} /></div>
+        <div><strong>{compactTokens(appTokensUsed)} / {isUnlimited(tokenLimit) ? "∞" : compactTokens(tokenLimit)}</strong><UsageBar used={appTokensUsed} limit={tokenLimit} t={t} /></div>
       </div>
       <div className={rowClass}>
         <span className="mono-label text-muted-foreground">{t("dashboard.expires")}</span>
@@ -793,7 +823,7 @@ function ShareAppColumn({ share, app, label, t, locale }: { share: ShareView; ap
       </div>
       <div className={rowClass}>
         <span className="mono-label text-muted-foreground">{t("dashboard.parallel")}</span>
-        <strong>{share.activeRequests || 0}<span className="text-muted-foreground">/{limit}</span></strong>
+        <strong>{appActiveRequests}<span className="text-muted-foreground">/{limit}</span></strong>
       </div>
       <div className={rowClass}>
         <span className="mono-label text-muted-foreground">{t("dashboard.response")}</span>
@@ -1000,8 +1030,13 @@ const PRICE_APPS: Array<{ key: PriceApp; label: string }> = [
 
 function shareAccessApps(share: ShareView | null): PriceApp[] {
   if (!share) return ["claude", "codex", "gemini"];
-  const bound = PRICE_APPS.map((app) => app.key).filter((app) => Boolean(share.bindings?.[app]));
-  return bound.length ? bound : ["claude", "codex", "gemini"];
+  return PRICE_APPS.map((app) => app.key).filter((app) => {
+    if (share.bindings?.[app]) return true;
+    if (share.support?.[app]) return true;
+    if (share.appSettings?.[app]) return true;
+    if (share.accessByApp?.[app]) return true;
+    return share.appType === app;
+  });
 }
 
 function effectiveShareAccessByApp(share: ShareView): ShareAccessByApp {
@@ -1125,7 +1160,11 @@ function buildShareEditPatch(
 ): ShareSettingsPatch {
   const effectiveSaleMarketKind = draft.forSale === "Yes" ? draft.saleMarketKind : "token";
   const effectiveMarketAccessMode = effectiveSaleMarketKind === "share" ? "selected" : draft.marketAccessMode;
+  const tokenLimit = draft.tokenLimitUnlimited ? UNLIMITED_TOKEN_LIMIT : Number.parseInt(draft.tokenLimitInput, 10);
+  const parallelLimit = draft.parallelLimitUnlimited ? UNLIMITED_PARALLEL_LIMIT : Number.parseInt(draft.parallelLimitInput, 10);
+  const expiresIso = draft.expiresPermanent ? PERMANENT_EXPIRES_AT_ISO : fromLocalDateTimeValue(draft.expiresAtInput);
   const accessByApp: ShareAccessByApp = {};
+  const appSettings: NonNullable<ShareSettingsPatch["appSettings"]> = {};
   for (const app of activeShareApps) {
     const shareToEmails = (draft.shareToEmailsByApp[app] ?? []).filter((email) => !publicMarketEmails.has(email));
     const saleEmails =
@@ -1138,6 +1177,15 @@ function buildShareEditPatch(
       sharedWithEmails: normalizedUniqueEmails([...shareToEmails, ...saleEmails]),
       marketAccessMode: effectiveMarketAccessMode,
     };
+    appSettings[app] = {
+      forSale: draft.forSale,
+      saleMarketKind: effectiveSaleMarketKind,
+      marketAccessMode: effectiveMarketAccessMode,
+      sharedWithEmails: accessByApp[app]?.sharedWithEmails ?? [],
+      tokenLimit,
+      parallelLimit,
+      expiresAt: expiresIso || share.expiresAt,
+    };
   }
   const patch: ShareSettingsPatch = {
     description: draft.description.trim() || null,
@@ -1148,11 +1196,11 @@ function buildShareEditPatch(
       Object.values(accessByApp).flatMap((access) => access?.sharedWithEmails ?? []),
     ),
     accessByApp,
-    tokenLimit: draft.tokenLimitUnlimited ? UNLIMITED_TOKEN_LIMIT : Number.parseInt(draft.tokenLimitInput, 10),
-    parallelLimit: draft.parallelLimitUnlimited ? UNLIMITED_PARALLEL_LIMIT : Number.parseInt(draft.parallelLimitInput, 10),
+    appSettings,
+    tokenLimit,
+    parallelLimit,
     forSaleOfficialPricePercentByApp: buildShareEditPricingPayload(draft, share),
   };
-  const expiresIso = draft.expiresPermanent ? PERMANENT_EXPIRES_AT_ISO : fromLocalDateTimeValue(draft.expiresAtInput);
   if (expiresIso) patch.expiresAt = expiresIso;
   return patch;
 }
@@ -1194,12 +1242,14 @@ function ShareEditDialog({
   const [confirmFreeOpen, setConfirmFreeOpen] = React.useState(false);
   const [transferTargetEmail, setTransferTargetEmail] = React.useState("");
   const [marketSelectKey, setMarketSelectKey] = React.useState(0);
+  const [activeShareApp, setActiveShareApp] = React.useState<PriceApp>("claude");
   const [baseShare, setBaseShare] = React.useState<ShareView | null>(null);
   const [baseDraft, setBaseDraft] = React.useState<ShareEditDraft | null>(null);
   const { t } = useLocaleText();
   const readOnly = !!share && !share.canManage;
   const editShare = baseShare || share;
   const activeShareApps = React.useMemo(() => shareAccessApps(editShare), [editShare]);
+  const activeShareAppPresent = activeShareApps.includes(activeShareApp);
   const tokenMarkets = React.useMemo(() => markets.filter((market) => !isShareMarket(market)), [markets]);
   const shareMarkets = React.useMemo(() => markets.filter(isShareMarket), [markets]);
   const publicMarketEmails = React.useMemo(
@@ -1249,6 +1299,7 @@ function ShareEditDialog({
     const draft = buildShareEditDraft(share, publicMarketEmails, tokenMarketEmails, shareMarketEmails);
     setBaseShare(share);
     setBaseDraft(draft);
+    setActiveShareApp(shareAccessApps(share)[0] ?? "claude");
     applyDraft(draft);
     setError(share.activeEdit?.status === "rejected" ? share.activeEdit.errorMessage || t("dashboard.applyFailedFallback") : "");
     setNotice("");
@@ -1389,8 +1440,8 @@ function ShareEditDialog({
       const value = Number.parseInt(raw, 10);
       return !(Number.isFinite(value) && value >= 1 && value <= 100);
     };
-    return PRICE_APPS.some((app) => check(priceInputs[app.key]));
-  }, [priceInputs, saleMarketKind]);
+    return activeShareApps.some((app) => check(priceInputs[app]));
+  }, [activeShareApps, priceInputs, saleMarketKind]);
 
   const shareMarketInvalid = forSale === "Yes" && saleMarketKind === "share" && !selectedShareMarketEmail;
 
@@ -1510,18 +1561,47 @@ function ShareEditDialog({
                   <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">{notice}</div>
                 ) : null}
 
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <FieldGroup label={t("dashboard.field.ownerEmail")}>
+                    <Input value={share?.ownerEmail || ""} disabled />
+                  </FieldGroup>
+                  <FieldGroup label={t("dashboard.field.subdomain")}>
+                    <Input value={share?.subdomain || ""} disabled />
+                  </FieldGroup>
+                </div>
+
                 <FieldGroup
                   label={t("dashboard.field.description")}
                   hint={<span>{t("dashboard.hint.maxChars")}<span className="ml-2 font-mono">{descriptionLength}/200</span></span>}
                   invalid={descriptionInvalid}
                 >
-	                  <TextArea
-	                    value={description}
-	                    maxLength={200}
-                      disabled={readOnly}
-	                    onChange={(event) => setDescription(event.target.value)}
-	                  />
+                  <TextArea
+                    value={description}
+                    maxLength={200}
+                    disabled={readOnly}
+                    onChange={(event) => setDescription(event.target.value)}
+                  />
                 </FieldGroup>
+
+                <div className="inline-flex w-fit rounded-lg border bg-muted/40 p-0.5">
+                  {PRICE_APPS.map((app) => (
+                    <button
+                      key={app.key}
+                      type="button"
+                      onClick={() => setActiveShareApp(app.key)}
+                      className={`rounded-md px-3 py-1 text-xs font-medium transition-colors ${
+                        activeShareApp === app.key
+                          ? "bg-white text-slate-900 shadow-sm"
+                          : "text-muted-foreground hover:text-slate-900"
+                      }`}
+                    >
+                      {app.label}
+                    </button>
+                  ))}
+                </div>
+
+                {activeShareAppPresent ? (
+                  <>
 
                 <div className="grid gap-3 sm:grid-cols-3">
                   <FieldGroup label={t("dashboard.field.forSale")}>
@@ -1621,7 +1701,7 @@ function ShareEditDialog({
                     <span className="text-xs text-muted-foreground">{t("dashboard.hint.modelPricing")}</span>
                   </div>
                   <div className="grid gap-3 sm:grid-cols-3">
-                    {PRICE_APPS.map((app) => {
+                    {PRICE_APPS.filter((app) => app.key === activeShareApp).map((app) => {
                       const supported = !!share?.support?.[app.key];
                       const hint = providerHint(share?.appRuntimes?.[app.key]);
                       return (
@@ -1704,7 +1784,7 @@ function ShareEditDialog({
 
 	                <FieldGroup label={t("dashboard.field.sharedWith")} hint={readOnly ? t("dashboard.hint.sharedWithReadOnly") : t("dashboard.hint.sharedWith")}>
                     <div className="grid gap-3">
-                      {activeShareApps.map((app) => {
+                      {[activeShareApp].map((app) => {
                         const label = PRICE_APPS.find((item) => item.key === app)?.label ?? app;
                         return (
                           <div key={app} className="grid gap-1.5">
@@ -1798,6 +1878,10 @@ function ShareEditDialog({
                     </div>
                   </FieldGroup>
                 </div>
+                  </>
+                ) : (
+                  <div className="min-h-24 rounded-lg border border-dashed border-border bg-muted/20" />
+                )}
               </Modal.Body>
               <Modal.Footer>
 	                {readOnly ? null : (

@@ -1548,6 +1548,9 @@ impl AppStore {
             is_online,
             cleanup_at: None,
             active_requests,
+            active_requests_by_app: BTreeMap::new(),
+            tokens_used_by_app: BTreeMap::new(),
+            requests_count_by_app: BTreeMap::new(),
             online_minutes_24h: 0,
             online_rate_24h: 0.0,
             recent_requests: Vec::new(),
@@ -2887,6 +2890,7 @@ impl AppStore {
             .into_iter()
             .collect::<HashSet<_>>();
         let inflight_by_share = proxy.inflight_by_share().await;
+        let inflight_by_share_app = proxy.inflight_by_share_app().await;
         let inflight_by_market_email = proxy.inflight_by_market_email().await;
         let now = Utc::now();
         let (health_timeline_start, _) = health_timeline_window(now);
@@ -2902,6 +2906,7 @@ impl AppStore {
             market_logs,
             market_request_timeline_by_market,
             model_health_by_share,
+            share_usage_by_app,
             client_tunnels,
         ) = {
             let conn = self.conn.lock().await;
@@ -2917,6 +2922,7 @@ impl AppStore {
                 list_recent_market_request_logs(&conn, 200)?,
                 list_market_request_timeline_stats_24h(&conn, now)?,
                 list_model_health_summaries(&conn)?,
+                list_share_usage_by_app(&conn)?,
                 list_client_tunnels(&conn)?,
             )
         };
@@ -3058,6 +3064,14 @@ impl AppStore {
             .into_iter()
             .map(|(installation_id, share)| {
                 let active_requests = inflight_by_share.get(&share.share_id).copied().unwrap_or(0);
+                let active_requests_by_app = inflight_by_share_app
+                    .get(&share.share_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let (tokens_used_by_app, requests_count_by_app) = share_usage_by_app
+                    .get(&share.share_id)
+                    .cloned()
+                    .unwrap_or_default();
                 let recent_requests = logs_by_share
                     .get(&share.share_id)
                     .cloned()
@@ -3183,6 +3197,9 @@ impl AppStore {
                         .then(|| installation_cleanup_at.get(&installation_id).copied())
                         .flatten(),
                     active_requests,
+                    active_requests_by_app,
+                    tokens_used_by_app,
+                    requests_count_by_app,
                     online_minutes_24h,
                     online_rate_24h,
                     recent_requests,
@@ -10319,6 +10336,47 @@ fn list_recent_share_request_logs(
         .map_err(|e| AppError::Internal(format!("query recent share request logs failed: {e}")))?;
     let logs = collect_rows(rows)?;
     Ok(deduplicate_recent_share_request_logs(logs))
+}
+
+fn list_share_usage_by_app(
+    conn: &Connection,
+) -> Result<HashMap<String, (BTreeMap<String, i64>, BTreeMap<String, i64>)>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT share_id,
+                    lower(CASE
+                        WHEN COALESCE(request_agent, '') != '' THEN request_agent
+                        ELSE app_type
+                    END) AS app,
+                    COUNT(*) AS requests_count,
+                    COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens), 0) AS total_tokens
+             FROM share_request_logs
+             WHERE is_health_check = 0
+             GROUP BY share_id, app",
+        )
+        .map_err(|e| AppError::Internal(format!("prepare share usage by app failed: {e}")))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(|e| AppError::Internal(format!("query share usage by app failed: {e}")))?;
+    let mut result = HashMap::<String, (BTreeMap<String, i64>, BTreeMap<String, i64>)>::new();
+    for row in rows {
+        let (share_id, app, requests_count, total_tokens) =
+            row.map_err(|e| AppError::Internal(format!("read share usage by app row failed: {e}")))?;
+        if !matches!(app.as_str(), "claude" | "codex" | "gemini") {
+            continue;
+        }
+        let entry = result.entry(share_id).or_default();
+        entry.0.insert(app.clone(), total_tokens);
+        entry.1.insert(app, requests_count);
+    }
+    Ok(result)
 }
 
 fn map_image_generation_request_log_row(

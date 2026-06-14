@@ -115,6 +115,9 @@ export type ShareView = {
   expiresAt: string;
   isOnline: boolean;
   activeRequests: number;
+  activeRequestsByApp?: Record<string, number>;
+  tokensUsedByApp?: Record<string, number>;
+  requestsCountByApp?: Record<string, number>;
   onlineMinutes24h?: number;
   onlineRate24h: number;
   recentRequests?: ShareRequestLog[];
