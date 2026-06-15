@@ -11641,6 +11641,7 @@ fn dashboard_market_to_share_link(market: &DashboardMarketView) -> ShareMarketLi
         market_kind: market.market_kind.clone(),
         status: market.status.clone(),
         online: market.online,
+        listing_status_by_app: BTreeMap::new(),
     }
 }
 

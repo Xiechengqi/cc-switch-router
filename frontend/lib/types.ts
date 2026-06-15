@@ -225,6 +225,16 @@ export type ShareMarketLink = {
   marketKind?: string;
   status: string;
   online: boolean;
+  listingStatusByApp?: Record<string, ShareMarketListingStatus>;
+};
+
+export type ShareMarketListingStatus = {
+  listingUrl?: string;
+  status?: "idle" | "carpooling" | "full" | "unavailable" | "unknown" | string;
+  saleMode?: "single" | "carpool" | string | null;
+  filledSeats?: number | null;
+  requiredSeats?: number | null;
+  listingStatus?: string | null;
 };
 
 export type DashboardMarket = {

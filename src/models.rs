@@ -1845,6 +1845,21 @@ pub struct MarketAppAvailabilityEntry {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ShareMarketListingStatusView {
+    pub listing_url: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sale_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filled_seats: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_seats: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listing_status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ShareMarketLinkView {
     pub id: String,
     pub display_name: String,
@@ -1854,6 +1869,8 @@ pub struct ShareMarketLinkView {
     pub market_kind: String,
     pub status: String,
     pub online: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub listing_status_by_app: BTreeMap<String, ShareMarketListingStatusView>,
 }
 
 #[derive(Debug, Clone, Serialize)]
