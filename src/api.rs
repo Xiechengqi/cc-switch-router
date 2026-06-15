@@ -11,7 +11,7 @@ use axum::response::sse::Event;
 use axum::response::{IntoResponse, Response, Sse};
 use axum::routing::{any, delete, get, patch, post};
 use axum::{Json, Router};
-use futures_util::{StreamExt, future::join_all};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::time::{Duration, sleep};
@@ -56,11 +56,11 @@ use crate::models::{
     ShareApiShareResponse, ShareBatchSyncRequest, ShareClaimSubdomainRequest, ShareDeleteRequest,
     ShareEditAckRequest, ShareEditAvailableEvent, ShareEditEventSignaturePayload,
     ShareHeartbeatRequest, ShareMarketGrantRequest, ShareMarketGrantResponse,
-    ShareMarketGrantStatusResponse, ShareMarketListingStatusView, SharePendingEditsRequest,
+    ShareMarketGrantStatusResponse, ShareMarketListingStatusSyncRequest,
+    ShareMarketListingStatusSyncResponse, SharePendingEditsRequest,
     ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRuntimeRefreshRequest,
-    ShareSettingsPatch, ShareSettingsUpdateRequest, ShareSyncRequest, ShareView,
-    UserApiTokenResetResponse, UserApiTokenResponse, UserSharesResponse, VerifyEmailCodeRequest,
-    VerifyEmailCodeResponse,
+    ShareSettingsPatch, ShareSettingsUpdateRequest, ShareSyncRequest, UserApiTokenResetResponse,
+    UserApiTokenResponse, UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 use crate::proxy::{gateway_proxy_handler, market_proxy_handler, proxy_handler};
 use crate::recent_traffic::{RecentRequestEvent, RecentTrafficSnapshot};
@@ -126,6 +126,10 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/markets/register", post(register_market))
         .route("/v1/market/shares", get(market_shares))
         .route("/v1/share-market/shares", get(share_market_shares))
+        .route(
+            "/v1/share-market/listing-statuses/sync",
+            post(share_market_listing_statuses_sync),
+        )
         .route(
             "/v1/share-market/shares/:share_id/grants",
             post(share_market_create_grant),
@@ -458,6 +462,27 @@ async fn share_market_grant_status(
             .share_market_grant_status(&market.email, &share_id, &router_edit_id)
             .await?,
     ))
+}
+
+async fn share_market_listing_statuses_sync(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<ShareMarketListingStatusSyncRequest>,
+) -> Result<Json<ShareMarketListingStatusSyncResponse>, AppError> {
+    let market = authenticate_market(&state, &headers, "market:share_states:write").await?;
+    if market.market_kind != "share" {
+        return Err(AppError::Forbidden(
+            "listing status sync is only available to share markets".into(),
+        ));
+    }
+    let synced = state
+        .store
+        .sync_share_market_listing_statuses(&market.email, input.replace, input.statuses)
+        .await?;
+    Ok(Json(ShareMarketListingStatusSyncResponse {
+        ok: true,
+        synced,
+    }))
 }
 
 /// Per-request real-time headroom probe. The market normally consumes the
@@ -1109,227 +1134,16 @@ async fn dashboard(
             extract_session_email(&state, &headers).await?.as_deref(),
         )
         .await?;
+    state
+        .store
+        .attach_share_market_listing_statuses(&mut response)
+        .await?;
     let snapshot = state.recent_traffic.snapshot().await;
     let (confirmed_events, confirmed_country_counts) =
         confirmed_request_events(&snapshot, &response);
     response.user_country_counts = confirmed_country_counts;
     response.recent_request_events = confirmed_events;
-    enrich_share_market_listing_statuses(&state, &mut response).await;
     Ok(Json(response))
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "snake_case")]
-struct ShareMarketListingStatusResponse {
-    listing_url: Option<String>,
-    status: Option<String>,
-    sale_mode: Option<String>,
-    filled_seats: Option<i64>,
-    required_seats: Option<i64>,
-    listing_status: Option<String>,
-}
-
-async fn enrich_share_market_listing_statuses(
-    state: &ServerState,
-    response: &mut DashboardResponse,
-) {
-    let mut lookups = Vec::new();
-    for (share_index, share) in response.shares.iter().enumerate() {
-        let apps = share_market_sale_apps(share);
-        if apps.is_empty() {
-            continue;
-        }
-        let router_id = if share.router_id.trim().is_empty() {
-            "main".to_string()
-        } else {
-            share.router_id.clone()
-        };
-        for (market_index, market) in share.market_links.iter().enumerate().filter(|(_, market)| {
-            market.market_kind == "share" && !market.public_base_url.trim().is_empty()
-        }) {
-            let base_url = market
-                .public_base_url
-                .trim()
-                .trim_end_matches('/')
-                .to_string();
-            for app in &apps {
-                lookups.push(ShareMarketListingStatusLookup {
-                    share_index,
-                    market_index,
-                    router_id: router_id.clone(),
-                    share_id: share.share_id.clone(),
-                    app_type: app.clone(),
-                    base_url: base_url.clone(),
-                });
-            }
-        }
-    }
-
-    let results = join_all(lookups.into_iter().map(|lookup| async move {
-        let fallback_url = share_market_listing_url(
-            &lookup.base_url,
-            &lookup.router_id,
-            &lookup.share_id,
-            Some(&lookup.app_type),
-        );
-        let status = match fetch_share_market_listing_status(
-            state,
-            &lookup.base_url,
-            &lookup.router_id,
-            &lookup.share_id,
-            &lookup.app_type,
-        )
-        .await
-        {
-            Ok(status) => status,
-            Err(error) => {
-                tracing::debug!(
-                    share_id = %lookup.share_id,
-                    app_type = %lookup.app_type,
-                    market = %lookup.base_url,
-                    error = %error,
-                    "share market listing status lookup failed"
-                );
-                ShareMarketListingStatusView {
-                    listing_url: fallback_url,
-                    status: "unknown".to_string(),
-                    sale_mode: None,
-                    filled_seats: None,
-                    required_seats: None,
-                    listing_status: None,
-                }
-            }
-        };
-        (
-            lookup.share_index,
-            lookup.market_index,
-            lookup.app_type,
-            status,
-        )
-    }))
-    .await;
-
-    for (share_index, market_index, app_type, status) in results {
-        if let Some(market) = response
-            .shares
-            .get_mut(share_index)
-            .and_then(|share| share.market_links.get_mut(market_index))
-        {
-            market.listing_status_by_app.insert(app_type, status);
-        }
-    }
-}
-
-struct ShareMarketListingStatusLookup {
-    share_index: usize,
-    market_index: usize,
-    router_id: String,
-    share_id: String,
-    app_type: String,
-    base_url: String,
-}
-
-fn share_market_sale_apps(share: &ShareView) -> Vec<String> {
-    ["claude", "codex", "gemini"]
-        .into_iter()
-        .filter(|app| share_has_app(share, app) && share_app_is_share_market_sale(share, app))
-        .map(str::to_string)
-        .collect()
-}
-
-fn share_app_is_share_market_sale(share: &ShareView, app: &str) -> bool {
-    if let Some(settings) = share.app_settings.get(app) {
-        return settings.for_sale == "Yes" && settings.sale_market_kind == "share";
-    }
-    share.for_sale == "Yes" && share.sale_market_kind == "share"
-}
-
-fn share_has_app(share: &ShareView, app: &str) -> bool {
-    if share.app_type == app
-        || share.bindings.contains_key(app)
-        || share.access_by_app.contains_key(app)
-        || share.app_settings.contains_key(app)
-        || share
-            .recent_model_health_checks
-            .iter()
-            .any(|entry| entry.app_type == app)
-    {
-        return true;
-    }
-    match app {
-        "claude" => {
-            share.support.claude
-                || share.app_runtimes.claude.is_some()
-                || !share.app_providers.claude.is_empty()
-        }
-        "codex" => {
-            share.support.codex
-                || share.app_runtimes.codex.is_some()
-                || !share.app_providers.codex.is_empty()
-        }
-        "gemini" => {
-            share.support.gemini
-                || share.app_runtimes.gemini.is_some()
-                || !share.app_providers.gemini.is_empty()
-        }
-        _ => false,
-    }
-}
-
-async fn fetch_share_market_listing_status(
-    state: &ServerState,
-    base_url: &str,
-    router_id: &str,
-    share_id: &str,
-    app_type: &str,
-) -> Result<ShareMarketListingStatusView, String> {
-    let query = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("router_id", router_id)
-        .append_pair("share_id", share_id)
-        .append_pair("app_type", app_type)
-        .append_pair("base_url", base_url)
-        .finish();
-    let endpoint = format!("{base_url}/v1/listings/by-share/status?{query}");
-    let response = state
-        .proxy_http
-        .get(&endpoint)
-        .timeout(Duration::from_secs(2))
-        .send()
-        .await
-        .map_err(|error| error.to_string())?
-        .error_for_status()
-        .map_err(|error| error.to_string())?
-        .json::<ShareMarketListingStatusResponse>()
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(ShareMarketListingStatusView {
-        listing_url: response
-            .listing_url
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| {
-                share_market_listing_url(base_url, router_id, share_id, Some(app_type))
-            }),
-        status: response.status.unwrap_or_else(|| "unknown".to_string()),
-        sale_mode: response.sale_mode,
-        filled_seats: response.filled_seats,
-        required_seats: response.required_seats,
-        listing_status: response.listing_status,
-    })
-}
-
-fn share_market_listing_url(
-    base_url: &str,
-    router_id: &str,
-    share_id: &str,
-    app_type: Option<&str>,
-) -> String {
-    let mut query = url::form_urlencoded::Serializer::new(String::new());
-    query.append_pair("router_id", router_id);
-    query.append_pair("share_id", share_id);
-    if let Some(app_type) = app_type.filter(|value| !value.trim().is_empty()) {
-        query.append_pair("app_type", app_type);
-    }
-    format!("{base_url}/listing/share?{}", query.finish())
 }
 
 async fn share_api_context(

@@ -46,15 +46,15 @@ use crate::models::{
     ShareBatchSyncRequest, ShareClaimPayload, ShareClaimSubdomainRequest, ShareDeleteRequest,
     ShareDescriptor, ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest,
     ShareMarketGrantRequest, ShareMarketGrantResponse, ShareMarketGrantStatusResponse,
-    ShareMarketLinkView, ShareModelHealthCheckEntry, ShareModelHealthSummary,
-    SharePendingEditsRequest, SharePendingEditsResponse, ShareRequestLogBatchSyncRequest,
-    ShareRequestLogEntry, ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload,
-    ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse, ShareSettingsPatch,
-    ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest,
-    ShareUpstreamProvider, ShareUpstreamQuota, ShareUsageByEmailResponse, ShareUsageDailyBucket,
-    ShareUsageEmailRow, ShareView, TunnelLease, UserApiTokenResetResponse, UserApiTokenResponse,
-    UserApiTokenStatus, UserShareView, UserSharesResponse, VerifyEmailCodeRequest,
-    VerifyEmailCodeResponse,
+    ShareMarketLinkView, ShareMarketListingStatusInput, ShareMarketListingStatusView,
+    ShareModelHealthCheckEntry, ShareModelHealthSummary, SharePendingEditsRequest,
+    SharePendingEditsResponse, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry,
+    ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload, ShareRuntimeRefreshRequest,
+    ShareRuntimeSnapshotResponse, ShareSettingsPatch, ShareSettingsUpdateResponse, ShareSignals,
+    ShareSupport, ShareSyncRequest, ShareUpstreamProvider, ShareUpstreamQuota,
+    ShareUsageByEmailResponse, ShareUsageDailyBucket, ShareUsageEmailRow, ShareView, TunnelLease,
+    UserApiTokenResetResponse, UserApiTokenResponse, UserApiTokenStatus, UserShareView,
+    UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 #[cfg(test)]
 use crate::models::{ShareAppProvider, ShareUpstreamModel};
@@ -5176,6 +5176,139 @@ impl AppStore {
         Ok(synced)
     }
 
+    pub async fn sync_share_market_listing_statuses(
+        &self,
+        market_email: &str,
+        replace: bool,
+        statuses: Vec<ShareMarketListingStatusInput>,
+    ) -> Result<usize, AppError> {
+        let normalized_market_email = normalize_email(market_email)?;
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        let tx = conn.unchecked_transaction().map_err(|e| {
+            AppError::Internal(format!(
+                "begin share market listing status sync failed: {e}"
+            ))
+        })?;
+        if replace {
+            tx.execute(
+                "DELETE FROM share_market_listing_statuses WHERE lower(market_email) = lower(?1)",
+                params![normalized_market_email],
+            )
+            .map_err(|e| {
+                AppError::Internal(format!("replace share market listing statuses failed: {e}"))
+            })?;
+        }
+
+        let mut synced = 0usize;
+        for status in statuses {
+            let router_id =
+                normalize_optional_string(status.router_id).unwrap_or_else(|| "main".to_string());
+            let share_id = status.share_id.trim().to_string();
+            if share_id.is_empty() {
+                continue;
+            }
+            let app_type = normalize_app_type_token(&status.app_type)?;
+            if !share_market_listing_status_visible_to_market(
+                &tx,
+                &normalized_market_email,
+                &router_id,
+                &share_id,
+                &app_type,
+            )? {
+                continue;
+            }
+            let listing_url = status.listing_url.trim().to_string();
+            if !listing_url.starts_with("http://") && !listing_url.starts_with("https://") {
+                continue;
+            }
+            let status_value = normalize_listing_status_token(&status.status)?;
+            let sale_mode = normalize_optional_listing_sale_mode(status.sale_mode)?;
+            let listing_status = normalize_optional_string(status.listing_status);
+            let expires_at = normalize_optional_string(status.expires_at);
+            let filled_seats = status.filled_seats.map(|value| value.max(0));
+            let required_seats = status.required_seats.map(|value| value.max(0));
+            tx.execute(
+                r#"
+                INSERT INTO share_market_listing_statuses
+                    (market_email, router_id, share_id, app_type, listing_url, status, sale_mode,
+                     filled_seats, required_seats, listing_status, expires_at, created_at, updated_at)
+                VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12)
+                ON CONFLICT(market_email, router_id, share_id, app_type) DO UPDATE SET
+                    listing_url = excluded.listing_url,
+                    status = excluded.status,
+                    sale_mode = excluded.sale_mode,
+                    filled_seats = excluded.filled_seats,
+                    required_seats = excluded.required_seats,
+                    listing_status = excluded.listing_status,
+                    expires_at = excluded.expires_at,
+                    updated_at = excluded.updated_at
+                "#,
+                params![
+                    normalized_market_email,
+                    router_id,
+                    share_id,
+                    app_type,
+                    listing_url,
+                    status_value,
+                    sale_mode,
+                    filled_seats,
+                    required_seats,
+                    listing_status,
+                    expires_at,
+                    now
+                ],
+            )
+            .map_err(|e| {
+                AppError::Internal(format!("upsert share market listing status failed: {e}"))
+            })?;
+            synced += 1;
+        }
+        tx.commit().map_err(|e| {
+            AppError::Internal(format!(
+                "commit share market listing status sync failed: {e}"
+            ))
+        })?;
+        Ok(synced)
+    }
+
+    pub async fn attach_share_market_listing_statuses(
+        &self,
+        response: &mut DashboardResponse,
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().await;
+        let statuses = list_share_market_listing_status_map(&conn)?;
+        drop(conn);
+        for share in &mut response.shares {
+            for market in share
+                .market_links
+                .iter_mut()
+                .filter(|market| market.market_kind == "share")
+            {
+                let market_email = market.email.to_ascii_lowercase();
+                for app in ["claude", "codex", "gemini"] {
+                    let router_id = if share.router_id.trim().is_empty() {
+                        "main"
+                    } else {
+                        share.router_id.as_str()
+                    };
+                    let key = (
+                        market_email.clone(),
+                        router_id.to_string(),
+                        share.share_id.clone(),
+                        app.to_string(),
+                    );
+                    if let Some(status) = statuses.get(&key) {
+                        market
+                            .listing_status_by_app
+                            .insert(app.to_string(), status.clone());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn update_market_maintenance(
         &self,
         market_email: &str,
@@ -6878,6 +7011,23 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             updated_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS share_market_listing_statuses (
+            market_email TEXT NOT NULL,
+            router_id TEXT NOT NULL,
+            share_id TEXT NOT NULL,
+            app_type TEXT NOT NULL,
+            listing_url TEXT NOT NULL,
+            status TEXT NOT NULL,
+            sale_mode TEXT,
+            filled_seats INTEGER,
+            required_seats INTEGER,
+            listing_status TEXT,
+            expires_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (market_email, router_id, share_id, app_type)
+        );
+
         CREATE TABLE IF NOT EXISTS dashboard_presence (
             session_id TEXT PRIMARY KEY,
             last_seen_at INTEGER NOT NULL
@@ -7064,6 +7214,8 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         CREATE INDEX IF NOT EXISTS idx_market_share_model_failure_state_share ON market_share_model_failure_state(market_email, share_id, app_type, last_status);
         CREATE INDEX IF NOT EXISTS idx_market_share_runtime_states_market_share ON market_share_runtime_states(market_email, share_id);
         CREATE INDEX IF NOT EXISTS idx_market_share_runtime_states_expires ON market_share_runtime_states(expires_at);
+        CREATE INDEX IF NOT EXISTS idx_share_market_listing_statuses_market_share ON share_market_listing_statuses(market_email, router_id, share_id);
+        CREATE INDEX IF NOT EXISTS idx_share_market_listing_statuses_expires ON share_market_listing_statuses(expires_at);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_market_share_runtime_states_unique
             ON market_share_runtime_states (
                 market_email,
@@ -7515,6 +7667,36 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         [],
     )
     .map_err(|e| AppError::Internal(format!("create market failure state index failed: {e}")))?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS share_market_listing_statuses (
+            market_email TEXT NOT NULL,
+            router_id TEXT NOT NULL,
+            share_id TEXT NOT NULL,
+            app_type TEXT NOT NULL,
+            listing_url TEXT NOT NULL,
+            status TEXT NOT NULL,
+            sale_mode TEXT,
+            filled_seats INTEGER,
+            required_seats INTEGER,
+            listing_status TEXT,
+            expires_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (market_email, router_id, share_id, app_type)
+        )",
+        [],
+    )
+    .map_err(|e| AppError::Internal(format!("create listing status table failed: {e}")))?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_share_market_listing_statuses_market_share ON share_market_listing_statuses(market_email, router_id, share_id)",
+        [],
+    )
+    .map_err(|e| AppError::Internal(format!("create listing status share index failed: {e}")))?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_share_market_listing_statuses_expires ON share_market_listing_statuses(expires_at)",
+        [],
+    )
+    .map_err(|e| AppError::Internal(format!("create listing status expires index failed: {e}")))?;
     add_column_if_missing(
         conn,
         "share_request_logs",
@@ -11739,6 +11921,113 @@ fn list_market_share_runtime_state_map(
     Ok(result)
 }
 
+fn list_share_market_listing_status_map(
+    conn: &Connection,
+) -> Result<HashMap<(String, String, String, String), ShareMarketListingStatusView>, AppError> {
+    let now = Utc::now().to_rfc3339();
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT lower(market_email), router_id, share_id, app_type, listing_url, status,
+                   sale_mode, filled_seats, required_seats, listing_status, updated_at, expires_at,
+                   CASE WHEN expires_at IS NOT NULL AND expires_at <= ?1 THEN 1 ELSE 0 END AS is_stale
+              FROM share_market_listing_statuses
+             ORDER BY updated_at DESC
+            "#,
+        )
+        .map_err(|e| {
+            AppError::Internal(format!("prepare share market listing statuses failed: {e}"))
+        })?;
+    let rows = stmt
+        .query_map(params![now], |row| {
+            let market_email: String = row.get(0)?;
+            let router_id: String = row.get(1)?;
+            let share_id: String = row.get(2)?;
+            let app_type: String = row.get(3)?;
+            Ok((
+                (market_email, router_id, share_id, app_type),
+                ShareMarketListingStatusView {
+                    listing_url: row.get(4)?,
+                    status: row.get(5)?,
+                    sale_mode: row.get(6)?,
+                    filled_seats: row.get(7)?,
+                    required_seats: row.get(8)?,
+                    listing_status: row.get(9)?,
+                    updated_at: row.get(10)?,
+                    expires_at: row.get(11)?,
+                    is_stale: row.get::<_, i64>(12)? != 0,
+                },
+            ))
+        })
+        .map_err(|e| {
+            AppError::Internal(format!("query share market listing statuses failed: {e}"))
+        })?;
+    let mut result = HashMap::new();
+    for row in rows {
+        let (key, value) = row.map_err(|e| {
+            AppError::Internal(format!("read share market listing status failed: {e}"))
+        })?;
+        result.entry(key).or_insert(value);
+    }
+    Ok(result)
+}
+
+fn share_market_listing_status_visible_to_market(
+    tx: &rusqlite::Transaction<'_>,
+    market_email: &str,
+    _router_id: &str,
+    share_id: &str,
+    app_type: &str,
+) -> Result<bool, AppError> {
+    let row = tx
+        .query_row(
+            r#"
+            SELECT shared_with_emails_json, market_access_mode,
+                   COALESCE(access_by_app_json, '{}'), COALESCE(app_settings_json, '{}'),
+                   for_sale, sale_market_kind
+              FROM shares
+             WHERE share_id = ?1
+               AND share_status = 'active'
+            "#,
+            params![share_id],
+            |row| {
+                Ok((
+                    parse_string_vec(row.get(0)?)?,
+                    row.get::<_, String>(1)?,
+                    parse_share_access_by_app(row.get(2)?)?,
+                    parse_share_app_settings(row.get(3)?)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| AppError::Internal(format!("query listing status share failed: {e}")))?;
+    let Some((
+        shared_with_emails,
+        market_access_mode,
+        access_by_app,
+        app_settings,
+        for_sale,
+        sale_market_kind,
+    )) = row
+    else {
+        return Ok(false);
+    };
+    Ok(share_app_settings_visible_to_market(
+        app_type,
+        &app_settings,
+        &access_by_app,
+        &shared_with_emails,
+        &market_access_mode,
+        &for_sale,
+        &sale_market_kind,
+        "share",
+        false,
+        market_email,
+    ))
+}
+
 fn list_market_visible_share_ids(
     conn: &Connection,
     market_email: &str,
@@ -12396,6 +12685,33 @@ fn normalize_runtime_state_token(value: &str, field: &str) -> Result<String, App
         )));
     }
     Ok(value)
+}
+
+fn normalize_app_type_token(value: &str) -> Result<String, AppError> {
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "claude" | "codex" | "gemini" => Ok(value),
+        _ => Err(AppError::BadRequest("invalid app type".into())),
+    }
+}
+
+fn normalize_listing_status_token(value: &str) -> Result<String, AppError> {
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "idle" | "carpooling" | "full" | "unavailable" | "unknown" => Ok(value),
+        _ => Err(AppError::BadRequest("invalid listing status".into())),
+    }
+}
+
+fn normalize_optional_listing_sale_mode(value: Option<String>) -> Result<Option<String>, AppError> {
+    let Some(value) = normalize_optional_string(value) else {
+        return Ok(None);
+    };
+    let value = value.to_ascii_lowercase();
+    match value.as_str() {
+        "single" | "carpool" => Ok(Some(value)),
+        _ => Err(AppError::BadRequest("invalid listing sale mode".into())),
+    }
 }
 
 fn normalize_email_list(values: &[String], owner_email: &str) -> Vec<String> {
@@ -15366,6 +15682,89 @@ mod tests {
         assert_eq!(dashboard_share_market.parallel_capacity, 7);
         assert_eq!(dashboard_share_market.usage_tokens, 123456);
         assert_eq!(dashboard_share_market.usage_amount_usd, "0.00000000");
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn dashboard_uses_cached_share_market_listing_status() {
+        let (store, config) = setup_store("dashboard-share-market-listing-status").await;
+        let mut share_market = test_market();
+        share_market.id = "share-market-status".into();
+        share_market.email = "share-market@example.com".into();
+        share_market.subdomain = "share-market".into();
+        share_market.public_base_url = "https://share-market.example.com".into();
+        share_market.market_kind = "share".into();
+        insert_market(&store, &share_market).await;
+        insert_installation(&store, "inst-share-market-status").await;
+        insert_share(
+            &store,
+            "inst-share-market-status",
+            "share-market-status",
+            "share-market-status-sub",
+            "active",
+        )
+        .await;
+        set_share_shared_with_emails(&store, "share-market-status", &["share-market@example.com"])
+            .await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares
+                    SET for_sale = 'Yes',
+                        sale_market_kind = 'share'
+                  WHERE share_id = ?1",
+                params!["share-market-status"],
+            )
+            .expect("enable share market sale");
+        }
+
+        let synced = store
+            .sync_share_market_listing_statuses(
+                "share-market@example.com",
+                true,
+                vec![ShareMarketListingStatusInput {
+                    router_id: Some("main".into()),
+                    share_id: "share-market-status".into(),
+                    app_type: "codex".into(),
+                    listing_url: "https://share-market.example.com/listing/share?router_id=main&share_id=share-market-status&app_type=codex".into(),
+                    status: "idle".into(),
+                    sale_mode: Some("single".into()),
+                    filled_seats: Some(0),
+                    required_seats: Some(3),
+                    listing_status: Some("active".into()),
+                    expires_at: Some((Utc::now() + Duration::minutes(5)).to_rfc3339()),
+                }],
+            )
+            .await
+            .expect("sync listing status");
+        assert_eq!(synced, 1);
+
+        let server_geo = ServerGeo {
+            lat: None,
+            lon: None,
+        };
+        let proxy = ProxyRegistry::default();
+        let mut dashboard = store
+            .dashboard_snapshot(&config, &server_geo, &proxy, None)
+            .await
+            .expect("dashboard");
+        store
+            .attach_share_market_listing_statuses(&mut dashboard)
+            .await
+            .expect("attach listing statuses");
+        let share = dashboard
+            .shares
+            .iter()
+            .find(|share| share.share_id == "share-market-status")
+            .expect("share view");
+        let listing_status = share.market_links[0]
+            .listing_status_by_app
+            .get("codex")
+            .expect("codex listing status");
+        assert_eq!(listing_status.status, "idle");
+        assert_eq!(listing_status.sale_mode.as_deref(), Some("single"));
+        assert!(!listing_status.is_stale);
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }

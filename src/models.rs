@@ -1796,6 +1796,43 @@ pub struct MarketShareRuntimeStateSyncResponse {
     pub synced: usize,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareMarketListingStatusSyncRequest {
+    #[serde(default)]
+    pub replace: bool,
+    #[serde(default)]
+    pub statuses: Vec<ShareMarketListingStatusInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareMarketListingStatusInput {
+    #[serde(default)]
+    pub router_id: Option<String>,
+    pub share_id: String,
+    pub app_type: String,
+    pub listing_url: String,
+    pub status: String,
+    #[serde(default)]
+    pub sale_mode: Option<String>,
+    #[serde(default)]
+    pub filled_seats: Option<i64>,
+    #[serde(default)]
+    pub required_seats: Option<i64>,
+    #[serde(default)]
+    pub listing_status: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareMarketListingStatusSyncResponse {
+    pub ok: bool,
+    pub synced: usize,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MarketShareRuntimeStateReleaseRequest {
@@ -1856,6 +1893,12 @@ pub struct ShareMarketListingStatusView {
     pub required_seats: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listing_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub is_stale: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

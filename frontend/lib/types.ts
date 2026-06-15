@@ -235,6 +235,9 @@ export type ShareMarketListingStatus = {
   filledSeats?: number | null;
   requiredSeats?: number | null;
   listingStatus?: string | null;
+  updatedAt?: string | null;
+  expiresAt?: string | null;
+  isStale?: boolean;
 };
 
 export type DashboardMarket = {
