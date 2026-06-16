@@ -1710,24 +1710,31 @@ impl AppStore {
             .collect::<BTreeMap<_, _>>();
 
         let market_bucket_expr = if bucket_granularity == "hour" {
-            "strftime('%Y-%m-%dT%H:00:00Z', created_at)"
+            "strftime('%Y-%m-%dT%H:00:00Z', ml.created_at)"
         } else {
-            "date(created_at)"
+            "date(ml.created_at)"
         };
+        let market_input_expr = market_log_input_tokens_expr("ml");
+        let market_total_expr = market_log_total_tokens_expr("ml");
         let market_usage_sql = format!(
-            "SELECT lower(trim(user_email)),
+            "SELECT lower(trim(ml.user_email)),
                     {market_bucket_expr} AS usage_bucket,
-                    COALESCE(SUM(input_tokens), 0),
-                    COALESCE(SUM(output_tokens), 0),
-                    COALESCE(SUM(cache_read_tokens), 0),
-                    COALESCE(SUM(cache_creation_tokens), 0)
-             FROM market_request_logs
-             WHERE share_id = ?1
-               AND lower(request_agent) = lower(?2)
-               AND created_at >= ?3
-               AND user_email IS NOT NULL
-               AND trim(user_email) != ''
-             GROUP BY lower(trim(user_email)), usage_bucket"
+                    COALESCE(SUM(CASE WHEN ({market_total_expr}) > 0 OR sl.request_id IS NULL THEN {market_input_expr} ELSE COALESCE(sl.input_tokens, 0) END), 0),
+                    COALESCE(SUM(CASE WHEN ({market_total_expr}) > 0 OR sl.request_id IS NULL THEN COALESCE(ml.output_tokens, 0) ELSE COALESCE(sl.output_tokens, 0) END), 0),
+                    COALESCE(SUM(CASE WHEN ({market_total_expr}) > 0 OR sl.request_id IS NULL THEN COALESCE(ml.cache_read_tokens, 0) ELSE COALESCE(sl.cache_read_tokens, 0) END), 0),
+                    COALESCE(SUM(CASE WHEN ({market_total_expr}) > 0 OR sl.request_id IS NULL THEN COALESCE(ml.cache_creation_tokens, 0) ELSE COALESCE(sl.cache_creation_tokens, 0) END), 0)
+             FROM market_request_logs ml
+             LEFT JOIN share_request_logs sl
+               ON sl.request_id = ml.request_id
+              AND sl.share_id = ml.share_id
+              AND sl.is_health_check = 0
+              AND lower(CASE WHEN COALESCE(sl.request_agent, '') != '' THEN sl.request_agent ELSE sl.app_type END) = lower(ml.request_agent)
+             WHERE ml.share_id = ?1
+               AND lower(ml.request_agent) = lower(?2)
+               AND ml.created_at >= ?3
+               AND ml.user_email IS NOT NULL
+               AND trim(ml.user_email) != ''
+             GROUP BY lower(trim(ml.user_email)), usage_bucket"
         );
         let mut market_stmt = conn.prepare(&market_usage_sql).map_err(|e| {
             AppError::Internal(format!("prepare market share usage query failed: {e}"))
@@ -10530,22 +10537,100 @@ fn list_recent_share_request_logs(
     Ok(deduplicate_recent_share_request_logs(logs))
 }
 
+fn sql_prefix(alias: &str) -> String {
+    if alias.is_empty() {
+        String::new()
+    } else {
+        format!("{alias}.")
+    }
+}
+
+fn market_log_input_tokens_expr(alias: &str) -> String {
+    let prefix = sql_prefix(alias);
+    format!(
+        "CASE
+            WHEN lower(COALESCE({prefix}request_agent, '')) = 'codex' THEN
+                CASE
+                    WHEN COALESCE({prefix}input_tokens, 0) > COALESCE({prefix}cache_read_tokens, 0)
+                    THEN COALESCE({prefix}input_tokens, 0) - COALESCE({prefix}cache_read_tokens, 0)
+                    ELSE 0
+                END
+            ELSE COALESCE({prefix}input_tokens, 0)
+        END"
+    )
+}
+
+fn market_log_total_tokens_expr(alias: &str) -> String {
+    let prefix = sql_prefix(alias);
+    let input_expr = market_log_input_tokens_expr(alias);
+    format!(
+        "({input_expr}
+          + COALESCE({prefix}output_tokens, 0)
+          + COALESCE({prefix}cache_read_tokens, 0)
+          + COALESCE({prefix}cache_creation_tokens, 0))"
+    )
+}
+
+fn share_log_total_tokens_expr(alias: &str) -> String {
+    let prefix = sql_prefix(alias);
+    format!(
+        "(COALESCE({prefix}input_tokens, 0)
+          + COALESCE({prefix}output_tokens, 0)
+          + COALESCE({prefix}cache_read_tokens, 0)
+          + COALESCE({prefix}cache_creation_tokens, 0))"
+    )
+}
+
 fn list_share_usage_by_app(
     conn: &Connection,
 ) -> Result<HashMap<String, (BTreeMap<String, i64>, BTreeMap<String, i64>)>, AppError> {
+    let market_total_expr = market_log_total_tokens_expr("ml");
+    let share_total_expr = share_log_total_tokens_expr("sl");
     let mut stmt = conn
-        .prepare(
-            "SELECT share_id,
-                    lower(CASE
-                        WHEN COALESCE(request_agent, '') != '' THEN request_agent
-                        ELSE app_type
-                    END) AS app,
+        .prepare(&format!(
+            "WITH usage_rows AS (
+                SELECT sl.share_id AS share_id,
+                       lower(CASE
+                           WHEN COALESCE(sl.request_agent, '') != '' THEN sl.request_agent
+                           ELSE sl.app_type
+                       END) AS app,
+                       sl.request_id AS request_id,
+                       'share' AS source,
+                       {share_total_expr} AS total_tokens
+                  FROM share_request_logs sl
+                 WHERE sl.is_health_check = 0
+                UNION ALL
+                SELECT ml.share_id AS share_id,
+                       lower(ml.request_agent) AS app,
+                       ml.request_id AS request_id,
+                       'market' AS source,
+                       {market_total_expr} AS total_tokens
+                  FROM market_request_logs ml
+                 WHERE ml.share_id IS NOT NULL
+                   AND trim(ml.share_id) != ''
+             ),
+             per_request AS (
+                SELECT share_id,
+                       app,
+                       request_id,
+                       MAX(CASE WHEN source = 'market' THEN total_tokens END) AS market_total,
+                       MAX(CASE WHEN source = 'share' THEN total_tokens END) AS share_total
+                  FROM usage_rows
+                 WHERE app IN ('claude', 'codex', 'gemini')
+                 GROUP BY share_id, app, request_id
+             )
+             SELECT share_id,
+                    app,
                     COUNT(*) AS requests_count,
-                    COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens), 0) AS total_tokens
-             FROM share_request_logs
-             WHERE is_health_check = 0
-             GROUP BY share_id, app",
-        )
+                    COALESCE(SUM(
+                        CASE
+                            WHEN COALESCE(market_total, 0) > 0 THEN market_total
+                            ELSE COALESCE(share_total, market_total, 0)
+                        END
+                    ), 0) AS total_tokens
+              FROM per_request
+              GROUP BY share_id, app",
+        ))
         .map_err(|e| AppError::Internal(format!("prepare share usage by app failed: {e}")))?;
     let rows = stmt
         .query_map([], |row| {
@@ -11403,8 +11488,9 @@ fn list_dashboard_markets(
     market_request_timeline_by_market: &HashMap<String, Vec<HealthTimelineBucketStats>>,
     health_timeline_start: i64,
 ) -> Result<Vec<DashboardMarketView>, AppError> {
+    let market_total_expr = market_log_total_tokens_expr("ml");
     let mut stmt = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT rm.id, rm.display_name, rm.email, rm.subdomain, rm.public_base_url,
                     COALESCE(rm.market_kind, 'usage') AS market_kind, rm.status,
                     rm.created_at, rm.updated_at, rm.last_seen_at, rm.offline_since,
@@ -11413,8 +11499,7 @@ fn list_dashboard_markets(
                     rm.maintenance_message,
                     COALESCE(SUM(
                         CASE
-                            WHEN ml.usage_amount_usd IS NOT NULL THEN
-                                ml.input_tokens + ml.output_tokens + ml.cache_read_tokens + ml.cache_creation_tokens
+                            WHEN ml.usage_amount_usd IS NOT NULL THEN {market_total_expr}
                             ELSE 0
                         END
                     ), 0) AS usage_tokens,
@@ -11426,7 +11511,7 @@ fn list_dashboard_markets(
                       rm.created_at, rm.updated_at, rm.last_seen_at, rm.offline_since, rm.pricing_json,
                       rm.maintenance_enabled, rm.maintenance_message
              ORDER BY rm.display_name ASC, rm.subdomain ASC",
-        )
+        ))
         .map_err(|e| AppError::Internal(format!("prepare dashboard markets failed: {e}")))?;
     let rows = stmt
         .query_map([], |row| {
@@ -15420,8 +15505,9 @@ mod tests {
 
             let mut market_log = test_market_request_log("req_usage_market", "share-usage");
             market_log.user_email = Some("market@example.com".into());
-            market_log.input_tokens = 120;
-            market_log.output_tokens = 180;
+            market_log.input_tokens = 220;
+            market_log.output_tokens = 80;
+            market_log.cache_read_tokens = 100;
             upsert_market_request_log_tx(&conn, &market, market_log).expect("insert market log");
 
             let now = Utc::now().timestamp();
@@ -15455,12 +15541,97 @@ mod tests {
             .expect("market row");
         assert_eq!(market.role, "market");
         assert_eq!(market.total_tokens, 300);
+        assert_eq!(market.input_tokens, 120);
+        assert_eq!(market.output_tokens, 80);
+        assert_eq!(market.cache_read_tokens, 100);
         let owner = usage
             .rows
             .iter()
             .find(|row| row.email == "owner@example.com")
             .expect("owner row");
         assert_eq!(owner.total_tokens, 50);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn share_usage_by_app_merges_market_and_share_logs_by_request() {
+        let (store, config) = setup_store("share-usage-by-app-merged").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-usage", "usage-sub", "active").await;
+        let market = test_market();
+        insert_market(&store, &market).await;
+        {
+            let conn = store.conn.lock().await;
+            let now = Utc::now().timestamp();
+
+            let mut codex_market = test_market_request_log("req_usage_codex_market", "share-usage");
+            codex_market.input_tokens = 220;
+            codex_market.output_tokens = 80;
+            codex_market.cache_read_tokens = 100;
+            upsert_market_request_log_tx(&conn, &market, codex_market)
+                .expect("insert codex market log");
+
+            let mut duplicate_codex_share =
+                test_share_request_log_entry("req_usage_codex_market", "share-usage", now);
+            duplicate_codex_share.app_type = "codex".into();
+            duplicate_codex_share.request_agent = "codex".into();
+            duplicate_codex_share.input_tokens = 900;
+            duplicate_codex_share.output_tokens = 0;
+            upsert_share_request_log_tx(&conn, "inst-1", duplicate_codex_share)
+                .expect("insert duplicate codex share log");
+
+            let mut direct_codex =
+                test_share_request_log_entry("req_usage_codex_direct", "share-usage", now);
+            direct_codex.app_type = "codex".into();
+            direct_codex.request_agent = "codex".into();
+            direct_codex.input_tokens = 40;
+            direct_codex.output_tokens = 10;
+            upsert_share_request_log_tx(&conn, "inst-1", direct_codex)
+                .expect("insert direct codex share log");
+
+            let mut claude_market = test_market_request_log("req_usage_claude_zero", "share-usage");
+            claude_market.request_agent = "claude".into();
+            claude_market.requested_model = "claude-opus-4-7".into();
+            claude_market.actual_model = "claude-opus-4-7".into();
+            claude_market.input_tokens = 0;
+            claude_market.output_tokens = 0;
+            claude_market.cache_read_tokens = 0;
+            claude_market.cache_creation_tokens = 0;
+            upsert_market_request_log_tx(&conn, &market, claude_market)
+                .expect("insert zero claude market log");
+
+            let mut claude_share =
+                test_share_request_log_entry("req_usage_claude_zero", "share-usage", now);
+            claude_share.app_type = "claude".into();
+            claude_share.request_agent = "claude".into();
+            claude_share.input_tokens = 1;
+            claude_share.output_tokens = 2;
+            claude_share.cache_read_tokens = 100;
+            upsert_share_request_log_tx(&conn, "inst-1", claude_share)
+                .expect("insert matching claude share log");
+
+            let mut gemini_market =
+                test_market_request_log("req_usage_gemini_market", "share-usage");
+            gemini_market.request_agent = "gemini".into();
+            gemini_market.requested_model = "gemini-2.5-pro".into();
+            gemini_market.actual_model = "gemini-2.5-pro".into();
+            gemini_market.input_tokens = 4;
+            gemini_market.output_tokens = 5;
+            gemini_market.cache_read_tokens = 6;
+            upsert_market_request_log_tx(&conn, &market, gemini_market)
+                .expect("insert gemini market log");
+
+            let usage = list_share_usage_by_app(&conn).expect("list share usage");
+            let (tokens_by_app, requests_by_app) =
+                usage.get("share-usage").expect("share usage row");
+            assert_eq!(tokens_by_app.get("codex"), Some(&350));
+            assert_eq!(requests_by_app.get("codex"), Some(&2));
+            assert_eq!(tokens_by_app.get("claude"), Some(&103));
+            assert_eq!(requests_by_app.get("claude"), Some(&1));
+            assert_eq!(tokens_by_app.get("gemini"), Some(&15));
+            assert_eq!(requests_by_app.get("gemini"), Some(&1));
+        }
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
