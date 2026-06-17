@@ -1319,6 +1319,8 @@ pub struct ShareUpstreamQuota {
     pub blocked_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_limit_percent: Option<f64>,
     #[serde(default)]
     pub tiers: Vec<ShareUpstreamQuotaTier>,
 }
