@@ -23,7 +23,8 @@ use crate::models::{ShareDescriptor, ShareSettingsPatch};
 
 type HmacSha256 = Hmac<Sha256>;
 
-const CTL_PATH: &str = "/_ctl/apply_share_settings";
+const APPLY_SHARE_SETTINGS_PATH: &str = "/_ctl/apply_share_settings";
+const REFRESH_SHARE_USAGE_PATH: &str = "/_ctl/refresh_share_usage";
 const CTL_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Serialize)]
@@ -39,6 +40,34 @@ struct ApplyShareSettingsReply {
     #[serde(default)]
     ok: bool,
     share: Option<ShareDescriptor>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RefreshShareUsageBody<'a> {
+    share_id: &'a str,
+    app: Option<&'a str>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshShareUsageItem {
+    pub app: String,
+    pub provider_id: Option<String>,
+    pub provider_name: Option<String>,
+    pub auth_provider: Option<String>,
+    #[serde(default)]
+    pub refreshed: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshShareUsageReply {
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub refreshed: Vec<RefreshShareUsageItem>,
 }
 
 /// Why a control RPC did not produce an authoritative result. The caller maps
@@ -80,11 +109,11 @@ impl CtlError {
 
 /// Canonical string signed by both sides:
 /// `METHOD\nPATH\n<body>\n<timestamp_ms>\n<nonce>`
-fn signature(secret: &str, body: &str, timestamp_ms: i64, nonce: &str) -> String {
+fn signature(path: &str, secret: &str, body: &str, timestamp_ms: i64, nonce: &str) -> String {
     let mut mac =
         HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any size");
     mac.update(b"POST\n");
-    mac.update(CTL_PATH.as_bytes());
+    mac.update(path.as_bytes());
     mac.update(b"\n");
     mac.update(body.as_bytes());
     mac.update(b"\n");
@@ -94,28 +123,23 @@ fn signature(secret: &str, body: &str, timestamp_ms: i64, nonce: &str) -> String
     base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
 }
 
-/// Synchronously ask the installation behind `backend` (a `host:port` tunnel
-/// target) to apply `patch` to `share_id`, returning the descriptor the client
-/// actually wrote. `backend` comes from `RouteEntry::route_target()`.
-pub async fn apply_share_settings(
+async fn post_control<T: serde::de::DeserializeOwned>(
     backend: &str,
     installation_id: &str,
     control_secret: &str,
-    share_id: &str,
-    patch: &ShareSettingsPatch,
-) -> Result<ShareDescriptor, CtlError> {
-    let body = serde_json::to_string(&ApplyShareSettingsBody { share_id, patch })
-        .map_err(|e| CtlError::Malformed(format!("serialize control body failed: {e}")))?;
+    path: &str,
+    body: String,
+) -> Result<T, CtlError> {
     let timestamp_ms = chrono::Utc::now().timestamp_millis();
     let nonce = uuid::Uuid::new_v4().to_string();
-    let sig = signature(control_secret, &body, timestamp_ms, &nonce);
+    let sig = signature(path, control_secret, &body, timestamp_ms, &nonce);
 
     let client = reqwest::Client::builder()
         .timeout(CTL_TIMEOUT)
         .build()
         .map_err(|e| CtlError::Unreachable(format!("build http client failed: {e}")))?;
 
-    let url = format!("http://{backend}{CTL_PATH}");
+    let url = format!("http://{backend}{path}");
     let resp = client
         .post(&url)
         .header("content-type", "application/json")
@@ -142,16 +166,60 @@ pub async fn apply_share_settings(
             body: body.chars().take(500).collect(),
         });
     }
-    let reply: ApplyShareSettingsReply = resp
-        .json()
+    resp.json()
         .await
-        .map_err(|e| CtlError::Malformed(e.to_string()))?;
+        .map_err(|e| CtlError::Malformed(e.to_string()))
+}
+
+/// Synchronously ask the installation behind `backend` (a `host:port` tunnel
+/// target) to apply `patch` to `share_id`, returning the descriptor the client
+/// actually wrote. `backend` comes from `RouteEntry::route_target()`.
+pub async fn apply_share_settings(
+    backend: &str,
+    installation_id: &str,
+    control_secret: &str,
+    share_id: &str,
+    patch: &ShareSettingsPatch,
+) -> Result<ShareDescriptor, CtlError> {
+    let body = serde_json::to_string(&ApplyShareSettingsBody { share_id, patch })
+        .map_err(|e| CtlError::Malformed(format!("serialize control body failed: {e}")))?;
+    let reply: ApplyShareSettingsReply = post_control(
+        backend,
+        installation_id,
+        control_secret,
+        APPLY_SHARE_SETTINGS_PATH,
+        body,
+    )
+    .await?;
     if !reply.ok {
         return Err(CtlError::Malformed("client replied ok=false".into()));
     }
     reply
         .share
         .ok_or_else(|| CtlError::Malformed("client reply missing share".into()))
+}
+
+pub async fn refresh_share_usage(
+    backend: &str,
+    installation_id: &str,
+    control_secret: &str,
+    share_id: &str,
+    app: Option<&str>,
+) -> Result<RefreshShareUsageReply, CtlError> {
+    let body = serde_json::to_string(&RefreshShareUsageBody { share_id, app })
+        .map_err(|e| CtlError::Malformed(format!("serialize control body failed: {e}")))?;
+    let reply: RefreshShareUsageReply = post_control(
+        backend,
+        installation_id,
+        control_secret,
+        REFRESH_SHARE_USAGE_PATH,
+        body,
+    )
+    .await?;
+    if !reply.ok {
+        return Err(CtlError::Malformed("client replied ok=false".into()));
+    }
+    Ok(reply)
 }
 
 #[cfg(test)]
@@ -161,15 +229,53 @@ mod tests {
     #[test]
     fn signature_is_stable_and_key_sensitive() {
         let body = r#"{"shareId":"s1","patch":{"ownerEmail":"a@b.com"}}"#;
-        let a = signature("secret-1", body, 1700000000000, "nonce-1");
-        let b = signature("secret-1", body, 1700000000000, "nonce-1");
+        let a = signature(
+            APPLY_SHARE_SETTINGS_PATH,
+            "secret-1",
+            body,
+            1700000000000,
+            "nonce-1",
+        );
+        let b = signature(
+            APPLY_SHARE_SETTINGS_PATH,
+            "secret-1",
+            body,
+            1700000000000,
+            "nonce-1",
+        );
         assert_eq!(a, b, "same inputs must produce same signature");
-        let c = signature("secret-2", body, 1700000000000, "nonce-1");
+        let c = signature(
+            APPLY_SHARE_SETTINGS_PATH,
+            "secret-2",
+            body,
+            1700000000000,
+            "nonce-1",
+        );
         assert_ne!(a, c, "different secret must change signature");
-        let d = signature("secret-1", body, 1700000000001, "nonce-1");
+        let d = signature(
+            APPLY_SHARE_SETTINGS_PATH,
+            "secret-1",
+            body,
+            1700000000001,
+            "nonce-1",
+        );
         assert_ne!(a, d, "different timestamp must change signature");
-        let e = signature("secret-1", body, 1700000000000, "nonce-2");
+        let e = signature(
+            APPLY_SHARE_SETTINGS_PATH,
+            "secret-1",
+            body,
+            1700000000000,
+            "nonce-2",
+        );
         assert_ne!(a, e, "different nonce must change signature");
+        let f = signature(
+            REFRESH_SHARE_USAGE_PATH,
+            "secret-1",
+            body,
+            1700000000000,
+            "nonce-1",
+        );
+        assert_ne!(a, f, "different path must change signature");
     }
 
     #[test]

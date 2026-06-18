@@ -314,6 +314,13 @@ export type MarketShare = {
   modelHealth?: ShareModelHealthSummary;
   marketStates?: MarketShareRuntimeState[];
   signals?: ShareSignals;
+  sessionLoad?: number;
+};
+
+export type ShareSessionLoad = {
+  routerId: string;
+  shareId: string;
+  sessionLoad: number;
 };
 
 export type ShareSignals = {
@@ -927,4 +934,25 @@ export type ShareConnectionTestResponse = {
   } | null;
   durationMs: number;
   error: string | null;
+  schedulingRecovery?: {
+    shareModelHealthDeleted: number;
+    marketModelFailuresDeleted: number;
+    marketRuntimeStatesDeleted: number;
+  };
+};
+
+export type ShareUsageRefreshRequest = {
+  app?: "claude" | "codex" | "gemini";
+};
+
+export type ShareUsageRefreshResponse = {
+  ok: boolean;
+  refreshed: Array<{
+    app: string;
+    providerId?: string | null;
+    providerName?: string | null;
+    authProvider?: string | null;
+    refreshed: boolean;
+    error?: string | null;
+  }>;
 };

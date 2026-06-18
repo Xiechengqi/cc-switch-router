@@ -6,7 +6,7 @@ import * as React from "react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog";
-import { getMarketLinkedShares, getMarketSharePriority, getShareImageGenerationRequestLogs, getShareUsageByEmail, releaseMarketShareState, updateMarketDisabledShares, updateMarketMaintenance, updateShareSettings } from "@/lib/api";
+import { getMarketLinkedShares, getMarketSharePriority, getMarketShareSessionLoads, getShareImageGenerationRequestLogs, getShareUsageByEmail, releaseMarketShareState, updateMarketDisabledShares, updateMarketMaintenance, updateShareSettings } from "@/lib/api";
 import type { AppLocale } from "@/lib/i18n";
 import type { DashboardClient, DashboardMarket, HealthCheckEntry, HealthTimelineBucket, ImageGenerationRequestLog, MarketAppAvailabilityEntry, MarketRequestLog, MarketShare, MarketShareRuntimeState, ModelHealthSummary, ShareAccessByApp, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareMarketListingStatus, ShareModelHealthCheck, ShareRequestLog, ShareSettingsPatch, ShareUpstreamProvider, ShareUsageByEmailResponse, ShareView } from "@/lib/types";
 import { cn, compactTokens, formatDateTime, formatNumber, formatRelativeTime } from "@/lib/utils";
@@ -4121,9 +4121,17 @@ function MarketSharePriorityPanel({ market, t }: { market: DashboardMarket; t: T
     let cancelled = false;
     setShares(null);
     setError("");
-    getMarketSharePriority(market.email, activeApp)
-      .then((nextShares) => {
-        if (!cancelled) setShares(nextShares);
+    Promise.all([
+      getMarketSharePriority(market.email, activeApp),
+      getMarketShareSessionLoads(market.publicBaseUrl, activeApp).catch(() => []),
+    ])
+      .then(([nextShares, sessionLoads]) => {
+        if (cancelled) return;
+        const loadByShare = new Map(sessionLoads.map((load) => [`${load.routerId}:${load.shareId}`, load.sessionLoad]));
+        setShares(nextShares.map((share) => ({
+          ...share,
+          sessionLoad: loadByShare.get(`${share.routerId}:${share.shareId}`) ?? 0,
+        })));
       })
       .catch((err) => {
         if (!cancelled) setError(err instanceof Error ? err.message : String(err));
@@ -4131,7 +4139,7 @@ function MarketSharePriorityPanel({ market, t }: { market: DashboardMarket; t: T
     return () => {
       cancelled = true;
     };
-  }, [market.email, activeApp]);
+  }, [market.email, market.publicBaseUrl, activeApp]);
 
   const ranked = React.useMemo(
     () => rankMarketSharesForApp(shares || [], activeApp, t),
@@ -4209,7 +4217,9 @@ function MarketSharePriorityCard({ item, rank, t }: { item: MarketSharePriorityI
         ) : null}
         <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted-foreground">
           <span title={item.signalTitle}>{t("dashboard.sharePrioritySignals")}: {item.signalTitle}</span>
-          <span className="font-mono">{share.activeRequests || 0}/{isUnlimited(share.parallelLimit) ? "∞" : share.parallelLimit}</span>
+          <span className="font-mono">
+            {t("dashboard.sharePrioritySessions")} {share.sessionLoad ?? 0} · {share.activeRequests || 0}/{isUnlimited(share.parallelLimit) ? "∞" : share.parallelLimit}
+          </span>
         </div>
       </Card.Content>
     </Card>
@@ -4219,7 +4229,16 @@ function MarketSharePriorityCard({ item, rank, t }: { item: MarketSharePriorityI
 function rankMarketSharesForApp(shares: MarketShare[], app: MarketShareAppKey, t: TFn): MarketSharePriorityItem[] {
   return shares
     .filter((share) => isShareRelevantForApp(share, app))
-    .map((share) => marketSharePriorityItem(share, app, t));
+    .map((share) => marketSharePriorityItem(share, app, t))
+    .sort((a, b) => {
+      if (a.schedulable !== b.schedulable) return a.schedulable ? -1 : 1;
+      if (a.degraded !== b.degraded) return a.degraded ? 1 : -1;
+      const sessionDelta = Number(a.share.sessionLoad ?? 0) - Number(b.share.sessionLoad ?? 0);
+      if (sessionDelta !== 0) return sessionDelta;
+      const activeDelta = Number(a.share.activeRequests || 0) - Number(b.share.activeRequests || 0);
+      if (activeDelta !== 0) return activeDelta;
+      return b.score - a.score;
+    });
 }
 
 function isShareRelevantForApp(share: MarketShare, app: MarketShareAppKey) {
@@ -4231,8 +4250,14 @@ function isShareRelevantForApp(share: MarketShare, app: MarketShareAppKey) {
   );
 }
 
+function runtimeDispatchReady(runtime?: ShareUpstreamProvider | null) {
+  if (!runtime) return false;
+  if (runtime.kind === "official_oauth") return true;
+  return Array.isArray(runtime.models) && runtime.models.some((model) => model.slot && model.actualModel);
+}
+
 function marketSharePriorityItem(share: MarketShare, app: MarketShareAppKey, t: TFn): MarketSharePriorityItem {
-  const supported = Boolean(share.support?.[app] || share.appRuntimes?.[app]);
+  const supported = runtimeDispatchReady(share.appRuntimes?.[app]);
   const blockedStates = marketBlockedStatesByApp(share.marketStates).get(app) || [];
   const cooldownStates = (share.marketStates || []).filter((state) => {
     if (state.kind !== "cooldown") return false;

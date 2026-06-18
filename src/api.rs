@@ -243,6 +243,10 @@ pub fn router(state: ServerState) -> Router {
             post(test_share_connection),
         )
         .route(
+            "/v1/shares/:share_id/refresh-usage",
+            post(refresh_share_usage),
+        )
+        .route(
             "/v1/shares/:share_id/image-request-logs",
             get(list_share_image_generation_request_logs),
         )
@@ -3890,6 +3894,21 @@ struct ShareConnectionTestResponse {
     duration_ms: u64,
     /// 网络层错误（DNS / 连接 / 超时）时填写
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scheduling_recovery: Option<crate::store::ShareSchedulingRecovery>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShareUsageRefreshRequest {
+    app: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ShareUsageRefreshResponse {
+    ok: bool,
+    refreshed: Vec<crate::ctl_client::RefreshShareUsageItem>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4030,6 +4049,77 @@ fn share_codex_image_generation_enabled(share: &ShareForTest) -> bool {
             && provider.enabled
             && provider.codex_image_generation_enabled
     })
+}
+
+async fn refresh_share_usage(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(share_id): Path<String>,
+    Json(input): Json<ShareUsageRefreshRequest>,
+) -> Result<Json<ShareUsageRefreshResponse>, AppError> {
+    let current_user_email = require_user_email(&state, &headers, "share:read").await?;
+    let share = state
+        .store
+        .get_share_for_test(&share_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("share not found".into()))?;
+
+    let is_admin = state.dynamic.read().await.is_admin(&current_user_email);
+    let is_owner = share.owner_email.eq_ignore_ascii_case(&current_user_email);
+    let is_shared_with = share
+        .shared_with_emails
+        .iter()
+        .any(|e| e.eq_ignore_ascii_case(&current_user_email));
+
+    if !is_admin && !is_owner && !is_shared_with {
+        return Err(AppError::Forbidden(
+            "only the share owner, invited users, or admins can refresh this share usage".into(),
+        ));
+    }
+
+    let app = input
+        .app
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(app) = app {
+        if !matches!(app, "claude" | "codex" | "gemini") {
+            return Err(AppError::BadRequest(format!(
+                "unsupported app for usage refresh: {app}"
+            )));
+        }
+    }
+
+    let route = state
+        .proxy
+        .route_by_share_id(&share_id)
+        .await
+        .ok_or_else(|| AppError::UnprocessableEntity("share client is offline".into()))?;
+    let installation_id = route
+        .installation_id()
+        .ok_or_else(|| AppError::UnprocessableEntity("share installation is unavailable".into()))?;
+    let control_secret = state
+        .store
+        .installation_control_secret(installation_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::UnprocessableEntity("share control secret is unavailable".into())
+        })?;
+
+    let reply = crate::ctl_client::refresh_share_usage(
+        route.route_target(),
+        installation_id,
+        &control_secret,
+        &share_id,
+        app,
+    )
+    .await
+    .map_err(|err| AppError::UnprocessableEntity(err.to_string()))?;
+
+    Ok(Json(ShareUsageRefreshResponse {
+        ok: true,
+        refreshed: reply.refreshed,
+    }))
 }
 
 async fn list_share_image_generation_request_logs(
@@ -4305,6 +4395,7 @@ async fn test_share_connection(
                 response: None,
                 duration_ms,
                 error: Some(err.to_string()),
+                scheduling_recovery: None,
             }))
         }
         Ok(resp) => {
@@ -4338,6 +4429,28 @@ async fn test_share_connection(
                 duration_ms,
                 "test-connection completed"
             );
+            let scheduling_recovery = if status_code == 200 {
+                let recovery = state
+                    .store
+                    .recover_share_app_scheduling_after_successful_test(&share_id, &input.app)
+                    .await?;
+                if recovery.changed() {
+                    tracing::info!(
+                        tag = "test-connection",
+                        share_id = %share_id,
+                        app = %input.app,
+                        share_model_health_deleted = recovery.share_model_health_deleted,
+                        market_model_failures_deleted = recovery.market_model_failures_deleted,
+                        market_runtime_states_deleted = recovery.market_runtime_states_deleted,
+                        "test-connection recovered share app scheduling state"
+                    );
+                    Some(recovery)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             Ok(Json(ShareConnectionTestResponse {
                 request: request_echo,
                 response: Some(TestResponseEcho {
@@ -4349,6 +4462,7 @@ async fn test_share_connection(
                 }),
                 duration_ms,
                 error: None,
+                scheduling_recovery,
             }))
         }
     }

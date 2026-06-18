@@ -2,9 +2,9 @@
 
 import * as React from "react";
 import { Button } from "@heroui/react";
-import { Check, ChevronDown, ChevronRight, Copy, Loader2 } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, Copy, Loader2, RefreshCw } from "lucide-react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { testShareConnection } from "@/lib/api";
+import { refreshShareUsage, testShareConnection } from "@/lib/api";
 import type { MessageKey } from "@/lib/i18n";
 import type { ShareConnectionTestResponse, ShareView } from "@/lib/types";
 
@@ -158,6 +158,8 @@ export function ShareConnectionTestRow({
   const [testState, setTestState] = React.useState<TestState>("idle");
   const [result, setResult] = React.useState<ShareConnectionTestResponse | null>(null);
   const [errorMsg, setErrorMsg] = React.useState("");
+  const [refreshState, setRefreshState] = React.useState<TestState>("idle");
+  const [refreshMsg, setRefreshMsg] = React.useState("");
   const [resultOpen, setResultOpen] = React.useState(false);
 
   const isBound = !!(share.bindings?.[app]);
@@ -182,7 +184,36 @@ export function ShareConnectionTestRow({
     }
   }, [canExecute, isBound, probe, testState, share.shareId, app, kind]);
 
+  const runUsageRefresh = React.useCallback(async () => {
+    if (!canExecute || !isBound || refreshState === "running") return;
+    setRefreshState("running");
+    setRefreshMsg("");
+    try {
+      const response = await refreshShareUsage(share.shareId, { app });
+      const failed = response.refreshed.filter((item) => !item.refreshed);
+      if (failed.length > 0) {
+        setRefreshState("error");
+        setRefreshMsg(
+          failed
+            .map((item) => `${item.app}: ${item.error || "failed"}`)
+            .join("; "),
+        );
+      } else {
+        setRefreshState("done");
+        const labels = response.refreshed
+          .map((item) => item.providerName || item.providerId || item.app)
+          .join(", ");
+        setRefreshMsg(labels || t("dashboard.connectDialog.test.refreshUsageDone"));
+      }
+    } catch (err) {
+      setRefreshState("error");
+      setRefreshMsg(err instanceof Error ? err.message : String(err));
+    }
+  }, [canExecute, isBound, refreshState, share.shareId, app, t]);
+
   const running = testState === "running";
+  const refreshing = refreshState === "running";
+  const canRefreshUsage = kind === "text";
 
   let disabledReason: string | null = null;
   if (!isBound) disabledReason = t("dashboard.connectDialog.test.notBound");
@@ -213,23 +244,55 @@ export function ShareConnectionTestRow({
         {disabledReason ? (
           <span className="text-[11px] text-slate-400">{disabledReason}</span>
         ) : (
-          <Button
-            size="sm"
-            variant="outline"
-            isDisabled={running}
-            onClick={running ? undefined : runTest}
-          >
-            {running ? (
-              <>
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                {t("dashboard.connectDialog.test.running")}
-              </>
-            ) : (
-              t("dashboard.connectDialog.test.button")
-            )}
-          </Button>
+          <div className="flex shrink-0 items-center gap-1.5">
+            {canRefreshUsage ? (
+              <Button
+                size="sm"
+                variant="secondary"
+                isDisabled={refreshing}
+                onClick={refreshing ? undefined : runUsageRefresh}
+                aria-label={t("dashboard.connectDialog.test.refreshUsage")}
+              >
+                {refreshing ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <RefreshCw className="h-3.5 w-3.5" />
+                )}
+                {t("dashboard.connectDialog.test.refreshUsageShort")}
+              </Button>
+            ) : null}
+            <Button
+              size="sm"
+              variant="outline"
+              isDisabled={running}
+              onClick={running ? undefined : runTest}
+            >
+              {running ? (
+                <>
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  {t("dashboard.connectDialog.test.running")}
+                </>
+              ) : (
+                t("dashboard.connectDialog.test.button")
+              )}
+            </Button>
+          </div>
         )}
       </div>
+
+      {refreshMsg ? (
+        <div
+          className={`rounded border px-3 py-2 text-xs ${
+            refreshState === "error"
+              ? "border-red-200 bg-red-50 text-red-700"
+              : "border-emerald-200 bg-emerald-50 text-emerald-700"
+          }`}
+        >
+          {refreshState === "error"
+            ? t("dashboard.connectDialog.test.refreshUsageError", { message: refreshMsg })
+            : t("dashboard.connectDialog.test.refreshUsageOk", { target: refreshMsg })}
+        </div>
+      ) : null}
 
       {/* curl preview */}
       {curlCmd ? (
@@ -276,6 +339,14 @@ export function ShareConnectionTestRow({
                 <span className="text-slate-500">
                   {t("dashboard.connectDialog.test.durationMs", { ms: String(result.durationMs) })}
                 </span>
+                {result.schedulingRecovery ? (
+                  <>
+                    <span className="text-slate-400">·</span>
+                    <span className="text-emerald-700">
+                      {t("dashboard.connectDialog.test.schedulingRecovered")}
+                    </span>
+                  </>
+                ) : null}
               </>
             ) : null}
           </button>

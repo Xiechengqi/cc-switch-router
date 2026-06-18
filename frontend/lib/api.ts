@@ -5,6 +5,7 @@ import type {
   BoardMeta,
   DashboardResponse,
   MarketShare,
+  ShareSessionLoad,
   ClearMetricsResponse,
   SettingsSchema,
   SettingsUpdateResponse,
@@ -13,6 +14,8 @@ import type {
   ShareEditView,
   ShareConnectionTestRequest,
   ShareConnectionTestResponse,
+  ShareUsageRefreshRequest,
+  ShareUsageRefreshResponse,
   ImageGenerationRequestLog,
   ShareUsageByEmailResponse,
   UserApiTokenResponse,
@@ -87,6 +90,17 @@ export async function getMarketSharePriority(marketEmail: string, app?: string) 
   const query = app ? `?${new URLSearchParams({ app }).toString()}` : "";
   return parseJson<MarketShare[]>(
     await fetch(`/v1/markets/${encodeURIComponent(marketEmail)}/share-priority${query}`, {
+      cache: "no-store",
+    }),
+  );
+}
+
+export async function getMarketShareSessionLoads(publicBaseUrl: string, app?: string) {
+  const base = publicBaseUrl.trim().replace(/\/+$/, "");
+  if (!base) return [] as ShareSessionLoad[];
+  const query = app ? `?${new URLSearchParams({ app }).toString()}` : "";
+  return parseJson<ShareSessionLoad[]>(
+    await fetch(`${base}/v1/public/share-session-loads${query}`, {
       cache: "no-store",
     }),
   );
@@ -316,6 +330,19 @@ export async function testShareConnection(
 ): Promise<ShareConnectionTestResponse> {
   return parseJson<ShareConnectionTestResponse>(
     await authFetch(`/v1/shares/${encodeURIComponent(shareId)}/test-connection`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(req),
+    }),
+  );
+}
+
+export async function refreshShareUsage(
+  shareId: string,
+  req: ShareUsageRefreshRequest,
+): Promise<ShareUsageRefreshResponse> {
+  return parseJson<ShareUsageRefreshResponse>(
+    await authFetch(`/v1/shares/${encodeURIComponent(shareId)}/refresh-usage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(req),

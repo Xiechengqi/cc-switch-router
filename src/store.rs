@@ -154,6 +154,22 @@ pub struct ShareForTest {
     pub app_providers: ShareAppProviders,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareSchedulingRecovery {
+    pub share_model_health_deleted: usize,
+    pub market_model_failures_deleted: usize,
+    pub market_runtime_states_deleted: usize,
+}
+
+impl ShareSchedulingRecovery {
+    pub fn changed(&self) -> bool {
+        self.share_model_health_deleted > 0
+            || self.market_model_failures_deleted > 0
+            || self.market_runtime_states_deleted > 0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NewImageGenerationRequestLog {
     pub request_id: String,
@@ -1258,6 +1274,50 @@ impl AppStore {
             bindings,
             app_providers,
         }))
+    }
+
+    pub async fn recover_share_app_scheduling_after_successful_test(
+        &self,
+        share_id: &str,
+        app_type: &str,
+    ) -> Result<ShareSchedulingRecovery, AppError> {
+        let app = app_type.trim().to_ascii_lowercase();
+        if !matches!(app.as_str(), "claude" | "codex" | "gemini") {
+            return Err(AppError::BadRequest(format!(
+                "unsupported app for scheduling recovery: {app_type}"
+            )));
+        }
+        let conn = self.conn.lock().await;
+        let share_model_health_deleted = conn
+            .execute(
+                "DELETE FROM share_model_health_state
+                 WHERE share_id = ?1 AND lower(app_type) = lower(?2)",
+                params![share_id, app],
+            )
+            .map_err(|e| AppError::Internal(format!("delete share model health failed: {e}")))?;
+        let market_model_failures_deleted = conn
+            .execute(
+                "DELETE FROM market_share_model_failure_state
+                 WHERE share_id = ?1 AND lower(app_type) = lower(?2)",
+                params![share_id, app],
+            )
+            .map_err(|e| {
+                AppError::Internal(format!("delete market model failure state failed: {e}"))
+            })?;
+        let market_runtime_states_deleted = conn
+            .execute(
+                "DELETE FROM market_share_runtime_states
+                 WHERE share_id = ?1
+                   AND kind IN ('cooldown', 'model_block', 'capability_block')
+                   AND (app_type IS NULL OR lower(app_type) = lower(?2))",
+                params![share_id, app],
+            )
+            .map_err(|e| AppError::Internal(format!("delete market runtime states failed: {e}")))?;
+        Ok(ShareSchedulingRecovery {
+            share_model_health_deleted,
+            market_model_failures_deleted,
+            market_runtime_states_deleted,
+        })
     }
 
     pub async fn record_image_generation_request_log(
