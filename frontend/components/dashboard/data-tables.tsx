@@ -2911,6 +2911,19 @@ function marketBlockedStatesByApp(states?: MarketShareRuntimeState[]) {
   return result;
 }
 
+function marketStateRowKey(share: MarketShare, state: MarketShareRuntimeState) {
+  return [
+    state.routerId || share.routerId || "main",
+    state.shareId || share.shareId,
+    state.scope,
+    state.kind,
+    state.appType || "",
+    state.modelId || "",
+    state.modelName || "",
+    state.updatedAt || "",
+  ].join(":");
+}
+
 function MarketEditDialog({ market, onClose, onSaved }: { market: DashboardMarket | null; onClose: () => void; onSaved: () => Promise<void> }) {
   const [shares, setShares] = React.useState<MarketShare[]>([]);
   const [disabledIds, setDisabledIds] = React.useState<Set<string>>(new Set());
@@ -2978,10 +2991,10 @@ function MarketEditDialog({ market, onClose, onSaved }: { market: DashboardMarke
     }
   }
 
-  const releasableStates = shares.flatMap((share) =>
+  const blockedStateRows = shares.flatMap((share) =>
     (share.marketStates || [])
       .filter(isMarketReleasableState)
-      .map((state) => ({ share, state })),
+      .map((state) => ({ share, state, key: marketStateRowKey(share, state) })),
   );
 
   async function releaseState(share: MarketShare, state: MarketShareRuntimeState, key: string) {
@@ -3006,11 +3019,11 @@ function MarketEditDialog({ market, onClose, onSaved }: { market: DashboardMarke
   }
 
   async function releaseAllStates() {
-    if (!market || working || releasableStates.length === 0) return;
+    if (!market || working || blockedStateRows.length === 0) return;
     setReleasingKey("__all__");
     setError("");
     try {
-      for (const { share, state } of releasableStates) {
+      for (const { share, state } of blockedStateRows) {
         await releaseMarketShareState(market.email, {
           routerId: state.routerId || share.routerId || "main",
           shareId: state.shareId || share.shareId,
@@ -3080,9 +3093,9 @@ function MarketEditDialog({ market, onClose, onSaved }: { market: DashboardMarke
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <div>
                       <div className="text-sm font-medium text-slate-900">{t("dashboard.blockList")}</div>
-                      <div className="mt-1 text-xs text-muted-foreground">{t("dashboard.blockedStatesCount", { count: releasableStates.length })}</div>
+                      <div className="mt-1 text-xs text-muted-foreground">{t("dashboard.blockedStatesCount", { count: blockedStateRows.length })}</div>
                     </div>
-                    <Button size="sm" variant="outline" isDisabled={working || releasableStates.length === 0} onClick={releaseAllStates}>
+                    <Button size="sm" variant="outline" isDisabled={working || blockedStateRows.length === 0} onClick={releaseAllStates}>
                       {releasingKey === "__all__" ? <Loader2 className="h-4 w-4 animate-spin" /> : <X className="h-4 w-4" />}
                       {t("dashboard.releaseAll")}
                     </Button>
@@ -3101,8 +3114,7 @@ function MarketEditDialog({ market, onClose, onSaved }: { market: DashboardMarke
                         </tr>
                       </thead>
                       <tbody>
-                        {releasableStates.map(({ share, state }, index) => {
-                          const key = `${state.routerId || share.routerId || "main"}:${state.shareId || share.shareId}:${state.kind}:${state.appType || ""}:${state.modelId || ""}:${index}`;
+                        {blockedStateRows.map(({ share, state, key }) => {
                           return (
                             <tr key={key} className="border-t">
                               <td className="px-3 py-2 align-middle">
@@ -3131,7 +3143,7 @@ function MarketEditDialog({ market, onClose, onSaved }: { market: DashboardMarke
                             </tr>
                           );
                         })}
-                        {!releasableStates.length ? <tr><td colSpan={7} className="px-3 py-8 text-center text-muted-foreground">{t("dashboard.noBlockedStates")}</td></tr> : null}
+                        {!blockedStateRows.length ? <tr><td colSpan={7} className="px-3 py-8 text-center text-muted-foreground">{t("dashboard.noBlockedStates")}</td></tr> : null}
                       </tbody>
                     </table>
                   </div>
