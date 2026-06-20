@@ -4269,7 +4269,7 @@ function runtimeDispatchReady(runtime?: ShareUpstreamProvider | null) {
 }
 
 function marketSharePriorityItem(share: MarketShare, app: MarketShareAppKey, t: TFn): MarketSharePriorityItem {
-  const supported = runtimeDispatchReady(share.appRuntimes?.[app]);
+  const supported = Boolean(share.support?.[app]) || runtimeDispatchReady(share.appRuntimes?.[app]);
   const blockedStates = marketBlockedStatesByApp(share.marketStates).get(app) || [];
   const cooldownStates = (share.marketStates || []).filter((state) => {
     if (state.kind !== "cooldown") return false;
