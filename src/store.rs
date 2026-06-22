@@ -10988,14 +10988,18 @@ fn merge_market_request_logs_into_share_logs(
         let Some(created_at) = parse_rfc3339_timestamp(&market_log.created_at) else {
             continue;
         };
-        let entry = market_log_to_share_request_log(market_log, share_id, created_at, &share_names);
+        let mut entry =
+            market_log_to_share_request_log(market_log, share_id, created_at, &share_names);
         let logs = logs_by_share.entry(share_id.to_string()).or_default();
         if let Some(existing) = logs
             .iter_mut()
             .find(|candidate| candidate.request_id == entry.request_id)
         {
             if prefer_market_derived_share_log(&entry, existing) {
+                merge_share_log_model_route(&mut entry, existing);
                 *existing = entry;
+            } else {
+                merge_share_log_model_route(existing, &entry);
             }
         } else {
             logs.push(entry);
@@ -11084,6 +11088,9 @@ fn prefer_market_derived_share_log(
     candidate: &ShareRequestLogEntry,
     existing: &ShareRequestLogEntry,
 ) -> bool {
+    if share_log_has_model_mapping(candidate) != share_log_has_model_mapping(existing) {
+        return share_log_has_model_mapping(candidate);
+    }
     let candidate_tokens = share_request_log_total_tokens(candidate);
     let existing_tokens = share_request_log_total_tokens(existing);
     if candidate_tokens != existing_tokens {
@@ -11093,6 +11100,23 @@ fn prefer_market_derived_share_log(
         return candidate.user_email.is_some();
     }
     candidate.created_at >= existing.created_at
+}
+
+fn share_log_has_model_mapping(log: &ShareRequestLogEntry) -> bool {
+    let requested = log.requested_model.trim();
+    let actual = log.actual_model.trim();
+    !requested.is_empty() && !actual.is_empty() && requested != actual
+}
+
+fn merge_share_log_model_route(target: &mut ShareRequestLogEntry, source: &ShareRequestLogEntry) {
+    if share_log_has_model_mapping(target) || !share_log_has_model_mapping(source) {
+        return;
+    }
+    target.request_model = source.requested_model.clone();
+    target.requested_model = source.requested_model.clone();
+    target.actual_model = source.actual_model.clone();
+    target.actual_model_source = source.actual_model_source.clone();
+    target.model = source.actual_model.clone();
 }
 
 fn share_request_log_total_tokens(log: &ShareRequestLogEntry) -> u32 {
