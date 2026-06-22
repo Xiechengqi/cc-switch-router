@@ -3030,9 +3030,15 @@ impl AppStore {
                 acc
             },
         );
-        let logs_by_share = self
+        let mut logs_by_share = self
             .recover_missing_share_request_logs(config, &active_subdomains, &shares, logs_by_share)
             .await?;
+        merge_market_request_logs_into_share_logs(
+            &mut logs_by_share,
+            &market_logs,
+            &shares,
+            SHARE_REQUEST_LOG_RECOVERY_LIMIT,
+        );
         let model_health_checks_by_share = recent_model_health_checks.into_iter().fold(
             HashMap::<String, Vec<ShareModelHealthCheckEntry>>::new(),
             |mut acc, check| {
@@ -10957,6 +10963,143 @@ fn list_recent_market_request_logs(
         })
         .map_err(|e| AppError::Internal(format!("query recent market request logs failed: {e}")))?;
     collect_rows(rows)
+}
+
+fn merge_market_request_logs_into_share_logs(
+    logs_by_share: &mut HashMap<String, Vec<ShareRequestLogEntry>>,
+    market_logs: &[DashboardMarketRequestLogView],
+    shares: &[(String, ShareDescriptor)],
+    per_share_limit: usize,
+) {
+    let share_names = shares
+        .iter()
+        .map(|(_, share)| (share.share_id.clone(), share.share_name.clone()))
+        .collect::<HashMap<_, _>>();
+
+    for market_log in market_logs {
+        let Some(share_id) = market_log
+            .share_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let Some(created_at) = parse_rfc3339_timestamp(&market_log.created_at) else {
+            continue;
+        };
+        let entry = market_log_to_share_request_log(market_log, share_id, created_at, &share_names);
+        let logs = logs_by_share.entry(share_id.to_string()).or_default();
+        if let Some(existing) = logs
+            .iter_mut()
+            .find(|candidate| candidate.request_id == entry.request_id)
+        {
+            if prefer_market_derived_share_log(&entry, existing) {
+                *existing = entry;
+            }
+        } else {
+            logs.push(entry);
+        }
+    }
+
+    for logs in logs_by_share.values_mut() {
+        logs.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.request_id.cmp(&a.request_id))
+        });
+        logs.truncate(per_share_limit);
+    }
+}
+
+fn market_log_to_share_request_log(
+    log: &DashboardMarketRequestLogView,
+    share_id: &str,
+    created_at: i64,
+    share_names: &HashMap<String, String>,
+) -> ShareRequestLogEntry {
+    let app_type = log.request_agent.trim().to_ascii_lowercase();
+    let model = log
+        .model
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| log.actual_model.clone());
+    ShareRequestLogEntry {
+        request_id: log.request_id.clone(),
+        share_id: share_id.to_string(),
+        share_name: share_names
+            .get(share_id)
+            .cloned()
+            .or_else(|| log.share_subdomain.clone())
+            .unwrap_or_else(|| share_id.to_string()),
+        provider_id: log.market_id.clone(),
+        provider_name: if log.market_subdomain.trim().is_empty() {
+            log.market_email.clone()
+        } else {
+            log.market_subdomain.clone()
+        },
+        app_type: if app_type.is_empty() {
+            "codex".to_string()
+        } else {
+            app_type.clone()
+        },
+        model: model.clone(),
+        request_model: log.requested_model.clone(),
+        request_agent: if app_type.is_empty() {
+            "codex".to_string()
+        } else {
+            app_type
+        },
+        requested_model: log.requested_model.clone(),
+        actual_model: log.actual_model.clone(),
+        actual_model_source: log.actual_model_source.clone(),
+        status_code: log
+            .status_code
+            .unwrap_or_else(|| status_code_from_market_status(&log.status)),
+        latency_ms: log.latency_ms.unwrap_or(0),
+        first_token_ms: None,
+        input_tokens: log.input_tokens,
+        output_tokens: log.output_tokens,
+        cache_read_tokens: log.cache_read_tokens,
+        cache_creation_tokens: log.cache_creation_tokens,
+        is_streaming: log.status == "streaming",
+        session_id: None,
+        user_country: log.user_country.clone(),
+        user_country_iso3: log.user_country_iso3.clone(),
+        user_email: log.user_email.clone(),
+        created_at,
+        is_health_check: false,
+    }
+}
+
+fn status_code_from_market_status(status: &str) -> u16 {
+    match status {
+        "settled" | "streaming" => 200,
+        "needs_review" => 202,
+        _ => 500,
+    }
+}
+
+fn prefer_market_derived_share_log(
+    candidate: &ShareRequestLogEntry,
+    existing: &ShareRequestLogEntry,
+) -> bool {
+    let candidate_tokens = share_request_log_total_tokens(candidate);
+    let existing_tokens = share_request_log_total_tokens(existing);
+    if candidate_tokens != existing_tokens {
+        return candidate_tokens > existing_tokens;
+    }
+    if candidate.user_email.is_some() != existing.user_email.is_some() {
+        return candidate.user_email.is_some();
+    }
+    candidate.created_at >= existing.created_at
+}
+
+fn share_request_log_total_tokens(log: &ShareRequestLogEntry) -> u32 {
+    log.input_tokens
+        .saturating_add(log.output_tokens)
+        .saturating_add(log.cache_read_tokens)
+        .saturating_add(log.cache_creation_tokens)
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
