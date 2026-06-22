@@ -614,7 +614,9 @@ function providerAccountLevel(runtime?: ShareUpstreamProvider, locale: AppLocale
 }
 
 function providerAccountIdentity(runtime?: ShareUpstreamProvider) {
-  return runtime?.accountEmail || "-";
+  const account = String(runtime?.accountEmail || "").trim();
+  if (!account || account.startsWith("cursor_apikey_")) return "-";
+  return account;
 }
 
 function providerModelMap(runtime?: ShareUpstreamProvider) {
@@ -731,13 +733,13 @@ function ShareAppSupportCard({
   const runtime = mergeStandaloneOAuthRuntime(share.appRuntimes?.[app], share.appRuntimes);
   const tone = enabled ? modelHealthTone(share, app) : { className: "bg-slate-50 text-muted-foreground", label: "" };
   return (
-    <div title={enabled ? modelHealthTitle(share, app) : undefined} className={`grid grid-cols-[56px_1fr] gap-2 rounded-lg border px-2 py-1.5 text-[11px] ${tone.className}`}>
-      <span className="font-mono uppercase">{label}</span>
-      <span className="grid min-w-0 gap-0.5 text-right">
-        <span className="whitespace-normal break-words font-semibold">{enabled ? providerAccountLevel(runtime, locale) : ""}</span>
-        <span className="whitespace-normal break-words text-[10px] font-medium opacity-75">{enabled ? providerAccountIdentity(runtime) : ""}</span>
-        <span className="whitespace-normal break-words text-[10px] font-medium opacity-75">{enabled ? providerModelMap(runtime) : ""}</span>
-        <span className="text-[10px] font-semibold opacity-70">{enabled ? tone.label : ""}</span>
+    <div title={enabled ? modelHealthTitle(share, app) : undefined} className={`grid min-w-0 grid-cols-[56px_minmax(0,1fr)] gap-2 overflow-hidden rounded-lg border px-2 py-1.5 text-[11px] ${tone.className}`}>
+      <span className="min-w-0 font-mono uppercase">{label}</span>
+      <span className="grid min-w-0 gap-0.5 overflow-hidden text-right">
+        <span className="min-w-0 whitespace-normal break-words font-semibold">{enabled ? providerAccountLevel(runtime, locale) : ""}</span>
+        <span className="min-w-0 whitespace-normal break-all text-[10px] font-medium opacity-75">{enabled ? providerAccountIdentity(runtime) : ""}</span>
+        <span className="min-w-0 whitespace-normal break-all text-[10px] font-medium opacity-75">{enabled ? providerModelMap(runtime) : ""}</span>
+        <span className="min-w-0 text-[10px] font-semibold opacity-70">{enabled ? tone.label : ""}</span>
       </span>
     </div>
   );
