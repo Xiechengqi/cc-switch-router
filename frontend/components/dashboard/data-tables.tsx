@@ -286,6 +286,11 @@ const drawerDialogClassName =
   "[--foreground:rgb(var(--router-foreground))] [--muted:rgb(var(--router-muted-foreground))] [--overlay:#fff] [--overlay-foreground:rgb(var(--router-foreground))] " +
   "[--surface:#fff] [--surface-foreground:rgb(var(--router-foreground))] [--surface-secondary:rgb(var(--router-muted))] [--surface-secondary-foreground:rgb(var(--router-foreground))] " +
   "[--default:rgb(var(--router-muted))] [--default-foreground:rgb(var(--router-foreground))]";
+const clientFrameDialogClassName =
+  "router-drawer-light light !w-[min(1180px,calc(100vw-16px))] !max-w-[calc(100vw-16px)] !bg-white !text-slate-900 " +
+  "[--foreground:rgb(var(--router-foreground))] [--muted:rgb(var(--router-muted-foreground))] [--overlay:#fff] [--overlay-foreground:rgb(var(--router-foreground))] " +
+  "[--surface:#fff] [--surface-foreground:rgb(var(--router-foreground))] [--surface-secondary:rgb(var(--router-muted))] [--surface-secondary-foreground:rgb(var(--router-foreground))] " +
+  "[--default:rgb(var(--router-muted))] [--default-foreground:rgb(var(--router-foreground))]";
 
 function StatusBadge({ active, label }: { active: boolean; label: string }) {
   return <Chip color={active ? "success" : "default"} size="sm" variant={active ? "soft" : "tertiary"}>{label}</Chip>;
@@ -916,6 +921,83 @@ function ShareConnectChip({
       <Link2 className="h-3 w-3" />
       {t("dashboard.connect")}
     </button>
+  );
+}
+
+function ShareClientTag({
+  client,
+  onOpen,
+  t,
+}: {
+  client?: DashboardClient;
+  onOpen: (url: string) => void;
+  t: TFn;
+}) {
+  const url = clientTunnelDisplayUrl(client?.clientTunnel?.tunnelUrl);
+  if (!url) return null;
+  const handle = (event: React.MouseEvent) => {
+    event.stopPropagation();
+    onOpen(url);
+  };
+  return (
+    <button
+      type="button"
+      onClick={handle}
+      data-no-row-drawer
+      title={url}
+      className="inline-flex h-[22px] items-center gap-1 rounded-full border border-sky-200 bg-sky-50 px-2.5 text-[11px] font-medium text-sky-700 transition-colors hover:border-sky-300 hover:bg-sky-100"
+    >
+      <Maximize2 className="h-3 w-3" />
+      {t("dashboard.clientTag")}
+    </button>
+  );
+}
+
+function ClientFrameDrawer({
+  url,
+  open,
+  onOpenChange,
+  t,
+}: {
+  url: string;
+  open: boolean;
+  onOpenChange: (next: boolean) => void;
+  t: TFn;
+}) {
+  return (
+    <Drawer isOpen={open} onOpenChange={onOpenChange}>
+      <Drawer.Backdrop>
+        <Drawer.Content placement="right">
+          <Drawer.Dialog className={clientFrameDialogClassName}>
+            <Drawer.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
+            <Drawer.Header>
+              <div className="min-w-0">
+                <Drawer.Heading>{t("dashboard.clientFrame.title")}</Drawer.Heading>
+                <a
+                  href={url || "#"}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="mt-2 inline-flex max-w-full items-center gap-1 break-all font-mono text-xs font-semibold text-primary underline-offset-4 hover:underline"
+                  title={url}
+                >
+                  <span className="min-w-0 break-all">{url || "-"}</span>
+                  <ExternalLink className="h-3.5 w-3.5 shrink-0" />
+                </a>
+              </div>
+            </Drawer.Header>
+            <Drawer.Body className="overflow-hidden p-0">
+              {url ? (
+                <iframe
+                  src={url}
+                  title={`${t("dashboard.clientFrame.title")} ${url}`}
+                  className="h-[calc(100vh-112px)] w-full border-0 bg-white"
+                />
+              ) : null}
+            </Drawer.Body>
+          </Drawer.Dialog>
+        </Drawer.Content>
+      </Drawer.Backdrop>
+    </Drawer>
   );
 }
 
@@ -2416,11 +2498,15 @@ export function SharesTable({
   const [selected, setSelected] = React.useState<ShareView | null>(null);
   const [editingShare, setEditingShare] = React.useState<ShareView | null>(null);
   const [connectShare, setConnectShare] = React.useState<ShareView | null>(null);
+  const [clientFrameUrl, setClientFrameUrl] = React.useState("");
   // 让 ShareConnectDialog 的 props 在每次 dashboard 5s 轮询期间保持引用稳定，
   // 配合 React.memo 阻断不必要的 Modal 重渲染；否则用户在弹窗里点复制时会看到
   // 轮询正好触发的卡片闪一下，误以为是复制按钮引发的。
   const closeConnectDialog = React.useCallback((next: boolean) => {
     if (!next) setConnectShare(null);
+  }, []);
+  const closeClientFrame = React.useCallback((next: boolean) => {
+    if (!next) setClientFrameUrl("");
   }, []);
 
   // shareId → 所属 installation 的 DashboardClient（含 region / platform）。
@@ -2502,9 +2588,9 @@ export function SharesTable({
                           <span className="break-all text-xs text-muted-foreground">
                             {share.ownerEmail || "-"}
                           </span>
-                          <ClientReference client={client} t={t} locale={locale} shareCount={client ? sharesForClient(client).length : 0} />
                           <div className="mt-1 flex flex-wrap items-center gap-2">
                             <ShareConnectChip share={share} onOpen={setConnectShare} t={t} />
+                            <ShareClientTag client={client} onOpen={setClientFrameUrl} t={t} />
                             <ShareStatusBadge share={share} t={t} />
                             <ShareEditAction share={share} onEdit={setEditingShare} t={t} />
                           </div>
@@ -2598,6 +2684,12 @@ export function SharesTable({
         share={connectShare}
         open={!!connectShare}
         onOpenChange={closeConnectDialog}
+      />
+      <ClientFrameDrawer
+        url={clientFrameUrl}
+        open={!!clientFrameUrl}
+        onOpenChange={closeClientFrame}
+        t={t}
       />
     </section>
   );
