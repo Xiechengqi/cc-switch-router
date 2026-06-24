@@ -1286,6 +1286,10 @@ pub async fn proxy_handler(
             .await
             {
                 Ok(Some(session)) => session,
+                Ok(None) if client_web_bearer_token(&parts.headers).is_some() => {
+                    client_web_session = None;
+                    ("".to_string(), false)
+                }
                 Ok(None) => return simple_response(StatusCode::UNAUTHORIZED, "login-required"),
                 Err(err) => {
                     warn!(
@@ -1302,10 +1306,12 @@ pub async fn proxy_handler(
                     return simple_response(StatusCode::UNAUTHORIZED, "login-required");
                 }
             };
-            if session.0 != owner_email && !session.1 {
+            if !session.0.is_empty() && session.0 != owner_email && !session.1 {
                 return simple_response(StatusCode::FORBIDDEN, "client-web-forbidden");
             }
-            client_web_session = Some(session);
+            if !session.0.is_empty() {
+                client_web_session = Some(session);
+            }
         }
     }
     if is_health_check_request
@@ -1464,7 +1470,7 @@ pub async fn proxy_handler(
                 || n.eq_ignore_ascii_case(CLIENT_WEB_ROLE_HEADER)
                 || n.eq_ignore_ascii_case(CLIENT_WEB_INSTALLATION_ID_HEADER)
                 || n.eq_ignore_ascii_case(CLIENT_WEB_SUBDOMAIN_HEADER)
-                || n.eq_ignore_ascii_case("authorization")
+                || (client_web_session.is_some() && n.eq_ignore_ascii_case("authorization"))
                 || n.eq_ignore_ascii_case("cookie"))
         {
             continue;
@@ -2724,9 +2730,15 @@ fn is_allowed_client_web_path(path: &str) -> bool {
         || path == "/favicon.ico"
         || path == "/favicon.png"
         || path.starts_with("/assets/")
+        || path == "/web-api/auth/methods"
         || path == "/web-api/auth/email/request-code"
         || path == "/web-api/auth/email/verify-code"
         || path == "/web-api/auth/session/refresh"
+        || path == "/web-api/auth/password/setup"
+        || path == "/web-api/auth/password/login"
+        || path == "/web-api/auth/password/refresh"
+        || path == "/web-api/auth/password/logout"
+        || path == "/web-api/auth/password/change"
         || path == "/web-api/context"
         || path.starts_with("/web-api/invoke/"))
         && !path.starts_with("/_ctl/")
