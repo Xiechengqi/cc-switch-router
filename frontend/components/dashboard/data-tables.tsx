@@ -300,6 +300,12 @@ function ShareStatusBadge({ share, t }: { share?: ShareView; t: TFn }) {
   return <StatusBadge active={false} label={formatShareStatus(share.shareStatus)} />;
 }
 
+function ShareExceptionalStatusBadge({ share, t }: { share?: ShareView; t: TFn }) {
+  const status = String(share?.shareStatus || "").trim().toLowerCase();
+  if (!share || status === "active") return null;
+  return <ShareStatusBadge share={share} t={t} />;
+}
+
 function UsageBar({ used, limit, t }: { used: number; limit: number; t: TFn }) {
   if (isUnlimited(limit)) return null;
   const pct = limit > 0 ? Math.min(100, Math.max(0, (used / limit) * 100)) : 0;
@@ -2596,7 +2602,7 @@ export function SharesTable({
                           <div className="mt-1 flex flex-wrap items-center gap-2">
                             <ShareConnectChip share={share} onOpen={setConnectShare} t={t} />
                             <ShareClientTag client={client} onOpen={setClientFrameUrl} t={t} />
-                            <ShareStatusBadge share={share} t={t} />
+                            <ShareExceptionalStatusBadge share={share} t={t} />
                             <ShareEditAction share={share} onEdit={setEditingShare} t={t} />
                           </div>
                         </div>

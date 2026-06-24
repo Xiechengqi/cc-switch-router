@@ -105,6 +105,9 @@ export function SettingsPage() {
                 onAction={(key: React.Key) => setActiveGroup(String(key))}
                 className="gap-1 pr-3"
               >
+                <ListBox.Item id={VERSION_GROUP} textValue={t("settings.version")} className={`flex items-center justify-between ${activeGroup === VERSION_GROUP ? "bg-primary/10 text-foreground" : ""}`}>
+                  <span>{t("settings.version")}</span>
+                </ListBox.Item>
                 {groups.map((group) => {
                   const count = (schema?.fields || []).filter((field) => field.group === group && Object.prototype.hasOwnProperty.call(dirty, field.key)).length;
                   return (
@@ -119,9 +122,6 @@ export function SettingsPage() {
                     </ListBox.Item>
                   );
                 })}
-                <ListBox.Item id={VERSION_GROUP} textValue={t("settings.version")} className={`flex items-center justify-between ${activeGroup === VERSION_GROUP ? "bg-primary/10 text-foreground" : ""}`}>
-                  <span>{t("settings.version")}</span>
-                </ListBox.Item>
                 <ListBox.Item id={LOGS_GROUP} textValue={t("settings.logs")} className={`flex items-center justify-between ${activeGroup === LOGS_GROUP ? "bg-primary/10 text-foreground" : ""}`}>
                   <span>{t("settings.logs")}</span>
                 </ListBox.Item>
