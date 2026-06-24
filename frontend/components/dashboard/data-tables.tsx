@@ -286,11 +286,6 @@ const drawerDialogClassName =
   "[--foreground:rgb(var(--router-foreground))] [--muted:rgb(var(--router-muted-foreground))] [--overlay:#fff] [--overlay-foreground:rgb(var(--router-foreground))] " +
   "[--surface:#fff] [--surface-foreground:rgb(var(--router-foreground))] [--surface-secondary:rgb(var(--router-muted))] [--surface-secondary-foreground:rgb(var(--router-foreground))] " +
   "[--default:rgb(var(--router-muted))] [--default-foreground:rgb(var(--router-foreground))]";
-const clientFrameDialogClassName =
-  "router-drawer-light light !w-[min(1180px,calc(100vw-16px))] !max-w-[calc(100vw-16px)] !bg-white !text-slate-900 " +
-  "[--foreground:rgb(var(--router-foreground))] [--muted:rgb(var(--router-muted-foreground))] [--overlay:#fff] [--overlay-foreground:rgb(var(--router-foreground))] " +
-  "[--surface:#fff] [--surface-foreground:rgb(var(--router-foreground))] [--surface-secondary:rgb(var(--router-muted))] [--surface-secondary-foreground:rgb(var(--router-foreground))] " +
-  "[--default:rgb(var(--router-muted))] [--default-foreground:rgb(var(--router-foreground))]";
 
 function StatusBadge({ active, label }: { active: boolean; label: string }) {
   return <Chip color={active ? "success" : "default"} size="sm" variant={active ? "soft" : "tertiary"}>{label}</Chip>;
@@ -953,7 +948,7 @@ function ShareClientTag({
   );
 }
 
-function ClientFrameDrawer({
+function ClientFrameDialog({
   url,
   open,
   onOpenChange,
@@ -965,14 +960,14 @@ function ClientFrameDrawer({
   t: TFn;
 }) {
   return (
-    <Drawer isOpen={open} onOpenChange={onOpenChange}>
-      <Drawer.Backdrop>
-        <Drawer.Content placement="right">
-          <Drawer.Dialog className={clientFrameDialogClassName}>
-            <Drawer.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
-            <Drawer.Header>
+    <Modal isOpen={open} onOpenChange={onOpenChange}>
+      <Modal.Backdrop>
+        <Modal.Container placement="center">
+          <Modal.Dialog className="light w-[min(1180px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900 [--foreground:rgb(15,23,42)] [--muted:rgb(100,116,139)] [--overlay:#fff] [--overlay-foreground:rgb(15,23,42)] [--surface:#fff] [--surface-foreground:rgb(15,23,42)]">
+            <Modal.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
+            <Modal.Header>
               <div className="min-w-0">
-                <Drawer.Heading>{t("dashboard.clientFrame.title")}</Drawer.Heading>
+                <Modal.Heading>{t("dashboard.clientFrame.title")}</Modal.Heading>
                 <a
                   href={url || "#"}
                   target="_blank"
@@ -984,20 +979,30 @@ function ClientFrameDrawer({
                   <ExternalLink className="h-3.5 w-3.5 shrink-0" />
                 </a>
               </div>
-            </Drawer.Header>
-            <Drawer.Body className="overflow-hidden p-0">
+            </Modal.Header>
+            <Modal.Body className="grid gap-3">
               {url ? (
-                <iframe
-                  src={url}
-                  title={`${t("dashboard.clientFrame.title")} ${url}`}
-                  className="h-[calc(100vh-112px)] w-full border-0 bg-white"
-                />
+                <div className="overflow-hidden rounded-xl border border-slate-200 bg-white">
+                  <iframe
+                    src={url}
+                    title={`${t("dashboard.clientFrame.title")} ${url}`}
+                    className="h-[min(72vh,760px)] w-full border-0 bg-white"
+                  />
+                </div>
               ) : null}
-            </Drawer.Body>
-          </Drawer.Dialog>
-        </Drawer.Content>
-      </Drawer.Backdrop>
-    </Drawer>
+            </Modal.Body>
+            <Modal.Footer>
+              <Button
+                variant="outline"
+                onClick={() => onOpenChange(false)}
+              >
+                {t("dashboard.connectDialog.close")}
+              </Button>
+            </Modal.Footer>
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
+    </Modal>
   );
 }
 
@@ -2685,7 +2690,7 @@ export function SharesTable({
         open={!!connectShare}
         onOpenChange={closeConnectDialog}
       />
-      <ClientFrameDrawer
+      <ClientFrameDialog
         url={clientFrameUrl}
         open={!!clientFrameUrl}
         onOpenChange={closeClientFrame}
