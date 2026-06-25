@@ -10,7 +10,7 @@ import type { ShareConnectionTestResponse, ShareView } from "@/lib/types";
 
 type TFn = ReturnType<typeof useLocaleText>["t"];
 type TestApp = "claude" | "codex" | "gemini";
-type TestKind = "text" | "image";
+type TestKind = "text" | "image" | "tools";
 type AppProbe = {
   labelKey: MessageKey;
   method: "POST";
@@ -32,6 +32,27 @@ const APP_PROBE: Record<TestApp, Partial<Record<TestKind, AppProbe>>> = {
         // openai_to_anthropic 转换（GitHub Copilot 这类绑定会因 Empty choices 抛 422）。
         stream: true,
         messages: [{ role: "user", content: "who are you" }],
+      }),
+    },
+    tools: {
+      labelKey: "dashboard.connectDialog.test.toolsApiCall",
+      method: "POST",
+      path: "/v1/messages",
+      body: JSON.stringify({
+        model: "claude-opus-4-7",
+        max_tokens: 256,
+        stream: true,
+        tools: [
+          {
+            name: "Bash",
+            description: "run bash",
+            input_schema: {
+              type: "object",
+              properties: { command: { type: "string" } },
+            },
+          },
+        ],
+        messages: [{ role: "user", content: "run ls" }],
       }),
     },
   },
@@ -86,10 +107,12 @@ function buildCurlCommand(baseUrl: string, app: TestApp, kind: TestKind, apiToke
     ? `Bearer ${apiToken}`
     : "Bearer <your-api-token>";
   return [
-    `curl ${kind === "image" ? "-N " : ""}-sS -X ${probe.method} \\`,
+    `curl ${kind === "image" || kind === "tools" ? "-N " : ""}-sS -X ${probe.method} \\`,
     `  '${url}' \\`,
     `  -H 'Authorization: ${bearer}' \\`,
-    ...(kind === "image" ? [`  -H 'Accept: text/event-stream' \\`] : []),
+    ...(kind === "image" || kind === "tools"
+      ? [`  -H 'Accept: text/event-stream' \\`]
+      : []),
     `  -H 'Content-Type: application/json' \\`,
     `  -d '${probe.body}'`,
   ].join("\n");
@@ -174,7 +197,11 @@ export function ShareConnectionTestRow({
     setTestState("running");
     setErrorMsg("");
     try {
-      const response = await testShareConnection(share.shareId, { app, kind, timeoutMs: 15000 });
+      const response = await testShareConnection(share.shareId, {
+        app,
+        kind,
+        timeoutMs: kind === "tools" ? 30000 : 15000,
+      });
       setResult(response);
       setResultOpen(true);
       setTestState("done");

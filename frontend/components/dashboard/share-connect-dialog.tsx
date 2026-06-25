@@ -22,6 +22,18 @@ function shareCodexImageGenerationEnabled(share: ShareView | null) {
   );
 }
 
+function shareClaudeCursorToolsProbeEnabled(share: ShareView | null) {
+  const providerId = share?.bindings?.claude;
+  if (!providerId) return false;
+  return !!share?.appProviders?.claude?.some(
+    (provider) =>
+      provider.id === providerId &&
+      provider.enabled === true &&
+      (provider.providerType === "cursor_oauth" ||
+        provider.providerType === "cursor_apikey"),
+  );
+}
+
 /**
  * P18: 让 dashboard ShareTable 行点击「连接」时打开这个弹窗。
  *
@@ -47,6 +59,10 @@ export const ShareConnectDialog = React.memo(function ShareConnectDialog({
   const canViewSecret = !!share?.canViewSecret;
   const codexImageGenerationEnabled = React.useMemo(
     () => shareCodexImageGenerationEnabled(share),
+    [share],
+  );
+  const claudeCursorToolsProbeEnabled = React.useMemo(
+    () => shareClaudeCursorToolsProbeEnabled(share),
     [share],
   );
 
@@ -179,6 +195,17 @@ export const ShareConnectDialog = React.memo(function ShareConnectDialog({
                     share={share}
                     app="codex"
                     kind="image"
+                    apiToken={apiTokenPlain}
+                    baseUrl={baseUrl}
+                    canExecute={authenticated && canViewSecret}
+                  />
+                ) : null}
+                {claudeCursorToolsProbeEnabled ? (
+                  <ShareConnectionTestRow
+                    key="claude-tools"
+                    share={share}
+                    app="claude"
+                    kind="tools"
                     apiToken={apiTokenPlain}
                     baseUrl={baseUrl}
                     canExecute={authenticated && canViewSecret}

@@ -2197,6 +2197,44 @@ mod tests {
     }
 
     #[test]
+    fn claude_tools_probe_exists_for_cursor_shares() {
+        let probe = app_probe_for_kind("claude", "tools").expect("claude tools probe");
+        assert_eq!(probe.path, "/v1/messages");
+        assert!(probe.body.contains("\"tools\""));
+        assert!(probe.body.contains("\"stream\":true"));
+    }
+
+    #[test]
+    fn claude_tools_probe_enabled_for_cursor_binding() {
+        let share = ShareForTest {
+            subdomain: "share-sub".into(),
+            owner_email: "owner@example.com".into(),
+            shared_with_emails: Vec::new(),
+            bindings: std::collections::BTreeMap::from([("claude".into(), "cursor-1".into())]),
+            app_providers: crate::models::ShareAppProviders {
+                claude: vec![crate::models::ShareAppProvider {
+                    id: "cursor-1".into(),
+                    name: "Cursor".into(),
+                    app: "claude".into(),
+                    kind: Some("cursor_apikey".into()),
+                    provider_type: Some("cursor_apikey".into()),
+                    is_current: true,
+                    enabled: true,
+                    codex_image_generation_enabled: false,
+                    for_sale_official_price_percent: None,
+                    account_email: None,
+                    api_url: None,
+                    quota: None,
+                    models: Vec::new(),
+                }],
+                ..crate::models::ShareAppProviders::default()
+            },
+        };
+
+        assert!(share_claude_cursor_tools_probe_enabled(&share));
+    }
+
+    #[test]
     fn codex_image_test_requires_enabled_bound_provider() {
         let share = ShareForTest {
             subdomain: "share-sub".into(),
@@ -4030,8 +4068,36 @@ fn app_probe_for_kind(app: &str, kind: &str) -> Option<AppProbe> {
             // 探针检测。Gemini 2.5 Flash 也是 reasoning model。
             body: r#"{"contents":[{"parts":[{"text":"who are you"}]}],"generationConfig":{"maxOutputTokens":16}}"#,
         }),
+        ("claude", "tools") => Some(AppProbe {
+            method: "POST",
+            path: "/v1/messages",
+            // Cursor AgentService path: Claude Code always ships tools. A passing
+            // probe should return tool_use or assistant text within the timeout,
+            // not stall after message_start.
+            body: r#"{"model":"claude-opus-4-7","max_tokens":256,"stream":true,"tools":[{"name":"Bash","description":"run bash","input_schema":{"type":"object","properties":{"command":{"type":"string"}}}}],"messages":[{"role":"user","content":"run ls"}]}"#,
+        }),
         _ => None,
     }
+}
+
+fn share_claude_cursor_tools_probe_enabled(share: &ShareForTest) -> bool {
+    let Some(bound_provider_id) = share
+        .bindings
+        .get("claude")
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+
+    share.app_providers.claude.iter().any(|provider| {
+        provider.id == bound_provider_id
+            && provider.enabled
+            && matches!(
+                provider.provider_type.as_deref(),
+                Some("cursor_oauth") | Some("cursor_apikey")
+            )
+    })
 }
 
 fn share_codex_image_generation_enabled(share: &ShareForTest) -> bool {
@@ -4315,6 +4381,15 @@ async fn test_share_connection(
     {
         return Err(AppError::BadRequest(
             "codex image generation is not enabled for the bound provider".into(),
+        ));
+    }
+
+    if input.app == "claude"
+        && probe_kind == "tools"
+        && !share_claude_cursor_tools_probe_enabled(&share)
+    {
+        return Err(AppError::BadRequest(
+            "claude tools probe is only available for cursor_oauth / cursor_apikey shares".into(),
         ));
     }
 
