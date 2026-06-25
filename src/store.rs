@@ -11023,10 +11023,10 @@ fn merge_market_request_logs_into_share_logs(
         let mut entry =
             market_log_to_share_request_log(market_log, share_id, created_at, &share_names);
         let logs = logs_by_share.entry(share_id.to_string()).or_default();
-        if let Some(existing) = logs
-            .iter_mut()
-            .find(|candidate| candidate.request_id == entry.request_id)
-        {
+        if let Some(existing) = logs.iter_mut().find(|candidate| {
+            candidate.request_id == entry.request_id
+                || share_request_logs_are_semantic_duplicates(candidate, &entry)
+        }) {
             if prefer_market_derived_share_log(&entry, existing) {
                 merge_share_log_model_route(&mut entry, existing);
                 *existing = entry;
@@ -11114,6 +11114,55 @@ fn status_code_from_market_status(status: &str) -> u16 {
         "needs_review" => 202,
         _ => 500,
     }
+}
+
+fn share_request_logs_are_semantic_duplicates(
+    left: &ShareRequestLogEntry,
+    right: &ShareRequestLogEntry,
+) -> bool {
+    if left.share_id != right.share_id
+        || left.status_code != right.status_code
+        || left.input_tokens != right.input_tokens
+        || left.output_tokens != right.output_tokens
+        || left.cache_read_tokens != right.cache_read_tokens
+        || left.cache_creation_tokens != right.cache_creation_tokens
+    {
+        return false;
+    }
+
+    let left_app = if left.request_agent.trim().is_empty() {
+        left.app_type.trim()
+    } else {
+        left.request_agent.trim()
+    };
+    let right_app = if right.request_agent.trim().is_empty() {
+        right.app_type.trim()
+    } else {
+        right.request_agent.trim()
+    };
+    if !left_app.eq_ignore_ascii_case(right_app) {
+        return false;
+    }
+
+    if !left
+        .requested_model
+        .trim()
+        .eq_ignore_ascii_case(right.requested_model.trim())
+        || !left
+            .actual_model
+            .trim()
+            .eq_ignore_ascii_case(right.actual_model.trim())
+    {
+        return false;
+    }
+
+    let latency_window_secs = left
+        .latency_ms
+        .max(right.latency_ms)
+        .div_ceil(1000)
+        .saturating_add(10)
+        .clamp(10, 300);
+    left.created_at.abs_diff(right.created_at) <= latency_window_secs
 }
 
 fn prefer_market_derived_share_log(
@@ -15847,6 +15896,72 @@ mod tests {
         assert_eq!(shareto.daily.len(), 7);
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[test]
+    fn merge_market_logs_deduplicates_semantic_duplicate_with_different_request_id() {
+        let started_at = Utc::now().timestamp();
+        let mut share_log =
+            test_share_request_log_entry("share-side-uuid", "share-usage", started_at + 6);
+        share_log.requested_model = "gpt-5.5".into();
+        share_log.request_model = "gpt-5.5".into();
+        share_log.actual_model = "glm-5.2".into();
+        share_log.model = "glm-5.2".into();
+        share_log.latency_ms = 3338;
+        share_log.input_tokens = 156_605;
+        share_log.output_tokens = 18;
+        share_log.is_streaming = true;
+
+        let market_log = DashboardMarketRequestLogView {
+            request_id: "req_market_side".into(),
+            market_id: "market-id".into(),
+            market_email: "xiechengqi01@gmail.com".into(),
+            market_subdomain: "market".into(),
+            user_email: Some("user@example.com".into()),
+            api_key_prefix: Some("sk-test".into()),
+            router_id: Some("main".into()),
+            share_id: Some("share-usage".into()),
+            share_subdomain: Some("usage-sub".into()),
+            model: Some("gpt-5.5".into()),
+            request_agent: "codex".into(),
+            requested_model: "gpt-5.5".into(),
+            actual_model: "glm-5.2".into(),
+            actual_model_source: "share_runtime_mapping".into(),
+            status: "settled".into(),
+            status_code: Some(200),
+            error_message: None,
+            latency_ms: Some(5157),
+            input_tokens: 156_605,
+            output_tokens: 18,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            usage_amount_usd: Some("0.001".into()),
+            created_at: DateTime::<Utc>::from_timestamp(started_at, 0)
+                .expect("timestamp")
+                .to_rfc3339(),
+            settled_at: None,
+            user_country: None,
+            user_country_iso3: None,
+        };
+
+        let mut logs_by_share = HashMap::from([("share-usage".to_string(), vec![share_log])]);
+        let shares: Vec<(String, ShareDescriptor)> = Vec::new();
+        merge_market_request_logs_into_share_logs(
+            &mut logs_by_share,
+            &[market_log],
+            &shares,
+            SHARE_REQUEST_LOG_RECOVERY_LIMIT,
+        );
+
+        let logs = logs_by_share.get("share-usage").expect("share logs");
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].request_id, "req_market_side");
+        assert_eq!(logs[0].provider_id, "market-id");
+        assert_eq!(logs[0].provider_name, "market");
+        assert_eq!(logs[0].requested_model, "gpt-5.5");
+        assert_eq!(logs[0].actual_model, "glm-5.2");
+        assert_eq!(logs[0].input_tokens, 156_605);
+        assert_eq!(logs[0].output_tokens, 18);
     }
 
     #[tokio::test]
