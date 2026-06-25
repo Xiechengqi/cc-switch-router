@@ -4495,7 +4495,11 @@ impl AppStore {
                     .unwrap_or_default();
                 let raw_app_runtimes = parse_app_runtimes(row.get(20)?)?;
                 let available_app_runtimes = filter_app_runtimes_by_quota(
-                    filter_app_runtimes_by_model_health(raw_app_runtimes.clone(), &model_health),
+                    filter_app_runtimes_by_model_health(
+                        raw_app_runtimes.clone(),
+                        &model_health,
+                        now,
+                    ),
                     now,
                 );
                 let app_runtimes = if allow_all_market_access {
@@ -9895,10 +9899,11 @@ fn quota_blocked_app_availability(
     health
         .iter()
         .filter(|entry| {
-            entry.status.eq_ignore_ascii_case("quota_blocked")
+            let is_quota_block = entry.status.eq_ignore_ascii_case("quota_blocked")
                 || (is_app_level_model_health(entry, app_type)
                     && entry.status.eq_ignore_ascii_case("failed")
-                    && model_health_error_is_quota_block(entry.error_message.as_deref()))
+                    && model_health_error_is_quota_block(entry.error_message.as_deref()));
+            is_quota_block && !quota_block_expired(entry.error_message.as_deref(), now)
         })
         .max_by_key(|entry| entry.last_checked_at.unwrap_or_default())
         .map(|entry| MarketAppAvailabilityEntry {
@@ -10069,12 +10074,13 @@ fn list_model_health_summaries(
 fn filter_app_runtimes_by_model_health(
     mut runtimes: ShareAppRuntimes,
     health: &ShareModelHealthSummary,
+    now: DateTime<Utc>,
 ) -> ShareAppRuntimes {
-    runtimes.claude = filter_provider_by_app_health(runtimes.claude, &health.claude, "claude")
+    runtimes.claude = filter_provider_by_app_health(runtimes.claude, &health.claude, "claude", now)
         .and_then(|provider| filter_provider_models_by_health(Some(provider), &health.claude));
-    runtimes.codex = filter_provider_by_app_health(runtimes.codex, &health.codex, "codex")
+    runtimes.codex = filter_provider_by_app_health(runtimes.codex, &health.codex, "codex", now)
         .and_then(|provider| filter_provider_models_by_health(Some(provider), &health.codex));
-    runtimes.gemini = filter_provider_by_app_health(runtimes.gemini, &health.gemini, "gemini")
+    runtimes.gemini = filter_provider_by_app_health(runtimes.gemini, &health.gemini, "gemini", now)
         .and_then(|provider| filter_provider_models_by_health(Some(provider), &health.gemini));
     // OAuth-only providers have no model-level health entries; pass through as-is.
     runtimes.kiro = filter_provider_models_by_health(runtimes.kiro, &[]);
@@ -10168,22 +10174,48 @@ fn filter_provider_by_app_health(
     provider: Option<ShareUpstreamProvider>,
     health: &[ModelHealthSummary],
     app_type: &str,
+    now: DateTime<Utc>,
 ) -> Option<ShareUpstreamProvider> {
     let provider = provider?;
-    if app_health_blocks_runtime(health, app_type) {
+    if app_health_blocks_runtime(health, app_type, now) {
         None
     } else {
         Some(provider)
     }
 }
 
-fn app_health_blocks_runtime(health: &[ModelHealthSummary], app_type: &str) -> bool {
+fn app_health_blocks_runtime(
+    health: &[ModelHealthSummary],
+    app_type: &str,
+    now: DateTime<Utc>,
+) -> bool {
     health.iter().any(|entry| {
-        entry.status.eq_ignore_ascii_case("quota_blocked")
+        let is_quota_block = entry.status.eq_ignore_ascii_case("quota_blocked")
             || (is_app_level_model_health(entry, app_type)
                 && entry.status.eq_ignore_ascii_case("failed")
-                && model_health_error_is_quota_block(entry.error_message.as_deref()))
+                && model_health_error_is_quota_block(entry.error_message.as_deref()));
+        is_quota_block && !quota_block_expired(entry.error_message.as_deref(), now)
     })
+}
+
+/// Parse the "until <RFC3339>" timestamp from a quota-block error message and
+/// return true if the block has already expired.  If no timestamp is found the
+/// block is treated as still active (conservative default).
+fn quota_block_expired(error_message: Option<&str>, now: DateTime<Utc>) -> bool {
+    let Some(msg) = error_message else {
+        return false;
+    };
+    let lower = msg.to_ascii_lowercase();
+    let Some(pos) = lower.rfind("until ") else {
+        return false;
+    };
+    let raw = msg[pos + 6..].trim();
+    // Trim trailing punctuation that might follow the timestamp.
+    let raw = raw.trim_end_matches('.');
+    match DateTime::parse_from_rfc3339(raw) {
+        Ok(dt) => dt.with_timezone(&Utc) <= now,
+        Err(_) => false,
+    }
 }
 
 fn is_app_level_model_health(entry: &ModelHealthSummary, app_type: &str) -> bool {
@@ -18915,7 +18947,7 @@ mod tests {
             ..ShareModelHealthSummary::default()
         };
 
-        let filtered = filter_app_runtimes_by_model_health(runtimes, &health);
+        let filtered = filter_app_runtimes_by_model_health(runtimes, &health, Utc::now());
 
         assert!(filtered.codex.is_some());
     }
@@ -18934,7 +18966,7 @@ mod tests {
             ..ShareModelHealthSummary::default()
         };
 
-        let filtered = filter_app_runtimes_by_model_health(runtimes, &health);
+        let filtered = filter_app_runtimes_by_model_health(runtimes, &health, Utc::now());
 
         assert!(filtered.codex.is_none());
     }
@@ -18954,9 +18986,54 @@ mod tests {
             ..ShareModelHealthSummary::default()
         };
 
-        let filtered = filter_app_runtimes_by_model_health(runtimes, &health);
+        let filtered = filter_app_runtimes_by_model_health(runtimes, &health, Utc::now());
 
         assert!(filtered.codex.is_none());
+    }
+
+    #[test]
+    fn market_runtime_filter_keeps_app_when_quota_block_expired() {
+        let runtimes = ShareAppRuntimes {
+            codex: Some(test_upstream_provider("gpt-5.5")),
+            ..ShareAppRuntimes::default()
+        };
+        let mut quota_health = test_model_summary("codex", &["failed"]);
+        quota_health.actual_model = "codex".into();
+        // Expired block: 1 hour ago.
+        let expired = (Utc::now() - Duration::hours(1)).to_rfc3339();
+        quota_health.error_message = Some(format!("five hour quota exhausted until {}", expired));
+        let health = ShareModelHealthSummary {
+            codex: vec![quota_health],
+            ..ShareModelHealthSummary::default()
+        };
+
+        let filtered = filter_app_runtimes_by_model_health(runtimes, &health, Utc::now());
+
+        // Expired quota block should NOT remove the runtime.
+        assert!(filtered.codex.is_some());
+    }
+
+    #[test]
+    fn market_runtime_filter_keeps_app_when_quota_block_expired_in_availability() {
+        // Test that quota_blocked_app_availability also respects expiry.
+        let expired = (Utc::now() - Duration::hours(1)).to_rfc3339();
+        let mut quota_health = test_model_summary("codex", &["failed"]);
+        quota_health.actual_model = "codex".into();
+        quota_health.error_message = Some(format!("five hour quota exhausted until {}", expired));
+        let result = quota_blocked_app_availability("codex", None, &[quota_health], Utc::now());
+        // Expired block should not produce an availability entry.
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn market_runtime_filter_blocks_app_when_quota_block_not_expired_in_availability() {
+        let future = (Utc::now() + Duration::hours(1)).to_rfc3339();
+        let mut quota_health = test_model_summary("codex", &["failed"]);
+        quota_health.actual_model = "codex".into();
+        quota_health.error_message = Some(format!("five hour quota exhausted until {}", future));
+        let result = quota_blocked_app_availability("codex", None, &[quota_health], Utc::now());
+        // Active block should produce an availability entry.
+        assert!(result.is_some());
     }
 
     #[test]
@@ -18978,7 +19055,7 @@ mod tests {
             ..ShareModelHealthSummary::default()
         };
 
-        let filtered = filter_app_runtimes_by_model_health(runtimes, &health);
+        let filtered = filter_app_runtimes_by_model_health(runtimes, &health, Utc::now());
 
         assert!(filtered.codex.is_some());
     }
@@ -18993,7 +19070,7 @@ mod tests {
         };
         let health = ShareModelHealthSummary::default();
 
-        let filtered = filter_app_runtimes_by_model_health(runtimes, &health);
+        let filtered = filter_app_runtimes_by_model_health(runtimes, &health, Utc::now());
 
         assert!(filtered.codex.is_some());
     }
