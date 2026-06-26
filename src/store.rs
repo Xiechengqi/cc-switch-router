@@ -9664,9 +9664,11 @@ fn compute_market_share_quota_health(
     now: DateTime<Utc>,
 ) -> f64 {
     if let Some(app) = signal_app {
-        return runtime_quota_for_app(runtimes, app)
-            .or_else(|| upstream_provider.and_then(|provider| provider.quota.as_ref()))
-            .map(|quota| market_quota_health(quota, now))
+        return runtime_provider_for_app(runtimes, app)
+            .and_then(|provider| market_provider_quota_health(provider, now))
+            .or_else(|| {
+                upstream_provider.and_then(|provider| market_provider_quota_health(provider, now))
+            })
             .unwrap_or_else(|| crate::scheduling_signals::compute_quota_health(None, now));
     }
 
@@ -9679,15 +9681,14 @@ fn compute_market_share_quota_health(
     }
 
     upstream_provider
-        .and_then(|provider| provider.quota.as_ref())
-        .map(|quota| market_quota_health(quota, now))
+        .and_then(|provider| market_provider_quota_health(provider, now))
         .unwrap_or_else(|| crate::scheduling_signals::compute_quota_health(None, now))
 }
 
-fn runtime_quota_for_app<'a>(
+fn runtime_provider_for_app<'a>(
     runtimes: &'a ShareAppRuntimes,
     app: &str,
-) -> Option<&'a ShareUpstreamQuota> {
+) -> Option<&'a ShareUpstreamProvider> {
     match app {
         "claude" => runtimes.claude.as_ref(),
         "codex" => runtimes.codex.as_ref(),
@@ -9698,7 +9699,6 @@ fn runtime_quota_for_app<'a>(
         "copilot" => runtimes.copilot.as_ref(),
         _ => None,
     }
-    .and_then(|provider| provider.quota.as_ref())
 }
 
 fn runtime_quota_healths(runtimes: &ShareAppRuntimes, now: DateTime<Utc>) -> Vec<f64> {
@@ -9712,9 +9712,23 @@ fn runtime_quota_healths(runtimes: &ShareAppRuntimes, now: DateTime<Utc>) -> Vec
         runtimes.copilot.as_ref(),
     ]
     .into_iter()
-    .filter_map(|provider| provider.and_then(|provider| provider.quota.as_ref()))
-    .map(|quota| market_quota_health(quota, now))
+    .flatten()
+    .filter_map(|provider| market_provider_quota_health(provider, now))
     .collect()
+}
+
+fn market_provider_quota_health(
+    provider: &ShareUpstreamProvider,
+    now: DateTime<Utc>,
+) -> Option<f64> {
+    if provider_has_display_only_quota(provider) {
+        Some(crate::scheduling_signals::compute_quota_health(None, now))
+    } else {
+        provider
+            .quota
+            .as_ref()
+            .map(|quota| market_quota_health(quota, now))
+    }
 }
 
 fn market_quota_health(quota: &ShareUpstreamQuota, now: DateTime<Utc>) -> f64 {
@@ -9723,6 +9737,24 @@ fn market_quota_health(quota: &ShareUpstreamQuota, now: DateTime<Utc>) -> f64 {
     } else {
         crate::scheduling_signals::compute_quota_health(Some(quota), now)
     }
+}
+
+fn provider_has_display_only_quota(provider: &ShareUpstreamProvider) -> bool {
+    let provider_type = provider
+        .provider_type
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if provider_type == "ollama_cloud" {
+        return true;
+    }
+
+    let provider_name = provider
+        .provider_name
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    provider.kind == "official_oauth" && provider_name.contains("ollama")
 }
 
 fn sort_market_shares_for_app(shares: &mut [MarketShareView], app: &str) {
@@ -9874,6 +9906,12 @@ fn quota_blocked_app_availability(
     health: &[ModelHealthSummary],
     now: DateTime<Utc>,
 ) -> Option<MarketAppAvailabilityEntry> {
+    if provider
+        .map(provider_has_display_only_quota)
+        .unwrap_or(false)
+    {
+        return None;
+    }
     if let Some(quota) = provider.and_then(|provider| provider.quota.as_ref()) {
         if quota_block_is_active(quota, now) || quota_dispatch_limit_reached(quota, now) {
             let reason = if quota_block_is_active(quota, now) {
@@ -10108,6 +10146,13 @@ fn filter_provider_by_quota(
     provider: Option<ShareUpstreamProvider>,
     now: DateTime<Utc>,
 ) -> Option<ShareUpstreamProvider> {
+    if provider
+        .as_ref()
+        .map(provider_has_display_only_quota)
+        .unwrap_or(false)
+    {
+        return provider;
+    }
     let provider = provider?;
     if provider
         .quota
@@ -10245,6 +10290,7 @@ mod quota_runtime_filter_tests {
             kind: "official_oauth".to_string(),
             app: "codex".to_string(),
             provider_name: Some("Codex".to_string()),
+            provider_type: None,
             for_sale_official_price_percent: None,
             account_email: None,
             api_url: None,
@@ -10272,6 +10318,7 @@ mod quota_runtime_filter_tests {
             kind: "official_oauth".to_string(),
             app: "codex".to_string(),
             provider_name: Some("Codex".to_string()),
+            provider_type: None,
             for_sale_official_price_percent: None,
             account_email: None,
             api_url: None,
@@ -10288,6 +10335,37 @@ mod quota_runtime_filter_tests {
                     label: "1w".to_string(),
                     utilization,
                     resets_at: Some(resets_at),
+                    used: None,
+                    limit: None,
+                    unit: None,
+                }],
+            }),
+            models: Vec::new(),
+        }
+    }
+
+    fn ollama_provider_with_display_only_quota() -> ShareUpstreamProvider {
+        ShareUpstreamProvider {
+            kind: "official_oauth".to_string(),
+            app: "codex".to_string(),
+            provider_name: Some("Ollama Cloud".to_string()),
+            provider_type: Some("ollama_cloud".to_string()),
+            for_sale_official_price_percent: None,
+            account_email: Some("xiechengqi01@gmail.com".to_string()),
+            api_url: None,
+            quota: Some(ShareUpstreamQuota {
+                status: "ok".to_string(),
+                plan: Some("pro".to_string()),
+                queried_at: None,
+                availability: Some("available".to_string()),
+                blocked_until: None,
+                blocked_reason: None,
+                blocked_scope: None,
+                dispatch_limit_percent: Some(1.0),
+                tiers: vec![crate::models::ShareUpstreamQuotaTier {
+                    label: "xiechengqi01@gmail.com".to_string(),
+                    utilization: 100.0,
+                    resets_at: Some((Utc::now() + Duration::days(28)).to_rfc3339()),
                     used: None,
                     limit: None,
                     unit: None,
@@ -10405,6 +10483,24 @@ mod quota_runtime_filter_tests {
         assert!(
             health < 0.2,
             "high-utilization runtime quota should down-rank codex, got {health}"
+        );
+    }
+
+    #[test]
+    fn ollama_display_only_quota_is_not_used_for_filtering_or_health() {
+        let now = Utc::now();
+        let runtimes = ShareAppRuntimes {
+            codex: Some(ollama_provider_with_display_only_quota()),
+            ..Default::default()
+        };
+
+        let filtered = filter_app_runtimes_by_quota(runtimes.clone(), now);
+        assert!(filtered.codex.is_some());
+
+        let health = compute_market_share_quota_health(Some("codex"), &runtimes, None, now);
+        assert_eq!(
+            health,
+            crate::scheduling_signals::compute_quota_health(None, now)
         );
     }
 
@@ -14945,6 +15041,7 @@ mod tests {
             kind: "test".into(),
             app: "codex".into(),
             provider_name: Some("test".into()),
+            provider_type: None,
             for_sale_official_price_percent: None,
             account_email: None,
             api_url: None,

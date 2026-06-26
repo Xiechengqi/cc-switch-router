@@ -1340,6 +1340,8 @@ pub struct ShareUpstreamProvider {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub for_sale_official_price_percent: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_email: Option<String>,

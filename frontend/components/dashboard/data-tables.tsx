@@ -454,6 +454,19 @@ function runtimeLooksOAuth(runtime?: ShareUpstreamProvider) {
   return text.includes("oauth") || text.includes("ollama_cloud") || Boolean(oauthRuntimeKeyFromProvider(runtime));
 }
 
+function isOllamaCloudRuntime(runtime?: ShareUpstreamProvider) {
+  const text = [
+    runtime?.providerType,
+    runtime?.providerName,
+    runtime?.kind,
+    runtime?.app,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  return text.includes("ollama_cloud") || text.includes("ollama cloud") || text.includes("ollama");
+}
+
 function isOfficialRuntime(runtime?: ShareUpstreamProvider) {
   if (!runtime) return false;
   const kind = String(runtime.kind || "").toLowerCase();
@@ -597,6 +610,7 @@ function quotaSummary(runtime?: ShareUpstreamProvider, locale: AppLocale = "en")
   const status = String(quota?.status || "").toLowerCase();
   if (!quota || (status && !["ok", "success", "valid"].includes(status))) return "";
   const isKiro = oauthRuntimeKeyFromProvider(runtime) === "kiro";
+  const isOllamaCloud = isOllamaCloudRuntime(runtime);
   let tiers = (quota.tiers || [])
     .map((tier) => ({ ...tier, label: tier.label || tier.name }))
     .filter((tier) => tier.label);
@@ -610,7 +624,10 @@ function quotaSummary(runtime?: ShareUpstreamProvider, locale: AppLocale = "en")
       const used = formatQuotaAmount(tier.used, locale);
       const limit = formatQuotaAmount(tier.limit, locale);
       const usage = isKiro && used && limit ? `${used}/${limit}` : quotaTierLabel(tier.label, locale);
-      return [usage, `${Math.round(tier.utilization || 0)}%`, countdownStr(tier.resetsAt)].filter(Boolean).join(" ");
+      const utilization = typeof tier.utilization === "number" && Number.isFinite(tier.utilization)
+        ? `${Math.round(tier.utilization)}%`
+        : "";
+      return [usage, isOllamaCloud ? "" : utilization, countdownStr(tier.resetsAt)].filter(Boolean).join(" ");
     })
     .join(" · ");
   return [quota.plan || quota.credentialMessage, tierText].filter(Boolean).join(" · ");
