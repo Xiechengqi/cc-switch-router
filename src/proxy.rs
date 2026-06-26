@@ -30,6 +30,8 @@ const CLIENT_WEB_USER_EMAIL_HEADER: &str = "x-cc-switch-web-user-email";
 const CLIENT_WEB_ROLE_HEADER: &str = "x-cc-switch-web-role";
 const CLIENT_WEB_INSTALLATION_ID_HEADER: &str = "x-cc-switch-installation-id";
 const CLIENT_WEB_SUBDOMAIN_HEADER: &str = "x-cc-switch-client-tunnel-subdomain";
+const SHARE_USER_COUNTRY_HEADER: &str = "X-CC-Switch-User-Country";
+const SHARE_USER_COUNTRY_ISO3_HEADER: &str = "X-CC-Switch-User-Country-Iso3";
 const IMAGE_JOB_MAX_RUNNING_PER_SHARE: usize = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -614,6 +616,8 @@ pub async fn market_proxy_handler(
         if n.eq_ignore_ascii_case("host")
             || n.eq_ignore_ascii_case("authorization")
             || n.eq_ignore_ascii_case(MARKET_REQUEST_ID_HEADER)
+            || n.eq_ignore_ascii_case(SHARE_USER_COUNTRY_HEADER)
+            || n.eq_ignore_ascii_case(SHARE_USER_COUNTRY_ISO3_HEADER)
             || is_hop_by_hop_header(n)
         {
             continue;
@@ -709,6 +713,7 @@ pub async fn market_proxy_handler(
     if let Some(ref request_id) = live_request_id {
         builder = builder.header("X-CC-Switch-Request-Id", request_id.as_str());
     }
+    builder = with_share_user_country_headers(builder, client_metadata.country_code.as_deref());
     let recent_traffic_guard = live_request_id.as_ref().map(|id| RecentTrafficGuard {
         traffic: state.recent_traffic.clone(),
         request_id: id.clone(),
@@ -943,6 +948,8 @@ pub async fn gateway_proxy_handler(
             || n.eq_ignore_ascii_case("x-goog-api-key")
             || n.eq_ignore_ascii_case("api-key")
             || n.starts_with("x-cc-gateway-")
+            || n.eq_ignore_ascii_case(SHARE_USER_COUNTRY_HEADER)
+            || n.eq_ignore_ascii_case(SHARE_USER_COUNTRY_ISO3_HEADER)
             || is_hop_by_hop_header(n)
         {
             continue;
@@ -951,6 +958,7 @@ pub async fn gateway_proxy_handler(
     }
     builder = builder.header("X-CC-Switch-Share-Id", share_id.as_str());
     builder = builder.header("X-CC-Switch-Share-Subdomain", route.subdomain.as_str());
+    builder = with_share_user_country_headers(builder, client_metadata.country_code.as_deref());
 
     let live_request_id = state
         .recent_traffic
@@ -1454,7 +1462,10 @@ pub async fn proxy_handler(
         // Strip client-supplied user/share credentials on share routes; router
         // authenticates the caller at the edge (user_api_token + email ACL)
         // and the cc-switch tunnel only needs the share id we inject below.
-        if n.eq_ignore_ascii_case("x-cc-switch-user-email") {
+        if n.eq_ignore_ascii_case("x-cc-switch-user-email")
+            || n.eq_ignore_ascii_case(SHARE_USER_COUNTRY_HEADER)
+            || n.eq_ignore_ascii_case(SHARE_USER_COUNTRY_ISO3_HEADER)
+        {
             continue;
         }
         if route.is_share()
@@ -1488,6 +1499,9 @@ pub async fn proxy_handler(
     builder = builder.header("X-CC-Switch-Share-Subdomain", route.subdomain.as_str());
     if let Some(ref email) = api_user_email {
         builder = builder.header("X-CC-Switch-User-Email", email.as_str());
+    }
+    if route.is_share() {
+        builder = with_share_user_country_headers(builder, client_metadata.country_code.as_deref());
     }
     if let Some((email, is_admin)) = client_web_session.as_ref() {
         builder = builder
@@ -1925,6 +1939,7 @@ async fn handle_image_generation_stream_submit(
     if let Some(email) = api_user_email.as_deref() {
         builder = builder.header("X-CC-Switch-User-Email", email);
     }
+    builder = with_share_user_country_headers(builder, Some(user_country.as_str()));
 
     let metrics_permit = state.metrics.proxy_request_started();
     let recent_traffic_guard = Some(RecentTrafficGuard {
@@ -2669,6 +2684,27 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("-")
+}
+
+fn with_share_user_country_headers(
+    mut builder: reqwest::RequestBuilder,
+    country_code: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let Some(country) = country_code.map(str::trim).filter(|value| {
+        value.len() == 2
+            && value
+                .as_bytes()
+                .iter()
+                .all(|byte| byte.is_ascii_uppercase())
+    }) else {
+        return builder;
+    };
+
+    builder = builder.header(SHARE_USER_COUNTRY_HEADER, country);
+    if let Some(iso3) = crate::geo::iso2_to_iso3(country) {
+        builder = builder.header(SHARE_USER_COUNTRY_ISO3_HEADER, iso3);
+    }
+    builder
 }
 
 fn truthy_header(headers: &HeaderMap, name: &str) -> bool {
