@@ -560,6 +560,7 @@ export type ShareUpstreamProvider = {
   providerName?: string;
   kind?: string;
   app?: string;
+  providerType?: string;
   accountEmail?: string;
   forSaleOfficialPricePercent?: number;
   apiUrl?: string;

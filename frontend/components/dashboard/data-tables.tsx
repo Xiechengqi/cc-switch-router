@@ -446,11 +446,12 @@ function runtimeLooksOAuth(runtime?: ShareUpstreamProvider) {
     runtime?.app,
     runtime?.kind,
     runtime?.providerName,
+    runtime?.providerType,
   ]
     .filter(Boolean)
     .join(" ")
     .toLowerCase();
-  return text.includes("oauth") || Boolean(oauthRuntimeKeyFromProvider(runtime));
+  return text.includes("oauth") || text.includes("ollama_cloud") || Boolean(oauthRuntimeKeyFromProvider(runtime));
 }
 
 function isOfficialRuntime(runtime?: ShareUpstreamProvider) {
@@ -3444,6 +3445,7 @@ function providerRuntime(provider: ShareAppProvider): ShareUpstreamProvider {
     providerName: provider.name,
     kind: provider.kind,
     app: provider.app,
+    providerType: provider.providerType,
     accountEmail: provider.accountEmail,
     forSaleOfficialPricePercent: provider.forSaleOfficialPricePercent,
     apiUrl: provider.apiUrl,
