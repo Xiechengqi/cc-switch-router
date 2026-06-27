@@ -3345,36 +3345,52 @@ impl AppStore {
                     .remove(&installation.id)
                     .unwrap_or_default();
                 let share_count = share_ids.len();
-                let online_minutes_24h = client_online_minutes_by_installation
+                let tunnel_record = client_tunnels_by_installation.get(&installation.id);
+                let client_tunnel_online = tunnel_record
+                    .map(|tunnel| tunnel.enabled && active_subdomains.contains(&tunnel.subdomain))
+                    .unwrap_or(false);
+                let mut online_minutes_24h = client_online_minutes_by_installation
                     .get(&installation.id)
                     .copied()
                     .unwrap_or(0);
+                if share_count == 0 && online_minutes_24h == 0 && client_tunnel_online {
+                    online_minutes_24h = ONLINE_WINDOW_MINUTES;
+                }
                 let online_rate_24h =
                     ((online_minutes_24h as f64 / ONLINE_WINDOW_MINUTES as f64) * 100.0).min(100.0);
-                let client_tunnel =
-                    client_tunnels_by_installation
-                        .get(&installation.id)
-                        .map(|tunnel| DashboardClientTunnelView {
-                            owner_email: tunnel.owner_email.clone(),
-                            subdomain: tunnel.subdomain.clone(),
-                            tunnel_url: config.tunnel_url(&tunnel.subdomain),
-                            enabled: tunnel.enabled,
-                            online: active_subdomains.contains(&tunnel.subdomain),
-                        });
+                let client_tunnel = tunnel_record.map(|tunnel| DashboardClientTunnelView {
+                    owner_email: tunnel.owner_email.clone(),
+                    subdomain: tunnel.subdomain.clone(),
+                    tunnel_url: config.tunnel_url(&tunnel.subdomain),
+                    enabled: tunnel.enabled,
+                    online: client_tunnel_online,
+                });
+                let mut health_checks = client_health_by_installation
+                    .get(&installation.id)
+                    .cloned()
+                    .unwrap_or_default();
+                if share_count == 0 && client_tunnel_online {
+                    if health_checks.is_empty() {
+                        append_recent_online_health_checks(&mut health_checks, 10);
+                    } else {
+                        append_current_online_health_check(&mut health_checks);
+                    }
+                }
+                let mut health_timeline = client_timeline_by_installation
+                    .get(&installation.id)
+                    .cloned()
+                    .unwrap_or_default();
+                if share_count == 0 && client_tunnel_online && health_timeline.is_empty() {
+                    health_timeline = current_online_health_timeline(health_timeline_start);
+                }
                 DashboardClientView {
                     share_count,
                     share_ids,
                     client_tunnel,
                     online_minutes_24h,
                     online_rate_24h,
-                    health_checks: client_health_by_installation
-                        .get(&installation.id)
-                        .cloned()
-                        .unwrap_or_default(),
-                    health_timeline: client_timeline_by_installation
-                        .get(&installation.id)
-                        .cloned()
-                        .unwrap_or_default(),
+                    health_checks,
+                    health_timeline,
                     installation,
                 }
             })
@@ -12398,6 +12414,28 @@ fn merge_health_timeline(
         .collect()
 }
 
+fn current_online_health_timeline(start: i64) -> Vec<HealthTimelineBucket> {
+    let current = Utc::now().timestamp();
+    (0..HEALTH_TIMELINE_BUCKETS)
+        .map(|index| {
+            let bucket_start = start + index as i64 * HEALTH_TIMELINE_BUCKET_SECS;
+            let bucket_end = bucket_start + HEALTH_TIMELINE_BUCKET_SECS;
+            let online = current >= bucket_start
+                && (current < bucket_end || index + 1 == HEALTH_TIMELINE_BUCKETS);
+            HealthTimelineBucket {
+                start_at: timeline_timestamp_rfc3339(bucket_start),
+                end_at: timeline_timestamp_rfc3339(bucket_end),
+                status: if online { "healthy" } else { "unknown" }.into(),
+                score: if online { 100.0 } else { 0.0 },
+                online_minutes: if online { 1 } else { 0 },
+                observed_minutes: if online { 1 } else { 0 },
+                request_count: 0,
+                failure_count: 0,
+            }
+        })
+        .collect()
+}
+
 fn stronger_timeline_status(left: &str, right: &str) -> String {
     let score = |status: &str| match status {
         "healthy" => 4,
@@ -14609,6 +14647,23 @@ mod tests {
             params![installation_id, value.to_rfc3339()],
         )
         .expect("update installation last_seen_at");
+    }
+
+    async fn insert_client_tunnel(
+        store: &AppStore,
+        installation_id: &str,
+        owner_email: &str,
+        subdomain: &str,
+    ) {
+        let now = Utc::now().to_rfc3339();
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "INSERT INTO installation_client_tunnels (
+                installation_id, owner_email, subdomain, enabled, created_at, updated_at, last_seen_at
+             ) VALUES (?1, ?2, ?3, 1, ?4, ?4, ?4)",
+            params![installation_id, owner_email, subdomain, now],
+        )
+        .expect("insert client tunnel");
     }
 
     async fn insert_share(
@@ -18429,6 +18484,59 @@ mod tests {
         let mut client_share_ids = snapshot.clients[0].share_ids.clone();
         client_share_ids.sort();
         assert_eq!(client_share_ids, vec!["share-new", "share-old"]);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn dashboard_snapshot_uses_client_tunnel_health_when_installation_has_no_shares() {
+        let (store, config) = setup_store("dashboard-client-tunnel-health").await;
+        insert_installation(&store, "inst-client").await;
+        insert_client_tunnel(&store, "inst-client", "owner@example.com", "client-sub").await;
+
+        let server_geo = ServerGeo {
+            lat: None,
+            lon: None,
+        };
+        let proxy = ProxyRegistry::default();
+        proxy
+            .set_route(
+                "client-sub".into(),
+                "http://127.0.0.1:15721".into(),
+                None,
+                None,
+                None,
+                false,
+                -1,
+                None,
+            )
+            .await;
+
+        let snapshot = store
+            .dashboard_snapshot(&config, &server_geo, &proxy, None)
+            .await
+            .expect("dashboard snapshot");
+
+        assert_eq!(snapshot.clients.len(), 1);
+        let client = &snapshot.clients[0];
+        assert_eq!(client.share_count, 0);
+        assert!(client.share_ids.is_empty());
+        assert!(
+            client
+                .client_tunnel
+                .as_ref()
+                .is_some_and(|tunnel| tunnel.online)
+        );
+        assert_eq!(client.online_minutes_24h, ONLINE_WINDOW_MINUTES);
+        assert_eq!(client.online_rate_24h, 100.0);
+        assert_eq!(client.health_checks.len(), 10);
+        assert!(client.health_checks.iter().all(|entry| entry.is_healthy));
+        assert!(
+            client
+                .health_timeline
+                .iter()
+                .any(|bucket| bucket.status == "healthy")
+        );
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
