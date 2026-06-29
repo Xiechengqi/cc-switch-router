@@ -569,6 +569,7 @@ export type ShareUpstreamProvider = {
     plan?: string;
     credentialMessage?: string;
     queriedAt?: number;
+    subscriptionPeriodEnd?: string;
     availability?: string;
     blockedUntil?: string;
     blockedReason?: string;

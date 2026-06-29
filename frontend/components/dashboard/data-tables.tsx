@@ -559,6 +559,14 @@ function quotaTierLabel(label?: string, locale: AppLocale = "en") {
   return label || "";
 }
 
+function quotaPlanLabel(runtime: ShareUpstreamProvider, plan?: string, subscriptionPeriodEnd?: string) {
+  const normalized = String(plan || "").trim();
+  if (!normalized) return "";
+  if (!isOllamaCloudRuntime(runtime)) return normalized;
+  const label = normalized.toLowerCase().includes("ollama") ? normalized : `ollama ${normalized}`;
+  return [label, countdownStr(subscriptionPeriodEnd)].filter(Boolean).join(" · ");
+}
+
 function formatQuotaAmount(value?: number, locale: AppLocale = "en") {
   if (typeof value !== "number" || !Number.isFinite(value)) return "";
   return new Intl.NumberFormat(locale, {
@@ -630,7 +638,7 @@ function quotaSummary(runtime?: ShareUpstreamProvider, locale: AppLocale = "en")
       return [usage, isOllamaCloud ? "" : utilization, countdownStr(tier.resetsAt)].filter(Boolean).join(" ");
     })
     .join(" · ");
-  return [quota.plan || quota.credentialMessage, tierText].filter(Boolean).join(" · ");
+  return [quotaPlanLabel(runtime, quota.plan || quota.credentialMessage, quota.subscriptionPeriodEnd), tierText].filter(Boolean).join(" · ");
 }
 
 function providerAccountLevel(runtime?: ShareUpstreamProvider, locale: AppLocale = "en") {

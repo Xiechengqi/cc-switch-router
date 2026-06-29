@@ -1312,6 +1312,8 @@ pub struct ShareUpstreamQuota {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queried_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_period_end: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub availability: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_until: Option<String>,
