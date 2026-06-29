@@ -189,6 +189,15 @@ export const ShareConnectDialog = React.memo(function ShareConnectDialog({
                     canExecute={authenticated && canViewSecret}
                   />
                 ))}
+                <ShareConnectionTestRow
+                  key="codex-chat"
+                  share={share}
+                  app="codex"
+                  kind="chat"
+                  apiToken={apiTokenPlain}
+                  baseUrl={baseUrl}
+                  canExecute={authenticated && canViewSecret}
+                />
                 {codexImageGenerationEnabled ? (
                   <ShareConnectionTestRow
                     key="codex-image"

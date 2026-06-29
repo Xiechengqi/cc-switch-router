@@ -915,7 +915,7 @@ export type BoardMeta = {
 // P18: test-connection types
 export type ShareConnectionTestRequest = {
   app: "claude" | "codex" | "gemini";
-  kind?: "text" | "image" | "tools";
+  kind?: "text" | "chat" | "image" | "tools";
   timeoutMs?: number;
 };
 

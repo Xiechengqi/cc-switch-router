@@ -10,7 +10,7 @@ import type { ShareConnectionTestResponse, ShareView } from "@/lib/types";
 
 type TFn = ReturnType<typeof useLocaleText>["t"];
 type TestApp = "claude" | "codex" | "gemini";
-type TestKind = "text" | "image" | "tools";
+type TestKind = "text" | "chat" | "image" | "tools";
 type AppProbe = {
   labelKey: MessageKey;
   method: "POST";
@@ -65,6 +65,16 @@ const APP_PROBE: Record<TestApp, Partial<Record<TestKind, AppProbe>>> = {
         model: "gpt-5.5",
         input: [{ role: "user", content: "who are you" }],
         max_output_tokens: 16,
+      }),
+    },
+    chat: {
+      labelKey: "dashboard.connectDialog.test.chatApiCall",
+      method: "POST",
+      path: "/v1/chat/completions",
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        messages: [{ role: "user", content: "who are you" }],
+        max_completion_tokens: 16,
       }),
     },
     image: {

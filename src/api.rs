@@ -3916,7 +3916,7 @@ async fn admin_metrics_clear(
 struct ShareConnectionTestRequest {
     /// "claude" | "codex" | "gemini"
     app: String,
-    /// "text" | "image"; image is only supported for codex shares.
+    /// "text" | "chat" | "image" | "tools"; image is only supported for codex shares.
     #[serde(default)]
     kind: Option<String>,
     /// 可选，毫秒；默认 15000，上限 30000
@@ -4055,6 +4055,11 @@ fn app_probe_for_kind(app: &str, kind: &str) -> Option<AppProbe> {
             // list"），不能是裸字符串。max_output_tokens=16 是允许 reasoning trace
             // 启动的最小值。
             body: r#"{"model":"gpt-5.5","input":[{"role":"user","content":"who are you"}],"max_output_tokens":16}"#,
+        }),
+        ("codex", "chat") => Some(AppProbe {
+            method: "POST",
+            path: "/v1/chat/completions",
+            body: r#"{"model":"gpt-5.5","messages":[{"role":"user","content":"who are you"}],"max_completion_tokens":16}"#,
         }),
         ("codex", "image") => Some(AppProbe {
             method: "POST",
