@@ -97,6 +97,10 @@ pub struct RegisterInstallationRequest {
     pub platform: String,
     pub app_version: String,
     pub instance_nonce: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -392,7 +396,7 @@ pub struct ClientTunnelView {
     pub last_seen_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IssueLeaseRequest {
     pub installation_id: String,

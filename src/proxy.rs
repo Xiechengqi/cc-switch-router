@@ -1138,10 +1138,6 @@ pub async fn proxy_handler(
         .unwrap_or(false)
         && path == "/_share-router/health";
     let is_share_model_health_check = truthy_header(&parts.headers, "x-share-router-health-check");
-    let is_legacy_share_router_ping =
-        matches!(method, axum::http::Method::GET | axum::http::Method::HEAD)
-            && truthy_header(&parts.headers, "x-share-router-ping-request");
-
     if !host_matches_tunnel_domain(&host, &state.config.tunnel_domain) {
         tracing::debug!(
             method = %method,
@@ -1193,11 +1189,6 @@ pub async fn proxy_handler(
         return simple_response(StatusCode::NOT_FOUND, "unregistered-subdomain");
     };
     let backend = route.backend.clone();
-    let log_share_id = route
-        .share_id
-        .as_deref()
-        .map(mask_token)
-        .unwrap_or_else(|| "-".to_string());
     let is_health_check_request = is_share_router_probe || is_share_model_health_check;
     let is_direct_share_web_request = route.is_share() && is_allowed_direct_share_web_path(&path);
     if route.is_client_web() && is_share_router_probe {
@@ -1212,22 +1203,6 @@ pub async fn proxy_handler(
             client_asn = %user_asn,
             user_agent = %user_agent,
             "proxy client web health probe completed"
-        );
-        return empty_response(StatusCode::NO_CONTENT);
-    }
-    if is_legacy_share_router_ping {
-        debug!(
-            method = %method,
-            host = %host,
-            path = %path_and_query,
-            backend = %backend,
-            status = %StatusCode::NO_CONTENT.as_u16(),
-            share_id = %log_share_id,
-            client_ip = %user_ip,
-            client_country = %user_country,
-            client_asn = %user_asn,
-            user_agent = %user_agent,
-            "proxy legacy health ping completed"
         );
         return empty_response(StatusCode::NO_CONTENT);
     }

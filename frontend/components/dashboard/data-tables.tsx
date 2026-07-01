@@ -553,18 +553,33 @@ function countdownStr(resetsAt?: string) {
   return `${minutes}m`;
 }
 
+function formatExpireDistance(expiresAt?: string) {
+  if (!expiresAt) return "";
+  const diffMs = new Date(expiresAt).getTime() - Date.now();
+  if (!Number.isFinite(diffMs)) return "";
+  if (diffMs <= 0) return "expired";
+  const minutes = Math.max(1, Math.floor(diffMs / (1000 * 60)));
+  if (minutes < 60) return `expire in ${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `expire in ${hours}h`;
+  return `expire in ${Math.floor(hours / 24)}d`;
+}
+
 function quotaTierLabel(label?: string, locale: AppLocale = "en") {
   const normalized = String(label || "").trim().toLowerCase();
+  if (normalized === "cursor credits" || normalized === "cursor included usage") return "Usage";
   if (normalized === "premium") return locale.startsWith("zh") ? "高级请求" : "Premium request";
   return label || "";
 }
 
 function quotaPlanLabel(runtime: ShareUpstreamProvider, plan?: string, subscriptionPeriodEnd?: string) {
   const normalized = String(plan || "").trim();
-  if (!normalized) return "";
-  if (!isOllamaCloudRuntime(runtime)) return normalized;
-  const label = normalized.toLowerCase().includes("ollama") ? normalized : `ollama ${normalized}`;
-  return [label, countdownStr(subscriptionPeriodEnd)].filter(Boolean).join(" · ");
+  const expires = formatExpireDistance(subscriptionPeriodEnd);
+  if (!normalized) return expires;
+  const label = isOllamaCloudRuntime(runtime) && !normalized.toLowerCase().includes("ollama")
+    ? `ollama ${normalized}`
+    : normalized;
+  return [label, expires].filter(Boolean).join(" · ");
 }
 
 function formatQuotaAmount(value?: number, locale: AppLocale = "en") {
@@ -573,6 +588,18 @@ function formatQuotaAmount(value?: number, locale: AppLocale = "en") {
     maximumFractionDigits: value % 1 === 0 ? 0 : 2,
     useGrouping: false,
   }).format(value);
+}
+
+function formatQuotaUsageAmount(
+  tier: { used?: number; limit?: number; unit?: string },
+  locale: AppLocale = "en",
+) {
+  const used = formatQuotaAmount(tier.used, locale);
+  const limit = formatQuotaAmount(tier.limit, locale);
+  if (!used || !limit) return "";
+  const unit = String(tier.unit || "").trim();
+  if (unit.toUpperCase() === "USD") return `$${used}/$${limit}`;
+  return [`${used}/${limit}`, unit].filter(Boolean).join(" ");
 }
 
 type OAuthRuntimeKey = "kiro" | "cursor" | "antigravity" | "copilot";
@@ -617,7 +644,6 @@ function quotaSummary(runtime?: ShareUpstreamProvider, locale: AppLocale = "en")
   const quota = runtime.quota;
   const status = String(quota?.status || "").toLowerCase();
   if (!quota || (status && !["ok", "success", "valid"].includes(status))) return "";
-  const isKiro = oauthRuntimeKeyFromProvider(runtime) === "kiro";
   const isOllamaCloud = isOllamaCloudRuntime(runtime);
   let tiers = (quota.tiers || [])
     .map((tier) => ({ ...tier, label: tier.label || tier.name }))
@@ -629,9 +655,13 @@ function quotaSummary(runtime?: ShareUpstreamProvider, locale: AppLocale = "en")
   }
   const tierText = tiers
     .map((tier) => {
-      const used = formatQuotaAmount(tier.used, locale);
-      const limit = formatQuotaAmount(tier.limit, locale);
-      const usage = isKiro && used && limit ? `${used}/${limit}` : quotaTierLabel(tier.label, locale);
+      const usageAmount = formatQuotaUsageAmount(tier, locale);
+      const usageLabel = quotaTierLabel(tier.label, locale);
+      const usage = usageAmount
+        ? usageLabel === "Usage"
+          ? `${usageLabel} ${usageAmount}`
+          : usageAmount
+        : usageLabel;
       const utilization = typeof tier.utilization === "number" && Number.isFinite(tier.utilization)
         ? `${Math.round(tier.utilization)}%`
         : "";

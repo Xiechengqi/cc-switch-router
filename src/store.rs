@@ -307,18 +307,33 @@ impl AppStore {
         if public_key.is_empty() {
             return Err(AppError::BadRequest("public_key is required".into()));
         }
+        validate_ed25519_public_key(public_key)?;
         let platform = input.platform.trim();
         if platform.is_empty() {
             return Err(AppError::BadRequest("platform is required".into()));
         }
+        validate_request_nonce(&input.instance_nonce)?;
         let now = Utc::now();
         let ip = metadata.ip.clone();
         let country_code = metadata.country_code.clone();
         let new_control_secret = Alphanumeric.sample_string(&mut rand::thread_rng(), 44);
         let conn = self.conn.lock().await;
+        consume_request_nonce(
+            &conn,
+            &registration_nonce_subject(public_key),
+            "register_installation",
+            &input.instance_nonce,
+            now,
+        )?;
         if let Some(existing_installation_id) =
             find_installation_id_by_public_key(&conn, public_key)?
         {
+            let return_control_secret = verify_registration_recovery_signature(
+                public_key,
+                &input,
+                &existing_installation_id,
+                now,
+            )?;
             conn.execute(
                 "UPDATE installations
                  SET public_key = ?2,
@@ -341,15 +356,18 @@ impl AppStore {
                 ],
             )
             .map_err(|e| AppError::Internal(format!("update installation failed: {e}")))?;
-            let control_secret: Option<String> = conn
-                .query_row(
+            let control_secret = if return_control_secret {
+                conn.query_row(
                     "SELECT control_secret_b64 FROM installations WHERE id = ?1",
                     params![existing_installation_id],
-                    |row| row.get(0),
+                    |row| row.get::<_, Option<String>>(0),
                 )
                 .optional()
                 .map_err(|e| AppError::Internal(format!("read control secret failed: {e}")))?
-                .flatten();
+                .flatten()
+            } else {
+                None
+            };
             drop(conn);
             self.refresh_installation_geo(&existing_installation_id, &ip, true)
                 .await?;
@@ -1951,26 +1969,6 @@ impl AppStore {
         _current_user_email: Option<&str>,
     ) -> Result<IssueLeaseResponse, AppError> {
         let now = Utc::now();
-        let skew = (now.timestamp_millis() - input.timestamp_ms).abs();
-        if skew > SIGNED_REQUEST_MAX_SKEW_MS {
-            return Err(AppError::Unauthorized("stale lease request".into()));
-        }
-
-        let installation = {
-            let conn = self.conn.lock().await;
-            let installation = get_installation(&conn, &input.installation_id)?
-                .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
-            let should_refresh_geo =
-                should_refresh_installation_geo(&installation, metadata.ip.as_deref());
-            touch_installation_presence(&conn, &input.installation_id, &metadata, now)?;
-            (installation, should_refresh_geo)
-        };
-        if installation.1 {
-            self.refresh_installation_geo(&input.installation_id, &metadata.ip, false)
-                .await?;
-        }
-        let installation = installation.0;
-
         let tunnel_type = input.tunnel_type.to_ascii_lowercase();
         let is_client_web_tunnel = tunnel_type == "client-web-http";
         if tunnel_type != "http" && !is_client_web_tunnel {
@@ -1986,6 +1984,22 @@ impl AppStore {
 
         let requested_subdomain = normalize_subdomain(&input.requested_subdomain)?;
         ensure_subdomain_allowed(&requested_subdomain, config)?;
+        let installation = {
+            let conn = self.conn.lock().await;
+            let installation = get_installation(&conn, &input.installation_id)?
+                .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
+            verify_issue_lease_request(&conn, &installation.public_key, &input, now)?;
+            let should_refresh_geo =
+                should_refresh_installation_geo(&installation, metadata.ip.as_deref());
+            touch_installation_presence(&conn, &input.installation_id, &metadata, now)?;
+            (installation, should_refresh_geo)
+        };
+        if installation.1 {
+            self.refresh_installation_geo(&input.installation_id, &metadata.ip, false)
+                .await?;
+        }
+        let installation = installation.0;
+
         let subdomain = if let Some(share) = input.share.as_ref() {
             let conn = self.conn.lock().await;
             ensure_subdomain_not_registered_market(&conn, &requested_subdomain)?;
@@ -2073,8 +2087,6 @@ impl AppStore {
                 }
             }
         }
-
-        verify_signature(&installation.public_key, &input)?;
 
         let normalized_share = if let Some(mut share) = input.share.clone() {
             {
@@ -12995,7 +13007,108 @@ fn map_client_tunnel_constraint_error(err: rusqlite::Error) -> AppError {
     }
 }
 
-fn verify_signature(public_key: &str, input: &IssueLeaseRequest) -> Result<(), AppError> {
+fn validate_request_nonce(nonce: &str) -> Result<(), AppError> {
+    if nonce.trim() != nonce
+        || nonce.len() < 8
+        || nonce.len() > 128
+        || !nonce
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+    {
+        return Err(AppError::BadRequest(
+            "nonce must be 8-128 ASCII letters, digits, hyphen, or underscore".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn registration_nonce_subject(public_key: &str) -> String {
+    let digest = Sha256::digest(public_key.trim().as_bytes());
+    format!(
+        "registration:{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+    )
+}
+
+fn verify_registration_recovery_signature(
+    public_key: &str,
+    input: &RegisterInstallationRequest,
+    installation_id: &str,
+    now: DateTime<Utc>,
+) -> Result<bool, AppError> {
+    let Some(timestamp_ms) = input.timestamp_ms else {
+        if input.signature.is_some() {
+            return Err(AppError::BadRequest(
+                "timestamp_ms is required when registration signature is provided".into(),
+            ));
+        }
+        return Ok(false);
+    };
+    let Some(signature) = input.signature.as_deref() else {
+        return Err(AppError::BadRequest(
+            "signature is required when registration timestamp_ms is provided".into(),
+        ));
+    };
+    let skew = (now.timestamp_millis() - timestamp_ms).abs();
+    if skew > SIGNED_REQUEST_MAX_SKEW_MS {
+        return Err(AppError::Unauthorized(
+            "stale registration recovery request".into(),
+        ));
+    }
+    let payload = format!(
+        "{}\nregister_installation\n{}\n{}\n{}\n{}\n{}",
+        installation_id,
+        input.public_key.trim(),
+        input.platform.trim(),
+        input.app_version,
+        input.instance_nonce,
+        timestamp_ms
+    );
+    verify_detached_signature(public_key, payload.as_bytes(), signature)?;
+    Ok(true)
+}
+
+fn verify_issue_lease_request(
+    conn: &Connection,
+    public_key: &str,
+    input: &IssueLeaseRequest,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let skew = (now.timestamp_millis() - input.timestamp_ms).abs();
+    if skew > SIGNED_REQUEST_MAX_SKEW_MS {
+        return Err(AppError::Unauthorized("stale lease request".into()));
+    }
+    verify_issue_lease_signature(public_key, input)?;
+    consume_request_nonce(
+        conn,
+        &input.installation_id,
+        "issue_lease",
+        &input.nonce,
+        now,
+    )
+}
+
+fn verify_issue_lease_signature(
+    public_key: &str,
+    input: &IssueLeaseRequest,
+) -> Result<(), AppError> {
+    validate_request_nonce(&input.nonce)?;
+    let payload = format!(
+        "{}\n{}\n{}\n{}\n{}",
+        input.installation_id,
+        input.requested_subdomain,
+        input.tunnel_type,
+        input.timestamp_ms,
+        input.nonce
+    );
+    verify_detached_signature(public_key, payload.as_bytes(), &input.signature)
+}
+
+fn verify_detached_signature(
+    public_key: &str,
+    payload: &[u8],
+    signature: &str,
+) -> Result<(), AppError> {
     let key_bytes = base64::engine::general_purpose::STANDARD
         .decode(public_key)
         .map_err(|_| AppError::Unauthorized("invalid stored public key".into()))?;
@@ -13006,23 +13119,15 @@ fn verify_signature(public_key: &str, input: &IssueLeaseRequest) -> Result<(), A
         .map_err(|_| AppError::Unauthorized("invalid public key".into()))?;
 
     let sig_bytes = base64::engine::general_purpose::STANDARD
-        .decode(&input.signature)
+        .decode(signature)
         .map_err(|_| AppError::Unauthorized("invalid signature".into()))?;
     let sig_array: [u8; 64] = sig_bytes
         .try_into()
         .map_err(|_| AppError::Unauthorized("invalid signature length".into()))?;
     let signature = Signature::from_bytes(&sig_array);
 
-    let payload = format!(
-        "{}\n{}\n{}\n{}\n{}",
-        input.installation_id,
-        input.requested_subdomain,
-        input.tunnel_type,
-        input.timestamp_ms,
-        input.nonce
-    );
     verifying_key
-        .verify(payload.as_bytes(), &signature)
+        .verify(payload, &signature)
         .map_err(|_| AppError::Unauthorized("signature verification failed".into()))
 }
 
@@ -13240,12 +13345,12 @@ fn validate_ed25519_public_key(public_key: &str) -> Result<(), AppError> {
 fn ed25519_verifying_key(public_key: &str) -> Result<VerifyingKey, AppError> {
     let key_bytes = base64::engine::general_purpose::STANDARD
         .decode(public_key)
-        .map_err(|_| AppError::BadRequest("invalid gateway public key".into()))?;
+        .map_err(|_| AppError::BadRequest("invalid public key".into()))?;
     let key_array: [u8; 32] = key_bytes
         .try_into()
-        .map_err(|_| AppError::BadRequest("invalid gateway public key length".into()))?;
+        .map_err(|_| AppError::BadRequest("invalid public key length".into()))?;
     VerifyingKey::from_bytes(&key_array)
-        .map_err(|_| AppError::BadRequest("invalid gateway public key".into()))
+        .map_err(|_| AppError::BadRequest("invalid public key".into()))
 }
 
 async fn redeem_verification_token(
@@ -16818,6 +16923,26 @@ mod tests {
         base64::engine::general_purpose::STANDARD.encode(signature.to_bytes())
     }
 
+    fn public_key_b64(signing_key: &SigningKey) -> String {
+        base64::engine::general_purpose::STANDARD.encode(signing_key.verifying_key().to_bytes())
+    }
+
+    fn sign_registration_recovery_request(
+        signing_key: &SigningKey,
+        installation_id: &str,
+        public_key: &str,
+        platform: &str,
+        app_version: &str,
+        instance_nonce: &str,
+        timestamp_ms: i64,
+    ) -> String {
+        let body = format!(
+            "{installation_id}\nregister_installation\n{public_key}\n{platform}\n{app_version}\n{instance_nonce}\n{timestamp_ms}"
+        );
+        let signature = signing_key.sign(body.as_bytes());
+        base64::engine::general_purpose::STANDARD.encode(signature.to_bytes())
+    }
+
     #[tokio::test]
     async fn list_share_route_targets_only_returns_active_shares() {
         let (store, config) = setup_store("route-targets").await;
@@ -16991,6 +17116,244 @@ mod tests {
             .expect("same share route should be renewable");
 
         assert_eq!(lease.subdomain, "aaa");
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn issue_lease_rejects_replayed_nonce_without_replacing_lease() {
+        let (store, config) = setup_store("issue-lease-replay-nonce").await;
+        let signing_key = insert_signed_installation(&store, "inst-replay").await;
+        insert_share(
+            &store,
+            "inst-replay",
+            "share-replay",
+            "replay-sub",
+            "active",
+        )
+        .await;
+        let proxy = ProxyRegistry::default();
+
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let request = IssueLeaseRequest {
+            installation_id: "inst-replay".into(),
+            requested_subdomain: "replay-sub".into(),
+            tunnel_type: "http".into(),
+            timestamp_ms,
+            nonce: nonce.clone(),
+            signature: sign_issue_lease_request(
+                &signing_key,
+                "inst-replay",
+                "replay-sub",
+                "http",
+                timestamp_ms,
+                &nonce,
+            ),
+            share: Some(test_share_descriptor("share-replay", "replay-sub")),
+        };
+
+        let first = store
+            .issue_lease(
+                &config,
+                &proxy,
+                request.clone(),
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                None,
+            )
+            .await
+            .expect("first lease should succeed");
+        let replay = store
+            .issue_lease(
+                &config,
+                &proxy,
+                request,
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                None,
+            )
+            .await
+            .expect_err("same nonce must be rejected");
+        assert!(replay.to_string().contains("nonce already used"));
+
+        let conn = store.conn.lock().await;
+        let lease_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM leases WHERE connection_id = ?1",
+                params![first.connection_id],
+                |row| row.get(0),
+            )
+            .expect("count first lease");
+        assert_eq!(lease_count, 1);
+        drop(conn);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn issue_lease_bad_signature_does_not_delete_existing_lease() {
+        let (store, config) = setup_store("issue-lease-bad-signature-preserves").await;
+        let signing_key = insert_signed_installation(&store, "inst-bad-sig").await;
+        insert_share(
+            &store,
+            "inst-bad-sig",
+            "share-bad-sig",
+            "bad-sig-sub",
+            "active",
+        )
+        .await;
+        let proxy = ProxyRegistry::default();
+
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let first = store
+            .issue_lease(
+                &config,
+                &proxy,
+                IssueLeaseRequest {
+                    installation_id: "inst-bad-sig".into(),
+                    requested_subdomain: "bad-sig-sub".into(),
+                    tunnel_type: "http".into(),
+                    timestamp_ms,
+                    nonce: nonce.clone(),
+                    signature: sign_issue_lease_request(
+                        &signing_key,
+                        "inst-bad-sig",
+                        "bad-sig-sub",
+                        "http",
+                        timestamp_ms,
+                        &nonce,
+                    ),
+                    share: Some(test_share_descriptor("share-bad-sig", "bad-sig-sub")),
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                None,
+            )
+            .await
+            .expect("first lease should succeed");
+
+        let bad = store
+            .issue_lease(
+                &config,
+                &proxy,
+                IssueLeaseRequest {
+                    installation_id: "inst-bad-sig".into(),
+                    requested_subdomain: "bad-sig-sub".into(),
+                    tunnel_type: "http".into(),
+                    timestamp_ms: Utc::now().timestamp_millis(),
+                    nonce: Uuid::new_v4().to_string(),
+                    signature: "not-a-valid-signature".into(),
+                    share: Some(test_share_descriptor("share-bad-sig", "bad-sig-sub")),
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                None,
+            )
+            .await
+            .expect_err("invalid signature must be rejected");
+        assert!(bad.to_string().contains("invalid signature"));
+
+        let conn = store.conn.lock().await;
+        let lease_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM leases WHERE connection_id = ?1",
+                params![first.connection_id],
+                |row| row.get(0),
+            )
+            .expect("count preserved lease");
+        assert_eq!(lease_count, 1);
+        drop(conn);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn register_installation_does_not_return_existing_control_secret_without_signature() {
+        let (store, config) = setup_store("register-existing-no-secret-leak").await;
+        let signing_key = insert_signed_installation(&store, "inst-existing-register").await;
+        let public_key = public_key_b64(&signing_key);
+
+        let response = store
+            .register_installation(
+                RegisterInstallationRequest {
+                    public_key,
+                    platform: "macOS".into(),
+                    app_version: "2.0.0".into(),
+                    instance_nonce: Uuid::new_v4().to_string(),
+                    timestamp_ms: None,
+                    signature: None,
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+            )
+            .await
+            .expect("existing register should refresh metadata");
+
+        assert_eq!(response.installation_id, "inst-existing-register");
+        assert!(response.control_secret.is_none());
+        let conn = store.conn.lock().await;
+        let stored_secret: Option<String> = conn
+            .query_row(
+                "SELECT control_secret_b64 FROM installations WHERE id = 'inst-existing-register'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read stored control secret");
+        assert!(stored_secret.is_some());
+        drop(conn);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn register_installation_signed_recovery_returns_existing_control_secret() {
+        let (store, config) = setup_store("register-existing-signed-recovery").await;
+        let signing_key = insert_signed_installation(&store, "inst-signed-register").await;
+        let public_key = public_key_b64(&signing_key);
+        let instance_nonce = Uuid::new_v4().to_string();
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let signature = sign_registration_recovery_request(
+            &signing_key,
+            "inst-signed-register",
+            &public_key,
+            "macOS",
+            "2.0.0",
+            &instance_nonce,
+            timestamp_ms,
+        );
+
+        let response = store
+            .register_installation(
+                RegisterInstallationRequest {
+                    public_key,
+                    platform: "macOS".into(),
+                    app_version: "2.0.0".into(),
+                    instance_nonce,
+                    timestamp_ms: Some(timestamp_ms),
+                    signature: Some(signature),
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+            )
+            .await
+            .expect("signed registration recovery should return control secret");
+
+        assert_eq!(response.installation_id, "inst-signed-register");
+        assert!(response.control_secret.is_some());
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
