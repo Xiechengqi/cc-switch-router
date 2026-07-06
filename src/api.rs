@@ -49,7 +49,7 @@ use crate::models::{
     MarketRequestLogBatchSyncRequest, MarketShareRuntimeStateReleaseRequest,
     MarketShareRuntimeStateReleaseResponse, MarketShareRuntimeStateSyncRequest,
     MarketShareRuntimeStateSyncResponse, MarketShareView, MarketsResponse, PostBoardMessageRequest,
-    PublicMapPointsResponse, RefreshSessionRequest, RegisterGatewayRequest,
+    PublicMapPointsResponse, PublicNetworkStatsResponse, RefreshSessionRequest, RegisterGatewayRequest,
     RegisterGatewayResponse, RegisterInstallationRequest, RegisterInstallationResponse,
     RegisterMarketRequest, RequestEmailCodeRequest, RequestEmailCodeResponse,
     SessionStatusResponse, ShareApiAuthResponse, ShareApiAuthUser, ShareApiContextResponse,
@@ -69,6 +69,14 @@ use crate::scheduling_signals::{
     ShareHeadroomRequest, ShareHeadroomResponse,
 };
 use crate::store::{BoardAuthor, ShareForTest, image_result_path};
+use tower_http::cors::{Any, CorsLayer};
+
+fn public_cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::OPTIONS])
+        .allow_headers(Any)
+}
 
 const REGIONS: &str = include_str!("../regions");
 const SHARE_EDIT_WAKE_RETRY_INTERVAL_SECS: u64 = 20;
@@ -117,7 +125,16 @@ struct ShareUsageByEmailQuery {
 
 pub fn router(state: ServerState) -> Router {
     let middleware_state = state.clone();
+    let public_api = Router::new()
+        .route("/v1/healthz", get(health))
+        .route("/v1/public/map-points", get(public_map_points))
+        .route("/v1/public/network-stats", get(public_network_stats))
+        .route("/v1/regions", get(regions))
+        .layer(public_cors_layer())
+        .with_state(state.clone());
+
     Router::new()
+        .merge(public_api)
         .route("/", any(root_handler))
         .route("/favicon.ico", get(favicon))
         .route("/v1/healthz", get(health))
@@ -182,7 +199,6 @@ pub fn router(state: ServerState) -> Router {
             get(list_market_notification_emails),
         )
         .route("/v1/markets/tunnel/lease", post(issue_market_lease))
-        .route("/v1/public/map-points", get(public_map_points))
         .route("/v1/regions", get(regions))
         .route("/v1/dashboard/presence", post(dashboard_presence))
         .route("/v1/installations/register", post(register_installation))
@@ -1471,6 +1487,12 @@ async fn public_map_points(
     Ok(Json(
         state.store.public_map_points(&state.server_geo).await?,
     ))
+}
+
+async fn public_network_stats(
+    State(state): State<ServerState>,
+) -> Result<Json<PublicNetworkStatsResponse>, AppError> {
+    Ok(Json(state.store.public_network_stats().await?))
 }
 
 async fn regions() -> Result<Json<Vec<RegionOption>>, AppError> {

@@ -931,6 +931,13 @@ pub struct PublicMapPointsResponse {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PublicNetworkStatsResponse {
+    pub active_shares: usize,
+    pub active_clients: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MarketsResponse {
     pub markets: Vec<PublicMarketConfig>,
 }

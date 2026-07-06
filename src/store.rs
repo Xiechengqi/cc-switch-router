@@ -39,7 +39,7 @@ use crate::models::{
     MarketMaintenanceUpdateResponse, MarketRegistryRecord, MarketRequestLogBatchSyncRequest,
     MarketRequestLogEntry, MarketShareAppView, MarketShareRuntimeStateInput,
     MarketShareRuntimeStateView, MarketShareView, ModelHealthSummary, PublicMapClientPoint,
-    PublicMapPointsResponse, PublicMarketConfig, RefreshSessionRequest, RegisterGatewayRequest,
+    PublicMapPointsResponse, PublicMarketConfig, PublicNetworkStatsResponse, RefreshSessionRequest, RegisterGatewayRequest,
     RegisterGatewayResponse, RegisterInstallationRequest, RegisterInstallationResponse,
     RegisterMarketRequest, RequestEmailCodeRequest, RequestEmailCodeResponse,
     SessionStatusResponse, ShareAppAccess, ShareAppProviders, ShareAppRuntimes, ShareAppSettings,
@@ -5576,6 +5576,34 @@ impl AppStore {
                 .map(|(lat, lon)| LatLonPoint { lat, lon }),
             client_count,
             clients,
+        })
+    }
+
+    pub async fn public_network_stats(&self) -> Result<PublicNetworkStatsResponse, AppError> {
+        let active_cutoff =
+            (Utc::now() - Duration::minutes(PUBLIC_MAP_CLIENT_ACTIVE_WINDOW_MINUTES)).to_rfc3339();
+        let conn = self.conn.lock().await;
+        let active_shares: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM shares WHERE share_status = 'active'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| AppError::Internal(format!("count active shares failed: {e}")))?;
+        let active_clients: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT i.id)
+                 FROM installations i
+                 INNER JOIN shares s ON s.installation_id = i.id
+                 WHERE i.last_seen_at >= ?1
+                   AND s.share_status = 'active'",
+                params![active_cutoff],
+                |row| row.get(0),
+            )
+            .map_err(|e| AppError::Internal(format!("count active clients failed: {e}")))?;
+        Ok(PublicNetworkStatsResponse {
+            active_shares: active_shares.max(0) as usize,
+            active_clients: active_clients.max(0) as usize,
         })
     }
 
