@@ -1237,13 +1237,13 @@ pub async fn proxy_handler(
         if is_client_web_auth_required_path(&path) {
             let owner_email = match state
                 .store
-                .client_tunnel_owner_email(&route.subdomain)
+                .resolve_client_tunnel_owner_email(
+                    &route.subdomain,
+                    route.installation_id().as_deref(),
+                )
                 .await
             {
-                Ok(Some(email)) => email,
-                Ok(None) => {
-                    return simple_response(StatusCode::NOT_FOUND, "client-tunnel-not-found");
-                }
+                Ok(owner_email) => owner_email,
                 Err(err) => {
                     warn!(
                         method = %method,
@@ -1259,41 +1259,57 @@ pub async fn proxy_handler(
                     );
                 }
             };
-            let required_scope = client_web_required_api_token_scope(&path);
-            let session = match resolve_client_web_bearer(
-                &state,
-                &parts.headers,
-                &owner_email,
-                required_scope,
-            )
-            .await
-            {
-                Ok(Some(session)) => session,
-                Ok(None) if client_web_bearer_token(&parts.headers).is_some() => {
-                    client_web_session = None;
-                    ("".to_string(), false)
+            if let Some(owner_email) = owner_email {
+                let required_scope = client_web_required_api_token_scope(&path);
+                let session = match resolve_client_web_bearer(
+                    &state,
+                    &parts.headers,
+                    &owner_email,
+                    required_scope,
+                )
+                .await
+                {
+                    Ok(Some(session)) => session,
+                    Ok(None) if client_web_bearer_token(&parts.headers).is_some() => {
+                        client_web_session = None;
+                        ("".to_string(), false)
+                    }
+                    Ok(None) => {
+                        return simple_response(StatusCode::UNAUTHORIZED, "login-required");
+                    }
+                    Err(err) => {
+                        warn!(
+                            method = %method,
+                            host = %host,
+                            path = %path_and_query,
+                            client_ip = %user_ip,
+                            client_country = %user_country,
+                            client_asn = %user_asn,
+                            user_agent = %user_agent,
+                            error = %err,
+                            "proxy request rejected: client web auth lookup failed"
+                        );
+                        return simple_response(StatusCode::UNAUTHORIZED, "login-required");
+                    }
+                };
+                if !session.0.is_empty() && session.0 != owner_email && !session.1 {
+                    return simple_response(StatusCode::FORBIDDEN, "client-web-forbidden");
                 }
-                Ok(None) => return simple_response(StatusCode::UNAUTHORIZED, "login-required"),
-                Err(err) => {
-                    warn!(
-                        method = %method,
-                        host = %host,
-                        path = %path_and_query,
-                        client_ip = %user_ip,
-                        client_country = %user_country,
-                        client_asn = %user_asn,
-                        user_agent = %user_agent,
-                        error = %err,
-                        "proxy request rejected: client web auth lookup failed"
-                    );
-                    return simple_response(StatusCode::UNAUTHORIZED, "login-required");
+                if !session.0.is_empty() {
+                    client_web_session = Some(session);
                 }
-            };
-            if !session.0.is_empty() && session.0 != owner_email && !session.1 {
-                return simple_response(StatusCode::FORBIDDEN, "client-web-forbidden");
-            }
-            if !session.0.is_empty() {
-                client_web_session = Some(session);
+            } else if client_web_bearer_token(&parts.headers).is_some() {
+                debug!(
+                    method = %method,
+                    host = %host,
+                    path = %path_and_query,
+                    subdomain = %route.subdomain,
+                    installation_id = route.installation_id().unwrap_or("-"),
+                    "proxy client web auth passthrough: tunnel owner metadata missing, forwarding bearer to cc-switch-server"
+                );
+                client_web_session = None;
+            } else {
+                return simple_response(StatusCode::UNAUTHORIZED, "login-required");
             }
         }
     }
@@ -2750,6 +2766,7 @@ fn is_allowed_client_web_path(path: &str) -> bool {
         || path == "/web-api/auth/password/refresh"
         || path == "/web-api/auth/password/logout"
         || path == "/web-api/auth/password/change"
+        || path == "/web-api/auth/initial-setup"
         || path == "/web-api/context"
         || path.starts_with("/web-api/invoke/"))
         && !path.starts_with("/_ctl/")
@@ -2794,6 +2811,19 @@ async fn resolve_client_web_bearer(
             return Ok(Some((email, is_admin)));
         }
         return Ok(Some((email, false)));
+    }
+    if required_api_token_scope == "share:write" {
+        if let Some(principal) = state
+            .store
+            .resolve_user_api_token(token, "share:read")
+            .await?
+        {
+            let email = principal.email;
+            let is_admin = state.dynamic.read().await.is_admin(&email);
+            if email.eq_ignore_ascii_case(owner_email) || is_admin {
+                return Ok(Some((email, is_admin)));
+            }
+        }
     }
     Ok(None)
 }
@@ -3173,6 +3203,15 @@ data: {"data":[{"b64_json":"iVBORw0KGgo="}]}
         assert!(is_allowed_client_web_path("/favicon.ico"));
         assert!(is_allowed_client_web_path("/favicon.png"));
         assert!(is_allowed_client_web_path("/assets/index-abc.js"));
+        assert!(is_allowed_client_web_path("/web-api/context"));
+        assert!(is_allowed_client_web_path("/web-api/auth/password/login"));
+        assert!(is_allowed_client_web_path("/web-api/auth/initial-setup"));
+        assert!(is_allowed_client_web_path("/web-api/invoke/get_providers"));
+        assert!(is_allowed_client_web_path(
+            "/web-api/invoke/get_proxy_takeover_status"
+        ));
+        assert!(!is_allowed_client_web_path("/api/providers"));
+        assert!(!is_allowed_client_web_path("/web-api/unknown"));
     }
 
     #[test]

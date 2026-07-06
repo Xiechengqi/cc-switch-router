@@ -1163,15 +1163,43 @@ impl AppStore {
         &self,
         subdomain: &str,
     ) -> Result<Option<String>, AppError> {
+        self.resolve_client_tunnel_owner_email(subdomain, None)
+            .await
+    }
+
+    pub async fn resolve_client_tunnel_owner_email(
+        &self,
+        subdomain: &str,
+        installation_id: Option<&str>,
+    ) -> Result<Option<String>, AppError> {
         let conn = self.conn.lock().await;
-        conn.query_row(
-            "SELECT owner_email FROM installation_client_tunnels
-             WHERE subdomain = ?1 AND enabled = 1",
-            params![subdomain],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|e| AppError::Internal(format!("query client tunnel owner failed: {e}")))
+        if let Some(email) = conn
+            .query_row(
+                "SELECT owner_email FROM installation_client_tunnels
+                 WHERE subdomain = ?1 AND enabled = 1",
+                params![subdomain],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| AppError::Internal(format!("query client tunnel owner failed: {e}")))?
+        {
+            return Ok(Some(email));
+        }
+
+        if let Some(installation_id) = installation_id {
+            if let Some(record) = get_client_tunnel_by_installation(&conn, installation_id)? {
+                if record.enabled {
+                    return Ok(Some(record.owner_email));
+                }
+            }
+            if let Some(installation) = get_installation(&conn, installation_id)? {
+                if let Some(email) = installation.owner_email {
+                    return Ok(Some(email));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     pub async fn resolve_session_by_access_token(
