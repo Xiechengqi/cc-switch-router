@@ -641,13 +641,13 @@ Environment:
   CC_SWITCH_ROUTER_RESEND_FROM           Sender email, default noreply@[TUNNEL_DOMAIN]
   CC_SWITCH_ROUTER_USE_LOCALHOST         Use http for localhost-style domains, default false
   CC_SWITCH_ROUTER_LEASE_TTL_SECS        Tunnel lease ttl, default 60
-  CC_SWITCH_ROUTER_DB_PATH               SQLite path, default $HOME/.config/cc-switch-router/cc-switch-router.db
+  CC_SWITCH_ROUTER_DB_PATH               SQLite path, default $HOME/.cc-switch-router/cc-switch-router.db
   CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS Cleanup interval, default 300
   CC_SWITCH_ROUTER_LEASE_RETENTION_SECS  Lease retention period, default 604800
   CC_SWITCH_ROUTER_CLIENT_STALE_SECS     Delete clients and shares after no report, default 3600
   CC_SWITCH_ROUTER_PAUSED_SHARE_STALE_SECS Delete paused shares after no update, default 3600
 Default env file:
-  $HOME/.config/cc-switch-router/.env
+  $HOME/.cc-switch-router/.env
   The file is auto-created on first start when missing.
 "
     );

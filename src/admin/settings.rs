@@ -594,9 +594,9 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         field_type: FieldType::Path,
         required: false,
         restart_required: true,
-        default: Some("/root/.config/cc-switch-router/cc-switch-router-metrics.db"),
+        default: None,
         description: "SQLite file used only for metrics history. This is separate from the business database.",
-        placeholder: Some("/root/.config/cc-switch-router/cc-switch-router-metrics.db"),
+        placeholder: Some("$HOME/.cc-switch-router/cc-switch-router-metrics.db"),
         dynamic_group: None,
     },
     SettingsField {
@@ -634,7 +634,29 @@ pub fn schema_response() -> SettingsSchemaResponse {
         }
     }
     SettingsSchemaResponse {
-        fields: SETTINGS_FIELDS.iter().map(field_to_view).collect(),
+        fields: SETTINGS_FIELDS
+            .iter()
+            .map(|field| {
+                let mut view = field_to_view(field);
+                match field.key {
+                    "CC_SWITCH_ROUTER_DB_PATH" => {
+                        let path = crate::config::default_db_path().display().to_string();
+                        view.placeholder = Some(path);
+                    }
+                    "CC_SWITCH_ROUTER_HOST_KEY_PATH" => {
+                        let path = crate::config::default_host_key_path().display().to_string();
+                        view.placeholder = Some(path);
+                    }
+                    "CC_SWITCH_ROUTER_METRICS_DB_PATH" => {
+                        let path = crate::config::default_metrics_db_path().display().to_string();
+                        view.default = Some(path.clone());
+                        view.placeholder = Some(path);
+                    }
+                    _ => {}
+                }
+                view
+            })
+            .collect(),
         groups,
     }
 }

@@ -56,7 +56,7 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 
 ### 环境变量
 
-默认配置文件路径：`$HOME/.config/cc-switch-router/.env`
+默认配置文件路径：`$HOME/.cc-switch-router/.env`
 
 启动时如果这个文件不存在，`cc-switch-router` 会自动生成默认 `.env`，然后按该文件加载配置。进程环境变量优先级更高，会覆盖 `.env` 里的同名配置。
 
@@ -70,7 +70,7 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_SSH_PUBLIC_ADDR` | `{TUNNEL_DOMAIN}:{SSH_PORT}` | 下发给客户端的 SSH 地址（Cloudflare 代理时填源站 IP:端口） |
 | `CC_SWITCH_ROUTER_USE_LOCALHOST` | `false` | 为 `false` 时 tunnel URL 使用 `https://` |
 | `CC_SWITCH_ROUTER_LEASE_TTL_SECS` | `60` | Tunnel lease 有效期（秒） |
-| `CC_SWITCH_ROUTER_DB_PATH` | `$HOME/.config/cc-switch-router/cc-switch-router.db` | SQLite 路径 |
+| `CC_SWITCH_ROUTER_DB_PATH` | `$HOME/.cc-switch-router/cc-switch-router.db` | SQLite 路径 |
 | `CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS` | `300` | 清理任务执行间隔（秒） |
 | `CC_SWITCH_ROUTER_LEASE_RETENTION_SECS` | `604800` | 过期 lease 保留时长（秒） |
 | `CC_SWITCH_ROUTER_CLIENT_STALE_SECS` | `3600` | client 超过该时间未上报时清理其 share、lease 和 client 记录 |
@@ -91,7 +91,7 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 最小生产示例：
 
 ```bash
-cat > "$HOME/.config/cc-switch-router/.env" <<'EOF'
+cat > "$HOME/.cc-switch-router/.env" <<'EOF'
 CC_SWITCH_ROUTER_API_ADDR=0.0.0.0:80
 CC_SWITCH_ROUTER_SSH_ADDR=0.0.0.0:2222
 CC_SWITCH_ROUTER_TUNNEL_DOMAIN=example.com
@@ -157,7 +157,7 @@ After=network.target
 Type=simple
 WorkingDirectory=/opt/cc-switch-router
 Environment=HOME=/root
-EnvironmentFile=%h/.config/cc-switch-router/.env
+EnvironmentFile=%h/.cc-switch-router/.env
 ExecStart=/opt/cc-switch-router/cc-switch-router
 Restart=always
 RestartSec=3

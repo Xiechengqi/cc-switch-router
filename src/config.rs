@@ -221,7 +221,27 @@ impl Config {
 }
 
 pub fn default_env_path() -> PathBuf {
-    path_in_home(APP_NAME, ".env").unwrap_or_else(|| PathBuf::from("./.env"))
+    path_in_home(".env").unwrap_or_else(|| PathBuf::from("./.env"))
+}
+
+/// Default data directory: `$HOME/.cc-switch-router` (or `./data` when `HOME` is unset).
+pub fn default_data_dir() -> PathBuf {
+    data_dir_in_home().unwrap_or_else(|| PathBuf::from("./data"))
+}
+
+pub fn default_db_path() -> PathBuf {
+    path_in_home(&format!("{APP_NAME}.db"))
+        .unwrap_or_else(|| PathBuf::from(format!("./data/{APP_NAME}.db")))
+}
+
+pub fn default_metrics_db_path() -> PathBuf {
+    path_in_home(&format!("{APP_NAME}-metrics.db"))
+        .unwrap_or_else(|| PathBuf::from(format!("./data/{APP_NAME}-metrics.db")))
+}
+
+pub fn default_host_key_path() -> PathBuf {
+    path_in_home("ssh_host_ed25519_key")
+        .unwrap_or_else(|| PathBuf::from("./data/ssh_host_ed25519_key"))
 }
 
 pub fn ensure_default_env_file() -> Result<PathBuf> {
@@ -267,21 +287,6 @@ pub fn load_env_file(path: &PathBuf) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn default_db_path() -> PathBuf {
-    path_in_home(APP_NAME, &format!("{APP_NAME}.db"))
-        .unwrap_or_else(|| PathBuf::from(format!("./data/{APP_NAME}.db")))
-}
-
-fn default_metrics_db_path() -> PathBuf {
-    path_in_home(APP_NAME, &format!("{APP_NAME}-metrics.db"))
-        .unwrap_or_else(|| PathBuf::from(format!("./data/{APP_NAME}-metrics.db")))
-}
-
-fn default_host_key_path() -> PathBuf {
-    path_in_home(APP_NAME, "ssh_host_ed25519_key")
-        .unwrap_or_else(|| PathBuf::from("./data/ssh_host_ed25519_key"))
 }
 
 fn default_env_contents() -> String {
@@ -389,10 +394,20 @@ fn derive_default_admin_email(tunnel_domain: &str) -> Option<String> {
     tunnel_domain_host(tunnel_domain).map(|host| format!("router@{host}"))
 }
 
-fn path_in_home(app_name: &str, leaf: &str) -> Option<PathBuf> {
+fn data_dir_in_home() -> Option<PathBuf> {
     env::var_os("HOME")
         .map(PathBuf::from)
-        .map(|home| home.join(".config").join(app_name).join(leaf))
+        .map(|home| home.join(format!(".{APP_NAME}")))
+}
+
+fn legacy_data_dir_in_home() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".config").join(APP_NAME))
+}
+
+fn path_in_home(leaf: &str) -> Option<PathBuf> {
+    data_dir_in_home().map(|dir| dir.join(leaf))
 }
 
 fn existing_env_path() -> Option<PathBuf> {
@@ -400,7 +415,9 @@ fn existing_env_path() -> Option<PathBuf> {
     if default_path.exists() {
         return Some(default_path);
     }
-    None
+    legacy_data_dir_in_home()
+        .map(|dir| dir.join(".env"))
+        .filter(|path| path.exists())
 }
 
 #[cfg(test)]
@@ -525,6 +542,16 @@ mod tests {
         unsafe {
             env::remove_var("CC_SWITCH_ROUTER_TUNNEL_DOMAIN");
             env::remove_var("CC_SWITCH_ROUTER_RESEND_FROM");
+        }
+    }
+
+    #[test]
+    fn default_data_dir_uses_home_dot_prefix() {
+        let dir = default_data_dir();
+        if let Some(home) = env::var_os("HOME") {
+            assert_eq!(dir, PathBuf::from(home).join(".cc-switch-router"));
+        } else {
+            assert_eq!(dir, PathBuf::from("./data"));
         }
     }
 
