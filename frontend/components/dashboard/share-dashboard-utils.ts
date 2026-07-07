@@ -1,0 +1,697 @@
+"use client";
+
+import * as React from "react";
+import { useLocaleText } from "@/components/i18n/locale-provider";
+import type { AppLocale } from "@/lib/i18n";
+import type { DashboardClient, DashboardMarket, HealthCheckEntry, MarketRequestLog, ModelHealthSummary, ShareAppProvider, ShareAppRuntimes, ShareRequestLog, ShareUpstreamProvider, ShareView } from "@/lib/types";
+import { formatDateTime } from "@/lib/utils";
+
+export function shouldOpenRowDrawer(event: React.MouseEvent<HTMLElement>) {
+  const selection = window.getSelection();
+  if (selection && !selection.isCollapsed && selection.toString().trim()) {
+    return false;
+  }
+
+  const target = event.target as HTMLElement | null;
+  if (target?.closest("a,button,input,textarea,select,[role='button'],[data-no-row-drawer]")) {
+    return false;
+  }
+
+  return true;
+}
+
+export const UNLIMITED_TOKEN_LIMIT = -1;
+export const UNLIMITED_PARALLEL_LIMIT = -1;
+export const MIN_PARALLEL_LIMIT = 3;
+export const DEFAULT_PARALLEL_LIMIT = 3;
+export const DEFAULT_TOKEN_LIMIT = 100000;
+export const PERMANENT_EXPIRES_AT_ISO = "2099-12-31T23:59:59Z";
+export const CORE_SHARE_APPS = [
+  ["claude", "Claude"],
+  ["codex", "Codex"],
+  ["gemini", "Gemini"],
+] as const;
+
+export function isUnlimitedTokenLimit(value?: number | null) {
+  return value === UNLIMITED_TOKEN_LIMIT;
+}
+
+export function isUnlimitedParallelLimit(value?: number | null) {
+  return value === UNLIMITED_PARALLEL_LIMIT;
+}
+
+export function isPermanentExpiryDate(value?: string | null) {
+  if (!value) return false;
+  const date = new Date(value);
+  return !Number.isNaN(date.getTime()) && date.getUTCFullYear() >= 2099;
+}
+
+export function isUnlimited(value?: number) {
+  return Number(value) < 0;
+}
+
+export function isUnlimitedExpiry(value?: string) {
+  if (!value) return false;
+  const expiresAt = new Date(value).getTime();
+  if (Number.isNaN(expiresAt)) return false;
+  const fiftyYearsMs = 50 * 365 * 24 * 60 * 60 * 1000;
+  return expiresAt - Date.now() >= fiftyYearsMs;
+}
+
+export function expiryTitle(value?: string) {
+  return isUnlimitedExpiry(value) ? "∞" : formatDateTime(value);
+}
+
+export function formatDurationShort(value?: string, locale: AppLocale = "en", mode: "elapsed" | "remaining" = "elapsed") {
+  if (!value) return "--";
+  const ts = new Date(value).getTime();
+  if (!Number.isFinite(ts)) return "--";
+  const diff = mode === "remaining" ? ts - Date.now() : Date.now() - ts;
+  const isZh = locale.startsWith("zh");
+  if (mode === "remaining" && diff < 0) return isZh ? "已过期" : "expired";
+  const abs = Math.max(0, Math.abs(diff));
+  const units: Array<[string, string, number]> = [
+    ["年", "y", 365 * 24 * 60 * 60 * 1000],
+    ["天", "d", 24 * 60 * 60 * 1000],
+    ["小时", "h", 60 * 60 * 1000],
+    ["分钟", "m", 60 * 1000],
+    ["秒", "s", 1000],
+  ];
+  const [zhUnit, enUnit, ms] = units.find(([, , unitMs]) => abs >= unitMs) || units[units.length - 1];
+  const valueCount = Math.max(0, Math.floor(abs / ms));
+  return isZh ? `${valueCount}${zhUnit}` : `${valueCount}${enUnit}`;
+}
+
+export function shareExpiryProgress(share: ShareView, locale: AppLocale) {
+  const age = formatDurationShort(share.createdAt, locale, "elapsed");
+  const expiry = isUnlimitedExpiry(share.expiresAt) ? "∞" : formatDurationShort(share.expiresAt, locale, "remaining");
+  return `${age}/${expiry}`;
+}
+
+export function averageRecentLatencyMs(logs?: ShareRequestLog[], limit = 10) {
+  const samples = [...(logs || [])]
+    .sort((left, right) => Number(right.createdAt || 0) - Number(left.createdAt || 0))
+    .slice(0, limit)
+    .map((log) => Number(log.latencyMs || 0))
+    .filter((latency) => Number.isFinite(latency) && latency > 0);
+  if (!samples.length) return null;
+  return samples.reduce((sum, latency) => sum + latency, 0) / samples.length;
+}
+
+export function formatLatencySeconds(latencyMs: number | null) {
+  if (latencyMs == null || !Number.isFinite(latencyMs) || latencyMs <= 0) return "-";
+  const seconds = latencyMs / 1000;
+  return `${seconds < 1 ? seconds.toFixed(2) : seconds.toFixed(1)}s`;
+}
+
+export function formatImageLogTimestamp(value?: number | null) {
+  if (!value) return "-";
+  const date = new Date(value * 1000);
+  if (!Number.isFinite(date.getTime())) return "-";
+  const pad = (next: number) => String(next).padStart(2, "0");
+  return `${pad(date.getMonth() + 1)}${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+export function formatImageLogSpendSeconds(latencyMs?: number | null) {
+  if (latencyMs == null || !Number.isFinite(latencyMs) || latencyMs <= 0) return "-";
+  const seconds = latencyMs / 1000;
+  return `${seconds < 10 ? seconds.toFixed(2) : seconds < 100 ? seconds.toFixed(1) : Math.round(seconds)}s`;
+}
+
+export function formatImageLogSizeMb(bytes?: number | null) {
+  if (bytes == null || !Number.isFinite(bytes) || bytes <= 0) return "-";
+  return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+}
+
+export function expirySortValue(share?: ShareView) {
+  if (!share?.expiresAt) return 0;
+  if (isUnlimitedExpiry(share.expiresAt)) return Number.POSITIVE_INFINITY;
+  const value = new Date(share.expiresAt).getTime();
+  return Number.isFinite(value) ? value : 0;
+}
+
+export function shareApiUrlKey(share?: ShareView) {
+  return share?.subdomain || share?.shareName || "";
+}
+
+export function shareApiParts(share?: ShareView) {
+  if (!share) return { apiUrl: "-" };
+  const baseHost = typeof window === "undefined" ? "" : window.location.host || "";
+  const apiUrl = share.subdomain && baseHost ? `${share.subdomain}.${baseHost}` : share.subdomain || baseHost || "-";
+  return { apiUrl };
+}
+
+export function clientTunnelDisplayUrl(value?: string | null) {
+  const trimmed = String(value || "").trim();
+  if (!trimmed) return "";
+  if (/^http:\/\//i.test(trimmed)) return `https://${trimmed.slice("http://".length)}`;
+  if (/^https:\/\//i.test(trimmed)) return trimmed;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) return trimmed;
+  return `https://${trimmed}`;
+}
+
+export function formatUsdOneDecimal(value?: string | number) {
+  const amount = Number(value || 0);
+  return Number.isFinite(amount) ? `$${amount.toFixed(1)}` : "$0.0";
+}
+
+export function formatUsdExactTrimmed(value?: string | number) {
+  if (value == null || value === "") return "";
+  const raw = String(value).trim();
+  const amount = Number(raw);
+  if (!Number.isFinite(amount)) return "";
+  if (amount === 0) return "$0";
+  const unsigned = raw.replace(/^\+/, "");
+  const normalized = unsigned.includes("e") || unsigned.includes("E")
+    ? amount.toFixed(12)
+    : unsigned;
+  return `$${normalized.replace(/(\.\d*?[1-9])0+$/, "$1").replace(/\.0+$/, "")}`;
+}
+
+export function tokenCount(value?: string | number | null) {
+  const count = Number(value || 0);
+  return Number.isFinite(count) && count > 0 ? count : 0;
+}
+
+export function usageBucketTotalTokens(log?: Partial<ShareRequestLog | MarketRequestLog>) {
+  return tokenCount(log?.inputTokens) + tokenCount(log?.outputTokens) + tokenCount(log?.cacheReadTokens) + tokenCount(log?.cacheCreationTokens);
+}
+
+export function cacheHitRate(log?: Partial<ShareRequestLog | MarketRequestLog>) {
+  const input = tokenCount(log?.inputTokens);
+  const cacheRead = tokenCount(log?.cacheReadTokens);
+  const denominator = input + cacheRead;
+  return denominator > 0 ? cacheRead / denominator : 0;
+}
+
+export function formatPercent(value: number) {
+  const percent = Math.max(0, Math.min(1, Number(value) || 0)) * 100;
+  return `${percent.toFixed(percent >= 10 ? 0 : 1).replace(/\.0$/, "")}%`;
+}
+
+export function formatOfficialPriceMultiplier(value: string | number | null | undefined, label: string, t: TFn) {
+  if (typeof value === "string" && value.trim().toLowerCase() === "mixed") {
+    return `${t("dashboard.mixed")} x ${label}`;
+  }
+  const percent = Number(value);
+  if (!Number.isFinite(percent) || percent <= 0) return `- x ${label}`;
+  const multiplier = percent / 100;
+  const text = multiplier >= 1
+    ? multiplier.toFixed(2)
+    : multiplier.toFixed(3);
+  return `${text.replace(/(\.\d*?[1-9])0+$/, "$1").replace(/\.0+$/, "")} x ${label}`;
+}
+
+export function requestModelRoute(log?: Partial<ShareRequestLog | MarketRequestLog>) {
+  const record = (log || {}) as Partial<ShareRequestLog & MarketRequestLog>;
+  const agent = record.requestAgent || "";
+  const requested = record.requestedModel || record.requestModel || "";
+  const actual = record.actualModel || record.model || "";
+  return [agent, requested && actual && requested !== actual ? `${requested} -> ${actual}` : actual || requested].filter(Boolean).join(" · ") || "-";
+}
+
+export function formatShareStatus(value?: string) {
+  return value ? String(value).replaceAll("_", " ") : "-";
+}
+
+export function formatPlatformVersion(platform?: string, version?: string) {
+  const platformLabel = (platform || "-").toLowerCase();
+  const versionLabel = version ? String(version).replace(/^v/i, "") : "-";
+  const commitMatch = versionLabel.match(/^commit\s+([0-9a-f]{7,40})$/i);
+  if (commitMatch) {
+    return `${platformLabel}/${commitMatch[1].slice(0, 7)}`;
+  }
+  return `${platformLabel}/${versionLabel}`;
+}
+
+export function clientPlatformLabel(client: DashboardClient) {
+  return formatPlatformVersion(client.installation.platform, client.installation.appVersion);
+}
+
+export function sortClients(clients: DashboardClient[]) {
+  // 按注册时间升序（先注册的在前）。lastSeenAt / shareCount 都是高频变化字段，
+  // 用作排序键会让行频繁上下跳动，体验很差。createdAt 一旦写入就稳定。
+  return [...clients].sort((left, right) => {
+    return (
+      (Date.parse(left.installation.createdAt) || 0) -
+        (Date.parse(right.installation.createdAt) || 0) ||
+      left.installation.id.localeCompare(right.installation.id, undefined, { sensitivity: "base" })
+    );
+  });
+}
+
+export function sortMarkets(markets: DashboardMarket[]) {
+  // 同上：按注册时间升序，避免 online 抖动改变行序。
+  return [...markets].sort(
+    (a, b) =>
+      (Date.parse(a.createdAt) || 0) - (Date.parse(b.createdAt) || 0) ||
+      (a.publicBaseUrl || a.email || a.id).localeCompare(b.publicBaseUrl || b.email || b.id),
+  );
+}
+
+export function isShareMarket(market: DashboardMarket) {
+  return market.marketKind === "share";
+}
+
+export function isUsageMarket(market: DashboardMarket) {
+  return !isShareMarket(market);
+}
+
+export function marketKindLabel(market: DashboardMarket, t: TFn) {
+  return isShareMarket(market) ? t("dashboard.shareMarket") : t("dashboard.tokenMarket");
+}
+
+export function marketKindDescription(market: DashboardMarket, t: TFn) {
+  return isShareMarket(market)
+    ? t("dashboard.shareMarketTooltip")
+    : t("dashboard.tokenMarketTooltip");
+}
+
+export function canShowMarketSharePriority(market: DashboardMarket) {
+  return isUsageMarket(market);
+}
+
+export function marketLabel(market: Pick<DashboardMarket, "publicBaseUrl" | "email" | "subdomain">) {
+  return market.publicBaseUrl || market.email || market.subdomain;
+}
+
+export type TFn = ReturnType<typeof useLocaleText>["t"];
+export const drawerDialogClassName =
+  "router-drawer-light light !w-[min(760px,calc(100vw-16px))] !max-w-[calc(100vw-16px)] !bg-white !text-slate-900 " +
+  "[--foreground:rgb(var(--router-foreground))] [--muted:rgb(var(--router-muted-foreground))] [--overlay:#fff] [--overlay-foreground:rgb(var(--router-foreground))] " +
+  "[--surface:#fff] [--surface-foreground:rgb(var(--router-foreground))] [--surface-secondary:rgb(var(--router-muted))] [--surface-secondary-foreground:rgb(var(--router-foreground))] " +
+  "[--default:rgb(var(--router-muted))] [--default-foreground:rgb(var(--router-foreground))]";
+
+export function HealthDots({ entries = [] }: { entries?: HealthCheckEntry[] }) {
+  const dots = entries.slice(-10);
+  if (!dots.length) {
+    return React.createElement(
+      "span",
+      { className: "inline-flex gap-1" },
+      Array.from({ length: 10 }).map((_, index) => React.createElement("i", { key: index, className: "h-2 w-2 rounded-full bg-slate-300" })),
+    );
+  }
+  return React.createElement(
+    "span",
+    { className: "inline-flex gap-1" },
+    dots.map((entry, index) =>
+      React.createElement("i", {
+        key: `${entry.checkedAt}-${index}`,
+        className: entry.isHealthy ? "h-2 w-2 rounded-full bg-emerald-500" : "h-2 w-2 rounded-full bg-red-500",
+        title: formatDateTime(entry.checkedAt * 1000),
+      }),
+    ),
+  );
+}
+
+export function upstreamPercent(apps?: ShareAppRuntimes, key?: keyof ShareAppRuntimes) {
+  const value = key ? apps?.[key]?.forSaleOfficialPricePercent : undefined;
+  return Number.isInteger(value) && Number(value) > 0 ? `${value}%` : "-";
+}
+
+export function configuredUpstreamPercent(apps?: ShareAppRuntimes, key?: keyof ShareAppRuntimes) {
+  const value = key ? apps?.[key]?.forSaleOfficialPricePercent : undefined;
+  return Number.isInteger(value) && Number(value) > 0 ? `${value}%` : null;
+}
+
+export function isOfficialMarker(value?: string) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return normalized === "official" || normalized === "offical";
+}
+
+export function runtimeApiUrl(runtime?: ShareUpstreamProvider) {
+  return runtime?.apiUrl || "";
+}
+
+export function hasConcreteApiUrl(runtime?: ShareUpstreamProvider) {
+  const apiUrl = runtimeApiUrl(runtime);
+  return Boolean(apiUrl && !isOfficialMarker(apiUrl));
+}
+
+export function runtimeLooksOAuth(runtime?: ShareUpstreamProvider) {
+  const text = [
+    runtime?.app,
+    runtime?.kind,
+    runtime?.providerName,
+    runtime?.providerType,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  return text.includes("oauth") || text.includes("ollama_cloud") || Boolean(oauthRuntimeKeyFromProvider(runtime));
+}
+
+export function isOllamaCloudRuntime(runtime?: ShareUpstreamProvider) {
+  const text = [
+    runtime?.providerType,
+    runtime?.providerName,
+    runtime?.kind,
+    runtime?.app,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  return text.includes("ollama_cloud") || text.includes("ollama cloud") || text.includes("ollama");
+}
+
+export function isOfficialRuntime(runtime?: ShareUpstreamProvider) {
+  if (!runtime) return false;
+  const kind = String(runtime.kind || "").toLowerCase();
+  const apiUrl = runtimeApiUrl(runtime);
+  const models = Array.isArray(runtime.models) ? runtime.models : [];
+  const modelsMarkedOfficial = models.length > 0 && models.every((item) => isOfficialMarker(item.actualModel));
+  return (kind === "official_oauth" || isOfficialMarker(kind) || isOfficialMarker(apiUrl) || modelsMarkedOfficial) && !hasConcreteApiUrl(runtime);
+}
+
+export function runtimeModelSummary(runtime?: ShareUpstreamProvider) {
+  const models = Array.isArray(runtime?.models) ? runtime.models : [];
+  return models
+    .map((item) => `${item.slot || "model"}:${item.actualModel || ""}`)
+    .filter((value) => !value.endsWith(":"))
+    .join(" · ");
+}
+
+export function modelHealthKey(value?: string) {
+  return String(value || "").trim().toLowerCase();
+}
+
+export function runtimeModelKeys(runtime?: ShareUpstreamProvider) {
+  const models = Array.isArray(runtime?.models) ? runtime.models : [];
+  return new Set(models.map((item) => modelHealthKey(item.actualModel)).filter(Boolean));
+}
+
+export function relevantModelHealthEntries(share: ShareView, key: "claude" | "codex" | "gemini") {
+  const entries = share.modelHealth?.[key] || [];
+  const currentModels = runtimeModelKeys(share.appRuntimes?.[key]);
+  if (currentModels.size === 0) return entries;
+  return entries.filter((entry) => isAppLevelQuotaBlockedModelHealth(entry, key) || currentModels.has(modelHealthKey(entry.requestedModel)) || currentModels.has(modelHealthKey(entry.actualModel)));
+}
+
+export function modelHealthFailureReason(entries: ModelHealthSummary[]) {
+  const failed = entries
+    .filter((entry) => entry.status === "failed" || (entry.recentResults || []).includes("failed"))
+    .sort((left, right) => Number(right.lastCheckedAt || 0) - Number(left.lastCheckedAt || 0))[0];
+  const code = Number(failed?.statusCode || 0);
+  const message = String(failed?.errorMessage || "").toLowerCase();
+  if (code === 429 || message.includes("429") || message.includes("rate limit") || message.includes("rate limited") || message.includes("usage limit")) return "Rate Limited";
+  if (code === 401 || message.includes("auth rejected (401)") || message.includes("token_invalidated") || message.includes("token invalidated") || message.includes("invalidated")) return "Banned";
+  if (code === 403 || message.includes("403") || message.includes("forbidden")) return "Forbidden";
+  if (code === 402 || message.includes("insufficient") || message.includes("quota")) return "No Credits";
+  if (message.includes("timeout") || message.includes("timed out")) return "Timeout";
+  if (message.includes("oauth") || message.includes("refresh token")) return "Auth Failed";
+  if (code >= 500 || message.includes("server error")) return "Provider Error";
+  return "Failed";
+}
+
+export function isQuotaBlockedModelHealth(entry: ModelHealthSummary) {
+  const message = String(entry.errorMessage || "").toLowerCase();
+  return entry.status === "quota_blocked"
+    || message.includes("quota exhausted")
+    || message.includes("quota_exhausted")
+    || message.includes("usage limit")
+    || message.includes("usage_limit")
+    || message.includes("weekly limit")
+    || message.includes("monthly limit");
+}
+
+export function isAppLevelQuotaBlockedModelHealth(entry: ModelHealthSummary, key: "claude" | "codex" | "gemini") {
+  return modelHealthKey(entry.requestedModel) === key
+    && modelHealthKey(entry.actualModel) === key
+    && isQuotaBlockedModelHealth(entry);
+}
+
+export function runtimeEndpointSummary(runtime?: ShareUpstreamProvider) {
+  if (!runtime) return "";
+  const apiUrl = runtimeApiUrl(runtime);
+  return apiUrl && !isOfficialMarker(apiUrl) ? apiUrl : "";
+}
+
+export function countdownStr(resetsAt?: string) {
+  if (!resetsAt) return "";
+  const diffMs = new Date(resetsAt).getTime() - Date.now();
+  if (!Number.isFinite(diffMs) || diffMs <= 0) return "";
+  const hours = Math.floor(diffMs / (1000 * 60 * 60));
+  const minutes = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+  if (hours > 24) {
+    const days = Math.floor(hours / 24);
+    return `${days}d${hours % 24}h`;
+  }
+  if (hours > 0) return `${hours}h${minutes}m`;
+  return `${minutes}m`;
+}
+
+export function formatExpireDistance(expiresAt?: string) {
+  if (!expiresAt) return "";
+  const diffMs = new Date(expiresAt).getTime() - Date.now();
+  if (!Number.isFinite(diffMs)) return "";
+  if (diffMs <= 0) return "expired";
+  const minutes = Math.max(1, Math.floor(diffMs / (1000 * 60)));
+  if (minutes < 60) return `expire in ${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `expire in ${hours}h`;
+  return `expire in ${Math.floor(hours / 24)}d`;
+}
+
+export function quotaTierLabel(label?: string, locale: AppLocale = "en") {
+  const normalized = String(label || "").trim().toLowerCase();
+  if (normalized === "cursor credits" || normalized === "cursor included usage") return "Usage";
+  if (normalized === "premium") return locale.startsWith("zh") ? "高级请求" : "Premium request";
+  return label || "";
+}
+
+export function quotaPlanLabel(runtime: ShareUpstreamProvider, plan?: string, subscriptionPeriodEnd?: string) {
+  const normalized = String(plan || "").trim();
+  const expires = formatExpireDistance(subscriptionPeriodEnd);
+  if (!normalized) return expires;
+  const label = isOllamaCloudRuntime(runtime) && !normalized.toLowerCase().includes("ollama")
+    ? `ollama ${normalized}`
+    : normalized;
+  return [label, expires].filter(Boolean).join(" · ");
+}
+
+export function formatQuotaAmount(value?: number, locale: AppLocale = "en") {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "";
+  return new Intl.NumberFormat(locale, {
+    maximumFractionDigits: value % 1 === 0 ? 0 : 2,
+    useGrouping: false,
+  }).format(value);
+}
+
+export function formatQuotaUsageAmount(
+  tier: { used?: number; limit?: number; unit?: string },
+  locale: AppLocale = "en",
+) {
+  const used = formatQuotaAmount(tier.used, locale);
+  const limit = formatQuotaAmount(tier.limit, locale);
+  if (!used || !limit) return "";
+  const unit = String(tier.unit || "").trim();
+  if (unit.toUpperCase() === "USD") return `$${used}/$${limit}`;
+  return [`${used}/${limit}`, unit].filter(Boolean).join(" ");
+}
+
+type OAuthRuntimeKey = "kiro" | "cursor" | "antigravity" | "copilot";
+
+export function oauthRuntimeKeyFromProvider(value?: Partial<ShareUpstreamProvider & ShareAppProvider>): OAuthRuntimeKey | undefined {
+  const text = [
+    value?.app,
+    value?.kind,
+    value?.providerName,
+    value?.providerType,
+    value?.name,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  if (text.includes("kiro")) return "kiro";
+  if (text.includes("cursor")) return "cursor";
+  if (text.includes("antigravity")) return "antigravity";
+  if (text.includes("copilot") || text.includes("github_copilot")) return "copilot";
+  return undefined;
+}
+
+export function mergeStandaloneOAuthRuntime(
+  runtime?: ShareUpstreamProvider,
+  appRuntimes?: ShareAppRuntimes,
+  provider?: Partial<ShareUpstreamProvider & ShareAppProvider>,
+) {
+  const key = oauthRuntimeKeyFromProvider(provider || runtime);
+  const standalone = key ? appRuntimes?.[key] : undefined;
+  if (!runtime) return standalone;
+  if (!standalone) return runtime;
+  return {
+    ...runtime,
+    accountEmail: runtime.accountEmail || standalone.accountEmail,
+    quota: runtime.quota || standalone.quota,
+    models: runtime.models?.length ? runtime.models : standalone.models,
+  };
+}
+
+export function quotaSummary(runtime?: ShareUpstreamProvider, locale: AppLocale = "en") {
+  if (!runtime || (hasConcreteApiUrl(runtime) && !runtimeLooksOAuth(runtime))) return "";
+  const quota = runtime.quota;
+  const status = String(quota?.status || "").toLowerCase();
+  if (!quota || (status && !["ok", "success", "valid"].includes(status))) return "";
+  const isOllamaCloud = isOllamaCloudRuntime(runtime);
+  let tiers = (quota.tiers || [])
+    .map((tier) => ({ ...tier, label: tier.label || tier.name }))
+    .filter((tier) => tier.label);
+  if (runtime.app === "claude") {
+    const preferredLabels = new Set(["5h", "1w"]);
+    const preferredTiers = tiers.filter((tier) => preferredLabels.has(String(tier.label).toLowerCase()));
+    if (preferredTiers.length) tiers = preferredTiers;
+  }
+  const tierText = tiers
+    .map((tier) => {
+      const usageAmount = formatQuotaUsageAmount(tier, locale);
+      const usageLabel = quotaTierLabel(tier.label, locale);
+      const usage = usageAmount
+        ? usageLabel === "Usage"
+          ? `${usageLabel} ${usageAmount}`
+          : usageAmount
+        : usageLabel;
+      const utilization = typeof tier.utilization === "number" && Number.isFinite(tier.utilization)
+        ? `${Math.round(tier.utilization)}%`
+        : "";
+      return [usage, isOllamaCloud ? "" : utilization, countdownStr(tier.resetsAt)].filter(Boolean).join(" ");
+    })
+    .join(" · ");
+  return [quotaPlanLabel(runtime, quota.plan || quota.credentialMessage, quota.subscriptionPeriodEnd), tierText].filter(Boolean).join(" · ");
+}
+
+export function providerAccountLevel(runtime?: ShareUpstreamProvider, locale: AppLocale = "en") {
+  return quotaSummary(runtime, locale) || runtime?.providerName || runtime?.kind || "-";
+}
+
+export function providerAccountIdentity(runtime?: ShareUpstreamProvider) {
+  const account = String(runtime?.accountEmail || "").trim();
+  if (!account || account.startsWith("cursor_apikey_")) return "-";
+  return account;
+}
+
+export function providerModelMap(runtime?: ShareUpstreamProvider) {
+  return runtimeModelSummary(runtime) || "-";
+}
+
+export function modelHealthTone(share: ShareView, key: "claude" | "codex" | "gemini") {
+  const entries = relevantModelHealthEntries(share, key);
+  if (entries.some((entry) => isAppLevelQuotaBlockedModelHealth(entry, key))) {
+    return {
+      className: "border-red-200 bg-red-50 text-red-700",
+      label: modelHealthFailureReason(entries),
+    };
+  }
+  const results = entries.flatMap((entry) => (entry.recentResults || []).slice(0, 3));
+  if (!results.length) {
+    return {
+      className: "border-emerald-200 bg-emerald-50 text-emerald-700",
+      label: "healthy",
+    };
+  }
+  const failures = results.filter((result) => result === "failed").length;
+  const allModelsFailed = entries.length > 0 && entries.every((entry) => {
+    const recent = (entry.recentResults || []).slice(0, 3);
+    return recent.length >= 3 && recent.every((result) => result === "failed");
+  });
+  if (allModelsFailed) {
+    return {
+      className: "border-red-200 bg-red-50 text-red-700",
+      label: modelHealthFailureReason(entries),
+    };
+  }
+  if (failures > 0) {
+    return {
+      className: "border-amber-200 bg-amber-50 text-amber-700",
+      label: "degraded",
+    };
+  }
+  return {
+    className: "border-emerald-200 bg-emerald-50 text-emerald-700",
+    label: "healthy",
+  };
+}
+
+export function modelHealthTitle(share: ShareView, key: "claude" | "codex" | "gemini") {
+  const entries = relevantModelHealthEntries(share, key);
+  if (!entries.length) return "No failures recorded yet";
+  return entries
+    .map((entry) => {
+      const recent = (entry.recentResults || []).join(" / ") || entry.status;
+      const checked = entry.lastCheckedAt ? formatDateTime(entry.lastCheckedAt * 1000) : "-";
+      const model = entry.requestedModel || entry.actualModel || "-";
+      return `${model}: ${recent} · ${checked}${entry.errorMessage ? ` · ${entry.errorMessage}` : ""}`;
+    })
+    .join("\n");
+}
+
+export type CoreShareApp = "claude" | "codex" | "gemini";
+
+export function shareAppSettings(share: ShareView, app: CoreShareApp) {
+  const access = share.accessByApp?.[app];
+  return {
+    forSale: share.appSettings?.[app]?.forSale ?? share.forSale,
+    saleMarketKind: share.appSettings?.[app]?.saleMarketKind ?? share.saleMarketKind ?? "token",
+    marketAccessMode: share.appSettings?.[app]?.marketAccessMode ?? access?.marketAccessMode ?? share.marketAccessMode,
+    sharedWithEmails: share.appSettings?.[app]?.sharedWithEmails ?? access?.sharedWithEmails ?? share.sharedWithEmails ?? [],
+    tokenLimit: share.appSettings?.[app]?.tokenLimit ?? share.tokenLimit,
+    parallelLimit: share.appSettings?.[app]?.parallelLimit ?? share.parallelLimit,
+    expiresAt: share.appSettings?.[app]?.expiresAt || share.expiresAt,
+  };
+}
+
+export function shareAppExists(share: ShareView, app: CoreShareApp) {
+  return Boolean(
+    share.bindings?.[app] ||
+      share.support?.[app] ||
+      share.appSettings?.[app] ||
+      share.accessByApp?.[app] ||
+      share.appRuntimes?.[app] ||
+      share.modelHealth?.[app]?.length ||
+      share.appType === app,
+  );
+}
+
+export function requestBelongsToApp(request: ShareRequestLog, app: CoreShareApp) {
+  const appType = (request.appType || "").trim().toLowerCase();
+  if (appType) return appType === app;
+  const agent = (request.requestAgent || "").trim().toLowerCase();
+  return agent === app;
+}
+
+export function shareAppTokensUsed(share: ShareView, app: CoreShareApp) {
+  const value = share.tokensUsedByApp?.[app];
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  const appCount = CORE_SHARE_APPS.filter(([key]) => shareAppExists(share, key)).length;
+  return appCount <= 1 && share.appType === app ? share.tokensUsed || 0 : 0;
+}
+
+export function formatMinutesShort(minutes?: number, locale: AppLocale = "en") {
+  const value = Math.max(0, Number(minutes || 0));
+  const isZh = locale.startsWith("zh");
+  if (value >= 1440) {
+    const days = Math.floor(value / 1440);
+    const hours = Math.floor((value % 1440) / 60);
+    return isZh ? `${days}天${hours ? `${hours}小时` : ""}` : `${days}d${hours ? `${hours}h` : ""}`;
+  }
+  if (value >= 60) {
+    const hours = Math.floor(value / 60);
+    const mins = value % 60;
+    return isZh ? `${hours}小时${mins ? `${mins}分钟` : ""}` : `${hours}h${mins ? `${mins}m` : ""}`;
+  }
+  return isZh ? `${value}分钟` : `${value}m`;
+}
+
+export function formatAgeDaysOrHours(value?: string, locale: AppLocale = "en") {
+  if (!value) return "--";
+  const ts = new Date(value).getTime();
+  if (!Number.isFinite(ts)) return "--";
+  const diff = Math.max(0, Date.now() - ts);
+  const isZh = locale.startsWith("zh");
+  const dayMs = 24 * 60 * 60 * 1000;
+  const hourMs = 60 * 60 * 1000;
+  if (diff >= dayMs) {
+    const days = Math.floor(diff / dayMs);
+    return isZh ? `${days}天` : `${days}d`;
+  }
+  const hours = Math.max(1, Math.floor(diff / hourMs));
+  return isZh ? `${hours}小时` : `${hours}h`;
+}

@@ -4,7 +4,8 @@ import * as React from "react";
 import { Alert } from "@heroui/react";
 import { BoardDock } from "@/components/board/board-dock";
 import { useAuth } from "@/components/auth/auth-provider";
-import { ClientsTable, MarketsTable, PresenceFooter, SharesTable } from "@/components/dashboard/data-tables";
+import { ClientBoard } from "@/components/dashboard/client-board";
+import { MarketsTable, PresenceFooter } from "@/components/dashboard/data-tables";
 import { LiveMap } from "@/components/dashboard/live-map";
 import { getDashboard } from "@/lib/api";
 import type { DashboardResponse } from "@/lib/types";
@@ -42,14 +43,7 @@ export function DashboardPage() {
       <main className="mx-auto grid w-[calc(100%-2rem)] max-w-7xl gap-6 pb-6">
         {error ? <Alert status="danger" className="!text-slate-900">{error}</Alert> : null}
         <LiveMap data={data} />
-        {/* P7 Step 2：shares 表（share 维度，主入口）+ clients 表（installation 维度，机器视角）。 */}
-        <SharesTable
-          clients={data?.clients || []}
-          shares={data?.shares || []}
-          markets={data?.markets || []}
-          onChanged={load}
-        />
-        <ClientsTable
+        <ClientBoard
           clients={data?.clients || []}
           shares={data?.shares || []}
           markets={data?.markets || []}
