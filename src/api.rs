@@ -137,7 +137,6 @@ pub fn router(state: ServerState) -> Router {
         .merge(public_api)
         .route("/", any(root_handler))
         .route("/favicon.ico", get(favicon))
-        .route("/v1/healthz", get(health))
         .route("/v1/dashboard", get(dashboard))
         .route("/v1/markets", get(markets))
         .route("/v1/markets/register", post(register_market))
@@ -199,7 +198,6 @@ pub fn router(state: ServerState) -> Router {
             get(list_market_notification_emails),
         )
         .route("/v1/markets/tunnel/lease", post(issue_market_lease))
-        .route("/v1/regions", get(regions))
         .route("/v1/dashboard/presence", post(dashboard_presence))
         .route("/v1/installations/register", post(register_installation))
         .route(
