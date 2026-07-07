@@ -6,7 +6,7 @@ This project was previously named `portr-rs`.
 
 - Crate/binary name: `portr-rs` -> `cc-switch-router`
 - Release asset: `portr-rs-linux-amd64` -> `cc-switch-router-linux-amd64`
-- Default config dir: `~/.cc-switch-router/` (legacy: `~/.config/cc-switch-router/`)
+- Default config dir: `~/.cc-switch-router/`
 - Preferred env prefix: `PORTR_RS_*` -> `CC_SWITCH_ROUTER_*`
 - Preferred internal probe paths:
   - `/_portr/health` -> `/_share-router/health`
@@ -35,7 +35,7 @@ Move existing deployments to the new names before upgrading to this version.
 1. Replace the binary with `cc-switch-router`.
 2. Update systemd or process manager commands to the new binary path.
 3. Move env vars from `PORTR_RS_*` to `CC_SWITCH_ROUTER_*`.
-4. Move config files from `~/.config/cc-switch-router/` (or legacy `~/.config/portr-rs/`) to `~/.cc-switch-router/`.
+4. Move config files from `~/.config/portr-rs/` to `~/.cc-switch-router/`.
 5. Keep the old files around until you confirm the new deployment is stable.
 
 ## Example systemd changes

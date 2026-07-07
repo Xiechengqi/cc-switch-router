@@ -400,24 +400,13 @@ fn data_dir_in_home() -> Option<PathBuf> {
         .map(|home| home.join(format!(".{APP_NAME}")))
 }
 
-fn legacy_data_dir_in_home() -> Option<PathBuf> {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(".config").join(APP_NAME))
-}
-
 fn path_in_home(leaf: &str) -> Option<PathBuf> {
     data_dir_in_home().map(|dir| dir.join(leaf))
 }
 
 fn existing_env_path() -> Option<PathBuf> {
     let default_path = default_env_path();
-    if default_path.exists() {
-        return Some(default_path);
-    }
-    legacy_data_dir_in_home()
-        .map(|dir| dir.join(".env"))
-        .filter(|path| path.exists())
+    default_path.exists().then_some(default_path)
 }
 
 #[cfg(test)]
