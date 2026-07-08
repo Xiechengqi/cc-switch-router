@@ -648,7 +648,9 @@ pub fn schema_response() -> SettingsSchemaResponse {
                         view.placeholder = Some(path);
                     }
                     "CC_SWITCH_ROUTER_METRICS_DB_PATH" => {
-                        let path = crate::config::default_metrics_db_path().display().to_string();
+                        let path = crate::config::default_metrics_db_path()
+                            .display()
+                            .to_string();
                         view.default = Some(path.clone());
                         view.placeholder = Some(path);
                     }

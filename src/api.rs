@@ -49,14 +49,14 @@ use crate::models::{
     MarketRequestLogBatchSyncRequest, MarketShareRuntimeStateReleaseRequest,
     MarketShareRuntimeStateReleaseResponse, MarketShareRuntimeStateSyncRequest,
     MarketShareRuntimeStateSyncResponse, MarketShareView, MarketsResponse, PostBoardMessageRequest,
-    PublicMapPointsResponse, PublicNetworkStatsResponse, RefreshSessionRequest, RegisterGatewayRequest,
-    RegisterGatewayResponse, RegisterInstallationRequest, RegisterInstallationResponse,
-    RegisterMarketRequest, RequestEmailCodeRequest, RequestEmailCodeResponse,
-    SessionStatusResponse, ShareApiAuthResponse, ShareApiAuthUser, ShareApiContextResponse,
-    ShareApiShareResponse, ShareBatchSyncRequest, ShareClaimSubdomainRequest, ShareDeleteRequest,
-    ShareEditAckRequest, ShareEditAvailableEvent, ShareEditEventSignaturePayload,
-    ShareHeartbeatRequest, ShareMarketGrantRequest, ShareMarketGrantResponse,
-    ShareMarketGrantStatusResponse, ShareMarketListingStatusSyncRequest,
+    PublicMapPointsResponse, PublicNetworkStatsResponse, RefreshSessionRequest,
+    RegisterGatewayRequest, RegisterGatewayResponse, RegisterInstallationRequest,
+    RegisterInstallationResponse, RegisterMarketRequest, RequestEmailCodeRequest,
+    RequestEmailCodeResponse, SessionStatusResponse, ShareApiAuthResponse, ShareApiAuthUser,
+    ShareApiContextResponse, ShareApiShareResponse, ShareBatchSyncRequest,
+    ShareClaimSubdomainRequest, ShareDeleteRequest, ShareEditAckRequest, ShareEditAvailableEvent,
+    ShareEditEventSignaturePayload, ShareHeartbeatRequest, ShareMarketGrantRequest,
+    ShareMarketGrantResponse, ShareMarketGrantStatusResponse, ShareMarketListingStatusSyncRequest,
     ShareMarketListingStatusSyncResponse, SharePendingEditsRequest,
     ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRuntimeRefreshRequest,
     ShareSettingsPatch, ShareSettingsUpdateRequest, ShareSyncRequest, UserApiTokenResetResponse,
@@ -2255,6 +2255,7 @@ mod tests {
                     api_url: None,
                     quota: None,
                     models: Vec::new(),
+                    ..Default::default()
                 }],
                 ..crate::models::ShareAppProviders::default()
             },
@@ -2285,6 +2286,7 @@ mod tests {
                     api_url: None,
                     quota: None,
                     models: Vec::new(),
+                    ..Default::default()
                 }],
                 ..crate::models::ShareAppProviders::default()
             },
@@ -2315,6 +2317,7 @@ mod tests {
                     api_url: None,
                     quota: None,
                     models: Vec::new(),
+                    ..Default::default()
                 }],
                 ..crate::models::ShareAppProviders::default()
             },

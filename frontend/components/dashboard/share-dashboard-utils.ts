@@ -572,67 +572,6 @@ export function providerModelMap(runtime?: ShareUpstreamProvider) {
   return runtimeModelSummary(runtime) || "-";
 }
 
-export function shareAppSupportLine(
-  share: ShareView,
-  app: CoreShareApp,
-  appLabel: string,
-  locale: AppLocale = "en",
-) {
-  const enabled = !!share.support?.[app];
-  if (!enabled) return appLabel;
-
-  const runtime = mergeStandaloneOAuthRuntime(share.appRuntimes?.[app], share.appRuntimes);
-  const quota = runtime?.quota;
-  const status = String(quota?.status || "").toLowerCase();
-  const segments: string[] = [];
-
-  const plan = String(quota?.plan || quota?.credentialMessage || runtime?.providerName || "").trim();
-  segments.push(plan ? `${appLabel} ${plan}` : appLabel);
-
-  const expire = formatExpireDistance(quota?.subscriptionPeriodEnd);
-  if (expire) segments.push(expire);
-
-  if (quota && (!status || ["ok", "success", "valid"].includes(status))) {
-    const isOllamaCloud = isOllamaCloudRuntime(runtime);
-    let tiers = (quota.tiers || [])
-      .map((tier) => ({ ...tier, label: tier.label || tier.name }))
-      .filter((tier) => tier.label);
-    if (app === "claude") {
-      const preferredLabels = new Set(["5h", "1w"]);
-      const preferredTiers = tiers.filter((tier) => preferredLabels.has(String(tier.label).toLowerCase()));
-      if (preferredTiers.length) tiers = preferredTiers;
-    }
-    for (const tier of tiers) {
-      const tierLabel = quotaTierLabel(tier.label, locale);
-      const utilization =
-        typeof tier.utilization === "number" && Number.isFinite(tier.utilization)
-          ? `${Math.round(tier.utilization)}%`
-          : "";
-      const countdown = countdownStr(tier.resetsAt);
-      const usageAmount = formatQuotaUsageAmount(tier, locale);
-      const usage = usageAmount
-        ? tierLabel === "Usage"
-          ? `${tierLabel} ${usageAmount}`
-          : usageAmount
-        : tierLabel;
-      const tierText = [usage, isOllamaCloud ? "" : utilization, countdown].filter(Boolean).join(" ");
-      if (tierText) segments.push(tierText);
-    }
-  }
-
-  const tail: string[] = [];
-  const email = providerAccountIdentity(runtime);
-  if (email && email !== "-") tail.push(email);
-  const modelSummary = runtimeModelSummary(runtime);
-  if (modelSummary && modelSummary !== "-") tail.push(modelSummary);
-  const health = modelHealthTone(share, app).label;
-  if (health) tail.push(health);
-
-  const main = segments.join(" · ");
-  if (!tail.length) return main;
-  return `${main} ${tail.join(" ")}`.trim();
-}
-
 export function modelHealthTone(share: ShareView, key: "claude" | "codex" | "gemini") {
   const entries = relevantModelHealthEntries(share, key);
   if (entries.some((entry) => isAppLevelQuotaBlockedModelHealth(entry, key))) {

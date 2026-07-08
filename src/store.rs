@@ -39,22 +39,23 @@ use crate::models::{
     MarketMaintenanceUpdateResponse, MarketRegistryRecord, MarketRequestLogBatchSyncRequest,
     MarketRequestLogEntry, MarketShareAppView, MarketShareRuntimeStateInput,
     MarketShareRuntimeStateView, MarketShareView, ModelHealthSummary, PublicMapClientPoint,
-    PublicMapPointsResponse, PublicMarketConfig, PublicNetworkStatsResponse, RefreshSessionRequest, RegisterGatewayRequest,
-    RegisterGatewayResponse, RegisterInstallationRequest, RegisterInstallationResponse,
-    RegisterMarketRequest, RequestEmailCodeRequest, RequestEmailCodeResponse,
-    SessionStatusResponse, ShareAppAccess, ShareAppProviders, ShareAppRuntimes, ShareAppSettings,
-    ShareBatchSyncRequest, ShareClaimPayload, ShareClaimSubdomainRequest, ShareDeleteRequest,
-    ShareDescriptor, ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest,
-    ShareMarketGrantRequest, ShareMarketGrantResponse, ShareMarketGrantStatusResponse,
-    ShareMarketLinkView, ShareMarketListingStatusInput, ShareMarketListingStatusView,
-    ShareModelHealthCheckEntry, ShareModelHealthSummary, SharePendingEditsRequest,
-    SharePendingEditsResponse, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry,
-    ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload, ShareRuntimeRefreshRequest,
-    ShareRuntimeSnapshotResponse, ShareSettingsPatch, ShareSettingsUpdateResponse, ShareSignals,
-    ShareSupport, ShareSyncRequest, ShareUpstreamProvider, ShareUpstreamQuota,
-    ShareUsageByEmailResponse, ShareUsageDailyBucket, ShareUsageEmailRow, ShareView, TunnelLease,
-    UserApiTokenResetResponse, UserApiTokenResponse, UserApiTokenStatus, UserShareView,
-    UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    PublicMapPointsResponse, PublicMarketConfig, PublicNetworkStatsResponse, RefreshSessionRequest,
+    RegisterGatewayRequest, RegisterGatewayResponse, RegisterInstallationRequest,
+    RegisterInstallationResponse, RegisterMarketRequest, RequestEmailCodeRequest,
+    RequestEmailCodeResponse, SessionStatusResponse, ShareAppAccess, ShareAppAvailability,
+    ShareAppProviders, ShareAppRuntimes, ShareAppSettings, ShareBatchSyncRequest,
+    ShareClaimPayload, ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptor,
+    ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest, ShareMarketGrantRequest,
+    ShareMarketGrantResponse, ShareMarketGrantStatusResponse, ShareMarketLinkView,
+    ShareMarketListingStatusInput, ShareMarketListingStatusView, ShareModelHealthCheckEntry,
+    ShareModelHealthSummary, SharePendingEditsRequest, SharePendingEditsResponse,
+    ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRequestLogFetchResponse,
+    ShareRuntimeRefreshPayload, ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse,
+    ShareSettingsPatch, ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest,
+    ShareUpstreamProvider, ShareUpstreamQuota, ShareUsageByEmailResponse, ShareUsageDailyBucket,
+    ShareUsageEmailRow, ShareView, TunnelLease, UserApiTokenResetResponse, UserApiTokenResponse,
+    UserApiTokenStatus, UserShareView, UserSharesResponse, VerifyEmailCodeRequest,
+    VerifyEmailCodeResponse,
 };
 #[cfg(test)]
 use crate::models::{ShareAppProvider, ShareUpstreamModel};
@@ -8460,6 +8461,9 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                     upstream_provider: parse_upstream_provider(row.get(24)?)?,
                     app_runtimes: parse_app_runtimes(row.get(25)?)?,
                     app_providers: parse_app_providers(row.get(26)?)?,
+                    market_grant: None,
+                    app_availability: ShareAppAvailability::default(),
+                    model_health: ShareModelHealthSummary::default(),
                 },
             ))
         })
@@ -10391,6 +10395,7 @@ mod quota_runtime_filter_tests {
                 tiers: Vec::new(),
             }),
             models: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -10427,6 +10432,7 @@ mod quota_runtime_filter_tests {
                 }],
             }),
             models: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -10459,6 +10465,7 @@ mod quota_runtime_filter_tests {
                 }],
             }),
             models: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -15269,6 +15276,7 @@ mod tests {
                 slot: "default".into(),
                 actual_model: model.into(),
             }],
+            ..Default::default()
         }
     }
 
@@ -15349,6 +15357,9 @@ mod tests {
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
             app_providers: ShareAppProviders::default(),
+            market_grant: None,
+            app_availability: ShareAppAvailability::default(),
+            model_health: ShareModelHealthSummary::default(),
         }
     }
 
@@ -17630,6 +17641,9 @@ mod tests {
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
             app_providers: ShareAppProviders::default(),
+            market_grant: None,
+            app_availability: ShareAppAvailability::default(),
+            model_health: ShareModelHealthSummary::default(),
         };
         let timestamp_ms = Utc::now().timestamp_millis();
         let nonce = Uuid::new_v4().to_string();
@@ -17698,6 +17712,9 @@ mod tests {
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
             app_providers: ShareAppProviders::default(),
+            market_grant: None,
+            app_availability: ShareAppAvailability::default(),
+            model_health: ShareModelHealthSummary::default(),
         };
 
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -17982,6 +17999,9 @@ mod tests {
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
             app_providers: ShareAppProviders::default(),
+            market_grant: None,
+            app_availability: ShareAppAvailability::default(),
+            model_health: ShareModelHealthSummary::default(),
         };
         let claim = share_claim_payload(&share);
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -18063,6 +18083,9 @@ mod tests {
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
             app_providers: ShareAppProviders::default(),
+            market_grant: None,
+            app_availability: ShareAppAvailability::default(),
+            model_health: ShareModelHealthSummary::default(),
         };
         let claim = ShareClaimPayload {
             subdomain: "other-sub".into(),
@@ -18136,6 +18159,9 @@ mod tests {
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
             app_providers: ShareAppProviders::default(),
+            market_grant: None,
+            app_availability: ShareAppAvailability::default(),
+            model_health: ShareModelHealthSummary::default(),
         };
 
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -18238,6 +18264,9 @@ mod tests {
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
             app_providers: ShareAppProviders::default(),
+            market_grant: None,
+            app_availability: ShareAppAvailability::default(),
+            model_health: ShareModelHealthSummary::default(),
         };
 
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -18313,6 +18342,9 @@ mod tests {
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
             app_providers: ShareAppProviders::default(),
+            market_grant: None,
+            app_availability: ShareAppAvailability::default(),
+            model_health: ShareModelHealthSummary::default(),
         };
 
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -18407,6 +18439,9 @@ mod tests {
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
             app_providers: ShareAppProviders::default(),
+            market_grant: None,
+            app_availability: ShareAppAvailability::default(),
+            model_health: ShareModelHealthSummary::default(),
         };
         let ops = vec![ShareSyncOperation {
             kind: "upsert".into(),
@@ -20084,6 +20119,7 @@ mod tests {
                         api_url: None,
                         quota: None,
                         models: Vec::new(),
+                        ..Default::default()
                     }],
                     ..ShareAppProviders::default()
                 },

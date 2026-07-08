@@ -1166,6 +1166,18 @@ pub struct ShareMarketGrantResponse {
     pub status: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareMarketGrantStatus {
+    pub status: String,
+    #[serde(default)]
+    pub grant_id: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub updated_at_ms: Option<u128>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareMarketGrantStatusResponse {
@@ -1345,6 +1357,25 @@ pub struct ShareUpstreamModel {
     pub actual_model: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareProviderHealth {
+    pub healthy: bool,
+    pub requests: u64,
+    pub successes: u64,
+    pub failures: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_latency_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_status_code: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_request_at_ms: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareUpstreamProvider {
@@ -1359,11 +1390,48 @@ pub struct ShareUpstreamProvider {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_email: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_level: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_remaining_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_percent: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_blocked: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota: Option<ShareUpstreamQuota>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ShareUpstreamModel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<ShareProviderHealth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available: Option<bool>,
+}
+
+impl Default for ShareUpstreamProvider {
+    fn default() -> Self {
+        Self {
+            kind: String::new(),
+            app: String::new(),
+            provider_name: None,
+            provider_type: None,
+            for_sale_official_price_percent: None,
+            account_email: None,
+            subscription_level: None,
+            subscription_expires_at: None,
+            subscription_remaining_ms: None,
+            quota_percent: None,
+            quota_blocked: None,
+            api_url: None,
+            quota: None,
+            models: Vec::new(),
+            health: None,
+            available: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1387,11 +1455,52 @@ pub struct ShareAppProvider {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_email: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_level: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_remaining_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_percent: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_blocked: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota: Option<ShareUpstreamQuota>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ShareUpstreamModel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<ShareProviderHealth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available: Option<bool>,
+}
+
+impl Default for ShareAppProvider {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            app: String::new(),
+            kind: None,
+            provider_type: None,
+            is_current: false,
+            enabled: false,
+            codex_image_generation_enabled: false,
+            for_sale_official_price_percent: None,
+            account_email: None,
+            subscription_level: None,
+            subscription_expires_at: None,
+            subscription_remaining_ms: None,
+            quota_percent: None,
+            quota_blocked: None,
+            api_url: None,
+            quota: None,
+            models: Vec::new(),
+            health: None,
+            available: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1422,6 +1531,35 @@ pub struct ShareAppRuntimes {
     pub antigravity: Option<ShareUpstreamProvider>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copilot: Option<ShareUpstreamProvider>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareAppAvailability {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude: Option<ShareProviderAvailability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex: Option<ShareProviderAvailability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gemini: Option<ShareProviderAvailability>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareProviderAvailability {
+    pub app: String,
+    pub provider_id: String,
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_blocked: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_status_code: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_latency_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1465,6 +1603,8 @@ pub struct ShareDescriptor {
     pub for_sale_official_price_percent_by_app: BTreeMap<String, u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_grant: Option<ShareMarketGrantStatus>,
     #[serde(default = "default_share_for_sale")]
     pub for_sale: String,
     #[serde(default = "default_sale_market_kind")]
@@ -1494,6 +1634,10 @@ pub struct ShareDescriptor {
     pub app_runtimes: ShareAppRuntimes,
     #[serde(default)]
     pub app_providers: ShareAppProviders,
+    #[serde(default)]
+    pub app_availability: ShareAppAvailability,
+    #[serde(default)]
+    pub model_health: ShareModelHealthSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
