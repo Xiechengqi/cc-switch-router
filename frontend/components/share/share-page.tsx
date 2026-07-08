@@ -18,13 +18,14 @@ import {
   validateShareSettingsDraft,
   type ShareSettingsDraft,
 } from "@/lib/share-settings";
+import { resolveShareCoreApp, shareAccessApps, SHARE_APP_LABELS } from "@/lib/share-app";
 import { compactTokens, formatDateTime } from "@/lib/utils";
 
 const PRICE_APPS = [
-  { key: "claude", label: "Claude" },
-  { key: "codex", label: "Codex" },
-  { key: "gemini", label: "Gemini" },
-] as const;
+  { key: "claude" as const, label: SHARE_APP_LABELS.claude },
+  { key: "codex" as const, label: SHARE_APP_LABELS.codex },
+  { key: "gemini" as const, label: SHARE_APP_LABELS.gemini },
+];
 type ShareAppKey = (typeof PRICE_APPS)[number]["key"];
 
 function statusTone(online: boolean) {
@@ -33,12 +34,6 @@ function statusTone(online: boolean) {
 
 function tokenLabel(value: number) {
   return value < 0 ? "∞" : compactTokens(value);
-}
-
-function shareAccessApps(share: ShareView): ShareAppKey[] {
-  const apps = PRICE_APPS.map((app) => app.key);
-  const bound = apps.filter((app) => Boolean(share.bindings?.[app]));
-  return bound.length ? bound : [...apps];
 }
 
 function accessByAppFromShare(share: ShareView): ShareAccessByApp {
@@ -173,6 +168,8 @@ function ShareSettingsForm({
   const [busy, setBusy] = React.useState(false);
   const [notice, setNotice] = React.useState("");
   const [error, setError] = React.useState("");
+  const shareApp = resolveShareCoreApp(share);
+  const accessibleApps = shareAccessApps(share);
   const tokenMarkets = React.useMemo(() => markets.filter((market) => !isShareMarket(market)), [markets]);
   const shareMarkets = React.useMemo(() => markets.filter(isShareMarket), [markets]);
   const publicMarketEmails = React.useMemo(
@@ -222,7 +219,7 @@ function ShareSettingsForm({
     const saleMarketKind = draft.forSale === "Yes" ? draft.saleMarketKind : "token";
     const effectiveMarketAccessMode = saleMarketKind === "share" ? "selected" : draft.marketAccessMode;
     const accessByApp: ShareAccessByApp = {};
-    for (const app of shareAccessApps(share)) {
+    for (const app of accessibleApps) {
       const nonMarketEmails = rawEmailsByApp[app].filter((email) => !publicMarketEmails.has(email));
       const marketEmails =
         draft.forSale === "Yes" && saleMarketKind === "token" && effectiveMarketAccessMode === "selected"
@@ -286,7 +283,7 @@ function ShareSettingsForm({
     const normalized = email.toLowerCase();
     setSharedTextByApp((current) => {
       const result = { ...current };
-      for (const app of shareAccessApps(share)) {
+      for (const app of accessibleApps) {
         const appEmails = new Set(normalizeEmailList(current[app] || "").filter((item) => !shareMarketEmails.has(item)));
         if (checked) appEmails.add(normalized);
         else appEmails.delete(normalized);
@@ -300,7 +297,7 @@ function ShareSettingsForm({
     const normalized = email.toLowerCase();
     setSharedTextByApp((current) => {
       const result = { ...current };
-      for (const app of shareAccessApps(share)) {
+      for (const app of accessibleApps) {
         const appEmails = new Set(normalizeEmailList(current[app] || "").filter((item) => !shareMarketEmails.has(item) && !tokenMarketEmails.has(item)));
         if (normalized) appEmails.add(normalized);
         result[app] = Array.from(appEmails).sort().join(", ");
@@ -429,22 +426,18 @@ function ShareSettingsForm({
 
       <div className="grid gap-2">
         <span className="text-sm font-medium text-foreground">Shared with emails</span>
-        {shareAccessApps(share).map((app) => {
-          const label = PRICE_APPS.find((item) => item.key === app)?.label ?? app;
-          return (
-            <label key={app} className="grid gap-1 text-sm">
-              <span className="text-xs text-muted-foreground">{label}</span>
-              <Input
-                value={sharedTextByApp[app] || ""}
-                disabled={!editable}
-                placeholder="friend@example.com, teammate@example.com"
-                onChange={(event) =>
-                  setSharedTextByApp((current) => ({ ...current, [app]: event.target.value }))
-                }
-              />
-            </label>
-          );
-        })}
+        {shareApp ? (
+          <label className="grid gap-1 text-sm">
+            <Input
+              value={sharedTextByApp[shareApp] || ""}
+              disabled={!editable}
+              placeholder="friend@example.com, teammate@example.com"
+              onChange={(event) =>
+                setSharedTextByApp((current) => ({ ...current, [shareApp]: event.target.value }))
+              }
+            />
+          </label>
+        ) : null}
       </div>
 
       <div className="grid gap-4 lg:grid-cols-3">
@@ -494,36 +487,29 @@ function ShareSettingsForm({
         </label>
       </div>
 
-      {draft.forSale === "Yes" && draft.saleMarketKind === "token" ? (
+      {draft.forSale === "Yes" && draft.saleMarketKind === "token" && shareApp ? (
       <div className="grid gap-3">
         <div className="text-sm font-medium text-foreground">Model pricing percent</div>
-        <div className="grid gap-3 sm:grid-cols-3">
-          {PRICE_APPS.map((app) => {
-            const supported = Boolean(share.support?.[app.key]);
-            return (
-              <label key={app.key} className="grid gap-1 text-sm">
-                <span className="text-xs text-muted-foreground">{app.label}</span>
-                <Input
-                  type="number"
-                  min={1}
-                  max={100}
-                  value={draft.pricing[app.key] == null ? "" : String(draft.pricing[app.key])}
-                  placeholder={supported ? "Unset" : "No node"}
-                  disabled={!editable || !supported}
-                  onChange={(event) => {
-                    const raw = event.target.value;
-                    setDraft((current) => {
-                      const pricing = { ...current.pricing };
-                      if (!raw.trim()) delete pricing[app.key];
-                      else pricing[app.key] = Number.parseInt(raw, 10) || 0;
-                      return { ...current, pricing };
-                    });
-                  }}
-                />
-              </label>
-            );
-          })}
-        </div>
+        <label className="grid max-w-xs gap-1 text-sm">
+          <span className="text-xs text-muted-foreground">{SHARE_APP_LABELS[shareApp]}</span>
+          <Input
+            type="number"
+            min={1}
+            max={100}
+            value={draft.pricing[shareApp] == null ? "" : String(draft.pricing[shareApp])}
+            placeholder={share.support?.[shareApp] ? "Unset" : "No node"}
+            disabled={!editable || !share.support?.[shareApp]}
+            onChange={(event) => {
+              const raw = event.target.value;
+              setDraft((current) => {
+                const pricing = { ...current.pricing };
+                if (!raw.trim()) delete pricing[shareApp];
+                else pricing[shareApp] = Number.parseInt(raw, 10) || 0;
+                return { ...current, pricing };
+              });
+            }}
+          />
+        </label>
       </div>
       ) : null}
 

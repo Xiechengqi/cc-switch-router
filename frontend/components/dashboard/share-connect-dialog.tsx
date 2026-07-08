@@ -7,12 +7,14 @@ import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getUserApiToken } from "@/lib/api";
 import { ShareConnectionTestRow } from "@/components/dashboard/share-connection-test";
+import { boundProviderIdForShareApp, resolveShareCoreApp, SHARE_APP_LABELS } from "@/lib/share-app";
 import type { ShareView, UserApiTokenStatus } from "@/lib/types";
 
 const ROUTER_OPEN_LOGIN_EVENT = "router-open-login";
 
 function shareCodexImageGenerationEnabled(share: ShareView | null) {
-  const providerId = share?.bindings?.codex;
+  if (resolveShareCoreApp(share) !== "codex") return false;
+  const providerId = boundProviderIdForShareApp(share, "codex");
   if (!providerId) return false;
   return !!share?.appProviders?.codex?.some(
     (provider) =>
@@ -23,7 +25,8 @@ function shareCodexImageGenerationEnabled(share: ShareView | null) {
 }
 
 function shareClaudeCursorToolsProbeEnabled(share: ShareView | null) {
-  const providerId = share?.bindings?.claude;
+  if (resolveShareCoreApp(share) !== "claude") return false;
+  const providerId = boundProviderIdForShareApp(share, "claude");
   if (!providerId) return false;
   return !!share?.appProviders?.claude?.some(
     (provider) =>
@@ -133,6 +136,9 @@ export const ShareConnectDialog = React.memo(function ShareConnectDialog({
     return `mailto:${ownerEmail}?subject=${subject}`;
   }, [ownerEmail, share?.subdomain, share?.shareId]);
 
+  const shareApp = resolveShareCoreApp(share);
+  const shareAppLabel = shareApp ? SHARE_APP_LABELS[shareApp] : "";
+
   if (!share) return null;
 
   return (
@@ -147,7 +153,9 @@ export const ShareConnectDialog = React.memo(function ShareConnectDialog({
                   {t("dashboard.connectDialog.title")}
                 </Modal.Heading>
                 <p className="mt-1 text-sm text-slate-600">
-                  {t("dashboard.connectDialog.appShared")}
+                  {shareAppLabel
+                    ? t("dashboard.connectDialog.appSharedSingle", { app: shareAppLabel })
+                    : t("dashboard.connectDialog.appShared")}
                 </p>
               </div>
             </Modal.Header>
@@ -179,26 +187,28 @@ export const ShareConnectDialog = React.memo(function ShareConnectDialog({
                 <span className="text-xs font-medium uppercase tracking-wide text-slate-500">
                   {t("dashboard.connectDialog.test.section")}
                 </span>
-                {(["claude", "codex", "gemini"] as const).map((app) => (
+                {shareApp ? (
                   <ShareConnectionTestRow
-                    key={app}
+                    key={shareApp}
                     share={share}
-                    app={app}
+                    app={shareApp}
                     apiToken={apiTokenPlain}
                     baseUrl={baseUrl}
                     canExecute={authenticated && canViewSecret}
                   />
-                ))}
-                <ShareConnectionTestRow
-                  key="codex-chat"
-                  share={share}
-                  app="codex"
-                  kind="chat"
-                  apiToken={apiTokenPlain}
-                  baseUrl={baseUrl}
-                  canExecute={authenticated && canViewSecret}
-                />
-                {codexImageGenerationEnabled ? (
+                ) : null}
+                {shareApp === "codex" ? (
+                  <ShareConnectionTestRow
+                    key="codex-chat"
+                    share={share}
+                    app="codex"
+                    kind="chat"
+                    apiToken={apiTokenPlain}
+                    baseUrl={baseUrl}
+                    canExecute={authenticated && canViewSecret}
+                  />
+                ) : null}
+                {shareApp === "codex" && codexImageGenerationEnabled ? (
                   <ShareConnectionTestRow
                     key="codex-image"
                     share={share}
@@ -209,7 +219,7 @@ export const ShareConnectDialog = React.memo(function ShareConnectDialog({
                     canExecute={authenticated && canViewSecret}
                   />
                 ) : null}
-                {claudeCursorToolsProbeEnabled ? (
+                {shareApp === "claude" && claudeCursorToolsProbeEnabled ? (
                   <ShareConnectionTestRow
                     key="claude-tools"
                     share={share}

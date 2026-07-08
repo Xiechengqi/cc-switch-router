@@ -8,6 +8,7 @@ import { getShareImageGenerationRequestLogs, getShareUsageByEmail } from "@/lib/
 import type { AppLocale } from "@/lib/i18n";
 import type { DashboardClient, HealthTimelineBucket, ImageGenerationRequestLog, MarketRequestLog, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareMarketListingStatus, ShareModelHealthCheck, ShareRequestLog, ShareUpstreamProvider, ShareUsageByEmailResponse, ShareView } from "@/lib/types";
 import { compactTokens, formatDateTime, formatNumber, formatRelativeTime } from "@/lib/utils";
+import { resolveShareCoreApp, SHARE_APP_LABELS } from "@/lib/share-app";
 import { averageRecentLatencyMs, cacheHitRate, clientPlatformLabel, clientTunnelDisplayUrl, configuredUpstreamPercent, CORE_SHARE_APPS, expiryTitle, formatAgeDaysOrHours, formatImageLogSizeMb, formatImageLogSpendSeconds, formatImageLogTimestamp, formatLatencySeconds, formatMinutesShort, formatPercent, formatShareStatus, HealthDots, isUnlimited, mergeStandaloneOAuthRuntime, modelHealthTitle, modelHealthTone, providerAccountIdentity, providerAccountLevel, providerModelMap, requestBelongsToApp, requestModelRoute, runtimeEndpointSummary, shareApiParts, shareAppExists, shareAppSettings, shareAppTokensUsed, shareExpiryProgress, tokenCount, usageBucketTotalTokens, type CoreShareApp, type TFn } from "@/components/dashboard/share-dashboard-utils";
 
 export function StatusBadge({ active, label }: { active: boolean; label: string }) {
@@ -471,6 +472,8 @@ export function clientDisplayLabel(client?: DashboardClient | null) {
 }
 
 export function shareSupportLabel(share: ShareView) {
+  const app = resolveShareCoreApp(share);
+  if (app && share.support?.[app]) return SHARE_APP_LABELS[app];
   return CORE_SHARE_APPS
     .filter(([key]) => !!share.support?.[key])
     .map(([, label]) => label)
@@ -717,31 +720,20 @@ export function ProviderCard({
 
 export function ShareProvidersPanel({ share }: { share?: ShareView }) {
   const { locale, t } = useLocaleText();
-  const [selectedKey, setSelectedKey] = React.useState<keyof ShareAppProviders>("claude");
+  const shareApp = resolveShareCoreApp(share);
   const providers = share?.appProviders;
   const runtimes = share?.appRuntimes;
-  React.useEffect(() => {
-    const firstBound = PROVIDER_APP_TABS.find((tab) => boundProviderIdForApp(share, tab.key));
-    if (firstBound) setSelectedKey(firstBound.key);
-  }, [share?.shareId]);
-  const boundProviderId = boundProviderIdForApp(share, selectedKey);
-  const currentProviders = (providers?.[selectedKey] || []).filter((provider) => provider.id === boundProviderId);
+  const boundProviderId = shareApp ? boundProviderIdForApp(share, shareApp) : undefined;
+  const currentProviders = shareApp
+    ? (providers?.[shareApp] || []).filter((provider) => provider.id === boundProviderId)
+    : [];
+
+  if (!shareApp) {
+    return <EmptyBlock>{t("dashboard.noProviders")}</EmptyBlock>;
+  }
 
   return (
     <div className="grid gap-3">
-      <Tabs selectedKey={selectedKey} onSelectionChange={(key: React.Key) => setSelectedKey(String(key) as keyof ShareAppProviders)} variant="secondary" className="text-foreground">
-        <Tabs.List className="grid w-full grid-cols-3 text-foreground">
-          {PROVIDER_APP_TABS.map((tab) => (
-            <Tabs.Tab
-              key={tab.key}
-              id={tab.key}
-              className="rounded-md border border-transparent px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors data-[selected=true]:border-primary/30 data-[selected=true]:bg-primary/10 data-[selected=true]:text-primary"
-            >
-              {tab.label}
-            </Tabs.Tab>
-          ))}
-        </Tabs.List>
-      </Tabs>
       {!currentProviders.length ? (
         <EmptyBlock>{t("dashboard.noProviders")}</EmptyBlock>
       ) : (
@@ -754,8 +746,8 @@ export function ShareProvidersPanel({ share }: { share?: ShareView }) {
           })}
         </div>
       )}
-      {share ? <ShareEmailUsagePanel share={share} app={selectedKey} /> : null}
-      {share ? <ShareProviderRequestsPanel share={share} app={selectedKey} /> : null}
+      {share ? <ShareEmailUsagePanel share={share} app={shareApp} /> : null}
+      {share ? <ShareProviderRequestsPanel share={share} app={shareApp} /> : null}
     </div>
   );
 }

@@ -23,18 +23,7 @@ import {
 import type { ShareRequestLog, ShareView } from "@/lib/types";
 import { compactTokens } from "@/lib/utils";
 
-const SHARE_APP_LABELS: Record<CoreShareApp, string> = {
-  claude: "Claude",
-  codex: "Codex",
-  gemini: "Gemini",
-};
-
-function coreShareApp(value?: string): CoreShareApp | null {
-  const normalized = String(value || "").trim().toLowerCase();
-  return normalized === "claude" || normalized === "codex" || normalized === "gemini"
-    ? normalized
-    : null;
-}
+import { resolveShareCoreApp, SHARE_APP_LABELS } from "@/lib/share-app";
 
 function requestBelongsToApp(request: ShareRequestLog, app: CoreShareApp) {
   const appType = (request.appType || "").trim().toLowerCase();
@@ -58,7 +47,7 @@ export const ShareCard = React.memo(function ShareCard({
   onConnect: (share: ShareView) => void;
 }) {
   const { locale, t } = useLocaleText();
-  const app = coreShareApp(share.appType);
+  const app = resolveShareCoreApp(share);
   const api = shareApiParts(share);
   const settings = app ? shareAppSettings(share, app) : null;
   const appRequests = app ? (share.recentRequests || []).filter((request) => requestBelongsToApp(request, app)) : share.recentRequests || [];

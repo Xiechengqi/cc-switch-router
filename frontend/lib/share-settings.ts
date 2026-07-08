@@ -1,3 +1,4 @@
+import { shareAccessApps } from "@/lib/share-app";
 import type { ShareAccessByApp, ShareSettingsPatch, ShareView } from "@/lib/types";
 
 export const UNLIMITED_TOKEN_LIMIT = -1;
@@ -79,12 +80,6 @@ export function buildShareSettingsPatch(draft: ShareSettingsDraft): ShareSetting
     expiresAt: draft.expiresAt,
     forSaleOfficialPricePercentByApp: draft.saleMarketKind === "share" ? {} : draft.pricing,
   };
-}
-
-function shareAccessApps(share: ShareView): Array<"claude" | "codex" | "gemini"> {
-  const apps: Array<"claude" | "codex" | "gemini"> = ["claude", "codex", "gemini"];
-  const bound = apps.filter((app) => Boolean(share.bindings?.[app]));
-  return bound.length ? bound : apps;
 }
 
 function effectiveShareAccessByApp(share: ShareView): ShareAccessByApp {

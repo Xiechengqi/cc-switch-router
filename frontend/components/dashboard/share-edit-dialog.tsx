@@ -6,6 +6,7 @@ import * as React from "react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { updateShareSettings } from "@/lib/api";
+import { shareAccessApps, SHARE_APP_LABELS, type CoreShareApp } from "@/lib/share-app";
 import type { DashboardMarket, ShareAccessByApp, ShareAppRuntimes, ShareSettingsPatch, ShareUpstreamProvider, ShareView } from "@/lib/types";
 import { DEFAULT_PARALLEL_LIMIT, DEFAULT_TOKEN_LIMIT, MIN_PARALLEL_LIMIT, PERMANENT_EXPIRES_AT_ISO, UNLIMITED_PARALLEL_LIMIT, UNLIMITED_TOKEN_LIMIT, isOfficialRuntime, isPermanentExpiryDate, isShareMarket, isUnlimitedExpiry, isUnlimitedParallelLimit, isUnlimitedTokenLimit, marketLabel, type TFn } from "@/components/dashboard/share-dashboard-utils";
 
@@ -134,24 +135,12 @@ function providerHint(runtime?: ShareUpstreamProvider) {
   return runtime.accountEmail || runtime.apiUrl || runtime.kind || "";
 }
 
-type PriceApp = "claude" | "codex" | "gemini";
+type PriceApp = CoreShareApp;
 const PRICE_APPS: Array<{ key: PriceApp; label: string }> = [
-  { key: "claude", label: "Claude" },
-  { key: "codex", label: "Codex" },
-  { key: "gemini", label: "Gemini" },
+  { key: "claude", label: SHARE_APP_LABELS.claude },
+  { key: "codex", label: SHARE_APP_LABELS.codex },
+  { key: "gemini", label: SHARE_APP_LABELS.gemini },
 ];
-
-function shareAccessApps(share: ShareView | null): PriceApp[] {
-  if (!share) return [];
-  const appType = String(share.appType || "").trim().toLowerCase();
-  if (appType === "claude" || appType === "codex" || appType === "gemini") {
-    return [appType];
-  }
-  const bound = (["claude", "codex", "gemini"] as const).find(
-    (app) => typeof share.bindings?.[app] === "string" && share.bindings[app],
-  );
-  return bound ? [bound] : [];
-}
 
 function effectiveShareAccessByApp(share: ShareView): ShareAccessByApp {
   if (share.accessByApp && Object.keys(share.accessByApp).length > 0) return share.accessByApp;
@@ -256,12 +245,12 @@ function buildShareEditDraft(
 function buildShareEditPricingPayload(draft: ShareEditDraft, share?: ShareView | null) {
   if (draft.saleMarketKind === "share") return {};
   const result: Record<string, number> = {};
-  for (const app of PRICE_APPS) {
-    if (!share?.support?.[app.key]) continue;
-    const raw = draft.priceInputs[app.key];
+  for (const app of shareAccessApps(share ?? null)) {
+    if (!share?.support?.[app]) continue;
+    const raw = draft.priceInputs[app];
     if (!raw || !raw.trim()) continue;
     const value = Number.parseInt(raw, 10);
-    if (Number.isFinite(value) && value >= 1 && value <= 100) result[app.key] = value;
+    if (Number.isFinite(value) && value >= 1 && value <= 100) result[app] = value;
   }
   return result;
 }
@@ -356,14 +345,13 @@ export function ShareEditDialog({
   const [confirmFreeOpen, setConfirmFreeOpen] = React.useState(false);
   const [transferTargetEmail, setTransferTargetEmail] = React.useState("");
   const [marketSelectKey, setMarketSelectKey] = React.useState(0);
-  const [activeShareApp, setActiveShareApp] = React.useState<PriceApp>("claude");
   const [baseShare, setBaseShare] = React.useState<ShareView | null>(null);
   const [baseDraft, setBaseDraft] = React.useState<ShareEditDraft | null>(null);
   const { t } = useLocaleText();
   const readOnly = !!share && !share.canManage;
   const editShare = baseShare || share;
   const activeShareApps = React.useMemo(() => shareAccessApps(editShare), [editShare]);
-  const activeShareAppPresent = activeShareApps.includes(activeShareApp);
+  const shareApp = activeShareApps[0];
   const tokenMarkets = React.useMemo(() => markets.filter((market) => !isShareMarket(market)), [markets]);
   const shareMarkets = React.useMemo(() => markets.filter(isShareMarket), [markets]);
   const publicMarketEmails = React.useMemo(
@@ -413,7 +401,6 @@ export function ShareEditDialog({
     const draft = buildShareEditDraft(share, publicMarketEmails, tokenMarketEmails, shareMarketEmails);
     setBaseShare(share);
     setBaseDraft(draft);
-    setActiveShareApp(shareAccessApps(share)[0] ?? "claude");
     applyDraft(draft);
     setError(share.activeEdit?.status === "rejected" ? share.activeEdit.errorMessage || t("dashboard.applyFailedFallback") : "");
     setNotice("");
@@ -697,24 +684,7 @@ export function ShareEditDialog({
                   />
                 </FieldGroup>
 
-                <div className="inline-flex w-fit rounded-lg border bg-muted/40 p-0.5">
-                  {PRICE_APPS.map((app) => (
-                    <button
-                      key={app.key}
-                      type="button"
-                      onClick={() => setActiveShareApp(app.key)}
-                      className={`rounded-md px-3 py-1 text-xs font-medium transition-colors ${
-                        activeShareApp === app.key
-                          ? "bg-white text-slate-900 shadow-sm"
-                          : "text-muted-foreground hover:text-slate-900"
-                      }`}
-                    >
-                      {app.label}
-                    </button>
-                  ))}
-                </div>
-
-                {activeShareAppPresent ? (
+                {shareApp ? (
                   <>
 
                 <div className="grid gap-3 sm:grid-cols-3">
@@ -815,7 +785,7 @@ export function ShareEditDialog({
                     <span className="text-xs text-muted-foreground">{t("dashboard.hint.modelPricing")}</span>
                   </div>
                   <div className="grid gap-3 sm:grid-cols-3">
-                    {PRICE_APPS.filter((app) => app.key === activeShareApp).map((app) => {
+                    {PRICE_APPS.filter((app) => app.key === shareApp).map((app) => {
                       const supported = !!share?.support?.[app.key];
                       const hint = providerHint(share?.appRuntimes?.[app.key]);
                       return (
@@ -897,27 +867,17 @@ export function ShareEditDialog({
                 ) : null}
 
 	                <FieldGroup label={t("dashboard.field.sharedWith")} hint={readOnly ? t("dashboard.hint.sharedWithReadOnly") : t("dashboard.hint.sharedWith")}>
-                    <div className="grid gap-3">
-                      {[activeShareApp].map((app) => {
-                        const label = PRICE_APPS.find((item) => item.key === app)?.label ?? app;
-                        return (
-                          <div key={app} className="grid gap-1.5">
-                            <span className="mono-label text-muted-foreground">{label}</span>
-                            <EmailTagsField
-                              value={shareToEmailsByApp[app] ?? []}
-                              placeholder="friend@example.com, teammate@example.com"
-                              disabled={readOnly}
-                              onChange={(emails) =>
-                                setShareToEmailsByApp((current) => ({ ...current, [app]: emails }))
-                              }
-                              onPromote={(email) => setTransferTargetEmail(email)}
-                              promotableEmails={transferableShareEmails}
-                              promoteLabel={t("dashboard.setAsOwner")}
-                            />
-                          </div>
-                        );
-                      })}
-                    </div>
+                    <EmailTagsField
+                      value={shareToEmailsByApp[shareApp] ?? []}
+                      placeholder="friend@example.com, teammate@example.com"
+                      disabled={readOnly}
+                      onChange={(emails) =>
+                        setShareToEmailsByApp((current) => ({ ...current, [shareApp]: emails }))
+                      }
+                      onPromote={(email) => setTransferTargetEmail(email)}
+                      promotableEmails={transferableShareEmails}
+                      promoteLabel={t("dashboard.setAsOwner")}
+                    />
                 </FieldGroup>
 
                 <div className="grid gap-3 md:grid-cols-3">

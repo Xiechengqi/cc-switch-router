@@ -56,7 +56,7 @@ const APP_PROBE: Record<TestApp, Partial<Record<TestKind, AppProbe>>> = {
       }),
     },
   },
-  codex: {
+    codex: {
     text: {
       labelKey: "dashboard.connectDialog.test.textApiCall",
       method: "POST",
@@ -64,7 +64,13 @@ const APP_PROBE: Record<TestApp, Partial<Record<TestKind, AppProbe>>> = {
       body: JSON.stringify({
         model: "gpt-5.5",
         input: [{ role: "user", content: "who are you" }],
-        max_output_tokens: 16,
+        stream: true,
+        store: false,
+        reasoning: { effort: "low" },
+        include: ["reasoning.encrypted_content"],
+        instructions: "",
+        tools: [],
+        parallel_tool_calls: false,
       }),
     },
     chat: {
@@ -117,10 +123,10 @@ function buildCurlCommand(baseUrl: string, app: TestApp, kind: TestKind, apiToke
     ? `Bearer ${apiToken}`
     : "Bearer <your-api-token>";
   return [
-    `curl ${kind === "image" || kind === "tools" ? "-N " : ""}-sS -X ${probe.method} \\`,
+    `curl ${kind === "image" || kind === "tools" || (app === "codex" && kind === "text") ? "-N " : ""}-sS -X ${probe.method} \\`,
     `  '${url}' \\`,
     `  -H 'Authorization: ${bearer}' \\`,
-    ...(kind === "image" || kind === "tools"
+    ...(kind === "image" || kind === "tools" || (app === "codex" && kind === "text")
       ? [`  -H 'Accept: text/event-stream' \\`]
       : []),
     `  -H 'Content-Type: application/json' \\`,

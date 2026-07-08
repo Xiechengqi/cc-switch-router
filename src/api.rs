@@ -2225,6 +2225,15 @@ mod tests {
     }
 
     #[test]
+    fn codex_text_probe_includes_store_false_for_oauth() {
+        let probe = app_probe_for_kind("codex", "text").expect("codex text probe");
+        assert_eq!(probe.path, "/v1/responses");
+        assert!(probe.body.contains("\"store\":false"));
+        assert!(probe.body.contains("\"stream\":true"));
+        assert!(!probe.body.contains("max_output_tokens"));
+    }
+
+    #[test]
     fn claude_tools_probe_enabled_for_cursor_binding() {
         let share = ShareForTest {
             subdomain: "share-sub".into(),
@@ -4071,10 +4080,10 @@ fn app_probe_for_kind(app: &str, kind: &str) -> Option<AppProbe> {
         ("codex", "text") => Some(AppProbe {
             method: "POST",
             path: "/v1/responses",
-            // gpt-5 系 Responses API：input 必须是 message 数组（"Input must be a
-            // list"），不能是裸字符串。max_output_tokens=16 是允许 reasoning trace
-            // 启动的最小值。
-            body: r#"{"model":"gpt-5.5","input":[{"role":"user","content":"who are you"}],"max_output_tokens":16}"#,
+            // Codex OAuth 上游强制 store=false（否则 400 "Store must be set to false"）。
+            // 对齐 cc-switch-server provider_test_body：stream + reasoning + include，
+            // 不用 max_output_tokens（OAuth 端点会拒绝）。
+            body: r#"{"model":"gpt-5.5","input":[{"role":"user","content":"who are you"}],"stream":true,"store":false,"reasoning":{"effort":"low"},"include":["reasoning.encrypted_content"],"instructions":"","tools":[],"parallel_tool_calls":false}"#,
         }),
         ("codex", "chat") => Some(AppProbe {
             method: "POST",
@@ -4506,7 +4515,7 @@ async fn test_share_connection(
                 .iter()
                 .map(|(k, v)| [k.as_str().to_string(), v.to_str().unwrap_or("").to_string()])
                 .collect();
-            let body_bytes = if input.app == "codex" && probe_kind == "image" {
+            let body_bytes = if input.app == "codex" && matches!(probe_kind, "image" | "text") {
                 let mut stream = resp.bytes_stream();
                 match tokio::time::timeout(std::time::Duration::from_secs(5), stream.next()).await {
                     Ok(Some(Ok(bytes))) => bytes,
