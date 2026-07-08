@@ -2766,6 +2766,7 @@ fn is_allowed_client_web_path(path: &str) -> bool {
         || path == "/web-api/auth/password/refresh"
         || path == "/web-api/auth/password/logout"
         || path == "/web-api/auth/password/change"
+        || path == "/web-api/auth/password/set"
         || path == "/web-api/auth/initial-setup"
         || path == "/web-api/context"
         || path.starts_with("/web-api/invoke/"))
@@ -3205,6 +3206,7 @@ data: {"data":[{"b64_json":"iVBORw0KGgo="}]}
         assert!(is_allowed_client_web_path("/assets/index-abc.js"));
         assert!(is_allowed_client_web_path("/web-api/context"));
         assert!(is_allowed_client_web_path("/web-api/auth/password/login"));
+        assert!(is_allowed_client_web_path("/web-api/auth/password/set"));
         assert!(is_allowed_client_web_path("/web-api/auth/initial-setup"));
         assert!(is_allowed_client_web_path("/web-api/invoke/get_providers"));
         assert!(is_allowed_client_web_path(
