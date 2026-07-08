@@ -9,7 +9,7 @@ import type { AppLocale } from "@/lib/i18n";
 import type { DashboardClient, HealthTimelineBucket, ImageGenerationRequestLog, MarketRequestLog, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareMarketListingStatus, ShareModelHealthCheck, ShareRequestLog, ShareUpstreamProvider, ShareUsageByEmailResponse, ShareView } from "@/lib/types";
 import { compactTokens, formatDateTime, formatNumber, formatRelativeTime } from "@/lib/utils";
 import { resolveShareCoreApp, SHARE_APP_LABELS } from "@/lib/share-app";
-import { averageRecentLatencyMs, cacheHitRate, clientPlatformLabel, clientTunnelDisplayUrl, configuredUpstreamPercent, CORE_SHARE_APPS, expiryTitle, formatAgeDaysOrHours, formatImageLogSizeMb, formatImageLogSpendSeconds, formatImageLogTimestamp, formatLatencySeconds, formatMinutesShort, formatPercent, formatShareStatus, HealthDots, isUnlimited, mergeStandaloneOAuthRuntime, modelHealthTitle, modelHealthTone, providerAccountIdentity, providerAccountLevel, providerModelMap, requestBelongsToApp, requestModelRoute, runtimeEndpointSummary, shareApiParts, shareAppExists, shareAppSettings, shareAppTokensUsed, shareExpiryProgress, tokenCount, usageBucketTotalTokens, type CoreShareApp, type TFn } from "@/components/dashboard/share-dashboard-utils";
+import { averageRecentLatencyMs, cacheHitRate, clientPlatformLabel, clientTunnelDisplayUrl, configuredUpstreamPercent, CORE_SHARE_APPS, expiryTitle, formatAgeDaysOrHours, formatImageLogSizeMb, formatImageLogSpendSeconds, formatImageLogTimestamp, formatLatencySeconds, formatMinutesShort, formatPercent, formatShareStatus, HealthDots, isUnlimited, mergeStandaloneOAuthRuntime, modelHealthTitle, modelHealthTone, providerAccountIdentity, providerAccountLevel, providerModelMap, requestBelongsToApp, requestModelRoute, runtimeEndpointSummary, shareApiParts, shareAppExists, shareAppSettings, shareAppTokensUsed, shareAppSupportLine, shareExpiryProgress, tokenCount, usageBucketTotalTokens, type CoreShareApp, type TFn } from "@/components/dashboard/share-dashboard-utils";
 
 export function StatusBadge({ active, label }: { active: boolean; label: string }) {
   return <Chip color={active ? "success" : "default"} size="sm" variant={active ? "soft" : "tertiary"}>{label}</Chip>;
@@ -164,17 +164,15 @@ export function ShareAppSupportCard({
   locale: AppLocale;
 }) {
   const enabled = !!share.support?.[app];
-  const runtime = mergeStandaloneOAuthRuntime(share.appRuntimes?.[app], share.appRuntimes);
   const tone = enabled ? modelHealthTone(share, app) : { className: "bg-slate-50 text-muted-foreground", label: "" };
+  const summary = shareAppSupportLine(share, app, label, locale);
   return (
-    <div title={enabled ? modelHealthTitle(share, app) : undefined} className={`grid min-w-0 grid-cols-[56px_minmax(0,1fr)] gap-2 overflow-hidden rounded-lg border px-2 py-1.5 text-[11px] ${tone.className}`}>
-      <span className="min-w-0 font-mono uppercase">{label}</span>
-      <span className="grid min-w-0 gap-0.5 overflow-hidden text-right">
-        <span className="min-w-0 whitespace-normal break-words font-semibold">{enabled ? providerAccountLevel(runtime, locale) : ""}</span>
-        <span className="min-w-0 whitespace-normal break-all text-[10px] font-medium opacity-75">{enabled ? providerAccountIdentity(runtime) : ""}</span>
-        <span className="min-w-0 whitespace-normal break-all text-[10px] font-medium opacity-75">{enabled ? providerModelMap(runtime) : ""}</span>
-        <span className="min-w-0 text-[10px] font-semibold opacity-70">{enabled ? tone.label : ""}</span>
-      </span>
+    <div
+      data-no-row-drawer
+      title={enabled ? modelHealthTitle(share, app) : undefined}
+      className={`select-text rounded-lg border px-2 py-1.5 text-[11px] leading-5 ${tone.className}`}
+    >
+      <span className="min-w-0 whitespace-normal break-words">{summary}</span>
     </div>
   );
 }
