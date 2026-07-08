@@ -9,7 +9,7 @@ import type { AppLocale } from "@/lib/i18n";
 import type { DashboardClient, HealthTimelineBucket, ImageGenerationRequestLog, MarketRequestLog, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareMarketListingStatus, ShareModelHealthCheck, ShareRequestLog, ShareUpstreamProvider, ShareUsageByEmailResponse, ShareView } from "@/lib/types";
 import { compactTokens, formatDateTime, formatNumber, formatRelativeTime } from "@/lib/utils";
 import { resolveShareCoreApp, SHARE_APP_LABELS } from "@/lib/share-app";
-import { averageRecentLatencyMs, cacheHitRate, clientPlatformLabel, clientTunnelDisplayUrl, configuredUpstreamPercent, CORE_SHARE_APPS, expiryTitle, formatAgeDaysOrHours, formatImageLogSizeMb, formatImageLogSpendSeconds, formatImageLogTimestamp, formatLatencySeconds, formatMinutesShort, formatPercent, formatShareStatus, HealthDots, isUnlimited, mergeStandaloneOAuthRuntime, modelHealthTitle, modelHealthTone, providerAccountIdentity, providerAccountLevel, providerModelMap, requestBelongsToApp, requestModelRoute, runtimeEndpointSummary, shareApiParts, shareAppExists, shareAppSettings, shareAppTokensUsed, shareExpiryProgress, tokenCount, usageBucketTotalTokens, type CoreShareApp, type TFn } from "@/components/dashboard/share-dashboard-utils";
+import { averageRecentLatencyMs, boundProviderIdForApp, cacheHitRate, clientPlatformLabel, clientTunnelDisplayUrl, configuredUpstreamPercent, CORE_SHARE_APPS, expiryTitle, formatAgeDaysOrHours, formatImageLogSizeMb, formatImageLogSpendSeconds, formatImageLogTimestamp, formatLatencySeconds, formatMinutesShort, formatPercent, formatShareStatus, HealthDots, isUnlimited, mergeStandaloneOAuthRuntime, modelHealthTitle, modelHealthTone, providerAccountIdentity, providerAccountLevel, providerModelMap, requestBelongsToApp, requestModelRoute, resolveShareAppRuntime, runtimeEndpointSummary, shareApiParts, shareAppExists, shareAppProviderRuntime, shareAppSettings, shareAppTokensUsed, shareExpiryProgress, tokenCount, usageBucketTotalTokens, type CoreShareApp, type TFn } from "@/components/dashboard/share-dashboard-utils";
 
 export function StatusBadge({ active, label }: { active: boolean; label: string }) {
   return <Chip color={active ? "success" : "default"} size="sm" variant={active ? "soft" : "tertiary"}>{label}</Chip>;
@@ -164,7 +164,7 @@ export function ShareAppSupportCard({
   locale: AppLocale;
 }) {
   const enabled = !!share.support?.[app];
-  const runtime = mergeStandaloneOAuthRuntime(share.appRuntimes?.[app], share.appRuntimes);
+  const runtime = resolveShareAppRuntime(share, app);
   const tone = enabled ? modelHealthTone(share, app) : { className: "bg-slate-50 text-muted-foreground", label: "" };
   const accountEmail = enabled ? providerAccountIdentity(runtime) : "";
   const modelSummary = enabled ? providerModelMap(runtime) : "";
@@ -676,17 +676,7 @@ const PROVIDER_APP_TABS: Array<{ key: keyof ShareAppProviders; label: string }> 
 ];
 
 export function providerRuntime(provider: ShareAppProvider): ShareUpstreamProvider {
-  return {
-    providerName: provider.name,
-    kind: provider.kind,
-    app: provider.app,
-    providerType: provider.providerType,
-    accountEmail: provider.accountEmail,
-    forSaleOfficialPricePercent: provider.forSaleOfficialPricePercent,
-    apiUrl: provider.apiUrl,
-    quota: provider.quota,
-    models: provider.models,
-  };
+  return shareAppProviderRuntime(provider);
 }
 
 export function providerMetaLabel(provider: ShareAppProvider) {
@@ -1075,10 +1065,6 @@ export function ShareUsageTrendChart({
           ) : null}
         </svg>
   );
-}
-
-export function boundProviderIdForApp(share: ShareView | undefined, app: keyof ShareAppProviders) {
-  return share?.bindings?.[app] || (share?.appType === app ? share.providerId : undefined);
 }
 
 /**

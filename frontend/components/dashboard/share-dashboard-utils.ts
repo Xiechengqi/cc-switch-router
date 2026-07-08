@@ -50,10 +50,22 @@ export function isUnlimited(value?: number) {
   return Number(value) < 0;
 }
 
+export function parseShareTimestamp(value?: string) {
+  if (!value) return Number.NaN;
+  const trimmed = value.trim();
+  if (!trimmed) return Number.NaN;
+  const parsed = new Date(trimmed).getTime();
+  if (Number.isFinite(parsed)) return parsed;
+  const numeric = Number(trimmed);
+  if (!Number.isFinite(numeric)) return Number.NaN;
+  if (numeric > 0 && numeric < 10_000_000_000) return numeric * 1000;
+  return numeric;
+}
+
 export function isUnlimitedExpiry(value?: string) {
   if (!value) return false;
-  const expiresAt = new Date(value).getTime();
-  if (Number.isNaN(expiresAt)) return false;
+  const expiresAt = parseShareTimestamp(value);
+  if (!Number.isFinite(expiresAt)) return false;
   const fiftyYearsMs = 50 * 365 * 24 * 60 * 60 * 1000;
   return expiresAt - Date.now() >= fiftyYearsMs;
 }
@@ -64,7 +76,7 @@ export function expiryTitle(value?: string) {
 
 export function formatDurationShort(value?: string, locale: AppLocale = "en", mode: "elapsed" | "remaining" = "elapsed") {
   if (!value) return "--";
-  const ts = new Date(value).getTime();
+  const ts = parseShareTimestamp(value);
   if (!Number.isFinite(ts)) return "--";
   const diff = mode === "remaining" ? ts - Date.now() : Date.now() - ts;
   const isZh = locale.startsWith("zh");
@@ -526,6 +538,48 @@ export function mergeStandaloneOAuthRuntime(
   };
 }
 
+export function shareAppProviderRuntime(provider: ShareAppProvider): ShareUpstreamProvider {
+  return {
+    providerName: provider.name,
+    kind: provider.kind,
+    app: provider.app,
+    providerType: provider.providerType,
+    accountEmail: provider.accountEmail,
+    forSaleOfficialPricePercent: provider.forSaleOfficialPricePercent,
+    apiUrl: provider.apiUrl,
+    quota: provider.quota,
+    models: provider.models,
+  };
+}
+
+export function boundProviderIdForApp(share: ShareView | undefined, app: CoreShareApp) {
+  return share?.bindings?.[app] || (share?.appType === app ? share.providerId : undefined);
+}
+
+export function resolveShareAppRuntime(share: ShareView, app: CoreShareApp) {
+  const runtimes = share.appRuntimes;
+  const boundProviderId = boundProviderIdForApp(share, app);
+  const providers = share.appProviders?.[app] || [];
+  const provider =
+    providers.find((item) => item.id === boundProviderId) ||
+    providers.find((item) => item.isCurrent) ||
+    providers[0];
+  if (provider) {
+    return mergeStandaloneOAuthRuntime(shareAppProviderRuntime(provider), runtimes, provider);
+  }
+  const slotRuntime = runtimes?.[app];
+  if (slotRuntime) {
+    return mergeStandaloneOAuthRuntime(slotRuntime, runtimes);
+  }
+  return slotRuntime;
+}
+
+export function utilizationPercentForDisplay(value: number) {
+  if (!Number.isFinite(value)) return 0;
+  if (value >= 0 && value <= 1) return Math.round(value * 100);
+  return Math.round(value);
+}
+
 export function quotaSummary(runtime?: ShareUpstreamProvider, locale: AppLocale = "en") {
   if (!runtime || (hasConcreteApiUrl(runtime) && !runtimeLooksOAuth(runtime))) return "";
   const quota = runtime.quota;
@@ -549,9 +603,10 @@ export function quotaSummary(runtime?: ShareUpstreamProvider, locale: AppLocale 
           ? `${usageLabel} ${usageAmount}`
           : usageAmount
         : usageLabel;
-      const utilization = typeof tier.utilization === "number" && Number.isFinite(tier.utilization)
-        ? `${Math.round(tier.utilization)}%`
-        : "";
+      const utilization =
+        typeof tier.utilization === "number" && Number.isFinite(tier.utilization)
+          ? `${utilizationPercentForDisplay(tier.utilization)}%`
+          : "";
       return [usage, isOllamaCloud ? "" : utilization, countdownStr(tier.resetsAt)].filter(Boolean).join(" ");
     })
     .join(" · ");

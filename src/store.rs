@@ -6617,12 +6617,16 @@ fn upsert_share_tx(
                 .map_err(|e| AppError::Internal(format!("serialize share bindings failed: {e}")))?,
         )
     };
+    let app_runtimes_json = serde_json::to_string(&share.app_runtimes)
+        .map_err(|e| AppError::Internal(format!("serialize app runtimes failed: {e}")))?;
+    let app_providers_json = serde_json::to_string(&share.app_providers)
+        .map_err(|e| AppError::Internal(format!("serialize app providers failed: {e}")))?;
     conn.execute(
         "INSERT INTO shares (
             share_id, installation_id, share_name, owner_email, shared_with_emails_json, market_access_mode, access_by_app_json, app_settings_json, description, for_sale, sale_market_kind, subdomain, app_type, provider_id,
             enabled_claude, enabled_codex, enabled_gemini,
-            token_limit, parallel_limit, tokens_used, requests_count, share_status, created_at, expires_at, upstream_provider_json, bindings_json, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
+            token_limit, parallel_limit, tokens_used, requests_count, share_status, created_at, expires_at, upstream_provider_json, app_runtimes_json, app_providers_json, bindings_json, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)
         ON CONFLICT(share_id) DO UPDATE SET
             installation_id = excluded.installation_id,
             share_name = excluded.share_name,
@@ -6645,11 +6649,11 @@ fn upsert_share_tx(
             tokens_used = excluded.tokens_used,
             requests_count = excluded.requests_count,
             share_status = excluded.share_status,
-            created_at = excluded.created_at,
+            created_at = COALESCE(NULLIF(shares.created_at, ''), excluded.created_at),
             expires_at = excluded.expires_at,
-            upstream_provider_json = shares.upstream_provider_json,
-            app_runtimes_json = shares.app_runtimes_json,
-            app_providers_json = shares.app_providers_json,
+            upstream_provider_json = excluded.upstream_provider_json,
+            app_runtimes_json = excluded.app_runtimes_json,
+            app_providers_json = excluded.app_providers_json,
             bindings_json = excluded.bindings_json,
             runtime_refreshed_at = shares.runtime_refreshed_at,
             updated_at = excluded.updated_at",
@@ -6679,6 +6683,8 @@ fn upsert_share_tx(
             share.created_at,
             share.expires_at,
             upstream_provider_json,
+            app_runtimes_json,
+            app_providers_json,
             bindings_json,
             Utc::now().to_rfc3339(),
         ],
