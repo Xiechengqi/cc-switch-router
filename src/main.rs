@@ -45,7 +45,9 @@ use crate::models::ShareRuntimeSnapshotResponse;
 use crate::recent_traffic::RecentTraffic;
 use crate::scheduling_signals::OverrideStore;
 use crate::startup_config::{StartupConfigMode, ensure_startup_config};
-use crate::store::{AppStore, ShareRouteTarget, fetch_share_runtime_snapshot_from_route};
+use crate::store::{
+    AppStore, ClientTunnelRouteTarget, ShareRouteTarget, fetch_share_runtime_snapshot_from_route,
+};
 
 pub use crate::server_state::{ResendUsageCache, ServerGeo, ServerState};
 
@@ -422,6 +424,23 @@ async fn run_route_health_probe_cycle(
             tracing::warn!(share_id = %target.share_id, "record route health failed: {err}");
         }
     }
+    let client_targets = store.list_client_tunnel_route_targets().await?;
+    for target in client_targets {
+        let is_healthy = if active.contains(&target.subdomain) {
+            probe_client_tunnel_route(config, client, &target).await
+        } else {
+            false
+        };
+        if let Err(err) = store
+            .record_installation_route_health(&target.installation_id, is_healthy)
+            .await
+        {
+            tracing::warn!(
+                installation_id = %target.installation_id,
+                "record client tunnel route health failed: {err}"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -511,10 +530,23 @@ async fn probe_share_route(
     client: &reqwest::Client,
     target: &ShareRouteTarget,
 ) -> bool {
-    let url = format!(
-        "{}/_share-router/health",
-        config.tunnel_url(&target.subdomain)
-    );
+    probe_tunnel_route_health(config, client, &target.subdomain).await
+}
+
+async fn probe_client_tunnel_route(
+    config: &Config,
+    client: &reqwest::Client,
+    target: &ClientTunnelRouteTarget,
+) -> bool {
+    probe_tunnel_route_health(config, client, &target.subdomain).await
+}
+
+async fn probe_tunnel_route_health(
+    config: &Config,
+    client: &reqwest::Client,
+    subdomain: &str,
+) -> bool {
+    let url = format!("{}/_share-router/health", config.tunnel_url(subdomain));
     match client
         .get(&url)
         .header("X-Share-Router-Probe", "1")

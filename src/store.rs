@@ -265,6 +265,12 @@ pub struct ShareRouteTarget {
     pub app_runtimes: ShareAppRuntimes,
 }
 
+#[derive(Debug, Clone)]
+pub struct ClientTunnelRouteTarget {
+    pub installation_id: String,
+    pub subdomain: String,
+}
+
 #[derive(Debug, Default)]
 pub struct CleanupResult {
     pub deleted_leases: usize,
@@ -3009,6 +3015,9 @@ impl AppStore {
             health_by_share,
             health_timeline_by_share,
             online_by_share,
+            health_by_installation,
+            health_timeline_by_installation,
+            online_by_installation,
             recent_logs,
             recent_model_health_checks,
             market_logs,
@@ -3025,6 +3034,9 @@ impl AppStore {
                 list_health_checks(&conn, 10)?,
                 list_share_health_timeline_24h(&conn, now)?,
                 list_online_minutes_24h(&conn)?,
+                list_installation_health_checks(&conn, 10)?,
+                list_installation_health_timeline_24h(&conn, now)?,
+                list_installation_online_minutes_24h(&conn)?,
                 list_recent_share_request_logs(&conn, SHARE_REQUEST_LOG_RECOVERY_LIMIT)?,
                 list_recent_share_model_health_checks(&conn, SHARE_MODEL_HEALTH_CHECK_LIMIT)?,
                 list_recent_market_request_logs(&conn, 200)?,
@@ -3394,8 +3406,14 @@ impl AppStore {
                     .get(&installation.id)
                     .copied()
                     .unwrap_or(0);
-                if share_count == 0 && online_minutes_24h == 0 && client_tunnel_online {
-                    online_minutes_24h = ONLINE_WINDOW_MINUTES;
+                if share_count == 0 {
+                    online_minutes_24h = online_by_installation
+                        .get(&installation.id)
+                        .copied()
+                        .unwrap_or(online_minutes_24h);
+                    if online_minutes_24h == 0 && client_tunnel_online {
+                        online_minutes_24h = 1;
+                    }
                 }
                 let online_rate_24h =
                     ((online_minutes_24h as f64 / ONLINE_WINDOW_MINUTES as f64) * 100.0).min(100.0);
@@ -3410,19 +3428,31 @@ impl AppStore {
                     .get(&installation.id)
                     .cloned()
                     .unwrap_or_default();
-                if share_count == 0 && client_tunnel_online {
-                    if health_checks.is_empty() {
-                        append_recent_online_health_checks(&mut health_checks, 10);
-                    } else {
-                        append_current_online_health_check(&mut health_checks);
+                if share_count == 0 {
+                    health_checks = health_by_installation
+                        .get(&installation.id)
+                        .cloned()
+                        .unwrap_or(health_checks);
+                    if client_tunnel_online {
+                        if health_checks.is_empty() {
+                            append_recent_online_health_checks(&mut health_checks, 10);
+                        } else {
+                            append_current_online_health_check(&mut health_checks);
+                        }
                     }
                 }
                 let mut health_timeline = client_timeline_by_installation
                     .get(&installation.id)
                     .cloned()
                     .unwrap_or_default();
-                if share_count == 0 && client_tunnel_online && health_timeline.is_empty() {
-                    health_timeline = current_online_health_timeline(health_timeline_start);
+                if share_count == 0 {
+                    health_timeline = health_timeline_by_installation
+                        .get(&installation.id)
+                        .cloned()
+                        .unwrap_or(health_timeline);
+                    if health_timeline.is_empty() && client_tunnel_online {
+                        health_timeline = current_online_health_timeline(health_timeline_start);
+                    }
                 }
                 DashboardClientView {
                     share_count,
@@ -4058,6 +4088,33 @@ impl AppStore {
                 })
             })
             .map_err(|e| AppError::Internal(format!("query route targets failed: {e}")))?;
+        collect_rows(rows)
+    }
+
+    pub async fn list_client_tunnel_route_targets(
+        &self,
+    ) -> Result<Vec<ClientTunnelRouteTarget>, AppError> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT installation_id, subdomain
+                 FROM installation_client_tunnels
+                 WHERE enabled = 1
+                   AND subdomain IS NOT NULL
+                   AND subdomain != ''
+                 ORDER BY subdomain ASC",
+            )
+            .map_err(|e| {
+                AppError::Internal(format!("prepare client tunnel targets failed: {e}"))
+            })?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ClientTunnelRouteTarget {
+                    installation_id: row.get(0)?,
+                    subdomain: row.get(1)?,
+                })
+            })
+            .map_err(|e| AppError::Internal(format!("query client tunnel targets failed: {e}")))?;
         collect_rows(rows)
     }
 
@@ -5628,6 +5685,26 @@ impl AppStore {
         Ok(())
     }
 
+    pub async fn record_installation_route_health(
+        &self,
+        installation_id: &str,
+        is_healthy: bool,
+    ) -> Result<(), AppError> {
+        let now = Utc::now().timestamp();
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO installation_health_checks (installation_id, checked_at, is_healthy) VALUES (?1, ?2, ?3)",
+            params![installation_id, now, if is_healthy { 1 } else { 0 }],
+        )
+        .map_err(|e| AppError::Internal(format!("insert installation route health failed: {e}")))?;
+        conn.execute(
+            "DELETE FROM installation_health_checks WHERE checked_at < ?1",
+            params![now - 86_400],
+        )
+        .map_err(|e| AppError::Internal(format!("prune installation route health failed: {e}")))?;
+        Ok(())
+    }
+
     pub async fn record_share_model_health_check(
         &self,
         check: ShareModelHealthCheckEntry,
@@ -7089,6 +7166,13 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             is_healthy INTEGER NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS installation_health_checks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            installation_id TEXT NOT NULL,
+            checked_at INTEGER NOT NULL,
+            is_healthy INTEGER NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS share_model_health_checks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             request_id TEXT NOT NULL UNIQUE,
@@ -7361,6 +7445,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         CREATE INDEX IF NOT EXISTS idx_image_request_logs_provider_created ON image_generation_request_logs(provider_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_image_request_logs_status_created ON image_generation_request_logs(status, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_share_health_checks ON share_health_checks(share_id, checked_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_installation_health_checks ON installation_health_checks(installation_id, checked_at DESC);
         CREATE INDEX IF NOT EXISTS idx_share_model_health_checks_share ON share_model_health_checks(share_id, app_type, requested_model, checked_at DESC);
         CREATE INDEX IF NOT EXISTS idx_share_model_health_state_share ON share_model_health_state(share_id, app_type, last_status);
         CREATE INDEX IF NOT EXISTS idx_dashboard_presence_last_seen ON dashboard_presence(last_seen_at DESC);
@@ -11543,6 +11628,74 @@ fn list_online_minutes_24h(conn: &Connection) -> Result<HashMap<String, usize>, 
     Ok(map)
 }
 
+fn list_installation_health_checks(
+    conn: &Connection,
+    minutes: usize,
+) -> Result<HashMap<String, Vec<HealthCheckEntry>>, AppError> {
+    let current_bucket = Utc::now().timestamp().div_euclid(60);
+    let cutoff = (current_bucket - (minutes as i64 - 1)) * 60;
+    let mut stmt = conn
+        .prepare(
+            "SELECT installation_id, checked_at, is_healthy
+             FROM installation_health_checks
+             WHERE checked_at >= ?1
+             ORDER BY checked_at ASC",
+        )
+        .map_err(|e| {
+            AppError::Internal(format!("prepare installation health checks failed: {e}"))
+        })?;
+    let rows = stmt
+        .query_map(params![cutoff], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                HealthCheckEntry {
+                    checked_at: row.get(1)?,
+                    is_healthy: row.get::<_, i64>(2)? != 0,
+                },
+            ))
+        })
+        .map_err(|e| AppError::Internal(format!("query installation health checks failed: {e}")))?;
+    let mut map: HashMap<String, Vec<HealthCheckEntry>> = HashMap::new();
+    for row in rows {
+        let (installation_id, entry) = row.map_err(|e| {
+            AppError::Internal(format!("read installation health check row failed: {e}"))
+        })?;
+        map.entry(installation_id).or_default().push(entry);
+    }
+    Ok(map)
+}
+
+fn list_installation_online_minutes_24h(
+    conn: &Connection,
+) -> Result<HashMap<String, usize>, AppError> {
+    let cutoff = Utc::now().timestamp() - 24 * 60 * 60;
+    let mut stmt = conn
+        .prepare(
+            "SELECT installation_id, COUNT(DISTINCT checked_at / 60) AS online_minutes
+             FROM installation_health_checks
+             WHERE checked_at >= ?1 AND is_healthy = 1
+             GROUP BY installation_id",
+        )
+        .map_err(|e| {
+            AppError::Internal(format!("prepare installation online minutes failed: {e}"))
+        })?;
+    let rows = stmt
+        .query_map(params![cutoff], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+        })
+        .map_err(|e| {
+            AppError::Internal(format!("query installation online minutes failed: {e}"))
+        })?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let (installation_id, online_minutes) = row.map_err(|e| {
+            AppError::Internal(format!("read installation online minute row failed: {e}"))
+        })?;
+        map.insert(installation_id, online_minutes.min(ONLINE_WINDOW_MINUTES));
+    }
+    Ok(map)
+}
+
 #[derive(Debug, Clone, Default)]
 struct HealthTimelineBucketStats {
     healthy_minutes: HashSet<i64>,
@@ -11800,6 +11953,58 @@ fn list_share_health_timeline_24h(
     Ok(by_share
         .into_iter()
         .map(|(share_id, stats)| (share_id, materialize_health_timeline(&stats, start)))
+        .collect())
+}
+
+fn list_installation_health_timeline_24h(
+    conn: &Connection,
+    now: DateTime<Utc>,
+) -> Result<HashMap<String, Vec<HealthTimelineBucket>>, AppError> {
+    let (start, end) = health_timeline_window(now);
+    let mut by_installation: HashMap<String, Vec<HealthTimelineBucketStats>> = HashMap::new();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT installation_id, checked_at, is_healthy
+             FROM installation_health_checks
+             WHERE checked_at >= ?1 AND checked_at <= ?2",
+        )
+        .map_err(|e| {
+            AppError::Internal(format!("prepare installation health timeline failed: {e}"))
+        })?;
+    let rows = stmt
+        .query_map(params![start, end], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)? != 0,
+            ))
+        })
+        .map_err(|e| {
+            AppError::Internal(format!("query installation health timeline failed: {e}"))
+        })?;
+    for row in rows {
+        let (installation_id, checked_at, is_healthy) = row.map_err(|e| {
+            AppError::Internal(format!("read installation health timeline row failed: {e}"))
+        })?;
+        let Some(index) = health_timeline_bucket_index(checked_at, start, end) else {
+            continue;
+        };
+        let minute = checked_at.div_euclid(60);
+        let bucket = &mut by_installation
+            .entry(installation_id)
+            .or_insert_with(empty_health_timeline_stats)[index];
+        bucket.observed_minutes.insert(minute);
+        if is_healthy {
+            bucket.healthy_minutes.insert(minute);
+        }
+    }
+
+    Ok(by_installation
+        .into_iter()
+        .map(|(installation_id, stats)| {
+            (installation_id, materialize_health_timeline(&stats, start))
+        })
         .collect())
 }
 
@@ -15249,6 +15454,24 @@ mod tests {
             params![share_id, checked_at, if is_healthy { 1 } else { 0 }],
         )
         .expect("insert health check");
+    }
+
+    async fn insert_installation_health_check(
+        store: &AppStore,
+        installation_id: &str,
+        checked_at: i64,
+        is_healthy: bool,
+    ) {
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "INSERT INTO installation_health_checks (installation_id, checked_at, is_healthy) VALUES (?1, ?2, ?3)",
+            params![
+                installation_id,
+                checked_at,
+                if is_healthy { 1 } else { 0 }
+            ],
+        )
+        .expect("insert installation health check");
     }
 
     async fn insert_model_health_check(
@@ -18957,6 +19180,16 @@ mod tests {
         let (store, config) = setup_store("dashboard-client-tunnel-health").await;
         insert_installation(&store, "inst-client").await;
         insert_client_tunnel(&store, "inst-client", "owner@example.com", "client-sub").await;
+        let now = Utc::now();
+        for minute_offset in 0..30 {
+            insert_installation_health_check(
+                &store,
+                "inst-client",
+                now.timestamp() - minute_offset * 60,
+                true,
+            )
+            .await;
+        }
 
         let server_geo = ServerGeo {
             lat: None,
@@ -18991,15 +19224,23 @@ mod tests {
                 .as_ref()
                 .is_some_and(|tunnel| tunnel.online)
         );
-        assert_eq!(client.online_minutes_24h, ONLINE_WINDOW_MINUTES);
-        assert_eq!(client.online_rate_24h, 100.0);
+        assert_eq!(client.online_minutes_24h, 30);
+        assert!(
+            (client.online_rate_24h - (30.0 / ONLINE_WINDOW_MINUTES as f64 * 100.0)).abs() < 0.01
+        );
         assert_eq!(client.health_checks.len(), 10);
         assert!(client.health_checks.iter().all(|entry| entry.is_healthy));
+        assert_eq!(client.health_timeline.len(), HEALTH_TIMELINE_BUCKETS);
+        let latest = client.health_timeline.last().expect("latest bucket");
+        assert_eq!(latest.status, "healthy");
+        assert_eq!(latest.online_minutes, 30);
         assert!(
             client
                 .health_timeline
                 .iter()
-                .any(|bucket| bucket.status == "healthy")
+                .filter(|bucket| bucket.status == "healthy")
+                .count()
+                >= 1
         );
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
