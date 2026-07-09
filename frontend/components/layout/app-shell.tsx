@@ -370,11 +370,11 @@ function Topbar({ active }: { active: "dashboard" | "settings" | "metrics" }) {
                 </Dropdown.Item>
                 {session?.isAdmin ? (
                   <>
-                    <Dropdown.Item id="metrics" href="/metrics/">
+                    <Dropdown.Item id="metrics" onAction={() => window.open("/metrics/", "_blank", "noopener,noreferrer")}>
                       <Activity className="h-4 w-4" />
                       {t("nav.metrics")}
                     </Dropdown.Item>
-                    <Dropdown.Item id="settings" href="/settings/">
+                    <Dropdown.Item id="settings" onAction={() => window.open("/settings/", "_blank", "noopener,noreferrer")}>
                       <Settings className="h-4 w-4" />
                       {t("nav.settings")}
                     </Dropdown.Item>

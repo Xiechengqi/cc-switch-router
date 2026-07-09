@@ -1,7 +1,7 @@
 "use client";
 
 import { Card, Chip } from "@heroui/react";
-import { ExternalLink } from "lucide-react";
+import { ChevronRight, ExternalLink } from "lucide-react";
 import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
@@ -18,7 +18,6 @@ import {
   shareAppTokensUsed,
   shareExpiryProgress,
   shareStatusShareMarketUrl,
-  shouldOpenRowDrawer,
   UsageBar,
 } from "@/components/dashboard/data-tables";
 import type { ShareRequestLog, ShareView } from "@/lib/types";
@@ -73,15 +72,10 @@ export const ShareCard = React.memo(function ShareCard({
   const rowClass = "grid grid-cols-[58px_minmax(0,1fr)] gap-2 text-[11px]";
 
   return (
-    <Card
-      className="w-72 shrink-0 snap-start rounded-lg border border-default/50 bg-white p-0 shadow-sm transition-colors hover:border-primary/30 hover:bg-primary/[0.03]"
-      onClick={(event) => {
-        if (shouldOpenRowDrawer(event)) onOpen(share);
-      }}
-    >
-      <Card.Content className="grid gap-3 p-3">
+    <Card className="flex w-72 shrink-0 snap-start overflow-hidden rounded-lg border border-default/50 bg-white p-0 shadow-sm">
+      <Card.Content className="grid min-w-0 flex-1 gap-3 p-3">
         <div className="grid min-w-0 gap-1.5">
-          <div className="flex min-w-0 cursor-pointer items-start justify-between gap-2">
+          <div className="flex min-w-0 items-start justify-between gap-2">
             <strong className="min-w-0 break-all font-mono text-xs text-foreground">
               {api.apiUrl}
             </strong>
@@ -152,6 +146,14 @@ export const ShareCard = React.memo(function ShareCard({
           </div>
         </div>
       </Card.Content>
+      <button
+        type="button"
+        className="flex w-9 shrink-0 items-center justify-center self-stretch border-l border-default/50 bg-slate-50 text-muted-foreground transition-colors hover:bg-primary/10 hover:text-foreground"
+        aria-label={t("dashboard.openShareDrawer")}
+        onClick={() => onOpen(share)}
+      >
+        <ChevronRight className="h-4 w-4" />
+      </button>
     </Card>
   );
 });

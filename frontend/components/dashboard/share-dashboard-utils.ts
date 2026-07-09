@@ -6,7 +6,22 @@ import type { AppLocale } from "@/lib/i18n";
 import type { DashboardClient, DashboardMarket, HealthCheckEntry, MarketRequestLog, ModelHealthSummary, ShareAppProvider, ShareAppRuntimes, ShareRequestLog, ShareUpstreamProvider, ShareView } from "@/lib/types";
 import { formatDateTime } from "@/lib/utils";
 
+let rowPointerDown: { x: number; y: number } | null = null;
+
+export function onRowPointerDown(event: React.MouseEvent<HTMLElement> | React.PointerEvent<HTMLElement>) {
+  rowPointerDown = { x: event.clientX, y: event.clientY };
+}
+
 export function shouldOpenRowDrawer(event: React.MouseEvent<HTMLElement>) {
+  if (rowPointerDown) {
+    const deltaX = Math.abs(event.clientX - rowPointerDown.x);
+    const deltaY = Math.abs(event.clientY - rowPointerDown.y);
+    rowPointerDown = null;
+    if (deltaX > 4 || deltaY > 4) {
+      return false;
+    }
+  }
+
   const selection = window.getSelection();
   if (selection && !selection.isCollapsed && selection.toString().trim()) {
     return false;

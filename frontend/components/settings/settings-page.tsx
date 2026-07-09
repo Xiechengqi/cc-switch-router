@@ -19,7 +19,7 @@ export function SettingsPage() {
   const { t } = useLocaleText();
   const [schema, setSchema] = React.useState<SettingsSchema | null>(null);
   const [values, setValues] = React.useState<Record<string, SettingValueEntry>>({});
-  const [activeGroup, setActiveGroup] = React.useState<string>("");
+  const [activeGroup, setActiveGroup] = React.useState<string>(VERSION_GROUP);
   const [dirty, setDirty] = React.useState<Record<string, DirtyValue>>({});
   const [busy, setBusy] = React.useState("");
   const [banner, setBanner] = React.useState<{ kind: "default" | "success" | "destructive"; text: string } | null>(null);
@@ -32,7 +32,7 @@ export function SettingsPage() {
       const [nextSchema, nextValues] = await Promise.all([getSettingsSchema(), getSettingsValues()]);
       setSchema(nextSchema);
       setValues(Object.fromEntries(nextValues.values.map((entry) => [entry.key, entry])));
-      setActiveGroup((current) => current || nextSchema.groups[0] || "");
+      setActiveGroup((current) => current || VERSION_GROUP);
       setDirty({});
       setBanner(null);
     } catch (err) {

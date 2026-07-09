@@ -25,6 +25,8 @@ import {
   ShareModelHealthChecks,
   ShareProvidersPanel,
   shareApiParts,
+  onRowPointerDown,
+  shouldOpenRowDrawer,
   sortClients,
 } from "@/components/dashboard/data-tables";
 import type { DashboardClient, DashboardMarket, ShareView } from "@/lib/types";
@@ -122,7 +124,13 @@ function ClientCard({
   return (
     <Card className="overflow-hidden rounded-lg border bg-white p-0 shadow-sm">
       <Card.Content className="grid gap-4 p-4">
-        <div className="grid cursor-pointer gap-3 rounded-md px-1 py-0.5 transition-colors hover:bg-primary/[0.03] md:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_auto]" onClick={() => onOpenClient(client)}>
+        <div
+          className="grid cursor-pointer select-text gap-3 rounded-md px-1 py-0.5 transition-colors hover:bg-primary/[0.03] md:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_auto]"
+          onMouseDown={onRowPointerDown}
+          onClick={(event) => {
+            if (shouldOpenRowDrawer(event)) onOpenClient(client);
+          }}
+        >
           <div className="grid min-w-0 gap-1">
             {tunnelUrl ? (
               <a href={tunnelUrl} target="_blank" rel="noopener noreferrer" data-no-row-drawer className="inline-flex min-w-0 max-w-full items-center gap-1 break-all font-mono text-xs font-semibold text-foreground underline-offset-4 hover:underline" title={tunnelUrl} onClick={(event) => event.stopPropagation()}>
