@@ -2528,12 +2528,6 @@ impl AppStore {
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| AppError::Internal(format!("begin batch sync tx failed: {e}")))?;
-        let upsert_count = input.ops.iter().filter(|op| op.kind == "upsert").count();
-        if upsert_count > 1 {
-            return Err(AppError::BadRequest(
-                "multiple share upserts are not supported for one installation".into(),
-            ));
-        }
         for op in input.ops {
             match op.kind.as_str() {
                 "upsert" => {
@@ -3514,8 +3508,8 @@ impl AppStore {
                 clients: client_map_points,
             },
             clients: client_views,
-            // P7 Step 2：share 维度全量列表，前端 SharesTable 唯一数据源。
-            // clients 数组退化为 installation 维度（只含 share_ids/share_count），不再持有 share 实体。
+            // Share 全量列表；前端按 installation 分组为独立横向卡片。
+            // clients 只持有 share_ids/share_count，不重复嵌入 share 实体。
             shares: share_views.clone(),
             markets,
             ticker_shares,
@@ -6669,6 +6663,15 @@ fn upsert_share_tx(
     installation_id: &str,
     share: ShareDescriptor,
 ) -> Result<(), AppError> {
+    if share.bindings.len() != 1
+        || share.provider_id.as_deref().is_none_or(|provider_id| {
+            share.bindings.get(&share.app_type).map(String::as_str) != Some(provider_id)
+        })
+    {
+        return Err(AppError::BadRequest(
+            "share must contain exactly one binding matching appType/providerId".into(),
+        ));
+    }
     let description = normalize_share_description(share.description.clone())?;
     let for_sale = normalize_share_for_sale(&share.for_sale)?;
     let market_access_mode = normalize_market_access_mode(&share.market_access_mode)?;
@@ -7060,7 +7063,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             upstream_provider_json TEXT,
             app_runtimes_json TEXT,
             app_providers_json TEXT,
-            -- P9: 多 app share 的每槽 provider 绑定快照（JSON: {app_type: provider_id}）。
+            -- Share 的单一 app/provider 绑定快照（JSON: {app_type: provider_id}）。
             bindings_json TEXT,
             runtime_refreshed_at TEXT,
             updated_at TEXT NOT NULL
@@ -7846,10 +7849,8 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             })?;
     }
     if !columns.iter().any(|name| name == "bindings_json") {
-        // P9: per-app provider 绑定快照（{"claude": "p-1", "codex": "p-2"}）。
-        // cc-switch 多 app share 改造后，share 不再只挂一个 provider，需要把全量 slot
-        // bindings 推到 router 让 dashboard 可视化。老库迁移后该列为 NULL，路由功能
-        // 不受影响（route 决策仍走 app_runtimes/app_type）。
+        // Share 的 app/provider 绑定快照。新写入严格要求一个 binding；该列保留
+        // nullable 仅用于 SQLite schema 的增量建表过程。
         conn.execute("ALTER TABLE shares ADD COLUMN bindings_json TEXT", [])
             .map_err(|e| AppError::Internal(format!("add shares bindings_json failed: {e}")))?;
     }
@@ -9251,8 +9252,8 @@ fn parse_app_runtimes(value: Option<String>) -> Result<ShareAppRuntimes, rusqlit
     })
 }
 
-/// P9: 反序列化 share_provider_bindings JSON 列 ({app_type: provider_id})。
-/// 空字符串 / NULL → 空 map（老数据或 ShareDescriptor 没带 bindings 字段时的兜底）。
+/// 反序列化 share 的单一 app/provider binding JSON 列。
+/// 空字符串 / NULL 只作为数据库读取的防御性兜底；新写入不会产生空 binding。
 fn parse_share_bindings(
     value: Option<String>,
 ) -> Result<BTreeMap<String, String>, rusqlite::Error> {
@@ -15568,9 +15569,9 @@ mod tests {
             for_sale: "No".into(),
             sale_market_kind: "token".into(),
             subdomain: subdomain.into(),
-            app_type: "proxy".into(),
-            provider_id: None,
-            bindings: Default::default(),
+            app_type: "codex".into(),
+            provider_id: Some("provider-test".into()),
+            bindings: BTreeMap::from([("codex".into(), "provider-test".into())]),
             token_limit: 1000,
             parallel_limit: 3,
             tokens_used: 0,
@@ -15579,9 +15580,9 @@ mod tests {
             created_at: Utc::now().to_rfc3339(),
             expires_at: (Utc::now() + Duration::hours(1)).to_rfc3339(),
             support: ShareSupport {
-                claude: true,
+                claude: false,
                 codex: true,
-                gemini: true,
+                gemini: false,
             },
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
@@ -17856,9 +17857,9 @@ mod tests {
             for_sale: "No".into(),
             sale_market_kind: "token".into(),
             subdomain: "market-a".into(),
-            app_type: "proxy".into(),
-            provider_id: None,
-            bindings: Default::default(),
+            app_type: "codex".into(),
+            provider_id: Some("provider-market".into()),
+            bindings: BTreeMap::from([("codex".into(), "provider-market".into())]),
             token_limit: 1000,
             parallel_limit: 3,
             tokens_used: 0,
@@ -17927,9 +17928,9 @@ mod tests {
             for_sale: "No".into(),
             sale_market_kind: "token".into(),
             subdomain: "signed-sub".into(),
-            app_type: "proxy".into(),
-            provider_id: None,
-            bindings: Default::default(),
+            app_type: "codex".into(),
+            provider_id: Some("provider-signed".into()),
+            bindings: BTreeMap::from([("codex".into(), "provider-signed".into())]),
             token_limit: 1000,
             parallel_limit: 3,
             tokens_used: 0,
@@ -18214,9 +18215,9 @@ mod tests {
             for_sale: "Yes".into(),
             sale_market_kind: "token".into(),
             subdomain: "minimal-sub".into(),
-            app_type: "proxy".into(),
-            provider_id: None,
-            bindings: Default::default(),
+            app_type: "codex".into(),
+            provider_id: Some("provider-minimal".into()),
+            bindings: BTreeMap::from([("codex".into(), "provider-minimal".into())]),
             token_limit: -1,
             parallel_limit: -1,
             tokens_used: 0,
@@ -18298,9 +18299,9 @@ mod tests {
             for_sale: "No".into(),
             sale_market_kind: "token".into(),
             subdomain: "mismatch-sub".into(),
-            app_type: "proxy".into(),
-            provider_id: None,
-            bindings: Default::default(),
+            app_type: "codex".into(),
+            provider_id: Some("provider-mismatch".into()),
+            bindings: BTreeMap::from([("codex".into(), "provider-mismatch".into())]),
             token_limit: 1000,
             parallel_limit: 3,
             tokens_used: 0,
@@ -18374,9 +18375,9 @@ mod tests {
             for_sale: "No".into(),
             sale_market_kind: "token".into(),
             subdomain: "owner-sub".into(),
-            app_type: "proxy".into(),
-            provider_id: None,
-            bindings: Default::default(),
+            app_type: "codex".into(),
+            provider_id: Some("provider-owner".into()),
+            bindings: BTreeMap::from([("codex".into(), "provider-owner".into())]),
             token_limit: 1000,
             parallel_limit: 3,
             tokens_used: 0,
@@ -18479,9 +18480,9 @@ mod tests {
             for_sale: "No".into(),
             sale_market_kind: "token".into(),
             subdomain: "heal-sub".into(),
-            app_type: "proxy".into(),
-            provider_id: None,
-            bindings: Default::default(),
+            app_type: "codex".into(),
+            provider_id: Some("provider-heal".into()),
+            bindings: BTreeMap::from([("codex".into(), "provider-heal".into())]),
             token_limit: 1000,
             parallel_limit: 3,
             tokens_used: 0,
@@ -18557,9 +18558,9 @@ mod tests {
             for_sale: "No".into(),
             sale_market_kind: "token".into(),
             subdomain: "reused-sub".into(),
-            app_type: "proxy".into(),
-            provider_id: None,
-            bindings: Default::default(),
+            app_type: "codex".into(),
+            provider_id: Some("provider-reused".into()),
+            bindings: BTreeMap::from([("codex".into(), "provider-reused".into())]),
             token_limit: 1000,
             parallel_limit: 3,
             tokens_used: 0,
@@ -18650,9 +18651,9 @@ mod tests {
             for_sale: "Yes".into(),
             sale_market_kind: "token".into(),
             subdomain: "batch-sub".into(),
-            app_type: "proxy".into(),
-            provider_id: None,
-            bindings: Default::default(),
+            app_type: "codex".into(),
+            provider_id: Some("provider-batch".into()),
+            bindings: BTreeMap::from([("codex".into(), "provider-batch".into())]),
             token_limit: 2048,
             parallel_limit: 3,
             tokens_used: 12,
@@ -18772,6 +18773,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upsert_share_requires_one_matching_provider_binding() {
+        let (store, config) = setup_store("share-single-binding-validation").await;
+        let conn = store.conn.lock().await;
+
+        let mut missing = test_share_descriptor("share-missing", "missing-sub");
+        missing.bindings.clear();
+        let missing_error = upsert_share_tx(&conn, "inst-binding", missing).unwrap_err();
+        assert!(
+            missing_error
+                .to_string()
+                .contains("exactly one binding matching appType/providerId")
+        );
+
+        let mut multiple = test_share_descriptor("share-multiple", "multiple-sub");
+        multiple
+            .bindings
+            .insert("claude".into(), "provider-claude".into());
+        let multiple_error = upsert_share_tx(&conn, "inst-binding", multiple).unwrap_err();
+        assert!(
+            multiple_error
+                .to_string()
+                .contains("exactly one binding matching appType/providerId")
+        );
+
+        let mut mismatched = test_share_descriptor("share-mismatch", "mismatch-sub");
+        mismatched.provider_id = Some("different-provider".into());
+        let mismatch_error = upsert_share_tx(&conn, "inst-binding", mismatched).unwrap_err();
+        assert!(
+            mismatch_error
+                .to_string()
+                .contains("exactly one binding matching appType/providerId")
+        );
+
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
     async fn upsert_share_preserves_other_installation_shares_and_logs() {
         let (store, config) = setup_store("multi-share-upsert-preserve").await;
         insert_installation(&store, "inst-clean").await;
@@ -18885,8 +18924,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_sync_shares_rejects_multiple_upserts() {
-        let (store, config) = setup_store("batch-multiple-upsert-reject").await;
+    async fn batch_sync_shares_accepts_multiple_upserts_for_one_installation() {
+        let (store, config) = setup_store("batch-multiple-upsert").await;
         let signing_key = insert_signed_installation(&store, "inst-multi").await;
         let ops = vec![
             ShareSyncOperation {
@@ -18911,7 +18950,7 @@ mod tests {
             &nonce,
         );
 
-        let err = store
+        store
             .batch_sync_shares(
                 ShareBatchSyncRequest {
                     installation_id: "inst-multi".into(),
@@ -18927,8 +18966,17 @@ mod tests {
                 "owner@example.com",
             )
             .await
-            .expect_err("multiple upserts should fail");
-        assert!(err.to_string().contains("multiple share upserts"));
+            .expect("multiple independent share upserts should succeed");
+
+        let conn = store.conn.lock().await;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM shares WHERE installation_id='inst-multi'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count reconciled shares");
+        assert_eq!(count, 2);
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
@@ -20004,8 +20052,9 @@ mod tests {
         };
         let mut quota_health = test_model_summary("codex", &["failed"]);
         quota_health.actual_model = "codex".into();
+        let future_reset = (Utc::now() + Duration::hours(1)).to_rfc3339();
         quota_health.error_message =
-            Some("long window quota exhausted until 2026-07-08T04:25:06+00:00".into());
+            Some(format!("long window quota exhausted until {future_reset}"));
         let health = ShareModelHealthSummary {
             codex: vec![quota_health],
             ..ShareModelHealthSummary::default()

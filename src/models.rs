@@ -1613,9 +1613,8 @@ pub struct ShareDescriptor {
     pub app_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
-    /// P9: 多 app share 模式下，cc-switch 把每个 app slot 绑定的 provider id 一起推上来。
-    /// 老版本 cc-switch（P8 之前）不会带这个字段——serde default 让它为空，router 不依赖
-    /// 它做路由决策，仅用于 dashboard 展示。
+    /// Share 的唯一 app/provider binding。写入时必须恰好一项，且与
+    /// `app_type` / `provider_id` 一致。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub bindings: BTreeMap<String, String>,
     pub token_limit: i64,
@@ -1689,8 +1688,7 @@ pub struct DashboardResponse {
     pub stats: DashboardStats,
     pub map: DashboardMap,
     pub clients: Vec<DashboardClientView>,
-    /// 多 share 模式：把所有 share 平铺到顶层，前端 SharesTable 直接消费。
-    /// 与 `clients[*].share` 是两套视图（installation 维度 vs share 维度），新前端用 shares。
+    /// 所有 share 的平铺数据；前端按 installation 归入对应 client 的横向卡片列表。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shares: Vec<ShareView>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2113,8 +2111,7 @@ pub struct ShareView {
     pub app_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
-    /// P9: 多 app share 的每个 app slot 当前绑定的 provider id。前端 SharesTable
-    /// 渲染每条 share 的 binding chips；老 ShareDescriptor 不带这个字段时为空。
+    /// Share 的唯一 app/provider binding，供卡片和详情展示。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub bindings: BTreeMap<String, String>,
     pub token_limit: i64,

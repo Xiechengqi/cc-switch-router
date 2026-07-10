@@ -57,19 +57,47 @@ const ShareScroller = React.memo(function ShareScroller({
 }) {
   const { t } = useLocaleText();
   const scrollRef = React.useRef<HTMLDivElement | null>(null);
-  const enableWheel = shares.length >= 4;
+  const [scrollState, setScrollState] = React.useState({
+    overflowing: false,
+    canScrollLeft: false,
+    canScrollRight: false,
+  });
+
+  const updateScrollState = React.useCallback(() => {
+    const element = scrollRef.current;
+    if (!element) return;
+    const maxScrollLeft = Math.max(0, element.scrollWidth - element.clientWidth);
+    setScrollState({
+      overflowing: maxScrollLeft > 1,
+      canScrollLeft: element.scrollLeft > 1,
+      canScrollRight: element.scrollLeft < maxScrollLeft - 1,
+    });
+  }, []);
 
   React.useEffect(() => {
     const element = scrollRef.current;
-    if (!element || !enableWheel) return;
+    if (!element) return;
+    updateScrollState();
+    const observer = new ResizeObserver(updateScrollState);
+    observer.observe(element);
+    for (const child of Array.from(element.children)) observer.observe(child);
     const onWheel = (event: WheelEvent) => {
       if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return;
+      const maxScrollLeft = Math.max(0, element.scrollWidth - element.clientWidth);
+      const movingRight = event.deltaY > 0;
+      const canMove = movingRight
+        ? element.scrollLeft < maxScrollLeft - 1
+        : element.scrollLeft > 1;
+      if (!canMove) return;
       event.preventDefault();
       element.scrollLeft += event.deltaY;
     };
     element.addEventListener("wheel", onWheel, { passive: false });
-    return () => element.removeEventListener("wheel", onWheel);
-  }, [enableWheel, shares.length]);
+    return () => {
+      observer.disconnect();
+      element.removeEventListener("wheel", onWheel);
+    };
+  }, [shares.length, updateScrollState]);
 
   const scrollByCards = React.useCallback((direction: -1 | 1) => {
     scrollRef.current?.scrollBy({ left: direction * 320, behavior: "smooth" });
@@ -79,17 +107,29 @@ const ShareScroller = React.memo(function ShareScroller({
 
   return (
     <div className="grid min-w-0 gap-2">
-      {enableWheel ? (
+      {scrollState.overflowing ? (
         <div className="flex justify-end gap-1">
-          <Button size="sm" variant="outline" isIconOnly className="h-7 w-7 min-w-0 rounded-md p-0" aria-label={t("dashboard.scrollSharesLeft")} onClick={() => scrollByCards(-1)}>
+          <Button size="sm" variant="outline" isIconOnly isDisabled={!scrollState.canScrollLeft} className="h-7 w-7 min-w-0 rounded-md p-0" aria-label={t("dashboard.scrollSharesLeft")} onClick={() => scrollByCards(-1)}>
             <ChevronLeft className="h-3.5 w-3.5" />
           </Button>
-          <Button size="sm" variant="outline" isIconOnly className="h-7 w-7 min-w-0 rounded-md p-0" aria-label={t("dashboard.scrollSharesRight")} onClick={() => scrollByCards(1)}>
+          <Button size="sm" variant="outline" isIconOnly isDisabled={!scrollState.canScrollRight} className="h-7 w-7 min-w-0 rounded-md p-0" aria-label={t("dashboard.scrollSharesRight")} onClick={() => scrollByCards(1)}>
             <ChevronRight className="h-3.5 w-3.5" />
           </Button>
         </div>
       ) : null}
-      <div ref={scrollRef} className="flex min-w-0 snap-x gap-3 overflow-x-auto pb-2">
+      <div
+        ref={scrollRef}
+        className="flex min-w-0 snap-x gap-3 overflow-x-auto pb-2"
+        onScroll={updateScrollState}
+        tabIndex={0}
+        aria-label={t("dashboard.shares")}
+        onKeyDown={(event) => {
+          if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+            event.preventDefault();
+            scrollByCards(event.key === "ArrowLeft" ? -1 : 1);
+          }
+        }}
+      >
         {shares.map((share) => (
           <ShareCard key={share.shareId} share={share} onOpen={onOpenShare} onEdit={onEditShare} onConnect={onConnectShare} />
         ))}

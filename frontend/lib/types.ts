@@ -23,7 +23,7 @@ export type DashboardResponse = {
     clients: MapPoint[];
   };
   clients: DashboardClient[];
-  /** P7: per-share 全量列表（多 share 模式下用 SharesTable 直接消费）。 */
+  /** 全量 share 列表；ClientBoard 按 installation 分组为横向卡片。 */
   shares?: ShareView[];
   markets?: DashboardMarket[];
   tickerShares?: DashboardTickerShare[];
@@ -67,7 +67,7 @@ export type DashboardClient = {
     enabled: boolean;
     online: boolean;
   };
-  /** 该 installation 名下所有 share 的 id 集合（多 share 模式）。 */
+  /** 该 installation 名下所有独立 share 的 id 集合。 */
   shareIds?: string[];
   /** 该 installation 名下 share 总数；等价于 shareIds.length。 */
   shareCount?: number;
@@ -101,10 +101,7 @@ export type ShareView = {
   activeEdit?: ShareEditView;
   appType: string;
   providerId?: string;
-  /**
-   * P9: 多 app share 的每个 app_type 当前绑定的 provider id（{app: provider_id}）。
-   * 老 ShareDescriptor 不带这个字段时为 undefined / 空对象。
-   */
+  /** 唯一 app/provider binding（{app: provider_id}）。 */
   bindings?: Record<string, string>;
   tokenLimit: number;
   parallelLimit: number;
