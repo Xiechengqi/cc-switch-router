@@ -22,6 +22,8 @@
 - **SSH 服务** — 基于 `russh` 的 reverse forwarding，一次性密码认证
 - **数据存储** — SQLite，存储 installation、lease、share 等状态
 
+Client Web tunnel 的边界策略：静态资源和明确列出的登录/OAuth 回调公开；其余 `/web-api/*` 默认要求 owner/admin 身份，Router 鉴权后向 client 注入可信身份头。`/api/*`、`/v1/*`、`/_ctl/*` 和 `/_share-router/*` 不通过 client web tunnel 暴露。流式管理接口必须使用 `Authorization` header，不接受 query-string token。
+
 核心依赖：`axum`、`russh`、`rusqlite`、`tokio`
 
 当前实现的端点：

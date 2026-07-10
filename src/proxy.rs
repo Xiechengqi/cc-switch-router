@@ -1234,6 +1234,19 @@ pub async fn proxy_handler(
             );
             return simple_response(StatusCode::NOT_FOUND, "non-api-path");
         }
+        if has_client_web_query_token(parts.uri.query()) {
+            warn!(
+                method = %method,
+                host = %host,
+                path = %path,
+                client_ip = %user_ip,
+                client_country = %user_country,
+                client_asn = %user_asn,
+                user_agent = %user_agent,
+                "proxy request rejected: client web token in query string"
+            );
+            return simple_response(StatusCode::BAD_REQUEST, "query-token-not-allowed");
+        }
         if is_client_web_auth_required_path(&path) {
             let owner_email = match state
                 .store
@@ -2757,26 +2770,38 @@ fn is_allowed_client_web_path(path: &str) -> bool {
         || path == "/favicon.ico"
         || path == "/favicon.png"
         || path.starts_with("/assets/")
-        || path == "/web-api/auth/methods"
-        || path == "/web-api/auth/email/request-code"
-        || path == "/web-api/auth/email/verify-code"
-        || path == "/web-api/auth/session/refresh"
-        || path == "/web-api/auth/password/setup"
-        || path == "/web-api/auth/password/login"
-        || path == "/web-api/auth/password/refresh"
-        || path == "/web-api/auth/password/logout"
-        || path == "/web-api/auth/password/change"
-        || path == "/web-api/auth/password/set"
-        || path == "/web-api/auth/initial-setup"
-        || path == "/web-api/context"
-        || path.starts_with("/web-api/invoke/"))
+        || path == "/web-api"
+        || path.starts_with("/web-api/"))
         && !path.starts_with("/_ctl/")
         && !path.starts_with("/_share-router/")
         && !is_allowed_direct_share_api_path(path)
 }
 
 fn is_client_web_auth_required_path(path: &str) -> bool {
-    path == "/web-api/context" || path.starts_with("/web-api/invoke/")
+    (path == "/web-api" || path.starts_with("/web-api/")) && !is_public_client_web_path(path)
+}
+
+fn has_client_web_query_token(query: Option<&str>) -> bool {
+    query.is_some_and(|query| {
+        url::form_urlencoded::parse(query.as_bytes())
+            .any(|(name, _)| matches!(name.as_ref(), "token" | "accessToken"))
+    })
+}
+
+fn is_public_client_web_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/web-api/auth/methods"
+            | "/web-api/auth/email/request-code"
+            | "/web-api/auth/email/verify-code"
+            | "/web-api/auth/session/refresh"
+            | "/web-api/auth/password/setup"
+            | "/web-api/auth/password/login"
+            | "/web-api/auth/password/refresh"
+            | "/web-api/auth/initial-setup"
+            | "/web-api/oauth/claude-cli/callback"
+            | "/web-api/oauth/openai-cli/callback"
+    )
 }
 
 fn client_web_required_api_token_scope(path: &str) -> &'static str {
@@ -3199,7 +3224,7 @@ data: {"data":[{"b64_json":"iVBORw0KGgo="}]}
     }
 
     #[test]
-    fn client_web_path_allows_favicon_png() {
+    fn client_web_path_exposes_only_static_and_web_api_namespaces() {
         assert!(is_allowed_client_web_path("/"));
         assert!(is_allowed_client_web_path("/favicon.ico"));
         assert!(is_allowed_client_web_path("/favicon.png"));
@@ -3212,8 +3237,46 @@ data: {"data":[{"b64_json":"iVBORw0KGgo="}]}
         assert!(is_allowed_client_web_path(
             "/web-api/invoke/get_proxy_takeover_status"
         ));
+        assert!(is_allowed_client_web_path("/web-api/events"));
+        assert!(is_allowed_client_web_path("/web-api/admin/upgrade/stream"));
+        assert!(is_allowed_client_web_path("/web-api/admin/upgrade/status"));
+        assert!(is_allowed_client_web_path("/web-api/admin/logs/tail"));
         assert!(!is_allowed_client_web_path("/api/providers"));
-        assert!(!is_allowed_client_web_path("/web-api/unknown"));
+        assert!(!is_allowed_client_web_path("/v1/messages"));
+        assert!(!is_allowed_client_web_path("/_ctl/apply_share_settings"));
+        assert!(!is_allowed_client_web_path("/_share-router/health"));
+    }
+
+    #[test]
+    fn client_web_auth_policy_defaults_web_api_to_private() {
+        assert!(!is_client_web_auth_required_path(
+            "/web-api/auth/password/login"
+        ));
+        assert!(!is_client_web_auth_required_path(
+            "/web-api/oauth/openai-cli/callback"
+        ));
+        assert!(is_client_web_auth_required_path("/web-api/context"));
+        assert!(is_client_web_auth_required_path("/web-api/events"));
+        assert!(is_client_web_auth_required_path(
+            "/web-api/admin/upgrade/stream"
+        ));
+        assert!(is_client_web_auth_required_path(
+            "/web-api/admin/upgrade/status"
+        ));
+        assert!(is_client_web_auth_required_path("/web-api/admin/logs/tail"));
+        assert!(is_client_web_auth_required_path("/web-api/future-command"));
+    }
+
+    #[test]
+    fn client_web_rejects_query_string_tokens() {
+        assert!(has_client_web_query_token(Some("token=secret")));
+        assert!(has_client_web_query_token(Some(
+            "taskId=task-1&accessToken=secret"
+        )));
+        assert!(has_client_web_query_token(Some("%74oken=secret")));
+        assert!(!has_client_web_query_token(Some("taskId=task-1")));
+        assert!(!has_client_web_query_token(Some("Token=secret")));
+        assert!(!has_client_web_query_token(None));
     }
 
     #[test]
