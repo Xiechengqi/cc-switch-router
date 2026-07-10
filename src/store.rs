@@ -44,24 +44,27 @@ use crate::models::{
     PublicNetworkStatsResponse, PublicPayoutProfileResponse, PublicPayoutProfilesResponse,
     RefreshSessionRequest, RegisterGatewayRequest, RegisterGatewayResponse,
     RegisterInstallationRequest, RegisterInstallationResponse, RegisterMarketRequest,
-    RequestEmailCodeRequest, RequestEmailCodeResponse, SessionStatusResponse, ShareAppAccess,
-    ShareAppAvailability, ShareAppProviders, ShareAppRuntimes, ShareAppSettings,
-    ShareBatchSyncRequest, ShareClaimPayload, ShareClaimSubdomainRequest, ShareDeleteRequest,
-    ShareDescriptor, ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest,
-    ShareMarketGrantRequest, ShareMarketGrantResponse, ShareMarketGrantStatusResponse,
-    ShareMarketLinkView, ShareMarketListingStatusInput, ShareMarketListingStatusView,
-    ShareModelHealthCheckEntry, ShareModelHealthSummary, SharePendingEditsRequest,
-    SharePendingEditsResponse, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry,
-    ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload, ShareRuntimeRefreshRequest,
-    ShareRuntimeSnapshotResponse, ShareSettingsPatch, ShareSettingsUpdateResponse, ShareSignals,
-    ShareSupport, ShareSyncRequest, ShareUpstreamProvider, ShareUpstreamQuota,
-    ShareUsageByEmailResponse, ShareUsageDailyBucket, ShareUsageEmailRow, ShareView, TunnelLease,
-    UserApiTokenResetResponse, UserApiTokenResponse, UserApiTokenStatus, UserShareView,
-    UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    RenewLeaseRequest, RenewLeaseResponse, RequestEmailCodeRequest, RequestEmailCodeResponse,
+    SessionStatusResponse, ShareAppAccess, ShareAppAvailability, ShareAppProviders,
+    ShareAppRuntimes, ShareAppSettings, ShareBatchSyncRequest, ShareClaimPayload,
+    ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptor, ShareEditAckRequest,
+    ShareEditView, ShareHeartbeatRequest, ShareMarketGrantRequest, ShareMarketGrantResponse,
+    ShareMarketGrantStatusResponse, ShareMarketLinkView, ShareMarketListingStatusInput,
+    ShareMarketListingStatusView, ShareModelHealthCheckEntry, ShareModelHealthSummary,
+    SharePendingEditsRequest, SharePendingEditsResponse, ShareRequestLogBatchSyncRequest,
+    ShareRequestLogEntry, ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload,
+    ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse, ShareSettingsPatch,
+    ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest,
+    ShareUpstreamProvider, ShareUpstreamQuota, ShareUsageByEmailResponse, ShareUsageDailyBucket,
+    ShareUsageEmailRow, ShareView, TunnelLease, UserApiTokenResetResponse, UserApiTokenResponse,
+    UserApiTokenStatus, UserShareView, UserSharesResponse, VerifyEmailCodeRequest,
+    VerifyEmailCodeResponse,
 };
 #[cfg(test)]
-use crate::models::{ShareAppProvider, ShareUpstreamModel};
+use crate::models::{RenewLeasePayload, ShareAppProvider, ShareUpstreamModel};
 use crate::proxy::ProxyRegistry;
+#[cfg(test)]
+use crate::proxy::RouteKind;
 
 const SHARE_REQUEST_LOG_RECOVERY_LIMIT: usize = 10;
 pub const IMAGE_GENERATION_REQUEST_LOG_RETAIN_PER_SHARE: usize = 10;
@@ -2531,6 +2534,109 @@ impl AppStore {
         )
         .map_err(|e| AppError::Internal(format!("update lease use failed: {e}")))?;
         Ok(lease)
+    }
+
+    pub async fn renew_lease(
+        &self,
+        config: &Config,
+        proxy: &ProxyRegistry,
+        input: RenewLeaseRequest,
+        metadata: ClientMetadata,
+    ) -> Result<RenewLeaseResponse, AppError> {
+        let now = Utc::now();
+        let (subdomain, tunnel_type) = {
+            let conn = self.conn.lock().await;
+            let installation = get_installation(&conn, &input.installation_id)?
+                .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
+            verify_signed_share_request(
+                &conn,
+                &installation.public_key,
+                &input.installation_id,
+                "renew_lease",
+                &input.renewal,
+                input.timestamp_ms,
+                &input.nonce,
+                &input.signature,
+            )?;
+            let lease = conn
+                .query_row(
+                    "SELECT subdomain, tunnel_type, used_at
+                     FROM leases
+                     WHERE id = ?1 AND installation_id = ?2 AND connection_id = ?3",
+                    params![
+                        input.renewal.lease_id,
+                        input.installation_id,
+                        input.renewal.connection_id
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|error| {
+                    AppError::Internal(format!("query tunnel lease for renewal failed: {error}"))
+                })?
+                .ok_or_else(|| AppError::Conflict("tunnel lease is no longer renewable".into()))?;
+            if lease.2.is_none() {
+                return Err(AppError::Conflict(
+                    "tunnel lease has not established an SSH session".into(),
+                ));
+            }
+            touch_installation_presence(&conn, &input.installation_id, &metadata, now)?;
+            (lease.0, lease.1)
+        };
+
+        let route = proxy
+            .backend_for_host(
+                &format!("{subdomain}.{}", config.tunnel_domain),
+                &config.tunnel_domain,
+            )
+            .await
+            .ok_or_else(|| AppError::Conflict("tunnel route is not active".into()))?;
+        if route.connection_id() != Some(input.renewal.connection_id.as_str())
+            || route.installation_id() != Some(input.installation_id.as_str())
+        {
+            return Err(AppError::Conflict(
+                "tunnel route belongs to a different connection".into(),
+            ));
+        }
+
+        let expires_at = Utc::now() + Duration::seconds(config.lease_ttl_secs);
+        let conn = self.conn.lock().await;
+        let updated = conn
+            .execute(
+                "UPDATE leases
+                 SET expires_at = ?4
+                 WHERE id = ?1 AND installation_id = ?2 AND connection_id = ?3",
+                params![
+                    input.renewal.lease_id,
+                    input.installation_id,
+                    input.renewal.connection_id,
+                    expires_at.to_rfc3339()
+                ],
+            )
+            .map_err(|error| AppError::Internal(format!("renew tunnel lease failed: {error}")))?;
+        if updated != 1 {
+            return Err(AppError::Conflict(
+                "tunnel lease changed during renewal".into(),
+            ));
+        }
+        if tunnel_type == "client-web-http" {
+            conn.execute(
+                "UPDATE installation_client_tunnels
+                 SET last_seen_at = ?2, updated_at = ?2
+                 WHERE installation_id = ?1",
+                params![input.installation_id, Utc::now().to_rfc3339()],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("touch renewed client tunnel failed: {error}"))
+            })?;
+        }
+        Ok(RenewLeaseResponse { expires_at })
     }
 
     pub async fn sync_share(
@@ -17902,6 +18008,131 @@ mod tests {
             .expect("same share route should be renewable");
 
         assert_eq!(lease.subdomain, "aaa");
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn renew_lease_extends_active_connection_without_replacing_route() {
+        let (store, mut config) = setup_store("renew-active-lease").await;
+        config.lease_ttl_secs = 300;
+        let signing_key = insert_signed_installation(&store, "inst-active-renew").await;
+        insert_share(
+            &store,
+            "inst-active-renew",
+            "share-active-renew",
+            "active-renew-sub",
+            "active",
+        )
+        .await;
+        let proxy = ProxyRegistry::default();
+        let issued_at_ms = Utc::now().timestamp_millis();
+        let issue_nonce = Uuid::new_v4().to_string();
+        let lease = store
+            .issue_lease(
+                &config,
+                &proxy,
+                IssueLeaseRequest {
+                    installation_id: "inst-active-renew".into(),
+                    requested_subdomain: "active-renew-sub".into(),
+                    tunnel_type: "http".into(),
+                    timestamp_ms: issued_at_ms,
+                    nonce: issue_nonce.clone(),
+                    signature: sign_issue_lease_request(
+                        &signing_key,
+                        "inst-active-renew",
+                        "active-renew-sub",
+                        "http",
+                        issued_at_ms,
+                        &issue_nonce,
+                    ),
+                    share: Some(test_share_descriptor(
+                        "share-active-renew",
+                        "active-renew-sub",
+                    )),
+                },
+                ClientMetadata {
+                    ip: Some("127.0.0.1".into()),
+                    country_code: None,
+                },
+                None,
+            )
+            .await
+            .expect("issue active lease");
+        store
+            .consume_lease(&lease.ssh_username, &lease.ssh_password)
+            .await
+            .expect("consume active lease");
+        proxy
+            .set_route_with_kind(
+                "active-renew-sub".into(),
+                "127.0.0.1:65530".into(),
+                RouteKind::Share,
+                Some("inst-active-renew".into()),
+                Some(lease.connection_id.clone()),
+                Some("share-active-renew".into()),
+                Some("Active Renew".into()),
+                false,
+                -1,
+                None,
+            )
+            .await;
+
+        let renewal = RenewLeasePayload {
+            lease_id: lease.lease_id.clone(),
+            connection_id: lease.connection_id.clone(),
+        };
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let request = RenewLeaseRequest {
+            installation_id: "inst-active-renew".into(),
+            timestamp_ms,
+            nonce: nonce.clone(),
+            signature: sign_test_payload(
+                &signing_key,
+                "inst-active-renew",
+                "renew_lease",
+                &renewal,
+                timestamp_ms,
+                &nonce,
+            ),
+            renewal,
+        };
+        let renewed = store
+            .renew_lease(
+                &config,
+                &proxy,
+                request.clone(),
+                ClientMetadata {
+                    ip: Some("127.0.0.1".into()),
+                    country_code: None,
+                },
+            )
+            .await
+            .expect("renew active lease");
+
+        assert!(renewed.expires_at >= lease.expires_at);
+        let route = proxy
+            .backend_for_host(
+                &format!("active-renew-sub.{}", config.tunnel_domain),
+                &config.tunnel_domain,
+            )
+            .await
+            .expect("active route remains registered");
+        assert_eq!(route.connection_id(), Some(lease.connection_id.as_str()));
+        let replay = store
+            .renew_lease(
+                &config,
+                &proxy,
+                request,
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+            )
+            .await
+            .expect_err("renewal nonce replay must fail");
+        assert!(replay.to_string().contains("nonce already used"));
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }

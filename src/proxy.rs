@@ -4,6 +4,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use base64::Engine;
 use bytes::Bytes;
+use futures_util::StreamExt;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
@@ -750,18 +751,18 @@ pub async fn market_proxy_handler(
     let status = upstream.status();
     state.metrics.record_proxy_status(status);
     let response_headers = upstream.headers().clone();
-    let body_stream = {
-        use futures_util::StreamExt;
-
-        upstream.bytes_stream().map(move |chunk| {
+    let is_event_stream = is_event_stream_response(&response_headers);
+    let body_stream = upstream
+        .bytes_stream()
+        .scan(false, move |stream_ended, chunk| {
             let _permit = &share_permit;
             let _free_share_ip_permit = &free_share_ip_permit;
             let _market_permit = &market_permit;
             let _recent_traffic_guard = &recent_traffic_guard;
             let _metrics_permit = &metrics_permit;
-            chunk
-        })
-    };
+            let output = proxy_body_chunk(is_event_stream, stream_ended, chunk);
+            futures_util::future::ready(output)
+        });
     let body = Body::from_stream(body_stream);
 
     let mut response = Response::new(body);
@@ -774,6 +775,9 @@ pub async fn market_proxy_handler(
         response.headers_mut().append(name.clone(), value.clone());
     }
     strip_connection_listed_headers(response.headers_mut());
+    if is_event_stream {
+        response.headers_mut().remove(header::CONTENT_LENGTH);
+    }
     info!(
         method = %method,
         host = %host,
@@ -1716,6 +1720,7 @@ pub async fn proxy_handler(
             .await;
     }
     let response_headers = upstream.headers().clone();
+    let is_event_stream = is_event_stream_response(&response_headers);
     if is_invalid_auth_status(status) && is_abuse_tracked_api_path(&path) {
         if let Some(decision) = state.abuse.record_invalid_auth(&user_ip).await {
             warn!(
@@ -1739,10 +1744,9 @@ pub async fn proxy_handler(
     // Stream the response body instead of buffering it entirely.
     // This is critical for SSE (text/event-stream) responses so that
     // downstream clients receive chunks in real time.
-    let body_stream = {
-        use futures_util::StreamExt;
-
-        upstream.bytes_stream().map(move |chunk| {
+    let body_stream = upstream
+        .bytes_stream()
+        .scan(false, move |stream_ended, chunk| {
             let _permit = &share_permit;
             let _free_share_ip_permit = &free_share_ip_permit;
             // Hold the recent-traffic guard until the upstream stream ends so
@@ -1750,9 +1754,9 @@ pub async fn proxy_handler(
             // request lifecycle (success, client disconnect, or chunk error).
             let _recent_traffic_guard = &recent_traffic_guard;
             let _metrics_permit = &metrics_permit;
-            chunk
-        })
-    };
+            let output = proxy_body_chunk(is_event_stream, stream_ended, chunk);
+            futures_util::future::ready(output)
+        });
     let body = Body::from_stream(body_stream);
 
     let mut response = Response::new(body);
@@ -1765,6 +1769,9 @@ pub async fn proxy_handler(
         response.headers_mut().append(name.clone(), value.clone());
     }
     strip_connection_listed_headers(response.headers_mut());
+    if is_event_stream {
+        response.headers_mut().remove(header::CONTENT_LENGTH);
+    }
     if is_share_router_probe {
         debug!(
             method = %method,
@@ -2888,6 +2895,37 @@ fn is_hop_by_hop_header(name: &str) -> bool {
     )
 }
 
+fn is_event_stream_response(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
+        })
+}
+
+fn proxy_body_chunk<E: std::fmt::Display>(
+    is_event_stream: bool,
+    stream_ended: &mut bool,
+    chunk: Result<Bytes, E>,
+) -> Option<Result<Bytes, E>> {
+    if *stream_ended {
+        return None;
+    }
+    match chunk {
+        Ok(bytes) => Some(Ok(bytes)),
+        Err(error) if is_event_stream => {
+            *stream_ended = true;
+            warn!(error = %error, "proxy SSE upstream stream ended unexpectedly");
+            None
+        }
+        Err(error) => Some(Err(error)),
+    }
+}
+
 fn strip_connection_listed_headers(headers: &mut HeaderMap) {
     let connection_values = headers
         .get_all("connection")
@@ -3277,6 +3315,42 @@ data: {"data":[{"b64_json":"iVBORw0KGgo="}]}
         assert!(!has_client_web_query_token(Some("taskId=task-1")));
         assert!(!has_client_web_query_token(Some("Token=secret")));
         assert!(!has_client_web_query_token(None));
+    }
+
+    #[test]
+    fn event_stream_content_type_allows_parameters_and_mixed_case() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("Text/Event-Stream; charset=utf-8"),
+        );
+        assert!(is_event_stream_response(&headers));
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        assert!(!is_event_stream_response(&headers));
+    }
+
+    #[test]
+    fn event_stream_chunk_errors_become_clean_eof_only_for_sse() {
+        let mut ended = false;
+        let sse = proxy_body_chunk(
+            true,
+            &mut ended,
+            Err::<Bytes, _>(std::io::Error::other("connection lost")),
+        );
+        assert!(sse.is_none());
+        assert!(ended);
+
+        let mut ended = false;
+        let regular = proxy_body_chunk(
+            false,
+            &mut ended,
+            Err::<Bytes, _>(std::io::Error::other("connection lost")),
+        );
+        assert!(regular.is_some_and(|chunk| chunk.is_err()));
+        assert!(!ended);
     }
 
     #[test]

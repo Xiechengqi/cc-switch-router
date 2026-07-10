@@ -53,11 +53,12 @@ use crate::models::{
     PublicMapPointsResponse, PublicNetworkStatsResponse, PublicPayoutProfilesQuery,
     RefreshSessionRequest, RegisterGatewayRequest, RegisterGatewayResponse,
     RegisterInstallationRequest, RegisterInstallationResponse, RegisterMarketRequest,
-    RequestEmailCodeRequest, RequestEmailCodeResponse, SessionStatusResponse, ShareApiAuthResponse,
-    ShareApiAuthUser, ShareApiContextResponse, ShareApiShareResponse, ShareBatchSyncRequest,
-    ShareClaimSubdomainRequest, ShareDeleteRequest, ShareEditAckRequest, ShareEditAvailableEvent,
-    ShareEditEventSignaturePayload, ShareHeartbeatRequest, ShareMarketGrantRequest,
-    ShareMarketGrantResponse, ShareMarketGrantStatusResponse, ShareMarketListingStatusSyncRequest,
+    RenewLeaseRequest, RenewLeaseResponse, RequestEmailCodeRequest, RequestEmailCodeResponse,
+    SessionStatusResponse, ShareApiAuthResponse, ShareApiAuthUser, ShareApiContextResponse,
+    ShareApiShareResponse, ShareBatchSyncRequest, ShareClaimSubdomainRequest, ShareDeleteRequest,
+    ShareEditAckRequest, ShareEditAvailableEvent, ShareEditEventSignaturePayload,
+    ShareHeartbeatRequest, ShareMarketGrantRequest, ShareMarketGrantResponse,
+    ShareMarketGrantStatusResponse, ShareMarketListingStatusSyncRequest,
     ShareMarketListingStatusSyncResponse, SharePendingEditsRequest,
     ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRuntimeRefreshRequest,
     ShareSettingsPatch, ShareSettingsUpdateRequest, ShareSyncRequest, UserApiTokenResetResponse,
@@ -253,6 +254,7 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/me/api-token/reset", post(reset_default_api_token))
         .route("/v1/me/shares", get(my_shares))
         .route("/v1/tunnels/lease", post(issue_lease))
+        .route("/v1/tunnels/lease/renew", post(renew_lease))
         .route("/v1/shares/claim-subdomain", post(claim_share_subdomain))
         .route("/v1/shares/sync", post(sync_share))
         .route("/v1/shares/batch-sync", post(batch_sync_share))
@@ -1271,6 +1273,43 @@ async fn issue_lease(
         client_ip = %client_ip,
         client_country = %client_country,
         "client tunnel lease issued"
+    );
+    Ok(Json(response))
+}
+
+async fn renew_lease(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(input): Json<RenewLeaseRequest>,
+) -> Result<Json<RenewLeaseResponse>, AppError> {
+    let metadata = extract_client_metadata(&headers, addr);
+    let installation_id = input.installation_id.clone();
+    let lease_id = input.renewal.lease_id.clone();
+    let connection_id = input.renewal.connection_id.clone();
+    let response = match state
+        .store
+        .renew_lease(&state.config, &state.proxy, input, metadata)
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(
+                installation_id = %installation_id,
+                lease_id = %lease_id,
+                connection_id = %connection_id,
+                error = %error,
+                "tunnel lease renewal rejected"
+            );
+            return Err(error);
+        }
+    };
+    tracing::debug!(
+        installation_id = %installation_id,
+        lease_id = %lease_id,
+        connection_id = %connection_id,
+        expires_at = %response.expires_at,
+        "tunnel lease renewed in place"
     );
     Ok(Json(response))
 }
