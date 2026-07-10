@@ -1,7 +1,7 @@
 "use client";
 
 import { Button, Card, Chip, Drawer } from "@heroui/react";
-import { ChevronLeft, ChevronRight, ExternalLink, Maximize2 } from "lucide-react";
+import { Check, ChevronLeft, ChevronRight, Copy, ExternalLink, Maximize2, WalletCards } from "lucide-react";
 import * as React from "react";
 import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog";
 import { ShareCard } from "@/components/dashboard/share-card";
@@ -30,6 +30,52 @@ import {
   sortClients,
 } from "@/components/dashboard/data-tables";
 import type { DashboardClient, DashboardMarket, ShareView } from "@/lib/types";
+
+const PAYOUT_NETWORK_LABELS: Record<string, string> = {
+  "eip155:56": "BSC",
+  "eip155:8453": "Base",
+  "eip155:42161": "Arbitrum One",
+};
+
+function PayoutProfilePanel({ client, detailed = false }: { client: DashboardClient; detailed?: boolean }) {
+  const { locale, t } = useLocaleText();
+  const profile = client.payoutProfile;
+  const [copied, setCopied] = React.useState(false);
+  if (!profile) {
+    return detailed ? <EmptyBlock>{t("dashboard.payoutNotConfigured")}</EmptyBlock> : null;
+  }
+  const copyAddress = async () => {
+    try {
+      await navigator.clipboard.writeText(profile.address);
+    } catch {
+      return;
+    }
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1500);
+  };
+  return (
+    <div className={`grid min-w-0 gap-2 rounded-md border border-amber-200/80 bg-amber-50/50 ${detailed ? "p-3" : "px-3 py-2"}`}>
+      <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs">
+        <span className="inline-flex items-center gap-1 font-medium text-amber-800"><WalletCards className="h-3.5 w-3.5" />{t("dashboard.payout")}</span>
+        <Chip size="sm" variant="tertiary">{profile.token}</Chip>
+        {profile.networks.map((network) => <Chip key={network} size="sm" variant="soft">{PAYOUT_NETWORK_LABELS[network] || network}</Chip>)}
+        <Chip size="sm" variant="tertiary">{t("dashboard.payoutSelfDeclared")}</Chip>
+      </div>
+      <div className="flex min-w-0 items-center gap-1.5">
+        <code className={`${detailed ? "break-all" : "min-w-0 truncate"} font-mono text-xs text-foreground`} title={profile.address}>{profile.address}</code>
+        <Button size="sm" variant="ghost" isIconOnly className="h-7 w-7 min-w-0 shrink-0 rounded-md p-0" aria-label={t("dashboard.copyPayoutAddress")} data-no-row-drawer onClick={(event) => { event.stopPropagation(); void copyAddress(); }}>
+          {copied ? <Check className="h-3.5 w-3.5 text-emerald-600" /> : <Copy className="h-3.5 w-3.5" />}
+        </Button>
+      </div>
+      {detailed ? (
+        <div className="grid gap-1 text-xs text-muted-foreground">
+          <span>{t("dashboard.payoutUpdated")}: <strong className="text-foreground">{new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(profile.updatedAt))}</strong></span>
+          <span className="text-amber-700">{t("dashboard.payoutUnverifiedHint")}</span>
+        </div>
+      ) : null}
+    </div>
+  );
+}
 
 function sortShares(shares: ShareView[]) {
   return [...shares].sort((left, right) => {
@@ -200,6 +246,8 @@ function ClientCard({
           </div>
         </div>
 
+        <PayoutProfilePanel client={client} />
+
         <ShareScroller shares={shares} onOpenShare={onOpenShare} onEditShare={onEditShare} onConnectShare={onConnectShare} />
       </Card.Content>
     </Card>
@@ -310,6 +358,9 @@ export function ClientBoard({
                         <span>{t("dashboard.version")}: <strong className="text-foreground">{clientPlatformLabel(selectedClient)}</strong></span>
                         <span>{t("dashboard.online")}: <strong className="text-foreground">{(selectedClient.onlineRate24h || 0).toFixed(1)}% / {formatAgeDaysOrHours(selectedClient.installation.createdAt, locale)}</strong></span>
                       </div>
+                    </DrawerSection>
+                    <DrawerSection label={t("dashboard.payout")}>
+                      <PayoutProfilePanel client={selectedClient} detailed />
                     </DrawerSection>
                     <DrawerSection label={t("dashboard.linkedShares")}>
                       <ClientLinkedSharesPanel shares={sharesForClient(selectedClient)} onEdit={openEditShare} t={t} />

@@ -42,6 +42,7 @@ use crate::models::{
     DashboardMarketRequestLogView, DashboardPresenceRequest, DashboardPresenceResponse,
     DashboardResponse, DashboardTickerShare, GatewayRegistryRecord, GetInstallationOwnerEmailQuery,
     GetInstallationOwnerEmailResponse, HealthResponse, ImageGenerationRequestLogEntry,
+    InstallationPayoutProfileUpdateRequest, InstallationPayoutProfileUpdateResponse,
     IssueLeaseRequest, IssueLeaseResponse, MarketDisabledSharesUpdateRequest,
     MarketDisabledSharesUpdateResponse, MarketMaintenanceUpdateRequest,
     MarketMaintenanceUpdateResponse, MarketNotificationEmailLogView,
@@ -49,11 +50,11 @@ use crate::models::{
     MarketRequestLogBatchSyncRequest, MarketShareRuntimeStateReleaseRequest,
     MarketShareRuntimeStateReleaseResponse, MarketShareRuntimeStateSyncRequest,
     MarketShareRuntimeStateSyncResponse, MarketShareView, MarketsResponse, PostBoardMessageRequest,
-    PublicMapPointsResponse, PublicNetworkStatsResponse, RefreshSessionRequest,
-    RegisterGatewayRequest, RegisterGatewayResponse, RegisterInstallationRequest,
-    RegisterInstallationResponse, RegisterMarketRequest, RequestEmailCodeRequest,
-    RequestEmailCodeResponse, SessionStatusResponse, ShareApiAuthResponse, ShareApiAuthUser,
-    ShareApiContextResponse, ShareApiShareResponse, ShareBatchSyncRequest,
+    PublicMapPointsResponse, PublicNetworkStatsResponse, PublicPayoutProfilesQuery,
+    RefreshSessionRequest, RegisterGatewayRequest, RegisterGatewayResponse,
+    RegisterInstallationRequest, RegisterInstallationResponse, RegisterMarketRequest,
+    RequestEmailCodeRequest, RequestEmailCodeResponse, SessionStatusResponse, ShareApiAuthResponse,
+    ShareApiAuthUser, ShareApiContextResponse, ShareApiShareResponse, ShareBatchSyncRequest,
     ShareClaimSubdomainRequest, ShareDeleteRequest, ShareEditAckRequest, ShareEditAvailableEvent,
     ShareEditEventSignaturePayload, ShareHeartbeatRequest, ShareMarketGrantRequest,
     ShareMarketGrantResponse, ShareMarketGrantStatusResponse, ShareMarketListingStatusSyncRequest,
@@ -129,6 +130,14 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/healthz", get(health))
         .route("/v1/public/map-points", get(public_map_points))
         .route("/v1/public/network-stats", get(public_network_stats))
+        .route(
+            "/v1/public/installations/:installation_id/payout-profile",
+            get(public_installation_payout_profile),
+        )
+        .route(
+            "/v1/public/payout-profiles",
+            get(public_installation_payout_profiles),
+        )
         .route("/v1/regions", get(regions))
         .layer(public_cors_layer())
         .with_state(state.clone());
@@ -219,6 +228,10 @@ pub fn router(state: ServerState) -> Router {
         .route(
             "/v1/installations/client-tunnel/claim",
             post(claim_client_tunnel),
+        )
+        .route(
+            "/v1/installations/payout-profile",
+            axum::routing::put(update_installation_payout_profile),
         )
         .route("/v1/auth/email/request-code", post(request_email_code))
         .route("/v1/auth/email/verify-code", post(verify_email_code))
@@ -1091,6 +1104,129 @@ async fn update_client_tunnel(
             )
             .await?,
     ))
+}
+
+async fn update_installation_payout_profile(
+    State(state): State<ServerState>,
+    Json(input): Json<InstallationPayoutProfileUpdateRequest>,
+) -> Result<Json<InstallationPayoutProfileUpdateResponse>, AppError> {
+    Ok(Json(
+        state
+            .store
+            .update_installation_payout_profile(input)
+            .await?,
+    ))
+}
+
+async fn public_installation_payout_profile(
+    State(state): State<ServerState>,
+    Path(installation_id): Path<String>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Result<Response, AppError> {
+    if !state.payout_profile_read_limiter.allow(addr.ip()).await {
+        return Err(AppError::TooManyRequests(
+            "public payout profile read rate limit exceeded".into(),
+        ));
+    }
+    validate_public_installation_id(&installation_id)?;
+    let profile = state
+        .store
+        .public_installation_payout_profile(&installation_id)
+        .await?;
+    tracing::info!(
+        installation_id = %installation_id,
+        client_ip = %addr.ip(),
+        "public payout profile read"
+    );
+    public_cached_json_response(&headers, &profile)
+}
+
+async fn public_installation_payout_profiles(
+    State(state): State<ServerState>,
+    Query(query): Query<PublicPayoutProfilesQuery>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Result<Response, AppError> {
+    if !state.payout_profile_read_limiter.allow(addr.ip()).await {
+        return Err(AppError::TooManyRequests(
+            "public payout profile read rate limit exceeded".into(),
+        ));
+    }
+    let mut seen = HashSet::new();
+    let mut installation_ids = Vec::new();
+    for value in query.installation_ids.split(',') {
+        let installation_id = value.trim();
+        if installation_id.is_empty() {
+            continue;
+        }
+        validate_public_installation_id(installation_id)?;
+        if seen.insert(installation_id.to_string()) {
+            installation_ids.push(installation_id.to_string());
+        }
+    }
+    if installation_ids.is_empty() {
+        return Err(AppError::BadRequest(
+            "installationIds must contain at least one installation id".into(),
+        ));
+    }
+    if installation_ids.len() > 100 {
+        return Err(AppError::BadRequest(
+            "installationIds may contain at most 100 unique ids".into(),
+        ));
+    }
+    let response = state
+        .store
+        .public_installation_payout_profiles(&installation_ids)
+        .await?;
+    tracing::info!(
+        requested_installations = installation_ids.len(),
+        returned_profiles = response.profiles.len(),
+        client_ip = %addr.ip(),
+        "public payout profiles batch read"
+    );
+    public_cached_json_response(&headers, &response)
+}
+
+fn validate_public_installation_id(value: &str) -> Result<(), AppError> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(AppError::BadRequest("invalid installation id".into()));
+    }
+    Ok(())
+}
+
+fn public_cached_json_response<T: Serialize>(
+    request_headers: &HeaderMap,
+    value: &T,
+) -> Result<Response, AppError> {
+    let body = serde_json::to_vec(value).map_err(|error| {
+        AppError::Internal(format!("serialize public response failed: {error}"))
+    })?;
+    let etag = format!("\"{}\"", hex::encode(Sha256::digest(&body)));
+    if request_headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.split(',').any(|candidate| candidate.trim() == etag))
+    {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, etag)
+            .header(header::CACHE_CONTROL, "public, max-age=60")
+            .body(Body::empty())
+            .map_err(|error| AppError::Internal(format!("build public response failed: {error}")));
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ETAG, etag)
+        .header(header::CACHE_CONTROL, "public, max-age=60")
+        .body(Body::from(body))
+        .map_err(|error| AppError::Internal(format!("build public response failed: {error}")))
 }
 
 async fn issue_lease(

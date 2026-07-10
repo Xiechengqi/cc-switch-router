@@ -31,6 +31,8 @@
 - `GET /v1/healthz`
 - `GET /v1/dashboard`
 - `GET /v1/public/map-points`
+- `GET /v1/public/installations/:installation_id/payout-profile`
+- `GET /v1/public/payout-profiles?installationIds=...`
 - `POST /v1/dashboard/presence`
 - `POST /v1/auth/email/request-code`
 - `POST /v1/auth/email/verify-code`
@@ -132,6 +134,9 @@ curl http://127.0.0.1/v1/healthz
 
 dashboard 当前行为：
 
+- Client installation 可选携带公开收款资料（一个 EVM 地址、USDC/USDT、BSC/Base/Arbitrum One 多选网络）；Client 卡片显示摘要，详情抽屉显示完整地址和自行声明状态。
+- 即使 installation 暂无 share/client tunnel，只要配置了收款资料，也会出现在 Client 列表。
+
 - 未登录时 share 表格中的 API key 默认脱敏
 - owner 或 `shared_with_emails` 中的邮箱登录后，可看到对应 share 的 API key 明文
 - 页脚 `PAGE ONLINE` 右侧在 free plan 且 Resend 返回 `x-resend-daily-quota` 时，会显示 `RESEND USAGE xx%`
@@ -182,5 +187,6 @@ sudo systemctl status cc-switch-router
 - share 用量同步为"事件驱动最终一致"，由 `cc-switch` 在创建、状态变更、用量变更、删除时异步上报
 - `cc-switch` 端 share 同步已做短延迟批量聚合，降低高频请求噪音
 - share owner / `shared_with_emails` ACL 以 `cc-switch` 推送为准，`cc-switch-router` 负责持久化、鉴权和 dashboard 脱敏控制
+- 收款资料以 installation 为作用域，通过 Client Ed25519 签名的 `PUT /v1/installations/payout-profile` 同步；清除会保留 revision tombstone，防止旧请求恢复地址。资料公开可读，但 `self_declared` 不代表 Router 已验证钱包所有权。
 - `cc-switch-router` 会定时清理超过保留期的历史 lease，以及状态为 `expired` / `deleted` 的陈旧 share 记录
 - 当请求经 Cloudflare 代理进入时，free share 限流会基于可信的 `CF-Connecting-IP` 识别真实用户 IP；直连源站时会回退到 socket peer IP，防止伪造头绕过限制

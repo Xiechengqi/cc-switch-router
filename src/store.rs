@@ -30,32 +30,34 @@ use crate::models::{
     ClientTunnelClaimRequest, ClientTunnelConfig, ClientTunnelQuery, ClientTunnelResponse,
     ClientTunnelUpdateRequest, ClientTunnelView, DashboardClientTunnelView, DashboardClientView,
     DashboardMap, DashboardMapPoint, DashboardMarketRequestLogView, DashboardMarketView,
-    DashboardPresenceRequest, DashboardResponse, DashboardStats, DashboardTickerShare,
-    GatewayRegistryRecord, GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse,
-    HealthCheckEntry, HealthTimelineBucket, ImageGenerationRequestLogEntry, Installation,
-    InstallationView, IssueLeaseRequest, IssueLeaseResponse, LatLonPoint, MarketAppAvailability,
-    MarketAppAvailabilityEntry, MarketDisabledSharesUpdateRequest,
-    MarketDisabledSharesUpdateResponse, MarketLinkedShareView, MarketMaintenanceUpdateRequest,
-    MarketMaintenanceUpdateResponse, MarketRegistryRecord, MarketRequestLogBatchSyncRequest,
-    MarketRequestLogEntry, MarketShareAppView, MarketShareRuntimeStateInput,
-    MarketShareRuntimeStateView, MarketShareView, ModelHealthSummary, PublicMapClientPoint,
-    PublicMapPointsResponse, PublicMarketConfig, PublicNetworkStatsResponse, RefreshSessionRequest,
-    RegisterGatewayRequest, RegisterGatewayResponse, RegisterInstallationRequest,
-    RegisterInstallationResponse, RegisterMarketRequest, RequestEmailCodeRequest,
-    RequestEmailCodeResponse, SessionStatusResponse, ShareAppAccess, ShareAppAvailability,
-    ShareAppProviders, ShareAppRuntimes, ShareAppSettings, ShareBatchSyncRequest,
-    ShareClaimPayload, ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptor,
-    ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest, ShareMarketGrantRequest,
-    ShareMarketGrantResponse, ShareMarketGrantStatusResponse, ShareMarketLinkView,
-    ShareMarketListingStatusInput, ShareMarketListingStatusView, ShareModelHealthCheckEntry,
-    ShareModelHealthSummary, SharePendingEditsRequest, SharePendingEditsResponse,
-    ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRequestLogFetchResponse,
-    ShareRuntimeRefreshPayload, ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse,
-    ShareSettingsPatch, ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest,
-    ShareUpstreamProvider, ShareUpstreamQuota, ShareUsageByEmailResponse, ShareUsageDailyBucket,
-    ShareUsageEmailRow, ShareView, TunnelLease, UserApiTokenResetResponse, UserApiTokenResponse,
-    UserApiTokenStatus, UserShareView, UserSharesResponse, VerifyEmailCodeRequest,
-    VerifyEmailCodeResponse,
+    DashboardPayoutProfileView, DashboardPresenceRequest, DashboardResponse, DashboardStats,
+    DashboardTickerShare, GatewayRegistryRecord, GetInstallationOwnerEmailQuery,
+    GetInstallationOwnerEmailResponse, HealthCheckEntry, HealthTimelineBucket,
+    ImageGenerationRequestLogEntry, Installation, InstallationPayoutProfileUpdateRequest,
+    InstallationPayoutProfileUpdateResponse, InstallationView, IssueLeaseRequest,
+    IssueLeaseResponse, LatLonPoint, MarketAppAvailability, MarketAppAvailabilityEntry,
+    MarketDisabledSharesUpdateRequest, MarketDisabledSharesUpdateResponse, MarketLinkedShareView,
+    MarketMaintenanceUpdateRequest, MarketMaintenanceUpdateResponse, MarketRegistryRecord,
+    MarketRequestLogBatchSyncRequest, MarketRequestLogEntry, MarketShareAppView,
+    MarketShareRuntimeStateInput, MarketShareRuntimeStateView, MarketShareView, ModelHealthSummary,
+    PayoutProfile, PublicMapClientPoint, PublicMapPointsResponse, PublicMarketConfig,
+    PublicNetworkStatsResponse, PublicPayoutProfileResponse, PublicPayoutProfilesResponse,
+    RefreshSessionRequest, RegisterGatewayRequest, RegisterGatewayResponse,
+    RegisterInstallationRequest, RegisterInstallationResponse, RegisterMarketRequest,
+    RequestEmailCodeRequest, RequestEmailCodeResponse, SessionStatusResponse, ShareAppAccess,
+    ShareAppAvailability, ShareAppProviders, ShareAppRuntimes, ShareAppSettings,
+    ShareBatchSyncRequest, ShareClaimPayload, ShareClaimSubdomainRequest, ShareDeleteRequest,
+    ShareDescriptor, ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest,
+    ShareMarketGrantRequest, ShareMarketGrantResponse, ShareMarketGrantStatusResponse,
+    ShareMarketLinkView, ShareMarketListingStatusInput, ShareMarketListingStatusView,
+    ShareModelHealthCheckEntry, ShareModelHealthSummary, SharePendingEditsRequest,
+    SharePendingEditsResponse, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry,
+    ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload, ShareRuntimeRefreshRequest,
+    ShareRuntimeSnapshotResponse, ShareSettingsPatch, ShareSettingsUpdateResponse, ShareSignals,
+    ShareSupport, ShareSyncRequest, ShareUpstreamProvider, ShareUpstreamQuota,
+    ShareUsageByEmailResponse, ShareUsageDailyBucket, ShareUsageEmailRow, ShareView, TunnelLease,
+    UserApiTokenResetResponse, UserApiTokenResponse, UserApiTokenStatus, UserShareView,
+    UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 #[cfg(test)]
 use crate::models::{ShareAppProvider, ShareUpstreamModel};
@@ -477,6 +479,166 @@ impl AppStore {
         Ok(secret)
     }
 
+    pub async fn update_installation_payout_profile(
+        &self,
+        input: InstallationPayoutProfileUpdateRequest,
+    ) -> Result<InstallationPayoutProfileUpdateResponse, AppError> {
+        if input.update.schema_version != crate::models::PAYOUT_PROFILE_SCHEMA_VERSION {
+            return Err(AppError::BadRequest(
+                "unsupported payout profile schema version".into(),
+            ));
+        }
+        if input.update.revision < 1 {
+            return Err(AppError::BadRequest(
+                "payout profile revision must be positive".into(),
+            ));
+        }
+        if input.update.updated_at_ms <= 0 {
+            return Err(AppError::BadRequest(
+                "payout profile updatedAtMs must be positive".into(),
+            ));
+        }
+        if input.update.updated_at_ms > Utc::now().timestamp_millis() + 5 * 60 * 1000 {
+            return Err(AppError::BadRequest(
+                "payout profile updatedAtMs cannot be in the future".into(),
+            ));
+        }
+        let normalized_profile = input
+            .update
+            .profile
+            .clone()
+            .map(PayoutProfile::validate_and_normalize)
+            .transpose()
+            .map_err(AppError::BadRequest)?;
+        let profile_json = normalized_profile
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| {
+                AppError::Internal(format!("serialize payout profile failed: {error}"))
+            })?;
+
+        let conn = self.conn.lock().await;
+        let installation = get_installation(&conn, &input.installation_id)?
+            .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
+        verify_signed_share_request(
+            &conn,
+            &installation.public_key,
+            &input.installation_id,
+            "update_installation_payout_profile",
+            &input.update,
+            input.timestamp_ms,
+            &input.nonce,
+            &input.signature,
+        )?;
+        let owner_email = installation
+            .owner_email
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                AppError::Conflict(
+                    "installation owner email must be verified before publishing payout information"
+                        .into(),
+                )
+            })?;
+
+        let existing = conn
+            .query_row(
+                "SELECT revision, profile_json, source_updated_at_ms
+                 FROM installation_payout_profiles WHERE installation_id = ?1",
+                params![input.installation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!("read payout profile revision failed: {error}"))
+            })?;
+        if let Some((revision, existing_json, source_updated_at_ms)) = existing {
+            if input.update.revision < revision {
+                return Err(AppError::Conflict(format!(
+                    "stale payout profile revision: current revision is {revision}"
+                )));
+            }
+            if input.update.revision == revision {
+                if existing_json == profile_json
+                    && source_updated_at_ms == input.update.updated_at_ms
+                {
+                    conn.execute(
+                        "UPDATE installation_payout_profiles SET owner_email = ?2 WHERE installation_id = ?1",
+                        params![input.installation_id, owner_email],
+                    )
+                    .map_err(|error| {
+                        AppError::Internal(format!("refresh payout profile owner failed: {error}"))
+                    })?;
+                    return Ok(InstallationPayoutProfileUpdateResponse { ok: true, revision });
+                }
+                return Err(AppError::Conflict(
+                    "payout profile revision already exists with different content".into(),
+                ));
+            }
+        }
+
+        conn.execute(
+            "INSERT INTO installation_payout_profiles (
+                installation_id, owner_email, revision, profile_json,
+                source_updated_at_ms, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(installation_id) DO UPDATE SET
+                owner_email = excluded.owner_email,
+                revision = excluded.revision,
+                profile_json = excluded.profile_json,
+                source_updated_at_ms = excluded.source_updated_at_ms,
+                updated_at = excluded.updated_at",
+            params![
+                input.installation_id,
+                owner_email,
+                input.update.revision,
+                profile_json,
+                input.update.updated_at_ms,
+                Utc::now().to_rfc3339(),
+            ],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "upsert installation payout profile failed: {error}"
+            ))
+        })?;
+
+        Ok(InstallationPayoutProfileUpdateResponse {
+            ok: true,
+            revision: input.update.revision,
+        })
+    }
+
+    pub async fn public_installation_payout_profile(
+        &self,
+        installation_id: &str,
+    ) -> Result<PublicPayoutProfileResponse, AppError> {
+        let conn = self.conn.lock().await;
+        public_payout_profile_for_installation(&conn, installation_id)?
+            .ok_or_else(|| AppError::NotFound("installation not found".into()))
+    }
+
+    pub async fn public_installation_payout_profiles(
+        &self,
+        installation_ids: &[String],
+    ) -> Result<PublicPayoutProfilesResponse, AppError> {
+        let conn = self.conn.lock().await;
+        let mut profiles = Vec::with_capacity(installation_ids.len());
+        for installation_id in installation_ids {
+            if let Some(profile) = public_payout_profile_for_installation(&conn, installation_id)? {
+                profiles.push(profile);
+            }
+        }
+        Ok(PublicPayoutProfilesResponse { profiles })
+    }
+
     pub async fn bind_installation_owner_email(
         &self,
         config: &Config,
@@ -651,6 +813,15 @@ impl AppStore {
             ],
         )
         .map_err(|e| AppError::Internal(format!("change installation owner email failed: {e}")))?;
+        tx.execute(
+            "UPDATE installation_payout_profiles
+             SET owner_email = ?2
+             WHERE installation_id = ?1",
+            params![input.installation_id, new_email],
+        )
+        .map_err(|e| {
+            AppError::Internal(format!("change payout profile owner email failed: {e}"))
+        })?;
         tx.commit()
             .map_err(|e| AppError::Internal(format!("commit owner email change failed: {e}")))?;
 
@@ -3019,6 +3190,7 @@ impl AppStore {
             model_health_by_share,
             share_usage_by_app,
             client_tunnels,
+            payout_profiles,
         ) = {
             let conn = self.conn.lock().await;
             (
@@ -3038,6 +3210,7 @@ impl AppStore {
                 list_model_health_summaries(&conn)?,
                 list_share_usage_by_app(&conn)?,
                 list_client_tunnels(&conn)?,
+                list_dashboard_payout_profiles(&conn)?,
             )
         };
         let client_tunnels_by_installation = client_tunnels
@@ -3418,6 +3591,7 @@ impl AppStore {
                     enabled: tunnel.enabled,
                     online: client_tunnel_online,
                 });
+                let payout_profile = payout_profiles.get(&installation.id).cloned();
                 let mut health_checks = client_health_by_installation
                     .get(&installation.id)
                     .cloned()
@@ -3452,6 +3626,7 @@ impl AppStore {
                     share_count,
                     share_ids,
                     client_tunnel,
+                    payout_profile,
                     online_minutes_24h,
                     online_rate_24h,
                     health_checks,
@@ -3461,7 +3636,11 @@ impl AppStore {
             })
             // 只展示有 share 或已配置 client tunnel 的机器；otherwise dashboard 会被纯
             // lease/heartbeat 但无可用入口的 installation 撑满。
-            .filter(|client| !client.share_ids.is_empty() || client.client_tunnel.is_some())
+            .filter(|client| {
+                !client.share_ids.is_empty()
+                    || client.client_tunnel.is_some()
+                    || client.payout_profile.is_some()
+            })
             .collect::<Vec<_>>();
         client_views.sort_by(|left, right| {
             // P7 Step 2：installation 维度排序。原"can_manage 优先"是 share 字段，已移除；
@@ -7079,6 +7258,16 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             last_seen_at TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS installation_payout_profiles (
+            installation_id TEXT PRIMARY KEY,
+            owner_email TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            profile_json TEXT,
+            source_updated_at_ms INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (installation_id) REFERENCES installations(id)
+        );
+
         CREATE TABLE IF NOT EXISTS share_request_logs (
             request_id TEXT PRIMARY KEY,
             installation_id TEXT NOT NULL,
@@ -8223,6 +8412,109 @@ fn list_installations(conn: &Connection) -> Result<Vec<Installation>, AppError> 
         })
         .map_err(|e| AppError::Internal(format!("query installations failed: {e}")))?;
     collect_rows(rows)
+}
+
+fn public_payout_profile_for_installation(
+    conn: &Connection,
+    installation_id: &str,
+) -> Result<Option<PublicPayoutProfileResponse>, AppError> {
+    conn.query_row(
+        "SELECT i.owner_email, i.created_at, p.revision, p.profile_json,
+                p.source_updated_at_ms
+         FROM installations i
+         LEFT JOIN installation_payout_profiles p ON p.installation_id = i.id
+         WHERE i.id = ?1",
+        params![installation_id],
+        |row| {
+            let owner_email = row.get::<_, Option<String>>(0)?;
+            let created_at = parse_dt_sql(&row.get::<_, String>(1)?)?;
+            let revision = row.get::<_, Option<i64>>(2)?.unwrap_or(0);
+            let profile_json = row.get::<_, Option<String>>(3)?;
+            let source_updated_at_ms = row.get::<_, Option<i64>>(4)?;
+            let profile = profile_json
+                .as_deref()
+                .map(serde_json::from_str::<PayoutProfile>)
+                .transpose()
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            let updated_at = source_updated_at_ms
+                .and_then(DateTime::<Utc>::from_timestamp_millis)
+                .unwrap_or(created_at);
+            Ok(PublicPayoutProfileResponse {
+                schema_version: crate::models::PAYOUT_PROFILE_SCHEMA_VERSION,
+                revision,
+                configured: profile.is_some(),
+                owner_email,
+                installation_id: installation_id.to_string(),
+                profile,
+                updated_at,
+            })
+        },
+    )
+    .optional()
+    .map_err(|error| AppError::Internal(format!("query public payout profile failed: {error}")))
+}
+
+fn list_dashboard_payout_profiles(
+    conn: &Connection,
+) -> Result<HashMap<String, DashboardPayoutProfileView>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT installation_id, profile_json, source_updated_at_ms
+             FROM installation_payout_profiles
+             WHERE profile_json IS NOT NULL",
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("prepare dashboard payout profiles failed: {error}"))
+        })?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|error| {
+            AppError::Internal(format!("query dashboard payout profiles failed: {error}"))
+        })?;
+    let mut profiles = HashMap::new();
+    for row in rows {
+        let (installation_id, profile_json, source_updated_at_ms) = row.map_err(|error| {
+            AppError::Internal(format!("read dashboard payout profile failed: {error}"))
+        })?;
+        let Ok(profile) = serde_json::from_str::<PayoutProfile>(&profile_json) else {
+            tracing::error!(
+                installation_id = %installation_id,
+                "invalid stored payout profile omitted from dashboard"
+            );
+            continue;
+        };
+        let Some(updated_at) = DateTime::<Utc>::from_timestamp_millis(source_updated_at_ms) else {
+            tracing::error!(
+                installation_id = %installation_id,
+                "invalid stored payout profile timestamp omitted from dashboard"
+            );
+            continue;
+        };
+        profiles.insert(
+            installation_id,
+            DashboardPayoutProfileView {
+                address_type: profile.address_type,
+                address: profile.address,
+                token: profile.token,
+                networks: profile.networks,
+                verification_status: profile.verification_status,
+                updated_at,
+            },
+        );
+    }
+    Ok(profiles)
 }
 
 fn get_installation_geo_state(
@@ -17203,6 +17495,203 @@ mod tests {
         let body = format!("{installation_id}\n{action}\n{payload_json}\n{timestamp_ms}\n{nonce}");
         let signature = signing_key.sign(body.as_bytes());
         base64::engine::general_purpose::STANDARD.encode(signature.to_bytes())
+    }
+
+    fn payout_update(
+        revision: i64,
+        profile: Option<crate::models::PayoutProfile>,
+    ) -> crate::models::InstallationPayoutProfileUpdate {
+        crate::models::InstallationPayoutProfileUpdate {
+            schema_version: crate::models::PAYOUT_PROFILE_SCHEMA_VERSION,
+            revision,
+            profile,
+            updated_at_ms: 1_750_000_000_000 + revision,
+        }
+    }
+
+    fn test_payout_profile() -> crate::models::PayoutProfile {
+        crate::models::PayoutProfile {
+            address_type: crate::models::PayoutAddressType::Evm,
+            address: "0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed".into(),
+            token: crate::models::PayoutToken::USDC,
+            networks: vec![
+                crate::models::PayoutNetwork::Base,
+                crate::models::PayoutNetwork::Bsc,
+            ],
+            verification_status: crate::models::PayoutVerificationStatus::SelfDeclared,
+        }
+    }
+
+    async fn push_test_payout_update(
+        store: &AppStore,
+        signing_key: &SigningKey,
+        installation_id: &str,
+        update: crate::models::InstallationPayoutProfileUpdate,
+    ) -> Result<crate::models::InstallationPayoutProfileUpdateResponse, AppError> {
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            signing_key,
+            installation_id,
+            "update_installation_payout_profile",
+            &update,
+            timestamp_ms,
+            &nonce,
+        );
+        store
+            .update_installation_payout_profile(
+                crate::models::InstallationPayoutProfileUpdateRequest {
+                    installation_id: installation_id.into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    update,
+                },
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn payout_profile_revision_and_tombstone_prevent_stale_restore() {
+        let (store, config) = setup_store("payout-profile-revisions").await;
+        let signing_key = insert_signed_installation(&store, "inst-payout").await;
+
+        let first = payout_update(1, Some(test_payout_profile()));
+        push_test_payout_update(&store, &signing_key, "inst-payout", first.clone())
+            .await
+            .expect("publish payout profile");
+        push_test_payout_update(&store, &signing_key, "inst-payout", first.clone())
+            .await
+            .expect("same revision and content is idempotent");
+
+        let public = store
+            .public_installation_payout_profile("inst-payout")
+            .await
+            .expect("public payout profile");
+        assert!(public.configured);
+        assert_eq!(public.revision, 1);
+        assert_eq!(
+            public.profile.as_ref().unwrap().address,
+            "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"
+        );
+
+        push_test_payout_update(&store, &signing_key, "inst-payout", payout_update(2, None))
+            .await
+            .expect("clear payout profile");
+        let stale = push_test_payout_update(
+            &store,
+            &signing_key,
+            "inst-payout",
+            payout_update(1, Some(test_payout_profile())),
+        )
+        .await
+        .expect_err("stale profile must not restore tombstone");
+        assert!(matches!(stale, AppError::Conflict(_)));
+
+        let cleared = store
+            .public_installation_payout_profile("inst-payout")
+            .await
+            .expect("cleared public payout profile");
+        assert!(!cleared.configured);
+        assert_eq!(cleared.revision, 2);
+        assert!(cleared.profile.is_none());
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn payout_profile_rejects_tampered_signature_and_replayed_nonce() {
+        let (store, config) = setup_store("payout-profile-signature").await;
+        let signing_key = insert_signed_installation(&store, "inst-payout-signature").await;
+        let update = payout_update(1, Some(test_payout_profile()));
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            "inst-payout-signature",
+            "update_installation_payout_profile",
+            &update,
+            timestamp_ms,
+            &nonce,
+        );
+
+        let mut tampered = update.clone();
+        tampered.profile.as_mut().unwrap().token = crate::models::PayoutToken::USDT;
+        let error = store
+            .update_installation_payout_profile(
+                crate::models::InstallationPayoutProfileUpdateRequest {
+                    installation_id: "inst-payout-signature".into(),
+                    timestamp_ms,
+                    nonce: nonce.clone(),
+                    signature: signature.clone(),
+                    update: tampered,
+                },
+            )
+            .await
+            .expect_err("tampered payout profile must fail signature verification");
+        assert!(matches!(error, AppError::Unauthorized(_)));
+
+        store
+            .update_installation_payout_profile(
+                crate::models::InstallationPayoutProfileUpdateRequest {
+                    installation_id: "inst-payout-signature".into(),
+                    timestamp_ms,
+                    nonce: nonce.clone(),
+                    signature: signature.clone(),
+                    update: update.clone(),
+                },
+            )
+            .await
+            .expect("untampered payout profile");
+        let replay = store
+            .update_installation_payout_profile(
+                crate::models::InstallationPayoutProfileUpdateRequest {
+                    installation_id: "inst-payout-signature".into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    update,
+                },
+            )
+            .await
+            .expect_err("replayed nonce must fail");
+        assert!(matches!(replay, AppError::Unauthorized(_)));
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn dashboard_includes_client_with_only_a_payout_profile() {
+        let (store, config) = setup_store("payout-profile-dashboard-client").await;
+        let signing_key = insert_signed_installation(&store, "inst-payout-only").await;
+        push_test_payout_update(
+            &store,
+            &signing_key,
+            "inst-payout-only",
+            payout_update(1, Some(test_payout_profile())),
+        )
+        .await
+        .expect("publish payout profile");
+
+        let snapshot = store
+            .dashboard_snapshot(
+                &config,
+                &ServerGeo {
+                    lat: None,
+                    lon: None,
+                },
+                &ProxyRegistry::default(),
+                None,
+            )
+            .await
+            .expect("dashboard snapshot");
+        assert_eq!(snapshot.clients.len(), 1);
+        assert_eq!(snapshot.clients[0].installation.id, "inst-payout-only");
+        assert!(snapshot.clients[0].payout_profile.is_some());
+        assert!(snapshot.clients[0].share_ids.is_empty());
+        assert!(snapshot.clients[0].client_tunnel.is_none());
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 
     fn sign_issue_lease_request(

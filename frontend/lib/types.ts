@@ -67,6 +67,14 @@ export type DashboardClient = {
     enabled: boolean;
     online: boolean;
   };
+  payoutProfile?: {
+    addressType: "evm";
+    address: string;
+    token: "USDC" | "USDT";
+    networks: Array<"eip155:56" | "eip155:8453" | "eip155:42161">;
+    verificationStatus: "self_declared";
+    updatedAt: string;
+  };
   /** 该 installation 名下所有独立 share 的 id 集合。 */
   shareIds?: string[];
   /** 该 installation 名下 share 总数；等价于 shareIds.length。 */

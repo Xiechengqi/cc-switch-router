@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha3::{Digest, Keccak256};
 use std::collections::BTreeMap;
 
 fn default_share_for_sale() -> String {
@@ -394,6 +395,203 @@ pub struct ClientTunnelView {
     pub updated_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_at: Option<DateTime<Utc>>,
+}
+
+pub const PAYOUT_PROFILE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PayoutAddressType {
+    #[serde(rename = "evm")]
+    Evm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PayoutToken {
+    USDC,
+    USDT,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum PayoutNetwork {
+    #[serde(rename = "eip155:56")]
+    Bsc,
+    #[serde(rename = "eip155:8453")]
+    Base,
+    #[serde(rename = "eip155:42161")]
+    ArbitrumOne,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PayoutVerificationStatus {
+    #[serde(rename = "self_declared")]
+    SelfDeclared,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PayoutProfile {
+    pub address_type: PayoutAddressType,
+    pub address: String,
+    pub token: PayoutToken,
+    pub networks: Vec<PayoutNetwork>,
+    pub verification_status: PayoutVerificationStatus,
+}
+
+impl PayoutProfile {
+    pub fn validate_and_normalize(mut self) -> Result<Self, String> {
+        self.address = normalize_evm_address(&self.address)?;
+        self.networks.sort_unstable();
+        self.networks.dedup();
+        if self.networks.is_empty() {
+            return Err("at least one payout network is required".into());
+        }
+        Ok(self)
+    }
+}
+
+pub fn normalize_evm_address(value: &str) -> Result<String, String> {
+    if value.trim() != value || !value.starts_with("0x") || value.len() != 42 {
+        return Err("EVM address must be 0x followed by 40 hexadecimal characters".into());
+    }
+    let body = &value[2..];
+    if !body.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("EVM address must contain only hexadecimal characters".into());
+    }
+    let normalized = checksum_evm_address(&body.to_ascii_lowercase());
+    let has_lower = body.bytes().any(|byte| byte.is_ascii_lowercase());
+    let has_upper = body.bytes().any(|byte| byte.is_ascii_uppercase());
+    if has_lower && has_upper && normalized != value {
+        return Err("mixed-case EVM address must use a valid EIP-55 checksum".into());
+    }
+    Ok(normalized)
+}
+
+fn checksum_evm_address(lowercase_body: &str) -> String {
+    let digest = Keccak256::digest(lowercase_body.as_bytes());
+    let mut output = String::with_capacity(42);
+    output.push_str("0x");
+    for (index, byte) in lowercase_body.bytes().enumerate() {
+        if byte.is_ascii_alphabetic() {
+            let hash_nibble = if index % 2 == 0 {
+                digest[index / 2] >> 4
+            } else {
+                digest[index / 2] & 0x0f
+            };
+            if hash_nibble >= 8 {
+                output.push((byte as char).to_ascii_uppercase());
+                continue;
+            }
+        }
+        output.push(byte as char);
+    }
+    output
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InstallationPayoutProfileUpdate {
+    pub schema_version: u32,
+    pub revision: i64,
+    pub profile: Option<PayoutProfile>,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InstallationPayoutProfileUpdateRequest {
+    pub installation_id: String,
+    pub timestamp_ms: i64,
+    pub nonce: String,
+    pub signature: String,
+    pub update: InstallationPayoutProfileUpdate,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallationPayoutProfileUpdateResponse {
+    pub ok: bool,
+    pub revision: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicPayoutProfileResponse {
+    pub schema_version: u32,
+    pub revision: i64,
+    pub configured: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_email: Option<String>,
+    pub installation_id: String,
+    pub profile: Option<PayoutProfile>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicPayoutProfilesResponse {
+    pub profiles: Vec<PublicPayoutProfileResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicPayoutProfilesQuery {
+    pub installation_ids: String,
+}
+
+#[cfg(test)]
+mod payout_profile_tests {
+    use super::*;
+
+    #[test]
+    fn evm_address_normalization_enforces_eip55_for_mixed_case() {
+        assert_eq!(
+            normalize_evm_address("0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed").unwrap(),
+            "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"
+        );
+        assert!(normalize_evm_address("0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAee").is_err());
+        assert!(normalize_evm_address("5aaeb6053f3e94c9b9a09f33669435e7ef1beaed").is_err());
+    }
+
+    #[test]
+    fn payout_profile_sorts_and_deduplicates_networks() {
+        let profile = PayoutProfile {
+            address_type: PayoutAddressType::Evm,
+            address: "0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed".into(),
+            token: PayoutToken::USDC,
+            networks: vec![
+                PayoutNetwork::ArbitrumOne,
+                PayoutNetwork::Bsc,
+                PayoutNetwork::Bsc,
+            ],
+            verification_status: PayoutVerificationStatus::SelfDeclared,
+        }
+        .validate_and_normalize()
+        .unwrap();
+        assert_eq!(
+            profile.networks,
+            vec![PayoutNetwork::Bsc, PayoutNetwork::ArbitrumOne]
+        );
+    }
+
+    #[test]
+    fn payout_update_canonical_json_matches_client_signing_contract() {
+        let update = InstallationPayoutProfileUpdate {
+            schema_version: 1,
+            revision: 3,
+            profile: Some(PayoutProfile {
+                address_type: PayoutAddressType::Evm,
+                address: "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed".into(),
+                token: PayoutToken::USDT,
+                networks: vec![PayoutNetwork::Bsc, PayoutNetwork::Base],
+                verification_status: PayoutVerificationStatus::SelfDeclared,
+            }),
+            updated_at_ms: 1_753_000_000_000,
+        };
+        assert_eq!(
+            serde_json::to_string(&update).unwrap(),
+            r#"{"schemaVersion":1,"revision":3,"profile":{"addressType":"evm","address":"0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed","token":"USDT","networks":["eip155:56","eip155:8453"],"verificationStatus":"self_declared"},"updatedAtMs":1753000000000}"#
+        );
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1788,6 +1986,8 @@ pub struct DashboardClientView {
     pub installation: InstallationView,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_tunnel: Option<DashboardClientTunnelView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payout_profile: Option<DashboardPayoutProfileView>,
     /// 该 installation 名下挂的所有 active share id 列表。
     /// 前端 ClientsTable 用它展示 `#shares` 列，并在抽屉里反查顶层 `shares`
     /// 渲染该机器的所有 share 摘要。Share 维度的元数据（owner / status / 健康）
@@ -1805,6 +2005,17 @@ pub struct DashboardClientView {
     pub health_checks: Vec<HealthCheckEntry>,
     #[serde(default)]
     pub health_timeline: Vec<HealthTimelineBucket>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DashboardPayoutProfileView {
+    pub address_type: PayoutAddressType,
+    pub address: String,
+    pub token: PayoutToken,
+    pub networks: Vec<PayoutNetwork>,
+    pub verification_status: PayoutVerificationStatus,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize)]
