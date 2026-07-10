@@ -1,7 +1,7 @@
 "use client";
 
-import { Button, Card, Chip, Drawer } from "@heroui/react";
-import { Check, ChevronLeft, ChevronRight, Copy, ExternalLink, Maximize2, WalletCards } from "lucide-react";
+import { Button, Card, Chip, Drawer, toast } from "@heroui/react";
+import { Check, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Copy, ExternalLink, Maximize2, Search, SlidersHorizontal, WalletCards } from "lucide-react";
 import * as React from "react";
 import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog";
 import { ShareCard } from "@/components/dashboard/share-card";
@@ -17,7 +17,6 @@ import {
   drawerDialogClassName,
   EmptyBlock,
   formatAgeDaysOrHours,
-  HealthDots,
   HealthTimelineStrip,
   ShareClientPanel,
   ShareEditDialog,
@@ -30,12 +29,51 @@ import {
   sortClients,
 } from "@/components/dashboard/data-tables";
 import type { DashboardClient, DashboardMarket, ShareView } from "@/lib/types";
+import { formatRelativeTime } from "@/lib/utils";
 
 const PAYOUT_NETWORK_LABELS: Record<string, string> = {
   "eip155:56": "BSC",
   "eip155:8453": "Base",
   "eip155:42161": "Arbitrum One",
 };
+
+type OperationalState = "online" | "degraded" | "offline";
+
+function shareIsEnabled(share: ShareView) {
+  return String(share.shareStatus || "").trim().toLowerCase() === "active";
+}
+
+function clientOperationalState(client: DashboardClient, shares: ShareView[]): OperationalState {
+  const enabledShares = shares.filter(shareIsEnabled);
+  const onlineShares = enabledShares.filter((share) => share.isOnline);
+  if (enabledShares.length > 0) {
+    if (onlineShares.length === 0) return "offline";
+    if (onlineShares.length < enabledShares.length) return "degraded";
+    const latestHealth = client.healthChecks?.at(-1);
+    return latestHealth && !latestHealth.isHealthy ? "degraded" : "online";
+  }
+  if (shares.length > 0 && !client.clientTunnel) return "online";
+  return client.clientTunnel?.online ? "online" : "offline";
+}
+
+function stateRank(state: OperationalState) {
+  return state === "offline" ? 0 : state === "degraded" ? 1 : 2;
+}
+
+function OperationalStatus({ state }: { state: OperationalState }) {
+  const { t } = useLocaleText();
+  const styles = state === "online"
+    ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+    : state === "degraded"
+      ? "border-amber-200 bg-amber-50 text-amber-700"
+      : "border-rose-200 bg-rose-50 text-rose-700";
+  return (
+    <span className={`inline-flex h-6 items-center gap-1.5 rounded-full border px-2.5 text-[11px] font-semibold ${styles}`}>
+      <span className="h-1.5 w-1.5 rounded-full bg-current" />
+      {state === "online" ? t("common.online") : state === "degraded" ? t("dashboard.degraded") : t("common.offline")}
+    </span>
+  );
+}
 
 function PayoutProfilePanel({ client, detailed = false }: { client: DashboardClient; detailed?: boolean }) {
   const { locale, t } = useLocaleText();
@@ -47,14 +85,34 @@ function PayoutProfilePanel({ client, detailed = false }: { client: DashboardCli
   const copyAddress = async () => {
     try {
       await navigator.clipboard.writeText(profile.address);
+      toast.success(t("dashboard.payoutCopied"));
     } catch {
+      toast.danger(t("dashboard.payoutCopyFailed"));
       return;
     }
     setCopied(true);
     window.setTimeout(() => setCopied(false), 1500);
   };
+  if (!detailed) {
+    const networks = profile.networks.map((network) => PAYOUT_NETWORK_LABELS[network] || network).join(" / ");
+    return (
+      <button
+        type="button"
+        data-no-row-drawer
+        onClick={(event) => { event.stopPropagation(); void copyAddress(); }}
+        className="inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-md px-1.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-slate-100 hover:text-foreground"
+        title={`${profile.token} · ${networks} · ${profile.address}`}
+      >
+        <WalletCards className="h-3.5 w-3.5 shrink-0" />
+        <span className="shrink-0 font-medium text-foreground">{profile.token}</span>
+        <span className="shrink-0">· {networks} ·</span>
+        <code className="min-w-0 truncate font-mono text-[11px]">{profile.address}</code>
+        {copied ? <Check className="h-3.5 w-3.5 shrink-0 text-emerald-600" /> : <Copy className="h-3.5 w-3.5 shrink-0" />}
+      </button>
+    );
+  }
   return (
-    <div className={`grid min-w-0 gap-2 rounded-md border border-amber-200/80 bg-amber-50/50 ${detailed ? "p-3" : "px-3 py-2"}`}>
+    <div className="grid min-w-0 gap-2 rounded-md border border-amber-200/80 bg-amber-50/50 p-3">
       <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs">
         <span className="inline-flex items-center gap-1 font-medium text-amber-800"><WalletCards className="h-3.5 w-3.5" />{t("dashboard.payout")}</span>
         <Chip size="sm" variant="tertiary">{profile.token}</Chip>
@@ -67,12 +125,10 @@ function PayoutProfilePanel({ client, detailed = false }: { client: DashboardCli
           {copied ? <Check className="h-3.5 w-3.5 text-emerald-600" /> : <Copy className="h-3.5 w-3.5" />}
         </Button>
       </div>
-      {detailed ? (
-        <div className="grid gap-1 text-xs text-muted-foreground">
-          <span>{t("dashboard.payoutUpdated")}: <strong className="text-foreground">{new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(profile.updatedAt))}</strong></span>
-          <span className="text-amber-700">{t("dashboard.payoutUnverifiedHint")}</span>
-        </div>
-      ) : null}
+      <div className="grid gap-1 text-xs text-muted-foreground">
+        <span>{t("dashboard.payoutUpdated")}: <strong className="text-foreground">{new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(profile.updatedAt))}</strong></span>
+        <span className="text-amber-700">{t("dashboard.payoutUnverifiedHint")}</span>
+      </div>
     </div>
   );
 }
@@ -90,13 +146,34 @@ function sortShares(shares: ShareView[]) {
   });
 }
 
+const CLIENT_COLLAPSE_STORAGE_KEY = "cc_switch_router_client_collapsed_v1";
+
+function includesQuery(values: Array<string | undefined>, query: string) {
+  return values.some((value) => String(value || "").toLocaleLowerCase().includes(query));
+}
+
+function shareMatchesQuery(share: ShareView, query: string) {
+  return includesQuery([
+    share.shareName,
+    share.shareId,
+    share.subdomain,
+    share.ownerEmail,
+    share.appType,
+    share.providerId,
+    ...Object.keys(share.bindings || {}),
+    ...Object.values(share.bindings || {}),
+  ], query);
+}
+
 const ShareScroller = React.memo(function ShareScroller({
   shares,
+  totalCount = shares.length,
   onOpenShare,
   onEditShare,
   onConnectShare,
 }: {
   shares: ShareView[];
+  totalCount?: number;
   onOpenShare: (share: ShareView) => void;
   onEditShare: (share: ShareView) => void;
   onConnectShare: (share: ShareView) => void;
@@ -107,6 +184,7 @@ const ShareScroller = React.memo(function ShareScroller({
     overflowing: false,
     canScrollLeft: false,
     canScrollRight: false,
+    currentIndex: 0,
   });
 
   const updateScrollState = React.useCallback(() => {
@@ -117,8 +195,9 @@ const ShareScroller = React.memo(function ShareScroller({
       overflowing: maxScrollLeft > 1,
       canScrollLeft: element.scrollLeft > 1,
       canScrollRight: element.scrollLeft < maxScrollLeft - 1,
+      currentIndex: Math.min(shares.length - 1, Math.max(0, Math.round(element.scrollLeft / 272))),
     });
-  }, []);
+  }, [shares.length]);
 
   React.useEffect(() => {
     const element = scrollRef.current;
@@ -146,39 +225,58 @@ const ShareScroller = React.memo(function ShareScroller({
   }, [shares.length, updateScrollState]);
 
   const scrollByCards = React.useCallback((direction: -1 | 1) => {
-    scrollRef.current?.scrollBy({ left: direction * 320, behavior: "smooth" });
+    scrollRef.current?.scrollBy({ left: direction * 272, behavior: "smooth" });
   }, []);
 
   if (!shares.length) return <EmptyBlock>{t("dashboard.noLinkedShares")}</EmptyBlock>;
 
+  const enabledCount = shares.filter(shareIsEnabled).length;
+  const onlineCount = shares.filter((share) => shareIsEnabled(share) && share.isOnline).length;
+  const disabledCount = shares.length - enabledCount;
+
   return (
     <div className="grid min-w-0 gap-2">
-      {scrollState.overflowing ? (
-        <div className="flex justify-end gap-1">
+      <div className="flex h-7 items-center justify-between gap-4">
+        <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
+          <span className="font-semibold text-foreground">{t("dashboard.shares")}</span>
+          <span>{shares.length === totalCount ? shares.length : `${shares.length}/${totalCount}`}</span>
+          <span aria-hidden>·</span>
+          <span className="text-emerald-700">{onlineCount} {t("common.online")}</span>
+          {enabledCount - onlineCount > 0 ? <span className="text-rose-700">{enabledCount - onlineCount} {t("common.offline")}</span> : null}
+          {disabledCount > 0 ? <span>{disabledCount} {t("common.disabled")}</span> : null}
+        </div>
+        {scrollState.overflowing ? (
+          <div className="flex shrink-0 items-center gap-1">
+            <span className="mr-1 font-mono text-[10px] tabular-nums text-muted-foreground">{scrollState.currentIndex + 1}/{shares.length}</span>
           <Button size="sm" variant="outline" isIconOnly isDisabled={!scrollState.canScrollLeft} className="h-7 w-7 min-w-0 rounded-md p-0" aria-label={t("dashboard.scrollSharesLeft")} onClick={() => scrollByCards(-1)}>
             <ChevronLeft className="h-3.5 w-3.5" />
           </Button>
           <Button size="sm" variant="outline" isIconOnly isDisabled={!scrollState.canScrollRight} className="h-7 w-7 min-w-0 rounded-md p-0" aria-label={t("dashboard.scrollSharesRight")} onClick={() => scrollByCards(1)}>
             <ChevronRight className="h-3.5 w-3.5" />
           </Button>
+          </div>
+        ) : null}
+      </div>
+      <div className="relative min-w-0">
+        {scrollState.canScrollLeft ? <div className="pointer-events-none absolute inset-y-0 left-0 z-10 w-7 bg-gradient-to-r from-white to-transparent" /> : null}
+        {scrollState.canScrollRight ? <div className="pointer-events-none absolute inset-y-0 right-0 z-10 w-10 bg-gradient-to-l from-white to-transparent" /> : null}
+        <div
+          ref={scrollRef}
+          className="flex min-w-0 snap-x gap-3 overflow-x-auto pb-2 pr-5 outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
+          onScroll={updateScrollState}
+          tabIndex={0}
+          aria-label={t("dashboard.shares")}
+          onKeyDown={(event) => {
+            if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+              event.preventDefault();
+              scrollByCards(event.key === "ArrowLeft" ? -1 : 1);
+            }
+          }}
+        >
+          {shares.map((share) => (
+            <ShareCard key={share.shareId} share={share} onOpen={onOpenShare} onEdit={onEditShare} onConnect={onConnectShare} />
+          ))}
         </div>
-      ) : null}
-      <div
-        ref={scrollRef}
-        className="flex min-w-0 snap-x gap-3 overflow-x-auto pb-2"
-        onScroll={updateScrollState}
-        tabIndex={0}
-        aria-label={t("dashboard.shares")}
-        onKeyDown={(event) => {
-          if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
-            event.preventDefault();
-            scrollByCards(event.key === "ArrowLeft" ? -1 : 1);
-          }
-        }}
-      >
-        {shares.map((share) => (
-          <ShareCard key={share.shareId} share={share} onOpen={onOpenShare} onEdit={onEditShare} onConnect={onConnectShare} />
-        ))}
       </div>
     </div>
   );
@@ -187,68 +285,105 @@ const ShareScroller = React.memo(function ShareScroller({
 function ClientCard({
   client,
   shares,
+  summaryShares,
   onOpenClient,
   onOpenFrame,
   onOpenShare,
   onEditShare,
   onConnectShare,
+  collapsed,
+  onToggleCollapsed,
 }: {
   client: DashboardClient;
   shares: ShareView[];
+  summaryShares?: ShareView[];
   onOpenClient: (client: DashboardClient) => void;
   onOpenFrame: (url: string) => void;
   onOpenShare: (share: ShareView) => void;
   onEditShare: (share: ShareView) => void;
   onConnectShare: (share: ShareView) => void;
+  collapsed: boolean;
+  onToggleCollapsed: () => void;
 }) {
   const { locale, t } = useLocaleText();
   const tunnelUrl = clientTunnelDisplayUrl(client.clientTunnel?.tunnelUrl);
   const owner = clientOwnerEmail(client);
+  const allShares = summaryShares || shares;
   const onlineRate = client.onlineRate24h || 0;
   const onlineTitle = `${onlineRate.toFixed(1)}% online in last 24h (${client.onlineMinutes24h || 0} / 1440 min)`;
+  const state = clientOperationalState(client, allShares);
+  const enabledShares = allShares.filter(shareIsEnabled);
+  const onlineShares = enabledShares.filter((share) => share.isOnline);
+  const issueCount = enabledShares.length - onlineShares.length;
+  const identity = client.clientTunnel?.subdomain || client.installation.id;
+  const borderTone = state === "offline" ? "border-l-rose-500" : state === "degraded" ? "border-l-amber-400" : "border-l-slate-200";
 
   return (
-    <Card className="overflow-hidden rounded-lg border bg-white p-0 shadow-sm">
-      <Card.Content className="grid gap-4 p-4">
+    <Card className={`overflow-hidden rounded-lg border border-l-[3px] bg-white p-0 shadow-sm ${borderTone}`}>
+      <Card.Content className="grid gap-3 p-3.5">
         <div
-          className="grid cursor-pointer select-text gap-3 rounded-md px-1 py-0.5 transition-colors hover:bg-primary/[0.03] md:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_auto]"
+          className="grid min-h-14 cursor-pointer select-text grid-cols-[minmax(300px,1.35fr)_minmax(330px,1fr)_auto] items-center gap-4 rounded-md px-1.5 py-1 outline-none transition-colors hover:bg-primary/[0.03] focus-visible:ring-2 focus-visible:ring-primary/30"
           onMouseDown={onRowPointerDown}
           onClick={(event) => {
             if (shouldOpenRowDrawer(event)) onOpenClient(client);
           }}
+          role="button"
+          tabIndex={0}
+          onKeyDown={(event) => {
+            if ((event.key === "Enter" || event.key === " ") && event.target === event.currentTarget) {
+              event.preventDefault();
+              onOpenClient(client);
+            }
+          }}
         >
-          <div className="grid min-w-0 gap-1">
-            {tunnelUrl ? (
-              <a href={tunnelUrl} target="_blank" rel="noopener noreferrer" data-no-row-drawer className="inline-flex min-w-0 max-w-full items-center gap-1 break-all font-mono text-xs font-semibold text-foreground underline-offset-4 hover:underline" title={tunnelUrl} onClick={(event) => event.stopPropagation()}>
-                <span className="min-w-0 break-all">{tunnelUrl}</span>
-                <ExternalLink className="h-3 w-3 shrink-0 text-muted-foreground" />
-              </a>
-            ) : (
-              <strong className="break-all font-mono text-xs text-muted-foreground">{client.installation.id}</strong>
-            )}
-            <span className="truncate text-xs text-muted-foreground" title={owner}>{t("dashboard.owner")}: {owner}</span>
+          <div className="grid min-w-0 gap-1.5">
+            <div className="flex min-w-0 items-center gap-2">
+              <strong className="truncate text-sm font-semibold text-foreground" title={identity}>{identity}</strong>
+              <OperationalStatus state={state} />
+            </div>
+            <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
+              {tunnelUrl ? (
+                <a href={tunnelUrl} target="_blank" rel="noopener noreferrer" data-no-row-drawer className="inline-flex min-w-0 items-center gap-1 truncate font-mono underline-offset-4 hover:underline" title={tunnelUrl} onClick={(event) => event.stopPropagation()}>
+                  <span className="truncate">{tunnelUrl}</span>
+                  <ExternalLink className="h-3 w-3 shrink-0" />
+                </a>
+              ) : <span className="truncate font-mono" title={client.installation.id}>{client.installation.id}</span>}
+              <span aria-hidden>·</span>
+              <span className="truncate" title={owner}>{owner}</span>
+            </div>
           </div>
 
-          <div className="grid min-w-0 gap-1 text-xs text-muted-foreground sm:grid-cols-3 md:grid-cols-1 lg:grid-cols-3">
-            <span className="truncate" title={client.installation.countryCode || client.installation.region || "-"}>{t("dashboard.region")}: <strong className="text-foreground">{client.installation.countryCode || client.installation.region || "-"}</strong></span>
-            <span className="truncate" title={clientPlatformLabel(client)}>{t("dashboard.version")}: <strong className="text-foreground">{clientPlatformLabel(client)}</strong></span>
-            <span className="truncate" title={onlineTitle}>{t("dashboard.online")}: <strong className="text-foreground">{onlineRate.toFixed(1)}% / {formatAgeDaysOrHours(client.installation.createdAt, locale)}</strong></span>
+          <div className="grid min-w-0 gap-1.5 text-xs text-muted-foreground">
+            <div className="flex min-w-0 items-center gap-2">
+              <span>{client.installation.countryCode || client.installation.region || "-"}</span>
+              <span aria-hidden>·</span>
+              <span className="truncate" title={clientPlatformLabel(client)}>{clientPlatformLabel(client)}</span>
+              <span aria-hidden>·</span>
+              <span title={onlineTitle}>{onlineRate.toFixed(1)}% {t("dashboard.availability")}</span>
+              <span aria-hidden>·</span>
+              <span>{t("dashboard.lastSeen")} {formatRelativeTime(client.installation.lastSeenAt, locale)}</span>
+            </div>
+            <div className="flex min-w-0 items-center gap-2">
+              {enabledShares.length ? <span className={issueCount ? "font-medium text-rose-700" : "text-foreground"}>{onlineShares.length}/{enabledShares.length} {t("common.online")}</span> : null}
+              {allShares.length - enabledShares.length > 0 ? <span>{allShares.length - enabledShares.length} {t("common.disabled")}</span> : null}
+              <PayoutProfilePanel client={client} />
+            </div>
           </div>
 
-          <div className="flex min-w-0 flex-wrap items-center justify-start gap-2 md:justify-end">
-            <HealthDots entries={client.healthChecks || []} />
-            <Chip size="sm" variant="tertiary">{t("dashboard.sharesCount", { count: shares.length })}</Chip>
+          <div className="flex min-w-0 items-center justify-end gap-1.5">
+            <Chip size="sm" variant={issueCount ? "soft" : "tertiary"}>{t("dashboard.sharesCount", { count: allShares.length })}</Chip>
             {tunnelUrl ? (
               <Button size="sm" variant="outline" isIconOnly className="h-7 w-7 min-w-0 rounded-md p-0" aria-label={t("dashboard.clientFrame.title")} data-no-row-drawer onClick={(event) => { event.stopPropagation(); onOpenFrame(tunnelUrl); }}>
                 <Maximize2 className="h-3.5 w-3.5" />
               </Button>
             ) : null}
+            <Button size="sm" variant="ghost" isIconOnly className="h-7 w-7 min-w-0 rounded-md p-0" aria-label={collapsed ? t("dashboard.expandClient") : t("dashboard.collapseClient")} data-no-row-drawer onClick={(event) => { event.stopPropagation(); onToggleCollapsed(); }}>
+              {collapsed ? <ChevronDown className="h-4 w-4" /> : <ChevronUp className="h-4 w-4" />}
+            </Button>
           </div>
         </div>
 
-        <PayoutProfilePanel client={client} />
-
-        <ShareScroller shares={shares} onOpenShare={onOpenShare} onEditShare={onEditShare} onConnectShare={onConnectShare} />
+        {!collapsed ? <ShareScroller shares={shares} totalCount={allShares.length} onOpenShare={onOpenShare} onEditShare={onEditShare} onConnectShare={onConnectShare} /> : null}
       </Card.Content>
     </Card>
   );
@@ -271,6 +406,21 @@ export function ClientBoard({
   const [editingShare, setEditingShare] = React.useState<ShareView | null>(null);
   const [connectShare, setConnectShare] = React.useState<ShareView | null>(null);
   const [clientFrameUrl, setClientFrameUrl] = React.useState("");
+  const [query, setQuery] = React.useState("");
+  const [statusFilter, setStatusFilter] = React.useState<"all" | OperationalState>("all");
+  const [regionFilter, setRegionFilter] = React.useState("all");
+  const [sortOrder, setSortOrder] = React.useState("issues");
+  const [onlyIssues, setOnlyIssues] = React.useState(false);
+  const [collapsedClientIds, setCollapsedClientIds] = React.useState<Set<string>>(new Set());
+
+  React.useEffect(() => {
+    try {
+      const stored = JSON.parse(window.localStorage.getItem(CLIENT_COLLAPSE_STORAGE_KEY) || "[]");
+      if (Array.isArray(stored)) setCollapsedClientIds(new Set(stored.filter((value): value is string => typeof value === "string")));
+    } catch {
+      // Ignore invalid local preferences and keep every Client expanded.
+    }
+  }, []);
 
   const sortedClients = React.useMemo(() => sortClients(clients), [clients]);
   const shareById = React.useMemo(() => new Map(shares.map((share) => [share.shareId, share])), [shares]);
@@ -292,6 +442,72 @@ export function ClientBoard({
   );
   const orphanShares = React.useMemo(() => sortShares(shares.filter((share) => !linkedShareIds.has(share.shareId))), [linkedShareIds, shares]);
 
+  const regions = React.useMemo(() => Array.from(new Set(
+    clients.map((client) => client.installation.countryCode || client.installation.region || "").filter(Boolean),
+  )).sort((left, right) => left.localeCompare(right)), [clients]);
+
+  const clientRows = React.useMemo(() => {
+    const normalizedQuery = query.trim().toLocaleLowerCase();
+    const stableOrder = new Map(sortedClients.map((client, index) => [client.installation.id, index]));
+    const rows = sortedClients.map((client) => {
+      const allShares = sharesForClient(client);
+      const clientMatch = !normalizedQuery || includesQuery([
+        client.installation.id,
+        client.installation.ownerEmail,
+        client.installation.countryCode,
+        client.installation.region,
+        client.installation.platform,
+        client.installation.appVersion,
+        client.clientTunnel?.subdomain,
+        client.clientTunnel?.tunnelUrl,
+        client.clientTunnel?.ownerEmail,
+        client.payoutProfile?.address,
+        client.payoutProfile?.token,
+      ], normalizedQuery);
+      const matchedShares = clientMatch ? allShares : allShares.filter((share) => shareMatchesQuery(share, normalizedQuery));
+      return { client, shares: matchedShares, allShares, state: clientOperationalState(client, allShares), clientMatch };
+    }).filter((row) => {
+      if (normalizedQuery && row.shares.length === 0 && !row.clientMatch) return false;
+      const region = row.client.installation.countryCode || row.client.installation.region || "";
+      if (regionFilter !== "all" && region !== regionFilter) return false;
+      if (statusFilter !== "all" && row.state !== statusFilter) return false;
+      if (onlyIssues && row.state === "online") return false;
+      return true;
+    });
+    rows.sort((left, right) => {
+      if (sortOrder === "name") {
+        const leftName = left.client.clientTunnel?.subdomain || left.client.installation.id;
+        const rightName = right.client.clientTunnel?.subdomain || right.client.installation.id;
+        return leftName.localeCompare(rightName, undefined, { sensitivity: "base" });
+      }
+      if (sortOrder === "recent") {
+        return (Date.parse(right.client.installation.lastSeenAt) || 0) - (Date.parse(left.client.installation.lastSeenAt) || 0);
+      }
+      if (sortOrder === "shares") return right.allShares.length - left.allShares.length;
+      if (sortOrder === "registered") return (stableOrder.get(left.client.installation.id) || 0) - (stableOrder.get(right.client.installation.id) || 0);
+      return stateRank(left.state) - stateRank(right.state) || (stableOrder.get(left.client.installation.id) || 0) - (stableOrder.get(right.client.installation.id) || 0);
+    });
+    return rows;
+  }, [onlyIssues, query, regionFilter, sharesForClient, sortOrder, sortedClients, statusFilter]);
+
+  const clientSummary = React.useMemo(() => {
+    const states = sortedClients.map((client) => clientOperationalState(client, sharesForClient(client)));
+    return {
+      online: states.filter((state) => state === "online").length,
+      issues: states.filter((state) => state !== "online").length,
+    };
+  }, [sharesForClient, sortedClients]);
+
+  const visibleOrphanShares = React.useMemo(() => {
+    const normalizedQuery = query.trim().toLocaleLowerCase();
+    return orphanShares.filter((share) => {
+      if (normalizedQuery && !shareMatchesQuery(share, normalizedQuery)) return false;
+      if (statusFilter === "online" && !(shareIsEnabled(share) && share.isOnline)) return false;
+      if ((statusFilter === "offline" || statusFilter === "degraded" || onlyIssues) && shareIsEnabled(share) && share.isOnline) return false;
+      return true;
+    });
+  }, [onlyIssues, orphanShares, query, statusFilter]);
+
   const openClient = React.useCallback((client: DashboardClient) => setSelectedClientId(client.installation.id), []);
   const closeClientDrawer = React.useCallback((open: boolean) => { if (!open) setSelectedClientId(""); }, []);
   const openShare = React.useCallback((share: ShareView) => setSelectedShareId(share.shareId), []);
@@ -303,6 +519,14 @@ export function ClientBoard({
   const openClientFrame = React.useCallback((url: string) => setClientFrameUrl(url), []);
   const closeClientFrame = React.useCallback((open: boolean) => { if (!open) setClientFrameUrl(""); }, []);
   const handleSaved = React.useCallback(async () => { await onChanged?.(); }, [onChanged]);
+  const toggleClientCollapsed = React.useCallback((clientId: string) => {
+    setCollapsedClientIds((current) => {
+      const next = new Set(current);
+      if (next.has(clientId)) next.delete(clientId); else next.add(clientId);
+      window.localStorage.setItem(CLIENT_COLLAPSE_STORAGE_KEY, JSON.stringify(Array.from(next)));
+      return next;
+    });
+  }, []);
 
   const selectedClient = selectedClientId ? clientById.get(selectedClientId) || null : null;
   const selectedShare = selectedShareId ? shareById.get(selectedShareId) || null : null;
@@ -311,25 +535,65 @@ export function ClientBoard({
 
   return (
     <section className="grid gap-4">
-      <div className="flex items-center justify-between font-mono text-[11px] uppercase tracking-[0.14em] text-muted-foreground">
-        <div>{t("dashboard.clients")} <span className="font-semibold text-foreground">{sortedClients.length}</span></div>
-        <a href="https://github.com/Xiechengqi/cc-switch/releases" target="_blank" rel="noopener noreferrer" className="transition-colors hover:text-blue-400">{t("dashboard.install")}</a>
+      <div className="grid gap-3 rounded-lg border bg-white p-3 shadow-sm">
+        <div className="flex items-center justify-between gap-4">
+          <div className="flex items-baseline gap-2">
+            <h2 className="text-sm font-semibold text-foreground">{t("dashboard.clients")}</h2>
+            <span className="text-xs text-muted-foreground">{sortedClients.length}</span>
+            <span className="text-xs text-emerald-700">{clientSummary.online} {t("common.online")}</span>
+            {clientSummary.issues ? <span className="text-xs font-medium text-rose-700">{clientSummary.issues} {t("dashboard.issues")}</span> : null}
+          </div>
+          <a href="https://github.com/Xiechengqi/cc-switch/releases" target="_blank" rel="noopener noreferrer" className="font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground transition-colors hover:text-blue-500">{t("dashboard.install")}</a>
+        </div>
+        <div className="flex items-center gap-2">
+          <label className="flex h-9 min-w-64 flex-1 items-center gap-2 rounded-md border bg-white px-3 text-sm focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-primary/10">
+            <Search className="h-4 w-4 shrink-0 text-muted-foreground" />
+            <input value={query} onChange={(event) => setQuery(event.target.value)} className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground" placeholder={t("dashboard.searchClients")} aria-label={t("dashboard.searchClients")} />
+          </label>
+          <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value as "all" | OperationalState)} className="h-9 rounded-md border bg-white px-3 text-xs text-foreground outline-none focus:border-primary/50" aria-label={t("dashboard.filterStatus")}>
+            <option value="all">{t("dashboard.allStatuses")}</option>
+            <option value="online">{t("common.online")}</option>
+            <option value="degraded">{t("dashboard.degraded")}</option>
+            <option value="offline">{t("common.offline")}</option>
+          </select>
+          <select value={regionFilter} onChange={(event) => setRegionFilter(event.target.value)} className="h-9 max-w-36 rounded-md border bg-white px-3 text-xs text-foreground outline-none focus:border-primary/50" aria-label={t("dashboard.filterRegion")}>
+            <option value="all">{t("dashboard.allRegions")}</option>
+            {regions.map((region) => <option key={region} value={region}>{region}</option>)}
+          </select>
+          <button type="button" onClick={() => setOnlyIssues((value) => !value)} aria-pressed={onlyIssues} className={`inline-flex h-9 items-center gap-1.5 rounded-md border px-3 text-xs font-medium transition-colors ${onlyIssues ? "border-amber-300 bg-amber-50 text-amber-800" : "bg-white text-muted-foreground hover:text-foreground"}`}>
+            <SlidersHorizontal className="h-3.5 w-3.5" />{t("dashboard.onlyIssues")}
+          </button>
+          <select value={sortOrder} onChange={(event) => setSortOrder(event.target.value)} className="h-9 rounded-md border bg-white px-3 text-xs text-foreground outline-none focus:border-primary/50" aria-label={t("dashboard.sortBy")}>
+            <option value="issues">{t("dashboard.sortIssues")}</option>
+            <option value="name">{t("dashboard.sortName")}</option>
+            <option value="recent">{t("dashboard.sortRecent")}</option>
+            <option value="shares">{t("dashboard.sortShares")}</option>
+            <option value="registered">{t("dashboard.sortRegistered")}</option>
+          </select>
+        </div>
       </div>
 
       <div className="grid gap-4">
-        {sortedClients.length ? sortedClients.map((client) => (
-          <ClientCard key={client.installation.id} client={client} shares={sharesForClient(client)} onOpenClient={openClient} onOpenFrame={openClientFrame} onOpenShare={openShare} onEditShare={openEditShare} onConnectShare={openConnectShare} />
-        )) : <EmptyBlock>{t("dashboard.noClients")}</EmptyBlock>}
+        {clientRows.length ? clientRows.map(({ client, shares: visibleShares, allShares }) => (
+          <ClientCard key={client.installation.id} client={client} shares={visibleShares} summaryShares={allShares} onOpenClient={openClient} onOpenFrame={openClientFrame} onOpenShare={openShare} onEditShare={openEditShare} onConnectShare={openConnectShare} collapsed={!query && collapsedClientIds.has(client.installation.id)} onToggleCollapsed={() => toggleClientCollapsed(client.installation.id)} />
+        )) : (
+          <EmptyBlock>
+            <div className="grid justify-items-center gap-2">
+              <span>{sortedClients.length ? t("dashboard.noFilterResults") : t("dashboard.noClients")}</span>
+              {sortedClients.length ? <button type="button" className="text-xs font-medium text-primary hover:underline" onClick={() => { setQuery(""); setStatusFilter("all"); setRegionFilter("all"); setOnlyIssues(false); }}>{t("dashboard.clearFilters")}</button> : null}
+            </div>
+          </EmptyBlock>
+        )}
       </div>
 
-      {orphanShares.length ? (
+      {visibleOrphanShares.length ? (
         <div className="grid gap-3">
           <div className="font-mono text-[11px] uppercase tracking-[0.14em] text-muted-foreground">
-            {t("dashboard.unlinkedClients")} <span className="font-semibold text-foreground">{orphanShares.length}</span>
+            {t("dashboard.unlinkedClients")} <span className="font-semibold text-foreground">{visibleOrphanShares.length}</span>
           </div>
           <Card className="rounded-lg border bg-white p-0 shadow-sm">
             <Card.Content className="p-4">
-              <ShareScroller shares={orphanShares} onOpenShare={openShare} onEditShare={openEditShare} onConnectShare={openConnectShare} />
+              <ShareScroller shares={visibleOrphanShares} onOpenShare={openShare} onEditShare={openEditShare} onConnectShare={openConnectShare} />
             </Card.Content>
           </Card>
         </div>

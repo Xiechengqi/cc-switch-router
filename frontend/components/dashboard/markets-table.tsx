@@ -1,29 +1,73 @@
 "use client";
 
-import { ExternalLink, Loader2, Pencil, Save, X } from "lucide-react";
+import { ChevronRight, ExternalLink, Loader2, Pencil, Save, Search, SlidersHorizontal, X } from "lucide-react";
 import { Button, Card, Checkbox, Chip, Drawer, Modal, Tabs, TextArea } from "@heroui/react";
 import * as React from "react";
-import { DrawerSection, EmptyBlock, HealthTimelineStrip, Info, StatusBadge, TokenGrid } from "@/components/dashboard/drawer-panels";
+import { DrawerSection, EmptyBlock, HealthTimelineStrip, Info, TokenGrid } from "@/components/dashboard/drawer-panels";
 import { FieldGroup } from "@/components/dashboard/share-edit-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getMarketLinkedShares, getMarketSharePriority, getMarketShareSessionLoads, releaseMarketShareState, updateMarketDisabledShares, updateMarketMaintenance } from "@/lib/api";
-import type { AppLocale } from "@/lib/i18n";
 import type { DashboardMarket, MarketAppAvailabilityEntry, MarketRequestLog, MarketShare, MarketShareRuntimeState, ShareAppRuntimes, ShareUpstreamProvider } from "@/lib/types";
 import { cn, compactTokens, formatDateTime, formatRelativeTime } from "@/lib/utils";
-import { canShowMarketSharePriority, drawerDialogClassName, formatAgeDaysOrHours, formatOfficialPriceMultiplier, formatUsdExactTrimmed, formatUsdOneDecimal, HealthDots, isShareMarket, isUnlimited, isUsageMarket, marketKindDescription, marketKindLabel, requestModelRoute, shouldOpenRowDrawer, sortMarkets, usageBucketTotalTokens, type TFn } from "@/components/dashboard/share-dashboard-utils";
-
-function marketStatusLabel(market: DashboardMarket, t: TFn) {
-  if (market.online) return t("common.online");
-  return market.status === "active" ? t("common.offline") : market.status || t("common.offline");
-}
+import { canShowMarketSharePriority, drawerDialogClassName, formatOfficialPriceMultiplier, formatUsdExactTrimmed, formatUsdOneDecimal, isShareMarket, isUnlimited, isUsageMarket, marketKindDescription, marketKindLabel, requestModelRoute, shouldOpenRowDrawer, sortMarkets, usageBucketTotalTokens, type TFn } from "@/components/dashboard/share-dashboard-utils";
 
 function marketHealthLabel(market: DashboardMarket, t: TFn) {
-  if (market.status === "disabled") return t("dashboard.disabled");
-  if (market.status === "offline") return t("common.offline");
+  const status = String(market.status || "").trim().toLowerCase();
+  if (status === "disabled") return t("dashboard.disabled");
+  if (market.maintenanceEnabled) return t("dashboard.maintenance");
+  if (status === "offline") return t("common.offline");
   if (!market.online) return t("dashboard.routeOffline");
   if ((market.shareCount || 0) === 0) return t("dashboard.noShares");
   if ((market.shareCount || 0) > 0 && (market.onlineShareCount || 0) === 0) return t("dashboard.noOnlineShares");
+  const capacity = marketCapacityPercent(market);
+  if (capacity != null && capacity >= 90) return t("dashboard.capacityWarning", { percent: capacity.toFixed(0) });
+  const latestHealth = market.healthChecks?.at(-1);
+  if (latestHealth && !latestHealth.isHealthy) return t("dashboard.healthCheckFailed");
   return t("dashboard.healthy");
+}
+
+type MarketOperationalState = "available" | "degraded" | "offline" | "maintenance" | "disabled";
+
+function marketCapacityPercent(market: DashboardMarket) {
+  if (isUnlimited(market.parallelCapacity) || market.parallelCapacity <= 0) return null;
+  return Math.max(0, Math.min(100, ((market.activeRequests || 0) / market.parallelCapacity) * 100));
+}
+
+function marketOperationalState(market: DashboardMarket): MarketOperationalState {
+  const status = String(market.status || "").trim().toLowerCase();
+  if (status === "disabled") return "disabled";
+  if (market.maintenanceEnabled) return "maintenance";
+  if (!market.online || status === "offline") return "offline";
+  const latestHealth = market.healthChecks?.at(-1);
+  const capacity = marketCapacityPercent(market);
+  if ((market.shareCount || 0) === 0 || ((market.shareCount || 0) > 0 && (market.onlineShareCount || 0) === 0) || (capacity != null && capacity >= 90) || (latestHealth && !latestHealth.isHealthy)) return "degraded";
+  return "available";
+}
+
+function marketStateRank(state: MarketOperationalState) {
+  return state === "offline" ? 0 : state === "degraded" ? 1 : state === "maintenance" ? 2 : state === "available" ? 3 : 4;
+}
+
+function MarketStatusPill({ state, t }: { state: MarketOperationalState; t: TFn }) {
+  const style = state === "available"
+    ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+    : state === "degraded"
+      ? "border-amber-200 bg-amber-50 text-amber-700"
+      : state === "offline"
+        ? "border-rose-200 bg-rose-50 text-rose-700"
+        : state === "maintenance"
+          ? "border-blue-200 bg-blue-50 text-blue-700"
+          : "border-slate-200 bg-slate-100 text-slate-600";
+  const label = state === "available"
+    ? t("dashboard.available")
+    : state === "degraded"
+      ? t("dashboard.degraded")
+      : state === "offline"
+        ? t("common.offline")
+        : state === "maintenance"
+          ? t("dashboard.maintenance")
+          : t("dashboard.disabled");
+  return <span className={`inline-flex h-6 items-center gap-1.5 rounded-full border px-2.5 text-[11px] font-semibold ${style}`}><span className="h-1.5 w-1.5 rounded-full bg-current" />{label}</span>;
 }
 
 function MarketEditAction({ market, onEdit, t }: { market: DashboardMarket; onEdit: (market: DashboardMarket) => void; t: TFn }) {
@@ -75,77 +119,29 @@ function MarketTypeChip({ market, t }: { market: DashboardMarket; t: TFn }) {
   );
 }
 
-function MarketIdentityCell({
-  market,
-  onEdit,
-  t,
-}: {
-  market: DashboardMarket;
-  onEdit: (market: DashboardMarket) => void;
-  t: TFn;
-}) {
+function MarketIdentityCell({ market, t }: { market: DashboardMarket; t: TFn }) {
   return (
-    <div className="grid min-w-72 gap-1.5">
+    <div className="grid min-w-0 gap-1">
+      <strong className="truncate text-sm font-semibold text-foreground" title={market.displayName || market.subdomain || market.id}>{market.displayName || market.subdomain || market.id}</strong>
       {market.publicBaseUrl ? (
         <a
           href={market.publicBaseUrl}
           target="_blank"
           rel="noreferrer"
           onClick={(event) => event.stopPropagation()}
-          className="inline-flex min-w-0 max-w-full items-center gap-1 break-all font-mono font-medium text-foreground underline-offset-4 hover:underline"
+          className="inline-flex min-w-0 max-w-full items-center gap-1 truncate font-mono text-[10px] text-muted-foreground underline-offset-4 hover:underline"
           title={market.publicBaseUrl}
         >
-          <span className="min-w-0 break-all">{market.publicBaseUrl}</span>
+          <span className="min-w-0 truncate">{market.publicBaseUrl}</span>
           <ExternalLink className="h-3 w-3 shrink-0" />
         </a>
       ) : (
-        <strong className="min-w-0 break-all font-mono font-medium">{market.id}</strong>
+        <span className="min-w-0 truncate font-mono text-[10px] text-muted-foreground">{market.id}</span>
       )}
-      <span className="break-all text-xs text-muted-foreground">{market.email}</span>
-      <div className="flex min-w-0 flex-wrap items-center gap-2">
+      <div className="flex min-w-0 items-center gap-1.5">
         <MarketTypeChip market={market} t={t} />
-        <StatusBadge active={market.online} label={marketStatusLabel(market, t)} />
-        {market.maintenanceEnabled ? (
-          <Chip color="warning" size="sm" variant="soft">
-            {t("dashboard.maintenance")}
-          </Chip>
-        ) : null}
-        <MarketEditAction market={market} onEdit={onEdit} t={t} />
+        <span className="min-w-0 truncate text-[10px] text-muted-foreground" title={market.email}>{market.email}</span>
       </div>
-    </div>
-  );
-}
-
-function MarketStatusCell({ market, t, locale }: { market: DashboardMarket; t: TFn; locale: AppLocale }) {
-  const ageValue = formatAgeDaysOrHours(market.createdAt, locale);
-  const rowClass = "grid grid-cols-[76px_minmax(0,1fr)] gap-2";
-  const limit = isUnlimited(market.parallelCapacity) ? "∞" : String(market.parallelCapacity || 0);
-  const onlineValue = market.online ? `${(market.onlineRate24h || 0).toFixed(1)}% / ${ageValue}` : ageValue;
-  const usageValue = isShareMarket(market)
-    ? compactTokens(market.usageTokens)
-    : `${compactTokens(market.usageTokens)} / ${formatUsdOneDecimal(market.usageAmountUsd)}`;
-  return (
-    <div className="grid min-w-52 gap-2 text-sm">
-      <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.shares")}</span><strong>{market.onlineShareCount || 0} / {market.shareCount || 0}</strong></div>
-      <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.online")}</span><strong title={`${market.onlineMinutes24h || 0} / 1440 min · ${formatDateTime(market.createdAt)}`}>{onlineValue}</strong></div>
-      <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.parallel")}</span><strong>{market.activeRequests || 0}<span className="text-muted-foreground">/{limit}</span></strong></div>
-      <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.usage")}</span><strong>{usageValue}</strong></div>
-      <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.health")}</span><HealthDots entries={market.healthChecks} /></div>
-    </div>
-  );
-}
-
-function MarketBasicInfoPanel({ market, t, locale }: { market: DashboardMarket; t: TFn; locale: AppLocale }) {
-  return (
-    <div className="grid gap-3 sm:grid-cols-2">
-      <Info label={t("dashboard.marketType")} value={<MarketTypeChip market={market} t={t} />} />
-      <Info label={t("dashboard.status")} value={marketStatusLabel(market, t)} />
-      <Info label={t("dashboard.publicUrl")} value={market.publicBaseUrl || "-"} />
-      <Info label={t("dashboard.subdomain")} value={market.subdomain || "-"} />
-      <Info label={t("dashboard.lastSeen")} value={formatRelativeTime(market.lastSeenAt, locale)} />
-      {!market.online && market.offlineSince ? (
-        <Info label={t("dashboard.offlineSince")} value={formatRelativeTime(market.offlineSince, locale)} />
-      ) : null}
     </div>
   );
 }
@@ -153,35 +149,149 @@ function MarketBasicInfoPanel({ market, t, locale }: { market: DashboardMarket; 
 export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[]; onChanged?: () => Promise<void> }) {
   const [selected, setSelected] = React.useState<DashboardMarket | null>(null);
   const [editingMarket, setEditingMarket] = React.useState<DashboardMarket | null>(null);
+  const [query, setQuery] = React.useState("");
+  const [statusFilter, setStatusFilter] = React.useState<"all" | MarketOperationalState>("all");
+  const [sortOrder, setSortOrder] = React.useState("issues");
+  const [onlyIssues, setOnlyIssues] = React.useState(false);
   const { locale, t } = useLocaleText();
-  const sorted = sortMarkets(markets);
+  const stableMarkets = React.useMemo(() => sortMarkets(markets), [markets]);
+  const summary = React.useMemo(() => {
+    const states = stableMarkets.map(marketOperationalState);
+    return {
+      available: states.filter((state) => state === "available").length,
+      issues: states.filter((state) => state === "degraded" || state === "offline" || state === "maintenance").length,
+      disabled: states.filter((state) => state === "disabled").length,
+    };
+  }, [stableMarkets]);
+  const rows = React.useMemo(() => {
+    const normalizedQuery = query.trim().toLocaleLowerCase();
+    const stableOrder = new Map(stableMarkets.map((market, index) => [market.id, index]));
+    const next = stableMarkets.map((market) => ({ market, state: marketOperationalState(market) })).filter(({ market, state }) => {
+      if (normalizedQuery && ![
+        market.id,
+        market.displayName,
+        market.email,
+        market.subdomain,
+        market.publicBaseUrl,
+        market.marketKind,
+      ].some((value) => String(value || "").toLocaleLowerCase().includes(normalizedQuery))) return false;
+      if (statusFilter !== "all" && state !== statusFilter) return false;
+      if (onlyIssues && state !== "degraded" && state !== "offline" && state !== "maintenance") return false;
+      return true;
+    });
+    next.sort((left, right) => {
+      if (sortOrder === "name") return (left.market.displayName || left.market.subdomain || left.market.id).localeCompare(right.market.displayName || right.market.subdomain || right.market.id, undefined, { sensitivity: "base" });
+      if (sortOrder === "capacity") return (marketCapacityPercent(right.market) ?? -1) - (marketCapacityPercent(left.market) ?? -1);
+      if (sortOrder === "activity") return (right.market.activeRequests || 0) - (left.market.activeRequests || 0);
+      if (sortOrder === "shares") return (right.market.shareCount || 0) - (left.market.shareCount || 0);
+      if (sortOrder === "updated") return (Date.parse(right.market.lastSeenAt) || 0) - (Date.parse(left.market.lastSeenAt) || 0);
+      return marketStateRank(left.state) - marketStateRank(right.state) || (stableOrder.get(left.market.id) || 0) - (stableOrder.get(right.market.id) || 0);
+    });
+    return next;
+  }, [onlyIssues, query, sortOrder, stableMarkets, statusFilter]);
+
   return (
     <section className="grid gap-3">
-      <div className="flex items-center justify-between font-mono text-[11px] uppercase tracking-[0.14em] text-muted-foreground">
-        <div>{t("dashboard.markets")} <span className="font-semibold text-foreground">{sorted.length}</span></div>
-        <a href="https://github.com/Xiechengqi/cc-switch-market/releases" target="_blank" rel="noopener noreferrer" className="transition-colors hover:text-blue-400">{t("dashboard.install")}</a>
+      <div className="grid gap-3 rounded-lg border bg-white p-3 shadow-sm">
+        <div className="flex items-center justify-between gap-4">
+          <div className="flex items-baseline gap-2">
+            <h2 className="text-sm font-semibold text-foreground">{t("dashboard.markets")}</h2>
+            <span className="text-xs text-muted-foreground">{stableMarkets.length}</span>
+            <span className="text-xs text-emerald-700">{summary.available} {t("dashboard.available")}</span>
+            {summary.issues ? <span className="text-xs font-medium text-rose-700">{summary.issues} {t("dashboard.issues")}</span> : null}
+            {summary.disabled ? <span className="text-xs text-muted-foreground">{summary.disabled} {t("common.disabled")}</span> : null}
+          </div>
+          <a href="https://github.com/Xiechengqi/cc-switch-market/releases" target="_blank" rel="noopener noreferrer" className="font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground transition-colors hover:text-blue-500">{t("dashboard.install")}</a>
+        </div>
+        <div className="flex items-center gap-2">
+          <label className="flex h-9 min-w-64 flex-1 items-center gap-2 rounded-md border bg-white px-3 text-sm focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-primary/10">
+            <Search className="h-4 w-4 shrink-0 text-muted-foreground" />
+            <input value={query} onChange={(event) => setQuery(event.target.value)} className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground" placeholder={t("dashboard.searchMarkets")} aria-label={t("dashboard.searchMarkets")} />
+          </label>
+          <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value as "all" | MarketOperationalState)} className="h-9 rounded-md border bg-white px-3 text-xs text-foreground outline-none focus:border-primary/50" aria-label={t("dashboard.filterStatus")}>
+            <option value="all">{t("dashboard.allStatuses")}</option>
+            <option value="available">{t("dashboard.available")}</option>
+            <option value="degraded">{t("dashboard.degraded")}</option>
+            <option value="offline">{t("common.offline")}</option>
+            <option value="maintenance">{t("dashboard.maintenance")}</option>
+            <option value="disabled">{t("dashboard.disabled")}</option>
+          </select>
+          <button type="button" onClick={() => setOnlyIssues((value) => !value)} aria-pressed={onlyIssues} className={`inline-flex h-9 items-center gap-1.5 rounded-md border px-3 text-xs font-medium transition-colors ${onlyIssues ? "border-amber-300 bg-amber-50 text-amber-800" : "bg-white text-muted-foreground hover:text-foreground"}`}>
+            <SlidersHorizontal className="h-3.5 w-3.5" />{t("dashboard.onlyIssues")}
+          </button>
+          <select value={sortOrder} onChange={(event) => setSortOrder(event.target.value)} className="h-9 rounded-md border bg-white px-3 text-xs text-foreground outline-none focus:border-primary/50" aria-label={t("dashboard.sortBy")}>
+            <option value="issues">{t("dashboard.sortIssues")}</option>
+            <option value="name">{t("dashboard.sortName")}</option>
+            <option value="capacity">{t("dashboard.sortCapacity")}</option>
+            <option value="activity">{t("dashboard.sortActivity")}</option>
+            <option value="shares">{t("dashboard.sortShares")}</option>
+            <option value="updated">{t("dashboard.sortUpdated")}</option>
+          </select>
+        </div>
       </div>
-      <Card className="overflow-hidden rounded-[20px]">
+      <Card className="overflow-hidden rounded-lg border bg-white shadow-sm">
         <Card.Content className="overflow-x-auto p-0">
-          <table className="w-full min-w-[760px] border-collapse text-sm">
-            <thead className="bg-muted text-left font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground">
+          <table className="w-full min-w-[1080px] table-fixed border-collapse text-sm">
+            <thead className="bg-slate-50 text-left text-[11px] font-semibold text-muted-foreground">
               <tr>
-                <th className="w-[48%] px-4 py-3">{t("dashboard.market")}</th>
-                <th className="px-4 py-3">{t("dashboard.status")}</th>
-                <th className="w-7 px-4 py-3" />
+                <th className="w-[22%] px-3 py-2.5">{t("dashboard.market")}</th>
+                <th className="w-[11%] px-3 py-2.5">{t("dashboard.status")}</th>
+                <th className="w-[13%] px-3 py-2.5">{t("dashboard.capacity")}</th>
+                <th className="w-[14%] px-3 py-2.5">{t("dashboard.activity")}</th>
+                <th className="w-[10%] px-3 py-2.5">{t("dashboard.shares")}</th>
+                <th className="w-[14%] px-3 py-2.5">{t("dashboard.health")}</th>
+                <th className="w-[10%] px-3 py-2.5">{t("dashboard.updated")}</th>
+                <th className="w-[6%] px-3 py-2.5 text-right">{t("dashboard.actions")}</th>
               </tr>
             </thead>
             <tbody>
-              {sorted.length ? sorted.map((market) => (
-                <tr key={market.id} className="cursor-pointer border-b last:border-0 hover:bg-primary/5" onClick={(event) => { if (shouldOpenRowDrawer(event)) setSelected(market); }}>
-                  <td className="break-words px-4 py-3 align-middle">
-                    <MarketIdentityCell market={market} onEdit={setEditingMarket} t={t} />
-                  </td>
-                  <td className="px-4 py-3 align-middle"><MarketStatusCell market={market} t={t} locale={locale} /></td>
-                  <td className="px-4 py-3 align-middle text-lg text-muted-foreground">›</td>
-                </tr>
-              )) : (
-                <tr><td colSpan={3} className="px-4 py-10 text-center text-muted-foreground">{t("dashboard.noMarkets")}</td></tr>
+              {rows.length ? rows.map(({ market, state }) => {
+                const capacityPercent = marketCapacityPercent(market);
+                const capacityLimit = isUnlimited(market.parallelCapacity) ? "∞" : market.parallelCapacity > 0 ? String(market.parallelCapacity) : "-";
+                const usageValue = isShareMarket(market) ? compactTokens(market.usageTokens) : `${compactTokens(market.usageTokens)} · ${formatUsdOneDecimal(market.usageAmountUsd)}`;
+                const rowTone = state === "offline" ? "border-l-rose-500" : state === "degraded" ? "border-l-amber-400" : state === "maintenance" ? "border-l-blue-400" : state === "disabled" ? "border-l-slate-300 opacity-70" : "border-l-transparent";
+                return (
+                  <tr key={market.id} tabIndex={0} className={`cursor-pointer border-b border-l-[3px] outline-none last:border-b-0 hover:bg-primary/[0.03] focus-visible:bg-primary/[0.05] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary/30 ${rowTone}`} onClick={(event) => { if (shouldOpenRowDrawer(event)) setSelected(market); }} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setSelected(market); } }}>
+                    <td className="px-3 py-2.5 align-middle"><MarketIdentityCell market={market} t={t} /></td>
+                    <td className="px-3 py-2.5 align-middle"><MarketStatusPill state={state} t={t} /></td>
+                    <td className="px-3 py-2.5 align-middle">
+                      <div className="grid gap-1">
+                        <strong className="text-xs tabular-nums">{market.activeRequests || 0}<span className="font-normal text-muted-foreground">/{capacityLimit}</span></strong>
+                        <div className="h-1.5 overflow-hidden rounded-full bg-slate-100" title={capacityPercent == null ? t("dashboard.capacityUnknown") : `${capacityPercent.toFixed(0)}%`}>
+                          {capacityPercent != null ? <div className={`h-full rounded-full ${capacityPercent >= 90 ? "bg-rose-500" : capacityPercent >= 70 ? "bg-amber-400" : "bg-primary/70"}`} style={{ width: `${capacityPercent}%` }} /> : null}
+                        </div>
+                      </div>
+                    </td>
+                    <td className="px-3 py-2.5 align-middle">
+                      <strong className="block text-xs tabular-nums">{market.activeRequests || 0} {t("dashboard.active")}</strong>
+                      <span className="block truncate text-[10px] text-muted-foreground" title={usageValue}>{usageValue}</span>
+                    </td>
+                    <td className="px-3 py-2.5 align-middle">
+                      <strong className="text-xs tabular-nums">{market.onlineShareCount || 0}<span className="font-normal text-muted-foreground">/{market.shareCount || 0}</span></strong>
+                      <span className="block text-[10px] text-muted-foreground">{t("common.online")}</span>
+                    </td>
+                    <td className="px-3 py-2.5 align-middle">
+                      <span className={`block truncate text-xs font-medium ${state === "offline" ? "text-rose-700" : state === "degraded" ? "text-amber-700" : "text-foreground"}`} title={marketHealthLabel(market, t)}>{marketHealthLabel(market, t)}</span>
+                      <span className="block text-[10px] text-muted-foreground">{(market.onlineRate24h || 0).toFixed(1)}% · 24h</span>
+                    </td>
+                    <td className="px-3 py-2.5 align-middle">
+                      <span className="block text-xs" title={formatDateTime(market.lastSeenAt)}>{formatRelativeTime(market.lastSeenAt, locale)}</span>
+                    </td>
+                    <td className="px-3 py-2.5 align-middle">
+                      <div className="flex items-center justify-end gap-1">
+                        <MarketEditAction market={market} onEdit={setEditingMarket} t={t} />
+                        <ChevronRight className="h-4 w-4 text-muted-foreground" />
+                      </div>
+                    </td>
+                  </tr>
+                );
+              }) : (
+                <tr><td colSpan={8} className="px-4 py-10 text-center text-muted-foreground">
+                  <div className="grid justify-items-center gap-2">
+                    <span>{stableMarkets.length ? t("dashboard.noFilterResults") : t("dashboard.noMarkets")}</span>
+                    {stableMarkets.length ? <button type="button" className="text-xs font-medium text-primary hover:underline" onClick={() => { setQuery(""); setStatusFilter("all"); setOnlyIssues(false); }}>{t("dashboard.clearFilters")}</button> : null}
+                  </div>
+                </td></tr>
               )}
             </tbody>
           </table>
