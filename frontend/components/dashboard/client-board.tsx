@@ -27,8 +27,6 @@ import {
   ShareModelHealthChecks,
   ShareProvidersPanel,
   shareApiParts,
-  onRowPointerDown,
-  shouldOpenRowDrawer,
   sortClients,
 } from "@/components/dashboard/data-tables";
 import type { DashboardClient, DashboardMarket, OperationalState, ShareView } from "@/lib/types";
@@ -117,6 +115,31 @@ const CLIENT_EXPANDED_STORAGE_KEY = "cc_switch_router_client_expanded_v1";
 
 function includesQuery(values: Array<string | undefined>, query: string) {
   return values.some((value) => String(value || "").toLocaleLowerCase().includes(query));
+}
+
+function shouldToggleClientHeader(
+  event: React.MouseEvent<HTMLElement>,
+  pointerDown: { x: number; y: number } | null,
+) {
+  if (pointerDown) {
+    const deltaX = Math.abs(event.clientX - pointerDown.x);
+    const deltaY = Math.abs(event.clientY - pointerDown.y);
+    if (deltaX > 4 || deltaY > 4) {
+      return false;
+    }
+  }
+
+  const selection = window.getSelection();
+  if (selection && !selection.isCollapsed && selection.toString().trim()) {
+    return false;
+  }
+
+  const target = event.target as HTMLElement | null;
+  if (target?.closest("a,button,input,textarea,select,[data-no-row-drawer]")) {
+    return false;
+  }
+
+  return true;
 }
 
 function shareMatchesQuery(share: ShareView, query: string) {
@@ -289,47 +312,49 @@ function ClientCard({
   const focused = focus.isFocused("client", client.installation.id);
   const related = focus.isRelated("client", client.installation.id);
   const dimmed = Boolean(focus.target) && !related;
-  const headerClickTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  React.useEffect(() => () => {
-    if (headerClickTimeoutRef.current) clearTimeout(headerClickTimeoutRef.current);
-  }, []);
+  const headerPointerDownRef = React.useRef<{ x: number; y: number } | null>(null);
 
   const openClientDrawer = React.useCallback(() => {
     focus.setFocus({ kind: "client", id: client.installation.id, source: "client-board" });
     onOpenClient(client);
   }, [client, focus, onOpenClient]);
 
+  const handleHeaderPointerDown = React.useCallback(
+    (event: React.MouseEvent<HTMLElement>) => {
+      headerPointerDownRef.current = { x: event.clientX, y: event.clientY };
+    },
+    [],
+  );
+
+  const handleHeaderClick = React.useCallback(
+    (event: React.MouseEvent<HTMLElement>) => {
+      const pointerDown = headerPointerDownRef.current;
+      headerPointerDownRef.current = null;
+      if (!shouldToggleClientHeader(event, pointerDown)) return;
+      onToggleCollapsed();
+    },
+    [onToggleCollapsed],
+  );
+
+  const handleHeaderDoubleClick = React.useCallback(
+    (event: React.MouseEvent<HTMLElement>) => {
+      const pointerDown = headerPointerDownRef.current;
+      headerPointerDownRef.current = null;
+      if (!shouldToggleClientHeader(event, pointerDown)) return;
+      openClientDrawer();
+    },
+    [openClientDrawer],
+  );
+
   return (
     <Card id={`dashboard-client-${client.installation.id}`} className={`overflow-hidden rounded-lg border border-l-[3px] bg-white p-0 shadow-sm transition-[border-color,box-shadow,opacity] ${borderTone} ${focused ? "ring-2 ring-primary/20" : ""} ${dimmed ? "opacity-40" : "opacity-100"}`}>
       <Card.Content className="grid gap-3 p-3.5">
         <div
           className="grid min-h-14 cursor-pointer select-text grid-cols-[minmax(300px,1.35fr)_minmax(330px,1fr)_auto] items-center gap-4 rounded-md px-1.5 py-1 outline-none transition-colors hover:bg-primary/[0.03] focus-visible:ring-2 focus-visible:ring-primary/30"
-          onMouseDown={onRowPointerDown}
-          onClick={(event) => {
-            if (!shouldOpenRowDrawer(event)) return;
-            if (headerClickTimeoutRef.current) clearTimeout(headerClickTimeoutRef.current);
-            headerClickTimeoutRef.current = setTimeout(() => {
-              headerClickTimeoutRef.current = null;
-              onToggleCollapsed();
-            }, 220);
-          }}
-          onDoubleClick={(event) => {
-            if (!shouldOpenRowDrawer(event)) return;
-            if (headerClickTimeoutRef.current) {
-              clearTimeout(headerClickTimeoutRef.current);
-              headerClickTimeoutRef.current = null;
-            }
-            openClientDrawer();
-          }}
-          role="button"
-          tabIndex={0}
-          onKeyDown={(event) => {
-            if ((event.key === "Enter" || event.key === " ") && event.target === event.currentTarget) {
-              event.preventDefault();
-              onToggleCollapsed();
-            }
-          }}
+          aria-expanded={!collapsed}
+          onMouseDown={handleHeaderPointerDown}
+          onClick={handleHeaderClick}
+          onDoubleClick={handleHeaderDoubleClick}
         >
           <div className="grid min-w-0 gap-1.5">
             <div className="flex min-w-0 items-center gap-2">
@@ -608,7 +633,7 @@ export function ClientBoard({
 
       <div className="grid gap-4">
         {clientRows.length ? clientRows.map(({ client, shares: visibleShares, allShares }) => (
-          <ClientCard key={client.installation.id} client={client} shares={visibleShares} summaryShares={allShares} onOpenClient={openClient} onOpenFrame={openClientFrame} onOpenShare={openShare} onEditShare={openEditShare} onConnectShare={openConnectShare} collapsed={!query && !expandedClientIdSet.has(client.installation.id) && !focus.relatedClientIds.has(client.installation.id)} onToggleCollapsed={() => toggleClientExpanded(client.installation.id)} />
+          <ClientCard key={client.installation.id} client={client} shares={visibleShares} summaryShares={allShares} onOpenClient={openClient} onOpenFrame={openClientFrame} onOpenShare={openShare} onEditShare={openEditShare} onConnectShare={openConnectShare} collapsed={!query && !expandedClientIdSet.has(client.installation.id)} onToggleCollapsed={() => toggleClientExpanded(client.installation.id)} />
         )) : (
           <EmptyBlock>
             <div className="grid justify-items-center gap-2">
