@@ -267,21 +267,19 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
       for (const shareId of client.shareIds || []) shareToClient.set(shareId, client.installation.id);
     }
     const meta = buildRequestMeta(data);
-    const flows = new Map<string, { count: number; inflight: number; failures: number; highLatency: number; latestAt: number }>();
+    const flows = new Map<string, { inflight: number; failures: number; highLatency: number }>();
     for (const event of (data?.recentRequestEvents || []).slice(-200)) {
+      if (!event.isInflight) continue;
       const clientId = event.shareId ? shareToClient.get(event.shareId) : undefined;
       if (!clientId) continue;
       const item = meta.get(event.requestId);
       const statusCode = Number(item?.statusCode || 0);
       const status = String(item?.status || event.healthStatus || "").toLowerCase();
       const latency = Number(event.latencyMs || item?.latencyMs || 0);
-      const timestamp = Date.parse(event.startedAt || event.createdAt || "") || Date.now();
-      const flow = flows.get(clientId) || { count: 0, inflight: 0, failures: 0, highLatency: 0, latestAt: 0 };
-      flow.count += 1;
-      if (event.isInflight) flow.inflight += 1;
+      const flow = flows.get(clientId) || { inflight: 0, failures: 0, highLatency: 0 };
+      flow.inflight += 1;
       if (statusCode >= 400 || ["failed", "error", "offline"].includes(status)) flow.failures += 1;
       if (latency >= 2000) flow.highLatency += 1;
-      flow.latestAt = Math.max(flow.latestAt, timestamp);
       flows.set(clientId, flow);
     }
     return flows;
@@ -437,15 +435,17 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
             ? clientPlaced.map(({ point: client, pos: b }) => {
                 const a = serverPlaced.pos;
                 const flow = requestFlows.get(client.id);
-                const requestCount = Math.max(client.activeRequests || 0, flow?.count || 0);
+                const activeCount = client.activeRequests || 0;
+                if (activeCount <= 0) return null;
                 const related = !focus.target || focus.relatedClientIds.has(client.id);
                 const focused = focus.isFocused("client", client.id) || (focus.target?.kind === "request" && focus.relatedClientIds.has(client.id));
-                const highVolume = requestCount >= 12;
-                const mediumVolume = requestCount >= 4;
-                const stroke = flow?.failures ? "stroke-rose-500" : flow?.highLatency ? "stroke-amber-500" : focused ? "stroke-blue-600" : requestCount > 0 ? "stroke-blue-500" : "stroke-slate-400";
-                const width = focused ? 1.25 : highVolume ? 1.15 : mediumVolume ? 0.9 : requestCount > 0 ? 0.7 : 0.5;
-                const ageMs = flow?.latestAt ? Math.max(0, Date.now() - flow.latestAt) : Number.POSITIVE_INFINITY;
-                const residualOpacity = flow?.failures ? (ageMs < 30_000 ? 0.82 : 0.5) : flow?.highLatency ? (ageMs < 15_000 ? 0.72 : 0.4) : ageMs < 5_000 ? 0.62 : 0.35;
+                const stroke = flow?.failures
+                  ? "stroke-rose-300"
+                  : flow?.highLatency
+                    ? "stroke-amber-300"
+                    : focused
+                      ? "stroke-slate-400"
+                      : "stroke-slate-300";
                 return (
                   <g key={`flow-${client.id}`} className={cn("transition-opacity", related ? "opacity-100" : "opacity-15")}>
                     <line
@@ -453,18 +453,11 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
                       y1={a.y}
                       x2={b.x}
                       y2={b.y}
-                      className={cn(stroke, requestCount > 0 && !highVolume ? "animate-pulse" : "")}
-                      strokeOpacity={focused ? 0.9 : requestCount > 0 ? residualOpacity : 0.22}
-                      strokeWidth={width}
-                      strokeDasharray={highVolume ? undefined : requestCount > 0 ? "1.5 2.5" : "1 5"}
+                      className={stroke}
+                      strokeOpacity={focused ? 0.72 : 0.52}
+                      strokeWidth={focused ? 0.3 : 0.24}
                       strokeLinecap="round"
                     />
-                    {mediumVolume ? (
-                      <g transform={`translate(${(a.x + b.x) / 2} ${(a.y + b.y) / 2})`}>
-                        <circle r="4.2" className="fill-white stroke-blue-300" strokeWidth="0.5" />
-                        <text textAnchor="middle" dominantBaseline="central" className="fill-slate-600 text-[4px] font-semibold">{requestCount > 99 ? "99+" : requestCount}</text>
-                      </g>
-                    ) : null}
                   </g>
                 );
               })
