@@ -113,7 +113,7 @@ function sortShares(shares: ShareView[]) {
   });
 }
 
-const CLIENT_COLLAPSE_STORAGE_KEY = "cc_switch_router_client_collapsed_v1";
+const CLIENT_EXPANDED_STORAGE_KEY = "cc_switch_router_client_expanded_v1";
 
 function includesQuery(values: Array<string | undefined>, query: string) {
   return values.some((value) => String(value || "").toLocaleLowerCase().includes(query));
@@ -390,17 +390,15 @@ export function ClientBoard({
   const [regionFilter, setRegionFilter] = usePersistentState("cc_switch_router_client_region_v1", "all");
   const [sortOrder, setSortOrder] = usePersistentState("cc_switch_router_client_sort_v1", "issues");
   const [onlyIssues, setOnlyIssues] = usePersistentState("cc_switch_router_client_issues_v1", false);
-  const [collapsedClientIds, setCollapsedClientIds] = React.useState<Set<string>>(new Set());
+  const [expandedClientIds, setExpandedClientIds] = usePersistentState<string[]>(
+    CLIENT_EXPANDED_STORAGE_KEY,
+    [],
+  );
+  const expandedClientIdSet = React.useMemo(
+    () => new Set(expandedClientIds),
+    [expandedClientIds],
+  );
   const lastLocatedFocusRef = React.useRef("");
-
-  React.useEffect(() => {
-    try {
-      const stored = JSON.parse(window.localStorage.getItem(CLIENT_COLLAPSE_STORAGE_KEY) || "[]");
-      if (Array.isArray(stored)) setCollapsedClientIds(new Set(stored.filter((value): value is string => typeof value === "string")));
-    } catch {
-      // Ignore invalid local preferences and keep every Client expanded.
-    }
-  }, []);
 
   const sortedClients = React.useMemo(() => sortClients(clients), [clients]);
   const shareById = React.useMemo(() => new Map(shares.map((share) => [share.shareId, share])), [shares]);
@@ -515,14 +513,14 @@ export function ClientBoard({
     await onChanged?.();
     if (!appliedSynchronously) toast.info(t("dashboard.shareEditQueued"));
   }, [editingShare, onChanged, t, trackOperation]);
-  const toggleClientCollapsed = React.useCallback((clientId: string) => {
-    setCollapsedClientIds((current) => {
+  const toggleClientExpanded = React.useCallback((clientId: string) => {
+    setExpandedClientIds((current) => {
       const next = new Set(current);
-      if (next.has(clientId)) next.delete(clientId); else next.add(clientId);
-      window.localStorage.setItem(CLIENT_COLLAPSE_STORAGE_KEY, JSON.stringify(Array.from(next)));
-      return next;
+      if (next.has(clientId)) next.delete(clientId);
+      else next.add(clientId);
+      return Array.from(next);
     });
-  }, []);
+  }, [setExpandedClientIds]);
 
   React.useEffect(() => {
     if (!focus.target || focus.target.source === "client-board") return;
@@ -591,7 +589,7 @@ export function ClientBoard({
 
       <div className="grid gap-4">
         {clientRows.length ? clientRows.map(({ client, shares: visibleShares, allShares }) => (
-          <ClientCard key={client.installation.id} client={client} shares={visibleShares} summaryShares={allShares} onOpenClient={openClient} onOpenFrame={openClientFrame} onOpenShare={openShare} onEditShare={openEditShare} onConnectShare={openConnectShare} collapsed={!query && collapsedClientIds.has(client.installation.id) && !focus.relatedClientIds.has(client.installation.id)} onToggleCollapsed={() => toggleClientCollapsed(client.installation.id)} />
+          <ClientCard key={client.installation.id} client={client} shares={visibleShares} summaryShares={allShares} onOpenClient={openClient} onOpenFrame={openClientFrame} onOpenShare={openShare} onEditShare={openEditShare} onConnectShare={openConnectShare} collapsed={!query && !expandedClientIdSet.has(client.installation.id) && !focus.relatedClientIds.has(client.installation.id)} onToggleCollapsed={() => toggleClientExpanded(client.installation.id)} />
         )) : (
           <EmptyBlock>
             <div className="grid justify-items-center gap-2">
