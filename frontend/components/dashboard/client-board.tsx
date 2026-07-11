@@ -5,6 +5,9 @@ import { Check, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Copy, Externa
 import * as React from "react";
 import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog";
 import { ShareCard } from "@/components/dashboard/share-card";
+import { clientOperationalSummary, OperationalDiagnosis, OperationalStatusPill, operationalReasonLabel, shareIsEnabled, shareOperationalSummary, useStableOperationalRanks } from "@/components/dashboard/operational-status";
+import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
+import { useOperationVerification } from "@/components/dashboard/operation-verification";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   ClientFrameDialog,
@@ -28,52 +31,16 @@ import {
   shouldOpenRowDrawer,
   sortClients,
 } from "@/components/dashboard/data-tables";
-import type { DashboardClient, DashboardMarket, ShareView } from "@/lib/types";
+import type { DashboardClient, DashboardMarket, OperationalState, ShareView } from "@/lib/types";
 import { formatRelativeTime } from "@/lib/utils";
+import { usePersistentState } from "@/lib/use-persistent-state";
+import { recordDashboardUxEvent } from "@/lib/api";
 
 const PAYOUT_NETWORK_LABELS: Record<string, string> = {
   "eip155:56": "BSC",
   "eip155:8453": "Base",
   "eip155:42161": "Arbitrum One",
 };
-
-type OperationalState = "online" | "degraded" | "offline";
-
-function shareIsEnabled(share: ShareView) {
-  return String(share.shareStatus || "").trim().toLowerCase() === "active";
-}
-
-function clientOperationalState(client: DashboardClient, shares: ShareView[]): OperationalState {
-  const enabledShares = shares.filter(shareIsEnabled);
-  const onlineShares = enabledShares.filter((share) => share.isOnline);
-  if (enabledShares.length > 0) {
-    if (onlineShares.length === 0) return "offline";
-    if (onlineShares.length < enabledShares.length) return "degraded";
-    const latestHealth = client.healthChecks?.at(-1);
-    return latestHealth && !latestHealth.isHealthy ? "degraded" : "online";
-  }
-  if (shares.length > 0 && !client.clientTunnel) return "online";
-  return client.clientTunnel?.online ? "online" : "offline";
-}
-
-function stateRank(state: OperationalState) {
-  return state === "offline" ? 0 : state === "degraded" ? 1 : 2;
-}
-
-function OperationalStatus({ state }: { state: OperationalState }) {
-  const { t } = useLocaleText();
-  const styles = state === "online"
-    ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-    : state === "degraded"
-      ? "border-amber-200 bg-amber-50 text-amber-700"
-      : "border-rose-200 bg-rose-50 text-rose-700";
-  return (
-    <span className={`inline-flex h-6 items-center gap-1.5 rounded-full border px-2.5 text-[11px] font-semibold ${styles}`}>
-      <span className="h-1.5 w-1.5 rounded-full bg-current" />
-      {state === "online" ? t("common.online") : state === "degraded" ? t("dashboard.degraded") : t("common.offline")}
-    </span>
-  );
-}
 
 function PayoutProfilePanel({ client, detailed = false }: { client: DashboardClient; detailed?: boolean }) {
   const { locale, t } = useLocaleText();
@@ -306,32 +273,41 @@ function ClientCard({
   onToggleCollapsed: () => void;
 }) {
   const { locale, t } = useLocaleText();
+  const focus = useDashboardFocus();
   const tunnelUrl = clientTunnelDisplayUrl(client.clientTunnel?.tunnelUrl);
   const owner = clientOwnerEmail(client);
   const allShares = summaryShares || shares;
   const onlineRate = client.onlineRate24h || 0;
   const onlineTitle = `${onlineRate.toFixed(1)}% online in last 24h (${client.onlineMinutes24h || 0} / 1440 min)`;
-  const state = clientOperationalState(client, allShares);
+  const summary = clientOperationalSummary(client, allShares);
+  const state = summary.state;
   const enabledShares = allShares.filter(shareIsEnabled);
   const onlineShares = enabledShares.filter((share) => share.isOnline);
   const issueCount = enabledShares.length - onlineShares.length;
   const identity = client.clientTunnel?.subdomain || client.installation.id;
   const borderTone = state === "offline" ? "border-l-rose-500" : state === "degraded" ? "border-l-amber-400" : "border-l-slate-200";
+  const focused = focus.isFocused("client", client.installation.id);
+  const related = focus.isRelated("client", client.installation.id);
+  const dimmed = Boolean(focus.target) && !related;
 
   return (
-    <Card className={`overflow-hidden rounded-lg border border-l-[3px] bg-white p-0 shadow-sm ${borderTone}`}>
+    <Card id={`dashboard-client-${client.installation.id}`} className={`overflow-hidden rounded-lg border border-l-[3px] bg-white p-0 shadow-sm transition-[border-color,box-shadow,opacity] ${borderTone} ${focused ? "ring-2 ring-primary/20" : ""} ${dimmed ? "opacity-40" : "opacity-100"}`}>
       <Card.Content className="grid gap-3 p-3.5">
         <div
           className="grid min-h-14 cursor-pointer select-text grid-cols-[minmax(300px,1.35fr)_minmax(330px,1fr)_auto] items-center gap-4 rounded-md px-1.5 py-1 outline-none transition-colors hover:bg-primary/[0.03] focus-visible:ring-2 focus-visible:ring-primary/30"
           onMouseDown={onRowPointerDown}
           onClick={(event) => {
-            if (shouldOpenRowDrawer(event)) onOpenClient(client);
+            if (shouldOpenRowDrawer(event)) {
+              focus.setFocus({ kind: "client", id: client.installation.id, source: "client-board" });
+              onOpenClient(client);
+            }
           }}
           role="button"
           tabIndex={0}
           onKeyDown={(event) => {
             if ((event.key === "Enter" || event.key === " ") && event.target === event.currentTarget) {
               event.preventDefault();
+              focus.setFocus({ kind: "client", id: client.installation.id, source: "client-board" });
               onOpenClient(client);
             }
           }}
@@ -339,7 +315,7 @@ function ClientCard({
           <div className="grid min-w-0 gap-1.5">
             <div className="flex min-w-0 items-center gap-2">
               <strong className="truncate text-sm font-semibold text-foreground" title={identity}>{identity}</strong>
-              <OperationalStatus state={state} />
+              <OperationalStatusPill summary={summary} />
             </div>
             <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
               {tunnelUrl ? (
@@ -362,6 +338,7 @@ function ClientCard({
               <span title={onlineTitle}>{onlineRate.toFixed(1)}% {t("dashboard.availability")}</span>
               <span aria-hidden>·</span>
               <span>{t("dashboard.lastSeen")} {formatRelativeTime(client.installation.lastSeenAt, locale)}</span>
+              {summary.primaryReason ? <span className={state === "offline" ? "truncate font-medium text-rose-700" : "truncate font-medium text-amber-700"} title={operationalReasonLabel(summary.primaryReason, t)}>· {operationalReasonLabel(summary.primaryReason, t)}</span> : null}
             </div>
             <div className="flex min-w-0 items-center gap-2">
               {enabledShares.length ? <span className={issueCount ? "font-medium text-rose-700" : "text-foreground"}>{onlineShares.length}/{enabledShares.length} {t("common.online")}</span> : null}
@@ -401,17 +378,20 @@ export function ClientBoard({
   onChanged?: () => Promise<void> | void;
 }) {
   const { locale, t } = useLocaleText();
+  const focus = useDashboardFocus();
+  const { trackOperation } = useOperationVerification();
   const [selectedClientId, setSelectedClientId] = React.useState("");
   const [selectedShareId, setSelectedShareId] = React.useState("");
   const [editingShare, setEditingShare] = React.useState<ShareView | null>(null);
   const [connectShare, setConnectShare] = React.useState<ShareView | null>(null);
   const [clientFrameUrl, setClientFrameUrl] = React.useState("");
   const [query, setQuery] = React.useState("");
-  const [statusFilter, setStatusFilter] = React.useState<"all" | OperationalState>("all");
-  const [regionFilter, setRegionFilter] = React.useState("all");
-  const [sortOrder, setSortOrder] = React.useState("issues");
-  const [onlyIssues, setOnlyIssues] = React.useState(false);
+  const [statusFilter, setStatusFilter] = usePersistentState<"all" | Extract<OperationalState, "online" | "degraded" | "offline">>("cc_switch_router_client_status_v1", "all");
+  const [regionFilter, setRegionFilter] = usePersistentState("cc_switch_router_client_region_v1", "all");
+  const [sortOrder, setSortOrder] = usePersistentState("cc_switch_router_client_sort_v1", "issues");
+  const [onlyIssues, setOnlyIssues] = usePersistentState("cc_switch_router_client_issues_v1", false);
   const [collapsedClientIds, setCollapsedClientIds] = React.useState<Set<string>>(new Set());
+  const lastLocatedFocusRef = React.useRef("");
 
   React.useEffect(() => {
     try {
@@ -445,6 +425,10 @@ export function ClientBoard({
   const regions = React.useMemo(() => Array.from(new Set(
     clients.map((client) => client.installation.countryCode || client.installation.region || "").filter(Boolean),
   )).sort((left, right) => left.localeCompare(right)), [clients]);
+  const stableStateRanks = useStableOperationalRanks(sortedClients.map((client) => ({
+    id: client.installation.id,
+    state: clientOperationalSummary(client, sharesForClient(client)).state,
+  })));
 
   const clientRows = React.useMemo(() => {
     const normalizedQuery = query.trim().toLocaleLowerCase();
@@ -465,7 +449,7 @@ export function ClientBoard({
         client.payoutProfile?.token,
       ], normalizedQuery);
       const matchedShares = clientMatch ? allShares : allShares.filter((share) => shareMatchesQuery(share, normalizedQuery));
-      return { client, shares: matchedShares, allShares, state: clientOperationalState(client, allShares), clientMatch };
+      return { client, shares: matchedShares, allShares, state: clientOperationalSummary(client, allShares).state, clientMatch };
     }).filter((row) => {
       if (normalizedQuery && row.shares.length === 0 && !row.clientMatch) return false;
       const region = row.client.installation.countryCode || row.client.installation.region || "";
@@ -485,13 +469,14 @@ export function ClientBoard({
       }
       if (sortOrder === "shares") return right.allShares.length - left.allShares.length;
       if (sortOrder === "registered") return (stableOrder.get(left.client.installation.id) || 0) - (stableOrder.get(right.client.installation.id) || 0);
-      return stateRank(left.state) - stateRank(right.state) || (stableOrder.get(left.client.installation.id) || 0) - (stableOrder.get(right.client.installation.id) || 0);
+      if (focus.target) return (stableOrder.get(left.client.installation.id) || 0) - (stableOrder.get(right.client.installation.id) || 0);
+      return (stableStateRanks.get(left.client.installation.id) || 0) - (stableStateRanks.get(right.client.installation.id) || 0) || (stableOrder.get(left.client.installation.id) || 0) - (stableOrder.get(right.client.installation.id) || 0);
     });
     return rows;
-  }, [onlyIssues, query, regionFilter, sharesForClient, sortOrder, sortedClients, statusFilter]);
+  }, [focus.target, onlyIssues, query, regionFilter, sharesForClient, sortOrder, sortedClients, stableStateRanks, statusFilter]);
 
   const clientSummary = React.useMemo(() => {
-    const states = sortedClients.map((client) => clientOperationalState(client, sharesForClient(client)));
+    const states = sortedClients.map((client) => clientOperationalSummary(client, sharesForClient(client)).state);
     return {
       online: states.filter((state) => state === "online").length,
       issues: states.filter((state) => state !== "online").length,
@@ -507,18 +492,29 @@ export function ClientBoard({
       return true;
     });
   }, [onlyIssues, orphanShares, query, statusFilter]);
-
-  const openClient = React.useCallback((client: DashboardClient) => setSelectedClientId(client.installation.id), []);
-  const closeClientDrawer = React.useCallback((open: boolean) => { if (!open) setSelectedClientId(""); }, []);
-  const openShare = React.useCallback((share: ShareView) => setSelectedShareId(share.shareId), []);
-  const closeShareDrawer = React.useCallback((open: boolean) => { if (!open) setSelectedShareId(""); }, []);
+  const openClient = React.useCallback((client: DashboardClient) => {
+    setSelectedClientId(client.installation.id);
+    focus.openDrawer("client", client.installation.id);
+    void recordDashboardUxEvent({ eventType: "drawer_opened", source: "client-board", targetType: "client" });
+  }, [focus]);
+  const closeClientDrawer = React.useCallback((open: boolean) => { if (!open) { setSelectedClientId(""); focus.closeDrawer(); } }, [focus]);
+  const openShare = React.useCallback((share: ShareView) => {
+    setSelectedShareId(share.shareId);
+    focus.openDrawer("share", share.shareId);
+    void recordDashboardUxEvent({ eventType: "drawer_opened", source: "client-board", targetType: "share" });
+  }, [focus]);
+  const closeShareDrawer = React.useCallback((open: boolean) => { if (!open) { setSelectedShareId(""); focus.closeDrawer(); } }, [focus]);
   const openEditShare = React.useCallback((share: ShareView) => setEditingShare(share), []);
   const closeEditShare = React.useCallback(() => setEditingShare(null), []);
   const openConnectShare = React.useCallback((share: ShareView) => setConnectShare(share), []);
   const closeConnectDialog = React.useCallback((open: boolean) => { if (!open) setConnectShare(null); }, []);
   const openClientFrame = React.useCallback((url: string) => setClientFrameUrl(url), []);
   const closeClientFrame = React.useCallback((open: boolean) => { if (!open) setClientFrameUrl(""); }, []);
-  const handleSaved = React.useCallback(async () => { await onChanged?.(); }, [onChanged]);
+  const handleSaved = React.useCallback(async ({ appliedSynchronously }: { appliedSynchronously: boolean }) => {
+    if (editingShare) trackOperation({ kind: "share", id: editingShare.shareId, requireHealthyRoute: true });
+    await onChanged?.();
+    if (!appliedSynchronously) toast.info(t("dashboard.shareEditQueued"));
+  }, [editingShare, onChanged, t, trackOperation]);
   const toggleClientCollapsed = React.useCallback((clientId: string) => {
     setCollapsedClientIds((current) => {
       const next = new Set(current);
@@ -527,6 +523,26 @@ export function ClientBoard({
       return next;
     });
   }, []);
+
+  React.useEffect(() => {
+    if (!focus.target || focus.target.source === "client-board") return;
+    const focusKey = `${focus.target.kind}:${focus.target.id}`;
+    if (lastLocatedFocusRef.current === focusKey) return;
+    lastLocatedFocusRef.current = focusKey;
+    const clientId = focus.target.kind === "client"
+      ? focus.target.id
+      : Array.from(focus.relatedClientIds)[0];
+    if (!clientId) return;
+    window.requestAnimationFrame(() => {
+      document.getElementById(`dashboard-client-${clientId}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+    if (focus.target.source === "map") void recordDashboardUxEvent({ eventType: "client_located_from_map", source: "map", targetType: "client" });
+  }, [focus.relatedClientIds, focus.target]);
+
+  React.useEffect(() => {
+    if (focus.drawerTarget?.kind === "client" && clientById.has(focus.drawerTarget.id)) setSelectedClientId(focus.drawerTarget.id);
+    if (focus.drawerTarget?.kind === "share" && shareById.has(focus.drawerTarget.id)) setSelectedShareId(focus.drawerTarget.id);
+  }, [clientById, focus.drawerTarget, shareById]);
 
   const selectedClient = selectedClientId ? clientById.get(selectedClientId) || null : null;
   const selectedShare = selectedShareId ? shareById.get(selectedShareId) || null : null;
@@ -550,20 +566,20 @@ export function ClientBoard({
             <Search className="h-4 w-4 shrink-0 text-muted-foreground" />
             <input value={query} onChange={(event) => setQuery(event.target.value)} className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground" placeholder={t("dashboard.searchClients")} aria-label={t("dashboard.searchClients")} />
           </label>
-          <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value as "all" | OperationalState)} className="h-9 rounded-md border bg-white px-3 text-xs text-foreground outline-none focus:border-primary/50" aria-label={t("dashboard.filterStatus")}>
+          <select value={statusFilter} onChange={(event) => { setStatusFilter(event.target.value as "all" | Extract<OperationalState, "online" | "degraded" | "offline">); void recordDashboardUxEvent({ eventType: "filter_applied", source: "client-board", targetType: "client" }); }} className="h-9 rounded-md border bg-white px-3 text-xs text-foreground outline-none focus:border-primary/50" aria-label={t("dashboard.filterStatus")}>
             <option value="all">{t("dashboard.allStatuses")}</option>
             <option value="online">{t("common.online")}</option>
             <option value="degraded">{t("dashboard.degraded")}</option>
             <option value="offline">{t("common.offline")}</option>
           </select>
-          <select value={regionFilter} onChange={(event) => setRegionFilter(event.target.value)} className="h-9 max-w-36 rounded-md border bg-white px-3 text-xs text-foreground outline-none focus:border-primary/50" aria-label={t("dashboard.filterRegion")}>
+          <select value={regionFilter} onChange={(event) => { setRegionFilter(event.target.value); void recordDashboardUxEvent({ eventType: "filter_applied", source: "client-board", targetType: "client" }); }} className="h-9 max-w-36 rounded-md border bg-white px-3 text-xs text-foreground outline-none focus:border-primary/50" aria-label={t("dashboard.filterRegion")}>
             <option value="all">{t("dashboard.allRegions")}</option>
             {regions.map((region) => <option key={region} value={region}>{region}</option>)}
           </select>
-          <button type="button" onClick={() => setOnlyIssues((value) => !value)} aria-pressed={onlyIssues} className={`inline-flex h-9 items-center gap-1.5 rounded-md border px-3 text-xs font-medium transition-colors ${onlyIssues ? "border-amber-300 bg-amber-50 text-amber-800" : "bg-white text-muted-foreground hover:text-foreground"}`}>
+          <button type="button" onClick={() => { setOnlyIssues((value) => !value); void recordDashboardUxEvent({ eventType: "filter_applied", source: "client-board", targetType: "client" }); }} aria-pressed={onlyIssues} className={`inline-flex h-9 items-center gap-1.5 rounded-md border px-3 text-xs font-medium transition-colors ${onlyIssues ? "border-amber-300 bg-amber-50 text-amber-800" : "bg-white text-muted-foreground hover:text-foreground"}`}>
             <SlidersHorizontal className="h-3.5 w-3.5" />{t("dashboard.onlyIssues")}
           </button>
-          <select value={sortOrder} onChange={(event) => setSortOrder(event.target.value)} className="h-9 rounded-md border bg-white px-3 text-xs text-foreground outline-none focus:border-primary/50" aria-label={t("dashboard.sortBy")}>
+          <select value={sortOrder} onChange={(event) => { setSortOrder(event.target.value); void recordDashboardUxEvent({ eventType: "filter_applied", source: "client-board", targetType: "client" }); }} className="h-9 rounded-md border bg-white px-3 text-xs text-foreground outline-none focus:border-primary/50" aria-label={t("dashboard.sortBy")}>
             <option value="issues">{t("dashboard.sortIssues")}</option>
             <option value="name">{t("dashboard.sortName")}</option>
             <option value="recent">{t("dashboard.sortRecent")}</option>
@@ -575,7 +591,7 @@ export function ClientBoard({
 
       <div className="grid gap-4">
         {clientRows.length ? clientRows.map(({ client, shares: visibleShares, allShares }) => (
-          <ClientCard key={client.installation.id} client={client} shares={visibleShares} summaryShares={allShares} onOpenClient={openClient} onOpenFrame={openClientFrame} onOpenShare={openShare} onEditShare={openEditShare} onConnectShare={openConnectShare} collapsed={!query && collapsedClientIds.has(client.installation.id)} onToggleCollapsed={() => toggleClientCollapsed(client.installation.id)} />
+          <ClientCard key={client.installation.id} client={client} shares={visibleShares} summaryShares={allShares} onOpenClient={openClient} onOpenFrame={openClientFrame} onOpenShare={openShare} onEditShare={openEditShare} onConnectShare={openConnectShare} collapsed={!query && collapsedClientIds.has(client.installation.id) && !focus.relatedClientIds.has(client.installation.id)} onToggleCollapsed={() => toggleClientCollapsed(client.installation.id)} />
         )) : (
           <EmptyBlock>
             <div className="grid justify-items-center gap-2">
@@ -613,7 +629,8 @@ export function ClientBoard({
               <Drawer.Body className="overflow-y-auto">
                 {selectedClient ? (
                   <div className="grid gap-5">
-                    <HealthTimelineStrip timeline={selectedClient.healthTimeline || []} />
+                    <OperationalDiagnosis summary={clientOperationalSummary(selectedClient, sharesForClient(selectedClient))} kind="client" onEvidence={() => { document.getElementById("client-health-evidence")?.scrollIntoView({ behavior: "smooth" }); void recordDashboardUxEvent({ eventType: "diagnosis_evidence_opened", source: "drawer", targetType: "client" }); }} />
+                    <div id="client-health-evidence"><HealthTimelineStrip timeline={selectedClient.healthTimeline || []} /></div>
                     <DrawerSection label={t("dashboard.client")}>
                       <div className="grid gap-1 text-xs text-muted-foreground">
                         <span>URL: <strong className="break-all text-foreground">{selectedClientUrl || "-"}</strong></span>
@@ -655,7 +672,8 @@ export function ClientBoard({
               <Drawer.Body className="overflow-y-auto">
                 {selectedShare ? (
                   <div className="grid gap-5">
-                    <HealthTimelineStrip timeline={selectedShare.healthTimeline} />
+                    <OperationalDiagnosis summary={shareOperationalSummary(selectedShare)} kind="share" onEvidence={() => { document.getElementById("share-health-evidence")?.scrollIntoView({ behavior: "smooth" }); void recordDashboardUxEvent({ eventType: "diagnosis_evidence_opened", source: "drawer", targetType: "share" }); }} />
+                    <div id="share-health-evidence"><HealthTimelineStrip timeline={selectedShare.healthTimeline} /></div>
                     <DrawerSection label={t("dashboard.client")}>
                       <ShareClientPanel client={clientByShareId.get(selectedShare.shareId)} currentShare={selectedShare} shares={sharesForClient(clientByShareId.get(selectedShare.shareId))} onEdit={openEditShare} t={t} locale={locale} />
                     </DrawerSection>

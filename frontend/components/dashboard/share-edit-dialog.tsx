@@ -321,7 +321,7 @@ export function ShareEditDialog({
   share: ShareView | null;
   markets: DashboardMarket[];
   onClose: () => void;
-  onSaved: () => Promise<void>;
+  onSaved: (result: { appliedSynchronously: boolean }) => Promise<void>;
 }) {
   const [description, setDescription] = React.useState("");
   const [forSale, setForSale] = React.useState<"Yes" | "No" | "Free">("No");
@@ -575,7 +575,7 @@ export function ShareEditDialog({
     setNotice("");
     try {
       const res = await updateShareSettings(share.shareId, currentPatch);
-      await onSaved();
+      await onSaved({ appliedSynchronously: res.appliedSynchronously });
       if (res.appliedSynchronously) {
         onClose();
       } else {
@@ -627,7 +627,7 @@ export function ShareEditDialog({
         saleMarketKind: effectiveSaleMarketKind,
         marketAccessMode: effectiveMarketAccessMode,
       });
-      await onSaved();
+      await onSaved({ appliedSynchronously: res.appliedSynchronously });
       setTransferTargetEmail("");
       if (res.appliedSynchronously) {
         onClose();

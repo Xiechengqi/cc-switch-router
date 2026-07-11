@@ -40,25 +40,25 @@ use crate::models::{
     ChangeInstallationOwnerEmailRequest, ChangeInstallationOwnerEmailResponse,
     ClientTunnelClaimRequest, ClientTunnelQuery, ClientTunnelResponse, ClientTunnelUpdateRequest,
     DashboardMarketRequestLogView, DashboardPresenceRequest, DashboardPresenceResponse,
-    DashboardResponse, DashboardTickerShare, GatewayRegistryRecord, GetInstallationOwnerEmailQuery,
-    GetInstallationOwnerEmailResponse, HealthResponse, ImageGenerationRequestLogEntry,
-    InstallationPayoutProfileUpdateRequest, InstallationPayoutProfileUpdateResponse,
-    IssueLeaseRequest, IssueLeaseResponse, MarketDisabledSharesUpdateRequest,
-    MarketDisabledSharesUpdateResponse, MarketMaintenanceUpdateRequest,
-    MarketMaintenanceUpdateResponse, MarketNotificationEmailLogView,
-    MarketNotificationEmailRequest, MarketNotificationEmailResponse,
-    MarketRequestLogBatchSyncRequest, MarketShareRuntimeStateReleaseRequest,
-    MarketShareRuntimeStateReleaseResponse, MarketShareRuntimeStateSyncRequest,
-    MarketShareRuntimeStateSyncResponse, MarketShareView, MarketsResponse, PostBoardMessageRequest,
-    PublicMapPointsResponse, PublicNetworkStatsResponse, PublicPayoutProfilesQuery,
-    RefreshSessionRequest, RegisterGatewayRequest, RegisterGatewayResponse,
-    RegisterInstallationRequest, RegisterInstallationResponse, RegisterMarketRequest,
-    RenewLeaseRequest, RenewLeaseResponse, RequestEmailCodeRequest, RequestEmailCodeResponse,
-    SessionStatusResponse, ShareApiAuthResponse, ShareApiAuthUser, ShareApiContextResponse,
-    ShareApiShareResponse, ShareBatchSyncRequest, ShareClaimSubdomainRequest, ShareDeleteRequest,
-    ShareEditAckRequest, ShareEditAvailableEvent, ShareEditEventSignaturePayload,
-    ShareHeartbeatRequest, ShareMarketGrantRequest, ShareMarketGrantResponse,
-    ShareMarketGrantStatusResponse, ShareMarketListingStatusSyncRequest,
+    DashboardResponse, DashboardTickerShare, DashboardUxEventRequest, DashboardUxEventResponse,
+    GatewayRegistryRecord, GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse,
+    HealthResponse, ImageGenerationRequestLogEntry, InstallationPayoutProfileUpdateRequest,
+    InstallationPayoutProfileUpdateResponse, IssueLeaseRequest, IssueLeaseResponse,
+    MarketDisabledSharesUpdateRequest, MarketDisabledSharesUpdateResponse,
+    MarketMaintenanceUpdateRequest, MarketMaintenanceUpdateResponse,
+    MarketNotificationEmailLogView, MarketNotificationEmailRequest,
+    MarketNotificationEmailResponse, MarketRequestLogBatchSyncRequest,
+    MarketShareRuntimeStateReleaseRequest, MarketShareRuntimeStateReleaseResponse,
+    MarketShareRuntimeStateSyncRequest, MarketShareRuntimeStateSyncResponse, MarketShareView,
+    MarketsResponse, PostBoardMessageRequest, PublicMapPointsResponse, PublicNetworkStatsResponse,
+    PublicPayoutProfilesQuery, RefreshSessionRequest, RegisterGatewayRequest,
+    RegisterGatewayResponse, RegisterInstallationRequest, RegisterInstallationResponse,
+    RegisterMarketRequest, RenewLeaseRequest, RenewLeaseResponse, RequestEmailCodeRequest,
+    RequestEmailCodeResponse, SessionStatusResponse, ShareApiAuthResponse, ShareApiAuthUser,
+    ShareApiContextResponse, ShareApiShareResponse, ShareBatchSyncRequest,
+    ShareClaimSubdomainRequest, ShareDeleteRequest, ShareEditAckRequest, ShareEditAvailableEvent,
+    ShareEditEventSignaturePayload, ShareHeartbeatRequest, ShareMarketGrantRequest,
+    ShareMarketGrantResponse, ShareMarketGrantStatusResponse, ShareMarketListingStatusSyncRequest,
     ShareMarketListingStatusSyncResponse, SharePendingEditsRequest,
     ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRuntimeRefreshRequest,
     ShareSettingsPatch, ShareSettingsUpdateRequest, ShareSyncRequest, UserApiTokenResetResponse,
@@ -209,6 +209,7 @@ pub fn router(state: ServerState) -> Router {
         )
         .route("/v1/markets/tunnel/lease", post(issue_market_lease))
         .route("/v1/dashboard/presence", post(dashboard_presence))
+        .route("/v1/dashboard/ux-events", post(dashboard_ux_event))
         .route("/v1/installations/register", post(register_installation))
         .route(
             "/v1/installations/bind-owner-email",
@@ -1701,6 +1702,20 @@ async fn dashboard_presence(
         online_count,
         email_sent_24h,
     }))
+}
+
+async fn dashboard_ux_event(
+    State(state): State<ServerState>,
+    Json(input): Json<DashboardUxEventRequest>,
+) -> Result<Json<DashboardUxEventResponse>, AppError> {
+    if !state.config.ux_telemetry_enabled {
+        return Ok(Json(DashboardUxEventResponse { accepted: false }));
+    }
+    state
+        .store
+        .record_dashboard_ux_event(input, state.config.ux_telemetry_retention_days)
+        .await?;
+    Ok(Json(DashboardUxEventResponse { accepted: true }))
 }
 
 async fn request_email_code(

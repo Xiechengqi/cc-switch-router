@@ -7,6 +7,9 @@ import { useAuth } from "@/components/auth/auth-provider";
 import { ClientBoard } from "@/components/dashboard/client-board";
 import { MarketsTable, PresenceFooter } from "@/components/dashboard/data-tables";
 import { LiveMap } from "@/components/dashboard/live-map";
+import { DashboardFocusProvider } from "@/components/dashboard/dashboard-focus";
+import { FocusBar } from "@/components/dashboard/focus-bar";
+import { OperationVerificationProvider } from "@/components/dashboard/operation-verification";
 import { getDashboard } from "@/lib/api";
 import type { DashboardResponse } from "@/lib/types";
 
@@ -39,20 +42,23 @@ export function DashboardPage() {
   }, [authLoading, load, session?.authenticated, session?.user?.email]);
 
   return (
-    <>
-      <main className="mx-auto grid w-[calc(100%-2rem)] max-w-7xl gap-6 pb-6">
-        {error ? <Alert status="danger" className="!text-slate-900">{error}</Alert> : null}
-        <LiveMap data={data} />
-        <ClientBoard
-          clients={data?.clients || []}
-          shares={data?.shares || []}
-          markets={data?.markets || []}
-          onChanged={load}
-        />
-        <MarketsTable markets={data?.markets || []} onChanged={load} />
-      </main>
-      <PresenceFooter />
-      <BoardDock />
-    </>
+    <DashboardFocusProvider data={data}>
+      <OperationVerificationProvider data={data}>
+        <main className="mx-auto grid w-[calc(100%-2rem)] max-w-7xl gap-6 pb-6">
+          {error ? <Alert status="danger" className="!text-slate-900">{error}</Alert> : null}
+          <LiveMap data={data} />
+          <FocusBar />
+          <ClientBoard
+            clients={data?.clients || []}
+            shares={data?.shares || []}
+            markets={data?.markets || []}
+            onChanged={load}
+          />
+          <MarketsTable markets={data?.markets || []} onChanged={load} />
+        </main>
+        <PresenceFooter />
+        <BoardDock />
+      </OperationVerificationProvider>
+    </DashboardFocusProvider>
   );
 }

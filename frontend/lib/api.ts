@@ -45,6 +45,24 @@ export async function getDashboard() {
   return parseJson<DashboardResponse>(await authFetch("/v1/dashboard", { cache: "no-store" }));
 }
 
+export type DashboardUxEvent = {
+  eventType: string;
+  source?: string;
+  targetType?: "request" | "client" | "share" | "market";
+  stepCount?: number;
+  elapsedMs?: number;
+  keyboard?: boolean;
+};
+
+export function recordDashboardUxEvent(event: DashboardUxEvent) {
+  return fetch("/v1/dashboard/ux-events", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(event),
+    keepalive: true,
+  }).catch(() => undefined);
+}
+
 export async function updateShareSettings(shareId: string, patch: ShareSettingsPatch) {
   return parseJson<{ ok: boolean; edit: ShareEditView; appliedSynchronously: boolean }>(
     await authFetch(`/v1/shares/${encodeURIComponent(shareId)}/settings`, {

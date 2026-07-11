@@ -1,0 +1,178 @@
+"use client";
+
+import * as React from "react";
+import { AlertTriangle, CheckCircle2, CircleOff, Clock3, PauseCircle } from "lucide-react";
+import { useLocaleText } from "@/components/i18n/locale-provider";
+import type { DashboardClient, DashboardMarket, OperationalReason, OperationalState, OperationalSummary, ShareView } from "@/lib/types";
+import { formatRelativeTime } from "@/lib/utils";
+
+export function shareIsEnabled(share: ShareView) {
+  return String(share.shareStatus || "").trim().toLowerCase() === "active";
+}
+
+function fallbackShareSummary(share: ShareView): OperationalSummary {
+  const status = String(share.shareStatus || "").trim().toLowerCase();
+  if (status !== "active") {
+    return {
+      state: "disabled",
+      primaryReason: { code: status === "expired" ? "expired" : "manually_disabled", severity: status === "expired" ? "critical" : "info", entityType: "share", entityId: share.shareId },
+      additionalReasonCount: 0,
+    };
+  }
+  if (!share.isOnline) {
+    return { state: "offline", primaryReason: { code: "route_offline", severity: "critical", entityType: "share", entityId: share.shareId }, additionalReasonCount: 0 };
+  }
+  if (share.canManage && share.activeEdit?.status === "rejected") {
+    return { state: "degraded", primaryReason: { code: "edit_failed", severity: "critical", entityType: "share", entityId: share.shareId, startedAt: share.activeEdit.updatedAt }, additionalReasonCount: 0 };
+  }
+  if (share.canManage && share.activeEdit?.status === "pending") {
+    return { state: "degraded", primaryReason: { code: "edit_pending", severity: "warning", entityType: "share", entityId: share.shareId, startedAt: share.activeEdit.updatedAt }, additionalReasonCount: 0 };
+  }
+  const latestHealth = share.healthChecks?.at(-1);
+  if (latestHealth && !latestHealth.isHealthy) {
+    return { state: "degraded", primaryReason: { code: "health_check_failed", severity: "warning", entityType: "share", entityId: share.shareId }, additionalReasonCount: 0 };
+  }
+  return { state: "online", additionalReasonCount: 0 };
+}
+
+export function shareOperationalSummary(share: ShareView): OperationalSummary {
+  return share.operationalSummary || fallbackShareSummary(share);
+}
+
+export function clientOperationalSummary(client: DashboardClient, shares: ShareView[]): OperationalSummary {
+  if (client.operationalSummary) return client.operationalSummary;
+  const enabled = shares.filter(shareIsEnabled);
+  const online = enabled.filter((share) => share.isOnline);
+  if (enabled.length && online.length === 0) {
+    return { state: "offline", primaryReason: { code: "route_offline", severity: "critical", entityType: "client", entityId: client.installation.id, currentValue: "0", threshold: String(enabled.length) }, additionalReasonCount: 0 };
+  }
+  if (online.length < enabled.length) {
+    return { state: "degraded", primaryReason: { code: "partial_share_outage", severity: "warning", entityType: "client", entityId: client.installation.id, currentValue: String(online.length), threshold: String(enabled.length) }, additionalReasonCount: 0 };
+  }
+  const degraded = enabled.find((share) => shareOperationalSummary(share).state === "degraded");
+  if (degraded) return { ...shareOperationalSummary(degraded), state: "degraded" };
+  if (!enabled.length && client.clientTunnel && !client.clientTunnel.online) {
+    return { state: "offline", primaryReason: { code: "route_offline", severity: "critical", entityType: "client", entityId: client.installation.id }, additionalReasonCount: 0 };
+  }
+  return { state: "online", additionalReasonCount: 0 };
+}
+
+export function marketOperationalSummary(market: DashboardMarket): OperationalSummary {
+  if (market.operationalSummary) return market.operationalSummary;
+  const status = String(market.status || "").trim().toLowerCase();
+  if (status === "disabled") return { state: "disabled", primaryReason: { code: "manually_disabled", severity: "info", entityType: "market", entityId: market.id }, additionalReasonCount: 0 };
+  if (market.maintenanceEnabled) return { state: "maintenance", primaryReason: { code: "maintenance_enabled", severity: "info", entityType: "market", entityId: market.id }, additionalReasonCount: 0 };
+  if (!market.online || status === "offline") return { state: "offline", primaryReason: { code: "route_offline", severity: "critical", entityType: "market", entityId: market.id, startedAt: market.offlineSince }, additionalReasonCount: 0 };
+  if (market.onlineShareCount === 0) return { state: "degraded", primaryReason: { code: "no_online_shares", severity: "critical", entityType: "market", entityId: market.id, currentValue: "0", threshold: String(Math.max(1, market.shareCount)) }, additionalReasonCount: 0 };
+  if (market.parallelCapacity > 0 && market.activeRequests / market.parallelCapacity >= 0.9) {
+    return { state: "degraded", primaryReason: { code: market.activeRequests >= market.parallelCapacity ? "parallel_capacity_full" : "parallel_capacity_warning", severity: market.activeRequests >= market.parallelCapacity ? "critical" : "warning", entityType: "market", entityId: market.id, currentValue: String(market.activeRequests), threshold: String(market.parallelCapacity) }, additionalReasonCount: 0 };
+  }
+  return { state: "available", additionalReasonCount: 0 };
+}
+
+export function operationalStateRank(state: OperationalState) {
+  return state === "offline" ? 0 : state === "degraded" ? 1 : state === "maintenance" ? 2 : state === "online" || state === "available" ? 3 : 4;
+}
+
+export function useStableOperationalRanks(entries: Array<{ id: string; state: OperationalState }>, settleMs = 15_000) {
+  const memory = React.useRef(new Map<string, { observed: OperationalState; observedAt: number; committed: OperationalState }>());
+  const now = Date.now();
+  const activeIds = new Set(entries.map((entry) => entry.id));
+  for (const id of memory.current.keys()) {
+    if (!activeIds.has(id)) memory.current.delete(id);
+  }
+  const ranks = new Map<string, number>();
+  for (const entry of entries) {
+    const existing = memory.current.get(entry.id);
+    if (!existing) {
+      memory.current.set(entry.id, { observed: entry.state, observedAt: now, committed: entry.state });
+      ranks.set(entry.id, operationalStateRank(entry.state));
+      continue;
+    }
+    if (existing.observed !== entry.state) {
+      existing.observed = entry.state;
+      existing.observedAt = now;
+    } else if (existing.committed !== entry.state && now - existing.observedAt >= settleMs) {
+      existing.committed = entry.state;
+    }
+    ranks.set(entry.id, operationalStateRank(existing.committed));
+  }
+  return ranks;
+}
+
+export function operationalStateLabel(state: OperationalState, t: ReturnType<typeof useLocaleText>["t"]) {
+  if (state === "online") return t("common.online");
+  if (state === "available") return t("dashboard.available");
+  if (state === "degraded") return t("dashboard.degraded");
+  if (state === "offline") return t("common.offline");
+  if (state === "maintenance") return t("dashboard.maintenance");
+  return t("dashboard.disabled");
+}
+
+export function operationalReasonLabel(reason: OperationalReason | undefined, t: ReturnType<typeof useLocaleText>["t"]) {
+  if (!reason) return t("dashboard.healthy");
+  const current = reason.currentValue || "-";
+  const threshold = reason.threshold || "-";
+  switch (reason.code) {
+    case "route_offline": return t("dashboard.reason.routeOffline");
+    case "health_check_failed": return t("dashboard.reason.healthCheckFailed");
+    case "no_online_shares": return t("dashboard.reason.noOnlineShares");
+    case "partial_share_outage": return t("dashboard.reason.partialShareOutage", { current, total: threshold });
+    case "parallel_capacity_full": return t("dashboard.reason.parallelFull", { current, total: threshold });
+    case "parallel_capacity_warning": return t("dashboard.reason.parallelWarning", { current, total: threshold });
+    case "usage_limit_warning": return t("dashboard.reason.usageWarning", { current, total: threshold });
+    case "expired": return t("dashboard.reason.expired");
+    case "expires_soon": return t("dashboard.reason.expiresSoon");
+    case "provider_unavailable": return t("dashboard.reason.providerUnavailable");
+    case "high_latency": return t("dashboard.reason.highLatency", { value: current });
+    case "edit_pending": return t("dashboard.reason.editPending");
+    case "edit_failed": return t("dashboard.reason.editFailed");
+    case "maintenance_enabled": return t("dashboard.reason.maintenance");
+    case "manually_disabled": return t("dashboard.reason.disabled");
+    default: return String(reason.code).replaceAll("_", " ");
+  }
+}
+
+export function operationalImpactLabel(kind: "client" | "share" | "market", reason: OperationalReason | undefined, t: ReturnType<typeof useLocaleText>["t"]) {
+  if (!reason) return t("dashboard.impact.none");
+  if (reason.code === "route_offline" || reason.code === "no_online_shares") return kind === "market" ? t("dashboard.impact.marketOffline") : t("dashboard.impact.routeOffline");
+  if (reason.code === "parallel_capacity_full") return t("dashboard.impact.capacityFull");
+  if (reason.code === "provider_unavailable") return t("dashboard.impact.providerUnavailable");
+  if (reason.code === "maintenance_enabled" || reason.code === "manually_disabled") return t("dashboard.impact.disabled");
+  return t("dashboard.impact.degraded");
+}
+
+export function OperationalStatusPill({ summary, className = "" }: { summary: OperationalSummary; className?: string }) {
+  const { t } = useLocaleText();
+  const state = summary.state;
+  const style = state === "online" || state === "available"
+    ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+    : state === "degraded"
+      ? "border-amber-200 bg-amber-50 text-amber-700"
+      : state === "offline"
+        ? "border-rose-200 bg-rose-50 text-rose-700"
+        : state === "maintenance"
+          ? "border-blue-200 bg-blue-50 text-blue-700"
+          : "border-slate-200 bg-slate-100 text-slate-600";
+  const Icon = state === "online" || state === "available" ? CheckCircle2 : state === "degraded" ? AlertTriangle : state === "offline" ? CircleOff : state === "maintenance" ? Clock3 : PauseCircle;
+  return <span className={`inline-flex h-6 shrink-0 items-center gap-1.5 rounded-full border px-2.5 text-[11px] font-semibold ${style} ${className}`}><Icon className="h-3 w-3" />{operationalStateLabel(state, t)}</span>;
+}
+
+export function OperationalDiagnosis({ summary, kind, onEvidence }: { summary: OperationalSummary; kind: "client" | "share" | "market"; onEvidence?: () => void }) {
+  const { locale, t } = useLocaleText();
+  const reason = summary.primaryReason;
+  return (
+    <section className="grid gap-3 rounded-lg border bg-slate-50 p-3" aria-label={t("dashboard.diagnosis")}>
+      <div className="flex items-center justify-between gap-3">
+        <OperationalStatusPill summary={summary} />
+        {summary.changedAt ? <span className="text-[11px] text-muted-foreground">{t("dashboard.since")} {formatRelativeTime(summary.changedAt, locale)}</span> : null}
+      </div>
+      <div className="grid gap-1">
+        <strong className="text-sm text-foreground">{operationalReasonLabel(reason, t)}</strong>
+        <span className="text-xs leading-5 text-muted-foreground">{operationalImpactLabel(kind, reason, t)}</span>
+        {summary.additionalReasonCount > 0 ? <span className="text-[11px] font-medium text-amber-700">{t("dashboard.otherIssues", { count: summary.additionalReasonCount })}</span> : null}
+      </div>
+      {onEvidence && reason ? <button type="button" className="justify-self-start text-xs font-medium text-primary hover:underline" onClick={onEvidence}>{t("dashboard.viewEvidence")}</button> : null}
+    </section>
+  );
+}

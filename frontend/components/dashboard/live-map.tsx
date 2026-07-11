@@ -4,8 +4,10 @@ import { Minus, Plus, RotateCcw } from "lucide-react";
 import { Button } from "@heroui/react";
 import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
 import type { DashboardResponse, MapPoint, MarketRequestLog, RecentRequestEvent, ShareRequestLog } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { usePersistentState } from "@/lib/use-persistent-state";
 
 function projectPoint(point: MapPoint) {
   if (typeof point.lat !== "number" || typeof point.lon !== "number") return null;
@@ -187,6 +189,7 @@ function buildRequestMeta(data: DashboardResponse | null) {
 }
 
 function RequestTicker({ data }: { data: DashboardResponse | null }) {
+  const focus = useDashboardFocus();
   const meta = React.useMemo(() => buildRequestMeta(data), [data]);
   const events = React.useMemo(() => {
     return [...(data?.recentRequestEvents || [])]
@@ -220,13 +223,13 @@ function RequestTicker({ data }: { data: DashboardResponse | null }) {
         const subdomain = event.shareSubdomain || event.subdomain || event.shareName || mergedItem?.shareName || "share";
         const eventKey = [event.requestId, event.startedAt || event.createdAt || "", index].join(":");
         return (
-          <div key={eventKey} className="flex max-w-full items-center gap-1 overflow-hidden rounded-md border border-slate-200/70 bg-white/55 px-2 py-1 text-[10px] text-slate-700 backdrop-blur-sm">
+          <button type="button" data-map-control key={eventKey} onClick={() => focus.setFocus({ kind: "request", id: event.requestId, source: "activity" })} className={`flex max-w-full items-center gap-1 overflow-hidden rounded-md border px-2 py-1 text-left text-[10px] text-slate-700 backdrop-blur-sm transition-colors ${focus.isFocused("request", event.requestId) ? "border-primary bg-white ring-2 ring-primary/20" : "border-slate-200/70 bg-white/55 hover:bg-white/90"}`}>
             <span className="font-mono text-slate-500">{formatTickerTime(event.startedAt || event.createdAt, item?.createdAt)}</span>
             <span>{countryFlag(country)}</span>
             <span className="font-semibold text-slate-600">{country}</span>
             <span className="font-semibold text-slate-500">{subdomain}</span>
             <span className="truncate font-semibold text-slate-700/80">{tickerDetail(mergedItem)}</span>
-          </div>
+          </button>
         );
       })}
     </div>
@@ -235,12 +238,15 @@ function RequestTicker({ data }: { data: DashboardResponse | null }) {
 
 export function LiveMap({ data }: { data: DashboardResponse | null }) {
   const { t } = useLocaleText();
+  const focus = useDashboardFocus();
   const shellRef = React.useRef<HTMLDivElement | null>(null);
   const worldRef = React.useRef<HTMLDivElement | null>(null);
   const dragRef = React.useRef<{ pointerId: number; x: number; y: number; panX: number; panY: number } | null>(null);
   const [worldSvg, setWorldSvg] = React.useState("");
   const [zoom, setZoomState] = React.useState(1);
   const [pan, setPan] = React.useState({ x: 0, y: 0 });
+  const [showFlows, setShowFlows] = usePersistentState("cc_switch_router_map_flows_v1", true);
+  const [showHeat, setShowHeat] = usePersistentState("cc_switch_router_map_heat_v1", true);
   const clients = data?.map?.clients || [];
   const server = data?.map?.server;
   const points = [server, ...clients].filter(Boolean) as MapPoint[];
@@ -255,6 +261,31 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
   }, [clients, server]);
   const serverPlaced = placed.find((item) => item.point.pointType === "server");
   const clientPlaced = placed.filter((item) => item.point.pointType !== "server");
+  const requestFlows = React.useMemo(() => {
+    const shareToClient = new Map<string, string>();
+    for (const client of data?.clients || []) {
+      for (const shareId of client.shareIds || []) shareToClient.set(shareId, client.installation.id);
+    }
+    const meta = buildRequestMeta(data);
+    const flows = new Map<string, { count: number; inflight: number; failures: number; highLatency: number; latestAt: number }>();
+    for (const event of (data?.recentRequestEvents || []).slice(-200)) {
+      const clientId = event.shareId ? shareToClient.get(event.shareId) : undefined;
+      if (!clientId) continue;
+      const item = meta.get(event.requestId);
+      const statusCode = Number(item?.statusCode || 0);
+      const status = String(item?.status || event.healthStatus || "").toLowerCase();
+      const latency = Number(event.latencyMs || item?.latencyMs || 0);
+      const timestamp = Date.parse(event.startedAt || event.createdAt || "") || Date.now();
+      const flow = flows.get(clientId) || { count: 0, inflight: 0, failures: 0, highLatency: 0, latestAt: 0 };
+      flow.count += 1;
+      if (event.isInflight) flow.inflight += 1;
+      if (statusCode >= 400 || ["failed", "error", "offline"].includes(status)) flow.failures += 1;
+      if (latency >= 2000) flow.highLatency += 1;
+      flow.latestAt = Math.max(flow.latestAt, timestamp);
+      flows.set(clientId, flow);
+    }
+    return flows;
+  }, [data]);
 
   const clampPan = React.useCallback((nextPan: { x: number; y: number }, nextZoom = zoom) => {
     const shell = shellRef.current;
@@ -295,7 +326,7 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
   React.useEffect(() => {
     const root = worldRef.current;
     if (!root) return;
-    const counts = data?.userCountryCounts || data?.countryCounts || {};
+    const counts = showHeat ? data?.userCountryCounts || data?.countryCounts || {} : {};
     const values = Object.values(counts).filter((value) => value > 0);
     const max = values.length ? Math.max(...values) : 0;
     for (const element of Array.from(root.querySelectorAll<SVGElement>(".country"))) {
@@ -305,7 +336,7 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
       element.style.fillOpacity = String(0.1 + heat * 0.55);
       element.style.strokeOpacity = String(0.16 + heat * 0.4);
     }
-  }, [data?.countryCounts, data?.userCountryCounts, worldSvg]);
+  }, [data?.countryCounts, data?.userCountryCounts, showHeat, worldSvg]);
 
   React.useEffect(() => {
     function handleResize() {
@@ -402,35 +433,57 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
           <div className="pointer-events-none absolute inset-0 bg-[url('/world-map.svg')] bg-[length:100%_100%] bg-center bg-no-repeat" aria-hidden="true" />
         )}
         <svg className="absolute inset-0 h-full w-full overflow-visible" viewBox="0 0 360 180" preserveAspectRatio="none" aria-hidden="true">
-          {serverPlaced
+          {showFlows && serverPlaced
             ? clientPlaced.map(({ point: client, pos: b }) => {
                 const a = serverPlaced.pos;
+                const flow = requestFlows.get(client.id);
+                const requestCount = Math.max(client.activeRequests || 0, flow?.count || 0);
+                const related = !focus.target || focus.relatedClientIds.has(client.id);
+                const focused = focus.isFocused("client", client.id) || (focus.target?.kind === "request" && focus.relatedClientIds.has(client.id));
+                const highVolume = requestCount >= 12;
+                const mediumVolume = requestCount >= 4;
+                const stroke = flow?.failures ? "stroke-rose-500" : flow?.highLatency ? "stroke-amber-500" : focused ? "stroke-blue-600" : requestCount > 0 ? "stroke-blue-500" : "stroke-slate-400";
+                const width = focused ? 1.25 : highVolume ? 1.15 : mediumVolume ? 0.9 : requestCount > 0 ? 0.7 : 0.5;
+                const ageMs = flow?.latestAt ? Math.max(0, Date.now() - flow.latestAt) : Number.POSITIVE_INFINITY;
+                const residualOpacity = flow?.failures ? (ageMs < 30_000 ? 0.82 : 0.5) : flow?.highLatency ? (ageMs < 15_000 ? 0.72 : 0.4) : ageMs < 5_000 ? 0.62 : 0.35;
                 return (
-                  <line
-                    key={`flow-${client.id}`}
-                    x1={a.x}
-                    y1={a.y}
-                    x2={b.x}
-                    y2={b.y}
-                    className={cn("stroke-blue-500/35", client.activeRequests > 0 ? "animate-pulse" : "stroke-slate-400/25")}
-                    strokeWidth={client.activeRequests > 0 ? 0.7 : 0.5}
-                    strokeDasharray={client.activeRequests > 0 ? "1.5 2.5" : "1 5"}
-                    strokeLinecap="round"
-                  />
+                  <g key={`flow-${client.id}`} className={cn("transition-opacity", related ? "opacity-100" : "opacity-15")}>
+                    <line
+                      x1={a.x}
+                      y1={a.y}
+                      x2={b.x}
+                      y2={b.y}
+                      className={cn(stroke, requestCount > 0 && !highVolume ? "animate-pulse" : "")}
+                      strokeOpacity={focused ? 0.9 : requestCount > 0 ? residualOpacity : 0.22}
+                      strokeWidth={width}
+                      strokeDasharray={highVolume ? undefined : requestCount > 0 ? "1.5 2.5" : "1 5"}
+                      strokeLinecap="round"
+                    />
+                    {mediumVolume ? (
+                      <g transform={`translate(${(a.x + b.x) / 2} ${(a.y + b.y) / 2})`}>
+                        <circle r="4.2" className="fill-white stroke-blue-300" strokeWidth="0.5" />
+                        <text textAnchor="middle" dominantBaseline="central" className="fill-slate-600 text-[4px] font-semibold">{requestCount > 99 ? "99+" : requestCount}</text>
+                      </g>
+                    ) : null}
+                  </g>
                 );
               })
             : null}
         </svg>
           {placed.map(({ point, pos }) => {
             const isServer = point.pointType === "server";
+            const related = isServer || !focus.target || focus.relatedClientIds.has(point.id);
+            const focused = !isServer && focus.isFocused("client", point.id);
             return (
-              <div
+              <button
+                type="button"
+                data-map-control
                 key={`${point.pointType}-${point.id}`}
-                className="absolute -translate-x-1/2 -translate-y-1/2 rounded-full"
+                className={`absolute -translate-x-1/2 -translate-y-1/2 rounded-full outline-none transition-opacity focus-visible:ring-2 focus-visible:ring-primary/40 ${related ? "opacity-100" : "opacity-20"} ${focused ? "ring-4 ring-primary/20" : ""}`}
                 style={{ left: `${pos.xPct}%`, top: `${pos.yPct}%` }}
                 title={[point.label, point.city, point.region, point.country, point.activeRequests ? t("map.active", { count: point.activeRequests }) : ""].filter(Boolean).join(" · ")}
-                role="img"
                 aria-label={[isServer ? t("map.router") : point.label, point.country].filter(Boolean).join(" · ")}
+                onClick={() => { if (!isServer) focus.setFocus({ kind: "client", id: point.id, source: "map" }); }}
               >
                 <div
                   className={cn(
@@ -440,9 +493,13 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
                     point.activeRequests > 0 && "pulse-dot",
                   )}
                 />
-              </div>
+              </button>
             );
           })}
+      </div>
+      <div data-map-control className="absolute right-[1.6%] top-[3.5%] z-30 flex items-center gap-1 rounded-lg border border-slate-200/70 bg-white/60 p-1 text-[10px] text-slate-600 backdrop-blur-sm">
+        <button type="button" aria-pressed={showFlows} onClick={() => setShowFlows((value) => !value)} className={`rounded-md px-2 py-1 transition-colors ${showFlows ? "bg-primary/10 font-medium text-primary" : "hover:bg-white"}`}>{t("map.requestFlows")}</button>
+        <button type="button" aria-pressed={showHeat} onClick={() => setShowHeat((value) => !value)} className={`rounded-md px-2 py-1 transition-colors ${showHeat ? "bg-primary/10 font-medium text-primary" : "hover:bg-white"}`}>{t("map.demandHeat")}</button>
       </div>
       <div className="absolute bottom-[4%] left-[1.6%] z-30 inline-flex items-center gap-0.5 rounded-lg border border-slate-200/70 bg-white/50 p-1 text-slate-600 backdrop-blur-sm">
         <Button data-map-control variant="ghost" size="sm" isIconOnly className="h-6 w-6 min-w-0 rounded-md p-0 text-slate-600 hover:bg-blue-50 hover:text-primary" aria-label={t("map.zoomOut")} onClick={() => setZoom(zoom - 0.25)}>

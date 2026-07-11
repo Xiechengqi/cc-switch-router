@@ -4,14 +4,13 @@ import { Card } from "@heroui/react";
 import { ChevronRight, Eye, Link2, MoreHorizontal, Pencil } from "lucide-react";
 import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import { OperationalStatusPill, operationalReasonLabel, shareOperationalSummary } from "@/components/dashboard/operational-status";
+import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
 import {
   averageRecentLatencyMs,
-  formatDurationShort,
   formatLatencySeconds,
-  isUnlimitedExpiry,
   modelHealthTitle,
   modelHealthTone,
-  parseShareTimestamp,
   providerAccountIdentity,
   providerAccountLevel,
   resolveShareAppRuntime,
@@ -23,6 +22,7 @@ import {
 import type { ShareRequestLog, ShareView } from "@/lib/types";
 import { compactTokens } from "@/lib/utils";
 import { resolveShareCoreApp, SHARE_APP_LABELS } from "@/lib/share-app";
+import { recordDashboardUxEvent } from "@/lib/api";
 
 function requestBelongsToApp(request: ShareRequestLog, app: CoreShareApp) {
   const appType = (request.appType || "").trim().toLowerCase();
@@ -32,76 +32,6 @@ function requestBelongsToApp(request: ShareRequestLog, app: CoreShareApp) {
 
 function isUnlimited(value?: number) {
   return Number(value) < 0;
-}
-
-function shareOperationalState(share: ShareView) {
-  const status = String(share.shareStatus || "").trim().toLowerCase();
-  if (status !== "active") return status === "paused" || status === "expired" ? status : "disabled";
-  if (!share.isOnline) return "offline";
-  const latestHealth = share.healthChecks?.at(-1);
-  return latestHealth && !latestHealth.isHealthy ? "degraded" : "online";
-}
-
-function ShareStatus({ share }: { share: ShareView }) {
-  const { t } = useLocaleText();
-  const state = shareOperationalState(share);
-  const label = state === "online"
-    ? t("common.online")
-    : state === "degraded"
-      ? t("dashboard.degraded")
-      : state === "offline"
-        ? t("common.offline")
-        : state === "paused"
-          ? t("dashboard.shareStatus.paused")
-          : state === "expired"
-            ? t("dashboard.shareStatus.expired")
-            : t("common.disabled");
-  const style = state === "online"
-    ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-    : state === "degraded"
-      ? "border-amber-200 bg-amber-50 text-amber-700"
-      : state === "offline"
-        ? "border-rose-200 bg-rose-50 text-rose-700"
-        : "border-slate-200 bg-slate-100 text-slate-600";
-  return <span className={`inline-flex h-5 shrink-0 items-center gap-1 rounded-full border px-2 text-[10px] font-semibold ${style}`}><span className="h-1.5 w-1.5 rounded-full bg-current" />{label}</span>;
-}
-
-function exceptionalMessage({
-  share,
-  tokenLimit,
-  tokensUsed,
-  parallelLimit,
-  activeRequests,
-  averageLatency,
-  expiresAt,
-  locale,
-  t,
-}: {
-  share: ShareView;
-  tokenLimit?: number;
-  tokensUsed: number;
-  parallelLimit?: number;
-  activeRequests: number;
-  averageLatency: number | null;
-  expiresAt?: string;
-  locale: "en" | "zh-CN";
-  t: ReturnType<typeof useLocaleText>["t"];
-}) {
-  if (share.canManage && share.activeEdit?.status === "rejected") return t("dashboard.applyFailed");
-  if (share.canManage && share.activeEdit?.status === "pending") return t("dashboard.pendingApply");
-  const status = String(share.shareStatus || "").trim().toLowerCase();
-  if (status === "active" && !share.isOnline) return t("dashboard.routeOffline");
-  if (status !== "active") return null;
-  if (expiresAt && !isUnlimitedExpiry(expiresAt)) {
-    const expiresMs = parseShareTimestamp(expiresAt);
-    if (Number.isFinite(expiresMs) && expiresMs - Date.now() < 7 * 24 * 60 * 60 * 1000) {
-      return `${t("dashboard.expires")} ${formatDurationShort(expiresAt, locale, "remaining")}`;
-    }
-  }
-  if (!isUnlimited(tokenLimit) && Number(tokenLimit) > 0 && tokensUsed / Number(tokenLimit) >= 0.9) return t("dashboard.usageHigh");
-  if (!isUnlimited(parallelLimit) && Number(parallelLimit) > 0 && activeRequests >= Number(parallelLimit)) return t("dashboard.parallelFull");
-  if (averageLatency != null && averageLatency >= 2000) return `${t("dashboard.response")} ${formatLatencySeconds(averageLatency)}`;
-  return null;
 }
 
 export const ShareCard = React.memo(function ShareCard({
@@ -116,6 +46,8 @@ export const ShareCard = React.memo(function ShareCard({
   onConnect: (share: ShareView) => void;
 }) {
   const { locale, t } = useLocaleText();
+  const focus = useDashboardFocus();
+  const cardRef = React.useRef<HTMLDivElement | null>(null);
   const app = resolveShareCoreApp(share);
   const api = shareApiParts(share);
   const settings = app ? shareAppSettings(share, app) : null;
@@ -125,28 +57,43 @@ export const ShareCard = React.memo(function ShareCard({
   const parallelLimit = settings?.parallelLimit ?? share.parallelLimit;
   const activeRequests = app ? share.activeRequestsByApp?.[app] ?? 0 : share.activeRequests || 0;
   const averageLatency = averageRecentLatencyMs(appRequests);
-  const expiresAt = settings?.expiresAt || share.expiresAt;
   const runtime = app ? resolveShareAppRuntime(share, app) : undefined;
   const accountLevel = runtime ? providerAccountLevel(runtime, locale) : "";
   const accountIdentity = runtime ? providerAccountIdentity(runtime) : share.providerId || "";
   const healthTone = app ? modelHealthTone(share, app) : { className: "bg-slate-50 text-muted-foreground", label: "" };
   const marketCount = share.marketAccessMode === "all" ? null : (share.marketLinks || []).length;
-  const issue = exceptionalMessage({ share, tokenLimit, tokensUsed, parallelLimit, activeRequests, averageLatency, expiresAt, locale, t });
+  const summary = shareOperationalSummary(share);
+  const issue = summary.primaryReason ? operationalReasonLabel(summary.primaryReason, t) : null;
   const title = share.shareName || share.subdomain || share.shareId;
   const usagePercent = !isUnlimited(tokenLimit) && Number(tokenLimit) > 0 ? Math.min(100, Math.max(0, (tokensUsed / Number(tokenLimit)) * 100)) : null;
   const editPending = share.canManage && share.activeEdit?.status === "pending";
   const editRejected = share.canManage && share.activeEdit?.status === "rejected";
+  const focused = focus.isFocused("share", share.shareId);
+  const related = focus.isRelated("share", share.shareId);
+  const dimmed = Boolean(focus.target) && !related;
+
+  React.useEffect(() => {
+    if (!focused || focus.target?.source === "client-board") return;
+    cardRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
+    if (focus.target?.kind === "request") void recordDashboardUxEvent({ eventType: "share_located_from_request", source: "activity", targetType: "share" });
+  }, [focus.target?.source, focused]);
 
   return (
     <Card
-      className="group w-64 shrink-0 snap-start overflow-visible rounded-lg border border-default/60 bg-white p-0 shadow-sm transition-colors hover:border-primary/30"
+      ref={cardRef}
+      data-share-id={share.shareId}
+      className={`group w-64 shrink-0 snap-start overflow-visible rounded-lg border bg-white p-0 shadow-sm transition-[border-color,box-shadow,opacity] hover:border-primary/30 ${focused ? "border-primary ring-2 ring-primary/20" : related ? "border-primary/35" : "border-default/60"} ${dimmed ? "opacity-40" : "opacity-100"}`}
       onClick={(event) => {
         const target = event.target as HTMLElement;
-        if (!target.closest("button,a,summary,details")) onOpen(share);
+        if (!target.closest("button,a,summary,details")) {
+          focus.setFocus({ kind: "share", id: share.shareId, source: "client-board" });
+          onOpen(share);
+        }
       }}
       onKeyDown={(event) => {
         if ((event.key === "Enter" || event.key === " ") && event.target === event.currentTarget) {
           event.preventDefault();
+          focus.setFocus({ kind: "share", id: share.shareId, source: "client-board" });
           onOpen(share);
         }
       }}
@@ -160,7 +107,7 @@ export const ShareCard = React.memo(function ShareCard({
             <strong className="block truncate text-sm font-semibold text-foreground" title={title}>{title}</strong>
             <span className="block truncate font-mono text-[10px] text-muted-foreground" title={api.apiUrl}>{api.apiUrl}</span>
           </div>
-          <ShareStatus share={share} />
+          <OperationalStatusPill summary={summary} className="h-5 px-2 text-[10px]" />
         </div>
 
         <div className={`grid min-w-0 gap-0.5 rounded-md border px-2 py-1.5 text-[11px] ${healthTone.className}`} title={app ? modelHealthTitle(share, app) : undefined}>
@@ -186,7 +133,7 @@ export const ShareCard = React.memo(function ShareCard({
 
         <div className="flex min-w-0 items-center justify-between gap-2 border-t pt-2">
           <span className={`min-w-0 truncate text-[10px] ${issue ? "font-medium text-amber-700" : "text-muted-foreground"}`} title={issue || undefined}>
-            {issue || `${t("dashboard.response")} ${formatLatencySeconds(averageLatency)}`}
+            {issue ? `${issue}${summary.additionalReasonCount ? ` · +${summary.additionalReasonCount}` : ""}` : `${t("dashboard.response")} ${formatLatencySeconds(averageLatency)}`}
           </span>
           <div className="flex shrink-0 items-center gap-1">
             <button type="button" data-no-row-drawer className="inline-flex h-6 items-center gap-1 rounded-md border border-emerald-200 bg-emerald-50 px-2 text-[10px] font-semibold text-emerald-700 hover:bg-emerald-100" onClick={(event) => { event.stopPropagation(); onConnect(share); }}>
@@ -200,7 +147,7 @@ export const ShareCard = React.memo(function ShareCard({
                 <button type="button" disabled={editPending} title={editRejected ? share.activeEdit?.errorMessage || t("dashboard.applyFailedFallback") : undefined} className="flex items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50" onClick={() => { if (!editPending) onEdit(share); }}>
                   {share.canManage ? <Pencil className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}{editPending ? t("dashboard.pendingApply") : editRejected ? t("dashboard.applyFailed") : share.canManage ? t("common.edit") : t("common.view")}
                 </button>
-                <button type="button" className="flex items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-slate-100" onClick={() => onOpen(share)}>
+                <button type="button" className="flex items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-slate-100" onClick={() => { focus.setFocus({ kind: "share", id: share.shareId, source: "client-board" }); onOpen(share); }}>
                   <ChevronRight className="h-3.5 w-3.5" />{t("dashboard.details")}
                 </button>
               </div>

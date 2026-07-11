@@ -6,68 +6,19 @@ import * as React from "react";
 import { DrawerSection, EmptyBlock, HealthTimelineStrip, Info, TokenGrid } from "@/components/dashboard/drawer-panels";
 import { FieldGroup } from "@/components/dashboard/share-edit-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import { marketOperationalSummary, OperationalDiagnosis, OperationalStatusPill, operationalReasonLabel, useStableOperationalRanks } from "@/components/dashboard/operational-status";
+import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
+import { useOperationVerification } from "@/components/dashboard/operation-verification";
 import { getMarketLinkedShares, getMarketSharePriority, getMarketShareSessionLoads, releaseMarketShareState, updateMarketDisabledShares, updateMarketMaintenance } from "@/lib/api";
-import type { DashboardMarket, MarketAppAvailabilityEntry, MarketRequestLog, MarketShare, MarketShareRuntimeState, ShareAppRuntimes, ShareUpstreamProvider } from "@/lib/types";
+import type { DashboardMarket, MarketAppAvailabilityEntry, MarketRequestLog, MarketShare, MarketShareRuntimeState, OperationalState, ShareAppRuntimes, ShareUpstreamProvider } from "@/lib/types";
 import { cn, compactTokens, formatDateTime, formatRelativeTime } from "@/lib/utils";
+import { usePersistentState } from "@/lib/use-persistent-state";
+import { recordDashboardUxEvent } from "@/lib/api";
 import { canShowMarketSharePriority, drawerDialogClassName, formatOfficialPriceMultiplier, formatUsdExactTrimmed, formatUsdOneDecimal, isShareMarket, isUnlimited, isUsageMarket, marketKindDescription, marketKindLabel, requestModelRoute, shouldOpenRowDrawer, sortMarkets, usageBucketTotalTokens, type TFn } from "@/components/dashboard/share-dashboard-utils";
-
-function marketHealthLabel(market: DashboardMarket, t: TFn) {
-  const status = String(market.status || "").trim().toLowerCase();
-  if (status === "disabled") return t("dashboard.disabled");
-  if (market.maintenanceEnabled) return t("dashboard.maintenance");
-  if (status === "offline") return t("common.offline");
-  if (!market.online) return t("dashboard.routeOffline");
-  if ((market.shareCount || 0) === 0) return t("dashboard.noShares");
-  if ((market.shareCount || 0) > 0 && (market.onlineShareCount || 0) === 0) return t("dashboard.noOnlineShares");
-  const capacity = marketCapacityPercent(market);
-  if (capacity != null && capacity >= 90) return t("dashboard.capacityWarning", { percent: capacity.toFixed(0) });
-  const latestHealth = market.healthChecks?.at(-1);
-  if (latestHealth && !latestHealth.isHealthy) return t("dashboard.healthCheckFailed");
-  return t("dashboard.healthy");
-}
-
-type MarketOperationalState = "available" | "degraded" | "offline" | "maintenance" | "disabled";
 
 function marketCapacityPercent(market: DashboardMarket) {
   if (isUnlimited(market.parallelCapacity) || market.parallelCapacity <= 0) return null;
   return Math.max(0, Math.min(100, ((market.activeRequests || 0) / market.parallelCapacity) * 100));
-}
-
-function marketOperationalState(market: DashboardMarket): MarketOperationalState {
-  const status = String(market.status || "").trim().toLowerCase();
-  if (status === "disabled") return "disabled";
-  if (market.maintenanceEnabled) return "maintenance";
-  if (!market.online || status === "offline") return "offline";
-  const latestHealth = market.healthChecks?.at(-1);
-  const capacity = marketCapacityPercent(market);
-  if ((market.shareCount || 0) === 0 || ((market.shareCount || 0) > 0 && (market.onlineShareCount || 0) === 0) || (capacity != null && capacity >= 90) || (latestHealth && !latestHealth.isHealthy)) return "degraded";
-  return "available";
-}
-
-function marketStateRank(state: MarketOperationalState) {
-  return state === "offline" ? 0 : state === "degraded" ? 1 : state === "maintenance" ? 2 : state === "available" ? 3 : 4;
-}
-
-function MarketStatusPill({ state, t }: { state: MarketOperationalState; t: TFn }) {
-  const style = state === "available"
-    ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-    : state === "degraded"
-      ? "border-amber-200 bg-amber-50 text-amber-700"
-      : state === "offline"
-        ? "border-rose-200 bg-rose-50 text-rose-700"
-        : state === "maintenance"
-          ? "border-blue-200 bg-blue-50 text-blue-700"
-          : "border-slate-200 bg-slate-100 text-slate-600";
-  const label = state === "available"
-    ? t("dashboard.available")
-    : state === "degraded"
-      ? t("dashboard.degraded")
-      : state === "offline"
-        ? t("common.offline")
-        : state === "maintenance"
-          ? t("dashboard.maintenance")
-          : t("dashboard.disabled");
-  return <span className={`inline-flex h-6 items-center gap-1.5 rounded-full border px-2.5 text-[11px] font-semibold ${style}`}><span className="h-1.5 w-1.5 rounded-full bg-current" />{label}</span>;
 }
 
 function MarketEditAction({ market, onEdit, t }: { market: DashboardMarket; onEdit: (market: DashboardMarket) => void; t: TFn }) {
@@ -119,6 +70,30 @@ function MarketTypeChip({ market, t }: { market: DashboardMarket; t: TFn }) {
   );
 }
 
+function MarketActivitySparkline({ market }: { market: DashboardMarket }) {
+  const timestamps = (market.recentRequests || [])
+    .map((request) => Date.parse(request.createdAt))
+    .filter(Number.isFinite)
+    .sort((left, right) => left - right);
+  if (timestamps.length < 2) return null;
+  const end = timestamps[timestamps.length - 1];
+  const start = end - 10 * 60 * 1000;
+  const buckets = Array.from({ length: 12 }, () => 0);
+  for (const timestamp of timestamps) {
+    if (timestamp < start) continue;
+    const index = Math.min(11, Math.max(0, Math.floor(((timestamp - start) / (end - start || 1)) * 12)));
+    buckets[index] += 1;
+  }
+  const max = Math.max(...buckets);
+  if (max <= 0) return null;
+  const points = buckets.map((value, index) => `${(index / 11) * 58 + 1},${15 - (value / max) * 12}`).join(" ");
+  return (
+    <svg viewBox="0 0 60 18" className="mt-0.5 h-4 w-16" aria-hidden="true">
+      <polyline points={points} fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="text-primary/60" />
+    </svg>
+  );
+}
+
 function MarketIdentityCell({ market, t }: { market: DashboardMarket; t: TFn }) {
   return (
     <div className="grid min-w-0 gap-1">
@@ -150,13 +125,17 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
   const [selected, setSelected] = React.useState<DashboardMarket | null>(null);
   const [editingMarket, setEditingMarket] = React.useState<DashboardMarket | null>(null);
   const [query, setQuery] = React.useState("");
-  const [statusFilter, setStatusFilter] = React.useState<"all" | MarketOperationalState>("all");
-  const [sortOrder, setSortOrder] = React.useState("issues");
-  const [onlyIssues, setOnlyIssues] = React.useState(false);
+  const [statusFilter, setStatusFilter] = usePersistentState<"all" | Extract<OperationalState, "available" | "degraded" | "offline" | "maintenance" | "disabled">>("cc_switch_router_market_status_v1", "all");
+  const [sortOrder, setSortOrder] = usePersistentState("cc_switch_router_market_sort_v1", "issues");
+  const [onlyIssues, setOnlyIssues] = usePersistentState("cc_switch_router_market_issues_v1", false);
   const { locale, t } = useLocaleText();
+  const focus = useDashboardFocus();
+  const { trackOperation } = useOperationVerification();
+  const lastLocatedFocusRef = React.useRef("");
   const stableMarkets = React.useMemo(() => sortMarkets(markets), [markets]);
+  const stableStateRanks = useStableOperationalRanks(stableMarkets.map((market) => ({ id: market.id, state: marketOperationalSummary(market).state })));
   const summary = React.useMemo(() => {
-    const states = stableMarkets.map(marketOperationalState);
+    const states = stableMarkets.map((market) => marketOperationalSummary(market).state);
     return {
       available: states.filter((state) => state === "available").length,
       issues: states.filter((state) => state === "degraded" || state === "offline" || state === "maintenance").length,
@@ -166,7 +145,7 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
   const rows = React.useMemo(() => {
     const normalizedQuery = query.trim().toLocaleLowerCase();
     const stableOrder = new Map(stableMarkets.map((market, index) => [market.id, index]));
-    const next = stableMarkets.map((market) => ({ market, state: marketOperationalState(market) })).filter(({ market, state }) => {
+    const next = stableMarkets.map((market) => ({ market, summary: marketOperationalSummary(market), state: marketOperationalSummary(market).state })).filter(({ market, state }) => {
       if (normalizedQuery && ![
         market.id,
         market.displayName,
@@ -185,10 +164,28 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
       if (sortOrder === "activity") return (right.market.activeRequests || 0) - (left.market.activeRequests || 0);
       if (sortOrder === "shares") return (right.market.shareCount || 0) - (left.market.shareCount || 0);
       if (sortOrder === "updated") return (Date.parse(right.market.lastSeenAt) || 0) - (Date.parse(left.market.lastSeenAt) || 0);
-      return marketStateRank(left.state) - marketStateRank(right.state) || (stableOrder.get(left.market.id) || 0) - (stableOrder.get(right.market.id) || 0);
+      if (focus.target) return (stableOrder.get(left.market.id) || 0) - (stableOrder.get(right.market.id) || 0);
+      return (stableStateRanks.get(left.market.id) || 0) - (stableStateRanks.get(right.market.id) || 0) || (stableOrder.get(left.market.id) || 0) - (stableOrder.get(right.market.id) || 0);
     });
     return next;
-  }, [onlyIssues, query, sortOrder, stableMarkets, statusFilter]);
+  }, [focus.target, onlyIssues, query, sortOrder, stableMarkets, stableStateRanks, statusFilter]);
+
+  React.useEffect(() => {
+    if (!focus.target || focus.target.source === "market-table") return;
+    const focusKey = `${focus.target.kind}:${focus.target.id}`;
+    if (lastLocatedFocusRef.current === focusKey) return;
+    lastLocatedFocusRef.current = focusKey;
+    const marketId = focus.target.kind === "market" ? focus.target.id : Array.from(focus.relatedMarketIds)[0];
+    if (!marketId) return;
+    window.requestAnimationFrame(() => document.getElementById(`dashboard-market-${marketId}`)?.scrollIntoView({ behavior: "smooth", block: "center" }));
+    if (focus.target.kind === "share") void recordDashboardUxEvent({ eventType: "market_located_from_share", source: "client-board", targetType: "market" });
+  }, [focus.relatedMarketIds, focus.target]);
+
+  React.useEffect(() => {
+    if (focus.drawerTarget?.kind !== "market") return;
+    const market = stableMarkets.find((candidate) => candidate.id === focus.drawerTarget?.id);
+    if (market) setSelected(market);
+  }, [focus.drawerTarget, stableMarkets]);
 
   return (
     <section className="grid gap-3">
@@ -208,7 +205,7 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
             <Search className="h-4 w-4 shrink-0 text-muted-foreground" />
             <input value={query} onChange={(event) => setQuery(event.target.value)} className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground" placeholder={t("dashboard.searchMarkets")} aria-label={t("dashboard.searchMarkets")} />
           </label>
-          <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value as "all" | MarketOperationalState)} className="h-9 rounded-md border bg-white px-3 text-xs text-foreground outline-none focus:border-primary/50" aria-label={t("dashboard.filterStatus")}>
+          <select value={statusFilter} onChange={(event) => { setStatusFilter(event.target.value as "all" | Extract<OperationalState, "available" | "degraded" | "offline" | "maintenance" | "disabled">); void recordDashboardUxEvent({ eventType: "filter_applied", source: "market-table", targetType: "market" }); }} className="h-9 rounded-md border bg-white px-3 text-xs text-foreground outline-none focus:border-primary/50" aria-label={t("dashboard.filterStatus")}>
             <option value="all">{t("dashboard.allStatuses")}</option>
             <option value="available">{t("dashboard.available")}</option>
             <option value="degraded">{t("dashboard.degraded")}</option>
@@ -216,10 +213,10 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
             <option value="maintenance">{t("dashboard.maintenance")}</option>
             <option value="disabled">{t("dashboard.disabled")}</option>
           </select>
-          <button type="button" onClick={() => setOnlyIssues((value) => !value)} aria-pressed={onlyIssues} className={`inline-flex h-9 items-center gap-1.5 rounded-md border px-3 text-xs font-medium transition-colors ${onlyIssues ? "border-amber-300 bg-amber-50 text-amber-800" : "bg-white text-muted-foreground hover:text-foreground"}`}>
+          <button type="button" onClick={() => { setOnlyIssues((value) => !value); void recordDashboardUxEvent({ eventType: "filter_applied", source: "market-table", targetType: "market" }); }} aria-pressed={onlyIssues} className={`inline-flex h-9 items-center gap-1.5 rounded-md border px-3 text-xs font-medium transition-colors ${onlyIssues ? "border-amber-300 bg-amber-50 text-amber-800" : "bg-white text-muted-foreground hover:text-foreground"}`}>
             <SlidersHorizontal className="h-3.5 w-3.5" />{t("dashboard.onlyIssues")}
           </button>
-          <select value={sortOrder} onChange={(event) => setSortOrder(event.target.value)} className="h-9 rounded-md border bg-white px-3 text-xs text-foreground outline-none focus:border-primary/50" aria-label={t("dashboard.sortBy")}>
+          <select value={sortOrder} onChange={(event) => { setSortOrder(event.target.value); void recordDashboardUxEvent({ eventType: "filter_applied", source: "market-table", targetType: "market" }); }} className="h-9 rounded-md border bg-white px-3 text-xs text-foreground outline-none focus:border-primary/50" aria-label={t("dashboard.sortBy")}>
             <option value="issues">{t("dashboard.sortIssues")}</option>
             <option value="name">{t("dashboard.sortName")}</option>
             <option value="capacity">{t("dashboard.sortCapacity")}</option>
@@ -245,15 +242,18 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
               </tr>
             </thead>
             <tbody>
-              {rows.length ? rows.map(({ market, state }) => {
+              {rows.length ? rows.map(({ market, state, summary: operational }) => {
                 const capacityPercent = marketCapacityPercent(market);
                 const capacityLimit = isUnlimited(market.parallelCapacity) ? "∞" : market.parallelCapacity > 0 ? String(market.parallelCapacity) : "-";
                 const usageValue = isShareMarket(market) ? compactTokens(market.usageTokens) : `${compactTokens(market.usageTokens)} · ${formatUsdOneDecimal(market.usageAmountUsd)}`;
                 const rowTone = state === "offline" ? "border-l-rose-500" : state === "degraded" ? "border-l-amber-400" : state === "maintenance" ? "border-l-blue-400" : state === "disabled" ? "border-l-slate-300 opacity-70" : "border-l-transparent";
+                const focused = focus.isFocused("market", market.id);
+                const related = focus.isRelated("market", market.id);
+                const dimmed = Boolean(focus.target) && !related;
                 return (
-                  <tr key={market.id} tabIndex={0} className={`cursor-pointer border-b border-l-[3px] outline-none last:border-b-0 hover:bg-primary/[0.03] focus-visible:bg-primary/[0.05] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary/30 ${rowTone}`} onClick={(event) => { if (shouldOpenRowDrawer(event)) setSelected(market); }} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setSelected(market); } }}>
+                  <tr id={`dashboard-market-${market.id}`} key={market.id} tabIndex={0} className={`cursor-pointer border-b border-l-[3px] outline-none transition-opacity last:border-b-0 hover:bg-primary/[0.03] focus-visible:bg-primary/[0.05] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary/30 ${rowTone} ${focused ? "bg-primary/[0.07] ring-2 ring-inset ring-primary/20" : ""} ${dimmed ? "opacity-40" : "opacity-100"}`} onClick={(event) => { if (shouldOpenRowDrawer(event)) { focus.setFocus({ kind: "market", id: market.id, source: "market-table" }); focus.openDrawer("market", market.id); setSelected(market); void recordDashboardUxEvent({ eventType: "drawer_opened", source: "market-table", targetType: "market" }); } }} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); focus.setFocus({ kind: "market", id: market.id, source: "market-table" }); focus.openDrawer("market", market.id); setSelected(market); void recordDashboardUxEvent({ eventType: "drawer_opened", source: "market-table", targetType: "market", keyboard: true }); } }}>
                     <td className="px-3 py-2.5 align-middle"><MarketIdentityCell market={market} t={t} /></td>
-                    <td className="px-3 py-2.5 align-middle"><MarketStatusPill state={state} t={t} /></td>
+                    <td className="px-3 py-2.5 align-middle"><OperationalStatusPill summary={operational} /></td>
                     <td className="px-3 py-2.5 align-middle">
                       <div className="grid gap-1">
                         <strong className="text-xs tabular-nums">{market.activeRequests || 0}<span className="font-normal text-muted-foreground">/{capacityLimit}</span></strong>
@@ -265,13 +265,14 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
                     <td className="px-3 py-2.5 align-middle">
                       <strong className="block text-xs tabular-nums">{market.activeRequests || 0} {t("dashboard.active")}</strong>
                       <span className="block truncate text-[10px] text-muted-foreground" title={usageValue}>{usageValue}</span>
+                      <MarketActivitySparkline market={market} />
                     </td>
                     <td className="px-3 py-2.5 align-middle">
                       <strong className="text-xs tabular-nums">{market.onlineShareCount || 0}<span className="font-normal text-muted-foreground">/{market.shareCount || 0}</span></strong>
                       <span className="block text-[10px] text-muted-foreground">{t("common.online")}</span>
                     </td>
                     <td className="px-3 py-2.5 align-middle">
-                      <span className={`block truncate text-xs font-medium ${state === "offline" ? "text-rose-700" : state === "degraded" ? "text-amber-700" : "text-foreground"}`} title={marketHealthLabel(market, t)}>{marketHealthLabel(market, t)}</span>
+                      <span className={`block truncate text-xs font-medium ${state === "offline" ? "text-rose-700" : state === "degraded" ? "text-amber-700" : "text-foreground"}`} title={operationalReasonLabel(operational.primaryReason, t)}>{operationalReasonLabel(operational.primaryReason, t)}</span>
                       <span className="block text-[10px] text-muted-foreground">{(market.onlineRate24h || 0).toFixed(1)}% · 24h</span>
                     </td>
                     <td className="px-3 py-2.5 align-middle">
@@ -297,7 +298,7 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
           </table>
         </Card.Content>
       </Card>
-      <Drawer isOpen={!!selected} onOpenChange={(open) => !open && setSelected(null)}>
+      <Drawer isOpen={!!selected} onOpenChange={(open) => { if (!open) { setSelected(null); focus.closeDrawer(); } }}>
         <Drawer.Backdrop>
           <Drawer.Content placement="right">
             <Drawer.Dialog className={drawerDialogClassName}>
@@ -312,14 +313,15 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
               <Drawer.Body className="overflow-y-auto">
                 {selected ? (
                   <div className="grid gap-4">
-                    {isUsageMarket(selected) ? (
+                    <OperationalDiagnosis summary={marketOperationalSummary(selected)} kind="market" onEvidence={() => { document.getElementById("market-health-evidence")?.scrollIntoView({ behavior: "smooth" }); void recordDashboardUxEvent({ eventType: "diagnosis_evidence_opened", source: "drawer", targetType: "market" }); }} />
+                    <div id="market-health-evidence">{isUsageMarket(selected) ? (
                       <>
                         <HealthTimelineStrip timeline={selected.healthTimeline} />
                         <DrawerSection label={t("dashboard.officialPrice")}>
                           <MarketPricingCell market={selected} t={t} />
                         </DrawerSection>
                       </>
-                    ) : null}
+                    ) : null}</div>
                     <DrawerSection label={canShowMarketSharePriority(selected) ? t("dashboard.sharePriority") : t("dashboard.linkedShares")}>
                       {canShowMarketSharePriority(selected) ? <MarketSharePriorityPanel market={selected} t={t} /> : <MarketLinkedShares market={selected} t={t} />}
                     </DrawerSection>
@@ -333,7 +335,10 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
           </Drawer.Content>
         </Drawer.Backdrop>
       </Drawer>
-      <MarketEditDialog market={editingMarket} onClose={() => setEditingMarket(null)} onSaved={async () => { await onChanged?.(); }} />
+      <MarketEditDialog market={editingMarket} onClose={() => setEditingMarket(null)} onSaved={async (verification) => {
+        if (editingMarket) trackOperation({ kind: "market", id: editingMarket.id, expectedState: verification?.expectedState });
+        await onChanged?.();
+      }} />
     </section>
   );
 }
@@ -413,7 +418,7 @@ function marketStateRowKey(share: MarketShare, state: MarketShareRuntimeState) {
   ].join(":");
 }
 
-function MarketEditDialog({ market, onClose, onSaved }: { market: DashboardMarket | null; onClose: () => void; onSaved: () => Promise<void> }) {
+function MarketEditDialog({ market, onClose, onSaved }: { market: DashboardMarket | null; onClose: () => void; onSaved: (verification?: { expectedState?: OperationalState }) => Promise<void> }) {
   const [shares, setShares] = React.useState<MarketShare[]>([]);
   const [disabledIds, setDisabledIds] = React.useState<Set<string>>(new Set());
   const [selectedIds, setSelectedIds] = React.useState<Set<string>>(new Set());
@@ -472,7 +477,7 @@ function MarketEditDialog({ market, onClose, onSaved }: { market: DashboardMarke
       });
       setMaintenanceEnabled(response.maintenanceEnabled);
       setMaintenanceMessage(response.maintenanceMessage || "");
-      await onSaved();
+      await onSaved({ expectedState: response.maintenanceEnabled ? "maintenance" : undefined });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {

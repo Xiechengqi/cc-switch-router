@@ -1509,6 +1509,28 @@ pub struct DashboardPresenceResponse {
     pub email_sent_24h: usize,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DashboardUxEventRequest {
+    pub event_type: String,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub target_type: Option<String>,
+    #[serde(default)]
+    pub step_count: Option<u16>,
+    #[serde(default)]
+    pub elapsed_ms: Option<u64>,
+    #[serde(default)]
+    pub keyboard: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DashboardUxEventResponse {
+    pub accepted: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResendUsageResponse {
@@ -1943,6 +1965,49 @@ pub struct DashboardStats {
     pub total_active_requests: usize,
 }
 
+/// Canonical dashboard state shared by the map, entity summaries and drawers.
+/// Raw health/capacity fields remain available as supporting evidence; consumers
+/// should not independently derive a conflicting top-level state from them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationalSummary {
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_reason: Option<OperationalReason>,
+    #[serde(default)]
+    pub additional_reason_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_at: Option<String>,
+}
+
+impl OperationalSummary {
+    pub fn healthy(state: impl Into<String>) -> Self {
+        Self {
+            state: state.into(),
+            primary_reason: None,
+            additional_reason_count: 0,
+            changed_at: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationalReason {
+    pub code: String,
+    pub severity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DashboardTickerShare {
@@ -2029,6 +2094,7 @@ pub struct DashboardClientView {
     pub health_checks: Vec<HealthCheckEntry>,
     #[serde(default)]
     pub health_timeline: Vec<HealthTimelineBucket>,
+    pub operational_summary: OperationalSummary,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2097,6 +2163,7 @@ pub struct DashboardMarketView {
     pub linked_shares: Vec<MarketLinkedShareView>,
     #[serde(default)]
     pub recent_requests: Vec<DashboardMarketRequestLogView>,
+    pub operational_summary: OperationalSummary,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2387,6 +2454,7 @@ pub struct ShareView {
     pub recent_model_health_checks: Vec<ShareModelHealthCheckEntry>,
     #[serde(default)]
     pub model_health: ShareModelHealthSummary,
+    pub operational_summary: OperationalSummary,
 }
 
 #[derive(Debug, Deserialize)]

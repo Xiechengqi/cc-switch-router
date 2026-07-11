@@ -49,6 +49,42 @@ export type MapPoint = {
   activeRequests: number;
 };
 
+export type OperationalState = "available" | "online" | "degraded" | "offline" | "maintenance" | "disabled";
+
+export type OperationalReasonCode =
+  | "route_offline"
+  | "health_check_failed"
+  | "no_online_shares"
+  | "partial_share_outage"
+  | "parallel_capacity_full"
+  | "parallel_capacity_warning"
+  | "usage_limit_warning"
+  | "expired"
+  | "expires_soon"
+  | "provider_unavailable"
+  | "high_latency"
+  | "edit_pending"
+  | "edit_failed"
+  | "maintenance_enabled"
+  | "manually_disabled";
+
+export type OperationalReason = {
+  code: OperationalReasonCode | string;
+  severity: "info" | "warning" | "critical" | string;
+  startedAt?: string;
+  entityType?: "client" | "share" | "market" | "provider" | string;
+  entityId?: string;
+  currentValue?: string;
+  threshold?: string;
+};
+
+export type OperationalSummary = {
+  state: OperationalState;
+  primaryReason?: OperationalReason;
+  additionalReasonCount: number;
+  changedAt?: string;
+};
+
 export type DashboardClient = {
   installation: {
     id: string;
@@ -83,6 +119,7 @@ export type DashboardClient = {
   onlineRate24h?: number;
   healthChecks?: HealthCheckEntry[];
   healthTimeline?: HealthTimelineBucket[];
+  operationalSummary?: OperationalSummary;
 };
 
 export type ShareSaleMarketKind = "token" | "share";
@@ -133,6 +170,7 @@ export type ShareView = {
   appRuntimes?: ShareAppRuntimes;
   appProviders?: ShareAppProviders;
   modelHealth?: ShareModelHealthSummary;
+  operationalSummary?: OperationalSummary;
 };
 
 export type ShareAppAccess = {
@@ -290,6 +328,7 @@ export type DashboardMarket = {
     marketStates?: MarketShareRuntimeState[];
   }>;
   recentRequests?: MarketRequestLog[];
+  operationalSummary?: OperationalSummary;
 };
 
 export type MarketShare = {

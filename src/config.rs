@@ -57,6 +57,8 @@ pub struct Config {
     pub board_user_per_hour: i64,
     pub board_pin_limit: i64,
     pub board_guest_self_delete_secs: i64,
+    pub ux_telemetry_enabled: bool,
+    pub ux_telemetry_retention_days: u32,
     pub metrics: MetricsConfig,
 }
 
@@ -167,6 +169,10 @@ impl Config {
             board_guest_self_delete_secs: env_var("CC_SWITCH_ROUTER_BOARD_GUEST_SELF_DELETE_SECS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(300),
+            ux_telemetry_enabled: env_bool("CC_SWITCH_ROUTER_UX_TELEMETRY_ENABLED", false),
+            ux_telemetry_retention_days: env_var("CC_SWITCH_ROUTER_UX_TELEMETRY_RETENTION_DAYS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(7),
             metrics: MetricsConfig {
                 enabled: env_bool("CC_SWITCH_ROUTER_METRICS_ENABLED", true),
                 db_path: env_var("CC_SWITCH_ROUTER_METRICS_DB_PATH")
@@ -331,6 +337,8 @@ CC_SWITCH_ROUTER_BOARD_GUEST_PER_HOUR=5
 CC_SWITCH_ROUTER_BOARD_USER_PER_HOUR=30
 CC_SWITCH_ROUTER_BOARD_PIN_LIMIT=3
 CC_SWITCH_ROUTER_BOARD_GUEST_SELF_DELETE_SECS=300
+CC_SWITCH_ROUTER_UX_TELEMETRY_ENABLED=false
+CC_SWITCH_ROUTER_UX_TELEMETRY_RETENTION_DAYS=7
 CC_SWITCH_ROUTER_METRICS_ENABLED=true
 CC_SWITCH_ROUTER_METRICS_DB_PATH={}
 CC_SWITCH_ROUTER_METRICS_RETENTION_DAYS=7
@@ -455,6 +463,8 @@ mod tests {
             board_user_per_hour: 30,
             board_pin_limit: 3,
             board_guest_self_delete_secs: 300,
+            ux_telemetry_enabled: false,
+            ux_telemetry_retention_days: 7,
             metrics: MetricsConfig {
                 enabled: true,
                 db_path: PathBuf::from("/tmp/test-metrics.db"),

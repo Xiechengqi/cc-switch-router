@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use base64::Engine;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rand::distributions::{Alphanumeric, DistString};
 use resend_rs::Resend;
@@ -31,30 +31,31 @@ use crate::models::{
     ClientTunnelUpdateRequest, ClientTunnelView, DashboardClientTunnelView, DashboardClientView,
     DashboardMap, DashboardMapPoint, DashboardMarketRequestLogView, DashboardMarketView,
     DashboardPayoutProfileView, DashboardPresenceRequest, DashboardResponse, DashboardStats,
-    DashboardTickerShare, GatewayRegistryRecord, GetInstallationOwnerEmailQuery,
-    GetInstallationOwnerEmailResponse, HealthCheckEntry, HealthTimelineBucket,
-    ImageGenerationRequestLogEntry, Installation, InstallationPayoutProfileUpdateRequest,
-    InstallationPayoutProfileUpdateResponse, InstallationView, IssueLeaseRequest,
-    IssueLeaseResponse, LatLonPoint, MarketAppAvailability, MarketAppAvailabilityEntry,
-    MarketDisabledSharesUpdateRequest, MarketDisabledSharesUpdateResponse, MarketLinkedShareView,
-    MarketMaintenanceUpdateRequest, MarketMaintenanceUpdateResponse, MarketRegistryRecord,
-    MarketRequestLogBatchSyncRequest, MarketRequestLogEntry, MarketShareAppView,
-    MarketShareRuntimeStateInput, MarketShareRuntimeStateView, MarketShareView, ModelHealthSummary,
-    PayoutProfile, PublicMapClientPoint, PublicMapPointsResponse, PublicMarketConfig,
-    PublicNetworkStatsResponse, PublicPayoutProfileResponse, PublicPayoutProfilesResponse,
-    RefreshSessionRequest, RegisterGatewayRequest, RegisterGatewayResponse,
-    RegisterInstallationRequest, RegisterInstallationResponse, RegisterMarketRequest,
-    RenewLeaseRequest, RenewLeaseResponse, RequestEmailCodeRequest, RequestEmailCodeResponse,
-    SessionStatusResponse, ShareAppAccess, ShareAppAvailability, ShareAppProviders,
-    ShareAppRuntimes, ShareAppSettings, ShareBatchSyncRequest, ShareClaimPayload,
-    ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptor, ShareEditAckRequest,
-    ShareEditView, ShareHeartbeatRequest, ShareMarketGrantRequest, ShareMarketGrantResponse,
-    ShareMarketGrantStatusResponse, ShareMarketLinkView, ShareMarketListingStatusInput,
-    ShareMarketListingStatusView, ShareModelHealthCheckEntry, ShareModelHealthSummary,
-    SharePendingEditsRequest, SharePendingEditsResponse, ShareRequestLogBatchSyncRequest,
-    ShareRequestLogEntry, ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload,
-    ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse, ShareSettingsPatch,
-    ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest,
+    DashboardTickerShare, DashboardUxEventRequest, GatewayRegistryRecord,
+    GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse, HealthCheckEntry,
+    HealthTimelineBucket, ImageGenerationRequestLogEntry, Installation,
+    InstallationPayoutProfileUpdateRequest, InstallationPayoutProfileUpdateResponse,
+    InstallationView, IssueLeaseRequest, IssueLeaseResponse, LatLonPoint, MarketAppAvailability,
+    MarketAppAvailabilityEntry, MarketDisabledSharesUpdateRequest,
+    MarketDisabledSharesUpdateResponse, MarketLinkedShareView, MarketMaintenanceUpdateRequest,
+    MarketMaintenanceUpdateResponse, MarketRegistryRecord, MarketRequestLogBatchSyncRequest,
+    MarketRequestLogEntry, MarketShareAppView, MarketShareRuntimeStateInput,
+    MarketShareRuntimeStateView, MarketShareView, ModelHealthSummary, OperationalReason,
+    OperationalSummary, PayoutProfile, PublicMapClientPoint, PublicMapPointsResponse,
+    PublicMarketConfig, PublicNetworkStatsResponse, PublicPayoutProfileResponse,
+    PublicPayoutProfilesResponse, RefreshSessionRequest, RegisterGatewayRequest,
+    RegisterGatewayResponse, RegisterInstallationRequest, RegisterInstallationResponse,
+    RegisterMarketRequest, RenewLeaseRequest, RenewLeaseResponse, RequestEmailCodeRequest,
+    RequestEmailCodeResponse, SessionStatusResponse, ShareAppAccess, ShareAppAvailability,
+    ShareAppProviders, ShareAppRuntimes, ShareAppSettings, ShareBatchSyncRequest,
+    ShareClaimPayload, ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptor,
+    ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest, ShareMarketGrantRequest,
+    ShareMarketGrantResponse, ShareMarketGrantStatusResponse, ShareMarketLinkView,
+    ShareMarketListingStatusInput, ShareMarketListingStatusView, ShareModelHealthCheckEntry,
+    ShareModelHealthSummary, SharePendingEditsRequest, SharePendingEditsResponse,
+    ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRequestLogFetchResponse,
+    ShareRuntimeRefreshPayload, ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse,
+    ShareSettingsPatch, ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest,
     ShareUpstreamProvider, ShareUpstreamQuota, ShareUsageByEmailResponse, ShareUsageDailyBucket,
     ShareUsageEmailRow, ShareView, TunnelLease, UserApiTokenResetResponse, UserApiTokenResponse,
     UserApiTokenStatus, UserShareView, UserSharesResponse, VerifyEmailCodeRequest,
@@ -100,6 +101,467 @@ const GATEWAY_DEFAULT_SCOPES: &[&str] = &[
 ];
 const USER_DEFAULT_API_TOKEN_SCOPES: &[&str] = &["share:read", "share:write", "share:invoke"];
 const USER_DEFAULT_API_TOKEN_NAME: &str = "default";
+const DASHBOARD_EXPIRY_WARNING_DAYS: i64 = 7;
+const DASHBOARD_CAPACITY_WARNING_RATIO: f64 = 0.9;
+const DASHBOARD_HIGH_LATENCY_MS: u64 = 2_000;
+
+fn operational_reason(
+    code: &str,
+    severity: &str,
+    started_at: Option<String>,
+    entity_type: Option<&str>,
+    entity_id: Option<&str>,
+    current_value: Option<String>,
+    threshold: Option<String>,
+) -> OperationalReason {
+    OperationalReason {
+        code: code.to_string(),
+        severity: severity.to_string(),
+        started_at,
+        entity_type: entity_type.map(str::to_string),
+        entity_id: entity_id.map(str::to_string),
+        current_value,
+        threshold,
+    }
+}
+
+fn operational_summary(state: &str, reasons: Vec<OperationalReason>) -> OperationalSummary {
+    let changed_at = reasons.first().and_then(|reason| reason.started_at.clone());
+    OperationalSummary {
+        state: state.to_string(),
+        primary_reason: reasons.first().cloned(),
+        additional_reason_count: reasons.len().saturating_sub(1),
+        changed_at,
+    }
+}
+
+fn unix_timestamp_rfc3339(value: i64) -> Option<String> {
+    Utc.timestamp_opt(value, 0)
+        .single()
+        .map(|timestamp| timestamp.to_rfc3339())
+}
+
+fn share_model_health_failed(share: &ShareView) -> bool {
+    let entries = match share.app_type.trim().to_ascii_lowercase().as_str() {
+        "claude" => &share.model_health.claude,
+        "codex" => &share.model_health.codex,
+        "gemini" => &share.model_health.gemini,
+        _ => return false,
+    };
+    !entries.is_empty()
+        && entries.iter().all(|entry| {
+            let recent = entry
+                .recent_results
+                .iter()
+                .rev()
+                .take(3)
+                .collect::<Vec<_>>();
+            (!recent.is_empty() && recent.iter().all(|result| result.as_str() == "failed"))
+                || matches!(entry.status.as_str(), "failed" | "unavailable" | "blocked")
+        })
+}
+
+fn share_operational_summary(share: &ShareView, now: DateTime<Utc>) -> OperationalSummary {
+    let status = share.share_status.trim().to_ascii_lowercase();
+    if status != "active" {
+        let (code, severity) = if status == "expired" {
+            ("expired", "critical")
+        } else {
+            ("manually_disabled", "info")
+        };
+        return operational_summary(
+            "disabled",
+            vec![operational_reason(
+                code,
+                severity,
+                (status == "expired").then(|| share.expires_at.clone()),
+                Some("share"),
+                Some(&share.share_id),
+                Some(status),
+                None,
+            )],
+        );
+    }
+
+    let mut reasons = Vec::new();
+    if !share.is_online {
+        reasons.push(operational_reason(
+            "route_offline",
+            "critical",
+            None,
+            Some("share"),
+            Some(&share.share_id),
+            None,
+            None,
+        ));
+    }
+    if let Some(edit) = &share.active_edit {
+        if edit.status == "rejected" {
+            reasons.push(operational_reason(
+                "edit_failed",
+                "critical",
+                Some(edit.updated_at.to_rfc3339()),
+                Some("share"),
+                Some(&share.share_id),
+                edit.error_message.clone(),
+                None,
+            ));
+        } else if edit.status == "pending" {
+            reasons.push(operational_reason(
+                "edit_pending",
+                "warning",
+                Some(edit.updated_at.to_rfc3339()),
+                Some("share"),
+                Some(&share.share_id),
+                None,
+                None,
+            ));
+        }
+    }
+
+    if let Ok(expires_at) = DateTime::parse_from_rfc3339(&share.expires_at) {
+        let remaining = expires_at.with_timezone(&Utc) - now;
+        if expires_at.year() < 2099 {
+            if remaining.num_seconds() <= 0 {
+                reasons.push(operational_reason(
+                    "expired",
+                    "critical",
+                    Some(share.expires_at.clone()),
+                    Some("share"),
+                    Some(&share.share_id),
+                    Some("0".to_string()),
+                    None,
+                ));
+            } else if remaining <= Duration::days(DASHBOARD_EXPIRY_WARNING_DAYS) {
+                reasons.push(operational_reason(
+                    "expires_soon",
+                    "warning",
+                    Some(
+                        (expires_at.with_timezone(&Utc)
+                            - Duration::days(DASHBOARD_EXPIRY_WARNING_DAYS))
+                        .to_rfc3339(),
+                    ),
+                    Some("share"),
+                    Some(&share.share_id),
+                    Some(remaining.num_seconds().to_string()),
+                    Some((Duration::days(DASHBOARD_EXPIRY_WARNING_DAYS).num_seconds()).to_string()),
+                ));
+            }
+        }
+    }
+
+    if share_model_health_failed(share) {
+        let checked_at = share
+            .recent_model_health_checks
+            .iter()
+            .map(|entry| entry.checked_at)
+            .max()
+            .and_then(unix_timestamp_rfc3339);
+        reasons.push(operational_reason(
+            "provider_unavailable",
+            "critical",
+            checked_at,
+            Some("provider"),
+            share.provider_id.as_deref(),
+            None,
+            None,
+        ));
+    }
+
+    let app_key = share.app_type.trim().to_ascii_lowercase();
+    let settings = share.app_settings.get(&app_key);
+    let parallel_limit = settings
+        .map(|value| value.parallel_limit)
+        .unwrap_or(share.parallel_limit);
+    let token_limit = settings
+        .map(|value| value.token_limit)
+        .unwrap_or(share.token_limit);
+    let active_requests = share
+        .active_requests_by_app
+        .get(&app_key)
+        .copied()
+        .unwrap_or(share.active_requests);
+    let tokens_used = share
+        .tokens_used_by_app
+        .get(&app_key)
+        .copied()
+        .unwrap_or(share.tokens_used);
+    if parallel_limit > 0 && active_requests as i64 >= parallel_limit {
+        reasons.push(operational_reason(
+            "parallel_capacity_full",
+            "critical",
+            None,
+            Some("share"),
+            Some(&share.share_id),
+            Some(active_requests.to_string()),
+            Some(parallel_limit.to_string()),
+        ));
+    }
+    if token_limit > 0
+        && tokens_used >= 0
+        && tokens_used as f64 / token_limit as f64 >= DASHBOARD_CAPACITY_WARNING_RATIO
+    {
+        reasons.push(operational_reason(
+            "usage_limit_warning",
+            "warning",
+            None,
+            Some("share"),
+            Some(&share.share_id),
+            Some(tokens_used.to_string()),
+            Some(token_limit.to_string()),
+        ));
+    }
+    if let Some(health) = share.health_checks.last().filter(|entry| !entry.is_healthy) {
+        reasons.push(operational_reason(
+            "health_check_failed",
+            "warning",
+            unix_timestamp_rfc3339(health.checked_at),
+            Some("share"),
+            Some(&share.share_id),
+            None,
+            None,
+        ));
+    }
+    let recent_latency = share
+        .recent_requests
+        .iter()
+        .rev()
+        .take(10)
+        .filter(|request| !request.is_health_check)
+        .map(|request| request.latency_ms)
+        .filter(|value| *value > 0)
+        .collect::<Vec<_>>();
+    if !recent_latency.is_empty() {
+        let average = recent_latency.iter().sum::<u64>() / recent_latency.len() as u64;
+        if average >= DASHBOARD_HIGH_LATENCY_MS {
+            reasons.push(operational_reason(
+                "high_latency",
+                "warning",
+                share
+                    .recent_requests
+                    .last()
+                    .and_then(|request| unix_timestamp_rfc3339(request.created_at)),
+                Some("share"),
+                Some(&share.share_id),
+                Some(average.to_string()),
+                Some(DASHBOARD_HIGH_LATENCY_MS.to_string()),
+            ));
+        }
+    }
+
+    if !share.is_online {
+        operational_summary("offline", reasons)
+    } else if reasons.is_empty() {
+        OperationalSummary::healthy("online")
+    } else {
+        operational_summary("degraded", reasons)
+    }
+}
+
+fn client_operational_summary(
+    client: &DashboardClientView,
+    shares_by_id: &HashMap<String, &ShareView>,
+    stale_seconds: i64,
+    now: DateTime<Utc>,
+) -> OperationalSummary {
+    let shares = client
+        .share_ids
+        .iter()
+        .filter_map(|share_id| shares_by_id.get(share_id).copied())
+        .collect::<Vec<_>>();
+    let enabled = shares
+        .iter()
+        .filter(|share| share.share_status.eq_ignore_ascii_case("active"))
+        .copied()
+        .collect::<Vec<_>>();
+    let online = enabled.iter().filter(|share| share.is_online).count();
+    let mut reasons = Vec::new();
+    if !enabled.is_empty() && online == 0 {
+        reasons.push(operational_reason(
+            "route_offline",
+            "critical",
+            None,
+            Some("client"),
+            Some(&client.installation.id),
+            Some("0".to_string()),
+            Some(enabled.len().to_string()),
+        ));
+    } else if online < enabled.len() {
+        reasons.push(operational_reason(
+            "partial_share_outage",
+            "warning",
+            None,
+            Some("client"),
+            Some(&client.installation.id),
+            Some(online.to_string()),
+            Some(enabled.len().to_string()),
+        ));
+    }
+    if let Some(degraded_share) = enabled
+        .iter()
+        .find(|share| share.operational_summary.state == "degraded")
+    {
+        if let Some(mut reason) = degraded_share.operational_summary.primary_reason.clone() {
+            reason.entity_type = Some("share".to_string());
+            reason.entity_id = Some(degraded_share.share_id.clone());
+            reasons.push(reason);
+        }
+    }
+    if let Some(health) = (!enabled.is_empty() || shares.is_empty())
+        .then(|| client.health_checks.last())
+        .flatten()
+        .filter(|entry| !entry.is_healthy)
+    {
+        reasons.push(operational_reason(
+            "health_check_failed",
+            "warning",
+            unix_timestamp_rfc3339(health.checked_at),
+            Some("client"),
+            Some(&client.installation.id),
+            None,
+            None,
+        ));
+    }
+
+    let no_enabled_route = enabled.is_empty();
+    let tunnel_offline = client
+        .client_tunnel
+        .as_ref()
+        .is_some_and(|tunnel| tunnel.enabled && !tunnel.online);
+    let heartbeat_stale = now - client.installation.last_seen_at > Duration::seconds(stale_seconds);
+    if no_enabled_route
+        && (tunnel_offline
+            || (client.client_tunnel.is_none() && shares.is_empty() && heartbeat_stale))
+    {
+        reasons.insert(
+            0,
+            operational_reason(
+                "route_offline",
+                "critical",
+                Some(client.installation.last_seen_at.to_rfc3339()),
+                Some("client"),
+                Some(&client.installation.id),
+                None,
+                None,
+            ),
+        );
+    }
+
+    if reasons
+        .first()
+        .is_some_and(|reason| reason.severity == "critical" && reason.code == "route_offline")
+    {
+        operational_summary("offline", reasons)
+    } else if reasons.is_empty() {
+        OperationalSummary::healthy("online")
+    } else {
+        operational_summary("degraded", reasons)
+    }
+}
+
+fn market_operational_summary(market: &DashboardMarketView) -> OperationalSummary {
+    let status = market.status.trim().to_ascii_lowercase();
+    if status == "disabled" {
+        return operational_summary(
+            "disabled",
+            vec![operational_reason(
+                "manually_disabled",
+                "info",
+                Some(market.updated_at.clone()),
+                Some("market"),
+                Some(&market.id),
+                None,
+                None,
+            )],
+        );
+    }
+    if market.maintenance_enabled {
+        return operational_summary(
+            "maintenance",
+            vec![operational_reason(
+                "maintenance_enabled",
+                "info",
+                Some(market.updated_at.clone()),
+                Some("market"),
+                Some(&market.id),
+                market.maintenance_message.clone(),
+                None,
+            )],
+        );
+    }
+    let mut reasons = Vec::new();
+    if !market.online || status == "offline" {
+        reasons.push(operational_reason(
+            "route_offline",
+            "critical",
+            market
+                .offline_since
+                .clone()
+                .or_else(|| Some(market.last_seen_at.clone())),
+            Some("market"),
+            Some(&market.id),
+            None,
+            None,
+        ));
+    }
+    if market.online_share_count == 0 {
+        reasons.push(operational_reason(
+            "no_online_shares",
+            "critical",
+            market.offline_since.clone(),
+            Some("market"),
+            Some(&market.id),
+            Some("0".to_string()),
+            Some(market.share_count.max(1).to_string()),
+        ));
+    }
+    if market.parallel_capacity > 0 {
+        let percent = market.active_requests as f64 / market.parallel_capacity as f64;
+        if percent >= 1.0 {
+            reasons.push(operational_reason(
+                "parallel_capacity_full",
+                "critical",
+                None,
+                Some("market"),
+                Some(&market.id),
+                Some(market.active_requests.to_string()),
+                Some(market.parallel_capacity.to_string()),
+            ));
+        } else if percent >= DASHBOARD_CAPACITY_WARNING_RATIO {
+            reasons.push(operational_reason(
+                "parallel_capacity_warning",
+                "warning",
+                None,
+                Some("market"),
+                Some(&market.id),
+                Some(market.active_requests.to_string()),
+                Some(market.parallel_capacity.to_string()),
+            ));
+        }
+    }
+    if let Some(health) = market
+        .health_checks
+        .last()
+        .filter(|entry| !entry.is_healthy)
+    {
+        reasons.push(operational_reason(
+            "health_check_failed",
+            "warning",
+            unix_timestamp_rfc3339(health.checked_at),
+            Some("market"),
+            Some(&market.id),
+            None,
+            None,
+        ));
+    }
+    if !market.online || status == "offline" {
+        operational_summary("offline", reasons)
+    } else if reasons.is_empty() {
+        OperationalSummary::healthy("available")
+    } else {
+        operational_summary("degraded", reasons)
+    }
+}
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -868,6 +1330,73 @@ impl AppStore {
             )
             .map_err(|e| AppError::Internal(format!("count dashboard presence failed: {e}")))?;
         Ok(count as usize)
+    }
+
+    pub async fn record_dashboard_ux_event(
+        &self,
+        input: DashboardUxEventRequest,
+        retention_days: u32,
+    ) -> Result<(), AppError> {
+        const ALLOWED_EVENTS: &[&str] = &[
+            "dashboard_focus_set",
+            "dashboard_focus_clear",
+            "map_request_selected",
+            "client_located_from_map",
+            "share_located_from_request",
+            "market_located_from_share",
+            "drawer_opened",
+            "diagnosis_evidence_opened",
+            "filter_applied",
+            "operation_submitted",
+            "operation_verified",
+        ];
+        let event_type = input.event_type.trim();
+        if !ALLOWED_EVENTS.contains(&event_type) {
+            return Err(AppError::BadRequest(
+                "unsupported dashboard UX event".into(),
+            ));
+        }
+        let source = input.source.as_deref().map(str::trim).filter(|value| {
+            matches!(
+                *value,
+                "map" | "client-board" | "market-table" | "drawer" | "activity"
+            )
+        });
+        let target_type = input
+            .target_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| matches!(*value, "request" | "client" | "share" | "market"));
+        let now = Utc::now();
+        let cutoff = now - Duration::days(i64::from(retention_days.clamp(1, 90)));
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO dashboard_ux_events (
+                id, event_type, source, target_type, step_count, elapsed_ms, keyboard, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                Uuid::new_v4().to_string(),
+                event_type,
+                source,
+                target_type,
+                input.step_count.map(|value| i64::from(value.min(100))),
+                input
+                    .elapsed_ms
+                    .map(|value| value.min(60 * 60 * 1000) as i64),
+                i64::from(input.keyboard),
+                now.to_rfc3339(),
+            ],
+        )
+        .map_err(|e| AppError::Internal(format!("record dashboard UX event failed: {e}")))?;
+        conn.execute(
+            "DELETE FROM dashboard_ux_events
+             WHERE created_at < ?1 OR id IN (
+               SELECT id FROM dashboard_ux_events ORDER BY created_at DESC LIMIT -1 OFFSET 10000
+             )",
+            params![cutoff.to_rfc3339()],
+        )
+        .map_err(|e| AppError::Internal(format!("prune dashboard UX events failed: {e}")))?;
+        Ok(())
     }
 
     pub async fn count_sent_emails_last_24h(&self) -> Result<usize, AppError> {
@@ -1785,7 +2314,7 @@ impl AppStore {
         let is_online =
             share.share_status == "active" && active_subdomains.contains(&share.subdomain);
         let active_requests = inflight_by_share.get(&share.share_id).copied().unwrap_or(0);
-        Ok(ShareView {
+        let mut view = ShareView {
             router_id: "main".to_string(),
             share_id: share.share_id,
             share_name: share.share_name,
@@ -1845,7 +2374,10 @@ impl AppStore {
             health_timeline: Vec::new(),
             recent_model_health_checks: Vec::new(),
             model_health: ShareModelHealthSummary::default(),
-        })
+            operational_summary: OperationalSummary::healthy("online"),
+        };
+        view.operational_summary = share_operational_summary(&view, Utc::now());
+        Ok(view)
     }
 
     pub async fn user_can_invoke_share(
@@ -3543,7 +4075,7 @@ impl AppStore {
                     .get(&share.share_id)
                     .cloned()
                     .unwrap_or_default();
-                ShareView {
+                let mut view = ShareView {
                     router_id: "main".to_string(),
                     share_id: share.share_id,
                     share_name: share.share_name,
@@ -3606,7 +4138,10 @@ impl AppStore {
                     health_timeline,
                     recent_model_health_checks,
                     model_health,
-                }
+                    operational_summary: OperationalSummary::healthy("online"),
+                };
+                view.operational_summary = share_operational_summary(&view, Utc::now());
+                view
             })
             .collect::<Vec<_>>();
         let active_requests_by_installation =
@@ -3663,6 +4198,10 @@ impl AppStore {
                 })
                 .or_insert_with(|| share.health_timeline.clone());
         }
+        let share_views_by_id = share_views
+            .iter()
+            .map(|share| (share.share_id.clone(), share))
+            .collect::<HashMap<_, _>>();
         let mut client_views = installation_views
             .iter()
             .cloned()
@@ -3728,7 +4267,7 @@ impl AppStore {
                         health_timeline = current_online_health_timeline(health_timeline_start);
                     }
                 }
-                DashboardClientView {
+                let mut view = DashboardClientView {
                     share_count,
                     share_ids,
                     client_tunnel,
@@ -3738,7 +4277,15 @@ impl AppStore {
                     health_checks,
                     health_timeline,
                     installation,
-                }
+                    operational_summary: OperationalSummary::healthy("online"),
+                };
+                view.operational_summary = client_operational_summary(
+                    &view,
+                    &share_views_by_id,
+                    config.client_stale_secs,
+                    Utc::now(),
+                );
+                view
             })
             // 只展示有 share 或已配置 client tunnel 的机器；otherwise dashboard 会被纯
             // lease/heartbeat 但无可用入口的 installation 撑满。
@@ -7583,6 +8130,17 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             last_seen_at INTEGER NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS dashboard_ux_events (
+            id TEXT PRIMARY KEY,
+            event_type TEXT NOT NULL,
+            source TEXT,
+            target_type TEXT,
+            step_count INTEGER,
+            elapsed_ms INTEGER,
+            keyboard INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS email_send_logs (
             id TEXT PRIMARY KEY,
             email_type TEXT NOT NULL,
@@ -7747,6 +8305,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         CREATE INDEX IF NOT EXISTS idx_share_model_health_checks_share ON share_model_health_checks(share_id, app_type, requested_model, checked_at DESC);
         CREATE INDEX IF NOT EXISTS idx_share_model_health_state_share ON share_model_health_state(share_id, app_type, last_status);
         CREATE INDEX IF NOT EXISTS idx_dashboard_presence_last_seen ON dashboard_presence(last_seen_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_dashboard_ux_events_created ON dashboard_ux_events(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_email_send_logs_created_at ON email_send_logs(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_request_nonces_created_at ON request_nonces(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_auth_challenges_email ON email_login_challenges(email_normalized, created_at DESC);
@@ -12763,6 +13322,7 @@ fn list_dashboard_markets(
                 health_timeline: Vec::new(),
                 linked_shares: Vec::new(),
                 recent_requests: Vec::new(),
+                operational_summary: OperationalSummary::healthy("available"),
                 subdomain,
             })
         })
@@ -12791,6 +13351,7 @@ fn list_dashboard_markets(
             &app_availability_by_market,
             &runtime_states_by_market,
         );
+        market.operational_summary = market_operational_summary(market);
     }
     Ok(markets)
 }
@@ -15314,6 +15875,8 @@ mod tests {
             board_user_per_hour: 30,
             board_pin_limit: 3,
             board_guest_self_delete_secs: 300,
+            ux_telemetry_enabled: false,
+            ux_telemetry_retention_days: 7,
             metrics: crate::config::MetricsConfig {
                 enabled: true,
                 db_path: std::env::temp_dir().join(format!(
@@ -16034,6 +16597,7 @@ mod tests {
             health_timeline: Vec::new(),
             linked_shares: Vec::new(),
             recent_requests: Vec::new(),
+            operational_summary: OperationalSummary::healthy("available"),
         };
 
         enrich_dashboard_market(
@@ -16067,6 +16631,16 @@ mod tests {
                 .last()
                 .map(|entry| entry.is_healthy)
                 .unwrap_or(false)
+        );
+        assert_eq!(market_operational_summary(&market).state, "available");
+        market.active_requests = market.parallel_capacity as usize;
+        let full = market_operational_summary(&market);
+        assert_eq!(full.state, "degraded");
+        assert_eq!(
+            full.primary_reason
+                .as_ref()
+                .map(|reason| reason.code.as_str()),
+            Some("parallel_capacity_full")
         );
     }
 
@@ -16102,6 +16676,7 @@ mod tests {
             health_timeline: Vec::new(),
             linked_shares: Vec::new(),
             recent_requests: Vec::new(),
+            operational_summary: OperationalSummary::healthy("available"),
         };
 
         enrich_dashboard_market(
@@ -19877,6 +20452,88 @@ mod tests {
             snapshot.shares.first().expect("share view").share_status,
             "paused"
         );
+        assert_eq!(
+            snapshot
+                .shares
+                .first()
+                .expect("share view")
+                .operational_summary
+                .state,
+            "disabled"
+        );
+        assert_eq!(snapshot.clients[0].operational_summary.state, "online");
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn dashboard_operational_summary_marks_missing_active_route_offline() {
+        let (store, config) = setup_store("dashboard-operational-offline").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-offline", "offline-sub", "active").await;
+
+        let snapshot = store
+            .dashboard_snapshot(
+                &config,
+                &ServerGeo {
+                    lat: None,
+                    lon: None,
+                },
+                &ProxyRegistry::default(),
+                None,
+            )
+            .await
+            .expect("dashboard snapshot");
+        let share = snapshot.shares.first().expect("share");
+        assert_eq!(share.operational_summary.state, "offline");
+        assert_eq!(
+            share
+                .operational_summary
+                .primary_reason
+                .as_ref()
+                .map(|reason| reason.code.as_str()),
+            Some("route_offline")
+        );
+        assert_eq!(snapshot.clients[0].operational_summary.state, "offline");
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn local_ux_telemetry_records_only_minimized_fields() {
+        let (store, config) = setup_store("dashboard-ux-telemetry").await;
+        store
+            .record_dashboard_ux_event(
+                DashboardUxEventRequest {
+                    event_type: "dashboard_focus_set".into(),
+                    source: Some("map".into()),
+                    target_type: Some("client".into()),
+                    step_count: Some(1),
+                    elapsed_ms: Some(25),
+                    keyboard: false,
+                },
+                7,
+            )
+            .await
+            .expect("record UX event");
+        let conn = store.conn.lock().await;
+        let row: (String, Option<String>, Option<String>, i64) = conn
+            .query_row(
+                "SELECT event_type, source, target_type, keyboard FROM dashboard_ux_events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("UX event row");
+        assert_eq!(
+            row,
+            (
+                "dashboard_focus_set".into(),
+                Some("map".into()),
+                Some("client".into()),
+                0
+            )
+        );
+        drop(conn);
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
