@@ -2808,7 +2808,24 @@ fn is_public_client_web_path(path: &str) -> bool {
             | "/web-api/auth/initial-setup"
             | "/web-api/oauth/claude-cli/callback"
             | "/web-api/oauth/openai-cli/callback"
-    )
+    ) || is_public_client_debug_path(path)
+}
+
+fn is_public_client_debug_path(path: &str) -> bool {
+    if matches!(
+        path,
+        "/web-api/debug/runtime"
+            | "/web-api/debug/diagnostics"
+            | "/web-api/debug/logs/tail"
+            | "/web-api/debug/restart"
+            | "/web-api/debug/upgrade"
+            | "/web-api/debug/upgrade/status"
+            | "/web-api/debug/upgrade/stream"
+    ) {
+        return true;
+    }
+    path.strip_prefix("/web-api/debug/operations/")
+        .is_some_and(|id| id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 fn client_web_required_api_token_scope(path: &str) -> &'static str {
@@ -3303,6 +3320,45 @@ data: {"data":[{"b64_json":"iVBORw0KGgo="}]}
         ));
         assert!(is_client_web_auth_required_path("/web-api/admin/logs/tail"));
         assert!(is_client_web_auth_required_path("/web-api/future-command"));
+        assert!(!is_client_web_auth_required_path(
+            "/web-api/debug/diagnostics"
+        ));
+        assert!(!is_client_web_auth_required_path(
+            "/web-api/debug/operations/0123456789abcdef0123456789abcdef"
+        ));
+        assert!(is_client_web_auth_required_path(
+            "/web-api/debug/operations/not-an-operation-id"
+        ));
+        assert!(is_client_web_auth_required_path(
+            "/web-api/debug/future-capability"
+        ));
+    }
+
+    #[test]
+    fn debug_api_public_paths_are_explicit() {
+        for path in [
+            "/web-api/debug/runtime",
+            "/web-api/debug/diagnostics",
+            "/web-api/debug/logs/tail",
+            "/web-api/debug/restart",
+            "/web-api/debug/upgrade",
+            "/web-api/debug/upgrade/status",
+            "/web-api/debug/upgrade/stream",
+            "/web-api/debug/operations/0123456789abcdef0123456789abcdef",
+        ] {
+            assert!(is_public_client_debug_path(path), "{path}");
+        }
+        for path in [
+            "/web-api/debug",
+            "/web-api/debug/",
+            "/web-api/debug/restart/extra",
+            "/web-api/debug/operations/",
+            "/web-api/debug/operations/../../admin",
+            "/web-api/debug/future",
+            "/web-api/invoke/restart_server_service",
+        ] {
+            assert!(!is_public_client_debug_path(path), "{path}");
+        }
     }
 
     #[test]
