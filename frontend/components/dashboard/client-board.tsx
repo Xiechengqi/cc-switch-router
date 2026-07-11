@@ -289,6 +289,16 @@ function ClientCard({
   const focused = focus.isFocused("client", client.installation.id);
   const related = focus.isRelated("client", client.installation.id);
   const dimmed = Boolean(focus.target) && !related;
+  const headerClickTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  React.useEffect(() => () => {
+    if (headerClickTimeoutRef.current) clearTimeout(headerClickTimeoutRef.current);
+  }, []);
+
+  const openClientDrawer = React.useCallback(() => {
+    focus.setFocus({ kind: "client", id: client.installation.id, source: "client-board" });
+    onOpenClient(client);
+  }, [client, focus, onOpenClient]);
 
   return (
     <Card id={`dashboard-client-${client.installation.id}`} className={`overflow-hidden rounded-lg border border-l-[3px] bg-white p-0 shadow-sm transition-[border-color,box-shadow,opacity] ${borderTone} ${focused ? "ring-2 ring-primary/20" : ""} ${dimmed ? "opacity-40" : "opacity-100"}`}>
@@ -297,18 +307,27 @@ function ClientCard({
           className="grid min-h-14 cursor-pointer select-text grid-cols-[minmax(300px,1.35fr)_minmax(330px,1fr)_auto] items-center gap-4 rounded-md px-1.5 py-1 outline-none transition-colors hover:bg-primary/[0.03] focus-visible:ring-2 focus-visible:ring-primary/30"
           onMouseDown={onRowPointerDown}
           onClick={(event) => {
-            if (shouldOpenRowDrawer(event)) {
-              focus.setFocus({ kind: "client", id: client.installation.id, source: "client-board" });
-              onOpenClient(client);
+            if (!shouldOpenRowDrawer(event)) return;
+            if (headerClickTimeoutRef.current) clearTimeout(headerClickTimeoutRef.current);
+            headerClickTimeoutRef.current = setTimeout(() => {
+              headerClickTimeoutRef.current = null;
+              onToggleCollapsed();
+            }, 220);
+          }}
+          onDoubleClick={(event) => {
+            if (!shouldOpenRowDrawer(event)) return;
+            if (headerClickTimeoutRef.current) {
+              clearTimeout(headerClickTimeoutRef.current);
+              headerClickTimeoutRef.current = null;
             }
+            openClientDrawer();
           }}
           role="button"
           tabIndex={0}
           onKeyDown={(event) => {
             if ((event.key === "Enter" || event.key === " ") && event.target === event.currentTarget) {
               event.preventDefault();
-              focus.setFocus({ kind: "client", id: client.installation.id, source: "client-board" });
-              onOpenClient(client);
+              onToggleCollapsed();
             }
           }}
         >

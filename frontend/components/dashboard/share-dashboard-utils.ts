@@ -28,7 +28,10 @@ export function shouldOpenRowDrawer(event: React.MouseEvent<HTMLElement>) {
   }
 
   const target = event.target as HTMLElement | null;
-  if (target?.closest("a,button,input,textarea,select,[role='button'],[data-no-row-drawer]")) {
+  const interactive = target?.closest(
+    "a,button,input,textarea,select,[role='button'],[data-no-row-drawer]",
+  );
+  if (interactive && interactive !== event.currentTarget) {
     return false;
   }
 
