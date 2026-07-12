@@ -34,6 +34,7 @@ import type { DashboardClient, DashboardMarket, OperationalState, ShareView } fr
 import { formatRelativeTime } from "@/lib/utils";
 import { usePersistentState } from "@/lib/use-persistent-state";
 import { recordDashboardUxEvent } from "@/lib/api";
+import { CompactSelect } from "@/components/common/compact-select";
 
 const PAYOUT_NETWORK_LABELS: Record<string, string> = {
   "eip155:56": "BSC",
@@ -541,17 +542,8 @@ export function ClientBoard({
             <Search className="h-4 w-4 shrink-0 text-muted-foreground" />
             <input value={query} onChange={(event) => setQuery(event.target.value)} className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground" placeholder={t("dashboard.searchClients")} aria-label={t("dashboard.searchClients")} />
           </label>
-          {regions.length > 1 ? <select value={regionFilter} onChange={(event) => { setRegionFilter(event.target.value); void recordDashboardUxEvent({ eventType: "filter_applied", source: "client-board", targetType: "client" }); }} className="h-9 max-w-36 rounded-md border bg-white px-3 text-xs text-foreground outline-none focus:border-primary/50" aria-label={t("dashboard.filterRegion")}>
-            <option value="all">{t("dashboard.allRegions")}</option>
-            {regions.map((region) => <option key={region} value={region}>{region}</option>)}
-          </select> : null}
-          <select value={sortOrder} onChange={(event) => { setSortOrder(event.target.value); void recordDashboardUxEvent({ eventType: "filter_applied", source: "client-board", targetType: "client" }); }} className="h-9 rounded-md border bg-white px-3 text-xs text-foreground outline-none focus:border-primary/50" aria-label={t("dashboard.sortBy")}>
-            <option value="issues">{t("dashboard.sortIssues")}</option>
-            <option value="name">{t("dashboard.sortName")}</option>
-            <option value="recent">{t("dashboard.sortRecent")}</option>
-            <option value="shares">{t("dashboard.sortShares")}</option>
-            <option value="registered">{t("dashboard.sortRegistered")}</option>
-          </select>
+          {regions.length > 1 ? <CompactSelect value={regionFilter} onChange={(value) => { setRegionFilter(value); void recordDashboardUxEvent({ eventType: "filter_applied", source: "client-board", targetType: "client" }); }} options={[{ value: "all", label: t("dashboard.allRegions") }, ...regions.map((region) => ({ value: region, label: region }))]} ariaLabel={t("dashboard.filterRegion")} className="w-36" /> : null}
+          <CompactSelect value={sortOrder} onChange={(value) => { setSortOrder(value); void recordDashboardUxEvent({ eventType: "filter_applied", source: "client-board", targetType: "client" }); }} options={[{ value: "issues", label: t("dashboard.sortIssues") }, { value: "name", label: t("dashboard.sortName") }, { value: "recent", label: t("dashboard.sortRecent") }, { value: "shares", label: t("dashboard.sortShares") }, { value: "registered", label: t("dashboard.sortRegistered") }]} ariaLabel={t("dashboard.sortBy")} className="w-44" />
           <a href="https://github.com/Xiechengqi/cc-switch/releases" target="_blank" rel="noopener noreferrer" className="font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground transition-colors hover:text-blue-500">{t("dashboard.install")}</a>
         </div>
       </div>

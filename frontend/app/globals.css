@@ -29,7 +29,7 @@
   --radius-xl: calc(var(--radius) + 4px);
   --font-sans: var(--font-inter), Inter, system-ui, sans-serif;
   --font-mono: var(--font-jetbrains), "JetBrains Mono", monospace;
-  --font-display: var(--font-calistoga), Calistoga, Georgia, serif;
+  --font-display: var(--font-inter), Inter, system-ui, sans-serif;
 }
 
 :root {
@@ -97,6 +97,10 @@ body {
     rgb(var(--router-background));
   color: rgb(var(--router-foreground));
   font-family: var(--font-inter), Inter, system-ui, sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 @keyframes router-live-pulse {
@@ -133,7 +137,82 @@ button,
 input,
 textarea,
 select {
-  font: inherit;
+  font-family: var(--font-inter), Inter, system-ui, sans-serif;
+  font-variant-numeric: tabular-nums;
+}
+
+.font-display {
+  font-family: var(--font-inter), Inter, system-ui, sans-serif !important;
+  font-weight: 700;
+  letter-spacing: -0.025em;
+}
+
+/* Every visible dropdown uses HeroUI Select, with one shared control language. */
+.select__trigger {
+  min-height: 2.25rem;
+  border: 1px solid rgb(var(--router-border));
+  border-radius: 0.5rem;
+  background: rgb(var(--router-card));
+  color: rgb(var(--router-foreground));
+  font-family: var(--font-inter), Inter, system-ui, sans-serif;
+  font-size: 0.75rem;
+  font-weight: 500;
+  box-shadow: 0 1px 2px rgb(15 23 42 / 0.04);
+  transition: border-color 160ms ease, box-shadow 160ms ease, background-color 160ms ease;
+}
+
+.select__trigger:hover {
+  border-color: rgb(148 163 184);
+  background: rgb(248 250 252);
+}
+
+.select__trigger[data-focused="true"],
+.select__trigger:focus-visible {
+  border-color: rgb(var(--router-primary) / 0.5);
+  box-shadow: 0 0 0 3px rgb(var(--router-primary) / 0.1);
+}
+
+.select__value {
+  color: rgb(var(--router-foreground));
+  font-family: var(--font-inter), Inter, system-ui, sans-serif;
+  font-weight: 500;
+}
+
+.select__indicator {
+  color: rgb(var(--router-muted-foreground));
+}
+
+.select__popover {
+  overflow: hidden;
+  border: 1px solid rgb(var(--router-border));
+  border-radius: 0.625rem;
+  background: rgb(var(--router-popover));
+  color: rgb(var(--router-popover-foreground));
+  box-shadow: 0 14px 34px rgb(15 23 42 / 0.14), 0 2px 8px rgb(15 23 42 / 0.06);
+}
+
+.select__popover .listbox {
+  padding: 0.3rem;
+  font-family: var(--font-inter), Inter, system-ui, sans-serif;
+  font-size: 0.75rem;
+}
+
+.select__popover .listbox__item {
+  min-height: 2rem;
+  border-radius: 0.4rem;
+  padding-inline: 0.65rem;
+  color: rgb(var(--router-foreground));
+  font-weight: 500;
+}
+
+.select__popover .listbox__item:hover,
+.select__popover .listbox__item[data-focused="true"] {
+  background: rgb(var(--router-muted));
+}
+
+.select__popover .listbox__item[data-selected="true"] {
+  background: rgb(var(--router-primary) / 0.09);
+  color: rgb(var(--router-primary));
 }
 
 a {

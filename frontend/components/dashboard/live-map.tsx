@@ -244,6 +244,7 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
   const shellRef = React.useRef<HTMLDivElement | null>(null);
   const worldRef = React.useRef<HTMLDivElement | null>(null);
   const dragRef = React.useRef<{ pointerId: number; x: number; y: number; panX: number; panY: number } | null>(null);
+  const zoomRef = React.useRef(1);
   const [worldSvg, setWorldSvg] = React.useState("");
   const [zoom, setZoomState] = React.useState(1);
   const [pan, setPan] = React.useState({ x: 0, y: 0 });
@@ -304,9 +305,21 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
 
   const setZoom = React.useCallback((next: number) => {
     const nextZoom = Math.max(1, Math.min(3, Number(next.toFixed(2))));
+    zoomRef.current = nextZoom;
     setZoomState(nextZoom);
     setPan((current) => clampPan(current, nextZoom));
   }, [clampPan]);
+
+  React.useEffect(() => {
+    const shell = shellRef.current;
+    if (!shell) return;
+    const handleWheel = (event: WheelEvent) => {
+      event.preventDefault();
+      setZoom(zoomRef.current + (event.deltaY < 0 ? 0.18 : -0.18));
+    };
+    shell.addEventListener("wheel", handleWheel, { passive: false });
+    return () => shell.removeEventListener("wheel", handleWheel);
+  }, [setZoom]);
 
   React.useEffect(() => {
     let cancelled = false;
@@ -363,6 +376,7 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
   }, []);
 
   function reset() {
+    zoomRef.current = 1;
     setZoomState(1);
     setPan({ x: 0, y: 0 });
   }
@@ -380,10 +394,6 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
       tabIndex={0}
       aria-label={t("map.aria")}
       onDragStart={(event) => event.preventDefault()}
-      onWheel={(event) => {
-        event.preventDefault();
-        setZoom(zoom + (event.deltaY < 0 ? 0.18 : -0.18));
-      }}
       onPointerDown={(event) => {
         if ((event.target as HTMLElement).closest("[data-map-control]")) return;
         event.preventDefault();

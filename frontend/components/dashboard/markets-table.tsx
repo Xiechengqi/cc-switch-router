@@ -16,6 +16,7 @@ import { cn, compactTokens, formatDateTime, formatRelativeTime } from "@/lib/uti
 import { usePersistentState } from "@/lib/use-persistent-state";
 import { recordDashboardUxEvent } from "@/lib/api";
 import { canShowMarketSharePriority, drawerDialogClassName, formatOfficialPriceMultiplier, formatUsdExactTrimmed, formatUsdOneDecimal, isShareMarket, isUnlimited, isUsageMarket, marketKindDescription, marketKindLabel, requestModelRoute, shouldOpenRowDrawer, sortMarkets, usageBucketTotalTokens, type TFn } from "@/components/dashboard/share-dashboard-utils";
+import { CompactSelect } from "@/components/common/compact-select";
 
 function marketCapacityPercent(market: DashboardMarket) {
   if (isUnlimited(market.parallelCapacity) || market.parallelCapacity <= 0) return null;
@@ -210,14 +211,7 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
             <Search className="h-4 w-4 shrink-0 text-muted-foreground" />
             <input value={query} onChange={(event) => setQuery(event.target.value)} className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground" placeholder={t("dashboard.searchMarkets")} aria-label={t("dashboard.searchMarkets")} />
           </label>
-          <select value={sortOrder} onChange={(event) => { setSortOrder(event.target.value); void recordDashboardUxEvent({ eventType: "filter_applied", source: "market-table", targetType: "market" }); }} className="h-9 rounded-md border bg-white px-3 text-xs text-foreground outline-none focus:border-primary/50" aria-label={t("dashboard.sortBy")}>
-            <option value="issues">{t("dashboard.sortIssues")}</option>
-            <option value="name">{t("dashboard.sortName")}</option>
-            <option value="capacity">{t("dashboard.sortCapacity")}</option>
-            <option value="activity">{t("dashboard.sortActivity")}</option>
-            <option value="shares">{t("dashboard.sortShares")}</option>
-            <option value="updated">{t("dashboard.sortUpdated")}</option>
-          </select>
+          <CompactSelect value={sortOrder} onChange={(value) => { setSortOrder(value); void recordDashboardUxEvent({ eventType: "filter_applied", source: "market-table", targetType: "market" }); }} options={[{ value: "issues", label: t("dashboard.sortIssues") }, { value: "name", label: t("dashboard.sortName") }, { value: "capacity", label: t("dashboard.sortCapacity") }, { value: "activity", label: t("dashboard.sortActivity") }, { value: "shares", label: t("dashboard.sortShares") }, { value: "updated", label: t("dashboard.sortUpdated") }]} ariaLabel={t("dashboard.sortBy")} className="w-44" />
           <a href="https://github.com/Xiechengqi/cc-switch-market/releases" target="_blank" rel="noopener noreferrer" className="font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground transition-colors hover:text-blue-500">{t("dashboard.install")}</a>
         </div>
       </div>

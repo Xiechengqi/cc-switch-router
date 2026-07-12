@@ -1,17 +1,10 @@
 import type { Metadata } from "next";
-import { Calistoga, Inter, JetBrains_Mono } from "next/font/google";
+import { Inter, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
 
 const inter = Inter({
   subsets: ["latin"],
   variable: "--font-inter",
-  display: "swap",
-});
-
-const calistoga = Calistoga({
-  subsets: ["latin"],
-  weight: "400",
-  variable: "--font-calistoga",
   display: "swap",
 });
 
@@ -38,7 +31,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body className={`${inter.variable} ${calistoga.variable} ${jetbrains.variable}`}>
+      <body className={`${inter.variable} ${jetbrains.variable}`}>
         {children}
       </body>
     </html>

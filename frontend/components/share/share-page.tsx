@@ -20,6 +20,7 @@ import {
 } from "@/lib/share-settings";
 import { resolveShareCoreApp, shareAccessApps, SHARE_APP_LABELS } from "@/lib/share-app";
 import { compactTokens, formatDateTime } from "@/lib/utils";
+import { CompactSelect } from "@/components/common/compact-select";
 
 const PRICE_APPS = [
   { key: "claude" as const, label: SHARE_APP_LABELS.claude },
@@ -332,27 +333,20 @@ function ShareSettingsForm({
 
         <label className="grid gap-1 text-sm">
           <span className="font-medium text-foreground">For sale</span>
-          <select
-            className="h-10 rounded-lg border border-border bg-white px-3 text-sm"
-            value={draft.forSale}
-            disabled={!editable}
-            onChange={(event) => setDraft((current) => ({ ...current, forSale: event.target.value as "Yes" | "No" | "Free" }))}
-          >
-            <option value="No">No</option>
-            <option value="Yes">Yes</option>
-            <option value="Free">Free</option>
-          </select>
+          <CompactSelect value={draft.forSale} disabled={!editable} onChange={(value) => setDraft((current) => ({ ...current, forSale: value as "Yes" | "No" | "Free" }))} options={[{ value: "No", label: "No" }, { value: "Yes", label: "Yes" }, { value: "Free", label: "Free" }]} ariaLabel="For sale" triggerClassName="min-h-10 text-sm" />
         </label>
 
         {draft.forSale === "Yes" ? (
           <label className="grid gap-1 text-sm">
             <span className="font-medium text-foreground">Market type</span>
-            <select
-              className="h-10 rounded-lg border border-border bg-white px-3 text-sm"
+            <CompactSelect
               value={draft.saleMarketKind}
               disabled={!editable}
-              onChange={(event) => {
-                const next = event.target.value as "token" | "share";
+              ariaLabel="Market type"
+              triggerClassName="min-h-10 text-sm"
+              options={[{ value: "token", label: "Token Market" }, { value: "share", label: "Share Market" }]}
+              onChange={(value) => {
+                const next = value as "token" | "share";
                 if (next === "share" && !selectedShareMarketEmail && shareMarkets[0]) {
                   setShareMarketForAllApps(shareMarkets[0].email);
                 }
@@ -362,24 +356,13 @@ function ShareSettingsForm({
                   marketAccessMode: next === "share" ? "selected" : current.marketAccessMode,
                 }));
               }}
-            >
-              <option value="token">Token Market</option>
-              <option value="share">Share Market</option>
-            </select>
+            />
           </label>
         ) : null}
 
         <label className="grid gap-1 text-sm">
           <span className="font-medium text-foreground">Market access</span>
-          <select
-            className="h-10 rounded-lg border border-border bg-white px-3 text-sm"
-            value={draft.marketAccessMode}
-            disabled={!editable || draft.forSale !== "Yes" || draft.saleMarketKind === "share"}
-            onChange={(event) => setDraft((current) => ({ ...current, marketAccessMode: event.target.value as "selected" | "all" }))}
-          >
-            <option value="selected">Selected markets</option>
-            <option value="all">All markets</option>
-          </select>
+          <CompactSelect value={draft.marketAccessMode} disabled={!editable || draft.forSale !== "Yes" || draft.saleMarketKind === "share"} onChange={(value) => setDraft((current) => ({ ...current, marketAccessMode: value as "selected" | "all" }))} options={[{ value: "selected", label: "Selected markets" }, { value: "all", label: "All markets" }]} ariaLabel="Market access" triggerClassName="min-h-10 text-sm" />
         </label>
       </div>
 
@@ -408,19 +391,7 @@ function ShareSettingsForm({
       {draft.forSale === "Yes" && draft.saleMarketKind === "share" ? (
         <label className="grid gap-1 text-sm">
           <span className="font-medium text-foreground">Share Market</span>
-          <select
-            className="h-10 rounded-lg border border-border bg-white px-3 text-sm"
-            value={selectedShareMarketEmail}
-            disabled={!editable}
-            onChange={(event) => setShareMarketForAllApps(event.target.value)}
-          >
-            <option value="">Select one Share Market</option>
-            {shareMarkets.map((market) => (
-              <option key={market.id} value={market.email.toLowerCase()}>
-                {marketLabel(market)} · {market.email}
-              </option>
-            ))}
-          </select>
+          <CompactSelect value={selectedShareMarketEmail} disabled={!editable} onChange={setShareMarketForAllApps} options={[{ value: "", label: "Select one Share Market" }, ...shareMarkets.map((market) => ({ value: market.email.toLowerCase(), label: `${marketLabel(market)} · ${market.email}` }))]} ariaLabel="Share Market" triggerClassName="min-h-10 text-sm" />
         </label>
       ) : null}
 
