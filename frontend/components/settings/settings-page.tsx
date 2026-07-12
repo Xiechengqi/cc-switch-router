@@ -5,6 +5,13 @@ import { Alert, Button, Card, Chip, Input, ListBox, ScrollShadow, Switch, TextAr
 import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import {
+  settingsFieldDescription,
+  settingsFieldLabel,
+  settingsFieldPlaceholder,
+  settingsGroupLabel,
+  settingsValueSource,
+} from "@/lib/settings-i18n";
 import { LogsPanel } from "@/components/settings/logs-panel";
 import { MapDisplayPanel } from "@/components/settings/map-display-panel";
 import { VersionPanel } from "@/components/settings/version-panel";
@@ -133,10 +140,10 @@ export function SettingsPage() {
                     <ListBox.Item
                       key={group}
                       id={group}
-                      textValue={group}
+                      textValue={settingsGroupLabel(t, group)}
                       className={`flex items-center justify-between ${activeGroup === group ? "bg-primary/10 text-foreground" : ""}`}
                     >
-                      <span>{group}</span>
+                      <span>{settingsGroupLabel(t, group)}</span>
                       {count ? <Chip size="sm" variant="soft">{count}</Chip> : null}
                     </ListBox.Item>
                   );
@@ -165,7 +172,7 @@ export function SettingsPage() {
           ) : (
             <Card className="rounded-lg">
               <Card.Header>
-                <Card.Title>{activeGroup || t("settings.title")}</Card.Title>
+                <Card.Title>{settingsGroupLabel(t, activeGroup)}</Card.Title>
                 <Card.Description>{t("settings.restartFieldDesc")}</Card.Description>
               </Card.Header>
               <Card.Content className="grid gap-4">
@@ -258,14 +265,14 @@ function SettingsFieldRow({
       <Card.Content className="grid gap-3 p-4 md:grid-cols-[minmax(220px,0.8fr)_minmax(0,1.2fr)]">
       <div>
         <div className="flex flex-wrap items-center gap-2">
-          <label className="font-medium" htmlFor={field.key}>{field.label}</label>
+          <label className="font-medium" htmlFor={field.key}>{settingsFieldLabel(t, field)}</label>
           {field.required ? <Chip size="sm" variant="soft">{t("common.required")}</Chip> : null}
           {field.restartRequired ? <Chip color="warning" size="sm" variant="soft">{t("common.restartRequired")}</Chip> : null}
           {dirty ? <Chip color="accent" size="sm" variant="soft">{t("common.changed")}</Chip> : null}
         </div>
-        <p className="mt-2 text-sm leading-6 text-muted-foreground">{field.description}</p>
+        <p className="mt-2 text-sm leading-6 text-muted-foreground">{settingsFieldDescription(t, field)}</p>
         <div className="mt-2 text-xs text-muted-foreground">
-          <code>{field.key}</code> · {entry?.source || t("common.unset")}
+          <code>{field.key}</code> · {settingsValueSource(t, entry?.source)}
           {field.fieldType === "secret" && entry?.hasValue ? ` · ${t("settings.currentlySet")}` : ""}
         </div>
       </div>
@@ -283,7 +290,9 @@ function SettingsFieldRow({
             type={field.fieldType === "secret" ? "password" : field.fieldType === "int" ? "number" : field.fieldType === "url" ? "url" : field.fieldType === "email" ? "email" : "text"}
             value={String(value ?? "")}
             onChange={(event) => onChange(event.target.value)}
-            placeholder={field.fieldType === "secret" && entry?.hasValue ? t("settings.secretPlaceholder") : field.placeholder || field.default || ""}
+            placeholder={field.fieldType === "secret" && entry?.hasValue
+              ? t("settings.secretPlaceholder")
+              : settingsFieldPlaceholder(t, field) || field.placeholder || field.default || ""}
           />
         )}
       </div>

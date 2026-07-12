@@ -1,5 +1,7 @@
 "use client";
 
+import { settingsMessagesEn, settingsMessagesZh } from "@/lib/settings-messages";
+
 export const LOCALE_STORAGE_KEY = "cc_switch_router_locale_v1";
 export const SUPPORTED_LOCALES = ["en", "zh-CN"] as const;
 
@@ -656,6 +658,7 @@ export const messages = {
     "map.empty": "No server geo · No active clients",
     "map.active": "{count} active",
     "progress.usage": "Usage",
+    ...settingsMessagesEn,
   },
   "zh-CN": {
     "common.language": "语言",
@@ -1306,6 +1309,7 @@ export const messages = {
     "map.empty": "无 server 地理信息 · 无活跃 clients",
     "map.active": "{count} 活跃",
     "progress.usage": "用量",
+    ...settingsMessagesZh,
   },
 } as const;
 

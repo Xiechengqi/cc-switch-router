@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "lint": "tsc --noEmit",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "audit:settings-i18n": "node ../scripts/audit/audit-settings-i18n.mjs --check"
   },
   "dependencies": {
     "@heroui/react": "^3.0.4",
