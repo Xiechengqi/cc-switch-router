@@ -5,7 +5,7 @@ import { useLocaleText } from "@/components/i18n/locale-provider";
 import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
 import type { DashboardResponse, MapPoint, MarketRequestLog, RecentRequestEvent, ShareRequestLog } from "@/lib/types";
 import { cn } from "@/lib/utils";
-import { useMapDisplaySettings, useMapDragOffsetY } from "@/lib/map-display-settings";
+import { useMapDisplaySettings } from "@/lib/map-display-settings";
 
 function projectPoint(point: MapPoint) {
   if (typeof point.lat !== "number" || typeof point.lon !== "number") return null;
@@ -24,71 +24,21 @@ type TickerMeta = Partial<Omit<ShareRequestLog, "createdAt"> & Omit<MarketReques
 
 const REQUEST_TICKER_LIMIT = 6;
 const MAP_VIEWPORT_HEIGHT_PX = 420;
-const MAP_VERTICAL_NUDGE_PX = -10;
-const MAP_RULER_STEP_PX = 20;
-// Cape Agulhas — southern tip of the African mainland.
-const AFRICA_SOUTH_LATITUDE = -34.8;
-
-function latitudeToMapYFraction(latitude: number) {
-  return (90 - latitude) / 180;
-}
+// Calibrated dashboard map framing (map content px 74-493 at reference width).
+const MAP_VISIBLE_START_PX = 74;
+const MAP_VISIBLE_END_PX = 493;
 
 function computeFixedMapOffsetY(viewportWidth: number, viewportHeight: number) {
   const mapHeight = viewportWidth / 2;
-  const viewportCenterY = viewportHeight / 2;
-  const africaYFraction = latitudeToMapYFraction(AFRICA_SOUTH_LATITUDE);
-  // Map layer is centered horizontally and vertically, then shifted by offsetY.
-  return viewportHeight - viewportCenterY + mapHeight / 2 - africaYFraction * mapHeight + MAP_VERTICAL_NUDGE_PX;
-}
-
-function buildMapRulerTicks(viewportHeight: number, step = MAP_RULER_STEP_PX) {
-  const ticks: number[] = [];
-  for (let value = 0; value <= viewportHeight; value += step) ticks.push(value);
-  if (ticks[ticks.length - 1] !== viewportHeight) ticks.push(viewportHeight);
-  return ticks;
-}
-
-function MapViewportRuler({
-  viewportHeight,
-  mapTopPx,
-  mapBottomPx,
-  mapOffsetY,
-  mapVisibleStartPx,
-  mapVisibleEndPx,
-}: {
-  viewportHeight: number;
-  mapTopPx: number;
-  mapBottomPx: number;
-  mapOffsetY: number;
-  mapVisibleStartPx: number;
-  mapVisibleEndPx: number;
-}) {
-  const ticks = React.useMemo(() => buildMapRulerTicks(viewportHeight), [viewportHeight]);
-
-  return (
-    <div
-      className="pointer-events-none absolute inset-y-0 left-0 z-40 w-9 border-r border-slate-300/80 bg-white/75 backdrop-blur-sm"
-      aria-hidden="true"
-    >
-      {ticks.map((tick) => (
-        <div
-          key={tick}
-          className="absolute left-0 right-0"
-          style={{ top: `${(tick / viewportHeight) * 100}%` }}
-        >
-          <div className="absolute right-0 top-0 h-px w-2 bg-slate-400/80" />
-          <span className="absolute left-0.5 top-0 -translate-y-1/2 font-mono text-[8px] leading-none text-slate-500">
-            {tick}
-          </span>
-        </div>
-      ))}
-      <div className="absolute bottom-1 left-0.5 right-0.5 rounded bg-slate-900/80 px-1 py-0.5 font-mono text-[8px] leading-tight text-white">
-        <div>off {Math.round(mapOffsetY)}px</div>
-        <div>map {Math.round(mapVisibleStartPx)}-{Math.round(mapVisibleEndPx)}</div>
-        <div>edge {Math.round(mapTopPx)}-{Math.round(mapBottomPx)}</div>
-      </div>
-    </div>
-  );
+  const mapTopPx = -MAP_VISIBLE_START_PX;
+  const mapBottomPx = mapTopPx + mapHeight;
+  const offsetY = mapTopPx - viewportHeight / 2 + mapHeight / 2;
+  // Keep the calibrated bottom edge when the map is taller than the target slice.
+  if (mapBottomPx > MAP_VISIBLE_END_PX) {
+    const adjustedTopPx = MAP_VISIBLE_END_PX - mapHeight;
+    return adjustedTopPx - viewportHeight / 2 + mapHeight / 2;
+  }
+  return offsetY;
 }
 
 function spreadPoints(points: PlacedPoint[], minDistPct: number, lockedIndex: number) {
@@ -273,7 +223,7 @@ function RequestTicker({ data }: { data: DashboardResponse | null }) {
   if (!events.length) return null;
 
   return (
-    <div className="activity-feed-mask pointer-events-none absolute bottom-[52px] left-10 z-30 flex w-[min(46%,520px)] flex-col gap-1">
+    <div className="activity-feed-mask pointer-events-none absolute bottom-[52px] left-3 z-30 flex w-[min(46%,520px)] flex-col gap-1">
       {events.map((event, index) => {
         const item = meta.get(event.requestId);
         const eventUserEmail = event.userEmail;
@@ -315,11 +265,8 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
   const focus = useDashboardFocus();
   const shellRef = React.useRef<HTMLDivElement | null>(null);
   const worldRef = React.useRef<HTMLDivElement | null>(null);
-  const verticalDragRef = React.useRef<{ pointerId: number; startY: number; startOffsetY: number } | null>(null);
   const [worldSvg, setWorldSvg] = React.useState("");
-  const [baseOffsetY, setBaseOffsetY] = React.useState(0);
-  const [viewportSize, setViewportSize] = React.useState({ width: 0, height: MAP_VIEWPORT_HEIGHT_PX });
-  const { dragOffsetY, setDragOffsetY } = useMapDragOffsetY();
+  const [mapOffsetY, setMapOffsetY] = React.useState(0);
   const { showFlows, showHeat } = useMapDisplaySettings();
   const clients = data?.map?.clients || [];
   const server = data?.map?.server;
@@ -359,36 +306,15 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
     return flows;
   }, [data]);
 
-  const mapHeightPx = viewportSize.width > 0 ? viewportSize.width / 2 : 0;
-  const mapOffsetY = baseOffsetY + dragOffsetY;
-  const mapTopPx = viewportSize.height / 2 - mapHeightPx / 2 + mapOffsetY;
-  const mapBottomPx = viewportSize.height / 2 + mapHeightPx / 2 + mapOffsetY;
-  const mapVisibleStartPx = mapHeightPx > 0 ? Math.max(0, Math.min(mapHeightPx, -mapTopPx)) : 0;
-  const mapVisibleEndPx = mapHeightPx > 0 ? Math.max(0, Math.min(mapHeightPx, viewportSize.height - mapTopPx)) : 0;
-
-  const endVerticalDrag = React.useCallback((pointerId?: number) => {
-    const shell = shellRef.current;
-    if (pointerId != null) {
-      try {
-        shell?.releasePointerCapture(pointerId);
-      } catch {
-        // Pointer capture may already be released by the browser.
-      }
-    }
-    verticalDragRef.current = null;
-  }, []);
-
   React.useLayoutEffect(() => {
     const shell = shellRef.current;
     if (!shell) return;
-    const updateViewport = () => {
+    const updateOffset = () => {
       const height = shell.clientHeight || MAP_VIEWPORT_HEIGHT_PX;
-      const width = shell.clientWidth;
-      setViewportSize({ width, height });
-      setBaseOffsetY(computeFixedMapOffsetY(width, height));
+      setMapOffsetY(computeFixedMapOffsetY(shell.clientWidth, height));
     };
-    updateViewport();
-    const observer = new ResizeObserver(updateViewport);
+    updateOffset();
+    const observer = new ResizeObserver(updateOffset);
     observer.observe(shell);
     return () => observer.disconnect();
   }, []);
@@ -436,40 +362,9 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
   return (
     <section
       ref={shellRef}
-      className="relative h-[420px] cursor-ns-resize overflow-hidden rounded-[20px] border bg-white text-primary shadow-[0_4px_6px_rgba(15,23,42,0.04),0_12px_28px_rgba(15,23,42,0.05)]"
-      style={{ touchAction: "pan-y" }}
+      className="relative h-[420px] overflow-hidden rounded-[20px] border bg-white text-primary shadow-[0_4px_6px_rgba(15,23,42,0.04),0_12px_28px_rgba(15,23,42,0.05)]"
       aria-label={t("map.aria")}
-      onPointerDown={(event) => {
-        if ((event.target as HTMLElement).closest("[data-map-control]")) return;
-        event.preventDefault();
-        verticalDragRef.current = {
-          pointerId: event.pointerId,
-          startY: event.clientY,
-          startOffsetY: dragOffsetY,
-        };
-        shellRef.current?.setPointerCapture(event.pointerId);
-      }}
-      onPointerMove={(event) => {
-        const drag = verticalDragRef.current;
-        if (!drag || drag.pointerId !== event.pointerId) return;
-        event.preventDefault();
-        setDragOffsetY(drag.startOffsetY + (event.clientY - drag.startY));
-      }}
-      onPointerUp={(event) => {
-        if (verticalDragRef.current?.pointerId === event.pointerId) endVerticalDrag(event.pointerId);
-      }}
-      onPointerCancel={(event) => {
-        if (verticalDragRef.current?.pointerId === event.pointerId) endVerticalDrag(event.pointerId);
-      }}
     >
-      <MapViewportRuler
-        viewportHeight={viewportSize.height}
-        mapTopPx={mapTopPx}
-        mapBottomPx={mapBottomPx}
-        mapOffsetY={mapOffsetY}
-        mapVisibleStartPx={mapVisibleStartPx}
-        mapVisibleEndPx={mapVisibleEndPx}
-      />
       <div className="pointer-events-none absolute inset-0 z-10 bg-[radial-gradient(circle,rgba(15,23,42,0.05)_1px,transparent_1px)] bg-[length:28px_28px] bg-[position:14px_14px]" />
       <div className="pointer-events-none absolute inset-0 z-10 bg-[radial-gradient(circle_at_6%_12%,rgba(0,82,255,0.10),transparent_38%),radial-gradient(circle_at_94%_88%,rgba(77,124,255,0.07),transparent_42%)]" />
       <RequestTicker data={data} />
@@ -547,7 +442,7 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
             );
           })}
       </div>
-      <div className="pointer-events-none absolute bottom-3 left-10 z-30 flex max-w-[min(46%,320px)] flex-wrap gap-2 rounded-lg border border-slate-200/70 bg-white/70 px-2 py-1.5 text-[10px] text-slate-500 backdrop-blur-md">
+      <div className="pointer-events-none absolute bottom-3 left-3 z-30 flex max-w-[min(46%,320px)] flex-wrap gap-2 rounded-lg border border-slate-200/70 bg-white/70 px-2 py-1.5 text-[10px] text-slate-500 backdrop-blur-md">
         <span className="inline-flex items-center gap-1"><i className="h-1.5 w-1.5 rounded-full bg-primary" />{t("map.router")}</span>
         <span className="inline-flex items-center gap-1"><i className="h-1.5 w-1.5 rounded-full bg-primary" />{t("map.activeClient")}</span>
         <span className="inline-flex items-center gap-1"><i className="h-1.5 w-1.5 rounded-full bg-slate-500 opacity-55" />{t("map.idleClient")}</span>
