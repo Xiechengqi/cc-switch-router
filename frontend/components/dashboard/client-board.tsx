@@ -682,7 +682,6 @@ export function ClientBoard({
               <Drawer.Header>
                 <div>
                   <Drawer.Heading className="break-all font-mono text-base">{selectedApi.apiUrl}</Drawer.Heading>
-                  <p className="mt-1 break-all text-sm text-muted-foreground">{selectedShare?.ownerEmail || "-"}</p>
                   {selectedShare?.description ? <p className="mt-2 whitespace-pre-wrap break-words text-xs leading-5 text-muted-foreground">{selectedShare.description}</p> : null}
                 </div>
               </Drawer.Header>

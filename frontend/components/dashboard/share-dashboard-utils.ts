@@ -164,6 +164,10 @@ export function shareApiUrlKey(share?: ShareView) {
   return share?.subdomain || share?.shareName || "";
 }
 
+export function shareDisplayTitle(share?: Pick<ShareView, "subdomain" | "shareId">) {
+  return share?.subdomain || share?.shareId || "-";
+}
+
 export function shareApiParts(share?: ShareView) {
   if (!share) return { apiUrl: "-" };
   const baseHost = typeof window === "undefined" ? "" : window.location.host || "";

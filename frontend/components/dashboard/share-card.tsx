@@ -1,7 +1,7 @@
 "use client";
 
 import { Card } from "@heroui/react";
-import { ChevronRight, Eye, Link2, MoreHorizontal, Pencil } from "lucide-react";
+import { Eye, Link2, Pencil } from "lucide-react";
 import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { operationalReasonLabel, shareOperationalSummary } from "@/components/dashboard/operational-status";
@@ -14,7 +14,7 @@ import {
   providerAccountIdentity,
   providerAccountLevel,
   resolveShareAppRuntime,
-  shareApiParts,
+  shareDisplayTitle,
   shareAppSettings,
   shareAppTokensUsed,
   type CoreShareApp,
@@ -34,6 +34,29 @@ function isUnlimited(value?: number) {
   return Number(value) < 0;
 }
 
+function shouldOpenShareCard(
+  event: React.MouseEvent<HTMLElement>,
+  pointerDown: { x: number; y: number } | null,
+) {
+  if (pointerDown) {
+    const deltaX = Math.abs(event.clientX - pointerDown.x);
+    const deltaY = Math.abs(event.clientY - pointerDown.y);
+    if (deltaX > 4 || deltaY > 4) return false;
+  }
+
+  const selection = window.getSelection();
+  if (selection && !selection.isCollapsed && selection.toString().trim()) {
+    return false;
+  }
+
+  const target = event.target as HTMLElement | null;
+  if (target?.closest("button,a,[data-no-row-drawer]")) {
+    return false;
+  }
+
+  return true;
+}
+
 export const ShareCard = React.memo(function ShareCard({
   share,
   onOpen,
@@ -48,8 +71,8 @@ export const ShareCard = React.memo(function ShareCard({
   const { locale, t } = useLocaleText();
   const focus = useDashboardFocus();
   const cardRef = React.useRef<HTMLDivElement | null>(null);
+  const pointerDownRef = React.useRef<{ x: number; y: number } | null>(null);
   const app = resolveShareCoreApp(share);
-  const api = shareApiParts(share);
   const settings = app ? shareAppSettings(share, app) : null;
   const appRequests = app ? (share.recentRequests || []).filter((request) => requestBelongsToApp(request, app)) : share.recentRequests || [];
   const tokensUsed = app ? shareAppTokensUsed(share, app) : share.tokensUsed || 0;
@@ -64,7 +87,8 @@ export const ShareCard = React.memo(function ShareCard({
   const marketCount = share.marketAccessMode === "all" ? null : (share.marketLinks || []).length;
   const summary = shareOperationalSummary(share);
   const issue = summary.primaryReason ? operationalReasonLabel(summary.primaryReason, t) : null;
-  const title = share.shareName || share.subdomain || share.shareId;
+  const title = shareDisplayTitle(share);
+  const description = share.description?.trim() || "";
   const usagePercent = !isUnlimited(tokenLimit) && Number(tokenLimit) > 0 ? Math.min(100, Math.max(0, (tokensUsed / Number(tokenLimit)) * 100)) : null;
   const editPending = share.canManage && share.activeEdit?.status === "pending";
   const editRejected = share.canManage && share.activeEdit?.status === "rejected";
@@ -74,6 +98,20 @@ export const ShareCard = React.memo(function ShareCard({
   const stateTone = summary.state === "offline" ? "border-rose-200" : summary.state === "degraded" ? "border-amber-300" : summary.state === "disabled" ? "border-slate-300 opacity-70" : "border-slate-200";
   const statusDot = summary.state === "offline" ? "bg-rose-500" : summary.state === "degraded" ? "bg-amber-400" : summary.state === "disabled" ? "bg-slate-400" : "bg-emerald-500";
   const connectDisabled = summary.state === "offline" || summary.state === "disabled";
+  const editLabel = editPending
+    ? t("dashboard.pendingApply")
+    : editRejected
+      ? t("dashboard.applyFailed")
+      : share.canManage
+        ? t("common.edit")
+        : t("common.view");
+  const secondaryActionClass =
+    "inline-flex h-6 items-center gap-1 rounded-md border border-slate-200 bg-white px-2 text-[10px] font-semibold text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50";
+
+  const openShareDrawer = React.useCallback(() => {
+    focus.setFocus({ kind: "share", id: share.shareId, source: "client-board" });
+    onOpen(share);
+  }, [focus, onOpen, share]);
 
   React.useEffect(() => {
     if (!focused || focus.target?.source === "client-board") return;
@@ -85,30 +123,23 @@ export const ShareCard = React.memo(function ShareCard({
     <Card
       ref={cardRef}
       data-share-id={share.shareId}
-      className={`group w-full min-w-0 overflow-visible rounded-xl border bg-white p-0 shadow-sm transition-[border-color,box-shadow,opacity] hover:border-primary/35 ${focused ? "border-primary ring-2 ring-primary/20" : related ? "border-primary/35" : stateTone} ${dimmed ? "opacity-40" : "opacity-100"}`}
+      className={`w-full min-w-0 overflow-visible rounded-xl border bg-white p-0 shadow-sm transition-[border-color,box-shadow,opacity] hover:border-primary/35 ${focused ? "border-primary ring-2 ring-primary/20" : related ? "border-primary/35" : stateTone} ${dimmed ? "opacity-40" : "opacity-100"}`}
+      onMouseDown={(event) => {
+        pointerDownRef.current = { x: event.clientX, y: event.clientY };
+      }}
       onClick={(event) => {
-        const target = event.target as HTMLElement;
-        if (!target.closest("button,a,summary,details")) {
-          focus.setFocus({ kind: "share", id: share.shareId, source: "client-board" });
-          onOpen(share);
-        }
+        if (!shouldOpenShareCard(event, pointerDownRef.current)) return;
+        pointerDownRef.current = null;
+        openShareDrawer();
       }}
-      onKeyDown={(event) => {
-        if ((event.key === "Enter" || event.key === " ") && event.target === event.currentTarget) {
-          event.preventDefault();
-          focus.setFocus({ kind: "share", id: share.shareId, source: "client-board" });
-          onOpen(share);
-        }
-      }}
-      role="button"
-      tabIndex={0}
-      aria-label={`${t("dashboard.details")}: ${title}`}
     >
-      <Card.Content className="grid min-h-[178px] min-w-0 grid-rows-[auto_auto_1fr_auto] gap-2.5 p-3">
+      <Card.Content className="grid min-h-[178px] min-w-0 cursor-pointer select-text grid-rows-[auto_auto_1fr_auto] gap-2.5 p-3">
         <div className="flex min-w-0 items-start justify-between gap-2">
           <div className="min-w-0">
             <div className="flex min-w-0 items-center gap-1.5"><strong className="truncate text-sm font-semibold text-foreground" title={title}>{title}</strong>{app ? <span className="rounded bg-primary/10 px-1.5 py-0.5 text-[9px] font-semibold text-primary">{SHARE_APP_LABELS[app]}</span> : null}</div>
-            <span className="block truncate font-mono text-[10px] text-muted-foreground" title={api.apiUrl}>{api.apiUrl}</span>
+            {description ? (
+              <span className="block truncate text-[10px] text-muted-foreground" title={description}>{description}</span>
+            ) : null}
           </div>
           <span className={`mt-1 h-2 w-2 shrink-0 rounded-full ${statusDot}`} title={issue || summary.state} />
         </div>
@@ -134,28 +165,39 @@ export const ShareCard = React.memo(function ShareCard({
           </div>
         </div>
 
-        <div className="flex min-w-0 items-center justify-between gap-2 border-t pt-2">
+        <div className="grid gap-2 border-t pt-2">
           <span className={`min-w-0 truncate text-[10px] ${issue ? "font-medium text-amber-700" : "text-muted-foreground"}`} title={issue || undefined}>
             {issue ? `${issue}${summary.additionalReasonCount ? ` · +${summary.additionalReasonCount}` : ""}` : `${t("dashboard.response")} ${formatLatencySeconds(averageLatency)}`}
           </span>
-          <div className="flex shrink-0 items-center gap-1">
+          <div className="flex flex-wrap items-center justify-end gap-1">
             <button type="button" data-no-row-drawer disabled={connectDisabled} title={connectDisabled ? issue || t("common.offline") : undefined} className="inline-flex h-6 items-center gap-1 rounded-md border border-primary/20 bg-primary/5 px-2 text-[10px] font-semibold text-primary hover:bg-primary/10 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-50 disabled:text-slate-400" onClick={(event) => { event.stopPropagation(); if (!connectDisabled) onConnect(share); }}>
               <Link2 className="h-3 w-3" />{t("dashboard.connect")}
             </button>
-            <details className="relative" data-no-row-drawer onClick={(event) => event.stopPropagation()}>
-              <summary className="flex h-6 w-6 cursor-pointer list-none items-center justify-center rounded-md text-muted-foreground hover:bg-slate-100 hover:text-foreground" aria-label={t("dashboard.moreActions")}>
-                <MoreHorizontal className="h-4 w-4" />
-              </summary>
-              <div className="absolute bottom-7 right-0 z-30 grid w-32 overflow-hidden rounded-md border bg-white p-1 text-xs shadow-lg">
-                <button type="button" disabled={editPending} title={editRejected ? share.activeEdit?.errorMessage || t("dashboard.applyFailedFallback") : undefined} className="flex items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50" onClick={() => { if (!editPending) onEdit(share); }}>
-                  {share.canManage ? <Pencil className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}{editPending ? t("dashboard.pendingApply") : editRejected ? t("dashboard.applyFailed") : share.canManage ? t("common.edit") : t("common.view")}
-                </button>
-                <button type="button" className="flex items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-slate-100" onClick={() => { focus.setFocus({ kind: "share", id: share.shareId, source: "client-board" }); onOpen(share); }}>
-                  <ChevronRight className="h-3.5 w-3.5" />{t("dashboard.details")}
-                </button>
-              </div>
-            </details>
-            <ChevronRight className="h-4 w-4 text-muted-foreground transition-transform group-hover:translate-x-0.5 group-hover:text-foreground" />
+            <button
+              type="button"
+              data-no-row-drawer
+              disabled={editPending}
+              title={editRejected ? share.activeEdit?.errorMessage || t("dashboard.applyFailedFallback") : undefined}
+              className={secondaryActionClass}
+              onClick={(event) => {
+                event.stopPropagation();
+                if (!editPending) onEdit(share);
+              }}
+            >
+              {share.canManage ? <Pencil className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
+              {editLabel}
+            </button>
+            <button
+              type="button"
+              data-no-row-drawer
+              className={secondaryActionClass}
+              onClick={(event) => {
+                event.stopPropagation();
+                openShareDrawer();
+              }}
+            >
+              {t("dashboard.details")}
+            </button>
           </div>
         </div>
       </Card.Content>

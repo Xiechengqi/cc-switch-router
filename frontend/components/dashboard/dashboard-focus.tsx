@@ -177,7 +177,7 @@ export function DashboardFocusProvider({ data, children }: { data: DashboardResp
     }
     if (target.kind === "share") {
       const share = data.shares?.find((item) => item.shareId === target.id);
-      return share?.shareName || share?.subdomain || target.id;
+      return share?.subdomain || share?.shareId || target.id;
     }
     if (target.kind === "market") {
       const market = data.markets?.find((item) => item.id === target.id);
