@@ -27,6 +27,7 @@ const MAP_VIEWPORT_HEIGHT_PX = 420;
 // Calibrated dashboard map framing (map content px 74-493 at reference width).
 const MAP_VISIBLE_START_PX = 74;
 const MAP_VISIBLE_END_PX = 493;
+const MAP_VERTICAL_PAN_PX = 125;
 
 function computeFixedMapOffsetY(viewportWidth: number, viewportHeight: number) {
   const mapHeight = viewportWidth / 2;
@@ -36,9 +37,9 @@ function computeFixedMapOffsetY(viewportWidth: number, viewportHeight: number) {
   // Keep the calibrated bottom edge when the map is taller than the target slice.
   if (mapBottomPx > MAP_VISIBLE_END_PX) {
     const adjustedTopPx = MAP_VISIBLE_END_PX - mapHeight;
-    return adjustedTopPx - viewportHeight / 2 + mapHeight / 2;
+    return adjustedTopPx - viewportHeight / 2 + mapHeight / 2 + MAP_VERTICAL_PAN_PX;
   }
-  return offsetY;
+  return offsetY + MAP_VERTICAL_PAN_PX;
 }
 
 function spreadPoints(points: PlacedPoint[], minDistPct: number, lockedIndex: number) {
