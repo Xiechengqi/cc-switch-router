@@ -24,6 +24,7 @@ type TickerMeta = Partial<Omit<ShareRequestLog, "createdAt"> & Omit<MarketReques
 
 const REQUEST_TICKER_LIMIT = 6;
 const MAP_VIEWPORT_HEIGHT_PX = 420;
+const MAP_VERTICAL_NUDGE_PX = -10;
 // Cape Agulhas — southern tip of the African mainland.
 const AFRICA_SOUTH_LATITUDE = -34.8;
 
@@ -36,7 +37,7 @@ function computeFixedMapOffsetY(viewportWidth: number, viewportHeight: number) {
   const viewportCenterY = viewportHeight / 2;
   const africaYFraction = latitudeToMapYFraction(AFRICA_SOUTH_LATITUDE);
   // Map layer is centered horizontally and vertically, then shifted by offsetY.
-  return viewportHeight - viewportCenterY + mapHeight / 2 - africaYFraction * mapHeight;
+  return viewportHeight - viewportCenterY + mapHeight / 2 - africaYFraction * mapHeight + MAP_VERTICAL_NUDGE_PX;
 }
 
 function spreadPoints(points: PlacedPoint[], minDistPct: number, lockedIndex: number) {
