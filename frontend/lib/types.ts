@@ -11,6 +11,24 @@ export type SessionStatus = {
   isAdmin: boolean;
 };
 
+export type MapViewportSettings = {
+  visibleStartPx: number;
+  visibleEndPx: number;
+  verticalPanPx: number;
+};
+
+export type MapDisplaySettings = {
+  showFlows: boolean;
+  showHeat: boolean;
+  viewport: MapViewportSettings;
+};
+
+export type MapDisplaySettingsUpdate = {
+  showFlows?: boolean;
+  showHeat?: boolean;
+  viewport?: Partial<MapViewportSettings>;
+};
+
 export type DashboardResponse = {
   generatedAt: string;
   stats: {
@@ -22,6 +40,7 @@ export type DashboardResponse = {
     server?: MapPoint;
     clients: MapPoint[];
   };
+  mapDisplay: MapDisplaySettings;
   clients: DashboardClient[];
   /** 全量 share 列表；ClientBoard 按 installation 分组为横向卡片。 */
   shares?: ShareView[];

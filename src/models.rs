@@ -1925,12 +1925,65 @@ impl Default for ShareAppSettings {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MapViewportSettings {
+    pub visible_start_px: i32,
+    pub visible_end_px: i32,
+    pub vertical_pan_px: i32,
+}
+
+impl Default for MapViewportSettings {
+    fn default() -> Self {
+        Self {
+            visible_start_px: 74,
+            visible_end_px: 493,
+            vertical_pan_px: 125,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MapDisplaySettings {
+    pub show_flows: bool,
+    pub show_heat: bool,
+    pub viewport: MapViewportSettings,
+}
+
+impl Default for MapDisplaySettings {
+    fn default() -> Self {
+        Self {
+            show_flows: true,
+            show_heat: true,
+            viewport: MapViewportSettings::default(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MapViewportSettingsUpdate {
+    pub visible_start_px: Option<i32>,
+    pub visible_end_px: Option<i32>,
+    pub vertical_pan_px: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MapDisplaySettingsUpdate {
+    pub show_flows: Option<bool>,
+    pub show_heat: Option<bool>,
+    pub viewport: Option<MapViewportSettingsUpdate>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DashboardResponse {
     pub generated_at: DateTime<Utc>,
     pub stats: DashboardStats,
     pub map: DashboardMap,
+    pub map_display: MapDisplaySettings,
     pub clients: Vec<DashboardClientView>,
     /// 所有 share 的平铺数据；前端按 installation 归入对应 client 的横向卡片列表。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

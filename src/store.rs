@@ -35,7 +35,8 @@ use crate::models::{
     GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse, HealthCheckEntry,
     HealthTimelineBucket, ImageGenerationRequestLogEntry, Installation,
     InstallationPayoutProfileUpdateRequest, InstallationPayoutProfileUpdateResponse,
-    InstallationView, IssueLeaseRequest, IssueLeaseResponse, LatLonPoint, MarketAppAvailability,
+    InstallationView, IssueLeaseRequest, IssueLeaseResponse, LatLonPoint, MapDisplaySettings,
+    MapDisplaySettingsUpdate, MarketAppAvailability,
     MarketAppAvailabilityEntry, MarketDisabledSharesUpdateRequest,
     MarketDisabledSharesUpdateResponse, MarketLinkedShareView, MarketMaintenanceUpdateRequest,
     MarketMaintenanceUpdateResponse, MarketRegistryRecord, MarketRequestLogBatchSyncRequest,
@@ -4311,6 +4312,10 @@ impl AppStore {
             .filter(|share| share.share_status == "active")
             .count();
         let total_active_requests = share_views.iter().map(|share| share.active_requests).sum();
+        let map_display = {
+            let conn = self.conn.lock().await;
+            read_map_display_settings(&conn)?
+        };
         Ok(DashboardResponse {
             generated_at: now,
             stats: DashboardStats {
@@ -4349,7 +4354,41 @@ impl AppStore {
             user_country_counts: HashMap::new(),
             recent_request_events: Vec::new(),
             market_request_logs: market_logs,
+            map_display,
         })
+    }
+
+    pub async fn map_display_settings(&self) -> Result<MapDisplaySettings, AppError> {
+        let conn = self.conn.lock().await;
+        read_map_display_settings(&conn)
+    }
+
+    pub async fn update_map_display_settings(
+        &self,
+        update: MapDisplaySettingsUpdate,
+    ) -> Result<MapDisplaySettings, AppError> {
+        let conn = self.conn.lock().await;
+        let mut current = read_map_display_settings(&conn)?;
+        if let Some(show_flows) = update.show_flows {
+            current.show_flows = show_flows;
+        }
+        if let Some(show_heat) = update.show_heat {
+            current.show_heat = show_heat;
+        }
+        if let Some(viewport) = update.viewport {
+            if let Some(visible_start_px) = viewport.visible_start_px {
+                current.viewport.visible_start_px = visible_start_px;
+            }
+            if let Some(visible_end_px) = viewport.visible_end_px {
+                current.viewport.visible_end_px = visible_end_px;
+            }
+            if let Some(vertical_pan_px) = viewport.vertical_pan_px {
+                current.viewport.vertical_pan_px = vertical_pan_px;
+            }
+        }
+        current = sanitize_map_display_settings(current);
+        write_map_display_settings(&conn, &current)?;
+        Ok(current)
     }
 
     async fn recover_missing_share_request_logs(
@@ -7822,6 +7861,52 @@ fn upsert_market_request_log_tx(
     Ok(())
 }
 
+fn sanitize_map_display_settings(mut settings: MapDisplaySettings) -> MapDisplaySettings {
+    settings.viewport.visible_start_px = settings.viewport.visible_start_px.clamp(0, 5000);
+    settings.viewport.visible_end_px = settings.viewport.visible_end_px.clamp(0, 5000);
+    settings.viewport.vertical_pan_px = settings.viewport.vertical_pan_px.clamp(-2000, 2000);
+    settings
+}
+
+fn read_map_display_settings(conn: &Connection) -> Result<MapDisplaySettings, AppError> {
+    let json: Option<String> = conn
+        .query_row(
+            "SELECT settings_json FROM router_map_display_settings WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| AppError::Internal(format!("read map display settings failed: {e}")))?;
+    match json {
+        Some(raw) => {
+            let parsed = serde_json::from_str::<MapDisplaySettings>(&raw).map_err(|e| {
+                AppError::Internal(format!("parse map display settings failed: {e}"))
+            })?;
+            Ok(sanitize_map_display_settings(parsed))
+        }
+        None => Ok(MapDisplaySettings::default()),
+    }
+}
+
+fn write_map_display_settings(
+    conn: &Connection,
+    settings: &MapDisplaySettings,
+) -> Result<(), AppError> {
+    let json = serde_json::to_string(settings)
+        .map_err(|e| AppError::Internal(format!("serialize map display settings failed: {e}")))?;
+    let updated_at = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO router_map_display_settings (id, settings_json, updated_at)
+         VALUES (1, ?1, ?2)
+         ON CONFLICT(id) DO UPDATE SET
+            settings_json = excluded.settings_json,
+            updated_at = excluded.updated_at",
+        params![json, updated_at],
+    )
+    .map_err(|e| AppError::Internal(format!("write map display settings failed: {e}")))?;
+    Ok(())
+}
+
 fn init_schema(conn: &Connection) -> Result<(), AppError> {
     conn.execute_batch(
         "
@@ -8377,6 +8462,12 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_admin_audit_created ON admin_audit_log(created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS router_map_display_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            settings_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         ",
     )
     .map_err(|e| AppError::Internal(format!("init schema failed: {e}")))?;

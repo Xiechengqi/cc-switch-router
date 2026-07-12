@@ -44,6 +44,7 @@ use crate::models::{
     GatewayRegistryRecord, GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse,
     HealthResponse, ImageGenerationRequestLogEntry, InstallationPayoutProfileUpdateRequest,
     InstallationPayoutProfileUpdateResponse, IssueLeaseRequest, IssueLeaseResponse,
+    MapDisplaySettings, MapDisplaySettingsUpdate,
     MarketDisabledSharesUpdateRequest, MarketDisabledSharesUpdateResponse,
     MarketMaintenanceUpdateRequest, MarketMaintenanceUpdateResponse,
     MarketNotificationEmailLogView, MarketNotificationEmailRequest,
@@ -148,6 +149,7 @@ pub fn router(state: ServerState) -> Router {
         .route("/", any(root_handler))
         .route("/favicon.ico", get(favicon))
         .route("/v1/dashboard", get(dashboard))
+        .route("/v1/map-display", get(map_display_get))
         .route("/v1/markets", get(markets))
         .route("/v1/markets/register", post(register_market))
         .route("/v1/market/shares", get(market_shares))
@@ -307,6 +309,7 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/board/messages/:id", delete(delete_board_message))
         .route("/v1/board/meta", get(board_meta))
         .route("/v1/admin/settings/schema", get(admin_settings_schema))
+        .route("/v1/admin/map-display", patch(admin_map_display_update))
         .route(
             "/v1/admin/settings/values",
             get(admin_settings_values).patch(admin_settings_apply),
@@ -1340,6 +1343,36 @@ async fn dashboard(
     Ok(Json(response))
 }
 
+async fn map_display_get(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<MapDisplaySettings>, AppError> {
+    let _ = extract_session_email(&state, &headers).await?;
+    Ok(Json(state.store.map_display_settings().await?))
+}
+
+async fn admin_map_display_update(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(input): Json<MapDisplaySettingsUpdate>,
+) -> Result<Json<MapDisplaySettings>, AppError> {
+    let session = require_admin_session(&state, &headers).await?;
+    let updated = state.store.update_map_display_settings(input).await?;
+    let metadata = extract_client_metadata(&headers, addr);
+    let payload = serde_json::to_value(&updated).unwrap_or_else(|_| serde_json::json!({}));
+    let _ = state
+        .store
+        .record_admin_audit(
+            Some(&session.email),
+            "map_display.update",
+            Some(&payload),
+            metadata.ip.as_deref(),
+        )
+        .await;
+    Ok(Json(updated))
+}
+
 async fn share_api_context(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -2087,6 +2120,7 @@ mod tests {
                 server: None,
                 clients: Vec::new(),
             },
+            map_display: MapDisplaySettings::default(),
             clients: Vec::new(),
             shares: Vec::new(),
             markets: Vec::new(),
@@ -2144,6 +2178,7 @@ mod tests {
                 server: None,
                 clients: Vec::new(),
             },
+            map_display: MapDisplaySettings::default(),
             clients: Vec::new(),
             shares: Vec::new(),
             markets: Vec::new(),
@@ -2195,6 +2230,7 @@ mod tests {
                 server: None,
                 clients: Vec::new(),
             },
+            map_display: MapDisplaySettings::default(),
             clients: Vec::new(),
             shares: Vec::new(),
             markets: Vec::new(),
@@ -2254,6 +2290,7 @@ mod tests {
                 server: None,
                 clients: Vec::new(),
             },
+            map_display: MapDisplaySettings::default(),
             clients: Vec::new(),
             shares: Vec::new(),
             markets: Vec::new(),

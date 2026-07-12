@@ -5,7 +5,7 @@ import { useLocaleText } from "@/components/i18n/locale-provider";
 import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
 import type { DashboardResponse, MapPoint, MarketRequestLog, RecentRequestEvent, ShareRequestLog } from "@/lib/types";
 import { cn } from "@/lib/utils";
-import { useMapDisplaySettings, computeMapOffsetY } from "@/lib/map-display-settings";
+import { computeMapOffsetY, DEFAULT_MAP_DISPLAY } from "@/lib/map-display-settings";
 
 function projectPoint(point: MapPoint) {
   if (typeof point.lat !== "number" || typeof point.lon !== "number") return null;
@@ -251,7 +251,8 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
   const worldRef = React.useRef<HTMLDivElement | null>(null);
   const [worldSvg, setWorldSvg] = React.useState("");
   const [mapOffsetY, setMapOffsetY] = React.useState(0);
-  const { showFlows, showHeat, viewport } = useMapDisplaySettings();
+  const mapDisplay = data?.mapDisplay ?? DEFAULT_MAP_DISPLAY;
+  const { showFlows, showHeat, viewport } = mapDisplay;
   const clients = data?.map?.clients || [];
   const server = data?.map?.server;
   const points = [server, ...clients].filter(Boolean) as MapPoint[];
@@ -301,7 +302,7 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
     const observer = new ResizeObserver(updateOffset);
     observer.observe(shell);
     return () => observer.disconnect();
-  }, [viewport]);
+  }, [viewport.visibleEndPx, viewport.visibleStartPx, viewport.verticalPanPx]);
 
   React.useEffect(() => {
     let cancelled = false;

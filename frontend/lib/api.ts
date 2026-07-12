@@ -29,6 +29,8 @@ import type {
   LlmTopResponse,
   LlmReliabilityResponse,
   MetricEvent,
+  MapDisplaySettings,
+  MapDisplaySettingsUpdate,
 } from "@/lib/types";
 
 export type { BoardListResponse, BoardMessage, BoardMeta };
@@ -43,6 +45,20 @@ export async function parseJson<T>(response: Response): Promise<T> {
 
 export async function getDashboard() {
   return parseJson<DashboardResponse>(await authFetch("/v1/dashboard", { cache: "no-store" }));
+}
+
+export async function getMapDisplay() {
+  return parseJson<MapDisplaySettings>(await authFetch("/v1/map-display", { cache: "no-store" }));
+}
+
+export async function updateMapDisplay(update: MapDisplaySettingsUpdate) {
+  return parseJson<MapDisplaySettings>(
+    await authFetch("/v1/admin/map-display", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(update),
+    }),
+  );
 }
 
 export type DashboardUxEvent = {

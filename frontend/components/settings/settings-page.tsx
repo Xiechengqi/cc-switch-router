@@ -61,7 +61,7 @@ export function SettingsPage() {
           <p className="mt-3 text-muted-foreground">{t("settings.adminRequiredDesc")}</p>
         </div>
         <VersionPanel isAdmin={false} />
-        <MapDisplayPanel canEditViewport={false} />
+        <MapDisplayPanel canEdit={false} />
       </main>
     );
   }
@@ -142,7 +142,7 @@ export function SettingsPage() {
           {activeGroup === VERSION_GROUP ? (
             <VersionPanel isAdmin={true} />
           ) : activeGroup === MAP_GROUP ? (
-            <MapDisplayPanel canEditViewport />
+            <MapDisplayPanel canEdit />
           ) : activeGroup === LOGS_GROUP ? (
             <LogsPanel />
           ) : (
