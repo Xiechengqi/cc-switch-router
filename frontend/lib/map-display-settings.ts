@@ -1,9 +1,9 @@
-import type { MapDisplaySettings, MapViewportSettings } from "@/lib/types";
+import type { MapDisplaySettings, MapDisplaySettingsUpdate, MapViewportSettings } from "@/lib/types";
 
 export const DEFAULT_MAP_VIEWPORT: MapViewportSettings = {
-  visibleStartPx: 74,
-  visibleEndPx: 493,
-  verticalPanPx: 125,
+  visibleStartPx: 14,
+  visibleEndPx: 433,
+  verticalPanPx: 0,
 };
 
 export const DEFAULT_MAP_DISPLAY: MapDisplaySettings = {
@@ -11,6 +11,22 @@ export const DEFAULT_MAP_DISPLAY: MapDisplaySettings = {
   showHeat: true,
   viewport: DEFAULT_MAP_VIEWPORT,
 };
+
+export function sameMapDisplaySettings(left: MapDisplaySettings, right: MapDisplaySettings) {
+  return left.showFlows === right.showFlows
+    && left.showHeat === right.showHeat
+    && left.viewport.visibleStartPx === right.viewport.visibleStartPx
+    && left.viewport.visibleEndPx === right.viewport.visibleEndPx
+    && left.viewport.verticalPanPx === right.viewport.verticalPanPx;
+}
+
+export function toMapDisplayUpdate(settings: MapDisplaySettings): MapDisplaySettingsUpdate {
+  return {
+    showFlows: settings.showFlows,
+    showHeat: settings.showHeat,
+    viewport: { ...settings.viewport },
+  };
+}
 
 export function computeMapOffsetY(
   viewport: MapViewportSettings,

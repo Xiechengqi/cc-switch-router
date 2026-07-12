@@ -8,8 +8,9 @@ import { useLocaleText } from "@/components/i18n/locale-provider";
 import { LogsPanel } from "@/components/settings/logs-panel";
 import { MapDisplayPanel } from "@/components/settings/map-display-panel";
 import { VersionPanel } from "@/components/settings/version-panel";
-import { getSettingsSchema, getSettingsValues, saveSettings, testTelegram, restartService } from "@/lib/api";
-import type { SettingValueEntry, SettingsField, SettingsSchema } from "@/lib/types";
+import { getSettingsSchema, getSettingsValues, saveSettings, testTelegram, restartService, getMapDisplay, updateMapDisplay } from "@/lib/api";
+import type { MapDisplaySettings, SettingValueEntry, SettingsField, SettingsSchema } from "@/lib/types";
+import { DEFAULT_MAP_DISPLAY, sameMapDisplaySettings, toMapDisplayUpdate } from "@/lib/map-display-settings";
 
 type DirtyValue = string | boolean | null;
 const VERSION_GROUP = "__version";
@@ -25,15 +26,24 @@ export function SettingsPage() {
   const [dirty, setDirty] = React.useState<Record<string, DirtyValue>>({});
   const [busy, setBusy] = React.useState("");
   const [banner, setBanner] = React.useState<{ kind: "default" | "success" | "destructive"; text: string } | null>(null);
+  const [mapSaved, setMapSaved] = React.useState<MapDisplaySettings>(DEFAULT_MAP_DISPLAY);
+  const [mapDraft, setMapDraft] = React.useState<MapDisplaySettings>(DEFAULT_MAP_DISPLAY);
 
   const isAdmin = !!session?.isAdmin;
+  const mapDirty = !sameMapDisplaySettings(mapDraft, mapSaved);
 
   const load = React.useCallback(async () => {
     setBusy("load");
     try {
-      const [nextSchema, nextValues] = await Promise.all([getSettingsSchema(), getSettingsValues()]);
+      const [nextSchema, nextValues, nextMap] = await Promise.all([
+        getSettingsSchema(),
+        getSettingsValues(),
+        getMapDisplay(),
+      ]);
       setSchema(nextSchema);
       setValues(Object.fromEntries(nextValues.values.map((entry) => [entry.key, entry])));
+      setMapSaved(nextMap);
+      setMapDraft(nextMap);
       setActiveGroup((current) => current || VERSION_GROUP);
       setDirty({});
       setBanner(null);
@@ -70,7 +80,7 @@ export function SettingsPage() {
   const fields = activeGroup === VERSION_GROUP || activeGroup === MAP_GROUP || activeGroup === LOGS_GROUP
     ? []
     : (schema?.fields || []).filter((field) => field.group === activeGroup);
-  const dirtyCount = Object.keys(dirty).length;
+  const dirtyCount = Object.keys(dirty).length + (mapDirty ? 1 : 0);
 
   return (
     <main className="settings-surface mx-auto grid w-[calc(100%-2rem)] max-w-7xl gap-6 pb-10 text-foreground">
@@ -115,6 +125,7 @@ export function SettingsPage() {
                 </ListBox.Item>
                 <ListBox.Item id={MAP_GROUP} textValue={t("settings.map")} className={`flex items-center justify-between ${activeGroup === MAP_GROUP ? "bg-primary/10 text-foreground" : ""}`}>
                   <span>{t("settings.map")}</span>
+                  {mapDirty ? <Chip size="sm" variant="soft">1</Chip> : null}
                 </ListBox.Item>
                 {groups.map((group) => {
                   const count = (schema?.fields || []).filter((field) => field.group === group && Object.prototype.hasOwnProperty.call(dirty, field.key)).length;
@@ -142,7 +153,13 @@ export function SettingsPage() {
           {activeGroup === VERSION_GROUP ? (
             <VersionPanel isAdmin={true} />
           ) : activeGroup === MAP_GROUP ? (
-            <MapDisplayPanel canEdit />
+            <MapDisplayPanel
+              canEdit
+              value={mapDraft}
+              onChange={setMapDraft}
+              dirty={mapDirty}
+              loading={busy === "load" && !schema}
+            />
           ) : activeGroup === LOGS_GROUP ? (
             <LogsPanel />
           ) : (
@@ -176,13 +193,25 @@ export function SettingsPage() {
     setBusy("save");
     setBanner(null);
     try {
-      const updates = buildUpdates(schema, dirty);
-      const result = await saveSettings(updates);
-      setBanner({
-        kind: "success",
-        text: t("settings.saved", { updated: result.updatedKeys.length, unchanged: result.unchangedKeys.length, restartRequired: result.restartRequiredKeys.length }),
-      });
-      await load();
+      const schemaDirty = Object.keys(dirty).length > 0;
+      let mapSavedNow = false;
+      if (mapDirty) {
+        const nextMap = await updateMapDisplay(toMapDisplayUpdate(mapDraft));
+        setMapSaved(nextMap);
+        setMapDraft(nextMap);
+        mapSavedNow = true;
+      }
+      if (schemaDirty) {
+        const updates = buildUpdates(schema, dirty);
+        const result = await saveSettings(updates);
+        setBanner({
+          kind: "success",
+          text: t("settings.saved", { updated: result.updatedKeys.length, unchanged: result.unchangedKeys.length, restartRequired: result.restartRequiredKeys.length }),
+        });
+        await load();
+      } else if (mapSavedNow) {
+        setBanner({ kind: "success", text: t("settings.mapSaved") });
+      }
       if (thenRestart) {
         setBusy("restart");
         await restartService();
