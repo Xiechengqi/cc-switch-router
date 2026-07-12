@@ -1257,15 +1257,8 @@ impl AppStore {
         let tx = conn
             .transaction()
             .map_err(|e| AppError::Internal(format!("begin owner email change failed: {e}")))?;
-        let updated_shares = tx
-            .execute(
-                "UPDATE shares
-                 SET owner_email = ?3
-                 WHERE installation_id = ?1
-                   AND owner_email = ?2",
-                params![input.installation_id, old_email, new_email],
-            )
-            .map_err(|e| AppError::Internal(format!("update share owner email failed: {e}")))?;
+        let updated_shares =
+            rebind_installation_shares_to_owner(&tx, &input.installation_id, &new_email)?;
         tx.execute(
             "UPDATE installations
                  SET owner_email = ?2, owner_verified_at = ?3
@@ -1800,7 +1793,7 @@ impl AppStore {
         signature: String,
         metadata: ClientMetadata,
     ) -> Result<ClientTunnelResponse, AppError> {
-        let owner_email = normalize_email(&tunnel.owner_email)?;
+        let requested_owner = normalize_email(&tunnel.owner_email)?;
         let subdomain = normalize_subdomain(&tunnel.subdomain)?;
         ensure_subdomain_allowed(&subdomain, config)?;
         let now = Utc::now();
@@ -1811,7 +1804,7 @@ impl AppStore {
         let installation = get_installation(&conn, &installation_id)?
             .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
         let signed_payload = ClientTunnelConfig {
-            owner_email,
+            owner_email: requested_owner.clone(),
             subdomain: subdomain.clone(),
             enabled: tunnel.enabled,
         };
@@ -1825,20 +1818,19 @@ impl AppStore {
             &nonce,
             &signature,
         )?;
+        let owner_email = installation
+            .owner_email
+            .as_deref()
+            .ok_or_else(|| AppError::Conflict("installation owner email is not configured".into()))
+            .and_then(normalize_email)?;
+        if requested_owner != owner_email {
+            return Err(AppError::Conflict(
+                "client tunnel owner must match the installation owner".into(),
+            ));
+        }
         let should_refresh_geo =
             should_refresh_installation_geo(&installation, metadata.ip.as_deref());
         touch_installation_presence(&conn, &installation_id, &metadata, now)?;
-        conn.execute(
-            "UPDATE installations
-                SET owner_email = ?2, owner_verified_at = ?3
-              WHERE id = ?1",
-            params![
-                &installation_id,
-                &signed_payload.owner_email,
-                now.to_rfc3339()
-            ],
-        )
-        .map_err(|e| AppError::Internal(format!("update installation owner email failed: {e}")))?;
         conn.execute(
             "INSERT INTO installation_client_tunnels (
                 installation_id, owner_email, subdomain, enabled, created_at, updated_at, last_seen_at
@@ -2839,7 +2831,14 @@ impl AppStore {
                     &input.installation_id,
                 )?;
             }
-            normalize_self_reported_share_owner(&mut share)?;
+            let installation_owner = installation
+                .owner_email
+                .as_deref()
+                .ok_or_else(|| {
+                    AppError::Conflict("installation owner email is not configured".into())
+                })
+                .and_then(normalize_email)?;
+            normalize_self_reported_share_owner(&mut share, &installation_owner)?;
             Some(share)
         } else {
             None
@@ -3178,12 +3177,19 @@ impl AppStore {
         metadata: ClientMetadata,
         _current_user_email: &str,
     ) -> Result<(), AppError> {
-        {
+        let installation_owner = {
             let conn = self.conn.lock().await;
             let installation = get_installation(&conn, &input.installation_id)?;
             let Some(installation) = installation else {
                 return Err(AppError::Unauthorized("installation not found".into()));
             };
+            let owner = installation
+                .owner_email
+                .as_deref()
+                .ok_or_else(|| {
+                    AppError::Conflict("installation owner email is not configured".into())
+                })
+                .and_then(normalize_email)?;
             verify_signed_share_request(
                 &conn,
                 &installation.public_key,
@@ -3202,7 +3208,8 @@ impl AppStore {
                 self.refresh_installation_geo(&input.installation_id, &metadata.ip, false)
                     .await?;
             }
-        }
+            owner
+        };
         let mut share = input.share;
         {
             let conn = self.conn.lock().await;
@@ -3212,7 +3219,7 @@ impl AppStore {
                 &input.installation_id,
             )?;
         }
-        normalize_self_reported_share_owner(&mut share)?;
+        normalize_self_reported_share_owner(&mut share, &installation_owner)?;
         self.upsert_share(&input.installation_id, share).await
     }
 
@@ -3236,6 +3243,11 @@ impl AppStore {
         let Some(installation) = installation else {
             return Err(AppError::Unauthorized("installation not found".into()));
         };
+        let installation_owner = installation
+            .owner_email
+            .as_deref()
+            .ok_or_else(|| AppError::Conflict("installation owner email is not configured".into()))
+            .and_then(normalize_email)?;
         verify_share_claim_request(
             &conn,
             &installation.public_key,
@@ -3261,7 +3273,7 @@ impl AppStore {
             .map_err(|e| AppError::Internal(format!("begin share claim tx failed: {e}")))?;
         let mut share = input.share;
         ensure_share_id_writable_by_installation(&tx, &share.share_id, &input.installation_id)?;
-        normalize_self_reported_share_owner(&mut share)?;
+        normalize_self_reported_share_owner(&mut share, &installation_owner)?;
         share.subdomain = subdomain;
         release_reclaimable_subdomain_claim(
             &tx,
@@ -3315,6 +3327,11 @@ impl AppStore {
         let Some(installation) = installation else {
             return Err(AppError::Unauthorized("installation not found".into()));
         };
+        let installation_owner = installation
+            .owner_email
+            .as_deref()
+            .ok_or_else(|| AppError::Conflict("installation owner email is not configured".into()))
+            .and_then(normalize_email)?;
         verify_signed_share_request(
             &conn,
             &installation.public_key,
@@ -3349,7 +3366,7 @@ impl AppStore {
                         &share.share_id,
                         &input.installation_id,
                     )?;
-                    normalize_self_reported_share_owner(&mut share)?;
+                    normalize_self_reported_share_owner(&mut share, &installation_owner)?;
                     upsert_share_tx(&tx, &input.installation_id, share)?;
                 }
                 "delete" => {
@@ -3503,7 +3520,14 @@ impl AppStore {
             &returned_share.share_id,
             &edit.installation_id,
         )?;
-        normalize_self_reported_share_owner(&mut returned_share)?;
+        let installation = get_installation(&tx, &edit.installation_id)?
+            .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
+        let installation_owner = installation
+            .owner_email
+            .as_deref()
+            .ok_or_else(|| AppError::Conflict("installation owner email is not configured".into()))
+            .and_then(normalize_email)?;
+        normalize_self_reported_share_owner(&mut returned_share, &installation_owner)?;
         upsert_share_tx(&tx, &edit.installation_id, returned_share)?;
         let changed = tx
             .execute(
@@ -7526,7 +7550,7 @@ pub async fn fetch_share_runtime_snapshot_from_route(
 fn upsert_share_tx(
     conn: &Connection,
     installation_id: &str,
-    share: ShareDescriptor,
+    mut share: ShareDescriptor,
 ) -> Result<(), AppError> {
     if share.bindings.len() != 1
         || share.provider_id.as_deref().is_none_or(|provider_id| {
@@ -7537,6 +7561,14 @@ fn upsert_share_tx(
             "share must contain exactly one binding matching appType/providerId".into(),
         ));
     }
+    let installation = get_installation(conn, installation_id)?
+        .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
+    let installation_owner = installation
+        .owner_email
+        .as_deref()
+        .ok_or_else(|| AppError::Conflict("installation owner email is not configured".into()))
+        .and_then(normalize_email)?;
+    normalize_self_reported_share_owner(&mut share, &installation_owner)?;
     let description = normalize_share_description(share.description.clone())?;
     let for_sale = normalize_share_for_sale(&share.for_sale)?;
     let market_access_mode = normalize_market_access_mode(&share.market_access_mode)?;
@@ -7915,7 +7947,9 @@ fn read_map_display_settings(conn: &Connection) -> Result<MapDisplaySettings, Ap
             let parsed = serde_json::from_str::<StoredMapDisplaySettings>(&raw).map_err(|e| {
                 AppError::Internal(format!("parse map display settings failed: {e}"))
             })?;
-            Ok(sanitize_map_display_settings(normalize_stored_map_display_settings(parsed)))
+            Ok(sanitize_map_display_settings(
+                normalize_stored_map_display_settings(parsed),
+            ))
         }
         None => Ok(MapDisplaySettings::default()),
     }
@@ -9937,11 +9971,13 @@ fn normalize_share_settings_patch(
     current_shared_with_emails: Option<&[String]>,
     current_sale_market_kind: Option<&str>,
 ) -> Result<ShareSettingsPatch, AppError> {
+    if patch.owner_email.is_some() {
+        return Err(AppError::Conflict(
+            "share owner is managed by the installation owner".into(),
+        ));
+    }
     let current_owner_email = owner_email.unwrap_or("");
-    let next_owner_email = match patch.owner_email {
-        Some(value) => Some(normalize_email(&value)?),
-        None => None,
-    };
+    let next_owner_email = None;
     let sale_market_kind = match patch.sale_market_kind {
         Some(value) => Some(normalize_sale_market_kind(&value)?),
         None => None,
@@ -14171,12 +14207,20 @@ fn ensure_share_id_writable_by_installation(
     Ok(())
 }
 
-fn normalize_self_reported_share_owner(share: &mut ShareDescriptor) -> Result<(), AppError> {
+fn normalize_self_reported_share_owner(
+    share: &mut ShareDescriptor,
+    installation_owner: &str,
+) -> Result<(), AppError> {
     let owner_email = share
         .owner_email
         .as_deref()
         .ok_or_else(|| AppError::BadRequest("share owner email is required".into()))
         .and_then(normalize_email)?;
+    if owner_email != installation_owner {
+        return Err(AppError::Conflict(
+            "share owner must match the installation owner".into(),
+        ));
+    }
     share.owner_email = Some(owner_email.clone());
     share.share_name = owner_email.clone();
     let allow_owner_in_acl = share.sale_market_kind == "share";
@@ -14202,6 +14246,110 @@ fn normalize_self_reported_share_owner(share: &mut ShareDescriptor) -> Result<()
     }
     share.access_by_app = access_by_app;
     Ok(())
+}
+
+fn rebind_installation_shares_to_owner(
+    conn: &Connection,
+    installation_id: &str,
+    new_owner: &str,
+) -> Result<usize, AppError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT share_id, owner_email, shared_with_emails_json,
+                    COALESCE(access_by_app_json, '{}'), COALESCE(app_settings_json, '{}')
+             FROM shares WHERE installation_id = ?1",
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("prepare share owner rebind failed: {error}"))
+        })?;
+    let rows = statement
+        .query_map(params![installation_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|error| {
+            AppError::Internal(format!("query shares for owner rebind failed: {error}"))
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            AppError::Internal(format!("read share for owner rebind failed: {error}"))
+        })?;
+    drop(statement);
+
+    let mut updated = 0;
+    for (share_id, current_owner, shared_json, access_json, settings_json) in rows {
+        if current_owner
+            .as_deref()
+            .and_then(|email| normalize_email(email).ok())
+            .is_some_and(|email| email == new_owner)
+        {
+            continue;
+        }
+        let previous_owner = current_owner
+            .as_deref()
+            .and_then(|email| normalize_email(email).ok())
+            .filter(|email| email != new_owner);
+        let mut shared = parse_string_vec(Some(shared_json)).map_err(|error| {
+            AppError::Internal(format!("parse share ACL for owner rebind failed: {error}"))
+        })?;
+        if let Some(previous_owner) = previous_owner.as_ref() {
+            shared.push(previous_owner.clone());
+        }
+        shared = normalize_email_list(&shared, new_owner);
+
+        let mut access = parse_share_access_by_app(Some(access_json)).map_err(|error| {
+            AppError::Internal(format!("parse app ACL for owner rebind failed: {error}"))
+        })?;
+        for entry in access.values_mut() {
+            if let Some(previous_owner) = previous_owner.as_ref() {
+                entry.shared_with_emails.push(previous_owner.clone());
+            }
+            entry.shared_with_emails = normalize_email_list(&entry.shared_with_emails, new_owner);
+        }
+        let mut settings = parse_share_app_settings(Some(settings_json)).map_err(|error| {
+            AppError::Internal(format!(
+                "parse app settings for owner rebind failed: {error}"
+            ))
+        })?;
+        for entry in settings.values_mut() {
+            if let Some(previous_owner) = previous_owner.as_ref() {
+                entry.shared_with_emails.push(previous_owner.clone());
+            }
+            entry.shared_with_emails = normalize_email_list(&entry.shared_with_emails, new_owner);
+        }
+
+        let shared = serde_json::to_string(&shared).map_err(|error| {
+            AppError::Internal(format!("serialize share ACL rebind failed: {error}"))
+        })?;
+        let access = serde_json::to_string(&access).map_err(|error| {
+            AppError::Internal(format!("serialize app ACL rebind failed: {error}"))
+        })?;
+        let settings = serde_json::to_string(&settings).map_err(|error| {
+            AppError::Internal(format!("serialize app settings rebind failed: {error}"))
+        })?;
+        updated += conn
+            .execute(
+                "UPDATE shares
+                 SET owner_email = ?2, share_name = ?2, shared_with_emails_json = ?3,
+                     access_by_app_json = ?4, app_settings_json = ?5, updated_at = ?6
+                 WHERE share_id = ?1",
+                params![
+                    share_id,
+                    new_owner,
+                    shared,
+                    access,
+                    settings,
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .map_err(|error| AppError::Internal(format!("rebind share owner failed: {error}")))?;
+    }
+    Ok(updated)
 }
 
 fn find_share_claim_by_subdomain(
@@ -16676,6 +16824,19 @@ mod tests {
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
         }
+    }
+
+    #[test]
+    fn self_reported_share_owner_must_match_installation_owner() {
+        let mut share = test_share_descriptor("owner-mismatch", "owner-mismatch-sub");
+        share.owner_email = Some("other@example.com".into());
+        let error = normalize_self_reported_share_owner(&mut share, "owner@example.com")
+            .expect_err("mismatched owner must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("share owner must match the installation owner")
+        );
     }
 
     #[test]
@@ -19530,6 +19691,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_tunnel_cannot_change_installation_owner() {
+        let (store, config) = setup_store("client-tunnel-owner-gate").await;
+        let installation_id = "inst-client-tunnel-owner";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        let tunnel = ClientTunnelConfig {
+            owner_email: "other@example.com".into(),
+            subdomain: "owner-gate-client".into(),
+            enabled: true,
+        };
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            installation_id,
+            "client_tunnel_claim",
+            &tunnel,
+            timestamp_ms,
+            &nonce,
+        );
+
+        let error = store
+            .claim_client_tunnel(
+                &config,
+                ClientTunnelClaimRequest {
+                    installation_id: installation_id.into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    tunnel,
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+            )
+            .await
+            .expect_err("client tunnel owner mismatch must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("client tunnel owner must match the installation owner")
+        );
+        let conn = store.conn.lock().await;
+        assert_eq!(
+            get_installation_owner_email(&conn, installation_id).expect("installation owner"),
+            Some("owner@example.com".into())
+        );
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
     async fn change_installation_owner_email_uses_new_owner_session() {
         let (store, config) = setup_store("change-owner-session").await;
         let installation_id = "inst-change-owner";
@@ -19542,12 +19755,26 @@ mod tests {
             "paused",
         )
         .await;
+        insert_share(
+            &store,
+            installation_id,
+            "share-divergent-owner",
+            "divergent-owner",
+            "paused",
+        )
+        .await;
         let old_email = "owner@example.com";
         let new_email = "new-owner@example.com";
         let access_token = "access-token-for-change-owner";
         let now = Utc::now();
         {
             let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET owner_email = 'historical@example.com', shared_with_emails_json = '[]'
+                 WHERE share_id = 'share-divergent-owner'",
+                [],
+            )
+            .expect("seed divergent share owner");
             let user = upsert_user_by_email(&conn, new_email, now).expect("upsert user");
             persist_session(
                 &conn,
@@ -19600,7 +19827,7 @@ mod tests {
         assert!(response.ok);
         assert_eq!(response.old_email, old_email);
         assert_eq!(response.new_email, new_email);
-        assert_eq!(response.updated_shares, 1);
+        assert_eq!(response.updated_shares, 2);
         let conn = store.conn.lock().await;
         assert_eq!(
             get_installation_owner_email(&conn, installation_id).expect("owner email"),
@@ -19610,6 +19837,19 @@ mod tests {
             get_share_owner_email(&conn, "share-change-owner").expect("share owner"),
             Some(new_email.into())
         );
+        assert_eq!(
+            get_share_owner_email(&conn, "share-divergent-owner").expect("divergent share owner"),
+            Some(new_email.into())
+        );
+        let shared_json: String = conn
+            .query_row(
+                "SELECT shared_with_emails_json FROM shares WHERE share_id = 'share-divergent-owner'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read migrated share ACL");
+        let shared: Vec<String> = serde_json::from_str(&shared_json).expect("parse migrated ACL");
+        assert_eq!(shared, vec!["historical@example.com".to_string()]);
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 
@@ -19967,7 +20207,7 @@ mod tests {
         let share = ShareDescriptor {
             share_id: "share-new".into(),
             share_name: "owner@example.com".into(),
-            owner_email: Some("different@example.com".into()),
+            owner_email: Some("owner@example.com".into()),
             shared_with_emails: vec![],
             market_access_mode: "selected".into(),
             access_by_app: Default::default(),
@@ -20928,7 +21168,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owner_can_transfer_share_owner_to_existing_shared_email() {
+    async fn owner_cannot_patch_share_owner_even_when_target_is_shared() {
         let (store, config) = setup_store("share-settings-owner-transfer").await;
         insert_installation(&store, "inst-1").await;
         insert_share(&store, "inst-1", "share-edit", "edit-sub", "active").await;
@@ -20939,7 +21179,7 @@ mod tests {
         )
         .await;
 
-        let response = store
+        let error = store
             .create_share_settings_edit(
                 "share-edit",
                 "owner@example.com",
@@ -20949,22 +21189,18 @@ mod tests {
                 },
             )
             .await
-            .expect("owner can transfer share owner to shareto");
-
-        assert_eq!(
-            response.edit.patch.owner_email.as_deref(),
-            Some("shared@example.com")
-        );
-        assert_eq!(
-            response.edit.patch.shared_with_emails,
-            Some(vec!["other@example.com".into(), "owner@example.com".into()])
+            .expect_err("share owner patch must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("share owner is managed by the installation owner")
         );
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 
     #[tokio::test]
-    async fn owner_cannot_transfer_share_owner_to_unshared_email() {
+    async fn owner_cannot_patch_share_owner_to_unshared_email() {
         let (store, config) = setup_store("share-settings-owner-transfer-unshared").await;
         insert_installation(&store, "inst-1").await;
         insert_share(&store, "inst-1", "share-edit", "edit-sub", "active").await;
@@ -20980,11 +21216,11 @@ mod tests {
                 },
             )
             .await
-            .expect_err("owner transfer target must already be shared");
+            .expect_err("share owner patch must be rejected");
 
         assert!(
             err.to_string()
-                .contains("new share owner must already be a shareto email")
+                .contains("share owner is managed by the installation owner")
         );
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
