@@ -3,7 +3,7 @@ import type { MapDisplaySettings, MapDisplaySettingsUpdate, MapViewportSettings 
 export const MAP_VIEWPORT_HEIGHT_PX = 420;
 
 export const DEFAULT_MAP_VIEWPORT: MapViewportSettings = {
-  visibleStartPx: 14,
+  visibleStartPx: 90,
 };
 
 export const DEFAULT_MAP_DISPLAY: MapDisplaySettings = {

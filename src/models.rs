@@ -1934,7 +1934,7 @@ pub struct MapViewportSettings {
 impl Default for MapViewportSettings {
     fn default() -> Self {
         Self {
-            visible_start_px: 14,
+            visible_start_px: 90,
         }
     }
 }
