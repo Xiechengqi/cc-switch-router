@@ -5,7 +5,7 @@ import { useLocaleText } from "@/components/i18n/locale-provider";
 import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
 import type { DashboardResponse, MapPoint, MarketRequestLog, RecentRequestEvent, ShareRequestLog } from "@/lib/types";
 import { cn } from "@/lib/utils";
-import { computeMapOffsetY, DEFAULT_MAP_DISPLAY } from "@/lib/map-display-settings";
+import { computeMapOffsetY, DEFAULT_MAP_DISPLAY, MAP_VIEWPORT_HEIGHT_PX } from "@/lib/map-display-settings";
 
 function projectPoint(point: MapPoint) {
   if (typeof point.lat !== "number" || typeof point.lon !== "number") return null;
@@ -23,7 +23,6 @@ type TickerMeta = Partial<Omit<ShareRequestLog, "createdAt"> & Omit<MarketReques
 };
 
 const REQUEST_TICKER_LIMIT = 6;
-const MAP_VIEWPORT_HEIGHT_PX = 420;
 
 function spreadPoints(points: PlacedPoint[], minDistPct: number, lockedIndex: number) {
   if (points.length < 2) return points;
@@ -296,13 +295,13 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
     if (!shell) return;
     const updateOffset = () => {
       const height = shell.clientHeight || MAP_VIEWPORT_HEIGHT_PX;
-      setMapOffsetY(computeMapOffsetY(viewport, shell.clientWidth, height));
+      setMapOffsetY(computeMapOffsetY(viewport.visibleStartPx, shell.clientWidth, height));
     };
     updateOffset();
     const observer = new ResizeObserver(updateOffset);
     observer.observe(shell);
     return () => observer.disconnect();
-  }, [viewport.visibleEndPx, viewport.visibleStartPx, viewport.verticalPanPx]);
+  }, [viewport.visibleStartPx]);
 
   React.useEffect(() => {
     let cancelled = false;

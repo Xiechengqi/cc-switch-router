@@ -13,8 +13,6 @@ export type SessionStatus = {
 
 export type MapViewportSettings = {
   visibleStartPx: number;
-  visibleEndPx: number;
-  verticalPanPx: number;
 };
 
 export type MapDisplaySettings = {

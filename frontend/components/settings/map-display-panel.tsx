@@ -1,8 +1,9 @@
 "use client";
 
 import { Loader2, RotateCcw } from "lucide-react";
-import { Alert, Button, Card, Chip, Input, Switch } from "@heroui/react";
+import { Alert, Button, Card, Chip, Input } from "@heroui/react";
 import * as React from "react";
+import { CompactSelect } from "@/components/common/compact-select";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getMapDisplay } from "@/lib/api";
 import { DEFAULT_MAP_DISPLAY } from "@/lib/map-display-settings";
@@ -84,30 +85,22 @@ export function MapDisplayPanel({
           </div>
         ) : (
           <>
-            <label className="flex items-center justify-between gap-4 rounded-lg border bg-background px-4 py-3">
-              <div className="grid gap-1">
-                <span className="text-sm font-medium">{t("map.requestFlows")}</span>
-                <span className="text-sm text-muted-foreground">{t("settings.mapShowFlowsDescription")}</span>
-              </div>
-              <Switch
-                isSelected={display.showFlows}
-                isDisabled={!canEdit}
-                onChange={(next) => updateSettings((prev) => ({ ...prev, showFlows: next }))}
-                aria-label={t("map.requestFlows")}
-              />
-            </label>
-            <label className="flex items-center justify-between gap-4 rounded-lg border bg-background px-4 py-3">
-              <div className="grid gap-1">
-                <span className="text-sm font-medium">{t("map.demandHeat")}</span>
-                <span className="text-sm text-muted-foreground">{t("settings.mapShowHeatDescription")}</span>
-              </div>
-              <Switch
-                isSelected={display.showHeat}
-                isDisabled={!canEdit}
-                onChange={(next) => updateSettings((prev) => ({ ...prev, showHeat: next }))}
-                aria-label={t("map.demandHeat")}
-              />
-            </label>
+            <BoolSelectField
+              id="map-show-flows"
+              label={t("map.requestFlows")}
+              description={t("settings.mapShowFlowsDescription")}
+              value={display.showFlows}
+              disabled={!canEdit}
+              onChange={(next) => updateSettings((prev) => ({ ...prev, showFlows: next }))}
+            />
+            <BoolSelectField
+              id="map-show-heat"
+              label={t("map.demandHeat")}
+              description={t("settings.mapShowHeatDescription")}
+              value={display.showHeat}
+              disabled={!canEdit}
+              onChange={(next) => updateSettings((prev) => ({ ...prev, showHeat: next }))}
+            />
 
             <div className="grid gap-4 rounded-lg border bg-background px-4 py-4">
               <div className="flex flex-wrap items-start justify-between gap-3">
@@ -120,57 +113,65 @@ export function MapDisplayPanel({
                     variant="outline"
                     size="sm"
                     onPress={resetViewport}
-                    isDisabled={
-                      display.viewport.visibleStartPx === DEFAULT_MAP_DISPLAY.viewport.visibleStartPx
-                      && display.viewport.visibleEndPx === DEFAULT_MAP_DISPLAY.viewport.visibleEndPx
-                      && display.viewport.verticalPanPx === DEFAULT_MAP_DISPLAY.viewport.verticalPanPx
-                    }
+                    isDisabled={display.viewport.visibleStartPx === DEFAULT_MAP_DISPLAY.viewport.visibleStartPx}
                   >
                     <RotateCcw className="h-3.5 w-3.5" />
                     {t("settings.mapViewportReset")}
                   </Button>
                 ) : null}
               </div>
-              <div className="grid gap-3 md:grid-cols-3">
-                <ViewportField
-                  id="map-visible-start"
-                  label={t("settings.mapVisibleStartPx")}
-                  description={t("settings.mapVisibleStartPxDescription")}
-                  value={display.viewport.visibleStartPx}
-                  disabled={!canEdit}
-                  onChange={(next) => updateSettings((prev) => ({
-                    ...prev,
-                    viewport: { ...prev.viewport, visibleStartPx: next },
-                  }))}
-                />
-                <ViewportField
-                  id="map-visible-end"
-                  label={t("settings.mapVisibleEndPx")}
-                  description={t("settings.mapVisibleEndPxDescription")}
-                  value={display.viewport.visibleEndPx}
-                  disabled={!canEdit}
-                  onChange={(next) => updateSettings((prev) => ({
-                    ...prev,
-                    viewport: { ...prev.viewport, visibleEndPx: next },
-                  }))}
-                />
-                <ViewportField
-                  id="map-vertical-pan"
-                  label={t("settings.mapVerticalPanPx")}
-                  description={t("settings.mapVerticalPanPxDescription")}
-                  value={display.viewport.verticalPanPx}
-                  disabled={!canEdit}
-                  onChange={(next) => updateSettings((prev) => ({
-                    ...prev,
-                    viewport: { ...prev.viewport, verticalPanPx: next },
-                  }))}
-                />
-              </div>
+              <ViewportField
+                id="map-visible-start"
+                label={t("settings.mapVisibleStartPx")}
+                description={t("settings.mapVisibleStartPxDescription")}
+                value={display.viewport.visibleStartPx}
+                disabled={!canEdit}
+                onChange={(next) => updateSettings((prev) => ({
+                  ...prev,
+                  viewport: { visibleStartPx: next },
+                }))}
+              />
             </div>
           </>
         )}
       </Card.Content>
     </Card>
+  );
+}
+
+const BOOL_SELECT_OPTIONS = [
+  { value: "true", label: "true" },
+  { value: "false", label: "false" },
+] as const;
+
+function BoolSelectField({
+  id,
+  label,
+  description,
+  value,
+  disabled,
+  onChange,
+}: {
+  id: string;
+  label: string;
+  description: string;
+  value: boolean;
+  disabled: boolean;
+  onChange: (value: boolean) => void;
+}) {
+  return (
+    <div className="grid gap-2 rounded-lg border bg-background px-4 py-3">
+      <label className="text-sm font-medium" htmlFor={id}>{label}</label>
+      <CompactSelect
+        value={value ? "true" : "false"}
+        options={[...BOOL_SELECT_OPTIONS]}
+        disabled={disabled}
+        onChange={(next) => onChange(next === "true")}
+        ariaLabel={label}
+        triggerClassName="min-h-10 w-full max-w-[180px] text-sm"
+      />
+      <span className="text-sm text-muted-foreground">{description}</span>
+    </div>
   );
 }
 

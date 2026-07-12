@@ -1929,16 +1929,12 @@ impl Default for ShareAppSettings {
 #[serde(rename_all = "camelCase")]
 pub struct MapViewportSettings {
     pub visible_start_px: i32,
-    pub visible_end_px: i32,
-    pub vertical_pan_px: i32,
 }
 
 impl Default for MapViewportSettings {
     fn default() -> Self {
         Self {
             visible_start_px: 14,
-            visible_end_px: 433,
-            vertical_pan_px: 0,
         }
     }
 }
@@ -1965,8 +1961,6 @@ impl Default for MapDisplaySettings {
 #[serde(rename_all = "camelCase")]
 pub struct MapViewportSettingsUpdate {
     pub visible_start_px: Option<i32>,
-    pub visible_end_px: Option<i32>,
-    pub vertical_pan_px: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]

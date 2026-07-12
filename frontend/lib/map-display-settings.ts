@@ -1,9 +1,9 @@
 import type { MapDisplaySettings, MapDisplaySettingsUpdate, MapViewportSettings } from "@/lib/types";
 
+export const MAP_VIEWPORT_HEIGHT_PX = 420;
+
 export const DEFAULT_MAP_VIEWPORT: MapViewportSettings = {
   visibleStartPx: 14,
-  visibleEndPx: 433,
-  verticalPanPx: 0,
 };
 
 export const DEFAULT_MAP_DISPLAY: MapDisplaySettings = {
@@ -15,31 +15,23 @@ export const DEFAULT_MAP_DISPLAY: MapDisplaySettings = {
 export function sameMapDisplaySettings(left: MapDisplaySettings, right: MapDisplaySettings) {
   return left.showFlows === right.showFlows
     && left.showHeat === right.showHeat
-    && left.viewport.visibleStartPx === right.viewport.visibleStartPx
-    && left.viewport.visibleEndPx === right.viewport.visibleEndPx
-    && left.viewport.verticalPanPx === right.viewport.verticalPanPx;
+    && left.viewport.visibleStartPx === right.viewport.visibleStartPx;
 }
 
 export function toMapDisplayUpdate(settings: MapDisplaySettings): MapDisplaySettingsUpdate {
   return {
     showFlows: settings.showFlows,
     showHeat: settings.showHeat,
-    viewport: { ...settings.viewport },
+    viewport: { visibleStartPx: settings.viewport.visibleStartPx },
   };
 }
 
 export function computeMapOffsetY(
-  viewport: MapViewportSettings,
+  visibleStartPx: number,
   viewportWidth: number,
   viewportHeight: number,
 ) {
   const mapHeight = viewportWidth / 2;
-  const mapTopPx = -viewport.visibleStartPx;
-  const mapBottomPx = mapTopPx + mapHeight;
-  const offsetY = mapTopPx - viewportHeight / 2 + mapHeight / 2;
-  if (mapBottomPx > viewport.visibleEndPx) {
-    const adjustedTopPx = viewport.visibleEndPx - mapHeight;
-    return adjustedTopPx - viewportHeight / 2 + mapHeight / 2 + viewport.verticalPanPx;
-  }
-  return offsetY + viewport.verticalPanPx;
+  const mapTopPx = -visibleStartPx;
+  return mapTopPx - viewportHeight / 2 + mapHeight / 2;
 }

@@ -11,7 +11,7 @@ use rand::distributions::{Alphanumeric, DistString};
 use resend_rs::Resend;
 use resend_rs::types::CreateEmailBaseOptions;
 use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -36,7 +36,7 @@ use crate::models::{
     HealthTimelineBucket, ImageGenerationRequestLogEntry, Installation,
     InstallationPayoutProfileUpdateRequest, InstallationPayoutProfileUpdateResponse,
     InstallationView, IssueLeaseRequest, IssueLeaseResponse, LatLonPoint, MapDisplaySettings,
-    MapDisplaySettingsUpdate, MarketAppAvailability,
+    MapDisplaySettingsUpdate, MapViewportSettings, MarketAppAvailability,
     MarketAppAvailabilityEntry, MarketDisabledSharesUpdateRequest,
     MarketDisabledSharesUpdateResponse, MarketLinkedShareView, MarketMaintenanceUpdateRequest,
     MarketMaintenanceUpdateResponse, MarketRegistryRecord, MarketRequestLogBatchSyncRequest,
@@ -4379,12 +4379,6 @@ impl AppStore {
             if let Some(visible_start_px) = viewport.visible_start_px {
                 current.viewport.visible_start_px = visible_start_px;
             }
-            if let Some(visible_end_px) = viewport.visible_end_px {
-                current.viewport.visible_end_px = visible_end_px;
-            }
-            if let Some(vertical_pan_px) = viewport.vertical_pan_px {
-                current.viewport.vertical_pan_px = vertical_pan_px;
-            }
         }
         current = sanitize_map_display_settings(current);
         write_map_display_settings(&conn, &current)?;
@@ -7863,9 +7857,48 @@ fn upsert_market_request_log_tx(
 
 fn sanitize_map_display_settings(mut settings: MapDisplaySettings) -> MapDisplaySettings {
     settings.viewport.visible_start_px = settings.viewport.visible_start_px.clamp(0, 5000);
-    settings.viewport.visible_end_px = settings.viewport.visible_end_px.clamp(0, 5000);
-    settings.viewport.vertical_pan_px = settings.viewport.vertical_pan_px.clamp(-2000, 2000);
     settings
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredMapDisplaySettings {
+    #[serde(default = "default_show_flows")]
+    show_flows: bool,
+    #[serde(default = "default_show_heat")]
+    show_heat: bool,
+    viewport: StoredMapViewportSettings,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredMapViewportSettings {
+    #[serde(default)]
+    visible_start_px: i32,
+    #[serde(default)]
+    visible_end_px: i32,
+    #[serde(default)]
+    vertical_pan_px: i32,
+}
+
+fn default_show_flows() -> bool {
+    true
+}
+
+fn default_show_heat() -> bool {
+    true
+}
+
+fn normalize_stored_map_display_settings(stored: StoredMapDisplaySettings) -> MapDisplaySettings {
+    let _legacy_visible_end_px = stored.viewport.visible_end_px;
+    MapDisplaySettings {
+        show_flows: stored.show_flows,
+        show_heat: stored.show_heat,
+        viewport: MapViewportSettings {
+            visible_start_px: (stored.viewport.visible_start_px - stored.viewport.vertical_pan_px)
+                .clamp(0, 5000),
+        },
+    }
 }
 
 fn read_map_display_settings(conn: &Connection) -> Result<MapDisplaySettings, AppError> {
@@ -7879,10 +7912,10 @@ fn read_map_display_settings(conn: &Connection) -> Result<MapDisplaySettings, Ap
         .map_err(|e| AppError::Internal(format!("read map display settings failed: {e}")))?;
     match json {
         Some(raw) => {
-            let parsed = serde_json::from_str::<MapDisplaySettings>(&raw).map_err(|e| {
+            let parsed = serde_json::from_str::<StoredMapDisplaySettings>(&raw).map_err(|e| {
                 AppError::Internal(format!("parse map display settings failed: {e}"))
             })?;
-            Ok(sanitize_map_display_settings(parsed))
+            Ok(sanitize_map_display_settings(normalize_stored_map_display_settings(parsed)))
         }
         None => Ok(MapDisplaySettings::default()),
     }
