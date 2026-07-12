@@ -5,7 +5,7 @@ import { Check, ChevronDown, Copy, ExternalLink, Maximize2, PanelRightOpen, Sear
 import * as React from "react";
 import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog";
 import { ShareCard } from "@/components/dashboard/share-card";
-import { clientOperationalSummary, OperationalDiagnosis, OperationalStatusPill, operationalReasonLabel, shareIsEnabled, shareOperationalSummary, useStableOperationalRanks } from "@/components/dashboard/operational-status";
+import { ClientRemovalSchedule, clientOperationalSummary, OperationalDiagnosis, OperationalStatusPill, operationalReasonLabel, shareIsEnabled, shareOperationalSummary, useStableOperationalRanks } from "@/components/dashboard/operational-status";
 import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
 import { useDashboardViewState } from "@/components/dashboard/dashboard-view-state";
 import { useOperationVerification } from "@/components/dashboard/operation-verification";
@@ -31,7 +31,7 @@ import {
   sortClients,
 } from "@/components/dashboard/data-tables";
 import type { DashboardClient, DashboardMarket, OperationalState, ShareView } from "@/lib/types";
-import { formatRelativeTime } from "@/lib/utils";
+import { formatDateTime, formatRelativeTime } from "@/lib/utils";
 import { usePersistentState } from "@/lib/use-persistent-state";
 import { recordDashboardUxEvent } from "@/lib/api";
 import { CompactSelect } from "@/components/common/compact-select";
@@ -300,6 +300,7 @@ function ClientCard({
   const onlineShares = enabledShares.filter((share) => share.isOnline);
   const issueCount = enabledShares.length - onlineShares.length;
   const identity = client.clientTunnel?.subdomain || client.installation.id;
+  const showRemoval = state === "offline" && !!client.removalAt;
   const borderTone = state === "offline" ? "border-l-rose-500" : state === "degraded" ? "border-l-amber-400" : "border-l-slate-200";
   const headerPointerDownRef = React.useRef<{ x: number; y: number } | null>(null);
 
@@ -350,6 +351,7 @@ function ClientCard({
               <strong className="truncate text-sm font-semibold text-foreground" title={identity}>{identity}</strong>
               <OperationalStatusPill summary={summary} />
               {summary.primaryReason ? <span className={`truncate text-[11px] font-medium ${state === "offline" ? "text-rose-700" : "text-amber-700"}`} title={operationalReasonLabel(summary.primaryReason, t)}>{operationalReasonLabel(summary.primaryReason, t)}</span> : null}
+              {showRemoval ? <ClientRemovalSchedule removalAt={client.removalAt} className="text-[11px]" /> : null}
             </div>
             <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
               {tunnelUrl ? (
@@ -363,11 +365,19 @@ function ClientCard({
             </div>
           </div>
 
-          <div className="grid min-w-0 grid-cols-4 gap-5">
+          <div className={`grid min-w-0 gap-5 ${showRemoval ? "grid-cols-5" : "grid-cols-4"}`}>
             <Metric label={t("dashboard.region")} value={`${client.installation.countryCode || client.installation.region || "-"} · ${clientPlatformLabel(client)}`} />
             <Metric label={t("dashboard.uptime24h")} value={`${onlineRate.toFixed(1)}%`} title={onlineTitle} tone={onlineRate < 90 ? "warning" : "success"} />
             <Metric label={t("dashboard.shares")} value={`${onlineShares.length}/${enabledShares.length || allShares.length} ${t("common.online")}`} tone={issueCount ? "danger" : "default"} />
             <Metric label={t("dashboard.lastSeen")} value={formatRelativeTime(client.installation.lastSeenAt, locale)} tone={state === "offline" ? "danger" : "default"} />
+            {showRemoval ? (
+              <Metric
+                label={t("dashboard.removalAt")}
+                value={formatRelativeTime(client.removalAt, locale)}
+                title={formatDateTime(client.removalAt)}
+                tone="danger"
+              />
+            ) : null}
           </div>
 
           <div className="flex justify-end">
@@ -646,7 +656,7 @@ export function ClientBoard({
               <Drawer.Body className="overflow-y-auto">
                 {selectedClient ? (
                   <div className="grid gap-5">
-                    <OperationalDiagnosis summary={clientOperationalSummary(selectedClient, sharesForClient(selectedClient))} kind="client" onEvidence={() => { document.getElementById("client-health-evidence")?.scrollIntoView({ behavior: "smooth" }); void recordDashboardUxEvent({ eventType: "diagnosis_evidence_opened", source: "drawer", targetType: "client" }); }} />
+                    <OperationalDiagnosis summary={clientOperationalSummary(selectedClient, sharesForClient(selectedClient))} kind="client" removalAt={selectedClient.removalAt} onEvidence={() => { document.getElementById("client-health-evidence")?.scrollIntoView({ behavior: "smooth" }); void recordDashboardUxEvent({ eventType: "diagnosis_evidence_opened", source: "drawer", targetType: "client" }); }} />
                     <div id="client-health-evidence"><HealthTimelineStrip timeline={selectedClient.healthTimeline || []} /></div>
                     <DrawerSection label={t("dashboard.client")}>
                       <div className="grid gap-1 text-xs text-muted-foreground">
@@ -655,6 +665,15 @@ export function ClientBoard({
                         <span>{t("dashboard.region")}: <strong className="text-foreground">{selectedClient.installation.countryCode || selectedClient.installation.region || "-"}</strong></span>
                         <span>{t("dashboard.version")}: <strong className="text-foreground">{clientPlatformLabel(selectedClient)}</strong></span>
                         <span>{t("dashboard.online")}: <strong className="text-foreground">{(selectedClient.onlineRate24h || 0).toFixed(1)}% / {formatAgeDaysOrHours(selectedClient.installation.createdAt, locale)}</strong></span>
+                        {selectedClient.removalAt ? (
+                          <span>
+                            {t("dashboard.removalAt")}:{" "}
+                            <strong className="text-rose-700" title={formatDateTime(selectedClient.removalAt)}>
+                              {formatRelativeTime(selectedClient.removalAt, locale)}
+                            </strong>
+                            <span className="text-muted-foreground"> · {formatDateTime(selectedClient.removalAt)}</span>
+                          </span>
+                        ) : null}
                       </div>
                     </DrawerSection>
                     <DrawerSection label={t("dashboard.payout")}>

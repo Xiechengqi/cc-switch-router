@@ -78,7 +78,8 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_DB_PATH` | `$HOME/.cc-switch-router/cc-switch-router.db` | SQLite 路径 |
 | `CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS` | `300` | 清理任务执行间隔（秒） |
 | `CC_SWITCH_ROUTER_LEASE_RETENTION_SECS` | `604800` | 过期 lease 保留时长（秒） |
-| `CC_SWITCH_ROUTER_CLIENT_STALE_SECS` | `3600` | client 超过该时间未上报时清理其 share、lease 和 client 记录 |
+| `CC_SWITCH_ROUTER_CLIENT_STALE_SECS` | `3600` | client 超过该时间未心跳时标记离线，并清理其 share、lease 与内存路由 |
+| `CC_SWITCH_ROUTER_CLIENT_INSTALLATION_RETENTION_SECS` | `86400` | 离线 client 的 installation 记录（含 payout）保留时长，超时后删除；必须 >= `CLIENT_STALE_SECS` |
 | `CC_SWITCH_ROUTER_RESEND_API_KEY` | 空 | Resend API Key，用于邮箱验证码发送和 dashboard 用量读取 |
 | `CC_SWITCH_ROUTER_RESEND_FROM` | 空 | 邮件发件人，可填裸邮箱或 `TokenSwitch <noreply@example.com>`；裸邮箱会自动显示为 `TokenSwitch <邮箱>` |
 | `CC_SWITCH_ROUTER_RESEND_FROM_NAME` | `TokenSwitch` | `CC_SWITCH_ROUTER_RESEND_FROM` 为裸邮箱时使用的发件人显示名 |

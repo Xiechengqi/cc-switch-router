@@ -4,7 +4,7 @@ import * as React from "react";
 import { AlertTriangle, CheckCircle2, CircleOff, Clock3, PauseCircle } from "lucide-react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import type { DashboardClient, DashboardMarket, OperationalReason, OperationalState, OperationalSummary, ShareView } from "@/lib/types";
-import { formatRelativeTime } from "@/lib/utils";
+import { formatDateTime, formatRelativeTime } from "@/lib/utils";
 
 export function shareIsEnabled(share: ShareView) {
   return String(share.shareStatus || "").trim().toLowerCase() === "active";
@@ -142,6 +142,32 @@ export function operationalImpactLabel(kind: "client" | "share" | "market", reas
   return t("dashboard.impact.degraded");
 }
 
+export function ClientRemovalSchedule({
+  removalAt,
+  className = "",
+  showLabel = true,
+}: {
+  removalAt?: string;
+  className?: string;
+  showLabel?: boolean;
+}) {
+  const { locale, t } = useLocaleText();
+  if (!removalAt) return null;
+  const ts = Date.parse(removalAt);
+  if (!Number.isFinite(ts)) return null;
+  return (
+    <span
+      className={`inline-flex min-w-0 items-center gap-1 truncate font-medium text-rose-700 ${className}`}
+      title={formatDateTime(removalAt)}
+    >
+      {showLabel ? <span className="shrink-0">{t("dashboard.removalAt")}</span> : null}
+      <time className="truncate" dateTime={removalAt}>
+        {formatRelativeTime(removalAt, locale)}
+      </time>
+    </span>
+  );
+}
+
 export function OperationalStatusPill({ summary, className = "" }: { summary: OperationalSummary; className?: string }) {
   const { t } = useLocaleText();
   const state = summary.state;
@@ -158,7 +184,17 @@ export function OperationalStatusPill({ summary, className = "" }: { summary: Op
   return <span className={`inline-flex h-6 shrink-0 items-center gap-1.5 rounded-full border px-2.5 text-[11px] font-semibold ${style} ${className}`}><Icon className="h-3 w-3" />{operationalStateLabel(state, t)}</span>;
 }
 
-export function OperationalDiagnosis({ summary, kind, onEvidence }: { summary: OperationalSummary; kind: "client" | "share" | "market"; onEvidence?: () => void }) {
+export function OperationalDiagnosis({
+  summary,
+  kind,
+  onEvidence,
+  removalAt,
+}: {
+  summary: OperationalSummary;
+  kind: "client" | "share" | "market";
+  onEvidence?: () => void;
+  removalAt?: string;
+}) {
   const { locale, t } = useLocaleText();
   const reason = summary.primaryReason;
   return (
@@ -170,6 +206,9 @@ export function OperationalDiagnosis({ summary, kind, onEvidence }: { summary: O
       <div className="grid gap-1">
         <strong className="text-sm text-foreground">{operationalReasonLabel(reason, t)}</strong>
         <span className="text-xs leading-5 text-muted-foreground">{operationalImpactLabel(kind, reason, t)}</span>
+        {kind === "client" && summary.state === "offline" && removalAt ? (
+          <ClientRemovalSchedule removalAt={removalAt} className="text-xs" />
+        ) : null}
         {summary.additionalReasonCount > 0 ? <span className="text-[11px] font-medium text-amber-700">{t("dashboard.otherIssues", { count: summary.additionalReasonCount })}</span> : null}
       </div>
       {onEvidence && reason ? <button type="button" className="justify-self-start text-xs font-medium text-primary hover:underline" onClick={onEvidence}>{t("dashboard.viewEvidence")}</button> : null}

@@ -137,6 +137,7 @@ export type DashboardClient = {
   healthChecks?: HealthCheckEntry[];
   healthTimeline?: HealthTimelineBucket[];
   operationalSummary?: OperationalSummary;
+  removalAt?: string;
 };
 
 export type ShareSaleMarketKind = "token" | "share";

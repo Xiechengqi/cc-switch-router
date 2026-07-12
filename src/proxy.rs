@@ -318,6 +318,15 @@ impl ProxyRegistry {
         }
     }
 
+    pub async fn remove_route_if_present(&self, subdomain: &str) -> bool {
+        let old_route = self.routes.write().await.remove(subdomain);
+        let removed = old_route.is_some();
+        if let Some(shutdown) = old_route.and_then(|route| route.shutdown) {
+            shutdown.shutdown();
+        }
+        removed
+    }
+
     pub async fn remove_route_if_connection(&self, subdomain: &str, connection_id: &str) {
         let mut routes = self.routes.write().await;
         let should_remove = routes

@@ -82,7 +82,6 @@ const SIGNED_REQUEST_MAX_SKEW_MS: i64 = 60_000;
 const NONCE_RETENTION_SECS: i64 = 10 * 60;
 const MARKET_OFFLINE_GRACE_SECS: i64 = 24 * 60 * 60;
 const MARKET_ACTIVE_MISSING_GRACE_SECS: i64 = 5 * 60;
-const CLEANUP_ACTIVE_SUBDOMAIN_CHUNK_SIZE: usize = 500;
 const AUTH_CODE_DIGITS: usize = 6;
 const AUTH_PURPOSE_LOGIN: &str = "login";
 const MARKET_DEFAULT_SCOPES: &[&str] = &[
@@ -3953,6 +3952,16 @@ impl AppStore {
                 )
             })
             .collect::<HashMap<_, _>>();
+        let installation_removal_at = installations
+            .iter()
+            .map(|installation| {
+                (
+                    installation.id.clone(),
+                    installation.last_seen_at
+                        + Duration::seconds(config.client_installation_retention_secs),
+                )
+            })
+            .collect::<HashMap<_, _>>();
 
         let mut installation_views = Vec::new();
         let mut client_map_points = Vec::new();
@@ -4303,6 +4312,7 @@ impl AppStore {
                     health_timeline,
                     installation,
                     operational_summary: OperationalSummary::healthy("online"),
+                    removal_at: None,
                 };
                 view.operational_summary = client_operational_summary(
                     &view,
@@ -4310,6 +4320,9 @@ impl AppStore {
                     config.client_stale_secs,
                     Utc::now(),
                 );
+                if view.operational_summary.state == "offline" {
+                    view.removal_at = installation_removal_at.get(&view.installation.id).copied();
+                }
                 view
             })
             // 只展示有 share 或已配置 client tunnel 的机器；otherwise dashboard 会被纯
@@ -4534,78 +4547,23 @@ impl AppStore {
             .map(|dt| dt.timestamp())
             .unwrap_or_default();
         let stale_cutoff = (Utc::now() - Duration::seconds(config.client_stale_secs)).to_rfc3339();
+        let installation_retention_cutoff = (Utc::now()
+            - Duration::seconds(config.client_installation_retention_secs))
+        .to_rfc3339();
         let paused_cutoff =
             (Utc::now() - Duration::seconds(config.paused_share_stale_secs)).to_rfc3339();
         let market_missing_cutoff =
             (Utc::now() - Duration::seconds(MARKET_ACTIVE_MISSING_GRACE_SECS)).to_rfc3339();
         let market_release_cutoff =
             (Utc::now() - Duration::seconds(MARKET_OFFLINE_GRACE_SECS)).to_rfc3339();
-        let active_subdomains_set = active_subdomains.iter().cloned().collect::<HashSet<_>>();
         let (mut result, stale_subdomains, stale_image_storage_keys) = {
             let conn = self.conn.lock().await;
             let tx = conn
                 .unchecked_transaction()
                 .map_err(|e| AppError::Internal(format!("begin cleanup tx failed: {e}")))?;
 
-            if !active_subdomains.is_empty() {
-                let now = Utc::now().to_rfc3339();
-                for chunk in active_subdomains.chunks(CLEANUP_ACTIVE_SUBDOMAIN_CHUNK_SIZE) {
-                    let placeholders = repeat_vars(chunk.len());
-                    let mut update_installation_params = Vec::with_capacity(chunk.len() + 1);
-                    update_installation_params.push(now.clone());
-                    update_installation_params.extend(chunk.iter().cloned());
-                    tx.execute(
-                        &format!(
-                            "UPDATE installations
-                             SET last_seen_at = ?
-                             WHERE id IN (
-                                 SELECT DISTINCT installation_id
-                                 FROM shares
-                                 WHERE subdomain IN ({placeholders})
-                             )"
-                        ),
-                        params_from_iter(update_installation_params),
-                    )
-                    .map_err(|e| {
-                        AppError::Internal(format!("touch active route installations failed: {e}"))
-                    })?;
-
-                    let mut update_share_params = Vec::with_capacity(chunk.len() + 1);
-                    update_share_params.push(now.clone());
-                    update_share_params.extend(chunk.iter().cloned());
-                    tx.execute(
-                        &format!(
-                            "UPDATE shares
-                             SET updated_at = ?
-                             WHERE subdomain IN ({placeholders})"
-                        ),
-                        params_from_iter(update_share_params),
-                    )
-                    .map_err(|e| {
-                        AppError::Internal(format!("touch active route shares failed: {e}"))
-                    })?;
-                }
-            }
-
-            let mut stale_subdomains = {
-                let mut stmt = tx
-                    .prepare(
-                        "SELECT DISTINCT subdomain
-                         FROM shares
-                         WHERE installation_id IN (
-                             SELECT id FROM installations WHERE last_seen_at < ?1
-                         )
-                           AND subdomain IS NOT NULL
-                           AND subdomain != ''
-                           AND subdomain != '-'",
-                    )
-                    .map_err(|e| AppError::Internal(format!("prepare stale routes failed: {e}")))?;
-                let rows = stmt
-                    .query_map(params![stale_cutoff], |row| row.get::<_, String>(0))
-                    .map_err(|e| AppError::Internal(format!("query stale routes failed: {e}")))?;
-                collect_rows(rows)?
-            };
-
+            let mut stale_subdomains =
+                collect_stale_installation_subdomains_tx(&tx, &stale_cutoff)?;
             let deleted_leases = tx
                 .execute(
                     "DELETE FROM leases
@@ -4653,7 +4611,30 @@ impl AppStore {
                     AppError::Internal(format!("delete stale client leases failed: {e}"))
                 })? as usize;
 
-            let deleted_installations = 0;
+            let mut deleted_installations = 0usize;
+            let expired_installation_ids = {
+                let mut stmt = tx
+                    .prepare("SELECT id FROM installations WHERE last_seen_at < ?1")
+                    .map_err(|e| {
+                        AppError::Internal(format!("prepare expired installations failed: {e}"))
+                    })?;
+                let rows = stmt
+                    .query_map(params![installation_retention_cutoff], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .map_err(|e| {
+                        AppError::Internal(format!("query expired installations failed: {e}"))
+                    })?;
+                collect_rows(rows)?
+            };
+            for installation_id in expired_installation_ids {
+                stale_subdomains
+                    .extend(route_subdomains_for_installation_tx(&tx, &installation_id)?);
+                purge_installation_data_tx(&tx, &installation_id)?;
+                deleted_installations += 1;
+            }
+            stale_subdomains.sort();
+            stale_subdomains.dedup();
 
             let stale_active_offline_shares = {
                 let mut stmt = tx
@@ -4679,9 +4660,6 @@ impl AppStore {
                         AppError::Internal(format!("query stale active offline shares failed: {e}"))
                     })?;
                 collect_rows(rows)?
-                    .into_iter()
-                    .filter(|(_, subdomain)| !active_subdomains_set.contains(subdomain))
-                    .collect::<Vec<_>>()
             };
             let (deleted_stale_active_offline_shares, deleted_stale_active_offline_leases) =
                 if stale_active_offline_shares.is_empty() {
@@ -4897,11 +4875,9 @@ impl AppStore {
 
         let mut removed_routes = 0;
         for subdomain in stale_subdomains {
-            if active_subdomains_set.contains(&subdomain) {
-                continue;
+            if proxy.remove_route_if_present(&subdomain).await {
+                removed_routes += 1;
             }
-            proxy.remove_route(&subdomain).await;
-            removed_routes += 1;
         }
         result.removed_routes = removed_routes;
 
@@ -7670,6 +7646,242 @@ fn upsert_share_tx(
     Ok(())
 }
 
+fn collect_stale_installation_subdomains_tx(
+    conn: &Connection,
+    stale_cutoff: &str,
+) -> Result<Vec<String>, AppError> {
+    let share_subdomains = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT subdomain
+                 FROM shares
+                 WHERE installation_id IN (
+                     SELECT id FROM installations WHERE last_seen_at < ?1
+                 )
+                   AND subdomain IS NOT NULL
+                   AND subdomain != ''
+                   AND subdomain != '-'",
+            )
+            .map_err(|e| AppError::Internal(format!("prepare stale share routes failed: {e}")))?;
+        let rows = stmt
+            .query_map(params![stale_cutoff], |row| row.get::<_, String>(0))
+            .map_err(|e| AppError::Internal(format!("query stale share routes failed: {e}")))?;
+        collect_rows(rows)?
+    };
+    let tunnel_subdomains = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT subdomain
+                 FROM installation_client_tunnels
+                 WHERE installation_id IN (
+                     SELECT id FROM installations WHERE last_seen_at < ?1
+                 )
+                   AND subdomain IS NOT NULL
+                   AND subdomain != ''",
+            )
+            .map_err(|e| {
+                AppError::Internal(format!("prepare stale client tunnel routes failed: {e}"))
+            })?;
+        let rows = stmt
+            .query_map(params![stale_cutoff], |row| row.get::<_, String>(0))
+            .map_err(|e| {
+                AppError::Internal(format!("query stale client tunnel routes failed: {e}"))
+            })?;
+        collect_rows(rows)?
+    };
+    let mut subdomains = share_subdomains;
+    subdomains.extend(tunnel_subdomains);
+    subdomains.sort();
+    subdomains.dedup();
+    Ok(subdomains)
+}
+
+fn route_subdomains_for_installation_tx(
+    conn: &Connection,
+    installation_id: &str,
+) -> Result<Vec<String>, AppError> {
+    let share_subdomains = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT subdomain
+                 FROM shares
+                 WHERE installation_id = ?1
+                   AND subdomain IS NOT NULL
+                   AND subdomain != ''
+                   AND subdomain != '-'",
+            )
+            .map_err(|e| {
+                AppError::Internal(format!("prepare installation share routes failed: {e}"))
+            })?;
+        let rows = stmt
+            .query_map(params![installation_id], |row| row.get::<_, String>(0))
+            .map_err(|e| {
+                AppError::Internal(format!("query installation share routes failed: {e}"))
+            })?;
+        collect_rows(rows)?
+    };
+    let tunnel_subdomain: Option<String> = conn
+        .query_row(
+            "SELECT subdomain
+             FROM installation_client_tunnels
+             WHERE installation_id = ?1
+               AND subdomain IS NOT NULL
+               AND subdomain != ''",
+            params![installation_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| {
+            AppError::Internal(format!(
+                "query installation client tunnel route failed: {e}"
+            ))
+        })?;
+    let mut subdomains = share_subdomains;
+    if let Some(subdomain) = tunnel_subdomain {
+        subdomains.push(subdomain);
+    }
+    subdomains.sort();
+    subdomains.dedup();
+    Ok(subdomains)
+}
+
+fn delete_share_auxiliary_rows_tx(conn: &Connection, share_id: &str) -> Result<(), AppError> {
+    conn.execute(
+        "DELETE FROM share_request_logs WHERE share_id = ?1",
+        params![share_id],
+    )
+    .map_err(|e| AppError::Internal(format!("delete share request logs failed: {e}")))?;
+    conn.execute(
+        "DELETE FROM share_health_checks WHERE share_id = ?1",
+        params![share_id],
+    )
+    .map_err(|e| AppError::Internal(format!("delete share health checks failed: {e}")))?;
+    conn.execute(
+        "DELETE FROM share_model_health_checks WHERE share_id = ?1",
+        params![share_id],
+    )
+    .map_err(|e| AppError::Internal(format!("delete share model health checks failed: {e}")))?;
+    conn.execute(
+        "DELETE FROM share_model_health_state WHERE share_id = ?1",
+        params![share_id],
+    )
+    .map_err(|e| AppError::Internal(format!("delete share model health state failed: {e}")))?;
+    conn.execute(
+        "DELETE FROM share_edit_requests WHERE share_id = ?1",
+        params![share_id],
+    )
+    .map_err(|e| AppError::Internal(format!("delete share edit requests failed: {e}")))?;
+    conn.execute(
+        "DELETE FROM image_generation_jobs WHERE share_id = ?1",
+        params![share_id],
+    )
+    .map_err(|e| AppError::Internal(format!("delete image generation jobs failed: {e}")))?;
+    conn.execute(
+        "DELETE FROM image_generation_request_logs WHERE share_id = ?1",
+        params![share_id],
+    )
+    .map_err(|e| AppError::Internal(format!("delete image generation request logs failed: {e}")))?;
+    conn.execute(
+        "DELETE FROM market_disabled_shares WHERE share_id = ?1",
+        params![share_id],
+    )
+    .map_err(|e| AppError::Internal(format!("delete market disabled shares failed: {e}")))?;
+    conn.execute(
+        "DELETE FROM market_share_model_failure_state WHERE share_id = ?1",
+        params![share_id],
+    )
+    .map_err(|e| {
+        AppError::Internal(format!(
+            "delete market share model failure state failed: {e}"
+        ))
+    })?;
+    conn.execute(
+        "DELETE FROM market_share_runtime_states WHERE share_id = ?1",
+        params![share_id],
+    )
+    .map_err(|e| AppError::Internal(format!("delete market share runtime states failed: {e}")))?;
+    conn.execute(
+        "DELETE FROM share_market_listing_statuses WHERE share_id = ?1",
+        params![share_id],
+    )
+    .map_err(|e| AppError::Internal(format!("delete share market listing statuses failed: {e}")))?;
+    Ok(())
+}
+
+fn purge_installation_data_tx(conn: &Connection, installation_id: &str) -> Result<(), AppError> {
+    let share_ids = {
+        let mut stmt = conn
+            .prepare("SELECT share_id FROM shares WHERE installation_id = ?1")
+            .map_err(|e| AppError::Internal(format!("prepare installation shares failed: {e}")))?;
+        let rows = stmt
+            .query_map(params![installation_id], |row| row.get::<_, String>(0))
+            .map_err(|e| AppError::Internal(format!("query installation shares failed: {e}")))?;
+        collect_rows(rows)?
+    };
+    for share_id in &share_ids {
+        delete_share_auxiliary_rows_tx(conn, share_id)?;
+    }
+    conn.execute(
+        "DELETE FROM share_request_logs WHERE installation_id = ?1",
+        params![installation_id],
+    )
+    .map_err(|e| {
+        AppError::Internal(format!(
+            "delete installation share request logs failed: {e}"
+        ))
+    })?;
+    conn.execute(
+        "DELETE FROM image_generation_jobs WHERE installation_id = ?1",
+        params![installation_id],
+    )
+    .map_err(|e| AppError::Internal(format!("delete installation image jobs failed: {e}")))?;
+    conn.execute(
+        "DELETE FROM image_generation_request_logs WHERE installation_id = ?1",
+        params![installation_id],
+    )
+    .map_err(|e| {
+        AppError::Internal(format!(
+            "delete installation image request logs failed: {e}"
+        ))
+    })?;
+    conn.execute(
+        "DELETE FROM share_edit_requests WHERE installation_id = ?1",
+        params![installation_id],
+    )
+    .map_err(|e| AppError::Internal(format!("delete installation share edits failed: {e}")))?;
+    conn.execute(
+        "DELETE FROM leases WHERE installation_id = ?1",
+        params![installation_id],
+    )
+    .map_err(|e| AppError::Internal(format!("delete installation leases failed: {e}")))?;
+    conn.execute(
+        "DELETE FROM shares WHERE installation_id = ?1",
+        params![installation_id],
+    )
+    .map_err(|e| AppError::Internal(format!("delete installation shares failed: {e}")))?;
+    conn.execute(
+        "DELETE FROM installation_health_checks WHERE installation_id = ?1",
+        params![installation_id],
+    )
+    .map_err(|e| AppError::Internal(format!("delete installation health checks failed: {e}")))?;
+    conn.execute(
+        "DELETE FROM installation_client_tunnels WHERE installation_id = ?1",
+        params![installation_id],
+    )
+    .map_err(|e| AppError::Internal(format!("delete installation client tunnel failed: {e}")))?;
+    conn.execute(
+        "DELETE FROM installation_payout_profiles WHERE installation_id = ?1",
+        params![installation_id],
+    )
+    .map_err(|e| AppError::Internal(format!("delete installation payout profile failed: {e}")))?;
+    conn.execute(
+        "DELETE FROM installations WHERE id = ?1",
+        params![installation_id],
+    )
+    .map_err(|e| AppError::Internal(format!("delete installation failed: {e}")))?;
+    Ok(())
+}
+
 fn delete_all_shares_for_installation_tx(
     conn: &Connection,
     installation_id: &str,
@@ -7689,24 +7901,7 @@ fn delete_all_shares_for_installation_tx(
     };
 
     for share_id in &share_ids {
-        conn.execute(
-            "DELETE FROM share_request_logs WHERE share_id = ?1",
-            params![share_id],
-        )
-        .map_err(|e| {
-            AppError::Internal(format!(
-                "delete installation share request logs failed: {e}"
-            ))
-        })?;
-        conn.execute(
-            "DELETE FROM share_health_checks WHERE share_id = ?1",
-            params![share_id],
-        )
-        .map_err(|e| {
-            AppError::Internal(format!(
-                "delete installation share health checks failed: {e}"
-            ))
-        })?;
+        delete_share_auxiliary_rows_tx(conn, share_id)?;
     }
 
     let deleted = conn
@@ -16119,6 +16314,7 @@ mod tests {
             cleanup_interval_secs: 300,
             lease_retention_secs: 7 * 24 * 60 * 60,
             client_stale_secs: 60 * 60,
+            client_installation_retention_secs: 24 * 60 * 60,
             paused_share_stale_secs: 60 * 60,
             resend_api_key: None,
             resend_from: None,
@@ -21320,7 +21516,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_keeps_stale_clients_with_active_routes() {
+    async fn cleanup_removes_stale_clients_even_with_active_routes() {
         let (store, config) = setup_store("cleanup-stale-client").await;
         insert_installation(&store, "inst-stale").await;
         insert_installation(&store, "inst-fresh").await;
@@ -21360,8 +21556,8 @@ mod tests {
             .expect("cleanup stale client");
 
         assert_eq!(result.deleted_installations, 0);
-        assert_eq!(result.deleted_shares, 0);
-        assert_eq!(result.removed_routes, 0);
+        assert_eq!(result.deleted_shares, 1);
+        assert_eq!(result.removed_routes, 1);
 
         let conn = store.conn.lock().await;
         let stale_installations: i64 = conn
@@ -21388,11 +21584,76 @@ mod tests {
         drop(conn);
 
         assert_eq!(stale_installations, 1);
-        assert_eq!(stale_shares, 1);
+        assert_eq!(stale_shares, 0);
         assert_eq!(fresh_shares, 1);
         let active_subdomains = proxy.active_subdomains().await;
-        assert!(active_subdomains.contains(&"stale-sub".to_string()));
+        assert!(!active_subdomains.contains(&"stale-sub".to_string()));
         assert!(active_subdomains.contains(&"fresh-sub".to_string()));
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn cleanup_deletes_installation_after_retention() {
+        let (store, mut config) = setup_store("cleanup-installation-retention").await;
+        config.client_installation_retention_secs = 2 * 60 * 60;
+        insert_installation(&store, "inst-retained").await;
+        insert_share(
+            &store,
+            "inst-retained",
+            "share-retained",
+            "retained-sub",
+            "active",
+        )
+        .await;
+        mark_installation_last_seen(&store, "inst-retained", Utc::now() - Duration::minutes(90))
+            .await;
+
+        let proxy = ProxyRegistry::default();
+        let before_retention = store
+            .cleanup_expired_data(&config, &proxy)
+            .await
+            .expect("cleanup before retention");
+        assert_eq!(before_retention.deleted_installations, 0);
+
+        let conn = store.conn.lock().await;
+        let installations_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM installations WHERE id = 'inst-retained'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count installations before retention");
+        drop(conn);
+        assert_eq!(installations_before, 1);
+
+        mark_installation_last_seen(&store, "inst-retained", Utc::now() - Duration::hours(3)).await;
+
+        let after_retention = store
+            .cleanup_expired_data(&config, &proxy)
+            .await
+            .expect("cleanup after retention");
+        assert_eq!(after_retention.deleted_installations, 1);
+
+        let conn = store.conn.lock().await;
+        let installations_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM installations WHERE id = 'inst-retained'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count installations after retention");
+        let shares_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM shares WHERE installation_id = 'inst-retained'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count shares after retention");
+        drop(conn);
+
+        assert_eq!(installations_after, 0);
+        assert_eq!(shares_after, 0);
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
@@ -21427,7 +21688,7 @@ mod tests {
 
         assert_eq!(result.deleted_installations, 0);
         assert_eq!(result.deleted_shares, 1);
-        assert_eq!(result.removed_routes, 1);
+        assert_eq!(result.removed_routes, 0);
 
         let conn = store.conn.lock().await;
         let stale_shares: i64 = conn

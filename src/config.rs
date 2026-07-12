@@ -29,6 +29,7 @@ pub struct Config {
     pub cleanup_interval_secs: u64,
     pub lease_retention_secs: i64,
     pub client_stale_secs: i64,
+    pub client_installation_retention_secs: i64,
     pub paused_share_stale_secs: i64,
     pub resend_api_key: Option<String>,
     pub resend_from: Option<String>,
@@ -102,6 +103,15 @@ impl Config {
             client_stale_secs: env_var("CC_SWITCH_ROUTER_CLIENT_STALE_SECS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60 * 60),
+            client_installation_retention_secs: {
+                let stale = env_var("CC_SWITCH_ROUTER_CLIENT_STALE_SECS")
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(60 * 60);
+                let retention = env_var("CC_SWITCH_ROUTER_CLIENT_INSTALLATION_RETENTION_SECS")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(24 * 60 * 60);
+                retention.max(stale)
+            },
             paused_share_stale_secs: env_var("CC_SWITCH_ROUTER_PAUSED_SHARE_STALE_SECS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60 * 60),
@@ -308,6 +318,7 @@ CC_SWITCH_ROUTER_DB_PATH={}
 CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS=300
 CC_SWITCH_ROUTER_LEASE_RETENTION_SECS=604800
 CC_SWITCH_ROUTER_CLIENT_STALE_SECS=3600
+CC_SWITCH_ROUTER_CLIENT_INSTALLATION_RETENTION_SECS=86400
 CC_SWITCH_ROUTER_PAUSED_SHARE_STALE_SECS=3600
 CC_SWITCH_ROUTER_AUTH_CODE_TTL_SECS=300
 CC_SWITCH_ROUTER_AUTH_CODE_COOLDOWN_SECS=60
@@ -435,6 +446,7 @@ mod tests {
             cleanup_interval_secs: 300,
             lease_retention_secs: 60,
             client_stale_secs: 60,
+            client_installation_retention_secs: 24 * 60 * 60,
             paused_share_stale_secs: 60,
             resend_api_key: None,
             resend_from: None,

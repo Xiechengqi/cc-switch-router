@@ -245,6 +245,18 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         placeholder: Some("3600"),
         dynamic_group: None,
     },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_CLIENT_INSTALLATION_RETENTION_SECS",
+        label: "Client installation retention (seconds)",
+        group: "Lease & Cleanup",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("86400"),
+        description: "Offline installation records are deleted after this duration. Must be >= stale threshold.",
+        placeholder: Some("86400"),
+        dynamic_group: None,
+    },
     // ── Email (Resend) ──
     SettingsField {
         key: "CC_SWITCH_ROUTER_RESEND_API_KEY",
@@ -1285,6 +1297,7 @@ mod tests {
             cleanup_interval_secs: 300,
             lease_retention_secs: 7 * 24 * 60 * 60,
             client_stale_secs: 60 * 60,
+            client_installation_retention_secs: 24 * 60 * 60,
             paused_share_stale_secs: 60 * 60,
             resend_api_key: None,
             resend_from: None,
