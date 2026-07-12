@@ -1,7 +1,7 @@
 "use client";
 
 import { Button, Card, Chip, Drawer, toast } from "@heroui/react";
-import { Check, ChevronDown, ChevronRight, ChevronUp, Copy, ExternalLink, Maximize2, Search, WalletCards } from "lucide-react";
+import { Check, ChevronDown, Copy, ExternalLink, Maximize2, PanelRightOpen, Search, WalletCards } from "lucide-react";
 import * as React from "react";
 import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog";
 import { ShareCard } from "@/components/dashboard/share-card";
@@ -142,6 +142,73 @@ function shouldToggleClientHeader(
   }
 
   return true;
+}
+
+function ClientHeaderActionButton({
+  label,
+  onClick,
+  children,
+}: {
+  label: string;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      data-no-row-drawer
+      aria-label={label}
+      onClick={(event) => {
+        event.stopPropagation();
+        onClick();
+      }}
+      className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-slate-500 transition-colors hover:bg-white hover:text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
+    >
+      {children}
+    </button>
+  );
+}
+
+function ClientHeaderActions({
+  collapsed,
+  tunnelUrl,
+  onOpenFrame,
+  onOpenDetails,
+  onToggleCollapsed,
+}: {
+  collapsed: boolean;
+  tunnelUrl: string;
+  onOpenFrame: (url: string) => void;
+  onOpenDetails: () => void;
+  onToggleCollapsed: () => void;
+}) {
+  const { t } = useLocaleText();
+  return (
+    <div
+      className="inline-flex shrink-0 items-center self-center rounded-lg border border-slate-200/70 bg-slate-50/60 p-0.5"
+      data-no-row-drawer
+      onClick={(event) => event.stopPropagation()}
+    >
+      {tunnelUrl ? (
+        <>
+          <ClientHeaderActionButton label={t("dashboard.clientFrame.title")} onClick={() => onOpenFrame(tunnelUrl)}>
+            <Maximize2 className="h-3.5 w-3.5" />
+          </ClientHeaderActionButton>
+          <span className="mx-0.5 h-4 w-px shrink-0 bg-slate-200" aria-hidden />
+        </>
+      ) : null}
+      <ClientHeaderActionButton label={t("dashboard.details")} onClick={onOpenDetails}>
+        <PanelRightOpen className="h-3.5 w-3.5" />
+      </ClientHeaderActionButton>
+      <span className="mx-0.5 h-4 w-px shrink-0 bg-slate-200" aria-hidden />
+      <ClientHeaderActionButton
+        label={collapsed ? t("dashboard.expandClient") : t("dashboard.collapseClient")}
+        onClick={onToggleCollapsed}
+      >
+        <ChevronDown className={`h-3.5 w-3.5 transition-transform duration-200 ${collapsed ? "" : "rotate-180"}`} />
+      </ClientHeaderActionButton>
+    </div>
+  );
 }
 
 function shareMatchesQuery(share: ShareView, query: string) {
@@ -303,18 +370,14 @@ function ClientCard({
             <Metric label={t("dashboard.lastSeen")} value={formatRelativeTime(client.installation.lastSeenAt, locale)} tone={state === "offline" ? "danger" : "default"} />
           </div>
 
-          <div className="flex min-w-0 items-center justify-end gap-1.5">
-            {tunnelUrl ? (
-              <Button size="sm" variant="outline" isIconOnly className="h-7 w-7 min-w-0 rounded-md p-0" aria-label={t("dashboard.clientFrame.title")} data-no-row-drawer onClick={(event) => { event.stopPropagation(); onOpenFrame(tunnelUrl); }}>
-                <Maximize2 className="h-3.5 w-3.5" />
-              </Button>
-            ) : null}
-            <Button size="sm" variant="ghost" isIconOnly className="h-7 w-7 min-w-0 rounded-md p-0" aria-label={t("dashboard.details")} data-no-row-drawer onClick={(event) => { event.stopPropagation(); openClientDrawer(); }}>
-              <ChevronRight className="h-4 w-4" />
-            </Button>
-            <Button size="sm" variant="ghost" isIconOnly className="h-7 w-7 min-w-0 rounded-md p-0" aria-label={collapsed ? t("dashboard.expandClient") : t("dashboard.collapseClient")} data-no-row-drawer onClick={(event) => { event.stopPropagation(); onToggleCollapsed(); }}>
-              {collapsed ? <ChevronDown className="h-4 w-4" /> : <ChevronUp className="h-4 w-4" />}
-            </Button>
+          <div className="flex justify-end">
+            <ClientHeaderActions
+              collapsed={collapsed}
+              tunnelUrl={tunnelUrl || ""}
+              onOpenFrame={onOpenFrame}
+              onOpenDetails={openClientDrawer}
+              onToggleCollapsed={onToggleCollapsed}
+            />
           </div>
         </div>
 
