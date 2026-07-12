@@ -361,7 +361,7 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
       <div className="pointer-events-none absolute inset-0 z-10 bg-[radial-gradient(circle_at_6%_12%,rgba(0,82,255,0.10),transparent_38%),radial-gradient(circle_at_94%_88%,rgba(77,124,255,0.07),transparent_42%)]" />
       <StatsStrip
         data={data}
-        className="pointer-events-none absolute left-3 top-3 z-30 max-w-[min(72%,560px)] rounded-lg border border-slate-200/70 bg-white/70 px-2.5 py-1.5 backdrop-blur-md"
+        className="pointer-events-none absolute left-3 top-3 z-30 max-w-[min(72%,560px)]"
       />
       <RequestTicker data={data} />
       <div
