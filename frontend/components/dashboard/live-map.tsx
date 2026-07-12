@@ -1,13 +1,11 @@
 "use client";
 
-import { Minus, Plus, RotateCcw } from "lucide-react";
-import { Button } from "@heroui/react";
 import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
 import type { DashboardResponse, MapPoint, MarketRequestLog, RecentRequestEvent, ShareRequestLog } from "@/lib/types";
 import { cn } from "@/lib/utils";
-import { usePersistentState } from "@/lib/use-persistent-state";
+import { useMapDisplaySettings } from "@/lib/map-display-settings";
 
 function projectPoint(point: MapPoint) {
   if (typeof point.lat !== "number" || typeof point.lon !== "number") return null;
@@ -25,6 +23,21 @@ type TickerMeta = Partial<Omit<ShareRequestLog, "createdAt"> & Omit<MarketReques
 };
 
 const REQUEST_TICKER_LIMIT = 6;
+const MAP_VIEWPORT_HEIGHT_PX = 420;
+// Cape Agulhas — southern tip of the African mainland.
+const AFRICA_SOUTH_LATITUDE = -34.8;
+
+function latitudeToMapYFraction(latitude: number) {
+  return (90 - latitude) / 180;
+}
+
+function computeFixedMapOffsetY(viewportWidth: number, viewportHeight: number) {
+  const mapHeight = viewportWidth / 2;
+  const viewportCenterY = viewportHeight / 2;
+  const africaYFraction = latitudeToMapYFraction(AFRICA_SOUTH_LATITUDE);
+  // Map layer is centered horizontally and vertically, then shifted by offsetY.
+  return viewportHeight - viewportCenterY + mapHeight / 2 - africaYFraction * mapHeight;
+}
 
 function spreadPoints(points: PlacedPoint[], minDistPct: number, lockedIndex: number) {
   if (points.length < 2) return points;
@@ -250,13 +263,9 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
   const focus = useDashboardFocus();
   const shellRef = React.useRef<HTMLDivElement | null>(null);
   const worldRef = React.useRef<HTMLDivElement | null>(null);
-  const dragRef = React.useRef<{ pointerId: number; x: number; y: number; panX: number; panY: number } | null>(null);
-  const zoomRef = React.useRef(1);
   const [worldSvg, setWorldSvg] = React.useState("");
-  const [zoom, setZoomState] = React.useState(1);
-  const [pan, setPan] = React.useState({ x: 0, y: 0 });
-  const [showFlows, setShowFlows] = usePersistentState("cc_switch_router_map_flows_v1", true);
-  const [showHeat, setShowHeat] = usePersistentState("cc_switch_router_map_heat_v1", true);
+  const [mapOffsetY, setMapOffsetY] = React.useState(0);
+  const { showFlows, showHeat } = useMapDisplaySettings();
   const clients = data?.map?.clients || [];
   const server = data?.map?.server;
   const points = [server, ...clients].filter(Boolean) as MapPoint[];
@@ -295,38 +304,17 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
     return flows;
   }, [data]);
 
-  const clampPan = React.useCallback((nextPan: { x: number; y: number }, nextZoom = zoom) => {
-    const shell = shellRef.current;
-    if (!shell) return nextPan;
-    const viewportWidth = shell.clientWidth;
-    const viewportHeight = shell.clientHeight;
-    const mapWidth = viewportWidth;
-    const mapHeight = viewportWidth / 2;
-    const maxX = Math.max(0, (mapWidth * nextZoom - viewportWidth) / 2);
-    const maxY = Math.max(0, (mapHeight * nextZoom - viewportHeight) / 2);
-    return {
-      x: Math.max(-maxX, Math.min(maxX, nextPan.x)),
-      y: Math.max(-maxY, Math.min(maxY, nextPan.y)),
-    };
-  }, [zoom]);
-
-  const setZoom = React.useCallback((next: number) => {
-    const nextZoom = Math.max(1, Math.min(3, Number(next.toFixed(2))));
-    zoomRef.current = nextZoom;
-    setZoomState(nextZoom);
-    setPan((current) => clampPan(current, nextZoom));
-  }, [clampPan]);
-
-  React.useEffect(() => {
+  React.useLayoutEffect(() => {
     const shell = shellRef.current;
     if (!shell) return;
-    const handleWheel = (event: WheelEvent) => {
-      event.preventDefault();
-      setZoom(zoomRef.current + (event.deltaY < 0 ? 0.18 : -0.18));
+    const updateOffset = () => {
+      setMapOffsetY(computeFixedMapOffsetY(shell.clientWidth, shell.clientHeight || MAP_VIEWPORT_HEIGHT_PX));
     };
-    shell.addEventListener("wheel", handleWheel, { passive: false });
-    return () => shell.removeEventListener("wheel", handleWheel);
-  }, [setZoom]);
+    updateOffset();
+    const observer = new ResizeObserver(updateOffset);
+    observer.observe(shell);
+    return () => observer.disconnect();
+  }, []);
 
   React.useEffect(() => {
     let cancelled = false;
@@ -368,90 +356,18 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
     }
   }, [heatCountsKey, worldSvg]);
 
-  React.useEffect(() => {
-    function handleResize() {
-      setPan((current) => clampPan(current));
-    }
-    window.addEventListener("resize", handleResize);
-    return () => window.removeEventListener("resize", handleResize);
-  }, [clampPan]);
-
-  const setClampedPan = React.useCallback((nextPan: { x: number; y: number }) => {
-    setPan(clampPan(nextPan));
-  }, [clampPan]);
-
-  const endDrag = React.useCallback((pointerId?: number) => {
-    const shell = shellRef.current;
-    if (pointerId != null) {
-      try {
-        shell?.releasePointerCapture(pointerId);
-      } catch {
-        // Pointer capture may already be released by the browser.
-      }
-    }
-    dragRef.current = null;
-  }, []);
-
-  function reset() {
-    zoomRef.current = 1;
-    setZoomState(1);
-    setPan({ x: 0, y: 0 });
-  }
-
   return (
     <section
       ref={shellRef}
-      className="relative h-[420px] cursor-grab select-none overflow-hidden rounded-[20px] border bg-white text-primary shadow-[0_4px_6px_rgba(15,23,42,0.04),0_12px_28px_rgba(15,23,42,0.05)] outline-none active:cursor-grabbing"
-      style={{
-        userSelect: "none",
-        WebkitUserSelect: "none",
-        WebkitTapHighlightColor: "transparent",
-        touchAction: "none",
-      }}
-      tabIndex={0}
+      className="relative h-[420px] overflow-hidden rounded-[20px] border bg-white text-primary shadow-[0_4px_6px_rgba(15,23,42,0.04),0_12px_28px_rgba(15,23,42,0.05)]"
       aria-label={t("map.aria")}
-      onDragStart={(event) => event.preventDefault()}
-      onPointerDown={(event) => {
-        if ((event.target as HTMLElement).closest("[data-map-control]")) return;
-        event.preventDefault();
-        dragRef.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, panX: pan.x, panY: pan.y };
-        shellRef.current?.setPointerCapture(event.pointerId);
-      }}
-      onPointerMove={(event) => {
-        const drag = dragRef.current;
-        if (!drag || drag.pointerId !== event.pointerId) return;
-        event.preventDefault();
-        setClampedPan({ x: drag.panX + event.clientX - drag.x, y: drag.panY + event.clientY - drag.y });
-      }}
-      onPointerUp={(event) => {
-        if (dragRef.current?.pointerId === event.pointerId) endDrag(event.pointerId);
-      }}
-      onPointerCancel={(event) => {
-        if (dragRef.current?.pointerId === event.pointerId) endDrag(event.pointerId);
-      }}
-      onKeyDown={(event) => {
-        const step = 24;
-        if (event.key === "+" || event.key === "=") setZoom(zoom + 0.25);
-        else if (event.key === "-" || event.key === "_") setZoom(zoom - 0.25);
-        else if (event.key === "0") reset();
-        else if (event.key === "ArrowUp") setPan((p) => clampPan({ ...p, y: p.y + step }));
-        else if (event.key === "ArrowDown") setPan((p) => clampPan({ ...p, y: p.y - step }));
-        else if (event.key === "ArrowLeft") setPan((p) => clampPan({ ...p, x: p.x + step }));
-        else if (event.key === "ArrowRight") setPan((p) => clampPan({ ...p, x: p.x - step }));
-        else return;
-        event.preventDefault();
-      }}
     >
       <div className="pointer-events-none absolute inset-0 z-10 bg-[radial-gradient(circle,rgba(15,23,42,0.05)_1px,transparent_1px)] bg-[length:28px_28px] bg-[position:14px_14px]" />
       <div className="pointer-events-none absolute inset-0 z-10 bg-[radial-gradient(circle_at_6%_12%,rgba(0,82,255,0.10),transparent_38%),radial-gradient(circle_at_94%_88%,rgba(77,124,255,0.07),transparent_42%)]" />
-      <div data-map-control className="absolute left-3 top-3 z-30 inline-flex items-center gap-1.5 rounded-full border border-slate-200/70 bg-white/70 px-2.5 py-1 backdrop-blur-md">
-        <span className="live-pulse h-1.5 w-1.5 rounded-full bg-rose-500" />
-        <span className="font-mono text-[9px] font-semibold uppercase tracking-[0.14em] text-slate-700">{t("map.liveActivity")}</span>
-      </div>
       <RequestTicker data={data} />
       <div
-        className="absolute left-1/2 top-1/2 z-20 aspect-[2/1] w-full origin-center transition-transform duration-200 ease-out"
-        style={{ transform: `translate(-50%, -50%) translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}
+        className="absolute left-1/2 top-1/2 z-20 aspect-[2/1] w-full origin-center"
+        style={{ transform: `translate(-50%, -50%) translate(0px, ${mapOffsetY}px)` }}
       >
         {worldSvg ? (
           <div
@@ -523,22 +439,7 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
             );
           })}
       </div>
-      <div className="absolute bottom-3 left-3 z-30 inline-flex items-center gap-0.5 rounded-lg border border-slate-200/70 bg-white/70 p-1 text-slate-600 backdrop-blur-md">
-        <Button data-map-control variant="ghost" size="sm" isIconOnly className="h-6 w-6 min-w-0 rounded-md p-0 text-slate-600 hover:bg-blue-50 hover:text-primary" aria-label={t("map.zoomOut")} onClick={() => setZoom(zoom - 0.25)}>
-          <Minus className="h-3.5 w-3.5" />
-        </Button>
-        <span className="min-w-9 text-center font-mono text-[10px] text-slate-500">{Math.round(zoom * 100)}%</span>
-        <Button data-map-control variant="ghost" size="sm" isIconOnly className="h-6 w-6 min-w-0 rounded-md p-0 text-slate-600 hover:bg-blue-50 hover:text-primary" aria-label={t("map.zoomIn")} onClick={() => setZoom(zoom + 0.25)}>
-          <Plus className="h-3.5 w-3.5" />
-        </Button>
-        <Button data-map-control variant="ghost" size="sm" isIconOnly className="h-6 w-6 min-w-0 rounded-md p-0 text-slate-600 hover:bg-blue-50 hover:text-primary" aria-label={t("map.reset")} onClick={reset}>
-          <RotateCcw className="h-3.5 w-3.5" />
-        </Button>
-        <span className="mx-1 h-4 w-px bg-slate-200" />
-        <button data-map-control type="button" aria-pressed={showFlows} onClick={() => setShowFlows((value) => !value)} className={`rounded-md px-2 py-1 text-[10px] transition-colors ${showFlows ? "bg-primary/10 font-medium text-primary" : "hover:bg-white"}`}>{t("map.requestFlows")}</button>
-        <button data-map-control type="button" aria-pressed={showHeat} onClick={() => setShowHeat((value) => !value)} className={`rounded-md px-2 py-1 text-[10px] transition-colors ${showHeat ? "bg-primary/10 font-medium text-primary" : "hover:bg-white"}`}>{t("map.demandHeat")}</button>
-      </div>
-      <div className="absolute bottom-3 right-3 z-30 flex max-w-[min(34%,280px)] flex-wrap gap-2 rounded-lg border border-slate-200/70 bg-white/70 px-2 py-1.5 text-[10px] text-slate-500 backdrop-blur-md">
+      <div className="pointer-events-none absolute bottom-3 left-3 z-30 flex max-w-[min(46%,320px)] flex-wrap gap-2 rounded-lg border border-slate-200/70 bg-white/70 px-2 py-1.5 text-[10px] text-slate-500 backdrop-blur-md">
         <span className="inline-flex items-center gap-1"><i className="h-1.5 w-1.5 rounded-full bg-primary" />{t("map.router")}</span>
         <span className="inline-flex items-center gap-1"><i className="h-1.5 w-1.5 rounded-full bg-primary" />{t("map.activeClient")}</span>
         <span className="inline-flex items-center gap-1"><i className="h-1.5 w-1.5 rounded-full bg-slate-500 opacity-55" />{t("map.idleClient")}</span>

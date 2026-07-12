@@ -6,12 +6,14 @@ import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { LogsPanel } from "@/components/settings/logs-panel";
+import { MapDisplayPanel } from "@/components/settings/map-display-panel";
 import { VersionPanel } from "@/components/settings/version-panel";
 import { getSettingsSchema, getSettingsValues, saveSettings, testTelegram, restartService } from "@/lib/api";
 import type { SettingValueEntry, SettingsField, SettingsSchema } from "@/lib/types";
 
 type DirtyValue = string | boolean | null;
 const VERSION_GROUP = "__version";
+const MAP_GROUP = "__map";
 const LOGS_GROUP = "__logs";
 
 export function SettingsPage() {
@@ -59,12 +61,15 @@ export function SettingsPage() {
           <p className="mt-3 text-muted-foreground">{t("settings.adminRequiredDesc")}</p>
         </div>
         <VersionPanel isAdmin={false} />
+        <MapDisplayPanel />
       </main>
     );
   }
 
   const groups = schema?.groups || [];
-  const fields = activeGroup === VERSION_GROUP || activeGroup === LOGS_GROUP ? [] : (schema?.fields || []).filter((field) => field.group === activeGroup);
+  const fields = activeGroup === VERSION_GROUP || activeGroup === MAP_GROUP || activeGroup === LOGS_GROUP
+    ? []
+    : (schema?.fields || []).filter((field) => field.group === activeGroup);
   const dirtyCount = Object.keys(dirty).length;
 
   return (
@@ -108,6 +113,9 @@ export function SettingsPage() {
                 <ListBox.Item id={VERSION_GROUP} textValue={t("settings.version")} className={`flex items-center justify-between ${activeGroup === VERSION_GROUP ? "bg-primary/10 text-foreground" : ""}`}>
                   <span>{t("settings.version")}</span>
                 </ListBox.Item>
+                <ListBox.Item id={MAP_GROUP} textValue={t("settings.map")} className={`flex items-center justify-between ${activeGroup === MAP_GROUP ? "bg-primary/10 text-foreground" : ""}`}>
+                  <span>{t("settings.map")}</span>
+                </ListBox.Item>
                 {groups.map((group) => {
                   const count = (schema?.fields || []).filter((field) => field.group === group && Object.prototype.hasOwnProperty.call(dirty, field.key)).length;
                   return (
@@ -133,6 +141,8 @@ export function SettingsPage() {
         <div className="grid gap-6">
           {activeGroup === VERSION_GROUP ? (
             <VersionPanel isAdmin={true} />
+          ) : activeGroup === MAP_GROUP ? (
+            <MapDisplayPanel />
           ) : activeGroup === LOGS_GROUP ? (
             <LogsPanel />
           ) : (
