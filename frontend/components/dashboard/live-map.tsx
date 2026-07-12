@@ -160,6 +160,13 @@ function tickerDetail(meta?: TickerMeta) {
   return parts.join(" · ");
 }
 
+function resolveMapHeatCounts(data: DashboardResponse | null, showHeat: boolean) {
+  if (!showHeat || !data) return {};
+  // Client installation density is stable across dashboard polls. Request ticker
+  // country counts fluctuate every few seconds and made shared country fills flash.
+  return data.countryCounts || {};
+}
+
 function buildRequestMeta(data: DashboardResponse | null) {
   const marketMeta = new Map<string, MarketRequestLog>();
   const meta = new Map<string, TickerMeta>();
@@ -336,20 +343,30 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
     };
   }, []);
 
+  const heatCountsKey = React.useMemo(
+    () => JSON.stringify(resolveMapHeatCounts(data, showHeat)),
+    [data?.countryCounts, showHeat],
+  );
+
   React.useEffect(() => {
     const root = worldRef.current;
     if (!root) return;
-    const counts = showHeat ? data?.userCountryCounts || data?.countryCounts || {} : {};
+    const counts = JSON.parse(heatCountsKey) as Record<string, number>;
     const values = Object.values(counts).filter((value) => value > 0);
     const max = values.length ? Math.max(...values) : 0;
     for (const element of Array.from(root.querySelectorAll<SVGElement>(".country"))) {
       const iso3 = Array.from(element.classList).find((name) => /^[A-Z]{3}$/.test(name));
       const count = iso3 ? counts[iso3] || 0 : 0;
       const heat = max > 0 ? Math.min(1, count / max) : 0;
-      element.style.fillOpacity = String(0.1 + heat * 0.55);
-      element.style.strokeOpacity = String(0.16 + heat * 0.4);
+      const fillOpacity = String(0.1 + heat * 0.55);
+      const strokeOpacity = String(0.16 + heat * 0.4);
+      if (!element.style.transition) {
+        element.style.transition = "fill-opacity 0.8s ease-out, stroke-opacity 0.8s ease-out";
+      }
+      if (element.style.fillOpacity !== fillOpacity) element.style.fillOpacity = fillOpacity;
+      if (element.style.strokeOpacity !== strokeOpacity) element.style.strokeOpacity = strokeOpacity;
     }
-  }, [data?.countryCounts, data?.userCountryCounts, showHeat, worldSvg]);
+  }, [heatCountsKey, worldSvg]);
 
   React.useEffect(() => {
     function handleResize() {
