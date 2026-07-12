@@ -1883,8 +1883,12 @@ pub struct ShareDescriptor {
     pub model_health: ShareModelHealthSummary,
     #[serde(default)]
     pub auto_start: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_revision")]
     pub config_revision: u64,
+}
+
+fn is_zero_revision(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
