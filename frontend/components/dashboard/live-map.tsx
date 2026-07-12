@@ -5,7 +5,7 @@ import { useLocaleText } from "@/components/i18n/locale-provider";
 import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
 import type { DashboardResponse, MapPoint, MarketRequestLog, RecentRequestEvent, ShareRequestLog } from "@/lib/types";
 import { cn } from "@/lib/utils";
-import { useMapDisplaySettings } from "@/lib/map-display-settings";
+import { useMapDisplaySettings, computeMapOffsetY } from "@/lib/map-display-settings";
 
 function projectPoint(point: MapPoint) {
   if (typeof point.lat !== "number" || typeof point.lon !== "number") return null;
@@ -24,23 +24,6 @@ type TickerMeta = Partial<Omit<ShareRequestLog, "createdAt"> & Omit<MarketReques
 
 const REQUEST_TICKER_LIMIT = 6;
 const MAP_VIEWPORT_HEIGHT_PX = 420;
-// Calibrated dashboard map framing (map content px 74-493 at reference width).
-const MAP_VISIBLE_START_PX = 74;
-const MAP_VISIBLE_END_PX = 493;
-const MAP_VERTICAL_PAN_PX = 125;
-
-function computeFixedMapOffsetY(viewportWidth: number, viewportHeight: number) {
-  const mapHeight = viewportWidth / 2;
-  const mapTopPx = -MAP_VISIBLE_START_PX;
-  const mapBottomPx = mapTopPx + mapHeight;
-  const offsetY = mapTopPx - viewportHeight / 2 + mapHeight / 2;
-  // Keep the calibrated bottom edge when the map is taller than the target slice.
-  if (mapBottomPx > MAP_VISIBLE_END_PX) {
-    const adjustedTopPx = MAP_VISIBLE_END_PX - mapHeight;
-    return adjustedTopPx - viewportHeight / 2 + mapHeight / 2 + MAP_VERTICAL_PAN_PX;
-  }
-  return offsetY + MAP_VERTICAL_PAN_PX;
-}
 
 function spreadPoints(points: PlacedPoint[], minDistPct: number, lockedIndex: number) {
   if (points.length < 2) return points;
@@ -268,7 +251,7 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
   const worldRef = React.useRef<HTMLDivElement | null>(null);
   const [worldSvg, setWorldSvg] = React.useState("");
   const [mapOffsetY, setMapOffsetY] = React.useState(0);
-  const { showFlows, showHeat } = useMapDisplaySettings();
+  const { showFlows, showHeat, viewport } = useMapDisplaySettings();
   const clients = data?.map?.clients || [];
   const server = data?.map?.server;
   const points = [server, ...clients].filter(Boolean) as MapPoint[];
@@ -312,13 +295,13 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
     if (!shell) return;
     const updateOffset = () => {
       const height = shell.clientHeight || MAP_VIEWPORT_HEIGHT_PX;
-      setMapOffsetY(computeFixedMapOffsetY(shell.clientWidth, height));
+      setMapOffsetY(computeMapOffsetY(viewport, shell.clientWidth, height));
     };
     updateOffset();
     const observer = new ResizeObserver(updateOffset);
     observer.observe(shell);
     return () => observer.disconnect();
-  }, []);
+  }, [viewport]);
 
   React.useEffect(() => {
     let cancelled = false;
