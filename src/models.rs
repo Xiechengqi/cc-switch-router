@@ -1883,6 +1883,8 @@ pub struct ShareDescriptor {
     pub model_health: ShareModelHealthSummary,
     #[serde(default)]
     pub auto_start: bool,
+    #[serde(default)]
+    pub config_revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]

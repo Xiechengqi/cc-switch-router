@@ -7607,8 +7607,8 @@ fn upsert_share_tx(
         "INSERT INTO shares (
             share_id, installation_id, share_name, owner_email, shared_with_emails_json, market_access_mode, access_by_app_json, app_settings_json, description, for_sale, sale_market_kind, subdomain, app_type, provider_id,
             enabled_claude, enabled_codex, enabled_gemini,
-            token_limit, parallel_limit, tokens_used, requests_count, share_status, created_at, expires_at, upstream_provider_json, app_runtimes_json, app_providers_json, bindings_json, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)
+            token_limit, parallel_limit, tokens_used, requests_count, share_status, created_at, expires_at, upstream_provider_json, app_runtimes_json, app_providers_json, bindings_json, config_revision, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)
         ON CONFLICT(share_id) DO UPDATE SET
             installation_id = excluded.installation_id,
             share_name = excluded.share_name,
@@ -7637,8 +7637,10 @@ fn upsert_share_tx(
             app_runtimes_json = excluded.app_runtimes_json,
             app_providers_json = excluded.app_providers_json,
             bindings_json = excluded.bindings_json,
+            config_revision = excluded.config_revision,
             runtime_refreshed_at = shares.runtime_refreshed_at,
-            updated_at = excluded.updated_at",
+            updated_at = excluded.updated_at
+        WHERE excluded.config_revision >= shares.config_revision",
         params![
             share.share_id,
             installation_id,
@@ -7668,6 +7670,7 @@ fn upsert_share_tx(
             app_runtimes_json,
             app_providers_json,
             bindings_json,
+            i64::try_from(share.config_revision).unwrap_or(i64::MAX),
             Utc::now().to_rfc3339(),
         ],
     )
@@ -8274,6 +8277,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             -- Share 的单一 app/provider 绑定快照（JSON: {app_type: provider_id}）。
             bindings_json TEXT,
             runtime_refreshed_at TEXT,
+            config_revision INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT NOT NULL
         );
 
@@ -9104,6 +9108,13 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         )
         .map_err(|e| AppError::Internal(format!("add shares runtime_refreshed_at failed: {e}")))?;
     }
+    if !columns.iter().any(|name| name == "config_revision") {
+        conn.execute(
+            "ALTER TABLE shares ADD COLUMN config_revision INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| AppError::Internal(format!("add shares config_revision failed: {e}")))?;
+    }
     // share_token 已废弃：caller 身份在 router 边界由 user_api_token + email ACL 校验，
     // tunnel→client 用 X-CC-Switch-Share-Id 识别 share。该列对老库可能仍然存在 + 带
     // NOT NULL 约束，新 INSERT 会因此报错，需要 DROP 掉。
@@ -9852,7 +9863,7 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                     s.owner_email, s.shared_with_emails_json,
                     s.enabled_claude, s.enabled_codex, s.enabled_gemini,
                     s.token_limit, s.parallel_limit, s.tokens_used, s.requests_count, s.share_status, s.created_at, s.expires_at, s.upstream_provider_json, s.app_runtimes_json, s.app_providers_json,
-                    s.bindings_json
+                    s.bindings_json, s.config_revision
              FROM shares s
              ORDER BY s.share_name ASC",
         )
@@ -9896,6 +9907,7 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                     app_availability: ShareAppAvailability::default(),
                     model_health: ShareModelHealthSummary::default(),
                     auto_start: false,
+                    config_revision: row.get::<_, i64>(28)?.max(0) as u64,
                 },
             ))
         })
@@ -17052,6 +17064,7 @@ mod tests {
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
+            config_revision: 0,
         }
     }
 
@@ -19684,6 +19697,7 @@ mod tests {
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
+            config_revision: 0,
         };
         let timestamp_ms = Utc::now().timestamp_millis();
         let nonce = Uuid::new_v4().to_string();
@@ -19756,6 +19770,7 @@ mod tests {
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
+            config_revision: 0,
         };
 
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -20123,6 +20138,7 @@ mod tests {
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
+            config_revision: 0,
         };
         let claim = share_claim_payload(&share);
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -20208,6 +20224,7 @@ mod tests {
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
+            config_revision: 0,
         };
         let claim = ShareClaimPayload {
             subdomain: "other-sub".into(),
@@ -20285,6 +20302,7 @@ mod tests {
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
+            config_revision: 0,
         };
 
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -20391,6 +20409,7 @@ mod tests {
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
+            config_revision: 0,
         };
 
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -20470,6 +20489,7 @@ mod tests {
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
+            config_revision: 0,
         };
 
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -20568,6 +20588,7 @@ mod tests {
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
+            config_revision: 0,
         };
         let ops = vec![ShareSyncOperation {
             kind: "upsert".into(),
@@ -20703,6 +20724,50 @@ mod tests {
         );
 
         drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn upsert_share_rejects_stale_config_revision_and_preserves_settings() {
+        let (store, config) = setup_store("share-config-revision").await;
+        insert_installation(&store, "inst-revision").await;
+        let mut newest = test_share_descriptor("share-revision", "revision-sub");
+        newest.config_revision = 2;
+        newest.description = Some("new description".into());
+        newest.for_sale = "Yes".into();
+        newest.sale_market_kind = "token".into();
+        newest.market_access_mode = "selected".into();
+        newest.shared_with_emails = vec!["buyer@example.com".into()];
+        newest.token_limit = 50_000;
+        newest.parallel_limit = 7;
+        newest.expires_at = "2030-01-01T00:00:00Z".into();
+        {
+            let conn = store.conn.lock().await;
+            upsert_share_tx(&conn, "inst-revision", newest).expect("write newest revision");
+        }
+
+        let mut stale = test_share_descriptor("share-revision", "revision-sub");
+        stale.config_revision = 1;
+        stale.description = Some("stale description".into());
+        stale.token_limit = 100;
+        stale.parallel_limit = 3;
+        {
+            let conn = store.conn.lock().await;
+            upsert_share_tx(&conn, "inst-revision", stale).expect("stale write is idempotent");
+            let (_, stored) = list_shares(&conn)
+                .expect("list shares")
+                .into_iter()
+                .find(|(_, share)| share.share_id == "share-revision")
+                .expect("stored share");
+            assert_eq!(stored.config_revision, 2);
+            assert_eq!(stored.description.as_deref(), Some("new description"));
+            assert_eq!(stored.for_sale, "Yes");
+            assert_eq!(stored.shared_with_emails, vec!["buyer@example.com"]);
+            assert_eq!(stored.token_limit, 50_000);
+            assert_eq!(stored.parallel_limit, 7);
+            assert_eq!(stored.expires_at, "2030-01-01T00:00:00Z");
+        }
+
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 
