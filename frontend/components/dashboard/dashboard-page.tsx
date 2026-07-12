@@ -22,8 +22,10 @@ export function DashboardPage() {
         <OperationVerificationProvider data={data}>
           <main className="mx-auto grid w-[calc(100%-2rem)] max-w-7xl gap-5 pb-6">
           {error ? <Alert status="danger" className="!text-slate-900">{error}</Alert> : null}
-          <StatsStrip data={data} />
-          <LiveMap data={data} />
+          <div className="grid gap-2">
+            <StatsStrip data={data} />
+            <LiveMap data={data} />
+          </div>
           <FocusBar />
           <AttentionPanel data={data} />
           <ClientBoard
