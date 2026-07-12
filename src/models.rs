@@ -16,7 +16,7 @@ fn default_sale_market_kind() -> String {
 }
 
 pub fn default_share_parallel_limit() -> i64 {
-    3
+    -1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1881,6 +1881,8 @@ pub struct ShareDescriptor {
     pub app_availability: ShareAppAvailability,
     #[serde(default)]
     pub model_health: ShareModelHealthSummary,
+    #[serde(default)]
+    pub auto_start: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]

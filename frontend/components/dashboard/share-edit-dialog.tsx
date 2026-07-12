@@ -202,7 +202,9 @@ function buildShareEditDraft(
   const accessByApp = effectiveShareAccessByApp(share);
   const tokenLimit = share.tokenLimit ?? UNLIMITED_TOKEN_LIMIT;
   const tokenLimitUnlimited = isUnlimitedTokenLimit(tokenLimit);
-  const parallelLimit = share.parallelLimit ?? DEFAULT_PARALLEL_LIMIT;
+  const parallelLimit = Number.isFinite(share.parallelLimit)
+    ? share.parallelLimit
+    : UNLIMITED_PARALLEL_LIMIT;
   const parallelLimitUnlimited = isUnlimitedParallelLimit(parallelLimit);
   const expiresPermanent = isPermanentExpiryDate(share.expiresAt) || isUnlimitedExpiry(share.expiresAt);
 

@@ -3499,6 +3499,7 @@ impl AppStore {
                 "control reply share_id does not match edit".into(),
             ));
         }
+        normalize_share_descriptor_fields(&mut returned_share);
         if let Err(field) = validate_returned_share_against_patch(&edit.patch, &returned_share) {
             let message = format!("client reply did not satisfy patch field: {field}");
             conn.execute(
@@ -7523,11 +7524,39 @@ pub async fn fetch_share_runtime_snapshot_from_route(
         .map_err(|e| AppError::Internal(format!("decode share runtime failed: {e}")))
 }
 
+const LEGACY_PERMANENT_SHARE_EXPIRES_AT: &str = "2100-01-01T00:00:00Z";
+const PERMANENT_SHARE_EXPIRES_AT: &str = "2099-12-31T23:59:59Z";
+const UNLIMITED_LIMIT_SENTINEL: i64 = 9_007_199_254_740_991;
+
+fn normalize_share_limit_value(value: i64) -> i64 {
+    if value < 0 || value >= UNLIMITED_LIMIT_SENTINEL {
+        -1
+    } else {
+        value
+    }
+}
+
+fn normalize_share_descriptor_fields(share: &mut ShareDescriptor) {
+    share.token_limit = normalize_share_limit_value(share.token_limit);
+    share.parallel_limit = normalize_share_limit_value(share.parallel_limit);
+    if share.expires_at == LEGACY_PERMANENT_SHARE_EXPIRES_AT {
+        share.expires_at = PERMANENT_SHARE_EXPIRES_AT.to_string();
+    }
+    for settings in share.app_settings.values_mut() {
+        settings.token_limit = normalize_share_limit_value(settings.token_limit);
+        settings.parallel_limit = normalize_share_limit_value(settings.parallel_limit);
+        if settings.expires_at == LEGACY_PERMANENT_SHARE_EXPIRES_AT {
+            settings.expires_at = PERMANENT_SHARE_EXPIRES_AT.to_string();
+        }
+    }
+}
+
 fn upsert_share_tx(
     conn: &Connection,
     installation_id: &str,
     mut share: ShareDescriptor,
 ) -> Result<(), AppError> {
+    normalize_share_descriptor_fields(&mut share);
     if share.bindings.len() != 1
         || share.provider_id.as_deref().is_none_or(|provider_id| {
             share.bindings.get(&share.app_type).map(String::as_str) != Some(provider_id)
@@ -9866,6 +9895,7 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                     market_grant: None,
                     app_availability: ShareAppAvailability::default(),
                     model_health: ShareModelHealthSummary::default(),
+                    auto_start: false,
                 },
             ))
         })
@@ -10017,9 +10047,6 @@ fn share_settings_patch_is_empty(patch: &ShareSettingsPatch) -> bool {
 /// honored the whole patch. The server uses this to refuse writing a partial
 /// application (the desktop bug where an owner transfer dropped the demoted
 /// owner from `shareto`) instead of silently persisting it.
-///
-/// `auto_start` is intentionally not checked: it is not part of
-/// `ShareDescriptor`, so the report cannot confirm it.
 fn validate_returned_share_against_patch(
     patch: &ShareSettingsPatch,
     share: &ShareDescriptor,
@@ -10155,6 +10182,11 @@ fn validate_returned_share_against_patch(
             if share.for_sale_official_price_percent_by_app.get(app) != Some(percent) {
                 return Err("forSaleOfficialPricePercentByApp");
             }
+        }
+    }
+    if let Some(auto_start) = patch.auto_start {
+        if auto_start != share.auto_start {
+            return Err("autoStart");
         }
     }
     Ok(())
@@ -17019,6 +17051,7 @@ mod tests {
             market_grant: None,
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
+            auto_start: false,
         }
     }
 
@@ -19650,6 +19683,7 @@ mod tests {
             market_grant: None,
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
+            auto_start: false,
         };
         let timestamp_ms = Utc::now().timestamp_millis();
         let nonce = Uuid::new_v4().to_string();
@@ -19721,6 +19755,7 @@ mod tests {
             market_grant: None,
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
+            auto_start: false,
         };
 
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -20087,6 +20122,7 @@ mod tests {
             market_grant: None,
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
+            auto_start: false,
         };
         let claim = share_claim_payload(&share);
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -20171,6 +20207,7 @@ mod tests {
             market_grant: None,
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
+            auto_start: false,
         };
         let claim = ShareClaimPayload {
             subdomain: "other-sub".into(),
@@ -20247,6 +20284,7 @@ mod tests {
             market_grant: None,
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
+            auto_start: false,
         };
 
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -20352,6 +20390,7 @@ mod tests {
             market_grant: None,
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
+            auto_start: false,
         };
 
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -20430,6 +20469,7 @@ mod tests {
             market_grant: None,
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
+            auto_start: false,
         };
 
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -20527,6 +20567,7 @@ mod tests {
             market_grant: None,
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
+            auto_start: false,
         };
         let ops = vec![ShareSyncOperation {
             kind: "upsert".into(),
