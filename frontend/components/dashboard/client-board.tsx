@@ -222,7 +222,6 @@ function ClientCard({
   onToggleCollapsed: () => void;
 }) {
   const { locale, t } = useLocaleText();
-  const focus = useDashboardFocus();
   const tunnelUrl = clientTunnelDisplayUrl(client.clientTunnel?.tunnelUrl);
   const owner = clientOwnerEmail(client);
   const allShares = summaryShares || shares;
@@ -235,15 +234,11 @@ function ClientCard({
   const issueCount = enabledShares.length - onlineShares.length;
   const identity = client.clientTunnel?.subdomain || client.installation.id;
   const borderTone = state === "offline" ? "border-l-rose-500" : state === "degraded" ? "border-l-amber-400" : "border-l-slate-200";
-  const focused = focus.isFocused("client", client.installation.id);
-  const related = focus.isRelated("client", client.installation.id);
-  const dimmed = Boolean(focus.target) && !related;
   const headerPointerDownRef = React.useRef<{ x: number; y: number } | null>(null);
 
   const openClientDrawer = React.useCallback(() => {
-    focus.setFocus({ kind: "client", id: client.installation.id, source: "client-board" });
     onOpenClient(client);
-  }, [client, focus, onOpenClient]);
+  }, [client, onOpenClient]);
 
   const handleHeaderPointerDown = React.useCallback(
     (event: React.MouseEvent<HTMLElement>) => {
@@ -273,7 +268,7 @@ function ClientCard({
   );
 
   return (
-    <Card id={`dashboard-client-${client.installation.id}`} className={`overflow-hidden rounded-lg border border-l-[3px] bg-white p-0 shadow-sm transition-[border-color,box-shadow,opacity] ${borderTone} ${focused ? "ring-2 ring-primary/20" : ""} ${dimmed ? "opacity-40" : "opacity-100"}`}>
+    <Card id={`dashboard-client-${client.installation.id}`} className={`overflow-hidden rounded-lg border border-l-[3px] bg-white p-0 shadow-sm transition-[border-color,box-shadow] ${borderTone}`}>
       <Card.Content className="grid gap-3 p-3.5">
         <div
           className="grid min-h-16 cursor-pointer select-text grid-cols-[minmax(300px,1.3fr)_minmax(420px,1fr)_auto] items-center gap-6 rounded-md px-1.5 py-1 outline-none transition-colors hover:bg-primary/[0.03] focus-visible:ring-2 focus-visible:ring-primary/30"

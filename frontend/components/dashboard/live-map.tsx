@@ -2,10 +2,12 @@
 
 import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import { recordDashboardUxEvent } from "@/lib/api";
 import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
 import type { DashboardResponse, MapPoint, MarketRequestLog, RecentRequestEvent, ShareRequestLog } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { computeMapOffsetY, DEFAULT_MAP_DISPLAY, MAP_VIEWPORT_HEIGHT_PX } from "@/lib/map-display-settings";
+import { StatsStrip } from "@/components/dashboard/stats-strip";
 
 function projectPoint(point: MapPoint) {
   if (typeof point.lat !== "number" || typeof point.lon !== "number") return null;
@@ -23,6 +25,10 @@ type TickerMeta = Partial<Omit<ShareRequestLog, "createdAt"> & Omit<MarketReques
 };
 
 const REQUEST_TICKER_LIMIT = 6;
+
+function scrollToDashboardClient(clientId: string) {
+  document.getElementById(`dashboard-client-${clientId}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+}
 
 function spreadPoints(points: PlacedPoint[], minDistPct: number, lockedIndex: number) {
   if (points.length < 2) return points;
@@ -290,6 +296,8 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
     return flows;
   }, [data]);
 
+  const suppressClientFocusFx = focus.target?.kind === "client";
+
   React.useLayoutEffect(() => {
     const shell = shellRef.current;
     if (!shell) return;
@@ -351,6 +359,10 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
     >
       <div className="pointer-events-none absolute inset-0 z-10 bg-[radial-gradient(circle,rgba(15,23,42,0.05)_1px,transparent_1px)] bg-[length:28px_28px] bg-[position:14px_14px]" />
       <div className="pointer-events-none absolute inset-0 z-10 bg-[radial-gradient(circle_at_6%_12%,rgba(0,82,255,0.10),transparent_38%),radial-gradient(circle_at_94%_88%,rgba(77,124,255,0.07),transparent_42%)]" />
+      <StatsStrip
+        data={data}
+        className="pointer-events-none absolute left-3 top-3 z-30 max-w-[min(72%,560px)] rounded-lg border border-slate-200/70 bg-white/70 px-2.5 py-1.5 backdrop-blur-md"
+      />
       <RequestTicker data={data} />
       <div
         className="absolute left-1/2 top-1/2 z-20 aspect-[2/1] w-full origin-center"
@@ -373,8 +385,9 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
                 const flow = requestFlows.get(client.id);
                 const activeCount = client.activeRequests || 0;
                 if (activeCount <= 0) return null;
-                const related = !focus.target || focus.relatedClientIds.has(client.id);
-                const focused = focus.isFocused("client", client.id) || (focus.target?.kind === "request" && focus.relatedClientIds.has(client.id));
+                const related = suppressClientFocusFx || !focus.target || focus.relatedClientIds.has(client.id);
+                const focused = !suppressClientFocusFx
+                  && (focus.isFocused("client", client.id) || (focus.target?.kind === "request" && focus.relatedClientIds.has(client.id)));
                 const stroke = flow?.failures
                   ? "stroke-rose-300"
                   : flow?.highLatency
@@ -401,8 +414,8 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
         </svg>
           {placed.map(({ point, pos }) => {
             const isServer = point.pointType === "server";
-            const related = isServer || !focus.target || focus.relatedClientIds.has(point.id);
-            const focused = !isServer && focus.isFocused("client", point.id);
+            const related = isServer || suppressClientFocusFx || !focus.target || focus.relatedClientIds.has(point.id);
+            const focused = !suppressClientFocusFx && !isServer && focus.isFocused("client", point.id);
             return (
               <button
                 type="button"
@@ -412,7 +425,11 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
                 style={{ left: `${pos.xPct}%`, top: `${pos.yPct}%` }}
                 title={[point.label, point.city, point.region, point.country, point.activeRequests ? t("map.active", { count: point.activeRequests }) : ""].filter(Boolean).join(" · ")}
                 aria-label={[isServer ? t("map.router") : point.label, point.country].filter(Boolean).join(" · ")}
-                onClick={() => { if (!isServer) focus.setFocus({ kind: "client", id: point.id, source: "map" }); }}
+                onClick={() => {
+                  if (isServer) return;
+                  scrollToDashboardClient(point.id);
+                  void recordDashboardUxEvent({ eventType: "client_located_from_map", source: "map", targetType: "client" });
+                }}
               >
                 <div
                   className={cn(
@@ -425,11 +442,6 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
               </button>
             );
           })}
-      </div>
-      <div className="pointer-events-none absolute bottom-3 left-3 z-30 flex max-w-[min(46%,320px)] flex-wrap gap-2 rounded-lg border border-slate-200/70 bg-white/70 px-2 py-1.5 text-[10px] text-slate-500 backdrop-blur-md">
-        <span className="inline-flex items-center gap-1"><i className="h-1.5 w-1.5 rounded-full bg-primary" />{t("map.router")}</span>
-        <span className="inline-flex items-center gap-1"><i className="h-1.5 w-1.5 rounded-full bg-primary" />{t("map.activeClient")}</span>
-        <span className="inline-flex items-center gap-1"><i className="h-1.5 w-1.5 rounded-full bg-slate-500 opacity-55" />{t("map.idleClient")}</span>
       </div>
       {points.length === 0 ? (
         <div className="pointer-events-none absolute inset-0 z-20 grid place-items-center text-center text-muted-foreground">

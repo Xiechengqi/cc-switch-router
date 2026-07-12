@@ -2,7 +2,7 @@
 
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import type { DashboardResponse } from "@/lib/types";
-import { formatNumber } from "@/lib/utils";
+import { cn, formatNumber } from "@/lib/utils";
 
 function countDistinctCountries(data: DashboardResponse | null) {
   const set = new Set<string>();
@@ -13,11 +13,14 @@ function countDistinctCountries(data: DashboardResponse | null) {
   return set.size;
 }
 
-export function StatsStrip({ data }: { data: DashboardResponse | null }) {
+export function StatsStrip({ data, className }: { data: DashboardResponse | null; className?: string }) {
   const { t } = useLocaleText();
 
   return (
-    <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground" aria-label={t("dashboard.overview")}>
+    <div
+      className={cn("flex flex-wrap items-center gap-2 text-xs text-muted-foreground", className)}
+      aria-label={t("dashboard.overview")}
+    >
       <span title={t("nav.clientsTitle")}>
         <strong className="text-foreground">{formatNumber(data?.stats?.clients || 0)}</strong> {t("nav.clients")}
       </span>
