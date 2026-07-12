@@ -10,59 +10,15 @@ import { Toast } from "@heroui/react";
 import { AuthProvider, useAuth } from "@/components/auth/auth-provider";
 import { LocaleProvider, useLocaleText } from "@/components/i18n/locale-provider";
 import { refreshAccessToken } from "@/lib/auth";
-import { getDashboard, getUserApiToken, resetUserApiToken } from "@/lib/api";
+import { getUserApiToken, resetUserApiToken } from "@/lib/api";
+import { DashboardDataProvider, useDashboardData } from "@/components/dashboard/dashboard-data";
 import type { AppLocale } from "@/lib/i18n";
-import type { DashboardResponse, UserApiTokenStatus } from "@/lib/types";
-import { formatNumber } from "@/lib/utils";
+import type { UserApiTokenStatus } from "@/lib/types";
 
 type RegionOption = {
   name: string;
   url: string;
 };
-
-function countDistinctCountries(data: DashboardResponse | null) {
-  const set = new Set<string>();
-  if (data?.map?.server?.countryCode) set.add(data.map.server.countryCode);
-  for (const client of data?.map?.clients || []) {
-    if (client.countryCode) set.add(client.countryCode);
-  }
-  return set.size;
-}
-
-function TopbarStats() {
-  const [data, setData] = React.useState<DashboardResponse | null>(null);
-  const { t } = useLocaleText();
-
-  const load = React.useCallback(async () => {
-    setData(await getDashboard());
-  }, []);
-
-  React.useEffect(() => {
-    load().catch(console.error);
-    const id = window.setInterval(() => load().catch(console.error), 5000);
-    return () => window.clearInterval(id);
-  }, [load]);
-
-  return (
-    <div className="hidden flex-wrap items-center justify-end gap-2 text-xs text-muted-foreground lg:flex">
-      <span title={t("nav.clientsTitle")}>
-        <strong className="text-foreground">{formatNumber(data?.stats?.clients || 0)}</strong> {t("nav.clients")}
-      </span>
-      <span className="opacity-40">·</span>
-      <span title={t("nav.countriesTitle")}>
-        <strong className="text-foreground">{formatNumber(countDistinctCountries(data))}</strong> {t("nav.countries")}
-      </span>
-      <span className="opacity-40">·</span>
-      <span title={t("nav.activeSharesTitle")}>
-        <strong className="text-foreground">{formatNumber(data?.stats?.activeShares || 0)}</strong> {t("nav.activeShares")}
-      </span>
-      <span className="opacity-40">·</span>
-      <span title={t("nav.inFlightTitle")}>
-        <strong className="text-foreground">{formatNumber(data?.stats?.totalActiveRequests || 0)}</strong> {t("nav.inFlight")}
-      </span>
-    </div>
-  );
-}
 
 function normalizeRegionUrl(url: string) {
   const trimmed = url.trim();
@@ -97,7 +53,7 @@ function sameRouterDomainClientRedirect(raw: string | null) {
   }
 }
 
-function RouterSwitcher() {
+function RouterSwitcher({ onNameChange }: { onNameChange?: (name: string) => void }) {
   const [regions, setRegions] = React.useState<RegionOption[]>([]);
   const [selected, setSelected] = React.useState("");
   const { t } = useLocaleText();
@@ -108,7 +64,9 @@ function RouterSwitcher() {
       if (!response.ok) return;
       const nextRegions = (await response.json()) as RegionOption[];
       setRegions(nextRegions);
-      setSelected(currentRegionName(nextRegions) || nextRegions[0]?.name || "");
+      const next = currentRegionName(nextRegions) || nextRegions[0]?.name || "";
+      setSelected(next);
+      onNameChange?.(next);
     }
     load().catch(console.error);
   }, []);
@@ -124,6 +82,7 @@ function RouterSwitcher() {
         const name = String(key || "");
         if (!name) return;
         setSelected(name);
+        onNameChange?.(name);
         const region = regions.find((item) => item.name === name);
         const href = region ? normalizeRegionUrl(region.url) : "";
         if (href) window.location.href = href;
@@ -308,6 +267,8 @@ function Topbar({ active }: { active: "dashboard" | "settings" | "metrics" }) {
   const [loginOpen, setLoginOpen] = React.useState(false);
   const [apiTokenOpen, setApiTokenOpen] = React.useState(false);
   const [clientRedirect, setClientRedirect] = React.useState<string | null>(null);
+  const [routerName, setRouterName] = React.useState("");
+  const dashboard = useDashboardData();
   const redirectStartedRef = React.useRef(false);
   const authed = !!session?.authenticated;
 
@@ -343,11 +304,15 @@ function Topbar({ active }: { active: "dashboard" | "settings" | "metrics" }) {
     <header className="mx-auto flex w-[calc(100%-2rem)] max-w-7xl items-center justify-between gap-4 py-5">
       <Link href="/" className="flex items-center gap-3">
         <Image src="/router-logo.svg" alt="" width={36} height={36} className="h-9 w-9" priority />
-        <span className="text-base font-extrabold leading-none">CC-Switch Router</span>
+        <span className="grid gap-1">
+          <span className="text-base font-extrabold leading-none">CC-Switch Router</span>
+          <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
+            {routerName || t("nav.router")}{active === "dashboard" ? <> · <span className={dashboard.fresh ? "text-emerald-700" : "text-amber-700"}>{dashboard.fresh ? "LIVE" : "STALE"}</span></> : null}
+          </span>
+        </span>
       </Link>
-      <RouterSwitcher />
       <div className="flex flex-1 items-center justify-end gap-4">
-        {active === "dashboard" ? <TopbarStats /> : null}
+        <RouterSwitcher onNameChange={setRouterName} />
         <LanguageSwitcher />
         {authed ? (
           <Dropdown>
@@ -415,9 +380,11 @@ export function AppShell({
   return (
     <LocaleProvider>
       <AuthProvider>
-        <Topbar active={active} />
-        {children}
-        <Toast.Provider placement="top end" />
+        <DashboardDataProvider enabled={active === "dashboard"}>
+          <Topbar active={active} />
+          {children}
+          <Toast.Provider placement="top end" />
+        </DashboardDataProvider>
       </AuthProvider>
     </LocaleProvider>
   );

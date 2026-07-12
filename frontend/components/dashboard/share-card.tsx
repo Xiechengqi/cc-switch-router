@@ -4,7 +4,7 @@ import { Card } from "@heroui/react";
 import { ChevronRight, Eye, Link2, MoreHorizontal, Pencil } from "lucide-react";
 import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { OperationalStatusPill, operationalReasonLabel, shareOperationalSummary } from "@/components/dashboard/operational-status";
+import { operationalReasonLabel, shareOperationalSummary } from "@/components/dashboard/operational-status";
 import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
 import {
   averageRecentLatencyMs,
@@ -71,6 +71,9 @@ export const ShareCard = React.memo(function ShareCard({
   const focused = focus.isFocused("share", share.shareId);
   const related = focus.isRelated("share", share.shareId);
   const dimmed = Boolean(focus.target) && !related;
+  const stateTone = summary.state === "offline" ? "border-rose-200" : summary.state === "degraded" ? "border-amber-300" : summary.state === "disabled" ? "border-slate-300 opacity-70" : "border-slate-200";
+  const statusDot = summary.state === "offline" ? "bg-rose-500" : summary.state === "degraded" ? "bg-amber-400" : summary.state === "disabled" ? "bg-slate-400" : "bg-emerald-500";
+  const connectDisabled = summary.state === "offline" || summary.state === "disabled";
 
   React.useEffect(() => {
     if (!focused || focus.target?.source === "client-board") return;
@@ -82,7 +85,7 @@ export const ShareCard = React.memo(function ShareCard({
     <Card
       ref={cardRef}
       data-share-id={share.shareId}
-      className={`group w-64 shrink-0 snap-start overflow-visible rounded-lg border bg-white p-0 shadow-sm transition-[border-color,box-shadow,opacity] hover:border-primary/30 ${focused ? "border-primary ring-2 ring-primary/20" : related ? "border-primary/35" : "border-default/60"} ${dimmed ? "opacity-40" : "opacity-100"}`}
+      className={`group w-full min-w-0 overflow-visible rounded-xl border bg-white p-0 shadow-sm transition-[border-color,box-shadow,opacity] hover:border-primary/35 ${focused ? "border-primary ring-2 ring-primary/20" : related ? "border-primary/35" : stateTone} ${dimmed ? "opacity-40" : "opacity-100"}`}
       onClick={(event) => {
         const target = event.target as HTMLElement;
         if (!target.closest("button,a,summary,details")) {
@@ -101,18 +104,18 @@ export const ShareCard = React.memo(function ShareCard({
       tabIndex={0}
       aria-label={`${t("dashboard.details")}: ${title}`}
     >
-      <Card.Content className="grid h-[178px] min-w-0 grid-rows-[auto_auto_1fr_auto] gap-2.5 p-3">
+      <Card.Content className="grid min-h-[178px] min-w-0 grid-rows-[auto_auto_1fr_auto] gap-2.5 p-3">
         <div className="flex min-w-0 items-start justify-between gap-2">
           <div className="min-w-0">
-            <strong className="block truncate text-sm font-semibold text-foreground" title={title}>{title}</strong>
+            <div className="flex min-w-0 items-center gap-1.5"><strong className="truncate text-sm font-semibold text-foreground" title={title}>{title}</strong>{app ? <span className="rounded bg-primary/10 px-1.5 py-0.5 text-[9px] font-semibold text-primary">{SHARE_APP_LABELS[app]}</span> : null}</div>
             <span className="block truncate font-mono text-[10px] text-muted-foreground" title={api.apiUrl}>{api.apiUrl}</span>
           </div>
-          <OperationalStatusPill summary={summary} className="h-5 px-2 text-[10px]" />
+          <span className={`mt-1 h-2 w-2 shrink-0 rounded-full ${statusDot}`} title={issue || summary.state} />
         </div>
 
         <div className={`grid min-w-0 gap-0.5 rounded-md border px-2 py-1.5 text-[11px] ${healthTone.className}`} title={app ? modelHealthTitle(share, app) : undefined}>
           <div className="flex min-w-0 items-center justify-between gap-2">
-            <span className="font-semibold">{app ? SHARE_APP_LABELS[app] : share.appType || t("dashboard.appType")}</span>
+            <span className="font-semibold">{t("dashboard.provider")}</span>
             {healthTone.label ? <span className="truncate text-[10px] opacity-75">{healthTone.label}</span> : null}
           </div>
           <span className="truncate opacity-80" title={[accountLevel, accountIdentity].filter(Boolean).join(" · ")}>{[accountLevel, accountIdentity].filter((value) => value && value !== "-").join(" · ") || t("dashboard.providerUnavailable")}</span>
@@ -136,7 +139,7 @@ export const ShareCard = React.memo(function ShareCard({
             {issue ? `${issue}${summary.additionalReasonCount ? ` · +${summary.additionalReasonCount}` : ""}` : `${t("dashboard.response")} ${formatLatencySeconds(averageLatency)}`}
           </span>
           <div className="flex shrink-0 items-center gap-1">
-            <button type="button" data-no-row-drawer className="inline-flex h-6 items-center gap-1 rounded-md border border-emerald-200 bg-emerald-50 px-2 text-[10px] font-semibold text-emerald-700 hover:bg-emerald-100" onClick={(event) => { event.stopPropagation(); onConnect(share); }}>
+            <button type="button" data-no-row-drawer disabled={connectDisabled} title={connectDisabled ? issue || t("common.offline") : undefined} className="inline-flex h-6 items-center gap-1 rounded-md border border-primary/20 bg-primary/5 px-2 text-[10px] font-semibold text-primary hover:bg-primary/10 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-50 disabled:text-slate-400" onClick={(event) => { event.stopPropagation(); if (!connectDisabled) onConnect(share); }}>
               <Link2 className="h-3 w-3" />{t("dashboard.connect")}
             </button>
             <details className="relative" data-no-row-drawer onClick={(event) => event.stopPropagation()}>

@@ -1,12 +1,13 @@
 "use client";
 
 import { Button, Card, Chip, Drawer, toast } from "@heroui/react";
-import { Check, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Copy, ExternalLink, Maximize2, Search, SlidersHorizontal, WalletCards } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, ChevronUp, Copy, ExternalLink, Maximize2, Search, WalletCards } from "lucide-react";
 import * as React from "react";
 import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog";
 import { ShareCard } from "@/components/dashboard/share-card";
 import { clientOperationalSummary, OperationalDiagnosis, OperationalStatusPill, operationalReasonLabel, shareIsEnabled, shareOperationalSummary, useStableOperationalRanks } from "@/components/dashboard/operational-status";
 import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
+import { useDashboardViewState } from "@/components/dashboard/dashboard-view-state";
 import { useOperationVerification } from "@/components/dashboard/operation-verification";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
@@ -111,7 +112,7 @@ function sortShares(shares: ShareView[]) {
   });
 }
 
-const CLIENT_EXPANDED_STORAGE_KEY = "cc_switch_router_client_expanded_v1";
+const CLIENT_EXPANDED_STORAGE_KEY = "cc_switch_router_client_expanded_v2";
 
 function includesQuery(values: Array<string | undefined>, query: string) {
   return values.some((value) => String(value || "").toLocaleLowerCase().includes(query));
@@ -169,55 +170,6 @@ const ShareScroller = React.memo(function ShareScroller({
   onConnectShare: (share: ShareView) => void;
 }) {
   const { t } = useLocaleText();
-  const scrollRef = React.useRef<HTMLDivElement | null>(null);
-  const [scrollState, setScrollState] = React.useState({
-    overflowing: false,
-    canScrollLeft: false,
-    canScrollRight: false,
-    currentIndex: 0,
-  });
-
-  const updateScrollState = React.useCallback(() => {
-    const element = scrollRef.current;
-    if (!element) return;
-    const maxScrollLeft = Math.max(0, element.scrollWidth - element.clientWidth);
-    setScrollState({
-      overflowing: maxScrollLeft > 1,
-      canScrollLeft: element.scrollLeft > 1,
-      canScrollRight: element.scrollLeft < maxScrollLeft - 1,
-      currentIndex: Math.min(shares.length - 1, Math.max(0, Math.round(element.scrollLeft / 272))),
-    });
-  }, [shares.length]);
-
-  React.useEffect(() => {
-    const element = scrollRef.current;
-    if (!element) return;
-    updateScrollState();
-    const observer = new ResizeObserver(updateScrollState);
-    observer.observe(element);
-    for (const child of Array.from(element.children)) observer.observe(child);
-    const onWheel = (event: WheelEvent) => {
-      if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return;
-      const maxScrollLeft = Math.max(0, element.scrollWidth - element.clientWidth);
-      const movingRight = event.deltaY > 0;
-      const canMove = movingRight
-        ? element.scrollLeft < maxScrollLeft - 1
-        : element.scrollLeft > 1;
-      if (!canMove) return;
-      event.preventDefault();
-      element.scrollLeft += event.deltaY;
-    };
-    element.addEventListener("wheel", onWheel, { passive: false });
-    return () => {
-      observer.disconnect();
-      element.removeEventListener("wheel", onWheel);
-    };
-  }, [shares.length, updateScrollState]);
-
-  const scrollByCards = React.useCallback((direction: -1 | 1) => {
-    scrollRef.current?.scrollBy({ left: direction * 272, behavior: "smooth" });
-  }, []);
-
   if (!shares.length) return <EmptyBlock>{t("dashboard.noLinkedShares")}</EmptyBlock>;
 
   const enabledCount = shares.filter(shareIsEnabled).length;
@@ -225,8 +177,8 @@ const ShareScroller = React.memo(function ShareScroller({
   const disabledCount = shares.length - enabledCount;
 
   return (
-    <div className="grid min-w-0 gap-2">
-      <div className="flex h-7 items-center justify-between gap-4">
+    <div className="grid min-w-0 gap-3 rounded-lg bg-slate-50/80 p-3">
+      <div className="flex items-center justify-between gap-4">
         <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
           <span className="font-semibold text-foreground">{t("dashboard.shares")}</span>
           <span>{shares.length === totalCount ? shares.length : `${shares.length}/${totalCount}`}</span>
@@ -235,39 +187,12 @@ const ShareScroller = React.memo(function ShareScroller({
           {enabledCount - onlineCount > 0 ? <span className="text-rose-700">{enabledCount - onlineCount} {t("common.offline")}</span> : null}
           {disabledCount > 0 ? <span>{disabledCount} {t("common.disabled")}</span> : null}
         </div>
-        {scrollState.overflowing ? (
-          <div className="flex shrink-0 items-center gap-1">
-            <span className="mr-1 font-mono text-[10px] tabular-nums text-muted-foreground">{scrollState.currentIndex + 1}/{shares.length}</span>
-          <Button size="sm" variant="outline" isIconOnly isDisabled={!scrollState.canScrollLeft} className="h-7 w-7 min-w-0 rounded-md p-0" aria-label={t("dashboard.scrollSharesLeft")} onClick={() => scrollByCards(-1)}>
-            <ChevronLeft className="h-3.5 w-3.5" />
-          </Button>
-          <Button size="sm" variant="outline" isIconOnly isDisabled={!scrollState.canScrollRight} className="h-7 w-7 min-w-0 rounded-md p-0" aria-label={t("dashboard.scrollSharesRight")} onClick={() => scrollByCards(1)}>
-            <ChevronRight className="h-3.5 w-3.5" />
-          </Button>
-          </div>
-        ) : null}
       </div>
-      <div className="relative min-w-0">
-        {scrollState.canScrollLeft ? <div className="pointer-events-none absolute inset-y-0 left-0 z-10 w-7 bg-gradient-to-r from-white to-transparent" /> : null}
-        {scrollState.canScrollRight ? <div className="pointer-events-none absolute inset-y-0 right-0 z-10 w-10 bg-gradient-to-l from-white to-transparent" /> : null}
-        <div
-          ref={scrollRef}
-          className="flex min-w-0 snap-x gap-3 overflow-x-auto pb-2 pr-5 outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
-          onScroll={updateScrollState}
-          tabIndex={0}
-          aria-label={t("dashboard.shares")}
-          onKeyDown={(event) => {
-            if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
-              event.preventDefault();
-              scrollByCards(event.key === "ArrowLeft" ? -1 : 1);
-            }
-          }}
-        >
+        <div className="grid min-w-0 grid-cols-3 gap-3" aria-label={t("dashboard.shares")}>
           {shares.map((share) => (
             <ShareCard key={share.shareId} share={share} onOpen={onOpenShare} onEdit={onEditShare} onConnect={onConnectShare} />
           ))}
         </div>
-      </div>
     </div>
   );
 });
@@ -350,7 +275,7 @@ function ClientCard({
     <Card id={`dashboard-client-${client.installation.id}`} className={`overflow-hidden rounded-lg border border-l-[3px] bg-white p-0 shadow-sm transition-[border-color,box-shadow,opacity] ${borderTone} ${focused ? "ring-2 ring-primary/20" : ""} ${dimmed ? "opacity-40" : "opacity-100"}`}>
       <Card.Content className="grid gap-3 p-3.5">
         <div
-          className="grid min-h-14 cursor-pointer select-text grid-cols-[minmax(300px,1.35fr)_minmax(330px,1fr)_auto] items-center gap-4 rounded-md px-1.5 py-1 outline-none transition-colors hover:bg-primary/[0.03] focus-visible:ring-2 focus-visible:ring-primary/30"
+          className="grid min-h-16 cursor-pointer select-text grid-cols-[minmax(300px,1.3fr)_minmax(420px,1fr)_auto] items-center gap-6 rounded-md px-1.5 py-1 outline-none transition-colors hover:bg-primary/[0.03] focus-visible:ring-2 focus-visible:ring-primary/30"
           aria-expanded={!collapsed}
           onMouseDown={handleHeaderPointerDown}
           onClick={handleHeaderClick}
@@ -358,8 +283,10 @@ function ClientCard({
         >
           <div className="grid min-w-0 gap-1.5">
             <div className="flex min-w-0 items-center gap-2">
+              <span className={`h-2 w-2 shrink-0 rounded-full ${state === "offline" ? "bg-rose-500" : state === "degraded" ? "bg-amber-400" : "bg-emerald-500"}`} />
               <strong className="truncate text-sm font-semibold text-foreground" title={identity}>{identity}</strong>
               <OperationalStatusPill summary={summary} />
+              {summary.primaryReason ? <span className={`truncate text-[11px] font-medium ${state === "offline" ? "text-rose-700" : "text-amber-700"}`} title={operationalReasonLabel(summary.primaryReason, t)}>{operationalReasonLabel(summary.primaryReason, t)}</span> : null}
             </div>
             <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
               {tunnelUrl ? (
@@ -373,31 +300,22 @@ function ClientCard({
             </div>
           </div>
 
-          <div className="grid min-w-0 gap-1.5 text-xs text-muted-foreground">
-            <div className="flex min-w-0 items-center gap-2">
-              <span>{client.installation.countryCode || client.installation.region || "-"}</span>
-              <span aria-hidden>·</span>
-              <span className="truncate" title={clientPlatformLabel(client)}>{clientPlatformLabel(client)}</span>
-              <span aria-hidden>·</span>
-              <span title={onlineTitle}>{onlineRate.toFixed(1)}% {t("dashboard.availability")}</span>
-              <span aria-hidden>·</span>
-              <span>{t("dashboard.lastSeen")} {formatRelativeTime(client.installation.lastSeenAt, locale)}</span>
-              {summary.primaryReason ? <span className={state === "offline" ? "truncate font-medium text-rose-700" : "truncate font-medium text-amber-700"} title={operationalReasonLabel(summary.primaryReason, t)}>· {operationalReasonLabel(summary.primaryReason, t)}</span> : null}
-            </div>
-            <div className="flex min-w-0 items-center gap-2">
-              {enabledShares.length ? <span className={issueCount ? "font-medium text-rose-700" : "text-foreground"}>{onlineShares.length}/{enabledShares.length} {t("common.online")}</span> : null}
-              {allShares.length - enabledShares.length > 0 ? <span>{allShares.length - enabledShares.length} {t("common.disabled")}</span> : null}
-              <PayoutProfilePanel client={client} />
-            </div>
+          <div className="grid min-w-0 grid-cols-4 gap-5">
+            <Metric label={t("dashboard.region")} value={`${client.installation.countryCode || client.installation.region || "-"} · ${clientPlatformLabel(client)}`} />
+            <Metric label={t("dashboard.uptime24h")} value={`${onlineRate.toFixed(1)}%`} title={onlineTitle} tone={onlineRate < 90 ? "warning" : "success"} />
+            <Metric label={t("dashboard.shares")} value={`${onlineShares.length}/${enabledShares.length || allShares.length} ${t("common.online")}`} tone={issueCount ? "danger" : "default"} />
+            <Metric label={t("dashboard.lastSeen")} value={formatRelativeTime(client.installation.lastSeenAt, locale)} tone={state === "offline" ? "danger" : "default"} />
           </div>
 
           <div className="flex min-w-0 items-center justify-end gap-1.5">
-            <Chip size="sm" variant={issueCount ? "soft" : "tertiary"}>{t("dashboard.sharesCount", { count: allShares.length })}</Chip>
             {tunnelUrl ? (
               <Button size="sm" variant="outline" isIconOnly className="h-7 w-7 min-w-0 rounded-md p-0" aria-label={t("dashboard.clientFrame.title")} data-no-row-drawer onClick={(event) => { event.stopPropagation(); onOpenFrame(tunnelUrl); }}>
                 <Maximize2 className="h-3.5 w-3.5" />
               </Button>
             ) : null}
+            <Button size="sm" variant="ghost" isIconOnly className="h-7 w-7 min-w-0 rounded-md p-0" aria-label={t("dashboard.details")} data-no-row-drawer onClick={(event) => { event.stopPropagation(); openClientDrawer(); }}>
+              <ChevronRight className="h-4 w-4" />
+            </Button>
             <Button size="sm" variant="ghost" isIconOnly className="h-7 w-7 min-w-0 rounded-md p-0" aria-label={collapsed ? t("dashboard.expandClient") : t("dashboard.collapseClient")} data-no-row-drawer onClick={(event) => { event.stopPropagation(); onToggleCollapsed(); }}>
               {collapsed ? <ChevronDown className="h-4 w-4" /> : <ChevronUp className="h-4 w-4" />}
             </Button>
@@ -408,6 +326,11 @@ function ClientCard({
       </Card.Content>
     </Card>
   );
+}
+
+function Metric({ label, value, title, tone = "default" }: { label: string; value: string; title?: string; tone?: "default" | "success" | "warning" | "danger" }) {
+  const color = tone === "success" ? "text-emerald-700" : tone === "warning" ? "text-amber-700" : tone === "danger" ? "text-rose-700" : "text-foreground";
+  return <div className="grid min-w-0 gap-1" title={title}><span className="font-mono text-[9px] uppercase tracking-[0.12em] text-slate-400">{label}</span><strong className={`truncate text-xs font-semibold ${color}`}>{value}</strong></div>;
 }
 
 export function ClientBoard({
@@ -423,6 +346,7 @@ export function ClientBoard({
 }) {
   const { locale, t } = useLocaleText();
   const focus = useDashboardFocus();
+  const { issuesOnly, setIssuesOnly } = useDashboardViewState();
   const { trackOperation } = useOperationVerification();
   const [selectedClientId, setSelectedClientId] = React.useState("");
   const [selectedShareId, setSelectedShareId] = React.useState("");
@@ -433,18 +357,24 @@ export function ClientBoard({
   const [statusFilter, setStatusFilter] = usePersistentState<"all" | Extract<OperationalState, "online" | "degraded" | "offline">>("cc_switch_router_client_status_v1", "all");
   const [regionFilter, setRegionFilter] = usePersistentState("cc_switch_router_client_region_v1", "all");
   const [sortOrder, setSortOrder] = usePersistentState("cc_switch_router_client_sort_v1", "issues");
-  const [onlyIssues, setOnlyIssues] = usePersistentState("cc_switch_router_client_issues_v1", false);
-  const [expandedClientIds, setExpandedClientIds] = usePersistentState<string[]>(
+  const [expandedClientIds, setExpandedClientIds] = usePersistentState<string[] | null>(
     CLIENT_EXPANDED_STORAGE_KEY,
-    [],
-  );
-  const expandedClientIdSet = React.useMemo(
-    () => new Set(expandedClientIds),
-    [expandedClientIds],
+    null,
   );
   const lastLocatedFocusRef = React.useRef("");
 
+  React.useEffect(() => {
+    if (issuesOnly) setStatusFilter("all");
+  }, [issuesOnly, setStatusFilter]);
+
   const sortedClients = React.useMemo(() => sortClients(clients), [clients]);
+  const defaultExpandedClientId = sortedClients.reduce<DashboardClient | undefined>((best, client) => {
+    return !best || (client.shareIds || []).length > (best.shareIds || []).length ? client : best;
+  }, undefined)?.installation.id;
+  const expandedClientIdSet = React.useMemo(
+    () => new Set(expandedClientIds ?? (defaultExpandedClientId ? [defaultExpandedClientId] : [])),
+    [defaultExpandedClientId, expandedClientIds],
+  );
   const shareById = React.useMemo(() => new Map(shares.map((share) => [share.shareId, share])), [shares]);
   const clientById = React.useMemo(() => new Map(clients.map((client) => [client.installation.id, client])), [clients]);
   const clientByShareId = React.useMemo(() => {
@@ -497,7 +427,7 @@ export function ClientBoard({
       const region = row.client.installation.countryCode || row.client.installation.region || "";
       if (regionFilter !== "all" && region !== regionFilter) return false;
       if (statusFilter !== "all" && row.state !== statusFilter) return false;
-      if (onlyIssues && row.state === "online") return false;
+      if (issuesOnly && row.state === "online") return false;
       return true;
     });
     rows.sort((left, right) => {
@@ -515,12 +445,14 @@ export function ClientBoard({
       return (stableStateRanks.get(left.client.installation.id) || 0) - (stableStateRanks.get(right.client.installation.id) || 0) || (stableOrder.get(left.client.installation.id) || 0) - (stableOrder.get(right.client.installation.id) || 0);
     });
     return rows;
-  }, [focus.target, onlyIssues, query, regionFilter, sharesForClient, sortOrder, sortedClients, stableStateRanks, statusFilter]);
+  }, [focus.target, issuesOnly, query, regionFilter, sharesForClient, sortOrder, sortedClients, stableStateRanks, statusFilter]);
 
   const clientSummary = React.useMemo(() => {
     const states = sortedClients.map((client) => clientOperationalSummary(client, sharesForClient(client)).state);
     return {
       online: states.filter((state) => state === "online").length,
+      degraded: states.filter((state) => state === "degraded").length,
+      offline: states.filter((state) => state === "offline").length,
       issues: states.filter((state) => state !== "online").length,
     };
   }, [sharesForClient, sortedClients]);
@@ -530,10 +462,10 @@ export function ClientBoard({
     return orphanShares.filter((share) => {
       if (normalizedQuery && !shareMatchesQuery(share, normalizedQuery)) return false;
       if (statusFilter === "online" && !(shareIsEnabled(share) && share.isOnline)) return false;
-      if ((statusFilter === "offline" || statusFilter === "degraded" || onlyIssues) && shareIsEnabled(share) && share.isOnline) return false;
+      if ((statusFilter === "offline" || statusFilter === "degraded" || issuesOnly) && shareIsEnabled(share) && share.isOnline) return false;
       return true;
     });
-  }, [onlyIssues, orphanShares, query, statusFilter]);
+  }, [issuesOnly, orphanShares, query, statusFilter]);
   const openClient = React.useCallback((client: DashboardClient) => {
     setSelectedClientId(client.installation.id);
     focus.openDrawer("client", client.installation.id);
@@ -559,12 +491,12 @@ export function ClientBoard({
   }, [editingShare, onChanged, t, trackOperation]);
   const toggleClientExpanded = React.useCallback((clientId: string) => {
     setExpandedClientIds((current) => {
-      const next = new Set(current);
+      const next = new Set(current ?? (defaultExpandedClientId ? [defaultExpandedClientId] : []));
       if (next.has(clientId)) next.delete(clientId);
       else next.add(clientId);
       return Array.from(next);
     });
-  }, [setExpandedClientIds]);
+  }, [defaultExpandedClientId, setExpandedClientIds]);
 
   React.useEffect(() => {
     if (!focus.target || focus.target.source === "client-board") return;
@@ -593,34 +525,26 @@ export function ClientBoard({
 
   return (
     <section className="grid gap-4">
-      <div className="grid gap-3 rounded-lg border bg-white p-3 shadow-sm">
-        <div className="flex items-center justify-between gap-4">
-          <div className="flex items-baseline gap-2">
-            <h2 className="text-sm font-semibold text-foreground">{t("dashboard.clients")}</h2>
-            <span className="text-xs text-muted-foreground">{sortedClients.length}</span>
-            <span className="text-xs text-emerald-700">{clientSummary.online} {t("common.online")}</span>
-            {clientSummary.issues ? <span className="text-xs font-medium text-rose-700">{clientSummary.issues} {t("dashboard.issues")}</span> : null}
+      <div className="flex items-center justify-between gap-4">
+        <div className="flex items-center gap-3">
+          <h2 className="font-mono text-xs font-semibold uppercase tracking-[0.14em] text-foreground">{t("dashboard.clients")}</h2>
+          <div className="inline-flex rounded-lg bg-slate-100 p-1 text-[11px]">
+            {([[
+              "all", t("dashboard.all"), sortedClients.length,
+            ], ["online", t("common.online"), clientSummary.online], ["degraded", t("dashboard.degraded"), clientSummary.degraded], ["offline", t("common.offline"), clientSummary.offline]] as const).map(([value, label, count]) => (
+              <button key={value} type="button" onClick={() => { setStatusFilter(value); if (value === "online") setIssuesOnly(false); }} className={`rounded-md px-2.5 py-1.5 transition-colors ${statusFilter === value ? "bg-white font-medium text-foreground shadow-sm" : value === "offline" ? "text-rose-700" : value === "degraded" ? "text-amber-700" : "text-muted-foreground"}`}>{label} · {count}</button>
+            ))}
           </div>
-          <a href="https://github.com/Xiechengqi/cc-switch/releases" target="_blank" rel="noopener noreferrer" className="font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground transition-colors hover:text-blue-500">{t("dashboard.install")}</a>
         </div>
         <div className="flex items-center gap-2">
           <label className="flex h-9 min-w-64 flex-1 items-center gap-2 rounded-md border bg-white px-3 text-sm focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-primary/10">
             <Search className="h-4 w-4 shrink-0 text-muted-foreground" />
             <input value={query} onChange={(event) => setQuery(event.target.value)} className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground" placeholder={t("dashboard.searchClients")} aria-label={t("dashboard.searchClients")} />
           </label>
-          <select value={statusFilter} onChange={(event) => { setStatusFilter(event.target.value as "all" | Extract<OperationalState, "online" | "degraded" | "offline">); void recordDashboardUxEvent({ eventType: "filter_applied", source: "client-board", targetType: "client" }); }} className="h-9 rounded-md border bg-white px-3 text-xs text-foreground outline-none focus:border-primary/50" aria-label={t("dashboard.filterStatus")}>
-            <option value="all">{t("dashboard.allStatuses")}</option>
-            <option value="online">{t("common.online")}</option>
-            <option value="degraded">{t("dashboard.degraded")}</option>
-            <option value="offline">{t("common.offline")}</option>
-          </select>
-          <select value={regionFilter} onChange={(event) => { setRegionFilter(event.target.value); void recordDashboardUxEvent({ eventType: "filter_applied", source: "client-board", targetType: "client" }); }} className="h-9 max-w-36 rounded-md border bg-white px-3 text-xs text-foreground outline-none focus:border-primary/50" aria-label={t("dashboard.filterRegion")}>
+          {regions.length > 1 ? <select value={regionFilter} onChange={(event) => { setRegionFilter(event.target.value); void recordDashboardUxEvent({ eventType: "filter_applied", source: "client-board", targetType: "client" }); }} className="h-9 max-w-36 rounded-md border bg-white px-3 text-xs text-foreground outline-none focus:border-primary/50" aria-label={t("dashboard.filterRegion")}>
             <option value="all">{t("dashboard.allRegions")}</option>
             {regions.map((region) => <option key={region} value={region}>{region}</option>)}
-          </select>
-          <button type="button" onClick={() => { setOnlyIssues((value) => !value); void recordDashboardUxEvent({ eventType: "filter_applied", source: "client-board", targetType: "client" }); }} aria-pressed={onlyIssues} className={`inline-flex h-9 items-center gap-1.5 rounded-md border px-3 text-xs font-medium transition-colors ${onlyIssues ? "border-amber-300 bg-amber-50 text-amber-800" : "bg-white text-muted-foreground hover:text-foreground"}`}>
-            <SlidersHorizontal className="h-3.5 w-3.5" />{t("dashboard.onlyIssues")}
-          </button>
+          </select> : null}
           <select value={sortOrder} onChange={(event) => { setSortOrder(event.target.value); void recordDashboardUxEvent({ eventType: "filter_applied", source: "client-board", targetType: "client" }); }} className="h-9 rounded-md border bg-white px-3 text-xs text-foreground outline-none focus:border-primary/50" aria-label={t("dashboard.sortBy")}>
             <option value="issues">{t("dashboard.sortIssues")}</option>
             <option value="name">{t("dashboard.sortName")}</option>
@@ -628,6 +552,7 @@ export function ClientBoard({
             <option value="shares">{t("dashboard.sortShares")}</option>
             <option value="registered">{t("dashboard.sortRegistered")}</option>
           </select>
+          <a href="https://github.com/Xiechengqi/cc-switch/releases" target="_blank" rel="noopener noreferrer" className="font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground transition-colors hover:text-blue-500">{t("dashboard.install")}</a>
         </div>
       </div>
 
@@ -638,7 +563,7 @@ export function ClientBoard({
           <EmptyBlock>
             <div className="grid justify-items-center gap-2">
               <span>{sortedClients.length ? t("dashboard.noFilterResults") : t("dashboard.noClients")}</span>
-              {sortedClients.length ? <button type="button" className="text-xs font-medium text-primary hover:underline" onClick={() => { setQuery(""); setStatusFilter("all"); setRegionFilter("all"); setOnlyIssues(false); }}>{t("dashboard.clearFilters")}</button> : null}
+              {sortedClients.length ? <button type="button" className="text-xs font-medium text-primary hover:underline" onClick={() => { setQuery(""); setStatusFilter("all"); setRegionFilter("all"); setIssuesOnly(false); }}>{t("dashboard.clearFilters")}</button> : null}
             </div>
           </EmptyBlock>
         )}

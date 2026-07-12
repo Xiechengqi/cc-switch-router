@@ -99,6 +99,36 @@ body {
   font-family: var(--font-inter), Inter, system-ui, sans-serif;
 }
 
+@keyframes router-live-pulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.18); opacity: 0.72; }
+}
+
+@keyframes router-activity-enter {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.live-pulse {
+  animation: router-live-pulse 2.2s ease-in-out infinite;
+}
+
+.activity-feed-enter {
+  animation: router-activity-enter 0.45s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.activity-feed-mask {
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 32%);
+  mask-image: linear-gradient(to bottom, transparent 0%, black 32%);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .live-pulse,
+  .activity-feed-enter {
+    animation: none !important;
+  }
+}
+
 button,
 input,
 textarea,
@@ -329,7 +359,8 @@ a {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .animate-fade-in-up {
+  .animate-fade-in-up,
+  .pulse-dot {
     animation: none;
   }
 }

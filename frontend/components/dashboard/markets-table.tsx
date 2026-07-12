@@ -1,13 +1,14 @@
 "use client";
 
-import { ChevronRight, ExternalLink, Loader2, Pencil, Save, Search, SlidersHorizontal, X } from "lucide-react";
+import { ChevronRight, ExternalLink, Loader2, Pencil, Save, Search, X } from "lucide-react";
 import { Button, Card, Checkbox, Chip, Drawer, Modal, Tabs, TextArea } from "@heroui/react";
 import * as React from "react";
 import { DrawerSection, EmptyBlock, HealthTimelineStrip, Info, TokenGrid } from "@/components/dashboard/drawer-panels";
 import { FieldGroup } from "@/components/dashboard/share-edit-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { marketOperationalSummary, OperationalDiagnosis, OperationalStatusPill, operationalReasonLabel, useStableOperationalRanks } from "@/components/dashboard/operational-status";
+import { marketOperationalSummary, OperationalDiagnosis, operationalReasonLabel, operationalStateLabel, useStableOperationalRanks } from "@/components/dashboard/operational-status";
 import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
+import { useDashboardViewState } from "@/components/dashboard/dashboard-view-state";
 import { useOperationVerification } from "@/components/dashboard/operation-verification";
 import { getMarketLinkedShares, getMarketSharePriority, getMarketShareSessionLoads, releaseMarketShareState, updateMarketDisabledShares, updateMarketMaintenance } from "@/lib/api";
 import type { DashboardMarket, MarketAppAvailabilityEntry, MarketRequestLog, MarketShare, MarketShareRuntimeState, OperationalState, ShareAppRuntimes, ShareUpstreamProvider } from "@/lib/types";
@@ -125,13 +126,16 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
   const [selected, setSelected] = React.useState<DashboardMarket | null>(null);
   const [editingMarket, setEditingMarket] = React.useState<DashboardMarket | null>(null);
   const [query, setQuery] = React.useState("");
-  const [statusFilter, setStatusFilter] = usePersistentState<"all" | Extract<OperationalState, "available" | "degraded" | "offline" | "maintenance" | "disabled">>("cc_switch_router_market_status_v1", "all");
+  const [statusFilter, setStatusFilter] = usePersistentState<"all" | "available" | "issues" | "disabled">("cc_switch_router_market_status_v2", "all");
   const [sortOrder, setSortOrder] = usePersistentState("cc_switch_router_market_sort_v1", "issues");
-  const [onlyIssues, setOnlyIssues] = usePersistentState("cc_switch_router_market_issues_v1", false);
   const { locale, t } = useLocaleText();
   const focus = useDashboardFocus();
+  const { issuesOnly, setIssuesOnly } = useDashboardViewState();
   const { trackOperation } = useOperationVerification();
   const lastLocatedFocusRef = React.useRef("");
+  React.useEffect(() => {
+    if (issuesOnly) setStatusFilter("all");
+  }, [issuesOnly, setStatusFilter]);
   const stableMarkets = React.useMemo(() => sortMarkets(markets), [markets]);
   const stableStateRanks = useStableOperationalRanks(stableMarkets.map((market) => ({ id: market.id, state: marketOperationalSummary(market).state })));
   const summary = React.useMemo(() => {
@@ -154,8 +158,11 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
         market.publicBaseUrl,
         market.marketKind,
       ].some((value) => String(value || "").toLocaleLowerCase().includes(normalizedQuery))) return false;
-      if (statusFilter !== "all" && state !== statusFilter) return false;
-      if (onlyIssues && state !== "degraded" && state !== "offline" && state !== "maintenance") return false;
+      const issue = state === "degraded" || state === "offline" || state === "maintenance";
+      if (statusFilter === "available" && state !== "available") return false;
+      if (statusFilter === "issues" && !issue) return false;
+      if (statusFilter === "disabled" && state !== "disabled") return false;
+      if (issuesOnly && !issue) return false;
       return true;
     });
     next.sort((left, right) => {
@@ -168,7 +175,7 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
       return (stableStateRanks.get(left.market.id) || 0) - (stableStateRanks.get(right.market.id) || 0) || (stableOrder.get(left.market.id) || 0) - (stableOrder.get(right.market.id) || 0);
     });
     return next;
-  }, [focus.target, onlyIssues, query, sortOrder, stableMarkets, stableStateRanks, statusFilter]);
+  }, [focus.target, issuesOnly, query, sortOrder, stableMarkets, stableStateRanks, statusFilter]);
 
   React.useEffect(() => {
     if (!focus.target || focus.target.source === "market-table") return;
@@ -189,33 +196,20 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
 
   return (
     <section className="grid gap-3">
-      <div className="grid gap-3 rounded-lg border bg-white p-3 shadow-sm">
-        <div className="flex items-center justify-between gap-4">
-          <div className="flex items-baseline gap-2">
-            <h2 className="text-sm font-semibold text-foreground">{t("dashboard.markets")}</h2>
-            <span className="text-xs text-muted-foreground">{stableMarkets.length}</span>
-            <span className="text-xs text-emerald-700">{summary.available} {t("dashboard.available")}</span>
-            {summary.issues ? <span className="text-xs font-medium text-rose-700">{summary.issues} {t("dashboard.issues")}</span> : null}
-            {summary.disabled ? <span className="text-xs text-muted-foreground">{summary.disabled} {t("common.disabled")}</span> : null}
+      <div className="flex items-center justify-between gap-4">
+        <div className="flex items-center gap-3">
+          <h2 className="font-mono text-xs font-semibold uppercase tracking-[0.14em] text-foreground">{t("dashboard.markets")}</h2>
+          <div className="inline-flex rounded-lg bg-slate-100 p-1 text-[11px]">
+            {([["all", t("dashboard.all"), stableMarkets.length], ["available", t("dashboard.available"), summary.available], ["issues", t("dashboard.issues"), summary.issues], ["disabled", t("common.disabled"), summary.disabled]] as const).map(([value, label, count]) => (
+              <button key={value} type="button" onClick={() => { setStatusFilter(value); if (value === "available" || value === "disabled") setIssuesOnly(false); }} className={`rounded-md px-2.5 py-1.5 transition-colors ${statusFilter === value ? "bg-white font-medium text-foreground shadow-sm" : value === "issues" ? "text-rose-700" : "text-muted-foreground"}`}>{label} · {count}</button>
+            ))}
           </div>
-          <a href="https://github.com/Xiechengqi/cc-switch-market/releases" target="_blank" rel="noopener noreferrer" className="font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground transition-colors hover:text-blue-500">{t("dashboard.install")}</a>
         </div>
         <div className="flex items-center gap-2">
           <label className="flex h-9 min-w-64 flex-1 items-center gap-2 rounded-md border bg-white px-3 text-sm focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-primary/10">
             <Search className="h-4 w-4 shrink-0 text-muted-foreground" />
             <input value={query} onChange={(event) => setQuery(event.target.value)} className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground" placeholder={t("dashboard.searchMarkets")} aria-label={t("dashboard.searchMarkets")} />
           </label>
-          <select value={statusFilter} onChange={(event) => { setStatusFilter(event.target.value as "all" | Extract<OperationalState, "available" | "degraded" | "offline" | "maintenance" | "disabled">); void recordDashboardUxEvent({ eventType: "filter_applied", source: "market-table", targetType: "market" }); }} className="h-9 rounded-md border bg-white px-3 text-xs text-foreground outline-none focus:border-primary/50" aria-label={t("dashboard.filterStatus")}>
-            <option value="all">{t("dashboard.allStatuses")}</option>
-            <option value="available">{t("dashboard.available")}</option>
-            <option value="degraded">{t("dashboard.degraded")}</option>
-            <option value="offline">{t("common.offline")}</option>
-            <option value="maintenance">{t("dashboard.maintenance")}</option>
-            <option value="disabled">{t("dashboard.disabled")}</option>
-          </select>
-          <button type="button" onClick={() => { setOnlyIssues((value) => !value); void recordDashboardUxEvent({ eventType: "filter_applied", source: "market-table", targetType: "market" }); }} aria-pressed={onlyIssues} className={`inline-flex h-9 items-center gap-1.5 rounded-md border px-3 text-xs font-medium transition-colors ${onlyIssues ? "border-amber-300 bg-amber-50 text-amber-800" : "bg-white text-muted-foreground hover:text-foreground"}`}>
-            <SlidersHorizontal className="h-3.5 w-3.5" />{t("dashboard.onlyIssues")}
-          </button>
           <select value={sortOrder} onChange={(event) => { setSortOrder(event.target.value); void recordDashboardUxEvent({ eventType: "filter_applied", source: "market-table", targetType: "market" }); }} className="h-9 rounded-md border bg-white px-3 text-xs text-foreground outline-none focus:border-primary/50" aria-label={t("dashboard.sortBy")}>
             <option value="issues">{t("dashboard.sortIssues")}</option>
             <option value="name">{t("dashboard.sortName")}</option>
@@ -224,21 +218,20 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
             <option value="shares">{t("dashboard.sortShares")}</option>
             <option value="updated">{t("dashboard.sortUpdated")}</option>
           </select>
+          <a href="https://github.com/Xiechengqi/cc-switch-market/releases" target="_blank" rel="noopener noreferrer" className="font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground transition-colors hover:text-blue-500">{t("dashboard.install")}</a>
         </div>
       </div>
       <Card className="overflow-hidden rounded-lg border bg-white shadow-sm">
-        <Card.Content className="overflow-x-auto p-0">
-          <table className="w-full min-w-[1080px] table-fixed border-collapse text-sm">
-            <thead className="bg-slate-50 text-left text-[11px] font-semibold text-muted-foreground">
+        <Card.Content className="p-0">
+          <table className="w-full table-fixed border-collapse text-sm">
+            <thead className="bg-slate-50 text-left font-mono text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
               <tr>
-                <th className="w-[22%] px-3 py-2.5">{t("dashboard.market")}</th>
-                <th className="w-[11%] px-3 py-2.5">{t("dashboard.status")}</th>
-                <th className="w-[13%] px-3 py-2.5">{t("dashboard.capacity")}</th>
-                <th className="w-[14%] px-3 py-2.5">{t("dashboard.activity")}</th>
-                <th className="w-[10%] px-3 py-2.5">{t("dashboard.shares")}</th>
-                <th className="w-[14%] px-3 py-2.5">{t("dashboard.health")}</th>
-                <th className="w-[10%] px-3 py-2.5">{t("dashboard.updated")}</th>
-                <th className="w-[6%] px-3 py-2.5 text-right">{t("dashboard.actions")}</th>
+                <th className="w-[25%] px-3 py-2.5">{t("dashboard.market")}</th>
+                <th className="w-[22%] px-3 py-2.5">{t("dashboard.status")} / {t("dashboard.health")}</th>
+                <th className="w-[15%] px-3 py-2.5">{t("dashboard.capacity")}</th>
+                <th className="w-[18%] px-3 py-2.5">{t("dashboard.activity")}</th>
+                <th className="w-[9%] px-3 py-2.5">{t("dashboard.shares")}</th>
+                <th className="w-[11%] px-3 py-2.5 text-right">{t("dashboard.updated")}</th>
               </tr>
             </thead>
             <tbody>
@@ -253,7 +246,10 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
                 return (
                   <tr id={`dashboard-market-${market.id}`} key={market.id} tabIndex={0} className={`cursor-pointer border-b border-l-[3px] outline-none transition-opacity last:border-b-0 hover:bg-primary/[0.03] focus-visible:bg-primary/[0.05] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary/30 ${rowTone} ${focused ? "bg-primary/[0.07] ring-2 ring-inset ring-primary/20" : ""} ${dimmed ? "opacity-40" : "opacity-100"}`} onClick={(event) => { if (shouldOpenRowDrawer(event)) { focus.setFocus({ kind: "market", id: market.id, source: "market-table" }); focus.openDrawer("market", market.id); setSelected(market); void recordDashboardUxEvent({ eventType: "drawer_opened", source: "market-table", targetType: "market" }); } }} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); focus.setFocus({ kind: "market", id: market.id, source: "market-table" }); focus.openDrawer("market", market.id); setSelected(market); void recordDashboardUxEvent({ eventType: "drawer_opened", source: "market-table", targetType: "market", keyboard: true }); } }}>
                     <td className="px-3 py-2.5 align-middle"><MarketIdentityCell market={market} t={t} /></td>
-                    <td className="px-3 py-2.5 align-middle"><OperationalStatusPill summary={operational} /></td>
+                    <td className="px-3 py-2.5 align-middle">
+                      <strong className={`block text-xs ${state === "offline" ? "text-rose-700" : state === "degraded" ? "text-amber-700" : state === "maintenance" ? "text-blue-700" : "text-emerald-700"}`}>{operationalStateLabel(state, t)}</strong>
+                      <span className={`block truncate text-[10px] ${state === "offline" ? "text-rose-700" : state === "degraded" ? "text-amber-700" : "text-muted-foreground"}`} title={operationalReasonLabel(operational.primaryReason, t)}>{operationalReasonLabel(operational.primaryReason, t)} · {(market.onlineRate24h || 0).toFixed(1)}% 24h</span>
+                    </td>
                     <td className="px-3 py-2.5 align-middle">
                       <div className="grid gap-1">
                         <strong className="text-xs tabular-nums">{market.activeRequests || 0}<span className="font-normal text-muted-foreground">/{capacityLimit}</span></strong>
@@ -263,7 +259,6 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
                       </div>
                     </td>
                     <td className="px-3 py-2.5 align-middle">
-                      <strong className="block text-xs tabular-nums">{market.activeRequests || 0} {t("dashboard.active")}</strong>
                       <span className="block truncate text-[10px] text-muted-foreground" title={usageValue}>{usageValue}</span>
                       <MarketActivitySparkline market={market} />
                     </td>
@@ -271,26 +266,17 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
                       <strong className="text-xs tabular-nums">{market.onlineShareCount || 0}<span className="font-normal text-muted-foreground">/{market.shareCount || 0}</span></strong>
                       <span className="block text-[10px] text-muted-foreground">{t("common.online")}</span>
                     </td>
-                    <td className="px-3 py-2.5 align-middle">
-                      <span className={`block truncate text-xs font-medium ${state === "offline" ? "text-rose-700" : state === "degraded" ? "text-amber-700" : "text-foreground"}`} title={operationalReasonLabel(operational.primaryReason, t)}>{operationalReasonLabel(operational.primaryReason, t)}</span>
-                      <span className="block text-[10px] text-muted-foreground">{(market.onlineRate24h || 0).toFixed(1)}% · 24h</span>
-                    </td>
-                    <td className="px-3 py-2.5 align-middle">
+                    <td className="px-3 py-2.5 text-right align-middle">
                       <span className="block text-xs" title={formatDateTime(market.lastSeenAt)}>{formatRelativeTime(market.lastSeenAt, locale)}</span>
-                    </td>
-                    <td className="px-3 py-2.5 align-middle">
-                      <div className="flex items-center justify-end gap-1">
-                        <MarketEditAction market={market} onEdit={setEditingMarket} t={t} />
-                        <ChevronRight className="h-4 w-4 text-muted-foreground" />
-                      </div>
+                      <ChevronRight className="ml-auto mt-1 h-3.5 w-3.5 text-muted-foreground" />
                     </td>
                   </tr>
                 );
               }) : (
-                <tr><td colSpan={8} className="px-4 py-10 text-center text-muted-foreground">
+                <tr><td colSpan={6} className="px-4 py-10 text-center text-muted-foreground">
                   <div className="grid justify-items-center gap-2">
                     <span>{stableMarkets.length ? t("dashboard.noFilterResults") : t("dashboard.noMarkets")}</span>
-                    {stableMarkets.length ? <button type="button" className="text-xs font-medium text-primary hover:underline" onClick={() => { setQuery(""); setStatusFilter("all"); setOnlyIssues(false); }}>{t("dashboard.clearFilters")}</button> : null}
+                    {stableMarkets.length ? <button type="button" className="text-xs font-medium text-primary hover:underline" onClick={() => { setQuery(""); setStatusFilter("all"); setIssuesOnly(false); }}>{t("dashboard.clearFilters")}</button> : null}
                   </div>
                 </td></tr>
               )}
@@ -313,6 +299,7 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
               <Drawer.Body className="overflow-y-auto">
                 {selected ? (
                   <div className="grid gap-4">
+                    <div className="flex justify-end"><MarketEditAction market={selected} onEdit={setEditingMarket} t={t} /></div>
                     <OperationalDiagnosis summary={marketOperationalSummary(selected)} kind="market" onEvidence={() => { document.getElementById("market-health-evidence")?.scrollIntoView({ behavior: "smooth" }); void recordDashboardUxEvent({ eventType: "diagnosis_evidence_opened", source: "drawer", targetType: "market" }); }} />
                     <div id="market-health-evidence">{isUsageMarket(selected) ? (
                       <>

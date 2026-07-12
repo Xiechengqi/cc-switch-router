@@ -24,7 +24,7 @@ type TickerMeta = Partial<Omit<ShareRequestLog, "createdAt"> & Omit<MarketReques
   shareName?: string;
 };
 
-const REQUEST_TICKER_LIMIT = 5;
+const REQUEST_TICKER_LIMIT = 6;
 
 function spreadPoints(points: PlacedPoint[], minDistPct: number, lockedIndex: number) {
   if (points.length < 2) return points;
@@ -138,7 +138,7 @@ function tickerDetail(meta?: TickerMeta) {
   if (meta?.isHealthCheck) {
     const model = meta.requestedModel || meta.requestModel || meta.actualModel || meta.model || "-";
     const status = meta.statusCode ?? meta.status ?? "-";
-    return ["健康检查", meta.requestAgent || meta.appType || "", model, String(status), formatTickerLatency(meta.latencyMs)].filter(Boolean).join(" · ");
+    return [meta.requestAgent || meta.appType || "", model, String(status), formatTickerLatency(meta.latencyMs)].filter(Boolean).join(" · ");
   }
   const agent = meta?.requestAgent || "";
   const requested = meta?.requestedModel || meta?.requestModel || "";
@@ -201,7 +201,7 @@ function RequestTicker({ data }: { data: DashboardResponse | null }) {
   if (!events.length) return null;
 
   return (
-    <div className="absolute left-[1.6%] top-[3.5%] z-20 flex max-w-[min(68%,760px)] flex-col items-start gap-1.5">
+    <div className="activity-feed-mask pointer-events-none absolute bottom-[52px] left-3 z-30 flex w-[min(46%,520px)] flex-col gap-1">
       {events.map((event, index) => {
         const item = meta.get(event.requestId);
         const eventUserEmail = event.userEmail;
@@ -221,14 +221,16 @@ function RequestTicker({ data }: { data: DashboardResponse | null }) {
               : undefined;
         const country = event.userCountry || event.countryCode || "--";
         const subdomain = event.shareSubdomain || event.subdomain || event.shareName || mergedItem?.shareName || "share";
-        const eventKey = [event.requestId, event.startedAt || event.createdAt || "", index].join(":");
+        const eventKey = [event.requestId, event.startedAt || event.createdAt || ""].join(":");
+        const statusCode = Number(mergedItem?.statusCode || 0);
+        const rawStatus = String(mergedItem?.status || event.healthStatus || "").toLowerCase();
+        const failed = statusCode >= 400 || ["failed", "error", "offline"].includes(rawStatus);
+        const badge = event.isHealthCheck ? "HC" : statusCode ? String(statusCode) : rawStatus ? rawStatus.slice(0, 3).toUpperCase() : "—";
         return (
-          <button type="button" data-map-control key={eventKey} onClick={() => focus.setFocus({ kind: "request", id: event.requestId, source: "activity" })} className={`flex max-w-full items-center gap-1 overflow-hidden rounded-md border px-2 py-1 text-left text-[10px] text-slate-700 backdrop-blur-sm transition-colors ${focus.isFocused("request", event.requestId) ? "border-primary bg-white ring-2 ring-primary/20" : "border-slate-200/70 bg-white/55 hover:bg-white/90"}`}>
+          <button type="button" data-map-control key={eventKey} onClick={() => focus.setFocus({ kind: "request", id: event.requestId, source: "activity" })} className={`pointer-events-auto flex max-w-full items-center gap-2 overflow-hidden rounded-lg border px-2.5 py-1.5 text-left text-[10px] text-slate-700 backdrop-blur-md transition-colors ${index === events.length - 1 ? "activity-feed-enter" : ""} ${focus.isFocused("request", event.requestId) ? "border-primary bg-white ring-2 ring-primary/20" : "border-slate-200/80 bg-white/75 hover:bg-white"}`}>
             <span className="font-mono text-slate-500">{formatTickerTime(event.startedAt || event.createdAt, item?.createdAt)}</span>
-            <span>{countryFlag(country)}</span>
-            <span className="font-semibold text-slate-600">{country}</span>
-            <span className="font-semibold text-slate-500">{subdomain}</span>
-            <span className="truncate font-semibold text-slate-700/80">{tickerDetail(mergedItem)}</span>
+            <span className={`inline-flex h-[15px] shrink-0 items-center rounded px-1.5 font-mono text-[9px] font-semibold ${event.isHealthCheck ? "bg-blue-100 text-blue-700" : failed ? "bg-rose-100 text-rose-700" : "bg-emerald-100 text-emerald-700"}`}>{badge}</span>
+            <span className="min-w-0 truncate text-[11px] text-slate-700"><strong className="font-semibold">{subdomain}</strong> · {countryFlag(country)} {country} · {tickerDetail(mergedItem)}</span>
           </button>
         );
       })}
@@ -415,6 +417,10 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
     >
       <div className="pointer-events-none absolute inset-0 z-10 bg-[radial-gradient(circle,rgba(15,23,42,0.05)_1px,transparent_1px)] bg-[length:28px_28px] bg-[position:14px_14px]" />
       <div className="pointer-events-none absolute inset-0 z-10 bg-[radial-gradient(circle_at_6%_12%,rgba(0,82,255,0.10),transparent_38%),radial-gradient(circle_at_94%_88%,rgba(77,124,255,0.07),transparent_42%)]" />
+      <div data-map-control className="absolute left-3 top-3 z-30 inline-flex items-center gap-1.5 rounded-full border border-slate-200/70 bg-white/70 px-2.5 py-1 backdrop-blur-md">
+        <span className="live-pulse h-1.5 w-1.5 rounded-full bg-rose-500" />
+        <span className="font-mono text-[9px] font-semibold uppercase tracking-[0.14em] text-slate-700">{t("map.liveActivity")}</span>
+      </div>
       <RequestTicker data={data} />
       <div
         className="absolute left-1/2 top-1/2 z-20 aspect-[2/1] w-full origin-center transition-transform duration-200 ease-out"
@@ -490,11 +496,7 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
             );
           })}
       </div>
-      <div data-map-control className="absolute right-[1.6%] top-[3.5%] z-30 flex items-center gap-1 rounded-lg border border-slate-200/70 bg-white/60 p-1 text-[10px] text-slate-600 backdrop-blur-sm">
-        <button type="button" aria-pressed={showFlows} onClick={() => setShowFlows((value) => !value)} className={`rounded-md px-2 py-1 transition-colors ${showFlows ? "bg-primary/10 font-medium text-primary" : "hover:bg-white"}`}>{t("map.requestFlows")}</button>
-        <button type="button" aria-pressed={showHeat} onClick={() => setShowHeat((value) => !value)} className={`rounded-md px-2 py-1 transition-colors ${showHeat ? "bg-primary/10 font-medium text-primary" : "hover:bg-white"}`}>{t("map.demandHeat")}</button>
-      </div>
-      <div className="absolute bottom-[4%] left-[1.6%] z-30 inline-flex items-center gap-0.5 rounded-lg border border-slate-200/70 bg-white/50 p-1 text-slate-600 backdrop-blur-sm">
+      <div className="absolute bottom-3 left-3 z-30 inline-flex items-center gap-0.5 rounded-lg border border-slate-200/70 bg-white/70 p-1 text-slate-600 backdrop-blur-md">
         <Button data-map-control variant="ghost" size="sm" isIconOnly className="h-6 w-6 min-w-0 rounded-md p-0 text-slate-600 hover:bg-blue-50 hover:text-primary" aria-label={t("map.zoomOut")} onClick={() => setZoom(zoom - 0.25)}>
           <Minus className="h-3.5 w-3.5" />
         </Button>
@@ -505,8 +507,11 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
         <Button data-map-control variant="ghost" size="sm" isIconOnly className="h-6 w-6 min-w-0 rounded-md p-0 text-slate-600 hover:bg-blue-50 hover:text-primary" aria-label={t("map.reset")} onClick={reset}>
           <RotateCcw className="h-3.5 w-3.5" />
         </Button>
+        <span className="mx-1 h-4 w-px bg-slate-200" />
+        <button data-map-control type="button" aria-pressed={showFlows} onClick={() => setShowFlows((value) => !value)} className={`rounded-md px-2 py-1 text-[10px] transition-colors ${showFlows ? "bg-primary/10 font-medium text-primary" : "hover:bg-white"}`}>{t("map.requestFlows")}</button>
+        <button data-map-control type="button" aria-pressed={showHeat} onClick={() => setShowHeat((value) => !value)} className={`rounded-md px-2 py-1 text-[10px] transition-colors ${showHeat ? "bg-primary/10 font-medium text-primary" : "hover:bg-white"}`}>{t("map.demandHeat")}</button>
       </div>
-      <div className="absolute bottom-[4%] right-[1.6%] z-30 flex max-w-[min(34%,280px)] flex-wrap gap-2 rounded-lg border border-slate-200/70 bg-white/50 px-2 py-1.5 text-[10px] text-slate-500 backdrop-blur-sm">
+      <div className="absolute bottom-3 right-3 z-30 flex max-w-[min(34%,280px)] flex-wrap gap-2 rounded-lg border border-slate-200/70 bg-white/70 px-2 py-1.5 text-[10px] text-slate-500 backdrop-blur-md">
         <span className="inline-flex items-center gap-1"><i className="h-1.5 w-1.5 rounded-full bg-primary" />{t("map.router")}</span>
         <span className="inline-flex items-center gap-1"><i className="h-1.5 w-1.5 rounded-full bg-primary" />{t("map.activeClient")}</span>
         <span className="inline-flex items-center gap-1"><i className="h-1.5 w-1.5 rounded-full bg-slate-500 opacity-55" />{t("map.idleClient")}</span>
