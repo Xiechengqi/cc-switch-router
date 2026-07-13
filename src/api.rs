@@ -147,6 +147,7 @@ pub fn router(state: ServerState) -> Router {
     Router::new()
         .merge(public_api)
         .route("/", any(root_handler))
+        .route("/install-client.sh", get(install_client_script))
         .route("/favicon.ico", get(favicon))
         .route("/v1/dashboard", get(dashboard))
         .route("/v1/map-display", get(map_display_get))
@@ -381,6 +382,16 @@ fn source_ip_from_request(req: &Request) -> Option<std::net::IpAddr> {
 
 async fn favicon() -> StatusCode {
     StatusCode::NO_CONTENT
+}
+
+async fn install_client_script() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=300"),
+        ],
+        include_str!("../install-client.sh"),
+    )
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -2021,6 +2032,7 @@ async fn is_market_host(state: &ServerState, host: &str) -> bool {
 fn is_router_share_ui_path(path: &str) -> bool {
     path == "/"
         || path == "/favicon.ico"
+        || path == "/install-client.sh"
         || path == "/router-logo.svg"
         || path == "/world-map.svg"
         || path.starts_with("/_next/")
@@ -2106,6 +2118,7 @@ mod tests {
         for path in [
             "/",
             "/favicon.ico",
+            "/install-client.sh",
             "/router-logo.svg",
             "/world-map.svg",
             "/_next/static/chunks/app.js",

@@ -17,6 +17,10 @@ const nextConfig = {
               source: "/v1/:path*",
               destination: `${devApiTarget}/v1/:path*`,
             },
+            {
+              source: "/install-client.sh",
+              destination: `${devApiTarget}/install-client.sh`,
+            },
           ];
         },
       }

@@ -7,6 +7,7 @@ fn main() {
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/index");
     println!("cargo:rerun-if-changed=frontend/out");
+    println!("cargo:rerun-if-changed=install-client.sh");
 
     let commit = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])

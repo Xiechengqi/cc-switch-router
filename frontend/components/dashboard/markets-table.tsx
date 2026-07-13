@@ -16,6 +16,8 @@ import { cn, compactTokens, formatDateTime, formatRelativeTime } from "@/lib/uti
 import { usePersistentState } from "@/lib/use-persistent-state";
 import { recordDashboardUxEvent } from "@/lib/api";
 import { canShowMarketSharePriority, drawerDialogClassName, formatOfficialPriceMultiplier, formatUsdExactTrimmed, formatUsdOneDecimal, isShareMarket, isUnlimited, isUsageMarket, marketKindDescription, marketKindLabel, requestModelRoute, shouldOpenRowDrawer, sortMarkets, usageBucketTotalTokens, type TFn } from "@/components/dashboard/share-dashboard-utils";
+import { InstallGuideDialog } from "@/components/dashboard/install-guide-dialog";
+import { SectionInstallButton } from "@/components/dashboard/section-install-button";
 import { CompactSelect } from "@/components/common/compact-select";
 
 function marketCapacityPercent(market: DashboardMarket) {
@@ -123,9 +125,12 @@ function MarketIdentityCell({ market, t }: { market: DashboardMarket; t: TFn }) 
   );
 }
 
+const MARKET_RELEASES_URL = "https://github.com/Xiechengqi/cc-switch-market/releases";
+
 export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[]; onChanged?: () => Promise<void> }) {
   const [selected, setSelected] = React.useState<DashboardMarket | null>(null);
   const [editingMarket, setEditingMarket] = React.useState<DashboardMarket | null>(null);
+  const [installOpen, setInstallOpen] = React.useState(false);
   const [query, setQuery] = React.useState("");
   const [statusFilter, setStatusFilter] = usePersistentState<"all" | "available" | "issues" | "disabled">("cc_switch_router_market_status_v2", "all");
   const [sortOrder, setSortOrder] = usePersistentState("cc_switch_router_market_sort_v1", "issues");
@@ -200,6 +205,7 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
       <div className="flex items-center justify-between gap-4">
         <div className="flex items-center gap-3">
           <h2 className="font-mono text-xs font-semibold uppercase tracking-[0.14em] text-foreground">{t("dashboard.markets")}</h2>
+          <SectionInstallButton label={t("dashboard.installMarket")} onClick={() => setInstallOpen(true)} />
           <div className="inline-flex rounded-lg bg-slate-100 p-1 text-[11px]">
             {([["all", t("dashboard.all"), stableMarkets.length], ["available", t("dashboard.available"), summary.available], ["issues", t("dashboard.issues"), summary.issues], ["disabled", t("common.disabled"), summary.disabled]] as const).map(([value, label, count]) => (
               <button key={value} type="button" onClick={() => { setStatusFilter(value); if (value === "available" || value === "disabled") setIssuesOnly(false); }} className={`rounded-md px-2.5 py-1.5 transition-colors ${statusFilter === value ? "bg-white font-medium text-foreground shadow-sm" : value === "issues" ? "text-rose-700" : "text-muted-foreground"}`}>{label} · {count}</button>
@@ -212,7 +218,6 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
             <input value={query} onChange={(event) => setQuery(event.target.value)} className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground" placeholder={t("dashboard.searchMarkets")} aria-label={t("dashboard.searchMarkets")} />
           </label>
           <CompactSelect value={sortOrder} onChange={(value) => { setSortOrder(value); void recordDashboardUxEvent({ eventType: "filter_applied", source: "market-table", targetType: "market" }); }} options={[{ value: "issues", label: t("dashboard.sortIssues") }, { value: "name", label: t("dashboard.sortName") }, { value: "capacity", label: t("dashboard.sortCapacity") }, { value: "activity", label: t("dashboard.sortActivity") }, { value: "shares", label: t("dashboard.sortShares") }, { value: "updated", label: t("dashboard.sortUpdated") }]} ariaLabel={t("dashboard.sortBy")} className="w-44" />
-          <a href="https://github.com/Xiechengqi/cc-switch-market/releases" target="_blank" rel="noopener noreferrer" className="font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground transition-colors hover:text-blue-500">{t("dashboard.install")}</a>
         </div>
       </div>
       <Card className="overflow-hidden rounded-lg border bg-white shadow-sm">
@@ -320,6 +325,15 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
         if (editingMarket) trackOperation({ kind: "market", id: editingMarket.id, expectedState: verification?.expectedState });
         await onChanged?.();
       }} />
+      <InstallGuideDialog
+        open={installOpen}
+        onOpenChange={setInstallOpen}
+        titleKey="dashboard.installMarketTitle"
+        descriptionKey="dashboard.installMarketDescription"
+        commandLabelKey="dashboard.installMarketCommandLabel"
+        command={MARKET_RELEASES_URL}
+        externalUrl={MARKET_RELEASES_URL}
+      />
     </section>
   );
 }

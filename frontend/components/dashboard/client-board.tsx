@@ -3,6 +3,8 @@
 import { Button, Card, Chip, Drawer, toast } from "@heroui/react";
 import { Check, ChevronDown, Copy, ExternalLink, Maximize2, PanelRightOpen, Search, WalletCards } from "lucide-react";
 import * as React from "react";
+import { buildClientInstallCommand, InstallGuideDialog } from "@/components/dashboard/install-guide-dialog";
+import { SectionInstallButton } from "@/components/dashboard/section-install-button";
 import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog";
 import { ShareCard } from "@/components/dashboard/share-card";
 import { ClientRemovalSchedule, clientOperationalSummary, OperationalDiagnosis, OperationalStatusPill, operationalReasonLabel, shareIsEnabled, shareOperationalSummary, useStableOperationalRanks } from "@/components/dashboard/operational-status";
@@ -440,6 +442,7 @@ export function ClientBoard({
   const [selectedShareId, setSelectedShareId] = React.useState("");
   const [editingShare, setEditingShare] = React.useState<ShareView | null>(null);
   const [connectShare, setConnectShare] = React.useState<ShareView | null>(null);
+  const [installOpen, setInstallOpen] = React.useState(false);
   const [clientFrameUrl, setClientFrameUrl] = React.useState("");
   const [query, setQuery] = React.useState("");
   const [statusFilter, setStatusFilter] = usePersistentState<"all" | Extract<OperationalState, "online" | "degraded" | "offline">>("cc_switch_router_client_status_v1", "all");
@@ -613,12 +616,14 @@ export function ClientBoard({
   const selectedShare = selectedShareId ? shareById.get(selectedShareId) || null : null;
   const selectedClientUrl = clientTunnelDisplayUrl(selectedClient?.clientTunnel?.tunnelUrl);
   const selectedApi = shareApiParts(selectedShare ?? undefined);
+  const clientInstallCommand = React.useMemo(() => buildClientInstallCommand(), [installOpen]);
 
   return (
     <section className="grid gap-4">
       <div className="flex items-center justify-between gap-4">
         <div className="flex items-center gap-3">
           <h2 className="font-mono text-xs font-semibold uppercase tracking-[0.14em] text-foreground">{t("dashboard.clients")}</h2>
+          <SectionInstallButton label={t("dashboard.installClient")} onClick={() => setInstallOpen(true)} />
           <div className="inline-flex rounded-lg bg-slate-100 p-1 text-[11px]">
             {([[
               "all", t("dashboard.all"), sortedClients.length,
@@ -634,7 +639,6 @@ export function ClientBoard({
           </label>
           {regions.length > 1 ? <CompactSelect value={regionFilter} onChange={(value) => { setRegionFilter(value); void recordDashboardUxEvent({ eventType: "filter_applied", source: "client-board", targetType: "client" }); }} options={[{ value: "all", label: t("dashboard.allRegions") }, ...regions.map((region) => ({ value: region, label: region }))]} ariaLabel={t("dashboard.filterRegion")} className="w-36" /> : null}
           <CompactSelect value={sortOrder} onChange={(value) => { setSortOrder(value); void recordDashboardUxEvent({ eventType: "filter_applied", source: "client-board", targetType: "client" }); }} options={[{ value: "issues", label: t("dashboard.sortIssues") }, { value: "name", label: t("dashboard.sortName") }, { value: "recent", label: t("dashboard.sortRecent") }, { value: "shares", label: t("dashboard.sortShares") }, { value: "registered", label: t("dashboard.sortRegistered") }]} ariaLabel={t("dashboard.sortBy")} className="w-44" />
-          <a href="https://github.com/Xiechengqi/cc-switch/releases" target="_blank" rel="noopener noreferrer" className="font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground transition-colors hover:text-blue-500">{t("dashboard.install")}</a>
         </div>
       </div>
 
@@ -753,6 +757,14 @@ export function ClientBoard({
 
       <ShareEditDialog share={editingShare} markets={markets} onClose={closeEditShare} onSaved={handleSaved} />
       <ShareConnectDialog share={connectShare} open={!!connectShare} onOpenChange={closeConnectDialog} />
+      <InstallGuideDialog
+        open={installOpen}
+        onOpenChange={setInstallOpen}
+        titleKey="dashboard.installClientTitle"
+        descriptionKey="dashboard.installClientDescription"
+        commandLabelKey="dashboard.installClientCommandLabel"
+        command={clientInstallCommand}
+      />
       <ClientFrameDialog url={clientFrameUrl} open={!!clientFrameUrl} onOpenChange={closeClientFrame} t={t} />
     </section>
   );
