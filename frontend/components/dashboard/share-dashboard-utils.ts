@@ -168,10 +168,36 @@ export function shareDisplayTitle(share?: Pick<ShareView, "subdomain" | "shareId
   return share?.subdomain || share?.shareId || "-";
 }
 
-export function shareApiParts(share?: ShareView) {
+export function tunnelDomainHost(referenceTunnelUrl?: string | null) {
+  const normalized = clientTunnelDisplayUrl(referenceTunnelUrl);
+  if (normalized) {
+    try {
+      const { hostname, port } = new URL(normalized);
+      const dot = hostname.indexOf(".");
+      if (dot > 0) {
+        return port ? `${hostname.slice(dot + 1)}:${port}` : hostname.slice(dot + 1);
+      }
+    } catch {
+      // fall through to window host
+    }
+  }
+  if (typeof window !== "undefined" && window.location.host) {
+    return window.location.host;
+  }
+  return "";
+}
+
+export function subdomainTunnelUrl(subdomain?: string | null, referenceTunnelUrl?: string | null) {
+  const sub = String(subdomain || "").trim();
+  if (!sub) return "";
+  const host = tunnelDomainHost(referenceTunnelUrl);
+  if (!host) return "";
+  return clientTunnelDisplayUrl(`${sub}.${host}`);
+}
+
+export function shareApiParts(share?: ShareView, referenceTunnelUrl?: string | null) {
   if (!share) return { apiUrl: "-" };
-  const baseHost = typeof window === "undefined" ? "" : window.location.host || "";
-  const apiUrl = share.subdomain && baseHost ? `${share.subdomain}.${baseHost}` : share.subdomain || baseHost || "-";
+  const apiUrl = subdomainTunnelUrl(share.subdomain, referenceTunnelUrl) || share.subdomain || "-";
   return { apiUrl };
 }
 
@@ -460,6 +486,23 @@ export function runtimeEndpointSummary(runtime?: ShareUpstreamProvider) {
   return apiUrl && !isOfficialMarker(apiUrl) ? apiUrl : "";
 }
 
+export function isCursorApiKeyRuntime(runtime?: ShareUpstreamProvider) {
+  return String(runtime?.providerType || "").trim().toLowerCase() === "cursor_apikey";
+}
+
+export function isApiProviderRuntime(runtime?: ShareUpstreamProvider) {
+  return Boolean(
+    runtime
+      && !isCursorApiKeyRuntime(runtime)
+      && hasConcreteApiUrl(runtime)
+      && !runtimeLooksOAuth(runtime),
+  );
+}
+
+export function providerApiEndpoint(runtime?: ShareUpstreamProvider) {
+  return runtimeEndpointSummary(runtime) || "-";
+}
+
 export function countdownStr(resetsAt?: string) {
   if (!resetsAt) return "";
   const diffMs = new Date(resetsAt).getTime() - Date.now();
@@ -526,6 +569,9 @@ export function formatQuotaUsageAmount(
 type OAuthRuntimeKey = "kiro" | "cursor" | "antigravity" | "copilot";
 
 export function oauthRuntimeKeyFromProvider(value?: Partial<ShareUpstreamProvider & ShareAppProvider>): OAuthRuntimeKey | undefined {
+  if (String(value?.providerType || "").trim().toLowerCase() === "cursor_apikey") {
+    return undefined;
+  }
   const text = [
     value?.app,
     value?.kind,
@@ -640,13 +686,120 @@ export function providerAccountLevel(runtime?: ShareUpstreamProvider, locale: Ap
 }
 
 export function providerAccountIdentity(runtime?: ShareUpstreamProvider) {
+  if (isCursorApiKeyRuntime(runtime)) {
+    const name = String(runtime?.providerName || "").trim();
+    if (name) return name;
+    const message = String(runtime?.quota?.credentialMessage || "").trim();
+    if (message) return message;
+    return "Cursor API Key";
+  }
   const account = String(runtime?.accountEmail || "").trim();
   if (!account || account.startsWith("cursor_apikey_")) return "-";
   return account;
 }
 
+export function providerStatusIdentity(runtime?: ShareUpstreamProvider) {
+  const identity = providerAccountIdentity(runtime);
+  if (identity && identity !== "-") return identity;
+  const name = String(runtime?.providerName || "").trim();
+  return name || "-";
+}
+
 export function providerModelMap(runtime?: ShareUpstreamProvider) {
   return runtimeModelSummary(runtime) || "-";
+}
+
+function preferredQuotaTiers(runtime?: ShareUpstreamProvider) {
+  const quota = runtime?.quota;
+  if (!quota) return [];
+  const status = String(quota.status || "").toLowerCase();
+  if (status && !["ok", "success", "valid"].includes(status)) return [];
+  let tiers = (quota.tiers || [])
+    .map((tier) => ({ ...tier, label: tier.label || tier.name }))
+    .filter((tier) => tier.label);
+  if (runtime?.app === "claude") {
+    const preferredLabels = new Set(["5h", "1w"]);
+    const preferredTiers = tiers.filter((tier) => preferredLabels.has(String(tier.label).toLowerCase()));
+    if (preferredTiers.length) tiers = preferredTiers;
+  }
+  return tiers;
+}
+
+export function providerAccountTierLabel(runtime?: ShareUpstreamProvider) {
+  if (!runtime) return "-";
+  if (isCursorApiKeyRuntime(runtime)) {
+    const quota = runtime.quota;
+    if (quota) {
+      const status = String(quota.status || "").toLowerCase();
+      if (status && !["ok", "success", "valid"].includes(status)) {
+        const message = String(quota.credentialMessage || "").trim();
+        if (message) return message;
+      }
+      const plan = String(quota.plan || quota.credentialMessage || "").trim();
+      if (plan) return plan;
+    }
+    return runtime.providerName || "Cursor API Key";
+  }
+  if (hasConcreteApiUrl(runtime) && !runtimeLooksOAuth(runtime)) {
+    return runtime.providerName || runtime.kind || "-";
+  }
+  const plan = String(runtime.quota?.plan || runtime.quota?.credentialMessage || "").trim();
+  if (plan) {
+    return isOllamaCloudRuntime(runtime) && !plan.toLowerCase().includes("ollama")
+      ? `ollama ${plan}`
+      : plan;
+  }
+  return runtime.providerName || runtime.kind || "-";
+}
+
+export function providerQuotaExpiry(runtime?: ShareUpstreamProvider, locale: AppLocale = "en") {
+  if (!runtime?.quota) return "-";
+  const subscriptionEnd = runtime.quota.subscriptionPeriodEnd;
+  if (subscriptionEnd) {
+    if (isUnlimitedExpiry(subscriptionEnd)) return "∞";
+    const remaining = formatDurationShort(subscriptionEnd, locale, "remaining");
+    return remaining === "--" ? "-" : remaining;
+  }
+  const resets = preferredQuotaTiers(runtime)
+    .map((tier) => tier.resetsAt)
+    .filter(Boolean)
+    .sort()[0];
+  if (resets) {
+    return countdownStr(resets) || formatDurationShort(resets, locale, "remaining") || "-";
+  }
+  return "-";
+}
+
+export function providerUsageData(runtime?: ShareUpstreamProvider, locale: AppLocale = "en") {
+  if (!runtime) return "-";
+  const isOllamaCloud = isOllamaCloudRuntime(runtime);
+  const tiers = preferredQuotaTiers(runtime);
+  if (!tiers.length) return "-";
+  const parts = tiers
+    .map((tier) => {
+      const usageAmount = formatQuotaUsageAmount(tier, locale);
+      const utilization =
+        typeof tier.utilization === "number" && Number.isFinite(tier.utilization)
+          ? `${utilizationPercentForDisplay(tier.utilization)}%`
+          : "";
+      const usageLabel = quotaTierLabel(tier.label, locale);
+      const usage = usageAmount
+        ? usageLabel === "Usage"
+          ? usageAmount
+          : `${usageLabel} ${usageAmount}`
+        : "";
+      return [usage, isOllamaCloud ? "" : utilization].filter(Boolean).join(" ");
+    })
+    .filter(Boolean);
+  return parts.length ? parts.join(" · ") : "-";
+}
+
+export function providerActualModelNames(runtime?: ShareUpstreamProvider) {
+  const models = Array.isArray(runtime?.models) ? runtime.models : [];
+  const names = models
+    .map((item) => String(item.actualModel || "").trim())
+    .filter((name) => name && !isOfficialMarker(name));
+  return names.length ? names.join(" · ") : "-";
 }
 
 export function modelHealthTone(share: ShareView, key: "claude" | "codex" | "gemini") {

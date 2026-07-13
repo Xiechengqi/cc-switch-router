@@ -1,7 +1,7 @@
 "use client";
 
 import { Button, Card, Chip, Drawer, toast } from "@heroui/react";
-import { Check, ChevronDown, Copy, ExternalLink, Maximize2, PanelRightOpen, Search, WalletCards } from "lucide-react";
+import { Check, ChevronDown, Copy, Maximize2, PanelRightOpen, Search, WalletCards } from "lucide-react";
 import * as React from "react";
 import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog";
 import { ShareCard } from "@/components/dashboard/share-card";
@@ -16,6 +16,7 @@ import {
   clientOwnerEmail,
   clientPlatformLabel,
   clientTunnelDisplayUrl,
+  subdomainTunnelUrl,
   ClientProvidersPanel,
   DrawerSection,
   drawerDialogClassName,
@@ -227,12 +228,14 @@ function shareMatchesQuery(share: ShareView, query: string) {
 const ShareScroller = React.memo(function ShareScroller({
   shares,
   totalCount = shares.length,
+  referenceTunnelUrl,
   onOpenShare,
   onEditShare,
   onConnectShare,
 }: {
   shares: ShareView[];
   totalCount?: number;
+  referenceTunnelUrl?: string;
   onOpenShare: (share: ShareView) => void;
   onEditShare: (share: ShareView) => void;
   onConnectShare: (share: ShareView) => void;
@@ -258,7 +261,7 @@ const ShareScroller = React.memo(function ShareScroller({
       </div>
         <div className="grid min-w-0 grid-cols-3 gap-3" aria-label={t("dashboard.shares")}>
           {shares.map((share) => (
-            <ShareCard key={share.shareId} share={share} onOpen={onOpenShare} onEdit={onEditShare} onConnect={onConnectShare} />
+            <ShareCard key={share.shareId} share={share} referenceTunnelUrl={referenceTunnelUrl} onOpen={onOpenShare} onEdit={onEditShare} onConnect={onConnectShare} />
           ))}
         </div>
     </div>
@@ -300,6 +303,8 @@ function ClientCard({
   const onlineShares = enabledShares.filter((share) => share.isOnline);
   const issueCount = enabledShares.length - onlineShares.length;
   const identity = client.clientTunnel?.subdomain || client.installation.id;
+  const identityUrl = client.clientTunnel?.subdomain ? tunnelUrl : "";
+  const versionLabel = clientPlatformLabel(client);
   const showRemoval = state === "offline" && !!client.removalAt;
   const borderTone = state === "offline" ? "border-l-rose-500" : state === "degraded" ? "border-l-amber-400" : "border-l-slate-200";
   const headerPointerDownRef = React.useRef<{ x: number; y: number } | null>(null);
@@ -339,7 +344,7 @@ function ClientCard({
     <Card id={`dashboard-client-${client.installation.id}`} className={`overflow-hidden rounded-lg border border-l-[3px] bg-white p-0 shadow-sm transition-[border-color,box-shadow] ${borderTone}`}>
       <Card.Content className="grid gap-3 p-3.5">
         <div
-          className="grid min-h-16 cursor-pointer select-text grid-cols-[minmax(300px,1.3fr)_minmax(420px,1fr)_auto] items-center gap-6 rounded-md px-1.5 py-1 outline-none transition-colors hover:bg-primary/[0.03] focus-visible:ring-2 focus-visible:ring-primary/30"
+          className="grid min-h-16 cursor-pointer select-text grid-cols-[minmax(300px,1.3fr)_minmax(520px,1fr)_auto] items-center gap-6 rounded-md px-1.5 py-1 outline-none transition-colors hover:bg-primary/[0.03] focus-visible:ring-2 focus-visible:ring-primary/30"
           aria-expanded={!collapsed}
           onMouseDown={handleHeaderPointerDown}
           onClick={handleHeaderClick}
@@ -348,25 +353,33 @@ function ClientCard({
           <div className="grid min-w-0 gap-1.5">
             <div className="flex min-w-0 items-center gap-2">
               <span className={`h-2 w-2 shrink-0 rounded-full ${state === "offline" ? "bg-rose-500" : state === "degraded" ? "bg-amber-400" : "bg-emerald-500"}`} />
-              <strong className="truncate text-sm font-semibold text-foreground" title={identity}>{identity}</strong>
+              {identityUrl ? (
+                <a
+                  href={identityUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-no-row-drawer
+                  className="truncate text-sm font-semibold text-foreground underline-offset-4 hover:underline"
+                  title={identityUrl}
+                  onClick={(event) => event.stopPropagation()}
+                >
+                  {identity}
+                </a>
+              ) : (
+                <strong className="truncate text-sm font-semibold text-foreground" title={identity}>{identity}</strong>
+              )}
               <OperationalStatusPill summary={summary} />
               {summary.primaryReason ? <span className={`truncate text-[11px] font-medium ${state === "offline" ? "text-rose-700" : "text-amber-700"}`} title={operationalReasonLabel(summary.primaryReason, t)}>{operationalReasonLabel(summary.primaryReason, t)}</span> : null}
               {showRemoval ? <ClientRemovalSchedule removalAt={client.removalAt} className="text-[11px]" /> : null}
             </div>
-            <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
-              {tunnelUrl ? (
-                <a href={tunnelUrl} target="_blank" rel="noopener noreferrer" data-no-row-drawer className="inline-flex min-w-0 items-center gap-1 truncate font-mono underline-offset-4 hover:underline" title={tunnelUrl} onClick={(event) => event.stopPropagation()}>
-                  <span className="truncate">{tunnelUrl}</span>
-                  <ExternalLink className="h-3 w-3 shrink-0" />
-                </a>
-              ) : <span className="truncate font-mono" title={client.installation.id}>{client.installation.id}</span>}
-              <span aria-hidden>·</span>
+            <div className="flex min-w-0 items-center text-xs text-muted-foreground">
               <span className="truncate" title={owner}>{owner}</span>
             </div>
           </div>
 
-          <div className={`grid min-w-0 gap-5 ${showRemoval ? "grid-cols-5" : "grid-cols-4"}`}>
-            <Metric label={t("dashboard.region")} value={`${client.installation.countryCode || client.installation.region || "-"} · ${clientPlatformLabel(client)}`} />
+          <div className={`grid min-w-0 gap-4 ${showRemoval ? "grid-cols-6" : "grid-cols-5"}`}>
+            <Metric label={t("dashboard.region")} value={client.installation.countryCode || client.installation.region || "-"} />
+            <Metric label={t("dashboard.version")} value={versionLabel} title={client.installation.appVersion || versionLabel} />
             <Metric label={t("dashboard.uptime24h")} value={`${onlineRate.toFixed(1)}%`} title={onlineTitle} tone={onlineRate < 90 ? "warning" : "success"} />
             <Metric label={t("dashboard.shares")} value={`${onlineShares.length}/${enabledShares.length || allShares.length} ${t("common.online")}`} tone={issueCount ? "danger" : "default"} />
             <Metric label={t("dashboard.lastSeen")} value={formatRelativeTime(client.installation.lastSeenAt, locale)} tone={state === "offline" ? "danger" : "default"} />
@@ -391,7 +404,7 @@ function ClientCard({
           </div>
         </div>
 
-        {!collapsed ? <ShareScroller shares={shares} totalCount={allShares.length} onOpenShare={onOpenShare} onEditShare={onEditShare} onConnectShare={onConnectShare} /> : null}
+        {!collapsed ? <ShareScroller shares={shares} totalCount={allShares.length} referenceTunnelUrl={client.clientTunnel?.tunnelUrl} onOpenShare={onOpenShare} onEditShare={onEditShare} onConnectShare={onConnectShare} /> : null}
       </Card.Content>
     </Card>
   );

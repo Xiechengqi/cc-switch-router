@@ -11,16 +11,24 @@ import {
   formatLatencySeconds,
   modelHealthTitle,
   modelHealthTone,
-  providerAccountIdentity,
-  providerAccountLevel,
+  providerAccountTierLabel,
+  providerActualModelNames,
+  providerApiEndpoint,
+  providerStatusIdentity,
+  isApiProviderRuntime,
+  providerQuotaExpiry,
+  providerUsageData,
   resolveShareAppRuntime,
   shareDisplayTitle,
+  subdomainTunnelUrl,
   shareAppSettings,
   shareAppTokensUsed,
+  shareExpiryProgress,
+  expiryTitle,
   type CoreShareApp,
 } from "@/components/dashboard/data-tables";
 import type { ShareRequestLog, ShareView } from "@/lib/types";
-import { compactTokens } from "@/lib/utils";
+import { compactTokens, formatDateTime } from "@/lib/utils";
 import { resolveShareCoreApp, SHARE_APP_LABELS } from "@/lib/share-app";
 import { recordDashboardUxEvent } from "@/lib/api";
 
@@ -59,11 +67,13 @@ function shouldOpenShareCard(
 
 export const ShareCard = React.memo(function ShareCard({
   share,
+  referenceTunnelUrl,
   onOpen,
   onEdit,
   onConnect,
 }: {
   share: ShareView;
+  referenceTunnelUrl?: string;
   onOpen: (share: ShareView) => void;
   onEdit: (share: ShareView) => void;
   onConnect: (share: ShareView) => void;
@@ -81,17 +91,29 @@ export const ShareCard = React.memo(function ShareCard({
   const activeRequests = app ? share.activeRequestsByApp?.[app] ?? 0 : share.activeRequests || 0;
   const averageLatency = averageRecentLatencyMs(appRequests);
   const runtime = app ? resolveShareAppRuntime(share, app) : undefined;
-  const accountLevel = runtime ? providerAccountLevel(runtime, locale) : "";
-  const accountIdentity = runtime ? providerAccountIdentity(runtime) : share.providerId || "";
+  const providerEnabled = app ? !!share.support?.[app] : !!runtime;
+  const accountTier = providerEnabled && runtime ? providerAccountTierLabel(runtime) : "-";
+  const quotaExpiry = providerEnabled && runtime ? providerQuotaExpiry(runtime, locale) : "-";
+  const providerUsage = providerEnabled && runtime ? providerUsageData(runtime, locale) : "-";
+  const accountLine = providerEnabled && runtime
+    ? providerStatusIdentity(runtime)
+    : share.providerId || t("dashboard.providerUnavailable");
+  const actualModels = providerEnabled && runtime ? providerActualModelNames(runtime) : "-";
+  const isApiProvider = providerEnabled && runtime ? isApiProviderRuntime(runtime) : false;
+  const apiEndpoint = providerEnabled && runtime ? providerApiEndpoint(runtime) : "-";
   const healthTone = app ? modelHealthTone(share, app) : { className: "bg-slate-50 text-muted-foreground", label: "" };
   const marketCount = share.marketAccessMode === "all" ? null : (share.marketLinks || []).length;
   const summary = shareOperationalSummary(share);
   const issue = summary.primaryReason ? operationalReasonLabel(summary.primaryReason, t) : null;
   const title = shareDisplayTitle(share);
+  const titleUrl = subdomainTunnelUrl(share.subdomain, referenceTunnelUrl);
   const description = share.description?.trim() || "";
   const usagePercent = !isUnlimited(tokenLimit) && Number(tokenLimit) > 0 ? Math.min(100, Math.max(0, (tokensUsed / Number(tokenLimit)) * 100)) : null;
   const onlineRate = share.onlineRate24h || 0;
   const onlineTitle = `${onlineRate.toFixed(1)}% online in last 24h (${share.onlineMinutes24h || 0} / 1440 min)`;
+  const expiryLabel = shareExpiryProgress(share, locale);
+  const expiryHint = `${formatDateTime(share.createdAt)} / ${expiryTitle(share.expiresAt)}`;
+  const saleLabel = share.forSale === "No" ? t("dashboard.notListed") : marketCount == null ? t("dashboard.allMarkets") : t("dashboard.marketsCount", { count: marketCount });
   const editPending = share.canManage && share.activeEdit?.status === "pending";
   const editRejected = share.canManage && share.activeEdit?.status === "rejected";
   const focused = focus.isFocused("share", share.shareId);
@@ -138,7 +160,24 @@ export const ShareCard = React.memo(function ShareCard({
       <Card.Content className="grid min-h-[178px] min-w-0 cursor-pointer select-text grid-rows-[auto_auto_1fr_auto] gap-2.5 p-3">
         <div className="flex min-w-0 items-start justify-between gap-2">
           <div className="min-w-0">
-            <div className="flex min-w-0 items-center gap-1.5"><strong className="truncate text-sm font-semibold text-foreground" title={title}>{title}</strong>{app ? <span className="rounded bg-primary/10 px-1.5 py-0.5 text-[9px] font-semibold text-primary">{SHARE_APP_LABELS[app]}</span> : null}</div>
+            <div className="flex min-w-0 items-center gap-1.5">
+              {titleUrl ? (
+                <a
+                  href={titleUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-no-row-drawer
+                  className="truncate text-sm font-semibold text-foreground underline-offset-4 hover:underline"
+                  title={titleUrl}
+                  onClick={(event) => event.stopPropagation()}
+                >
+                  {title}
+                </a>
+              ) : (
+                <strong className="truncate text-sm font-semibold text-foreground" title={title}>{title}</strong>
+              )}
+              {app ? <span className="rounded bg-primary/10 px-1.5 py-0.5 text-[9px] font-semibold text-primary">{SHARE_APP_LABELS[app]}</span> : null}
+            </div>
             {description ? (
               <span className="block truncate text-[10px] text-muted-foreground" title={description}>{description}</span>
             ) : null}
@@ -146,35 +185,63 @@ export const ShareCard = React.memo(function ShareCard({
           <span className={`mt-1 h-2 w-2 shrink-0 rounded-full ${statusDot}`} title={issue || summary.state} />
         </div>
 
-        <div className={`grid min-w-0 gap-0.5 rounded-md border px-2 py-1.5 text-[11px] ${healthTone.className}`} title={app ? modelHealthTitle(share, app) : undefined}>
-          <div className="flex min-w-0 items-center justify-between gap-2">
-            <span className="font-semibold">{t("dashboard.provider")}</span>
-            {healthTone.label ? <span className="truncate text-[10px] opacity-75">{healthTone.label}</span> : null}
-          </div>
-          <span className="truncate opacity-80" title={[accountLevel, accountIdentity].filter(Boolean).join(" · ")}>{[accountLevel, accountIdentity].filter((value) => value && value !== "-").join(" · ") || t("dashboard.providerUnavailable")}</span>
+        <div className={`grid min-w-0 gap-1 rounded-md border px-2 py-1.5 text-[11px] ${healthTone.className}`} title={app ? modelHealthTitle(share, app) : undefined}>
+          {isApiProvider ? (
+            <>
+              <span className="min-w-0 truncate font-mono text-[10px] font-semibold leading-4" title={`${t("dashboard.apiRequestUrl")}: ${apiEndpoint}`}>{apiEndpoint}</span>
+              <span className="min-w-0 truncate opacity-80">-</span>
+              <span className="min-w-0 truncate opacity-80" title={actualModels}>{actualModels}</span>
+            </>
+          ) : (
+            <>
+              <div className="grid grid-cols-3 gap-2 text-[10px] font-semibold leading-4">
+                <span className="min-w-0 truncate" title={accountTier}>{accountTier}</span>
+                <span className="min-w-0 truncate text-center" title={quotaExpiry}>{quotaExpiry}</span>
+                <span className="min-w-0 truncate text-right" title={providerUsage}>{providerUsage}</span>
+              </div>
+              <span className="min-w-0 truncate opacity-80" title={accountLine}>{accountLine}</span>
+              <span className="min-w-0 truncate opacity-80" title={actualModels}>{actualModels}</span>
+            </>
+          )}
         </div>
 
-        <div className="grid grid-cols-3 gap-2 text-[11px]">
-          <div className="min-w-0">
-            <span className="block text-muted-foreground">{t("dashboard.usage")}</span>
-            <strong className="tabular-nums">{compactTokens(tokensUsed)} / {isUnlimited(tokenLimit) ? "∞" : compactTokens(tokenLimit)}</strong>
-            {usagePercent != null ? <div className="mt-1 h-1 overflow-hidden rounded-full bg-slate-100"><div className={`h-full rounded-full ${usagePercent >= 90 ? "bg-rose-500" : "bg-primary/70"}`} style={{ width: `${usagePercent}%` }} /></div> : null}
+        <div className="grid gap-2 text-[11px]">
+          <div className="grid grid-cols-2 gap-2">
+            <div className="min-w-0">
+              <span className="block text-muted-foreground">{t("dashboard.usage")}</span>
+              <strong className="tabular-nums">{compactTokens(tokensUsed)} / {isUnlimited(tokenLimit) ? "∞" : compactTokens(tokenLimit)}</strong>
+              {usagePercent != null ? <div className="mt-1 h-1 overflow-hidden rounded-full bg-slate-100"><div className={`h-full rounded-full ${usagePercent >= 90 ? "bg-rose-500" : "bg-primary/70"}`} style={{ width: `${usagePercent}%` }} /></div> : null}
+            </div>
+            <div className="min-w-0">
+              <span className="block text-muted-foreground">{t("dashboard.parallel")}</span>
+              <strong className="tabular-nums">{activeRequests}<span className="text-muted-foreground">/{isUnlimited(parallelLimit) ? "∞" : parallelLimit || 0}</span></strong>
+            </div>
           </div>
-          <div>
-            <span className="block text-muted-foreground">{t("dashboard.parallel")}</span>
-            <strong className="tabular-nums">{activeRequests}<span className="text-muted-foreground">/{isUnlimited(parallelLimit) ? "∞" : parallelLimit || 0}</span></strong>
-            <span className="mt-1 block truncate text-[10px] text-muted-foreground">{share.forSale === "No" ? t("dashboard.notListed") : marketCount == null ? t("dashboard.allMarkets") : t("dashboard.marketsCount", { count: marketCount })}</span>
+          <div className="grid grid-cols-2 gap-2">
+            <div className="min-w-0">
+              <span className="block text-muted-foreground">{t("dashboard.expires")}</span>
+              <strong className="tabular-nums" title={expiryHint}>{expiryLabel}</strong>
+            </div>
+            <div className="min-w-0">
+              <span className="block text-muted-foreground">{t("dashboard.uptime24h")}</span>
+              <strong className={`tabular-nums ${onlineRate < 90 ? "text-amber-700" : "text-emerald-700"}`} title={onlineTitle}>{onlineRate.toFixed(1)}%</strong>
+            </div>
           </div>
-          <div>
-            <span className="block text-muted-foreground">{t("dashboard.uptime24h")}</span>
-            <strong className={`tabular-nums ${onlineRate < 90 ? "text-amber-700" : "text-emerald-700"}`} title={onlineTitle}>{onlineRate.toFixed(1)}%</strong>
+          <div className="grid grid-cols-2 gap-2">
+            <div className="min-w-0">
+              <span className="block text-muted-foreground">{t("dashboard.response")}</span>
+              <span className={`block truncate tabular-nums ${issue ? "font-medium text-amber-700" : "text-foreground"}`} title={issue || undefined}>
+                {issue ? `${issue}${summary.additionalReasonCount ? ` · +${summary.additionalReasonCount}` : ""}` : formatLatencySeconds(averageLatency)}
+              </span>
+            </div>
+            <div className="min-w-0">
+              <span className="block text-muted-foreground">{t("dashboard.forSale")}</span>
+              <span className="block truncate text-foreground" title={saleLabel}>{saleLabel}</span>
+            </div>
           </div>
         </div>
 
         <div className="grid gap-2 border-t pt-2">
-          <span className={`min-w-0 truncate text-[10px] ${issue ? "font-medium text-amber-700" : "text-muted-foreground"}`} title={issue || undefined}>
-            {issue ? `${issue}${summary.additionalReasonCount ? ` · +${summary.additionalReasonCount}` : ""}` : `${t("dashboard.response")} ${formatLatencySeconds(averageLatency)}`}
-          </span>
           <div className="flex flex-wrap items-center justify-end gap-1">
             <button type="button" data-no-row-drawer disabled={connectDisabled} title={connectDisabled ? issue || t("common.offline") : undefined} className="inline-flex h-6 items-center gap-1 rounded-md border border-primary/20 bg-primary/5 px-2 text-[10px] font-semibold text-primary hover:bg-primary/10 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-50 disabled:text-slate-400" onClick={(event) => { event.stopPropagation(); if (!connectDisabled) onConnect(share); }}>
               <Link2 className="h-3 w-3" />{t("dashboard.connect")}
