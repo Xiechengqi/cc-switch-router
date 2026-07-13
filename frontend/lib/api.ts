@@ -64,7 +64,7 @@ export async function updateMapDisplay(update: MapDisplaySettingsUpdate) {
 export type DashboardUxEvent = {
   eventType: string;
   source?: string;
-  targetType?: "request" | "client" | "share" | "market";
+  targetType?: "request" | "client" | "share" | "market" | "country";
   stepCount?: number;
   elapsedMs?: number;
   keyboard?: boolean;

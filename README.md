@@ -153,7 +153,7 @@ dashboard 当前行为：
 - `POST /v1/auth/session/refresh` 刷新会话
 - `GET /v1/auth/session/me` 查询当前浏览器登录态
 
-`GET /v1/public/map-points` 返回公开地图所需的点位数据，其中 `clients` 是按坐标聚合后的地图点数组，每个点包含 `count`；`clientCount` 是符合条件的真实活跃 client 总数，两者可能不相等。
+`GET /v1/public/map-points` 返回公开地图所需的点位数据，其中 `clients` 是按国家质心聚合后的地图点数组，每个点包含 `count`；`clientCount` 是符合条件的真实活跃 client 总数，两者可能不相等。
 
 ### systemd 部署示例
 

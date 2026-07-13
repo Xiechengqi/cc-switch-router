@@ -511,6 +511,7 @@ export function ClientBoard({
       const matchedShares = clientMatch ? allShares : allShares.filter((share) => shareMatchesQuery(share, normalizedQuery));
       return { client, shares: matchedShares, allShares, state: clientOperationalSummary(client, allShares).state, clientMatch };
     }).filter((row) => {
+      if (focus.target?.kind === "country" && !focus.relatedClientIds.has(row.client.installation.id)) return false;
       if (normalizedQuery && row.shares.length === 0 && !row.clientMatch) return false;
       const region = row.client.installation.countryCode || row.client.installation.region || "";
       if (regionFilter !== "all" && region !== regionFilter) return false;
@@ -533,7 +534,7 @@ export function ClientBoard({
       return (stableStateRanks.get(left.client.installation.id) || 0) - (stableStateRanks.get(right.client.installation.id) || 0) || (stableOrder.get(left.client.installation.id) || 0) - (stableOrder.get(right.client.installation.id) || 0);
     });
     return rows;
-  }, [focus.target, issuesOnly, query, regionFilter, sharesForClient, sortOrder, sortedClients, stableStateRanks, statusFilter]);
+  }, [focus.relatedClientIds, focus.target, issuesOnly, query, regionFilter, sharesForClient, sortOrder, sortedClients, stableStateRanks, statusFilter]);
 
   const clientSummary = React.useMemo(() => {
     const states = sortedClients.map((client) => clientOperationalSummary(client, sharesForClient(client)).state);
@@ -593,7 +594,9 @@ export function ClientBoard({
     lastLocatedFocusRef.current = focusKey;
     const clientId = focus.target.kind === "client"
       ? focus.target.id
-      : Array.from(focus.relatedClientIds)[0];
+      : focus.target.kind === "country"
+        ? Array.from(focus.relatedClientIds)[0]
+        : Array.from(focus.relatedClientIds)[0];
     if (!clientId) return;
     window.requestAnimationFrame(() => {
       document.getElementById(`dashboard-client-${clientId}`)?.scrollIntoView({ behavior: "smooth", block: "center" });

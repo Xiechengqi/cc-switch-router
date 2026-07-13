@@ -4,7 +4,7 @@ import * as React from "react";
 import type { DashboardResponse } from "@/lib/types";
 import { recordDashboardUxEvent } from "@/lib/api";
 
-export type DashboardFocusKind = "request" | "client" | "share" | "market";
+export type DashboardFocusKind = "request" | "client" | "share" | "market" | "country";
 export type DashboardFocusSource = "map" | "client-board" | "market-table" | "drawer" | "activity";
 export type DashboardFocusTarget = { kind: DashboardFocusKind; id: string; source: DashboardFocusSource };
 
@@ -30,7 +30,7 @@ function targetFromUrl(): DashboardFocusTarget | null {
   const params = new URLSearchParams(window.location.search);
   const kind = params.get("focusKind") as DashboardFocusKind | null;
   const id = params.get("focusId") || "";
-  if (!id || !kind || !["request", "client", "share", "market"].includes(kind)) return null;
+  if (!id || !kind || !["request", "client", "share", "market", "country"].includes(kind)) return null;
   return { kind, id, source: "activity" };
 }
 
@@ -79,6 +79,12 @@ function focusExists(data: DashboardResponse, target: DashboardFocusTarget) {
   if (target.kind === "client") return data.clients.some((client) => client.installation.id === target.id);
   if (target.kind === "share") return (data.shares || []).some((share) => share.shareId === target.id);
   if (target.kind === "market") return (data.markets || []).some((market) => market.id === target.id);
+  if (target.kind === "country") {
+    return Boolean(
+      data.countryBoards?.[target.id]
+        || data.map?.countries?.some((country) => country.countryCodeIso3 === target.id),
+    );
+  }
   return Boolean(data.recentRequestEvents?.some((event) => event.requestId === target.id) || data.marketRequestLogs?.some((log) => log.requestId === target.id));
 }
 
@@ -149,6 +155,16 @@ export function DashboardFocusProvider({ data, children }: { data: DashboardResp
     } else if (target.kind === "market") {
       markets.add(target.id);
       data.markets?.find((market) => market.id === target.id)?.linkedShares?.forEach((share) => shares.add(share.shareId));
+    } else if (target.kind === "country") {
+      const board = data.countryBoards?.[target.id];
+      board?.clientIds.forEach((clientId) => clients.add(clientId));
+      board?.clients.forEach((client) => {
+        clients.add(client.installationId);
+        client.shares.forEach((share) => shares.add(share.shareId));
+      });
+      data.map?.countries
+        ?.find((country) => country.countryCodeIso3 === target.id)
+        ?.clientIds.forEach((clientId) => clients.add(clientId));
     } else {
       const request = requestRelations(data, target.id);
       focusShareId = request.shareId;
@@ -182,6 +198,11 @@ export function DashboardFocusProvider({ data, children }: { data: DashboardResp
     if (target.kind === "market") {
       const market = data.markets?.find((item) => item.id === target.id);
       return market?.displayName || market?.subdomain || target.id;
+    }
+    if (target.kind === "country") {
+      return data.countryBoards?.[target.id]?.countryName
+        || data.map?.countries?.find((country) => country.countryCodeIso3 === target.id)?.countryName
+        || target.id;
     }
     return target.id.slice(0, 12);
   }, [data, target]);

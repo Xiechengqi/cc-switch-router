@@ -4,21 +4,13 @@ import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { recordDashboardUxEvent } from "@/lib/api";
 import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
-import type { DashboardResponse, MapPoint, MarketRequestLog, RecentRequestEvent, ShareRequestLog } from "@/lib/types";
+import { MapCountryTooltip } from "@/components/dashboard/map-country-tooltip";
+import type { CountryMapPoint, DashboardResponse, MapPoint, MarketRequestLog, ShareRequestLog } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { computeMapOffsetY, DEFAULT_MAP_DISPLAY, MAP_VIEWPORT_HEIGHT_PX } from "@/lib/map-display-settings";
 import { StatsStrip } from "@/components/dashboard/stats-strip";
 
-function projectPoint(point: MapPoint) {
-  if (typeof point.lat !== "number" || typeof point.lon !== "number") return null;
-  const x = ((point.lon + 180) / 360) * 100;
-  const y = ((90 - point.lat) / 180) * 100;
-  const xPct = Math.max(1, Math.min(99, x));
-  const yPct = Math.max(1, Math.min(99, y));
-  return { x: xPct * 3.6, y: yPct * 1.8, xPct, yPct };
-}
-
-type PlacedPoint = NonNullable<ReturnType<typeof projectPoint>>;
+type PlacedPoint = { x: number; y: number; xPct: number; yPct: number };
 type TickerMeta = Partial<Omit<ShareRequestLog, "createdAt"> & Omit<MarketRequestLog, "createdAt">> & {
   createdAt?: string | number;
   shareName?: string;
@@ -28,57 +20,17 @@ type TickerMeta = Partial<Omit<ShareRequestLog, "createdAt"> & Omit<MarketReques
 
 const REQUEST_TICKER_LIMIT = 6;
 
-function scrollToDashboardClient(clientId: string) {
-  document.getElementById(`dashboard-client-${clientId}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+function projectLatLon(lat: number, lon: number): PlacedPoint {
+  const x = ((lon + 180) / 360) * 100;
+  const y = ((90 - lat) / 180) * 100;
+  const xPct = Math.max(1, Math.min(99, x));
+  const yPct = Math.max(1, Math.min(99, y));
+  return { x: xPct * 3.6, y: yPct * 1.8, xPct, yPct };
 }
 
-function spreadPoints(points: PlacedPoint[], minDistPct: number, lockedIndex: number) {
-  if (points.length < 2) return points;
-  const placed = points.map((point) => ({ ...point }));
-  for (let iteration = 0; iteration < 28; iteration++) {
-    let moved = false;
-    for (let i = 0; i < placed.length; i++) {
-      for (let j = i + 1; j < placed.length; j++) {
-        const a = placed[i];
-        const b = placed[j];
-        let dx = b.xPct - a.xPct;
-        let dy = b.yPct - a.yPct;
-        let d = Math.hypot(dx, dy);
-        if (d < 0.0001) {
-          const angle = ((i * 137.5 + j * 23.4) % 360) * (Math.PI / 180);
-          dx = Math.cos(angle);
-          dy = Math.sin(angle);
-          d = 1;
-        }
-        if (d >= minDistPct) continue;
-        const overlap = minDistPct - d;
-        const ux = dx / d;
-        const uy = dy / d;
-        const aLocked = i === lockedIndex;
-        const bLocked = j === lockedIndex;
-        if (aLocked && bLocked) continue;
-        if (aLocked) {
-          b.xPct += ux * overlap;
-          b.yPct += uy * overlap;
-        } else if (bLocked) {
-          a.xPct -= ux * overlap;
-          a.yPct -= uy * overlap;
-        } else {
-          a.xPct -= (ux * overlap) / 2;
-          a.yPct -= (uy * overlap) / 2;
-          b.xPct += (ux * overlap) / 2;
-          b.yPct += (uy * overlap) / 2;
-        }
-        moved = true;
-      }
-    }
-    if (!moved) break;
-  }
-  return placed.map((point) => {
-    const xPct = Math.max(1, Math.min(99, point.xPct));
-    const yPct = Math.max(1, Math.min(99, point.yPct));
-    return { x: xPct * 3.6, y: yPct * 1.8, xPct, yPct };
-  });
+function projectPoint(point: MapPoint) {
+  if (typeof point.lat !== "number" || typeof point.lon !== "number") return null;
+  return projectLatLon(point.lat, point.lon);
 }
 
 function displayCountry(...values: Array<string | undefined | null>) {
@@ -168,21 +120,11 @@ function tickerDetail(meta?: TickerMeta) {
   const tokenTotal = usageBucketTotalTokens(meta);
   const tokens = `${compactTickerTokens(tokenTotal)} token${tokenTotal === 1 ? "" : "s"}`;
   const fee = formatMarketFee(meta?.usageAmountUsd);
-  const parts = [
-    meta?.userEmail || "",
-    modelName,
-    String(status),
-    latency,
-    tokens,
-    fee,
-  ].filter(Boolean);
-  return parts.join(" · ");
+  return [meta?.userEmail || "", modelName, String(status), latency, tokens, fee].filter(Boolean).join(" · ");
 }
 
 function resolveMapHeatCounts(data: DashboardResponse | null, showHeat: boolean) {
   if (!showHeat || !data) return {};
-  // Client installation density is stable across dashboard polls. Request ticker
-  // country counts fluctuate every few seconds and made shared country fills flash.
   return data.countryCounts || {};
 }
 
@@ -198,9 +140,6 @@ function buildRequestMeta(data: DashboardResponse | null) {
       meta.set(log.requestId, { ...log, shareName: share.shareName, shareId: share.shareId, userEmail: log.userEmail || market?.userEmail, apiKeyPrefix: market?.apiKeyPrefix, usageAmountUsd: market?.usageAmountUsd });
     }
   }
-  // P7 Step 2：share.recentRequests 现在直接来自顶层 data.shares 数组，
-  // 不再走 clients[*].share。tickerShares 是 router 高频推送的"最近活跃 share"
-  // 子集，先于完整 shares 列表填一遍，再用 shares 兜底补全。
   for (const share of data?.shares || []) {
     for (const log of share.recentRequests || []) {
       const market = marketMeta.get(log.requestId);
@@ -212,6 +151,13 @@ function buildRequestMeta(data: DashboardResponse | null) {
     meta.set(requestId, { ...(existing || {}), ...log, userEmail: log.userEmail || existing?.userEmail });
   }
   return meta;
+}
+
+function resolveIso3FromElement(element: Element | null) {
+  if (!element) return null;
+  const countryElement = element.closest(".country");
+  if (!countryElement) return null;
+  return Array.from(countryElement.classList).find((name) => /^[A-Z]{3}$/.test(name)) || null;
 }
 
 function RequestTicker({ data }: { data: DashboardResponse | null }) {
@@ -286,47 +232,72 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
   const worldRef = React.useRef<HTMLDivElement | null>(null);
   const [worldSvg, setWorldSvg] = React.useState("");
   const [mapOffsetY, setMapOffsetY] = React.useState(0);
+  const [hoveredIso3, setHoveredIso3] = React.useState<string | null>(null);
+  const [pinnedIso3, setPinnedIso3] = React.useState<string | null>(null);
+  const [tooltipPos, setTooltipPos] = React.useState({ x: 0, y: 0 });
   const mapDisplay = data?.mapDisplay ?? DEFAULT_MAP_DISPLAY;
   const { showFlows, showHeat, viewport } = mapDisplay;
-  const clients = data?.map?.clients || [];
+  const countries = data?.map?.countries || [];
   const server = data?.map?.server;
-  const points = [server, ...clients].filter(Boolean) as MapPoint[];
-  const placed = React.useMemo(() => {
-    const raw = [
-      ...(server ? [server] : []),
-      ...[...clients].sort((a, b) => (a.id || "").localeCompare(b.id || "")),
-    ];
-    const projected = raw.map((point) => ({ point, pos: projectPoint(point) })).filter((item): item is { point: MapPoint; pos: PlacedPoint } => !!item.pos);
-    const positions = spreadPoints(projected.map((item) => item.pos), 2.6, server ? 0 : -1);
-    return projected.map((item, index) => ({ ...item, pos: positions[index] }));
-  }, [clients, server]);
-  const serverPlaced = placed.find((item) => item.point.pointType === "server");
-  const clientPlaced = placed.filter((item) => item.point.pointType !== "server");
+  const activeIso3 = pinnedIso3 || hoveredIso3;
+  const activeBoard = activeIso3 ? data?.countryBoards?.[activeIso3] : undefined;
+
+  const countryPlaced = React.useMemo(
+    () =>
+      countries.map((country) => ({
+        country,
+        pos: projectLatLon(country.lat, country.lon),
+      })),
+    [countries],
+  );
+  const serverPlaced = React.useMemo(() => {
+    if (!server) return null;
+    const pos = projectPoint(server);
+    return pos ? { point: server, pos } : null;
+  }, [server]);
+
   const requestFlows = React.useMemo(() => {
-    const shareToClient = new Map<string, string>();
+    const shareToIso3 = new Map<string, string>();
     for (const client of data?.clients || []) {
-      for (const shareId of client.shareIds || []) shareToClient.set(shareId, client.installation.id);
+      const iso3 = countries.find((country) => country.clientIds.includes(client.installation.id))?.countryCodeIso3;
+      if (!iso3) continue;
+      for (const shareId of client.shareIds || []) {
+        shareToIso3.set(shareId, iso3);
+      }
     }
     const meta = buildRequestMeta(data);
     const flows = new Map<string, { inflight: number; failures: number; highLatency: number }>();
     for (const event of (data?.recentRequestEvents || []).slice(-200)) {
       if (!event.isInflight) continue;
-      const clientId = event.shareId ? shareToClient.get(event.shareId) : undefined;
-      if (!clientId) continue;
+      const iso3 = event.shareId ? shareToIso3.get(event.shareId) : undefined;
+      if (!iso3) continue;
       const item = meta.get(event.requestId);
       const statusCode = Number(item?.statusCode || 0);
       const status = String(item?.status || event.healthStatus || "").toLowerCase();
       const latency = Number(event.latencyMs || item?.latencyMs || 0);
-      const flow = flows.get(clientId) || { inflight: 0, failures: 0, highLatency: 0 };
+      const flow = flows.get(iso3) || { inflight: 0, failures: 0, highLatency: 0 };
       flow.inflight += 1;
       if (statusCode >= 400 || ["failed", "error", "offline"].includes(status)) flow.failures += 1;
       if (latency >= 2000) flow.highLatency += 1;
-      flows.set(clientId, flow);
+      flows.set(iso3, flow);
     }
     return flows;
-  }, [data]);
+  }, [countries, data]);
 
-  const suppressClientFocusFx = focus.target?.kind === "client";
+  const isCountryRelated = React.useCallback(
+    (country: CountryMapPoint) => {
+      if (!focus.target) return true;
+      if (focus.target.kind === "country") return focus.target.id === country.countryCodeIso3;
+      return country.clientIds.some((clientId) => focus.relatedClientIds.has(clientId));
+    },
+    [focus.relatedClientIds, focus.target],
+  );
+
+  const isCountryFocused = React.useCallback(
+    (country: CountryMapPoint) =>
+      focus.target?.kind === "country" && focus.target.id === country.countryCodeIso3,
+    [focus.target],
+  );
 
   React.useLayoutEffect(() => {
     const shell = shellRef.current;
@@ -370,16 +341,73 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
     for (const element of Array.from(root.querySelectorAll<SVGElement>(".country"))) {
       const iso3 = Array.from(element.classList).find((name) => /^[A-Z]{3}$/.test(name));
       const count = iso3 ? counts[iso3] || 0 : 0;
-      const heat = max > 0 ? Math.min(1, count / max) : 0;
-      const fillOpacity = String(0.1 + heat * 0.55);
-      const strokeOpacity = String(0.16 + heat * 0.4);
+      const heat = max > 0 ? Math.min(1, Math.sqrt(count / max)) : 0;
+      const fillOpacity = String(0.06 + heat * 0.74);
+      const strokeOpacity = String(0.12 + heat * 0.48);
+      const highlighted = iso3 && (iso3 === activeIso3 || isCountryFocused({ countryCodeIso3: iso3 } as CountryMapPoint));
       if (!element.style.transition) {
-        element.style.transition = "fill-opacity 0.8s ease-out, stroke-opacity 0.8s ease-out";
+        element.style.transition = "fill-opacity 0.8s ease-out, stroke-opacity 0.8s ease-out, stroke-width 0.2s ease-out";
       }
-      if (element.style.fillOpacity !== fillOpacity) element.style.fillOpacity = fillOpacity;
-      if (element.style.strokeOpacity !== strokeOpacity) element.style.strokeOpacity = strokeOpacity;
+      element.style.pointerEvents = count > 0 ? "auto" : "none";
+      element.style.cursor = count > 0 ? "pointer" : "default";
+      element.style.fillOpacity = fillOpacity;
+      element.style.strokeOpacity = highlighted ? "0.92" : strokeOpacity;
+      element.style.strokeWidth = highlighted ? "0.55" : "0.28";
     }
-  }, [heatCountsKey, worldSvg]);
+  }, [activeIso3, heatCountsKey, isCountryFocused, worldSvg]);
+
+  React.useEffect(() => {
+    const root = worldRef.current;
+    if (!root) return;
+
+    const updateTooltipPosition = (event: MouseEvent) => {
+      const shell = shellRef.current;
+      if (!shell) return;
+      const rect = shell.getBoundingClientRect();
+      setTooltipPos({
+        x: Math.min(Math.max(12, event.clientX - rect.left + 12), rect.width - 24),
+        y: Math.min(Math.max(12, event.clientY - rect.top + 12), rect.height - 24),
+      });
+    };
+
+    const onPointerOver = (event: PointerEvent) => {
+      const iso3 = resolveIso3FromElement(event.target as Element);
+      if (!iso3 || !(JSON.parse(heatCountsKey) as Record<string, number>)[iso3]) return;
+      setHoveredIso3(iso3);
+      updateTooltipPosition(event);
+    };
+    const onPointerMove = (event: PointerEvent) => {
+      if (!hoveredIso3 && !pinnedIso3) return;
+      updateTooltipPosition(event);
+    };
+    const onPointerLeave = (event: PointerEvent) => {
+      const next = resolveIso3FromElement(event.relatedTarget as Element | null);
+      if (next) return;
+      setHoveredIso3(null);
+    };
+    const onClick = (event: MouseEvent) => {
+      const iso3 = resolveIso3FromElement(event.target as Element);
+      if (!iso3 || !(JSON.parse(heatCountsKey) as Record<string, number>)[iso3]) return;
+      setPinnedIso3((current) => (current === iso3 ? null : iso3));
+      focus.setFocus({ kind: "country", id: iso3, source: "map" });
+      void recordDashboardUxEvent({ eventType: "country_located_from_map", source: "map", targetType: "country" });
+    };
+
+    root.addEventListener("pointerover", onPointerOver);
+    root.addEventListener("pointermove", onPointerMove);
+    root.addEventListener("pointerleave", onPointerLeave);
+    root.addEventListener("click", onClick);
+    return () => {
+      root.removeEventListener("pointerover", onPointerOver);
+      root.removeEventListener("pointermove", onPointerMove);
+      root.removeEventListener("pointerleave", onPointerLeave);
+      root.removeEventListener("click", onClick);
+    };
+  }, [focus, heatCountsKey, hoveredIso3, pinnedIso3]);
+
+  React.useEffect(() => {
+    if (!focus.target) setPinnedIso3(null);
+  }, [focus.target]);
 
   return (
     <section
@@ -401,23 +429,21 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
         {worldSvg ? (
           <div
             ref={worldRef}
-            className="pointer-events-none absolute inset-0 text-primary [&_svg]:absolute [&_svg]:inset-0 [&_svg]:block [&_svg]:h-full [&_svg]:w-full"
+            className="absolute inset-0 text-primary [&_svg]:absolute [&_svg]:inset-0 [&_svg]:block [&_svg]:h-full [&_svg]:w-full"
             aria-hidden="true"
             dangerouslySetInnerHTML={{ __html: worldSvg }}
           />
         ) : (
           <div className="pointer-events-none absolute inset-0 bg-[url('/world-map.svg')] bg-[length:100%_100%] bg-center bg-no-repeat" aria-hidden="true" />
         )}
-        <svg className="absolute inset-0 h-full w-full overflow-visible" viewBox="0 0 360 180" preserveAspectRatio="none" aria-hidden="true">
+        <svg className="pointer-events-none absolute inset-0 h-full w-full overflow-visible" viewBox="0 0 360 180" preserveAspectRatio="none" aria-hidden="true">
           {showFlows && serverPlaced
-            ? clientPlaced.map(({ point: client, pos: b }) => {
+            ? countryPlaced.map(({ country, pos: b }) => {
                 const a = serverPlaced.pos;
-                const flow = requestFlows.get(client.id);
-                const activeCount = client.activeRequests || 0;
-                if (activeCount <= 0) return null;
-                const related = suppressClientFocusFx || !focus.target || focus.relatedClientIds.has(client.id);
-                const focused = !suppressClientFocusFx
-                  && (focus.isFocused("client", client.id) || (focus.target?.kind === "request" && focus.relatedClientIds.has(client.id)));
+                const flow = requestFlows.get(country.countryCodeIso3);
+                if ((country.inflightRequests || 0) <= 0) return null;
+                const related = !focus.target || isCountryRelated(country);
+                const focused = isCountryFocused(country) || (focus.target?.kind === "request" && related);
                 const stroke = flow?.failures
                   ? "stroke-rose-300"
                   : flow?.highLatency
@@ -426,7 +452,7 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
                       ? "stroke-slate-400"
                       : "stroke-slate-300";
                 return (
-                  <g key={`flow-${client.id}`} className={cn("transition-opacity", related ? "opacity-100" : "opacity-15")}>
+                  <g key={`flow-${country.countryCodeIso3}`} className={cn("transition-opacity", related ? "opacity-100" : "opacity-15")}>
                     <line
                       x1={a.x}
                       y1={a.y}
@@ -442,38 +468,68 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
               })
             : null}
         </svg>
-          {placed.map(({ point, pos }) => {
-            const isServer = point.pointType === "server";
-            const related = isServer || suppressClientFocusFx || !focus.target || focus.relatedClientIds.has(point.id);
-            const focused = !suppressClientFocusFx && !isServer && focus.isFocused("client", point.id);
-            return (
-              <button
-                type="button"
-                data-map-control
-                key={`${point.pointType}-${point.id}`}
-                className={`absolute -translate-x-1/2 -translate-y-1/2 rounded-full outline-none transition-opacity focus-visible:ring-2 focus-visible:ring-primary/40 ${related ? "opacity-100" : "opacity-20"} ${focused ? "ring-4 ring-primary/20" : ""}`}
-                style={{ left: `${pos.xPct}%`, top: `${pos.yPct}%` }}
-                title={[point.label, point.city, point.region, point.country, point.activeRequests ? t("map.active", { count: point.activeRequests }) : ""].filter(Boolean).join(" · ")}
-                aria-label={[isServer ? t("map.router") : point.label, point.country].filter(Boolean).join(" · ")}
-                onClick={() => {
-                  if (isServer) return;
-                  scrollToDashboardClient(point.id);
-                  void recordDashboardUxEvent({ eventType: "client_located_from_map", source: "map", targetType: "client" });
-                }}
-              >
-                <div
-                  className={cn(
-                    isServer ? "h-3 w-3 bg-primary shadow-[0_0_0_5px_rgba(0,82,255,0.10),0_8px_22px_rgba(0,82,255,0.32)]" : "h-1.5 w-1.5",
-                    "rounded-full",
-                    !isServer && (point.activeRequests > 0 || point.isActive ? "bg-primary opacity-100 shadow-[0_0_0_2px_rgba(0,82,255,0.16)]" : "bg-slate-500 opacity-55"),
-                    point.activeRequests > 0 && "pulse-dot",
-                  )}
-                />
-              </button>
-            );
-          })}
+        {countryPlaced.map(({ country, pos }) => {
+          const related = !focus.target || isCountryRelated(country);
+          const focused = isCountryFocused(country) || activeIso3 === country.countryCodeIso3;
+          return (
+            <button
+              type="button"
+              data-map-control
+              key={`country-${country.countryCodeIso3}`}
+              className={cn(
+                "absolute -translate-x-1/2 -translate-y-1/2 rounded-full outline-none transition-all focus-visible:ring-2 focus-visible:ring-primary/40",
+                related ? "opacity-100" : "opacity-20",
+                focused ? "ring-4 ring-primary/20" : "",
+              )}
+              style={{ left: `${pos.xPct}%`, top: `${pos.yPct}%` }}
+              title={[
+                country.countryName || country.countryCode,
+                t("map.countryClients", { count: country.clientCount }),
+                country.inflightRequests ? t("map.active", { count: country.inflightRequests }) : "",
+              ].filter(Boolean).join(" · ")}
+              aria-label={[
+                country.countryName || country.countryCode,
+                t("map.countryClients", { count: country.clientCount }),
+              ].filter(Boolean).join(" · ")}
+              onMouseEnter={() => setHoveredIso3(country.countryCodeIso3)}
+              onClick={() => {
+                setPinnedIso3(country.countryCodeIso3);
+                focus.setFocus({ kind: "country", id: country.countryCodeIso3, source: "map" });
+                void recordDashboardUxEvent({ eventType: "country_located_from_map", source: "map", targetType: "country" });
+              }}
+            >
+              <div
+                className={cn(
+                  "rounded-full bg-primary shadow-[0_0_0_2px_rgba(0,82,255,0.16)]",
+                  country.clientCount > 1 ? "h-2 w-2" : "h-1.5 w-1.5",
+                  country.inflightRequests > 0 ? "pulse-dot opacity-100" : "opacity-80",
+                  focused && "h-2.5 w-2.5",
+                )}
+              />
+            </button>
+          );
+        })}
+        {serverPlaced ? (
+          <button
+            type="button"
+            data-map-control
+            className="absolute -translate-x-1/2 -translate-y-1/2 rounded-full opacity-100 outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+            style={{ left: `${serverPlaced.pos.xPct}%`, top: `${serverPlaced.pos.yPct}%` }}
+            title={t("map.router")}
+            aria-label={t("map.router")}
+          >
+            <div className="h-3 w-3 rounded-full bg-primary shadow-[0_0_0_5px_rgba(0,82,255,0.10),0_8px_22px_rgba(0,82,255,0.32)]" />
+          </button>
+        ) : null}
       </div>
-      {points.length === 0 ? (
+      {activeBoard ? (
+        <MapCountryTooltip
+          board={activeBoard}
+          className="absolute z-40"
+          style={{ left: tooltipPos.x, top: tooltipPos.y, transform: "translate(0, 0)" }}
+        />
+      ) : null}
+      {countries.length === 0 && !server ? (
         <div className="pointer-events-none absolute inset-0 z-20 grid place-items-center text-center text-muted-foreground">
           <div>
             <div className="font-semibold text-slate-600">{t("map.waiting")}</div>

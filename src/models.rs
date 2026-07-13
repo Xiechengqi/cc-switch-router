@@ -2007,6 +2007,9 @@ pub struct DashboardResponse {
     /// directly (the bundled `world-map.svg` uses alpha-3 as its CSS class names).
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub country_counts: std::collections::HashMap<String, usize>,
+    /// Per-country client/share board used by the dashboard map hover tooltip.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub country_boards: std::collections::HashMap<String, CountryBoard>,
     /// User-origin request counts over the last 5 minutes, keyed by ISO 3166-1 alpha-3.
     /// Drives the dashboard "demand" pins. Sourced from `cf-ipcountry` on trusted
     /// Cloudflare peers; spoofed values are dropped at the proxy.
@@ -2087,7 +2090,69 @@ pub struct DashboardTickerShare {
 pub struct DashboardMap {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<DashboardMapPoint>,
-    pub clients: Vec<DashboardMapPoint>,
+    pub countries: Vec<CountryMapPoint>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CountryMapPoint {
+    pub country_code: String,
+    pub country_code_iso3: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country_name: Option<String>,
+    pub lat: f64,
+    pub lon: f64,
+    pub client_count: usize,
+    pub share_count: usize,
+    pub online_share_count: usize,
+    pub inflight_requests: usize,
+    pub client_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CountryBoard {
+    pub country_code: String,
+    pub country_code_iso3: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country_name: Option<String>,
+    pub lat: f64,
+    pub lon: f64,
+    pub client_count: usize,
+    pub share_count: usize,
+    pub online_share_count: usize,
+    pub inflight_requests: usize,
+    pub client_ids: Vec<String>,
+    pub clients: Vec<CountryClientBoard>,
+    #[serde(default)]
+    pub overflow_client_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CountryClientBoard {
+    pub installation_id: String,
+    pub platform: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_email: Option<String>,
+    pub share_count: usize,
+    pub operational_state: String,
+    pub shares: Vec<CountryShareBoard>,
+    #[serde(default)]
+    pub overflow_share_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CountryShareBoard {
+    pub share_id: String,
+    pub share_name: String,
+    pub subdomain: String,
+    pub app_type: String,
+    pub is_online: bool,
+    pub active_requests: usize,
+    pub operational_state: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

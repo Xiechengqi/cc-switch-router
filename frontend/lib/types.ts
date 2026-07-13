@@ -36,7 +36,7 @@ export type DashboardResponse = {
   };
   map: {
     server?: MapPoint;
-    clients: MapPoint[];
+    countries: CountryMapPoint[];
   };
   mapDisplay: MapDisplaySettings;
   clients: DashboardClient[];
@@ -45,6 +45,7 @@ export type DashboardResponse = {
   markets?: DashboardMarket[];
   tickerShares?: DashboardTickerShare[];
   countryCounts?: Record<string, number>;
+  countryBoards?: Record<string, CountryBoard>;
   userCountryCounts?: Record<string, number>;
   recentRequestEvents?: RecentRequestEvent[];
   marketRequestLogs?: MarketRequestLog[];
@@ -64,6 +65,55 @@ export type MapPoint = {
   lastSeenAt?: string;
   isActive: boolean;
   activeRequests: number;
+};
+
+export type CountryMapPoint = {
+  countryCode: string;
+  countryCodeIso3: string;
+  countryName?: string;
+  lat: number;
+  lon: number;
+  clientCount: number;
+  shareCount: number;
+  onlineShareCount: number;
+  inflightRequests: number;
+  clientIds: string[];
+};
+
+export type CountryShareBoard = {
+  shareId: string;
+  shareName: string;
+  subdomain: string;
+  appType: string;
+  isOnline: boolean;
+  activeRequests: number;
+  operationalState: string;
+};
+
+export type CountryClientBoard = {
+  installationId: string;
+  platform: string;
+  label: string;
+  ownerEmail?: string;
+  shareCount: number;
+  operationalState: string;
+  shares: CountryShareBoard[];
+  overflowShareCount?: number;
+};
+
+export type CountryBoard = {
+  countryCode: string;
+  countryCodeIso3: string;
+  countryName?: string;
+  lat: number;
+  lon: number;
+  clientCount: number;
+  shareCount: number;
+  onlineShareCount: number;
+  inflightRequests: number;
+  clientIds: string[];
+  clients: CountryClientBoard[];
+  overflowClientCount?: number;
 };
 
 export type OperationalState = "available" | "online" | "degraded" | "offline" | "maintenance" | "disabled";

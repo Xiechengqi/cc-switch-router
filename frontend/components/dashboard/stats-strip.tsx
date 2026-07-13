@@ -5,11 +5,9 @@ import type { DashboardResponse } from "@/lib/types";
 import { cn, formatNumber } from "@/lib/utils";
 
 function countDistinctCountries(data: DashboardResponse | null) {
+  if (data?.map?.countries?.length) return data.map.countries.length;
   const set = new Set<string>();
   if (data?.map?.server?.countryCode) set.add(data.map.server.countryCode);
-  for (const client of data?.map?.clients || []) {
-    if (client.countryCode) set.add(client.countryCode);
-  }
   return set.size;
 }
 

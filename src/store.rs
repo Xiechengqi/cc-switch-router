@@ -28,8 +28,9 @@ use crate::models::{
     BoardMessageListResponse, BoardMessageView, BoardMetaResponse,
     ChangeInstallationOwnerEmailRequest, ChangeInstallationOwnerEmailResponse, ClientMetadata,
     ClientTunnelClaimRequest, ClientTunnelConfig, ClientTunnelQuery, ClientTunnelResponse,
-    ClientTunnelUpdateRequest, ClientTunnelView, DashboardClientTunnelView, DashboardClientView,
-    DashboardMap, DashboardMapPoint, DashboardMarketRequestLogView, DashboardMarketView,
+    ClientTunnelUpdateRequest, ClientTunnelView, CountryBoard, CountryClientBoard, CountryMapPoint,
+    CountryShareBoard, DashboardClientTunnelView, DashboardClientView, DashboardMap,
+    DashboardMapPoint, DashboardMarketRequestLogView, DashboardMarketView,
     DashboardPayoutProfileView, DashboardPresenceRequest, DashboardResponse, DashboardStats,
     DashboardTickerShare, DashboardUxEventRequest, GatewayRegistryRecord,
     GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse, HealthCheckEntry,
@@ -565,6 +566,168 @@ struct UserApiTokenRecord {
 }
 
 use crate::geo::country_centroid;
+
+const COUNTRY_BOARD_MAX_CLIENTS: usize = 8;
+const COUNTRY_BOARD_MAX_SHARES_PER_CLIENT: usize = 5;
+
+#[derive(Clone)]
+struct ActiveInstallationGeo {
+    id: String,
+    platform: String,
+    country_code: Option<String>,
+    country: Option<String>,
+    owner_email: Option<String>,
+}
+
+fn installation_map_label(platform: &str, tunnel: Option<&ClientTunnelRecord>) -> String {
+    tunnel
+        .map(|record| record.subdomain.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| platform.to_string())
+}
+
+fn build_dashboard_country_aggregation(
+    active_installations: &[ActiveInstallationGeo],
+    share_views: &[ShareView],
+    client_tunnels_by_installation: &HashMap<String, ClientTunnelRecord>,
+    client_operational_states: &HashMap<String, String>,
+) -> (
+    Vec<CountryMapPoint>,
+    HashMap<String, CountryBoard>,
+    HashMap<String, usize>,
+) {
+    let shares_by_installation = share_views.iter().fold(
+        HashMap::<String, Vec<&ShareView>>::new(),
+        |mut acc, share| {
+            acc.entry(share.installation_id.clone())
+                .or_default()
+                .push(share);
+            acc
+        },
+    );
+
+    let mut buckets: HashMap<String, CountryBoard> = HashMap::new();
+    let mut country_counts: HashMap<String, usize> = HashMap::new();
+
+    for installation in active_installations {
+        let Some(iso2_raw) = installation
+            .country_code
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let iso2 = iso2_raw.to_ascii_uppercase();
+        let Some(iso3) = crate::geo::iso2_to_iso3(&iso2) else {
+            continue;
+        };
+        let Some((lat, lon)) = country_centroid(&iso2) else {
+            continue;
+        };
+
+        let board = buckets
+            .entry(iso3.to_string())
+            .or_insert_with(|| CountryBoard {
+                country_code: iso2.clone(),
+                country_code_iso3: iso3.to_string(),
+                country_name: installation.country.clone(),
+                lat,
+                lon,
+                client_count: 0,
+                share_count: 0,
+                online_share_count: 0,
+                inflight_requests: 0,
+                client_ids: Vec::new(),
+                clients: Vec::new(),
+                overflow_client_count: 0,
+            });
+        if board.country_name.is_none() {
+            board.country_name = installation.country.clone();
+        }
+        board.client_count += 1;
+        board.client_ids.push(installation.id.clone());
+        *country_counts.entry(iso3.to_string()).or_insert(0) += 1;
+
+        let installation_shares = shares_by_installation
+            .get(&installation.id)
+            .map(|shares| shares.as_slice())
+            .unwrap_or(&[]);
+        board.share_count += installation_shares.len();
+        for share in installation_shares {
+            if share.is_online {
+                board.online_share_count += 1;
+            }
+            board.inflight_requests += share.active_requests;
+        }
+
+        let operational_state = client_operational_states
+            .get(&installation.id)
+            .cloned()
+            .unwrap_or_else(|| "online".to_string());
+        let total_shares = installation_shares.len();
+        let visible_shares = installation_shares
+            .iter()
+            .take(COUNTRY_BOARD_MAX_SHARES_PER_CLIENT)
+            .map(|share| CountryShareBoard {
+                share_id: share.share_id.clone(),
+                share_name: share.share_name.clone(),
+                subdomain: share.subdomain.clone(),
+                app_type: share.app_type.clone(),
+                is_online: share.is_online,
+                active_requests: share.active_requests,
+                operational_state: share.operational_summary.state.clone(),
+            })
+            .collect::<Vec<_>>();
+        board.clients.push(CountryClientBoard {
+            installation_id: installation.id.clone(),
+            platform: installation.platform.clone(),
+            label: installation_map_label(
+                &installation.platform,
+                client_tunnels_by_installation.get(&installation.id),
+            ),
+            owner_email: installation.owner_email.clone(),
+            share_count: total_shares,
+            operational_state,
+            shares: visible_shares,
+            overflow_share_count: total_shares.saturating_sub(COUNTRY_BOARD_MAX_SHARES_PER_CLIENT),
+        });
+    }
+
+    let mut country_map_points = Vec::new();
+    let mut country_boards = HashMap::new();
+    for (iso3, mut board) in buckets {
+        if board.clients.len() > COUNTRY_BOARD_MAX_CLIENTS {
+            board.overflow_client_count = board.clients.len() - COUNTRY_BOARD_MAX_CLIENTS;
+            board.clients.truncate(COUNTRY_BOARD_MAX_CLIENTS);
+        }
+        board
+            .clients
+            .sort_by(|left, right| left.label.cmp(&right.label));
+        country_map_points.push(CountryMapPoint {
+            country_code: board.country_code.clone(),
+            country_code_iso3: board.country_code_iso3.clone(),
+            country_name: board.country_name.clone(),
+            lat: board.lat,
+            lon: board.lon,
+            client_count: board.client_count,
+            share_count: board.share_count,
+            online_share_count: board.online_share_count,
+            inflight_requests: board.inflight_requests,
+            client_ids: board.client_ids.clone(),
+        });
+        country_boards.insert(iso3, board);
+    }
+    country_map_points.sort_by(|left, right| {
+        right
+            .client_count
+            .cmp(&left.client_count)
+            .then_with(|| left.country_code_iso3.cmp(&right.country_code_iso3))
+    });
+
+    (country_map_points, country_boards, country_counts)
+}
 
 #[derive(Clone)]
 pub struct AppStore {
@@ -3926,46 +4089,19 @@ impl AppStore {
             .collect::<HashMap<_, _>>();
 
         let mut installation_views = Vec::new();
-        let mut client_map_points = Vec::new();
-        let mut country_counts: HashMap<String, usize> = HashMap::new();
+        let mut active_installations = Vec::<ActiveInstallationGeo>::new();
         for installation in installations {
             let is_active = active_share_subdomains_by_installation
                 .get(&installation.id)
                 .map(|subdomains| !subdomains.is_empty())
                 .unwrap_or(false);
             if is_active {
-                let (lat, lon) = match (installation.latitude, installation.longitude) {
-                    (Some(lat), Some(lon)) => (Some(lat), Some(lon)),
-                    _ => match installation
-                        .country_code
-                        .as_deref()
-                        .and_then(country_centroid)
-                    {
-                        Some((lat, lon)) => (Some(lat), Some(lon)),
-                        None => (None, None),
-                    },
-                };
-                if let Some(iso3) = installation
-                    .country_code
-                    .as_deref()
-                    .and_then(crate::geo::iso2_to_iso3)
-                {
-                    *country_counts.entry(iso3.to_string()).or_insert(0) += 1;
-                }
-                client_map_points.push(DashboardMapPoint {
+                active_installations.push(ActiveInstallationGeo {
                     id: installation.id.clone(),
-                    label: installation.platform.clone(),
-                    point_type: "client".into(),
-                    platform: Some(installation.platform.clone()),
+                    platform: installation.platform.clone(),
                     country_code: installation.country_code.clone(),
                     country: installation.country.clone(),
-                    region: installation.region.clone(),
-                    city: installation.city.clone(),
-                    lat,
-                    lon,
-                    last_seen_at: Some(installation.last_seen_at),
-                    is_active,
-                    active_requests: 0,
+                    owner_email: installation.owner_email.clone(),
                 });
             }
             installation_views.push(InstallationView {
@@ -4140,19 +4276,6 @@ impl AppStore {
                 view
             })
             .collect::<Vec<_>>();
-        let active_requests_by_installation =
-            share_views
-                .iter()
-                .fold(HashMap::<String, usize>::new(), |mut acc, share| {
-                    *acc.entry(share.installation_id.clone()).or_insert(0) += share.active_requests;
-                    acc
-                });
-        for point in &mut client_map_points {
-            point.active_requests = active_requests_by_installation
-                .get(&point.id)
-                .copied()
-                .unwrap_or(0);
-        }
         let ticker_shares = share_views
             .iter()
             .map(|share| DashboardTickerShare {
@@ -4257,6 +4380,22 @@ impl AppStore {
                     .cmp(&left.installation.last_seen_at)
             })
         });
+        let client_operational_states = client_views
+            .iter()
+            .map(|view| {
+                (
+                    view.installation.id.clone(),
+                    view.operational_summary.state.clone(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let (country_map_points, country_boards, country_counts) =
+            build_dashboard_country_aggregation(
+                &active_installations,
+                &share_views,
+                &client_tunnels_by_installation,
+                &client_operational_states,
+            );
         let clients_count = client_views.len();
         let active_shares_count = share_views
             .iter()
@@ -4293,7 +4432,7 @@ impl AppStore {
                         is_active: true,
                         active_requests: 0,
                     }),
-                clients: client_map_points,
+                countries: country_map_points,
             },
             clients: client_views,
             // Share 全量列表；前端按 installation 分组为独立横向卡片。
@@ -4302,6 +4441,7 @@ impl AppStore {
             markets,
             ticker_shares,
             country_counts,
+            country_boards,
             user_country_counts: HashMap::new(),
             recent_request_events: Vec::new(),
             market_request_logs: market_logs,
@@ -6364,33 +6504,25 @@ impl AppStore {
             .map_err(|e| AppError::Internal(format!("prepare public map clients failed: {e}")))?;
         let rows = stmt
             .query_map(params![active_cutoff], |row| {
-                let lat = row.get::<_, Option<f64>>(1)?;
-                let lon = row.get::<_, Option<f64>>(2)?;
                 let country_code = row.get::<_, Option<String>>(3)?;
-                Ok(lat
-                    .zip(lon)
-                    .map(|(lat, lon)| LatLonPoint { lat, lon })
-                    .or_else(|| {
-                        country_code
-                            .as_deref()
-                            .and_then(country_centroid)
-                            .map(|(lat, lon)| LatLonPoint { lat, lon })
-                    }))
+                Ok(country_code)
             })
             .map_err(|e| AppError::Internal(format!("query public map clients failed: {e}")))?;
         let mut grouped_clients = HashMap::<String, PublicMapClientPoint>::new();
         let mut client_count = 0usize;
-        for point in collect_rows(rows)?.into_iter().flatten() {
+        for country_code in collect_rows(rows)?.into_iter().flatten() {
             client_count += 1;
-            let key = format!("{:.6},{:.6}", point.lat, point.lon);
+            let iso2 = country_code.trim().to_ascii_uppercase();
+            let Some(iso3) = crate::geo::iso2_to_iso3(&iso2) else {
+                continue;
+            };
+            let Some((lat, lon)) = country_centroid(&iso2) else {
+                continue;
+            };
             grouped_clients
-                .entry(key)
+                .entry(iso3.to_string())
                 .and_modify(|existing| existing.count += 1)
-                .or_insert(PublicMapClientPoint {
-                    lat: point.lat,
-                    lon: point.lon,
-                    count: 1,
-                });
+                .or_insert(PublicMapClientPoint { lat, lon, count: 1 });
         }
         let mut clients = grouped_clients.into_values().collect::<Vec<_>>();
         clients.sort_by(|a, b| {
@@ -21224,8 +21356,9 @@ mod tests {
 
         assert_eq!(snapshot.stats.clients, 1);
         assert_eq!(snapshot.stats.total_active_requests, 3);
-        assert_eq!(snapshot.map.clients.len(), 1);
-        assert_eq!(snapshot.map.clients[0].active_requests, 3);
+        assert_eq!(snapshot.map.countries.len(), 1);
+        assert_eq!(snapshot.map.countries[0].client_count, 1);
+        assert_eq!(snapshot.map.countries[0].inflight_requests, 3);
         // P7 Step 2：取消"prefer 出一个代表 share"的合并；两个 share 都在 snapshot.shares 里。
         assert_eq!(snapshot.shares.len(), 2);
         let mut shares_ids: Vec<_> = snapshot.shares.iter().map(|s| s.share_id.clone()).collect();
