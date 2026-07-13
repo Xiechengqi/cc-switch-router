@@ -379,8 +379,34 @@ export function isOfficialMarker(value?: string) {
   return normalized === "official" || normalized === "offical";
 }
 
+const API_KEY_PROVIDER_TYPES = new Set([
+  "nvidia",
+  "deepseek_api",
+  "openrouter",
+  "ollama_cloud",
+]);
+
+const API_KEY_PROVIDER_DEFAULT_URLS: Record<string, string> = {
+  nvidia: "https://integrate.api.nvidia.com/v1",
+  deepseek_api: "https://api.deepseek.com",
+  openrouter: "https://openrouter.ai/api",
+  ollama_cloud: "https://ollama.com",
+};
+
+const MODEL_MAPPING_METADATA = new Set([
+  "single",
+  "mode",
+  "type",
+  "default",
+  "available",
+  "model",
+]);
+
 export function runtimeApiUrl(runtime?: ShareUpstreamProvider) {
-  return runtime?.apiUrl || "";
+  const direct = String(runtime?.apiUrl || "").trim();
+  if (direct && !isOfficialMarker(direct)) return direct;
+  const providerType = String(runtime?.providerType || "").trim().toLowerCase();
+  return API_KEY_PROVIDER_DEFAULT_URLS[providerType] || "";
 }
 
 export function hasConcreteApiUrl(runtime?: ShareUpstreamProvider) {
@@ -491,12 +517,14 @@ export function isCursorApiKeyRuntime(runtime?: ShareUpstreamProvider) {
 }
 
 export function isApiProviderRuntime(runtime?: ShareUpstreamProvider) {
-  return Boolean(
-    runtime
-      && !isCursorApiKeyRuntime(runtime)
-      && hasConcreteApiUrl(runtime)
-      && !runtimeLooksOAuth(runtime),
-  );
+  if (!runtime || isCursorApiKeyRuntime(runtime) || runtimeLooksOAuth(runtime)) {
+    return false;
+  }
+  const providerType = String(runtime.providerType || "").trim().toLowerCase();
+  if (API_KEY_PROVIDER_TYPES.has(providerType)) {
+    return true;
+  }
+  return hasConcreteApiUrl(runtime);
 }
 
 export function providerApiEndpoint(runtime?: ShareUpstreamProvider) {
@@ -798,8 +826,8 @@ export function providerActualModelNames(runtime?: ShareUpstreamProvider) {
   const models = Array.isArray(runtime?.models) ? runtime.models : [];
   const names = models
     .map((item) => String(item.actualModel || "").trim())
-    .filter((name) => name && !isOfficialMarker(name));
-  return names.length ? names.join(" · ") : "-";
+    .filter((name) => name && !isOfficialMarker(name) && !MODEL_MAPPING_METADATA.has(name.toLowerCase()));
+  return names.length ? [...new Set(names)].join(" · ") : "-";
 }
 
 export function modelHealthTone(share: ShareView, key: "claude" | "codex" | "gemini") {
