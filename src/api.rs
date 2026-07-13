@@ -1336,6 +1336,7 @@ async fn dashboard(
         .attach_share_market_listing_statuses(&mut response)
         .await?;
     let snapshot = state.recent_traffic.snapshot().await;
+    enrich_share_ticker_logs_with_live_country(&mut response.ticker_shares, &snapshot);
     let (confirmed_events, confirmed_country_counts) =
         confirmed_request_events(&snapshot, &response);
     response.user_country_counts = confirmed_country_counts;
@@ -1551,7 +1552,26 @@ fn confirmed_request_events(
         .cloned()
         .collect::<Vec<_>>();
     for event in &confirmed_live_events {
-        events_by_id.insert(event.request_id.clone(), event.clone());
+        match events_by_id.get_mut(&event.request_id) {
+            Some(existing) => {
+                merge_ticker_event_country(existing, event);
+                existing.is_inflight = event.is_inflight;
+                if event.share_subdomain.is_some() {
+                    existing.share_subdomain = event.share_subdomain.clone();
+                }
+                if event.share_name.is_some() {
+                    existing.share_name = event.share_name.clone();
+                }
+            }
+            None => {
+                events_by_id.insert(event.request_id.clone(), event.clone());
+            }
+        }
+    }
+    for event in snapshot.events.iter() {
+        if let Some(existing) = events_by_id.get_mut(&event.request_id) {
+            merge_ticker_event_country(existing, event);
+        }
     }
     let mut events = events_by_id.into_values().collect::<Vec<_>>();
     events.sort_by(|left, right| left.started_at.cmp(&right.started_at));
@@ -1610,6 +1630,45 @@ fn enrich_market_request_logs_with_live_country(
                 log.user_country_iso3 = user_country_iso3.clone();
             }
         }
+    }
+}
+
+fn enrich_share_ticker_logs_with_live_country(
+    ticker_shares: &mut [crate::models::DashboardTickerShare],
+    snapshot: &RecentTrafficSnapshot,
+) {
+    let context_by_request_id = live_request_context_by_request_id(snapshot);
+    for share in ticker_shares {
+        for log in &mut share.recent_requests {
+            if log.user_country.is_some() && log.user_country_iso3.is_some() {
+                continue;
+            }
+            if let Some((user_country, user_country_iso3, user_email)) =
+                context_by_request_id.get(&log.request_id)
+            {
+                if log.user_country.is_none() {
+                    log.user_country = user_country.clone();
+                }
+                if log.user_country_iso3.is_none() {
+                    log.user_country_iso3 = user_country_iso3.clone();
+                }
+                if log.user_email.is_none() {
+                    log.user_email = user_email.clone();
+                }
+            }
+        }
+    }
+}
+
+fn merge_ticker_event_country(target: &mut RecentRequestEvent, source: &RecentRequestEvent) {
+    if target.user_country.is_none() {
+        target.user_country = source.user_country.clone();
+    }
+    if target.user_country_iso3.is_none() {
+        target.user_country_iso3 = source.user_country_iso3.clone();
+    }
+    if target.user_email.is_none() {
+        target.user_email = source.user_email.clone();
     }
 }
 
@@ -2312,6 +2371,61 @@ mod tests {
         assert!(events[0].is_inflight);
         assert_eq!(events[0].share_subdomain.as_deref(), Some("live-sub"));
         assert_eq!(country_counts.get("USA"), Some(&1));
+    }
+
+    #[test]
+    fn confirmed_request_events_backfills_country_from_live_snapshot() {
+        let live = RecentRequestEvent {
+            request_id: "req-country-live".into(),
+            share_id: "share-1".into(),
+            share_name: Some("Share".into()),
+            share_subdomain: Some("share-sub".into()),
+            user_country: Some("US".into()),
+            user_country_iso3: Some("USA".into()),
+            user_email: None,
+            started_at: Utc::now(),
+            is_inflight: false,
+            is_health_check: false,
+            health_status: None,
+            health_app_type: None,
+            health_model: None,
+        };
+        let snapshot = RecentTrafficSnapshot {
+            country_counts: HashMap::new(),
+            events: vec![live],
+            recent_events: Vec::new(),
+        };
+        let response = DashboardResponse {
+            generated_at: Utc::now(),
+            stats: crate::models::DashboardStats {
+                clients: 0,
+                active_shares: 0,
+                total_active_requests: 0,
+            },
+            map: crate::models::DashboardMap {
+                server: None,
+                clients: Vec::new(),
+            },
+            map_display: MapDisplaySettings::default(),
+            clients: Vec::new(),
+            shares: Vec::new(),
+            markets: Vec::new(),
+            ticker_shares: vec![crate::models::DashboardTickerShare {
+                share_id: "share-1".into(),
+                share_name: "Share".into(),
+                subdomain: "share-sub".into(),
+                recent_requests: vec![share_log("req-country-live", 1)],
+            }],
+            country_counts: HashMap::new(),
+            user_country_counts: HashMap::new(),
+            recent_request_events: Vec::new(),
+            market_request_logs: Vec::new(),
+        };
+
+        let (events, _) = confirmed_request_events(&snapshot, &response);
+
+        assert_eq!(events[0].user_country.as_deref(), Some("US"));
+        assert_eq!(events[0].user_country_iso3.as_deref(), Some("USA"));
     }
 
     fn share_log(request_id: &str, created_at: i64) -> crate::models::ShareRequestLogEntry {

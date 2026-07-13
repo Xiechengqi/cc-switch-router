@@ -18,7 +18,7 @@ export function StatsStrip({ data, className }: { data: DashboardResponse | null
 
   return (
     <div
-      className={cn("flex flex-wrap items-center gap-2 text-xs text-muted-foreground", className)}
+      className={cn("flex flex-wrap items-center gap-2 text-xs text-muted-foreground select-text", className)}
       aria-label={t("dashboard.overview")}
     >
       <span title={t("nav.clientsTitle")}>

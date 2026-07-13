@@ -22,6 +22,8 @@ type PlacedPoint = NonNullable<ReturnType<typeof projectPoint>>;
 type TickerMeta = Partial<Omit<ShareRequestLog, "createdAt"> & Omit<MarketRequestLog, "createdAt">> & {
   createdAt?: string | number;
   shareName?: string;
+  userCountry?: string;
+  userCountryIso3?: string;
 };
 
 const REQUEST_TICKER_LIMIT = 6;
@@ -77,6 +79,19 @@ function spreadPoints(points: PlacedPoint[], minDistPct: number, lockedIndex: nu
     const yPct = Math.max(1, Math.min(99, point.yPct));
     return { x: xPct * 3.6, y: yPct * 1.8, xPct, yPct };
   });
+}
+
+function displayCountry(...values: Array<string | undefined | null>) {
+  for (const value of values) {
+    const trimmed = String(value || "").trim();
+    if (trimmed && trimmed !== "-" && trimmed !== "--") return trimmed;
+  }
+  return "--";
+}
+
+function shouldIgnoreMapRowClick() {
+  const selection = window.getSelection();
+  return Boolean(selection && !selection.isCollapsed && selection.toString().trim());
 }
 
 function countryFlag(code?: string) {
@@ -230,7 +245,7 @@ function RequestTicker({ data }: { data: DashboardResponse | null }) {
             : eventUserEmail
               ? { userEmail: eventUserEmail }
               : undefined;
-        const country = event.userCountry || event.countryCode || "--";
+        const country = displayCountry(event.userCountry, mergedItem?.userCountry, event.countryCode, mergedItem?.userCountryIso3);
         const subdomain = event.shareSubdomain || event.subdomain || event.shareName || mergedItem?.shareName || "share";
         const eventKey = [event.requestId, event.startedAt || event.createdAt || ""].join(":");
         const statusCode = Number(mergedItem?.statusCode || 0);
@@ -238,11 +253,26 @@ function RequestTicker({ data }: { data: DashboardResponse | null }) {
         const failed = statusCode >= 400 || ["failed", "error", "offline"].includes(rawStatus);
         const badge = event.isHealthCheck ? "HC" : statusCode ? String(statusCode) : rawStatus ? rawStatus.slice(0, 3).toUpperCase() : "—";
         return (
-          <button type="button" data-map-control key={eventKey} onClick={() => focus.setFocus({ kind: "request", id: event.requestId, source: "activity" })} className={`pointer-events-auto flex max-w-full items-center gap-2 overflow-hidden rounded-lg border px-2.5 py-1.5 text-left text-[10px] text-slate-700 backdrop-blur-md transition-colors ${index === events.length - 1 ? "activity-feed-enter" : ""} ${focus.isFocused("request", event.requestId) ? "border-primary bg-white ring-2 ring-primary/20" : "border-slate-200/80 bg-white/75 hover:bg-white"}`}>
-            <span className="font-mono text-slate-500">{formatTickerTime(event.startedAt || event.createdAt, item?.createdAt)}</span>
-            <span className={`inline-flex h-[15px] shrink-0 items-center rounded px-1.5 font-mono text-[9px] font-semibold ${event.isHealthCheck ? "bg-blue-100 text-blue-700" : failed ? "bg-rose-100 text-rose-700" : "bg-emerald-100 text-emerald-700"}`}>{badge}</span>
-            <span className="min-w-0 truncate text-[11px] text-slate-700"><strong className="font-semibold">{subdomain}</strong> · {countryFlag(country)} {country} · {tickerDetail(mergedItem)}</span>
-          </button>
+          <div
+            role="button"
+            tabIndex={0}
+            data-map-control
+            key={eventKey}
+            onClick={(clickEvent) => {
+              if (shouldIgnoreMapRowClick()) return;
+              focus.setFocus({ kind: "request", id: event.requestId, source: "activity" });
+            }}
+            onKeyDown={(keyEvent) => {
+              if (keyEvent.key !== "Enter" && keyEvent.key !== " ") return;
+              keyEvent.preventDefault();
+              focus.setFocus({ kind: "request", id: event.requestId, source: "activity" });
+            }}
+            className={`pointer-events-auto flex max-w-full select-text cursor-pointer items-center gap-2 overflow-hidden rounded-lg border px-2.5 py-1.5 text-left text-[10px] text-slate-700 backdrop-blur-md transition-colors ${index === events.length - 1 ? "activity-feed-enter" : ""} ${focus.isFocused("request", event.requestId) ? "border-primary bg-white ring-2 ring-primary/20" : "border-slate-200/80 bg-white/75 hover:bg-white"}`}
+          >
+            <span className="select-text font-mono text-slate-500">{formatTickerTime(event.startedAt || event.createdAt, item?.createdAt)}</span>
+            <span className={`inline-flex h-[15px] shrink-0 select-none items-center rounded px-1.5 font-mono text-[9px] font-semibold ${event.isHealthCheck ? "bg-blue-100 text-blue-700" : failed ? "bg-rose-100 text-rose-700" : "bg-emerald-100 text-emerald-700"}`}>{badge}</span>
+            <span className="min-w-0 select-text truncate text-[11px] text-slate-700"><strong className="font-semibold">{subdomain}</strong> · {countryFlag(country)} {country} · {tickerDetail(mergedItem)}</span>
+          </div>
         );
       })}
     </div>
@@ -361,7 +391,7 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
       <div className="pointer-events-none absolute inset-0 z-10 bg-[radial-gradient(circle_at_6%_12%,rgba(0,82,255,0.10),transparent_38%),radial-gradient(circle_at_94%_88%,rgba(77,124,255,0.07),transparent_42%)]" />
       <StatsStrip
         data={data}
-        className="pointer-events-none absolute left-3 top-3 z-30 max-w-[min(72%,560px)]"
+        className="pointer-events-auto absolute left-3 top-3 z-30 max-w-[min(72%,560px)] select-text"
       />
       <RequestTicker data={data} />
       <div
