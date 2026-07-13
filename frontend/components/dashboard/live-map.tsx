@@ -123,9 +123,47 @@ function tickerDetail(meta?: TickerMeta) {
   return [meta?.userEmail || "", modelName, String(status), latency, tokens, fee].filter(Boolean).join(" · ");
 }
 
-function resolveMapHeatCounts(data: DashboardResponse | null, showHeat: boolean) {
-  if (!showHeat || !data) return {};
-  return data.countryCounts || {};
+function resolveMapHeatCounts(
+  data: DashboardResponse | null,
+  heatEnabled: boolean,
+): Record<string, number> {
+  if (!heatEnabled || !data) return {};
+  return data.countryCounts ?? {};
+}
+
+function hasPositiveHeatCounts(counts: Record<string, number>) {
+  return Object.values(counts).some((value) => value > 0);
+}
+
+function applyCountryHeatStyles(
+  root: HTMLElement,
+  counts: Record<string, number>,
+  options: {
+    highlightedIso3: string | null;
+    isCountryFocused: (iso3: string) => boolean;
+    animateFill: boolean;
+  },
+) {
+  const values = Object.values(counts).filter((value) => value > 0);
+  const max = values.length ? Math.max(...values) : 0;
+  for (const element of Array.from(root.querySelectorAll<SVGElement>(".country"))) {
+    const iso3 = Array.from(element.classList).find((name) => /^[A-Z]{3}$/.test(name));
+    const count = iso3 ? counts[iso3] || 0 : 0;
+    const heat = max > 0 ? Math.min(1, Math.sqrt(count / max)) : 0;
+    const fillOpacity = String(0.06 + heat * 0.74);
+    const strokeOpacity = String(0.12 + heat * 0.48);
+    const highlighted = Boolean(
+      iso3 && (iso3 === options.highlightedIso3 || options.isCountryFocused(iso3)),
+    );
+    element.style.transition = options.animateFill
+      ? "fill-opacity 0.8s ease-out, stroke-opacity 0.2s ease-out, stroke-width 0.2s ease-out"
+      : "stroke-opacity 0.2s ease-out, stroke-width 0.2s ease-out";
+    element.style.pointerEvents = count > 0 ? "auto" : "none";
+    element.style.cursor = count > 0 ? "pointer" : "default";
+    element.style.fillOpacity = fillOpacity;
+    element.style.strokeOpacity = highlighted ? "0.92" : strokeOpacity;
+    element.style.strokeWidth = highlighted ? "0.55" : "0.28";
+  }
 }
 
 function buildRequestMeta(data: DashboardResponse | null) {
@@ -236,7 +274,9 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
   const [pinnedIso3, setPinnedIso3] = React.useState<string | null>(null);
   const [tooltipPos, setTooltipPos] = React.useState({ x: 0, y: 0 });
   const mapDisplay = data?.mapDisplay ?? DEFAULT_MAP_DISPLAY;
-  const { showFlows, showHeat, viewport } = mapDisplay;
+  const showFlows = mapDisplay.showFlows ?? DEFAULT_MAP_DISPLAY.showFlows;
+  const heatEnabled = mapDisplay.showHeat ?? DEFAULT_MAP_DISPLAY.showHeat;
+  const viewport = mapDisplay.viewport ?? DEFAULT_MAP_DISPLAY.viewport;
   const countries = data?.map?.countries || [];
   const server = data?.map?.server;
   const activeIso3 = pinnedIso3 || hoveredIso3;
@@ -299,6 +339,11 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
     [focus.target],
   );
 
+  const isCountryFocusedIso3 = React.useCallback(
+    (iso3: string) => focus.target?.kind === "country" && focus.target.id === iso3,
+    [focus.target],
+  );
+
   React.useLayoutEffect(() => {
     const shell = shellRef.current;
     if (!shell) return;
@@ -327,38 +372,47 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
     };
   }, []);
 
-  const heatCountsKey = React.useMemo(
-    () => JSON.stringify(resolveMapHeatCounts(data, showHeat)),
-    [data?.countryCounts, showHeat],
-  );
+  const heatCounts = React.useMemo(() => {
+    const resolved = resolveMapHeatCounts(data, heatEnabled);
+    if (hasPositiveHeatCounts(resolved)) return resolved;
+    const fallback = data?.countryCounts ?? {};
+    if (heatEnabled && hasPositiveHeatCounts(fallback)) return fallback;
+    return resolved;
+  }, [data?.countryCounts, data?.generatedAt, heatEnabled]);
+
+  const heatCountsKey = React.useMemo(() => JSON.stringify(heatCounts), [heatCounts]);
+  const lastHeatCountsKeyRef = React.useRef("");
+  const heatCountsRef = React.useRef(heatCounts);
+  const pinnedIso3Ref = React.useRef(pinnedIso3);
+  const dashboardGeneratedAt = data?.generatedAt ?? "";
+
+  React.useEffect(() => {
+    heatCountsRef.current = heatCounts;
+  }, [heatCounts]);
+
+  React.useEffect(() => {
+    pinnedIso3Ref.current = pinnedIso3;
+  }, [pinnedIso3]);
+
+  React.useEffect(() => {
+    lastHeatCountsKeyRef.current = "";
+  }, [worldSvg]);
 
   React.useEffect(() => {
     const root = worldRef.current;
-    if (!root) return;
-    const counts = JSON.parse(heatCountsKey) as Record<string, number>;
-    const values = Object.values(counts).filter((value) => value > 0);
-    const max = values.length ? Math.max(...values) : 0;
-    for (const element of Array.from(root.querySelectorAll<SVGElement>(".country"))) {
-      const iso3 = Array.from(element.classList).find((name) => /^[A-Z]{3}$/.test(name));
-      const count = iso3 ? counts[iso3] || 0 : 0;
-      const heat = max > 0 ? Math.min(1, Math.sqrt(count / max)) : 0;
-      const fillOpacity = String(0.06 + heat * 0.74);
-      const strokeOpacity = String(0.12 + heat * 0.48);
-      const highlighted = iso3 && (iso3 === activeIso3 || isCountryFocused({ countryCodeIso3: iso3 } as CountryMapPoint));
-      if (!element.style.transition) {
-        element.style.transition = "fill-opacity 0.8s ease-out, stroke-opacity 0.8s ease-out, stroke-width 0.2s ease-out";
-      }
-      element.style.pointerEvents = count > 0 ? "auto" : "none";
-      element.style.cursor = count > 0 ? "pointer" : "default";
-      element.style.fillOpacity = fillOpacity;
-      element.style.strokeOpacity = highlighted ? "0.92" : strokeOpacity;
-      element.style.strokeWidth = highlighted ? "0.55" : "0.28";
-    }
-  }, [activeIso3, heatCountsKey, isCountryFocused, worldSvg]);
+    if (!root || !worldSvg) return;
+    const animateFill = lastHeatCountsKeyRef.current !== "" && lastHeatCountsKeyRef.current !== heatCountsKey;
+    lastHeatCountsKeyRef.current = heatCountsKey;
+    applyCountryHeatStyles(root, heatCounts, {
+      highlightedIso3: activeIso3,
+      isCountryFocused: isCountryFocusedIso3,
+      animateFill,
+    });
+  }, [activeIso3, dashboardGeneratedAt, heatCounts, heatCountsKey, isCountryFocusedIso3, worldSvg]);
 
   React.useEffect(() => {
     const root = worldRef.current;
-    if (!root) return;
+    if (!root || !worldSvg) return;
 
     const updateTooltipPosition = (event: MouseEvent) => {
       const shell = shellRef.current;
@@ -370,40 +424,44 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
       });
     };
 
-    const onPointerOver = (event: PointerEvent) => {
-      const iso3 = resolveIso3FromElement(event.target as Element);
-      if (!iso3 || !(JSON.parse(heatCountsKey) as Record<string, number>)[iso3]) return;
-      setHoveredIso3(iso3);
-      updateTooltipPosition(event);
-    };
-    const onPointerMove = (event: PointerEvent) => {
-      if (!hoveredIso3 && !pinnedIso3) return;
-      updateTooltipPosition(event);
-    };
-    const onPointerLeave = (event: PointerEvent) => {
-      const next = resolveIso3FromElement(event.relatedTarget as Element | null);
-      if (next) return;
+    const syncHoverFromTarget = (event: PointerEvent, target: Element | null) => {
+      if (pinnedIso3Ref.current) {
+        updateTooltipPosition(event);
+        return;
+      }
+      const iso3 = resolveIso3FromElement(target);
+      const counts = heatCountsRef.current;
+      if (iso3 && counts[iso3]) {
+        setHoveredIso3(iso3);
+        updateTooltipPosition(event);
+        return;
+      }
       setHoveredIso3(null);
+    };
+
+    const onPointerMove = (event: PointerEvent) => {
+      syncHoverFromTarget(event, event.target as Element);
+    };
+    const onPointerLeave = () => {
+      if (!pinnedIso3Ref.current) setHoveredIso3(null);
     };
     const onClick = (event: MouseEvent) => {
       const iso3 = resolveIso3FromElement(event.target as Element);
-      if (!iso3 || !(JSON.parse(heatCountsKey) as Record<string, number>)[iso3]) return;
+      if (!iso3 || !heatCountsRef.current[iso3]) return;
       setPinnedIso3((current) => (current === iso3 ? null : iso3));
       focus.setFocus({ kind: "country", id: iso3, source: "map" });
       void recordDashboardUxEvent({ eventType: "country_located_from_map", source: "map", targetType: "country" });
     };
 
-    root.addEventListener("pointerover", onPointerOver);
     root.addEventListener("pointermove", onPointerMove);
     root.addEventListener("pointerleave", onPointerLeave);
     root.addEventListener("click", onClick);
     return () => {
-      root.removeEventListener("pointerover", onPointerOver);
       root.removeEventListener("pointermove", onPointerMove);
       root.removeEventListener("pointerleave", onPointerLeave);
       root.removeEventListener("click", onClick);
     };
-  }, [focus, heatCountsKey, hoveredIso3, pinnedIso3]);
+  }, [focus, worldSvg]);
 
   React.useEffect(() => {
     if (!focus.target) setPinnedIso3(null);
@@ -492,8 +550,13 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
                 t("map.countryClients", { count: country.clientCount }),
               ].filter(Boolean).join(" · ")}
               onMouseEnter={() => setHoveredIso3(country.countryCodeIso3)}
+              onMouseLeave={() => {
+                if (!pinnedIso3) setHoveredIso3(null);
+              }}
               onClick={() => {
-                setPinnedIso3(country.countryCodeIso3);
+                setPinnedIso3((current) =>
+                  current === country.countryCodeIso3 ? null : country.countryCodeIso3,
+                );
                 focus.setFocus({ kind: "country", id: country.countryCodeIso3, source: "map" });
                 void recordDashboardUxEvent({ eventType: "country_located_from_map", source: "map", targetType: "country" });
               }}
