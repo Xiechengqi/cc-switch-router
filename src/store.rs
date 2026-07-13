@@ -10256,9 +10256,9 @@ fn normalize_share_settings_patch(
         }
     }
     if let Some(parallel_limit) = patch.parallel_limit {
-        if parallel_limit != -1 && parallel_limit < 3 {
+        if parallel_limit <= 0 && parallel_limit != -1 {
             return Err(AppError::BadRequest(
-                "parallelLimit must be at least 3 or -1".into(),
+                "parallelLimit must be positive or -1".into(),
             ));
         }
     }
@@ -10381,9 +10381,9 @@ fn normalize_share_app_settings(
                 "{app} tokenLimit must be positive or -1"
             )));
         }
-        if setting.parallel_limit != -1 && setting.parallel_limit < 3 {
+        if setting.parallel_limit <= 0 && setting.parallel_limit != -1 {
             return Err(AppError::BadRequest(format!(
-                "{app} parallelLimit must be at least 3 or -1"
+                "{app} parallelLimit must be positive or -1"
             )));
         }
         if !setting.expires_at.trim().is_empty() {

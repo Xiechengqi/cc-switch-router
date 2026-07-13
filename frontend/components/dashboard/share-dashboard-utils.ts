@@ -40,7 +40,6 @@ export function shouldOpenRowDrawer(event: React.MouseEvent<HTMLElement>) {
 
 export const UNLIMITED_TOKEN_LIMIT = -1;
 export const UNLIMITED_PARALLEL_LIMIT = -1;
-export const MIN_PARALLEL_LIMIT = 3;
 export const DEFAULT_PARALLEL_LIMIT = 3;
 export const DEFAULT_TOKEN_LIMIT = 100000;
 export const PERMANENT_EXPIRES_AT_ISO = "2099-12-31T23:59:59Z";
@@ -274,18 +273,19 @@ export function formatShareStatus(value?: string) {
   return value ? String(value).replaceAll("_", " ") : "-";
 }
 
-export function formatPlatformVersion(platform?: string, version?: string) {
-  const platformLabel = (platform || "-").toLowerCase();
-  const versionLabel = version ? String(version).replace(/^v/i, "") : "-";
-  const commitMatch = versionLabel.match(/^commit\s+([0-9a-f]{7,40})$/i);
+export function formatClientAppVersion(version?: string) {
+  const raw = String(version || "").trim();
+  if (!raw) return "-";
+  const normalized = raw.replace(/^v/i, "");
+  const commitMatch = normalized.match(/^(?:commit\s+)?([0-9a-f]{7,40})$/i);
   if (commitMatch) {
-    return `${platformLabel}/${commitMatch[1].slice(0, 7)}`;
+    return commitMatch[1].toLowerCase().slice(0, 12);
   }
-  return `${platformLabel}/${versionLabel}`;
+  return normalized;
 }
 
 export function clientPlatformLabel(client: DashboardClient) {
-  return formatPlatformVersion(client.installation.platform, client.installation.appVersion);
+  return formatClientAppVersion(client.installation.appVersion);
 }
 
 export function sortClients(clients: DashboardClient[]) {

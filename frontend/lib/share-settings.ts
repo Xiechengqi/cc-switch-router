@@ -3,7 +3,6 @@ import type { ShareAccessByApp, ShareSettingsPatch, ShareView } from "@/lib/type
 
 export const UNLIMITED_TOKEN_LIMIT = -1;
 export const UNLIMITED_PARALLEL_LIMIT = -1;
-export const MIN_PARALLEL_LIMIT = 3;
 export const PERMANENT_EXPIRES_AT_ISO = "2099-12-31T23:59:59Z";
 
 export type ShareSettingsDraft = {
@@ -102,9 +101,9 @@ export function validateShareSettingsDraft(draft: ShareSettingsDraft) {
   }
   if (
     draft.parallelLimit !== UNLIMITED_PARALLEL_LIMIT &&
-    (!Number.isFinite(draft.parallelLimit) || draft.parallelLimit < MIN_PARALLEL_LIMIT)
+    (!Number.isFinite(draft.parallelLimit) || draft.parallelLimit <= 0)
   ) {
-    errors.push(`Parallel limit must be at least ${MIN_PARALLEL_LIMIT} or unlimited.`);
+    errors.push("Parallel limit must be positive or unlimited.");
   }
   const expires = new Date(draft.expiresAt).getTime();
   if (!draft.expiresAt || !Number.isFinite(expires)) errors.push("Expiration time is invalid.");

@@ -8,7 +8,7 @@ import { useLocaleText } from "@/components/i18n/locale-provider";
 import { updateShareSettings } from "@/lib/api";
 import { shareAccessApps, SHARE_APP_LABELS, type CoreShareApp } from "@/lib/share-app";
 import type { DashboardMarket, ShareAccessByApp, ShareAppRuntimes, ShareSettingsPatch, ShareUpstreamProvider, ShareView } from "@/lib/types";
-import { DEFAULT_PARALLEL_LIMIT, DEFAULT_TOKEN_LIMIT, MIN_PARALLEL_LIMIT, PERMANENT_EXPIRES_AT_ISO, UNLIMITED_PARALLEL_LIMIT, UNLIMITED_TOKEN_LIMIT, isOfficialRuntime, isPermanentExpiryDate, isShareMarket, isUnlimitedExpiry, isUnlimitedParallelLimit, isUnlimitedTokenLimit, marketLabel, type TFn } from "@/components/dashboard/share-dashboard-utils";
+import { DEFAULT_PARALLEL_LIMIT, DEFAULT_TOKEN_LIMIT, PERMANENT_EXPIRES_AT_ISO, UNLIMITED_PARALLEL_LIMIT, UNLIMITED_TOKEN_LIMIT, isOfficialRuntime, isPermanentExpiryDate, isShareMarket, isUnlimitedExpiry, isUnlimitedParallelLimit, isUnlimitedTokenLimit, marketLabel, type TFn } from "@/components/dashboard/share-dashboard-utils";
 
 function splitEmails(value: string) {
   return value
@@ -237,7 +237,7 @@ function buildShareEditDraft(
     lastFiniteTokenLimit: !tokenLimitUnlimited && tokenLimit > 0 ? tokenLimit : DEFAULT_TOKEN_LIMIT,
     parallelLimitInput: parallelLimitUnlimited ? String(UNLIMITED_PARALLEL_LIMIT) : String(parallelLimit),
     parallelLimitUnlimited,
-    lastFiniteParallelLimit: !parallelLimitUnlimited && parallelLimit >= MIN_PARALLEL_LIMIT ? parallelLimit : DEFAULT_PARALLEL_LIMIT,
+    lastFiniteParallelLimit: !parallelLimitUnlimited && parallelLimit > 0 ? parallelLimit : DEFAULT_PARALLEL_LIMIT,
     expiresAtInput: expiresPermanent ? "" : toLocalDateTimeValue(share.expiresAt),
     expiresPermanent,
     priceInputs,
@@ -445,7 +445,7 @@ export function ShareEditDialog({
     setParallelLimitUnlimited(checked);
     if (checked) {
       const parsed = Number.parseInt(parallelLimitInput, 10);
-      if (Number.isFinite(parsed) && parsed >= MIN_PARALLEL_LIMIT) setLastFiniteParallelLimit(parsed);
+      if (Number.isFinite(parsed) && parsed > 0) setLastFiniteParallelLimit(parsed);
       setParallelLimitInput(String(UNLIMITED_PARALLEL_LIMIT));
     } else {
       setParallelLimitInput(String(lastFiniteParallelLimit));
@@ -532,7 +532,7 @@ export function ShareEditDialog({
 
   const parallelParsed = Number.parseInt(parallelLimitInput, 10);
   const parallelInvalid =
-    !parallelLimitUnlimited && (!Number.isFinite(parallelParsed) || parallelParsed < MIN_PARALLEL_LIMIT);
+    !parallelLimitUnlimited && (!Number.isFinite(parallelParsed) || parallelParsed <= 0);
 
   const expiryInvalid = !expiresPermanent && !expiresAtInput.trim();
 
@@ -908,18 +908,18 @@ export function ShareEditDialog({
                     </div>
                   </FieldGroup>
 
-                  <FieldGroup label={t("dashboard.field.parallelLimit")} hint={t("dashboard.hint.minValue", { value: MIN_PARALLEL_LIMIT })} invalid={parallelInvalid}>
+                  <FieldGroup label={t("dashboard.field.parallelLimit")} invalid={parallelInvalid}>
                     <div className="grid gap-2">
                       <Input
                         type="number"
-                        min={MIN_PARALLEL_LIMIT}
+                        min={1}
                         step={1}
 	                        value={parallelLimitInput}
 	                        disabled={readOnly || parallelLimitUnlimited}
                         onChange={(event) => {
                           setParallelLimitInput(event.target.value);
                           const parsed = Number.parseInt(event.target.value, 10);
-                          if (Number.isFinite(parsed) && parsed >= MIN_PARALLEL_LIMIT) {
+                          if (Number.isFinite(parsed) && parsed > 0) {
                             setLastFiniteParallelLimit(parsed);
                           }
                         }}

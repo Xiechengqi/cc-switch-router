@@ -380,7 +380,7 @@ function ClientCard({
 
           <div className={`grid min-w-0 gap-4 ${showRemoval ? "grid-cols-6" : "grid-cols-5"}`}>
             <Metric label={t("dashboard.region")} value={client.installation.countryCode || client.installation.region || "-"} />
-            <Metric label={t("dashboard.version")} value={versionLabel} title={client.installation.appVersion || versionLabel} />
+            <Metric label={t("dashboard.version")} value={versionLabel} title={client.installation.appVersion || versionLabel} preserveValue />
             <Metric label={t("dashboard.uptime24h")} value={`${onlineRate.toFixed(1)}%`} title={onlineTitle} tone={onlineRate < 90 ? "warning" : "success"} />
             <Metric label={t("dashboard.shares")} value={`${onlineShares.length}/${enabledShares.length || allShares.length} ${t("common.online")}`} tone={issueCount ? "danger" : "default"} />
             <Metric label={t("dashboard.lastSeen")} value={formatRelativeTime(client.installation.lastSeenAt, locale)} tone={state === "offline" ? "danger" : "default"} />
@@ -411,9 +411,14 @@ function ClientCard({
   );
 }
 
-function Metric({ label, value, title, tone = "default" }: { label: string; value: string; title?: string; tone?: "default" | "success" | "warning" | "danger" }) {
+function Metric({ label, value, title, tone = "default", preserveValue = false }: { label: string; value: string; title?: string; tone?: "default" | "success" | "warning" | "danger"; preserveValue?: boolean }) {
   const color = tone === "success" ? "text-emerald-700" : tone === "warning" ? "text-amber-700" : tone === "danger" ? "text-rose-700" : "text-foreground";
-  return <div className="grid min-w-0 gap-1" title={title}><span className="font-mono text-[9px] uppercase tracking-[0.12em] text-slate-400">{label}</span><strong className={`truncate text-xs font-semibold ${color}`}>{value}</strong></div>;
+  return (
+    <div className="grid min-w-0 gap-1" title={title}>
+      <span className="font-mono text-[9px] uppercase tracking-[0.12em] text-slate-400">{label}</span>
+      <strong className={`text-xs font-semibold ${preserveValue ? "font-mono whitespace-nowrap tabular-nums" : "truncate"} ${color}`}>{value}</strong>
+    </div>
+  );
 }
 
 export function ClientBoard({
@@ -677,7 +682,7 @@ export function ClientBoard({
                         <span>URL: <strong className="break-all text-foreground">{selectedClientUrl || "-"}</strong></span>
                         <span>{t("dashboard.owner")}: <strong className="text-foreground">{clientOwnerEmail(selectedClient)}</strong></span>
                         <span>{t("dashboard.region")}: <strong className="text-foreground">{selectedClient.installation.countryCode || selectedClient.installation.region || "-"}</strong></span>
-                        <span>{t("dashboard.version")}: <strong className="text-foreground">{clientPlatformLabel(selectedClient)}</strong></span>
+                        <span>{t("dashboard.version")}: <strong className="font-mono text-foreground">{clientPlatformLabel(selectedClient)}</strong></span>
                         <span>{t("dashboard.online")}: <strong className="text-foreground">{(selectedClient.onlineRate24h || 0).toFixed(1)}% / {formatAgeDaysOrHours(selectedClient.installation.createdAt, locale)}</strong></span>
                         {selectedClient.removalAt ? (
                           <span>

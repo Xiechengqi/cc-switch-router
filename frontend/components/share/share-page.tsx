@@ -9,7 +9,6 @@ import {
   buildShareSettingsPatch,
   draftFromShare,
   fromDateTimeLocal,
-  MIN_PARALLEL_LIMIT,
   normalizeEmailList,
   PERMANENT_EXPIRES_AT_ISO,
   toDateTimeLocal,
@@ -431,7 +430,7 @@ function ShareSettingsForm({
           <span className="font-medium text-foreground">Parallel limit</span>
           <Input
             type="number"
-            min={MIN_PARALLEL_LIMIT}
+            min={1}
             value={parallelUnlimited ? "" : String(draft.parallelLimit)}
             placeholder="Unlimited"
             disabled={!editable || parallelUnlimited}
