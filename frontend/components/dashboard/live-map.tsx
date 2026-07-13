@@ -5,7 +5,7 @@ import { useLocaleText } from "@/components/i18n/locale-provider";
 import { recordDashboardUxEvent } from "@/lib/api";
 import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
 import { MapCountryTooltip } from "@/components/dashboard/map-country-tooltip";
-import type { CountryMapPoint, DashboardResponse, MapPoint, MarketRequestLog, ShareRequestLog } from "@/lib/types";
+import type { CountryBoard, CountryMapPoint, DashboardResponse, MapPoint, MarketRequestLog, ShareRequestLog } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { computeMapOffsetY, DEFAULT_MAP_DISPLAY, MAP_VIEWPORT_HEIGHT_PX } from "@/lib/map-display-settings";
 import { StatsStrip } from "@/components/dashboard/stats-strip";
@@ -125,14 +125,43 @@ function tickerDetail(meta?: TickerMeta) {
 
 function resolveMapHeatCounts(
   data: DashboardResponse | null,
-  heatEnabled: boolean,
 ): Record<string, number> {
-  if (!heatEnabled || !data) return {};
-  return data.countryCounts ?? {};
+  const counts: Record<string, number> = {};
+  for (const country of data?.map?.countries ?? []) {
+    if (country.clientCount > 0) {
+      counts[country.countryCodeIso3] = country.clientCount;
+    }
+  }
+  for (const [iso3, count] of Object.entries(data?.countryCounts ?? {})) {
+    if (count > 0) {
+      counts[iso3] = Math.max(counts[iso3] ?? 0, count);
+    }
+  }
+  return counts;
 }
 
-function hasPositiveHeatCounts(counts: Record<string, number>) {
-  return Object.values(counts).some((value) => value > 0);
+function countryBoardFromMapPoint(country: CountryMapPoint): CountryBoard {
+  return {
+    countryCode: country.countryCode,
+    countryCodeIso3: country.countryCodeIso3,
+    countryName: country.countryName,
+    lat: country.lat,
+    lon: country.lon,
+    clientCount: country.clientCount,
+    shareCount: country.shareCount,
+    onlineShareCount: country.onlineShareCount,
+    inflightRequests: country.inflightRequests,
+    clientIds: country.clientIds,
+    clients: [],
+  };
+}
+
+function shellTooltipPosition(shell: HTMLElement, clientX: number, clientY: number) {
+  const rect = shell.getBoundingClientRect();
+  return {
+    x: Math.min(Math.max(12, clientX - rect.left + 18), rect.width - 24),
+    y: Math.min(Math.max(12, clientY - rect.top + 22), rect.height - 24),
+  };
 }
 
 const HEAT_BASE_FILL_OPACITY = 0.08;
@@ -157,21 +186,36 @@ function prepareWorldSvg(svg: string) {
   });
 }
 
-function buildMapHeatStyleSheet(counts: Record<string, number>) {
-  const values = Object.values(counts).filter((value) => value > 0);
+function applyCountryHeatDOM(
+  root: HTMLElement,
+  activityCounts: Record<string, number>,
+  heatEnabled: boolean,
+) {
+  const values = Object.values(activityCounts).filter((value) => value > 0);
   const max = values.length ? Math.max(...values) : 0;
-  const lines = [
-    ".cc-map-world .country{fill-opacity:0.08!important;stroke-opacity:0.18!important;stroke-width:0.28!important;transition:none!important;pointer-events:none!important;cursor:default!important}",
-  ];
-  for (const [iso3, count] of Object.entries(counts)) {
-    if (!/^[A-Z]{3}$/.test(iso3) || count <= 0) continue;
-    const fillOpacity = countryHeatFillOpacity(count, max);
-    const strokeOpacity = countryHeatStrokeOpacity(count, max);
-    lines.push(
-      `.cc-map-world .country.${iso3}{fill-opacity:${fillOpacity}!important;stroke-opacity:${strokeOpacity}!important;pointer-events:auto!important;cursor:pointer!important}`,
-    );
+  for (const element of Array.from(root.querySelectorAll<SVGElement>(".country"))) {
+    const iso3 = Array.from(element.classList).find((name) => /^[A-Z]{3}$/.test(name));
+    const count = iso3 ? activityCounts[iso3] || 0 : 0;
+    const interactive = count > 0;
+    element.style.transition = "none";
+    element.style.pointerEvents = interactive ? "auto" : "none";
+    element.style.cursor = interactive ? "pointer" : "default";
+    if (heatEnabled && interactive) {
+      const fillOpacity = String(countryHeatFillOpacity(count, max));
+      const strokeOpacity = String(countryHeatStrokeOpacity(count, max));
+      if (element.style.fillOpacity !== fillOpacity) {
+        element.style.fillOpacity = fillOpacity;
+      }
+      if (element.style.strokeOpacity !== strokeOpacity) {
+        element.style.strokeOpacity = strokeOpacity;
+      }
+      element.style.strokeWidth = "0.28";
+    } else {
+      element.style.removeProperty("fill-opacity");
+      element.style.removeProperty("stroke-opacity");
+      element.style.removeProperty("stroke-width");
+    }
   }
-  return lines.join("");
 }
 
 function mountWorldMap(root: HTMLElement, prepared: string, mountedRef: React.MutableRefObject<string>) {
@@ -181,26 +225,44 @@ function mountWorldMap(root: HTMLElement, prepared: string, mountedRef: React.Mu
   return true;
 }
 
-function applyMapHeatStyles(root: HTMLElement, counts: Record<string, number>) {
-  let styleEl = root.querySelector<HTMLStyleElement>("style[data-map-heat]");
-  if (!styleEl) {
-    styleEl = document.createElement("style");
-    styleEl.setAttribute("data-map-heat", "true");
-    root.insertBefore(styleEl, root.firstChild);
-  }
-  const next = buildMapHeatStyleSheet(counts);
-  if (styleEl.textContent !== next) {
-    styleEl.textContent = next;
-  }
+function isMapInteractiveElement(
+  element: Element,
+  worldRoot: HTMLElement | null,
+  mapLayer: HTMLElement | null,
+) {
+  return Boolean(worldRoot?.contains(element) || mapLayer?.contains(element));
 }
 
-function resolveMapHoverIso3(target: Element | null, counts: Record<string, number>) {
-  if (!target || target.closest("[data-map-country-tooltip]")) return null;
+function resolveMapHoverIso3(
+  target: Element | null,
+  activityCounts: Record<string, number>,
+  worldRoot?: HTMLElement | null,
+  mapLayer?: HTMLElement | null,
+  clientX?: number,
+  clientY?: number,
+) {
+  if (target?.closest("[data-map-country-tooltip]")) return null;
+  const fromTarget = resolveMapHoverIso3FromElement(target, activityCounts);
+  if (fromTarget) return fromTarget;
+  if (worldRoot == null || clientX == null || clientY == null) return null;
+  for (const element of document.elementsFromPoint(clientX, clientY)) {
+    if (!isMapInteractiveElement(element, worldRoot, mapLayer ?? null)) continue;
+    const iso3 = resolveMapHoverIso3FromElement(element, activityCounts);
+    if (iso3) return iso3;
+  }
+  return null;
+}
+
+function resolveMapHoverIso3FromElement(target: Element | null, activityCounts: Record<string, number>) {
+  if (!target) return null;
+  if (target.closest("[data-map-control]") && !target.closest(".country") && !target.closest("[data-country-iso3]")) {
+    return null;
+  }
   const fromPath = resolveIso3FromElement(target);
-  if (fromPath && counts[fromPath]) return fromPath;
+  if (fromPath && activityCounts[fromPath]) return fromPath;
   const marker = target.closest("[data-country-iso3]");
   const fromMarker = marker?.getAttribute("data-country-iso3")?.trim();
-  if (fromMarker && counts[fromMarker]) return fromMarker;
+  if (fromMarker && activityCounts[fromMarker]) return fromMarker;
   return null;
 }
 
@@ -319,7 +381,13 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
   const countries = data?.map?.countries || [];
   const server = data?.map?.server;
   const activeIso3 = pinnedIso3 || hoveredIso3;
-  const activeBoard = activeIso3 ? data?.countryBoards?.[activeIso3] : undefined;
+  const activeBoard = React.useMemo(() => {
+    if (!activeIso3) return undefined;
+    const board = data?.countryBoards?.[activeIso3];
+    if (board) return board;
+    const country = countries.find((item) => item.countryCodeIso3 === activeIso3);
+    return country ? countryBoardFromMapPoint(country) : undefined;
+  }, [activeIso3, countries, data?.countryBoards]);
 
   const countryPlaced = React.useMemo(
     () =>
@@ -406,58 +474,44 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
     };
   }, []);
 
-  const heatCounts = React.useMemo(() => {
-    const resolved = resolveMapHeatCounts(data, heatEnabled);
-    if (hasPositiveHeatCounts(resolved)) return resolved;
-    const fallback = data?.countryCounts ?? {};
-    if (heatEnabled && hasPositiveHeatCounts(fallback)) return fallback;
-    return resolved;
-  }, [data?.countryCounts, heatEnabled]);
-
+  const countryActivityCounts = React.useMemo(() => resolveMapHeatCounts(data), [data?.countryCounts, data?.map?.countries]);
   const heatCountsKey = React.useMemo(() => {
-    const entries = Object.entries(heatCounts).sort(([left], [right]) => left.localeCompare(right));
+    const entries = Object.entries(countryActivityCounts).sort(([left], [right]) => left.localeCompare(right));
     return JSON.stringify(entries);
-  }, [heatCounts]);
-  const heatCountsRef = React.useRef(heatCounts);
+  }, [countryActivityCounts]);
+  const activityCountsRef = React.useRef(countryActivityCounts);
   const pinnedIso3Ref = React.useRef(pinnedIso3);
-  const heatStyleKeyRef = React.useRef("");
   const worldMountedSvgRef = React.useRef("");
+  const heatApplyKeyRef = React.useRef("");
   const preparedWorldSvg = React.useMemo(() => (worldSvg ? prepareWorldSvg(worldSvg) : ""), [worldSvg]);
-
-  React.useEffect(() => {
-    heatCountsRef.current = heatCounts;
-  }, [heatCounts]);
 
   React.useEffect(() => {
     pinnedIso3Ref.current = pinnedIso3;
   }, [pinnedIso3]);
 
   React.useLayoutEffect(() => {
+    activityCountsRef.current = countryActivityCounts;
     const root = worldRef.current;
     if (!root || !preparedWorldSvg) return;
     const remounted = mountWorldMap(root, preparedWorldSvg, worldMountedSvgRef);
-    const styleKey = `${preparedWorldSvg.length}:${heatCountsKey}`;
-    if (!remounted && heatStyleKeyRef.current === styleKey) return;
-    heatStyleKeyRef.current = styleKey;
-    applyMapHeatStyles(root, heatCountsRef.current);
-  }, [heatCountsKey, preparedWorldSvg]);
+    const applyKey = `${preparedWorldSvg.length}:${heatEnabled ? 1 : 0}:${heatCountsKey}`;
+    if (!remounted && heatApplyKeyRef.current === applyKey) return;
+    heatApplyKeyRef.current = applyKey;
+    applyCountryHeatDOM(root, countryActivityCounts, heatEnabled);
+  }, [countryActivityCounts, heatCountsKey, heatEnabled, preparedWorldSvg]);
 
   React.useEffect(() => {
-    const layer = mapLayerRef.current;
-    if (!layer || !worldSvg) return;
+    const shell = shellRef.current;
+    if (!shell || !worldSvg) return;
 
     const lastTooltipPosRef = { x: 0, y: 0 };
 
     const updateTooltipPosition = (event: MouseEvent) => {
-      const shell = shellRef.current;
-      if (!shell) return;
-      const rect = shell.getBoundingClientRect();
-      const x = Math.min(Math.max(12, event.clientX - rect.left + 18), rect.width - 24);
-      const y = Math.min(Math.max(12, event.clientY - rect.top + 22), rect.height - 24);
-      if (Math.abs(x - lastTooltipPosRef.x) < 8 && Math.abs(y - lastTooltipPosRef.y) < 8) return;
-      lastTooltipPosRef.x = x;
-      lastTooltipPosRef.y = y;
-      setTooltipPos({ x, y });
+      const next = shellTooltipPosition(shell, event.clientX, event.clientY);
+      if (Math.abs(next.x - lastTooltipPosRef.x) < 8 && Math.abs(next.y - lastTooltipPosRef.y) < 8) return;
+      lastTooltipPosRef.x = next.x;
+      lastTooltipPosRef.y = next.y;
+      setTooltipPos(next);
     };
 
     const syncHoverFromEvent = (event: PointerEvent) => {
@@ -465,12 +519,15 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
         updateTooltipPosition(event);
         return;
       }
-      const directTarget = event.target instanceof Element ? event.target : null;
-      let iso3 = resolveMapHoverIso3(directTarget, heatCountsRef.current);
-      if (!iso3) {
-        const hitTarget = document.elementFromPoint(event.clientX, event.clientY) as Element | null;
-        iso3 = resolveMapHoverIso3(hitTarget, heatCountsRef.current);
-      }
+      const counts = activityCountsRef.current;
+      const iso3 = resolveMapHoverIso3(
+        event.target instanceof Element ? event.target : null,
+        counts,
+        worldRef.current,
+        mapLayerRef.current,
+        event.clientX,
+        event.clientY,
+      );
       setHoveredIso3((current) => (current === iso3 ? current : iso3));
       if (iso3) updateTooltipPosition(event);
     };
@@ -478,24 +535,38 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
     const onPointerMove = (event: PointerEvent) => {
       syncHoverFromEvent(event);
     };
-    const onPointerLeave = () => {
-      if (!pinnedIso3Ref.current) setHoveredIso3(null);
+    const onPointerLeave = (event: PointerEvent) => {
+      if (pinnedIso3Ref.current) return;
+      const next = event.relatedTarget;
+      if (next instanceof Node && shell.contains(next)) return;
+      setHoveredIso3(null);
     };
     const onClick = (event: MouseEvent) => {
-      const target = document.elementFromPoint(event.clientX, event.clientY) as Element | null;
-      const iso3 = resolveMapHoverIso3(target, heatCountsRef.current);
+      if (event.target instanceof Element && event.target.closest("[data-map-control]")) return;
+      const iso3 = resolveMapHoverIso3(
+        event.target instanceof Element ? event.target : null,
+        activityCountsRef.current,
+        worldRef.current,
+        mapLayerRef.current,
+        event.clientX,
+        event.clientY,
+      );
       if (!iso3) return;
+      updateTooltipPosition(event);
       setPinnedIso3((current) => (current === iso3 ? null : iso3));
       focus.setFocus({ kind: "country", id: iso3, source: "map" });
       void recordDashboardUxEvent({ eventType: "country_located_from_map", source: "map", targetType: "country" });
     };
 
-    layer.addEventListener("pointermove", onPointerMove);
-    layer.addEventListener("pointerleave", onPointerLeave);
+    const layer = mapLayerRef.current;
+    if (!layer) return;
+
+    shell.addEventListener("pointermove", onPointerMove);
+    shell.addEventListener("pointerleave", onPointerLeave);
     layer.addEventListener("click", onClick);
     return () => {
-      layer.removeEventListener("pointermove", onPointerMove);
-      layer.removeEventListener("pointerleave", onPointerLeave);
+      shell.removeEventListener("pointermove", onPointerMove);
+      shell.removeEventListener("pointerleave", onPointerLeave);
       layer.removeEventListener("click", onClick);
     };
   }, [focus, worldSvg]);
@@ -589,6 +660,10 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
               ].filter(Boolean).join(" · ")}
               onClick={(event) => {
                 event.stopPropagation();
+                const shell = shellRef.current;
+                if (shell) {
+                  setTooltipPos(shellTooltipPosition(shell, event.clientX, event.clientY));
+                }
                 setPinnedIso3((current) =>
                   current === country.countryCodeIso3 ? null : country.countryCodeIso3,
                 );
@@ -624,7 +699,11 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
         <MapCountryTooltip
           board={activeBoard}
           className="absolute z-40"
-          style={{ left: tooltipPos.x, top: tooltipPos.y, transform: "translate(0, 0)" }}
+          style={{
+            left: tooltipPos.x > 0 ? tooltipPos.x : 12,
+            top: tooltipPos.y > 0 ? tooltipPos.y : 12,
+            transform: "translate(0, 0)",
+          }}
         />
       ) : null}
       {countries.length === 0 && !server ? (
