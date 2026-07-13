@@ -1281,16 +1281,10 @@ impl AppStore {
                 ));
             }
             DateTime::<Utc>::from_timestamp(redeemed.verified_at, 0).unwrap_or(now)
-        } else {
-            let access_token = access_token
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    AppError::Unauthorized(
-                        "verification token or authenticated session is required to bind installation owner"
-                            .into(),
-                    )
-                })?;
+        } else if let Some(access_token) = access_token
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
             let session = self
                 .resolve_session_by_access_token(access_token)
                 .await?
@@ -1301,6 +1295,22 @@ impl AppStore {
                 ));
             }
             session.last_used_at
+        } else {
+            let conn = self.conn.lock().await;
+            let installation = get_installation(&conn, &input.installation_id)?
+                .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
+            let missing_owner = installation
+                .owner_email
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty());
+            drop(conn);
+            if !missing_owner {
+                return Err(AppError::Unauthorized(
+                    "verification token or authenticated session is required to bind installation owner"
+                        .into(),
+                ));
+            }
+            now
         };
 
         let conn = self.conn.lock().await;
