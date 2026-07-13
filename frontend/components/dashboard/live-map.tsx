@@ -150,49 +150,55 @@ function countryHeatStrokeOpacity(count: number, max: number) {
   return 0.12 + heat * 0.36;
 }
 
-function applyCountryHeatFill(root: HTMLElement, counts: Record<string, number>) {
-  const values = Object.values(counts).filter((value) => value > 0);
-  const max = values.length ? Math.max(...values) : 0;
-  for (const element of Array.from(root.querySelectorAll<SVGElement>(".country"))) {
-    const iso3 = Array.from(element.classList).find((name) => /^[A-Z]{3}$/.test(name));
-    const count = iso3 ? counts[iso3] || 0 : 0;
-    const fillOpacity = String(countryHeatFillOpacity(count, max));
-    element.style.transition = "none";
-    element.style.pointerEvents = count > 0 ? "auto" : "none";
-    element.style.cursor = count > 0 ? "pointer" : "default";
-    if (element.style.fillOpacity !== fillOpacity) {
-      element.style.fillOpacity = fillOpacity;
-    }
-  }
+function prepareWorldSvg(svg: string) {
+  return svg.replace(/\.country\{([^}]+)\}/, (_match, rules: string) => {
+    const cleaned = rules.replace(/fill-opacity:[^;]+;?/g, "");
+    return `.country{${cleaned}}`;
+  });
 }
 
-function applyCountryHeatHighlight(
-  root: HTMLElement,
-  counts: Record<string, number>,
-  options: {
-    highlightedIso3: string | null;
-    isCountryFocused: (iso3: string) => boolean;
-  },
-) {
+function buildMapHeatStyleSheet(counts: Record<string, number>) {
   const values = Object.values(counts).filter((value) => value > 0);
   const max = values.length ? Math.max(...values) : 0;
-  for (const element of Array.from(root.querySelectorAll<SVGElement>(".country"))) {
-    const iso3 = Array.from(element.classList).find((name) => /^[A-Z]{3}$/.test(name));
-    const count = iso3 ? counts[iso3] || 0 : 0;
-    const strokeOpacity = String(countryHeatStrokeOpacity(count, max));
-    const highlighted = Boolean(
-      iso3 && (iso3 === options.highlightedIso3 || options.isCountryFocused(iso3)),
+  const lines = [
+    ".cc-map-world .country{fill-opacity:0.08!important;stroke-opacity:0.18!important;stroke-width:0.28!important;transition:none!important;pointer-events:none!important;cursor:default!important}",
+  ];
+  for (const [iso3, count] of Object.entries(counts)) {
+    if (!/^[A-Z]{3}$/.test(iso3) || count <= 0) continue;
+    const fillOpacity = countryHeatFillOpacity(count, max);
+    const strokeOpacity = countryHeatStrokeOpacity(count, max);
+    lines.push(
+      `.cc-map-world .country.${iso3}{fill-opacity:${fillOpacity}!important;stroke-opacity:${strokeOpacity}!important;pointer-events:auto!important;cursor:pointer!important}`,
     );
-    element.style.transition = "stroke-opacity 0.15s ease-out, stroke-width 0.15s ease-out";
-    element.style.strokeOpacity = highlighted ? "0.88" : strokeOpacity;
-    element.style.strokeWidth = highlighted ? "0.5" : "0.28";
+  }
+  return lines.join("");
+}
+
+function mountWorldMap(root: HTMLElement, prepared: string, mountedRef: React.MutableRefObject<string>) {
+  if (mountedRef.current === prepared) return false;
+  mountedRef.current = prepared;
+  root.innerHTML = prepared;
+  return true;
+}
+
+function applyMapHeatStyles(root: HTMLElement, counts: Record<string, number>) {
+  let styleEl = root.querySelector<HTMLStyleElement>("style[data-map-heat]");
+  if (!styleEl) {
+    styleEl = document.createElement("style");
+    styleEl.setAttribute("data-map-heat", "true");
+    root.insertBefore(styleEl, root.firstChild);
+  }
+  const next = buildMapHeatStyleSheet(counts);
+  if (styleEl.textContent !== next) {
+    styleEl.textContent = next;
   }
 }
 
 function resolveMapHoverIso3(target: Element | null, counts: Record<string, number>) {
+  if (!target || target.closest("[data-map-country-tooltip]")) return null;
   const fromPath = resolveIso3FromElement(target);
   if (fromPath && counts[fromPath]) return fromPath;
-  const marker = target?.closest("[data-country-iso3]");
+  const marker = target.closest("[data-country-iso3]");
   const fromMarker = marker?.getAttribute("data-country-iso3")?.trim();
   if (fromMarker && counts[fromMarker]) return fromMarker;
   return null;
@@ -372,11 +378,6 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
     [focus.target],
   );
 
-  const isCountryFocusedIso3 = React.useCallback(
-    (iso3: string) => focus.target?.kind === "country" && focus.target.id === iso3,
-    [focus.target],
-  );
-
   React.useLayoutEffect(() => {
     const shell = shellRef.current;
     if (!shell) return;
@@ -413,10 +414,15 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
     return resolved;
   }, [data?.countryCounts, heatEnabled]);
 
-  const heatCountsKey = React.useMemo(() => JSON.stringify(heatCounts), [heatCounts]);
+  const heatCountsKey = React.useMemo(() => {
+    const entries = Object.entries(heatCounts).sort(([left], [right]) => left.localeCompare(right));
+    return JSON.stringify(entries);
+  }, [heatCounts]);
   const heatCountsRef = React.useRef(heatCounts);
   const pinnedIso3Ref = React.useRef(pinnedIso3);
-  const focusCountryId = focus.target?.kind === "country" ? focus.target.id : null;
+  const heatStyleKeyRef = React.useRef("");
+  const worldMountedSvgRef = React.useRef("");
+  const preparedWorldSvg = React.useMemo(() => (worldSvg ? prepareWorldSvg(worldSvg) : ""), [worldSvg]);
 
   React.useEffect(() => {
     heatCountsRef.current = heatCounts;
@@ -426,33 +432,32 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
     pinnedIso3Ref.current = pinnedIso3;
   }, [pinnedIso3]);
 
-  React.useEffect(() => {
+  React.useLayoutEffect(() => {
     const root = worldRef.current;
-    if (!root || !worldSvg) return;
-    applyCountryHeatFill(root, heatCounts);
-  }, [heatCounts, heatCountsKey, worldSvg]);
-
-  React.useEffect(() => {
-    const root = worldRef.current;
-    if (!root || !worldSvg) return;
-    applyCountryHeatHighlight(root, heatCounts, {
-      highlightedIso3: activeIso3,
-      isCountryFocused: isCountryFocusedIso3,
-    });
-  }, [activeIso3, focusCountryId, heatCounts, heatCountsKey, isCountryFocusedIso3, worldSvg]);
+    if (!root || !preparedWorldSvg) return;
+    const remounted = mountWorldMap(root, preparedWorldSvg, worldMountedSvgRef);
+    const styleKey = `${preparedWorldSvg.length}:${heatCountsKey}`;
+    if (!remounted && heatStyleKeyRef.current === styleKey) return;
+    heatStyleKeyRef.current = styleKey;
+    applyMapHeatStyles(root, heatCountsRef.current);
+  }, [heatCountsKey, preparedWorldSvg]);
 
   React.useEffect(() => {
     const layer = mapLayerRef.current;
     if (!layer || !worldSvg) return;
 
+    const lastTooltipPosRef = { x: 0, y: 0 };
+
     const updateTooltipPosition = (event: MouseEvent) => {
       const shell = shellRef.current;
       if (!shell) return;
       const rect = shell.getBoundingClientRect();
-      setTooltipPos({
-        x: Math.min(Math.max(12, event.clientX - rect.left + 12), rect.width - 24),
-        y: Math.min(Math.max(12, event.clientY - rect.top + 12), rect.height - 24),
-      });
+      const x = Math.min(Math.max(12, event.clientX - rect.left + 18), rect.width - 24);
+      const y = Math.min(Math.max(12, event.clientY - rect.top + 22), rect.height - 24);
+      if (Math.abs(x - lastTooltipPosRef.x) < 8 && Math.abs(y - lastTooltipPosRef.y) < 8) return;
+      lastTooltipPosRef.x = x;
+      lastTooltipPosRef.y = y;
+      setTooltipPos({ x, y });
     };
 
     const syncHoverFromEvent = (event: PointerEvent) => {
@@ -460,8 +465,12 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
         updateTooltipPosition(event);
         return;
       }
-      const target = document.elementFromPoint(event.clientX, event.clientY) as Element | null;
-      const iso3 = resolveMapHoverIso3(target, heatCountsRef.current);
+      const directTarget = event.target instanceof Element ? event.target : null;
+      let iso3 = resolveMapHoverIso3(directTarget, heatCountsRef.current);
+      if (!iso3) {
+        const hitTarget = document.elementFromPoint(event.clientX, event.clientY) as Element | null;
+        iso3 = resolveMapHoverIso3(hitTarget, heatCountsRef.current);
+      }
       setHoveredIso3((current) => (current === iso3 ? current : iso3));
       if (iso3) updateTooltipPosition(event);
     };
@@ -516,9 +525,8 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
         {worldSvg ? (
           <div
             ref={worldRef}
-            className="absolute inset-0 text-primary [&_svg]:absolute [&_svg]:inset-0 [&_svg]:block [&_svg]:h-full [&_svg]:w-full"
+            className="cc-map-world absolute inset-0 text-primary [&_svg]:absolute [&_svg]:inset-0 [&_svg]:block [&_svg]:h-full [&_svg]:w-full"
             aria-hidden="true"
-            dangerouslySetInnerHTML={{ __html: worldSvg }}
           />
         ) : (
           <div className="pointer-events-none absolute inset-0 bg-[url('/world-map.svg')] bg-[length:100%_100%] bg-center bg-no-repeat" aria-hidden="true" />
@@ -557,7 +565,7 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
         </svg>
         {countryPlaced.map(({ country, pos }) => {
           const related = !focus.target || isCountryRelated(country);
-          const focused = isCountryFocused(country) || activeIso3 === country.countryCodeIso3;
+          const focused = isCountryFocused(country);
           return (
             <button
               type="button"
@@ -565,7 +573,7 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
               data-country-iso3={country.countryCodeIso3}
               key={`country-${country.countryCodeIso3}`}
               className={cn(
-                "absolute -translate-x-1/2 -translate-y-1/2 rounded-full outline-none transition-all focus-visible:ring-2 focus-visible:ring-primary/40",
+                "absolute -translate-x-1/2 -translate-y-1/2 rounded-full outline-none focus-visible:ring-2 focus-visible:ring-primary/40",
                 related ? "opacity-100" : "opacity-20",
                 focused ? "ring-4 ring-primary/20" : "",
               )}
