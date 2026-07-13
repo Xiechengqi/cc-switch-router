@@ -360,56 +360,41 @@ fn share_operational_summary(share: &ShareView, now: DateTime<Utc>) -> Operation
 
 fn client_operational_summary(
     client: &DashboardClientView,
-    shares_by_id: &HashMap<String, &ShareView>,
     stale_seconds: i64,
     now: DateTime<Utc>,
 ) -> OperationalSummary {
-    let shares = client
-        .share_ids
-        .iter()
-        .filter_map(|share_id| shares_by_id.get(share_id).copied())
-        .collect::<Vec<_>>();
-    let enabled = shares
-        .iter()
-        .filter(|share| share.share_status.eq_ignore_ascii_case("active"))
-        .copied()
-        .collect::<Vec<_>>();
-    let online = enabled.iter().filter(|share| share.is_online).count();
     let mut reasons = Vec::new();
-    if !enabled.is_empty() && online == 0 {
+    let tunnel_offline = client
+        .client_tunnel
+        .as_ref()
+        .is_some_and(|tunnel| tunnel.enabled && !tunnel.online);
+    let heartbeat_stale = now - client.installation.last_seen_at > Duration::seconds(stale_seconds);
+
+    if tunnel_offline {
         reasons.push(operational_reason(
             "route_offline",
             "critical",
             None,
             Some("client"),
             Some(&client.installation.id),
-            Some("0".to_string()),
-            Some(enabled.len().to_string()),
-        ));
-    } else if online < enabled.len() {
-        reasons.push(operational_reason(
-            "partial_share_outage",
-            "warning",
             None,
+            None,
+        ));
+    } else if client.client_tunnel.is_none() && heartbeat_stale {
+        reasons.push(operational_reason(
+            "route_offline",
+            "critical",
+            Some(client.installation.last_seen_at.to_rfc3339()),
             Some("client"),
             Some(&client.installation.id),
-            Some(online.to_string()),
-            Some(enabled.len().to_string()),
+            None,
+            None,
         ));
     }
-    if let Some(degraded_share) = enabled
-        .iter()
-        .find(|share| share.operational_summary.state == "degraded")
-    {
-        if let Some(mut reason) = degraded_share.operational_summary.primary_reason.clone() {
-            reason.entity_type = Some("share".to_string());
-            reason.entity_id = Some(degraded_share.share_id.clone());
-            reasons.push(reason);
-        }
-    }
-    if let Some(health) = (!enabled.is_empty() || shares.is_empty())
-        .then(|| client.health_checks.last())
-        .flatten()
+
+    if let Some(health) = client
+        .health_checks
+        .last()
         .filter(|entry| !entry.is_healthy)
     {
         reasons.push(operational_reason(
@@ -421,30 +406,6 @@ fn client_operational_summary(
             None,
             None,
         ));
-    }
-
-    let no_enabled_route = enabled.is_empty();
-    let tunnel_offline = client
-        .client_tunnel
-        .as_ref()
-        .is_some_and(|tunnel| tunnel.enabled && !tunnel.online);
-    let heartbeat_stale = now - client.installation.last_seen_at > Duration::seconds(stale_seconds);
-    if no_enabled_route
-        && (tunnel_offline
-            || (client.client_tunnel.is_none() && shares.is_empty() && heartbeat_stale))
-    {
-        reasons.insert(
-            0,
-            operational_reason(
-                "route_offline",
-                "critical",
-                Some(client.installation.last_seen_at.to_rfc3339()),
-                Some("client"),
-                Some(&client.installation.id),
-                None,
-                None,
-            ),
-        );
     }
 
     if reasons
@@ -4211,32 +4172,6 @@ impl AppStore {
                 .or_default()
                 .push(share.share_id.clone());
         }
-        let mut client_online_minutes_by_installation = HashMap::<String, usize>::new();
-        let mut client_health_by_installation = HashMap::<String, Vec<HealthCheckEntry>>::new();
-        let mut client_timeline_by_installation =
-            HashMap::<String, Vec<HealthTimelineBucket>>::new();
-        for share in &share_views {
-            client_online_minutes_by_installation
-                .entry(share.installation_id.clone())
-                .and_modify(|minutes| *minutes = (*minutes).max(share.online_minutes_24h))
-                .or_insert(share.online_minutes_24h);
-            client_health_by_installation
-                .entry(share.installation_id.clone())
-                .and_modify(|entries| {
-                    *entries = merge_health_checks(entries, &share.health_checks);
-                })
-                .or_insert_with(|| share.health_checks.clone());
-            client_timeline_by_installation
-                .entry(share.installation_id.clone())
-                .and_modify(|timeline| {
-                    *timeline = merge_health_timeline(timeline, &share.health_timeline);
-                })
-                .or_insert_with(|| share.health_timeline.clone());
-        }
-        let share_views_by_id = share_views
-            .iter()
-            .map(|share| (share.share_id.clone(), share))
-            .collect::<HashMap<_, _>>();
         let mut client_views = installation_views
             .iter()
             .cloned()
@@ -4249,18 +4184,12 @@ impl AppStore {
                 let client_tunnel_online = tunnel_record
                     .map(|tunnel| tunnel.enabled && active_subdomains.contains(&tunnel.subdomain))
                     .unwrap_or(false);
-                let mut online_minutes_24h = client_online_minutes_by_installation
+                let mut online_minutes_24h = online_by_installation
                     .get(&installation.id)
                     .copied()
                     .unwrap_or(0);
-                if share_count == 0 {
-                    online_minutes_24h = online_by_installation
-                        .get(&installation.id)
-                        .copied()
-                        .unwrap_or(online_minutes_24h);
-                    if online_minutes_24h == 0 && client_tunnel_online {
-                        online_minutes_24h = 1;
-                    }
+                if online_minutes_24h == 0 && client_tunnel_online {
+                    online_minutes_24h = 1;
                 }
                 let online_rate_24h =
                     ((online_minutes_24h as f64 / ONLINE_WINDOW_MINUTES as f64) * 100.0).min(100.0);
@@ -4272,35 +4201,23 @@ impl AppStore {
                     online: client_tunnel_online,
                 });
                 let payout_profile = payout_profiles.get(&installation.id).cloned();
-                let mut health_checks = client_health_by_installation
+                let mut health_checks = health_by_installation
                     .get(&installation.id)
                     .cloned()
                     .unwrap_or_default();
-                if share_count == 0 {
-                    health_checks = health_by_installation
-                        .get(&installation.id)
-                        .cloned()
-                        .unwrap_or(health_checks);
-                    if client_tunnel_online {
-                        if health_checks.is_empty() {
-                            append_recent_online_health_checks(&mut health_checks, 10);
-                        } else {
-                            append_current_online_health_check(&mut health_checks);
-                        }
+                if client_tunnel_online {
+                    if health_checks.is_empty() {
+                        append_recent_online_health_checks(&mut health_checks, 10);
+                    } else {
+                        append_current_online_health_check(&mut health_checks);
                     }
                 }
-                let mut health_timeline = client_timeline_by_installation
+                let mut health_timeline = health_timeline_by_installation
                     .get(&installation.id)
                     .cloned()
                     .unwrap_or_default();
-                if share_count == 0 {
-                    health_timeline = health_timeline_by_installation
-                        .get(&installation.id)
-                        .cloned()
-                        .unwrap_or(health_timeline);
-                    if health_timeline.is_empty() && client_tunnel_online {
-                        health_timeline = current_online_health_timeline(health_timeline_start);
-                    }
+                if health_timeline.is_empty() && client_tunnel_online {
+                    health_timeline = current_online_health_timeline(health_timeline_start);
                 }
                 let mut view = DashboardClientView {
                     share_count,
@@ -4315,12 +4232,8 @@ impl AppStore {
                     operational_summary: OperationalSummary::healthy("online"),
                     removal_at: None,
                 };
-                view.operational_summary = client_operational_summary(
-                    &view,
-                    &share_views_by_id,
-                    config.client_stale_secs,
-                    Utc::now(),
-                );
+                view.operational_summary =
+                    client_operational_summary(&view, config.client_stale_secs, Utc::now());
                 if view.operational_summary.state == "offline" {
                     view.removal_at = installation_removal_at.get(&view.installation.id).copied();
                 }
@@ -14008,60 +13921,6 @@ fn aggregate_market_health_checks(
         .collect()
 }
 
-fn merge_health_checks(
-    left: &[HealthCheckEntry],
-    right: &[HealthCheckEntry],
-) -> Vec<HealthCheckEntry> {
-    let mut by_minute = BTreeMap::<i64, bool>::new();
-    for entry in left.iter().chain(right.iter()) {
-        let minute = entry.checked_at.div_euclid(60);
-        by_minute
-            .entry(minute)
-            .and_modify(|healthy| *healthy |= entry.is_healthy)
-            .or_insert(entry.is_healthy);
-    }
-    by_minute
-        .into_iter()
-        .rev()
-        .take(10)
-        .map(|(minute, is_healthy)| HealthCheckEntry {
-            checked_at: minute * 60,
-            is_healthy,
-        })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect()
-}
-
-fn merge_health_timeline(
-    left: &[HealthTimelineBucket],
-    right: &[HealthTimelineBucket],
-) -> Vec<HealthTimelineBucket> {
-    let mut by_start = BTreeMap::<String, HealthTimelineBucket>::new();
-    for bucket in left.iter().chain(right.iter()) {
-        by_start
-            .entry(bucket.start_at.clone())
-            .and_modify(|existing| {
-                existing.score = existing.score.max(bucket.score);
-                existing.online_minutes = existing.online_minutes.max(bucket.online_minutes);
-                existing.observed_minutes = existing.observed_minutes.max(bucket.observed_minutes);
-                existing.request_count += bucket.request_count;
-                existing.failure_count += bucket.failure_count;
-                existing.status = stronger_timeline_status(&existing.status, &bucket.status);
-            })
-            .or_insert_with(|| bucket.clone());
-    }
-    by_start
-        .into_values()
-        .rev()
-        .take(48)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect()
-}
-
 fn current_online_health_timeline(start: i64) -> Vec<HealthTimelineBucket> {
     let current = Utc::now().timestamp();
     (0..HEALTH_TIMELINE_BUCKETS)
@@ -14082,21 +13941,6 @@ fn current_online_health_timeline(start: i64) -> Vec<HealthTimelineBucket> {
             }
         })
         .collect()
-}
-
-fn stronger_timeline_status(left: &str, right: &str) -> String {
-    let score = |status: &str| match status {
-        "healthy" => 4,
-        "degraded" => 3,
-        "unhealthy" => 2,
-        "offline" => 1,
-        _ => 0,
-    };
-    if score(right) > score(left) {
-        right.to_string()
-    } else {
-        left.to_string()
-    }
 }
 
 fn dashboard_market_to_share_link(market: &DashboardMarketView) -> ShareMarketLinkView {
@@ -21133,7 +20977,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dashboard_operational_summary_marks_missing_active_route_offline() {
+    async fn dashboard_operational_summary_keeps_client_online_when_only_share_route_missing() {
         let (store, config) = setup_store("dashboard-operational-offline").await;
         insert_installation(&store, "inst-1").await;
         insert_share(&store, "inst-1", "share-offline", "offline-sub", "active").await;
@@ -21159,6 +21003,49 @@ mod tests {
                 .as_ref()
                 .map(|reason| reason.code.as_str()),
             Some("route_offline")
+        );
+        assert_eq!(snapshot.clients[0].operational_summary.state, "online");
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn dashboard_operational_summary_marks_client_tunnel_offline_independently_of_shares() {
+        let (store, config) = setup_store("dashboard-client-tunnel-offline").await;
+        insert_installation(&store, "inst-1").await;
+        insert_client_tunnel(&store, "inst-1", "owner@example.com", "client-sub").await;
+        insert_share(&store, "inst-1", "share-online", "share-sub", "active").await;
+
+        let proxy = ProxyRegistry::default();
+        proxy
+            .set_route(
+                "share-sub".into(),
+                "http://127.0.0.1:1".into(),
+                None,
+                Some("share-online".into()),
+                Some("Share".into()),
+                false,
+                -1,
+                None,
+            )
+            .await;
+
+        let snapshot = store
+            .dashboard_snapshot(
+                &config,
+                &ServerGeo {
+                    lat: None,
+                    lon: None,
+                },
+                &proxy,
+                None,
+            )
+            .await
+            .expect("dashboard snapshot");
+
+        assert!(
+            snapshot.shares.first().expect("share").is_online,
+            "share route should be online for this scenario"
         );
         assert_eq!(snapshot.clients[0].operational_summary.state, "offline");
 

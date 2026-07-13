@@ -90,6 +90,8 @@ export const ShareCard = React.memo(function ShareCard({
   const title = shareDisplayTitle(share);
   const description = share.description?.trim() || "";
   const usagePercent = !isUnlimited(tokenLimit) && Number(tokenLimit) > 0 ? Math.min(100, Math.max(0, (tokensUsed / Number(tokenLimit)) * 100)) : null;
+  const onlineRate = share.onlineRate24h || 0;
+  const onlineTitle = `${onlineRate.toFixed(1)}% online in last 24h (${share.onlineMinutes24h || 0} / 1440 min)`;
   const editPending = share.canManage && share.activeEdit?.status === "pending";
   const editRejected = share.canManage && share.activeEdit?.status === "rejected";
   const focused = focus.isFocused("share", share.shareId);
@@ -152,7 +154,7 @@ export const ShareCard = React.memo(function ShareCard({
           <span className="truncate opacity-80" title={[accountLevel, accountIdentity].filter(Boolean).join(" · ")}>{[accountLevel, accountIdentity].filter((value) => value && value !== "-").join(" · ") || t("dashboard.providerUnavailable")}</span>
         </div>
 
-        <div className="grid grid-cols-2 gap-3 text-[11px]">
+        <div className="grid grid-cols-3 gap-2 text-[11px]">
           <div className="min-w-0">
             <span className="block text-muted-foreground">{t("dashboard.usage")}</span>
             <strong className="tabular-nums">{compactTokens(tokensUsed)} / {isUnlimited(tokenLimit) ? "∞" : compactTokens(tokenLimit)}</strong>
@@ -162,6 +164,10 @@ export const ShareCard = React.memo(function ShareCard({
             <span className="block text-muted-foreground">{t("dashboard.parallel")}</span>
             <strong className="tabular-nums">{activeRequests}<span className="text-muted-foreground">/{isUnlimited(parallelLimit) ? "∞" : parallelLimit || 0}</span></strong>
             <span className="mt-1 block truncate text-[10px] text-muted-foreground">{share.forSale === "No" ? t("dashboard.notListed") : marketCount == null ? t("dashboard.allMarkets") : t("dashboard.marketsCount", { count: marketCount })}</span>
+          </div>
+          <div>
+            <span className="block text-muted-foreground">{t("dashboard.uptime24h")}</span>
+            <strong className={`tabular-nums ${onlineRate < 90 ? "text-amber-700" : "text-emerald-700"}`} title={onlineTitle}>{onlineRate.toFixed(1)}%</strong>
           </div>
         </div>
 

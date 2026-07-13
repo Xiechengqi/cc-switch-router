@@ -39,20 +39,30 @@ export function shareOperationalSummary(share: ShareView): OperationalSummary {
   return share.operationalSummary || fallbackShareSummary(share);
 }
 
-export function clientOperationalSummary(client: DashboardClient, shares: ShareView[]): OperationalSummary {
+export function clientOperationalSummary(client: DashboardClient, _shares: ShareView[] = []): OperationalSummary {
   if (client.operationalSummary) return client.operationalSummary;
-  const enabled = shares.filter(shareIsEnabled);
-  const online = enabled.filter((share) => share.isOnline);
-  if (enabled.length && online.length === 0) {
-    return { state: "offline", primaryReason: { code: "route_offline", severity: "critical", entityType: "client", entityId: client.installation.id, currentValue: "0", threshold: String(enabled.length) }, additionalReasonCount: 0 };
+  const latestHealth = client.healthChecks?.at(-1);
+  if (latestHealth && !latestHealth.isHealthy) {
+    return {
+      state: "degraded",
+      primaryReason: {
+        code: "health_check_failed",
+        severity: "warning",
+        entityType: "client",
+        entityId: client.installation.id,
+      },
+      additionalReasonCount: 0,
+    };
   }
-  if (online.length < enabled.length) {
-    return { state: "degraded", primaryReason: { code: "partial_share_outage", severity: "warning", entityType: "client", entityId: client.installation.id, currentValue: String(online.length), threshold: String(enabled.length) }, additionalReasonCount: 0 };
-  }
-  const degraded = enabled.find((share) => shareOperationalSummary(share).state === "degraded");
-  if (degraded) return { ...shareOperationalSummary(degraded), state: "degraded" };
-  if (!enabled.length && client.clientTunnel && !client.clientTunnel.online) {
-    return { state: "offline", primaryReason: { code: "route_offline", severity: "critical", entityType: "client", entityId: client.installation.id }, additionalReasonCount: 0 };
+  if (client.clientTunnel) {
+    if (client.clientTunnel.enabled && !client.clientTunnel.online) {
+      return {
+        state: "offline",
+        primaryReason: { code: "route_offline", severity: "critical", entityType: "client", entityId: client.installation.id },
+        additionalReasonCount: 0,
+      };
+    }
+    return { state: "online", additionalReasonCount: 0 };
   }
   return { state: "online", additionalReasonCount: 0 };
 }
