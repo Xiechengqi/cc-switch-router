@@ -166,6 +166,8 @@ function shellTooltipPosition(shell: HTMLElement, clientX: number, clientY: numb
 
 const HEAT_BASE_FILL_OPACITY = 0.08;
 const HEAT_MAX_FILL_BOOST = 0.34;
+const MAP_DEFAULT_FILL_OPACITY = 0.11;
+const MAP_DEFAULT_STROKE_OPACITY = 0.18;
 
 function countryHeatFillOpacity(count: number, max: number) {
   if (count <= 0 || max <= 0) return HEAT_BASE_FILL_OPACITY;
@@ -200,20 +202,16 @@ function applyCountryHeatDOM(
     element.style.transition = "none";
     element.style.pointerEvents = interactive ? "auto" : "none";
     element.style.cursor = interactive ? "pointer" : "default";
-    if (heatEnabled && interactive) {
+    if (heatEnabled) {
       const fillOpacity = String(countryHeatFillOpacity(count, max));
       const strokeOpacity = String(countryHeatStrokeOpacity(count, max));
-      if (element.style.fillOpacity !== fillOpacity) {
-        element.style.fillOpacity = fillOpacity;
-      }
-      if (element.style.strokeOpacity !== strokeOpacity) {
-        element.style.strokeOpacity = strokeOpacity;
-      }
-      element.style.strokeWidth = "0.28";
+      element.style.fillOpacity = fillOpacity;
+      element.style.strokeOpacity = strokeOpacity;
+      element.style.strokeWidth = interactive ? "0.28" : "0.24";
     } else {
-      element.style.removeProperty("fill-opacity");
-      element.style.removeProperty("stroke-opacity");
-      element.style.removeProperty("stroke-width");
+      element.style.fillOpacity = String(MAP_DEFAULT_FILL_OPACITY);
+      element.style.strokeOpacity = String(MAP_DEFAULT_STROKE_OPACITY);
+      element.style.strokeWidth = "0.28";
     }
   }
 }

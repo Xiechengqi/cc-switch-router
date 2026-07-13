@@ -25,26 +25,21 @@ export function MapCountryTooltip({
   return (
     <div
       className={cn(
-        "pointer-events-none w-[min(92vw,280px)] select-none rounded-xl border border-slate-200/90 bg-white/95 p-3 text-left shadow-[0_16px_40px_rgba(15,23,42,0.14)] backdrop-blur-md",
+        "pointer-events-none max-w-[min(92vw,240px)] select-none rounded-lg border border-slate-200/60 bg-white/55 px-2.5 py-2 text-left shadow-[0_8px_24px_rgba(15,23,42,0.10)] backdrop-blur-sm",
         className,
       )}
       style={style}
       data-map-country-tooltip
     >
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <div className="text-sm font-semibold text-foreground">
-            {countryFlag(board.countryCode)} {title}
-          </div>
-          <div className="mt-2 space-y-1 text-[11px] text-muted-foreground">
-            <div>{t("map.countryClients", { count: board.clientCount })}</div>
-            <div>{t("map.countryShares", { count: board.shareCount })}</div>
-            <div>{t("map.countryInflight", { count: board.inflightRequests })}</div>
-          </div>
-        </div>
-        <div className="shrink-0 rounded-md bg-slate-100 px-2 py-1 text-[10px] font-medium text-slate-600">
-          {t("map.onlineShares", { count: board.onlineShareCount })}
-        </div>
+      <div className="truncate text-[12px] font-semibold text-foreground">
+        {countryFlag(board.countryCode)} {title}
+      </div>
+      <div className="mt-1 truncate text-[11px] text-muted-foreground">
+        {t("map.countrySummary", {
+          clients: board.clientCount,
+          shares: board.shareCount,
+          inflight: board.inflightRequests,
+        })}
       </div>
     </div>
   );
