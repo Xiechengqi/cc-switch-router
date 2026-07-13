@@ -402,10 +402,34 @@ const MODEL_MAPPING_METADATA = new Set([
   "model",
 ]);
 
+function normalizedProviderType(runtime?: ShareUpstreamProvider) {
+  return String(runtime?.providerType || runtime?.kind || "").trim().toLowerCase();
+}
+
+function normalizedProviderName(runtime?: ShareUpstreamProvider) {
+  return String(runtime?.providerName || "").trim().toLowerCase();
+}
+
+function resolvedApiKeyProviderType(runtime?: ShareUpstreamProvider) {
+  const providerType = normalizedProviderType(runtime);
+  if (API_KEY_PROVIDER_TYPES.has(providerType)) return providerType;
+  const providerName = normalizedProviderName(runtime);
+  if (providerName.includes("nvidia")) return "nvidia";
+  if (providerName.includes("deepseek") && providerName.includes("api")) return "deepseek_api";
+  if (providerName.includes("openrouter")) return "openrouter";
+  if (providerName.includes("ollama")) return "ollama_cloud";
+  const apiUrl = String(runtime?.apiUrl || "").trim().toLowerCase();
+  if (apiUrl.includes("integrate.api.nvidia.com")) return "nvidia";
+  if (apiUrl.includes("api.deepseek.com")) return "deepseek_api";
+  if (apiUrl.includes("openrouter.ai")) return "openrouter";
+  if (apiUrl.includes("ollama.com")) return "ollama_cloud";
+  return "";
+}
+
 export function runtimeApiUrl(runtime?: ShareUpstreamProvider) {
   const direct = String(runtime?.apiUrl || "").trim();
   if (direct && !isOfficialMarker(direct)) return direct;
-  const providerType = String(runtime?.providerType || "").trim().toLowerCase();
+  const providerType = resolvedApiKeyProviderType(runtime);
   return API_KEY_PROVIDER_DEFAULT_URLS[providerType] || "";
 }
 
@@ -520,8 +544,7 @@ export function isApiProviderRuntime(runtime?: ShareUpstreamProvider) {
   if (!runtime || isCursorApiKeyRuntime(runtime) || runtimeLooksOAuth(runtime)) {
     return false;
   }
-  const providerType = String(runtime.providerType || "").trim().toLowerCase();
-  if (API_KEY_PROVIDER_TYPES.has(providerType)) {
+  if (resolvedApiKeyProviderType(runtime)) {
     return true;
   }
   return hasConcreteApiUrl(runtime);
@@ -714,6 +737,9 @@ export function providerAccountLevel(runtime?: ShareUpstreamProvider, locale: Ap
 }
 
 export function providerAccountIdentity(runtime?: ShareUpstreamProvider) {
+  if (isApiProviderRuntime(runtime)) {
+    return "-";
+  }
   if (isCursorApiKeyRuntime(runtime)) {
     const name = String(runtime?.providerName || "").trim();
     if (name) return name;
@@ -827,7 +853,18 @@ export function providerActualModelNames(runtime?: ShareUpstreamProvider) {
   const names = models
     .map((item) => String(item.actualModel || "").trim())
     .filter((name) => name && !isOfficialMarker(name) && !MODEL_MAPPING_METADATA.has(name.toLowerCase()));
-  return names.length ? [...new Set(names)].join(" · ") : "-";
+  const deduped = [...new Set(names)];
+  if (deduped.length === 1) {
+    return deduped[0];
+  }
+  if (deduped.length > 1) {
+    const withoutMetadata = deduped.filter((name) => !MODEL_MAPPING_METADATA.has(name.toLowerCase()));
+    if (withoutMetadata.length === 1) {
+      return withoutMetadata[0];
+    }
+    return withoutMetadata.join(" · ");
+  }
+  return "-";
 }
 
 export function modelHealthTone(share: ShareView, key: "claude" | "codex" | "gemini") {
