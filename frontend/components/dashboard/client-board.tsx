@@ -1,7 +1,7 @@
 "use client";
 
 import { Button, Card, Chip, Drawer, toast } from "@heroui/react";
-import { Check, ChevronDown, Copy, Maximize2, PanelRightOpen, Search, WalletCards } from "lucide-react";
+import { Check, ChevronDown, Copy, ExternalLink, Maximize2, PanelRightOpen, Search, WalletCards } from "lucide-react";
 import * as React from "react";
 import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog";
 import { ShareCard } from "@/components/dashboard/share-card";
@@ -259,7 +259,7 @@ const ShareScroller = React.memo(function ShareScroller({
           {disabledCount > 0 ? <span>{disabledCount} {t("common.disabled")}</span> : null}
         </div>
       </div>
-        <div className="grid min-w-0 grid-cols-3 gap-3" aria-label={t("dashboard.shares")}>
+        <div className="grid min-w-0 grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-4" aria-label={t("dashboard.shares")}>
           {shares.map((share) => (
             <ShareCard key={share.shareId} share={share} referenceTunnelUrl={referenceTunnelUrl} onOpen={onOpenShare} onEdit={onEditShare} onConnect={onConnectShare} />
           ))}
@@ -359,11 +359,12 @@ function ClientCard({
                   target="_blank"
                   rel="noopener noreferrer"
                   data-no-row-drawer
-                  className="truncate text-sm font-semibold text-foreground underline-offset-4 hover:underline"
+                  className="inline-flex min-w-0 max-w-full items-center gap-1 truncate text-sm font-semibold text-foreground underline-offset-4 hover:underline"
                   title={identityUrl}
                   onClick={(event) => event.stopPropagation()}
                 >
-                  {identity}
+                  <span className="truncate">{identity}</span>
+                  <ExternalLink className="h-3 w-3 shrink-0 text-muted-foreground" aria-hidden />
                 </a>
               ) : (
                 <strong className="truncate text-sm font-semibold text-foreground" title={identity}>{identity}</strong>

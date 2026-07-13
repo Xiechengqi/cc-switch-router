@@ -1,7 +1,7 @@
 "use client";
 
 import { Card } from "@heroui/react";
-import { Eye, Link2, Pencil } from "lucide-react";
+import { Eye, ExternalLink, Link2, Pencil } from "lucide-react";
 import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { operationalReasonLabel, shareOperationalSummary } from "@/components/dashboard/operational-status";
@@ -157,32 +157,52 @@ export const ShareCard = React.memo(function ShareCard({
         openShareDrawer();
       }}
     >
-      <Card.Content className="grid min-h-[178px] min-w-0 cursor-pointer select-text grid-rows-[auto_auto_1fr_auto] gap-2.5 p-3">
-        <div className="flex min-w-0 items-start justify-between gap-2">
-          <div className="min-w-0">
+      <Card.Content className="grid min-h-[150px] min-w-0 cursor-pointer select-text grid-rows-[auto_auto_1fr] gap-2.5 p-3">
+        <div className="grid min-w-0 gap-1">
+          <div className="flex min-w-0 items-center justify-between gap-2">
             <div className="flex min-w-0 items-center gap-1.5">
+              <span className={`h-2 w-2 shrink-0 rounded-full ${statusDot}`} title={issue || summary.state} />
               {titleUrl ? (
                 <a
                   href={titleUrl}
                   target="_blank"
                   rel="noopener noreferrer"
                   data-no-row-drawer
-                  className="truncate text-sm font-semibold text-foreground underline-offset-4 hover:underline"
+                  className="inline-flex min-w-0 max-w-full items-center gap-1 truncate text-sm font-semibold text-foreground underline-offset-4 hover:underline"
                   title={titleUrl}
                   onClick={(event) => event.stopPropagation()}
                 >
-                  {title}
+                  <span className="truncate">{title}</span>
+                  <ExternalLink className="h-3 w-3 shrink-0 text-muted-foreground" aria-hidden />
                 </a>
               ) : (
                 <strong className="truncate text-sm font-semibold text-foreground" title={title}>{title}</strong>
               )}
               {app ? <span className="rounded bg-primary/10 px-1.5 py-0.5 text-[9px] font-semibold text-primary">{SHARE_APP_LABELS[app]}</span> : null}
             </div>
-            {description ? (
-              <span className="block truncate text-[10px] text-muted-foreground" title={description}>{description}</span>
-            ) : null}
+            <div className="flex shrink-0 items-center gap-1">
+              <button type="button" data-no-row-drawer disabled={connectDisabled} title={connectDisabled ? issue || t("common.offline") : undefined} className="inline-flex h-6 items-center gap-1 rounded-md border border-primary/20 bg-primary/5 px-2 text-[10px] font-semibold text-primary hover:bg-primary/10 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-50 disabled:text-slate-400" onClick={(event) => { event.stopPropagation(); if (!connectDisabled) onConnect(share); }}>
+                <Link2 className="h-3 w-3" />{t("dashboard.connect")}
+              </button>
+              <button
+                type="button"
+                data-no-row-drawer
+                disabled={editPending}
+                title={editRejected ? share.activeEdit?.errorMessage || t("dashboard.applyFailedFallback") : undefined}
+                className={secondaryActionClass}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  if (!editPending) onEdit(share);
+                }}
+              >
+                {share.canManage ? <Pencil className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
+                {editLabel}
+              </button>
+            </div>
           </div>
-          <span className={`mt-1 h-2 w-2 shrink-0 rounded-full ${statusDot}`} title={issue || summary.state} />
+          {description ? (
+            <span className="block truncate text-[10px] text-muted-foreground" title={description}>{description}</span>
+          ) : null}
         </div>
 
         <div className={`grid min-w-0 gap-1 rounded-md border px-2 py-1.5 text-[11px] ${healthTone.className}`} title={app ? modelHealthTitle(share, app) : undefined}>
@@ -238,39 +258,6 @@ export const ShareCard = React.memo(function ShareCard({
               <span className="block text-muted-foreground">{t("dashboard.forSale")}</span>
               <span className="block truncate text-foreground" title={saleLabel}>{saleLabel}</span>
             </div>
-          </div>
-        </div>
-
-        <div className="grid gap-2 border-t pt-2">
-          <div className="flex flex-wrap items-center justify-end gap-1">
-            <button type="button" data-no-row-drawer disabled={connectDisabled} title={connectDisabled ? issue || t("common.offline") : undefined} className="inline-flex h-6 items-center gap-1 rounded-md border border-primary/20 bg-primary/5 px-2 text-[10px] font-semibold text-primary hover:bg-primary/10 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-50 disabled:text-slate-400" onClick={(event) => { event.stopPropagation(); if (!connectDisabled) onConnect(share); }}>
-              <Link2 className="h-3 w-3" />{t("dashboard.connect")}
-            </button>
-            <button
-              type="button"
-              data-no-row-drawer
-              disabled={editPending}
-              title={editRejected ? share.activeEdit?.errorMessage || t("dashboard.applyFailedFallback") : undefined}
-              className={secondaryActionClass}
-              onClick={(event) => {
-                event.stopPropagation();
-                if (!editPending) onEdit(share);
-              }}
-            >
-              {share.canManage ? <Pencil className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
-              {editLabel}
-            </button>
-            <button
-              type="button"
-              data-no-row-drawer
-              className={secondaryActionClass}
-              onClick={(event) => {
-                event.stopPropagation();
-                openShareDrawer();
-              }}
-            >
-              {t("dashboard.details")}
-            </button>
           </div>
         </div>
       </Card.Content>
