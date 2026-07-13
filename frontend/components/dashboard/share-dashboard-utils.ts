@@ -6,6 +6,10 @@ import type { AppLocale } from "@/lib/i18n";
 import type { DashboardClient, DashboardMarket, HealthCheckEntry, MarketRequestLog, ModelHealthSummary, ShareAppProvider, ShareAppRuntimes, ShareRequestLog, ShareUpstreamProvider, ShareView } from "@/lib/types";
 import { formatDateTime } from "@/lib/utils";
 
+export function modelHealthCheckedAt(entry: Pick<ModelHealthSummary, "checkedAt" | "lastCheckedAt">) {
+  return Number(entry.checkedAt ?? entry.lastCheckedAt ?? 0);
+}
+
 let rowPointerDown: { x: number; y: number } | null = null;
 
 export function onRowPointerDown(event: React.MouseEvent<HTMLElement> | React.PointerEvent<HTMLElement>) {
@@ -500,7 +504,7 @@ export function relevantModelHealthEntries(share: ShareView, key: "claude" | "co
 export function modelHealthFailureReason(entries: ModelHealthSummary[]) {
   const failed = entries
     .filter((entry) => entry.status === "failed" || (entry.recentResults || []).includes("failed"))
-    .sort((left, right) => Number(right.lastCheckedAt || 0) - Number(left.lastCheckedAt || 0))[0];
+    .sort((left, right) => modelHealthCheckedAt(right) - modelHealthCheckedAt(left))[0];
   const code = Number(failed?.statusCode || 0);
   const message = String(failed?.errorMessage || "").toLowerCase();
   if (code === 429 || message.includes("429") || message.includes("rate limit") || message.includes("rate limited") || message.includes("usage limit")) return "Rate Limited";
@@ -911,7 +915,7 @@ export function modelHealthTitle(share: ShareView, key: "claude" | "codex" | "ge
   return entries
     .map((entry) => {
       const recent = (entry.recentResults || []).join(" / ") || entry.status;
-      const checked = entry.lastCheckedAt ? formatDateTime(entry.lastCheckedAt * 1000) : "-";
+      const checked = modelHealthCheckedAt(entry) ? formatDateTime(modelHealthCheckedAt(entry) * 1000) : "-";
       const model = entry.requestedModel || entry.actualModel || "-";
       return `${model}: ${recent} · ${checked}${entry.errorMessage ? ` · ${entry.errorMessage}` : ""}`;
     })

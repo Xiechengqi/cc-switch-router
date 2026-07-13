@@ -929,9 +929,9 @@ pub struct ShareEditAvailableEvent {
 pub struct ShareSyncOperation {
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub share: Option<ShareDescriptor>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub share_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share: Option<ShareDescriptor>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1042,7 +1042,12 @@ pub struct ModelHealthSummary {
     pub status: String,
     #[serde(default)]
     pub recent_results: Vec<String>,
-    #[serde(default, alias = "checkedAt", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "checkedAt",
+        alias = "lastCheckedAt",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub last_checked_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_success_at: Option<i64>,
@@ -1688,11 +1693,11 @@ pub struct ShareAppProvider {
     pub kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_type: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub is_current: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub enabled: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub codex_image_generation_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub for_sale_official_price_percent: Option<u16>,

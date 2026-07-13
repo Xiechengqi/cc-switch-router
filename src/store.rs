@@ -20534,6 +20534,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_sync_shares_accepts_model_health_checked_at_wire_format() {
+        let (store, config) = setup_store("signed-share-batch-model-health").await;
+        let signing_key = insert_signed_installation(&store, "inst-batch-health").await;
+
+        let ops: Vec<ShareSyncOperation> = serde_json::from_value(serde_json::json!([{
+            "kind": "upsert",
+            "share": {
+                "shareId": "share-batch-health-1",
+                "shareName": "Batch Health Share",
+                "ownerEmail": "owner@example.com",
+                "subdomain": "batch-health-sub",
+                "appType": "codex",
+                "providerId": "provider-batch-health",
+                "bindings": { "codex": "provider-batch-health" },
+                "tokenLimit": -1,
+                "parallelLimit": -1,
+                "tokensUsed": 0,
+                "requestsCount": 0,
+                "shareStatus": "active",
+                "createdAt": "2026-01-01T00:00:00Z",
+                "expiresAt": "2099-01-01T00:00:00Z",
+                "support": { "claude": false, "codex": true, "gemini": false },
+                "appProviders": {
+                    "codex": [{
+                        "id": "provider-batch-health",
+                        "name": "Codex Provider",
+                        "app": "codex",
+                        "isCurrent": true,
+                        "enabled": true
+                    }]
+                },
+                "modelHealth": {
+                    "codex": [{
+                        "appType": "codex",
+                        "requestedModel": "gpt-5",
+                        "actualModel": "gpt-5",
+                        "status": "healthy",
+                        "recentResults": ["healthy"],
+                        "latencyMs": 120,
+                        "checkedAt": 1783917271880_i64,
+                        "source": "health_check",
+                        "providerId": "provider-batch-health",
+                        "providerName": "Codex Provider"
+                    }],
+                    "claude": [],
+                    "gemini": []
+                },
+                "configRevision": 1,
+                "autoStart": true
+            }
+        }]))
+        .expect("parse server-style batch sync ops");
+
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            "inst-batch-health",
+            "share_batch_sync",
+            &ops,
+            timestamp_ms,
+            &nonce,
+        );
+
+        store
+            .batch_sync_shares(
+                ShareBatchSyncRequest {
+                    installation_id: "inst-batch-health".into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    ops,
+                },
+                ClientMetadata {
+                    ip: Some("127.0.0.1".into()),
+                    country_code: None,
+                },
+                "owner@example.com",
+            )
+            .await
+            .expect("batch sync with checkedAt model health should verify");
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
     async fn upsert_share_requires_one_matching_provider_binding() {
         let (store, config) = setup_store("share-single-binding-validation").await;
         let conn = store.conn.lock().await;

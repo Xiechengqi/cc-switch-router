@@ -605,11 +605,16 @@ export type ModelHealthSummary = {
   actualModel: string;
   status: "success" | "failed" | "skipped" | string;
   recentResults?: string[];
+  checkedAt?: number;
   lastCheckedAt?: number;
   lastSuccessAt?: number;
   lastFailedAt?: number;
   errorMessage?: string;
   statusCode?: number;
+  latencyMs?: number;
+  source?: string;
+  providerId?: string;
+  providerName?: string;
 };
 
 export type ShareModelHealthSummary = {
