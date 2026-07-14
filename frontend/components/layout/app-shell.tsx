@@ -2,6 +2,7 @@
 
 import Image from "next/image";
 import Link from "next/link";
+import { usePathname } from "next/navigation";
 import { Button, Dropdown, ListBox, Modal, Select, Tabs } from "@heroui/react";
 import { Activity, Copy, Eye, EyeOff, KeyRound, Loader2, LogOut, RotateCcw, Settings, UserRound } from "lucide-react";
 import * as React from "react";
@@ -13,6 +14,7 @@ import { refreshAccessToken } from "@/lib/auth";
 import { getUserApiToken, resetUserApiToken } from "@/lib/api";
 import { DashboardDataProvider, useDashboardData } from "@/components/dashboard/dashboard-data";
 import type { AppLocale } from "@/lib/i18n";
+import { DASHBOARD_CLIENTS_PATH, DASHBOARD_MARKETS_PATH, type DashboardShellActive } from "@/lib/dashboard-nav";
 import type { UserApiTokenStatus } from "@/lib/types";
 
 type RegionOption = {
@@ -261,7 +263,32 @@ function ApiTokenDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (
   );
 }
 
-function Topbar({ active }: { active: "dashboard" | "settings" | "metrics" }) {
+function DashboardNav({ active }: { active: "clients" | "markets" }) {
+  const { t } = useLocaleText();
+  const pathname = usePathname() || DASHBOARD_CLIENTS_PATH;
+  const tabClass = (tab: "clients" | "markets") => {
+    const selected =
+      active === tab ||
+      (tab === "clients" && pathname.startsWith("/clients")) ||
+      (tab === "markets" && pathname.startsWith("/markets"));
+    return `inline-flex h-8 items-center rounded-md px-3 text-xs font-medium transition-colors ${
+      selected ? "bg-primary/10 text-primary" : "text-muted-foreground hover:bg-slate-100 hover:text-foreground"
+    }`;
+  };
+
+  return (
+    <nav className="flex items-center gap-1 rounded-lg border border-border bg-card p-1" aria-label={t("nav.dashboardSections")}>
+      <Link href={DASHBOARD_CLIENTS_PATH} className={tabClass("clients")}>
+        {t("nav.clientsTab")}
+      </Link>
+      <Link href={DASHBOARD_MARKETS_PATH} className={tabClass("markets")}>
+        {t("nav.marketsTab")}
+      </Link>
+    </nav>
+  );
+}
+
+function Topbar({ active }: { active: DashboardShellActive }) {
   const { session, loading, logout } = useAuth();
   const { t } = useLocaleText();
   const [loginOpen, setLoginOpen] = React.useState(false);
@@ -271,6 +298,8 @@ function Topbar({ active }: { active: "dashboard" | "settings" | "metrics" }) {
   const dashboard = useDashboardData();
   const redirectStartedRef = React.useRef(false);
   const authed = !!session?.authenticated;
+  const showDashboardNav = active === "clients" || active === "markets";
+  const showLive = showDashboardNav;
 
   React.useEffect(() => {
     setClientRedirect(sameRouterDomainClientRedirect(new URLSearchParams(window.location.search).get("clientRedirect")));
@@ -301,16 +330,26 @@ function Topbar({ active }: { active: "dashboard" | "settings" | "metrics" }) {
   }, [authed, clientRedirect, loading]);
 
   return (
-    <header className="mx-auto flex w-[calc(100%-2rem)] max-w-7xl items-center justify-between gap-4 py-5">
-      <Link href="/" className="flex items-center gap-3">
-        <Image src="/router-logo.svg" alt="" width={36} height={36} className="h-9 w-9" priority />
-        <span className="grid gap-1">
-          <span className="text-base font-extrabold leading-none">CC-Switch Router</span>
-          <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
-            {routerName || t("nav.router")}{active === "dashboard" ? <> · <span className={dashboard.fresh ? "text-emerald-700" : "text-amber-700"}>{dashboard.fresh ? "LIVE" : "STALE"}</span></> : null}
+    <header className="mx-auto flex w-[calc(100%-2rem)] max-w-7xl flex-wrap items-center justify-between gap-4 py-5">
+      <div className="flex min-w-0 items-center gap-4">
+        <Link href={DASHBOARD_CLIENTS_PATH} className="flex items-center gap-3">
+          <Image src="/router-logo.svg" alt="" width={36} height={36} className="h-9 w-9" priority />
+          <span className="grid gap-1">
+            <span className="text-base font-extrabold leading-none">CC-Switch Router</span>
+            <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
+              {routerName || t("nav.router")}
+              {showLive ? (
+                <>
+                  {" "}
+                  ·{" "}
+                  <span className={dashboard.fresh ? "text-emerald-700" : "text-amber-700"}>{dashboard.fresh ? "LIVE" : "STALE"}</span>
+                </>
+              ) : null}
+            </span>
           </span>
-        </span>
-      </Link>
+        </Link>
+        {showDashboardNav ? <DashboardNav active={active} /> : null}
+      </div>
       <div className="flex flex-1 items-center justify-end gap-4">
         <RouterSwitcher onNameChange={setRouterName} />
         <LanguageSwitcher />
@@ -374,13 +413,14 @@ export function AppShell({
   active,
   children,
 }: {
-  active: "dashboard" | "settings" | "metrics";
+  active: DashboardShellActive;
   children: React.ReactNode;
 }) {
+  const dashboardDataEnabled = active === "clients" || active === "markets";
   return (
     <LocaleProvider>
       <AuthProvider>
-        <DashboardDataProvider enabled={active === "dashboard"}>
+        <DashboardDataProvider enabled={dashboardDataEnabled}>
           <Topbar active={active} />
           {children}
           <Toast.Provider placement="top end" />

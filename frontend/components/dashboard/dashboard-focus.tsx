@@ -1,8 +1,15 @@
 "use client";
 
 import * as React from "react";
+import { usePathname, useRouter } from "next/navigation";
 import type { DashboardResponse } from "@/lib/types";
 import { recordDashboardUxEvent } from "@/lib/api";
+import {
+  buildDashboardHref,
+  dashboardRouteForDrawer,
+  dashboardRouteForFocus,
+  normalizeDashboardPath,
+} from "@/lib/dashboard-nav";
 
 export type DashboardFocusKind = "request" | "client" | "share" | "market" | "country";
 export type DashboardFocusSource = "map" | "client-board" | "market-table" | "drawer" | "activity";
@@ -34,8 +41,24 @@ function targetFromUrl(): DashboardFocusTarget | null {
   return { kind, id, source: "activity" };
 }
 
-function syncTargetToUrl(target: DashboardFocusTarget | null) {
+function syncDrawerToUrl(target: { kind: "client" | "share" | "market"; id: string } | null, pathname: string) {
+  const route = normalizeDashboardPath(pathname) || dashboardRouteForDrawer(target?.kind || "client");
   const url = new URL(window.location.href);
+  url.pathname = route;
+  if (target) {
+    url.searchParams.set("drawerKind", target.kind);
+    url.searchParams.set("drawerId", target.id);
+  } else {
+    url.searchParams.delete("drawerKind");
+    url.searchParams.delete("drawerId");
+  }
+  window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
+}
+
+function syncFocusToUrl(target: DashboardFocusTarget | null, pathname: string) {
+  const route = normalizeDashboardPath(pathname) || (target ? dashboardRouteForFocus(target.kind) : dashboardRouteForFocus("client"));
+  const url = new URL(window.location.href);
+  url.pathname = route;
   if (target) {
     url.searchParams.set("focusKind", target.kind);
     url.searchParams.set("focusId", target.id);
@@ -52,18 +75,6 @@ function drawerFromUrl() {
   const kind = params.get("drawerKind") as "client" | "share" | "market" | null;
   const id = params.get("drawerId") || "";
   return kind && id && ["client", "share", "market"].includes(kind) ? { kind, id } : null;
-}
-
-function syncDrawerToUrl(target: { kind: "client" | "share" | "market"; id: string } | null) {
-  const url = new URL(window.location.href);
-  if (target) {
-    url.searchParams.set("drawerKind", target.kind);
-    url.searchParams.set("drawerId", target.id);
-  } else {
-    url.searchParams.delete("drawerKind");
-    url.searchParams.delete("drawerId");
-  }
-  window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
 }
 
 function requestRelations(data: DashboardResponse, requestId: string) {
@@ -89,9 +100,47 @@ function focusExists(data: DashboardResponse, target: DashboardFocusTarget) {
 }
 
 export function DashboardFocusProvider({ data, children }: { data: DashboardResponse | null; children: React.ReactNode }) {
+  const router = useRouter();
+  const pathname = usePathname() || "/clients/";
   const [target, setTarget] = React.useState<DashboardFocusTarget | null>(null);
   const [drawerTarget, setDrawerTarget] = React.useState<{ kind: "client" | "share" | "market"; id: string } | null>(null);
   const restoredRef = React.useRef(false);
+
+  const navigateForDrawer = React.useCallback(
+    (kind: "client" | "share" | "market", id: string) => {
+      const route = dashboardRouteForDrawer(kind);
+      const params = new URLSearchParams(window.location.search);
+      params.set("drawerKind", kind);
+      params.set("drawerId", id);
+      const href = buildDashboardHref(route, params);
+      if (normalizeDashboardPath(pathname) !== route) {
+        router.push(href);
+        return;
+      }
+      syncDrawerToUrl({ kind, id }, pathname);
+    },
+    [pathname, router],
+  );
+
+  const navigateForFocus = React.useCallback(
+    (next: DashboardFocusTarget | null) => {
+      if (!next) {
+        syncFocusToUrl(null, pathname);
+        return;
+      }
+      const route = dashboardRouteForFocus(next.kind);
+      const params = new URLSearchParams(window.location.search);
+      params.set("focusKind", next.kind);
+      params.set("focusId", next.id);
+      const href = buildDashboardHref(route, params);
+      if (normalizeDashboardPath(pathname) !== route) {
+        router.push(href);
+        return;
+      }
+      syncFocusToUrl(next, pathname);
+    },
+    [pathname, router],
+  );
 
   React.useEffect(() => {
     if (restoredRef.current) return;
@@ -100,25 +149,41 @@ export function DashboardFocusProvider({ data, children }: { data: DashboardResp
     setDrawerTarget(drawerFromUrl());
   }, []);
 
-  const setFocus = React.useCallback((next: DashboardFocusTarget) => {
-    setTarget(next);
-    syncTargetToUrl(next);
-    void recordDashboardUxEvent({ eventType: next.kind === "request" && next.source === "activity" ? "map_request_selected" : "dashboard_focus_set", source: next.source, targetType: next.kind });
-  }, []);
+  const setFocus = React.useCallback(
+    (next: DashboardFocusTarget) => {
+      setTarget(next);
+      navigateForFocus(next);
+      void recordDashboardUxEvent({
+        eventType: next.kind === "request" && next.source === "activity" ? "map_request_selected" : "dashboard_focus_set",
+        source: next.source,
+        targetType: next.kind,
+      });
+    },
+    [navigateForFocus],
+  );
   const clearFocus = React.useCallback(() => {
     setTarget(null);
-    syncTargetToUrl(null);
+    navigateForFocus(null);
     void recordDashboardUxEvent({ eventType: "dashboard_focus_clear" });
-  }, []);
-  const openDrawer = React.useCallback((kind: "client" | "share" | "market", id: string) => {
-    const next = { kind, id };
-    setDrawerTarget(next);
-    syncDrawerToUrl(next);
-  }, []);
+  }, [navigateForFocus]);
+  const openDrawer = React.useCallback(
+    (kind: "client" | "share" | "market", id: string) => {
+      const next = { kind, id };
+      setDrawerTarget(next);
+      navigateForDrawer(kind, id);
+    },
+    [navigateForDrawer],
+  );
   const closeDrawer = React.useCallback(() => {
     setDrawerTarget(null);
-    syncDrawerToUrl(null);
-  }, []);
+    syncDrawerToUrl(null, pathname);
+  }, [pathname]);
+
+  React.useEffect(() => {
+    if (!restoredRef.current) return;
+    setDrawerTarget(drawerFromUrl());
+    setTarget(targetFromUrl());
+  }, [pathname]);
 
   React.useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {

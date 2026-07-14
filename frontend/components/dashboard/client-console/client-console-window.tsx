@@ -1,8 +1,9 @@
 "use client";
 
-import { ExternalLink } from "lucide-react";
+import { ExternalLink, RotateCw } from "lucide-react";
+import { usePathname } from "next/navigation";
 import * as React from "react";
-import { ClientConsoleIframeSlot } from "@/components/dashboard/client-console/client-console-iframe-pool";
+import { ClientConsoleIframe } from "@/components/dashboard/client-console/client-console-iframe";
 import { ClientConsoleTrafficLights } from "@/components/dashboard/client-console/client-console-traffic-lights";
 import {
   CONSOLE_DOCK_HEIGHT,
@@ -11,6 +12,7 @@ import {
   useClientConsole,
 } from "@/components/dashboard/client-console/client-console-manager";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import { DASHBOARD_CLIENTS_PATH, isClientsRoute } from "@/lib/dashboard-nav";
 
 const MIN_WIDTH = 420;
 const MIN_HEIGHT = 280;
@@ -36,23 +38,36 @@ function frameHost(url: string): string {
 }
 
 export function ClientConsoleWindowLayer() {
-  const { windows, dockVisible, focusedId, closeConsole, minimizeConsole, toggleMaximizeConsole, focusConsole, updateConsoleRect } =
-    useClientConsole();
+  const pathname = usePathname() || DASHBOARD_CLIENTS_PATH;
+  const onClientsPage = isClientsRoute(pathname);
+  const {
+    windows,
+    dockVisible,
+    focusedId,
+    closeConsole,
+    minimizeConsole,
+    toggleMaximizeConsole,
+    focusConsole,
+    refreshConsole,
+    updateConsoleRect,
+  } = useClientConsole();
 
   const dockOffset = dockVisible ? CONSOLE_DOCK_HEIGHT + 12 : 0;
-  const visibleWindows = windows.filter((window) => window.activated && window.state !== "minimized");
+  const mountedWindows = windows.filter((window) => window.activated);
 
   return (
     <>
-      {visibleWindows.map((window) => (
+      {mountedWindows.map((window) => (
         <ClientConsoleWindowShell
           key={window.id}
           window={window}
-          focused={window.id === focusedId}
+          minimized={window.state === "minimized" || !onClientsPage}
+          focused={onClientsPage && window.id === focusedId}
           dockOffset={dockOffset}
           onClose={() => closeConsole(window.id)}
           onMinimize={() => minimizeConsole(window.id)}
           onToggleMaximize={() => toggleMaximizeConsole(window.id)}
+          onRefresh={() => refreshConsole(window.id)}
           onFocus={() => focusConsole(window.id)}
           onRectChange={(rect) => updateConsoleRect(window.id, rect)}
         />
@@ -63,20 +78,24 @@ export function ClientConsoleWindowLayer() {
 
 function ClientConsoleWindowShell({
   window,
+  minimized,
   focused,
   dockOffset,
   onClose,
   onMinimize,
   onToggleMaximize,
+  onRefresh,
   onFocus,
   onRectChange,
 }: {
   window: ConsoleWindow;
+  minimized: boolean;
   focused: boolean;
   dockOffset: number;
   onClose: () => void;
   onMinimize: () => void;
   onToggleMaximize: () => void;
+  onRefresh: () => void;
   onFocus: () => void;
   onRectChange: (rect: NormalRect) => void;
 }) {
@@ -87,7 +106,7 @@ function ClientConsoleWindowShell({
   const resizeRef = React.useRef<{ startX: number; startY: number; origin: NormalRect } | null>(null);
 
   const onDragPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
-    if (maximized) return;
+    if (minimized || maximized) return;
     if ((event.target as HTMLElement).closest("[data-no-drag]")) return;
     event.preventDefault();
     onFocus();
@@ -145,7 +164,18 @@ function ClientConsoleWindowShell({
   const shellClass =
     "light flex flex-col overflow-hidden rounded-2xl border border-slate-200/80 bg-white text-slate-900 shadow-[0_24px_60px_rgba(15,23,42,0.16)] [--foreground:rgb(15,23,42)] [--muted:rgb(100,116,139)]";
 
-  const style: React.CSSProperties = maximized
+  const style: React.CSSProperties = minimized
+    ? {
+        position: "fixed",
+        left: -window.normalRect.width - 100,
+        top: 0,
+        width: window.normalRect.width,
+        height: window.normalRect.height,
+        zIndex: -1,
+        opacity: 0,
+        pointerEvents: "none",
+      }
+    : maximized
     ? {
         position: "fixed",
         top: "0.75rem",
@@ -165,12 +195,13 @@ function ClientConsoleWindowShell({
 
   return (
     <div
-      className={`${shellClass} ${focused ? "ring-2 ring-primary/20" : ""}`}
+      className={`${shellClass} ${focused && !minimized ? "ring-2 ring-primary/20" : ""}`}
       style={style}
-      onPointerDown={onFocus}
+      onPointerDown={minimized ? undefined : onFocus}
       role="dialog"
       aria-label={`${t("dashboard.clientConsole")} ${window.title}`}
-      aria-modal={maximized ? "true" : "false"}
+      aria-modal={maximized && !minimized ? "true" : "false"}
+      aria-hidden={minimized}
     >
       <div
         className="flex cursor-default items-center gap-3 border-b border-slate-100 bg-slate-50/90 px-3 py-2.5"
@@ -195,14 +226,25 @@ function ClientConsoleWindowShell({
             <ExternalLink className="h-2.5 w-2.5 shrink-0" />
           </a>
         </div>
-        <div className="w-[52px] shrink-0" aria-hidden />
+        <button
+          type="button"
+          data-no-drag
+          onClick={(event) => {
+            event.stopPropagation();
+            onRefresh();
+          }}
+          className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-slate-500 transition-colors hover:bg-slate-200/80 hover:text-slate-800"
+          aria-label={t("dashboard.clientConsole.refresh")}
+          title={t("dashboard.clientConsole.refresh")}
+        >
+          <RotateCw className="h-3.5 w-3.5" />
+        </button>
       </div>
 
       <div className="relative min-h-0 flex-1 bg-slate-50 p-3">
-        <ClientConsoleIframeSlot
-          windowId={window.id}
-          className="h-full overflow-hidden rounded-xl border border-slate-200/80 bg-transparent shadow-[inset_0_1px_0_rgba(255,255,255,0.7)]"
-        />
+        <div className="h-full overflow-hidden rounded-xl border border-slate-200/80 bg-white shadow-[inset_0_1px_0_rgba(255,255,255,0.7)]">
+          <ClientConsoleIframe window={window} paused={minimized} />
+        </div>
         {!maximized ? (
           <button
             type="button"

@@ -1,8 +1,10 @@
 "use client";
 
 import { toast } from "@heroui/react";
+import { usePathname, useRouter } from "next/navigation";
 import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import { DASHBOARD_CLIENTS_PATH, isClientsRoute, isMarketsRoute } from "@/lib/dashboard-nav";
 
 export const MAX_CONSOLE_WINDOWS = 5;
 export const CONSOLE_DOCK_HEIGHT = 56;
@@ -30,6 +32,7 @@ export type ConsoleWindow = {
   normalRect: NormalRect;
   /** false after session hydrate until user explicitly resumes loading the iframe */
   activated: boolean;
+  reloadKey: number;
 };
 
 type PersistedConsoleWindow = Pick<ConsoleWindow, "id" | "clientId" | "url" | "title" | "state" | "normalRect" | "zIndex">;
@@ -57,9 +60,8 @@ type ClientConsoleContextValue = {
   restoreConsole: (id: string) => void;
   toggleMaximizeConsole: (id: string) => void;
   focusConsole: (id: string) => void;
+  refreshConsole: (id: string) => void;
   updateConsoleRect: (id: string, rect: NormalRect) => void;
-  registerIframeTarget: (id: string, element: HTMLElement | null) => void;
-  getIframeTarget: (id: string) => HTMLElement | null;
 };
 
 const ClientConsoleContext = React.createContext<ClientConsoleContextValue | null>(null);
@@ -86,6 +88,7 @@ function createWindow(payload: OpenPayload, index: number, zIndex: number): Cons
     zIndex,
     normalRect: defaultRect(index),
     activated: true,
+    reloadKey: 0,
   };
 }
 
@@ -161,6 +164,7 @@ function reducer(state: ManagerState, action: { type: string; payload?: unknown 
           zIndex: window.zIndex || CONSOLE_BASE_Z_INDEX + index,
           normalRect: window.normalRect || defaultRect(index),
           activated: false,
+          reloadKey: 0,
         })),
         nextZIndex: maxZ + 1,
         focusedId: null,
@@ -234,6 +238,26 @@ function reducer(state: ManagerState, action: { type: string; payload?: unknown 
     }
     case "FOCUS":
       return bumpFocus(state, action.payload as string);
+    case "REFRESH": {
+      const id = action.payload as string;
+      return {
+        ...state,
+        windows: state.windows.map((window) =>
+          window.id === id ? { ...window, reloadKey: window.reloadKey + 1 } : window,
+        ),
+      };
+    }
+    case "MINIMIZE_ALL_VISIBLE": {
+      const hasVisible = state.windows.some((window) => window.activated && window.state !== "minimized");
+      if (!hasVisible) return state;
+      return {
+        ...state,
+        windows: state.windows.map((window) =>
+          window.activated && window.state !== "minimized" ? { ...window, state: "minimized" as const } : window,
+        ),
+        focusedId: null,
+      };
+    }
     case "UPDATE_RECT": {
       const { id, rect } = action.payload as { id: string; rect: NormalRect };
       return {
@@ -248,10 +272,37 @@ function reducer(state: ManagerState, action: { type: string; payload?: unknown 
 
 export function ClientConsoleManagerProvider({ children }: { children: React.ReactNode }) {
   const { t } = useLocaleText();
+  const router = useRouter();
+  const pathname = usePathname() || DASHBOARD_CLIENTS_PATH;
   const [state, dispatch] = React.useReducer(reducer, { windows: [], nextZIndex: CONSOLE_BASE_Z_INDEX, focusedId: null });
   const [hydrated, setHydrated] = React.useState(false);
-  const iframeTargetsRef = React.useRef(new Map<string, HTMLElement>());
-  const [iframeTargetsVersion, setIframeTargetsVersion] = React.useState(0);
+  const autoMinimizeNotifiedRef = React.useRef(false);
+  const prevPathRef = React.useRef(pathname);
+  const windowsRef = React.useRef(state.windows);
+  windowsRef.current = state.windows;
+
+  const ensureClientsRoute = React.useCallback(() => {
+    if (!isClientsRoute(pathname)) {
+      router.push(DASHBOARD_CLIENTS_PATH);
+    }
+  }, [pathname, router]);
+
+  React.useLayoutEffect(() => {
+    const previousPath = prevPathRef.current;
+    prevPathRef.current = pathname;
+    if (!isMarketsRoute(pathname)) {
+      autoMinimizeNotifiedRef.current = false;
+      return;
+    }
+    if (isMarketsRoute(previousPath)) return;
+    const hadVisible = windowsRef.current.some((window) => window.activated && window.state !== "minimized");
+    if (!hadVisible) return;
+    dispatch({ type: "MINIMIZE_ALL_VISIBLE" });
+    if (!autoMinimizeNotifiedRef.current) {
+      autoMinimizeNotifiedRef.current = true;
+      toast.info(t("dashboard.clientConsole.autoMinimized"));
+    }
+  }, [pathname, t]);
 
   React.useEffect(() => {
     const persisted = readPersistedWindows();
@@ -280,20 +331,6 @@ export function ClientConsoleManagerProvider({ children }: { children: React.Rea
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [state.focusedId, state.windows]);
 
-  const registerIframeTarget = React.useCallback((id: string, element: HTMLElement | null) => {
-    if (element) iframeTargetsRef.current.set(id, element);
-    else iframeTargetsRef.current.delete(id);
-    setIframeTargetsVersion((current) => current + 1);
-  }, []);
-
-  const getIframeTarget = React.useCallback(
-    (id: string) => {
-      void iframeTargetsVersion;
-      return iframeTargetsRef.current.get(id) ?? null;
-    },
-    [iframeTargetsVersion],
-  );
-
   const openConsole = React.useCallback(
     (payload: OpenPayload) => {
       const existing = state.windows.find((window) => window.clientId === payload.clientId);
@@ -301,9 +338,18 @@ export function ClientConsoleManagerProvider({ children }: { children: React.Rea
         toast.warning(t("dashboard.clientConsole.maxWindows", { count: MAX_CONSOLE_WINDOWS }));
         return;
       }
+      ensureClientsRoute();
       dispatch({ type: "OPEN", payload });
     },
-    [state.windows, t],
+    [ensureClientsRoute, state.windows, t],
+  );
+
+  const restoreConsole = React.useCallback(
+    (id: string) => {
+      ensureClientsRoute();
+      dispatch({ type: "RESTORE", payload: id });
+    },
+    [ensureClientsRoute],
   );
 
   const value = React.useMemo<ClientConsoleContextValue>(() => {
@@ -312,18 +358,22 @@ export function ClientConsoleManagerProvider({ children }: { children: React.Rea
       windows: state.windows,
       focusedId: state.focusedId,
       dockCount,
-      dockVisible: dockCount > 0,
+      dockVisible: dockCount > 0 && isClientsRoute(pathname),
       openConsole,
       closeConsole: (id) => dispatch({ type: "CLOSE", payload: id }),
       minimizeConsole: (id) => dispatch({ type: "MINIMIZE", payload: id }),
-      restoreConsole: (id) => dispatch({ type: "RESTORE", payload: id }),
-      toggleMaximizeConsole: (id) => dispatch({ type: "TOGGLE_MAXIMIZE", payload: id }),
+      restoreConsole,
+      toggleMaximizeConsole: (id) => {
+        if (!isClientsRoute(pathname)) {
+          ensureClientsRoute();
+        }
+        dispatch({ type: "TOGGLE_MAXIMIZE", payload: id });
+      },
       focusConsole: (id) => dispatch({ type: "FOCUS", payload: id }),
+      refreshConsole: (id) => dispatch({ type: "REFRESH", payload: id }),
       updateConsoleRect: (id, rect) => dispatch({ type: "UPDATE_RECT", payload: { id, rect } }),
-      registerIframeTarget,
-      getIframeTarget,
     };
-  }, [getIframeTarget, openConsole, registerIframeTarget, state.focusedId, state.windows]);
+  }, [ensureClientsRoute, openConsole, pathname, restoreConsole, state.focusedId, state.windows]);
 
   return <ClientConsoleContext.Provider value={value}>{children}</ClientConsoleContext.Provider>;
 }
