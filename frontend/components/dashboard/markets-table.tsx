@@ -4,7 +4,7 @@ import { ChevronRight, ExternalLink, Loader2, Pencil, Save, Search, X } from "lu
 import { Button, Card, Checkbox, Chip, Drawer, Modal, Tabs, TextArea } from "@heroui/react";
 import * as React from "react";
 import { DrawerSection, EmptyBlock, HealthTimelineStrip, Info, TokenGrid } from "@/components/dashboard/drawer-panels";
-import { FieldGroup } from "@/components/dashboard/share-edit-dialog";
+import { FieldGroup } from "@/components/dashboard/share-edit/share-edit-shared";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { marketOperationalSummary, OperationalDiagnosis, operationalReasonLabel, operationalStateLabel, useStableOperationalRanks } from "@/components/dashboard/operational-status";
 import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
