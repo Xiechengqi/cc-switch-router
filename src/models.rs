@@ -385,6 +385,14 @@ pub struct ClientTunnelResponse {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SubdomainAvailabilityResponse {
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ClientTunnelView {
     pub installation_id: String,
     pub owner_email: String,

@@ -59,9 +59,9 @@ use crate::models::{
     ShareRuntimeRefreshPayload, ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse,
     ShareSettingsPatch, ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest,
     ShareUpstreamProvider, ShareUpstreamQuota, ShareUsageByEmailResponse, ShareUsageDailyBucket,
-    ShareUsageEmailRow, ShareView, TunnelLease, UserApiTokenResetResponse, UserApiTokenResponse,
-    UserApiTokenStatus, UserShareView, UserSharesResponse, VerifyEmailCodeRequest,
-    VerifyEmailCodeResponse,
+    ShareUsageEmailRow, ShareView, SubdomainAvailabilityResponse, TunnelLease,
+    UserApiTokenResetResponse, UserApiTokenResponse, UserApiTokenStatus, UserShareView,
+    UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 #[cfg(test)]
 use crate::models::{RenewLeasePayload, ShareAppProvider, ShareUpstreamModel};
@@ -585,6 +585,22 @@ fn installation_map_label(platform: &str, tunnel: Option<&ClientTunnelRecord>) -
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| platform.to_string())
+}
+
+fn installation_visible_on_dashboard_map(
+    installation_id: &str,
+    active_share_subdomains_by_installation: &HashMap<String, HashSet<String>>,
+    client_tunnels_by_installation: &HashMap<String, ClientTunnelRecord>,
+) -> bool {
+    let has_active_share = active_share_subdomains_by_installation
+        .get(installation_id)
+        .map(|subdomains| !subdomains.is_empty())
+        .unwrap_or(false);
+    let has_enabled_tunnel = client_tunnels_by_installation
+        .get(installation_id)
+        .map(|tunnel| tunnel.enabled)
+        .unwrap_or(false);
+    has_active_share || has_enabled_tunnel
 }
 
 fn build_dashboard_country_aggregation(
@@ -1894,6 +1910,39 @@ impl AppStore {
             metadata,
         )
         .await
+    }
+
+    pub async fn check_client_tunnel_subdomain_availability(
+        &self,
+        config: &Config,
+        subdomain: &str,
+        installation_id: Option<&str>,
+    ) -> Result<SubdomainAvailabilityResponse, AppError> {
+        let subdomain = normalize_subdomain(subdomain)?;
+        ensure_subdomain_allowed(&subdomain, config)?;
+        let conn = self.conn.lock().await;
+        ensure_subdomain_not_registered_market(&conn, &subdomain)?;
+        ensure_subdomain_not_claimed_by_share(&conn, &subdomain)?;
+        if let Some(existing) = get_client_tunnel_by_subdomain(&conn, &subdomain)? {
+            if installation_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_some_and(|value| value == existing.installation_id)
+            {
+                return Ok(SubdomainAvailabilityResponse {
+                    available: true,
+                    reason: None,
+                });
+            }
+            return Ok(SubdomainAvailabilityResponse {
+                available: false,
+                reason: Some("already_claimed".into()),
+            });
+        }
+        Ok(SubdomainAvailabilityResponse {
+            available: true,
+            reason: None,
+        })
     }
 
     pub async fn update_client_tunnel(
@@ -4101,10 +4150,11 @@ impl AppStore {
         let mut installation_views = Vec::new();
         let mut active_installations = Vec::<ActiveInstallationGeo>::new();
         for installation in installations {
-            let is_active = active_share_subdomains_by_installation
-                .get(&installation.id)
-                .map(|subdomains| !subdomains.is_empty())
-                .unwrap_or(false);
+            let is_active = installation_visible_on_dashboard_map(
+                &installation.id,
+                &active_share_subdomains_by_installation,
+                &client_tunnels_by_installation,
+            );
             if is_active {
                 active_installations.push(ActiveInstallationGeo {
                     id: installation.id.clone(),
@@ -21449,6 +21499,38 @@ mod tests {
                 .count()
                 >= 1
         );
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn dashboard_snapshot_counts_tunnel_only_installations_on_map() {
+        let (store, config) = setup_store("dashboard-map-tunnel-only").await;
+        insert_installation(&store, "inst-us").await;
+        set_installation_country_code(&store, "inst-us", "US").await;
+        insert_client_tunnel(&store, "inst-us", "owner@example.com", "us-tunnel").await;
+        insert_installation(&store, "inst-de").await;
+        set_installation_country_code(&store, "inst-de", "DE").await;
+        insert_client_tunnel(&store, "inst-de", "owner@example.com", "de-tunnel").await;
+        insert_installation(&store, "inst-kr").await;
+        set_installation_country_code(&store, "inst-kr", "KR").await;
+        insert_client_tunnel(&store, "inst-kr", "owner@example.com", "kr-tunnel").await;
+
+        let server_geo = ServerGeo {
+            lat: None,
+            lon: None,
+        };
+        let proxy = ProxyRegistry::default();
+        let snapshot = store
+            .dashboard_snapshot(&config, &server_geo, &proxy, None)
+            .await
+            .expect("dashboard snapshot");
+
+        assert_eq!(snapshot.country_counts.get("USA"), Some(&1));
+        assert_eq!(snapshot.country_counts.get("DEU"), Some(&1));
+        assert_eq!(snapshot.country_counts.get("KOR"), Some(&1));
+        assert_eq!(snapshot.map.countries.len(), 3);
+        assert_eq!(snapshot.clients.len(), 3);
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }

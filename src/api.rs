@@ -62,8 +62,9 @@ use crate::models::{
     ShareMarketGrantStatusResponse, ShareMarketListingStatusSyncRequest,
     ShareMarketListingStatusSyncResponse, SharePendingEditsRequest,
     ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRuntimeRefreshRequest,
-    ShareSettingsPatch, ShareSettingsUpdateRequest, ShareSyncRequest, UserApiTokenResetResponse,
-    UserApiTokenResponse, UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    ShareSettingsPatch, ShareSettingsUpdateRequest, ShareSyncRequest,
+    SubdomainAvailabilityResponse, UserApiTokenResetResponse, UserApiTokenResponse,
+    UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 use crate::proxy::{gateway_proxy_handler, market_proxy_handler, proxy_handler};
 use crate::recent_traffic::{RecentRequestEvent, RecentTrafficSnapshot};
@@ -214,6 +215,10 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/dashboard/presence", post(dashboard_presence))
         .route("/v1/dashboard/ux-events", post(dashboard_ux_event))
         .route("/v1/installations/register", post(register_installation))
+        .route(
+            "/v1/client-tunnel/subdomain-availability",
+            get(check_client_tunnel_subdomain_availability),
+        )
         .route(
             "/v1/installations/bind-owner-email",
             post(bind_installation_owner_email),
@@ -1084,6 +1089,30 @@ async fn get_client_tunnel(
 ) -> Result<Json<ClientTunnelResponse>, AppError> {
     Ok(Json(
         state.store.get_client_tunnel(&state.config, query).await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubdomainAvailabilityQuery {
+    subdomain: String,
+    #[serde(default)]
+    installation_id: Option<String>,
+}
+
+async fn check_client_tunnel_subdomain_availability(
+    State(state): State<ServerState>,
+    Query(query): Query<SubdomainAvailabilityQuery>,
+) -> Result<Json<SubdomainAvailabilityResponse>, AppError> {
+    Ok(Json(
+        state
+            .store
+            .check_client_tunnel_subdomain_availability(
+                &state.config,
+                &query.subdomain,
+                query.installation_id.as_deref(),
+            )
+            .await?,
     ))
 }
 

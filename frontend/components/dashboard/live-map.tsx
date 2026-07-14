@@ -166,19 +166,23 @@ function shellTooltipPosition(shell: HTMLElement, clientX: number, clientY: numb
 
 const HEAT_BASE_FILL_OPACITY = 0.08;
 const HEAT_MAX_FILL_BOOST = 0.34;
+const HEAT_MIN_ACTIVE_FILL_OPACITY = 0.28;
+const HEAT_MIN_ACTIVE_STROKE_OPACITY = 0.28;
 const MAP_DEFAULT_FILL_OPACITY = 0.11;
 const MAP_DEFAULT_STROKE_OPACITY = 0.18;
 
 function countryHeatFillOpacity(count: number, max: number) {
   if (count <= 0 || max <= 0) return HEAT_BASE_FILL_OPACITY;
-  const heat = Math.min(1, count / max);
-  return HEAT_BASE_FILL_OPACITY + heat * HEAT_MAX_FILL_BOOST;
+  const heat = Math.min(1, Math.sqrt(count / max));
+  const scaled = HEAT_BASE_FILL_OPACITY + heat * HEAT_MAX_FILL_BOOST;
+  return Math.max(HEAT_MIN_ACTIVE_FILL_OPACITY, scaled);
 }
 
 function countryHeatStrokeOpacity(count: number, max: number) {
   if (count <= 0 || max <= 0) return 0.12;
-  const heat = Math.min(1, count / max);
-  return 0.12 + heat * 0.36;
+  const heat = Math.min(1, Math.sqrt(count / max));
+  const scaled = 0.12 + heat * 0.36;
+  return Math.max(HEAT_MIN_ACTIVE_STROKE_OPACITY, scaled);
 }
 
 function prepareWorldSvg(svg: string) {
@@ -195,6 +199,7 @@ function applyCountryHeatDOM(
 ) {
   const values = Object.values(activityCounts).filter((value) => value > 0);
   const max = values.length ? Math.max(...values) : 0;
+  const heatedElements: SVGElement[] = [];
   for (const element of Array.from(root.querySelectorAll<SVGElement>(".country"))) {
     const iso3 = Array.from(element.classList).find((name) => /^[A-Z]{3}$/.test(name));
     const count = iso3 ? activityCounts[iso3] || 0 : 0;
@@ -212,6 +217,15 @@ function applyCountryHeatDOM(
       element.style.fillOpacity = String(MAP_DEFAULT_FILL_OPACITY);
       element.style.strokeOpacity = String(MAP_DEFAULT_STROKE_OPACITY);
       element.style.strokeWidth = "0.28";
+    }
+    if (interactive) {
+      heatedElements.push(element);
+    }
+  }
+  for (const element of heatedElements) {
+    const parent = element.parentNode;
+    if (parent) {
+      parent.appendChild(element);
     }
   }
 }
