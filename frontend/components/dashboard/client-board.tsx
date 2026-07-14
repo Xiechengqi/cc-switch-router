@@ -1,7 +1,7 @@
 "use client";
 
 import { Button, Card, Chip, Drawer, toast } from "@heroui/react";
-import { Check, ChevronDown, Copy, ExternalLink, Maximize2, PanelRightOpen, Search, WalletCards } from "lucide-react";
+import { Check, ChevronDown, Copy, ExternalLink, Search, WalletCards } from "lucide-react";
 import * as React from "react";
 import { buildClientInstallCommand, InstallGuideDialog } from "@/components/dashboard/install-guide-dialog";
 import { SectionInstallButton } from "@/components/dashboard/section-install-button";
@@ -148,14 +148,28 @@ function shouldToggleClientHeader(
   return true;
 }
 
-function ClientHeaderActionButton({
+function ClientConsoleIcon({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 16 16" fill="none" aria-hidden="true" className={className}>
+      <rect x="1.5" y="2.5" width="13" height="9" rx="1.5" stroke="currentColor" strokeWidth="1.25" />
+      <path d="M5.5 12.5h5" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" />
+      <path d="M8 12.5V14" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" />
+      <path d="M4.5 6.25h7" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" />
+      <path d="M4.5 8.75h4.5" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function ClientHeaderInlineButton({
   label,
   onClick,
   children,
+  className,
 }: {
   label: string;
   onClick: () => void;
   children: React.ReactNode;
+  className: string;
 }) {
   return (
     <button
@@ -166,52 +180,56 @@ function ClientHeaderActionButton({
         event.stopPropagation();
         onClick();
       }}
-      className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-slate-500 transition-colors hover:bg-white hover:text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
+      className={className}
     >
       {children}
     </button>
   );
 }
 
-function ClientHeaderActions({
-  collapsed,
+function ClientConsoleButton({
   tunnelUrl,
-  onOpenFrame,
-  onOpenDetails,
-  onToggleCollapsed,
+  onOpen,
 }: {
-  collapsed: boolean;
   tunnelUrl: string;
-  onOpenFrame: (url: string) => void;
-  onOpenDetails: () => void;
-  onToggleCollapsed: () => void;
+  onOpen: (url: string) => void;
 }) {
   const { t } = useLocaleText();
   return (
-    <div
-      className="inline-flex shrink-0 items-center self-center rounded-lg border border-slate-200/70 bg-slate-50/60 p-0.5"
-      data-no-row-drawer
-      onClick={(event) => event.stopPropagation()}
+    <ClientHeaderInlineButton
+      label={t("dashboard.clientConsole")}
+      onClick={() => onOpen(tunnelUrl)}
+      className="inline-flex h-6 shrink-0 items-center gap-1 rounded-full border border-sky-200 bg-sky-50 px-2.5 text-[11px] font-medium text-sky-700 transition-colors hover:border-sky-300 hover:bg-sky-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
     >
-      {tunnelUrl ? (
-        <>
-          <ClientHeaderActionButton label={t("dashboard.clientFrame.title")} onClick={() => onOpenFrame(tunnelUrl)}>
-            <Maximize2 className="h-3.5 w-3.5" />
-          </ClientHeaderActionButton>
-          <span className="mx-0.5 h-4 w-px shrink-0 bg-slate-200" aria-hidden />
-        </>
-      ) : null}
-      <ClientHeaderActionButton label={t("dashboard.details")} onClick={onOpenDetails}>
-        <PanelRightOpen className="h-3.5 w-3.5" />
-      </ClientHeaderActionButton>
-      <span className="mx-0.5 h-4 w-px shrink-0 bg-slate-200" aria-hidden />
-      <ClientHeaderActionButton
-        label={collapsed ? t("dashboard.expandClient") : t("dashboard.collapseClient")}
-        onClick={onToggleCollapsed}
-      >
-        <ChevronDown className={`h-3.5 w-3.5 transition-transform duration-200 ${collapsed ? "" : "rotate-180"}`} />
-      </ClientHeaderActionButton>
-    </div>
+      <ClientConsoleIcon className="h-3 w-3 shrink-0" />
+      <span>{t("dashboard.clientConsole")}</span>
+    </ClientHeaderInlineButton>
+  );
+}
+
+function ClientDetailsButton({ onOpen }: { onOpen: () => void }) {
+  const { t } = useLocaleText();
+  return (
+    <ClientHeaderInlineButton
+      label={t("dashboard.details")}
+      onClick={onOpen}
+      className="inline-flex h-6 shrink-0 items-center rounded-full border border-slate-200 bg-white px-2.5 text-[11px] font-medium text-slate-700 transition-colors hover:border-slate-300 hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
+    >
+      {t("dashboard.details")}
+    </ClientHeaderInlineButton>
+  );
+}
+
+function ClientCollapseIndicator({ collapsed }: { collapsed: boolean }) {
+  return (
+    <span
+      className="inline-flex shrink-0 items-center text-slate-300 transition-colors duration-200 group-hover/client-header:text-slate-500"
+      aria-hidden="true"
+    >
+      <ChevronDown
+        className={`h-[18px] w-[18px] stroke-[1.75] transition-transform duration-200 ease-out ${collapsed ? "" : "rotate-180"}`}
+      />
+    </span>
   );
 }
 
@@ -347,14 +365,14 @@ function ClientCard({
     <Card id={`dashboard-client-${client.installation.id}`} className={`overflow-hidden rounded-lg border border-l-[3px] bg-white p-0 shadow-sm transition-[border-color,box-shadow] ${borderTone}`}>
       <Card.Content className="grid gap-3 p-3.5">
         <div
-          className="grid min-h-16 cursor-pointer select-text grid-cols-[minmax(300px,1.3fr)_minmax(520px,1fr)_auto] items-center gap-6 rounded-md px-1.5 py-1 outline-none transition-colors hover:bg-primary/[0.03] focus-visible:ring-2 focus-visible:ring-primary/30"
+          className="group/client-header grid min-h-16 cursor-pointer select-text grid-cols-[minmax(300px,1.3fr)_minmax(520px,1fr)_auto] items-center gap-6 rounded-md px-1.5 py-1 outline-none transition-colors hover:bg-primary/[0.03] focus-visible:ring-2 focus-visible:ring-primary/30"
           aria-expanded={!collapsed}
           onMouseDown={handleHeaderPointerDown}
           onClick={handleHeaderClick}
           onDoubleClick={handleHeaderDoubleClick}
         >
           <div className="grid min-w-0 gap-1.5">
-            <div className="flex min-w-0 items-center gap-2">
+            <div className="flex min-w-0 flex-wrap items-center gap-2">
               <span className={`h-2 w-2 shrink-0 rounded-full ${state === "offline" ? "bg-rose-500" : state === "degraded" ? "bg-amber-400" : "bg-emerald-500"}`} />
               {identityUrl ? (
                 <a
@@ -373,6 +391,8 @@ function ClientCard({
                 <strong className="truncate text-sm font-semibold text-foreground" title={identity}>{identity}</strong>
               )}
               <OperationalStatusPill summary={summary} />
+              {tunnelUrl ? <ClientConsoleButton tunnelUrl={tunnelUrl} onOpen={onOpenFrame} /> : null}
+              <ClientDetailsButton onOpen={openClientDrawer} />
               {summary.primaryReason ? <span className={`truncate text-[11px] font-medium ${state === "offline" ? "text-rose-700" : "text-amber-700"}`} title={operationalReasonLabel(summary.primaryReason, t)}>{operationalReasonLabel(summary.primaryReason, t)}</span> : null}
               {showRemoval ? <ClientRemovalSchedule removalAt={client.removalAt} className="text-[11px]" /> : null}
             </div>
@@ -397,14 +417,8 @@ function ClientCard({
             ) : null}
           </div>
 
-          <div className="flex justify-end">
-            <ClientHeaderActions
-              collapsed={collapsed}
-              tunnelUrl={tunnelUrl || ""}
-              onOpenFrame={onOpenFrame}
-              onOpenDetails={openClientDrawer}
-              onToggleCollapsed={onToggleCollapsed}
-            />
+          <div className="flex items-center justify-end self-center pl-1">
+            <ClientCollapseIndicator collapsed={collapsed} />
           </div>
         </div>
 
