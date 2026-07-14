@@ -2,9 +2,9 @@
 
 import Image from "next/image";
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { Button, Dropdown, ListBox, Modal, Select, Tabs } from "@heroui/react";
-import { Activity, Copy, Eye, EyeOff, KeyRound, Loader2, LogOut, RotateCcw, Settings, UserRound } from "lucide-react";
+import { Activity, Copy, Eye, EyeOff, KeyRound, Loader2, LogOut, Monitor, RotateCcw, Settings, Store, UserRound } from "lucide-react";
 import * as React from "react";
 import { LoginDialog } from "@/components/auth/login-dialog";
 import { Toast } from "@heroui/react";
@@ -12,7 +12,7 @@ import { AuthProvider, useAuth } from "@/components/auth/auth-provider";
 import { LocaleProvider, useLocaleText } from "@/components/i18n/locale-provider";
 import { refreshAccessToken } from "@/lib/auth";
 import { getUserApiToken, resetUserApiToken } from "@/lib/api";
-import { DashboardDataProvider, useDashboardData } from "@/components/dashboard/dashboard-data";
+import { DashboardDataProvider } from "@/components/dashboard/dashboard-data";
 import type { AppLocale } from "@/lib/i18n";
 import { DASHBOARD_CLIENTS_PATH, DASHBOARD_MARKETS_PATH, type DashboardShellActive } from "@/lib/dashboard-nav";
 import type { UserApiTokenStatus } from "@/lib/types";
@@ -55,7 +55,7 @@ function sameRouterDomainClientRedirect(raw: string | null) {
   }
 }
 
-function RouterSwitcher({ onNameChange }: { onNameChange?: (name: string) => void }) {
+function RouterSwitcher() {
   const [regions, setRegions] = React.useState<RegionOption[]>([]);
   const [selected, setSelected] = React.useState("");
   const { t } = useLocaleText();
@@ -66,9 +66,7 @@ function RouterSwitcher({ onNameChange }: { onNameChange?: (name: string) => voi
       if (!response.ok) return;
       const nextRegions = (await response.json()) as RegionOption[];
       setRegions(nextRegions);
-      const next = currentRegionName(nextRegions) || nextRegions[0]?.name || "";
-      setSelected(next);
-      onNameChange?.(next);
+      setSelected(currentRegionName(nextRegions) || nextRegions[0]?.name || "");
     }
     load().catch(console.error);
   }, []);
@@ -84,7 +82,6 @@ function RouterSwitcher({ onNameChange }: { onNameChange?: (name: string) => voi
         const name = String(key || "");
         if (!name) return;
         setSelected(name);
-        onNameChange?.(name);
         const region = regions.find((item) => item.name === name);
         const href = region ? normalizeRegionUrl(region.url) : "";
         if (href) window.location.href = href;
@@ -266,25 +263,35 @@ function ApiTokenDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (
 function DashboardNav({ active }: { active: "clients" | "markets" }) {
   const { t } = useLocaleText();
   const pathname = usePathname() || DASHBOARD_CLIENTS_PATH;
-  const tabClass = (tab: "clients" | "markets") => {
-    const selected =
-      active === tab ||
-      (tab === "clients" && pathname.startsWith("/clients")) ||
-      (tab === "markets" && pathname.startsWith("/markets"));
-    return `inline-flex h-8 items-center rounded-md px-3 text-xs font-medium transition-colors ${
-      selected ? "bg-primary/10 text-primary" : "text-muted-foreground hover:bg-slate-100 hover:text-foreground"
-    }`;
-  };
+  const router = useRouter();
+  const selectedKey =
+    active === "markets" || pathname.startsWith("/markets") ? "markets" : "clients";
+  const tabClass =
+    "inline-flex h-8 min-w-[5.75rem] items-center justify-center gap-1.5 rounded-md px-3 text-xs font-medium text-muted-foreground transition-[background-color,color,box-shadow] hover:text-foreground data-[selected=true]:bg-white data-[selected=true]:font-semibold data-[selected=true]:text-foreground data-[selected=true]:shadow-sm";
 
   return (
-    <nav className="flex items-center gap-1 rounded-lg border border-border bg-card p-1" aria-label={t("nav.dashboardSections")}>
-      <Link href={DASHBOARD_CLIENTS_PATH} className={tabClass("clients")}>
-        {t("nav.clientsTab")}
-      </Link>
-      <Link href={DASHBOARD_MARKETS_PATH} className={tabClass("markets")}>
-        {t("nav.marketsTab")}
-      </Link>
-    </nav>
+    <Tabs
+      selectedKey={selectedKey}
+      variant="secondary"
+      aria-label={t("nav.dashboardSections")}
+      className="text-foreground"
+      onSelectionChange={(key: React.Key) => {
+        const next = String(key);
+        if (next === "clients") router.push(DASHBOARD_CLIENTS_PATH);
+        else if (next === "markets") router.push(DASHBOARD_MARKETS_PATH);
+      }}
+    >
+      <Tabs.List className="inline-grid grid-cols-2 gap-0.5 rounded-lg bg-slate-100/90 p-1 text-foreground ring-1 ring-inset ring-slate-200/80">
+        <Tabs.Tab id="clients" className={tabClass}>
+          <Monitor className="h-3.5 w-3.5 shrink-0" aria-hidden />
+          <span>{t("nav.clientsTab")}</span>
+        </Tabs.Tab>
+        <Tabs.Tab id="markets" className={tabClass}>
+          <Store className="h-3.5 w-3.5 shrink-0" aria-hidden />
+          <span>{t("nav.marketsTab")}</span>
+        </Tabs.Tab>
+      </Tabs.List>
+    </Tabs>
   );
 }
 
@@ -294,12 +301,9 @@ function Topbar({ active }: { active: DashboardShellActive }) {
   const [loginOpen, setLoginOpen] = React.useState(false);
   const [apiTokenOpen, setApiTokenOpen] = React.useState(false);
   const [clientRedirect, setClientRedirect] = React.useState<string | null>(null);
-  const [routerName, setRouterName] = React.useState("");
-  const dashboard = useDashboardData();
   const redirectStartedRef = React.useRef(false);
   const authed = !!session?.authenticated;
   const showDashboardNav = active === "clients" || active === "markets";
-  const showLive = showDashboardNav;
 
   React.useEffect(() => {
     setClientRedirect(sameRouterDomainClientRedirect(new URLSearchParams(window.location.search).get("clientRedirect")));
@@ -334,24 +338,17 @@ function Topbar({ active }: { active: DashboardShellActive }) {
       <div className="flex min-w-0 items-center gap-4">
         <Link href={DASHBOARD_CLIENTS_PATH} className="flex items-center gap-3">
           <Image src="/router-logo.svg" alt="" width={36} height={36} className="h-9 w-9" priority />
-          <span className="grid gap-1">
-            <span className="text-base font-extrabold leading-none">CC-Switch Router</span>
-            <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
-              {routerName || t("nav.router")}
-              {showLive ? (
-                <>
-                  {" "}
-                  ·{" "}
-                  <span className={dashboard.fresh ? "text-emerald-700" : "text-amber-700"}>{dashboard.fresh ? "LIVE" : "STALE"}</span>
-                </>
-              ) : null}
-            </span>
-          </span>
+          <span className="text-base font-extrabold leading-none">CC-Switch Router</span>
         </Link>
-        {showDashboardNav ? <DashboardNav active={active} /> : null}
+        {showDashboardNav ? (
+          <>
+            <span className="hidden h-7 w-px shrink-0 bg-slate-200 sm:block" aria-hidden />
+            <DashboardNav active={active} />
+          </>
+        ) : null}
       </div>
       <div className="flex flex-1 items-center justify-end gap-4">
-        <RouterSwitcher onNameChange={setRouterName} />
+        <RouterSwitcher />
         <LanguageSwitcher />
         {authed ? (
           <Dropdown>

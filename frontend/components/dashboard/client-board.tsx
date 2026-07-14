@@ -257,7 +257,6 @@ function shareMatchesQuery(share: ShareView, query: string) {
 const ShareScroller = React.memo(function ShareScroller({
   shares,
   totalCount = shares.length,
-  client,
   referenceTunnelUrl,
   onOpenShare,
   onEditShare,
@@ -265,7 +264,6 @@ const ShareScroller = React.memo(function ShareScroller({
 }: {
   shares: ShareView[];
   totalCount?: number;
-  client?: DashboardClient;
   referenceTunnelUrl?: string;
   onOpenShare: (share: ShareView) => void;
   onEditShare: (share: ShareView) => void;
@@ -292,7 +290,7 @@ const ShareScroller = React.memo(function ShareScroller({
       </div>
         <div className="grid min-w-0 grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-4" aria-label={t("dashboard.shares")}>
           {shares.map((share) => (
-            <ShareCard key={share.shareId} share={share} client={client} referenceTunnelUrl={referenceTunnelUrl} onOpen={onOpenShare} onEdit={onEditShare} onConnect={onConnectShare} />
+            <ShareCard key={share.shareId} share={share} referenceTunnelUrl={referenceTunnelUrl} onOpen={onOpenShare} onEdit={onEditShare} onConnect={onConnectShare} />
           ))}
         </div>
     </div>
@@ -445,7 +443,7 @@ function ClientCard({
           </div>
         </div>
 
-        {!collapsed ? <ShareScroller shares={shares} totalCount={allShares.length} client={client} referenceTunnelUrl={client.clientTunnel?.tunnelUrl} onOpenShare={onOpenShare} onEditShare={onEditShare} onConnectShare={onConnectShare} /> : null}
+        {!collapsed ? <ShareScroller shares={shares} totalCount={allShares.length} referenceTunnelUrl={client.clientTunnel?.tunnelUrl} onOpenShare={onOpenShare} onEditShare={onEditShare} onConnectShare={onConnectShare} /> : null}
       </Card.Content>
     </Card>
   );
