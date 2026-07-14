@@ -1,19 +1,20 @@
 "use client";
 
-import { X } from "lucide-react";
+import { Trash2, X } from "lucide-react";
 import * as React from "react";
 import { CONSOLE_DOCK_HEIGHT, useClientConsole } from "@/components/dashboard/client-console/client-console-manager";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import { cn } from "@/lib/utils";
 
 export function ClientConsoleDock() {
-  const { windows, dockVisible, restoreConsole, closeConsole, focusConsole } = useClientConsole();
+  const { windows, focusedId, dockVisible, restoreConsole, closeConsole, closeAllConsoles } = useClientConsole();
   const { t } = useLocaleText();
 
-  const docked = windows.filter((window) => window.state === "minimized" || !window.activated);
-  if (!dockVisible || docked.length === 0) return null;
+  if (!dockVisible || windows.length === 0) return null;
 
   return (
     <div
+      data-console-dock
       className="fixed bottom-4 left-1/2 z-50 -translate-x-1/2"
       style={{ maxWidth: "min(calc(100vw - 2rem), 720px)" }}
       role="toolbar"
@@ -23,26 +24,35 @@ export function ClientConsoleDock() {
         className="flex items-center gap-2 overflow-x-auto rounded-2xl border border-slate-200/80 bg-white/95 px-3 py-2 shadow-[0_12px_40px_rgba(15,23,42,0.14)] backdrop-blur-md"
         style={{ minHeight: CONSOLE_DOCK_HEIGHT - 16 }}
       >
-        {docked.map((window) => {
+        {windows.map((window) => {
           const suspended = !window.activated;
+          const isActive = window.id === focusedId && window.activated && window.state !== "minimized";
           return (
             <div key={window.id} className="group relative flex shrink-0 items-center">
               <button
                 type="button"
-                onClick={() => {
-                  restoreConsole(window.id);
-                  focusConsole(window.id);
-                }}
-                className="inline-flex h-9 max-w-[200px] items-center gap-2 rounded-xl border border-slate-200/80 bg-slate-50 px-3 text-left text-[11px] font-medium text-slate-700 transition-colors hover:border-sky-200 hover:bg-sky-50 hover:text-sky-800"
+                onClick={() => restoreConsole(window.id)}
+                className={cn(
+                  "inline-flex h-9 max-w-[200px] items-center gap-2 rounded-xl border px-3 text-left text-[11px] font-medium transition-colors",
+                  isActive
+                    ? "border-sky-400 bg-sky-50 text-sky-900 ring-2 ring-sky-200"
+                    : "border-slate-200/80 bg-slate-50 text-slate-700 hover:border-sky-200 hover:bg-sky-50 hover:text-sky-800",
+                )}
                 title={suspended ? t("dashboard.clientConsole.resumeHint") : window.url}
+                aria-current={isActive ? "true" : undefined}
                 aria-label={
                   suspended
                     ? t("dashboard.clientConsole.resumeNamed", { name: window.title })
-                    : t("dashboard.clientConsole.restoreNamed", { name: window.title })
+                    : isActive
+                      ? t("dashboard.clientConsole.activeNamed", { name: window.title })
+                      : t("dashboard.clientConsole.switchNamed", { name: window.title })
                 }
               >
                 <span
-                  className={`h-2 w-2 shrink-0 rounded-full ${suspended ? "bg-amber-400" : "bg-emerald-500"}`}
+                  className={cn(
+                    "h-2 w-2 shrink-0 rounded-full",
+                    suspended ? "bg-amber-400" : isActive ? "bg-sky-500" : "bg-emerald-500",
+                  )}
                   aria-hidden
                 />
                 <span className="min-w-0 truncate font-mono">{window.title}</span>
@@ -66,6 +76,17 @@ export function ClientConsoleDock() {
             </div>
           );
         })}
+        <div className="ml-1 flex shrink-0 items-center border-l border-slate-200/80 pl-2">
+          <button
+            type="button"
+            onClick={() => closeAllConsoles()}
+            className="inline-flex h-9 w-9 items-center justify-center rounded-xl border border-slate-200/80 bg-white text-slate-600 transition-colors hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+            aria-label={t("dashboard.clientConsole.cleanAll")}
+            title={t("dashboard.clientConsole.cleanAll")}
+          >
+            <Trash2 className="h-4 w-4 shrink-0" aria-hidden />
+          </button>
+        </div>
       </div>
     </div>
   );

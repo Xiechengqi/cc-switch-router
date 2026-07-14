@@ -37,6 +37,50 @@ function frameHost(url: string): string {
   }
 }
 
+function useConsoleClickOutsideMinimize({
+  enabled,
+  windows,
+  focusedId,
+  minimizeConsole,
+}: {
+  enabled: boolean;
+  windows: ConsoleWindow[];
+  focusedId: string | null;
+  minimizeConsole: (id: string) => void;
+}) {
+  React.useEffect(() => {
+    if (!enabled) return;
+
+    function shouldIgnoreClickOutside(target: Element) {
+      if (target.closest("[data-console-window]")) return true;
+      if (target.closest("[data-console-dock]")) return true;
+      if (target.closest("[data-board-dock]")) return true;
+      if (target.closest("[data-rac]")) return true;
+      if (target.closest("[role='dialog']")) return true;
+      if (target.closest("[role='alertdialog']")) return true;
+      return false;
+    }
+
+    function handlePointerDown(event: PointerEvent) {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      if (shouldIgnoreClickOutside(target)) return;
+
+      const visible = windows.filter((window) => window.activated && window.state !== "minimized");
+      if (!visible.length) return;
+
+      let id = focusedId;
+      if (!id || !visible.some((window) => window.id === id)) {
+        id = visible.reduce((best, window) => (!best || window.zIndex > best.zIndex ? window : best)).id;
+      }
+      minimizeConsole(id);
+    }
+
+    document.addEventListener("pointerdown", handlePointerDown);
+    return () => document.removeEventListener("pointerdown", handlePointerDown);
+  }, [enabled, focusedId, minimizeConsole, windows]);
+}
+
 export function ClientConsoleWindowLayer() {
   const pathname = usePathname() || DASHBOARD_CLIENTS_PATH;
   const onClientsPage = isClientsRoute(pathname);
@@ -54,6 +98,13 @@ export function ClientConsoleWindowLayer() {
 
   const dockOffset = dockVisible ? CONSOLE_DOCK_HEIGHT + 12 : 0;
   const mountedWindows = windows.filter((window) => window.activated);
+
+  useConsoleClickOutsideMinimize({
+    enabled: onClientsPage,
+    windows,
+    focusedId,
+    minimizeConsole,
+  });
 
   return (
     <>
@@ -195,6 +246,7 @@ function ClientConsoleWindowShell({
 
   return (
     <div
+      data-console-window
       className={`${shellClass} ${focused && !minimized ? "ring-2 ring-primary/20" : ""}`}
       style={style}
       onPointerDown={minimized ? undefined : onFocus}

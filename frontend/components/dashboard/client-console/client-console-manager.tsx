@@ -62,6 +62,7 @@ type ClientConsoleContextValue = {
   focusConsole: (id: string) => void;
   refreshConsole: (id: string) => void;
   updateConsoleRect: (id: string, rect: NormalRect) => void;
+  closeAllConsoles: () => void;
 };
 
 const ClientConsoleContext = React.createContext<ClientConsoleContextValue | null>(null);
@@ -151,6 +152,16 @@ function bumpFocus(state: ManagerState, id: string): ManagerState {
   };
 }
 
+function minimizeOtherVisibleWindows(windows: ConsoleWindow[], exceptId: string): ConsoleWindow[] {
+  return windows.map((window) => {
+    if (window.id === exceptId) return window;
+    if (window.activated && window.state !== "minimized") {
+      return { ...window, state: "minimized" as const };
+    }
+    return window;
+  });
+}
+
 function reducer(state: ManagerState, action: { type: string; payload?: unknown }): ManagerState {
   switch (action.type) {
     case "HYDRATE": {
@@ -178,7 +189,7 @@ function reducer(state: ManagerState, action: { type: string; payload?: unknown 
         const bumped = bumpFocus(state, existing.id);
         return {
           ...bumped,
-          windows: bumped.windows.map((window) =>
+          windows: minimizeOtherVisibleWindows(bumped.windows, existing.id).map((window) =>
             window.id === existing.id
               ? { ...window, url: payload.url, title: payload.title, state: nextState, activated: true }
               : window,
@@ -186,10 +197,11 @@ function reducer(state: ManagerState, action: { type: string; payload?: unknown 
         };
       }
       if (state.windows.length >= MAX_CONSOLE_WINDOWS) return state;
-      const visibleCount = state.windows.filter((window) => !isDocked(window)).length;
+      const minimizedOthers = minimizeOtherVisibleWindows(state.windows, "");
+      const visibleCount = minimizedOthers.filter((window) => !isDocked(window)).length;
       const created = createWindow(payload, visibleCount, state.nextZIndex);
       return {
-        windows: [...state.windows, created],
+        windows: [...minimizedOthers, created],
         nextZIndex: state.nextZIndex + 1,
         focusedId: created.id,
       };
@@ -203,6 +215,13 @@ function reducer(state: ManagerState, action: { type: string; payload?: unknown 
         focusedId: state.focusedId === id ? windows.find((window) => !isDocked(window))?.id ?? null : state.focusedId,
       };
     }
+    case "CLOSE_ALL":
+      if (!state.windows.length) return state;
+      return {
+        windows: [],
+        nextZIndex: CONSOLE_BASE_Z_INDEX,
+        focusedId: null,
+      };
     case "MINIMIZE": {
       const id = action.payload as string;
       return {
@@ -213,10 +232,12 @@ function reducer(state: ManagerState, action: { type: string; payload?: unknown 
     }
     case "RESTORE": {
       const id = action.payload as string;
+      const target = state.windows.find((window) => window.id === id);
+      if (!target) return state;
       const bumped = bumpFocus(state, id);
       return {
         ...bumped,
-        windows: bumped.windows.map((window) =>
+        windows: minimizeOtherVisibleWindows(bumped.windows, id).map((window) =>
           window.id === id ? { ...window, state: "normal" as const, activated: true } : window,
         ),
       };
@@ -353,7 +374,7 @@ export function ClientConsoleManagerProvider({ children }: { children: React.Rea
   );
 
   const value = React.useMemo<ClientConsoleContextValue>(() => {
-    const dockCount = state.windows.filter(isDocked).length;
+    const dockCount = state.windows.length;
     return {
       windows: state.windows,
       focusedId: state.focusedId,
@@ -372,6 +393,7 @@ export function ClientConsoleManagerProvider({ children }: { children: React.Rea
       focusConsole: (id) => dispatch({ type: "FOCUS", payload: id }),
       refreshConsole: (id) => dispatch({ type: "REFRESH", payload: id }),
       updateConsoleRect: (id, rect) => dispatch({ type: "UPDATE_RECT", payload: { id, rect } }),
+      closeAllConsoles: () => dispatch({ type: "CLOSE_ALL" }),
     };
   }, [ensureClientsRoute, openConsole, pathname, restoreConsole, state.focusedId, state.windows]);
 

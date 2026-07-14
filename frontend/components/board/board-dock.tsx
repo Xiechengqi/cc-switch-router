@@ -338,7 +338,7 @@ export function BoardDock() {
       </button>
     );
     return (
-      <div className="fixed bottom-5 right-5 z-40">
+      <div className="fixed bottom-5 right-5 z-40" data-board-dock>
         {unread > 0 ? (
           <Badge color="danger" aria-label={t("board.unread", { count: unread })}>
             <Badge.Anchor className="block">{fabButton}</Badge.Anchor>
@@ -369,6 +369,7 @@ export function BoardDock() {
         aria-modal="true"
         aria-labelledby="board-dock-title"
         className="fixed bottom-5 right-5 z-40 flex h-[min(640px,calc(100vh-2rem))] w-[min(420px,calc(100vw-2rem))] flex-col gap-0 overflow-hidden rounded-2xl border border-[rgba(0,82,255,0.18)] bg-card p-0 shadow-xl"
+        data-board-dock
       >
         <Card.Header className="flex-row items-center justify-between gap-3 border-b p-4">
           <h2 id="board-dock-title" className="font-display text-xl leading-none text-foreground">{t("board.title")}</h2>
