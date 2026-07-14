@@ -14,7 +14,6 @@ import { useDashboardViewState } from "@/components/dashboard/dashboard-view-sta
 import { useOperationVerification } from "@/components/dashboard/operation-verification";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { withEmbedCompact } from "@/lib/embed-compact-url";
 import {
   ClientLinkedSharesPanel,
   clientOwnerEmail,
@@ -206,7 +205,7 @@ function ClientConsoleButton({ client }: { client: DashboardClient }) {
       onClick={() =>
         openConsole({
           clientId: client.installation.id,
-          url: withEmbedCompact(tunnelUrl),
+          url: tunnelUrl,
           title,
         })
       }

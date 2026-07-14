@@ -6,8 +6,6 @@ import { useClientConsole } from "@/components/dashboard/client-console";
 import { clientTunnelDisplayUrl } from "@/components/dashboard/share-dashboard-utils";
 import type { TFn } from "@/components/dashboard/share-dashboard-utils";
 import type { DashboardClient } from "@/lib/types";
-import { withEmbedCompact } from "@/lib/embed-compact-url";
-
 export function ShareClientTag({
   client,
   t,
@@ -23,7 +21,7 @@ export function ShareClientTag({
     event.stopPropagation();
     openConsole({
       clientId: client.installation.id,
-      url: withEmbedCompact(url),
+      url,
       title,
     });
   };
