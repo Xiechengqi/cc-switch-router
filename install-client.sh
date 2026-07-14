@@ -57,6 +57,10 @@ done
 
 }
 
+USAGE() {
+YELLOW "Usage: curl -SsL https://[Router]/install-client.sh | bash -s [Router_Url] [Owner_Email] [Password]"
+}
+
 export GITHUB_PROXY="https://gh-proxy.org"
 
 main() {
@@ -71,19 +75,39 @@ INFO "Location: ${countryCode}"
 [ "${countryCode}" = "China" ] && downloadUrl="${GITHUB_PROXY}/${downloadUrl}"
 binary="cc-switch-server"
 
+# check process
+if ps -ef | grep ${binary} | grep -v grep &> /dev/null
+then
+YELLOW "${binary} is running, exit installing ..." && ps -ef | grep ${binary} | grep -v grep
+exit 0
+fi
+
+ROUTER=${1} && [ ".${ROUTER}" = "." ] && USAGE
+ROUTER=$(echo ${ROUTER} | sed 's/\/$//')
+echo ${ROUTER} | grep -E '^https://|^http://' &> /dev/null || ERROR "ROUTER must be like https://xxx or http://xxx"
+OWNER=${2} && [ ".${OWNER}" = "." ] && USAGE
+PASSWORD=${3} && [ ".${PASSWORD}" = "." ] && USAGE
+
 # download tarball
 EXEC "curl -SsL ${downloadUrl} -o /usr/local/bin/${binary} && chmod +x /usr/local/bin/${binary}"
-INFO "${binary} -V" && ${binary} -V
+EXEC "${binary} -V" && ${binary} -V
 
 # start
+INFO "Client Owner Email: ${OWNER}"
+INFO "Client Web Password: ${PASSWORD}"
+INFO "Client Register To Router: ${ROUTER}"
+YELLOW "Check whether the above parameters are correct and start the installation in 3 seconds ..." && EXEC "sleep 3"
+
+cd $HOME &> /dev/null && ls .cc-switch-server &> /dev/null && INFO "Backup old local data ..." && EXEC "mv -v .cc-switch-server .cc-switch-server.bak.$(date +s)"
+EXEC "/usr/local/bin/${binary} init --router-url ${ROUTER} --owner-email ${OWNER} --password ${PASSWORD}"
 EXEC "nohup /usr/local/bin/${binary} &> /dev/null &"
 EXEC "sleep 3"
+SUBDOMAIN=$(grep tunnelSubdomain $HOME/.cc-switch-server/server.json  | awk -F '"' '{print $(NF-1)}')
+SUBDOMAIN_URL=$(echo ${ROUTER} | "s/:\/\//:\/\/${SUBDOMAIN}\./")
 
 # info
-YELLOW "${binary} -V" && ${binary} -V
-YELLOW "curl -SsL http://localhost:15721" && curl -SsL http://localhost:15721
-echo
-YELLOW "Visit http://localhost:15721 with the browser to continue completing the cc-switch-server initialization ..."
+YELLOW "Please visit ${SUBDOMAIN_URL} with the browser ..."
+YELLOW "Web Password: ${PASSWORD}"
 
 }
 
