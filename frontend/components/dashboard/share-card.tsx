@@ -11,13 +11,11 @@ import {
   formatLatencySeconds,
   modelHealthTitle,
   modelHealthTone,
-  providerAccountTierLabel,
   providerActualModelNames,
   providerApiEndpoint,
+  providerQuotaStatusLine,
   providerStatusIdentity,
   isApiProviderRuntime,
-  providerQuotaExpiry,
-  providerUsageData,
   resolveShareAppRuntime,
   shareDisplayTitle,
   subdomainTunnelUrl,
@@ -92,9 +90,7 @@ export const ShareCard = React.memo(function ShareCard({
   const averageLatency = averageRecentLatencyMs(appRequests);
   const runtime = app ? resolveShareAppRuntime(share, app) : undefined;
   const providerEnabled = app ? !!share.support?.[app] : !!runtime;
-  const accountTier = providerEnabled && runtime ? providerAccountTierLabel(runtime) : "-";
-  const quotaExpiry = providerEnabled && runtime ? providerQuotaExpiry(runtime, locale) : "-";
-  const providerUsage = providerEnabled && runtime ? providerUsageData(runtime, locale) : "-";
+  const quotaStatusLine = providerEnabled && runtime ? providerQuotaStatusLine(runtime, locale) : "-";
   const accountLine = providerEnabled && runtime
     ? providerStatusIdentity(runtime)
     : share.providerId || t("dashboard.providerUnavailable");
@@ -214,11 +210,7 @@ export const ShareCard = React.memo(function ShareCard({
             </>
           ) : (
             <>
-              <div className="grid grid-cols-3 gap-2 text-[10px] font-semibold leading-4">
-                <span className="min-w-0 truncate" title={accountTier}>{accountTier}</span>
-                <span className="min-w-0 truncate text-center" title={quotaExpiry}>{quotaExpiry}</span>
-                <span className="min-w-0 truncate text-right" title={providerUsage}>{providerUsage}</span>
-              </div>
+              <span className="min-w-0 truncate font-semibold leading-4" title={quotaStatusLine}>{quotaStatusLine}</span>
               <span className="min-w-0 truncate opacity-80" title={accountLine}>{accountLine}</span>
               <span className="min-w-0 truncate opacity-80" title={actualModels}>{actualModels}</span>
             </>
