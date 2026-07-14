@@ -504,6 +504,8 @@ export type ShareRequestLog = {
   isStreaming?: boolean;
   isHealthCheck?: boolean;
   userEmail?: string;
+  userCountry?: string;
+  userCountryIso3?: string;
   createdAt: number;
 };
 
