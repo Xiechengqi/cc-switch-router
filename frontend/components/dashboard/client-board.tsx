@@ -12,7 +12,9 @@ import { useClientConsole } from "@/components/dashboard/client-console";
 import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
 import { useDashboardViewState } from "@/components/dashboard/dashboard-view-state";
 import { useOperationVerification } from "@/components/dashboard/operation-verification";
+import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import { withEmbedCompact } from "@/lib/embed-compact-url";
 import {
   ClientLinkedSharesPanel,
   clientOwnerEmail,
@@ -204,7 +206,7 @@ function ClientConsoleButton({ client }: { client: DashboardClient }) {
       onClick={() =>
         openConsole({
           clientId: client.installation.id,
-          url: tunnelUrl,
+          url: withEmbedCompact(tunnelUrl),
           title,
         })
       }
@@ -219,6 +221,7 @@ function ClientConsoleButton({ client }: { client: DashboardClient }) {
 function ClientUpgradeButton({ client }: { client: DashboardClient }) {
   const { t } = useLocaleText();
   const [busy, setBusy] = React.useState(false);
+  const [confirmOpen, setConfirmOpen] = React.useState(false);
   const sessionEmail = readAuthState().email?.trim().toLowerCase();
   const ownerEmail = clientOwnerEmail(client)?.trim().toLowerCase();
   const tunnelUrl = clientTunnelDisplayUrl(client.clientTunnel?.tunnelUrl);
@@ -234,11 +237,15 @@ function ClientUpgradeButton({ client }: { client: DashboardClient }) {
 
   if (!canUpgrade) return null;
 
-  async function handleUpgrade() {
-    if (!window.confirm(t("dashboard.clientUpgradeConfirm"))) return;
+  const upgradeTarget =
+    client.clientTunnel?.subdomain ||
+    client.installation.id.slice(0, 8);
+
+  async function runUpgrade() {
     setBusy(true);
     try {
       const result = await upgradeClientInstallation(client.installation.id, true);
+      setConfirmOpen(false);
       toast.success(t("dashboard.clientUpgradeStarted", { taskId: result.taskId }));
     } catch (error) {
       toast.danger(error instanceof Error ? error.message : String(error));
@@ -248,14 +255,29 @@ function ClientUpgradeButton({ client }: { client: DashboardClient }) {
   }
 
   return (
-    <ClientHeaderInlineButton
-      label={t("dashboard.clientUpgrade")}
-      onClick={() => void handleUpgrade()}
-      className="inline-flex h-6 shrink-0 items-center gap-1 rounded-full border border-violet-200 bg-violet-50 px-2.5 text-[11px] font-medium text-violet-700 transition-colors hover:border-violet-300 hover:bg-violet-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
-    >
-      {busy ? <Loader2 className="h-3 w-3 shrink-0 animate-spin" /> : <Rocket className="h-3 w-3 shrink-0" />}
-      <span>{t("dashboard.clientUpgrade")}</span>
-    </ClientHeaderInlineButton>
+    <>
+      <ClientHeaderInlineButton
+        label={t("dashboard.clientUpgrade")}
+        onClick={() => setConfirmOpen(true)}
+        className="inline-flex h-6 shrink-0 items-center gap-1 rounded-full border border-violet-200 bg-violet-50 px-2.5 text-[11px] font-medium text-violet-700 transition-colors hover:border-violet-300 hover:bg-violet-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
+      >
+        {busy ? <Loader2 className="h-3 w-3 shrink-0 animate-spin" /> : <Rocket className="h-3 w-3 shrink-0" />}
+        <span>{t("dashboard.clientUpgrade")}</span>
+      </ClientHeaderInlineButton>
+      <ConfirmAlertDialog
+        open={confirmOpen}
+        title={t("dashboard.clientUpgradeConfirmTitle")}
+        description={t("dashboard.clientUpgradeConfirm", { target: upgradeTarget })}
+        confirmLabel={t("common.upgrade")}
+        cancelLabel={t("common.cancel")}
+        tone="warning"
+        busy={busy}
+        onConfirm={() => void runUpgrade()}
+        onOpenChange={(open) => {
+          if (!busy) setConfirmOpen(open);
+        }}
+      />
+    </>
   );
 }
 
