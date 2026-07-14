@@ -3,6 +3,7 @@
 import { Eye, ExternalLink, Link2, Maximize2, Pencil } from "lucide-react";
 import { Button, Card, Chip, Modal, ProgressBar, Tabs } from "@heroui/react";
 import * as React from "react";
+import { ShareClientTag } from "@/components/dashboard/share-client-tag";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getShareImageGenerationRequestLogs, getShareUsageByEmail } from "@/lib/api";
 import type { AppLocale } from "@/lib/i18n";
@@ -260,101 +261,7 @@ export function ShareConnectChip({
   );
 }
 
-export function ShareClientTag({
-  client,
-  onOpen,
-  t,
-}: {
-  client?: DashboardClient;
-  onOpen: (url: string) => void;
-  t: TFn;
-}) {
-  const url = clientTunnelDisplayUrl(client?.clientTunnel?.tunnelUrl);
-  if (!url) return null;
-  const handle = (event: React.MouseEvent) => {
-    event.stopPropagation();
-    onOpen(url);
-  };
-  return (
-    <button
-      type="button"
-      onClick={handle}
-      data-no-row-drawer
-      title={url}
-      className="inline-flex h-[22px] items-center gap-1 rounded-full border border-sky-200 bg-sky-50 px-2.5 text-[11px] font-medium text-sky-700 transition-colors hover:border-sky-300 hover:bg-sky-100"
-    >
-      <Maximize2 className="h-3 w-3" />
-      {t("dashboard.clientTag")}
-    </button>
-  );
-}
-
-export function ClientFrameDialog({
-  url,
-  open,
-  onOpenChange,
-  t,
-}: {
-  url: string;
-  open: boolean;
-  onOpenChange: (next: boolean) => void;
-  t: TFn;
-}) {
-  const frameHost = React.useMemo(() => {
-    if (!url) return "";
-    try {
-      return new URL(url).host;
-    } catch {
-      return url;
-    }
-  }, [url]);
-
-  return (
-    <Modal isOpen={open} onOpenChange={onOpenChange}>
-      <Modal.Backdrop>
-        <Modal.Container placement="center">
-          <Modal.Dialog className="light w-[min(880px,calc(100vw-2.5rem))] max-w-none overflow-hidden !rounded-2xl !border !border-slate-200/80 !bg-white !p-0 !text-slate-900 shadow-[0_24px_60px_rgba(15,23,42,0.16)] [--foreground:rgb(15,23,42)] [--muted:rgb(100,116,139)] [--overlay:#fff] [--overlay-foreground:rgb(15,23,42)] [--surface:#fff] [--surface-foreground:rgb(15,23,42)]">
-            <Modal.CloseTrigger className="!right-3 !top-3 !bg-white/90 !text-slate-600 hover:!bg-slate-100 hover:!text-slate-950" />
-            <Modal.Header className="border-b border-slate-100 px-4 py-3 pr-12">
-              <div className="min-w-0">
-                <Modal.Heading className="text-base font-semibold">{t("dashboard.clientConsole")}</Modal.Heading>
-                {url ? (
-                  <a
-                    href={url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="mt-1 inline-flex max-w-full items-center gap-1 truncate text-[11px] font-mono text-muted-foreground underline-offset-4 transition-colors hover:text-primary hover:underline"
-                    title={url}
-                  >
-                    <span className="min-w-0 truncate">{frameHost || url}</span>
-                    <ExternalLink className="h-3 w-3 shrink-0" />
-                  </a>
-                ) : null}
-              </div>
-            </Modal.Header>
-            <Modal.Body className="grid gap-0 p-4">
-              {url ? (
-                <div className="overflow-hidden rounded-xl border border-slate-200/80 bg-slate-50 shadow-[inset_0_1px_0_rgba(255,255,255,0.7)]">
-                  <div className="flex items-center gap-1.5 border-b border-slate-200/80 bg-slate-100/90 px-3 py-2">
-                    <span className="h-2 w-2 rounded-full bg-rose-300/90" aria-hidden />
-                    <span className="h-2 w-2 rounded-full bg-amber-300/90" aria-hidden />
-                    <span className="h-2 w-2 rounded-full bg-emerald-300/90" aria-hidden />
-                    <span className="ml-1 min-w-0 truncate text-[10px] font-mono text-slate-500">{frameHost || url}</span>
-                  </div>
-                  <iframe
-                    src={url}
-                    title={`${t("dashboard.clientConsole")} ${url}`}
-                    className="h-[min(48vh,460px)] w-full border-0 bg-white"
-                  />
-                </div>
-              ) : null}
-            </Modal.Body>
-          </Modal.Dialog>
-        </Modal.Container>
-      </Modal.Backdrop>
-    </Modal>
-  );
-}
+export { ShareClientTag };
 
 export function ShareStatusCell({ share, t, locale }: { share?: ShareView; t: TFn; locale: AppLocale }) {
   if (!share) return <span className="text-muted-foreground">-</span>;
@@ -528,23 +435,26 @@ export function ClientReference({
   const label = clientDisplayLabel(client);
   const url = clientTunnelDisplayUrl(client.clientTunnel?.tunnelUrl);
   return (
-    <div className="grid min-w-0 gap-1 rounded-md border border-default/40 bg-muted/20 px-2 py-1.5 text-xs">
-      <div className="min-w-0">
-        {url ? (
-          <a
-            href={url}
-            target="_blank"
-            rel="noopener noreferrer"
-            data-no-row-drawer
-            className="inline-flex min-w-0 max-w-full items-center gap-1 font-mono font-semibold text-foreground underline-offset-4 hover:underline"
-            title={url}
-          >
-            <span className="truncate">{label}</span>
-            <ExternalLink className="h-3 w-3 shrink-0 text-muted-foreground" />
-          </a>
-        ) : (
-          <strong className="min-w-0 truncate font-mono text-foreground" title={label}>{label}</strong>
-        )}
+    <div className="grid min-w-0 gap-2 rounded-md border border-default/40 bg-muted/20 px-2 py-1.5 text-xs">
+      <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
+        <div className="min-w-0">
+          {url ? (
+            <a
+              href={url}
+              target="_blank"
+              rel="noopener noreferrer"
+              data-no-row-drawer
+              className="inline-flex min-w-0 max-w-full items-center gap-1 font-mono font-semibold text-foreground underline-offset-4 hover:underline"
+              title={url}
+            >
+              <span className="truncate">{label}</span>
+              <ExternalLink className="h-3 w-3 shrink-0 text-muted-foreground" />
+            </a>
+          ) : (
+            <strong className="min-w-0 truncate font-mono text-foreground" title={label}>{label}</strong>
+          )}
+        </div>
+        <ShareClientTag client={client} t={t} />
       </div>
       <span className="truncate text-muted-foreground" title={clientOwnerEmail(client)}>{clientOwnerEmail(client)}</span>
     </div>

@@ -417,7 +417,7 @@ function regionCodeFromMapCountry(country?: CountryMapPoint) {
 export function LiveMap({ data }: { data: DashboardResponse | null }) {
   const { t } = useLocaleText();
   const focus = useDashboardFocus();
-  const { addRegionFilter } = useDashboardViewState();
+  const { setRegionFilters } = useDashboardViewState();
   const shellRef = React.useRef<HTMLDivElement | null>(null);
   const mapLayerRef = React.useRef<HTMLDivElement | null>(null);
   const worldRef = React.useRef<HTMLDivElement | null>(null);
@@ -499,10 +499,10 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
     (country?: CountryMapPoint) => {
       const region = regionCodeFromMapCountry(country);
       if (!region) return;
-      addRegionFilter(region);
+      setRegionFilters([region]);
       void recordDashboardUxEvent({ eventType: "filter_applied", source: "map", targetType: "client" });
     },
-    [addRegionFilter],
+    [setRegionFilters],
   );
 
   React.useLayoutEffect(() => {

@@ -3,6 +3,7 @@
 import { Card } from "@heroui/react";
 import { Eye, ExternalLink, Link2, Pencil } from "lucide-react";
 import * as React from "react";
+import { ShareClientTag } from "@/components/dashboard/share-client-tag";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { operationalReasonLabel, shareOperationalSummary } from "@/components/dashboard/operational-status";
 import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
@@ -27,7 +28,7 @@ import {
   expiryTitle,
   type CoreShareApp,
 } from "@/components/dashboard/data-tables";
-import type { ShareRequestLog, ShareView } from "@/lib/types";
+import type { DashboardClient, ShareRequestLog, ShareView } from "@/lib/types";
 import { compactTokens, formatDateTime } from "@/lib/utils";
 import { resolveShareCoreApp, SHARE_APP_LABELS } from "@/lib/share-app";
 import { recordDashboardUxEvent } from "@/lib/api";
@@ -67,12 +68,14 @@ function shouldOpenShareCard(
 
 export const ShareCard = React.memo(function ShareCard({
   share,
+  client,
   referenceTunnelUrl,
   onOpen,
   onEdit,
   onConnect,
 }: {
   share: ShareView;
+  client?: DashboardClient;
   referenceTunnelUrl?: string;
   onOpen: (share: ShareView) => void;
   onEdit: (share: ShareView) => void;
@@ -181,6 +184,7 @@ export const ShareCard = React.memo(function ShareCard({
               {app ? <span className="rounded bg-primary/10 px-1.5 py-0.5 text-[9px] font-semibold text-primary">{SHARE_APP_LABELS[app]}</span> : null}
             </div>
             <div className="flex shrink-0 items-center gap-1">
+              {client ? <ShareClientTag client={client} t={t} /> : null}
               <button type="button" data-no-row-drawer disabled={connectDisabled} title={connectDisabled ? issue || t("common.offline") : undefined} className="inline-flex h-6 items-center gap-1 rounded-md border border-primary/20 bg-primary/5 px-2 text-[10px] font-semibold text-primary hover:bg-primary/10 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-50 disabled:text-slate-400" onClick={(event) => { event.stopPropagation(); if (!connectDisabled) onConnect(share); }}>
                 <Link2 className="h-3 w-3" />{t("dashboard.connect")}
               </button>

@@ -3,6 +3,7 @@
 import { Alert } from "@heroui/react";
 import { BoardDock } from "@/components/board/board-dock";
 import { ClientBoard } from "@/components/dashboard/client-board";
+import { ClientConsoleDock, ClientConsoleIframePool, ClientConsoleManagerProvider, ClientConsoleWindowLayer } from "@/components/dashboard/client-console";
 import { MarketsTable, PresenceFooter } from "@/components/dashboard/data-tables";
 import { LiveMap } from "@/components/dashboard/live-map";
 import { DashboardFocusProvider } from "@/components/dashboard/dashboard-focus";
@@ -17,6 +18,7 @@ export function DashboardPage() {
     <DashboardFocusProvider data={data}>
       <DashboardViewStateProvider>
         <OperationVerificationProvider data={data}>
+          <ClientConsoleManagerProvider>
           <main className="mx-auto grid w-[calc(100%-2rem)] max-w-7xl gap-5 pb-6">
           {error ? <Alert status="danger" className="!text-slate-900">{error}</Alert> : null}
           <LiveMap data={data} />
@@ -29,7 +31,11 @@ export function DashboardPage() {
           <MarketsTable markets={data?.markets || []} onChanged={refresh} />
           </main>
           <PresenceFooter />
+          <ClientConsoleWindowLayer />
+          <ClientConsoleIframePool />
+          <ClientConsoleDock />
           <BoardDock />
+          </ClientConsoleManagerProvider>
         </OperationVerificationProvider>
       </DashboardViewStateProvider>
     </DashboardFocusProvider>
