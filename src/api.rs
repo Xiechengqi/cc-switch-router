@@ -54,7 +54,8 @@ use crate::models::{
     PublicMapPointsResponse, PublicNetworkStatsResponse, PublicPayoutProfilesQuery,
     RefreshSessionRequest, RegisterGatewayRequest, RegisterGatewayResponse,
     RegisterInstallationRequest, RegisterInstallationResponse, RegisterMarketRequest,
-    RenewLeaseRequest, RenewLeaseResponse, RequestEmailCodeRequest, RequestEmailCodeResponse,
+    RenewLeaseRequest, RenewLeaseResponse, ReportInstallationStatusRequest,
+    ReportInstallationStatusResponse, RequestEmailCodeRequest, RequestEmailCodeResponse,
     SessionStatusResponse, ShareApiAuthResponse, ShareApiAuthUser, ShareApiContextResponse,
     ShareApiShareResponse, ShareBatchSyncRequest, ShareClaimSubdomainRequest, ShareDeleteRequest,
     ShareEditAckRequest, ShareEditAvailableEvent, ShareEditEventSignaturePayload,
@@ -63,8 +64,9 @@ use crate::models::{
     ShareMarketListingStatusSyncResponse, SharePendingEditsRequest,
     ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRuntimeRefreshRequest,
     ShareSettingsPatch, ShareSettingsUpdateRequest, ShareSyncRequest,
-    SubdomainAvailabilityResponse, UserApiTokenResetResponse, UserApiTokenResponse,
-    UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    SubdomainAvailabilityResponse, UpgradeInstallationRequest, UpgradeInstallationResponse,
+    UserApiTokenResetResponse, UserApiTokenResponse, UserSharesResponse, VerifyEmailCodeRequest,
+    VerifyEmailCodeResponse,
 };
 use crate::proxy::{gateway_proxy_handler, market_proxy_handler, proxy_handler};
 use crate::recent_traffic::{RecentRequestEvent, RecentTrafficSnapshot};
@@ -215,6 +217,14 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/dashboard/presence", post(dashboard_presence))
         .route("/v1/dashboard/ux-events", post(dashboard_ux_event))
         .route("/v1/installations/register", post(register_installation))
+        .route(
+            "/v1/installations/report-status",
+            post(report_installation_status),
+        )
+        .route(
+            "/v1/installations/:installation_id/upgrade",
+            post(upgrade_installation),
+        )
         .route(
             "/v1/client-tunnel/subdomain-availability",
             get(check_client_tunnel_subdomain_availability),
@@ -1043,6 +1053,60 @@ async fn register_installation(
         .register_installation(input, extract_client_metadata(&headers, addr))
         .await?;
     Ok(Json(response))
+}
+
+async fn report_installation_status(
+    State(state): State<ServerState>,
+    Json(input): Json<ReportInstallationStatusRequest>,
+) -> Result<Json<ReportInstallationStatusResponse>, AppError> {
+    Ok(Json(state.store.report_installation_status(input).await?))
+}
+
+async fn upgrade_installation(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(installation_id): Path<String>,
+    Json(input): Json<UpgradeInstallationRequest>,
+) -> Result<Json<UpgradeInstallationResponse>, AppError> {
+    let session_email = require_session_email(&state, &headers).await?;
+    let bearer = extract_bearer_token(&headers)
+        .ok_or_else(|| AppError::Unauthorized("missing bearer token".into()))?;
+    let (tunnel_url, _) = state
+        .store
+        .prepare_installation_upgrade(&state.config, &installation_id, &session_email)
+        .await?;
+    let response = state
+        .proxy_http
+        .post(format!(
+            "{}/web-api/invoke/start_admin_upgrade",
+            tunnel_url.trim_end_matches('/')
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+        .header("x-cc-switch-web-user-email", session_email.as_str())
+        .header("x-cc-switch-web-role", "owner")
+        .json(&serde_json::json!({
+            "restartAfter": input.restart_after,
+            "force": true,
+        }))
+        .send()
+        .await
+        .map_err(|error| AppError::Internal(format!("client upgrade request failed: {error}")))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(AppError::Internal(format!(
+            "client upgrade failed: {status}: {body}"
+        )));
+    }
+    let payload: serde_json::Value = response.json().await.map_err(|error| {
+        AppError::Internal(format!("parse client upgrade response failed: {error}"))
+    })?;
+    let task_id = payload
+        .get("taskId")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| AppError::Internal("client upgrade response missing taskId".into()))?
+        .to_string();
+    Ok(Json(UpgradeInstallationResponse { ok: true, task_id }))
 }
 
 async fn bind_installation_owner_email(

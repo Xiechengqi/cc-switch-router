@@ -36,8 +36,8 @@ use crate::models::{
     GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse, HealthCheckEntry,
     HealthTimelineBucket, ImageGenerationRequestLogEntry, Installation,
     InstallationPayoutProfileUpdateRequest, InstallationPayoutProfileUpdateResponse,
-    InstallationView, IssueLeaseRequest, IssueLeaseResponse, LatLonPoint, MapDisplaySettings,
-    MapDisplaySettingsUpdate, MapViewportSettings, MarketAppAvailability,
+    InstallationUpgradeView, InstallationView, IssueLeaseRequest, IssueLeaseResponse, LatLonPoint,
+    MapDisplaySettings, MapDisplaySettingsUpdate, MapViewportSettings, MarketAppAvailability,
     MarketAppAvailabilityEntry, MarketDisabledSharesUpdateRequest,
     MarketDisabledSharesUpdateResponse, MarketLinkedShareView, MarketMaintenanceUpdateRequest,
     MarketMaintenanceUpdateResponse, MarketRegistryRecord, MarketRequestLogBatchSyncRequest,
@@ -1027,6 +1027,11 @@ impl AppStore {
             geo_last_changed_at: None,
             created_at: now,
             last_seen_at: now,
+            delegate_upgrade_to_router_owner: None,
+            app_commit_id: None,
+            update_available: None,
+            upgrade_capable: None,
+            status_reported_at: None,
         };
         conn.execute(
             "INSERT INTO installations (
@@ -1093,6 +1098,89 @@ impl AppStore {
             .map_err(|e| AppError::Internal(format!("read control secret failed: {e}")))?
             .flatten();
         Ok(secret)
+    }
+
+    pub async fn report_installation_status(
+        &self,
+        input: crate::models::ReportInstallationStatusRequest,
+    ) -> Result<crate::models::ReportInstallationStatusResponse, AppError> {
+        let conn = self.conn.lock().await;
+        let installation = get_installation(&conn, &input.installation_id)?
+            .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
+        verify_signed_share_request(
+            &conn,
+            &installation.public_key,
+            &input.installation_id,
+            "report_installation_status",
+            &input.payload,
+            input.timestamp_ms,
+            &input.nonce,
+            &input.signature,
+        )?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE installations
+             SET delegate_upgrade_to_router_owner = ?2,
+                 app_commit_id = ?3,
+                 update_available = ?4,
+                 upgrade_capable = ?5,
+                 status_reported_at = ?6,
+                 last_seen_at = ?6
+             WHERE id = ?1",
+            params![
+                input.installation_id,
+                i64::from(input.payload.delegate_upgrade_to_router_owner),
+                input.payload.app_commit_id,
+                i64::from(input.payload.update_available),
+                i64::from(input.payload.upgrade_capable),
+                now,
+            ],
+        )
+        .map_err(|e| AppError::Internal(format!("update installation status failed: {e}")))?;
+        Ok(crate::models::ReportInstallationStatusResponse { ok: true })
+    }
+
+    pub async fn prepare_installation_upgrade(
+        &self,
+        config: &Config,
+        installation_id: &str,
+        session_email: &str,
+    ) -> Result<(String, String), AppError> {
+        let conn = self.conn.lock().await;
+        let installation = get_installation(&conn, installation_id)?
+            .ok_or_else(|| AppError::NotFound("installation not found".into()))?;
+        let owner_email = installation
+            .owner_email
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase)
+            .ok_or_else(|| AppError::Forbidden("installation owner is not bound".into()))?;
+        if owner_email != session_email.trim().to_ascii_lowercase() {
+            return Err(AppError::Forbidden(
+                "only installation owner can trigger upgrade".into(),
+            ));
+        }
+        if !installation
+            .delegate_upgrade_to_router_owner
+            .unwrap_or(true)
+        {
+            return Err(AppError::Forbidden(
+                "router owner upgrade delegation is disabled on this client".into(),
+            ));
+        }
+        if installation.upgrade_capable == Some(false) {
+            return Err(AppError::BadRequest(
+                "client reported upgrade is unavailable in this environment".into(),
+            ));
+        }
+        let tunnel = get_client_tunnel_by_installation(&conn, installation_id)?
+            .ok_or_else(|| AppError::BadRequest("client tunnel is not configured".into()))?;
+        if !tunnel.enabled {
+            return Err(AppError::BadRequest("client tunnel is disabled".into()));
+        }
+        let tunnel_url = config.tunnel_url(&tunnel.subdomain);
+        Ok((tunnel_url, installation.id))
     }
 
     pub async fn update_installation_payout_profile(
@@ -4176,14 +4264,15 @@ impl AppStore {
                 });
             }
             installation_views.push(InstallationView {
-                id: installation.id,
-                platform: installation.platform,
-                app_version: installation.app_version,
-                owner_email: installation.owner_email,
-                region: installation.region,
-                country_code: installation.country_code,
+                id: installation.id.clone(),
+                platform: installation.platform.clone(),
+                app_version: installation.app_version.clone(),
+                owner_email: installation.owner_email.clone(),
+                region: installation.region.clone(),
+                country_code: installation.country_code.clone(),
                 created_at: installation.created_at,
                 last_seen_at: installation.last_seen_at,
+                upgrade: installation_upgrade_view(&installation),
             });
         }
         installation_views.sort_by(|a, b| b.last_seen_at.cmp(&a.last_seen_at));
@@ -9083,6 +9172,16 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             AppError::Internal(format!("add installations control_secret_b64 failed: {e}"))
         })?;
     }
+    add_column_if_missing(
+        conn,
+        "installations",
+        "delegate_upgrade_to_router_owner",
+        "INTEGER",
+    )?;
+    add_column_if_missing(conn, "installations", "app_commit_id", "TEXT")?;
+    add_column_if_missing(conn, "installations", "update_available", "INTEGER")?;
+    add_column_if_missing(conn, "installations", "upgrade_capable", "INTEGER")?;
+    add_column_if_missing(conn, "installations", "status_reported_at", "TEXT")?;
     let columns = conn
         .prepare("PRAGMA table_info(shares)")
         .and_then(|mut stmt| {
@@ -9456,52 +9555,124 @@ fn get_installation(
     installation_id: &str,
 ) -> Result<Option<Installation>, AppError> {
     conn.query_row(
-        "SELECT id, public_key, platform, app_version, owner_email, owner_verified_at, last_seen_ip, country_code, country, region, city, latitude, longitude,
-                geo_candidate_country_code, geo_candidate_country, geo_candidate_region, geo_candidate_city,
-                geo_candidate_latitude, geo_candidate_longitude, geo_candidate_hits, geo_candidate_first_seen_at,
-                geo_last_changed_at, created_at, last_seen_at
-         FROM installations WHERE id = ?1",
+        &format!(
+            "SELECT {INSTALLATION_SELECT_COLUMNS}
+         FROM installations WHERE id = ?1"
+        ),
         params![installation_id],
-        |row| {
-            Ok(Installation {
-                id: row.get(0)?,
-                public_key: row.get(1)?,
-                platform: row.get(2)?,
-                app_version: row.get(3)?,
-                owner_email: row.get(4)?,
-                owner_verified_at: row
-                    .get::<_, Option<String>>(5)?
-                    .map(|value| parse_dt_sql(&value))
-                    .transpose()?,
-                last_seen_ip: row.get(6)?,
-                country_code: row.get(7)?,
-                country: row.get(8)?,
-                region: row.get(9)?,
-                city: row.get(10)?,
-                latitude: row.get(11)?,
-                longitude: row.get(12)?,
-                geo_candidate_country_code: row.get(13)?,
-                geo_candidate_country: row.get(14)?,
-                geo_candidate_region: row.get(15)?,
-                geo_candidate_city: row.get(16)?,
-                geo_candidate_latitude: row.get(17)?,
-                geo_candidate_longitude: row.get(18)?,
-                geo_candidate_hits: row.get(19)?,
-                geo_candidate_first_seen_at: row
-                    .get::<_, Option<String>>(20)?
-                    .map(|value| parse_dt_sql(&value))
-                    .transpose()?,
-                geo_last_changed_at: row
-                    .get::<_, Option<String>>(21)?
-                    .map(|value| parse_dt_sql(&value))
-                    .transpose()?,
-                created_at: parse_dt_sql(&row.get::<_, String>(22)?)?,
-                last_seen_at: parse_dt_sql(&row.get::<_, String>(23)?)?,
-            })
-        },
+        map_installation_row,
     )
     .optional()
     .map_err(|e| AppError::Internal(format!("query installation failed: {e}")))
+}
+
+const INSTALLATION_SELECT_COLUMNS: &str = "id, public_key, platform, app_version, owner_email, owner_verified_at, last_seen_ip, country_code, country, region, city, latitude, longitude,
+                geo_candidate_country_code, geo_candidate_country, geo_candidate_region, geo_candidate_city,
+                geo_candidate_latitude, geo_candidate_longitude, geo_candidate_hits, geo_candidate_first_seen_at,
+                geo_last_changed_at, created_at, last_seen_at,
+                delegate_upgrade_to_router_owner, app_commit_id, update_available, upgrade_capable, status_reported_at";
+
+fn map_installation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Installation> {
+    Ok(Installation {
+        id: row.get(0)?,
+        public_key: row.get(1)?,
+        platform: row.get(2)?,
+        app_version: row.get(3)?,
+        owner_email: row.get(4)?,
+        owner_verified_at: row
+            .get::<_, Option<String>>(5)?
+            .map(|value| parse_dt_sql(&value))
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+        last_seen_ip: row.get(6)?,
+        country_code: row.get(7)?,
+        country: row.get(8)?,
+        region: row.get(9)?,
+        city: row.get(10)?,
+        latitude: row.get(11)?,
+        longitude: row.get(12)?,
+        geo_candidate_country_code: row.get(13)?,
+        geo_candidate_country: row.get(14)?,
+        geo_candidate_region: row.get(15)?,
+        geo_candidate_city: row.get(16)?,
+        geo_candidate_latitude: row.get(17)?,
+        geo_candidate_longitude: row.get(18)?,
+        geo_candidate_hits: row.get(19)?,
+        geo_candidate_first_seen_at: row
+            .get::<_, Option<String>>(20)?
+            .map(|value| parse_dt_sql(&value))
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    20,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+        geo_last_changed_at: row
+            .get::<_, Option<String>>(21)?
+            .map(|value| parse_dt_sql(&value))
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    21,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+        created_at: parse_dt_sql(&row.get::<_, String>(22)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                22,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        last_seen_at: parse_dt_sql(&row.get::<_, String>(23)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                23,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        delegate_upgrade_to_router_owner: row.get::<_, Option<i64>>(24)?.map(|value| value != 0),
+        app_commit_id: row.get(25)?,
+        update_available: row.get::<_, Option<i64>>(26)?.map(|value| value != 0),
+        upgrade_capable: row.get::<_, Option<i64>>(27)?.map(|value| value != 0),
+        status_reported_at: row
+            .get::<_, Option<String>>(28)?
+            .map(|value| parse_dt_sql(&value))
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    28,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+    })
+}
+
+fn installation_upgrade_view(installation: &Installation) -> Option<InstallationUpgradeView> {
+    if installation.status_reported_at.is_none()
+        && installation.delegate_upgrade_to_router_owner.is_none()
+        && installation.app_commit_id.is_none()
+    {
+        return None;
+    }
+    Some(InstallationUpgradeView {
+        delegate_upgrade_to_router_owner: installation
+            .delegate_upgrade_to_router_owner
+            .unwrap_or(true),
+        update_available: installation.update_available.unwrap_or(false),
+        upgrade_capable: installation.upgrade_capable.unwrap_or(false),
+        commit_id: installation.app_commit_id.clone(),
+    })
 }
 
 fn find_installation_id_by_public_key(
@@ -9538,52 +9709,13 @@ fn get_lease_by_connection_id(
 
 fn list_installations(conn: &Connection) -> Result<Vec<Installation>, AppError> {
     let mut stmt = conn
-        .prepare(
-            "SELECT id, public_key, platform, app_version, owner_email, owner_verified_at, last_seen_ip, country_code, country, region, city, latitude, longitude,
-                    geo_candidate_country_code, geo_candidate_country, geo_candidate_region, geo_candidate_city,
-                    geo_candidate_latitude, geo_candidate_longitude, geo_candidate_hits, geo_candidate_first_seen_at,
-                    geo_last_changed_at, created_at, last_seen_at
-             FROM installations ORDER BY last_seen_at DESC",
-        )
+        .prepare(&format!(
+            "SELECT {INSTALLATION_SELECT_COLUMNS}
+             FROM installations ORDER BY last_seen_at DESC"
+        ))
         .map_err(|e| AppError::Internal(format!("prepare installations failed: {e}")))?;
     let rows = stmt
-        .query_map([], |row| {
-            Ok(Installation {
-                id: row.get(0)?,
-                public_key: row.get(1)?,
-                platform: row.get(2)?,
-                app_version: row.get(3)?,
-                owner_email: row.get(4)?,
-                owner_verified_at: row
-                    .get::<_, Option<String>>(5)?
-                    .map(|value| parse_dt_sql(&value))
-                    .transpose()?,
-                last_seen_ip: row.get(6)?,
-                country_code: row.get(7)?,
-                country: row.get(8)?,
-                region: row.get(9)?,
-                city: row.get(10)?,
-                latitude: row.get(11)?,
-                longitude: row.get(12)?,
-                geo_candidate_country_code: row.get(13)?,
-                geo_candidate_country: row.get(14)?,
-                geo_candidate_region: row.get(15)?,
-                geo_candidate_city: row.get(16)?,
-                geo_candidate_latitude: row.get(17)?,
-                geo_candidate_longitude: row.get(18)?,
-                geo_candidate_hits: row.get(19)?,
-                geo_candidate_first_seen_at: row
-                    .get::<_, Option<String>>(20)?
-                    .map(|value| parse_dt_sql(&value))
-                    .transpose()?,
-                geo_last_changed_at: row
-                    .get::<_, Option<String>>(21)?
-                    .map(|value| parse_dt_sql(&value))
-                    .transpose()?,
-                created_at: parse_dt_sql(&row.get::<_, String>(22)?)?,
-                last_seen_at: parse_dt_sql(&row.get::<_, String>(23)?)?,
-            })
-        })
+        .query_map([], map_installation_row)
         .map_err(|e| AppError::Internal(format!("query installations failed: {e}")))?;
     collect_rows(rows)
 }

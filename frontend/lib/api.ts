@@ -214,6 +214,19 @@ export async function restartService() {
   );
 }
 
+export async function upgradeClientInstallation(
+  installationId: string,
+  restartAfter = true,
+) {
+  return parseJson<{ ok: boolean; taskId: string }>(
+    await authFetch(`/v1/installations/${installationId}/upgrade`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ restartAfter }),
+    }),
+  );
+}
+
 export async function rollbackService() {
   return parseJson<{ ok: boolean; strategy: string; backupPath: string }>(
     await authFetch("/v1/admin/rollback", {

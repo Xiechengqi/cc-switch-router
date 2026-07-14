@@ -162,6 +162,12 @@ export type DashboardClient = {
     countryCode?: string;
     createdAt: string;
     lastSeenAt: string;
+    upgrade?: {
+      delegateUpgradeToRouterOwner: boolean;
+      updateAvailable: boolean;
+      upgradeCapable: boolean;
+      commitId?: string;
+    };
   };
   clientTunnel?: {
     ownerEmail: string;

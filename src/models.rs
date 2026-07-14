@@ -46,6 +46,16 @@ pub struct Installation {
     pub geo_last_changed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
+    #[serde(default)]
+    pub delegate_upgrade_to_router_owner: Option<bool>,
+    #[serde(default)]
+    pub app_commit_id: Option<String>,
+    #[serde(default)]
+    pub update_available: Option<bool>,
+    #[serde(default)]
+    pub upgrade_capable: Option<bool>,
+    #[serde(default)]
+    pub status_reported_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2204,6 +2214,63 @@ pub struct InstallationView {
     pub country_code: Option<String>,
     pub created_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade: Option<InstallationUpgradeView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallationUpgradeView {
+    pub delegate_upgrade_to_router_owner: bool,
+    pub update_available: bool,
+    pub upgrade_capable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportInstallationStatusPayload {
+    pub delegate_upgrade_to_router_owner: bool,
+    pub auto_upgrade_enabled: bool,
+    pub app_commit_id: String,
+    pub update_available: bool,
+    pub upgrade_capable: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportInstallationStatusRequest {
+    pub installation_id: String,
+    pub timestamp_ms: i64,
+    pub nonce: String,
+    pub signature: String,
+    #[serde(flatten)]
+    pub payload: ReportInstallationStatusPayload,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportInstallationStatusResponse {
+    pub ok: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpgradeInstallationRequest {
+    #[serde(default = "default_restart_after_upgrade")]
+    pub restart_after: bool,
+}
+
+fn default_restart_after_upgrade() -> bool {
+    true
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpgradeInstallationResponse {
+    pub ok: bool,
+    pub task_id: String,
 }
 
 #[derive(Debug, Serialize)]

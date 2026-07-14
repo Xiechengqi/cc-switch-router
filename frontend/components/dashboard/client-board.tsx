@@ -1,7 +1,7 @@
 "use client";
 
 import { Button, Card, Chip, Drawer, toast } from "@heroui/react";
-import { Check, ChevronDown, Copy, ExternalLink, Search, WalletCards } from "lucide-react";
+import { Check, ChevronDown, Copy, ExternalLink, Loader2, Rocket, Search, WalletCards } from "lucide-react";
 import * as React from "react";
 import { buildClientInstallCommand, InstallGuideDialog } from "@/components/dashboard/install-guide-dialog";
 import { SectionInstallButton } from "@/components/dashboard/section-install-button";
@@ -40,7 +40,8 @@ import {
 import type { DashboardClient, DashboardMarket, OperationalState, ShareView } from "@/lib/types";
 import { formatDateTime, formatRelativeTime } from "@/lib/utils";
 import { usePersistentState } from "@/lib/use-persistent-state";
-import { recordDashboardUxEvent } from "@/lib/api";
+import { recordDashboardUxEvent, upgradeClientInstallation } from "@/lib/api";
+import { readAuthState } from "@/lib/auth";
 import { CompactSelect } from "@/components/common/compact-select";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 
@@ -211,6 +212,49 @@ function ClientConsoleButton({ client }: { client: DashboardClient }) {
     >
       <ClientConsoleIcon className="h-3 w-3 shrink-0" />
       <span>{t("dashboard.clientConsole")}</span>
+    </ClientHeaderInlineButton>
+  );
+}
+
+function ClientUpgradeButton({ client }: { client: DashboardClient }) {
+  const { t } = useLocaleText();
+  const [busy, setBusy] = React.useState(false);
+  const sessionEmail = readAuthState().email?.trim().toLowerCase();
+  const ownerEmail = clientOwnerEmail(client)?.trim().toLowerCase();
+  const tunnelUrl = clientTunnelDisplayUrl(client.clientTunnel?.tunnelUrl);
+  const delegateEnabled = client.installation.upgrade?.delegateUpgradeToRouterOwner !== false;
+  const upgradeCapable = client.installation.upgrade?.upgradeCapable;
+  const canUpgrade =
+    !!sessionEmail &&
+    !!ownerEmail &&
+    sessionEmail === ownerEmail &&
+    !!tunnelUrl &&
+    delegateEnabled &&
+    upgradeCapable !== false;
+
+  if (!canUpgrade) return null;
+
+  async function handleUpgrade() {
+    if (!window.confirm(t("dashboard.clientUpgradeConfirm"))) return;
+    setBusy(true);
+    try {
+      const result = await upgradeClientInstallation(client.installation.id, true);
+      toast.success(t("dashboard.clientUpgradeStarted", { taskId: result.taskId }));
+    } catch (error) {
+      toast.danger(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <ClientHeaderInlineButton
+      label={t("dashboard.clientUpgrade")}
+      onClick={() => void handleUpgrade()}
+      className="inline-flex h-6 shrink-0 items-center gap-1 rounded-full border border-violet-200 bg-violet-50 px-2.5 text-[11px] font-medium text-violet-700 transition-colors hover:border-violet-300 hover:bg-violet-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
+    >
+      {busy ? <Loader2 className="h-3 w-3 shrink-0 animate-spin" /> : <Rocket className="h-3 w-3 shrink-0" />}
+      <span>{t("dashboard.clientUpgrade")}</span>
     </ClientHeaderInlineButton>
   );
 }
@@ -398,6 +442,7 @@ function ClientCard({
               )}
               <OperationalStatusPill summary={summary} />
               {tunnelUrl ? <ClientConsoleButton client={client} /> : null}
+              <ClientUpgradeButton client={client} />
               <ClientDetailsButton onOpen={openClientDrawer} />
               {summary.primaryReason ? <span className={`truncate text-[11px] font-medium ${state === "offline" ? "text-rose-700" : "text-amber-700"}`} title={operationalReasonLabel(summary.primaryReason, t)}>{operationalReasonLabel(summary.primaryReason, t)}</span> : null}
               {showRemoval ? <ClientRemovalSchedule removalAt={client.removalAt} className="text-[11px]" /> : null}
