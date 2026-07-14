@@ -77,6 +77,7 @@ INFO "${binary} -V" && ${binary} -V
 
 # start
 EXEC "nohup /usr/local/bin/${binary} &> /dev/null &"
+EXEC "sleep 3"
 
 # info
 YELLOW "${binary} -V" && ${binary} -V
