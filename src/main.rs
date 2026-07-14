@@ -417,7 +417,7 @@ async fn run_route_health_probe_cycle(
     let targets = store.list_share_route_targets().await?;
     for target in targets {
         let is_healthy = if active.contains(&target.subdomain) {
-            probe_share_route(config, client, &target).await
+            probe_share_route(store, config, client, &target).await
         } else {
             false
         };
@@ -431,7 +431,7 @@ async fn run_route_health_probe_cycle(
     let client_targets = store.list_client_tunnel_route_targets().await?;
     for target in client_targets {
         let is_healthy = if active.contains(&target.subdomain) {
-            probe_client_tunnel_route(config, client, &target).await
+            probe_client_tunnel_route(store, config, client, &target).await
         } else {
             false
         };
@@ -461,10 +461,12 @@ async fn run_share_runtime_refresh_cycle(
     );
     for target in targets {
         match fetch_share_runtime_snapshot_from_route(
+            store,
             config,
             client,
             &target.subdomain,
             &target.share_id,
+            &target.installation_id,
         )
         .await
         {
@@ -530,33 +532,64 @@ fn filter_registered_route_targets(
 }
 
 async fn probe_share_route(
+    store: &AppStore,
     config: &Config,
     client: &reqwest::Client,
     target: &ShareRouteTarget,
 ) -> bool {
-    probe_tunnel_route_health(config, client, &target.subdomain).await
+    probe_tunnel_route_health(
+        store,
+        config,
+        client,
+        &target.subdomain,
+        &target.installation_id,
+    )
+    .await
 }
 
 async fn probe_client_tunnel_route(
+    store: &AppStore,
     config: &Config,
     client: &reqwest::Client,
     target: &ClientTunnelRouteTarget,
 ) -> bool {
-    probe_tunnel_route_health(config, client, &target.subdomain).await
+    probe_tunnel_route_health(
+        store,
+        config,
+        client,
+        &target.subdomain,
+        &target.installation_id,
+    )
+    .await
 }
 
 async fn probe_tunnel_route_health(
+    store: &AppStore,
     config: &Config,
     client: &reqwest::Client,
     subdomain: &str,
+    installation_id: &str,
 ) -> bool {
-    let url = format!("{}/_share-router/health", config.tunnel_url(subdomain));
-    match client
-        .get(&url)
-        .header("X-Share-Router-Probe", "1")
-        .send()
+    const PATH: &str = "/_share-router/health";
+    let Some(control_secret) = store
+        .installation_control_secret(installation_id)
         .await
-    {
+        .ok()
+        .flatten()
+        .filter(|secret| !secret.trim().is_empty())
+    else {
+        return false;
+    };
+    let url = format!("{}{PATH}", config.tunnel_url(subdomain));
+    let request = crate::ctl_client::authorize_control_request(
+        client.get(&url).header("X-Share-Router-Probe", "1"),
+        "GET",
+        PATH,
+        installation_id,
+        &control_secret,
+        &[],
+    );
+    match request.send().await {
         Ok(response) => response.status().is_success(),
         Err(_) => false,
     }

@@ -21,6 +21,7 @@ const MARKET_APP_AVAILABILITY_FAILURE_TTL_SECS: i64 = 30 * 60;
 
 use crate::ServerGeo;
 use crate::config::Config;
+use crate::ctl_client::authorize_control_request;
 use crate::dynamic_settings::BoardSettings;
 use crate::error::AppError;
 use crate::models::{
@@ -4694,18 +4695,26 @@ impl AppStore {
             })?;
 
         for (installation_id, share_id, subdomain) in missing_shares {
-            let response =
-                match fetch_share_request_logs_from_route(config, &client, &subdomain).await {
-                    Ok(response) => response,
-                    Err(err) => {
-                        tracing::debug!(
-                            share_id = %share_id,
-                            subdomain = %subdomain,
-                            "share request log recovery skipped: {err}"
-                        );
-                        continue;
-                    }
-                };
+            let response = match fetch_share_request_logs_from_route(
+                self,
+                config,
+                &client,
+                &subdomain,
+                &share_id,
+                &installation_id,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    tracing::debug!(
+                        share_id = %share_id,
+                        subdomain = %subdomain,
+                        "share request log recovery skipped: {err}"
+                    );
+                    continue;
+                }
+            };
 
             if response.logs.is_empty() {
                 continue;
@@ -7667,19 +7676,34 @@ fn consume_board_rate_limit_tx(
 }
 
 async fn fetch_share_request_logs_from_route(
+    store: &AppStore,
     config: &Config,
     client: &reqwest::Client,
     subdomain: &str,
+    share_id: &str,
+    installation_id: &str,
 ) -> Result<ShareRequestLogFetchResponse, AppError> {
-    let url = format!(
-        "{}/_share-router/request-logs",
-        config.tunnel_url(subdomain)
-    );
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| AppError::Internal(format!("fetch share request logs failed: {e}")))?;
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("shareId", share_id)
+        .finish();
+    let path = format!("/_share-router/request-logs?{query}");
+    let url = format!("{}{path}", config.tunnel_url(subdomain));
+    let control_secret = store
+        .installation_control_secret(installation_id)
+        .await?
+        .filter(|secret| !secret.trim().is_empty())
+        .ok_or_else(|| AppError::Unauthorized("installation control secret is missing".into()))?;
+    let response = authorize_control_request(
+        client.get(&url),
+        "GET",
+        &path,
+        installation_id,
+        &control_secret,
+        &[],
+    )
+    .send()
+    .await
+    .map_err(|e| AppError::Internal(format!("fetch share request logs failed: {e}")))?;
 
     if !response.status().is_success() {
         return Err(AppError::Internal(format!(
@@ -7695,26 +7719,36 @@ async fn fetch_share_request_logs_from_route(
 }
 
 pub async fn fetch_share_runtime_snapshot_from_route(
+    store: &AppStore,
     config: &Config,
     client: &reqwest::Client,
     subdomain: &str,
     share_id: &str,
+    installation_id: &str,
 ) -> Result<ShareRuntimeSnapshotResponse, AppError> {
     // 多 share 模式：同一 cc-switch 可能挂多个 share。
     // 用 `?shareId=...` 显式定位，避免老路径"取第一个 share"的歧义。
     let query = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("shareId", share_id)
         .finish();
-    let url = format!(
-        "{}/_share-router/share-runtime?{query}",
-        config.tunnel_url(subdomain)
-    );
-    let response = client
-        .get(&url)
-        .header("X-Share-Router-Probe", "1")
-        .send()
-        .await
-        .map_err(|e| AppError::Internal(format!("fetch share runtime failed: {e}")))?;
+    let path = format!("/_share-router/share-runtime?{query}");
+    let url = format!("{}{path}", config.tunnel_url(subdomain));
+    let control_secret = store
+        .installation_control_secret(installation_id)
+        .await?
+        .filter(|secret| !secret.trim().is_empty())
+        .ok_or_else(|| AppError::Unauthorized("installation control secret is missing".into()))?;
+    let response = authorize_control_request(
+        client.get(&url),
+        "GET",
+        &path,
+        installation_id,
+        &control_secret,
+        &[],
+    )
+    .send()
+    .await
+    .map_err(|e| AppError::Internal(format!("fetch share runtime failed: {e}")))?;
 
     if !response.status().is_success() {
         return Err(AppError::Internal(format!(

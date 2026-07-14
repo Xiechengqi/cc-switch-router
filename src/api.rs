@@ -3087,6 +3087,7 @@ async fn refresh_share_runtime(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(input): Json<ShareRuntimeRefreshRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let installation_id = input.installation_id.clone();
     let refresh = state
         .store
         .prepare_share_runtime_refresh(input, extract_client_metadata(&headers, addr))
@@ -3110,10 +3111,12 @@ async fn refresh_share_runtime(
         .build()
         .map_err(|e| AppError::Internal(format!("create runtime refresh client failed: {e}")))?;
     let snapshot = crate::store::fetch_share_runtime_snapshot_from_route(
+        &state.store,
         &state.config,
         &client,
         &refresh.subdomain,
         &refresh.share_id,
+        &installation_id,
     )
     .await?;
     state.store.record_share_runtime_snapshot(snapshot).await?;

@@ -110,17 +110,94 @@ impl CtlError {
 /// Canonical string signed by both sides:
 /// `METHOD\nPATH\n<body>\n<timestamp_ms>\n<nonce>`
 fn signature(path: &str, secret: &str, body: &str, timestamp_ms: i64, nonce: &str) -> String {
+    signature_for_method("POST", path, secret, body.as_bytes(), timestamp_ms, nonce)
+}
+
+fn signature_for_method(
+    method: &str,
+    path: &str,
+    secret: &str,
+    body: &[u8],
+    timestamp_ms: i64,
+    nonce: &str,
+) -> String {
+    base64::engine::general_purpose::STANDARD.encode(signature_bytes_for_method(
+        method,
+        path,
+        secret,
+        body,
+        timestamp_ms,
+        nonce,
+    ))
+}
+
+fn signature_bytes_for_method(
+    method: &str,
+    path: &str,
+    secret: &str,
+    body: &[u8],
+    timestamp_ms: i64,
+    nonce: &str,
+) -> Vec<u8> {
     let mut mac =
         HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any size");
-    mac.update(b"POST\n");
+    mac.update(method.as_bytes());
+    mac.update(b"\n");
     mac.update(path.as_bytes());
     mac.update(b"\n");
-    mac.update(body.as_bytes());
+    mac.update(body);
     mac.update(b"\n");
     mac.update(timestamp_ms.to_string().as_bytes());
     mac.update(b"\n");
     mac.update(nonce.as_bytes());
-    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+    mac.finalize().into_bytes().to_vec()
+}
+
+pub(crate) fn verify_control_request_signature(
+    method: &str,
+    path: &str,
+    control_secret: &str,
+    body: &[u8],
+    timestamp_ms: i64,
+    nonce: &str,
+    provided_signature: &str,
+    now_ms: i64,
+) -> bool {
+    const SIGNATURE_WINDOW_MS: i64 = 5 * 60 * 1_000;
+    if nonce.trim().is_empty() || now_ms.abs_diff(timestamp_ms) > SIGNATURE_WINDOW_MS as u64 {
+        return false;
+    }
+    let Ok(provided) = base64::engine::general_purpose::STANDARD.decode(provided_signature) else {
+        return false;
+    };
+    let expected =
+        signature_bytes_for_method(method, path, control_secret, body, timestamp_ms, nonce);
+    expected.len() == provided.len()
+        && expected
+            .iter()
+            .zip(provided.iter())
+            .fold(0_u8, |difference, (left, right)| {
+                difference | (left ^ right)
+            })
+            == 0
+}
+
+pub(crate) fn authorize_control_request(
+    request: reqwest::RequestBuilder,
+    method: &str,
+    path: &str,
+    installation_id: &str,
+    control_secret: &str,
+    body: &[u8],
+) -> reqwest::RequestBuilder {
+    let timestamp_ms = chrono::Utc::now().timestamp_millis();
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let signature = signature_for_method(method, path, control_secret, body, timestamp_ms, &nonce);
+    request
+        .header("x-ctl-installation-id", installation_id)
+        .header("x-ctl-timestamp-ms", timestamp_ms.to_string())
+        .header("x-ctl-nonce", nonce)
+        .header("x-ctl-signature", signature)
 }
 
 async fn post_control<T: serde::de::DeserializeOwned>(
@@ -276,6 +353,101 @@ mod tests {
             "nonce-1",
         );
         assert_ne!(a, f, "different path must change signature");
+
+        let get = signature_for_method(
+            "GET",
+            APPLY_SHARE_SETTINGS_PATH,
+            "secret-1",
+            body.as_bytes(),
+            1700000000000,
+            "nonce-1",
+        );
+        assert_ne!(a, get, "different method must change signature");
+    }
+
+    #[test]
+    fn authorized_get_binds_method_path_and_query() {
+        let request = authorize_control_request(
+            reqwest::Client::new().get("http://127.0.0.1/internal?shareId=share-a"),
+            "GET",
+            "/internal?shareId=share-a",
+            "inst-a",
+            "secret-a",
+            &[],
+        )
+        .build()
+        .unwrap();
+        let timestamp_ms = request.headers()["x-ctl-timestamp-ms"]
+            .to_str()
+            .unwrap()
+            .parse::<i64>()
+            .unwrap();
+        let nonce = request.headers()["x-ctl-nonce"].to_str().unwrap();
+        let expected = signature_for_method(
+            "GET",
+            "/internal?shareId=share-a",
+            "secret-a",
+            &[],
+            timestamp_ms,
+            nonce,
+        );
+
+        assert_eq!(request.headers()["x-ctl-installation-id"], "inst-a");
+        assert_eq!(request.headers()["x-ctl-signature"], expected);
+        assert_ne!(
+            expected,
+            signature_for_method(
+                "GET",
+                "/internal?shareId=share-b",
+                "secret-a",
+                &[],
+                timestamp_ms,
+                nonce,
+            )
+        );
+    }
+
+    #[test]
+    fn verifier_rejects_tampering_and_stale_requests() {
+        let now_ms = 1_700_000_000_000;
+        let signature = signature_for_method(
+            "GET",
+            "/_share-router/request-logs?shareId=share-a",
+            "secret-a",
+            &[],
+            now_ms,
+            "nonce-a",
+        );
+        assert!(verify_control_request_signature(
+            "GET",
+            "/_share-router/request-logs?shareId=share-a",
+            "secret-a",
+            &[],
+            now_ms,
+            "nonce-a",
+            &signature,
+            now_ms,
+        ));
+        assert!(!verify_control_request_signature(
+            "GET",
+            "/_share-router/request-logs?shareId=share-b",
+            "secret-a",
+            &[],
+            now_ms,
+            "nonce-a",
+            &signature,
+            now_ms,
+        ));
+        assert!(!verify_control_request_signature(
+            "GET",
+            "/_share-router/request-logs?shareId=share-a",
+            "secret-a",
+            &[],
+            now_ms,
+            "nonce-a",
+            &signature,
+            now_ms + 5 * 60 * 1_000 + 1,
+        ));
     }
 
     #[test]

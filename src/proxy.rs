@@ -33,6 +33,7 @@ const CLIENT_WEB_INSTALLATION_ID_HEADER: &str = "x-cc-switch-installation-id";
 const CLIENT_WEB_SUBDOMAIN_HEADER: &str = "x-cc-switch-client-tunnel-subdomain";
 const SHARE_USER_COUNTRY_HEADER: &str = "X-CC-Switch-User-Country";
 const SHARE_USER_COUNTRY_ISO3_HEADER: &str = "X-CC-Switch-User-Country-Iso3";
+const SHARE_DATA_SOURCE_HEADER: &str = "X-CC-Switch-Data-Source";
 const IMAGE_JOB_MAX_RUNNING_PER_SHARE: usize = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -626,8 +627,7 @@ pub async fn market_proxy_handler(
         if n.eq_ignore_ascii_case("host")
             || n.eq_ignore_ascii_case("authorization")
             || n.eq_ignore_ascii_case(MARKET_REQUEST_ID_HEADER)
-            || n.eq_ignore_ascii_case(SHARE_USER_COUNTRY_HEADER)
-            || n.eq_ignore_ascii_case(SHARE_USER_COUNTRY_ISO3_HEADER)
+            || is_internal_share_context_header(n)
             || is_hop_by_hop_header(n)
         {
             continue;
@@ -635,6 +635,7 @@ pub async fn market_proxy_handler(
         builder = builder.header(name, value);
     }
     builder = builder.header("X-CC-Switch-Share-Id", share_id.as_str());
+    builder = builder.header(SHARE_DATA_SOURCE_HEADER, "market");
 
     let log_share_id = mask_token(&share_id);
     let request_app = infer_share_request_app(&path_and_query, &parts.headers);
@@ -961,8 +962,7 @@ pub async fn gateway_proxy_handler(
             || n.eq_ignore_ascii_case("x-goog-api-key")
             || n.eq_ignore_ascii_case("api-key")
             || n.starts_with("x-cc-gateway-")
-            || n.eq_ignore_ascii_case(SHARE_USER_COUNTRY_HEADER)
-            || n.eq_ignore_ascii_case(SHARE_USER_COUNTRY_ISO3_HEADER)
+            || is_internal_share_context_header(n)
             || is_hop_by_hop_header(n)
         {
             continue;
@@ -971,6 +971,7 @@ pub async fn gateway_proxy_handler(
     }
     builder = builder.header("X-CC-Switch-Share-Id", share_id.as_str());
     builder = builder.header("X-CC-Switch-Share-Subdomain", route.subdomain.as_str());
+    builder = builder.header(SHARE_DATA_SOURCE_HEADER, "gateway");
     builder = with_share_user_country_headers(builder, client_metadata.country_code.as_deref());
 
     let live_request_id = state
@@ -1142,7 +1143,7 @@ pub async fn proxy_handler(
         );
         return simple_response(StatusCode::FORBIDDEN, "client-banned");
     }
-    let is_internal_share_router_path = path.starts_with("/_share-router");
+    let is_internal_share_router_path = is_internal_share_router_path(&path);
     let is_share_router_probe = parts
         .headers
         .get("x-share-router-probe")
@@ -1150,7 +1151,6 @@ pub async fn proxy_handler(
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
         && path == "/_share-router/health";
-    let is_share_model_health_check = truthy_header(&parts.headers, "x-share-router-health-check");
     if !host_matches_tunnel_domain(&host, &state.config.tunnel_domain) {
         tracing::debug!(
             method = %method,
@@ -1201,9 +1201,18 @@ pub async fn proxy_handler(
         );
         return simple_response(StatusCode::NOT_FOUND, "unregistered-subdomain");
     };
+    if is_internal_share_router_path
+        && method == axum::http::Method::GET
+        && !authorize_internal_share_router_get(&state, &route, &parts.headers, &path_and_query)
+            .await
+    {
+        return simple_response(StatusCode::NOT_FOUND, "not-found");
+    }
     let backend = route.backend.clone();
-    let is_health_check_request = is_share_router_probe || is_share_model_health_check;
+    let is_health_check_request = is_share_router_probe;
     let is_direct_share_web_request = route.is_share() && is_allowed_direct_share_web_path(&path);
+    let skips_share_edge_auth =
+        share_route_skips_edge_auth(is_internal_share_router_path, is_direct_share_web_request);
     if route.is_client_web() && is_share_router_probe {
         debug!(
             method = %method,
@@ -1363,10 +1372,7 @@ pub async fn proxy_handler(
     // User-facing credentials terminate at the router. The client only sees
     // the internal share secret registered with this tunnel route.
     let mut api_user_email = None;
-    if !is_internal_share_router_path
-        && !is_share_model_health_check
-        && !is_direct_share_web_request
-    {
+    if !skips_share_edge_auth {
         if let Some(share_id) = route.share_id.as_deref() {
             let Some(user_token) = crate::api::extract_router_api_token(&parts.headers) else {
                 return simple_response(StatusCode::UNAUTHORIZED, "missing-router-api-token");
@@ -1479,10 +1485,7 @@ pub async fn proxy_handler(
         // Strip client-supplied user/share credentials on share routes; router
         // authenticates the caller at the edge (user_api_token + email ACL)
         // and the cc-switch tunnel only needs the share id we inject below.
-        if n.eq_ignore_ascii_case("x-cc-switch-user-email")
-            || n.eq_ignore_ascii_case(SHARE_USER_COUNTRY_HEADER)
-            || n.eq_ignore_ascii_case(SHARE_USER_COUNTRY_ISO3_HEADER)
-        {
+        if is_internal_share_context_header(n) {
             continue;
         }
         if route.is_share()
@@ -1514,6 +1517,9 @@ pub async fn proxy_handler(
         builder = builder.header("X-CC-Switch-Share-Id", share_id.as_str());
     }
     builder = builder.header("X-CC-Switch-Share-Subdomain", route.subdomain.as_str());
+    if route.is_share() {
+        builder = builder.header(SHARE_DATA_SOURCE_HEADER, "direct");
+    }
     if let Some(ref email) = api_user_email {
         builder = builder.header("X-CC-Switch-User-Email", email.as_str());
     }
@@ -1540,10 +1546,7 @@ pub async fn proxy_handler(
         .map(mask_token)
         .unwrap_or_else(|| "-".to_string());
 
-    let share_permit = if is_internal_share_router_path
-        || is_share_model_health_check
-        || is_direct_share_web_request
-    {
+    let share_permit = if skips_share_edge_auth {
         None
     } else if let Some(share_id) = route.share_id.as_deref() {
         let request_app = infer_share_request_app(&path, &parts.headers);
@@ -1599,9 +1602,7 @@ pub async fn proxy_handler(
         }
     };
 
-    let free_share_ip_permit = if !is_internal_share_router_path
-        && !is_share_model_health_check
-        && !is_direct_share_web_request
+    let free_share_ip_permit = if !skips_share_edge_auth
         && route.is_free_share
         && state.config.free_share_ip_limit_enabled()
     {
@@ -1636,11 +1637,7 @@ pub async fn proxy_handler(
     // Record the request for the dashboard's demand/ticker stream and propagate the
     // generated identity downstream so share clients can write the same request id back
     // in their request logs.
-    let live_request_id = if !is_internal_share_router_path
-        && !is_share_router_probe
-        && !is_share_model_health_check
-        && !is_direct_share_web_request
-    {
+    let live_request_id = if !skips_share_edge_auth && !is_share_router_probe {
         if let Some(share_id) = route.share_id.as_deref() {
             Some(
                 state
@@ -1952,7 +1949,8 @@ async fn handle_image_generation_stream_submit(
         .post(target)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::ACCEPT, "text/event-stream")
-        .header("X-CC-Switch-Share-Subdomain", route.subdomain.as_str());
+        .header("X-CC-Switch-Share-Subdomain", route.subdomain.as_str())
+        .header(SHARE_DATA_SOURCE_HEADER, "direct");
     if let Some(share_id) = route.share_id.as_deref() {
         builder = builder.header("X-CC-Switch-Share-Id", share_id);
     }
@@ -2706,6 +2704,96 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
         .unwrap_or("-")
 }
 
+fn is_internal_share_context_header(name: &str) -> bool {
+    matches!(
+        name,
+        "x-cc-switch-share-id"
+            | "x-cc-switch-share-subdomain"
+            | "x-cc-switch-request-id"
+            | "x-cc-switch-user-email"
+            | "x-cc-switch-user-country"
+            | "x-cc-switch-user-country-iso3"
+            | "x-cc-switch-data-source"
+            | "x-cc-switch-source"
+            | "x-cc-switch-health-check"
+            | "x-cc-switch-web-user-email"
+            | "x-cc-switch-web-role"
+            | "x-cc-switch-installation-id"
+            | "x-cc-switch-client-tunnel-subdomain"
+            | "x-share-router-health-check"
+            | "x-share-router-probe"
+    )
+}
+
+fn is_internal_share_router_path(path: &str) -> bool {
+    path.starts_with("/_share-router/")
+}
+
+fn share_route_skips_edge_auth(
+    is_internal_share_router_path: bool,
+    is_direct_share_web_request: bool,
+) -> bool {
+    is_internal_share_router_path || is_direct_share_web_request
+}
+
+async fn authorize_internal_share_router_get(
+    state: &ServerState,
+    route: &RouteEntry,
+    headers: &HeaderMap,
+    path_and_query: &str,
+) -> bool {
+    let Some(route_installation_id) = route.installation_id() else {
+        return false;
+    };
+    let Some(installation_id) = single_header(headers, "x-ctl-installation-id") else {
+        return false;
+    };
+    if installation_id != route_installation_id {
+        return false;
+    }
+    let Some(timestamp_ms) =
+        single_header(headers, "x-ctl-timestamp-ms").and_then(|value| value.parse::<i64>().ok())
+    else {
+        return false;
+    };
+    let Some(nonce) = single_header(headers, "x-ctl-nonce") else {
+        return false;
+    };
+    let Some(signature) = single_header(headers, "x-ctl-signature") else {
+        return false;
+    };
+    let Ok(Some(control_secret)) = state
+        .store
+        .installation_control_secret(route_installation_id)
+        .await
+    else {
+        return false;
+    };
+    crate::ctl_client::verify_control_request_signature(
+        "GET",
+        path_and_query,
+        &control_secret,
+        &[],
+        timestamp_ms,
+        nonce,
+        signature,
+        chrono::Utc::now().timestamp_millis(),
+    )
+}
+
+fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    value
+        .to_str()
+        .ok()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 fn with_share_user_country_headers(
     mut builder: reqwest::RequestBuilder,
     country_code: Option<&str>,
@@ -2725,15 +2813,6 @@ fn with_share_user_country_headers(
         builder = builder.header(SHARE_USER_COUNTRY_ISO3_HEADER, iso3);
     }
     builder
-}
-
-fn truthy_header(headers: &HeaderMap, name: &str) -> bool {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
 }
 
 fn trusted_asn_header(headers: &HeaderMap, peer: SocketAddr) -> &str {
@@ -2969,7 +3048,302 @@ fn strip_connection_listed_headers(headers: &mut HeaderMap) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    use axum::routing::any;
+
     use super::*;
+
+    #[tokio::test]
+    async fn forged_health_check_header_cannot_reach_share_backend() {
+        let backend_hits = Arc::new(AtomicUsize::new(0));
+        let backend_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+        let backend = axum::Router::new()
+            .fallback(any(|State(hits): State<Arc<AtomicUsize>>| async move {
+                hits.fetch_add(1, AtomicOrdering::SeqCst);
+                StatusCode::OK
+            }))
+            .with_state(backend_hits.clone());
+        tokio::spawn(async move {
+            axum::serve(backend_listener, backend).await.unwrap();
+        });
+
+        let config = proxy_test_config("forged-health");
+        let proxy = Arc::new(ProxyRegistry::default());
+        proxy
+            .set_route(
+                "share-a".into(),
+                backend_addr.to_string(),
+                None,
+                Some("share-a".into()),
+                Some("Share A".into()),
+                false,
+                -1,
+                None,
+            )
+            .await;
+        let state = proxy_test_state(&config, proxy);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("host", "share-a.router.test")
+            .header("content-type", "application/json")
+            .header("x-share-router-health-check", "1")
+            .body(Body::from(r#"{"model":"test","messages":[]}"#))
+            .unwrap();
+
+        let response = proxy_handler(
+            State(state),
+            ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345)),
+            request,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(backend_hits.load(AtomicOrdering::SeqCst), 0);
+        let _ = std::fs::remove_file(&config.db_path);
+    }
+
+    #[tokio::test]
+    async fn unsigned_internal_request_logs_cannot_reach_share_backend() {
+        let backend_hits = Arc::new(AtomicUsize::new(0));
+        let backend_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+        let backend = axum::Router::new()
+            .fallback(any(|State(hits): State<Arc<AtomicUsize>>| async move {
+                hits.fetch_add(1, AtomicOrdering::SeqCst);
+                StatusCode::OK
+            }))
+            .with_state(backend_hits.clone());
+        tokio::spawn(async move {
+            axum::serve(backend_listener, backend).await.unwrap();
+        });
+
+        let config = proxy_test_config("unsigned-request-logs");
+        let proxy = Arc::new(ProxyRegistry::default());
+        proxy
+            .set_route_with_kind(
+                "share-a".into(),
+                backend_addr.to_string(),
+                RouteKind::Share,
+                Some("inst-a".into()),
+                None,
+                Some("share-a".into()),
+                Some("Share A".into()),
+                false,
+                -1,
+                None,
+            )
+            .await;
+        let state = proxy_test_state(&config, proxy);
+        let request = Request::builder()
+            .method("GET")
+            .uri("/_share-router/request-logs?shareId=share-a")
+            .header("host", "share-a.router.test")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = proxy_handler(
+            State(state),
+            ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345)),
+            request,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(backend_hits.load(AtomicOrdering::SeqCst), 0);
+        let _ = std::fs::remove_file(&config.db_path);
+    }
+
+    #[tokio::test]
+    async fn signed_internal_request_logs_reach_share_backend() {
+        let backend_hits = Arc::new(AtomicUsize::new(0));
+        let backend_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+        let backend = axum::Router::new()
+            .fallback(any(|State(hits): State<Arc<AtomicUsize>>| async move {
+                hits.fetch_add(1, AtomicOrdering::SeqCst);
+                StatusCode::OK
+            }))
+            .with_state(backend_hits.clone());
+        tokio::spawn(async move {
+            axum::serve(backend_listener, backend).await.unwrap();
+        });
+
+        let config = proxy_test_config("signed-request-logs");
+        let proxy = Arc::new(ProxyRegistry::default());
+        let state = proxy_test_state(&config, proxy.clone());
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7_u8; 32]);
+        let registered = state
+            .store
+            .register_installation(
+                crate::models::RegisterInstallationRequest {
+                    public_key: base64::engine::general_purpose::STANDARD
+                        .encode(signing_key.verifying_key().to_bytes()),
+                    platform: "test".into(),
+                    app_version: "test".into(),
+                    instance_nonce: "nonce-register-signed-route".into(),
+                    timestamp_ms: None,
+                    signature: None,
+                },
+                crate::models::ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+            )
+            .await
+            .unwrap();
+        let control_secret = registered.control_secret.unwrap();
+        proxy
+            .set_route_with_kind(
+                "share-a".into(),
+                backend_addr.to_string(),
+                RouteKind::Share,
+                Some(registered.installation_id.clone()),
+                None,
+                Some("share-a".into()),
+                Some("Share A".into()),
+                false,
+                -1,
+                None,
+            )
+            .await;
+
+        let path = "/_share-router/request-logs?shareId=share-a";
+        let signed = crate::ctl_client::authorize_control_request(
+            reqwest::Client::new().get(format!("http://share-a.router.test{path}")),
+            "GET",
+            path,
+            &registered.installation_id,
+            &control_secret,
+            &[],
+        )
+        .build()
+        .unwrap();
+        let mut request = Request::builder()
+            .method("GET")
+            .uri(path)
+            .header("host", "share-a.router.test");
+        for (name, value) in signed.headers() {
+            request = request.header(name, value);
+        }
+
+        let response = proxy_handler(
+            State(state),
+            ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345)),
+            request.body(Body::empty()).unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(backend_hits.load(AtomicOrdering::SeqCst), 1);
+        let _ = std::fs::remove_file(&config.db_path);
+    }
+
+    fn proxy_test_state(config: &Config, proxy: Arc<ProxyRegistry>) -> ServerState {
+        let metrics = crate::metrics::MetricsRegistry::new(config.metrics.clone());
+        let (share_edit_events, _) = tokio::sync::broadcast::channel(16);
+        ServerState {
+            config: config.clone(),
+            server_geo: crate::ServerGeo {
+                lat: None,
+                lon: None,
+            },
+            store: AppStore::new(config).unwrap(),
+            proxy,
+            proxy_http: reqwest::Client::new(),
+            resend: None,
+            resend_usage_cache: Arc::new(Mutex::new(None)),
+            dynamic: Arc::new(RwLock::new(
+                crate::dynamic_settings::DynamicSettings::from_config(config),
+            )),
+            ssh_host_fingerprint: None,
+            recent_traffic: RecentTraffic::new(),
+            abuse: Arc::new(crate::abuse::AbuseTracker::new()),
+            ip_blacklist_stats: Arc::new(crate::ip_blacklist_stats::IpBlacklistStats::new()),
+            telegram: Arc::new(RwLock::new(None)),
+            upgrade_registry: Arc::new(crate::admin::upgrade::UpgradeRegistry::new()),
+            share_edit_events,
+            env_path: std::env::temp_dir().join("cc-switch-router-proxy-test.env"),
+            start_instant: Instant::now(),
+            scheduling_overrides: crate::scheduling_signals::OverrideStore::new(),
+            metrics,
+            payout_profile_read_limiter: Arc::new(
+                crate::server_state::PublicPayoutProfileReadLimiter::default(),
+            ),
+        }
+    }
+
+    fn proxy_test_config(name: &str) -> Config {
+        Config {
+            api_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            ssh_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            tunnel_domain: "router.test".into(),
+            ssh_public_addr: String::new(),
+            use_localhost: true,
+            lease_ttl_secs: 60,
+            db_path: std::env::temp_dir().join(format!(
+                "cc-switch-router-proxy-{name}-{}.db",
+                Uuid::new_v4()
+            )),
+            host_key_path: std::env::temp_dir().join(format!(
+                "cc-switch-router-proxy-{name}-{}.key",
+                Uuid::new_v4()
+            )),
+            cleanup_interval_secs: 300,
+            lease_retention_secs: 7 * 24 * 60 * 60,
+            client_stale_secs: 60 * 60,
+            client_installation_retention_secs: 24 * 60 * 60,
+            paused_share_stale_secs: 60 * 60,
+            resend_api_key: None,
+            resend_from: None,
+            resend_from_name: None,
+            resend_reply_to: None,
+            auth_code_ttl_secs: 600,
+            auth_code_cooldown_secs: 60,
+            auth_session_ttl_secs: 7 * 24 * 60 * 60,
+            auth_refresh_ttl_secs: 30 * 24 * 60 * 60,
+            auth_max_verify_attempts: 8,
+            auth_email_hourly_limit: 10,
+            auth_ip_hourly_limit: 30,
+            auth_installation_hourly_limit: 15,
+            ip_blacklist: String::new(),
+            free_share_ip_parallel_limit: 1,
+            verification_service_base_url: "https://tokenswitch.org".into(),
+            verification_service_api_key: None,
+            admin_emails: HashSet::new(),
+            telegram_bot_token: None,
+            telegram_chat_id: None,
+            telegram_topic_id: None,
+            telegram_notify_all: false,
+            telegram_notify_admin: false,
+            board_max_len: 1000,
+            board_guest_per_hour: 5,
+            board_user_per_hour: 30,
+            board_pin_limit: 3,
+            board_guest_self_delete_secs: 300,
+            ux_telemetry_enabled: false,
+            ux_telemetry_retention_days: 7,
+            metrics: crate::config::MetricsConfig {
+                enabled: false,
+                db_path: std::env::temp_dir().join(format!(
+                    "cc-switch-router-proxy-{name}-{}-metrics.db",
+                    Uuid::new_v4()
+                )),
+                retention_days: 7,
+                sample_interval_secs: 5,
+            },
+        }
+    }
 
     #[test]
     fn image_generation_paths_infer_codex_app() {
@@ -3285,6 +3659,48 @@ data: {"data":[{"b64_json":"iVBORw0KGgo="}]}
         assert!(is_allowed_direct_share_proxy_path(
             "/web-api/invoke/list_shares"
         ));
+    }
+
+    #[test]
+    fn router_owned_share_context_headers_are_never_forwarded_from_callers() {
+        for name in [
+            "x-cc-switch-share-id",
+            "x-cc-switch-share-subdomain",
+            "x-cc-switch-request-id",
+            "x-cc-switch-user-email",
+            "x-cc-switch-user-country",
+            "x-cc-switch-user-country-iso3",
+            "x-cc-switch-data-source",
+            "x-cc-switch-source",
+            "x-cc-switch-health-check",
+            "x-cc-switch-web-user-email",
+            "x-cc-switch-web-role",
+            "x-cc-switch-installation-id",
+            "x-cc-switch-client-tunnel-subdomain",
+            "x-share-router-health-check",
+            "x-share-router-probe",
+        ] {
+            assert!(is_internal_share_context_header(name), "{name}");
+        }
+        assert!(!is_internal_share_context_header("x-api-key"));
+        assert!(!is_internal_share_context_header("anthropic-version"));
+    }
+
+    #[test]
+    fn caller_health_header_does_not_bypass_share_edge_auth() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-share-router-health-check", HeaderValue::from_static("1"));
+
+        assert!(headers.contains_key("x-share-router-health-check"));
+        assert!(!share_route_skips_edge_auth(
+            is_internal_share_router_path("/v1/messages"),
+            is_allowed_direct_share_web_path("/v1/messages"),
+        ));
+        assert!(share_route_skips_edge_auth(
+            is_internal_share_router_path("/_share-router/request-logs"),
+            false,
+        ));
+        assert!(!is_internal_share_router_path("/_share-router-evil/logs"));
     }
 
     #[test]
