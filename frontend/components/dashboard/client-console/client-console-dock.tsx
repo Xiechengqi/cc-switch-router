@@ -21,7 +21,7 @@ export function ClientConsoleDock() {
       aria-label={t("dashboard.clientConsole.dockLabel")}
     >
       <div
-        className="flex items-center gap-2 overflow-x-auto rounded-2xl border border-slate-200/80 bg-white/95 px-3 py-2 shadow-[0_12px_40px_rgba(15,23,42,0.14)] backdrop-blur-md"
+        className="flex items-center gap-2 overflow-x-auto rounded-2xl border border-white/50 bg-white/55 px-3 py-2 shadow-[0_12px_40px_rgba(15,23,42,0.14)] backdrop-blur-xl backdrop-saturate-150"
         style={{ minHeight: CONSOLE_DOCK_HEIGHT - 16 }}
       >
         {windows.map((window) => {
@@ -35,8 +35,8 @@ export function ClientConsoleDock() {
                 className={cn(
                   "inline-flex h-9 max-w-[200px] items-center gap-2 rounded-xl border px-3 text-left text-[11px] font-medium transition-colors",
                   isActive
-                    ? "border-sky-400 bg-sky-50 text-sky-900 ring-2 ring-sky-200"
-                    : "border-slate-200/80 bg-slate-50 text-slate-700 hover:border-sky-200 hover:bg-sky-50 hover:text-sky-800",
+                    ? "border-sky-400/80 bg-sky-50/80 text-sky-900 ring-2 ring-sky-200/80 backdrop-blur-sm"
+                    : "border-slate-200/70 bg-white/45 text-slate-700 backdrop-blur-sm hover:border-sky-200 hover:bg-sky-50/70 hover:text-sky-800",
                 )}
                 title={suspended ? t("dashboard.clientConsole.resumeHint") : window.url}
                 aria-current={isActive ? "true" : undefined}
@@ -80,7 +80,7 @@ export function ClientConsoleDock() {
           <button
             type="button"
             onClick={() => closeAllConsoles()}
-            className="inline-flex h-9 w-9 items-center justify-center rounded-xl border border-slate-200/80 bg-white text-slate-600 transition-colors hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+            className="inline-flex h-9 w-9 items-center justify-center rounded-xl border border-slate-200/70 bg-white/45 text-slate-600 backdrop-blur-sm transition-colors hover:border-rose-200 hover:bg-rose-50/70 hover:text-rose-700"
             aria-label={t("dashboard.clientConsole.cleanAll")}
             title={t("dashboard.clientConsole.cleanAll")}
           >

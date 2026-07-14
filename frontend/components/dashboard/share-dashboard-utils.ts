@@ -283,7 +283,11 @@ export function formatClientAppVersion(version?: string) {
   const normalized = raw.replace(/^v/i, "");
   const commitMatch = normalized.match(/^(?:commit\s+)?([0-9a-f]{7,40})$/i);
   if (commitMatch) {
-    return commitMatch[1].toLowerCase().slice(0, 12);
+    return commitMatch[1].toLowerCase().slice(0, 7);
+  }
+  const embeddedCommit = normalized.match(/\(([0-9a-f]{7,40})\)/i);
+  if (embeddedCommit) {
+    return embeddedCommit[1].toLowerCase().slice(0, 7);
   }
   return normalized;
 }

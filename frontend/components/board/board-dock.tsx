@@ -332,9 +332,9 @@ export function BoardDock() {
         type="button"
         onClick={() => setOpen(true)}
         aria-label={t("board.open")}
-        className="group flex h-14 w-14 items-center justify-center rounded-full text-accent-foreground shadow-[0_8px_24px_rgba(0,82,255,0.35)] transition-all duration-200 ease-out hover:-translate-y-0.5 hover:shadow-[0_14px_32px_rgba(0,82,255,0.45)] active:scale-[0.97] gradient-accent"
+        className="group flex h-11 w-11 items-center justify-center rounded-full border border-slate-200/80 bg-white/75 text-slate-600 shadow-[0_4px_16px_rgba(15,23,42,0.08)] backdrop-blur-md transition-all duration-200 ease-out hover:border-sky-200/80 hover:bg-sky-50/85 hover:text-sky-700 hover:shadow-[0_6px_20px_rgba(15,23,42,0.1)] active:scale-[0.97]"
       >
-        <MessageSquare className="h-6 w-6 transition-transform duration-200 group-hover:scale-110" />
+        <MessageSquare className="h-[18px] w-[18px] transition-transform duration-200 group-hover:scale-105" />
       </button>
     );
     return (
