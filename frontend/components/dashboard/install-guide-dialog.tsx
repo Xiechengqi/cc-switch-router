@@ -6,9 +6,18 @@ import { Check, Copy, ExternalLink } from "lucide-react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import type { MessageKey } from "@/lib/i18n";
 
-export function buildClientInstallCommand(origin = typeof window === "undefined" ? "https://[router_url]" : window.location.origin) {
-  const base = origin.replace(/\/$/, "");
-  return `curl -SsL ${base}/install-client.sh | sudo bash`;
+export function buildClientInstallCommand(options?: {
+  origin?: string;
+  ownerEmailPlaceholder?: string;
+  webPasswordPlaceholder?: string;
+}) {
+  const base = (options?.origin ?? (typeof window === "undefined" ? "https://[router_url]" : window.location.origin)).replace(
+    /\/$/,
+    "",
+  );
+  const ownerEmail = options?.ownerEmailPlaceholder ?? "owner@example.com";
+  const webPassword = options?.webPasswordPlaceholder ?? "web-login-password";
+  return `curl -SsL ${base}/install-client.sh | bash -s ${base} ${ownerEmail} ${webPassword}`;
 }
 
 export function InstallGuideDialog({

@@ -58,7 +58,7 @@ done
 }
 
 USAGE() {
-YELLOW "Usage: curl -SsL https://[Router]/install-client.sh | bash -s [Router_Url] [Owner_Email] [Password]"
+YELLOW "Usage: curl -SsL https://[Router]/install-client.sh | bash -s [Router_Url] [Owner_Email] [Web_Login_Password]"
 }
 
 export GITHUB_PROXY="https://gh-proxy.org"

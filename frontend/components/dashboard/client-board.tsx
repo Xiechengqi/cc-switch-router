@@ -734,7 +734,14 @@ export function ClientBoard({
   const selectedShare = selectedShareId ? shareById.get(selectedShareId) || null : null;
   const selectedClientUrl = clientTunnelDisplayUrl(selectedClient?.clientTunnel?.tunnelUrl);
   const selectedApi = shareApiParts(selectedShare ?? undefined);
-  const clientInstallCommand = React.useMemo(() => buildClientInstallCommand(), [installOpen]);
+  const clientInstallCommand = React.useMemo(
+    () =>
+      buildClientInstallCommand({
+        ownerEmailPlaceholder: t("dashboard.installClientCommandOwnerPlaceholder"),
+        webPasswordPlaceholder: t("dashboard.installClientCommandWebPasswordPlaceholder"),
+      }),
+    [installOpen, t],
+  );
 
   return (
     <section className="grid gap-4">
