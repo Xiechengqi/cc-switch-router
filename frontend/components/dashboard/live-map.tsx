@@ -4,6 +4,7 @@ import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { recordDashboardUxEvent } from "@/lib/api";
 import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
+import { useDashboardViewState } from "@/components/dashboard/dashboard-view-state";
 import { MapCountryTooltip } from "@/components/dashboard/map-country-tooltip";
 import type { CountryBoard, CountryMapPoint, DashboardResponse, MapPoint, MarketRequestLog, ShareRequestLog } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -408,9 +409,15 @@ function RequestTicker({ data }: { data: DashboardResponse | null }) {
   );
 }
 
+function regionCodeFromMapCountry(country?: CountryMapPoint) {
+  if (!country) return "";
+  return (country.countryCode || "").trim();
+}
+
 export function LiveMap({ data }: { data: DashboardResponse | null }) {
   const { t } = useLocaleText();
   const focus = useDashboardFocus();
+  const { addRegionFilter } = useDashboardViewState();
   const shellRef = React.useRef<HTMLDivElement | null>(null);
   const mapLayerRef = React.useRef<HTMLDivElement | null>(null);
   const worldRef = React.useRef<HTMLDivElement | null>(null);
@@ -418,7 +425,6 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
   const [worldSvg, setWorldSvg] = React.useState("");
   const [mapOffsetY, setMapOffsetY] = React.useState(0);
   const [hoveredIso3, setHoveredIso3] = React.useState<string | null>(null);
-  const [pinnedIso3, setPinnedIso3] = React.useState<string | null>(null);
   const [tooltipAnchor, setTooltipAnchor] = React.useState<TooltipAnchor>({ x: 0, y: 0 });
   const [tooltipPlacement, setTooltipPlacement] = React.useState<TooltipPlacement>({
     left: TOOLTIP_PADDING,
@@ -430,7 +436,7 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
   const viewport = mapDisplay.viewport ?? DEFAULT_MAP_DISPLAY.viewport;
   const countries = data?.map?.countries || [];
   const server = data?.map?.server;
-  const activeIso3 = pinnedIso3 || hoveredIso3;
+  const activeIso3 = hoveredIso3;
   const activeBoard = React.useMemo(() => {
     if (!activeIso3) return undefined;
     const board = data?.countryBoards?.[activeIso3];
@@ -484,16 +490,19 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
   const isCountryRelated = React.useCallback(
     (country: CountryMapPoint) => {
       if (!focus.target) return true;
-      if (focus.target.kind === "country") return focus.target.id === country.countryCodeIso3;
       return country.clientIds.some((clientId) => focus.relatedClientIds.has(clientId));
     },
     [focus.relatedClientIds, focus.target],
   );
 
-  const isCountryFocused = React.useCallback(
-    (country: CountryMapPoint) =>
-      focus.target?.kind === "country" && focus.target.id === country.countryCodeIso3,
-    [focus.target],
+  const applyMapRegionFilter = React.useCallback(
+    (country?: CountryMapPoint) => {
+      const region = regionCodeFromMapCountry(country);
+      if (!region) return;
+      addRegionFilter(region);
+      void recordDashboardUxEvent({ eventType: "filter_applied", source: "map", targetType: "client" });
+    },
+    [addRegionFilter],
   );
 
   React.useLayoutEffect(() => {
@@ -530,14 +539,9 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
     return JSON.stringify(entries);
   }, [countryActivityCounts]);
   const activityCountsRef = React.useRef(countryActivityCounts);
-  const pinnedIso3Ref = React.useRef(pinnedIso3);
   const worldMountedSvgRef = React.useRef("");
   const heatApplyKeyRef = React.useRef("");
   const preparedWorldSvg = React.useMemo(() => (worldSvg ? prepareWorldSvg(worldSvg) : ""), [worldSvg]);
-
-  React.useEffect(() => {
-    pinnedIso3Ref.current = pinnedIso3;
-  }, [pinnedIso3]);
 
   React.useLayoutEffect(() => {
     if (!activeBoard) return;
@@ -582,10 +586,6 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
     };
 
     const syncHoverFromEvent = (event: PointerEvent) => {
-      if (pinnedIso3Ref.current) {
-        updateTooltipAnchor(event);
-        return;
-      }
       const counts = activityCountsRef.current;
       const iso3 = resolveMapHoverIso3(
         event.target instanceof Element ? event.target : null,
@@ -603,7 +603,6 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
       syncHoverFromEvent(event);
     };
     const onPointerLeave = (event: PointerEvent) => {
-      if (pinnedIso3Ref.current) return;
       const next = event.relatedTarget;
       if (next instanceof Node && shell.contains(next)) return;
       setHoveredIso3(null);
@@ -620,9 +619,8 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
       );
       if (!iso3) return;
       updateTooltipAnchor(event);
-      setPinnedIso3((current) => (current === iso3 ? null : iso3));
-      focus.setFocus({ kind: "country", id: iso3, source: "map" });
-      void recordDashboardUxEvent({ eventType: "country_located_from_map", source: "map", targetType: "country" });
+      const country = countries.find((item) => item.countryCodeIso3 === iso3);
+      applyMapRegionFilter(country);
     };
 
     const layer = mapLayerRef.current;
@@ -636,11 +634,7 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
       shell.removeEventListener("pointerleave", onPointerLeave);
       layer.removeEventListener("click", onClick);
     };
-  }, [focus, worldSvg]);
-
-  React.useEffect(() => {
-    if (!focus.target) setPinnedIso3(null);
-  }, [focus.target]);
+  }, [applyMapRegionFilter, countries, worldSvg]);
 
   return (
     <section
@@ -676,7 +670,7 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
                 const flow = requestFlows.get(country.countryCodeIso3);
                 if ((country.inflightRequests || 0) <= 0) return null;
                 const related = !focus.target || isCountryRelated(country);
-                const focused = isCountryFocused(country) || (focus.target?.kind === "request" && related);
+                const focused = focus.target?.kind === "request" && related;
                 const stroke = flow?.failures
                   ? "stroke-rose-300"
                   : flow?.highLatency
@@ -703,7 +697,6 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
         </svg>
         {countryPlaced.map(({ country, pos }) => {
           const related = !focus.target || isCountryRelated(country);
-          const focused = isCountryFocused(country);
           return (
             <button
               type="button"
@@ -713,7 +706,6 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
               className={cn(
                 "absolute -translate-x-1/2 -translate-y-1/2 rounded-full outline-none focus-visible:ring-2 focus-visible:ring-primary/40",
                 related ? "opacity-100" : "opacity-20",
-                focused ? "ring-4 ring-primary/20" : "",
               )}
               style={{ left: `${pos.xPct}%`, top: `${pos.yPct}%` }}
               title={[
@@ -733,11 +725,7 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
                     shellTooltipAnchor(shell, event.clientX, event.clientY),
                   );
                 }
-                setPinnedIso3((current) =>
-                  current === country.countryCodeIso3 ? null : country.countryCodeIso3,
-                );
-                focus.setFocus({ kind: "country", id: country.countryCodeIso3, source: "map" });
-                void recordDashboardUxEvent({ eventType: "country_located_from_map", source: "map", targetType: "country" });
+                applyMapRegionFilter(country);
               }}
             >
               <div
@@ -745,7 +733,6 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
                   "rounded-full bg-primary shadow-[0_0_0_2px_rgba(0,82,255,0.16)]",
                   country.clientCount > 1 ? "h-2 w-2" : "h-1.5 w-1.5",
                   country.inflightRequests > 0 ? "pulse-dot opacity-100" : "opacity-80",
-                  focused && "h-2.5 w-2.5",
                 )}
               />
             </button>

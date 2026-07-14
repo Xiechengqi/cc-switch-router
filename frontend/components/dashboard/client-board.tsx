@@ -38,6 +38,7 @@ import { formatDateTime, formatRelativeTime } from "@/lib/utils";
 import { usePersistentState } from "@/lib/use-persistent-state";
 import { recordDashboardUxEvent } from "@/lib/api";
 import { CompactSelect } from "@/components/common/compact-select";
+import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 
 const PAYOUT_NETWORK_LABELS: Record<string, string> = {
   "eip155:56": "BSC",
@@ -436,7 +437,7 @@ export function ClientBoard({
 }) {
   const { locale, t } = useLocaleText();
   const focus = useDashboardFocus();
-  const { issuesOnly, setIssuesOnly } = useDashboardViewState();
+  const { issuesOnly, setIssuesOnly, regionFilters, setRegionFilters, clearRegionFilters } = useDashboardViewState();
   const { trackOperation } = useOperationVerification();
   const [selectedClientId, setSelectedClientId] = React.useState("");
   const [selectedShareId, setSelectedShareId] = React.useState("");
@@ -446,7 +447,6 @@ export function ClientBoard({
   const [clientFrameUrl, setClientFrameUrl] = React.useState("");
   const [query, setQuery] = React.useState("");
   const [statusFilter, setStatusFilter] = usePersistentState<"all" | Extract<OperationalState, "online" | "degraded" | "offline">>("cc_switch_router_client_status_v1", "all");
-  const [regionFilter, setRegionFilter] = usePersistentState("cc_switch_router_client_region_v1", "all");
   const [sortOrder, setSortOrder] = usePersistentState("cc_switch_router_client_sort_v1", "issues");
   const [expandedClientIds, setExpandedClientIds] = usePersistentState<string[] | null>(
     CLIENT_EXPANDED_STORAGE_KEY,
@@ -514,10 +514,9 @@ export function ClientBoard({
       const matchedShares = clientMatch ? allShares : allShares.filter((share) => shareMatchesQuery(share, normalizedQuery));
       return { client, shares: matchedShares, allShares, state: clientOperationalSummary(client, allShares).state, clientMatch };
     }).filter((row) => {
-      if (focus.target?.kind === "country" && !focus.relatedClientIds.has(row.client.installation.id)) return false;
       if (normalizedQuery && row.shares.length === 0 && !row.clientMatch) return false;
       const region = row.client.installation.countryCode || row.client.installation.region || "";
-      if (regionFilter !== "all" && region !== regionFilter) return false;
+      if (regionFilters.length > 0 && !regionFilters.includes(region)) return false;
       if (statusFilter !== "all" && row.state !== statusFilter) return false;
       if (issuesOnly && row.state === "online") return false;
       return true;
@@ -537,7 +536,7 @@ export function ClientBoard({
       return (stableStateRanks.get(left.client.installation.id) || 0) - (stableStateRanks.get(right.client.installation.id) || 0) || (stableOrder.get(left.client.installation.id) || 0) - (stableOrder.get(right.client.installation.id) || 0);
     });
     return rows;
-  }, [focus.relatedClientIds, focus.target, issuesOnly, query, regionFilter, sharesForClient, sortOrder, sortedClients, stableStateRanks, statusFilter]);
+  }, [focus.target, issuesOnly, query, regionFilters, sharesForClient, sortOrder, sortedClients, stableStateRanks, statusFilter]);
 
   const clientSummary = React.useMemo(() => {
     const states = sortedClients.map((client) => clientOperationalSummary(client, sharesForClient(client)).state);
@@ -591,20 +590,17 @@ export function ClientBoard({
   }, [defaultExpandedClientId, setExpandedClientIds]);
 
   React.useEffect(() => {
-    if (!focus.target || focus.target.source === "client-board") return;
+    if (!focus.target || focus.target.source === "client-board" || focus.target.source === "map") return;
     const focusKey = `${focus.target.kind}:${focus.target.id}`;
     if (lastLocatedFocusRef.current === focusKey) return;
     lastLocatedFocusRef.current = focusKey;
     const clientId = focus.target.kind === "client"
       ? focus.target.id
-      : focus.target.kind === "country"
-        ? Array.from(focus.relatedClientIds)[0]
-        : Array.from(focus.relatedClientIds)[0];
+      : Array.from(focus.relatedClientIds)[0];
     if (!clientId) return;
     window.requestAnimationFrame(() => {
       document.getElementById(`dashboard-client-${clientId}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
     });
-    if (focus.target.source === "map") void recordDashboardUxEvent({ eventType: "client_located_from_map", source: "map", targetType: "client" });
   }, [focus.relatedClientIds, focus.target]);
 
   React.useEffect(() => {
@@ -637,7 +633,20 @@ export function ClientBoard({
             <Search className="h-4 w-4 shrink-0 text-muted-foreground" />
             <input value={query} onChange={(event) => setQuery(event.target.value)} className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground" placeholder={t("dashboard.searchClients")} aria-label={t("dashboard.searchClients")} />
           </label>
-          {regions.length > 1 ? <CompactSelect value={regionFilter} onChange={(value) => { setRegionFilter(value); void recordDashboardUxEvent({ eventType: "filter_applied", source: "client-board", targetType: "client" }); }} options={[{ value: "all", label: t("dashboard.allRegions") }, ...regions.map((region) => ({ value: region, label: region }))]} ariaLabel={t("dashboard.filterRegion")} className="w-36" /> : null}
+          {regions.length > 1 ? (
+            <CompactRegionMultiSelect
+              values={regionFilters}
+              onChange={(value) => {
+                setRegionFilters(value);
+                void recordDashboardUxEvent({ eventType: "filter_applied", source: "client-board", targetType: "client" });
+              }}
+              options={regions.map((region) => ({ value: region, label: region }))}
+              allLabel={t("dashboard.allRegions")}
+              moreLabel={(count) => t("dashboard.regionsMore", { count })}
+              ariaLabel={t("dashboard.filterRegion")}
+              className="w-44"
+            />
+          ) : null}
           <CompactSelect value={sortOrder} onChange={(value) => { setSortOrder(value); void recordDashboardUxEvent({ eventType: "filter_applied", source: "client-board", targetType: "client" }); }} options={[{ value: "issues", label: t("dashboard.sortIssues") }, { value: "name", label: t("dashboard.sortName") }, { value: "recent", label: t("dashboard.sortRecent") }, { value: "shares", label: t("dashboard.sortShares") }, { value: "registered", label: t("dashboard.sortRegistered") }]} ariaLabel={t("dashboard.sortBy")} className="w-44" />
         </div>
       </div>
@@ -649,7 +658,7 @@ export function ClientBoard({
           <EmptyBlock>
             <div className="grid justify-items-center gap-2">
               <span>{sortedClients.length ? t("dashboard.noFilterResults") : t("dashboard.noClients")}</span>
-              {sortedClients.length ? <button type="button" className="text-xs font-medium text-primary hover:underline" onClick={() => { setQuery(""); setStatusFilter("all"); setRegionFilter("all"); setIssuesOnly(false); }}>{t("dashboard.clearFilters")}</button> : null}
+              {sortedClients.length ? <button type="button" className="text-xs font-medium text-primary hover:underline" onClick={() => { setQuery(""); setStatusFilter("all"); clearRegionFilters(); setIssuesOnly(false); }}>{t("dashboard.clearFilters")}</button> : null}
             </div>
           </EmptyBlock>
         )}
