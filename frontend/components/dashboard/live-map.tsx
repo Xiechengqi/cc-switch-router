@@ -156,11 +156,44 @@ function countryBoardFromMapPoint(country: CountryMapPoint): CountryBoard {
   };
 }
 
-function shellTooltipPosition(shell: HTMLElement, clientX: number, clientY: number) {
+type TooltipAnchor = { x: number; y: number };
+type TooltipPlacement = { left: number; top: number };
+
+const TOOLTIP_PADDING = 12;
+const TOOLTIP_OFFSET_X = 18;
+const TOOLTIP_OFFSET_Y = 22;
+const TOOLTIP_ESTIMATED_WIDTH = 200;
+const TOOLTIP_ESTIMATED_HEIGHT = 52;
+
+function shellTooltipAnchor(shell: HTMLElement, clientX: number, clientY: number): TooltipAnchor {
   const rect = shell.getBoundingClientRect();
   return {
-    x: Math.min(Math.max(12, clientX - rect.left + 18), rect.width - 24),
-    y: Math.min(Math.max(12, clientY - rect.top + 22), rect.height - 24),
+    x: clientX - rect.left,
+    y: clientY - rect.top,
+  };
+}
+
+function resolveTooltipPlacement(
+  anchor: TooltipAnchor,
+  shell: { width: number; height: number },
+  tooltip: { width: number; height: number },
+): TooltipPlacement {
+  const maxLeft = Math.max(TOOLTIP_PADDING, shell.width - tooltip.width - TOOLTIP_PADDING);
+  const maxTop = Math.max(TOOLTIP_PADDING, shell.height - tooltip.height - TOOLTIP_PADDING);
+
+  let left = anchor.x + TOOLTIP_OFFSET_X;
+  let top = anchor.y + TOOLTIP_OFFSET_Y;
+
+  if (left + tooltip.width > shell.width - TOOLTIP_PADDING) {
+    left = anchor.x - tooltip.width - TOOLTIP_OFFSET_X;
+  }
+  if (top + tooltip.height > shell.height - TOOLTIP_PADDING) {
+    top = anchor.y - tooltip.height - TOOLTIP_OFFSET_Y;
+  }
+
+  return {
+    left: Math.min(Math.max(TOOLTIP_PADDING, left), maxLeft),
+    top: Math.min(Math.max(TOOLTIP_PADDING, top), maxTop),
   };
 }
 
@@ -381,11 +414,16 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
   const shellRef = React.useRef<HTMLDivElement | null>(null);
   const mapLayerRef = React.useRef<HTMLDivElement | null>(null);
   const worldRef = React.useRef<HTMLDivElement | null>(null);
+  const tooltipRef = React.useRef<HTMLDivElement | null>(null);
   const [worldSvg, setWorldSvg] = React.useState("");
   const [mapOffsetY, setMapOffsetY] = React.useState(0);
   const [hoveredIso3, setHoveredIso3] = React.useState<string | null>(null);
   const [pinnedIso3, setPinnedIso3] = React.useState<string | null>(null);
-  const [tooltipPos, setTooltipPos] = React.useState({ x: 0, y: 0 });
+  const [tooltipAnchor, setTooltipAnchor] = React.useState<TooltipAnchor>({ x: 0, y: 0 });
+  const [tooltipPlacement, setTooltipPlacement] = React.useState<TooltipPlacement>({
+    left: TOOLTIP_PADDING,
+    top: TOOLTIP_PADDING,
+  });
   const mapDisplay = data?.mapDisplay ?? DEFAULT_MAP_DISPLAY;
   const showFlows = mapDisplay.showFlows ?? DEFAULT_MAP_DISPLAY.showFlows;
   const heatEnabled = mapDisplay.showHeat ?? DEFAULT_MAP_DISPLAY.showHeat;
@@ -502,6 +540,18 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
   }, [pinnedIso3]);
 
   React.useLayoutEffect(() => {
+    if (!activeBoard) return;
+    const shell = shellRef.current;
+    const tooltip = tooltipRef.current;
+    if (!shell) return;
+    const shellSize = { width: shell.clientWidth, height: shell.clientHeight };
+    const measured = tooltip
+      ? { width: tooltip.offsetWidth, height: tooltip.offsetHeight }
+      : { width: TOOLTIP_ESTIMATED_WIDTH, height: TOOLTIP_ESTIMATED_HEIGHT };
+    setTooltipPlacement(resolveTooltipPlacement(tooltipAnchor, shellSize, measured));
+  }, [activeBoard, tooltipAnchor]);
+
+  React.useLayoutEffect(() => {
     activityCountsRef.current = countryActivityCounts;
     const root = worldRef.current;
     if (!root || !preparedWorldSvg) return;
@@ -516,19 +566,24 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
     const shell = shellRef.current;
     if (!shell || !worldSvg) return;
 
-    const lastTooltipPosRef = { x: 0, y: 0 };
+    const lastTooltipAnchorRef = { x: 0, y: 0 };
 
-    const updateTooltipPosition = (event: MouseEvent) => {
-      const next = shellTooltipPosition(shell, event.clientX, event.clientY);
-      if (Math.abs(next.x - lastTooltipPosRef.x) < 8 && Math.abs(next.y - lastTooltipPosRef.y) < 8) return;
-      lastTooltipPosRef.x = next.x;
-      lastTooltipPosRef.y = next.y;
-      setTooltipPos(next);
+    const updateTooltipAnchor = (event: MouseEvent) => {
+      const next = shellTooltipAnchor(shell, event.clientX, event.clientY);
+      if (
+        Math.abs(next.x - lastTooltipAnchorRef.x) < 8 &&
+        Math.abs(next.y - lastTooltipAnchorRef.y) < 8
+      ) {
+        return;
+      }
+      lastTooltipAnchorRef.x = next.x;
+      lastTooltipAnchorRef.y = next.y;
+      setTooltipAnchor(next);
     };
 
     const syncHoverFromEvent = (event: PointerEvent) => {
       if (pinnedIso3Ref.current) {
-        updateTooltipPosition(event);
+        updateTooltipAnchor(event);
         return;
       }
       const counts = activityCountsRef.current;
@@ -541,7 +596,7 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
         event.clientY,
       );
       setHoveredIso3((current) => (current === iso3 ? current : iso3));
-      if (iso3) updateTooltipPosition(event);
+      if (iso3) updateTooltipAnchor(event);
     };
 
     const onPointerMove = (event: PointerEvent) => {
@@ -564,7 +619,7 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
         event.clientY,
       );
       if (!iso3) return;
-      updateTooltipPosition(event);
+      updateTooltipAnchor(event);
       setPinnedIso3((current) => (current === iso3 ? null : iso3));
       focus.setFocus({ kind: "country", id: iso3, source: "map" });
       void recordDashboardUxEvent({ eventType: "country_located_from_map", source: "map", targetType: "country" });
@@ -674,7 +729,9 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
                 event.stopPropagation();
                 const shell = shellRef.current;
                 if (shell) {
-                  setTooltipPos(shellTooltipPosition(shell, event.clientX, event.clientY));
+                  setTooltipAnchor(
+                    shellTooltipAnchor(shell, event.clientX, event.clientY),
+                  );
                 }
                 setPinnedIso3((current) =>
                   current === country.countryCodeIso3 ? null : country.countryCodeIso3,
@@ -709,12 +766,12 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
       </div>
       {activeBoard ? (
         <MapCountryTooltip
+          ref={tooltipRef}
           board={activeBoard}
           className="absolute z-40"
           style={{
-            left: tooltipPos.x > 0 ? tooltipPos.x : 12,
-            top: tooltipPos.y > 0 ? tooltipPos.y : 12,
-            transform: "translate(0, 0)",
+            left: tooltipPlacement.left,
+            top: tooltipPlacement.top,
           }}
         />
       ) : null}

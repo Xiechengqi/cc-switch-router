@@ -603,6 +603,10 @@ fn installation_visible_on_dashboard_map(
     has_active_share || has_enabled_tunnel
 }
 
+fn is_map_active_client(operational_state: &str) -> bool {
+    operational_state != "offline"
+}
+
 fn build_dashboard_country_aggregation(
     active_installations: &[ActiveInstallationGeo],
     share_views: &[ShareView],
@@ -627,6 +631,14 @@ fn build_dashboard_country_aggregation(
     let mut country_counts: HashMap<String, usize> = HashMap::new();
 
     for installation in active_installations {
+        let operational_state = client_operational_states
+            .get(&installation.id)
+            .map(String::as_str)
+            .unwrap_or("online");
+        if !is_map_active_client(operational_state) {
+            continue;
+        }
+
         let Some(iso2_raw) = installation
             .country_code
             .as_deref()
@@ -678,10 +690,6 @@ fn build_dashboard_country_aggregation(
             board.inflight_requests += share.active_requests;
         }
 
-        let operational_state = client_operational_states
-            .get(&installation.id)
-            .cloned()
-            .unwrap_or_else(|| "online".to_string());
         let total_shares = installation_shares.len();
         let visible_shares = installation_shares
             .iter()
@@ -705,7 +713,7 @@ fn build_dashboard_country_aggregation(
             ),
             owner_email: installation.owner_email.clone(),
             share_count: total_shares,
-            operational_state,
+            operational_state: operational_state.to_string(),
             shares: visible_shares,
             overflow_share_count: total_shares.saturating_sub(COUNTRY_BOARD_MAX_SHARES_PER_CLIENT),
         });
@@ -714,6 +722,9 @@ fn build_dashboard_country_aggregation(
     let mut country_map_points = Vec::new();
     let mut country_boards = HashMap::new();
     for (iso3, mut board) in buckets {
+        if board.client_count == 0 {
+            continue;
+        }
         if board.clients.len() > COUNTRY_BOARD_MAX_CLIENTS {
             board.overflow_client_count = board.clients.len() - COUNTRY_BOARD_MAX_CLIENTS;
             board.clients.truncate(COUNTRY_BOARD_MAX_CLIENTS);
@@ -21521,6 +21532,23 @@ mod tests {
             lon: None,
         };
         let proxy = ProxyRegistry::default();
+        for (index, subdomain) in ["us-tunnel", "de-tunnel", "kr-tunnel"]
+            .into_iter()
+            .enumerate()
+        {
+            proxy
+                .set_route(
+                    subdomain.into(),
+                    format!("http://127.0.0.1:{}", index + 1),
+                    None,
+                    None,
+                    None,
+                    false,
+                    -1,
+                    None,
+                )
+                .await;
+        }
         let snapshot = store
             .dashboard_snapshot(&config, &server_geo, &proxy, None)
             .await
@@ -21531,6 +21559,47 @@ mod tests {
         assert_eq!(snapshot.country_counts.get("KOR"), Some(&1));
         assert_eq!(snapshot.map.countries.len(), 3);
         assert_eq!(snapshot.clients.len(), 3);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn dashboard_snapshot_excludes_offline_clients_from_map_counts() {
+        let (store, config) = setup_store("dashboard-map-offline-clients").await;
+        insert_installation(&store, "inst-online").await;
+        set_installation_country_code(&store, "inst-online", "US").await;
+        insert_client_tunnel(&store, "inst-online", "owner@example.com", "online-sub").await;
+        insert_installation(&store, "inst-offline").await;
+        set_installation_country_code(&store, "inst-offline", "DE").await;
+        insert_client_tunnel(&store, "inst-offline", "owner@example.com", "offline-sub").await;
+
+        let server_geo = ServerGeo {
+            lat: None,
+            lon: None,
+        };
+        let proxy = ProxyRegistry::default();
+        proxy
+            .set_route(
+                "online-sub".into(),
+                "http://127.0.0.1:1".into(),
+                None,
+                None,
+                None,
+                false,
+                -1,
+                None,
+            )
+            .await;
+
+        let snapshot = store
+            .dashboard_snapshot(&config, &server_geo, &proxy, None)
+            .await
+            .expect("dashboard snapshot");
+
+        assert_eq!(snapshot.country_counts.get("USA"), Some(&1));
+        assert_eq!(snapshot.country_counts.get("DEU"), None);
+        assert_eq!(snapshot.map.countries.len(), 1);
+        assert_eq!(snapshot.clients.len(), 2);
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
