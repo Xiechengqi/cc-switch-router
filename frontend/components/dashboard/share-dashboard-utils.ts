@@ -4,7 +4,7 @@ import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import type { AppLocale } from "@/lib/i18n";
 import type { DashboardClient, DashboardMarket, HealthCheckEntry, MarketRequestLog, ModelHealthSummary, ShareAppProvider, ShareAppRuntimes, ShareRequestLog, ShareUpstreamProvider, ShareView } from "@/lib/types";
-import { formatDateTime } from "@/lib/utils";
+import { compactTokens, formatDateTime } from "@/lib/utils";
 
 export function modelHealthCheckedAt(entry: Pick<ModelHealthSummary, "checkedAt" | "lastCheckedAt">) {
   return Number(entry.checkedAt ?? entry.lastCheckedAt ?? 0);
@@ -993,4 +993,22 @@ export function formatAgeDaysOrHours(value?: string, locale: AppLocale = "en") {
   }
   const hours = Math.max(1, Math.floor(diff / hourMs));
   return isZh ? `${hours}小时` : `${hours}h`;
+}
+
+export function clientRunningDurationMs(client: DashboardClient, now = Date.now()) {
+  const ts = Date.parse(client.installation.createdAt);
+  if (!Number.isFinite(ts)) return 0;
+  return Math.max(0, now - ts);
+}
+
+export function clientRunningDurationLabel(client: DashboardClient, locale: AppLocale = "en") {
+  return formatAgeDaysOrHours(client.installation.createdAt, locale);
+}
+
+export function clientTotalTokensUsed(shares: ShareView[]) {
+  return shares.reduce((sum, share) => sum + (Number(share.tokensUsed) || 0), 0);
+}
+
+export function clientTotalTokensLabel(shares: ShareView[]) {
+  return compactTokens(clientTotalTokensUsed(shares));
 }

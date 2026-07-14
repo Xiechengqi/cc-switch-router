@@ -24,6 +24,10 @@ import {
   drawerDialogClassName,
   EmptyBlock,
   formatAgeDaysOrHours,
+  clientRunningDurationLabel,
+  clientRunningDurationMs,
+  clientTotalTokensLabel,
+  clientTotalTokensUsed,
   HealthTimelineStrip,
   ShareClientPanel,
   ShareEditDialog,
@@ -369,7 +373,7 @@ function ClientCard({
     <Card id={`dashboard-client-${client.installation.id}`} className={`overflow-hidden rounded-lg border border-l-[3px] bg-white p-0 shadow-sm transition-[border-color,box-shadow] ${borderTone}`}>
       <Card.Content className="grid gap-3 p-3.5">
         <div
-          className="group/client-header grid min-h-16 cursor-pointer select-text grid-cols-[minmax(300px,1.3fr)_minmax(520px,1fr)_auto] items-center gap-6 rounded-md px-1.5 py-1 outline-none transition-colors hover:bg-primary/[0.03] focus-visible:ring-2 focus-visible:ring-primary/30"
+          className="group/client-header grid min-h-16 cursor-pointer select-text grid-cols-[minmax(300px,1.3fr)_minmax(680px,1.15fr)_auto] items-center gap-6 rounded-md px-1.5 py-1 outline-none transition-colors hover:bg-primary/[0.03] focus-visible:ring-2 focus-visible:ring-primary/30"
           aria-expanded={!collapsed}
           onMouseDown={handleHeaderPointerDown}
           onClick={handleHeaderClick}
@@ -405,8 +409,23 @@ function ClientCard({
             </div>
           </div>
 
-          <div className={`grid min-w-0 gap-4 ${showRemoval ? "grid-cols-6" : "grid-cols-5"}`}>
+          <div className={`grid min-w-0 gap-3 ${showRemoval ? "grid-cols-8" : "grid-cols-7"}`}>
             <Metric label={t("dashboard.region")} value={client.installation.countryCode || client.installation.region || "-"} />
+            <Metric
+              label={t("dashboard.runningDuration")}
+              value={clientRunningDurationLabel(client, locale)}
+              title={t("dashboard.clientRunningSince", { date: formatDateTime(client.installation.createdAt) })}
+              preserveValue
+            />
+            <Metric
+              label={t("dashboard.totalTokens")}
+              value={clientTotalTokensLabel(allShares)}
+              title={t("dashboard.clientTotalTokensDetail", {
+                count: allShares.length,
+                total: clientTotalTokensUsed(allShares).toLocaleString(),
+              })}
+              preserveValue
+            />
             <Metric label={t("dashboard.version")} value={versionLabel} title={client.installation.appVersion || versionLabel} preserveValue />
             <Metric label={t("dashboard.uptime24h")} value={`${onlineRate.toFixed(1)}%`} title={onlineTitle} tone={onlineRate < 90 ? "warning" : "success"} />
             <Metric label={t("dashboard.shares")} value={`${onlineShares.length}/${enabledShares.length || allShares.length} ${t("common.online")}`} tone={issueCount ? "danger" : "default"} />
@@ -472,6 +491,10 @@ export function ClientBoard({
   const lastLocatedFocusRef = React.useRef("");
 
   React.useEffect(() => {
+    if (sortOrder === "registered") setSortOrder("running");
+  }, [setSortOrder, sortOrder]);
+
+  React.useEffect(() => {
     if (issuesOnly) setStatusFilter("all");
   }, [issuesOnly, setStatusFilter]);
 
@@ -529,7 +552,15 @@ export function ClientBoard({
         client.payoutProfile?.token,
       ], normalizedQuery);
       const matchedShares = clientMatch ? allShares : allShares.filter((share) => shareMatchesQuery(share, normalizedQuery));
-      return { client, shares: matchedShares, allShares, state: clientOperationalSummary(client, allShares).state, clientMatch };
+      return {
+        client,
+        shares: matchedShares,
+        allShares,
+        state: clientOperationalSummary(client, allShares).state,
+        clientMatch,
+        runningDurationMs: clientRunningDurationMs(client),
+        totalTokens: clientTotalTokensUsed(allShares),
+      };
     }).filter((row) => {
       if (normalizedQuery && row.shares.length === 0 && !row.clientMatch) return false;
       const region = row.client.installation.countryCode || row.client.installation.region || "";
@@ -547,8 +578,19 @@ export function ClientBoard({
       if (sortOrder === "recent") {
         return (Date.parse(right.client.installation.lastSeenAt) || 0) - (Date.parse(left.client.installation.lastSeenAt) || 0);
       }
+      if (sortOrder === "running") {
+        return (
+          right.runningDurationMs - left.runningDurationMs ||
+          (stableOrder.get(left.client.installation.id) || 0) - (stableOrder.get(right.client.installation.id) || 0)
+        );
+      }
+      if (sortOrder === "tokens") {
+        return (
+          right.totalTokens - left.totalTokens ||
+          (stableOrder.get(left.client.installation.id) || 0) - (stableOrder.get(right.client.installation.id) || 0)
+        );
+      }
       if (sortOrder === "shares") return right.allShares.length - left.allShares.length;
-      if (sortOrder === "registered") return (stableOrder.get(left.client.installation.id) || 0) - (stableOrder.get(right.client.installation.id) || 0);
       if (focus.target) return (stableOrder.get(left.client.installation.id) || 0) - (stableOrder.get(right.client.installation.id) || 0);
       return (stableStateRanks.get(left.client.installation.id) || 0) - (stableStateRanks.get(right.client.installation.id) || 0) || (stableOrder.get(left.client.installation.id) || 0) - (stableOrder.get(right.client.installation.id) || 0);
     });
@@ -662,7 +704,7 @@ export function ClientBoard({
               className="w-44"
             />
           ) : null}
-          <CompactSelect value={sortOrder} onChange={(value) => { setSortOrder(value); void recordDashboardUxEvent({ eventType: "filter_applied", source: "client-board", targetType: "client" }); }} options={[{ value: "issues", label: t("dashboard.sortIssues") }, { value: "name", label: t("dashboard.sortName") }, { value: "recent", label: t("dashboard.sortRecent") }, { value: "shares", label: t("dashboard.sortShares") }, { value: "registered", label: t("dashboard.sortRegistered") }]} ariaLabel={t("dashboard.sortBy")} className="w-44" />
+          <CompactSelect value={sortOrder === "registered" ? "running" : sortOrder} onChange={(value) => { setSortOrder(value); void recordDashboardUxEvent({ eventType: "filter_applied", source: "client-board", targetType: "client" }); }} options={[{ value: "issues", label: t("dashboard.sortIssues") }, { value: "name", label: t("dashboard.sortName") }, { value: "recent", label: t("dashboard.sortRecent") }, { value: "running", label: t("dashboard.sortRunning") }, { value: "tokens", label: t("dashboard.sortTokens") }, { value: "shares", label: t("dashboard.sortShares") }]} ariaLabel={t("dashboard.sortBy")} className="w-44" />
         </div>
       </div>
 
