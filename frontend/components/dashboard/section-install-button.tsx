@@ -1,17 +1,17 @@
 "use client";
 
-import { Button } from "@heroui/react";
+import { Download } from "lucide-react";
 
 export function SectionInstallButton({ label, onClick }: { label: string; onClick: () => void }) {
   return (
-    <Button
+    <button
       type="button"
-      size="sm"
-      variant="outline"
-      className="h-7 shrink-0 border-slate-200 bg-white px-2.5 text-[11px] font-medium normal-case tracking-normal text-foreground shadow-sm hover:bg-slate-50"
       onClick={onClick}
+      className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-slate-200 bg-white text-slate-600 shadow-sm transition-colors hover:border-sky-200 hover:bg-sky-50 hover:text-sky-700"
+      aria-label={label}
+      title={label}
     >
-      {label}
-    </Button>
+      <Download className="h-3.5 w-3.5" aria-hidden />
+    </button>
   );
 }

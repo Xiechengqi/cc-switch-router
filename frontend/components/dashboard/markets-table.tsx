@@ -204,13 +204,12 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
     <section className="grid gap-3">
       <div className="flex items-center justify-between gap-4">
         <div className="flex items-center gap-3">
-          <h2 className="font-mono text-xs font-semibold uppercase tracking-[0.14em] text-foreground">{t("dashboard.markets")}</h2>
-          <SectionInstallButton label={t("dashboard.installMarket")} onClick={() => setInstallOpen(true)} />
           <div className="inline-flex rounded-lg bg-slate-100 p-1 text-[11px]">
             {([["all", t("dashboard.all"), stableMarkets.length], ["available", t("dashboard.available"), summary.available], ["issues", t("dashboard.issues"), summary.issues], ["disabled", t("common.disabled"), summary.disabled]] as const).map(([value, label, count]) => (
               <button key={value} type="button" onClick={() => { setStatusFilter(value); if (value === "available" || value === "disabled") setIssuesOnly(false); }} className={`rounded-md px-2.5 py-1.5 transition-colors ${statusFilter === value ? "bg-white font-medium text-foreground shadow-sm" : value === "issues" ? "text-rose-700" : "text-muted-foreground"}`}>{label} · {count}</button>
             ))}
           </div>
+          <SectionInstallButton label={t("dashboard.installMarket")} onClick={() => setInstallOpen(true)} />
         </div>
         <div className="flex items-center gap-2">
           <label className="flex h-9 min-w-64 flex-1 items-center gap-2 rounded-md border bg-white px-3 text-sm focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-primary/10">

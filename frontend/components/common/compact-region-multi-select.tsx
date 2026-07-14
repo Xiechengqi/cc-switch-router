@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { ChevronDown } from "lucide-react";
+import { ChevronDown, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 export function CompactRegionMultiSelect({
@@ -10,6 +10,7 @@ export function CompactRegionMultiSelect({
   onChange,
   allLabel,
   moreLabel,
+  clearLabel,
   ariaLabel,
   className,
 }: {
@@ -18,11 +19,15 @@ export function CompactRegionMultiSelect({
   onChange: (values: string[]) => void;
   allLabel: string;
   moreLabel: (count: number) => string;
+  clearLabel: string;
   ariaLabel: string;
   className?: string;
 }) {
   const [open, setOpen] = React.useState(false);
+  const [hovered, setHovered] = React.useState(false);
   const rootRef = React.useRef<HTMLDivElement>(null);
+  const hasSelection = values.length > 0;
+  const showClear = hasSelection && hovered;
 
   React.useEffect(() => {
     if (!open) return;
@@ -55,16 +60,44 @@ export function CompactRegionMultiSelect({
 
   return (
     <div ref={rootRef} className={cn("relative", className)}>
-      <button
-        type="button"
-        aria-label={ariaLabel}
-        aria-expanded={open}
-        onClick={() => setOpen((current) => !current)}
-        className="flex min-h-9 w-full items-center justify-between gap-2 rounded-lg border bg-white px-3 text-xs shadow-sm"
+      <div
+        className="flex min-h-9 w-full items-center rounded-lg border bg-white shadow-sm"
+        onMouseEnter={() => setHovered(true)}
+        onMouseLeave={() => setHovered(false)}
       >
-        <span className="min-w-0 truncate pr-2 text-xs font-medium text-foreground">{summary}</span>
-        <ChevronDown className={cn("h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform", open && "rotate-180")} />
-      </button>
+        <button
+          type="button"
+          aria-label={ariaLabel}
+          aria-expanded={open}
+          onClick={() => setOpen((current) => !current)}
+          className="flex min-w-0 flex-1 items-center px-3 py-2 text-left text-xs"
+        >
+          <span className="min-w-0 truncate pr-2 text-xs font-medium text-foreground">{summary}</span>
+        </button>
+        {showClear ? (
+          <button
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              onChange([]);
+            }}
+            className="mr-0.5 inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-sm text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-600"
+            aria-label={clearLabel}
+            title={clearLabel}
+          >
+            <X className="h-3 w-3" aria-hidden />
+          </button>
+        ) : null}
+        <button
+          type="button"
+          aria-hidden
+          tabIndex={-1}
+          onClick={() => setOpen((current) => !current)}
+          className="inline-flex shrink-0 items-center justify-center px-2 py-2 text-muted-foreground"
+        >
+          <ChevronDown className={cn("h-3.5 w-3.5 transition-transform", open && "rotate-180")} />
+        </button>
+      </div>
       {open ? (
         <div className="absolute right-0 top-[calc(100%+4px)] z-50 max-h-64 min-w-full overflow-y-auto rounded-lg border bg-white py-1 shadow-lg">
           <label className="flex cursor-pointer items-center gap-2 px-3 py-2 text-xs hover:bg-slate-50">

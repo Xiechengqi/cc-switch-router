@@ -29,14 +29,6 @@ function clampRect(rect: NormalRect): NormalRect {
   return { x, y, width, height };
 }
 
-function frameHost(url: string): string {
-  try {
-    return new URL(url).host;
-  } catch {
-    return url;
-  }
-}
-
 function useConsoleClickOutsideMinimize({
   enabled,
   windows,
@@ -151,7 +143,6 @@ function ClientConsoleWindowShell({
   onRectChange: (rect: NormalRect) => void;
 }) {
   const { t } = useLocaleText();
-  const host = frameHost(window.url);
   const maximized = window.state === "maximized";
   const dragRef = React.useRef<{ startX: number; startY: number; origin: NormalRect } | null>(null);
   const resizeRef = React.useRef<{ startX: number; startY: number; origin: NormalRect } | null>(null);
@@ -264,19 +255,21 @@ function ClientConsoleWindowShell({
       >
         <ClientConsoleTrafficLights maximized={maximized} onClose={onClose} onMinimize={onMinimize} onToggleMaximize={onToggleMaximize} />
         <div className="min-w-0 flex-1 text-center">
-          <p className="truncate text-[12px] font-medium text-slate-700">{window.title}</p>
-          <a
-            href={window.url}
-            target="_blank"
-            rel="noopener noreferrer"
-            data-no-drag
-            className="mt-0.5 inline-flex max-w-full items-center justify-center gap-1 truncate text-[10px] font-mono text-muted-foreground underline-offset-4 transition-colors hover:text-primary hover:underline"
-            title={window.url}
-            onClick={(event) => event.stopPropagation()}
-          >
-            <span className="min-w-0 truncate">{host}</span>
-            <ExternalLink className="h-2.5 w-2.5 shrink-0" />
-          </a>
+          <div className="inline-flex max-w-full items-center justify-center gap-1">
+            <p className="truncate text-[12px] font-medium text-slate-700">{window.title}</p>
+            <a
+              href={window.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              data-no-drag
+              className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-md text-slate-500 transition-colors hover:bg-slate-200/80 hover:text-slate-800"
+              title={t("dashboard.clientFrame.openNewTab")}
+              aria-label={t("dashboard.clientFrame.openNewTab")}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <ExternalLink className="h-3 w-3" />
+            </a>
+          </div>
         </div>
         <button
           type="button"

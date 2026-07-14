@@ -633,8 +633,6 @@ export function ClientBoard({
     <section className="grid gap-4">
       <div className="flex items-center justify-between gap-4">
         <div className="flex items-center gap-3">
-          <h2 className="font-mono text-xs font-semibold uppercase tracking-[0.14em] text-foreground">{t("dashboard.clients")}</h2>
-          <SectionInstallButton label={t("dashboard.installClient")} onClick={() => setInstallOpen(true)} />
           <div className="inline-flex rounded-lg bg-slate-100 p-1 text-[11px]">
             {([[
               "all", t("dashboard.all"), sortedClients.length,
@@ -642,6 +640,7 @@ export function ClientBoard({
               <button key={value} type="button" onClick={() => { setStatusFilter(value); if (value === "online") setIssuesOnly(false); }} className={`rounded-md px-2.5 py-1.5 transition-colors ${statusFilter === value ? "bg-white font-medium text-foreground shadow-sm" : value === "offline" ? "text-rose-700" : value === "degraded" ? "text-amber-700" : "text-muted-foreground"}`}>{label} · {count}</button>
             ))}
           </div>
+          <SectionInstallButton label={t("dashboard.installClient")} onClick={() => setInstallOpen(true)} />
         </div>
         <div className="flex items-center gap-2">
           <label className="flex h-9 min-w-64 flex-1 items-center gap-2 rounded-md border bg-white px-3 text-sm focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-primary/10">
@@ -658,6 +657,7 @@ export function ClientBoard({
               options={regions.map((region) => ({ value: region, label: region }))}
               allLabel={t("dashboard.allRegions")}
               moreLabel={(count) => t("dashboard.regionsMore", { count })}
+              clearLabel={t("dashboard.clearRegionSelection")}
               ariaLabel={t("dashboard.filterRegion")}
               className="w-44"
             />
