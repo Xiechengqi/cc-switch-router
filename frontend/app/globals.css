@@ -121,11 +121,6 @@ body {
   animation: router-activity-enter 0.45s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
-.activity-feed-mask {
-  -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 32%);
-  mask-image: linear-gradient(to bottom, transparent 0%, black 32%);
-}
-
 @media (prefers-reduced-motion: reduce) {
   .live-pulse,
   .activity-feed-enter {

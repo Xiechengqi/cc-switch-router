@@ -415,7 +415,7 @@ async fn run_route_health_probe_cycle(
     let targets = store.list_share_route_targets().await?;
     for target in targets {
         let is_healthy = if active.contains(&target.subdomain) {
-            probe_share_route(store, config, client, &target).await
+            active_route_is_healthy(probe_share_route(store, config, client, &target).await)
         } else {
             false
         };
@@ -429,7 +429,7 @@ async fn run_route_health_probe_cycle(
     let client_targets = store.list_client_tunnel_route_targets().await?;
     for target in client_targets {
         let is_healthy = if active.contains(&target.subdomain) {
-            probe_client_tunnel_route(store, config, client, &target).await
+            active_route_is_healthy(probe_client_tunnel_route(store, config, client, &target).await)
         } else {
             false
         };
@@ -529,12 +529,23 @@ fn filter_registered_route_targets(
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TunnelRouteProbe {
+    Healthy,
+    Unhealthy,
+    Unavailable,
+}
+
+fn active_route_is_healthy(probe: TunnelRouteProbe) -> bool {
+    !matches!(probe, TunnelRouteProbe::Unhealthy)
+}
+
 async fn probe_share_route(
     store: &AppStore,
     config: &Config,
     client: &reqwest::Client,
     target: &ShareRouteTarget,
-) -> bool {
+) -> TunnelRouteProbe {
     probe_tunnel_route_health(
         store,
         config,
@@ -550,7 +561,7 @@ async fn probe_client_tunnel_route(
     config: &Config,
     client: &reqwest::Client,
     target: &ClientTunnelRouteTarget,
-) -> bool {
+) -> TunnelRouteProbe {
     probe_tunnel_route_health(
         store,
         config,
@@ -567,16 +578,19 @@ async fn probe_tunnel_route_health(
     client: &reqwest::Client,
     subdomain: &str,
     installation_id: &str,
-) -> bool {
+) -> TunnelRouteProbe {
     const PATH: &str = "/_share-router/health";
-    let Some(control_secret) = store
-        .installation_control_secret(installation_id)
-        .await
-        .ok()
-        .flatten()
-        .filter(|secret| !secret.trim().is_empty())
-    else {
-        return false;
+    let control_secret = match store.installation_control_secret(installation_id).await {
+        Ok(Some(secret)) if !secret.trim().is_empty() => secret,
+        Ok(_) => return TunnelRouteProbe::Unavailable,
+        Err(err) => {
+            tracing::warn!(
+                installation_id,
+                subdomain,
+                "read control secret for route health probe failed: {err}"
+            );
+            return TunnelRouteProbe::Unhealthy;
+        }
     };
     let url = format!("{}{PATH}", config.tunnel_url(subdomain));
     let request = crate::ctl_client::authorize_control_request(
@@ -588,8 +602,8 @@ async fn probe_tunnel_route_health(
         &[],
     );
     match request.send().await {
-        Ok(response) => response.status().is_success(),
-        Err(_) => false,
+        Ok(response) if response.status().is_success() => TunnelRouteProbe::Healthy,
+        Ok(_) | Err(_) => TunnelRouteProbe::Unhealthy,
     }
 }
 
@@ -723,7 +737,7 @@ Default env file:
 
 #[cfg(test)]
 mod tests {
-    use super::filter_registered_route_targets;
+    use super::{TunnelRouteProbe, active_route_is_healthy, filter_registered_route_targets};
     use crate::store::ShareRouteTarget;
 
     #[test]
@@ -751,5 +765,12 @@ mod tests {
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].share_id, "share-2");
         assert_eq!(filtered[0].subdomain, "bbb");
+    }
+
+    #[test]
+    fn active_route_is_available_when_legacy_control_secret_is_missing() {
+        assert!(active_route_is_healthy(TunnelRouteProbe::Healthy));
+        assert!(active_route_is_healthy(TunnelRouteProbe::Unavailable));
+        assert!(!active_route_is_healthy(TunnelRouteProbe::Unhealthy));
     }
 }

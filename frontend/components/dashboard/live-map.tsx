@@ -59,6 +59,18 @@ function resolveTickerCountry(
     };
   }
 
+  const compatibilityCountry = displayCountry(event.countryCode);
+  if (compatibilityCountry !== "--") {
+    return { label: compatibilityCountry, flagCode: compatibilityCountry };
+  }
+
+  const shareId = event.shareId || mergedItem?.shareId;
+  const installationCountry = shareId
+    ? data?.clients.find((client) => (client.shareIds || []).includes(shareId))?.installation.countryCode
+    : undefined;
+  const fallback = displayCountry(installationCountry);
+  if (fallback !== "--") return { label: fallback, flagCode: fallback };
+
   return { label: "--" };
 }
 
@@ -369,7 +381,7 @@ function RequestTicker({ data }: { data: DashboardResponse | null }) {
   if (!events.length) return null;
 
   return (
-    <div className="activity-feed-mask pointer-events-none absolute bottom-[52px] left-3 z-30 flex w-[min(72%,720px)] flex-col gap-1">
+    <div className="pointer-events-none absolute bottom-[52px] left-3 z-30 flex w-[min(72%,720px)] flex-col gap-1">
       {events.map((event, index) => {
         const item = meta.get(event.requestId);
         const eventUserEmail = event.userEmail;
