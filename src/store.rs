@@ -4071,8 +4071,8 @@ impl AppStore {
                 if log.user_country_iso3.is_none() {
                     log.user_country_iso3 = user_country_iso3.clone();
                 }
-                if log.user_email.is_none() {
-                    log.user_email = user_email.clone();
+                if let Some(user_email) = user_email.as_ref() {
+                    log.user_email = Some(user_email.clone());
                 }
             }
             upsert_share_request_log_tx(&tx, &input.installation_id, log)?;
@@ -21344,7 +21344,7 @@ mod tests {
             session_id: Some("session-1".into()),
             user_country: None,
             user_country_iso3: None,
-            user_email: None,
+            user_email: Some("stale@example.com".into()),
             created_at: Utc::now().timestamp(),
             is_health_check: false,
         }];
@@ -21365,7 +21365,7 @@ mod tests {
             (
                 Some("JP".into()),
                 Some("JPN".into()),
-                Some("user@example.com".into()),
+                Some("actual@example.com".into()),
             ),
         )]);
         store
@@ -21405,7 +21405,7 @@ mod tests {
         assert_eq!(stored_count, 1);
         assert_eq!(user_country.as_deref(), Some("JP"));
         assert_eq!(user_country_iso3.as_deref(), Some("JPN"));
-        assert_eq!(user_email.as_deref(), Some("user@example.com"));
+        assert_eq!(user_email.as_deref(), Some("actual@example.com"));
 
         let replay_err = store
             .batch_sync_share_request_logs(

@@ -609,6 +609,8 @@ export type MarketRequestLog = {
   outputTokens: number;
   cacheReadTokens?: number;
   cacheCreationTokens?: number;
+  userCountry?: string;
+  userCountryIso3?: string;
   usageAmountUsd?: string;
   createdAt: string;
   settledAt?: string;
@@ -630,6 +632,9 @@ export type RecentRequestEvent = {
   latencyMs?: number;
   inputTokens?: number;
   outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheCreationTokens?: number;
+  totalTokens?: number;
   isHealthCheck?: boolean;
   healthStatus?: string;
   healthAppType?: string;

@@ -1713,10 +1713,14 @@ fn confirmed_request_events(
     snapshot: &RecentTrafficSnapshot,
     response: &DashboardResponse,
 ) -> (Vec<RecentRequestEvent>, HashMap<String, usize>) {
-    let mut events_by_id = persisted_ticker_request_events(response)
-        .into_iter()
-        .map(|event| (event.request_id.clone(), event))
-        .collect::<HashMap<_, _>>();
+    let mut events_by_id = HashMap::new();
+    for event in persisted_ticker_request_events(response) {
+        if let Some(existing) = events_by_id.get_mut(&event.request_id) {
+            merge_persisted_ticker_event(existing, event);
+        } else {
+            events_by_id.insert(event.request_id.clone(), event);
+        }
+    }
     let request_log_ids = response
         .ticker_shares
         .iter()
@@ -1757,7 +1761,10 @@ fn confirmed_request_events(
             merge_ticker_event_country(existing, event);
         }
     }
-    let mut events = events_by_id.into_values().collect::<Vec<_>>();
+    let mut events = events_by_id
+        .into_values()
+        .filter(|event| !event.is_health_check)
+        .collect::<Vec<_>>();
     events.sort_by(|left, right| left.started_at.cmp(&right.started_at));
     if events.len() > DASHBOARD_REQUEST_TICKER_LIMIT {
         events.drain(0..events.len() - DASHBOARD_REQUEST_TICKER_LIMIT);
@@ -1769,6 +1776,46 @@ fn confirmed_request_events(
         }
     }
     (events, country_counts)
+}
+
+fn merge_persisted_ticker_event(target: &mut RecentRequestEvent, mut source: RecentRequestEvent) {
+    if source.share_id.trim().is_empty() {
+        source.share_id = target.share_id.clone();
+    }
+    if option_string_is_blank(&source.share_name) {
+        source.share_name = target.share_name.clone();
+    }
+    if option_string_is_blank(&source.share_subdomain) {
+        source.share_subdomain = target.share_subdomain.clone();
+    }
+    if option_string_is_blank(&source.user_country) {
+        source.user_country = target.user_country.clone();
+    }
+    if option_string_is_blank(&source.user_country_iso3) {
+        source.user_country_iso3 = target.user_country_iso3.clone();
+    }
+    if option_string_is_blank(&source.user_email) {
+        source.user_email = target.user_email.clone();
+    }
+    if source.total_tokens.unwrap_or(0) == 0 {
+        source.input_tokens = target.input_tokens;
+        source.output_tokens = target.output_tokens;
+        source.cache_read_tokens = target.cache_read_tokens;
+        source.cache_creation_tokens = target.cache_creation_tokens;
+        source.total_tokens = target.total_tokens;
+    }
+    if target.started_at < source.started_at {
+        source.started_at = target.started_at;
+    }
+    *target = source;
+}
+
+fn option_string_is_blank(value: &Option<String>) -> bool {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
 }
 
 fn live_request_context_by_request_id(
@@ -1801,10 +1848,7 @@ fn enrich_market_request_logs_with_live_country(
 ) {
     let context_by_request_id = live_request_context_by_request_id(snapshot);
     for log in logs {
-        if log.user_country.is_some() && log.user_country_iso3.is_some() {
-            continue;
-        }
-        if let Some((user_country, user_country_iso3, _)) =
+        if let Some((user_country, user_country_iso3, user_email)) =
             context_by_request_id.get(&log.request_id)
         {
             if log.user_country.is_none() {
@@ -1812,6 +1856,9 @@ fn enrich_market_request_logs_with_live_country(
             }
             if log.user_country_iso3.is_none() {
                 log.user_country_iso3 = user_country_iso3.clone();
+            }
+            if let Some(user_email) = user_email.as_ref() {
+                log.user_email = Some(user_email.clone());
             }
         }
     }
@@ -1824,9 +1871,6 @@ fn enrich_share_ticker_logs_with_live_country(
     let context_by_request_id = live_request_context_by_request_id(snapshot);
     for share in ticker_shares {
         for log in &mut share.recent_requests {
-            if log.user_country.is_some() && log.user_country_iso3.is_some() {
-                continue;
-            }
             if let Some((user_country, user_country_iso3, user_email)) =
                 context_by_request_id.get(&log.request_id)
             {
@@ -1836,8 +1880,8 @@ fn enrich_share_ticker_logs_with_live_country(
                 if log.user_country_iso3.is_none() {
                     log.user_country_iso3 = user_country_iso3.clone();
                 }
-                if log.user_email.is_none() {
-                    log.user_email = user_email.clone();
+                if let Some(user_email) = user_email.as_ref() {
+                    log.user_email = Some(user_email.clone());
                 }
             }
         }
@@ -1845,14 +1889,14 @@ fn enrich_share_ticker_logs_with_live_country(
 }
 
 fn merge_ticker_event_country(target: &mut RecentRequestEvent, source: &RecentRequestEvent) {
-    if target.user_country.is_none() {
-        target.user_country = source.user_country.clone();
+    if let Some(user_country) = source.user_country.as_ref() {
+        target.user_country = Some(user_country.clone());
     }
-    if target.user_country_iso3.is_none() {
-        target.user_country_iso3 = source.user_country_iso3.clone();
+    if let Some(user_country_iso3) = source.user_country_iso3.as_ref() {
+        target.user_country_iso3 = Some(user_country_iso3.clone());
     }
-    if target.user_email.is_none() {
-        target.user_email = source.user_email.clone();
+    if let Some(user_email) = source.user_email.as_ref() {
+        target.user_email = Some(user_email.clone());
     }
 }
 
@@ -1885,6 +1929,11 @@ fn share_log_to_ticker_event(
         user_country: log.user_country.clone(),
         user_country_iso3: log.user_country_iso3.clone(),
         user_email: log.user_email.clone(),
+        input_tokens: Some(log.input_tokens),
+        output_tokens: Some(log.output_tokens),
+        cache_read_tokens: Some(log.cache_read_tokens),
+        cache_creation_tokens: Some(log.cache_creation_tokens),
+        total_tokens: Some(share_log_total_tokens(log)),
         started_at: chrono::DateTime::<chrono::Utc>::from_timestamp(log.created_at, 0)
             .unwrap_or_else(chrono::Utc::now),
         is_inflight: false,
@@ -1916,6 +1965,11 @@ fn market_log_to_ticker_event(log: &DashboardMarketRequestLogView) -> RecentRequ
         user_country: log.user_country.clone(),
         user_country_iso3: log.user_country_iso3.clone(),
         user_email: log.user_email.clone(),
+        input_tokens: Some(log.input_tokens),
+        output_tokens: Some(log.output_tokens),
+        cache_read_tokens: Some(log.cache_read_tokens),
+        cache_creation_tokens: Some(log.cache_creation_tokens),
+        total_tokens: Some(market_log_total_tokens(log)),
         started_at: parse_dashboard_log_time(&log.created_at),
         is_inflight: false,
         is_health_check: false,
@@ -1923,6 +1977,27 @@ fn market_log_to_ticker_event(log: &DashboardMarketRequestLogView) -> RecentRequ
         health_app_type: None,
         health_model: None,
     }
+}
+
+fn share_log_total_tokens(log: &ShareRequestLogEntry) -> u64 {
+    u64::from(log.input_tokens)
+        + u64::from(log.output_tokens)
+        + u64::from(log.cache_read_tokens)
+        + u64::from(log.cache_creation_tokens)
+}
+
+fn market_log_total_tokens(log: &DashboardMarketRequestLogView) -> u64 {
+    let input_tokens = u64::from(log.input_tokens);
+    let cache_read_tokens = u64::from(log.cache_read_tokens);
+    let uncached_input_tokens = if log.request_agent.trim().eq_ignore_ascii_case("codex") {
+        input_tokens.saturating_sub(cache_read_tokens)
+    } else {
+        input_tokens
+    };
+    uncached_input_tokens
+        + u64::from(log.output_tokens)
+        + cache_read_tokens
+        + u64::from(log.cache_creation_tokens)
 }
 
 fn parse_dashboard_log_time(value: &str) -> chrono::DateTime<chrono::Utc> {
@@ -2407,6 +2482,199 @@ mod tests {
     }
 
     #[test]
+    fn share_log_ticker_event_preserves_email_and_usage() {
+        let mut log = share_log("req-share-usage", 1);
+        log.user_email = Some("share-user@example.com".into());
+        log.input_tokens = 10;
+        log.output_tokens = 20;
+        log.cache_read_tokens = 3;
+        log.cache_creation_tokens = 4;
+        let event = share_log_to_ticker_event(&ticker_share(Vec::new()), &log);
+
+        assert_eq!(event.user_email.as_deref(), Some("share-user@example.com"));
+        assert_eq!(event.input_tokens, Some(10));
+        assert_eq!(event.output_tokens, Some(20));
+        assert_eq!(event.cache_read_tokens, Some(3));
+        assert_eq!(event.cache_creation_tokens, Some(4));
+        assert_eq!(event.total_tokens, Some(37));
+
+        let json = serde_json::to_value(event).expect("serialize ticker event");
+        assert_eq!(json["inputTokens"], 10);
+        assert_eq!(json["outputTokens"], 20);
+        assert_eq!(json["cacheReadTokens"], 3);
+        assert_eq!(json["cacheCreationTokens"], 4);
+        assert_eq!(json["totalTokens"], 37);
+    }
+
+    #[test]
+    fn market_log_ticker_event_uses_canonical_total_and_preserves_email() {
+        let mut log = market_log("req-market-usage", "codex");
+        log.user_email = Some("market-user@example.com".into());
+        log.input_tokens = 100;
+        log.output_tokens = 20;
+        log.cache_read_tokens = 40;
+        log.cache_creation_tokens = 5;
+        let event = market_log_to_ticker_event(&log);
+
+        assert_eq!(event.user_email.as_deref(), Some("market-user@example.com"));
+        assert_eq!(event.input_tokens, Some(100));
+        assert_eq!(event.output_tokens, Some(20));
+        assert_eq!(event.cache_read_tokens, Some(40));
+        assert_eq!(event.cache_creation_tokens, Some(5));
+        assert_eq!(event.total_tokens, Some(125));
+
+        log.input_tokens = 10;
+        assert_eq!(market_log_total_tokens(&log), 65);
+        log.input_tokens = 100;
+        log.request_agent = "claude".into();
+        assert_eq!(market_log_total_tokens(&log), 165);
+    }
+
+    #[test]
+    fn live_context_overrides_email_without_erasing_persisted_usage() {
+        let mut log = share_log("req-live-merge", 1);
+        log.user_email = Some("persisted@example.com".into());
+        log.input_tokens = 10;
+        log.output_tokens = 20;
+        log.cache_read_tokens = 3;
+        log.cache_creation_tokens = 4;
+        log.user_country = Some("JP".into());
+        log.user_country_iso3 = Some("JPN".into());
+        let mut persisted = share_log_to_ticker_event(&ticker_share(Vec::new()), &log);
+        let live = live_event(
+            "req-live-merge",
+            Some("actual@example.com"),
+            Some("US"),
+            Some("USA"),
+        );
+
+        merge_ticker_event_country(&mut persisted, &live);
+
+        assert_eq!(persisted.user_email.as_deref(), Some("actual@example.com"));
+        assert_eq!(persisted.user_country.as_deref(), Some("US"));
+        assert_eq!(persisted.user_country_iso3.as_deref(), Some("USA"));
+        assert_eq!(persisted.input_tokens, Some(10));
+        assert_eq!(persisted.output_tokens, Some(20));
+        assert_eq!(persisted.cache_read_tokens, Some(3));
+        assert_eq!(persisted.cache_creation_tokens, Some(4));
+        assert_eq!(persisted.total_tokens, Some(37));
+    }
+
+    #[test]
+    fn live_email_overrides_logs_even_when_country_is_complete() {
+        let snapshot = RecentTrafficSnapshot {
+            country_counts: HashMap::new(),
+            events: vec![live_event(
+                "req-email-override",
+                Some("actual@example.com"),
+                Some("US"),
+                Some("USA"),
+            )],
+            recent_events: Vec::new(),
+        };
+        let mut share_log = share_log("req-email-override", 1);
+        share_log.user_country = Some("JP".into());
+        share_log.user_country_iso3 = Some("JPN".into());
+        share_log.user_email = Some("stale@example.com".into());
+        let mut ticker_shares = vec![ticker_share(vec![share_log])];
+        enrich_share_ticker_logs_with_live_country(&mut ticker_shares, &snapshot);
+        assert_eq!(
+            ticker_shares[0].recent_requests[0].user_email.as_deref(),
+            Some("actual@example.com")
+        );
+        assert_eq!(
+            ticker_shares[0].recent_requests[0].user_country.as_deref(),
+            Some("JP")
+        );
+
+        let mut market_logs = vec![market_sync_log("req-email-override", "codex")];
+        market_logs[0].user_country = Some("JP".into());
+        market_logs[0].user_country_iso3 = Some("JPN".into());
+        market_logs[0].user_email = Some("stale@example.com".into());
+        enrich_market_request_logs_with_live_country(&mut market_logs, &snapshot);
+        assert_eq!(
+            market_logs[0].user_email.as_deref(),
+            Some("actual@example.com")
+        );
+        assert_eq!(market_logs[0].user_country.as_deref(), Some("JP"));
+    }
+
+    #[test]
+    fn duplicate_share_and_market_events_keep_complete_email_and_usage() {
+        let mut share_log = share_log("req-duplicate", 1);
+        share_log.user_email = Some("share-user@example.com".into());
+        share_log.input_tokens = 10;
+        share_log.output_tokens = 20;
+        share_log.cache_read_tokens = 3;
+        share_log.cache_creation_tokens = 4;
+        let mut duplicate_market_log = market_log("req-duplicate", "codex");
+        duplicate_market_log.share_id = None;
+        duplicate_market_log.share_subdomain = None;
+        let mut response = dashboard_response(
+            vec![ticker_share(vec![share_log])],
+            vec![duplicate_market_log],
+        );
+        let snapshot = RecentTrafficSnapshot {
+            country_counts: HashMap::new(),
+            events: Vec::new(),
+            recent_events: Vec::new(),
+        };
+
+        let (events, _) = confirmed_request_events(&snapshot, &response);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].share_id, "share-1");
+        assert_eq!(events[0].share_name.as_deref(), Some("Share"));
+        assert_eq!(events[0].share_subdomain.as_deref(), Some("share-sub"));
+        assert_eq!(
+            events[0].user_email.as_deref(),
+            Some("share-user@example.com")
+        );
+        assert_eq!(events[0].input_tokens, Some(10));
+        assert_eq!(events[0].output_tokens, Some(20));
+        assert_eq!(events[0].cache_read_tokens, Some(3));
+        assert_eq!(events[0].cache_creation_tokens, Some(4));
+        assert_eq!(events[0].total_tokens, Some(37));
+
+        response.market_request_logs[0].user_email = Some("market-user@example.com".into());
+        response.market_request_logs[0].input_tokens = 100;
+        response.market_request_logs[0].output_tokens = 20;
+        response.market_request_logs[0].cache_read_tokens = 40;
+        response.market_request_logs[0].cache_creation_tokens = 5;
+        let (events, _) = confirmed_request_events(&snapshot, &response);
+        assert_eq!(
+            events[0].user_email.as_deref(),
+            Some("market-user@example.com")
+        );
+        assert_eq!(events[0].input_tokens, Some(100));
+        assert_eq!(events[0].output_tokens, Some(20));
+        assert_eq!(events[0].cache_read_tokens, Some(40));
+        assert_eq!(events[0].cache_creation_tokens, Some(5));
+        assert_eq!(events[0].total_tokens, Some(125));
+    }
+
+    #[test]
+    fn health_checks_do_not_consume_request_ticker_limit() {
+        let mut requests = vec![share_log("req-user", 1)];
+        for index in 0..=DASHBOARD_REQUEST_TICKER_LIMIT {
+            let mut health = share_log(&format!("req-health-{index}"), index as i64 + 2);
+            health.is_health_check = true;
+            requests.push(health);
+        }
+        let response = dashboard_response(vec![ticker_share(requests)], Vec::new());
+        let snapshot = RecentTrafficSnapshot {
+            country_counts: HashMap::new(),
+            events: Vec::new(),
+            recent_events: Vec::new(),
+        };
+
+        let (events, _) = confirmed_request_events(&snapshot, &response);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].request_id, "req-user");
+        assert!(!events[0].is_health_check);
+    }
+
+    #[test]
     fn confirmed_request_events_accepts_market_request_logs() {
         let event = RecentRequestEvent {
             request_id: "req_market_confirmed".into(),
@@ -2416,6 +2684,11 @@ mod tests {
             user_country: Some("US".into()),
             user_country_iso3: Some("USA".into()),
             user_email: Some("user@example.com".into()),
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            total_tokens: None,
             started_at: Utc::now(),
             is_inflight: true,
             is_health_check: false,
@@ -2589,6 +2862,11 @@ mod tests {
             user_country: Some("US".into()),
             user_country_iso3: Some("USA".into()),
             user_email: Some("live-user@example.com".into()),
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            total_tokens: None,
             started_at: Utc::now(),
             is_inflight: true,
             is_health_check: false,
@@ -2647,6 +2925,11 @@ mod tests {
             user_country: Some("US".into()),
             user_country_iso3: Some("USA".into()),
             user_email: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            total_tokens: None,
             started_at: Utc::now(),
             is_inflight: false,
             is_health_check: false,
@@ -2721,6 +3004,140 @@ mod tests {
             user_email: None,
             created_at,
             is_health_check: false,
+        }
+    }
+
+    fn ticker_share(
+        recent_requests: Vec<crate::models::ShareRequestLogEntry>,
+    ) -> crate::models::DashboardTickerShare {
+        crate::models::DashboardTickerShare {
+            share_id: "share-1".into(),
+            share_name: "Share".into(),
+            subdomain: "share-sub".into(),
+            recent_requests,
+        }
+    }
+
+    fn market_log(
+        request_id: &str,
+        request_agent: &str,
+    ) -> crate::models::DashboardMarketRequestLogView {
+        crate::models::DashboardMarketRequestLogView {
+            request_id: request_id.into(),
+            market_id: "market-1".into(),
+            market_email: "market@example.com".into(),
+            market_subdomain: "market".into(),
+            user_email: None,
+            api_key_prefix: None,
+            router_id: None,
+            share_id: Some("share-1".into()),
+            share_subdomain: Some("share-sub".into()),
+            model: Some("gpt-5".into()),
+            request_agent: request_agent.into(),
+            requested_model: "gpt-5".into(),
+            actual_model: "gpt-5".into(),
+            actual_model_source: "official".into(),
+            status: "settled".into(),
+            status_code: Some(200),
+            error_message: None,
+            latency_ms: Some(10),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            usage_amount_usd: None,
+            created_at: Utc::now().to_rfc3339(),
+            settled_at: Some(Utc::now().to_rfc3339()),
+            user_country: None,
+            user_country_iso3: None,
+        }
+    }
+
+    fn market_sync_log(
+        request_id: &str,
+        request_agent: &str,
+    ) -> crate::models::MarketRequestLogEntry {
+        crate::models::MarketRequestLogEntry {
+            request_id: request_id.into(),
+            user_email: None,
+            api_key_prefix: None,
+            router_id: None,
+            share_id: Some("share-1".into()),
+            share_subdomain: Some("share-sub".into()),
+            model: Some("gpt-5".into()),
+            request_agent: request_agent.into(),
+            requested_model: "gpt-5".into(),
+            actual_model: "gpt-5".into(),
+            actual_model_source: "official".into(),
+            status: "settled".into(),
+            status_code: Some(200),
+            error_message: None,
+            latency_ms: Some(10),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            usage_amount_usd: None,
+            created_at: Utc::now().to_rfc3339(),
+            settled_at: Some(Utc::now().to_rfc3339()),
+            user_country: None,
+            user_country_iso3: None,
+        }
+    }
+
+    fn live_event(
+        request_id: &str,
+        user_email: Option<&str>,
+        user_country: Option<&str>,
+        user_country_iso3: Option<&str>,
+    ) -> RecentRequestEvent {
+        RecentRequestEvent {
+            request_id: request_id.into(),
+            share_id: "share-1".into(),
+            share_name: Some("Live Share".into()),
+            share_subdomain: Some("live-share-sub".into()),
+            user_country: user_country.map(str::to_string),
+            user_country_iso3: user_country_iso3.map(str::to_string),
+            user_email: user_email.map(str::to_string),
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            total_tokens: None,
+            started_at: Utc::now(),
+            is_inflight: true,
+            is_health_check: false,
+            health_status: None,
+            health_app_type: None,
+            health_model: None,
+        }
+    }
+
+    fn dashboard_response(
+        ticker_shares: Vec<crate::models::DashboardTickerShare>,
+        market_request_logs: Vec<crate::models::DashboardMarketRequestLogView>,
+    ) -> DashboardResponse {
+        DashboardResponse {
+            generated_at: Utc::now(),
+            stats: crate::models::DashboardStats {
+                clients: 0,
+                active_shares: 0,
+                total_active_requests: 0,
+            },
+            map: crate::models::DashboardMap {
+                server: None,
+                countries: Vec::new(),
+            },
+            map_display: MapDisplaySettings::default(),
+            clients: Vec::new(),
+            shares: Vec::new(),
+            markets: Vec::new(),
+            ticker_shares,
+            country_counts: HashMap::new(),
+            country_boards: HashMap::new(),
+            user_country_counts: HashMap::new(),
+            recent_request_events: Vec::new(),
+            market_request_logs,
         }
     }
 

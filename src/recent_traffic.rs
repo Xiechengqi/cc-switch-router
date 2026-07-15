@@ -48,6 +48,16 @@ pub struct RecentRequestEvent {
     pub user_country_iso3: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
     pub started_at: DateTime<Utc>,
     /// True while the underlying proxy request is still streaming. Stamped at
     /// snapshot time from the `inflight_request_ids` set, not stored on the
@@ -135,6 +145,11 @@ impl RecentTraffic {
             user_country: user_country_iso2,
             user_country_iso3,
             user_email,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            total_tokens: None,
             started_at: Utc::now(),
             is_inflight: true,
             is_health_check: false,
@@ -175,6 +190,11 @@ impl RecentTraffic {
             user_country: None,
             user_country_iso3: None,
             user_email: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            total_tokens: None,
             started_at: Utc::now(),
             is_inflight: false,
             is_health_check: true,

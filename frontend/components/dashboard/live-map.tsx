@@ -17,6 +17,8 @@ type TickerMeta = Partial<Omit<ShareRequestLog, "createdAt"> & Omit<MarketReques
   shareName?: string;
   userCountry?: string;
   userCountryIso3?: string;
+  totalTokens?: number;
+  isInflight?: boolean;
 };
 
 const REQUEST_TICKER_LIMIT = 6;
@@ -34,49 +36,36 @@ function projectPoint(point: MapPoint) {
   return projectLatLon(point.lat, point.lon);
 }
 
-function displayCountry(...values: Array<string | undefined | null>) {
+function strictIso2(...values: Array<string | undefined | null>) {
   for (const value of values) {
-    const trimmed = String(value || "").trim();
-    if (trimmed && trimmed !== "-" && trimmed !== "--") return trimmed;
+    const code = String(value || "").trim().toUpperCase();
+    if (/^[A-Z]{2}$/.test(code)) return code;
   }
-  return "--";
+  return undefined;
 }
 
 function resolveTickerCountry(
   event: RecentRequestEvent,
   mergedItem: TickerMeta | undefined,
   data: DashboardResponse | null,
-): { label: string; flagCode?: string } {
-  const iso2 = displayCountry(event.userCountry, mergedItem?.userCountry);
-  if (iso2 !== "--") return { label: iso2, flagCode: iso2 };
+) {
+  const iso2 = strictIso2(event.userCountry, mergedItem?.userCountry);
+  if (iso2) return iso2;
 
-  const iso3 = displayCountry(event.userCountryIso3, mergedItem?.userCountryIso3);
-  if (iso3 !== "--") {
-    const fromMap = data?.map?.countries?.find((country) => country.countryCodeIso3 === iso3);
-    return {
-      label: fromMap?.countryName || fromMap?.countryCode || iso3,
-      flagCode: fromMap?.countryCode,
-    };
+  const iso3 = String(event.userCountryIso3 || mergedItem?.userCountryIso3 || "").trim().toUpperCase();
+  if (/^[A-Z]{3}$/.test(iso3)) {
+    const mappedIso2 = strictIso2(
+      data?.map.countries.find((country) => country.countryCodeIso3.trim().toUpperCase() === iso3)?.countryCode,
+    );
+    if (mappedIso2) return mappedIso2;
   }
 
-  const compatibilityCountry = displayCountry(event.countryCode);
-  if (compatibilityCountry !== "--") {
-    return { label: compatibilityCountry, flagCode: compatibilityCountry };
-  }
-
-  const shareId = event.shareId || mergedItem?.shareId;
-  const installationCountry = shareId
-    ? data?.clients.find((client) => (client.shareIds || []).includes(shareId))?.installation.countryCode
-    : undefined;
-  const fallback = displayCountry(installationCountry);
-  if (fallback !== "--") return { label: fallback, flagCode: fallback };
-
-  return { label: "--" };
+  return strictIso2(event.countryCode);
 }
 
 function countryFlag(code?: string) {
-  const cc = (code || "").trim().slice(0, 2).toUpperCase();
-  if (!/^[A-Z]{2}$/.test(cc)) return "·";
+  const cc = (code || "").trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(cc)) return "";
   return String.fromCodePoint(...[...cc].map((ch) => 127397 + ch.charCodeAt(0)));
 }
 
@@ -103,6 +92,24 @@ function tokenCount(value?: string | number | null) {
 
 function usageBucketTotalTokens(log?: Pick<TickerMeta, "inputTokens" | "outputTokens" | "cacheReadTokens" | "cacheCreationTokens"> | null) {
   return tokenCount(log?.inputTokens) + tokenCount(log?.outputTokens) + tokenCount(log?.cacheReadTokens) + tokenCount(log?.cacheCreationTokens);
+}
+
+function marketRequestTotalTokens(log: MarketRequestLog) {
+  const input = tokenCount(log.inputTokens);
+  const cacheRead = tokenCount(log.cacheReadTokens);
+  const canonicalInput = log.requestAgent.trim().toLowerCase() === "codex"
+    ? Math.max(0, input - cacheRead)
+    : input;
+  return canonicalInput + tokenCount(log.outputTokens) + cacheRead + tokenCount(log.cacheCreationTokens);
+}
+
+function eventTotalTokens(event: RecentRequestEvent) {
+  if (event.totalTokens != null) return tokenCount(event.totalTokens);
+  const hasUsageBuckets = event.inputTokens != null
+    || event.outputTokens != null
+    || event.cacheReadTokens != null
+    || event.cacheCreationTokens != null;
+  return hasUsageBuckets ? usageBucketTotalTokens(event) : undefined;
 }
 
 function compactTickerTokens(value: number) {
@@ -134,17 +141,17 @@ function formatMarketFee(value?: string | number) {
 }
 
 function tickerDetail(meta?: TickerMeta) {
-  if (meta?.isHealthCheck) {
-    const model = meta.requestedModel || meta.requestModel || meta.actualModel || meta.model || "-";
-    return [meta.requestAgent || meta.appType || "", model, formatTickerLatency(meta.latencyMs)].filter(Boolean).join(" · ");
-  }
   const agent = meta?.requestAgent || "";
   const requested = meta?.requestedModel || meta?.requestModel || "";
   const actual = meta?.actualModel || meta?.model || "";
   const modelName = [agent, requested && actual && requested !== actual ? `${requested} -> ${actual}` : actual || requested || "-"].filter(Boolean).join(" · ");
   const latency = formatTickerLatency(meta?.latencyMs);
-  const tokenTotal = usageBucketTotalTokens(meta);
-  const tokens = `${compactTickerTokens(tokenTotal)} token${tokenTotal === 1 ? "" : "s"}`;
+  const tokenTotal = meta?.totalTokens ?? usageBucketTotalTokens(meta);
+  const tokens = meta?.isInflight
+    ? tokenTotal > 0
+      ? `${compactTickerTokens(tokenTotal)}+ tokens`
+      : "tokens …"
+    : `${compactTickerTokens(tokenTotal)} token${tokenTotal === 1 ? "" : "s"}`;
   const fee = formatMarketFee(meta?.usageAmountUsd);
   return [meta?.userEmail || "", modelName, latency, tokens, fee].filter(Boolean).join(" · ");
 }
@@ -346,18 +353,21 @@ function buildRequestMeta(data: DashboardResponse | null) {
   for (const share of data?.tickerShares || []) {
     for (const log of share.recentRequests || []) {
       const market = marketMeta.get(log.requestId);
-      meta.set(log.requestId, { ...log, shareName: share.shareName, shareId: share.shareId, userEmail: log.userEmail || market?.userEmail, apiKeyPrefix: market?.apiKeyPrefix, usageAmountUsd: market?.usageAmountUsd });
+      const marketTotal = market ? marketRequestTotalTokens(market) : 0;
+      meta.set(log.requestId, { ...log, shareName: share.shareName, shareId: share.shareId, userEmail: log.userEmail || market?.userEmail, apiKeyPrefix: market?.apiKeyPrefix, usageAmountUsd: market?.usageAmountUsd, totalTokens: marketTotal > 0 ? marketTotal : usageBucketTotalTokens(log) });
     }
   }
   for (const share of data?.shares || []) {
     for (const log of share.recentRequests || []) {
       const market = marketMeta.get(log.requestId);
-      meta.set(log.requestId, { ...log, shareName: share.shareName || log.shareName, shareId: share.shareId || log.shareId, userEmail: log.userEmail || market?.userEmail, apiKeyPrefix: market?.apiKeyPrefix, usageAmountUsd: market?.usageAmountUsd });
+      const marketTotal = market ? marketRequestTotalTokens(market) : 0;
+      meta.set(log.requestId, { ...log, shareName: share.shareName || log.shareName, shareId: share.shareId || log.shareId, userEmail: log.userEmail || market?.userEmail, apiKeyPrefix: market?.apiKeyPrefix, usageAmountUsd: market?.usageAmountUsd, totalTokens: marketTotal > 0 ? marketTotal : usageBucketTotalTokens(log) });
     }
   }
   for (const [requestId, log] of marketMeta) {
     const existing = meta.get(requestId);
-    meta.set(requestId, { ...(existing || {}), ...log, userEmail: log.userEmail || existing?.userEmail });
+    const marketTotal = marketRequestTotalTokens(log);
+    meta.set(requestId, { ...(existing || {}), ...log, userEmail: log.userEmail || existing?.userEmail, totalTokens: marketTotal > 0 ? marketTotal : existing?.totalTokens ?? 0 });
   }
   return meta;
 }
@@ -373,6 +383,7 @@ function RequestTicker({ data }: { data: DashboardResponse | null }) {
   const meta = React.useMemo(() => buildRequestMeta(data), [data]);
   const events = React.useMemo(() => {
     return [...(data?.recentRequestEvents || [])]
+      .filter((event) => !event.isHealthCheck)
       .sort((a, b) => new Date(b.startedAt || b.createdAt || 0).getTime() - new Date(a.startedAt || a.createdAt || 0).getTime())
       .slice(0, REQUEST_TICKER_LIMIT)
       .reverse();
@@ -384,39 +395,27 @@ function RequestTicker({ data }: { data: DashboardResponse | null }) {
     <div className="pointer-events-none absolute bottom-[52px] left-3 z-30 flex w-[min(72%,720px)] flex-col gap-1">
       {events.map((event, index) => {
         const item = meta.get(event.requestId);
-        const eventUserEmail = event.userEmail;
-        const mergedItem: TickerMeta | undefined = event.isHealthCheck
-          ? {
-              ...(item || {}),
-              userEmail: item?.userEmail || eventUserEmail,
-              userCountry: item?.userCountry || event.userCountry,
-              userCountryIso3: item?.userCountryIso3 || event.userCountryIso3,
-              isHealthCheck: true,
-              requestAgent: event.healthAppType || item?.requestAgent || "",
-              requestedModel: event.healthModel || item?.requestedModel || item?.requestModel || "",
-              status: event.healthStatus || item?.status,
-            }
-          : item
-            ? {
-                ...item,
-                userEmail: item.userEmail || eventUserEmail,
-                userCountry: item.userCountry || event.userCountry,
-                userCountryIso3: item.userCountryIso3 || event.userCountryIso3,
-              }
-            : eventUserEmail || event.userCountry || event.userCountryIso3
-              ? {
-                  userEmail: eventUserEmail,
-                  userCountry: event.userCountry,
-                  userCountryIso3: event.userCountryIso3,
-                }
-              : undefined;
-        const { label: country, flagCode } = resolveTickerCountry(event, mergedItem, data);
+        const mergedItem: TickerMeta = {
+          ...(item || {}),
+          userEmail: event.userEmail || item?.userEmail,
+          userCountry: item?.userCountry || event.userCountry,
+          userCountryIso3: item?.userCountryIso3 || event.userCountryIso3,
+          latencyMs: event.latencyMs ?? item?.latencyMs,
+          inputTokens: event.inputTokens ?? item?.inputTokens,
+          outputTokens: event.outputTokens ?? item?.outputTokens,
+          cacheReadTokens: event.cacheReadTokens ?? item?.cacheReadTokens,
+          cacheCreationTokens: event.cacheCreationTokens ?? item?.cacheCreationTokens,
+          totalTokens: eventTotalTokens(event) ?? item?.totalTokens,
+          isInflight: event.isInflight,
+        };
+        const countryCode = resolveTickerCountry(event, mergedItem, data);
+        const flag = countryFlag(countryCode);
         const subdomain = event.shareSubdomain || event.subdomain || event.shareName || mergedItem?.shareName || "share";
         const eventKey = [event.requestId, event.startedAt || event.createdAt || ""].join(":");
         const statusCode = Number(mergedItem?.statusCode || 0);
-        const rawStatus = String(mergedItem?.status || event.healthStatus || "").toLowerCase();
+        const rawStatus = String(mergedItem?.status || "").toLowerCase();
         const failed = statusCode >= 400 || ["failed", "error", "offline"].includes(rawStatus);
-        const badge = event.isHealthCheck ? "HC" : statusCode ? String(statusCode) : rawStatus ? rawStatus.slice(0, 3).toUpperCase() : "—";
+        const badge = statusCode ? String(statusCode) : rawStatus ? rawStatus.slice(0, 3).toUpperCase() : "—";
         return (
           <div
             data-map-control
@@ -424,8 +423,8 @@ function RequestTicker({ data }: { data: DashboardResponse | null }) {
             className={`pointer-events-auto flex w-full select-text items-start gap-2 rounded-md bg-transparent px-1 py-0.5 text-left text-[10px] leading-relaxed text-slate-700 ${index === events.length - 1 ? "activity-feed-enter" : ""}`}
           >
             <span className="shrink-0 select-text font-mono text-slate-500">{formatTickerTime(event.startedAt || event.createdAt, item?.createdAt)}</span>
-            <span className={`inline-flex h-[15px] shrink-0 select-none items-center rounded px-1.5 font-mono text-[9px] font-semibold ${event.isHealthCheck ? "bg-blue-100 text-blue-700" : failed ? "bg-rose-100 text-rose-700" : "bg-emerald-100 text-emerald-700"}`}>{badge}</span>
-            <span className="min-w-0 flex-1 select-text whitespace-normal break-words text-[11px] text-slate-700"><strong className="font-semibold">{subdomain}</strong> · {countryFlag(flagCode || country)} {country} · {tickerDetail(mergedItem)}</span>
+            <span className={`inline-flex h-[15px] shrink-0 select-none items-center rounded px-1.5 font-mono text-[9px] font-semibold ${failed ? "bg-rose-100 text-rose-700" : "bg-emerald-100 text-emerald-700"}`}>{badge}</span>
+            <span className="min-w-0 flex-1 select-text whitespace-normal break-words text-[11px] text-slate-700"><strong className="font-semibold">{subdomain}</strong>{flag ? <> · <span role="img" title={countryCode} aria-label={countryCode}>{flag}</span></> : null} · {tickerDetail(mergedItem)}</span>
           </div>
         );
       })}
