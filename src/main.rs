@@ -12,8 +12,10 @@ mod geo;
 mod ip_blacklist_stats;
 mod metrics;
 mod models;
+mod notifications;
 mod proxy;
 mod recent_traffic;
+mod registration_admission;
 mod scheduling_signals;
 mod server_state;
 mod ssh;
@@ -43,6 +45,7 @@ use crate::ip_blacklist_stats::{IpBlacklistStats, format_top_counts};
 use crate::metrics::MetricsRegistry;
 use crate::models::ShareRuntimeSnapshotResponse;
 use crate::recent_traffic::RecentTraffic;
+use crate::registration_admission::RegistrationAdmissionLimiter;
 use crate::scheduling_signals::OverrideStore;
 use crate::startup_config::{StartupConfigMode, ensure_startup_config};
 use crate::store::{
@@ -86,6 +89,9 @@ async fn main() -> Result<()> {
         client_stale_secs = config.client_stale_secs,
         client_installation_retention_secs = config.client_installation_retention_secs,
         paused_share_stale_secs = config.paused_share_stale_secs,
+        client_email_notifications_enabled = config.client_notifications.enabled,
+        client_alert_recipients = config.client_notifications.alert_emails.len(),
+        client_offline_alert_secs = config.client_notifications.offline_alert_secs,
         db_exists = config.db_path.exists(),
         host_key_path = %config.host_key_path.display(),
         host_key_exists = config.host_key_path.exists(),
@@ -145,6 +151,7 @@ async fn main() -> Result<()> {
         payout_profile_read_limiter: Arc::new(
             crate::server_state::PublicPayoutProfileReadLimiter::default(),
         ),
+        registration_admission: Arc::new(RegistrationAdmissionLimiter::from_env()),
     };
 
     let ssh_server = ssh::SshServer {
@@ -155,6 +162,7 @@ async fn main() -> Result<()> {
     };
     let cleanup_store = state.store.clone();
     let cleanup_config = config.clone();
+    let cleanup_dynamic = state.dynamic.clone();
     let cleanup_proxy = state.proxy.clone();
     let cleanup_overrides = state.scheduling_overrides.clone();
     let ip_blacklist_stats = state.ip_blacklist_stats.clone();
@@ -170,6 +178,9 @@ async fn main() -> Result<()> {
     let metrics_config = config.clone();
     let metrics_proxy = state.proxy.clone();
     let metrics_registry = state.metrics.clone();
+    let notification_store = state.store.clone();
+    let notification_dynamic = state.dynamic.clone();
+    let notification_config = config.clone();
 
     let http_listener = TcpListener::bind(config.api_addr).await?;
     let ssh_listener = TcpListener::bind(config.ssh_addr).await?;
@@ -198,8 +209,11 @@ async fn main() -> Result<()> {
         loop {
             interval.tick().await;
             cleanup_overrides.cleanup_expired();
+            let mut cycle_config = cleanup_config.clone();
+            cycle_config.client_notifications =
+                cleanup_dynamic.read().await.client_notifications.clone();
             match cleanup_store
-                .cleanup_expired_data(&cleanup_config, &cleanup_proxy)
+                .cleanup_expired_data(&cycle_config, &cleanup_proxy)
                 .await
             {
                 Ok(result) if result.has_changes() => {
@@ -207,6 +221,9 @@ async fn main() -> Result<()> {
                         leases = result.deleted_leases,
                         shares = result.deleted_shares,
                         installations = result.deleted_installations,
+                        notification_batches = result.deleted_notification_batches,
+                        notification_events = result.deleted_notification_events,
+                        notification_send_logs = result.deleted_notification_send_logs,
                         routes = result.removed_routes,
                         "cleanup removed stale data"
                     );
@@ -291,6 +308,18 @@ async fn main() -> Result<()> {
         crate::metrics::run_collector(metrics_registry, metrics_config, metrics_proxy).await;
         Ok::<_, anyhow::Error>(())
     });
+    let notification_task = tokio::spawn(async move {
+        let result = crate::notifications::run_client_notification_service(
+            notification_store,
+            notification_dynamic,
+            notification_config,
+        )
+        .await;
+        if let Err(error) = &result {
+            tracing::error!(error = %error, "client notification service stopped");
+        }
+        result
+    });
     let ssh_task = tokio::spawn(async move { ssh_server.run_with_listener(ssh_listener).await });
     let http_task = tokio::spawn(async move {
         axum::serve(
@@ -309,6 +338,7 @@ async fn main() -> Result<()> {
             runtime_task.abort();
             resend_usage_task.abort();
             metrics_task.abort();
+            notification_task.abort();
             ssh_result??;
             Ok(())
         }
@@ -319,6 +349,7 @@ async fn main() -> Result<()> {
             runtime_task.abort();
             resend_usage_task.abort();
             metrics_task.abort();
+            notification_task.abort();
             http_result??;
             Ok(())
         }

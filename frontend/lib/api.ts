@@ -31,6 +31,7 @@ import type {
   MetricEvent,
   MapDisplaySettings,
   MapDisplaySettingsUpdate,
+  ClientNotificationDeliveriesResponse,
 } from "@/lib/types";
 
 export type { BoardListResponse, BoardMessage, BoardMeta };
@@ -190,7 +191,13 @@ export async function getSettingsValues() {
   return parseJson<SettingsValuesResponse>(await authFetch("/v1/admin/settings/values", { cache: "no-store" }));
 }
 
-export async function saveSettings(updates: Record<string, string | null | boolean>) {
+export async function getClientNotificationDeliveries() {
+  return parseJson<ClientNotificationDeliveriesResponse>(
+    await authFetch("/v1/admin/client-notifications/deliveries", { cache: "no-store" }),
+  );
+}
+
+export async function saveSettings(updates: Record<string, string | null>) {
   return parseJson<SettingsUpdateResponse>(
     await authFetch("/v1/admin/settings/values", {
       method: "PATCH",

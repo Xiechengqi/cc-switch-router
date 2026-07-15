@@ -1,15 +1,15 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;
 use std::io::{Read, Seek, SeekFrom};
 use std::net::SocketAddr;
 
 use axum::body::Body;
-use axum::extract::{ConnectInfo, Path, Query, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::Event;
 use axum::response::{IntoResponse, Response, Sse};
-use axum::routing::{any, delete, get, patch, post};
+use axum::routing::{MethodRouter, any, delete, get, patch, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -42,7 +42,8 @@ use crate::models::{
     DashboardMarketRequestLogView, DashboardPresenceRequest, DashboardPresenceResponse,
     DashboardResponse, DashboardTickerShare, DashboardUxEventRequest, DashboardUxEventResponse,
     GatewayRegistryRecord, GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse,
-    HealthResponse, ImageGenerationRequestLogEntry, InstallationPayoutProfileUpdateRequest,
+    HealthResponse, ImageGenerationRequestLogEntry, InstallationHeartbeatRequest,
+    InstallationHeartbeatResponse, InstallationPayoutProfileUpdateRequest,
     InstallationPayoutProfileUpdateResponse, IssueLeaseRequest, IssueLeaseResponse,
     MapDisplaySettings, MapDisplaySettingsUpdate, MarketDisabledSharesUpdateRequest,
     MarketDisabledSharesUpdateResponse, MarketMaintenanceUpdateRequest,
@@ -61,12 +62,16 @@ use crate::models::{
     ShareEditAckRequest, ShareEditAvailableEvent, ShareEditEventSignaturePayload,
     ShareHeartbeatRequest, ShareMarketGrantRequest, ShareMarketGrantResponse,
     ShareMarketGrantStatusResponse, ShareMarketListingStatusSyncRequest,
-    ShareMarketListingStatusSyncResponse, SharePendingEditsRequest,
+    ShareMarketListingStatusSyncResponse, SharePendingEditsRequest, SharePruneRequest,
     ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRuntimeRefreshRequest,
     ShareSettingsPatch, ShareSettingsUpdateRequest, ShareSyncRequest,
     SubdomainAvailabilityResponse, UpgradeInstallationRequest, UpgradeInstallationResponse,
     UpgradeInstallationStatusResponse, UserApiTokenResetResponse, UserApiTokenResponse,
     UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+};
+use crate::notifications::{
+    ClientNotificationDeliveriesResponse, ClientNotificationPolicy, NotificationTemplateContext,
+    validate_notification_cleanup_window,
 };
 use crate::proxy::{gateway_proxy_handler, market_proxy_handler, proxy_handler};
 use crate::recent_traffic::{RecentRequestEvent, RecentTrafficSnapshot};
@@ -89,6 +94,14 @@ const SHARE_EDIT_WAKE_RETRY_INTERVAL_SECS: u64 = 20;
 const SHARE_EDIT_WAKE_RETRY_ATTEMPTS: usize = 3;
 const DASHBOARD_REQUEST_TICKER_LIMIT: usize = 5;
 const ROUTER_ACCESS_COOKIE: &str = "cc_switch_router_access";
+const INSTALLATION_CONTROL_BODY_LIMIT_BYTES: usize = 16 * 1024;
+
+fn installation_control_body_limited<S>(route: MethodRouter<S>) -> MethodRouter<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    route.layer(DefaultBodyLimit::max(INSTALLATION_CONTROL_BODY_LIMIT_BYTES))
+}
 
 mod ui_assets {
     include!(concat!(env!("OUT_DIR"), "/ui_assets.rs"));
@@ -222,7 +235,14 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/markets/tunnel/lease", post(issue_market_lease))
         .route("/v1/dashboard/presence", post(dashboard_presence))
         .route("/v1/dashboard/ux-events", post(dashboard_ux_event))
-        .route("/v1/installations/register", post(register_installation))
+        .route(
+            "/v1/installations/register",
+            installation_control_body_limited(post(register_installation)),
+        )
+        .route(
+            "/v1/installations/heartbeat",
+            installation_control_body_limited(post(installation_heartbeat)),
+        )
         .route(
             "/v1/installations/report-status",
             post(report_installation_status),
@@ -325,6 +345,7 @@ pub fn router(state: ServerState) -> Router {
         )
         .route("/v1/shares/heartbeat", post(share_heartbeat))
         .route("/v1/shares/delete", post(delete_share))
+        .route("/v1/shares/prune", post(prune_shares))
         .route("/v1/board/messages", get(list_board_messages))
         .route("/v1/board/messages", post(post_board_message))
         .route("/v1/board/messages/:id/pin", post(pin_board_message))
@@ -335,6 +356,10 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/board/messages/:id", delete(delete_board_message))
         .route("/v1/board/meta", get(board_meta))
         .route("/v1/admin/settings/schema", get(admin_settings_schema))
+        .route(
+            "/v1/admin/client-notifications/deliveries",
+            get(admin_client_notification_deliveries),
+        )
         .route("/v1/admin/map-display", patch(admin_map_display_update))
         .route(
             "/v1/admin/settings/values",
@@ -1058,9 +1083,21 @@ async fn register_installation(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(input): Json<RegisterInstallationRequest>,
 ) -> Result<Json<RegisterInstallationResponse>, AppError> {
+    let metadata = extract_client_metadata(&headers, addr);
+    state
+        .registration_admission
+        .check_attempt(metadata.ip.as_deref(), &input.public_key)
+        .map_err(|rejection| AppError::RateLimited {
+            message: "installation registration rate limit exceeded".into(),
+            retry_after_secs: rejection.retry_after_secs,
+        })?;
     let response = state
         .store
-        .register_installation(input, extract_client_metadata(&headers, addr))
+        .register_installation_with_admission(
+            input,
+            metadata,
+            state.registration_admission.policy(),
+        )
         .await?;
     Ok(Json(response))
 }
@@ -1070,6 +1107,15 @@ async fn report_installation_status(
     Json(input): Json<ReportInstallationStatusRequest>,
 ) -> Result<Json<ReportInstallationStatusResponse>, AppError> {
     Ok(Json(state.store.report_installation_status(input).await?))
+}
+
+async fn installation_heartbeat(
+    State(state): State<ServerState>,
+    Json(input): Json<InstallationHeartbeatRequest>,
+) -> Result<Json<InstallationHeartbeatResponse>, AppError> {
+    Ok(Json(
+        state.store.record_installation_heartbeat(input).await?,
+    ))
 }
 
 async fn upgrade_installation(
@@ -2341,6 +2387,48 @@ fn ui_response(path: &str) -> Option<Response> {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn counted_json_handler(
+        State(calls): State<Arc<AtomicUsize>>,
+        Json(_value): Json<serde_json::Value>,
+    ) -> StatusCode {
+        calls.fetch_add(1, Ordering::SeqCst);
+        StatusCode::OK
+    }
+
+    #[tokio::test]
+    async fn registration_body_limit_rejects_before_handler() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/v1/installations/register",
+                installation_control_body_limited(post(counted_json_handler)),
+            )
+            .with_state(calls.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let oversized = format!(
+            "{{\"platform\":\"{}\"}}",
+            "x".repeat(INSTALLATION_CONTROL_BODY_LIMIT_BYTES)
+        );
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{address}/v1/installations/register"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(oversized)
+            .send()
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn dashboard_session_policy_accepts_valid_session() {
@@ -3407,6 +3495,19 @@ async fn delete_share(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+async fn prune_shares(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(input): Json<SharePruneRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let pruned = state
+        .store
+        .prune_shares(input, extract_client_metadata(&headers, addr))
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true, "pruned": pruned })))
+}
+
 async fn batch_sync_share(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -4225,6 +4326,15 @@ async fn admin_settings_schema(
     Ok(Json(schema_response()))
 }
 
+async fn admin_client_notification_deliveries(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<ClientNotificationDeliveriesResponse>, AppError> {
+    require_admin_session(&state, &headers).await?;
+    let deliveries = state.store.list_client_notification_deliveries(100).await?;
+    Ok(Json(ClientNotificationDeliveriesResponse { deliveries }))
+}
+
 async fn admin_settings_values(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -4250,17 +4360,90 @@ async fn admin_settings_apply(
     // 2) load current env, validate updates against the schema.
     let existing = read_env_file(&state.env_path)?;
     let outcome = validate_and_diff(&existing, &input.updates)?;
+    let mut next_dynamic = dynamic_guard.clone();
+    apply_updates_to_dynamic(&mut next_dynamic, &input.updates, &state.config);
+    // Process-level environment variables can make the live value differ from
+    // the value already present in .env. Compare the actual runtime policies so
+    // re-applying an unchanged file value still advances the durable boundary.
+    let needs_client_notification_sync =
+        next_dynamic.client_notifications != dynamic_guard.client_notifications;
+    let needs_client_notification_validation = needs_client_notification_sync
+        || outcome.updated_keys.iter().any(|key| {
+            key == "CC_SWITCH_ROUTER_CLIENT_STALE_SECS"
+                || key == "CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS"
+        });
+    if needs_client_notification_validation {
+        let normalized_policy = ClientNotificationPolicy::from(&next_dynamic.client_notifications);
+        if next_dynamic.client_notifications.enabled && !normalized_policy.enabled {
+            return Err(AppError::BadRequest(
+                "client email notifications require at least one valid explicit alert recipient"
+                    .into(),
+            ));
+        }
+        let mut validation_config = state.config.clone();
+        if let Some(value) = outcome
+            .new_env_kv
+            .get("CC_SWITCH_ROUTER_CLIENT_STALE_SECS")
+            .and_then(|value| value.parse().ok())
+        {
+            validation_config.client_stale_secs = value;
+        } else if outcome
+            .updated_keys
+            .iter()
+            .any(|key| key == "CC_SWITCH_ROUTER_CLIENT_STALE_SECS")
+        {
+            validation_config.client_stale_secs = 60 * 60;
+        }
+        if let Some(value) = outcome
+            .new_env_kv
+            .get("CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS")
+            .and_then(|value| value.parse().ok())
+        {
+            validation_config.cleanup_interval_secs = value;
+        } else if outcome
+            .updated_keys
+            .iter()
+            .any(|key| key == "CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS")
+        {
+            validation_config.cleanup_interval_secs = 300;
+        }
+        validate_notification_cleanup_window(
+            &next_dynamic.client_notifications,
+            &validation_config,
+        )
+        .map_err(AppError::BadRequest)?;
+    }
 
     // 3) persist .env atomically (keeps .bak of the prior file).
     write_env_file_atomic(&state.env_path, &outcome.new_env_kv)?;
 
-    // 4) apply the diff to the live DynamicSettings. Only fields named in
-    //    `updates` change; everything else keeps the current runtime value,
-    //    so an unrelated PATCH cannot silently revert process-env overrides.
-    //    Clears (Some("") / None) reset to the canonical default, which is
-    //    what gives admin revocation immediate effect.
-    apply_updates_to_dynamic(&mut dynamic_guard, &input.updates, &state.config);
-    let next_dynamic = dynamic_guard.clone();
+    // 4) persist the lifecycle-notification activation boundary before
+    // publishing the new in-memory settings. The dynamic write lock keeps the
+    // worker from observing a half-applied policy.
+    if needs_client_notification_sync {
+        let (policy, _) = ClientNotificationPolicy::for_runtime(
+            &next_dynamic.client_notifications,
+            &state.config,
+        );
+        let template = NotificationTemplateContext::from_config(&state.config);
+        if let Err(sync_error) = state
+            .store
+            .sync_client_notification_runtime(&policy, &template, chrono::Utc::now())
+            .await
+        {
+            let rollback_env = existing
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<BTreeMap<_, _>>();
+            if let Err(rollback_error) = write_env_file_atomic(&state.env_path, &rollback_env) {
+                return Err(AppError::Internal(format!(
+                    "sync client notification runtime failed: {sync_error}; env rollback also failed: {rollback_error}"
+                )));
+            }
+            return Err(sync_error);
+        }
+    }
+    *dynamic_guard = next_dynamic.clone();
     drop(dynamic_guard);
 
     // 5) rebuild telegram notifier if its inputs changed.

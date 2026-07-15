@@ -805,6 +805,24 @@ export type SettingsUpdateResponse = {
   envPath: string;
 };
 
+export type ClientNotificationDelivery = {
+  id: string;
+  deliveryKind: string;
+  eventKind: string;
+  eventCount: number;
+  recipientMasked: string;
+  status: string;
+  attempts: number;
+  createdAt: string;
+  nextAttemptAt?: string | null;
+  sentAt?: string | null;
+  errorMessage?: string | null;
+};
+
+export type ClientNotificationDeliveriesResponse = {
+  deliveries: ClientNotificationDelivery[];
+};
+
 export type VersionResponse = {
   version: string;
   commit: string;

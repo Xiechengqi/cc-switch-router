@@ -328,7 +328,7 @@ impl ProxyRegistry {
         removed
     }
 
-    pub async fn remove_route_if_connection(&self, subdomain: &str, connection_id: &str) {
+    pub async fn remove_route_if_connection(&self, subdomain: &str, connection_id: &str) -> bool {
         let mut routes = self.routes.write().await;
         let should_remove = routes
             .get(subdomain)
@@ -343,6 +343,16 @@ impl ProxyRegistry {
         if let Some(shutdown) = old_route.and_then(|route| route.shutdown) {
             shutdown.shutdown();
         }
+        should_remove
+    }
+
+    pub async fn active_route_connections(&self) -> HashMap<String, Option<String>> {
+        self.routes
+            .read()
+            .await
+            .iter()
+            .map(|(subdomain, route)| (subdomain.clone(), route.connection_id.clone()))
+            .collect()
     }
 
     pub(crate) async fn backend_for_host(
@@ -3194,6 +3204,7 @@ mod tests {
                     instance_nonce: "nonce-register-signed-route".into(),
                     timestamp_ms: None,
                     signature: None,
+                    proof_version: None,
                 },
                 crate::models::ClientMetadata {
                     ip: None,
@@ -3280,6 +3291,11 @@ mod tests {
             payout_profile_read_limiter: Arc::new(
                 crate::server_state::PublicPayoutProfileReadLimiter::default(),
             ),
+            registration_admission: Arc::new(
+                crate::registration_admission::RegistrationAdmissionLimiter::new(
+                    crate::registration_admission::RegistrationAdmissionPolicy::default(),
+                ),
+            ),
         }
     }
 
@@ -3308,6 +3324,7 @@ mod tests {
             resend_from: None,
             resend_from_name: None,
             resend_reply_to: None,
+            client_notifications: crate::config::ClientNotificationSettings::default(),
             auth_code_ttl_secs: 600,
             auth_code_cooldown_secs: 60,
             auth_session_ttl_secs: 7 * 24 * 60 * 60,

@@ -1,8 +1,9 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
+use std::net::IpAddr;
 use std::path::{Component, PathBuf};
 use std::sync::Arc;
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use base64::Engine;
 use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
@@ -10,11 +11,11 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rand::distributions::{Alphanumeric, DistString};
 use resend_rs::Resend;
 use resend_rs::types::CreateEmailBaseOptions;
-use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
 const MARKET_APP_AVAILABILITY_FAILURE_TTL_SECS: i64 = 30 * 60;
@@ -36,6 +37,7 @@ use crate::models::{
     DashboardTickerShare, DashboardUxEventRequest, GatewayRegistryRecord,
     GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse, HealthCheckEntry,
     HealthTimelineBucket, ImageGenerationRequestLogEntry, Installation,
+    InstallationHeartbeatRequest, InstallationHeartbeatResponse,
     InstallationPayoutProfileUpdateRequest, InstallationPayoutProfileUpdateResponse,
     InstallationUpgradeView, InstallationView, IssueLeaseRequest, IssueLeaseResponse, LatLonPoint,
     MapDisplaySettings, MapDisplaySettingsUpdate, MapViewportSettings, MarketAppAvailability,
@@ -56,19 +58,31 @@ use crate::models::{
     ShareMarketGrantResponse, ShareMarketGrantStatusResponse, ShareMarketLinkView,
     ShareMarketListingStatusInput, ShareMarketListingStatusView, ShareModelHealthCheckEntry,
     ShareModelHealthSummary, SharePendingEditsRequest, SharePendingEditsResponse,
-    ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRequestLogFetchResponse,
-    ShareRuntimeRefreshPayload, ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse,
-    ShareSettingsPatch, ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest,
-    ShareUpstreamProvider, ShareUpstreamQuota, ShareUsageByEmailResponse, ShareUsageDailyBucket,
-    ShareUsageEmailRow, ShareView, SubdomainAvailabilityResponse, TunnelLease,
-    UserApiTokenResetResponse, UserApiTokenResponse, UserApiTokenStatus, UserShareView,
-    UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    SharePruneRequest, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry,
+    ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload, ShareRuntimeRefreshRequest,
+    ShareRuntimeSnapshotResponse, ShareSettingsPatch, ShareSettingsUpdateResponse, ShareSignals,
+    ShareSupport, ShareSyncRequest, ShareUpstreamProvider, ShareUpstreamQuota,
+    ShareUsageByEmailResponse, ShareUsageDailyBucket, ShareUsageEmailRow, ShareView,
+    SubdomainAvailabilityResponse, TunnelLease, UserApiTokenResetResponse, UserApiTokenResponse,
+    UserApiTokenStatus, UserShareView, UserSharesResponse, VerifyEmailCodeRequest,
+    VerifyEmailCodeResponse,
 };
 #[cfg(test)]
 use crate::models::{RenewLeasePayload, ShareAppProvider, ShareUpstreamModel};
+use crate::notifications::{
+    ClientNotificationBatch, ClientNotificationClaim, ClientNotificationDeliveryView,
+    ClientNotificationPolicy, DigestEmailData, NotificationAggregateStats,
+    NotificationReconcileStats, NotificationTemplateContext, OfflineEmailData,
+    RegistrationEmailData, RegistrationOverflowEmailData, mask_email_address,
+    mask_email_like_tokens, render_digest_email, render_offline_email, render_registration_email,
+    render_registration_overflow_email,
+};
 use crate::proxy::ProxyRegistry;
 #[cfg(test)]
 use crate::proxy::RouteKind;
+use crate::registration_admission::{
+    RegistrationAdmissionPolicy, RegistrationQuotaWindow, registration_source_scope,
+};
 
 const SHARE_REQUEST_LOG_RECOVERY_LIMIT: usize = 10;
 pub const IMAGE_GENERATION_REQUEST_LOG_RETAIN_PER_SHARE: usize = 10;
@@ -81,7 +95,18 @@ const ONLINE_WINDOW_MINUTES: usize = 24 * 60;
 const HEALTH_TIMELINE_BUCKETS: usize = 48;
 const HEALTH_TIMELINE_BUCKET_SECS: i64 = 30 * 60;
 const SIGNED_REQUEST_MAX_SKEW_MS: i64 = 60_000;
+const SHARE_PRUNE_MAX_IDS: usize = 10_000;
+const SHARE_PRUNE_MAX_ID_BYTES: usize = 512;
 const NONCE_RETENTION_SECS: i64 = 10 * 60;
+const CLIENT_NOTIFICATION_AUDIT_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
+const CLIENT_NOTIFICATION_REGISTRATION_PENDING_TTL_SECS: i64 = 60 * 60;
+const CLIENT_NOTIFICATION_REGISTRATION_EVENT_HIGH_WATERMARK: i64 = 5_000;
+const CLIENT_NOTIFICATION_REGISTRATION_EVENT_LOW_WATERMARK: i64 = 4_000;
+const CLIENT_NOTIFICATION_REGISTRATION_BATCH_HIGH_WATERMARK: i64 = 500;
+const CLIENT_NOTIFICATION_REGISTRATION_BATCH_LOW_WATERMARK: i64 = 400;
+const CLIENT_NOTIFICATION_REGISTRATION_OVERFLOW_WINDOW_SECS: i64 = 5 * 60;
+const CLIENT_NOTIFICATION_AUDIT_HIGH_WATERMARK: i64 = 100_000;
+const CLIENT_NOTIFICATION_AUDIT_TARGET: i64 = 80_000;
 const MARKET_OFFLINE_GRACE_SECS: i64 = 24 * 60 * 60;
 const MARKET_ACTIVE_MISSING_GRACE_SECS: i64 = 5 * 60;
 const AUTH_CODE_DIGITS: usize = 6;
@@ -762,6 +787,7 @@ pub struct AppStore {
     conn: Arc<Mutex<Connection>>,
     share_log_recovery_attempts: Arc<Mutex<HashMap<String, i64>>>,
     ip_hash_salt: Arc<String>,
+    geo_lookup_base_url: Arc<String>,
 }
 
 /// P18: 测试接続で必要な share の基本情報。
@@ -869,11 +895,30 @@ struct InstallationGeoState {
     geo_last_changed_at: Option<DateTime<Utc>>,
 }
 
+enum RegistrationGeoCacheDecision {
+    Positive(GeoLookupResult),
+    Negative,
+    Claim(String),
+    Wait,
+}
+
+struct RegistrationGeoCacheRow {
+    status: String,
+    cached_at_ms: Option<i64>,
+    claim_expires_at_ms: Option<i64>,
+    geo: GeoLookupResult,
+}
+
 const GEO_STABLE_DISTANCE_KM: f64 = 120.0;
 const GEO_CANDIDATE_DISTANCE_KM: f64 = 120.0;
 const GEO_CANDIDATE_CONFIRM_HITS: i64 = 3;
 const GEO_CANDIDATE_MIN_AGE_SECS: i64 = 10 * 60;
 const GEO_STABLE_MIN_SWITCH_SECS: i64 = 30 * 60;
+const REGISTRATION_GEO_CACHE_TTL_SECS: i64 = 24 * 60 * 60;
+const REGISTRATION_GEO_CLAIM_TTL_SECS: i64 = 10;
+const REGISTRATION_GEO_WAIT_TIMEOUT_SECS: u64 = 5;
+const REGISTRATION_GEO_WAIT_POLL_MS: u64 = 50;
+const REGISTRATION_GEO_RESPONSE_MAX_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ShareRouteTarget {
@@ -890,11 +935,101 @@ pub struct ClientTunnelRouteTarget {
     pub subdomain: String,
 }
 
+#[derive(Debug)]
+struct ClientPresenceScanRow {
+    installation_id: String,
+    presence_state: String,
+    last_authenticated_seen_at: Option<DateTime<Utc>>,
+    recovery_candidate_since: Option<DateTime<Utc>>,
+    offline_episode: i64,
+    last_offline_event_at: Option<DateTime<Utc>>,
+    platform: String,
+    app_version: String,
+    owner_email: Option<String>,
+    owner_verified_at: Option<String>,
+    country_code: Option<String>,
+    created_at: DateTime<Utc>,
+    tunnel_subdomain: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingClientNotificationEvent {
+    id: String,
+    kind: String,
+    installation_id: String,
+    occurred_at: DateTime<Utc>,
+    snapshot: serde_json::Value,
+    verified_owner_email: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClientNotificationRecipient {
+    email: String,
+    priority: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotificationLane {
+    Offline,
+    Registration,
+}
+
+impl NotificationLane {
+    const ORDERED: [Self; 2] = [Self::Offline, Self::Registration];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Offline => "offline",
+            Self::Registration => "registration",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self, AppError> {
+        match value {
+            "offline" => Ok(Self::Offline),
+            "registration" => Ok(Self::Registration),
+            _ => Err(AppError::Internal(format!(
+                "invalid notification lane stored in database: {value}"
+            ))),
+        }
+    }
+
+    fn event_sql_predicate(self) -> &'static str {
+        match self {
+            Self::Offline => "e.kind = 'client_offline'",
+            Self::Registration => "e.kind IN ('client_registered', 'client_registration_overflow')",
+        }
+    }
+
+    fn storm_event_kind(self) -> &'static str {
+        match self {
+            Self::Offline => "client_offline",
+            Self::Registration => "client_registered",
+        }
+    }
+
+    fn hourly_limits(self, policy: &ClientNotificationPolicy) -> (i64, i64) {
+        match self {
+            Self::Offline => (policy.recipient_hourly_limit, policy.global_hourly_limit),
+            Self::Registration => (
+                policy.registration_recipient_hourly_limit,
+                policy.registration_global_hourly_limit,
+            ),
+        }
+    }
+}
+
+const EXPLICIT_NOTIFICATION_RECIPIENT_PRIORITY: i64 = 0;
+const OWNER_NOTIFICATION_RECIPIENT_PRIORITY: i64 = 1;
+
 #[derive(Debug, Default)]
 pub struct CleanupResult {
     pub deleted_leases: usize,
     pub deleted_shares: usize,
     pub deleted_installations: usize,
+    pub deleted_notification_batches: usize,
+    pub deleted_notification_events: usize,
+    pub deleted_notification_send_logs: usize,
     pub removed_routes: usize,
 }
 
@@ -903,6 +1038,9 @@ impl CleanupResult {
         self.deleted_leases > 0
             || self.deleted_shares > 0
             || self.deleted_installations > 0
+            || self.deleted_notification_batches > 0
+            || self.deleted_notification_events > 0
+            || self.deleted_notification_send_logs > 0
             || self.removed_routes > 0
     }
 }
@@ -915,12 +1053,28 @@ impl AppStore {
         }
         let conn = Connection::open(&config.db_path)
             .map_err(|e| AppError::Internal(format!("open db failed: {e}")))?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(|e| AppError::Internal(format!("enable sqlite foreign keys failed: {e}")))?;
+        conn.pragma_update(None, "busy_timeout", 5_000_i64)
+            .map_err(|e| AppError::Internal(format!("set sqlite busy timeout failed: {e}")))?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|e| AppError::Internal(format!("enable sqlite WAL failed: {e}")))?;
         init_schema(&conn)?;
+        let (boot_notification_policy, _) =
+            ClientNotificationPolicy::for_runtime(&config.client_notifications, config);
+        let boot_notification_template = NotificationTemplateContext::from_config(config);
+        initialize_client_notification_runtime(
+            &conn,
+            &boot_notification_policy,
+            &boot_notification_template,
+            Utc::now(),
+        )?;
         let salt = Alphanumeric.sample_string(&mut rand::thread_rng(), 32);
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             share_log_recovery_attempts: Arc::new(Mutex::new(HashMap::new())),
             ip_hash_salt: Arc::new(salt),
+            geo_lookup_base_url: Arc::new("https://ip.im".to_string()),
         })
     }
 
@@ -929,39 +1083,61 @@ impl AppStore {
         input: RegisterInstallationRequest,
         metadata: ClientMetadata,
     ) -> Result<RegisterInstallationResponse, AppError> {
+        self.register_installation_with_admission(
+            input,
+            metadata,
+            RegistrationAdmissionPolicy::default(),
+        )
+        .await
+    }
+
+    pub async fn register_installation_with_admission(
+        &self,
+        input: RegisterInstallationRequest,
+        metadata: ClientMetadata,
+        admission_policy: RegistrationAdmissionPolicy,
+    ) -> Result<RegisterInstallationResponse, AppError> {
         let public_key = input.public_key.trim();
         if public_key.is_empty() {
             return Err(AppError::BadRequest("public_key is required".into()));
         }
         validate_ed25519_public_key(public_key)?;
         let platform = input.platform.trim();
-        if platform.is_empty() {
-            return Err(AppError::BadRequest("platform is required".into()));
-        }
+        validate_registration_client_fields(&input.platform, &input.app_version)?;
         validate_request_nonce(&input.instance_nonce)?;
         let now = Utc::now();
         let ip = metadata.ip.clone();
+        let source_scope = registration_source_scope(ip.as_deref());
         let country_code = metadata.country_code.clone();
         let new_control_secret = Alphanumeric.sample_string(&mut rand::thread_rng(), 44);
-        let conn = self.conn.lock().await;
-        consume_request_nonce(
-            &conn,
-            &registration_nonce_subject(public_key),
-            "register_installation",
-            &input.instance_nonce,
-            now,
-        )?;
-        if let Some(existing_installation_id) =
-            find_installation_id_by_public_key(&conn, public_key)?
-        {
-            let return_control_secret = verify_registration_recovery_signature(
+        let response = {
+            let mut conn = self.conn.lock().await;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|error| {
+                    AppError::Internal(format!("begin installation registration failed: {error}"))
+                })?;
+            let existing_installation_id = find_installation_id_by_public_key(&tx, public_key)?;
+            let proof_verified = verify_registration_signature(
                 public_key,
                 &input,
-                &existing_installation_id,
+                existing_installation_id.as_deref(),
                 now,
             )?;
-            conn.execute(
-                "UPDATE installations
+            if existing_installation_id.is_none() {
+                consume_new_identity_admission(&tx, &source_scope, admission_policy, now)?;
+            }
+            let enable_monitoring = proof_verified && input.proof_version == Some(2);
+            consume_request_nonce(
+                &tx,
+                &registration_nonce_subject(public_key),
+                "register_installation",
+                &input.instance_nonce,
+                now,
+            )?;
+            if let Some(existing_installation_id) = existing_installation_id {
+                tx.execute(
+                    "UPDATE installations
                  SET public_key = ?2,
                      platform = ?3,
                      app_version = ?4,
@@ -970,71 +1146,84 @@ impl AppStore {
                      last_seen_at = ?7,
                      control_secret_b64 = COALESCE(control_secret_b64, ?8)
                  WHERE id = ?1",
-                params![
-                    existing_installation_id,
-                    public_key,
-                    platform,
-                    input.app_version,
-                    ip,
-                    country_code,
-                    now.to_rfc3339(),
-                    new_control_secret,
-                ],
-            )
-            .map_err(|e| AppError::Internal(format!("update installation failed: {e}")))?;
-            let control_secret = if return_control_secret {
-                conn.query_row(
-                    "SELECT control_secret_b64 FROM installations WHERE id = ?1",
-                    params![existing_installation_id],
-                    |row| row.get::<_, Option<String>>(0),
+                    params![
+                        existing_installation_id,
+                        public_key,
+                        platform,
+                        input.app_version,
+                        ip,
+                        country_code,
+                        now.to_rfc3339(),
+                        new_control_secret,
+                    ],
                 )
-                .optional()
-                .map_err(|e| AppError::Internal(format!("read control secret failed: {e}")))?
-                .flatten()
+                .map_err(|e| AppError::Internal(format!("update installation failed: {e}")))?;
+                let updated =
+                    get_installation(&tx, &existing_installation_id)?.ok_or_else(|| {
+                        AppError::Internal("installation disappeared during registration".into())
+                    })?;
+                insert_installation_notification_baseline(&tx, &existing_installation_id, now)?;
+                if proof_verified {
+                    record_authenticated_installation_presence(
+                        &tx,
+                        &updated,
+                        now,
+                        enable_monitoring,
+                        None,
+                    )?;
+                }
+                let control_secret = if proof_verified {
+                    tx.query_row(
+                        "SELECT control_secret_b64 FROM installations WHERE id = ?1",
+                        params![existing_installation_id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()
+                    .map_err(|e| AppError::Internal(format!("read control secret failed: {e}")))?
+                    .flatten()
+                } else {
+                    None
+                };
+                tx.commit().map_err(|error| {
+                    AppError::Internal(format!("commit installation registration failed: {error}"))
+                })?;
+                RegisterInstallationResponse {
+                    installation_id: existing_installation_id,
+                    control_secret,
+                }
             } else {
-                None
-            };
-            drop(conn);
-            self.refresh_installation_geo(&existing_installation_id, &ip, true)
-                .await?;
-            return Ok(RegisterInstallationResponse {
-                installation_id: existing_installation_id,
-                control_secret,
-            });
-        }
-
-        let installation = Installation {
-            id: Uuid::new_v4().to_string(),
-            public_key: public_key.to_string(),
-            platform: platform.to_string(),
-            app_version: input.app_version,
-            owner_email: None,
-            owner_verified_at: None,
-            last_seen_ip: ip.clone(),
-            country_code,
-            country: None,
-            region: None,
-            city: None,
-            latitude: None,
-            longitude: None,
-            geo_candidate_country_code: None,
-            geo_candidate_country: None,
-            geo_candidate_region: None,
-            geo_candidate_city: None,
-            geo_candidate_latitude: None,
-            geo_candidate_longitude: None,
-            geo_candidate_hits: 0,
-            geo_candidate_first_seen_at: None,
-            geo_last_changed_at: None,
-            created_at: now,
-            last_seen_at: now,
-            delegate_upgrade_to_router_owner: None,
-            app_commit_id: None,
-            update_available: None,
-            upgrade_capable: None,
-            status_reported_at: None,
-        };
-        conn.execute(
+                let installation = Installation {
+                    id: Uuid::new_v4().to_string(),
+                    public_key: public_key.to_string(),
+                    platform: platform.to_string(),
+                    app_version: input.app_version,
+                    owner_email: None,
+                    owner_verified_at: None,
+                    last_seen_ip: ip.clone(),
+                    country_code,
+                    country: None,
+                    region: None,
+                    city: None,
+                    latitude: None,
+                    longitude: None,
+                    geo_candidate_country_code: None,
+                    geo_candidate_country: None,
+                    geo_candidate_region: None,
+                    geo_candidate_city: None,
+                    geo_candidate_latitude: None,
+                    geo_candidate_longitude: None,
+                    geo_candidate_hits: 0,
+                    geo_candidate_first_seen_at: None,
+                    geo_last_changed_at: None,
+                    created_at: now,
+                    last_seen_at: now,
+                    delegate_upgrade_to_router_owner: None,
+                    app_commit_id: None,
+                    update_available: None,
+                    upgrade_capable: None,
+                    status_reported_at: None,
+                };
+                tx.execute(
             "INSERT INTO installations (
                 id, public_key, platform, app_version, owner_email, owner_verified_at, last_seen_ip, country_code, country, region,
                 city, latitude, longitude, geo_candidate_country_code, geo_candidate_country,
@@ -1073,15 +1262,38 @@ impl AppStore {
                 installation.last_seen_at.to_rfc3339(),
                 new_control_secret,
             ],
-        )
-        .map_err(|e| AppError::Internal(format!("insert installation failed: {e}")))?;
-        drop(conn);
-        self.refresh_installation_geo(&installation.id, &ip, true)
-            .await?;
-        Ok(RegisterInstallationResponse {
-            installation_id: installation.id,
-            control_secret: Some(new_control_secret),
-        })
+                )
+                .map_err(|e| AppError::Internal(format!("insert installation failed: {e}")))?;
+                insert_installation_notification_baseline(&tx, &installation.id, now)?;
+                if proof_verified {
+                    record_authenticated_installation_presence(
+                        &tx,
+                        &installation,
+                        now,
+                        enable_monitoring,
+                        None,
+                    )?;
+                }
+                tx.commit().map_err(|error| {
+                    AppError::Internal(format!("commit installation registration failed: {error}"))
+                })?;
+                RegisterInstallationResponse {
+                    installation_id: installation.id,
+                    control_secret: Some(new_control_secret),
+                }
+            }
+        };
+        if let Err(error) = self
+            .refresh_installation_geo(&response.installation_id, &ip, false)
+            .await
+        {
+            tracing::warn!(
+                installation_id = %response.installation_id,
+                %error,
+                "registration committed but geo refresh failed"
+            );
+        }
+        Ok(response)
     }
 
     pub async fn installation_control_secret(
@@ -1105,11 +1317,17 @@ impl AppStore {
         &self,
         input: crate::models::ReportInstallationStatusRequest,
     ) -> Result<crate::models::ReportInstallationStatusResponse, AppError> {
-        let conn = self.conn.lock().await;
-        let installation = get_installation(&conn, &input.installation_id)?
+        let now = Utc::now();
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!("begin installation status failed: {error}"))
+            })?;
+        let installation = get_installation(&tx, &input.installation_id)?
             .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
         verify_signed_share_request(
-            &conn,
+            &tx,
             &installation.public_key,
             &input.installation_id,
             "report_installation_status",
@@ -1118,8 +1336,9 @@ impl AppStore {
             &input.nonce,
             &input.signature,
         )?;
-        let now = Utc::now().to_rfc3339();
-        conn.execute(
+        record_authenticated_installation_presence(&tx, &installation, now, false, None)?;
+        let now = now.to_rfc3339();
+        tx.execute(
             "UPDATE installations
              SET delegate_upgrade_to_router_owner = ?2,
                  app_commit_id = ?3,
@@ -1138,7 +1357,1407 @@ impl AppStore {
             ],
         )
         .map_err(|e| AppError::Internal(format!("update installation status failed: {e}")))?;
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!("commit installation status failed: {error}"))
+        })?;
         Ok(crate::models::ReportInstallationStatusResponse { ok: true })
+    }
+
+    pub async fn record_installation_heartbeat(
+        &self,
+        input: InstallationHeartbeatRequest,
+    ) -> Result<InstallationHeartbeatResponse, AppError> {
+        if input.payload.protocol_version != 1 {
+            return Err(AppError::BadRequest(
+                "unsupported installation heartbeat protocol version".into(),
+            ));
+        }
+        if input.payload.boot_id.trim().is_empty() || input.payload.boot_id.len() > 128 {
+            return Err(AppError::BadRequest(
+                "heartbeat boot_id must be 1-128 characters".into(),
+            ));
+        }
+        if input.payload.app_version.len() > 128 || input.payload.commit_id.len() > 128 {
+            return Err(AppError::BadRequest(
+                "heartbeat version fields must not exceed 128 characters".into(),
+            ));
+        }
+
+        let now = Utc::now();
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!("begin installation heartbeat failed: {error}"))
+            })?;
+        let installation = get_installation(&tx, &input.installation_id)?
+            .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
+        verify_signed_share_request(
+            &tx,
+            &installation.public_key,
+            &input.installation_id,
+            "installation_heartbeat_v1",
+            &input.payload,
+            input.timestamp_ms,
+            &input.nonce,
+            &input.signature,
+        )?;
+        record_authenticated_installation_presence(
+            &tx,
+            &installation,
+            now,
+            true,
+            Some(&input.payload.boot_id),
+        )?;
+        tx.execute(
+            "UPDATE installations
+             SET app_version = ?2,
+                 app_commit_id = CASE WHEN ?3 = '' THEN app_commit_id ELSE ?3 END,
+                 last_seen_at = ?4
+             WHERE id = ?1",
+            params![
+                input.installation_id,
+                input.payload.app_version,
+                input.payload.commit_id,
+                now.to_rfc3339()
+            ],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("update installation heartbeat failed: {error}"))
+        })?;
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!("commit installation heartbeat failed: {error}"))
+        })?;
+
+        Ok(InstallationHeartbeatResponse {
+            ok: true,
+            server_time: now,
+        })
+    }
+
+    pub async fn sync_client_notification_runtime(
+        &self,
+        policy: &ClientNotificationPolicy,
+        template: &NotificationTemplateContext,
+        now: DateTime<Utc>,
+    ) -> Result<NotificationReconcileStats, AppError> {
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!("begin notification runtime sync failed: {error}"))
+            })?;
+        let mut stats = NotificationReconcileStats::default();
+        sync_client_notification_runtime_tx(&tx, policy, Some(template), now, &mut stats)?;
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!("commit notification runtime sync failed: {error}"))
+        })?;
+        Ok(stats)
+    }
+
+    pub async fn reconcile_client_notification_events(
+        &self,
+        policy: &ClientNotificationPolicy,
+        now: DateTime<Utc>,
+    ) -> Result<NotificationReconcileStats, AppError> {
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "begin client notification reconcile failed: {error}"
+                ))
+            })?;
+        let mut stats = NotificationReconcileStats::default();
+        if !client_notification_policy_is_current(&tx, policy)? {
+            tx.commit().map_err(|error| {
+                AppError::Internal(format!(
+                    "commit stale client notification reconcile failed: {error}"
+                ))
+            })?;
+            return Ok(stats);
+        }
+        if !policy.enabled {
+            suppress_disabled_notification_work_tx(&tx, now, &mut stats)?;
+        }
+
+        let baselined = tx
+            .execute(
+                "INSERT OR IGNORE INTO installation_notification_state (
+                    installation_id, registration_state, monitoring_enabled, presence_state,
+                    created_at, updated_at
+                 )
+                 SELECT id, 'baseline', 0, 'unknown', created_at, ?1 FROM installations",
+                params![now.to_rfc3339()],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("baseline notification states failed: {error}"))
+            })?;
+        stats.baselined += baselined as u64;
+
+        let states = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT ns.installation_id, ns.presence_state,
+                            ns.last_authenticated_seen_at, ns.recovery_candidate_since,
+                            ns.offline_episode, ns.last_offline_event_at,
+                            i.platform, i.app_version, i.owner_email,
+                            i.owner_verified_at, i.country_code, i.created_at,
+                            ict.subdomain
+                     FROM installation_notification_state ns
+                     INNER JOIN installations i ON i.id = ns.installation_id
+                     LEFT JOIN installation_client_tunnels ict
+                       ON ict.installation_id = ns.installation_id
+                     WHERE ns.monitoring_enabled = 1",
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "prepare notification presence scan failed: {error}"
+                    ))
+                })?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok(ClientPresenceScanRow {
+                        installation_id: row.get(0)?,
+                        presence_state: row.get(1)?,
+                        last_authenticated_seen_at: row
+                            .get::<_, Option<String>>(2)?
+                            .map(|value| parse_dt_sql(&value))
+                            .transpose()?,
+                        recovery_candidate_since: row
+                            .get::<_, Option<String>>(3)?
+                            .map(|value| parse_dt_sql(&value))
+                            .transpose()?,
+                        offline_episode: row.get(4)?,
+                        last_offline_event_at: row
+                            .get::<_, Option<String>>(5)?
+                            .map(|value| parse_dt_sql(&value))
+                            .transpose()?,
+                        platform: row.get(6)?,
+                        app_version: row.get(7)?,
+                        owner_email: row.get(8)?,
+                        owner_verified_at: row.get(9)?,
+                        country_code: row.get(10)?,
+                        created_at: parse_dt_sql(&row.get::<_, String>(11)?)?,
+                        tunnel_subdomain: row.get(12)?,
+                    })
+                })
+                .map_err(|error| {
+                    AppError::Internal(format!("query notification presence scan failed: {error}"))
+                })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+                AppError::Internal(format!("read notification presence scan failed: {error}"))
+            })?
+        };
+
+        let offline_cutoff = now - Duration::seconds(policy.offline_alert_secs.max(1));
+        let recovery_cutoff = now - Duration::seconds(policy.recovery_stable_secs.max(1));
+        let recovery_fresh_cutoff =
+            now - Duration::seconds((policy.offline_alert_secs / 2).max(30));
+        for state in states {
+            let Some(last_seen) = state.last_authenticated_seen_at else {
+                continue;
+            };
+            match state.presence_state.as_str() {
+                "online" if last_seen <= offline_cutoff => {
+                    let episode = state.offline_episode.saturating_add(1);
+                    let event_allowed_by_cooldown =
+                        state.last_offline_event_at.is_none_or(|last| {
+                            now - last >= Duration::seconds(policy.cooldown_secs.max(1))
+                        });
+                    let event_status = if !policy.enabled {
+                        "suppressed_disabled"
+                    } else if !event_allowed_by_cooldown {
+                        "suppressed_cooldown"
+                    } else {
+                        "pending"
+                    };
+                    let suppression_reason = match event_status {
+                        "suppressed_disabled" => Some("notifications disabled"),
+                        "suppressed_cooldown" => Some("client notification cooldown"),
+                        _ => None,
+                    };
+                    let timestamp = now.to_rfc3339();
+                    tx.execute(
+                        "UPDATE installation_notification_state
+                         SET presence_state = 'offline', offline_candidate_since = NULL,
+                             offline_since = ?2, recovery_candidate_since = NULL,
+                             offline_episode = ?3,
+                             last_offline_event_at = CASE WHEN ?4 = 1 THEN ?2 ELSE last_offline_event_at END,
+                             updated_at = ?2
+                         WHERE installation_id = ?1 AND presence_state = 'online'",
+                        params![
+                            state.installation_id,
+                            timestamp,
+                            episode,
+                            i64::from(event_status == "pending")
+                        ],
+                    )
+                    .map_err(|error| {
+                        AppError::Internal(format!("confirm client offline failed: {error}"))
+                    })?;
+                    let snapshot = serde_json::json!({
+                        "installationId": state.installation_id,
+                        "platform": state.platform,
+                        "appVersion": state.app_version,
+                        "ownerEmail": state.owner_email,
+                        "ownerVerified": state.owner_verified_at.is_some(),
+                        "countryCode": state.country_code,
+                        "tunnelSubdomain": state.tunnel_subdomain,
+                        "registeredAt": state.created_at,
+                        "lastAuthenticatedSeenAt": last_seen,
+                        "offlineSince": now,
+                    });
+                    tx.execute(
+                        "INSERT OR IGNORE INTO client_notification_events (
+                            id, dedupe_key, kind, installation_id, episode, status,
+                            occurred_at, not_before, snapshot_json, suppression_reason,
+                            created_at, updated_at
+                         ) VALUES (?1, ?2, 'client_offline', ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?6, ?6)",
+                        params![
+                            Uuid::new_v4().to_string(),
+                            format!("offline:{}:{episode}", state.installation_id),
+                            state.installation_id,
+                            episode,
+                            event_status,
+                            timestamp,
+                            snapshot.to_string(),
+                            suppression_reason,
+                        ],
+                    )
+                    .map_err(|error| {
+                        AppError::Internal(format!("insert client offline event failed: {error}"))
+                    })?;
+                    if event_status == "pending" {
+                        stats.offline_events += 1;
+                    } else if event_status == "suppressed_disabled" {
+                        stats.suppressed_disabled += 1;
+                    }
+                }
+                "recovering" => {
+                    let candidate = state.recovery_candidate_since.unwrap_or(last_seen);
+                    if last_seen <= offline_cutoff {
+                        tx.execute(
+                            "UPDATE installation_notification_state
+                             SET presence_state = 'offline', recovery_candidate_since = NULL,
+                                 updated_at = ?2
+                             WHERE installation_id = ?1 AND presence_state = 'recovering'",
+                            params![state.installation_id, now.to_rfc3339()],
+                        )
+                        .map_err(|error| {
+                            AppError::Internal(format!("restore offline episode failed: {error}"))
+                        })?;
+                    } else if candidate <= recovery_cutoff && last_seen >= recovery_fresh_cutoff {
+                        tx.execute(
+                            "UPDATE installation_notification_state
+                             SET presence_state = 'online', recovery_candidate_since = NULL,
+                                 offline_since = NULL, last_recovered_at = ?2, updated_at = ?2
+                             WHERE installation_id = ?1 AND presence_state = 'recovering'",
+                            params![state.installation_id, now.to_rfc3339()],
+                        )
+                        .map_err(|error| {
+                            AppError::Internal(format!("confirm client recovery failed: {error}"))
+                        })?;
+                        stats.recovered += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!(
+                "commit client notification reconcile failed: {error}"
+            ))
+        })?;
+        Ok(stats)
+    }
+
+    pub async fn aggregate_client_notification_batches(
+        &self,
+        policy: &ClientNotificationPolicy,
+        template: &NotificationTemplateContext,
+        now: DateTime<Utc>,
+    ) -> Result<NotificationAggregateStats, AppError> {
+        let mut aggregate = NotificationAggregateStats::default();
+        for lane in NotificationLane::ORDERED {
+            match self
+                .aggregate_client_notification_lane(policy, template, now, lane)
+                .await
+            {
+                Ok(stats) => merge_notification_aggregate_stats(&mut aggregate, stats),
+                Err(error) if lane == NotificationLane::Registration => {
+                    tracing::error!(
+                        error = %error,
+                        lane = lane.as_str(),
+                        "registration notification aggregation failed after offline lane committed"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(aggregate)
+    }
+
+    async fn aggregate_client_notification_lane(
+        &self,
+        policy: &ClientNotificationPolicy,
+        template: &NotificationTemplateContext,
+        now: DateTime<Utc>,
+        lane: NotificationLane,
+    ) -> Result<NotificationAggregateStats, AppError> {
+        let sender = template.sender.as_deref().unwrap_or_default();
+        if !policy.enabled {
+            return Ok(NotificationAggregateStats::default());
+        }
+
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!("begin notification aggregation failed: {error}"))
+            })?;
+        let mut stats = NotificationAggregateStats::default();
+        if !client_notification_policy_is_current(&tx, policy)? {
+            tx.commit().map_err(|error| {
+                AppError::Internal(format!(
+                    "commit stale notification aggregation failed: {error}"
+                ))
+            })?;
+            return Ok(stats);
+        }
+        if lane == NotificationLane::Registration {
+            materialize_registration_overflow_events_tx(&tx, now)?;
+        }
+        let cutoff = now - Duration::seconds(policy.batch_window_secs.max(1));
+        let events = load_pending_notification_events(&tx, now, cutoff, lane)?;
+        if events.is_empty() {
+            tx.commit().map_err(|error| {
+                AppError::Internal(format!(
+                    "commit empty notification aggregation failed: {error}"
+                ))
+            })?;
+            return Ok(stats);
+        }
+
+        let monitored_clients = tx
+            .query_row(
+                "SELECT COUNT(*) FROM installation_notification_state WHERE monitoring_enabled = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "count monitored notification clients failed: {error}"
+                ))
+            })?;
+        let offline_storm_threshold = policy.storm_min_clients.max(
+            (monitored_clients
+                .saturating_mul(policy.storm_percent.max(1))
+                .saturating_add(99))
+                / 100,
+        );
+
+        let mut by_recipient =
+            BTreeMap::<(i64, String), Vec<PendingClientNotificationEvent>>::new();
+        for event in &events {
+            let recipients = notification_event_recipients(event, policy);
+            if recipients.is_empty() {
+                tx.execute(
+                    "UPDATE client_notification_events
+                     SET status = 'suppressed_no_recipient',
+                         suppression_reason = 'no authorized recipient', updated_at = ?2
+                     WHERE id = ?1 AND status = 'pending'",
+                    params![event.id, now.to_rfc3339()],
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!("suppress recipientless event failed: {error}"))
+                })?;
+                continue;
+            }
+            for recipient in recipients {
+                let already_materialized = tx
+                    .query_row(
+                        "SELECT 1 FROM email_delivery_batch_items
+                         WHERE event_id = ?1 AND LOWER(recipient) = LOWER(?2) LIMIT 1",
+                        params![event.id, recipient.email],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .map_err(|error| {
+                        AppError::Internal(format!("check notification batch item failed: {error}"))
+                    })?
+                    .is_some();
+                if !already_materialized {
+                    by_recipient
+                        .entry((recipient.priority, recipient.email))
+                        .or_default()
+                        .push(event.clone());
+                }
+            }
+        }
+
+        let hour_cutoff = (now - Duration::hours(1)).to_rfc3339();
+        let (recipient_hourly_limit, global_hourly_limit) = lane.hourly_limits(policy);
+        let mut global_count = tx
+            .query_row(
+                "SELECT COUNT(*) FROM email_delivery_batches
+                 WHERE created_at >= ?1
+                   AND notification_lane = ?2
+                   AND status NOT IN ('suppressed_disabled', 'suppressed_recipient_removed',
+                                      'suppressed_rate_limit', 'suppressed_storm',
+                                      'suppressed_config_changed', 'cancelled_recovered',
+                                      'dead_letter')",
+                params![hour_cutoff, lane.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("count hourly notification batches failed: {error}"))
+            })?;
+        for ((recipient_priority, recipient), mut recipient_events) in by_recipient {
+            recipient_events.truncate(100);
+            let mut global_capped = global_count >= global_hourly_limit;
+            let recipient_count = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM email_delivery_batches
+                     WHERE created_at >= ?1 AND LOWER(recipient) = LOWER(?2)
+                       AND notification_lane = ?3
+                       AND status NOT IN ('suppressed_disabled', 'suppressed_recipient_removed',
+                                          'suppressed_rate_limit', 'suppressed_storm',
+                                          'suppressed_config_changed', 'cancelled_recovered',
+                                          'dead_letter')",
+                    params![hour_cutoff, recipient, lane.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "count recipient notification batches failed: {error}"
+                    ))
+                })?;
+            let recipient_capped = recipient_count >= recipient_hourly_limit;
+            if recipient_capped {
+                stats.deferred_by_recipient_cap += recipient_events.len() as u64;
+            }
+            let event_family = lane.as_str();
+            let storm_kind = Some(lane.storm_event_kind());
+            let storm_window_start =
+                (now - Duration::seconds(policy.storm_window_secs.max(1))).to_rfc3339();
+            let recipient_is_explicit =
+                recipient_priority == EXPLICIT_NOTIFICATION_RECIPIENT_PRIORITY;
+            let recent_storm_events = if recipient_is_explicit {
+                tx.query_row(
+                    "SELECT COUNT(DISTINCT installation_id)
+                     FROM client_notification_events
+                     WHERE occurred_at >= ?1
+                       AND occurred_at >= COALESCE(
+                           (SELECT enabled_since FROM client_notification_runtime WHERE id = 1), ?1
+                       )
+                       AND status IN ('pending', 'batched')
+                       AND (?2 IS NULL OR kind = ?2)",
+                    params![storm_window_start, storm_kind],
+                    |row| row.get::<_, i64>(0),
+                )
+            } else {
+                tx.query_row(
+                    "SELECT COUNT(DISTINCT e.installation_id)
+                     FROM client_notification_events e
+                     INNER JOIN installations i ON i.id = e.installation_id
+                     WHERE e.occurred_at >= ?1
+                       AND e.occurred_at >= COALESCE(
+                           (SELECT enabled_since FROM client_notification_runtime WHERE id = 1), ?1
+                       )
+                       AND e.status IN ('pending', 'batched')
+                       AND (?2 IS NULL OR e.kind = ?2)
+                       AND i.owner_verified_at IS NOT NULL
+                       AND LOWER(i.owner_email) = LOWER(?3)
+                       AND EXISTS (
+                           SELECT 1 FROM users u
+                           WHERE u.email_normalized = LOWER(i.owner_email)
+                             AND u.status = 'active'
+                       )",
+                    params![storm_window_start, storm_kind, recipient],
+                    |row| row.get::<_, i64>(0),
+                )
+            }
+            .map_err(|error| {
+                AppError::Internal(format!("count notification storm window failed: {error}"))
+            })?;
+            let storm_threshold = if lane == NotificationLane::Registration {
+                policy.storm_min_clients
+            } else {
+                offline_storm_threshold
+            };
+            let includes_overflow = recipient_events
+                .iter()
+                .any(|event| event.kind == "client_registration_overflow");
+            let incident =
+                !includes_overflow && recent_storm_events >= storm_threshold && storm_threshold > 1;
+            let incident_key =
+                incident.then(|| format!("{}:{recipient}:{event_family}", lane.as_str()));
+            let storm_suppressed = if let Some(incident_key) = incident_key.as_deref() {
+                tx.query_row(
+                    "SELECT 1 FROM email_delivery_batches
+                     WHERE incident_key = ?1 AND created_at >= ?2
+                       AND status IN ('pending', 'claimed', 'retry', 'blocked_config', 'sent')
+                     LIMIT 1",
+                    params![
+                        incident_key,
+                        (now - Duration::seconds(policy.storm_reminder_secs.max(1))).to_rfc3339()
+                    ],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|error| {
+                    AppError::Internal(format!("check notification storm reminder failed: {error}"))
+                })?
+                .is_some()
+            } else {
+                false
+            };
+            if global_capped && !recipient_capped && recipient_is_explicit && !storm_suppressed {
+                let reservations_needed = global_count
+                    .saturating_sub(global_hourly_limit)
+                    .saturating_add(1);
+                let preempted = preempt_lower_priority_notification_reservations(
+                    &tx,
+                    lane,
+                    recipient_priority,
+                    &hour_cutoff,
+                    &now.to_rfc3339(),
+                    reservations_needed,
+                )?;
+                global_count = global_count.saturating_sub(preempted);
+                global_capped = global_count >= global_hourly_limit;
+            }
+            if global_capped {
+                stats.deferred_by_global_cap += recipient_events.len() as u64;
+            }
+            let rendered = if incident {
+                let incident_clients = load_incident_client_ids(
+                    &tx,
+                    storm_kind,
+                    &storm_window_start,
+                    (!recipient_is_explicit).then_some(recipient.as_str()),
+                )?;
+                render_digest_email(&DigestEmailData {
+                    event_label: match event_family {
+                        "registration" => "registrations",
+                        "offline" => "offline clients",
+                        _ => "lifecycle events",
+                    }
+                    .into(),
+                    incident: true,
+                    clients: incident_clients,
+                    occurred_at: now.to_rfc3339(),
+                    dashboard_url: template.dashboard_url.clone(),
+                })
+            } else {
+                render_client_notification_batch(
+                    &recipient_events,
+                    false,
+                    &template.dashboard_url,
+                    now,
+                )?
+            };
+            let batch_id = Uuid::new_v4().to_string();
+            let idempotency_key = format!("client-notification-{batch_id}");
+            let timestamp = now.to_rfc3339();
+            let (batch_status, batch_error) = if recipient_capped || global_capped {
+                (
+                    "suppressed_rate_limit",
+                    Some("notification hourly hard cap reached"),
+                )
+            } else if storm_suppressed {
+                ("suppressed_storm", Some("incident reminder window active"))
+            } else if sender.is_empty() {
+                (
+                    "blocked_config",
+                    Some("notification sender is not configured"),
+                )
+            } else {
+                ("pending", None)
+            };
+            let delivery_kind = if batch_status.starts_with("suppressed_") {
+                "suppressed"
+            } else if incident {
+                "incident"
+            } else {
+                "lifecycle"
+            };
+            let next_attempt_at = (batch_status == "pending").then_some(timestamp.clone());
+            tx.execute(
+                "INSERT INTO email_delivery_batches (
+                    id, notification_lane, recipient, recipient_priority,
+                    from_address, reply_to, subject, html_body,
+                    idempotency_key, status, attempts, not_before, next_attempt_at,
+                    template_fingerprint, delivery_kind, incident_key, error_message,
+                    created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, ?12, ?13, ?14, ?15, ?16, ?11, ?11)",
+                params![
+                    batch_id,
+                    lane.as_str(),
+                    recipient,
+                    recipient_priority,
+                    sender,
+                    template.reply_to,
+                    rendered.subject,
+                    rendered.html,
+                    idempotency_key,
+                    batch_status,
+                    timestamp,
+                    next_attempt_at,
+                    template.delivery_config_fingerprint,
+                    delivery_kind,
+                    incident_key,
+                    batch_error,
+                ],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "insert notification delivery batch failed: {error}"
+                ))
+            })?;
+            for event in &recipient_events {
+                tx.execute(
+                    "INSERT OR IGNORE INTO email_delivery_batch_items (batch_id, event_id, recipient)
+                     VALUES (?1, ?2, ?3)",
+                    params![batch_id, event.id, recipient],
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!("insert notification batch item failed: {error}"))
+                })?;
+            }
+            if !batch_status.starts_with("suppressed_") {
+                global_count += 1;
+            }
+            if batch_status == "pending" || batch_status == "blocked_config" {
+                stats.batches_created += 1;
+            }
+            stats.events_batched += recipient_events.len() as u64;
+            if incident && !storm_suppressed && batch_status != "suppressed_rate_limit" {
+                stats.incident_digests += 1;
+            }
+        }
+
+        for event in &events {
+            let expected_recipients = notification_event_recipients(event, policy);
+            if expected_recipients.is_empty() {
+                continue;
+            }
+            let materialized = tx
+                .query_row(
+                    "SELECT COUNT(DISTINCT LOWER(recipient))
+                     FROM email_delivery_batch_items WHERE event_id = ?1",
+                    params![event.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!("count event delivery items failed: {error}"))
+                })?;
+            if materialized >= expected_recipients.len() as i64 {
+                tx.execute(
+                    "UPDATE client_notification_events
+                     SET status = 'batched', updated_at = ?2
+                     WHERE id = ?1 AND status = 'pending'",
+                    params![event.id, now.to_rfc3339()],
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!("mark notification event batched failed: {error}"))
+                })?;
+            }
+        }
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!("commit notification aggregation failed: {error}"))
+        })?;
+        Ok(stats)
+    }
+
+    pub async fn claim_client_notification_batch(
+        &self,
+        worker_id: &str,
+        now: DateTime<Utc>,
+        lease_secs: i64,
+    ) -> Result<ClientNotificationClaim, AppError> {
+        if worker_id.trim().is_empty() {
+            return Err(AppError::BadRequest(
+                "notification worker_id is required".into(),
+            ));
+        }
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!("begin notification batch claim failed: {error}"))
+            })?;
+        let timestamp = now.to_rfc3339();
+        let candidate = tx
+            .query_row(
+                "SELECT id, recipient, notification_lane FROM email_delivery_batches
+                 WHERE not_before <= ?1
+                   AND (
+                       (status IN ('pending', 'retry')
+                        AND (next_attempt_at IS NULL OR next_attempt_at <= ?1))
+                       OR (status = 'claimed' AND claim_expires_at <= ?1)
+                   )
+                 ORDER BY notification_lane, recipient_priority,
+                          COALESCE(next_attempt_at, not_before), created_at, id
+                 LIMIT 1",
+                params![timestamp],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!("select notification batch claim failed: {error}"))
+            })?;
+        let Some((batch_id, recipient, lane_value)) = candidate else {
+            tx.commit().map_err(|error| {
+                AppError::Internal(format!("commit empty notification claim failed: {error}"))
+            })?;
+            return Ok(ClientNotificationClaim::Empty);
+        };
+        let lane = NotificationLane::from_db(&lane_value)?;
+        let (
+            offline_recipient_limit,
+            offline_global_limit,
+            registration_recipient_limit,
+            registration_global_limit,
+        ) = tx
+            .query_row(
+                "SELECT recipient_hourly_limit, global_hourly_limit,
+                        registration_recipient_hourly_limit,
+                        registration_global_hourly_limit
+                 FROM client_notification_runtime WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("read notification claim caps failed: {error}"))
+            })?;
+        let (recipient_limit, global_limit) = match lane {
+            NotificationLane::Offline => (offline_recipient_limit, offline_global_limit),
+            NotificationLane::Registration => {
+                (registration_recipient_limit, registration_global_limit)
+            }
+        };
+        let sent_cutoff = (now - Duration::hours(1)).to_rfc3339();
+        let global_reserved = tx
+            .query_row(
+                "SELECT COUNT(*) FROM email_delivery_batches
+                 WHERE notification_lane = ?3
+                   AND ((status = 'sent' AND sent_at >= ?1)
+                        OR (status = 'claimed' AND claim_expires_at > ?2))",
+                params![sent_cutoff, timestamp, lane.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("count global notification claims failed: {error}"))
+            })?;
+        if global_reserved >= global_limit {
+            tx.execute(
+                "UPDATE email_delivery_batches
+                 SET status = 'suppressed_rate_limit',
+                     error_message = 'notification send-time hourly hard cap reached',
+                     next_attempt_at = NULL, claim_owner = NULL, claim_expires_at = NULL,
+                     updated_at = ?1
+                 WHERE not_before <= ?1
+                   AND notification_lane = ?2
+                   AND (
+                       (status IN ('pending', 'retry')
+                        AND (next_attempt_at IS NULL OR next_attempt_at <= ?1))
+                       OR (status = 'claimed' AND claim_expires_at <= ?1)
+                   )",
+                params![timestamp, lane.as_str()],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "suppress globally capped notification claims failed: {error}"
+                ))
+            })?;
+            tx.commit().map_err(|error| {
+                AppError::Internal(format!("commit capped notification claim failed: {error}"))
+            })?;
+            return Ok(ClientNotificationClaim::SuppressedByRateLimit);
+        }
+        let recipient_reserved = tx
+            .query_row(
+                "SELECT COUNT(*) FROM email_delivery_batches
+                 WHERE LOWER(recipient) = LOWER(?3)
+                   AND notification_lane = ?4
+                   AND ((status = 'sent' AND sent_at >= ?1)
+                        OR (status = 'claimed' AND claim_expires_at > ?2))",
+                params![sent_cutoff, timestamp, recipient, lane.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "count recipient notification claims failed: {error}"
+                ))
+            })?;
+        if recipient_reserved >= recipient_limit {
+            tx.execute(
+                "UPDATE email_delivery_batches
+                 SET status = 'suppressed_rate_limit',
+                     error_message = 'notification send-time recipient hourly hard cap reached',
+                     next_attempt_at = NULL, claim_owner = NULL, claim_expires_at = NULL,
+                     updated_at = ?1
+                 WHERE LOWER(recipient) = LOWER(?2) AND not_before <= ?1
+                   AND notification_lane = ?3
+                   AND (
+                       (status IN ('pending', 'retry')
+                        AND (next_attempt_at IS NULL OR next_attempt_at <= ?1))
+                       OR (status = 'claimed' AND claim_expires_at <= ?1)
+                   )",
+                params![timestamp, recipient, lane.as_str()],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "suppress recipient-capped notification claims failed: {error}"
+                ))
+            })?;
+            tx.commit().map_err(|error| {
+                AppError::Internal(format!("commit capped notification claim failed: {error}"))
+            })?;
+            return Ok(ClientNotificationClaim::SuppressedByRateLimit);
+        }
+        let claim_expires_at = (now + Duration::seconds(lease_secs.max(1))).to_rfc3339();
+        let changed = tx
+            .execute(
+                "UPDATE email_delivery_batches
+                 SET status = 'claimed', attempts = attempts + 1, claim_owner = ?2,
+                     claim_expires_at = ?3, updated_at = ?4
+                 WHERE id = ?1
+                   AND (
+                       (status IN ('pending', 'retry')
+                        AND (next_attempt_at IS NULL OR next_attempt_at <= ?4))
+                       OR (status = 'claimed' AND claim_expires_at <= ?4)
+                   )",
+                params![batch_id, worker_id, claim_expires_at, timestamp],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("claim notification batch failed: {error}"))
+            })?;
+        if changed != 1 {
+            tx.commit().map_err(|error| {
+                AppError::Internal(format!("commit lost notification claim failed: {error}"))
+            })?;
+            return Ok(ClientNotificationClaim::Empty);
+        }
+        let batch = tx
+            .query_row(
+                "SELECT id, recipient, from_address, reply_to, subject, html_body,
+                        idempotency_key, attempts
+                 FROM email_delivery_batches WHERE id = ?1",
+                params![batch_id],
+                |row| {
+                    let attempts = row.get::<_, i64>(7)?;
+                    Ok(ClientNotificationBatch {
+                        id: row.get(0)?,
+                        recipient: row.get(1)?,
+                        from: row.get(2)?,
+                        reply_to: row.get(3)?,
+                        subject: row.get(4)?,
+                        html: row.get(5)?,
+                        idempotency_key: row.get(6)?,
+                        attempts: attempts.max(0) as u32,
+                    })
+                },
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("read claimed notification batch failed: {error}"))
+            })?;
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!("commit notification batch claim failed: {error}"))
+        })?;
+        Ok(ClientNotificationClaim::Batch(batch))
+    }
+
+    pub async fn validate_client_notification_batch(
+        &self,
+        batch_id: &str,
+        worker_id: &str,
+        policy: &ClientNotificationPolicy,
+        now: DateTime<Utc>,
+    ) -> Result<bool, AppError> {
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "begin notification batch validation failed: {error}"
+                ))
+            })?;
+        if !client_notification_policy_is_current(&tx, policy)? {
+            let runtime_enabled = client_notification_runtime_enabled(&tx)?;
+            tx.execute(
+                "UPDATE email_delivery_batches
+                 SET status = ?3, next_attempt_at = CASE WHEN ?3 = 'retry' THEN ?4 ELSE NULL END,
+                     error_message = 'notification policy changed before delivery',
+                     claim_owner = NULL, claim_expires_at = NULL, updated_at = ?4
+                 WHERE id = ?1 AND status = 'claimed' AND claim_owner = ?2",
+                params![
+                    batch_id,
+                    worker_id,
+                    if runtime_enabled {
+                        "retry"
+                    } else {
+                        "suppressed_disabled"
+                    },
+                    now.to_rfc3339(),
+                ],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("release stale notification claim failed: {error}"))
+            })?;
+            tx.commit().map_err(|error| {
+                AppError::Internal(format!(
+                    "commit stale notification batch validation failed: {error}"
+                ))
+            })?;
+            return Ok(false);
+        }
+        let claimed_recipient = tx
+            .query_row(
+                "SELECT recipient, recipient_priority FROM email_delivery_batches
+                 WHERE id = ?1 AND status = 'claimed' AND claim_owner = ?2
+                   AND claim_expires_at > ?3",
+                params![batch_id, worker_id, now.to_rfc3339()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!("read notification batch claim failed: {error}"))
+            })?;
+        let Some((recipient, recipient_priority)) = claimed_recipient else {
+            tx.commit().map_err(|error| {
+                AppError::Internal(format!("commit invalid batch validation failed: {error}"))
+            })?;
+            return Ok(false);
+        };
+        let runtime_enabled =
+            tx.query_row(
+                "SELECT enabled FROM client_notification_runtime WHERE id = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "read notification runtime during validation failed: {error}"
+                ))
+            })? == Some(1);
+        if !policy.enabled || !runtime_enabled {
+            cancel_notification_batch_tx(
+                &tx,
+                batch_id,
+                worker_id,
+                "suppressed_disabled",
+                "notifications disabled",
+                now,
+            )?;
+            tx.commit().map_err(|error| {
+                AppError::Internal(format!(
+                    "commit disabled batch cancellation failed: {error}"
+                ))
+            })?;
+            return Ok(false);
+        }
+
+        let recipient_explicit = policy
+            .alert_emails
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(&recipient));
+        let recipient_owner = !recipient_explicit
+            && policy.notify_owner
+            && notification_batch_is_authorized_for_owner(&tx, batch_id, &recipient)?;
+        if !recipient_explicit && !recipient_owner {
+            cancel_notification_batch_tx(
+                &tx,
+                batch_id,
+                worker_id,
+                "suppressed_recipient_removed",
+                "recipient authorization removed",
+                now,
+            )?;
+            tx.commit().map_err(|error| {
+                AppError::Internal(format!("commit recipient cancellation failed: {error}"))
+            })?;
+            return Ok(false);
+        }
+        let expected_priority = if recipient_explicit {
+            EXPLICIT_NOTIFICATION_RECIPIENT_PRIORITY
+        } else {
+            OWNER_NOTIFICATION_RECIPIENT_PRIORITY
+        };
+        if recipient_priority != expected_priority {
+            tx.execute(
+                "UPDATE email_delivery_batches
+                 SET recipient_priority = ?3, updated_at = ?4
+                 WHERE id = ?1 AND status = 'claimed' AND claim_owner = ?2",
+                params![batch_id, worker_id, expected_priority, now.to_rfc3339()],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "update claimed notification recipient priority failed: {error}"
+                ))
+            })?;
+        }
+
+        let stale_offline_events = tx
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM email_delivery_batch_items bi
+                 INNER JOIN client_notification_events e ON e.id = bi.event_id
+                 LEFT JOIN installation_notification_state ns
+                   ON ns.installation_id = e.installation_id
+                 WHERE bi.batch_id = ?1 AND e.kind = 'client_offline'
+                   AND (ns.installation_id IS NULL OR ns.offline_episode != e.episode
+                        OR ns.presence_state NOT IN ('offline', 'recovering'))",
+                params![batch_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "validate offline notification episode failed: {error}"
+                ))
+            })?;
+        if stale_offline_events > 0 {
+            let (stale_event_ids, valid_event_ids) = {
+                let mut statement = tx
+                    .prepare(
+                        "SELECT e.id,
+                                e.kind = 'client_offline'
+                                AND (ns.installation_id IS NULL OR ns.offline_episode != e.episode
+                                     OR ns.presence_state NOT IN ('offline', 'recovering'))
+                         FROM email_delivery_batch_items bi
+                         INNER JOIN client_notification_events e ON e.id = bi.event_id
+                         LEFT JOIN installation_notification_state ns
+                           ON ns.installation_id = e.installation_id
+                         WHERE bi.batch_id = ?1",
+                    )
+                    .map_err(|error| {
+                        AppError::Internal(format!(
+                            "prepare digest event validation failed: {error}"
+                        ))
+                    })?;
+                let rows = statement
+                    .query_map(params![batch_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+                    })
+                    .map_err(|error| {
+                        AppError::Internal(format!("query digest event validation failed: {error}"))
+                    })?;
+                let mut stale = Vec::new();
+                let mut valid = Vec::new();
+                for row in rows {
+                    let (event_id, is_stale) = row.map_err(|error| {
+                        AppError::Internal(format!("read digest event validation failed: {error}"))
+                    })?;
+                    if is_stale {
+                        stale.push(event_id);
+                    } else {
+                        valid.push(event_id);
+                    }
+                }
+                (stale, valid)
+            };
+            cancel_notification_batch_tx(
+                &tx,
+                batch_id,
+                worker_id,
+                "cancelled_recovered",
+                "offline episode recovered before delivery",
+                now,
+            )?;
+            if !valid_event_ids.is_empty() {
+                let placeholders = repeat_vars(valid_event_ids.len());
+                tx.execute(
+                    &format!(
+                        "UPDATE client_notification_events
+                         SET status = 'pending', updated_at = ?1
+                         WHERE status = 'batched' AND id IN ({placeholders})"
+                    ),
+                    params_from_iter(
+                        std::iter::once(now.to_rfc3339()).chain(valid_event_ids.iter().cloned()),
+                    ),
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!("requeue valid digest events failed: {error}"))
+                })?;
+                tx.execute(
+                    &format!(
+                        "DELETE FROM email_delivery_batch_items
+                         WHERE batch_id = ?1 AND event_id IN ({placeholders})"
+                    ),
+                    params_from_iter(
+                        std::iter::once(batch_id.to_string())
+                            .chain(valid_event_ids.iter().cloned()),
+                    ),
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!("release valid digest items failed: {error}"))
+                })?;
+            }
+            if !stale_event_ids.is_empty() {
+                let placeholders = repeat_vars(stale_event_ids.len());
+                tx.execute(
+                    &format!(
+                        "UPDATE client_notification_events
+                         SET status = 'cancelled_recovered',
+                             suppression_reason = 'client recovered before delivery', updated_at = ?1
+                         WHERE id IN ({placeholders})"
+                    ),
+                    params_from_iter(
+                        std::iter::once(now.to_rfc3339()).chain(stale_event_ids.iter().cloned()),
+                    ),
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!("cancel recovered notification events failed: {error}"))
+                })?;
+            }
+            tx.commit().map_err(|error| {
+                AppError::Internal(format!(
+                    "commit recovered batch cancellation failed: {error}"
+                ))
+            })?;
+            return Ok(false);
+        }
+
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!(
+                "commit notification batch validation failed: {error}"
+            ))
+        })?;
+        Ok(true)
+    }
+
+    pub async fn mark_client_notification_batch_sent(
+        &self,
+        batch_id: &str,
+        worker_id: &str,
+        provider_message_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        self.finish_client_notification_batch(
+            batch_id,
+            worker_id,
+            "sent",
+            Some(provider_message_id),
+            None,
+            None,
+            now,
+        )
+        .await
+    }
+
+    pub async fn mark_client_notification_batch_retry(
+        &self,
+        batch_id: &str,
+        worker_id: &str,
+        error: &str,
+        next_attempt_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        self.finish_client_notification_batch(
+            batch_id,
+            worker_id,
+            "retry",
+            None,
+            Some(error),
+            Some(next_attempt_at),
+            now,
+        )
+        .await
+    }
+
+    pub async fn mark_client_notification_batch_dead_letter(
+        &self,
+        batch_id: &str,
+        worker_id: &str,
+        error: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        self.finish_client_notification_batch(
+            batch_id,
+            worker_id,
+            "dead_letter",
+            None,
+            Some(error),
+            None,
+            now,
+        )
+        .await
+    }
+
+    pub async fn mark_client_notification_batch_blocked_config(
+        &self,
+        batch_id: &str,
+        worker_id: &str,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        self.finish_client_notification_batch(
+            batch_id,
+            worker_id,
+            "blocked_config",
+            None,
+            Some(reason),
+            None,
+            now,
+        )
+        .await
+    }
+
+    async fn finish_client_notification_batch(
+        &self,
+        batch_id: &str,
+        worker_id: &str,
+        status: &str,
+        provider_message_id: Option<&str>,
+        error: Option<&str>,
+        next_attempt_at: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        let allowed = matches!(status, "sent" | "retry" | "dead_letter" | "blocked_config");
+        if !allowed {
+            return Err(AppError::Internal(
+                "invalid notification delivery terminal status".into(),
+            ));
+        }
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!("begin notification batch finish failed: {error}"))
+            })?;
+        let changed = tx
+            .execute(
+                "UPDATE email_delivery_batches
+                 SET status = ?3, provider_message_id = COALESCE(?4, provider_message_id),
+                     error_message = ?5, next_attempt_at = ?6,
+                     claim_owner = NULL, claim_expires_at = NULL,
+                     sent_at = CASE WHEN ?3 = 'sent' THEN ?7 ELSE sent_at END,
+                     updated_at = ?7
+                 WHERE id = ?1 AND status = 'claimed' AND claim_owner = ?2",
+                params![
+                    batch_id,
+                    worker_id,
+                    status,
+                    provider_message_id.map(|value| value.chars().take(512).collect::<String>()),
+                    error.map(|value| value.chars().take(2_000).collect::<String>()),
+                    next_attempt_at.map(|value| value.to_rfc3339()),
+                    now.to_rfc3339(),
+                ],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("finish notification batch failed: {error}"))
+            })?;
+        if changed != 1 {
+            return Err(AppError::Conflict(
+                "notification batch claim is no longer owned by this worker".into(),
+            ));
+        }
+        if status == "sent" {
+            tx.execute(
+                "INSERT OR IGNORE INTO email_send_logs (
+                    id, email_type, to_email, provider_message_id, status,
+                    error_message, created_at
+                 )
+                 SELECT id, 'client_notification', recipient, provider_message_id,
+                        'sent', NULL, ?2
+                 FROM email_delivery_batches WHERE id = ?1",
+                params![batch_id, now.to_rfc3339()],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("record sent client notification failed: {error}"))
+            })?;
+        }
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!("commit notification batch finish failed: {error}"))
+        })?;
+        Ok(())
+    }
+
+    pub async fn list_client_notification_deliveries(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ClientNotificationDeliveryView>, AppError> {
+        let conn = self.conn.lock().await;
+        let mut statement = conn
+            .prepare(
+                "WITH recent_batches AS (
+                     SELECT id, recipient, status, attempts, created_at,
+                            next_attempt_at, sent_at, error_message, delivery_kind
+                     FROM email_delivery_batches
+                     ORDER BY created_at DESC, id DESC
+                     LIMIT ?1
+                 )
+                 SELECT b.id,
+                        CASE WHEN b.status LIKE 'suppressed_%' THEN 'suppressed' ELSE b.delivery_kind END,
+                        COALESCE(GROUP_CONCAT(DISTINCT e.kind), ''),
+                        COALESCE(SUM(CASE
+                            WHEN e.id IS NULL THEN 0
+                            WHEN e.kind = 'client_registration_overflow'
+                                 AND json_valid(e.snapshot_json)
+                            THEN MAX(
+                                COALESCE(CAST(json_extract(
+                                    e.snapshot_json, '$.registrationCount'
+                                ) AS INTEGER), 1),
+                                1
+                            )
+                            ELSE 1
+                        END), 0),
+                        b.recipient, b.status, b.attempts,
+                        b.created_at, b.next_attempt_at, b.sent_at, b.error_message
+                 FROM recent_batches b
+                 LEFT JOIN email_delivery_batch_items bi ON bi.batch_id = b.id
+                 LEFT JOIN client_notification_events e ON e.id = bi.event_id
+                 GROUP BY b.id
+                 ORDER BY b.created_at DESC, b.id DESC",
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("prepare notification deliveries failed: {error}"))
+            })?;
+        let rows = statement
+            .query_map(params![limit.clamp(1, 100) as i64], |row| {
+                let recipient = row.get::<_, String>(4)?;
+                let recipient_masked = mask_email_address(&recipient);
+                let error_message = row
+                    .get::<_, Option<String>>(10)?
+                    .map(|value| mask_email_like_tokens(&value))
+                    .map(|value| value.chars().take(500).collect());
+                Ok(ClientNotificationDeliveryView {
+                    id: row.get(0)?,
+                    delivery_kind: row.get(1)?,
+                    event_kind: row.get(2)?,
+                    event_count: row.get::<_, i64>(3)?.max(0) as u64,
+                    recipient_masked,
+                    status: row.get(5)?,
+                    attempts: row.get::<_, i64>(6)?.max(0) as u32,
+                    created_at: row.get(7)?,
+                    next_attempt_at: row.get(8)?,
+                    sent_at: row.get(9)?,
+                    error_message,
+                })
+            })
+            .map_err(|error| {
+                AppError::Internal(format!("query notification deliveries failed: {error}"))
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+            AppError::Internal(format!("read notification deliveries failed: {error}"))
+        })
     }
 
     pub async fn prepare_installation_upgrade(
@@ -3622,12 +5241,57 @@ impl AppStore {
             &input.nonce,
             &input.signature,
         )?;
-        conn.execute(
-            "DELETE FROM shares WHERE share_id = ?1 AND installation_id = ?2",
-            params![input.share_id, input.installation_id],
-        )
-        .map_err(|e| AppError::Internal(format!("delete share failed: {e}")))?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| AppError::Internal(format!("begin share delete tx failed: {e}")))?;
+        retire_share_tx(&tx, &input.share_id, &input.installation_id)?;
+        tx.commit()
+            .map_err(|e| AppError::Internal(format!("commit share delete failed: {e}")))?;
         Ok(())
+    }
+
+    pub async fn prune_shares(
+        &self,
+        input: SharePruneRequest,
+        metadata: ClientMetadata,
+    ) -> Result<usize, AppError> {
+        let retained_share_ids = validate_share_prune_ids(&input.share_ids)?;
+        let conn = self.conn.lock().await;
+        let installation = get_installation(&conn, &input.installation_id)?;
+        let Some(installation) = installation else {
+            return Err(AppError::Unauthorized("installation not found".into()));
+        };
+        verify_signed_share_request(
+            &conn,
+            &installation.public_key,
+            &input.installation_id,
+            "share_prune_v1",
+            &input.share_ids,
+            input.timestamp_ms,
+            &input.nonce,
+            &input.signature,
+        )?;
+        let should_refresh_geo =
+            should_refresh_installation_geo(&installation, metadata.ip.as_deref());
+        touch_installation_presence(&conn, &input.installation_id, &metadata, Utc::now())?;
+        drop(conn);
+        if should_refresh_geo {
+            self.refresh_installation_geo(&input.installation_id, &metadata.ip, false)
+                .await?;
+        }
+
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| AppError::Internal(format!("begin share prune tx failed: {e}")))?;
+        let pruned = delete_all_shares_for_installation_tx(
+            &tx,
+            &input.installation_id,
+            &retained_share_ids,
+        )?;
+        tx.commit()
+            .map_err(|e| AppError::Internal(format!("commit share prune failed: {e}")))?;
+        Ok(pruned)
     }
 
     pub async fn batch_sync_shares(
@@ -3669,6 +5333,12 @@ impl AppStore {
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| AppError::Internal(format!("begin batch sync tx failed: {e}")))?;
+        let upsert_share_ids = input
+            .ops
+            .iter()
+            .filter(|op| op.kind == "upsert")
+            .filter_map(|op| op.share.as_ref().map(|share| share.share_id.clone()))
+            .collect::<HashSet<_>>();
         for op in input.ops {
             match op.kind.as_str() {
                 "upsert" => {
@@ -3687,16 +5357,14 @@ impl AppStore {
                     let share_id = op.share_id.ok_or_else(|| {
                         AppError::BadRequest("shareId is required for delete".into())
                     })?;
-                    tx.execute(
-                        "DELETE FROM shares WHERE share_id = ?1 AND installation_id = ?2",
-                        params![share_id, input.installation_id],
-                    )
-                    .map_err(|e| {
-                        AppError::Internal(format!("delete share in batch failed: {e}"))
-                    })?;
+                    retire_share_tx(&tx, &share_id, &input.installation_id)?;
                 }
                 "delete_all" => {
-                    delete_all_shares_for_installation_tx(&tx, &input.installation_id)?;
+                    delete_all_shares_for_installation_tx(
+                        &tx,
+                        &input.installation_id,
+                        &upsert_share_ids,
+                    )?;
                 }
                 other => {
                     return Err(AppError::BadRequest(format!(
@@ -4796,7 +6464,8 @@ impl AppStore {
         config: &Config,
         proxy: &ProxyRegistry,
     ) -> Result<CleanupResult, AppError> {
-        let active_subdomains = proxy.active_subdomains().await;
+        let active_route_connections = proxy.active_route_connections().await;
+        let active_subdomains = active_route_connections.keys().cloned().collect::<Vec<_>>();
         let cutoff = (Utc::now() - Duration::seconds(config.lease_retention_secs)).to_rfc3339();
         let log_cutoff_ts = DateTime::parse_from_rfc3339(&cutoff)
             .map(|dt| dt.timestamp())
@@ -4811,11 +6480,22 @@ impl AppStore {
             (Utc::now() - Duration::seconds(MARKET_ACTIVE_MISSING_GRACE_SECS)).to_rfc3339();
         let market_release_cutoff =
             (Utc::now() - Duration::seconds(MARKET_OFFLINE_GRACE_SECS)).to_rfc3339();
+        let notification_audit_cutoff =
+            (Utc::now() - Duration::seconds(CLIENT_NOTIFICATION_AUDIT_RETENTION_SECS)).to_rfc3339();
         let (mut result, stale_subdomains, stale_image_storage_keys) = {
-            let conn = self.conn.lock().await;
+            let mut conn = self.conn.lock().await;
             let tx = conn
-                .unchecked_transaction()
+                .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|e| AppError::Internal(format!("begin cleanup tx failed: {e}")))?;
+
+            let cleanup_notification_policy =
+                ClientNotificationPolicy::for_runtime(&config.client_notifications, config).0;
+            materialize_offline_events_before_cleanup_tx(
+                &tx,
+                &stale_cutoff,
+                cleanup_notification_policy.cooldown_secs,
+                Utc::now(),
+            )?;
 
             let mut stale_subdomains =
                 collect_stale_installation_subdomains_tx(&tx, &stale_cutoff)?;
@@ -4829,30 +6509,74 @@ impl AppStore {
                 .map_err(|e| AppError::Internal(format!("delete expired leases failed: {e}")))?
                 as usize;
 
-            tx.execute(
-                "DELETE FROM share_health_checks
-                     WHERE share_id IN (
-                         SELECT share_id
-                         FROM shares
-                         WHERE installation_id IN (
-                             SELECT id FROM installations WHERE last_seen_at < ?1
-                         )
-                     )",
-                params![stale_cutoff],
-            )
-            .map_err(|e| AppError::Internal(format!("delete stale share health failed: {e}")))?;
-
-            let deleted_stale_shares = tx
-                .execute(
-                    "DELETE FROM shares
-                     WHERE installation_id IN (
-                         SELECT id FROM installations WHERE last_seen_at < ?1
-                     )",
-                    params![stale_cutoff],
-                )
-                .map_err(|e| {
-                    AppError::Internal(format!("delete stale client shares failed: {e}"))
-                })? as usize;
+            let expired_installation_ids = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT i.id FROM installations i
+                         WHERE i.last_seen_at < ?1
+                           AND NOT EXISTS (
+                               SELECT 1 FROM client_notification_events e
+                               WHERE e.installation_id = i.id
+                                 AND e.kind = 'client_offline'
+                                 AND (
+                                     e.status = 'pending'
+                                     OR (e.status = 'batched' AND EXISTS (
+                                         SELECT 1
+                                         FROM email_delivery_batch_items bi
+                                         INNER JOIN email_delivery_batches b ON b.id = bi.batch_id
+                                         WHERE bi.event_id = e.id
+                                           AND b.status IN ('pending', 'claimed', 'retry', 'blocked_config')
+                                     ))
+                                 )
+                           )",
+                    )
+                    .map_err(|e| {
+                        AppError::Internal(format!("prepare expired installations failed: {e}"))
+                    })?;
+                let rows = stmt
+                    .query_map(params![installation_retention_cutoff], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .map_err(|e| {
+                        AppError::Internal(format!("query expired installations failed: {e}"))
+                    })?;
+                collect_rows(rows)?
+            };
+            let expired_installation_id_set = expired_installation_ids
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>();
+            let stale_installation_shares = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT s.share_id, s.installation_id
+                         FROM shares s
+                         INNER JOIN installations i ON i.id = s.installation_id
+                         WHERE i.last_seen_at < ?1",
+                    )
+                    .map_err(|e| {
+                        AppError::Internal(format!("prepare stale client shares failed: {e}"))
+                    })?;
+                let rows = stmt
+                    .query_map(params![stale_cutoff], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(|e| {
+                        AppError::Internal(format!("query stale client shares failed: {e}"))
+                    })?;
+                collect_rows(rows)?
+            };
+            let mut deleted_stale_shares = 0;
+            for (share_id, installation_id) in &stale_installation_shares {
+                if expired_installation_id_set.contains(installation_id) {
+                    // The final installation purge below still needs the share row
+                    // to discover and remove all share-scoped historical records.
+                    deleted_stale_shares += 1;
+                    continue;
+                }
+                deleted_stale_shares +=
+                    usize::from(retire_share_tx(&tx, share_id, installation_id)?);
+            }
 
             let deleted_stale_leases = tx
                 .execute(
@@ -4867,25 +6591,10 @@ impl AppStore {
                 })? as usize;
 
             let mut deleted_installations = 0usize;
-            let expired_installation_ids = {
-                let mut stmt = tx
-                    .prepare("SELECT id FROM installations WHERE last_seen_at < ?1")
-                    .map_err(|e| {
-                        AppError::Internal(format!("prepare expired installations failed: {e}"))
-                    })?;
-                let rows = stmt
-                    .query_map(params![installation_retention_cutoff], |row| {
-                        row.get::<_, String>(0)
-                    })
-                    .map_err(|e| {
-                        AppError::Internal(format!("query expired installations failed: {e}"))
-                    })?;
-                collect_rows(rows)?
-            };
-            for installation_id in expired_installation_ids {
+            for installation_id in &expired_installation_ids {
                 stale_subdomains
-                    .extend(route_subdomains_for_installation_tx(&tx, &installation_id)?);
-                purge_installation_data_tx(&tx, &installation_id)?;
+                    .extend(route_subdomains_for_installation_tx(&tx, installation_id)?);
+                purge_installation_data_tx(&tx, installation_id)?;
                 deleted_installations += 1;
             }
             stale_subdomains.sort();
@@ -4894,7 +6603,7 @@ impl AppStore {
             let stale_active_offline_shares = {
                 let mut stmt = tx
                     .prepare(
-                        "SELECT share_id, subdomain
+                        "SELECT share_id, installation_id, subdomain
                          FROM shares
                          WHERE share_status = 'active'
                            AND updated_at < ?1
@@ -4909,7 +6618,11 @@ impl AppStore {
                     })?;
                 let rows = stmt
                     .query_map(params![stale_cutoff], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
                     })
                     .map_err(|e| {
                         AppError::Internal(format!("query stale active offline shares failed: {e}"))
@@ -4920,28 +6633,10 @@ impl AppStore {
                 if stale_active_offline_shares.is_empty() {
                     (0, 0)
                 } else {
-                    let stale_active_share_ids = stale_active_offline_shares
-                        .iter()
-                        .map(|(share_id, _)| share_id.clone())
-                        .collect::<Vec<_>>();
                     let stale_active_subdomains = stale_active_offline_shares
                         .iter()
-                        .map(|(_, subdomain)| subdomain.clone())
+                        .map(|(_, _, subdomain)| subdomain.clone())
                         .collect::<Vec<_>>();
-
-                    let share_placeholders = repeat_vars(stale_active_share_ids.len());
-                    tx.execute(
-                        &format!(
-                            "DELETE FROM share_health_checks
-                             WHERE share_id IN ({share_placeholders})"
-                        ),
-                        params_from_iter(stale_active_share_ids.iter()),
-                    )
-                    .map_err(|e| {
-                        AppError::Internal(format!(
-                            "delete stale active offline share health failed: {e}"
-                        ))
-                    })?;
 
                     let subdomain_placeholders = repeat_vars(stale_active_subdomains.len());
                     let deleted_leases = tx
@@ -4958,16 +6653,11 @@ impl AppStore {
                             ))
                         })? as usize;
 
-                    let deleted_shares = tx
-                        .execute(
-                            &format!("DELETE FROM shares WHERE share_id IN ({share_placeholders})"),
-                            params_from_iter(stale_active_share_ids.iter()),
-                        )
-                        .map_err(|e| {
-                            AppError::Internal(format!(
-                                "delete stale active offline shares failed: {e}"
-                            ))
-                        })? as usize;
+                    let mut deleted_shares = 0;
+                    for (share_id, installation_id, _) in &stale_active_offline_shares {
+                        deleted_shares +=
+                            usize::from(retire_share_tx(&tx, share_id, installation_id)?);
+                    }
 
                     stale_subdomains.extend(stale_active_subdomains);
                     (deleted_shares, deleted_leases)
@@ -4975,34 +6665,48 @@ impl AppStore {
 
             // 已暂停且 updated_at 长期未刷新的 share 自动 GC：installation 维度的清理
             // 只删整台机器全离线的 share，但用户明确 paused 后只想保留账号、不想留路由的
-            // 也应该到期回收。先清掉 health_checks 再删 share 行，避免 orphan。
-            tx.execute(
-                "DELETE FROM share_health_checks
-                     WHERE share_id IN (
-                         SELECT share_id FROM shares
-                         WHERE share_status = 'paused' AND updated_at < ?1
-                     )",
-                params![paused_cutoff],
-            )
-            .map_err(|e| AppError::Internal(format!("delete paused share health failed: {e}")))?;
-            let deleted_paused_shares = tx
-                .execute(
-                    "DELETE FROM shares
-                     WHERE share_status = 'paused' AND updated_at < ?1",
-                    params![paused_cutoff],
-                )
-                .map_err(|e| AppError::Internal(format!("delete paused shares failed: {e}")))?
-                as usize;
+            // 也应该到期回收。历史与审计仍按各自 retention policy 单独清理。
+            let paused_shares = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT share_id, installation_id FROM shares
+                         WHERE share_status = 'paused' AND updated_at < ?1",
+                    )
+                    .map_err(|e| {
+                        AppError::Internal(format!("prepare paused shares failed: {e}"))
+                    })?;
+                let rows = stmt
+                    .query_map(params![paused_cutoff], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(|e| AppError::Internal(format!("query paused shares failed: {e}")))?;
+                collect_rows(rows)?
+            };
+            let mut deleted_paused_shares = 0;
+            for (share_id, installation_id) in paused_shares {
+                deleted_paused_shares +=
+                    usize::from(retire_share_tx(&tx, &share_id, &installation_id)?);
+            }
 
-            let deleted_old_shares = tx
-                .execute(
-                    "DELETE FROM shares
-                     WHERE share_status IN ('expired', 'deleted')
-                       AND updated_at < ?1",
-                    params![cutoff],
-                )
-                .map_err(|e| AppError::Internal(format!("delete stale shares failed: {e}")))?
-                as usize;
+            let old_shares = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT share_id, installation_id FROM shares
+                         WHERE share_status IN ('expired', 'deleted') AND updated_at < ?1",
+                    )
+                    .map_err(|e| AppError::Internal(format!("prepare stale shares failed: {e}")))?;
+                let rows = stmt
+                    .query_map(params![cutoff], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(|e| AppError::Internal(format!("query stale shares failed: {e}")))?;
+                collect_rows(rows)?
+            };
+            let mut deleted_old_shares = 0;
+            for (share_id, installation_id) in old_shares {
+                deleted_old_shares +=
+                    usize::from(retire_share_tx(&tx, &share_id, &installation_id)?);
+            }
 
             let _deleted_request_logs = tx
                 .execute(
@@ -5052,6 +6756,30 @@ impl AppStore {
                 params![(Utc::now() - Duration::seconds(NONCE_RETENTION_SECS)).to_rfc3339()],
             )
             .map_err(|e| AppError::Internal(format!("delete stale request nonces failed: {e}")))?;
+            let registration_cache_now_ms = Utc::now().timestamp_millis();
+            let registration_cache_cutoff_ms =
+                registration_cache_now_ms.saturating_sub(REGISTRATION_GEO_CACHE_TTL_SECS * 1_000);
+            tx.execute(
+                "DELETE FROM registration_admission_events WHERE occurred_at_ms <= ?1",
+                params![registration_cache_cutoff_ms],
+            )
+            .map_err(|e| {
+                AppError::Internal(format!(
+                    "delete stale registration admission events failed: {e}"
+                ))
+            })?;
+            tx.execute(
+                "DELETE FROM registration_geo_cache
+                 WHERE (status IN ('positive', 'negative') AND cached_at_ms <= ?1)
+                    OR (status = 'claimed' AND claim_expires_at_ms <= ?2)",
+                params![
+                    registration_cache_cutoff_ms,
+                    registration_cache_now_ms.saturating_sub(60 * 60 * 1_000)
+                ],
+            )
+            .map_err(|e| {
+                AppError::Internal(format!("delete stale registration geo cache failed: {e}"))
+            })?;
             tx.execute(
                 "DELETE FROM email_login_challenges
                  WHERE expires_at < ?1 OR consumed_at IS NOT NULL",
@@ -5108,6 +6836,52 @@ impl AppStore {
                 AppError::Internal(format!("delete released offline markets failed: {e}"))
             })?;
 
+            let (bounded_notification_batches, bounded_notification_events) =
+                cleanup_client_notification_queue_tx(&tx, Utc::now())?;
+            let deleted_notification_batches = bounded_notification_batches
+                + tx.execute(
+                    "DELETE FROM email_delivery_batches
+                     WHERE updated_at < ?1
+                       AND status IN (
+                           'sent', 'dead_letter', 'suppressed_disabled',
+                           'suppressed_recipient_removed', 'suppressed_rate_limit',
+                           'suppressed_storm', 'suppressed_config_changed',
+                           'suppressed_expired', 'cancelled_recovered'
+                       )",
+                    params![notification_audit_cutoff],
+                )
+                .map_err(|e| {
+                    AppError::Internal(format!(
+                        "delete expired client notification batches failed: {e}"
+                    ))
+                })? as usize;
+            let deleted_notification_events = bounded_notification_events
+                + tx.execute(
+                    "DELETE FROM client_notification_events
+                     WHERE updated_at < ?1 AND status != 'pending'
+                       AND NOT EXISTS (
+                           SELECT 1 FROM email_delivery_batch_items bi
+                           WHERE bi.event_id = client_notification_events.id
+                       )",
+                    params![notification_audit_cutoff],
+                )
+                .map_err(|e| {
+                    AppError::Internal(format!(
+                        "delete expired client notification events failed: {e}"
+                    ))
+                })? as usize;
+            let deleted_notification_send_logs = tx
+                .execute(
+                    "DELETE FROM email_send_logs
+                     WHERE email_type = 'client_notification' AND created_at < ?1",
+                    params![notification_audit_cutoff],
+                )
+                .map_err(|e| {
+                    AppError::Internal(format!(
+                        "delete expired client notification send logs failed: {e}"
+                    ))
+                })? as usize;
+
             tx.commit()
                 .map_err(|e| AppError::Internal(format!("commit cleanup tx failed: {e}")))?;
 
@@ -5121,6 +6895,9 @@ impl AppStore {
                         + deleted_paused_shares
                         + deleted_old_shares,
                     deleted_installations,
+                    deleted_notification_batches,
+                    deleted_notification_events,
+                    deleted_notification_send_logs,
                     removed_routes: 0,
                 },
                 stale_subdomains,
@@ -5128,13 +6905,8 @@ impl AppStore {
             )
         };
 
-        let mut removed_routes = 0;
-        for subdomain in stale_subdomains {
-            if proxy.remove_route_if_present(&subdomain).await {
-                removed_routes += 1;
-            }
-        }
-        result.removed_routes = removed_routes;
+        result.removed_routes =
+            remove_stale_route_snapshots(proxy, stale_subdomains, &active_route_connections).await;
 
         for storage_key in stale_image_storage_keys {
             if let Some(path) = image_result_path(config, &storage_key) {
@@ -6899,7 +8671,11 @@ impl AppStore {
         let Some(ip) = ip.as_deref().map(str::trim).filter(|v| !v.is_empty()) else {
             return Ok(());
         };
-        let current_state = {
+        let Ok(parsed_ip) = ip.parse::<IpAddr>() else {
+            return Ok(());
+        };
+        let canonical_ip = parsed_ip.to_string();
+        {
             let conn = self.conn.lock().await;
             let state = get_installation_geo_state(&conn, installation_id)?;
             let Some(state) = state else {
@@ -6912,79 +8688,47 @@ impl AppStore {
             {
                 return Ok(());
             }
-            state
-        };
-        let Some(geo) = lookup_ip_im_geo(ip).await else {
-            return Ok(());
-        };
-        let now = Utc::now();
-        let conn = self.conn.lock().await;
-        let no_stable_position =
-            current_state.latitude.is_none() || current_state.longitude.is_none();
-        if no_stable_position {
-            persist_stable_geo(&conn, installation_id, &geo, now)?;
-            return Ok(());
         }
-
-        let stable_distance_km = haversine_distance_km(
-            current_state.latitude,
-            current_state.longitude,
-            geo.latitude,
-            geo.longitude,
-        );
-        let crossed_country = current_state.country_code != geo.country_code
-            && current_state.country_code.is_some()
-            && geo.country_code.is_some();
-        let can_stay_stable = !crossed_country
-            && stable_distance_km
-                .map(|distance| distance <= GEO_STABLE_DISTANCE_KM)
-                .unwrap_or(false);
-
-        if can_stay_stable {
-            persist_stable_geo(&conn, installation_id, &geo, now)?;
-            return Ok(());
+        let source_scope = registration_source_scope(Some(&canonical_ip));
+        let wait_started = StdInstant::now();
+        loop {
+            let decision = {
+                let mut conn = self.conn.lock().await;
+                claim_registration_geo_cache(&mut conn, &source_scope, Utc::now())?
+            };
+            match decision {
+                RegistrationGeoCacheDecision::Positive(geo) => {
+                    let conn = self.conn.lock().await;
+                    apply_installation_geo(&conn, installation_id, &geo, Utc::now())?;
+                    return Ok(());
+                }
+                RegistrationGeoCacheDecision::Negative => return Ok(()),
+                RegistrationGeoCacheDecision::Claim(claim_owner) => {
+                    let geo = lookup_ip_im_geo_at(&self.geo_lookup_base_url, &canonical_ip).await;
+                    let now = Utc::now();
+                    let conn = self.conn.lock().await;
+                    finish_registration_geo_cache(
+                        &conn,
+                        &source_scope,
+                        &claim_owner,
+                        geo.as_ref(),
+                        now,
+                    )?;
+                    if let Some(geo) = geo {
+                        apply_installation_geo(&conn, installation_id, &geo, now)?;
+                    }
+                    return Ok(());
+                }
+                RegistrationGeoCacheDecision::Wait => {
+                    if wait_started.elapsed()
+                        >= StdDuration::from_secs(REGISTRATION_GEO_WAIT_TIMEOUT_SECS)
+                    {
+                        return Ok(());
+                    }
+                    sleep(StdDuration::from_millis(REGISTRATION_GEO_WAIT_POLL_MS)).await;
+                }
+            }
         }
-
-        let candidate_matches = current_state
-            .geo_candidate_latitude
-            .zip(current_state.geo_candidate_longitude)
-            .and_then(|(lat, lon)| {
-                haversine_distance_km(Some(lat), Some(lon), geo.latitude, geo.longitude)
-            })
-            .map(|distance| distance <= GEO_CANDIDATE_DISTANCE_KM)
-            .unwrap_or(false)
-            && current_state.geo_candidate_country_code == geo.country_code;
-
-        let candidate_hits = if candidate_matches {
-            current_state.geo_candidate_hits + 1
-        } else {
-            1
-        };
-        let candidate_first_seen_at = if candidate_matches {
-            current_state.geo_candidate_first_seen_at.unwrap_or(now)
-        } else {
-            now
-        };
-        persist_candidate_geo(
-            &conn,
-            installation_id,
-            &geo,
-            candidate_hits,
-            candidate_first_seen_at,
-        )?;
-
-        let candidate_age_secs = (now - candidate_first_seen_at).num_seconds();
-        let last_change_age_secs = current_state
-            .geo_last_changed_at
-            .map(|value| (now - value).num_seconds())
-            .unwrap_or(i64::MAX);
-        let promote_candidate = candidate_hits >= GEO_CANDIDATE_CONFIRM_HITS
-            && candidate_age_secs >= GEO_CANDIDATE_MIN_AGE_SECS
-            && last_change_age_secs >= GEO_STABLE_MIN_SWITCH_SECS;
-        if promote_candidate {
-            persist_stable_geo(&conn, installation_id, &geo, now)?;
-        }
-        Ok(())
     }
 
     pub async fn create_board_message(
@@ -8179,32 +9923,108 @@ fn purge_installation_data_tx(conn: &Connection, installation_id: &str) -> Resul
 fn delete_all_shares_for_installation_tx(
     conn: &Connection,
     installation_id: &str,
+    protected_share_ids: &HashSet<String>,
 ) -> Result<usize, AppError> {
+    // Legacy clients send delete_all plus their complete current snapshot. IDs
+    // upserted anywhere in the same batch never left that snapshot, so their
+    // pending edits and runtime state must survive the compatibility operation.
     let share_ids = {
         let mut stmt = conn
             .prepare("SELECT share_id FROM shares WHERE installation_id = ?1")
             .map_err(|e| {
-                AppError::Internal(format!("prepare installation shares cleanup failed: {e}"))
+                AppError::Internal(format!("prepare installation share retirement failed: {e}"))
             })?;
         let rows = stmt
             .query_map(params![installation_id], |row| row.get::<_, String>(0))
             .map_err(|e| {
-                AppError::Internal(format!("query installation shares cleanup failed: {e}"))
+                AppError::Internal(format!("query installation share retirement failed: {e}"))
             })?;
         collect_rows(rows)?
     };
-
-    for share_id in &share_ids {
-        delete_share_auxiliary_rows_tx(conn, share_id)?;
+    let mut deleted = 0;
+    for share_id in share_ids {
+        if protected_share_ids.contains(&share_id) {
+            continue;
+        }
+        deleted += usize::from(retire_share_tx(conn, &share_id, installation_id)?);
     }
+    Ok(deleted)
+}
 
+fn validate_share_prune_ids(share_ids: &[String]) -> Result<HashSet<String>, AppError> {
+    if share_ids.len() > SHARE_PRUNE_MAX_IDS {
+        return Err(AppError::BadRequest(format!(
+            "shareIds cannot contain more than {SHARE_PRUNE_MAX_IDS} entries"
+        )));
+    }
+    let mut unique = HashSet::with_capacity(share_ids.len());
+    for share_id in share_ids {
+        if share_id.is_empty()
+            || share_id.trim() != share_id
+            || share_id.len() > SHARE_PRUNE_MAX_ID_BYTES
+            || share_id.chars().any(char::is_control)
+        {
+            return Err(AppError::BadRequest(
+                "shareIds entries must be non-empty, trimmed identifiers of at most 512 bytes"
+                    .into(),
+            ));
+        }
+        unique.insert(share_id.clone());
+    }
+    Ok(unique)
+}
+
+fn retire_share_tx(
+    conn: &Connection,
+    share_id: &str,
+    installation_id: &str,
+) -> Result<bool, AppError> {
     let deleted = conn
         .execute(
-            "DELETE FROM shares WHERE installation_id = ?1",
-            params![installation_id],
+            "DELETE FROM shares WHERE share_id = ?1 AND installation_id = ?2",
+            params![share_id, installation_id],
         )
-        .map_err(|e| AppError::Internal(format!("delete installation shares failed: {e}")))?;
-    Ok(deleted)
+        .map_err(|e| AppError::Internal(format!("retire share failed: {e}")))?;
+    if deleted == 0 {
+        return Ok(false);
+    }
+
+    let retired_at = Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE share_edit_requests
+         SET status = CASE WHEN status = 'pending' THEN 'cancelled' ELSE status END,
+             updated_at = CASE WHEN status = 'pending' THEN ?3 ELSE updated_at END,
+             applied_at = CASE WHEN status = 'pending' THEN NULL ELSE applied_at END,
+             error_message = CASE
+                 WHEN status = 'pending' THEN 'share was deleted before the edit could be applied'
+                 ELSE error_message
+             END,
+             retired_at = ?3
+         WHERE share_id = ?1 AND installation_id = ?2 AND retired_at IS NULL",
+        params![share_id, installation_id, retired_at],
+    )
+    .map_err(|e| AppError::Internal(format!("retire share edits failed: {e}")))?;
+
+    for (table, description) in [
+        ("share_model_health_state", "share model health state"),
+        ("market_disabled_shares", "market disabled share state"),
+        (
+            "market_share_model_failure_state",
+            "market share model failure state",
+        ),
+        ("market_share_runtime_states", "market share runtime state"),
+        (
+            "share_market_listing_statuses",
+            "share market listing status",
+        ),
+    ] {
+        conn.execute(
+            &format!("DELETE FROM {table} WHERE share_id = ?1"),
+            params![share_id],
+        )
+        .map_err(|e| AppError::Internal(format!("delete {description} failed: {e}")))?;
+    }
+    Ok(true)
 }
 
 fn upsert_share_request_log_tx(
@@ -8494,6 +10314,27 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             control_secret_b64 TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS registration_admission_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_scope TEXT NOT NULL,
+            occurred_at_ms INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS registration_geo_cache (
+            source_scope TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            cached_at_ms INTEGER,
+            claim_owner TEXT,
+            claim_expires_at_ms INTEGER,
+            country_code TEXT,
+            country TEXT,
+            region TEXT,
+            city TEXT,
+            latitude REAL,
+            longitude REAL,
+            updated_at_ms INTEGER NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS leases (
             id TEXT PRIMARY KEY,
             installation_id TEXT NOT NULL,
@@ -8704,7 +10545,8 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             applied_at TEXT,
-            error_message TEXT
+            error_message TEXT,
+            retired_at TEXT
         );
 
         CREATE TABLE IF NOT EXISTS market_disabled_shares (
@@ -8799,6 +10641,105 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             nonce TEXT NOT NULL,
             created_at TEXT NOT NULL,
             PRIMARY KEY (installation_id, action, nonce)
+        );
+
+        CREATE TABLE IF NOT EXISTS installation_notification_state (
+            installation_id TEXT PRIMARY KEY,
+            registration_state TEXT NOT NULL DEFAULT 'provisional',
+            registration_verified_at TEXT,
+            monitoring_enabled INTEGER NOT NULL DEFAULT 0,
+            presence_state TEXT NOT NULL DEFAULT 'unknown',
+            last_authenticated_seen_at TEXT,
+            last_boot_id TEXT,
+            offline_candidate_since TEXT,
+            offline_since TEXT,
+            recovery_candidate_since TEXT,
+            last_recovered_at TEXT,
+            offline_episode INTEGER NOT NULL DEFAULT 0,
+            last_offline_event_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (installation_id) REFERENCES installations(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS client_notification_events (
+            id TEXT PRIMARY KEY,
+            dedupe_key TEXT NOT NULL UNIQUE,
+            kind TEXT NOT NULL,
+            installation_id TEXT NOT NULL,
+            episode INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            not_before TEXT NOT NULL,
+            snapshot_json TEXT NOT NULL,
+            suppression_reason TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS email_delivery_batches (
+            id TEXT PRIMARY KEY,
+            notification_lane TEXT NOT NULL DEFAULT 'registration'
+                CHECK (notification_lane IN ('offline', 'registration')),
+            recipient TEXT NOT NULL,
+            recipient_priority INTEGER NOT NULL DEFAULT 0,
+            from_address TEXT NOT NULL,
+            reply_to TEXT,
+            subject TEXT NOT NULL,
+            html_body TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            not_before TEXT NOT NULL,
+            next_attempt_at TEXT,
+            claim_owner TEXT,
+            claim_expires_at TEXT,
+            provider_message_id TEXT,
+            error_message TEXT,
+            template_fingerprint TEXT NOT NULL,
+            delivery_kind TEXT NOT NULL DEFAULT 'lifecycle',
+            incident_key TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            sent_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS email_delivery_batch_items (
+            batch_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            recipient TEXT NOT NULL,
+            PRIMARY KEY (batch_id, event_id, recipient),
+            UNIQUE (event_id, recipient),
+            FOREIGN KEY (batch_id) REFERENCES email_delivery_batches(id) ON DELETE CASCADE,
+            FOREIGN KEY (event_id) REFERENCES client_notification_events(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS client_notification_runtime (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            enabled INTEGER NOT NULL DEFAULT 0,
+            enabled_since TEXT,
+            policy_fingerprint TEXT,
+            delivery_configured INTEGER NOT NULL DEFAULT 0,
+            template_fingerprint TEXT,
+            recipient_hourly_limit INTEGER NOT NULL DEFAULT 10,
+            global_hourly_limit INTEGER NOT NULL DEFAULT 50,
+            registration_recipient_hourly_limit INTEGER NOT NULL DEFAULT 3,
+            registration_global_hourly_limit INTEGER NOT NULL DEFAULT 10,
+            registration_overflow_active INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS client_registration_notification_overflow (
+            window_start TEXT PRIMARY KEY,
+            window_end TEXT NOT NULL,
+            event_count INTEGER NOT NULL DEFAULT 0,
+            first_occurred_at TEXT NOT NULL,
+            last_occurred_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'materialized')),
+            summary_event_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS users (
@@ -8929,6 +10870,16 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         );
 
         CREATE INDEX IF NOT EXISTS idx_leases_installation_id ON leases(installation_id);
+        CREATE INDEX IF NOT EXISTS idx_registration_admission_source_time
+            ON registration_admission_events(source_scope, occurred_at_ms);
+        CREATE INDEX IF NOT EXISTS idx_registration_admission_time
+            ON registration_admission_events(occurred_at_ms);
+        CREATE INDEX IF NOT EXISTS idx_registration_geo_cache_cached
+            ON registration_geo_cache(status, cached_at_ms);
+        CREATE INDEX IF NOT EXISTS idx_registration_geo_cache_claim
+            ON registration_geo_cache(status, claim_expires_at_ms);
+        CREATE INDEX IF NOT EXISTS idx_installations_unowned
+            ON installations(owner_verified_at) WHERE owner_verified_at IS NULL;
         CREATE INDEX IF NOT EXISTS idx_leases_subdomain ON leases(subdomain);
         CREATE INDEX IF NOT EXISTS idx_installation_client_tunnels_owner ON installation_client_tunnels(owner_email, updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_shares_installation_id ON shares(installation_id);
@@ -8947,6 +10898,34 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         CREATE INDEX IF NOT EXISTS idx_share_model_health_checks_share ON share_model_health_checks(share_id, app_type, requested_model, checked_at DESC);
         CREATE INDEX IF NOT EXISTS idx_share_model_health_state_share ON share_model_health_state(share_id, app_type, last_status);
         CREATE INDEX IF NOT EXISTS idx_dashboard_presence_last_seen ON dashboard_presence(last_seen_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_installation_notification_presence
+            ON installation_notification_state(monitoring_enabled, presence_state, last_authenticated_seen_at);
+        CREATE INDEX IF NOT EXISTS idx_client_notification_events_pending
+            ON client_notification_events(status, not_before, occurred_at);
+        CREATE INDEX IF NOT EXISTS idx_client_notification_events_lane_pending
+            ON client_notification_events(status, kind, not_before, occurred_at, id);
+        CREATE INDEX IF NOT EXISTS idx_client_notification_events_installation_kind_status
+            ON client_notification_events(installation_id, kind, status);
+        CREATE INDEX IF NOT EXISTS idx_client_notification_events_storm
+            ON client_notification_events(status, occurred_at, kind, installation_id);
+        CREATE INDEX IF NOT EXISTS idx_email_delivery_batches_claim
+            ON email_delivery_batches(status, next_attempt_at, not_before, claim_expires_at);
+        CREATE INDEX IF NOT EXISTS idx_email_delivery_batches_send_cap
+            ON email_delivery_batches(status, sent_at);
+        CREATE INDEX IF NOT EXISTS idx_email_delivery_batches_claim_cap
+            ON email_delivery_batches(status, claim_expires_at);
+        CREATE INDEX IF NOT EXISTS idx_email_delivery_batches_recipient_send_cap
+            ON email_delivery_batches(LOWER(recipient), status, sent_at);
+        CREATE INDEX IF NOT EXISTS idx_email_delivery_batches_recipient_claim_cap
+            ON email_delivery_batches(LOWER(recipient), status, claim_expires_at);
+        CREATE INDEX IF NOT EXISTS idx_email_delivery_batches_recent
+            ON email_delivery_batches(created_at DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_email_delivery_batches_retention
+            ON email_delivery_batches(updated_at, status);
+        CREATE INDEX IF NOT EXISTS idx_client_notification_events_retention
+            ON client_notification_events(updated_at, status);
+        CREATE INDEX IF NOT EXISTS idx_client_registration_notification_overflow_pending
+            ON client_registration_notification_overflow(status, window_end, window_start);
         CREATE INDEX IF NOT EXISTS idx_dashboard_ux_events_created ON dashboard_ux_events(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_email_send_logs_created_at ON email_send_logs(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_request_nonces_created_at ON request_nonces(created_at DESC);
@@ -9396,6 +11375,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         conn.execute("ALTER TABLE shares DROP COLUMN share_token", [])
             .map_err(|e| AppError::Internal(format!("drop shares.share_token failed: {e}")))?;
     }
+    add_column_if_missing(conn, "share_edit_requests", "retired_at", "TEXT")?;
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_shares_subdomain_unique ON shares(subdomain) WHERE subdomain IS NOT NULL",
         [],
@@ -9528,6 +11508,130 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         "TEXT NOT NULL DEFAULT ''",
     )?;
     add_column_if_missing(conn, "user_api_tokens", "token_plaintext", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "email_delivery_batches",
+        "recipient_priority",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        conn,
+        "email_delivery_batches",
+        "notification_lane",
+        "TEXT NOT NULL DEFAULT 'registration' CHECK (notification_lane IN ('offline', 'registration'))",
+    )?;
+    conn.execute(
+        "UPDATE email_delivery_batches
+         SET notification_lane = CASE
+             WHEN EXISTS (
+                 SELECT 1
+                 FROM email_delivery_batch_items bi
+                 INNER JOIN client_notification_events e ON e.id = bi.event_id
+                 WHERE bi.batch_id = email_delivery_batches.id
+                   AND e.kind = 'client_offline'
+             ) THEN 'offline'
+             ELSE 'registration'
+         END",
+        [],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "backfill notification delivery lanes failed: {error}"
+        ))
+    })?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_email_delivery_batches_priority_claim
+         ON email_delivery_batches(
+             notification_lane, recipient_priority, status, next_attempt_at, not_before,
+             claim_expires_at
+         )",
+        [],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "create prioritized notification claim index failed: {error}"
+        ))
+    })?;
+    add_column_if_missing(
+        conn,
+        "email_delivery_batches",
+        "from_address",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column_if_missing(conn, "email_delivery_batches", "reply_to", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "email_delivery_batches",
+        "delivery_kind",
+        "TEXT NOT NULL DEFAULT 'lifecycle'",
+    )?;
+    add_column_if_missing(conn, "email_delivery_batches", "incident_key", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "client_notification_runtime",
+        "recipient_hourly_limit",
+        "INTEGER NOT NULL DEFAULT 10",
+    )?;
+    add_column_if_missing(
+        conn,
+        "client_notification_runtime",
+        "global_hourly_limit",
+        "INTEGER NOT NULL DEFAULT 50",
+    )?;
+    add_column_if_missing(
+        conn,
+        "client_notification_runtime",
+        "registration_recipient_hourly_limit",
+        "INTEGER NOT NULL DEFAULT 3",
+    )?;
+    add_column_if_missing(
+        conn,
+        "client_notification_runtime",
+        "registration_global_hourly_limit",
+        "INTEGER NOT NULL DEFAULT 10",
+    )?;
+    add_column_if_missing(
+        conn,
+        "client_notification_runtime",
+        "registration_overflow_active",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_client_notification_events_lane_pending
+             ON client_notification_events(status, kind, not_before, occurred_at, id);
+         CREATE INDEX IF NOT EXISTS idx_email_delivery_batches_lane_claim
+             ON email_delivery_batches(
+                 notification_lane, status, next_attempt_at, not_before,
+                 claim_expires_at, recipient_priority, created_at, id
+             );
+         CREATE INDEX IF NOT EXISTS idx_email_delivery_batches_lane_send_cap
+             ON email_delivery_batches(notification_lane, status, sent_at);
+         CREATE INDEX IF NOT EXISTS idx_email_delivery_batches_lane_claim_cap
+             ON email_delivery_batches(notification_lane, status, claim_expires_at);
+         CREATE INDEX IF NOT EXISTS idx_email_delivery_batches_recipient_lane_send_cap
+             ON email_delivery_batches(
+                 LOWER(recipient), notification_lane, status, sent_at
+             );
+         CREATE INDEX IF NOT EXISTS idx_email_delivery_batches_recipient_lane_claim_cap
+             ON email_delivery_batches(
+                 LOWER(recipient), notification_lane, status, claim_expires_at
+             );
+         CREATE INDEX IF NOT EXISTS idx_client_registration_notification_overflow_pending
+             ON client_registration_notification_overflow(status, window_end, window_start);",
+    )
+    .map_err(|error| {
+        AppError::Internal(format!("create notification lane indexes failed: {error}"))
+    })?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_email_delivery_batches_incident
+         ON email_delivery_batches(recipient, incident_key, created_at DESC)",
+        [],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "create notification incident index failed: {error}"
+        ))
+    })?;
     add_column_if_missing(conn, "market_request_logs", "error_message", "TEXT")?;
     add_column_if_missing(conn, "market_request_logs", "user_country", "TEXT")?;
     add_column_if_missing(conn, "market_request_logs", "user_country_iso3", "TEXT")?;
@@ -9580,6 +11684,1269 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         [],
     )
     .map_err(|e| AppError::Internal(format!("backfill installation owner email failed: {e}")))?;
+    conn.execute(
+        "INSERT OR IGNORE INTO installation_notification_state (
+            installation_id, registration_state, monitoring_enabled, presence_state,
+            created_at, updated_at
+         )
+         SELECT id, 'baseline', 0, 'unknown', created_at, last_seen_at
+         FROM installations",
+        [],
+    )
+    .map_err(|e| {
+        AppError::Internal(format!(
+            "baseline existing installation notification state failed: {e}"
+        ))
+    })?;
+    ensure_installation_public_key_uniqueness(conn)?;
+    Ok(())
+}
+
+fn ensure_installation_public_key_uniqueness(conn: &Connection) -> Result<(), AppError> {
+    let duplicates = conn
+        .prepare(
+            "SELECT public_key, GROUP_CONCAT(id, ',')
+             FROM installations
+             GROUP BY public_key
+             HAVING COUNT(*) > 1
+             ORDER BY public_key",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "inspect duplicate installation keys failed: {error}"
+            ))
+        })?;
+    if !duplicates.is_empty() {
+        let conflicts = duplicates
+            .into_iter()
+            .map(|(key, ids)| format!("{} => [{}]", client_identity_hash(&key), ids))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(AppError::Internal(format!(
+            "duplicate installation public keys require explicit data consolidation before migration: {conflicts}"
+        )));
+    }
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_installations_public_key_unique
+         ON installations(public_key)",
+        [],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "create installation public key unique index failed: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+fn initialize_client_notification_runtime(
+    conn: &Connection,
+    policy: &ClientNotificationPolicy,
+    template: &NotificationTemplateContext,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let tx = conn.unchecked_transaction().map_err(|error| {
+        AppError::Internal(format!(
+            "begin client notification runtime initialization failed: {error}"
+        ))
+    })?;
+    let mut stats = NotificationReconcileStats::default();
+    sync_client_notification_runtime_tx(&tx, policy, Some(template), now, &mut stats)?;
+    tx.commit().map_err(|error| {
+        AppError::Internal(format!(
+            "commit client notification runtime initialization failed: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+fn client_notification_policy_fingerprint(policy: &ClientNotificationPolicy) -> String {
+    let bytes = serde_json::to_vec(policy).expect("client notification policy is serializable");
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn client_notification_policy_is_current(
+    conn: &Connection,
+    policy: &ClientNotificationPolicy,
+) -> Result<bool, AppError> {
+    let expected_fingerprint = client_notification_policy_fingerprint(policy);
+    let current = conn
+        .query_row(
+            "SELECT enabled, policy_fingerprint FROM client_notification_runtime WHERE id = 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "read client notification policy version failed: {error}"
+            ))
+        })?;
+    Ok(current.is_some_and(|(enabled, fingerprint)| {
+        enabled == policy.enabled && fingerprint.as_deref() == Some(expected_fingerprint.as_str())
+    }))
+}
+
+fn client_notification_runtime_enabled(conn: &Connection) -> Result<bool, AppError> {
+    conn.query_row(
+        "SELECT enabled FROM client_notification_runtime WHERE id = 1",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .map(|value| value == Some(1))
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "read client notification runtime state failed: {error}"
+        ))
+    })
+}
+
+fn suppress_disabled_notification_work_tx(
+    conn: &Connection,
+    now: DateTime<Utc>,
+    stats: &mut NotificationReconcileStats,
+) -> Result<(), AppError> {
+    let timestamp = now.to_rfc3339();
+    let suppressed = conn
+        .execute(
+            "UPDATE client_notification_events
+             SET status = 'suppressed_disabled', suppression_reason = 'notifications disabled',
+                 updated_at = ?1
+             WHERE status IN ('pending', 'batched')",
+            params![timestamp],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "suppress disabled notification events failed: {error}"
+            ))
+        })?;
+    stats.suppressed_disabled += suppressed as u64;
+    conn.execute(
+        "UPDATE email_delivery_batches
+         SET status = 'suppressed_disabled', error_message = 'notifications disabled',
+             next_attempt_at = NULL, claim_owner = NULL, claim_expires_at = NULL,
+             updated_at = ?1
+         WHERE status IN ('pending', 'retry', 'blocked_config')
+            OR (status = 'claimed' AND claim_expires_at <= ?1)",
+        params![timestamp],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "suppress disabled notification batches failed: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+fn sync_client_notification_runtime_tx(
+    conn: &Connection,
+    policy: &ClientNotificationPolicy,
+    template: Option<&NotificationTemplateContext>,
+    now: DateTime<Utc>,
+    stats: &mut NotificationReconcileStats,
+) -> Result<(), AppError> {
+    let timestamp = now.to_rfc3339();
+    let previous = conn
+        .query_row(
+            "SELECT enabled, enabled_since FROM client_notification_runtime WHERE id = 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "read client notification activation failed: {error}"
+            ))
+        })?;
+    let enabled_since = match previous {
+        Some((1, value)) if policy.enabled => value.or_else(|| Some(timestamp.clone())),
+        _ if policy.enabled => Some(timestamp.clone()),
+        _ => None,
+    };
+    let policy_fingerprint = client_notification_policy_fingerprint(policy);
+    let (delivery_configured, template_fingerprint) = template
+        .map(|value| {
+            (
+                i64::from(value.delivery_configured),
+                Some(value.delivery_config_fingerprint.as_str()),
+            )
+        })
+        .unwrap_or((0, None));
+    conn.execute(
+        "INSERT INTO client_notification_runtime (
+            id, enabled, enabled_since, policy_fingerprint, delivery_configured,
+            template_fingerprint, recipient_hourly_limit, global_hourly_limit,
+            registration_recipient_hourly_limit, registration_global_hourly_limit,
+            updated_at
+         ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(id) DO UPDATE SET
+            enabled = excluded.enabled,
+            enabled_since = excluded.enabled_since,
+            policy_fingerprint = excluded.policy_fingerprint,
+            delivery_configured = CASE WHEN ?11 = 1 THEN excluded.delivery_configured ELSE delivery_configured END,
+            template_fingerprint = COALESCE(excluded.template_fingerprint, template_fingerprint),
+            recipient_hourly_limit = excluded.recipient_hourly_limit,
+            global_hourly_limit = excluded.global_hourly_limit,
+            registration_recipient_hourly_limit = excluded.registration_recipient_hourly_limit,
+            registration_global_hourly_limit = excluded.registration_global_hourly_limit,
+            registration_overflow_active = CASE
+                WHEN excluded.enabled = 0 THEN 0
+                ELSE registration_overflow_active
+            END,
+            updated_at = excluded.updated_at",
+        params![
+            i64::from(policy.enabled),
+            enabled_since,
+            policy_fingerprint,
+            delivery_configured,
+            template_fingerprint,
+            policy.recipient_hourly_limit,
+            policy.global_hourly_limit,
+            policy.registration_recipient_hourly_limit,
+            policy.registration_global_hourly_limit,
+            timestamp,
+            i64::from(template.is_some()),
+        ],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!("update client notification activation failed: {error}"))
+    })?;
+
+    if !policy.enabled {
+        suppress_disabled_notification_work_tx(conn, now, stats)?;
+        return Ok(());
+    }
+
+    if let Some(enabled_since) = enabled_since.as_deref() {
+        let suppressed = conn
+            .execute(
+                "UPDATE client_notification_events
+                 SET status = 'suppressed_before_activation',
+                     suppression_reason = 'event predates notification activation', updated_at = ?2
+                 WHERE status = 'pending' AND occurred_at < ?1",
+                params![enabled_since, timestamp],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("suppress pre-activation events failed: {error}"))
+            })?;
+        stats.suppressed_disabled += suppressed as u64;
+    }
+
+    if policy.alert_emails.is_empty() && !policy.notify_owner {
+        let suppressed = conn
+            .execute(
+                "UPDATE client_notification_events
+                 SET status = 'suppressed_no_recipient',
+                     suppression_reason = 'no notification recipients configured', updated_at = ?1
+                 WHERE status = 'pending'",
+                params![timestamp],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("suppress recipientless events failed: {error}"))
+            })?;
+        stats.suppressed_recipient_removed += suppressed as u64;
+    }
+
+    if template.is_some_and(|value| value.delivery_configured) {
+        let invalid_batches = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT id FROM email_delivery_batches
+                     WHERE status = 'blocked_config' AND from_address = ''",
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "prepare invalid notification batches failed: {error}"
+                    ))
+                })?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "query invalid notification batches failed: {error}"
+                    ))
+                })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+                AppError::Internal(format!("read invalid notification batches failed: {error}"))
+            })?
+        };
+        for batch_id in invalid_batches {
+            conn.execute(
+                "UPDATE client_notification_events
+                 SET status = 'pending', updated_at = ?2
+                 WHERE status = 'batched' AND id IN (
+                     SELECT event_id FROM email_delivery_batch_items WHERE batch_id = ?1
+                 )",
+                params![batch_id, timestamp],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("requeue invalid-envelope events failed: {error}"))
+            })?;
+            conn.execute(
+                "DELETE FROM email_delivery_batch_items WHERE batch_id = ?1",
+                params![batch_id],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("release invalid-envelope items failed: {error}"))
+            })?;
+            conn.execute(
+                "UPDATE email_delivery_batches
+                 SET status = 'suppressed_config_changed',
+                     error_message = 'delivery envelope became valid after batch freeze',
+                     next_attempt_at = NULL, updated_at = ?2
+                 WHERE id = ?1 AND status = 'blocked_config'",
+                params![batch_id, timestamp],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("suppress invalid-envelope batch failed: {error}"))
+            })?;
+        }
+        conn.execute(
+            "UPDATE email_delivery_batches
+             SET status = 'retry', next_attempt_at = ?1, error_message = NULL,
+                 claim_owner = NULL, claim_expires_at = NULL, updated_at = ?1
+             WHERE status = 'blocked_config' AND from_address != ''",
+            params![timestamp],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "resume configured notification batches failed: {error}"
+            ))
+        })?;
+    }
+
+    suppress_removed_notification_recipients(conn, policy, now, stats)?;
+    Ok(())
+}
+
+fn suppress_removed_notification_recipients(
+    conn: &Connection,
+    policy: &ClientNotificationPolicy,
+    now: DateTime<Utc>,
+    stats: &mut NotificationReconcileStats,
+) -> Result<(), AppError> {
+    let candidates = {
+        let mut statement = conn
+            .prepare(
+                "SELECT id, recipient FROM email_delivery_batches
+                 WHERE status IN ('pending', 'retry', 'blocked_config')
+                    OR (status = 'claimed' AND claim_expires_at <= ?1)",
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("prepare recipient revocation scan failed: {error}"))
+            })?;
+        let rows = statement
+            .query_map(params![now.to_rfc3339()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| {
+                AppError::Internal(format!("query recipient revocation scan failed: {error}"))
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+            AppError::Internal(format!("read recipient revocation scan failed: {error}"))
+        })?
+    };
+    let explicit = policy
+        .alert_emails
+        .iter()
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let timestamp = now.to_rfc3339();
+    for (batch_id, recipient) in candidates {
+        let recipient_priority = if explicit.contains(&recipient.to_ascii_lowercase()) {
+            Some(EXPLICIT_NOTIFICATION_RECIPIENT_PRIORITY)
+        } else if policy.notify_owner
+            && notification_batch_is_authorized_for_owner(conn, &batch_id, &recipient)?
+        {
+            Some(OWNER_NOTIFICATION_RECIPIENT_PRIORITY)
+        } else {
+            None
+        };
+        if let Some(recipient_priority) = recipient_priority {
+            conn.execute(
+                "UPDATE email_delivery_batches
+                 SET recipient_priority = ?2, updated_at = ?3
+                 WHERE id = ?1 AND recipient_priority != ?2",
+                params![batch_id, recipient_priority, timestamp],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "update notification recipient priority failed: {error}"
+                ))
+            })?;
+            continue;
+        }
+        let changed = conn
+            .execute(
+                "UPDATE email_delivery_batches
+                 SET status = 'suppressed_recipient_removed',
+                     error_message = 'recipient authorization removed',
+                     next_attempt_at = NULL, claim_owner = NULL, claim_expires_at = NULL,
+                     updated_at = ?2
+                 WHERE id = ?1",
+                params![batch_id, timestamp],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("suppress removed recipient failed: {error}"))
+            })?;
+        stats.suppressed_recipient_removed += changed as u64;
+    }
+    Ok(())
+}
+
+fn notification_batch_is_authorized_for_owner(
+    conn: &Connection,
+    batch_id: &str,
+    recipient: &str,
+) -> Result<bool, AppError> {
+    let (event_count, authorized_offline_event_count) = conn
+        .query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(CASE
+                        WHEN e.kind = 'client_offline'
+                         AND i.owner_verified_at IS NOT NULL
+                         AND LOWER(i.owner_email) = LOWER(?2)
+                         AND EXISTS (
+                             SELECT 1 FROM users u
+                             WHERE u.email_normalized = LOWER(i.owner_email)
+                               AND u.status = 'active'
+                         )
+                        THEN 1 ELSE 0 END), 0)
+             FROM email_delivery_batch_items bi
+             INNER JOIN client_notification_events e ON e.id = bi.event_id
+             LEFT JOIN installations i ON i.id = e.installation_id
+             WHERE bi.batch_id = ?1",
+            params![batch_id, recipient],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "validate notification owner event scope failed: {error}"
+            ))
+        })?;
+    Ok(event_count > 0 && authorized_offline_event_count == event_count)
+}
+
+fn merge_notification_aggregate_stats(
+    aggregate: &mut NotificationAggregateStats,
+    lane: NotificationAggregateStats,
+) {
+    aggregate.batches_created += lane.batches_created;
+    aggregate.events_batched += lane.events_batched;
+    aggregate.incident_digests += lane.incident_digests;
+    aggregate.deferred_by_recipient_cap += lane.deferred_by_recipient_cap;
+    aggregate.deferred_by_global_cap += lane.deferred_by_global_cap;
+}
+
+fn materialize_registration_overflow_events_tx(
+    conn: &Connection,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let windows = {
+        let mut statement = conn
+            .prepare(
+                "SELECT window_start, window_end, event_count,
+                        first_occurred_at, last_occurred_at
+                 FROM client_registration_notification_overflow
+                 WHERE status = 'pending' AND window_end <= ?1
+                 ORDER BY window_start
+                 LIMIT 1000",
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "prepare registration overflow materialization failed: {error}"
+                ))
+            })?;
+        let rows = statement
+            .query_map(params![now.to_rfc3339()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "query registration overflow materialization failed: {error}"
+                ))
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+            AppError::Internal(format!(
+                "read registration overflow materialization failed: {error}"
+            ))
+        })?
+    };
+
+    for (window_start, window_end, event_count, first_occurred_at, last_occurred_at) in windows {
+        let dedupe_key = format!("registration-overflow:{window_start}");
+        let event_id = Uuid::new_v4().to_string();
+        let snapshot = serde_json::json!({
+            "registrationCount": event_count.max(0) as u64,
+            "windowStart": window_start,
+            "windowEnd": window_end,
+            "firstOccurredAt": first_occurred_at,
+            "lastOccurredAt": last_occurred_at,
+        });
+        conn.execute(
+            "INSERT OR IGNORE INTO client_notification_events (
+                id, dedupe_key, kind, installation_id, episode, status,
+                occurred_at, not_before, snapshot_json, created_at, updated_at
+             ) VALUES (
+                ?1, ?2, 'client_registration_overflow', ?3, 0, 'pending',
+                ?4, ?5, ?6, ?7, ?7
+             )",
+            params![
+                event_id,
+                dedupe_key,
+                format!("registration-overflow:{window_start}"),
+                last_occurred_at,
+                window_end,
+                snapshot.to_string(),
+                now.to_rfc3339(),
+            ],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "insert registration overflow summary event failed: {error}"
+            ))
+        })?;
+        let summary_event_id = conn
+            .query_row(
+                "SELECT id FROM client_notification_events WHERE dedupe_key = ?1",
+                params![dedupe_key],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "read registration overflow summary event failed: {error}"
+                ))
+            })?;
+        conn.execute(
+            "UPDATE client_registration_notification_overflow
+             SET status = 'materialized', summary_event_id = ?2, updated_at = ?3
+             WHERE window_start = ?1 AND status = 'pending'",
+            params![window_start, summary_event_id, now.to_rfc3339()],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "finish registration overflow materialization failed: {error}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn load_pending_notification_events(
+    conn: &Connection,
+    now: DateTime<Utc>,
+    offline_cutoff: DateTime<Utc>,
+    lane: NotificationLane,
+) -> Result<Vec<PendingClientNotificationEvent>, AppError> {
+    let occurred_cutoff = match lane {
+        NotificationLane::Offline => offline_cutoff,
+        NotificationLane::Registration => now - Duration::seconds(5),
+    };
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT e.id, e.kind, e.installation_id, e.occurred_at, e.snapshot_json,
+                    CASE WHEN i.owner_verified_at IS NOT NULL
+                               AND EXISTS (
+                                   SELECT 1 FROM users u
+                                   WHERE u.email_normalized = LOWER(i.owner_email)
+                                     AND u.status = 'active'
+                               )
+                         THEN LOWER(i.owner_email) ELSE NULL END
+             FROM client_notification_events e
+             LEFT JOIN installations i ON i.id = e.installation_id
+             WHERE e.status = 'pending' AND e.not_before <= ?1
+               AND {} AND e.occurred_at <= ?2
+             ORDER BY CASE WHEN e.kind = 'client_registration_overflow' THEN 0 ELSE 1 END,
+                      e.occurred_at, e.id
+             LIMIT 1000",
+            lane.event_sql_predicate()
+        ))
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "prepare pending notification events failed: {error}"
+            ))
+        })?;
+    let rows = statement
+        .query_map(
+            params![now.to_rfc3339(), occurred_cutoff.to_rfc3339()],
+            |row| {
+                let snapshot_json = row.get::<_, String>(4)?;
+                let snapshot = serde_json::from_str(&snapshot_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                Ok(PendingClientNotificationEvent {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    installation_id: row.get(2)?,
+                    occurred_at: parse_dt_sql(&row.get::<_, String>(3)?)?,
+                    snapshot,
+                    verified_owner_email: row.get(5)?,
+                })
+            },
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("query pending notification events failed: {error}"))
+        })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+        AppError::Internal(format!("read pending notification events failed: {error}"))
+    })
+}
+
+fn notification_event_recipients(
+    event: &PendingClientNotificationEvent,
+    policy: &ClientNotificationPolicy,
+) -> Vec<ClientNotificationRecipient> {
+    let mut recipients = BTreeMap::<String, i64>::new();
+    for email in &policy.alert_emails {
+        recipients.insert(
+            email.to_ascii_lowercase(),
+            EXPLICIT_NOTIFICATION_RECIPIENT_PRIORITY,
+        );
+    }
+    if policy.notify_owner && event.kind == "client_offline" {
+        if let Some(owner) = event.verified_owner_email.as_deref() {
+            recipients
+                .entry(owner.to_ascii_lowercase())
+                .or_insert(OWNER_NOTIFICATION_RECIPIENT_PRIORITY);
+        }
+    }
+    recipients
+        .into_iter()
+        .map(|(email, priority)| ClientNotificationRecipient { email, priority })
+        .collect()
+}
+
+fn preempt_lower_priority_notification_reservations(
+    conn: &Connection,
+    lane: NotificationLane,
+    recipient_priority: i64,
+    hour_cutoff: &str,
+    now: &str,
+    limit: i64,
+) -> Result<i64, AppError> {
+    if limit <= 0 {
+        return Ok(0);
+    }
+    conn.execute(
+        "UPDATE email_delivery_batches
+         SET status = 'suppressed_rate_limit',
+             error_message = 'preempted by higher-priority explicit recipient',
+             next_attempt_at = NULL, claim_owner = NULL, claim_expires_at = NULL,
+             updated_at = ?3
+         WHERE id IN (
+             SELECT id FROM email_delivery_batches
+             WHERE created_at >= ?2 AND recipient_priority > ?1
+               AND notification_lane = ?5
+               AND (
+                   status IN ('pending', 'retry', 'blocked_config')
+                   OR (status = 'claimed' AND claim_expires_at <= ?3)
+               )
+             ORDER BY recipient_priority DESC, created_at DESC, id DESC
+             LIMIT ?4
+         )",
+        params![recipient_priority, hour_cutoff, now, limit, lane.as_str()],
+    )
+    .map(|changed| changed as i64)
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "preempt lower-priority notification reservations failed: {error}"
+        ))
+    })
+}
+
+fn load_incident_client_ids(
+    conn: &Connection,
+    event_kind: Option<&str>,
+    window_start: &str,
+    owner_recipient: Option<&str>,
+) -> Result<Vec<String>, AppError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT e.installation_id
+             FROM client_notification_events e
+             LEFT JOIN installations i ON i.id = e.installation_id
+             WHERE e.occurred_at >= ?1
+               AND e.occurred_at >= COALESCE(
+                   (SELECT enabled_since FROM client_notification_runtime WHERE id = 1), ?1
+               )
+               AND e.status IN ('pending', 'batched')
+               AND (?2 IS NULL OR e.kind = ?2)
+               AND (
+                   ?3 IS NULL OR (
+                       i.owner_verified_at IS NOT NULL
+                       AND LOWER(i.owner_email) = LOWER(?3)
+                       AND EXISTS (
+                           SELECT 1 FROM users u
+                           WHERE u.email_normalized = LOWER(i.owner_email)
+                             AND u.status = 'active'
+                       )
+                   )
+               )
+             GROUP BY e.installation_id
+             ORDER BY MAX(e.occurred_at) DESC
+             LIMIT 100",
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("prepare incident client list failed: {error}"))
+        })?;
+    let rows = statement
+        .query_map(params![window_start, event_kind, owner_recipient], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|error| {
+            AppError::Internal(format!("query incident client list failed: {error}"))
+        })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| AppError::Internal(format!("read incident client list failed: {error}")))
+}
+
+fn notification_snapshot_string(snapshot: &serde_json::Value, key: &str) -> Option<String> {
+    snapshot
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+fn render_client_notification_batch(
+    events: &[PendingClientNotificationEvent],
+    incident: bool,
+    dashboard_url: &str,
+    now: DateTime<Utc>,
+) -> Result<crate::notifications::RenderedNotificationEmail, AppError> {
+    let Some(first) = events.first() else {
+        return Err(AppError::Internal(
+            "cannot render an empty notification batch".into(),
+        ));
+    };
+    if events
+        .iter()
+        .any(|event| event.kind == "client_registration_overflow")
+    {
+        let count = events.iter().fold(0_u64, |total, event| {
+            let event_count = if event.kind == "client_registration_overflow" {
+                event
+                    .snapshot
+                    .get("registrationCount")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+            } else {
+                1
+            };
+            total.saturating_add(event_count)
+        });
+        let window_start = events
+            .iter()
+            .map(|event| {
+                notification_snapshot_string(&event.snapshot, "windowStart")
+                    .unwrap_or_else(|| event.occurred_at.to_rfc3339())
+            })
+            .min()
+            .unwrap_or_else(|| first.occurred_at.to_rfc3339());
+        let window_end = events
+            .iter()
+            .map(|event| {
+                notification_snapshot_string(&event.snapshot, "windowEnd")
+                    .unwrap_or_else(|| event.occurred_at.to_rfc3339())
+            })
+            .max()
+            .unwrap_or_else(|| first.occurred_at.to_rfc3339());
+        return Ok(render_registration_overflow_email(
+            &RegistrationOverflowEmailData {
+                count,
+                window_start,
+                window_end,
+                dashboard_url: dashboard_url.to_string(),
+            },
+        ));
+    }
+    if events.len() == 1 && !incident {
+        return match first.kind.as_str() {
+            "client_registered" => Ok(render_registration_email(&RegistrationEmailData {
+                installation_id: first.installation_id.clone(),
+                platform: notification_snapshot_string(&first.snapshot, "platform")
+                    .unwrap_or_else(|| "unknown".into()),
+                version: notification_snapshot_string(&first.snapshot, "appVersion"),
+                country_code: notification_snapshot_string(&first.snapshot, "countryCode"),
+                registered_at: notification_snapshot_string(&first.snapshot, "registeredAt")
+                    .unwrap_or_else(|| first.occurred_at.to_rfc3339()),
+                dashboard_url: dashboard_url.to_string(),
+            })),
+            "client_offline" => Ok(render_offline_email(&OfflineEmailData {
+                installation_id: first.installation_id.clone(),
+                tunnel_subdomain: notification_snapshot_string(&first.snapshot, "tunnelSubdomain"),
+                owner_email: first.verified_owner_email.clone(),
+                version: notification_snapshot_string(&first.snapshot, "appVersion"),
+                last_authenticated_seen_at: notification_snapshot_string(
+                    &first.snapshot,
+                    "lastAuthenticatedSeenAt",
+                )
+                .unwrap_or_else(|| first.occurred_at.to_rfc3339()),
+                offline_since: notification_snapshot_string(&first.snapshot, "offlineSince")
+                    .unwrap_or_else(|| first.occurred_at.to_rfc3339()),
+                dashboard_url: dashboard_url.to_string(),
+            })),
+            kind => Err(AppError::Internal(format!(
+                "unsupported client notification event kind: {kind}"
+            ))),
+        };
+    }
+    let all_registered = events.iter().all(|event| event.kind == "client_registered");
+    let all_offline = events.iter().all(|event| event.kind == "client_offline");
+    let event_label = if all_registered {
+        "registrations"
+    } else if all_offline {
+        "offline clients"
+    } else {
+        "lifecycle events"
+    };
+    Ok(render_digest_email(&DigestEmailData {
+        event_label: event_label.to_string(),
+        incident,
+        clients: events
+            .iter()
+            .map(|event| event.installation_id.clone())
+            .collect(),
+        occurred_at: now.to_rfc3339(),
+        dashboard_url: dashboard_url.to_string(),
+    }))
+}
+
+fn cancel_notification_batch_tx(
+    conn: &Connection,
+    batch_id: &str,
+    worker_id: &str,
+    status: &str,
+    reason: &str,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let changed = conn
+        .execute(
+            "UPDATE email_delivery_batches
+             SET status = ?3, error_message = ?4, next_attempt_at = NULL, claim_owner = NULL,
+                 claim_expires_at = NULL, updated_at = ?5
+             WHERE id = ?1 AND status = 'claimed' AND claim_owner = ?2",
+            params![batch_id, worker_id, status, reason, now.to_rfc3339()],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("cancel notification batch failed: {error}"))
+        })?;
+    if changed != 1 {
+        return Err(AppError::Conflict(
+            "notification batch claim is no longer owned by this worker".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn remove_stale_route_snapshots(
+    proxy: &ProxyRegistry,
+    stale_subdomains: Vec<String>,
+    route_connections: &HashMap<String, Option<String>>,
+) -> usize {
+    let mut removed = 0;
+    for subdomain in stale_subdomains {
+        let Some(Some(connection_id)) = route_connections.get(&subdomain) else {
+            // Routes without a lease connection id cannot be removed safely:
+            // a reconnect may have replaced the snapshot after cleanup began.
+            continue;
+        };
+        if proxy
+            .remove_route_if_connection(&subdomain, connection_id)
+            .await
+        {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn cleanup_client_notification_queue_tx(
+    conn: &Connection,
+    now: DateTime<Utc>,
+) -> Result<(usize, usize), AppError> {
+    let timestamp = now.to_rfc3339();
+    let registration_cutoff =
+        (now - Duration::seconds(CLIENT_NOTIFICATION_REGISTRATION_PENDING_TTL_SECS)).to_rfc3339();
+    conn.execute(
+        "UPDATE client_notification_events
+         SET status = 'suppressed_expired',
+             suppression_reason = 'registration notification pending TTL expired',
+             updated_at = ?1
+         WHERE status = 'pending'
+           AND kind IN ('client_registered', 'client_registration_overflow')
+           AND occurred_at < ?2",
+        params![timestamp, registration_cutoff],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "expire stale registration notification events failed: {error}"
+        ))
+    })?;
+
+    let low_value_event_count = conn
+        .query_row(
+            "SELECT COUNT(*) FROM client_notification_events e
+             WHERE (e.status LIKE 'suppressed_%' OR e.status = 'batched')
+               AND NOT EXISTS (
+                    SELECT 1
+                    FROM email_delivery_batch_items bi
+                    INNER JOIN email_delivery_batches b ON b.id = bi.batch_id
+                    WHERE bi.event_id = e.id AND b.status NOT LIKE 'suppressed_%'
+               )",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "count low-value notification event audit failed: {error}"
+            ))
+        })?;
+    let events_to_release = if low_value_event_count > CLIENT_NOTIFICATION_AUDIT_HIGH_WATERMARK {
+        low_value_event_count.saturating_sub(CLIENT_NOTIFICATION_AUDIT_TARGET)
+    } else {
+        0
+    };
+    let event_driven_deleted_batches = if events_to_release > 0 {
+        conn.execute(
+            "DELETE FROM email_delivery_batches
+             WHERE status LIKE 'suppressed_%'
+               AND id IN (
+                   SELECT DISTINCT bi.batch_id
+                   FROM email_delivery_batch_items bi
+                   WHERE bi.event_id IN (
+                       SELECT e.id FROM client_notification_events e
+                       WHERE (e.status LIKE 'suppressed_%' OR e.status = 'batched')
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM email_delivery_batch_items candidate_bi
+                             INNER JOIN email_delivery_batches candidate_b
+                               ON candidate_b.id = candidate_bi.batch_id
+                             WHERE candidate_bi.event_id = e.id
+                               AND candidate_b.status NOT LIKE 'suppressed_%'
+                         )
+                       ORDER BY e.occurred_at, e.id
+                       LIMIT ?1
+                   )
+               )",
+            params![events_to_release],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "release low-value notification event batches failed: {error}"
+            ))
+        })?
+    } else {
+        0
+    };
+
+    let suppressed_batch_count = conn
+        .query_row(
+            "SELECT COUNT(*) FROM email_delivery_batches
+             WHERE status LIKE 'suppressed_%'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "count suppressed notification batch audit failed: {error}"
+            ))
+        })?;
+    let batches_to_delete = if suppressed_batch_count > CLIENT_NOTIFICATION_AUDIT_HIGH_WATERMARK {
+        suppressed_batch_count.saturating_sub(CLIENT_NOTIFICATION_AUDIT_TARGET)
+    } else {
+        0
+    };
+    let watermark_deleted_batches = if batches_to_delete > 0 {
+        conn.execute(
+            "DELETE FROM email_delivery_batches
+             WHERE id IN (
+                 SELECT id FROM email_delivery_batches
+                 WHERE status LIKE 'suppressed_%'
+                 ORDER BY updated_at, id
+                 LIMIT ?1
+             )",
+            params![batches_to_delete],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "bound suppressed notification batch audit failed: {error}"
+            ))
+        })?
+    } else {
+        0
+    };
+    let deleted_batches = event_driven_deleted_batches + watermark_deleted_batches;
+
+    conn.execute(
+        "UPDATE client_notification_events
+         SET status = 'suppressed_compacted',
+             suppression_reason = COALESCE(
+                 suppression_reason, 'terminal suppressed delivery batch compacted'
+             ),
+             updated_at = ?1
+         WHERE status = 'batched'
+           AND NOT EXISTS (
+               SELECT 1 FROM email_delivery_batch_items bi
+               WHERE bi.event_id = client_notification_events.id
+           )",
+        params![timestamp],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "finalize compacted notification events failed: {error}"
+        ))
+    })?;
+
+    let deletable_event_count = conn
+        .query_row(
+            "SELECT COUNT(*) FROM client_notification_events e
+             WHERE e.status LIKE 'suppressed_%'
+               AND NOT EXISTS (
+                   SELECT 1 FROM email_delivery_batch_items bi WHERE bi.event_id = e.id
+               )",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "count deletable notification event audit failed: {error}"
+            ))
+        })?;
+    let events_to_delete = if low_value_event_count > CLIENT_NOTIFICATION_AUDIT_HIGH_WATERMARK {
+        low_value_event_count
+            .saturating_sub(CLIENT_NOTIFICATION_AUDIT_TARGET)
+            .min(deletable_event_count)
+    } else {
+        0
+    };
+    let deleted_events = if events_to_delete > 0 {
+        conn.execute(
+            "DELETE FROM client_notification_events
+             WHERE id IN (
+                 SELECT e.id FROM client_notification_events e
+                 WHERE e.status LIKE 'suppressed_%'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM email_delivery_batch_items bi WHERE bi.event_id = e.id
+                   )
+                 ORDER BY e.occurred_at, e.id
+                 LIMIT ?1
+             )",
+            params![events_to_delete],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "bound suppressed notification event audit failed: {error}"
+            ))
+        })?
+    } else {
+        0
+    };
+
+    let overflow_window_count = conn
+        .query_row(
+            "SELECT COUNT(*) FROM client_registration_notification_overflow
+             WHERE status = 'materialized'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("count registration overflow audit failed: {error}"))
+        })?;
+    if overflow_window_count > CLIENT_NOTIFICATION_AUDIT_HIGH_WATERMARK {
+        conn.execute(
+            "DELETE FROM client_registration_notification_overflow
+             WHERE window_start IN (
+                 SELECT window_start
+                 FROM client_registration_notification_overflow
+                 WHERE status = 'materialized'
+                 ORDER BY updated_at, window_start
+                 LIMIT ?1
+             )",
+            params![overflow_window_count.saturating_sub(CLIENT_NOTIFICATION_AUDIT_TARGET)],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("bound registration overflow audit failed: {error}"))
+        })?;
+    }
+
+    Ok((deleted_batches, deleted_events))
+}
+
+fn materialize_offline_events_before_cleanup_tx(
+    conn: &Connection,
+    stale_cutoff: &str,
+    cooldown_secs: i64,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let candidates = {
+        let mut statement = conn
+            .prepare(
+                "SELECT ns.installation_id, ns.presence_state, ns.offline_episode,
+                        ns.last_authenticated_seen_at, i.platform, i.app_version,
+                        i.owner_email, i.owner_verified_at, i.country_code,
+                        i.created_at, ict.subdomain, ns.last_offline_event_at
+                 FROM installation_notification_state ns
+                 INNER JOIN installations i ON i.id = ns.installation_id
+                 LEFT JOIN installation_client_tunnels ict
+                   ON ict.installation_id = ns.installation_id
+                 WHERE ns.monitoring_enabled = 1 AND i.last_seen_at < ?1
+                   AND ns.presence_state IN ('online', 'recovering')",
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("prepare cleanup offline events failed: {error}"))
+            })?;
+        let rows = statement
+            .query_map(params![stale_cutoff], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                ))
+            })
+            .map_err(|error| {
+                AppError::Internal(format!("query cleanup offline events failed: {error}"))
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+            AppError::Internal(format!("read cleanup offline events failed: {error}"))
+        })?
+    };
+    let notifications_enabled =
+        conn.query_row(
+            "SELECT enabled FROM client_notification_runtime WHERE id = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "read cleanup notification activation failed: {error}"
+            ))
+        })? == Some(1);
+    let timestamp = now.to_rfc3339();
+    for (
+        installation_id,
+        presence_state,
+        previous_episode,
+        last_authenticated_seen_at,
+        platform,
+        app_version,
+        owner_email,
+        owner_verified_at,
+        country_code,
+        created_at,
+        tunnel_subdomain,
+        last_offline_event_at,
+    ) in candidates
+    {
+        if presence_state == "recovering" {
+            conn.execute(
+                "UPDATE installation_notification_state
+                 SET presence_state = 'offline', recovery_candidate_since = NULL, updated_at = ?2
+                 WHERE installation_id = ?1 AND presence_state = 'recovering'",
+                params![installation_id, timestamp],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("restore cleanup offline episode failed: {error}"))
+            })?;
+            continue;
+        }
+        let episode = previous_episode.saturating_add(1);
+        let cooldown_elapsed = last_offline_event_at
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| now - value.with_timezone(&Utc) >= Duration::seconds(cooldown_secs.max(1)))
+            .unwrap_or(true);
+        let should_notify = notifications_enabled && cooldown_elapsed;
+        conn.execute(
+            "UPDATE installation_notification_state
+             SET presence_state = 'offline', offline_since = ?2,
+                 offline_candidate_since = NULL, recovery_candidate_since = NULL,
+                 offline_episode = ?3, last_offline_event_at = CASE WHEN ?4 = 1 THEN ?2 ELSE last_offline_event_at END,
+                 updated_at = ?2
+             WHERE installation_id = ?1 AND presence_state = 'online'",
+            params![
+                installation_id,
+                timestamp,
+                episode,
+                i64::from(should_notify)
+            ],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("materialize cleanup offline state failed: {error}"))
+        })?;
+        let status = if should_notify {
+            "pending"
+        } else if notifications_enabled {
+            "suppressed_cooldown"
+        } else {
+            "suppressed_disabled"
+        };
+        let snapshot = serde_json::json!({
+            "installationId": installation_id,
+            "platform": platform,
+            "appVersion": app_version,
+            "ownerEmail": owner_email,
+            "ownerVerified": owner_verified_at.is_some(),
+            "countryCode": country_code,
+            "tunnelSubdomain": tunnel_subdomain,
+            "registeredAt": created_at,
+            "lastAuthenticatedSeenAt": last_authenticated_seen_at,
+            "offlineSince": now,
+        });
+        conn.execute(
+            "INSERT OR IGNORE INTO client_notification_events (
+                id, dedupe_key, kind, installation_id, episode, status,
+                occurred_at, not_before, snapshot_json, suppression_reason,
+                created_at, updated_at
+             ) VALUES (?1, ?2, 'client_offline', ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?6, ?6)",
+            params![
+                Uuid::new_v4().to_string(),
+                format!("offline:{installation_id}:{episode}"),
+                installation_id,
+                episode,
+                status,
+                timestamp,
+                snapshot.to_string(),
+                if !notifications_enabled {
+                    Some("notifications disabled")
+                } else if !cooldown_elapsed {
+                    Some("client notification cooldown")
+                } else {
+                    None
+                },
+            ],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("insert cleanup offline event failed: {error}"))
+        })?;
+    }
     Ok(())
 }
 
@@ -9954,6 +13321,222 @@ fn should_refresh_installation_geo(installation: &Installation, next_ip: Option<
         || installation.longitude.is_none()
 }
 
+fn claim_registration_geo_cache(
+    conn: &mut Connection,
+    source_scope: &str,
+    now: DateTime<Utc>,
+) -> Result<RegistrationGeoCacheDecision, AppError> {
+    let now_ms = now.timestamp_millis();
+    let fresh_cutoff_ms = now_ms.saturating_sub(REGISTRATION_GEO_CACHE_TTL_SECS * 1_000);
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "begin registration geo cache claim failed: {error}"
+            ))
+        })?;
+    let cached = tx
+        .query_row(
+            "SELECT status, cached_at_ms, claim_expires_at_ms,
+                    country_code, country, region, city, latitude, longitude
+             FROM registration_geo_cache WHERE source_scope = ?1",
+            params![source_scope],
+            |row| {
+                Ok(RegistrationGeoCacheRow {
+                    status: row.get(0)?,
+                    cached_at_ms: row.get(1)?,
+                    claim_expires_at_ms: row.get(2)?,
+                    geo: GeoLookupResult {
+                        country_code: row.get(3)?,
+                        country: row.get(4)?,
+                        region: row.get(5)?,
+                        city: row.get(6)?,
+                        latitude: row.get(7)?,
+                        longitude: row.get(8)?,
+                    },
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| {
+            AppError::Internal(format!("read registration geo cache failed: {error}"))
+        })?;
+
+    if let Some(cached) = cached {
+        let fresh = cached
+            .cached_at_ms
+            .is_some_and(|cached_at_ms| cached_at_ms > fresh_cutoff_ms);
+        let ready = match cached.status.as_str() {
+            "positive"
+                if fresh && cached.geo.latitude.is_some() && cached.geo.longitude.is_some() =>
+            {
+                Some(RegistrationGeoCacheDecision::Positive(cached.geo))
+            }
+            "negative" if fresh => Some(RegistrationGeoCacheDecision::Negative),
+            "claimed"
+                if cached
+                    .claim_expires_at_ms
+                    .is_some_and(|expires_at_ms| expires_at_ms > now_ms) =>
+            {
+                Some(RegistrationGeoCacheDecision::Wait)
+            }
+            _ => None,
+        };
+        if let Some(ready) = ready {
+            tx.commit().map_err(|error| {
+                AppError::Internal(format!(
+                    "commit registration geo cache read failed: {error}"
+                ))
+            })?;
+            return Ok(ready);
+        }
+    }
+
+    let claim_owner = Uuid::new_v4().to_string();
+    tx.execute(
+        "INSERT INTO registration_geo_cache (
+            source_scope, status, cached_at_ms, claim_owner, claim_expires_at_ms,
+            country_code, country, region, city, latitude, longitude, updated_at_ms
+         ) VALUES (?1, 'claimed', NULL, ?2, ?3, NULL, NULL, NULL, NULL, NULL, NULL, ?4)
+         ON CONFLICT(source_scope) DO UPDATE SET
+            status = 'claimed', cached_at_ms = NULL, claim_owner = excluded.claim_owner,
+            claim_expires_at_ms = excluded.claim_expires_at_ms,
+            country_code = NULL, country = NULL, region = NULL, city = NULL,
+            latitude = NULL, longitude = NULL, updated_at_ms = excluded.updated_at_ms",
+        params![
+            source_scope,
+            claim_owner,
+            now_ms.saturating_add(REGISTRATION_GEO_CLAIM_TTL_SECS * 1_000),
+            now_ms,
+        ],
+    )
+    .map_err(|error| AppError::Internal(format!("claim registration geo cache failed: {error}")))?;
+    tx.commit().map_err(|error| {
+        AppError::Internal(format!(
+            "commit registration geo cache claim failed: {error}"
+        ))
+    })?;
+    Ok(RegistrationGeoCacheDecision::Claim(claim_owner))
+}
+
+fn finish_registration_geo_cache(
+    conn: &Connection,
+    source_scope: &str,
+    claim_owner: &str,
+    geo: Option<&GeoLookupResult>,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let (status, country_code, country, region, city, latitude, longitude) = match geo {
+        Some(geo) => (
+            "positive",
+            geo.country_code.as_deref(),
+            geo.country.as_deref(),
+            geo.region.as_deref(),
+            geo.city.as_deref(),
+            geo.latitude,
+            geo.longitude,
+        ),
+        None => ("negative", None, None, None, None, None, None),
+    };
+    conn.execute(
+        "UPDATE registration_geo_cache
+         SET status = ?3, cached_at_ms = ?4, claim_owner = NULL, claim_expires_at_ms = NULL,
+             country_code = ?5, country = ?6, region = ?7, city = ?8,
+             latitude = ?9, longitude = ?10, updated_at_ms = ?4
+         WHERE source_scope = ?1 AND status = 'claimed' AND claim_owner = ?2",
+        params![
+            source_scope,
+            claim_owner,
+            status,
+            now.timestamp_millis(),
+            country_code,
+            country,
+            region,
+            city,
+            latitude,
+            longitude,
+        ],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!("finish registration geo cache failed: {error}"))
+    })?;
+    Ok(())
+}
+
+fn apply_installation_geo(
+    conn: &Connection,
+    installation_id: &str,
+    geo: &GeoLookupResult,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let Some(current_state) = get_installation_geo_state(conn, installation_id)? else {
+        return Ok(());
+    };
+    let no_stable_position = current_state.latitude.is_none() || current_state.longitude.is_none();
+    if no_stable_position {
+        persist_stable_geo(conn, installation_id, geo, now)?;
+        return Ok(());
+    }
+
+    let stable_distance_km = haversine_distance_km(
+        current_state.latitude,
+        current_state.longitude,
+        geo.latitude,
+        geo.longitude,
+    );
+    let crossed_country = current_state.country_code != geo.country_code
+        && current_state.country_code.is_some()
+        && geo.country_code.is_some();
+    let can_stay_stable = !crossed_country
+        && stable_distance_km
+            .map(|distance| distance <= GEO_STABLE_DISTANCE_KM)
+            .unwrap_or(false);
+    if can_stay_stable {
+        persist_stable_geo(conn, installation_id, geo, now)?;
+        return Ok(());
+    }
+
+    let candidate_matches = current_state
+        .geo_candidate_latitude
+        .zip(current_state.geo_candidate_longitude)
+        .and_then(|(lat, lon)| {
+            haversine_distance_km(Some(lat), Some(lon), geo.latitude, geo.longitude)
+        })
+        .map(|distance| distance <= GEO_CANDIDATE_DISTANCE_KM)
+        .unwrap_or(false)
+        && current_state.geo_candidate_country_code == geo.country_code;
+    let candidate_hits = if candidate_matches {
+        current_state.geo_candidate_hits + 1
+    } else {
+        1
+    };
+    let candidate_first_seen_at = if candidate_matches {
+        current_state.geo_candidate_first_seen_at.unwrap_or(now)
+    } else {
+        now
+    };
+    persist_candidate_geo(
+        conn,
+        installation_id,
+        geo,
+        candidate_hits,
+        candidate_first_seen_at,
+    )?;
+
+    let candidate_age_secs = (now - candidate_first_seen_at).num_seconds();
+    let last_change_age_secs = current_state
+        .geo_last_changed_at
+        .map(|value| (now - value).num_seconds())
+        .unwrap_or(i64::MAX);
+    let promote_candidate = candidate_hits >= GEO_CANDIDATE_CONFIRM_HITS
+        && candidate_age_secs >= GEO_CANDIDATE_MIN_AGE_SECS
+        && last_change_age_secs >= GEO_STABLE_MIN_SWITCH_SECS;
+    if promote_candidate {
+        persist_stable_geo(conn, installation_id, geo, now)?;
+    }
+    Ok(())
+}
+
 fn deduplicate_dashboard_installations(
     installations: Vec<Installation>,
     active_share_subdomains_by_installation: &HashMap<String, HashSet<String>>,
@@ -10099,22 +13682,35 @@ fn persist_stable_geo(
     Ok(())
 }
 
-async fn lookup_ip_im_geo(ip: &str) -> Option<GeoLookupResult> {
-    let url = format!("https://ip.im/{ip}");
+async fn lookup_ip_im_geo_at(base_url: &str, ip: &str) -> Option<GeoLookupResult> {
+    let url = format!("{}/{ip}", base_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .user_agent("cc-switch-router/0.1")
         .timeout(StdDuration::from_secs(3))
         .build()
         .ok()?;
-    let response = timeout(StdDuration::from_secs(4), client.get(url).send())
+    let mut response = timeout(StdDuration::from_secs(4), client.get(url).send())
         .await
         .ok()?
         .ok()?;
     if !response.status().is_success() {
         return None;
     }
-    let body = response.text().await.ok()?;
-    parse_ip_im_geo(&body)
+    if response
+        .content_length()
+        .is_some_and(|length| length > REGISTRATION_GEO_RESPONSE_MAX_BYTES as u64)
+    {
+        return None;
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if chunk.len() > REGISTRATION_GEO_RESPONSE_MAX_BYTES.saturating_sub(body.len()) {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    parse_ip_im_geo(std::str::from_utf8(&body).ok()?)
 }
 
 fn parse_ip_im_geo(body: &str) -> Option<GeoLookupResult> {
@@ -10225,7 +13821,7 @@ fn list_active_share_edits(conn: &Connection) -> Result<HashMap<String, ShareEdi
         .prepare(
             "SELECT id, share_id, installation_id, revision, status, patch_json, created_by_email, created_at, updated_at, applied_at, error_message
              FROM share_edit_requests
-             WHERE status IN ('pending', 'rejected')
+             WHERE status IN ('pending', 'rejected') AND retired_at IS NULL
              ORDER BY revision DESC",
         )
         .map_err(|e| AppError::Internal(format!("prepare active share edits failed: {e}")))?;
@@ -10246,7 +13842,7 @@ fn get_active_share_edit(
     conn.query_row(
         "SELECT id, share_id, installation_id, revision, status, patch_json, created_by_email, created_at, updated_at, applied_at, error_message
          FROM share_edit_requests
-         WHERE share_id = ?1 AND status = 'pending'
+         WHERE share_id = ?1 AND status = 'pending' AND retired_at IS NULL
          ORDER BY revision DESC
          LIMIT 1",
         params![share_id],
@@ -10277,7 +13873,7 @@ fn list_pending_share_edits_for_installation(
         .prepare(
             "SELECT id, share_id, installation_id, revision, status, patch_json, created_by_email, created_at, updated_at, applied_at, error_message
              FROM share_edit_requests
-             WHERE installation_id = ?1 AND status = 'pending'
+             WHERE installation_id = ?1 AND status = 'pending' AND retired_at IS NULL
              ORDER BY revision ASC",
         )
         .map_err(|e| AppError::Internal(format!("prepare pending share edits failed: {e}")))?;
@@ -14862,21 +18458,7 @@ fn release_reclaimable_subdomain_claim(
         return Ok(());
     }
 
-    conn.execute(
-        "DELETE FROM share_request_logs WHERE share_id = ?1",
-        params![existing_share_id],
-    )
-    .map_err(|e| AppError::Internal(format!("delete replaced share request logs failed: {e}")))?;
-    conn.execute(
-        "DELETE FROM share_health_checks WHERE share_id = ?1",
-        params![existing_share_id],
-    )
-    .map_err(|e| AppError::Internal(format!("delete replaced share health checks failed: {e}")))?;
-    conn.execute(
-        "DELETE FROM shares WHERE share_id = ?1",
-        params![existing_share_id],
-    )
-    .map_err(|e| AppError::Internal(format!("delete replaced share claim failed: {e}")))?;
+    retire_share_tx(conn, &existing_share_id, &existing_installation_id)?;
     Ok(())
 }
 
@@ -15003,6 +18585,180 @@ fn validate_request_nonce(nonce: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+fn validate_registration_client_fields(platform: &str, app_version: &str) -> Result<(), AppError> {
+    let normalized_platform = platform.trim();
+    if normalized_platform.is_empty() {
+        return Err(AppError::BadRequest("platform is required".into()));
+    }
+    if normalized_platform.len() > 32 {
+        return Err(AppError::BadRequest(
+            "platform must be at most 32 bytes".into(),
+        ));
+    }
+    if platform.chars().any(char::is_control) {
+        return Err(AppError::BadRequest(
+            "platform must not contain control characters".into(),
+        ));
+    }
+    if app_version.len() > 128 {
+        return Err(AppError::BadRequest(
+            "app_version must be at most 128 bytes".into(),
+        ));
+    }
+    if app_version.chars().any(char::is_control) {
+        return Err(AppError::BadRequest(
+            "app_version must not contain control characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn consume_new_identity_admission(
+    conn: &Connection,
+    source_scope: &str,
+    policy: RegistrationAdmissionPolicy,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let now_ms = now.timestamp_millis();
+    let day_ms =
+        i64::try_from(StdDuration::from_secs(24 * 60 * 60).as_millis()).unwrap_or(86_400_000);
+    conn.execute(
+        "DELETE FROM registration_admission_events WHERE occurred_at_ms <= ?1",
+        params![now_ms.saturating_sub(day_ms)],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "prune expired registration admission events failed: {error}"
+        ))
+    })?;
+
+    let mut retry_after_secs = 0_u64;
+    for quota in policy.source_new_identity_quotas() {
+        retry_after_secs = retry_after_secs.max(registration_quota_retry_after(
+            conn,
+            Some(source_scope),
+            quota,
+            now_ms,
+        )?);
+    }
+    for quota in policy.global_new_identity_quotas() {
+        retry_after_secs =
+            retry_after_secs.max(registration_quota_retry_after(conn, None, quota, now_ms)?);
+    }
+    if retry_after_secs > 0 {
+        return Err(AppError::RateLimited {
+            message: "new installation registration quota exceeded".into(),
+            retry_after_secs,
+        });
+    }
+
+    let watermark = policy.unowned_installation_watermark.max(1);
+    let watermark_reached = conn
+        .query_row(
+            "SELECT 1
+             FROM installations i
+             WHERE i.owner_verified_at IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM shares s
+                   WHERE s.installation_id = i.id
+                     AND s.share_status NOT IN ('deleted', 'expired')
+               )
+             LIMIT 1 OFFSET ?1",
+            params![i64::from(watermark - 1)],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "check unowned installation watermark for registration admission failed: {error}"
+            ))
+        })?
+        .is_some();
+    if watermark_reached {
+        return Err(AppError::RateLimited {
+            message: "new installation capacity reached".into(),
+            retry_after_secs: 300,
+        });
+    }
+
+    conn.execute(
+        "INSERT INTO registration_admission_events (source_scope, occurred_at_ms)
+         VALUES (?1, ?2)",
+        params![source_scope, now_ms],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "record accepted registration identity failed: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+fn registration_quota_retry_after(
+    conn: &Connection,
+    source_scope: Option<&str>,
+    quota: RegistrationQuotaWindow,
+    now_ms: i64,
+) -> Result<u64, AppError> {
+    let window_ms = i64::try_from(quota.duration.as_millis()).unwrap_or(i64::MAX);
+    let cutoff_ms = now_ms.saturating_sub(window_ms);
+    let count = if let Some(source_scope) = source_scope {
+        conn.query_row(
+            "SELECT COUNT(*) FROM registration_admission_events
+             WHERE source_scope = ?1 AND occurred_at_ms > ?2",
+            params![source_scope, cutoff_ms],
+            |row| row.get::<_, i64>(0),
+        )
+    } else {
+        conn.query_row(
+            "SELECT COUNT(*) FROM registration_admission_events WHERE occurred_at_ms > ?1",
+            params![cutoff_ms],
+            |row| row.get::<_, i64>(0),
+        )
+    }
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "count rolling registration admission quota failed: {error}"
+        ))
+    })?;
+    let limit = i64::from(quota.limit.max(1));
+    if count < limit {
+        return Ok(0);
+    }
+
+    let offset = count.saturating_sub(limit);
+    let releases_at_ms = if let Some(source_scope) = source_scope {
+        conn.query_row(
+            "SELECT occurred_at_ms FROM registration_admission_events
+             WHERE source_scope = ?1 AND occurred_at_ms > ?2
+             ORDER BY occurred_at_ms, id
+             LIMIT 1 OFFSET ?3",
+            params![source_scope, cutoff_ms, offset],
+            |row| row.get::<_, i64>(0),
+        )
+    } else {
+        conn.query_row(
+            "SELECT occurred_at_ms FROM registration_admission_events
+             WHERE occurred_at_ms > ?1
+             ORDER BY occurred_at_ms, id
+             LIMIT 1 OFFSET ?2",
+            params![cutoff_ms, offset],
+            |row| row.get::<_, i64>(0),
+        )
+    }
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "read rolling registration quota release time failed: {error}"
+        ))
+    })?;
+    let remaining_ms = releases_at_ms
+        .saturating_add(window_ms)
+        .saturating_sub(now_ms);
+    Ok(u64::try_from(remaining_ms.saturating_add(999) / 1_000)
+        .unwrap_or(u64::MAX)
+        .max(1))
+}
+
 fn registration_nonce_subject(public_key: &str) -> String {
     let digest = Sha256::digest(public_key.trim().as_bytes());
     format!(
@@ -15011,12 +18767,310 @@ fn registration_nonce_subject(public_key: &str) -> String {
     )
 }
 
-fn verify_registration_recovery_signature(
-    public_key: &str,
-    input: &RegisterInstallationRequest,
+fn client_identity_hash(public_key: &str) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(Sha256::digest(public_key.trim().as_bytes()))
+}
+
+fn insert_installation_notification_baseline(
+    conn: &Connection,
     installation_id: &str,
     now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let now = now.to_rfc3339();
+    conn.execute(
+        "INSERT OR IGNORE INTO installation_notification_state (
+            installation_id, registration_state, monitoring_enabled, presence_state,
+            created_at, updated_at
+         ) VALUES (?1, 'provisional', 0, 'unknown', ?2, ?2)",
+        params![installation_id, now],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "insert installation notification baseline failed: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+fn record_authenticated_installation_presence(
+    conn: &Connection,
+    installation: &Installation,
+    now: DateTime<Utc>,
+    enable_monitoring: bool,
+    boot_id: Option<&str>,
+) -> Result<(), AppError> {
+    let previous_registration_state = conn
+        .query_row(
+            "SELECT registration_state
+             FROM installation_notification_state
+             WHERE installation_id = ?1",
+            params![installation.id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "read installation notification state failed: {error}"
+            ))
+        })?;
+    insert_installation_notification_baseline(conn, &installation.id, now)?;
+
+    let timestamp = now.to_rfc3339();
+    conn.execute(
+        "UPDATE installation_notification_state
+         SET registration_state = 'verified',
+             registration_verified_at = COALESCE(registration_verified_at, ?2),
+             monitoring_enabled = CASE WHEN ?3 = 1 THEN 1 ELSE monitoring_enabled END,
+             presence_state = CASE
+                 WHEN presence_state = 'offline' THEN 'recovering'
+                 WHEN presence_state = 'unknown' THEN 'online'
+                 ELSE presence_state
+             END,
+             last_authenticated_seen_at = ?2,
+             last_boot_id = COALESCE(?4, last_boot_id),
+             offline_candidate_since = NULL,
+             recovery_candidate_since = CASE
+                 WHEN presence_state = 'offline' THEN ?2
+                 WHEN presence_state = 'recovering' THEN COALESCE(recovery_candidate_since, ?2)
+                 ELSE recovery_candidate_since
+             END,
+             updated_at = ?2
+         WHERE installation_id = ?1",
+        params![
+            installation.id,
+            timestamp,
+            i64::from(enable_monitoring),
+            boot_id
+        ],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "update authenticated installation presence failed: {error}"
+        ))
+    })?;
+
+    if matches!(previous_registration_state.as_deref(), Some("provisional")) {
+        insert_client_registration_event(conn, installation, now)?;
+    }
+    Ok(())
+}
+
+fn insert_client_registration_event(
+    conn: &Connection,
+    installation: &Installation,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let notifications_enabled =
+        conn.query_row(
+            "SELECT enabled FROM client_notification_runtime WHERE id = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| {
+            AppError::Internal(format!("read client notification runtime failed: {error}"))
+        })? == Some(1);
+    if notifications_enabled && registration_overflow_should_capture_tx(conn, now)? {
+        record_registration_notification_overflow_tx(conn, now)?;
+        return Ok(());
+    }
+    let status = if notifications_enabled {
+        "pending"
+    } else {
+        "suppressed_disabled"
+    };
+    let suppression_reason = (!notifications_enabled).then_some("notifications disabled");
+    let snapshot = serde_json::json!({
+        "installationId": installation.id,
+        "platform": installation.platform,
+        "appVersion": installation.app_version,
+        "ownerEmail": installation.owner_email,
+        "countryCode": installation.country_code,
+        "registeredAt": installation.created_at,
+    });
+    let timestamp = now.to_rfc3339();
+    conn.execute(
+        "INSERT OR IGNORE INTO client_notification_events (
+            id, dedupe_key, kind, installation_id, episode, status, occurred_at,
+            not_before, snapshot_json, suppression_reason, created_at, updated_at
+         ) VALUES (?1, ?2, 'client_registered', ?3, 0, ?4, ?5, ?5, ?6, ?7, ?5, ?5)",
+        params![
+            Uuid::new_v4().to_string(),
+            format!("register:{}", installation.id),
+            installation.id,
+            status,
+            timestamp,
+            snapshot.to_string(),
+            suppression_reason,
+        ],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!("insert client registration event failed: {error}"))
+    })?;
+    Ok(())
+}
+
+fn registration_overflow_should_capture_tx(
+    conn: &Connection,
+    now: DateTime<Utc>,
 ) -> Result<bool, AppError> {
+    let active = conn
+        .query_row(
+            "SELECT registration_overflow_active
+             FROM client_notification_runtime WHERE id = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "read registration notification overflow state failed: {error}"
+            ))
+        })?
+        .unwrap_or(0)
+        != 0;
+    let active_event_count = conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM client_notification_events e
+             WHERE e.kind IN ('client_registered', 'client_registration_overflow')
+               AND (
+                   e.status = 'pending'
+                   OR (e.status = 'batched' AND EXISTS (
+                       SELECT 1
+                       FROM email_delivery_batch_items bi
+                       INNER JOIN email_delivery_batches b ON b.id = bi.batch_id
+                       WHERE bi.event_id = e.id
+                         AND b.notification_lane = 'registration'
+                         AND b.status IN ('pending', 'claimed', 'retry', 'blocked_config')
+                   ))
+               )",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "count active registration notification events failed: {error}"
+            ))
+        })?;
+    let active_batch_count = conn
+        .query_row(
+            "SELECT COUNT(*) FROM email_delivery_batches
+             WHERE notification_lane = 'registration'
+               AND status IN ('pending', 'claimed', 'retry', 'blocked_config')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "count active registration notification batches failed: {error}"
+            ))
+        })?;
+    let should_capture = if active {
+        active_event_count >= CLIENT_NOTIFICATION_REGISTRATION_EVENT_LOW_WATERMARK
+            || active_batch_count >= CLIENT_NOTIFICATION_REGISTRATION_BATCH_LOW_WATERMARK
+    } else {
+        active_event_count >= CLIENT_NOTIFICATION_REGISTRATION_EVENT_HIGH_WATERMARK
+            || active_batch_count >= CLIENT_NOTIFICATION_REGISTRATION_BATCH_HIGH_WATERMARK
+    };
+    if should_capture != active {
+        conn.execute(
+            "UPDATE client_notification_runtime
+             SET registration_overflow_active = ?1, updated_at = ?2
+             WHERE id = 1",
+            params![i64::from(should_capture), now.to_rfc3339()],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "update registration notification overflow state failed: {error}"
+            ))
+        })?;
+    }
+    Ok(should_capture)
+}
+
+fn record_registration_notification_overflow_tx(
+    conn: &Connection,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let window_start_seconds = now
+        .timestamp()
+        .div_euclid(CLIENT_NOTIFICATION_REGISTRATION_OVERFLOW_WINDOW_SECS)
+        * CLIENT_NOTIFICATION_REGISTRATION_OVERFLOW_WINDOW_SECS;
+    let window_start = Utc
+        .timestamp_opt(window_start_seconds, 0)
+        .single()
+        .ok_or_else(|| {
+            AppError::Internal("registration overflow window timestamp is invalid".into())
+        })?;
+    let window_end =
+        window_start + Duration::seconds(CLIENT_NOTIFICATION_REGISTRATION_OVERFLOW_WINDOW_SECS);
+    let occurred_at = now.to_rfc3339();
+    let changed = conn
+        .execute(
+            "INSERT INTO client_registration_notification_overflow (
+                window_start, window_end, event_count, first_occurred_at,
+                last_occurred_at, status, created_at, updated_at
+             ) VALUES (?1, ?2, 1, ?3, ?3, 'pending', ?3, ?3)
+             ON CONFLICT(window_start) DO UPDATE SET
+                event_count = client_registration_notification_overflow.event_count + 1,
+                last_occurred_at = excluded.last_occurred_at,
+                updated_at = excluded.updated_at
+             WHERE client_registration_notification_overflow.status = 'pending'",
+            params![
+                window_start.to_rfc3339(),
+                window_end.to_rfc3339(),
+                occurred_at
+            ],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "record registration notification overflow failed: {error}"
+            ))
+        })?;
+    if changed != 1 {
+        return Err(AppError::Internal(
+            "registration notification overflow window was already materialized".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_registration_signature(
+    public_key: &str,
+    input: &RegisterInstallationRequest,
+    existing_installation_id: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<bool, AppError> {
+    if let Some(proof_version) = input.proof_version {
+        if proof_version != 2 {
+            return Err(AppError::BadRequest(
+                "unsupported registration proof_version".into(),
+            ));
+        }
+        let timestamp_ms = input.timestamp_ms.ok_or_else(|| {
+            AppError::BadRequest("timestamp_ms is required for registration proof v2".into())
+        })?;
+        let signature = input.signature.as_deref().ok_or_else(|| {
+            AppError::BadRequest("signature is required for registration proof v2".into())
+        })?;
+        let skew = (now.timestamp_millis() - timestamp_ms).abs();
+        if skew > SIGNED_REQUEST_MAX_SKEW_MS {
+            return Err(AppError::Unauthorized("stale registration proof".into()));
+        }
+        let payload = format!(
+            "register_installation_v2\n{}\n{}\n{}\n{}\n{}",
+            input.public_key.trim(),
+            input.platform.trim(),
+            input.app_version,
+            input.instance_nonce,
+            timestamp_ms
+        );
+        verify_detached_signature(public_key, payload.as_bytes(), signature)?;
+        return Ok(true);
+    }
+
     let Some(timestamp_ms) = input.timestamp_ms else {
         if input.signature.is_some() {
             return Err(AppError::BadRequest(
@@ -15029,6 +19083,11 @@ fn verify_registration_recovery_signature(
         return Err(AppError::BadRequest(
             "signature is required when registration timestamp_ms is provided".into(),
         ));
+    };
+    let Some(installation_id) = existing_installation_id else {
+        // Legacy signatures included the Router-generated installation id and
+        // therefore cannot prove possession during a first registration.
+        return Ok(false);
     };
     let skew = (now.timestamp_millis() - timestamp_ms).abs();
     if skew > SIGNED_REQUEST_MAX_SKEW_MS {
@@ -15060,7 +19119,7 @@ fn verify_issue_lease_request(
         return Err(AppError::Unauthorized("stale lease request".into()));
     }
     verify_issue_lease_signature(public_key, input)?;
-    consume_request_nonce(
+    consume_authenticated_installation_nonce(
         conn,
         &input.installation_id,
         "issue_lease",
@@ -15137,7 +19196,7 @@ fn verify_signed_share_request<T: Serialize>(
         nonce,
         signature,
     )?;
-    consume_request_nonce(conn, installation_id, action, nonce, now)
+    consume_authenticated_installation_nonce(conn, installation_id, action, nonce, now)
 }
 
 fn verify_signed_gateway_request(
@@ -15220,7 +19279,49 @@ fn verify_share_claim_request(
         .map_err(|_| new_err)?;
     }
 
-    consume_request_nonce(conn, installation_id, "share_claim_subdomain", nonce, now)
+    consume_authenticated_installation_nonce(
+        conn,
+        installation_id,
+        "share_claim_subdomain",
+        nonce,
+        now,
+    )
+}
+
+fn consume_authenticated_installation_nonce(
+    conn: &Connection,
+    installation_id: &str,
+    action: &str,
+    nonce: &str,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    conn.execute_batch("SAVEPOINT authenticated_installation_request")
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "begin authenticated presence savepoint failed: {error}"
+            ))
+        })?;
+    let result = (|| {
+        consume_request_nonce(conn, installation_id, action, nonce, now)?;
+        let installation = get_installation(conn, installation_id)?
+            .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
+        record_authenticated_installation_presence(conn, &installation, now, false, None)
+    })();
+    match result {
+        Ok(()) => conn
+            .execute_batch("RELEASE authenticated_installation_request")
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "commit authenticated presence savepoint failed: {error}"
+                ))
+            }),
+        Err(error) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO authenticated_installation_request; RELEASE authenticated_installation_request",
+            );
+            Err(error)
+        }
+    }
 }
 
 fn share_claim_payload(share: &ShareDescriptor) -> ShareClaimPayload {
@@ -16434,10 +20535,16 @@ mod tests {
     use crate::config::Config;
     use crate::models::{ShareEditAckPayload, ShareSyncOperation};
     use crate::proxy::ProxyRegistry;
+    use axum::Router;
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use axum::routing::get;
     use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     #[test]
     fn resend_from_address_adds_default_display_name_for_plain_email() {
@@ -16600,6 +20707,7 @@ mod tests {
             resend_from: None,
             resend_from_name: None,
             resend_reply_to: None,
+            client_notifications: crate::config::ClientNotificationSettings::default(),
             auth_code_ttl_secs: 600,
             auth_code_cooldown_secs: 60,
             auth_session_ttl_secs: 7 * 24 * 60 * 60,
@@ -16641,6 +20749,120 @@ mod tests {
         let config = test_config(name);
         let store = AppStore::new(&config).expect("create store");
         (store, config)
+    }
+
+    fn enabled_notification_config(name: &str) -> Config {
+        let mut config = test_config(name);
+        config.client_notifications.enabled = true;
+        config.client_notifications.alert_emails = vec!["ops@example.com".into()];
+        config.resend_api_key = Some("test-api-key".into());
+        config.resend_from = Some("router@example.com".into());
+        config
+    }
+
+    fn notification_policy(config: &Config) -> ClientNotificationPolicy {
+        ClientNotificationPolicy::for_runtime(&config.client_notifications, config).0
+    }
+
+    fn notification_template() -> NotificationTemplateContext {
+        NotificationTemplateContext {
+            dashboard_url: "https://router.example.com".into(),
+            sender: Some("Router <router@example.com>".into()),
+            reply_to: Some("support@example.com".into()),
+            delivery_configured: true,
+            delivery_config_fingerprint: "test-delivery-config".into(),
+        }
+    }
+
+    fn expect_notification_batch(
+        claim: ClientNotificationClaim,
+        message: &str,
+    ) -> ClientNotificationBatch {
+        match claim {
+            ClientNotificationClaim::Batch(batch) => batch,
+            other => panic!("{message}: unexpected claim result {other:?}"),
+        }
+    }
+
+    fn insert_test_notification_batch(
+        conn: &Connection,
+        id: &str,
+        recipient: &str,
+        status: &str,
+        now: DateTime<Utc>,
+        claim_owner: Option<&str>,
+        claim_expires_at: Option<DateTime<Utc>>,
+        sent_at: Option<DateTime<Utc>>,
+    ) {
+        insert_test_notification_batch_in_lane(
+            conn,
+            id,
+            NotificationLane::Offline,
+            recipient,
+            status,
+            now,
+            claim_owner,
+            claim_expires_at,
+            sent_at,
+        );
+    }
+
+    fn insert_test_notification_batch_in_lane(
+        conn: &Connection,
+        id: &str,
+        lane: NotificationLane,
+        recipient: &str,
+        status: &str,
+        now: DateTime<Utc>,
+        claim_owner: Option<&str>,
+        claim_expires_at: Option<DateTime<Utc>>,
+        sent_at: Option<DateTime<Utc>>,
+    ) {
+        conn.execute(
+            "INSERT INTO email_delivery_batches (
+                id, notification_lane, recipient, from_address, subject, html_body, idempotency_key,
+                status, attempts, not_before, next_attempt_at, claim_owner,
+                claim_expires_at, template_fingerprint, delivery_kind,
+                created_at, updated_at, sent_at
+             ) VALUES (?1, ?2, ?3, 'Router <router@example.com>', 'subject', '<p>body</p>',
+                       ?4, ?5, 0, ?6, ?6, ?7, ?8, 'test', 'lifecycle', ?6, ?6, ?9)",
+            params![
+                id,
+                lane.as_str(),
+                recipient,
+                format!("idempotency-{id}"),
+                status,
+                now.to_rfc3339(),
+                claim_owner,
+                claim_expires_at.map(|value| value.to_rfc3339()),
+                sent_at.map(|value| value.to_rfc3339()),
+            ],
+        )
+        .expect("insert test notification batch");
+    }
+
+    fn insert_test_notification_event(
+        conn: &Connection,
+        id: &str,
+        kind: &str,
+        occurred_at: DateTime<Utc>,
+    ) {
+        let snapshot = serde_json::json!({
+            "installationId": id,
+            "platform": "linux",
+            "appVersion": "1.0.0",
+            "registeredAt": occurred_at,
+            "lastAuthenticatedSeenAt": occurred_at,
+            "offlineSince": occurred_at,
+        });
+        conn.execute(
+            "INSERT INTO client_notification_events (
+                id, dedupe_key, kind, installation_id, episode, status,
+                occurred_at, not_before, snapshot_json, created_at, updated_at
+             ) VALUES (?1, ?1, ?2, ?1, 0, 'pending', ?3, ?3, ?4, ?3, ?3)",
+            params![id, kind, occurred_at.to_rfc3339(), snapshot.to_string()],
+        )
+        .expect("insert test notification event");
     }
 
     fn test_market() -> MarketRegistryRecord {
@@ -17164,6 +21386,51 @@ mod tests {
             params![share_id, checked_at, if is_healthy { 1 } else { 0 }],
         )
         .expect("insert health check");
+    }
+
+    fn insert_ephemeral_share_state(conn: &Connection, share_id: &str) {
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        conn.execute(
+            "INSERT OR REPLACE INTO share_model_health_state (
+                share_id, app_type, requested_model, actual_model, last_status,
+                last_checked_at, recent_results_json, updated_at
+             ) VALUES (?1, 'codex', 'gpt-5', 'gpt-5', 'failed', ?2, '[\"failed\"]', ?2)",
+            params![share_id, now.timestamp()],
+        )
+        .expect("insert share model health state");
+        conn.execute(
+            "INSERT INTO market_disabled_shares (
+                market_email, share_id, disabled_by_email, reason, created_at, updated_at
+             ) VALUES ('market@example.com', ?1, 'owner@example.com', 'test', ?2, ?2)",
+            params![share_id, now_text],
+        )
+        .expect("insert market disabled share state");
+        conn.execute(
+            "INSERT INTO market_share_model_failure_state (
+                market_email, share_id, app_type, requested_model, actual_model, last_status,
+                last_checked_at, recent_results_json, updated_at
+             ) VALUES ('market@example.com', ?1, 'codex', 'gpt-5', 'gpt-5', 'failed',
+                       ?2, '[\"failed\"]', ?2)",
+            params![share_id, now.timestamp()],
+        )
+        .expect("insert market share model failure state");
+        conn.execute(
+            "INSERT INTO market_share_runtime_states (
+                market_email, share_id, scope, kind, created_at, updated_at
+             ) VALUES ('market@example.com', ?1, 'app', 'degraded', ?2, ?2)",
+            params![share_id, now_text],
+        )
+        .expect("insert market share runtime state");
+        conn.execute(
+            "INSERT INTO share_market_listing_statuses (
+                market_email, router_id, share_id, app_type, listing_url, status,
+                created_at, updated_at
+             ) VALUES ('market@example.com', 'main', ?1, 'codex',
+                       'https://market.example.com/listing', 'active', ?2, ?2)",
+            params![share_id, now_text],
+        )
+        .expect("insert share market listing status");
     }
 
     async fn insert_installation_health_check(
@@ -19173,6 +23440,128 @@ mod tests {
         base64::engine::general_purpose::STANDARD.encode(signature.to_bytes())
     }
 
+    fn sign_registration_v2_request(
+        signing_key: &SigningKey,
+        public_key: &str,
+        platform: &str,
+        app_version: &str,
+        instance_nonce: &str,
+        timestamp_ms: i64,
+    ) -> String {
+        let body = format!(
+            "register_installation_v2\n{public_key}\n{platform}\n{app_version}\n{instance_nonce}\n{timestamp_ms}"
+        );
+        let signature = signing_key.sign(body.as_bytes());
+        base64::engine::general_purpose::STANDARD.encode(signature.to_bytes())
+    }
+
+    async fn register_v2_with_key(
+        store: &AppStore,
+        signing_key: &SigningKey,
+        app_version: &str,
+    ) -> RegisterInstallationResponse {
+        let public_key = public_key_b64(signing_key);
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let instance_nonce = Uuid::new_v4().to_string();
+        let signature = sign_registration_v2_request(
+            signing_key,
+            &public_key,
+            "linux",
+            app_version,
+            &instance_nonce,
+            timestamp_ms,
+        );
+        store
+            .register_installation(
+                RegisterInstallationRequest {
+                    public_key,
+                    platform: "linux".into(),
+                    app_version: app_version.into(),
+                    instance_nonce,
+                    timestamp_ms: Some(timestamp_ms),
+                    signature: Some(signature),
+                    proof_version: Some(2),
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+            )
+            .await
+            .expect("register installation with proof v2")
+    }
+
+    fn registration_v2_request(
+        signing_key: &SigningKey,
+        app_version: &str,
+    ) -> RegisterInstallationRequest {
+        let public_key = public_key_b64(signing_key);
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let instance_nonce = Uuid::new_v4().to_string();
+        let signature = sign_registration_v2_request(
+            signing_key,
+            &public_key,
+            "linux",
+            app_version,
+            &instance_nonce,
+            timestamp_ms,
+        );
+        RegisterInstallationRequest {
+            public_key,
+            platform: "linux".into(),
+            app_version: app_version.into(),
+            instance_nonce,
+            timestamp_ms: Some(timestamp_ms),
+            signature: Some(signature),
+            proof_version: Some(2),
+        }
+    }
+
+    fn registration_policy_with_limit(limit: u32) -> RegistrationAdmissionPolicy {
+        RegistrationAdmissionPolicy {
+            source_new_identity_10m_limit: limit,
+            source_new_identity_hourly_limit: limit,
+            source_new_identity_daily_limit: limit,
+            global_new_identity_10m_limit: limit,
+            global_new_identity_hourly_limit: limit,
+            global_new_identity_daily_limit: limit,
+            unowned_installation_watermark: 50_000,
+            ..RegistrationAdmissionPolicy::default()
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockGeoState {
+        hits: Arc<AtomicUsize>,
+        status: StatusCode,
+        body: String,
+    }
+
+    async fn mock_geo_handler(State(state): State<MockGeoState>) -> impl IntoResponse {
+        state.hits.fetch_add(1, AtomicOrdering::SeqCst);
+        (state.status, state.body)
+    }
+
+    async fn start_mock_geo(
+        status: StatusCode,
+        body: &str,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/*path", get(mock_geo_handler))
+            .with_state(MockGeoState {
+                hits: hits.clone(),
+                status,
+                body: body.to_string(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), hits, task)
+    }
+
     #[tokio::test]
     async fn upgrade_status_lookup_survives_capability_or_delegation_changes() {
         let (store, config) = setup_store("upgrade-status-route").await;
@@ -19682,6 +24071,3127 @@ mod tests {
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 
+    #[test]
+    fn cross_repo_registration_and_heartbeat_contract_vectors_verify() {
+        let public_key = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=";
+        let registration = RegisterInstallationRequest {
+            public_key: public_key.into(),
+            platform: "linux".into(),
+            app_version: "1.2.3".into(),
+            instance_nonce: "fixture-nonce-123".into(),
+            timestamp_ms: Some(1_700_000_000_123),
+            signature: Some(
+                "ZZXnKtvGo8dPqW7oRNH6p878npyjH7AOjQHnFEegYdgbtSmx0GYMVdVOehycNZxxkKgTuyBfM176MjtNsZhqDg=="
+                    .into(),
+            ),
+            proof_version: Some(2),
+        };
+        let registration_time = Utc
+            .timestamp_millis_opt(1_700_000_000_123)
+            .single()
+            .unwrap();
+        assert!(
+            verify_registration_signature(public_key, &registration, None, registration_time)
+                .unwrap()
+        );
+
+        let legacy = RegisterInstallationRequest {
+            public_key: public_key.into(),
+            platform: "linux".into(),
+            app_version: "1.2.3".into(),
+            instance_nonce: "fixture-legacy-123".into(),
+            timestamp_ms: Some(1_700_000_000_234),
+            signature: Some(
+                "Xa7QqLps3PE6UpT8xeTZTR7DP/2FQnJIUEZGl5dkK672YWMBzXBrm4UwXtc1YsgnUUYH+4e0gxgpugZEfbBMDQ=="
+                    .into(),
+            ),
+            proof_version: None,
+        };
+        let legacy_time = Utc
+            .timestamp_millis_opt(1_700_000_000_234)
+            .single()
+            .unwrap();
+        assert!(
+            verify_registration_signature(
+                public_key,
+                &legacy,
+                Some("fixture-installation"),
+                legacy_time,
+            )
+            .unwrap()
+        );
+
+        let heartbeat = crate::models::InstallationHeartbeatPayload {
+            protocol_version: 1,
+            boot_id: "fixture-boot".into(),
+            app_version: "1.2.3".into(),
+            commit_id: "abcdef123456".into(),
+        };
+        verify_signed_payload(
+            public_key,
+            "fixture-installation",
+            "installation_heartbeat_v1",
+            &heartbeat,
+            1_700_000_000_456,
+            "fixture-heartbeat-123",
+            "SKGGtibTy3D/Fbnclkw2sLlq3q+LtiLfELbnDTlj+mT68pGPpULSJjKM9J/5LKcFysxaA87tuesjPD9WhEOmDw==",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn registration_v2_proves_possession_and_is_idempotent() {
+        let (store, config) = setup_store("register-v2-idempotent").await;
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = public_key_b64(&signing_key);
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_registration_v2_request(
+            &signing_key,
+            &public_key,
+            "linux",
+            "2.0.0",
+            &nonce,
+            timestamp_ms,
+        );
+        let registered = store
+            .register_installation(
+                RegisterInstallationRequest {
+                    public_key: public_key.clone(),
+                    platform: "linux".into(),
+                    app_version: "2.0.0".into(),
+                    instance_nonce: nonce,
+                    timestamp_ms: Some(timestamp_ms),
+                    signature: Some(signature),
+                    proof_version: Some(2),
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+            )
+            .await
+            .expect("register with proof v2");
+        assert!(registered.control_secret.is_some());
+
+        let second_timestamp = Utc::now().timestamp_millis();
+        let second_nonce = Uuid::new_v4().to_string();
+        let second_signature = sign_registration_v2_request(
+            &signing_key,
+            &public_key,
+            "linux",
+            "2.0.1",
+            &second_nonce,
+            second_timestamp,
+        );
+        let recovered = store
+            .register_installation(
+                RegisterInstallationRequest {
+                    public_key,
+                    platform: "linux".into(),
+                    app_version: "2.0.1".into(),
+                    instance_nonce: second_nonce,
+                    timestamp_ms: Some(second_timestamp),
+                    signature: Some(second_signature),
+                    proof_version: Some(2),
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+            )
+            .await
+            .expect("repeat authenticated registration");
+        assert_eq!(registered.installation_id, recovered.installation_id);
+
+        let conn = store.conn.lock().await;
+        let state: (String, i64) = conn
+            .query_row(
+                "SELECT registration_state, monitoring_enabled
+                 FROM installation_notification_state WHERE installation_id = ?1",
+                params![registered.installation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read registration state");
+        assert_eq!(state, ("verified".into(), 1));
+        let event_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM client_notification_events
+                 WHERE kind = 'client_registered'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count registration events");
+        assert_eq!(event_count, 1);
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[test]
+    fn registration_client_fields_enforce_byte_and_control_boundaries() {
+        assert!(validate_registration_client_fields("linux", "1.2.3").is_ok());
+        assert!(validate_registration_client_fields(&"a".repeat(32), &"v".repeat(128)).is_ok());
+        assert!(validate_registration_client_fields("", "1.0.0").is_err());
+        assert!(validate_registration_client_fields("   ", "1.0.0").is_err());
+        assert!(validate_registration_client_fields(&"a".repeat(33), "1.0.0").is_err());
+        assert!(validate_registration_client_fields("lin\nux", "1.0.0").is_err());
+        assert!(validate_registration_client_fields("linux\n", "1.0.0").is_err());
+        assert!(validate_registration_client_fields("linux", &"v".repeat(129)).is_err());
+        assert!(validate_registration_client_fields("linux", "1.0\tdebug").is_err());
+        assert!(validate_registration_client_fields(&"界".repeat(11), "1.0.0").is_err());
+    }
+
+    #[tokio::test]
+    async fn new_identity_quota_limits_new_keys_but_existing_key_recovers() {
+        let (store, config) = setup_store("registration-admission-existing").await;
+        let policy = registration_policy_with_limit(1);
+        let first_key = SigningKey::generate(&mut OsRng);
+        let registered = store
+            .register_installation_with_admission(
+                registration_v2_request(&first_key, "1.0.0"),
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                policy,
+            )
+            .await
+            .expect("first identity accepted");
+
+        let second_key = SigningKey::generate(&mut OsRng);
+        let limited = store
+            .register_installation_with_admission(
+                registration_v2_request(&second_key, "1.0.0"),
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                policy,
+            )
+            .await
+            .expect_err("second identity should be limited");
+        assert!(matches!(
+            limited,
+            AppError::RateLimited {
+                retry_after_secs: 86_399..=86_400,
+                ..
+            }
+        ));
+
+        let recovered = store
+            .register_installation_with_admission(
+                registration_v2_request(&first_key, "1.0.1"),
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                policy,
+            )
+            .await
+            .expect("existing key bypasses new identity quota");
+        assert_eq!(registered.installation_id, recovered.installation_id);
+
+        let conn = store.conn.lock().await;
+        let admission_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM registration_admission_events",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let installation_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM installations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!((admission_count, installation_count), (1, 1));
+        drop(conn);
+        let _ = std::fs::remove_file(config.db_path);
+    }
+
+    #[tokio::test]
+    async fn legacy_registration_consumes_new_identity_quota() {
+        let (store, config) = setup_store("registration-admission-legacy").await;
+        let signing_key = SigningKey::generate(&mut OsRng);
+        store
+            .register_installation_with_admission(
+                RegisterInstallationRequest {
+                    public_key: public_key_b64(&signing_key),
+                    platform: "linux".into(),
+                    app_version: "1.0.0".into(),
+                    instance_nonce: Uuid::new_v4().to_string(),
+                    timestamp_ms: None,
+                    signature: None,
+                    proof_version: None,
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                RegistrationAdmissionPolicy::default(),
+            )
+            .await
+            .expect("legacy identity accepted");
+
+        let conn = store.conn.lock().await;
+        let admission_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM registration_admission_events",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(admission_count, 1);
+        drop(conn);
+        let _ = std::fs::remove_file(config.db_path);
+    }
+
+    #[tokio::test]
+    async fn invalid_signature_and_nonce_failure_do_not_consume_admission() {
+        let (store, config) = setup_store("registration-admission-rollback").await;
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let mut invalid = registration_v2_request(&signing_key, "1.0.0");
+        invalid.signature = Some(base64::engine::general_purpose::STANDARD.encode([0_u8; 64]));
+        assert!(
+            store
+                .register_installation_with_admission(
+                    invalid,
+                    ClientMetadata {
+                        ip: None,
+                        country_code: None,
+                    },
+                    RegistrationAdmissionPolicy::default(),
+                )
+                .await
+                .is_err()
+        );
+
+        let replay_key = SigningKey::generate(&mut OsRng);
+        let replay = registration_v2_request(&replay_key, "1.0.0");
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO request_nonces (installation_id, action, nonce, created_at)
+                 VALUES (?1, 'register_installation', ?2, ?3)",
+                params![
+                    registration_nonce_subject(&replay.public_key),
+                    replay.instance_nonce,
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .unwrap();
+        }
+        assert!(
+            store
+                .register_installation_with_admission(
+                    replay,
+                    ClientMetadata {
+                        ip: None,
+                        country_code: None,
+                    },
+                    RegistrationAdmissionPolicy::default(),
+                )
+                .await
+                .is_err()
+        );
+
+        let conn = store.conn.lock().await;
+        let admission_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM registration_admission_events",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let installation_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM installations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!((admission_count, installation_count), (0, 0));
+        drop(conn);
+        let _ = std::fs::remove_file(config.db_path);
+    }
+
+    #[tokio::test]
+    async fn concurrent_new_identities_cannot_exceed_global_quota() {
+        let (store, config) = setup_store("registration-admission-concurrent").await;
+        let policy = registration_policy_with_limit(2);
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO registration_admission_events (source_scope, occurred_at_ms)
+                 VALUES ('prefill', ?1)",
+                params![Utc::now().timestamp_millis()],
+            )
+            .unwrap();
+        }
+        let first_key = SigningKey::generate(&mut OsRng);
+        let second_key = SigningKey::generate(&mut OsRng);
+        let first = store.register_installation_with_admission(
+            registration_v2_request(&first_key, "1.0.0"),
+            ClientMetadata {
+                ip: None,
+                country_code: None,
+            },
+            policy,
+        );
+        let second = store.register_installation_with_admission(
+            registration_v2_request(&second_key, "1.0.0"),
+            ClientMetadata {
+                ip: None,
+                country_code: None,
+            },
+            policy,
+        );
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        assert_eq!(
+            usize::from(matches!(first, Err(AppError::RateLimited { .. })))
+                + usize::from(matches!(second, Err(AppError::RateLimited { .. }))),
+            1
+        );
+
+        let conn = store.conn.lock().await;
+        let admission_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM registration_admission_events",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let installation_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM installations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!((admission_count, installation_count), (2, 1));
+        drop(conn);
+        let _ = std::fs::remove_file(config.db_path);
+    }
+
+    #[tokio::test]
+    async fn registration_schema_has_admission_and_geo_indexes() {
+        let (store, config) = setup_store("registration-admission-indexes").await;
+        let conn = store.conn.lock().await;
+        let indexes = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<HashSet<_>, _>>()
+            .unwrap();
+        for expected in [
+            "idx_registration_admission_source_time",
+            "idx_registration_admission_time",
+            "idx_registration_geo_cache_cached",
+            "idx_registration_geo_cache_claim",
+        ] {
+            assert!(indexes.contains(expected), "missing {expected}");
+        }
+        drop(conn);
+        let _ = std::fs::remove_file(config.db_path);
+    }
+
+    #[tokio::test]
+    async fn unowned_watermark_limits_new_keys_but_existing_key_recovers() {
+        let (store, config) = setup_store("registration-unowned-watermark").await;
+        let policy = RegistrationAdmissionPolicy {
+            unowned_installation_watermark: 1,
+            ..RegistrationAdmissionPolicy::default()
+        };
+        let first_key = SigningKey::generate(&mut OsRng);
+        let registered = store
+            .register_installation_with_admission(
+                registration_v2_request(&first_key, "1.0.0"),
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                policy,
+            )
+            .await
+            .expect("first unowned installation accepted");
+
+        let second_key = SigningKey::generate(&mut OsRng);
+        let limited = store
+            .register_installation_with_admission(
+                registration_v2_request(&second_key, "1.0.0"),
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                policy,
+            )
+            .await
+            .expect_err("new key should respect unowned watermark");
+        assert!(matches!(
+            limited,
+            AppError::RateLimited {
+                retry_after_secs: 300,
+                ..
+            }
+        ));
+
+        let recovered = store
+            .register_installation_with_admission(
+                registration_v2_request(&first_key, "1.0.1"),
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                policy,
+            )
+            .await
+            .expect("existing key remains recoverable at watermark");
+        assert_eq!(registered.installation_id, recovered.installation_id);
+
+        let conn = store.conn.lock().await;
+        let counts: (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM installations),
+                        (SELECT COUNT(*) FROM registration_admission_events)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 1));
+        drop(conn);
+        let _ = std::fs::remove_file(config.db_path);
+    }
+
+    #[tokio::test]
+    async fn rolling_quota_rejection_precedes_full_unowned_watermark() {
+        let (store, config) = setup_store("registration-quota-before-watermark").await;
+        let policy = RegistrationAdmissionPolicy {
+            unowned_installation_watermark: 1,
+            ..registration_policy_with_limit(1)
+        };
+        let first_key = SigningKey::generate(&mut OsRng);
+        store
+            .register_installation_with_admission(
+                registration_v2_request(&first_key, "1.0.0"),
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                policy,
+            )
+            .await
+            .expect("first identity fills quota and watermark");
+
+        let second_key = SigningKey::generate(&mut OsRng);
+        let limited = store
+            .register_installation_with_admission(
+                registration_v2_request(&second_key, "1.0.0"),
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                policy,
+            )
+            .await
+            .expect_err("rolling quota should reject before watermark check");
+        match limited {
+            AppError::RateLimited {
+                message,
+                retry_after_secs,
+            } => {
+                assert_eq!(message, "new installation registration quota exceeded");
+                assert!(retry_after_secs > 300);
+            }
+            error => panic!("unexpected admission error: {error}"),
+        }
+
+        let _ = std::fs::remove_file(config.db_path);
+    }
+
+    #[tokio::test]
+    async fn registration_geo_rejects_oversized_success_response() {
+        let body = format!(
+            "Country: US\nLoc: 37.7749,-122.4194\n{}",
+            "x".repeat(REGISTRATION_GEO_RESPONSE_MAX_BYTES)
+        );
+        let (endpoint, hits, server) = start_mock_geo(StatusCode::OK, &body).await;
+
+        let geo = lookup_ip_im_geo_at(&endpoint, "203.0.113.42").await;
+        server.abort();
+
+        assert!(geo.is_none());
+        assert_eq!(hits.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn registration_geo_positive_cache_is_shared_by_new_and_existing_keys() {
+        let (endpoint, hits, server) = start_mock_geo(
+            StatusCode::OK,
+            "Country: US\nRegion: California\nCity: San Francisco\nLoc: 37.7749,-122.4194\n",
+        )
+        .await;
+        let (mut store, config) = setup_store("registration-geo-positive-cache").await;
+        store.geo_lookup_base_url = Arc::new(endpoint);
+        let metadata = ClientMetadata {
+            ip: Some("203.0.113.42".into()),
+            country_code: None,
+        };
+        let first_key = SigningKey::generate(&mut OsRng);
+        let first = store
+            .register_installation_with_admission(
+                registration_v2_request(&first_key, "1.0.0"),
+                metadata.clone(),
+                RegistrationAdmissionPolicy::default(),
+            )
+            .await
+            .expect("first registration performs geo lookup");
+        let second_key = SigningKey::generate(&mut OsRng);
+        let second = store
+            .register_installation_with_admission(
+                registration_v2_request(&second_key, "1.0.0"),
+                metadata.clone(),
+                RegistrationAdmissionPolicy::default(),
+            )
+            .await
+            .expect("second registration uses geo cache");
+        let repeated = store
+            .register_installation_with_admission(
+                registration_v2_request(&first_key, "1.0.1"),
+                metadata,
+                RegistrationAdmissionPolicy::default(),
+            )
+            .await
+            .expect("existing key repeats without geo lookup");
+        server.abort();
+
+        assert_eq!(first.installation_id, repeated.installation_id);
+        assert_ne!(first.installation_id, second.installation_id);
+        assert_eq!(hits.load(AtomicOrdering::SeqCst), 1);
+        let conn = store.conn.lock().await;
+        let geocoded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM installations
+                 WHERE id IN (?1, ?2) AND latitude = 37.7749 AND longitude = -122.4194",
+                params![first.installation_id, second.installation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(geocoded, 2, "cached geo must be applied to the new key");
+        drop(conn);
+        let _ = std::fs::remove_file(config.db_path);
+    }
+
+    #[tokio::test]
+    async fn registration_geo_negative_cache_suppresses_then_retries_after_expiry() {
+        let (endpoint, hits, server) = start_mock_geo(StatusCode::OK, "no geo here").await;
+        let (mut store, config) = setup_store("registration-geo-negative-cache").await;
+        store.geo_lookup_base_url = Arc::new(endpoint);
+        let metadata = ClientMetadata {
+            ip: Some("198.51.100.8".into()),
+            country_code: None,
+        };
+        for _ in 0..2 {
+            let signing_key = SigningKey::generate(&mut OsRng);
+            store
+                .register_installation_with_admission(
+                    registration_v2_request(&signing_key, "1.0.0"),
+                    metadata.clone(),
+                    RegistrationAdmissionPolicy::default(),
+                )
+                .await
+                .expect("registration succeeds despite negative geo result");
+        }
+        assert_eq!(hits.load(AtomicOrdering::SeqCst), 1);
+
+        let source_scope = registration_source_scope(metadata.ip.as_deref());
+        {
+            let conn = store.conn.lock().await;
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM registration_geo_cache WHERE source_scope = ?1",
+                    params![source_scope],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "negative");
+            conn.execute(
+                "UPDATE registration_geo_cache
+                 SET cached_at_ms = ?2 WHERE source_scope = ?1",
+                params![
+                    source_scope,
+                    Utc::now()
+                        .timestamp_millis()
+                        .saturating_sub(REGISTRATION_GEO_CACHE_TTL_SECS * 1_000 + 1)
+                ],
+            )
+            .unwrap();
+        }
+
+        let third_key = SigningKey::generate(&mut OsRng);
+        store
+            .register_installation_with_admission(
+                registration_v2_request(&third_key, "1.0.0"),
+                metadata,
+                RegistrationAdmissionPolicy::default(),
+            )
+            .await
+            .expect("expired negative cache can be refreshed");
+        server.abort();
+        assert_eq!(hits.load(AtomicOrdering::SeqCst), 2);
+        let _ = std::fs::remove_file(config.db_path);
+    }
+
+    #[tokio::test]
+    async fn retained_audit_does_not_suppress_same_key_reregistration_lifecycle() {
+        let config = enabled_notification_config("notification-reregister-lifecycle");
+        let store = AppStore::new(&config).expect("create store");
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let policy = notification_policy(&config);
+        let first = register_v2_with_key(&store, &signing_key, "1.0.0").await;
+        let first_seen = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installation_notification_state
+                 SET monitoring_enabled = 1, presence_state = 'online',
+                     last_authenticated_seen_at = ?2
+                 WHERE installation_id = ?1",
+                params![first.installation_id, first_seen.to_rfc3339()],
+            )
+            .expect("enable first lifecycle monitoring");
+        }
+        store
+            .reconcile_client_notification_events(
+                &policy,
+                first_seen + Duration::seconds(policy.offline_alert_secs + 1),
+            )
+            .await
+            .expect("materialize first offline episode");
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE client_notification_events
+                 SET status = 'dead_letter', updated_at = ?2
+                 WHERE installation_id = ?1",
+                params![first.installation_id, Utc::now().to_rfc3339()],
+            )
+            .expect("make first lifecycle audit terminal");
+            purge_installation_data_tx(&conn, &first.installation_id)
+                .expect("purge first installation while retaining audit");
+        }
+
+        let second = register_v2_with_key(&store, &signing_key, "2.0.0").await;
+        assert_ne!(first.installation_id, second.installation_id);
+        let second_seen = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installation_notification_state
+                 SET monitoring_enabled = 1, presence_state = 'online',
+                     last_authenticated_seen_at = ?2
+                 WHERE installation_id = ?1",
+                params![second.installation_id, second_seen.to_rfc3339()],
+            )
+            .expect("enable second lifecycle monitoring");
+        }
+        store
+            .reconcile_client_notification_events(
+                &policy,
+                second_seen + Duration::seconds(policy.offline_alert_secs + 1),
+            )
+            .await
+            .expect("materialize second offline episode");
+
+        let conn = store.conn.lock().await;
+        let registration_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM client_notification_events
+                 WHERE kind = 'client_registered'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count registration audit rows");
+        let offline_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM client_notification_events
+                 WHERE kind = 'client_offline'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count offline audit rows");
+        let second_keys = conn
+            .prepare(
+                "SELECT dedupe_key FROM client_notification_events
+                 WHERE installation_id = ?1 ORDER BY kind",
+            )
+            .expect("prepare second lifecycle keys")
+            .query_map(params![second.installation_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .expect("query second lifecycle keys")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read second lifecycle keys");
+        assert_eq!(registration_count, 2);
+        assert_eq!(offline_count, 2);
+        assert!(
+            second_keys
+                .iter()
+                .all(|key| key.contains(&second.installation_id))
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn legacy_registration_is_provisional_until_a_signed_status() {
+        let (store, config) = setup_store("register-legacy-provisional").await;
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = public_key_b64(&signing_key);
+        let registered = store
+            .register_installation(
+                RegisterInstallationRequest {
+                    public_key,
+                    platform: "linux".into(),
+                    app_version: "1.0.0".into(),
+                    instance_nonce: Uuid::new_v4().to_string(),
+                    timestamp_ms: None,
+                    signature: None,
+                    proof_version: None,
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+            )
+            .await
+            .expect("legacy registration");
+        {
+            let conn = store.conn.lock().await;
+            let state: String = conn
+                .query_row(
+                    "SELECT registration_state FROM installation_notification_state
+                     WHERE installation_id = ?1",
+                    params![registered.installation_id],
+                    |row| row.get(0),
+                )
+                .expect("read provisional state");
+            assert_eq!(state, "provisional");
+        }
+
+        let payload = crate::models::ReportInstallationStatusPayload {
+            delegate_upgrade_to_router_owner: true,
+            auto_upgrade_enabled: false,
+            app_commit_id: "commit".into(),
+            update_available: false,
+            upgrade_capable: true,
+        };
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            &registered.installation_id,
+            "report_installation_status",
+            &payload,
+            timestamp_ms,
+            &nonce,
+        );
+        store
+            .report_installation_status(crate::models::ReportInstallationStatusRequest {
+                installation_id: registered.installation_id.clone(),
+                timestamp_ms,
+                nonce,
+                signature,
+                payload,
+            })
+            .await
+            .expect("signed status proves possession");
+        let conn = store.conn.lock().await;
+        let state: (String, i64, i64) = conn
+            .query_row(
+                "SELECT ns.registration_state, ns.monitoring_enabled,
+                        (SELECT COUNT(*) FROM client_notification_events e
+                         WHERE e.installation_id = ns.installation_id
+                           AND e.kind = 'client_registered')
+                 FROM installation_notification_state ns WHERE ns.installation_id = ?1",
+                params![registered.installation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read authenticated legacy state");
+        assert_eq!(state, ("verified".into(), 0, 1));
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn signed_heartbeat_enables_monitoring_and_rejects_nonce_replay() {
+        let (store, config) = setup_store("installation-heartbeat-v1").await;
+        let signing_key = insert_signed_installation(&store, "inst-heartbeat").await;
+        let payload = crate::models::InstallationHeartbeatPayload {
+            protocol_version: 1,
+            boot_id: "boot-1".into(),
+            app_version: "3.0.0".into(),
+            commit_id: "abc123".into(),
+        };
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            "inst-heartbeat",
+            "installation_heartbeat_v1",
+            &payload,
+            timestamp_ms,
+            &nonce,
+        );
+        store
+            .record_installation_heartbeat(crate::models::InstallationHeartbeatRequest {
+                installation_id: "inst-heartbeat".into(),
+                timestamp_ms,
+                nonce: nonce.clone(),
+                signature: signature.clone(),
+                payload,
+            })
+            .await
+            .expect("record signed heartbeat");
+        let replay_payload = crate::models::InstallationHeartbeatPayload {
+            protocol_version: 1,
+            boot_id: "boot-1".into(),
+            app_version: "3.0.0".into(),
+            commit_id: "abc123".into(),
+        };
+        let replay = store
+            .record_installation_heartbeat(crate::models::InstallationHeartbeatRequest {
+                installation_id: "inst-heartbeat".into(),
+                timestamp_ms,
+                nonce,
+                signature,
+                payload: replay_payload,
+            })
+            .await;
+        assert!(replay.is_err());
+        let conn = store.conn.lock().await;
+        let state: (i64, String, Option<String>) = conn
+            .query_row(
+                "SELECT monitoring_enabled, presence_state, last_boot_id
+                 FROM installation_notification_state WHERE installation_id = 'inst-heartbeat'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read heartbeat state");
+        assert_eq!(state, (1, "online".into(), Some("boot-1".into())));
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn offline_reconcile_is_episode_idempotent_and_recovery_is_delayed() {
+        let config = enabled_notification_config("offline-presence-episodes");
+        let store = AppStore::new(&config).expect("create store");
+        let signing_key = insert_signed_installation(&store, "inst-presence").await;
+        let payload = crate::models::InstallationHeartbeatPayload {
+            protocol_version: 1,
+            boot_id: "boot-presence".into(),
+            app_version: "1.0.0".into(),
+            commit_id: "commit".into(),
+        };
+        let heartbeat_at = Utc::now();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            "inst-presence",
+            "installation_heartbeat_v1",
+            &payload,
+            heartbeat_at.timestamp_millis(),
+            &nonce,
+        );
+        store
+            .record_installation_heartbeat(crate::models::InstallationHeartbeatRequest {
+                installation_id: "inst-presence".into(),
+                timestamp_ms: heartbeat_at.timestamp_millis(),
+                nonce,
+                signature,
+                payload,
+            })
+            .await
+            .expect("enable heartbeat monitoring");
+        let policy = notification_policy(&config);
+        let offline_now = heartbeat_at + Duration::minutes(4);
+        store
+            .reconcile_client_notification_events(&policy, offline_now)
+            .await
+            .expect("confirm first offline episode");
+        store
+            .reconcile_client_notification_events(&policy, offline_now + Duration::seconds(10))
+            .await
+            .expect("repeat offline scan");
+        {
+            let conn = store.conn.lock().await;
+            let state: (String, i64, i64) = conn
+                .query_row(
+                    "SELECT ns.presence_state, ns.offline_episode,
+                            (SELECT COUNT(*) FROM client_notification_events e
+                             WHERE e.installation_id = ns.installation_id
+                               AND e.kind = 'client_offline')
+                     FROM installation_notification_state ns
+                     WHERE ns.installation_id = 'inst-presence'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("read first offline episode");
+            assert_eq!(state, ("offline".into(), 1, 1));
+            conn.execute(
+                "UPDATE installation_notification_state
+                 SET presence_state = 'recovering', recovery_candidate_since = ?2,
+                     last_authenticated_seen_at = ?3
+                 WHERE installation_id = ?1",
+                params![
+                    "inst-presence",
+                    offline_now.to_rfc3339(),
+                    (offline_now + Duration::seconds(100)).to_rfc3339()
+                ],
+            )
+            .expect("simulate sustained recovery heartbeats");
+        }
+        store
+            .reconcile_client_notification_events(&policy, offline_now + Duration::seconds(121))
+            .await
+            .expect("confirm delayed recovery");
+        let conn = store.conn.lock().await;
+        let presence: String = conn
+            .query_row(
+                "SELECT presence_state FROM installation_notification_state
+                 WHERE installation_id = 'inst-presence'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read recovered presence");
+        assert_eq!(presence, "online");
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn notification_outbox_retries_with_a_frozen_idempotent_request() {
+        let config = enabled_notification_config("notification-outbox-retry");
+        let store = AppStore::new(&config).expect("create store");
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = public_key_b64(&signing_key);
+        let registered_at = Utc::now();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_registration_v2_request(
+            &signing_key,
+            &public_key,
+            "linux",
+            "1.0.0",
+            &nonce,
+            registered_at.timestamp_millis(),
+        );
+        store
+            .register_installation(
+                RegisterInstallationRequest {
+                    public_key,
+                    platform: "linux".into(),
+                    app_version: "1.0.0".into(),
+                    instance_nonce: nonce,
+                    timestamp_ms: Some(registered_at.timestamp_millis()),
+                    signature: Some(signature),
+                    proof_version: Some(2),
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+            )
+            .await
+            .expect("register notification client");
+        let policy = notification_policy(&config);
+        let template = notification_template();
+        let delivery_at = registered_at + Duration::seconds(6);
+        let aggregated = store
+            .aggregate_client_notification_batches(&policy, &template, delivery_at)
+            .await
+            .expect("aggregate registration notification");
+        assert_eq!(aggregated.batches_created, 1);
+        let first = expect_notification_batch(
+            store
+                .claim_client_notification_batch("worker-a", delivery_at, 30)
+                .await
+                .expect("claim first attempt"),
+            "pending batch",
+        );
+        assert!(
+            store
+                .validate_client_notification_batch(&first.id, "worker-a", &policy, delivery_at,)
+                .await
+                .expect("validate first attempt")
+        );
+        store
+            .mark_client_notification_batch_retry(
+                &first.id,
+                "worker-a",
+                "temporary provider error",
+                delivery_at + Duration::seconds(1),
+                delivery_at,
+            )
+            .await
+            .expect("schedule retry");
+        let second = expect_notification_batch(
+            store
+                .claim_client_notification_batch("worker-b", delivery_at + Duration::seconds(2), 30)
+                .await
+                .expect("claim retry"),
+            "retry batch",
+        );
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.idempotency_key, second.idempotency_key);
+        assert_eq!(first.from, second.from);
+        assert_eq!(first.reply_to, second.reply_to);
+        assert_eq!(first.subject, second.subject);
+        assert_eq!(first.html, second.html);
+        store
+            .mark_client_notification_batch_sent(
+                &second.id,
+                "worker-b",
+                "provider-message-1",
+                delivery_at + Duration::seconds(3),
+            )
+            .await
+            .expect("mark notification sent");
+        let conn = store.conn.lock().await;
+        let audit_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM email_send_logs
+                 WHERE email_type = 'client_notification' AND status = 'sent'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count sent notification audit");
+        assert_eq!(audit_count, 1);
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn incident_reminder_suppresses_followup_registration_storm() {
+        let config = enabled_notification_config("notification-storm-reminder");
+        let store = AppStore::new(&config).expect("create store");
+        let policy = notification_policy(&config);
+        let template = notification_template();
+        let base = Utc::now();
+        for wave in 0..2 {
+            let occurred_at = base + Duration::seconds(wave * 10);
+            {
+                let conn = store.conn.lock().await;
+                for index in 0..5 {
+                    let installation_id = format!("storm-{wave}-{index}");
+                    conn.execute(
+                        "INSERT INTO client_notification_events (
+                            id, dedupe_key, kind, installation_id, episode, status,
+                            occurred_at, not_before, snapshot_json, created_at, updated_at
+                         ) VALUES (?1, ?2, 'client_registered', ?3, 0, 'pending', ?4, ?4, ?5, ?4, ?4)",
+                        params![
+                            Uuid::new_v4().to_string(),
+                            format!("storm-{wave}-{index}"),
+                            installation_id,
+                            occurred_at.to_rfc3339(),
+                            serde_json::json!({
+                                "installationId": installation_id,
+                                "platform": "linux",
+                                "appVersion": "1.0.0",
+                                "registeredAt": occurred_at,
+                            })
+                            .to_string(),
+                        ],
+                    )
+                    .expect("insert storm event");
+                }
+            }
+            store
+                .aggregate_client_notification_batches(
+                    &policy,
+                    &template,
+                    occurred_at + Duration::seconds(6),
+                )
+                .await
+                .expect("aggregate storm wave");
+        }
+        let conn = store.conn.lock().await;
+        let statuses = conn
+            .prepare(
+                "SELECT status, COUNT(*) FROM email_delivery_batches
+                 WHERE incident_key IS NOT NULL GROUP BY status ORDER BY status",
+            )
+            .expect("prepare incident statuses")
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .expect("query incident statuses")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read incident statuses");
+        assert_eq!(
+            statuses,
+            vec![("pending".into(), 1), ("suppressed_storm".into(), 1)]
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn owner_notification_requires_a_real_logged_in_user() {
+        let config = enabled_notification_config("notification-owner-verification");
+        let store = AppStore::new(&config).expect("create store");
+        let signing_key = insert_signed_installation(&store, "inst-owner-recipient").await;
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installations
+                 SET owner_email = 'unverified-owner@example.com', owner_verified_at = ?2
+                 WHERE id = ?1",
+                params!["inst-owner-recipient", now.to_rfc3339()],
+            )
+            .expect("set legacy owner marker");
+            conn.execute(
+                "INSERT INTO installation_notification_state (
+                    installation_id, registration_state, registration_verified_at,
+                    monitoring_enabled, presence_state, last_authenticated_seen_at,
+                    created_at, updated_at
+                 ) VALUES (?1, 'verified', ?2, 0, 'online', ?2, ?2, ?2)",
+                params!["inst-owner-recipient", now.to_rfc3339()],
+            )
+            .expect("insert owner notification state");
+            let installation = get_installation(&conn, "inst-owner-recipient")
+                .expect("load owner installation")
+                .expect("owner installation");
+            insert_client_registration_event(&conn, &installation, now)
+                .expect("insert owner registration event");
+        }
+        drop(signing_key);
+        let mut policy = notification_policy(&config);
+        policy.notify_owner = true;
+        store
+            .sync_client_notification_runtime(&policy, &notification_template(), now)
+            .await
+            .expect("publish owner notification policy");
+        store
+            .aggregate_client_notification_batches(
+                &policy,
+                &notification_template(),
+                now + Duration::seconds(6),
+            )
+            .await
+            .expect("aggregate owner notification");
+        let conn = store.conn.lock().await;
+        let recipients = conn
+            .prepare("SELECT recipient FROM email_delivery_batches ORDER BY recipient")
+            .expect("prepare owner recipients")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query owner recipients")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read owner recipients");
+        assert_eq!(recipients, vec!["ops@example.com".to_string()]);
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn stale_worker_policy_cannot_reopen_disabled_runtime() {
+        let config = enabled_notification_config("notification-policy-version");
+        let store = AppStore::new(&config).expect("create store");
+        let active_policy = notification_policy(&config);
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            insert_test_notification_batch(
+                &conn,
+                "policy-version-batch",
+                "ops@example.com",
+                "pending",
+                now,
+                None,
+                None,
+                None,
+            );
+        }
+        let claimed = expect_notification_batch(
+            store
+                .claim_client_notification_batch("stale-worker", now, 90)
+                .await
+                .expect("claim before policy update"),
+            "pending policy batch",
+        );
+
+        let mut disabled_policy = active_policy.clone();
+        disabled_policy.enabled = false;
+        store
+            .sync_client_notification_runtime(
+                &disabled_policy,
+                &notification_template(),
+                now + Duration::seconds(1),
+            )
+            .await
+            .expect("publish disabled policy");
+        assert!(
+            !store
+                .validate_client_notification_batch(
+                    &claimed.id,
+                    "stale-worker",
+                    &active_policy,
+                    now + Duration::seconds(2),
+                )
+                .await
+                .expect("reject stale worker policy")
+        );
+        store
+            .reconcile_client_notification_events(&active_policy, now + Duration::seconds(3))
+            .await
+            .expect("ignore stale reconcile policy");
+
+        let conn = store.conn.lock().await;
+        let runtime_enabled: i64 = conn
+            .query_row(
+                "SELECT enabled FROM client_notification_runtime WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read disabled runtime");
+        let batch_status: String = conn
+            .query_row(
+                "SELECT status FROM email_delivery_batches WHERE id = 'policy-version-batch'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read stale batch status");
+        assert_eq!(runtime_enabled, 0);
+        assert_eq!(batch_status, "suppressed_disabled");
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn expired_claim_at_send_cap_is_suppressed_without_starving_next_batch() {
+        let config = enabled_notification_config("notification-expired-claim-cap");
+        let store = AppStore::new(&config).expect("create store");
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE client_notification_runtime
+                 SET recipient_hourly_limit = 1, global_hourly_limit = 50 WHERE id = 1",
+                [],
+            )
+            .expect("set notification caps");
+            insert_test_notification_batch(
+                &conn,
+                "sent-at-cap",
+                "ops@example.com",
+                "sent",
+                now,
+                None,
+                None,
+                Some(now),
+            );
+            insert_test_notification_batch(
+                &conn,
+                "expired-claim",
+                "ops@example.com",
+                "claimed",
+                now,
+                Some("dead-worker"),
+                Some(now - Duration::seconds(1)),
+                None,
+            );
+            insert_test_notification_batch(
+                &conn,
+                "capped-retry",
+                "ops@example.com",
+                "retry",
+                now,
+                None,
+                None,
+                None,
+            );
+            insert_test_notification_batch(
+                &conn,
+                "other-recipient",
+                "other@example.com",
+                "pending",
+                now,
+                None,
+                None,
+                None,
+            );
+        }
+        let first = store
+            .claim_client_notification_batch("worker", now, 30)
+            .await
+            .expect("evaluate expired claim");
+        assert_eq!(first, ClientNotificationClaim::SuppressedByRateLimit);
+        let second = expect_notification_batch(
+            store
+                .claim_client_notification_batch("worker", now, 30)
+                .await
+                .expect("claim next recipient"),
+            "next batch must not starve",
+        );
+        assert_eq!(second.id, "other-recipient");
+        let conn = store.conn.lock().await;
+        let capped = conn
+            .prepare(
+                "SELECT id, status, claim_owner FROM email_delivery_batches
+                 WHERE id IN ('expired-claim', 'capped-retry') ORDER BY id",
+            )
+            .expect("prepare capped notification batches")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .expect("query capped notification batches")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read capped notification batches");
+        assert_eq!(
+            capped,
+            vec![
+                ("capped-retry".into(), "suppressed_rate_limit".into(), None),
+                ("expired-claim".into(), "suppressed_rate_limit".into(), None),
+            ]
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn cleanup_prunes_only_terminal_notification_audit_history() {
+        let (store, config) = setup_store("notification-audit-retention").await;
+        let old = Utc::now() - Duration::days(31);
+        {
+            let conn = store.conn.lock().await;
+            insert_test_notification_batch(
+                &conn,
+                "old-sent-batch",
+                "ops@example.com",
+                "sent",
+                old,
+                None,
+                None,
+                Some(old),
+            );
+            insert_test_notification_batch(
+                &conn,
+                "old-retry-batch",
+                "ops@example.com",
+                "retry",
+                old,
+                None,
+                None,
+                None,
+            );
+            for (id, status) in [
+                ("old-suppressed-event", "suppressed_disabled"),
+                ("old-pending-event", "pending"),
+            ] {
+                conn.execute(
+                    "INSERT INTO client_notification_events (
+                        id, dedupe_key, kind, installation_id, episode, status,
+                        occurred_at, not_before, snapshot_json, created_at, updated_at
+                     ) VALUES (?1, ?1, 'client_registered', 'retained-installation', 0,
+                               ?2, ?3, ?3, '{}', ?3, ?3)",
+                    params![id, status, old.to_rfc3339()],
+                )
+                .expect("insert notification retention event");
+            }
+        }
+
+        let result = store
+            .cleanup_expired_data(&config, &ProxyRegistry::default())
+            .await
+            .expect("cleanup notification audit history");
+        assert_eq!(result.deleted_notification_batches, 1);
+        assert_eq!(result.deleted_notification_events, 1);
+        let conn = store.conn.lock().await;
+        let batches = conn
+            .prepare("SELECT id FROM email_delivery_batches ORDER BY id")
+            .expect("prepare retained notification batches")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query retained notification batches")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read retained notification batches");
+        let events = conn
+            .prepare("SELECT id FROM client_notification_events ORDER BY id")
+            .expect("prepare retained notification events")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query retained notification events")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read retained notification events");
+        assert_eq!(batches, vec!["old-retry-batch"]);
+        assert_eq!(events, vec!["old-pending-event"]);
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn notification_delivery_view_masks_recipient_and_omits_message_body() {
+        let (store, config) = setup_store("notification-delivery-view-privacy").await;
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            insert_test_notification_batch(
+                &conn,
+                "privacy-batch",
+                "operations@example.com",
+                "dead_letter",
+                now,
+                None,
+                None,
+                None,
+            );
+            conn.execute(
+                "UPDATE email_delivery_batches
+                 SET error_message = 'provider rejected Operations@Example.com; sender Sender+Alerts@Mail.Example.net is unverified.'
+                 WHERE id = 'privacy-batch'",
+                [],
+            )
+            .expect("set provider error");
+        }
+
+        let deliveries = store
+            .list_client_notification_deliveries(100)
+            .await
+            .expect("list notification deliveries");
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].recipient_masked, "o***@example.com");
+        assert_eq!(
+            deliveries[0].error_message.as_deref(),
+            Some("provider rejected O***@Example.com; sender S***@Mail.Example.net is unverified.")
+        );
+        let json = serde_json::to_value(&deliveries[0]).expect("serialize delivery view");
+        assert!(json.get("html").is_none());
+        assert!(json.get("htmlBody").is_none());
+        assert!(json.get("recipient").is_none());
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn superseded_config_batch_does_not_consume_replacement_hourly_capacity() {
+        let mut config = enabled_notification_config("notification-config-cap-release");
+        config.client_notifications.recipient_hourly_limit = 1;
+        config.client_notifications.global_hourly_limit = 1;
+        let store = AppStore::new(&config).expect("create store");
+        let policy = notification_policy(&config);
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO client_notification_events (
+                    id, dedupe_key, kind, installation_id, episode, status,
+                    occurred_at, not_before, snapshot_json, created_at, updated_at
+                 ) VALUES ('config-cap-event', 'config-cap-event', 'client_registered',
+                           'config-cap-installation', 0, 'pending', ?1, ?1, ?2, ?1, ?1)",
+                params![
+                    now.to_rfc3339(),
+                    serde_json::json!({
+                        "installationId": "config-cap-installation",
+                        "platform": "linux",
+                        "registeredAt": now,
+                    })
+                    .to_string(),
+                ],
+            )
+            .expect("insert config recovery event");
+        }
+        let invalid_template = NotificationTemplateContext {
+            dashboard_url: "https://router.example.com".into(),
+            sender: None,
+            reply_to: None,
+            delivery_configured: false,
+            delivery_config_fingerprint: "missing-sender".into(),
+        };
+        let first_delivery_at = now + Duration::seconds(6);
+        store
+            .aggregate_client_notification_batches(&policy, &invalid_template, first_delivery_at)
+            .await
+            .expect("aggregate invalid-envelope batch");
+        store
+            .sync_client_notification_runtime(
+                &policy,
+                &notification_template(),
+                first_delivery_at + Duration::seconds(1),
+            )
+            .await
+            .expect("publish valid delivery configuration");
+        let replacement_stats = store
+            .aggregate_client_notification_batches(
+                &policy,
+                &notification_template(),
+                first_delivery_at + Duration::seconds(2),
+            )
+            .await
+            .expect("aggregate replacement delivery batch");
+        assert_eq!(replacement_stats.batches_created, 1);
+        let conn = store.conn.lock().await;
+        let statuses = conn
+            .prepare(
+                "SELECT status, COUNT(*) FROM email_delivery_batches
+                 GROUP BY status ORDER BY status",
+            )
+            .expect("prepare config recovery statuses")
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .expect("query config recovery statuses")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read config recovery statuses");
+        assert_eq!(
+            statuses,
+            vec![
+                ("pending".into(), 1),
+                ("suppressed_config_changed".into(), 1),
+            ]
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn disabled_events_do_not_contribute_to_registration_storm() {
+        let config = enabled_notification_config("notification-disabled-storm");
+        let store = AppStore::new(&config).expect("create store");
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            for index in 0..5 {
+                conn.execute(
+                    "INSERT INTO client_notification_events (
+                        id, dedupe_key, kind, installation_id, episode, status,
+                        occurred_at, not_before, snapshot_json, suppression_reason,
+                        created_at, updated_at
+                     ) VALUES (?1, ?2, 'client_registered', ?3, 0,
+                               'suppressed_disabled', ?4, ?4, ?5,
+                               'notifications disabled', ?4, ?4)",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        format!("disabled-storm-{index}"),
+                        format!("disabled-inst-{index}"),
+                        now.to_rfc3339(),
+                        serde_json::json!({"installationId": format!("disabled-inst-{index}")})
+                            .to_string(),
+                    ],
+                )
+                .expect("insert disabled event");
+            }
+            conn.execute(
+                "INSERT INTO client_notification_events (
+                    id, dedupe_key, kind, installation_id, episode, status,
+                    occurred_at, not_before, snapshot_json, created_at, updated_at
+                 ) VALUES (?1, 'active-registration', 'client_registered', 'active-inst', 0,
+                           'pending', ?2, ?2, ?3, ?2, ?2)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    now.to_rfc3339(),
+                    serde_json::json!({
+                        "installationId": "active-inst",
+                        "platform": "linux",
+                        "registeredAt": now,
+                    })
+                    .to_string(),
+                ],
+            )
+            .expect("insert active registration");
+        }
+        store
+            .aggregate_client_notification_batches(
+                &notification_policy(&config),
+                &notification_template(),
+                now + Duration::seconds(6),
+            )
+            .await
+            .expect("aggregate active registration");
+        let conn = store.conn.lock().await;
+        let delivery_kind: String = conn
+            .query_row(
+                "SELECT delivery_kind FROM email_delivery_batches",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read active delivery kind");
+        assert_eq!(delivery_kind, "lifecycle");
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn verified_active_owner_is_added_only_to_offline_notification() {
+        let config = enabled_notification_config("notification-owner-offline");
+        let store = AppStore::new(&config).expect("create store");
+        let _signing_key = insert_signed_installation(&store, "inst-owner-offline").await;
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO users (id, email_normalized, status, created_at, last_login_at)
+                 VALUES ('owner-user', 'owner@example.com', 'active', ?1, ?1)",
+                params![now.to_rfc3339()],
+            )
+            .expect("insert verified owner user");
+            conn.execute(
+                "INSERT INTO installation_notification_state (
+                    installation_id, registration_state, registration_verified_at,
+                    monitoring_enabled, presence_state, last_authenticated_seen_at,
+                    offline_since, offline_episode, created_at, updated_at
+                 ) VALUES ('inst-owner-offline', 'verified', ?1, 1, 'offline', ?1, ?1, 1, ?1, ?1)",
+                params![now.to_rfc3339()],
+            )
+            .expect("insert owner offline state");
+            conn.execute(
+                "INSERT INTO client_notification_events (
+                    id, dedupe_key, kind, installation_id, episode, status,
+                    occurred_at, not_before, snapshot_json, created_at, updated_at
+                 ) VALUES (?1, 'owner-offline-event', 'client_offline',
+                           'inst-owner-offline', 1, 'pending', ?2, ?2, ?3, ?2, ?2)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    now.to_rfc3339(),
+                    serde_json::json!({
+                        "installationId": "inst-owner-offline",
+                        "ownerEmail": "owner@example.com",
+                        "lastAuthenticatedSeenAt": now,
+                        "offlineSince": now,
+                    })
+                    .to_string(),
+                ],
+            )
+            .expect("insert owner offline event");
+        }
+        let mut policy = notification_policy(&config);
+        policy.notify_owner = true;
+        store
+            .sync_client_notification_runtime(&policy, &notification_template(), now)
+            .await
+            .expect("publish offline owner notification policy");
+        store
+            .aggregate_client_notification_batches(
+                &policy,
+                &notification_template(),
+                now + Duration::seconds(policy.batch_window_secs + 1),
+            )
+            .await
+            .expect("aggregate owner offline event");
+        let conn = store.conn.lock().await;
+        let recipients = conn
+            .prepare("SELECT recipient FROM email_delivery_batches ORDER BY recipient")
+            .expect("prepare offline recipients")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query offline recipients")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read offline recipients");
+        assert_eq!(
+            recipients,
+            vec![
+                "ops@example.com".to_string(),
+                "owner@example.com".to_string()
+            ]
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn removed_explicit_recipient_cannot_receive_registration_as_owner() {
+        let mut config = enabled_notification_config("notification-owner-registration-scope");
+        config.client_notifications.alert_emails = vec!["owner@example.com".into()];
+        let store = AppStore::new(&config).expect("create store");
+        insert_installation(&store, "inst-owner-registration").await;
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO users (id, email_normalized, status, created_at, last_login_at)
+                 VALUES ('registration-owner-user', 'owner@example.com', 'active', ?1, ?1)",
+                params![now.to_rfc3339()],
+            )
+            .expect("insert registration owner user");
+            conn.execute(
+                "INSERT INTO client_notification_events (
+                    id, dedupe_key, kind, installation_id, episode, status,
+                    occurred_at, not_before, snapshot_json, created_at, updated_at
+                 ) VALUES ('owner-registration-event', 'owner-registration-event',
+                           'client_registered', 'inst-owner-registration', 0, 'pending',
+                           ?1, ?1, ?2, ?1, ?1)",
+                params![
+                    now.to_rfc3339(),
+                    serde_json::json!({
+                        "installationId": "inst-owner-registration",
+                        "platform": "linux",
+                        "registeredAt": now,
+                    })
+                    .to_string(),
+                ],
+            )
+            .expect("insert owner registration event");
+        }
+        let initial_policy = notification_policy(&config);
+        let delivery_at = now + Duration::seconds(6);
+        store
+            .aggregate_client_notification_batches(
+                &initial_policy,
+                &notification_template(),
+                delivery_at,
+            )
+            .await
+            .expect("aggregate explicit registration batch");
+        let batch = expect_notification_batch(
+            store
+                .claim_client_notification_batch("owner-scope-worker", delivery_at, 30)
+                .await
+                .expect("claim explicit registration batch"),
+            "explicit registration batch",
+        );
+
+        let mut current_policy = initial_policy.clone();
+        current_policy.alert_emails = vec!["ops@example.com".into()];
+        current_policy.notify_owner = true;
+        store
+            .sync_client_notification_runtime(
+                &current_policy,
+                &notification_template(),
+                delivery_at + Duration::seconds(1),
+            )
+            .await
+            .expect("publish owner-only notification policy");
+        assert!(
+            !store
+                .validate_client_notification_batch(
+                    &batch.id,
+                    "owner-scope-worker",
+                    &current_policy,
+                    delivery_at + Duration::seconds(2),
+                )
+                .await
+                .expect("validate registration recipient scope")
+        );
+        let conn = store.conn.lock().await;
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM email_delivery_batches WHERE id = ?1",
+                params![batch.id],
+                |row| row.get(0),
+            )
+            .expect("read rejected registration batch");
+        assert_eq!(status, "suppressed_recipient_removed");
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn recipient_role_change_keeps_offline_capacity_isolated_from_registration() {
+        let mut config = enabled_notification_config("notification-recipient-role-priority");
+        config.client_notifications.alert_emails = vec!["owner@example.com".into()];
+        config.client_notifications.global_hourly_limit = 1;
+        let store = AppStore::new(&config).expect("create store");
+        insert_installation(&store, "inst-role-priority").await;
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO users (id, email_normalized, status, created_at, last_login_at)
+                 VALUES ('priority-owner-user', 'owner@example.com', 'active', ?1, ?1)",
+                params![now.to_rfc3339()],
+            )
+            .expect("insert priority owner user");
+            conn.execute(
+                "INSERT INTO installation_notification_state (
+                    installation_id, registration_state, registration_verified_at,
+                    monitoring_enabled, presence_state, last_authenticated_seen_at,
+                    offline_since, offline_episode, created_at, updated_at
+                 ) VALUES ('inst-role-priority', 'verified', ?1, 1, 'offline',
+                           ?1, ?1, 1, ?1, ?1)",
+                params![now.to_rfc3339()],
+            )
+            .expect("insert priority owner offline state");
+            conn.execute(
+                "INSERT INTO client_notification_events (
+                    id, dedupe_key, kind, installation_id, episode, status,
+                    occurred_at, not_before, snapshot_json, created_at, updated_at
+                 ) VALUES ('owner-role-event', 'owner-role-event', 'client_offline',
+                           'inst-role-priority', 1, 'pending', ?1, ?1, ?2, ?1, ?1)",
+                params![
+                    now.to_rfc3339(),
+                    serde_json::json!({
+                        "installationId": "inst-role-priority",
+                        "lastAuthenticatedSeenAt": now,
+                        "offlineSince": now,
+                    })
+                    .to_string(),
+                ],
+            )
+            .expect("insert priority owner offline event");
+        }
+        let initial_policy = notification_policy(&config);
+        let first_delivery_at = now + Duration::seconds(initial_policy.batch_window_secs + 1);
+        store
+            .aggregate_client_notification_batches(
+                &initial_policy,
+                &notification_template(),
+                first_delivery_at,
+            )
+            .await
+            .expect("aggregate former explicit owner batch");
+
+        let mut current_policy = initial_policy.clone();
+        current_policy.alert_emails = vec!["ops@example.com".into()];
+        current_policy.notify_owner = true;
+        let policy_changed_at = first_delivery_at + Duration::seconds(1);
+        store
+            .sync_client_notification_runtime(
+                &current_policy,
+                &notification_template(),
+                policy_changed_at,
+            )
+            .await
+            .expect("publish changed recipient roles");
+        {
+            let conn = store.conn.lock().await;
+            let former_explicit: (String, i64) = conn
+                .query_row(
+                    "SELECT status, recipient_priority FROM email_delivery_batches
+                     WHERE recipient = 'owner@example.com'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read reprioritized owner batch");
+            assert_eq!(
+                former_explicit,
+                ("pending".into(), OWNER_NOTIFICATION_RECIPIENT_PRIORITY)
+            );
+            conn.execute(
+                "INSERT INTO client_notification_events (
+                    id, dedupe_key, kind, installation_id, episode, status,
+                    occurred_at, not_before, snapshot_json, created_at, updated_at
+                 ) VALUES ('new-explicit-event', 'new-explicit-event', 'client_registered',
+                           'inst-role-priority', 0, 'pending', ?1, ?1, ?2, ?1, ?1)",
+                params![
+                    policy_changed_at.to_rfc3339(),
+                    serde_json::json!({
+                        "installationId": "inst-role-priority",
+                        "platform": "linux",
+                        "registeredAt": policy_changed_at,
+                    })
+                    .to_string(),
+                ],
+            )
+            .expect("insert new explicit registration event");
+        }
+        store
+            .aggregate_client_notification_batches(
+                &current_policy,
+                &notification_template(),
+                policy_changed_at + Duration::seconds(6),
+            )
+            .await
+            .expect("aggregate explicit batch after role change");
+        let conn = store.conn.lock().await;
+        let batches = conn
+            .prepare(
+                "SELECT recipient, status, recipient_priority FROM email_delivery_batches
+                 WHERE recipient IN ('owner@example.com', 'ops@example.com')
+                 ORDER BY recipient",
+            )
+            .expect("prepare role-priority batches")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .expect("query role-priority batches")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read role-priority batches");
+        assert_eq!(
+            batches,
+            vec![
+                (
+                    "ops@example.com".into(),
+                    "pending".into(),
+                    EXPLICIT_NOTIFICATION_RECIPIENT_PRIORITY
+                ),
+                (
+                    "owner@example.com".into(),
+                    "pending".into(),
+                    OWNER_NOTIFICATION_RECIPIENT_PRIORITY
+                ),
+            ]
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn explicit_recipient_preempts_existing_owner_reservation_at_global_cap() {
+        let mut config = enabled_notification_config("notification-explicit-preemption");
+        config.client_notifications.global_hourly_limit = 1;
+        let store = AppStore::new(&config).expect("create store");
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            insert_test_notification_batch(
+                &conn,
+                "owner-reservation",
+                "a-owner@example.com",
+                "pending",
+                now,
+                None,
+                None,
+                None,
+            );
+            conn.execute(
+                "UPDATE email_delivery_batches SET recipient_priority = ?2 WHERE id = ?1",
+                params!["owner-reservation", OWNER_NOTIFICATION_RECIPIENT_PRIORITY],
+            )
+            .expect("mark owner reservation priority");
+            conn.execute(
+                "INSERT INTO client_notification_events (
+                    id, dedupe_key, kind, installation_id, episode, status,
+                    occurred_at, not_before, snapshot_json, created_at, updated_at
+                 ) VALUES ('explicit-event', 'explicit-event', 'client_offline',
+                           'inst-explicit', 0, 'pending', ?1, ?1, ?2, ?1, ?1)",
+                params![
+                    now.to_rfc3339(),
+                    serde_json::json!({
+                        "installationId": "inst-explicit",
+                        "platform": "linux",
+                        "registeredAt": now,
+                    })
+                    .to_string(),
+                ],
+            )
+            .expect("insert explicit notification event");
+        }
+        let policy = notification_policy(&config);
+        let delivery_at = now + Duration::seconds(policy.batch_window_secs + 1);
+        let stats = store
+            .aggregate_client_notification_batches(&policy, &notification_template(), delivery_at)
+            .await
+            .expect("aggregate explicit notification at global cap");
+        assert_eq!(stats.batches_created, 1);
+        {
+            let conn = store.conn.lock().await;
+            let owner_status: String = conn
+                .query_row(
+                    "SELECT status FROM email_delivery_batches WHERE id = 'owner-reservation'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read preempted owner reservation");
+            let explicit: (String, i64, String) = conn
+                .query_row(
+                    "SELECT status, recipient_priority, recipient
+                     FROM email_delivery_batches WHERE recipient = 'ops@example.com'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("read explicit reservation");
+            assert_eq!(owner_status, "suppressed_rate_limit");
+            assert_eq!(
+                explicit,
+                (
+                    "pending".into(),
+                    EXPLICIT_NOTIFICATION_RECIPIENT_PRIORITY,
+                    "ops@example.com".into()
+                )
+            );
+        }
+        let claimed = expect_notification_batch(
+            store
+                .claim_client_notification_batch("priority-worker", delivery_at, 30)
+                .await
+                .expect("claim explicit notification"),
+            "explicit notification batch",
+        );
+        assert_eq!(claimed.recipient, "ops@example.com");
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn claim_orders_explicit_recipient_before_older_owner_batch() {
+        let (store, config) = setup_store("notification-claim-priority").await;
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            insert_test_notification_batch(
+                &conn,
+                "a-owner-batch",
+                "owner@example.com",
+                "pending",
+                now - Duration::seconds(30),
+                None,
+                None,
+                None,
+            );
+            insert_test_notification_batch(
+                &conn,
+                "z-explicit-batch",
+                "ops@example.com",
+                "pending",
+                now,
+                None,
+                None,
+                None,
+            );
+            conn.execute(
+                "UPDATE email_delivery_batches
+                 SET recipient_priority = CASE id
+                     WHEN 'a-owner-batch' THEN ?1 ELSE ?2 END",
+                params![
+                    OWNER_NOTIFICATION_RECIPIENT_PRIORITY,
+                    EXPLICIT_NOTIFICATION_RECIPIENT_PRIORITY
+                ],
+            )
+            .expect("set notification recipient priorities");
+        }
+        let claimed = expect_notification_batch(
+            store
+                .claim_client_notification_batch("priority-worker", now, 30)
+                .await
+                .expect("claim prioritized notification"),
+            "prioritized batch",
+        );
+        assert_eq!(claimed.id, "z-explicit-batch");
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn notification_lanes_batch_independently_when_registration_queue_exceeds_scan_limit() {
+        let mut config = enabled_notification_config("notification-lane-scan-isolation");
+        config.client_notifications.recipient_hourly_limit = 100;
+        config.client_notifications.global_hourly_limit = 100;
+        config
+            .client_notifications
+            .registration_recipient_hourly_limit = 100;
+        config.client_notifications.registration_global_hourly_limit = 100;
+        config.client_notifications.storm_min_clients = 10_000;
+        let store = AppStore::new(&config).expect("create store");
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "WITH RECURSIVE registrations(value) AS (
+                     SELECT 0
+                     UNION ALL SELECT value + 1 FROM registrations WHERE value < 1000
+                 )
+                 INSERT INTO client_notification_events (
+                     id, dedupe_key, kind, installation_id, episode, status,
+                     occurred_at, not_before, snapshot_json, created_at, updated_at
+                 )
+                 SELECT printf('registration-%04d', value),
+                        printf('registration-%04d', value),
+                        'client_registered', printf('registration-%04d', value), 0,
+                        'pending', ?1, ?1, '{}', ?1, ?1
+                 FROM registrations",
+                params![now.to_rfc3339()],
+            )
+            .expect("insert registration backlog");
+            insert_test_notification_event(&conn, "offline-priority", "client_offline", now);
+        }
+
+        let stats = store
+            .aggregate_client_notification_batches(
+                &notification_policy(&config),
+                &notification_template(),
+                now + Duration::seconds(61),
+            )
+            .await
+            .expect("aggregate isolated notification lanes");
+        assert_eq!(stats.batches_created, 2);
+
+        let conn = store.conn.lock().await;
+        let lanes = conn
+            .prepare(
+                "SELECT b.notification_lane, COUNT(DISTINCT e.kind)
+                 FROM email_delivery_batches b
+                 INNER JOIN email_delivery_batch_items bi ON bi.batch_id = b.id
+                 INNER JOIN client_notification_events e ON e.id = bi.event_id
+                 GROUP BY b.notification_lane
+                 ORDER BY b.notification_lane",
+            )
+            .expect("prepare lane batches")
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .expect("query lane batches")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read lane batches");
+        assert_eq!(
+            lanes,
+            vec![("offline".into(), 1), ("registration".into(), 1)]
+        );
+        let offline_status: String = conn
+            .query_row(
+                "SELECT status FROM client_notification_events WHERE id = 'offline-priority'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read offline event status");
+        assert_eq!(offline_status, "batched");
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn notification_lane_migration_backfills_offline_mixed_and_empty_batches() {
+        let (store, config) = setup_store("notification-lane-backfill").await;
+        let now = Utc::now();
+        let conn = store.conn.lock().await;
+        for (id, kind) in [
+            ("backfill-offline", "client_offline"),
+            ("backfill-registration", "client_registered"),
+            ("backfill-mixed-offline", "client_offline"),
+            ("backfill-mixed-registration", "client_registered"),
+        ] {
+            insert_test_notification_event(&conn, id, kind, now);
+        }
+        for id in [
+            "offline-batch",
+            "registration-batch",
+            "mixed-batch",
+            "empty-batch",
+        ] {
+            insert_test_notification_batch_in_lane(
+                &conn,
+                id,
+                NotificationLane::Registration,
+                &format!("{id}@example.com"),
+                "pending",
+                now,
+                None,
+                None,
+                None,
+            );
+        }
+        for (batch_id, event_id) in [
+            ("offline-batch", "backfill-offline"),
+            ("registration-batch", "backfill-registration"),
+            ("mixed-batch", "backfill-mixed-offline"),
+            ("mixed-batch", "backfill-mixed-registration"),
+        ] {
+            conn.execute(
+                "INSERT INTO email_delivery_batch_items (batch_id, event_id, recipient)
+                 VALUES (?1, ?2, ?3)",
+                params![batch_id, event_id, format!("{batch_id}@example.com")],
+            )
+            .expect("insert lane backfill item");
+        }
+
+        init_schema(&conn).expect("rerun notification lane migration");
+        let lanes = conn
+            .prepare(
+                "SELECT id, notification_lane FROM email_delivery_batches
+                 WHERE id LIKE '%-batch' ORDER BY id",
+            )
+            .expect("prepare backfilled lanes")
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query backfilled lanes")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read backfilled lanes");
+        assert_eq!(
+            lanes,
+            vec![
+                ("empty-batch".into(), "registration".into()),
+                ("mixed-batch".into(), "offline".into()),
+                ("offline-batch".into(), "offline".into()),
+                ("registration-batch".into(), "registration".into()),
+            ]
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn notification_incidents_are_isolated_per_lane() {
+        let mut config = enabled_notification_config("notification-lane-incidents");
+        config.client_notifications.storm_min_clients = 2;
+        config.client_notifications.recipient_hourly_limit = 10;
+        config.client_notifications.global_hourly_limit = 10;
+        config
+            .client_notifications
+            .registration_recipient_hourly_limit = 10;
+        config.client_notifications.registration_global_hourly_limit = 10;
+        let store = AppStore::new(&config).expect("create store");
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            for (id, kind) in [
+                ("incident-offline-1", "client_offline"),
+                ("incident-offline-2", "client_offline"),
+                ("incident-registration-1", "client_registered"),
+                ("incident-registration-2", "client_registered"),
+            ] {
+                insert_test_notification_event(&conn, id, kind, now);
+            }
+        }
+        let stats = store
+            .aggregate_client_notification_batches(
+                &notification_policy(&config),
+                &notification_template(),
+                now + Duration::seconds(61),
+            )
+            .await
+            .expect("aggregate lane incidents");
+        assert_eq!(stats.incident_digests, 2);
+        let conn = store.conn.lock().await;
+        let incidents = conn
+            .prepare(
+                "SELECT notification_lane, delivery_kind, incident_key
+                 FROM email_delivery_batches ORDER BY notification_lane",
+            )
+            .expect("prepare lane incidents")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .expect("query lane incidents")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read lane incidents");
+        assert_eq!(incidents.len(), 2);
+        assert_eq!(incidents[0].0, "offline");
+        assert_eq!(incidents[1].0, "registration");
+        assert!(incidents.iter().all(|(_, kind, _)| kind == "incident"));
+        assert_ne!(incidents[0].2, incidents[1].2);
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn registration_aggregation_failure_cannot_rollback_offline_lane() {
+        let config = enabled_notification_config("notification-lane-failure-isolation");
+        let store = AppStore::new(&config).expect("create store");
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            insert_test_notification_event(&conn, "valid-offline", "client_offline", now);
+            conn.execute(
+                "INSERT INTO client_notification_events (
+                    id, dedupe_key, kind, installation_id, episode, status,
+                    occurred_at, not_before, snapshot_json, created_at, updated_at
+                 ) VALUES ('invalid-registration', 'invalid-registration',
+                           'client_registered', 'invalid-registration', 0, 'pending',
+                           ?1, ?1, '{', ?1, ?1)",
+                params![now.to_rfc3339()],
+            )
+            .expect("insert malformed registration event");
+        }
+        let stats = store
+            .aggregate_client_notification_batches(
+                &notification_policy(&config),
+                &notification_template(),
+                now + Duration::seconds(61),
+            )
+            .await
+            .expect("registration failure is contained");
+        assert_eq!(stats.batches_created, 1);
+        let conn = store.conn.lock().await;
+        let offline_batches: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM email_delivery_batches
+                 WHERE notification_lane = 'offline'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count committed offline batches");
+        let registration_status: String = conn
+            .query_row(
+                "SELECT status FROM client_notification_events
+                 WHERE id = 'invalid-registration'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read rolled back registration status");
+        assert_eq!(offline_batches, 1);
+        assert_eq!(registration_status, "pending");
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn claim_prioritizes_offline_lane_then_recipient_role() {
+        let config = enabled_notification_config("notification-lane-claim-order");
+        let store = AppStore::new(&config).expect("create store");
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            insert_test_notification_batch_in_lane(
+                &conn,
+                "registration-explicit",
+                NotificationLane::Registration,
+                "ops@example.com",
+                "pending",
+                now - Duration::minutes(2),
+                None,
+                None,
+                None,
+            );
+            insert_test_notification_batch_in_lane(
+                &conn,
+                "offline-owner",
+                NotificationLane::Offline,
+                "owner@example.com",
+                "pending",
+                now - Duration::minutes(1),
+                None,
+                None,
+                None,
+            );
+            insert_test_notification_batch_in_lane(
+                &conn,
+                "offline-explicit",
+                NotificationLane::Offline,
+                "ops@example.com",
+                "pending",
+                now,
+                None,
+                None,
+                None,
+            );
+            conn.execute(
+                "UPDATE email_delivery_batches
+                 SET recipient_priority = CASE id
+                     WHEN 'offline-owner' THEN ?1 ELSE ?2 END",
+                params![
+                    OWNER_NOTIFICATION_RECIPIENT_PRIORITY,
+                    EXPLICIT_NOTIFICATION_RECIPIENT_PRIORITY
+                ],
+            )
+            .expect("set lane claim priorities");
+        }
+
+        for (index, expected_id) in ["offline-explicit", "offline-owner", "registration-explicit"]
+            .into_iter()
+            .enumerate()
+        {
+            let claimed = expect_notification_batch(
+                store
+                    .claim_client_notification_batch(&format!("lane-worker-{index}"), now, 90)
+                    .await
+                    .expect("claim ordered lane batch"),
+                "ordered lane batch",
+            );
+            assert_eq!(claimed.id, expected_id);
+        }
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn dynamic_registration_claim_cap_does_not_suppress_offline_lane() {
+        let config = enabled_notification_config("notification-lane-dynamic-cap");
+        let store = AppStore::new(&config).expect("create store");
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE client_notification_runtime
+                 SET recipient_hourly_limit = 10, global_hourly_limit = 10,
+                     registration_recipient_hourly_limit = 1,
+                     registration_global_hourly_limit = 1
+                 WHERE id = 1",
+                [],
+            )
+            .expect("set dynamic lane caps");
+            insert_test_notification_batch_in_lane(
+                &conn,
+                "registration-sent",
+                NotificationLane::Registration,
+                "ops@example.com",
+                "sent",
+                now,
+                None,
+                None,
+                Some(now),
+            );
+            insert_test_notification_batch_in_lane(
+                &conn,
+                "registration-capped",
+                NotificationLane::Registration,
+                "ops@example.com",
+                "pending",
+                now - Duration::minutes(1),
+                None,
+                None,
+                None,
+            );
+            insert_test_notification_batch_in_lane(
+                &conn,
+                "offline-available",
+                NotificationLane::Offline,
+                "ops@example.com",
+                "pending",
+                now,
+                None,
+                None,
+                None,
+            );
+        }
+
+        let first = expect_notification_batch(
+            store
+                .claim_client_notification_batch("dynamic-cap-offline", now, 90)
+                .await
+                .expect("claim offline lane before capped registration"),
+            "offline lane must remain available",
+        );
+        assert_eq!(first.id, "offline-available");
+        assert_eq!(
+            store
+                .claim_client_notification_batch("dynamic-cap-registration", now, 90)
+                .await
+                .expect("apply dynamic registration cap"),
+            ClientNotificationClaim::SuppressedByRateLimit
+        );
+        let conn = store.conn.lock().await;
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM email_delivery_batches
+                 WHERE id = 'registration-capped'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read capped registration status");
+        assert_eq!(status, "suppressed_rate_limit");
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn registration_overflow_watermark_uses_hysteresis_boundaries() {
+        let config = enabled_notification_config("notification-overflow-hysteresis");
+        let store = AppStore::new(&config).expect("create store");
+        let now = Utc::now();
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "WITH RECURSIVE registrations(value) AS (
+                 SELECT 0
+                 UNION ALL SELECT value + 1 FROM registrations WHERE value < 4998
+             )
+             INSERT INTO client_notification_events (
+                 id, dedupe_key, kind, installation_id, episode, status,
+                 occurred_at, not_before, snapshot_json, created_at, updated_at
+             )
+             SELECT printf('watermark-%04d', value), printf('watermark-%04d', value),
+                    'client_registered', printf('watermark-%04d', value), 0,
+                    'pending', ?1, ?1, '{}', ?1, ?1
+             FROM registrations",
+            params![now.to_rfc3339()],
+        )
+        .expect("insert events below high watermark");
+        assert!(!registration_overflow_should_capture_tx(&conn, now).expect("below high"));
+        insert_test_notification_event(&conn, "watermark-4999", "client_registered", now);
+        assert!(registration_overflow_should_capture_tx(&conn, now).expect("at high"));
+
+        conn.execute(
+            "DELETE FROM client_notification_events
+             WHERE id >= 'watermark-4000' AND id <= 'watermark-4999'",
+            [],
+        )
+        .expect("drop to low watermark");
+        assert!(registration_overflow_should_capture_tx(&conn, now).expect("at low"));
+        conn.execute(
+            "DELETE FROM client_notification_events WHERE id = 'watermark-3999'",
+            [],
+        )
+        .expect("drop below low watermark");
+        assert!(!registration_overflow_should_capture_tx(&conn, now).expect("below low"));
+
+        conn.execute(
+            "WITH RECURSIVE batches(value) AS (
+                 SELECT 0
+                 UNION ALL SELECT value + 1 FROM batches WHERE value < 499
+             )
+             INSERT INTO email_delivery_batches (
+                 id, notification_lane, recipient, from_address, subject, html_body,
+                 idempotency_key, status, attempts, not_before, next_attempt_at,
+                 template_fingerprint, delivery_kind, created_at, updated_at
+             )
+             SELECT printf('watermark-batch-%03d', value), 'registration',
+                    'ops@example.com', 'router@example.com', 'subject', '<p>body</p>',
+                    printf('watermark-idempotency-%03d', value), 'pending', 0,
+                    ?1, ?1, 'test', 'lifecycle', ?1, ?1
+             FROM batches",
+            params![now.to_rfc3339()],
+        )
+        .expect("insert batches at high watermark");
+        assert!(registration_overflow_should_capture_tx(&conn, now).expect("batch high"));
+        conn.execute(
+            "DELETE FROM email_delivery_batches
+             WHERE id >= 'watermark-batch-400' AND id <= 'watermark-batch-499'",
+            [],
+        )
+        .expect("drop batches to low watermark");
+        assert!(registration_overflow_should_capture_tx(&conn, now).expect("batch low"));
+        conn.execute(
+            "DELETE FROM email_delivery_batches WHERE id = 'watermark-batch-399'",
+            [],
+        )
+        .expect("drop batches below low watermark");
+        assert!(!registration_overflow_should_capture_tx(&conn, now).expect("below batch low"));
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn registration_overflow_window_materializes_once() {
+        let config = enabled_notification_config("notification-overflow-window");
+        let store = AppStore::new(&config).expect("create store");
+        let now = Utc
+            .timestamp_opt(1_784_112_000, 0)
+            .single()
+            .expect("fixed overflow time");
+        {
+            let conn = store.conn.lock().await;
+            record_registration_notification_overflow_tx(&conn, now)
+                .expect("record first overflow");
+            record_registration_notification_overflow_tx(&conn, now + Duration::seconds(1))
+                .expect("record second overflow");
+            materialize_registration_overflow_events_tx(&conn, now + Duration::minutes(6))
+                .expect("materialize overflow window");
+            materialize_registration_overflow_events_tx(&conn, now + Duration::minutes(6))
+                .expect("repeat overflow materialization");
+        }
+        store
+            .aggregate_client_notification_batches(
+                &notification_policy(&config),
+                &notification_template(),
+                now + Duration::minutes(6),
+            )
+            .await
+            .expect("aggregate overflow summary");
+        let conn = store.conn.lock().await;
+        let window: (i64, String) = conn
+            .query_row(
+                "SELECT event_count, status
+                 FROM client_registration_notification_overflow",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read overflow window");
+        assert_eq!(window, (2, "materialized".into()));
+        let event_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM client_notification_events
+                 WHERE kind = 'client_registration_overflow'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count overflow summary events");
+        let batch: (i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*), MIN(notification_lane) FROM email_delivery_batches",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read overflow summary batch");
+        assert_eq!(event_count, 1);
+        assert_eq!(batch, (1, "registration".into()));
+        drop(conn);
+        let deliveries = store
+            .list_client_notification_deliveries(10)
+            .await
+            .expect("list overflow delivery summary");
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].event_count, 2);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn registration_pending_ttl_never_expires_offline_events() {
+        let (store, config) = setup_store("notification-registration-ttl").await;
+        let now = Utc::now();
+        let old = now - Duration::hours(2);
+        let conn = store.conn.lock().await;
+        insert_test_notification_event(&conn, "expired-registration", "client_registered", old);
+        insert_test_notification_event(&conn, "retained-offline", "client_offline", old);
+        cleanup_client_notification_queue_tx(&conn, now).expect("expire registration queue");
+        let statuses = conn
+            .prepare(
+                "SELECT id, status FROM client_notification_events
+                 WHERE id IN ('expired-registration', 'retained-offline') ORDER BY id",
+            )
+            .expect("prepare TTL statuses")
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query TTL statuses")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read TTL statuses");
+        assert_eq!(
+            statuses,
+            vec![
+                ("expired-registration".into(), "suppressed_expired".into()),
+                ("retained-offline".into(), "pending".into()),
+            ]
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn suppressed_notification_audit_compacts_from_high_to_target_watermark() {
+        let (store, config) = setup_store("notification-audit-watermark").await;
+        let now = Utc::now();
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "WITH RECURSIVE audit(value) AS (
+                 SELECT 0
+                 UNION ALL SELECT value + 1 FROM audit WHERE value < 100000
+             )
+             INSERT INTO client_notification_events (
+                 id, dedupe_key, kind, installation_id, episode, status,
+                 occurred_at, not_before, snapshot_json, created_at, updated_at
+             )
+             SELECT printf('audit-%06d', value), printf('audit-%06d', value),
+                    'client_registered', printf('audit-%06d', value), 0,
+                    'batched', ?1, ?1, '{}', ?1, ?1
+             FROM audit",
+            params![now.to_rfc3339()],
+        )
+        .expect("insert batched audit backlog");
+        conn.execute(
+            "WITH RECURSIVE batches(value) AS (
+                 SELECT 0
+                 UNION ALL SELECT value + 1 FROM batches WHERE value < 1000
+             )
+             INSERT INTO email_delivery_batches (
+                 id, notification_lane, recipient, from_address, subject, html_body,
+                 idempotency_key, status, attempts, not_before, next_attempt_at,
+                 template_fingerprint, delivery_kind, created_at, updated_at
+             )
+             SELECT printf('audit-batch-%04d', value), 'registration',
+                    'ops@example.com', 'router@example.com', 'subject', '<p>body</p>',
+                    printf('audit-batch-idempotency-%04d', value),
+                    'suppressed_rate_limit', 0, ?1, NULL, 'test', 'suppressed', ?1, ?1
+             FROM batches",
+            params![now.to_rfc3339()],
+        )
+        .expect("insert condensed suppressed batches");
+        conn.execute(
+            "INSERT INTO email_delivery_batch_items (batch_id, event_id, recipient)
+             SELECT printf('audit-batch-%04d', value / 100),
+                    printf('audit-%06d', value), 'ops@example.com'
+             FROM (
+                 WITH RECURSIVE audit(value) AS (
+                     SELECT 0
+                     UNION ALL SELECT value + 1 FROM audit WHERE value < 100000
+                 )
+                 SELECT value FROM audit
+             )",
+            [],
+        )
+        .expect("link condensed suppressed batch items");
+        for (id, status, sent_at) in [
+            ("retained-active", "pending", None),
+            ("retained-dead-letter", "dead_letter", None),
+            ("retained-sent", "sent", Some(now)),
+        ] {
+            insert_test_notification_batch_in_lane(
+                &conn,
+                id,
+                NotificationLane::Registration,
+                "retained@example.com",
+                status,
+                now,
+                None,
+                None,
+                sent_at,
+            );
+        }
+
+        let (deleted_batches, deleted_events) =
+            cleanup_client_notification_queue_tx(&conn, now).expect("compact audit backlog");
+        assert_eq!(deleted_batches, 201);
+        assert_eq!(deleted_events as i64, 20_001);
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM client_notification_events",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count compacted audit backlog");
+        assert_eq!(remaining, CLIENT_NOTIFICATION_AUDIT_TARGET);
+        let suppressed_batches: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM email_delivery_batches
+                 WHERE status = 'suppressed_rate_limit'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count retained condensed batches");
+        assert_eq!(suppressed_batches, 800);
+        let protected_statuses = conn
+            .prepare(
+                "SELECT id, status FROM email_delivery_batches
+                 WHERE id LIKE 'retained-%' ORDER BY id",
+            )
+            .expect("prepare protected audit batches")
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query protected audit batches")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read protected audit batches");
+        assert_eq!(
+            protected_statuses,
+            vec![
+                ("retained-active".into(), "pending".into()),
+                ("retained-dead-letter".into(), "dead_letter".into()),
+                ("retained-sent".into(), "sent".into()),
+            ]
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn offline_email_uses_current_verified_owner_not_snapshot_owner() {
+        let config = enabled_notification_config("notification-current-owner-privacy");
+        let store = AppStore::new(&config).expect("create store");
+        insert_installation(&store, "inst-owner-changed").await;
+        let now = Utc::now();
+        let mut policy = notification_policy(&config);
+        policy.notify_owner = true;
+        store
+            .sync_client_notification_runtime(&policy, &notification_template(), now)
+            .await
+            .expect("publish owner notification policy");
+        let occurred_at = now + Duration::seconds(1);
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO users (id, email_normalized, status, created_at, last_login_at)
+                 VALUES ('new-owner-user', 'new-owner@example.com', 'active', ?1, ?1)",
+                params![now.to_rfc3339()],
+            )
+            .expect("insert current owner user");
+            conn.execute(
+                "UPDATE installations
+                 SET owner_email = 'new-owner@example.com', owner_verified_at = ?2
+                 WHERE id = ?1",
+                params!["inst-owner-changed", now.to_rfc3339()],
+            )
+            .expect("change verified installation owner");
+            conn.execute(
+                "INSERT INTO client_notification_events (
+                    id, dedupe_key, kind, installation_id, episode, status,
+                    occurred_at, not_before, snapshot_json, created_at, updated_at
+                 ) VALUES ('owner-change-event', 'owner-change-event', 'client_offline',
+                           'inst-owner-changed', 1, 'pending', ?1, ?1, ?2, ?1, ?1)",
+                params![
+                    occurred_at.to_rfc3339(),
+                    serde_json::json!({
+                        "installationId": "inst-owner-changed",
+                        "ownerEmail": "old-owner@example.com",
+                        "lastAuthenticatedSeenAt": occurred_at,
+                        "offlineSince": occurred_at,
+                    })
+                    .to_string(),
+                ],
+            )
+            .expect("insert offline event with stale owner snapshot");
+        }
+        store
+            .aggregate_client_notification_batches(
+                &policy,
+                &notification_template(),
+                occurred_at + Duration::seconds(policy.batch_window_secs + 1),
+            )
+            .await
+            .expect("aggregate current owner notifications");
+        let conn = store.conn.lock().await;
+        let bodies = conn
+            .prepare(
+                "SELECT recipient, html_body FROM email_delivery_batches
+                 WHERE recipient IN ('ops@example.com', 'new-owner@example.com')
+                 ORDER BY recipient",
+            )
+            .expect("prepare owner privacy bodies")
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query owner privacy bodies")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read owner privacy bodies");
+        assert_eq!(bodies.len(), 2);
+        for (_, body) in &bodies {
+            assert!(body.contains("new-owner@example.com"));
+            assert!(!body.contains("old-owner@example.com"));
+        }
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn notification_cleanup_and_storm_queries_use_bounded_indexes() {
+        let (store, config) = setup_store("notification-query-indexes").await;
+        let conn = store.conn.lock().await;
+        let cleanup_plan = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT 1 FROM client_notification_events
+                 WHERE installation_id = 'inst-query-plan'
+                   AND kind = 'client_offline' AND status = 'pending'",
+            )
+            .expect("prepare notification cleanup query plan")
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("query notification cleanup plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read notification cleanup plan");
+        assert!(cleanup_plan.iter().any(|detail| {
+            detail.contains("idx_client_notification_events_installation_kind_status")
+        }));
+
+        let storm_plan = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT COUNT(DISTINCT installation_id)
+                 FROM client_notification_events
+                 WHERE status = 'pending' AND occurred_at >= '2026-01-01T00:00:00Z'
+                   AND kind = 'client_offline'",
+            )
+            .expect("prepare notification storm query plan")
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("query notification storm plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read notification storm plan");
+        assert!(
+            storm_plan
+                .iter()
+                .any(|detail| detail.contains("idx_client_notification_events_storm"))
+        );
+
+        let global_cap_plan = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT COUNT(*) FROM email_delivery_batches
+                 WHERE (status = 'sent' AND sent_at >= '2026-01-01T00:00:00Z')
+                    OR (status = 'claimed' AND claim_expires_at > '2026-01-01T00:00:00Z')",
+            )
+            .expect("prepare global send-cap query plan")
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("query global send-cap plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read global send-cap plan");
+        assert!(
+            global_cap_plan
+                .iter()
+                .any(|detail| detail.contains("idx_email_delivery_batches_send_cap"))
+        );
+        assert!(
+            global_cap_plan
+                .iter()
+                .any(|detail| detail.contains("idx_email_delivery_batches_claim_cap"))
+        );
+
+        let recipient_cap_plan = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT COUNT(*) FROM email_delivery_batches
+                 WHERE LOWER(recipient) = LOWER('ops@example.com')
+                   AND ((status = 'sent' AND sent_at >= '2026-01-01T00:00:00Z')
+                        OR (status = 'claimed' AND claim_expires_at > '2026-01-01T00:00:00Z'))",
+            )
+            .expect("prepare recipient send-cap query plan")
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("query recipient send-cap plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read recipient send-cap plan");
+        assert!(
+            recipient_cap_plan
+                .iter()
+                .any(|detail| { detail.contains("idx_email_delivery_batches_recipient_send_cap") })
+        );
+        assert!(
+            recipient_cap_plan.iter().any(|detail| {
+                detail.contains("idx_email_delivery_batches_recipient_claim_cap")
+            })
+        );
+
+        let lane_claim_plan = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT id FROM email_delivery_batches
+                 WHERE notification_lane = 'offline'
+                   AND status = 'pending'
+                   AND next_attempt_at <= '2026-01-01T00:00:00Z'
+                 ORDER BY notification_lane, recipient_priority, next_attempt_at
+                 LIMIT 1",
+            )
+            .expect("prepare lane claim query plan")
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("query lane claim plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read lane claim plan");
+        assert!(
+            lane_claim_plan
+                .iter()
+                .any(|detail| detail.contains("idx_email_delivery_batches_lane_claim"))
+        );
+
+        let lane_cap_plan = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT COUNT(*) FROM email_delivery_batches
+                 WHERE notification_lane = 'registration'
+                   AND status = 'sent'
+                   AND sent_at >= '2026-01-01T00:00:00Z'",
+            )
+            .expect("prepare lane cap query plan")
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("query lane cap plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read lane cap plan");
+        assert!(
+            lane_cap_plan
+                .iter()
+                .any(|detail| detail.contains("idx_email_delivery_batches_lane_send_cap"))
+        );
+
+        let lane_pending_plan = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT id FROM client_notification_events
+                 WHERE status = 'pending' AND kind = 'client_offline'
+                   AND not_before <= '2026-01-01T00:00:00Z'
+                 ORDER BY occurred_at LIMIT 1000",
+            )
+            .expect("prepare lane pending query plan")
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("query lane pending plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read lane pending plan");
+        assert!(
+            lane_pending_plan
+                .iter()
+                .any(|detail| detail.contains("idx_client_notification_events_lane_pending"))
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn recovered_offline_batch_does_not_requeue_registration_lane() {
+        let config = enabled_notification_config("notification-mixed-recovery");
+        let store = AppStore::new(&config).expect("create store");
+        let _offline_key = insert_signed_installation(&store, "inst-mixed-offline").await;
+        let _registered_key = insert_signed_installation(&store, "inst-mixed-register").await;
+        let now = Utc::now();
+        let occurred_at = now;
+        let delivery_at = now + Duration::seconds(61);
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO installation_notification_state (
+                    installation_id, registration_state, registration_verified_at,
+                    monitoring_enabled, presence_state, last_authenticated_seen_at,
+                    offline_since, offline_episode, created_at, updated_at
+                 ) VALUES ('inst-mixed-offline', 'verified', ?1, 1, 'offline', ?1, ?1, 1, ?1, ?1)",
+                params![occurred_at.to_rfc3339()],
+            )
+            .expect("insert mixed offline state");
+            for (kind, installation_id, episode) in [
+                ("client_offline", "inst-mixed-offline", 1_i64),
+                ("client_registered", "inst-mixed-register", 0_i64),
+            ] {
+                conn.execute(
+                    "INSERT INTO client_notification_events (
+                        id, dedupe_key, kind, installation_id, episode, status,
+                        occurred_at, not_before, snapshot_json, created_at, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?6, ?7, ?6, ?6)",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        format!("mixed-{kind}"),
+                        kind,
+                        installation_id,
+                        episode,
+                        occurred_at.to_rfc3339(),
+                        serde_json::json!({
+                            "installationId": installation_id,
+                            "platform": "linux",
+                            "registeredAt": occurred_at,
+                            "lastAuthenticatedSeenAt": occurred_at,
+                            "offlineSince": occurred_at,
+                        })
+                        .to_string(),
+                    ],
+                )
+                .expect("insert mixed event");
+            }
+        }
+        let policy = notification_policy(&config);
+        store
+            .aggregate_client_notification_batches(&policy, &notification_template(), delivery_at)
+            .await
+            .expect("aggregate mixed digest");
+        let batch = expect_notification_batch(
+            store
+                .claim_client_notification_batch("mixed-worker", delivery_at, 30)
+                .await
+                .expect("claim mixed digest"),
+            "mixed digest batch",
+        );
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installation_notification_state
+                 SET presence_state = 'online', offline_since = NULL
+                 WHERE installation_id = 'inst-mixed-offline'",
+                [],
+            )
+            .expect("recover mixed offline client");
+        }
+        assert!(
+            !store
+                .validate_client_notification_batch(
+                    &batch.id,
+                    "mixed-worker",
+                    &policy,
+                    delivery_at,
+                )
+                .await
+                .expect("validate recovered mixed digest")
+        );
+        {
+            let conn = store.conn.lock().await;
+            let statuses = conn
+                .prepare(
+                    "SELECT kind, status FROM client_notification_events
+                     WHERE dedupe_key LIKE 'mixed-%' ORDER BY kind",
+                )
+                .expect("prepare mixed statuses")
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .expect("query mixed statuses")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("read mixed statuses");
+            assert_eq!(
+                statuses,
+                vec![
+                    ("client_offline".into(), "cancelled_recovered".into()),
+                    ("client_registered".into(), "batched".into()),
+                ]
+            );
+        }
+        let registration_batch = expect_notification_batch(
+            store
+                .claim_client_notification_batch(
+                    "registration-worker",
+                    delivery_at + Duration::seconds(1),
+                    30,
+                )
+                .await
+                .expect("claim unaffected registration batch"),
+            "unaffected registration batch",
+        );
+        assert!(registration_batch.subject.contains("registered"));
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
     #[tokio::test]
     async fn register_installation_does_not_return_existing_control_secret_without_signature() {
         let (store, config) = setup_store("register-existing-no-secret-leak").await;
@@ -19697,6 +27207,7 @@ mod tests {
                     instance_nonce: Uuid::new_v4().to_string(),
                     timestamp_ms: None,
                     signature: None,
+                    proof_version: None,
                 },
                 ClientMetadata {
                     ip: None,
@@ -19748,6 +27259,7 @@ mod tests {
                     instance_nonce,
                     timestamp_ms: Some(timestamp_ms),
                     signature: Some(signature),
+                    proof_version: None,
                 },
                 ClientMetadata {
                     ip: None,
@@ -19759,6 +27271,17 @@ mod tests {
 
         assert_eq!(response.installation_id, "inst-signed-register");
         assert!(response.control_secret.is_some());
+        let conn = store.conn.lock().await;
+        let monitoring_enabled: i64 = conn
+            .query_row(
+                "SELECT monitoring_enabled FROM installation_notification_state
+                 WHERE installation_id = 'inst-signed-register'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read legacy recovery monitoring state");
+        assert_eq!(monitoring_enabled, 0);
+        drop(conn);
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
@@ -20976,6 +28499,934 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_delete_all_replaces_active_shares_without_erasing_history() {
+        let (store, config) = setup_store("legacy-delete-all-preserves-history").await;
+        let signing_key = insert_signed_installation(&store, "inst-legacy-delete-all").await;
+        insert_share(
+            &store,
+            "inst-legacy-delete-all",
+            "share-legacy-history",
+            "legacy-history-sub",
+            "active",
+        )
+        .await;
+        insert_health_check(&store, "share-legacy-history", Utc::now().timestamp(), true).await;
+        store
+            .create_share_settings_edit(
+                "share-legacy-history",
+                "owner@example.com",
+                ShareSettingsPatch {
+                    description: Some(Some("retained edit".into())),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .await
+            .expect("create retained share edit");
+
+        {
+            let conn = store.conn.lock().await;
+            let now = Utc::now();
+            let now_text = now.to_rfc3339();
+            upsert_share_request_log_tx(
+                &conn,
+                "inst-legacy-delete-all",
+                test_share_request_log_entry(
+                    "req_legacy_delete_all_history",
+                    "share-legacy-history",
+                    now.timestamp(),
+                ),
+            )
+            .expect("insert retained share request log");
+            record_share_model_health_check_conn(
+                &conn,
+                &test_health_check("share-legacy-history", "gpt-5", "success", now.timestamp()),
+            )
+            .expect("insert retained model health");
+            upsert_market_request_log_tx(
+                &conn,
+                &test_market(),
+                test_market_request_log("req_legacy_delete_all_market", "share-legacy-history"),
+            )
+            .expect("insert retained market request log");
+            conn.execute(
+                "INSERT INTO image_generation_jobs (
+                    job_id, share_id, installation_id, share_name, provider_id, provider_name,
+                    app_type, model, status, queued_at
+                 ) VALUES ('job-legacy-history', ?1, ?2, 'Legacy Share', 'provider-1',
+                           'Provider One', 'codex', 'gpt-image-1', 'completed', ?3)",
+                params![
+                    "share-legacy-history",
+                    "inst-legacy-delete-all",
+                    now.timestamp()
+                ],
+            )
+            .expect("insert retained image job");
+            conn.execute(
+                "INSERT INTO image_generation_request_logs (
+                    request_id, share_id, installation_id, share_name, provider_id, provider_name,
+                    app_type, model, status, created_at
+                 ) VALUES ('imgreq-legacy-history', ?1, ?2, 'Legacy Share', 'provider-1',
+                           'Provider One', 'codex', 'gpt-image-1', 'completed', ?3)",
+                params![
+                    "share-legacy-history",
+                    "inst-legacy-delete-all",
+                    now.timestamp()
+                ],
+            )
+            .expect("insert retained image request log");
+            conn.execute(
+                "INSERT INTO market_disabled_shares (
+                    market_email, share_id, disabled_by_email, reason, created_at, updated_at
+                 ) VALUES ('market@example.com', ?1, 'owner@example.com', 'audit', ?2, ?2)",
+                params!["share-legacy-history", now_text],
+            )
+            .expect("insert retained market disable audit");
+            conn.execute(
+                "INSERT INTO market_share_model_failure_state (
+                    market_email, share_id, app_type, requested_model, actual_model, last_status,
+                    last_checked_at, recent_results_json, updated_at
+                 ) VALUES ('market@example.com', ?1, 'codex', 'gpt-5', 'gpt-5', 'failed',
+                           ?2, '[\"failed\"]', ?2)",
+                params!["share-legacy-history", now.timestamp()],
+            )
+            .expect("insert retained market model health");
+            conn.execute(
+                "INSERT INTO market_share_runtime_states (
+                    market_email, share_id, scope, kind, created_at, updated_at
+                 ) VALUES ('market@example.com', ?1, 'app', 'degraded', ?2, ?2)",
+                params!["share-legacy-history", now_text],
+            )
+            .expect("insert retained market runtime state");
+            conn.execute(
+                "INSERT INTO share_market_listing_statuses (
+                    market_email, router_id, share_id, app_type, listing_url, status,
+                    created_at, updated_at
+                 ) VALUES ('market@example.com', 'main', ?1, 'codex',
+                           'https://market.example.com/listing', 'active', ?2, ?2)",
+                params!["share-legacy-history", now_text],
+            )
+            .expect("insert retained listing status");
+        }
+
+        let ops = vec![
+            ShareSyncOperation {
+                kind: "delete_all".into(),
+                share: None,
+                share_id: None,
+            },
+            ShareSyncOperation {
+                kind: "upsert".into(),
+                share: Some(test_share_descriptor(
+                    "share-current-after-delete-all",
+                    "current-after-delete-all",
+                )),
+                share_id: None,
+            },
+        ];
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            "inst-legacy-delete-all",
+            "share_batch_sync",
+            &ops,
+            timestamp_ms,
+            &nonce,
+        );
+        store
+            .batch_sync_shares(
+                ShareBatchSyncRequest {
+                    installation_id: "inst-legacy-delete-all".into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    ops,
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                "owner@example.com",
+            )
+            .await
+            .expect("apply legacy delete_all snapshot replacement");
+
+        let conn = store.conn.lock().await;
+        let old_active: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM shares WHERE share_id = 'share-legacy-history'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count removed active share");
+        let current_active: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM shares WHERE share_id = 'share-current-after-delete-all'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count replacement active share");
+        assert_eq!(old_active, 0);
+        assert_eq!(current_active, 1);
+        for table in [
+            "share_request_logs",
+            "share_health_checks",
+            "share_model_health_checks",
+            "share_edit_requests",
+            "image_generation_jobs",
+            "image_generation_request_logs",
+            "market_request_logs",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE share_id = ?1"),
+                    params!["share-legacy-history"],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|error| panic!("count retained {table}: {error}"));
+            assert_eq!(count, 1, "legacy delete_all erased {table}");
+        }
+        for table in [
+            "share_model_health_state",
+            "market_disabled_shares",
+            "market_share_model_failure_state",
+            "market_share_runtime_states",
+            "share_market_listing_statuses",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE share_id = ?1"),
+                    params!["share-legacy-history"],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|error| panic!("count cleared {table}: {error}"));
+            assert_eq!(
+                count, 0,
+                "legacy delete_all retained current state in {table}"
+            );
+        }
+        let retired_edit: (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT status, error_message, retired_at
+                 FROM share_edit_requests
+                 WHERE share_id = ?1",
+                params!["share-legacy-history"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read retired pending edit");
+        assert_eq!(retired_edit.0, "cancelled");
+        assert_eq!(
+            retired_edit.1.as_deref(),
+            Some("share was deleted before the edit could be applied")
+        );
+        assert!(retired_edit.2.is_some());
+        drop(conn);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn legacy_delete_all_protects_same_batch_upsert_lifecycle() {
+        let (store, config) = setup_store("legacy-delete-all-protected-upsert").await;
+        let signing_key = insert_signed_installation(&store, "inst-protected-upsert").await;
+        insert_share(
+            &store,
+            "inst-protected-upsert",
+            "share-protected-upsert",
+            "protected-upsert-sub",
+            "active",
+        )
+        .await;
+        let pending = store
+            .create_share_settings_edit(
+                "share-protected-upsert",
+                "owner@example.com",
+                ShareSettingsPatch {
+                    description: Some(Some("keep pending".into())),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .await
+            .expect("create protected pending edit")
+            .edit;
+        {
+            let conn = store.conn.lock().await;
+            insert_ephemeral_share_state(&conn, "share-protected-upsert");
+        }
+
+        let ops = vec![
+            ShareSyncOperation {
+                kind: "delete_all".into(),
+                share: None,
+                share_id: None,
+            },
+            ShareSyncOperation {
+                kind: "upsert".into(),
+                share: Some(test_share_descriptor(
+                    "share-protected-upsert",
+                    "protected-upsert-sub",
+                )),
+                share_id: None,
+            },
+        ];
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            "inst-protected-upsert",
+            "share_batch_sync",
+            &ops,
+            timestamp_ms,
+            &nonce,
+        );
+        store
+            .batch_sync_shares(
+                ShareBatchSyncRequest {
+                    installation_id: "inst-protected-upsert".into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    ops,
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                "owner@example.com",
+            )
+            .await
+            .expect("apply protected legacy snapshot");
+
+        let conn = store.conn.lock().await;
+        let share_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM shares WHERE share_id = ?1",
+                params!["share-protected-upsert"],
+                |row| row.get(0),
+            )
+            .expect("count protected share");
+        assert_eq!(share_count, 1);
+        let edit_state: (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, retired_at FROM share_edit_requests WHERE id = ?1",
+                params![pending.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read protected edit");
+        assert_eq!(edit_state, ("pending".into(), None));
+        for table in [
+            "share_model_health_state",
+            "market_disabled_shares",
+            "market_share_model_failure_state",
+            "market_share_runtime_states",
+            "share_market_listing_statuses",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE share_id = ?1"),
+                    params!["share-protected-upsert"],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|error| panic!("count protected {table}: {error}"));
+            assert_eq!(count, 1, "delete_all cleared protected state in {table}");
+        }
+        drop(conn);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn deleted_share_rebuild_does_not_inherit_edits_or_runtime_state() {
+        let (store, config) = setup_store("deleted-share-rebuild-lifecycle").await;
+        let installation_id = "inst-rebuild-lifecycle";
+        let share_id = "share-rebuild-lifecycle";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        insert_share(
+            &store,
+            installation_id,
+            share_id,
+            "rebuild-lifecycle-sub",
+            "active",
+        )
+        .await;
+
+        let rejected = store
+            .create_share_settings_edit(
+                share_id,
+                "owner@example.com",
+                ShareSettingsPatch {
+                    description: Some(Some("old rejected".into())),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .await
+            .expect("create old rejected edit")
+            .edit;
+        store
+            .mark_share_edit_rejected(&rejected.id, "old lifecycle rejection")
+            .await
+            .expect("reject old edit");
+        let pending = store
+            .create_share_settings_edit(
+                share_id,
+                "owner@example.com",
+                ShareSettingsPatch {
+                    description: Some(Some("old pending".into())),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .await
+            .expect("create old pending edit")
+            .edit;
+        insert_health_check(&store, share_id, Utc::now().timestamp(), true).await;
+        {
+            let conn = store.conn.lock().await;
+            record_share_model_health_check_conn(
+                &conn,
+                &test_health_check(share_id, "gpt-5", "success", Utc::now().timestamp()),
+            )
+            .expect("insert retained model health history");
+            insert_ephemeral_share_state(&conn, share_id);
+        }
+
+        let delete_payload = serde_json::json!({ "shareId": share_id });
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            installation_id,
+            "share_delete",
+            &delete_payload,
+            timestamp_ms,
+            &nonce,
+        );
+        store
+            .delete_share(
+                ShareDeleteRequest {
+                    installation_id: installation_id.into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    share_id: share_id.into(),
+                },
+                "",
+            )
+            .await
+            .expect("delete old share lifecycle");
+
+        let ops = vec![ShareSyncOperation {
+            kind: "upsert".into(),
+            share: Some(test_share_descriptor(share_id, "rebuild-lifecycle-sub")),
+            share_id: None,
+        }];
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            installation_id,
+            "share_batch_sync",
+            &ops,
+            timestamp_ms,
+            &nonce,
+        );
+        store
+            .batch_sync_shares(
+                ShareBatchSyncRequest {
+                    installation_id: installation_id.into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    ops,
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                "",
+            )
+            .await
+            .expect("rebuild share with same id");
+
+        let requested_share_ids = vec![share_id.to_string()];
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            installation_id,
+            "share_pending_edits",
+            &requested_share_ids,
+            timestamp_ms,
+            &nonce,
+        );
+        let pending_response = store
+            .pending_share_edits(
+                SharePendingEditsRequest {
+                    installation_id: installation_id.into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    share_ids: requested_share_ids,
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+            )
+            .await
+            .expect("query rebuilt share pending edits");
+        assert!(pending_response.edits.is_empty());
+
+        let conn = store.conn.lock().await;
+        assert!(
+            !list_active_share_edits(&conn)
+                .expect("list rebuilt share active edits")
+                .contains_key(share_id)
+        );
+        let audit_rows: Vec<(String, String, Option<String>, Option<String>)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, status, error_message, retired_at
+                     FROM share_edit_requests
+                     WHERE share_id = ?1
+                     ORDER BY revision ASC",
+                )
+                .expect("prepare retired edit audit query");
+            stmt.query_map(params![share_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .expect("query retired edit audit")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect retired edit audit")
+        };
+        assert_eq!(audit_rows.len(), 2);
+        assert_eq!(audit_rows[0].0, rejected.id);
+        assert_eq!(audit_rows[0].1, "rejected");
+        assert_eq!(audit_rows[0].2.as_deref(), Some("old lifecycle rejection"));
+        assert!(audit_rows[0].3.is_some());
+        assert_eq!(audit_rows[1].0, pending.id);
+        assert_eq!(audit_rows[1].1, "cancelled");
+        assert_eq!(
+            audit_rows[1].2.as_deref(),
+            Some("share was deleted before the edit could be applied")
+        );
+        assert!(audit_rows[1].3.is_some());
+        for table in [
+            "share_model_health_state",
+            "market_disabled_shares",
+            "market_share_model_failure_state",
+            "market_share_runtime_states",
+            "share_market_listing_statuses",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE share_id = ?1"),
+                    params![share_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|error| panic!("count rebuilt {table}: {error}"));
+            assert_eq!(count, 0, "rebuilt share inherited {table}");
+        }
+        for table in ["share_health_checks", "share_model_health_checks"] {
+            let count: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE share_id = ?1"),
+                    params![share_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|error| panic!("count retained {table}: {error}"));
+            assert_eq!(count, 1, "delete erased historical {table}");
+        }
+        drop(conn);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[test]
+    fn share_prune_ids_are_bounded_validated_and_deduplicated() {
+        assert!(
+            validate_share_prune_ids(&[])
+                .expect("empty snapshot")
+                .is_empty()
+        );
+        let duplicate_ids = vec!["share-1".to_string(), "share-1".to_string()];
+        assert_eq!(
+            validate_share_prune_ids(&duplicate_ids)
+                .expect("duplicate ids")
+                .len(),
+            1
+        );
+        for invalid in ["", " share-1", "share-1 ", "share\n1"] {
+            assert!(validate_share_prune_ids(&[invalid.to_string()]).is_err());
+        }
+        assert!(validate_share_prune_ids(&["x".repeat(SHARE_PRUNE_MAX_ID_BYTES + 1)]).is_err());
+        assert!(validate_share_prune_ids(&vec!["share".into(); SHARE_PRUNE_MAX_IDS + 1]).is_err());
+    }
+
+    #[tokio::test]
+    async fn prune_shares_rejects_invalid_signature_without_deleting() {
+        let (store, config) = setup_store("share-prune-invalid-signature").await;
+        let installation_id = "inst-prune-invalid-signature";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        insert_share(
+            &store,
+            installation_id,
+            "share-prune-kept",
+            "prune-kept-sub",
+            "active",
+        )
+        .await;
+        insert_share(
+            &store,
+            installation_id,
+            "share-prune-ghost",
+            "prune-ghost-sub",
+            "active",
+        )
+        .await;
+
+        let share_ids = vec!["share-prune-kept".to_string()];
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            installation_id,
+            "share_prune_v1",
+            &Vec::<String>::new(),
+            timestamp_ms,
+            &nonce,
+        );
+        let error = store
+            .prune_shares(
+                SharePruneRequest {
+                    installation_id: installation_id.into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    share_ids,
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+            )
+            .await
+            .expect_err("mismatched prune signature must fail");
+        assert!(error.to_string().contains("signature verification failed"));
+
+        let conn = store.conn.lock().await;
+        let share_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM shares WHERE installation_id = ?1",
+                params![installation_id],
+                |row| row.get(0),
+            )
+            .expect("count shares after rejected prune");
+        assert_eq!(share_count, 2);
+        drop(conn);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn prune_shares_preserves_history_clears_state_and_is_idempotent() {
+        let (store, config) = setup_store("share-prune-lifecycle").await;
+        let installation_id = "inst-prune-lifecycle";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        insert_installation(&store, "inst-prune-other").await;
+        insert_share(
+            &store,
+            installation_id,
+            "share-prune-current",
+            "prune-current-sub",
+            "active",
+        )
+        .await;
+        insert_share(
+            &store,
+            installation_id,
+            "share-prune-missing",
+            "prune-missing-sub",
+            "active",
+        )
+        .await;
+        insert_share(
+            &store,
+            "inst-prune-other",
+            "share-prune-other",
+            "prune-other-sub",
+            "active",
+        )
+        .await;
+        store
+            .create_share_settings_edit(
+                "share-prune-missing",
+                "owner@example.com",
+                ShareSettingsPatch {
+                    description: Some(Some("retire with missing snapshot".into())),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .await
+            .expect("create prune pending edit");
+        insert_health_check(&store, "share-prune-missing", Utc::now().timestamp(), true).await;
+        {
+            let conn = store.conn.lock().await;
+            let now = Utc::now();
+            upsert_share_request_log_tx(
+                &conn,
+                installation_id,
+                test_share_request_log_entry(
+                    "req_share_prune_history",
+                    "share-prune-missing",
+                    now.timestamp(),
+                ),
+            )
+            .expect("insert prune request history");
+            record_share_model_health_check_conn(
+                &conn,
+                &test_health_check("share-prune-missing", "gpt-5", "success", now.timestamp()),
+            )
+            .expect("insert prune model health history");
+            upsert_market_request_log_tx(
+                &conn,
+                &test_market(),
+                test_market_request_log("req_share_prune_market", "share-prune-missing"),
+            )
+            .expect("insert prune market request history");
+            conn.execute(
+                "INSERT INTO image_generation_jobs (
+                    job_id, share_id, installation_id, share_name, provider_id, provider_name,
+                    app_type, model, status, queued_at
+                 ) VALUES ('job-share-prune', ?1, ?2, 'Pruned Share', 'provider-1',
+                           'Provider One', 'codex', 'gpt-image-1', 'completed', ?3)",
+                params!["share-prune-missing", installation_id, now.timestamp()],
+            )
+            .expect("insert prune image job history");
+            conn.execute(
+                "INSERT INTO image_generation_request_logs (
+                    request_id, share_id, installation_id, share_name, provider_id, provider_name,
+                    app_type, model, status, created_at
+                 ) VALUES ('imgreq-share-prune', ?1, ?2, 'Pruned Share', 'provider-1',
+                           'Provider One', 'codex', 'gpt-image-1', 'completed', ?3)",
+                params!["share-prune-missing", installation_id, now.timestamp()],
+            )
+            .expect("insert prune image request history");
+            insert_ephemeral_share_state(&conn, "share-prune-missing");
+        }
+
+        let share_ids = vec![
+            "share-prune-current".to_string(),
+            "share-prune-current".to_string(),
+            "share-prune-other".to_string(),
+        ];
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            installation_id,
+            "share_prune_v1",
+            &share_ids,
+            timestamp_ms,
+            &nonce,
+        );
+        let pruned = store
+            .prune_shares(
+                SharePruneRequest {
+                    installation_id: installation_id.into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    share_ids: share_ids.clone(),
+                },
+                ClientMetadata {
+                    ip: Some("127.0.0.1".into()),
+                    country_code: None,
+                },
+            )
+            .await
+            .expect("prune missing share");
+        assert_eq!(pruned, 1);
+
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            installation_id,
+            "share_prune_v1",
+            &share_ids,
+            timestamp_ms,
+            &nonce,
+        );
+        let pruned_again = store
+            .prune_shares(
+                SharePruneRequest {
+                    installation_id: installation_id.into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    share_ids,
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+            )
+            .await
+            .expect("repeat idempotent prune");
+        assert_eq!(pruned_again, 0);
+
+        let conn = store.conn.lock().await;
+        for (share_id, expected) in [
+            ("share-prune-current", 1),
+            ("share-prune-missing", 0),
+            ("share-prune-other", 1),
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM shares WHERE share_id = ?1",
+                    params![share_id],
+                    |row| row.get(0),
+                )
+                .expect("count share after prune");
+            assert_eq!(count, expected, "unexpected prune result for {share_id}");
+        }
+        for table in [
+            "share_request_logs",
+            "share_health_checks",
+            "share_model_health_checks",
+            "share_edit_requests",
+            "image_generation_jobs",
+            "image_generation_request_logs",
+            "market_request_logs",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE share_id = ?1"),
+                    params!["share-prune-missing"],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|error| panic!("count prune history {table}: {error}"));
+            assert_eq!(count, 1, "prune erased {table}");
+        }
+        for table in [
+            "share_model_health_state",
+            "market_disabled_shares",
+            "market_share_model_failure_state",
+            "market_share_runtime_states",
+            "share_market_listing_statuses",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE share_id = ?1"),
+                    params!["share-prune-missing"],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|error| panic!("count pruned state {table}: {error}"));
+            assert_eq!(count, 0, "prune retained {table}");
+        }
+        let edit: (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT status, error_message, retired_at
+                 FROM share_edit_requests
+                 WHERE share_id = 'share-prune-missing'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read pruned edit audit");
+        assert_eq!(edit.0, "cancelled");
+        assert_eq!(
+            edit.1.as_deref(),
+            Some("share was deleted before the edit could be applied")
+        );
+        assert!(edit.2.is_some());
+        drop(conn);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn prune_shares_accepts_empty_snapshot_without_cross_installation_deletion() {
+        let (store, config) = setup_store("share-prune-empty-snapshot").await;
+        let installation_id = "inst-prune-empty";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        insert_installation(&store, "inst-prune-empty-other").await;
+        insert_share(
+            &store,
+            installation_id,
+            "share-prune-empty-1",
+            "prune-empty-1-sub",
+            "active",
+        )
+        .await;
+        insert_share(
+            &store,
+            installation_id,
+            "share-prune-empty-2",
+            "prune-empty-2-sub",
+            "active",
+        )
+        .await;
+        insert_share(
+            &store,
+            "inst-prune-empty-other",
+            "share-prune-empty-other",
+            "prune-empty-other-sub",
+            "active",
+        )
+        .await;
+
+        let share_ids = Vec::<String>::new();
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            installation_id,
+            "share_prune_v1",
+            &share_ids,
+            timestamp_ms,
+            &nonce,
+        );
+        let pruned = store
+            .prune_shares(
+                SharePruneRequest {
+                    installation_id: installation_id.into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    share_ids,
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+            )
+            .await
+            .expect("prune empty snapshot");
+        assert_eq!(pruned, 2);
+
+        let conn = store.conn.lock().await;
+        let owned_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM shares WHERE installation_id = ?1",
+                params![installation_id],
+                |row| row.get(0),
+            )
+            .expect("count pruned installation shares");
+        let other_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM shares WHERE installation_id = 'inst-prune-empty-other'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count other installation shares");
+        assert_eq!(owned_count, 0);
+        assert_eq!(other_count, 1);
+        drop(conn);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
     async fn batch_sync_shares_accepts_model_health_checked_at_wire_format() {
         let (store, config) = setup_store("signed-share-batch-model-health").await;
         let signing_key = insert_signed_installation(&store, "inst-batch-health").await;
@@ -21260,6 +29711,14 @@ mod tests {
     async fn batch_sync_shares_accepts_multiple_upserts_for_one_installation() {
         let (store, config) = setup_store("batch-multiple-upsert").await;
         let signing_key = insert_signed_installation(&store, "inst-multi").await;
+        insert_share(
+            &store,
+            "inst-multi",
+            "share-existing",
+            "existing-sub",
+            "active",
+        )
+        .await;
         let ops = vec![
             ShareSyncOperation {
                 kind: "upsert".into(),
@@ -21302,14 +29761,17 @@ mod tests {
             .expect("multiple independent share upserts should succeed");
 
         let conn = store.conn.lock().await;
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM shares WHERE installation_id='inst-multi'",
-                [],
-                |row| row.get(0),
+        let share_ids = conn
+            .prepare(
+                "SELECT share_id FROM shares
+                 WHERE installation_id = 'inst-multi' ORDER BY share_id",
             )
-            .expect("count reconciled shares");
-        assert_eq!(count, 2);
+            .expect("prepare reconciled shares")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query reconciled shares")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read reconciled shares");
+        assert_eq!(share_ids, vec!["share-existing", "share-one", "share-two"]);
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
@@ -22141,7 +30603,7 @@ mod tests {
             .set_route(
                 "stale-sub".into(),
                 "127.0.0.1:1234".into(),
-                None,
+                Some("stale-connection".into()),
                 None,
                 None,
                 false,
@@ -22206,6 +30668,208 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_client_cleanup_rebuild_does_not_restore_old_pending_edit() {
+        let (store, config) = setup_store("cleanup-stale-client-edit-lifecycle").await;
+        let installation_id = "inst-stale-edit-lifecycle";
+        let share_id = "share-stale-edit-lifecycle";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        insert_share(
+            &store,
+            installation_id,
+            share_id,
+            "stale-edit-lifecycle-sub",
+            "active",
+        )
+        .await;
+        let pending = store
+            .create_share_settings_edit(
+                share_id,
+                "owner@example.com",
+                ShareSettingsPatch {
+                    description: Some(Some("must not cross cleanup lifecycle".into())),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .await
+            .expect("create stale cleanup pending edit")
+            .edit;
+        insert_health_check(&store, share_id, Utc::now().timestamp(), true).await;
+        {
+            let conn = store.conn.lock().await;
+            record_share_model_health_check_conn(
+                &conn,
+                &test_health_check(share_id, "gpt-5", "success", Utc::now().timestamp()),
+            )
+            .expect("insert stale cleanup model health history");
+            insert_ephemeral_share_state(&conn, share_id);
+        }
+        mark_installation_last_seen(&store, installation_id, Utc::now() - Duration::hours(2)).await;
+
+        let cleanup = store
+            .cleanup_expired_data(&config, &ProxyRegistry::default())
+            .await
+            .expect("retire stale client share");
+        assert_eq!(cleanup.deleted_installations, 0);
+        assert_eq!(cleanup.deleted_shares, 1);
+
+        let ops = vec![ShareSyncOperation {
+            kind: "upsert".into(),
+            share: Some(test_share_descriptor(share_id, "stale-edit-lifecycle-sub")),
+            share_id: None,
+        }];
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            installation_id,
+            "share_batch_sync",
+            &ops,
+            timestamp_ms,
+            &nonce,
+        );
+        store
+            .batch_sync_shares(
+                ShareBatchSyncRequest {
+                    installation_id: installation_id.into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    ops,
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                "",
+            )
+            .await
+            .expect("rebuild stale client share");
+
+        let requested_share_ids = vec![share_id.to_string()];
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            installation_id,
+            "share_pending_edits",
+            &requested_share_ids,
+            timestamp_ms,
+            &nonce,
+        );
+        let pending_edits = store
+            .pending_share_edits(
+                SharePendingEditsRequest {
+                    installation_id: installation_id.into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    share_ids: requested_share_ids,
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+            )
+            .await
+            .expect("query rebuilt stale share pending edits");
+        assert!(pending_edits.edits.is_empty());
+
+        let conn = store.conn.lock().await;
+        let retired_edit: (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT status, error_message, retired_at
+                 FROM share_edit_requests WHERE id = ?1",
+                params![pending.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read stale cleanup edit audit");
+        assert_eq!(retired_edit.0, "cancelled");
+        assert_eq!(
+            retired_edit.1.as_deref(),
+            Some("share was deleted before the edit could be applied")
+        );
+        assert!(retired_edit.2.is_some());
+        assert!(
+            !list_active_share_edits(&conn)
+                .expect("list stale cleanup active edits")
+                .contains_key(share_id)
+        );
+        for table in ["share_health_checks", "share_model_health_checks"] {
+            let count: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE share_id = ?1"),
+                    params![share_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|error| panic!("count cleanup history {table}: {error}"));
+            assert_eq!(count, 1, "stale cleanup erased {table}");
+        }
+        for table in [
+            "share_model_health_state",
+            "market_disabled_shares",
+            "market_share_model_failure_state",
+            "market_share_runtime_states",
+            "share_market_listing_statuses",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE share_id = ?1"),
+                    params![share_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|error| panic!("count cleanup state {table}: {error}"));
+            assert_eq!(count, 0, "rebuilt stale share inherited {table}");
+        }
+        drop(conn);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn stale_route_snapshot_does_not_remove_a_reconnected_route() {
+        let proxy = ProxyRegistry::default();
+        proxy
+            .set_route(
+                "client-sub".into(),
+                "127.0.0.1:1234".into(),
+                Some("old-connection".into()),
+                None,
+                None,
+                false,
+                -1,
+                None,
+            )
+            .await;
+        let snapshot = proxy.active_route_connections().await;
+        proxy
+            .set_route(
+                "client-sub".into(),
+                "127.0.0.1:5678".into(),
+                Some("new-connection".into()),
+                None,
+                None,
+                false,
+                -1,
+                None,
+            )
+            .await;
+
+        let removed =
+            remove_stale_route_snapshots(&proxy, vec!["client-sub".into()], &snapshot).await;
+        assert_eq!(removed, 0);
+        assert_eq!(
+            proxy
+                .active_route_connections()
+                .await
+                .get("client-sub")
+                .cloned()
+                .flatten()
+                .as_deref(),
+            Some("new-connection")
+        );
+    }
+
+    #[tokio::test]
     async fn cleanup_deletes_installation_after_retention() {
         let (store, mut config) = setup_store("cleanup-installation-retention").await;
         config.client_installation_retention_secs = 2 * 60 * 60;
@@ -22267,6 +30931,68 @@ mod tests {
         assert_eq!(installations_after, 0);
         assert_eq!(shares_after, 0);
 
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn cleanup_retains_installation_until_offline_notification_is_terminal() {
+        let mut config = enabled_notification_config("cleanup-pending-offline-event");
+        config.cleanup_interval_secs = 60;
+        config.client_stale_secs = 600;
+        config.client_installation_retention_secs = 600;
+        config.client_notifications.offline_alert_secs = 180;
+        let store = AppStore::new(&config).expect("create store");
+        let _signing_key = insert_signed_installation(&store, "inst-pending-offline").await;
+        insert_share(
+            &store,
+            "inst-pending-offline",
+            "share-pending-offline",
+            "pending-offline-sub",
+            "active",
+        )
+        .await;
+        let stale = Utc::now() - Duration::seconds(700);
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installations SET last_seen_at = ?2 WHERE id = ?1",
+                params!["inst-pending-offline", stale.to_rfc3339()],
+            )
+            .expect("backdate pending offline installation");
+            conn.execute(
+                "INSERT INTO installation_notification_state (
+                    installation_id, registration_state, registration_verified_at,
+                    monitoring_enabled, presence_state, last_authenticated_seen_at,
+                    offline_episode, created_at, updated_at
+                 ) VALUES (?1, 'verified', ?2, 1, 'online', ?2, 0, ?2, ?2)",
+                params!["inst-pending-offline", stale.to_rfc3339()],
+            )
+            .expect("insert pending offline state");
+        }
+        let result = store
+            .cleanup_expired_data(&config, &ProxyRegistry::default())
+            .await
+            .expect("cleanup pending offline installation");
+        assert_eq!(result.deleted_installations, 0);
+        let conn = store.conn.lock().await;
+        let retained: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM installations WHERE id = 'inst-pending-offline'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count retained installation");
+        let event_status: String = conn
+            .query_row(
+                "SELECT status FROM client_notification_events
+                 WHERE installation_id = 'inst-pending-offline' AND kind = 'client_offline'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read pending offline event");
+        assert_eq!(retained, 1);
+        assert_eq!(event_status, "pending");
+        drop(conn);
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 

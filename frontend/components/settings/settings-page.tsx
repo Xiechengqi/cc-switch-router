@@ -13,6 +13,7 @@ import {
   settingsValueSource,
 } from "@/lib/settings-i18n";
 import { LogsPanel } from "@/components/settings/logs-panel";
+import { ClientNotificationDeliveriesPanel } from "@/components/settings/client-notification-deliveries-panel";
 import { MapDisplayPanel } from "@/components/settings/map-display-panel";
 import { VersionPanel } from "@/components/settings/version-panel";
 import { getSettingsSchema, getSettingsValues, saveSettings, testTelegram, restartService, getMapDisplay, updateMapDisplay } from "@/lib/api";
@@ -23,6 +24,7 @@ type DirtyValue = string | boolean | null;
 const VERSION_GROUP = "__version";
 const MAP_GROUP = "__map";
 const LOGS_GROUP = "__logs";
+const NOTIFICATION_DELIVERIES_GROUP = "__notification_deliveries";
 
 export function SettingsPage() {
   const { session, loading } = useAuth();
@@ -84,7 +86,7 @@ export function SettingsPage() {
   }
 
   const groups = schema?.groups || [];
-  const fields = activeGroup === VERSION_GROUP || activeGroup === MAP_GROUP || activeGroup === LOGS_GROUP
+  const fields = activeGroup === VERSION_GROUP || activeGroup === MAP_GROUP || activeGroup === LOGS_GROUP || activeGroup === NOTIFICATION_DELIVERIES_GROUP
     ? []
     : (schema?.fields || []).filter((field) => field.group === activeGroup);
   const dirtyCount = Object.keys(dirty).length + (mapDirty ? 1 : 0);
@@ -148,6 +150,9 @@ export function SettingsPage() {
                     </ListBox.Item>
                   );
                 })}
+                <ListBox.Item id={NOTIFICATION_DELIVERIES_GROUP} textValue={t("settings.notificationDeliveries")} className={`flex items-center justify-between ${activeGroup === NOTIFICATION_DELIVERIES_GROUP ? "bg-primary/10 text-foreground" : ""}`}>
+                  <span>{t("settings.notificationDeliveries")}</span>
+                </ListBox.Item>
                 <ListBox.Item id={LOGS_GROUP} textValue={t("settings.logs")} className={`flex items-center justify-between ${activeGroup === LOGS_GROUP ? "bg-primary/10 text-foreground" : ""}`}>
                   <span>{t("settings.logs")}</span>
                 </ListBox.Item>
@@ -169,6 +174,8 @@ export function SettingsPage() {
             />
           ) : activeGroup === LOGS_GROUP ? (
             <LogsPanel />
+          ) : activeGroup === NOTIFICATION_DELIVERIES_GROUP ? (
+            <ClientNotificationDeliveriesPanel />
           ) : (
             <Card className="rounded-lg">
               <Card.Header>
@@ -312,12 +319,12 @@ function dirtyValue(field: SettingsField, entry: SettingValueEntry | undefined, 
 }
 
 function buildUpdates(schema: SettingsSchema | null, dirty: Record<string, DirtyValue>) {
-  const updates: Record<string, string | null | boolean> = {};
+  const updates: Record<string, string | null> = {};
   for (const [key, value] of Object.entries(dirty)) {
     const field = schema?.fields.find((candidate) => candidate.key === key);
     if (!field) continue;
     if (field.fieldType === "bool") {
-      updates[key] = Boolean(value);
+      updates[key] = Boolean(value) ? "true" : "false";
     } else if (field.fieldType === "secret") {
       if (value === "" || value == null) continue;
       updates[key] = value === "-" ? null : String(value);

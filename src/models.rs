@@ -112,6 +112,8 @@ pub struct RegisterInstallationRequest {
     pub timestamp_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof_version: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -688,6 +690,16 @@ pub struct ShareDeleteRequest {
     pub nonce: String,
     pub signature: String,
     pub share_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SharePruneRequest {
+    pub installation_id: String,
+    pub timestamp_ms: i64,
+    pub nonce: String,
+    pub signature: String,
+    pub share_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2253,6 +2265,33 @@ pub struct ReportInstallationStatusRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ReportInstallationStatusResponse {
     pub ok: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallationHeartbeatPayload {
+    pub protocol_version: i64,
+    pub boot_id: String,
+    pub app_version: String,
+    pub commit_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallationHeartbeatRequest {
+    pub installation_id: String,
+    pub timestamp_ms: i64,
+    pub nonce: String,
+    pub signature: String,
+    #[serde(flatten)]
+    pub payload: InstallationHeartbeatPayload,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallationHeartbeatResponse {
+    pub ok: bool,
+    pub server_time: DateTime<Utc>,
 }
 
 #[derive(Debug, Deserialize)]

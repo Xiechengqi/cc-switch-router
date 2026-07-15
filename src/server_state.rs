@@ -17,6 +17,7 @@ use crate::metrics::MetricsRegistry;
 use crate::models::{ResendUsageResponse, ShareEditAvailableEvent};
 use crate::proxy::ProxyRegistry;
 use crate::recent_traffic::RecentTraffic;
+use crate::registration_admission::RegistrationAdmissionLimiter;
 use crate::scheduling_signals::OverrideStore;
 use crate::store::AppStore;
 
@@ -59,6 +60,8 @@ pub struct ServerState {
     pub metrics: Arc<MetricsRegistry>,
     /// Per-IP limiter for the public payout-profile lookup endpoints.
     pub payout_profile_read_limiter: Arc<PublicPayoutProfileReadLimiter>,
+    /// Bounded in-memory admission limiter for the public installation registration endpoint.
+    pub registration_admission: Arc<RegistrationAdmissionLimiter>,
 }
 
 const PUBLIC_PAYOUT_READS_PER_MINUTE: u32 = 300;

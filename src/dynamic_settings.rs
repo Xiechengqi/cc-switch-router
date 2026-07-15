@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::net::IpAddr;
 
-use crate::config::Config;
+use crate::config::{ClientNotificationSettings, Config};
 
 /// Settings that can change at runtime without restarting the process.
 ///
@@ -15,6 +15,7 @@ pub struct DynamicSettings {
     pub security: SecuritySettings,
     pub telegram: TelegramSettings,
     pub board: BoardSettings,
+    pub client_notifications: ClientNotificationSettings,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +68,7 @@ impl DynamicSettings {
                 pin_limit: config.board_pin_limit,
                 guest_self_delete_secs: config.board_guest_self_delete_secs,
             },
+            client_notifications: config.client_notifications.clone(),
         }
     }
 
@@ -175,6 +177,30 @@ fn prefix_match(block: u128, candidate: u128, prefix: u8, bits: u8) -> bool {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn dynamic_settings_preserve_registration_notification_caps() {
+        let mut config = Config::from_env();
+        config
+            .client_notifications
+            .registration_recipient_hourly_limit = 8;
+        config.client_notifications.registration_global_hourly_limit = 21;
+
+        let dynamic = DynamicSettings::from_config(&config);
+
+        assert_eq!(
+            dynamic
+                .client_notifications
+                .registration_recipient_hourly_limit,
+            8
+        );
+        assert_eq!(
+            dynamic
+                .client_notifications
+                .registration_global_hourly_limit,
+            21
+        );
+    }
 
     #[test]
     fn ip_blacklist_supports_exact_ipv4_and_cidr() {

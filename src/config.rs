@@ -16,6 +16,47 @@ pub struct MetricsConfig {
     pub sample_interval_secs: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientNotificationSettings {
+    pub enabled: bool,
+    pub alert_emails: Vec<String>,
+    pub offline_alert_secs: i64,
+    pub recovery_stable_secs: i64,
+    pub cooldown_secs: i64,
+    pub batch_window_secs: i64,
+    pub storm_window_secs: i64,
+    pub storm_min_clients: i64,
+    pub storm_percent: i64,
+    pub storm_reminder_secs: i64,
+    pub recipient_hourly_limit: i64,
+    pub global_hourly_limit: i64,
+    pub registration_recipient_hourly_limit: i64,
+    pub registration_global_hourly_limit: i64,
+    pub notify_owner: bool,
+}
+
+impl Default for ClientNotificationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            alert_emails: Vec::new(),
+            offline_alert_secs: 180,
+            recovery_stable_secs: 120,
+            cooldown_secs: 30 * 60,
+            batch_window_secs: 60,
+            storm_window_secs: 5 * 60,
+            storm_min_clients: 5,
+            storm_percent: 20,
+            storm_reminder_secs: 30 * 60,
+            recipient_hourly_limit: 10,
+            global_hourly_limit: 50,
+            registration_recipient_hourly_limit: 3,
+            registration_global_hourly_limit: 10,
+            notify_owner: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub api_addr: SocketAddr,
@@ -35,6 +76,7 @@ pub struct Config {
     pub resend_from: Option<String>,
     pub resend_from_name: Option<String>,
     pub resend_reply_to: Option<String>,
+    pub client_notifications: ClientNotificationSettings,
     pub auth_code_ttl_secs: i64,
     pub auth_code_cooldown_secs: i64,
     pub auth_session_ttl_secs: i64,
@@ -120,6 +162,43 @@ impl Config {
                 .or_else(|| crate::startup_config::default_resend_from(&tunnel_domain)),
             resend_from_name: env_var("CC_SWITCH_ROUTER_RESEND_FROM_NAME"),
             resend_reply_to: env_var("CC_SWITCH_ROUTER_RESEND_REPLY_TO"),
+            client_notifications: ClientNotificationSettings {
+                enabled: env_bool("CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED", false),
+                alert_emails: parse_email_list(
+                    env_var("CC_SWITCH_ROUTER_CLIENT_ALERT_EMAILS").as_deref(),
+                ),
+                offline_alert_secs: env_i64("CC_SWITCH_ROUTER_CLIENT_OFFLINE_ALERT_SECS", 180),
+                recovery_stable_secs: env_i64("CC_SWITCH_ROUTER_CLIENT_RECOVERY_STABLE_SECS", 120),
+                cooldown_secs: env_i64("CC_SWITCH_ROUTER_CLIENT_ALERT_COOLDOWN_SECS", 30 * 60),
+                batch_window_secs: env_i64("CC_SWITCH_ROUTER_CLIENT_ALERT_BATCH_WINDOW_SECS", 60),
+                storm_window_secs: env_i64(
+                    "CC_SWITCH_ROUTER_CLIENT_ALERT_STORM_WINDOW_SECS",
+                    5 * 60,
+                ),
+                storm_min_clients: env_i64("CC_SWITCH_ROUTER_CLIENT_ALERT_STORM_MIN_CLIENTS", 5),
+                storm_percent: env_i64("CC_SWITCH_ROUTER_CLIENT_ALERT_STORM_PERCENT", 20),
+                storm_reminder_secs: env_i64(
+                    "CC_SWITCH_ROUTER_CLIENT_ALERT_STORM_REMINDER_SECS",
+                    30 * 60,
+                ),
+                recipient_hourly_limit: env_i64(
+                    "CC_SWITCH_ROUTER_CLIENT_ALERT_RECIPIENT_HOURLY_LIMIT",
+                    10,
+                ),
+                global_hourly_limit: env_i64(
+                    "CC_SWITCH_ROUTER_CLIENT_ALERT_GLOBAL_HOURLY_LIMIT",
+                    50,
+                ),
+                registration_recipient_hourly_limit: env_i64(
+                    "CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_RECIPIENT_HOURLY_LIMIT",
+                    3,
+                ),
+                registration_global_hourly_limit: env_i64(
+                    "CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_GLOBAL_HOURLY_LIMIT",
+                    10,
+                ),
+                notify_owner: env_bool("CC_SWITCH_ROUTER_CLIENT_OFFLINE_NOTIFY_OWNER", false),
+            },
             auth_code_ttl_secs: env_var("CC_SWITCH_ROUTER_AUTH_CODE_TTL_SECS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(5 * 60),
@@ -319,6 +398,22 @@ CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS=300
 CC_SWITCH_ROUTER_LEASE_RETENTION_SECS=604800
 CC_SWITCH_ROUTER_CLIENT_STALE_SECS=3600
 CC_SWITCH_ROUTER_CLIENT_INSTALLATION_RETENTION_SECS=86400
+CC_SWITCH_ROUTER_REGISTRATION_SOURCE_RATE_PER_MINUTE=60
+CC_SWITCH_ROUTER_REGISTRATION_SOURCE_BURST=20
+CC_SWITCH_ROUTER_REGISTRATION_GLOBAL_RATE_PER_MINUTE=600
+CC_SWITCH_ROUTER_REGISTRATION_GLOBAL_BURST=200
+CC_SWITCH_ROUTER_REGISTRATION_KEY_RATE_PER_MINUTE=10
+CC_SWITCH_ROUTER_REGISTRATION_KEY_BURST=3
+CC_SWITCH_ROUTER_REGISTRATION_BUCKET_IDLE_SECS=600
+CC_SWITCH_ROUTER_REGISTRATION_MAX_SOURCE_BUCKETS=8192
+CC_SWITCH_ROUTER_REGISTRATION_MAX_KEY_BUCKETS=16384
+CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_SOURCE_10M_LIMIT=30
+CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_SOURCE_HOURLY_LIMIT=100
+CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_SOURCE_DAILY_LIMIT=300
+CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_GLOBAL_10M_LIMIT=300
+CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_GLOBAL_HOURLY_LIMIT=1000
+CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_GLOBAL_DAILY_LIMIT=5000
+CC_SWITCH_ROUTER_REGISTRATION_UNOWNED_INSTALLATION_WATERMARK=50000
 CC_SWITCH_ROUTER_PAUSED_SHARE_STALE_SECS=3600
 CC_SWITCH_ROUTER_AUTH_CODE_TTL_SECS=300
 CC_SWITCH_ROUTER_AUTH_CODE_COOLDOWN_SECS=60
@@ -333,6 +428,22 @@ CC_SWITCH_ROUTER_FREE_SHARE_IP_PARALLEL_LIMIT=1
 CC_SWITCH_ROUTER_RESEND_API_KEY=
 # CC_SWITCH_ROUTER_RESEND_FROM defaults to noreply@[CC_SWITCH_ROUTER_TUNNEL_DOMAIN]
 CC_SWITCH_ROUTER_RESEND_FROM=
+# Client lifecycle email notifications are opt-in and require explicit recipients.
+CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED=false
+CC_SWITCH_ROUTER_CLIENT_ALERT_EMAILS=
+CC_SWITCH_ROUTER_CLIENT_OFFLINE_ALERT_SECS=180
+CC_SWITCH_ROUTER_CLIENT_RECOVERY_STABLE_SECS=120
+CC_SWITCH_ROUTER_CLIENT_ALERT_COOLDOWN_SECS=1800
+CC_SWITCH_ROUTER_CLIENT_ALERT_BATCH_WINDOW_SECS=60
+CC_SWITCH_ROUTER_CLIENT_ALERT_STORM_WINDOW_SECS=300
+CC_SWITCH_ROUTER_CLIENT_ALERT_STORM_MIN_CLIENTS=5
+CC_SWITCH_ROUTER_CLIENT_ALERT_STORM_PERCENT=20
+CC_SWITCH_ROUTER_CLIENT_ALERT_STORM_REMINDER_SECS=1800
+CC_SWITCH_ROUTER_CLIENT_ALERT_RECIPIENT_HOURLY_LIMIT=10
+CC_SWITCH_ROUTER_CLIENT_ALERT_GLOBAL_HOURLY_LIMIT=50
+CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_RECIPIENT_HOURLY_LIMIT=3
+CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_GLOBAL_HOURLY_LIMIT=10
+CC_SWITCH_ROUTER_CLIENT_OFFLINE_NOTIFY_OWNER=false
 # router@<tunnel_domain-host> is always treated as admin. Use this variable
 # to add additional admin emails (comma-separated, case-insensitive).
 # Admins post with an OFFICIAL badge and can pin/feature/delete any message.
@@ -376,6 +487,24 @@ fn env_bool(key: &str, default: bool) -> bool {
         "0" | "false" | "no" | "off" => false,
         _ => default,
     }
+}
+
+fn env_i64(key: &str, default: i64) -> i64 {
+    env_var(key)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn parse_email_list(value: Option<&str>) -> Vec<String> {
+    let mut emails = value
+        .into_iter()
+        .flat_map(|raw| raw.split(','))
+        .map(|email| email.trim().to_ascii_lowercase())
+        .filter(|email| !email.is_empty())
+        .collect::<Vec<_>>();
+    emails.sort_unstable();
+    emails.dedup();
+    emails
 }
 
 fn parse_admin_emails(value: Option<&str>) -> HashSet<String> {
@@ -452,6 +581,7 @@ mod tests {
             resend_from: None,
             resend_from_name: None,
             resend_reply_to: None,
+            client_notifications: ClientNotificationSettings::default(),
             auth_code_ttl_secs: 300,
             auth_code_cooldown_secs: 60,
             auth_session_ttl_secs: 300,
@@ -500,6 +630,88 @@ mod tests {
         assert!(parsed.contains("alice@example.com"));
         assert!(parsed.contains("bob@x.org"));
         assert_eq!(parsed.len(), 2);
+    }
+
+    #[test]
+    fn parse_client_alert_emails_normalizes_sorts_and_deduplicates() {
+        assert_eq!(
+            parse_email_list(Some(
+                " Ops@Example.com, oncall@example.com,ops@example.com "
+            )),
+            vec!["oncall@example.com", "ops@example.com"]
+        );
+        assert!(parse_email_list(None).is_empty());
+    }
+
+    #[test]
+    fn client_notification_defaults_are_opt_in_and_strictly_capped() {
+        let settings = ClientNotificationSettings::default();
+        assert!(!settings.enabled);
+        assert!(settings.alert_emails.is_empty());
+        assert_eq!(settings.recipient_hourly_limit, 10);
+        assert_eq!(settings.global_hourly_limit, 50);
+        assert_eq!(settings.registration_recipient_hourly_limit, 3);
+        assert_eq!(settings.registration_global_hourly_limit, 10);
+    }
+
+    #[test]
+    fn client_notification_registration_caps_load_from_env() {
+        unsafe {
+            env::set_var(
+                "CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_RECIPIENT_HOURLY_LIMIT",
+                "7",
+            );
+            env::set_var(
+                "CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_GLOBAL_HOURLY_LIMIT",
+                "19",
+            );
+        }
+
+        let config = Config::from_env();
+        assert_eq!(
+            config
+                .client_notifications
+                .registration_recipient_hourly_limit,
+            7
+        );
+        assert_eq!(
+            config.client_notifications.registration_global_hourly_limit,
+            19
+        );
+
+        unsafe {
+            env::remove_var("CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_RECIPIENT_HOURLY_LIMIT");
+            env::remove_var("CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_GLOBAL_HOURLY_LIMIT");
+        }
+    }
+
+    #[test]
+    fn default_env_includes_registration_admission_defaults() {
+        let contents = default_env_contents();
+        let expected = vec![
+            "CC_SWITCH_ROUTER_REGISTRATION_SOURCE_RATE_PER_MINUTE=60",
+            "CC_SWITCH_ROUTER_REGISTRATION_SOURCE_BURST=20",
+            "CC_SWITCH_ROUTER_REGISTRATION_GLOBAL_RATE_PER_MINUTE=600",
+            "CC_SWITCH_ROUTER_REGISTRATION_GLOBAL_BURST=200",
+            "CC_SWITCH_ROUTER_REGISTRATION_KEY_RATE_PER_MINUTE=10",
+            "CC_SWITCH_ROUTER_REGISTRATION_KEY_BURST=3",
+            "CC_SWITCH_ROUTER_REGISTRATION_BUCKET_IDLE_SECS=600",
+            "CC_SWITCH_ROUTER_REGISTRATION_MAX_SOURCE_BUCKETS=8192",
+            "CC_SWITCH_ROUTER_REGISTRATION_MAX_KEY_BUCKETS=16384",
+            "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_SOURCE_10M_LIMIT=30",
+            "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_SOURCE_HOURLY_LIMIT=100",
+            "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_SOURCE_DAILY_LIMIT=300",
+            "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_GLOBAL_10M_LIMIT=300",
+            "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_GLOBAL_HOURLY_LIMIT=1000",
+            "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_GLOBAL_DAILY_LIMIT=5000",
+            "CC_SWITCH_ROUTER_REGISTRATION_UNOWNED_INSTALLATION_WATERMARK=50000",
+        ];
+        let actual = contents
+            .lines()
+            .filter(|line| line.starts_with("CC_SWITCH_ROUTER_REGISTRATION_"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

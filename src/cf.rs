@@ -5,8 +5,9 @@
 //! the connecting peer is in fact a Cloudflare edge, anyone hitting the origin
 //! directly could spoof those headers. This module owns that gate.
 //!
-//! Loopback / RFC1918 peers (LAN, dev) are also treated as trusted so local testing
-//! and direct-to-origin operators are not surprised by missing geo data.
+//! Direct, loopback, and private-network peers are intentionally not trusted. Local
+//! development still works from the socket peer address; forwarded identity headers
+//! require a verified Cloudflare edge.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -63,34 +64,17 @@ fn ipv6_in_cidr(ip: Ipv6Addr, base: Ipv6Addr, prefix: u8) -> bool {
 /// Returns `true` if `ip` is allowed to set CF spoof-prone headers
 /// (`cf-connecting-ip`, `cf-ipcountry`, …).
 ///
-/// The peer is trusted when it is a Cloudflare edge OR a loopback/private host (the
-/// latter keeps local development from failing the check).
+/// Only published Cloudflare edge ranges are trusted. Treating an entire private
+/// network as a proxy boundary lets any host on that network rotate spoofed source
+/// addresses and bypass per-source controls.
 pub fn is_cloudflare_peer(ip: IpAddr) -> bool {
-    if ip.is_loopback() {
-        return true;
-    }
     match ip {
-        IpAddr::V4(v4) => {
-            if v4.is_private() || v4.is_link_local() || v4.is_unspecified() {
-                return true;
-            }
-            CF_IPV4_CIDRS
-                .iter()
-                .any(|(base, prefix)| ipv4_in_cidr(v4, *base, *prefix))
-        }
-        IpAddr::V6(v6) => {
-            if v6.is_unspecified() {
-                return true;
-            }
-            // ULA fc00::/7
-            let seg = v6.segments();
-            if (seg[0] & 0xfe00) == 0xfc00 {
-                return true;
-            }
-            CF_IPV6_CIDRS
-                .iter()
-                .any(|(base, prefix)| ipv6_in_cidr(v6, *base, *prefix))
-        }
+        IpAddr::V4(v4) => CF_IPV4_CIDRS
+            .iter()
+            .any(|(base, prefix)| ipv4_in_cidr(v4, *base, *prefix)),
+        IpAddr::V6(v6) => CF_IPV6_CIDRS
+            .iter()
+            .any(|(base, prefix)| ipv6_in_cidr(v6, *base, *prefix)),
     }
 }
 
@@ -111,11 +95,13 @@ mod tests {
     }
 
     #[test]
-    fn dev_friendly_ranges_pass() {
-        assert!(is_cloudflare_peer("127.0.0.1".parse().unwrap()));
-        assert!(is_cloudflare_peer("::1".parse().unwrap()));
-        assert!(is_cloudflare_peer("10.0.0.5".parse().unwrap()));
-        assert!(is_cloudflare_peer("192.168.1.1".parse().unwrap()));
+    fn direct_and_private_peers_cannot_supply_forwarded_identity() {
+        assert!(!is_cloudflare_peer("127.0.0.1".parse().unwrap()));
+        assert!(!is_cloudflare_peer("::1".parse().unwrap()));
+        assert!(!is_cloudflare_peer("10.0.0.5".parse().unwrap()));
+        assert!(!is_cloudflare_peer("192.168.1.1".parse().unwrap()));
+        assert!(!is_cloudflare_peer("169.254.1.2".parse().unwrap()));
+        assert!(!is_cloudflare_peer("fc00::1".parse().unwrap()));
     }
 
     #[test]

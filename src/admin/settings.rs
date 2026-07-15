@@ -30,6 +30,7 @@ pub enum DynamicGroup {
     Security,
     Telegram,
     Board,
+    ClientNotifications,
 }
 
 #[derive(Debug, Clone)]
@@ -257,6 +258,199 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         placeholder: Some("86400"),
         dynamic_group: None,
     },
+    // ── Registration admission ──
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_REGISTRATION_SOURCE_RATE_PER_MINUTE",
+        label: "Source attempt rate / minute",
+        group: "Registration admission",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("60"),
+        description: "Sustained registration attempts allowed per trusted source each minute.",
+        placeholder: Some("60"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_REGISTRATION_SOURCE_BURST",
+        label: "Source attempt burst",
+        group: "Registration admission",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("20"),
+        description: "Short registration attempt burst allowed per trusted source.",
+        placeholder: Some("20"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_REGISTRATION_GLOBAL_RATE_PER_MINUTE",
+        label: "Global attempt rate / minute",
+        group: "Registration admission",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("600"),
+        description: "Sustained registration attempts allowed across the router each minute.",
+        placeholder: Some("600"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_REGISTRATION_GLOBAL_BURST",
+        label: "Global attempt burst",
+        group: "Registration admission",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("200"),
+        description: "Short registration attempt burst allowed across the router.",
+        placeholder: Some("200"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_REGISTRATION_KEY_RATE_PER_MINUTE",
+        label: "Key attempt rate / minute",
+        group: "Registration admission",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("10"),
+        description: "Sustained registration attempts allowed per public key each minute.",
+        placeholder: Some("10"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_REGISTRATION_KEY_BURST",
+        label: "Key attempt burst",
+        group: "Registration admission",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("3"),
+        description: "Short registration attempt burst allowed per public key.",
+        placeholder: Some("3"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_REGISTRATION_BUCKET_IDLE_SECS",
+        label: "Attempt counter idle time (seconds)",
+        group: "Registration admission",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("600"),
+        description: "Idle time before per-source and per-key attempt counters are released.",
+        placeholder: Some("600"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_REGISTRATION_MAX_SOURCE_BUCKETS",
+        label: "Maximum source counters",
+        group: "Registration admission",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("8192"),
+        description: "Maximum in-memory source attempt counters retained at once.",
+        placeholder: Some("8192"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_REGISTRATION_MAX_KEY_BUCKETS",
+        label: "Maximum key counters",
+        group: "Registration admission",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("16384"),
+        description: "Maximum in-memory public-key attempt counters retained at once.",
+        placeholder: Some("16384"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_SOURCE_10M_LIMIT",
+        label: "Source new identities / 10 minutes",
+        group: "Registration admission",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("30"),
+        description: "New installation identities allowed per source in ten minutes.",
+        placeholder: Some("30"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_SOURCE_HOURLY_LIMIT",
+        label: "Source new identities / hour",
+        group: "Registration admission",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("100"),
+        description: "New installation identities allowed per source in one hour.",
+        placeholder: Some("100"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_SOURCE_DAILY_LIMIT",
+        label: "Source new identities / day",
+        group: "Registration admission",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("300"),
+        description: "New installation identities allowed per source in one day.",
+        placeholder: Some("300"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_GLOBAL_10M_LIMIT",
+        label: "Global new identities / 10 minutes",
+        group: "Registration admission",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("300"),
+        description: "New installation identities allowed across the router in ten minutes.",
+        placeholder: Some("300"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_GLOBAL_HOURLY_LIMIT",
+        label: "Global new identities / hour",
+        group: "Registration admission",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("1000"),
+        description: "New installation identities allowed across the router in one hour.",
+        placeholder: Some("1000"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_GLOBAL_DAILY_LIMIT",
+        label: "Global new identities / day",
+        group: "Registration admission",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("5000"),
+        description: "New installation identities allowed across the router in one day.",
+        placeholder: Some("5000"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_REGISTRATION_UNOWNED_INSTALLATION_WATERMARK",
+        label: "Unowned installation watermark",
+        group: "Registration admission",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("50000"),
+        description: "Maximum unowned installation records allowed before new identity admission is paused.",
+        placeholder: Some("50000"),
+        dynamic_group: None,
+    },
     // ── Email (Resend) ──
     SettingsField {
         key: "CC_SWITCH_ROUTER_RESEND_API_KEY",
@@ -266,7 +460,7 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         required: true,
         restart_required: true,
         default: None,
-        description: "re_xxx API key from Resend. Required for sending verification emails.",
+        description: "re_xxx API key from Resend. Required for verification and client lifecycle emails.",
         placeholder: Some("re_…"),
         dynamic_group: None,
     },
@@ -302,9 +496,190 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         required: false,
         restart_required: true,
         default: None,
-        description: "Optional Reply-To: header. Replies go here when set.",
+        description: "Optional Reply-To header for verification and client lifecycle emails.",
         placeholder: Some("support@example.com"),
         dynamic_group: None,
+    },
+    // ── Client lifecycle notifications ──
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED",
+        label: "Client email notifications",
+        group: "Client notifications",
+        field_type: FieldType::Bool,
+        required: false,
+        restart_required: false,
+        default: Some("false"),
+        description: "Send lifecycle alerts for newly registered and offline clients.",
+        placeholder: None,
+        dynamic_group: Some(DynamicGroup::ClientNotifications),
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_CLIENT_ALERT_EMAILS",
+        label: "Alert recipients",
+        group: "Client notifications",
+        field_type: FieldType::EmailList,
+        required: false,
+        restart_required: false,
+        default: None,
+        description: "Explicit comma-separated operations recipients. No address is inferred from the router domain.",
+        placeholder: Some("ops@example.com,oncall@example.com"),
+        dynamic_group: Some(DynamicGroup::ClientNotifications),
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_CLIENT_OFFLINE_ALERT_SECS",
+        label: "Offline confirmation (seconds)",
+        group: "Client notifications",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: false,
+        default: Some("180"),
+        description: "Authenticated heartbeat silence required before a client is confirmed offline (minimum 180 seconds).",
+        placeholder: Some("180"),
+        dynamic_group: Some(DynamicGroup::ClientNotifications),
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_CLIENT_RECOVERY_STABLE_SECS",
+        label: "Recovery stability (seconds)",
+        group: "Client notifications",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: false,
+        default: Some("120"),
+        description: "Fresh authenticated heartbeats required before an offline client returns online.",
+        placeholder: Some("120"),
+        dynamic_group: Some(DynamicGroup::ClientNotifications),
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_CLIENT_ALERT_COOLDOWN_SECS",
+        label: "Per-client cooldown (seconds)",
+        group: "Client notifications",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: false,
+        default: Some("1800"),
+        description: "Minimum interval between offline alerts for the same client.",
+        placeholder: Some("1800"),
+        dynamic_group: Some(DynamicGroup::ClientNotifications),
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_CLIENT_ALERT_BATCH_WINDOW_SECS",
+        label: "Batch window (seconds)",
+        group: "Client notifications",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: false,
+        default: Some("60"),
+        description: "Offline events for the same recipient are combined within this window; authenticated registrations use a five-second debounce.",
+        placeholder: Some("60"),
+        dynamic_group: Some(DynamicGroup::ClientNotifications),
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_CLIENT_ALERT_STORM_WINDOW_SECS",
+        label: "Storm detection window (seconds)",
+        group: "Client notifications",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: false,
+        default: Some("300"),
+        description: "Window used to detect a correlated multi-client outage.",
+        placeholder: Some("300"),
+        dynamic_group: Some(DynamicGroup::ClientNotifications),
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_CLIENT_ALERT_STORM_MIN_CLIENTS",
+        label: "Storm minimum clients",
+        group: "Client notifications",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: false,
+        default: Some("5"),
+        description: "Absolute registration or offline event count that can trigger incident digest mode.",
+        placeholder: Some("5"),
+        dynamic_group: Some(DynamicGroup::ClientNotifications),
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_CLIENT_ALERT_STORM_PERCENT",
+        label: "Storm monitored-client percentage",
+        group: "Client notifications",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: false,
+        default: Some("20"),
+        description: "Percentage of monitored clients offline that triggers incident digest mode; registration bursts use the absolute threshold.",
+        placeholder: Some("20"),
+        dynamic_group: Some(DynamicGroup::ClientNotifications),
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_CLIENT_ALERT_STORM_REMINDER_SECS",
+        label: "Storm digest interval (seconds)",
+        group: "Client notifications",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: false,
+        default: Some("1800"),
+        description: "Minimum interval between digest updates for the same active incident.",
+        placeholder: Some("1800"),
+        dynamic_group: Some(DynamicGroup::ClientNotifications),
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_CLIENT_ALERT_RECIPIENT_HOURLY_LIMIT",
+        label: "Offline per-recipient hourly cap",
+        group: "Client notifications",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: false,
+        default: Some("10"),
+        description: "Maximum offline notifications sent to one recipient per hour.",
+        placeholder: Some("10"),
+        dynamic_group: Some(DynamicGroup::ClientNotifications),
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_CLIENT_ALERT_GLOBAL_HOURLY_LIMIT",
+        label: "Offline global hourly cap",
+        group: "Client notifications",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: false,
+        default: Some("50"),
+        description: "Maximum offline notifications sent by this router per hour.",
+        placeholder: Some("50"),
+        dynamic_group: Some(DynamicGroup::ClientNotifications),
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_RECIPIENT_HOURLY_LIMIT",
+        label: "Registration per-recipient hourly cap",
+        group: "Client notifications",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: false,
+        default: Some("3"),
+        description: "Maximum registration notifications sent to one recipient per hour.",
+        placeholder: Some("3"),
+        dynamic_group: Some(DynamicGroup::ClientNotifications),
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_GLOBAL_HOURLY_LIMIT",
+        label: "Registration global hourly cap",
+        group: "Client notifications",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: false,
+        default: Some("10"),
+        description: "Maximum registration notifications sent by this router per hour.",
+        placeholder: Some("10"),
+        dynamic_group: Some(DynamicGroup::ClientNotifications),
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_CLIENT_OFFLINE_NOTIFY_OWNER",
+        label: "Notify verified owner",
+        group: "Client notifications",
+        field_type: FieldType::Bool,
+        required: false,
+        restart_required: false,
+        default: Some("false"),
+        description: "Also send offline alerts when the owner email belongs to an active logged-in user.",
+        placeholder: None,
+        dynamic_group: Some(DynamicGroup::ClientNotifications),
     },
     // ── Auth code / session ──
     SettingsField {
@@ -850,6 +1225,8 @@ pub fn validate_and_diff(
             }
         }
     }
+    validate_registration_admission_relations(&next, updates)?;
+    validate_client_notification_relations(&next, updates)?;
 
     Ok(ApplyOutcome {
         updated_keys: updated,
@@ -941,9 +1318,11 @@ fn normalize_value(field: &SettingsField, raw: &str) -> Result<Option<String>, A
     }
     match field.field_type {
         FieldType::Int => {
-            trimmed.parse::<i64>().map_err(|_| {
+            let value = trimmed.parse::<i64>().map_err(|_| {
                 AppError::BadRequest(format!("{} must be an integer, got: {raw}", field.key))
             })?;
+            validate_client_notification_integer(field.key, value)?;
+            validate_registration_admission_integer(field.key, value)?;
             Ok(Some(trimmed.to_string()))
         }
         FieldType::Bool => match trimmed.to_ascii_lowercase().as_str() {
@@ -970,14 +1349,21 @@ fn normalize_value(field: &SettingsField, raw: &str) -> Result<Option<String>, A
                 if part.is_empty() {
                     continue;
                 }
-                if !part.contains('@') {
+                let valid = if field.key == "CC_SWITCH_ROUTER_CLIENT_ALERT_EMAILS" {
+                    crate::notifications::is_basic_email(part)
+                } else {
+                    part.contains('@')
+                };
+                if !valid {
                     return Err(AppError::BadRequest(format!(
-                        "{} entry must contain @, got: {part}",
+                        "{} contains an invalid email address: {part}",
                         field.key
                     )));
                 }
-                cleaned.push(part.to_string());
+                cleaned.push(part.to_ascii_lowercase());
             }
+            cleaned.sort_unstable();
+            cleaned.dedup();
             if cleaned.is_empty() {
                 Ok(None)
             } else {
@@ -1004,6 +1390,135 @@ fn normalize_value(field: &SettingsField, raw: &str) -> Result<Option<String>, A
         }
         FieldType::Path | FieldType::Text | FieldType::Secret => Ok(Some(trimmed.to_string())),
     }
+}
+
+fn validate_client_notification_integer(key: &str, value: i64) -> Result<(), AppError> {
+    let range = match key {
+        "CC_SWITCH_ROUTER_CLIENT_OFFLINE_ALERT_SECS" => {
+            Some((crate::notifications::MIN_OFFLINE_ALERT_SECS, 86_400))
+        }
+        "CC_SWITCH_ROUTER_CLIENT_RECOVERY_STABLE_SECS" => Some((30, 3_600)),
+        "CC_SWITCH_ROUTER_CLIENT_ALERT_COOLDOWN_SECS" => Some((60, 604_800)),
+        "CC_SWITCH_ROUTER_CLIENT_ALERT_BATCH_WINDOW_SECS" => Some((1, 600)),
+        "CC_SWITCH_ROUTER_CLIENT_ALERT_STORM_WINDOW_SECS" => Some((60, 3_600)),
+        "CC_SWITCH_ROUTER_CLIENT_ALERT_STORM_MIN_CLIENTS" => Some((2, 10_000)),
+        "CC_SWITCH_ROUTER_CLIENT_ALERT_STORM_PERCENT" => Some((1, 100)),
+        "CC_SWITCH_ROUTER_CLIENT_ALERT_STORM_REMINDER_SECS" => Some((300, 86_400)),
+        "CC_SWITCH_ROUTER_CLIENT_ALERT_RECIPIENT_HOURLY_LIMIT" => Some((1, 10_000)),
+        "CC_SWITCH_ROUTER_CLIENT_ALERT_GLOBAL_HOURLY_LIMIT" => Some((1, 100_000)),
+        "CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_RECIPIENT_HOURLY_LIMIT" => Some((1, 1_000)),
+        "CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_GLOBAL_HOURLY_LIMIT" => Some((1, 10_000)),
+        _ => None,
+    };
+    if let Some((min, max)) = range {
+        if !(min..=max).contains(&value) {
+            return Err(AppError::BadRequest(format!(
+                "{key} must be between {min} and {max}, got: {value}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_client_notification_relations(
+    next: &BTreeMap<String, String>,
+    updates: &BTreeMap<String, Option<String>>,
+) -> Result<(), AppError> {
+    const RECIPIENT_KEY: &str = "CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_RECIPIENT_HOURLY_LIMIT";
+    const GLOBAL_KEY: &str = "CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_GLOBAL_HOURLY_LIMIT";
+    if !updates.contains_key(RECIPIENT_KEY) && !updates.contains_key(GLOBAL_KEY) {
+        return Ok(());
+    }
+    let recipient = effective_integer_setting(next, RECIPIENT_KEY)?;
+    let global = effective_integer_setting(next, GLOBAL_KEY)?;
+    if global < recipient {
+        return Err(AppError::BadRequest(format!(
+            "{GLOBAL_KEY} must be greater than or equal to {RECIPIENT_KEY}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_registration_admission_integer(key: &str, value: i64) -> Result<(), AppError> {
+    let range = match key {
+        "CC_SWITCH_ROUTER_REGISTRATION_SOURCE_RATE_PER_MINUTE" => Some((1, 6_000)),
+        "CC_SWITCH_ROUTER_REGISTRATION_SOURCE_BURST" => Some((1, 1_000)),
+        "CC_SWITCH_ROUTER_REGISTRATION_GLOBAL_RATE_PER_MINUTE" => Some((1, 60_000)),
+        "CC_SWITCH_ROUTER_REGISTRATION_GLOBAL_BURST" => Some((1, 10_000)),
+        "CC_SWITCH_ROUTER_REGISTRATION_KEY_RATE_PER_MINUTE" => Some((1, 600)),
+        "CC_SWITCH_ROUTER_REGISTRATION_KEY_BURST" => Some((1, 100)),
+        "CC_SWITCH_ROUTER_REGISTRATION_BUCKET_IDLE_SECS" => Some((30, 86_400)),
+        "CC_SWITCH_ROUTER_REGISTRATION_MAX_SOURCE_BUCKETS" => Some((128, 65_536)),
+        "CC_SWITCH_ROUTER_REGISTRATION_MAX_KEY_BUCKETS" => Some((256, 131_072)),
+        "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_SOURCE_10M_LIMIT"
+        | "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_SOURCE_HOURLY_LIMIT"
+        | "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_SOURCE_DAILY_LIMIT"
+        | "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_GLOBAL_10M_LIMIT"
+        | "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_GLOBAL_HOURLY_LIMIT"
+        | "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_GLOBAL_DAILY_LIMIT" => Some((1, 1_000_000)),
+        "CC_SWITCH_ROUTER_REGISTRATION_UNOWNED_INSTALLATION_WATERMARK" => Some((1_000, 1_000_000)),
+        _ => None,
+    };
+    if let Some((min, max)) = range {
+        if !(min..=max).contains(&value) {
+            return Err(AppError::BadRequest(format!(
+                "{key} must be between {min} and {max}, got: {value}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_registration_admission_relations(
+    next: &BTreeMap<String, String>,
+    updates: &BTreeMap<String, Option<String>>,
+) -> Result<(), AppError> {
+    const SOURCE_KEYS: [&str; 3] = [
+        "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_SOURCE_10M_LIMIT",
+        "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_SOURCE_HOURLY_LIMIT",
+        "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_SOURCE_DAILY_LIMIT",
+    ];
+    const GLOBAL_KEYS: [&str; 3] = [
+        "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_GLOBAL_10M_LIMIT",
+        "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_GLOBAL_HOURLY_LIMIT",
+        "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_GLOBAL_DAILY_LIMIT",
+    ];
+    if !updates
+        .keys()
+        .any(|key| SOURCE_KEYS.contains(&key.as_str()) || GLOBAL_KEYS.contains(&key.as_str()))
+    {
+        return Ok(());
+    }
+    for keys in [SOURCE_KEYS, GLOBAL_KEYS] {
+        let values = keys
+            .map(|key| effective_integer_setting(next, key))
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+        for index in 1..values.len() {
+            if values[index] < values[index - 1] {
+                return Err(AppError::BadRequest(format!(
+                    "{} must be greater than or equal to {}",
+                    keys[index],
+                    keys[index - 1]
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn effective_integer_setting(next: &BTreeMap<String, String>, key: &str) -> Result<i64, AppError> {
+    let field = field_by_key(key)
+        .ok_or_else(|| AppError::Internal(format!("missing settings schema field: {key}")))?;
+    let value = next
+        .get(key)
+        .map(String::as_str)
+        .or(field.default)
+        .ok_or_else(|| AppError::Internal(format!("missing settings default: {key}")))?;
+    value
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| AppError::BadRequest(format!("{key} must be an integer, got: {value}")))
 }
 
 /// Apply the admin's settings updates to the live `DynamicSettings` in
@@ -1087,6 +1602,70 @@ pub fn apply_updates_to_dynamic(
                 current.board.guest_self_delete_secs =
                     value.and_then(|v| v.parse::<i64>().ok()).unwrap_or(300);
             }
+            "CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED" => {
+                current.client_notifications.enabled =
+                    value.map(parse_bool_truthy).unwrap_or(false);
+            }
+            "CC_SWITCH_ROUTER_CLIENT_ALERT_EMAILS" => {
+                current.client_notifications.alert_emails =
+                    value.map(parse_dynamic_email_list).unwrap_or_default();
+            }
+            "CC_SWITCH_ROUTER_CLIENT_OFFLINE_ALERT_SECS" => {
+                current.client_notifications.offline_alert_secs =
+                    value.and_then(|v| v.parse().ok()).unwrap_or(180);
+            }
+            "CC_SWITCH_ROUTER_CLIENT_RECOVERY_STABLE_SECS" => {
+                current.client_notifications.recovery_stable_secs =
+                    value.and_then(|v| v.parse().ok()).unwrap_or(120);
+            }
+            "CC_SWITCH_ROUTER_CLIENT_ALERT_COOLDOWN_SECS" => {
+                current.client_notifications.cooldown_secs =
+                    value.and_then(|v| v.parse().ok()).unwrap_or(30 * 60);
+            }
+            "CC_SWITCH_ROUTER_CLIENT_ALERT_BATCH_WINDOW_SECS" => {
+                current.client_notifications.batch_window_secs =
+                    value.and_then(|v| v.parse().ok()).unwrap_or(60);
+            }
+            "CC_SWITCH_ROUTER_CLIENT_ALERT_STORM_WINDOW_SECS" => {
+                current.client_notifications.storm_window_secs =
+                    value.and_then(|v| v.parse().ok()).unwrap_or(5 * 60);
+            }
+            "CC_SWITCH_ROUTER_CLIENT_ALERT_STORM_MIN_CLIENTS" => {
+                current.client_notifications.storm_min_clients =
+                    value.and_then(|v| v.parse().ok()).unwrap_or(5);
+            }
+            "CC_SWITCH_ROUTER_CLIENT_ALERT_STORM_PERCENT" => {
+                current.client_notifications.storm_percent =
+                    value.and_then(|v| v.parse().ok()).unwrap_or(20);
+            }
+            "CC_SWITCH_ROUTER_CLIENT_ALERT_STORM_REMINDER_SECS" => {
+                current.client_notifications.storm_reminder_secs =
+                    value.and_then(|v| v.parse().ok()).unwrap_or(30 * 60);
+            }
+            "CC_SWITCH_ROUTER_CLIENT_ALERT_RECIPIENT_HOURLY_LIMIT" => {
+                current.client_notifications.recipient_hourly_limit =
+                    value.and_then(|v| v.parse().ok()).unwrap_or(10);
+            }
+            "CC_SWITCH_ROUTER_CLIENT_ALERT_GLOBAL_HOURLY_LIMIT" => {
+                current.client_notifications.global_hourly_limit =
+                    value.and_then(|v| v.parse().ok()).unwrap_or(50);
+            }
+            "CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_RECIPIENT_HOURLY_LIMIT" => {
+                current
+                    .client_notifications
+                    .registration_recipient_hourly_limit =
+                    value.and_then(|v| v.parse().ok()).unwrap_or(3);
+            }
+            "CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_GLOBAL_HOURLY_LIMIT" => {
+                current
+                    .client_notifications
+                    .registration_global_hourly_limit =
+                    value.and_then(|v| v.parse().ok()).unwrap_or(10);
+            }
+            "CC_SWITCH_ROUTER_CLIENT_OFFLINE_NOTIFY_OWNER" => {
+                current.client_notifications.notify_owner =
+                    value.map(parse_bool_truthy).unwrap_or(false);
+            }
             // Restart-required fields (paths, addresses, TTLs, Resend API
             // key, auth limits, verification URLs, email From/Reply-To):
             // these have already been written to the .env file by the
@@ -1101,9 +1680,45 @@ fn parse_bool_truthy(v: &str) -> bool {
     matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
 }
 
+fn parse_dynamic_email_list(value: &str) -> Vec<String> {
+    let mut emails = value
+        .split(',')
+        .map(|email| email.trim().to_ascii_lowercase())
+        .filter(|email| !email.is_empty())
+        .collect::<Vec<_>>();
+    emails.sort_unstable();
+    emails.dedup();
+    emails
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_update_json_contract_uses_strings_for_boolean_fields() {
+        let parsed: SettingsUpdateRequest = serde_json::from_value(serde_json::json!({
+            "updates": {
+                "CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED": "true",
+                "CC_SWITCH_ROUTER_CLIENT_OFFLINE_NOTIFY_OWNER": "false"
+            }
+        }))
+        .expect("string boolean settings should deserialize");
+        assert_eq!(
+            parsed
+                .updates
+                .get("CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED"),
+            Some(&Some("true".to_string()))
+        );
+        assert!(
+            serde_json::from_value::<SettingsUpdateRequest>(serde_json::json!({
+                "updates": {
+                    "CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED": true
+                }
+            }))
+            .is_err()
+        );
+    }
 
     #[test]
     fn normalize_int_rejects_garbage() {
@@ -1131,6 +1746,186 @@ mod tests {
             Some("a@b.com,c@d.io".into())
         );
         assert!(normalize_value(field, "not-an-email").is_err());
+    }
+
+    #[test]
+    fn client_notification_recipients_are_normalized_and_deduplicated() {
+        let field = field_by_key("CC_SWITCH_ROUTER_CLIENT_ALERT_EMAILS").unwrap();
+        assert_eq!(
+            normalize_value(
+                field,
+                " Ops@Example.com,ops@example.com, oncall@example.com "
+            )
+            .unwrap(),
+            Some("oncall@example.com,ops@example.com".into())
+        );
+        assert!(normalize_value(field, "ops@localhost").is_err());
+    }
+
+    #[test]
+    fn client_notification_thresholds_enforce_safe_ranges() {
+        let offline = field_by_key("CC_SWITCH_ROUTER_CLIENT_OFFLINE_ALERT_SECS").unwrap();
+        let storm_percent = field_by_key("CC_SWITCH_ROUTER_CLIENT_ALERT_STORM_PERCENT").unwrap();
+        let registration_recipient =
+            field_by_key("CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_RECIPIENT_HOURLY_LIMIT")
+                .unwrap();
+        let registration_global =
+            field_by_key("CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_GLOBAL_HOURLY_LIMIT").unwrap();
+        assert!(normalize_value(offline, "179").is_err());
+        assert_eq!(normalize_value(offline, "180").unwrap(), Some("180".into()));
+        assert!(normalize_value(storm_percent, "0").is_err());
+        assert!(normalize_value(storm_percent, "101").is_err());
+        assert!(normalize_value(registration_recipient, "0").is_err());
+        assert!(normalize_value(registration_recipient, "1001").is_err());
+        assert!(normalize_value(registration_global, "0").is_err());
+        assert!(normalize_value(registration_global, "10001").is_err());
+    }
+
+    #[test]
+    fn registration_notification_global_cap_covers_recipient_cap() {
+        let existing = HashMap::new();
+        let mut updates = BTreeMap::new();
+        updates.insert(
+            "CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_RECIPIENT_HOURLY_LIMIT".into(),
+            Some("11".into()),
+        );
+        assert!(validate_and_diff(&existing, &updates).is_err());
+
+        updates.insert(
+            "CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_GLOBAL_HOURLY_LIMIT".into(),
+            Some("11".into()),
+        );
+        let outcome = validate_and_diff(&existing, &updates).expect("compatible lane caps");
+        assert!(outcome.restart_required_keys.is_empty());
+        assert_eq!(outcome.dynamic_groups.len(), 1);
+    }
+
+    #[test]
+    fn client_notification_settings_are_dynamic() {
+        let fields = SETTINGS_FIELDS
+            .iter()
+            .filter(|field| field.group == "Client notifications")
+            .collect::<Vec<_>>();
+        assert!(!fields.is_empty());
+        assert!(fields.iter().all(|field| !field.restart_required));
+        assert!(
+            fields.iter().all(|field| matches!(
+                field.dynamic_group,
+                Some(DynamicGroup::ClientNotifications)
+            ))
+        );
+    }
+
+    #[test]
+    fn registration_admission_settings_restart_and_enforce_runtime_bounds() {
+        let fields = SETTINGS_FIELDS
+            .iter()
+            .filter(|field| field.group == "Registration admission")
+            .collect::<Vec<_>>();
+        assert_eq!(fields.len(), 16);
+        assert!(fields.iter().all(|field| field.restart_required));
+        assert!(fields.iter().all(|field| field.dynamic_group.is_none()));
+
+        for (key, min, max) in [
+            (
+                "CC_SWITCH_ROUTER_REGISTRATION_SOURCE_RATE_PER_MINUTE",
+                1,
+                6_000,
+            ),
+            ("CC_SWITCH_ROUTER_REGISTRATION_SOURCE_BURST", 1, 1_000),
+            (
+                "CC_SWITCH_ROUTER_REGISTRATION_GLOBAL_RATE_PER_MINUTE",
+                1,
+                60_000,
+            ),
+            ("CC_SWITCH_ROUTER_REGISTRATION_GLOBAL_BURST", 1, 10_000),
+            ("CC_SWITCH_ROUTER_REGISTRATION_KEY_RATE_PER_MINUTE", 1, 600),
+            ("CC_SWITCH_ROUTER_REGISTRATION_KEY_BURST", 1, 100),
+            ("CC_SWITCH_ROUTER_REGISTRATION_BUCKET_IDLE_SECS", 30, 86_400),
+            (
+                "CC_SWITCH_ROUTER_REGISTRATION_MAX_SOURCE_BUCKETS",
+                128,
+                65_536,
+            ),
+            (
+                "CC_SWITCH_ROUTER_REGISTRATION_MAX_KEY_BUCKETS",
+                256,
+                131_072,
+            ),
+            (
+                "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_SOURCE_10M_LIMIT",
+                1,
+                1_000_000,
+            ),
+            (
+                "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_SOURCE_HOURLY_LIMIT",
+                1,
+                1_000_000,
+            ),
+            (
+                "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_SOURCE_DAILY_LIMIT",
+                1,
+                1_000_000,
+            ),
+            (
+                "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_GLOBAL_10M_LIMIT",
+                1,
+                1_000_000,
+            ),
+            (
+                "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_GLOBAL_HOURLY_LIMIT",
+                1,
+                1_000_000,
+            ),
+            (
+                "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_GLOBAL_DAILY_LIMIT",
+                1,
+                1_000_000,
+            ),
+            (
+                "CC_SWITCH_ROUTER_REGISTRATION_UNOWNED_INSTALLATION_WATERMARK",
+                1_000,
+                1_000_000,
+            ),
+        ] {
+            let field = field_by_key(key).expect("registration admission setting");
+            assert_eq!(
+                normalize_value(field, &min.to_string()).expect("minimum value"),
+                Some(min.to_string())
+            );
+            assert_eq!(
+                normalize_value(field, &max.to_string()).expect("maximum value"),
+                Some(max.to_string())
+            );
+            assert!(normalize_value(field, &(min - 1).to_string()).is_err());
+            assert!(normalize_value(field, &(max + 1).to_string()).is_err());
+        }
+    }
+
+    #[test]
+    fn registration_identity_windows_must_be_monotonic() {
+        let existing = HashMap::new();
+        let mut updates = BTreeMap::new();
+        updates.insert(
+            "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_SOURCE_10M_LIMIT".into(),
+            Some("101".into()),
+        );
+        assert!(validate_and_diff(&existing, &updates).is_err());
+
+        updates.clear();
+        updates.insert(
+            "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_GLOBAL_HOURLY_LIMIT".into(),
+            Some("6000".into()),
+        );
+        assert!(validate_and_diff(&existing, &updates).is_err());
+
+        updates.insert(
+            "CC_SWITCH_ROUTER_REGISTRATION_NEW_IDENTITY_GLOBAL_DAILY_LIMIT".into(),
+            Some("6000".into()),
+        );
+        let outcome = validate_and_diff(&existing, &updates).expect("monotonic windows");
+        assert_eq!(outcome.restart_required_keys.len(), 2);
+        assert!(outcome.dynamic_groups.is_empty());
     }
 
     #[test]
@@ -1282,6 +2077,85 @@ mod tests {
         assert_eq!(current.board.max_len, 1000, "schema default kicks in");
     }
 
+    #[test]
+    fn client_notification_kill_switch_and_recipients_apply_immediately() {
+        let static_config = test_static_config_with_board_overrides();
+        let mut current = DynamicSettings::from_config(&static_config);
+        let mut updates = BTreeMap::new();
+        updates.insert(
+            "CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED".into(),
+            Some("true".into()),
+        );
+        updates.insert(
+            "CC_SWITCH_ROUTER_CLIENT_ALERT_EMAILS".into(),
+            Some(" OPS@example.com,ops@example.com ".into()),
+        );
+        updates.insert(
+            "CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_RECIPIENT_HOURLY_LIMIT".into(),
+            Some("7".into()),
+        );
+        updates.insert(
+            "CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_GLOBAL_HOURLY_LIMIT".into(),
+            Some("19".into()),
+        );
+        apply_updates_to_dynamic(&mut current, &updates, &static_config);
+        assert!(current.client_notifications.enabled);
+        assert_eq!(
+            current.client_notifications.alert_emails,
+            vec!["ops@example.com"]
+        );
+        assert_eq!(
+            current
+                .client_notifications
+                .registration_recipient_hourly_limit,
+            7
+        );
+        assert_eq!(
+            current
+                .client_notifications
+                .registration_global_hourly_limit,
+            19
+        );
+
+        updates.insert(
+            "CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED".into(),
+            None,
+        );
+        updates.insert("CC_SWITCH_ROUTER_CLIENT_ALERT_EMAILS".into(), None);
+        apply_updates_to_dynamic(&mut current, &updates, &static_config);
+        assert!(!current.client_notifications.enabled);
+        assert!(current.client_notifications.alert_emails.is_empty());
+    }
+
+    #[test]
+    fn client_notification_offline_window_must_precede_cleanup() {
+        let mut config = test_static_config_with_board_overrides();
+        config.cleanup_interval_secs = 300;
+        config.client_stale_secs = 3_600;
+        let mut settings = crate::config::ClientNotificationSettings::default();
+        settings.enabled = true;
+        settings.alert_emails = vec!["ops@example.com".into()];
+        assert!(
+            crate::notifications::validate_notification_cleanup_window(&settings, &config).is_ok()
+        );
+        settings.offline_alert_secs = 3_301;
+        assert!(
+            crate::notifications::validate_notification_cleanup_window(&settings, &config).is_err()
+        );
+
+        config.client_stale_secs = 300;
+        let (policy, warning) =
+            crate::notifications::ClientNotificationPolicy::for_runtime(&settings, &config);
+        assert!(!policy.enabled);
+        assert!(warning.is_some());
+
+        settings.enabled = false;
+        assert!(
+            crate::notifications::validate_notification_cleanup_window(&settings, &config).is_ok(),
+            "an invalid active policy must never prevent using the kill switch"
+        );
+    }
+
     fn test_static_config_with_board_overrides() -> Config {
         use std::collections::HashSet;
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -1303,6 +2177,7 @@ mod tests {
             resend_from: None,
             resend_from_name: None,
             resend_reply_to: None,
+            client_notifications: crate::config::ClientNotificationSettings::default(),
             auth_code_ttl_secs: 300,
             auth_code_cooldown_secs: 60,
             auth_session_ttl_secs: 1800,
