@@ -409,7 +409,7 @@ function RequestTicker({ data }: { data: DashboardResponse | null }) {
           <div
             data-map-control
             key={eventKey}
-            className={`pointer-events-auto flex w-full select-text items-start gap-2 rounded-md border border-transparent bg-transparent px-1 py-0.5 text-left text-[10px] leading-relaxed text-slate-700 ${index === events.length - 1 ? "activity-feed-enter" : ""}`}
+            className={`pointer-events-auto flex w-full select-text items-start gap-2 rounded-md bg-transparent px-1 py-0.5 text-left text-[10px] leading-relaxed text-slate-700 ${index === events.length - 1 ? "activity-feed-enter" : ""}`}
           >
             <span className="shrink-0 select-text font-mono text-slate-500">{formatTickerTime(event.startedAt || event.createdAt, item?.createdAt)}</span>
             <span className={`inline-flex h-[15px] shrink-0 select-none items-center rounded px-1.5 font-mono text-[9px] font-semibold ${event.isHealthCheck ? "bg-blue-100 text-blue-700" : failed ? "bg-rose-100 text-rose-700" : "bg-emerald-100 text-emerald-700"}`}>{badge}</span>

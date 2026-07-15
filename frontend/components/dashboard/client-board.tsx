@@ -691,7 +691,15 @@ export function ClientBoard({
     focus.openDrawer("share", share.shareId);
     void recordDashboardUxEvent({ eventType: "drawer_opened", source: "client-board", targetType: "share" });
   }, [focus]);
-  const closeShareDrawer = React.useCallback((open: boolean) => { if (!open) { setSelectedShareId(""); focus.closeDrawer(); } }, [focus]);
+  const closeShareDrawer = React.useCallback((open: boolean) => {
+    if (open) return;
+    const closingShareId = selectedShareId;
+    setSelectedShareId("");
+    focus.closeDrawer();
+    if (focus.target?.kind === "share" && focus.target.id === closingShareId) {
+      focus.clearFocus();
+    }
+  }, [focus, selectedShareId]);
   const openEditShare = React.useCallback((share: ShareView) => setEditingShare(share), []);
   const closeEditShare = React.useCallback(() => setEditingShare(null), []);
   const openConnectShare = React.useCallback((share: ShareView) => setConnectShare(share), []);

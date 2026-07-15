@@ -6788,15 +6788,6 @@ impl AppStore {
         Ok(())
     }
 
-    pub async fn clear_share_model_health_checks(&self) -> Result<(), AppError> {
-        let conn = self.conn.lock().await;
-        conn.execute("DELETE FROM share_model_health_checks", [])
-            .map_err(|e| AppError::Internal(format!("clear model health checks failed: {e}")))?;
-        conn.execute("DELETE FROM share_model_health_state", [])
-            .map_err(|e| AppError::Internal(format!("clear model health state failed: {e}")))?;
-        Ok(())
-    }
-
     pub async fn record_share_health_request_log(
         &self,
         installation_id: &str,
@@ -22514,7 +22505,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dashboard_snapshot_includes_recent_model_health_checks() {
+    async fn dashboard_snapshot_preserves_recent_model_health_checks_after_reopen() {
         let (store, config) = setup_store("recent-model-health-checks").await;
         insert_installation(&store, "inst-1").await;
         insert_share(&store, "inst-1", "share-1", "share-sub", "active").await;
@@ -22524,6 +22515,9 @@ mod tests {
             let status = if offset % 2 == 0 { "success" } else { "failed" };
             insert_model_health_check(&store, "share-1", now - offset, status).await;
         }
+        drop(store);
+
+        let store = AppStore::new(&config).expect("reopen store");
 
         let server_geo = ServerGeo {
             lat: None,

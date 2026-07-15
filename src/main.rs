@@ -175,8 +175,6 @@ async fn main() -> Result<()> {
     let ssh_listener = TcpListener::bind(config.ssh_addr).await?;
     info!("http listening on {}", config.api_addr);
     info!("ssh listener bound on {}", config.ssh_addr);
-    state.store.clear_share_model_health_checks().await?;
-    info!("cleared previous share model health checks");
 
     let ip_blacklist_log_task = tokio::spawn(async move {
         loop {
