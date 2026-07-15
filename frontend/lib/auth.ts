@@ -3,6 +3,11 @@
 import type { SessionStatus } from "@/lib/types";
 
 const AUTH_KEY = "cc_switch_router_auth_v1";
+const ACCESS_TOKEN_REFRESH_SKEW_MS = 10_000;
+const AUTH_REFRESH_LOCK_NAME = "cc-switch-router-auth-refresh-v1";
+const FALLBACK_REFRESH_RECHECK_MS = 200;
+
+let accessTokenRefresh: Promise<boolean> | null = null;
 
 export type AuthState = {
   installationId?: string | null;
@@ -155,19 +160,66 @@ export function authBearerHeaders() {
   return state.accessToken ? { Authorization: `Bearer ${state.accessToken}` } : {};
 }
 
-export async function refreshAccessToken() {
-  const state = readAuthState();
+function accessTokenExpiresSoon(state: AuthState) {
+  if (!state.accessToken || !state.refreshToken || !state.installationId || !state.expiresAt) return false;
+  const expiresAt = Date.parse(state.expiresAt);
+  return Number.isFinite(expiresAt) && expiresAt <= Date.now() + ACCESS_TOKEN_REFRESH_SKEW_MS;
+}
+
+function changedSessionResult(expected: AuthState, current = readAuthState()): boolean | null {
+  const changed =
+    current.installationId !== expected.installationId ||
+    current.accessToken !== expected.accessToken ||
+    current.refreshToken !== expected.refreshToken;
+  if (!changed) return null;
+  return !!current.installationId && !!current.accessToken && !!current.refreshToken;
+}
+
+function waitForFallbackRefreshRecheck() {
+  return new Promise<void>((resolve) => setTimeout(resolve, FALLBACK_REFRESH_RECHECK_MS));
+}
+
+async function handleUnauthorizedRefresh(state: AuthState, crossTabLockHeld: boolean) {
+  if (!crossTabLockHeld) await waitForFallbackRefreshRecheck();
+  const changedResult = changedSessionResult(state);
+  if (changedResult !== null) return changedResult;
+  clearSessionTokens();
+  return false;
+}
+
+async function refreshSessionWithState(state: AuthState, crossTabLockHeld: boolean) {
   if (!state.refreshToken || !state.installationId) return false;
-  const response = await fetch("/v1/auth/session/refresh", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      refreshToken: state.refreshToken,
-      installationId: state.installationId,
-    }),
-  });
+
+  let response: Response;
+  try {
+    response = await fetch("/v1/auth/session/refresh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        refreshToken: state.refreshToken,
+        installationId: state.installationId,
+      }),
+    });
+  } catch {
+    return changedSessionResult(state) ?? false;
+  }
+
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) return false;
+  if (!response.ok) {
+    if (response.status === 401) return handleUnauthorizedRefresh(state, crossTabLockHeld);
+    return changedSessionResult(state) ?? false;
+  }
+
+  const changedResult = changedSessionResult(state);
+  if (changedResult !== null) return changedResult;
+  if (
+    typeof data.accessToken !== "string" ||
+    typeof data.refreshToken !== "string" ||
+    typeof data.expiresAt !== "string" ||
+    typeof data.refreshExpiresAt !== "string"
+  ) {
+    return false;
+  }
   mergeAuthState({
     accessToken: data.accessToken,
     refreshToken: data.refreshToken,
@@ -177,15 +229,70 @@ export async function refreshAccessToken() {
   return true;
 }
 
-export async function authFetch(input: RequestInfo | URL, init: RequestInit = {}) {
+async function performAccessTokenRefresh() {
+  const requestedState = readAuthState();
+  if (!requestedState.refreshToken || !requestedState.installationId) return false;
+
+  const lockManager = typeof navigator !== "undefined" ? navigator.locks : undefined;
+  if (!lockManager) return refreshSessionWithState(requestedState, false);
+
+  try {
+    return await lockManager.request(AUTH_REFRESH_LOCK_NAME, async () => {
+      const lockedState = readAuthState();
+      const changedResult = changedSessionResult(requestedState, lockedState);
+      if (changedResult !== null) return changedResult;
+      return refreshSessionWithState(lockedState, true);
+    });
+  } catch {
+    const fallbackState = readAuthState();
+    const changedResult = changedSessionResult(requestedState, fallbackState);
+    if (changedResult !== null) return changedResult;
+    return refreshSessionWithState(fallbackState, false);
+  }
+}
+
+export async function refreshAccessToken() {
+  if (accessTokenRefresh) return accessTokenRefresh;
+  const pending = performAccessTokenRefresh();
+  accessTokenRefresh = pending;
+  try {
+    return await pending;
+  } finally {
+    if (accessTokenRefresh === pending) accessTokenRefresh = null;
+  }
+}
+
+function requestWithAccessToken(input: RequestInfo | URL, init: RequestInit, accessToken?: string | null) {
   const headers = new Headers(init.headers || {});
-  const bearer = authBearerHeaders();
-  Object.entries(bearer).forEach(([key, value]) => headers.set(key, value));
-  let response = await fetch(input, { ...init, headers });
-  if (response.status === 401 && (await refreshAccessToken())) {
-    const retryHeaders = new Headers(init.headers || {});
-    Object.entries(authBearerHeaders()).forEach(([key, value]) => retryHeaders.set(key, value));
-    response = await fetch(input, { ...init, headers: retryHeaders });
+  if (accessToken) headers.set("Authorization", `Bearer ${accessToken}`);
+  return fetch(input, { ...init, headers });
+}
+
+export async function authFetch(input: RequestInfo | URL, init: RequestInit = {}) {
+  let state = readAuthState();
+  if (accessTokenExpiresSoon(state)) {
+    await refreshAccessToken();
+    state = readAuthState();
+  }
+
+  const attemptedAccessToken = state.accessToken;
+  const response = await requestWithAccessToken(input, init, attemptedAccessToken);
+  if (response.status !== 401) return response;
+
+  let currentAccessToken = readAuthState().accessToken;
+  if (currentAccessToken && currentAccessToken !== attemptedAccessToken) {
+    return requestWithAccessToken(input, init, currentAccessToken);
+  }
+
+  if (await refreshAccessToken()) {
+    currentAccessToken = readAuthState().accessToken;
+    if (currentAccessToken) return requestWithAccessToken(input, init, currentAccessToken);
+  }
+
+  // Another tab may have completed token rotation while this tab's refresh was rejected.
+  currentAccessToken = readAuthState().accessToken;
+  if (currentAccessToken && currentAccessToken !== attemptedAccessToken) {
+    return requestWithAccessToken(input, init, currentAccessToken);
   }
   return response;
 }

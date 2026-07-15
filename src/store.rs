@@ -1148,20 +1148,13 @@ impl AppStore {
         session_email: &str,
     ) -> Result<(String, String), AppError> {
         let conn = self.conn.lock().await;
-        let installation = get_installation(&conn, installation_id)?
-            .ok_or_else(|| AppError::NotFound("installation not found".into()))?;
-        let owner_email = installation
-            .owner_email
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_ascii_lowercase)
-            .ok_or_else(|| AppError::Forbidden("installation owner is not bound".into()))?;
-        if owner_email != session_email.trim().to_ascii_lowercase() {
-            return Err(AppError::Forbidden(
-                "only installation owner can trigger upgrade".into(),
-            ));
-        }
+        let (installation, tunnel_url) = Self::installation_upgrade_context(
+            &conn,
+            config,
+            installation_id,
+            session_email,
+            "only installation owner can trigger upgrade",
+        )?;
         if !installation
             .delegate_upgrade_to_router_owner
             .unwrap_or(true)
@@ -1175,13 +1168,52 @@ impl AppStore {
                 "client reported upgrade is unavailable in this environment".into(),
             ));
         }
-        let tunnel = get_client_tunnel_by_installation(&conn, installation_id)?
+        Ok((tunnel_url, installation.id))
+    }
+
+    pub async fn prepare_installation_upgrade_status(
+        &self,
+        config: &Config,
+        installation_id: &str,
+        session_email: &str,
+    ) -> Result<String, AppError> {
+        let conn = self.conn.lock().await;
+        let (_, tunnel_url) = Self::installation_upgrade_context(
+            &conn,
+            config,
+            installation_id,
+            session_email,
+            "only installation owner can inspect upgrade status",
+        )?;
+        Ok(tunnel_url)
+    }
+
+    fn installation_upgrade_context(
+        conn: &Connection,
+        config: &Config,
+        installation_id: &str,
+        session_email: &str,
+        owner_error: &str,
+    ) -> Result<(Installation, String), AppError> {
+        let installation = get_installation(conn, installation_id)?
+            .ok_or_else(|| AppError::NotFound("installation not found".into()))?;
+        let owner_email = installation
+            .owner_email
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase)
+            .ok_or_else(|| AppError::Forbidden("installation owner is not bound".into()))?;
+        if owner_email != session_email.trim().to_ascii_lowercase() {
+            return Err(AppError::Forbidden(owner_error.into()));
+        }
+        let tunnel = get_client_tunnel_by_installation(conn, installation_id)?
             .ok_or_else(|| AppError::BadRequest("client tunnel is not configured".into()))?;
         if !tunnel.enabled {
             return Err(AppError::BadRequest("client tunnel is disabled".into()));
         }
         let tunnel_url = config.tunnel_url(&tunnel.subdomain);
-        Ok((tunnel_url, installation.id))
+        Ok((installation, tunnel_url))
     }
 
     pub async fn update_installation_payout_profile(
@@ -19139,6 +19171,56 @@ mod tests {
         );
         let signature = signing_key.sign(body.as_bytes());
         base64::engine::general_purpose::STANDARD.encode(signature.to_bytes())
+    }
+
+    #[tokio::test]
+    async fn upgrade_status_lookup_survives_capability_or_delegation_changes() {
+        let (store, config) = setup_store("upgrade-status-route").await;
+        insert_installation(&store, "inst-upgrade-status").await;
+        insert_client_tunnel(
+            &store,
+            "inst-upgrade-status",
+            "owner@example.com",
+            "upgrade-status-sub",
+        )
+        .await;
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "UPDATE installations
+             SET delegate_upgrade_to_router_owner = 0, upgrade_capable = 0
+             WHERE id = 'inst-upgrade-status'",
+            [],
+        )
+        .expect("disable future upgrades");
+        drop(conn);
+
+        let status_url = store
+            .prepare_installation_upgrade_status(
+                &config,
+                "inst-upgrade-status",
+                "owner@example.com",
+            )
+            .await
+            .expect("owner should still be able to inspect an existing task");
+        assert_eq!(status_url, "http://upgrade-status-sub.127.0.0.1:8787");
+
+        let start_error = store
+            .prepare_installation_upgrade(&config, "inst-upgrade-status", "owner@example.com")
+            .await
+            .expect_err("new upgrade must still honor delegation");
+        assert!(start_error.to_string().contains("delegation is disabled"));
+
+        let owner_error = store
+            .prepare_installation_upgrade_status(
+                &config,
+                "inst-upgrade-status",
+                "other@example.com",
+            )
+            .await
+            .expect_err("other users cannot inspect upgrade state");
+        assert!(owner_error.to_string().contains("only installation owner"));
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 
     #[tokio::test]

@@ -65,8 +65,8 @@ use crate::models::{
     ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRuntimeRefreshRequest,
     ShareSettingsPatch, ShareSettingsUpdateRequest, ShareSyncRequest,
     SubdomainAvailabilityResponse, UpgradeInstallationRequest, UpgradeInstallationResponse,
-    UserApiTokenResetResponse, UserApiTokenResponse, UserSharesResponse, VerifyEmailCodeRequest,
-    VerifyEmailCodeResponse,
+    UpgradeInstallationStatusResponse, UserApiTokenResetResponse, UserApiTokenResponse,
+    UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 use crate::proxy::{gateway_proxy_handler, market_proxy_handler, proxy_handler};
 use crate::recent_traffic::{RecentRequestEvent, RecentTrafficSnapshot};
@@ -127,6 +127,12 @@ struct ShareApiAuthQuery {
 struct ShareUsageByEmailQuery {
     app: Option<String>,
     period: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InstallationUpgradeStatusQuery {
+    task_id: String,
 }
 
 pub fn router(state: ServerState) -> Router {
@@ -224,6 +230,10 @@ pub fn router(state: ServerState) -> Router {
         .route(
             "/v1/installations/:installation_id/upgrade",
             post(upgrade_installation),
+        )
+        .route(
+            "/v1/installations/:installation_id/upgrade/status",
+            get(upgrade_installation_status),
         )
         .route(
             "/v1/client-tunnel/subdomain-availability",
@@ -1069,8 +1079,8 @@ async fn upgrade_installation(
     Json(input): Json<UpgradeInstallationRequest>,
 ) -> Result<Json<UpgradeInstallationResponse>, AppError> {
     let session_email = require_session_email(&state, &headers).await?;
-    let bearer = extract_bearer_token(&headers)
-        .ok_or_else(|| AppError::Unauthorized("missing bearer token".into()))?;
+    let session_token = extract_session_token(&headers)
+        .ok_or_else(|| AppError::Unauthorized("missing session token".into()))?;
     let (tunnel_url, _) = state
         .store
         .prepare_installation_upgrade(&state.config, &installation_id, &session_email)
@@ -1081,7 +1091,7 @@ async fn upgrade_installation(
             "{}/web-api/invoke/start_admin_upgrade",
             tunnel_url.trim_end_matches('/')
         ))
-        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+        .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
         .header("x-cc-switch-web-user-email", session_email.as_str())
         .header("x-cc-switch-web-role", "owner")
         .json(&serde_json::json!({
@@ -1104,9 +1114,78 @@ async fn upgrade_installation(
     let task_id = payload
         .get("taskId")
         .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .ok_or_else(|| AppError::Internal("client upgrade response missing taskId".into()))?
         .to_string();
     Ok(Json(UpgradeInstallationResponse { ok: true, task_id }))
+}
+
+async fn upgrade_installation_status(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(installation_id): Path<String>,
+    Query(query): Query<InstallationUpgradeStatusQuery>,
+) -> Result<Json<UpgradeInstallationStatusResponse>, AppError> {
+    let session_email = require_session_email(&state, &headers).await?;
+    let session_token = extract_session_token(&headers)
+        .ok_or_else(|| AppError::Unauthorized("missing session token".into()))?;
+    let task_id = query.task_id.trim();
+    if task_id.is_empty() {
+        return Err(AppError::BadRequest("taskId is required".into()));
+    }
+    let tunnel_url = state
+        .store
+        .prepare_installation_upgrade_status(&state.config, &installation_id, &session_email)
+        .await?;
+    let response = state
+        .proxy_http
+        .get(format!(
+            "{}/web-api/admin/upgrade/status",
+            tunnel_url.trim_end_matches('/')
+        ))
+        .query(&[("taskId", task_id)])
+        .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+        .header("x-cc-switch-web-user-email", session_email.as_str())
+        .header("x-cc-switch-web-role", "owner")
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|error| {
+            AppError::Internal(format!("client upgrade status request failed: {error}"))
+        })?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(AppError::Internal(format!(
+            "client upgrade status failed: {status}: {body}"
+        )));
+    }
+    let status = response
+        .json::<UpgradeInstallationStatusResponse>()
+        .await
+        .map_err(|error| {
+            AppError::Internal(format!("parse client upgrade status failed: {error}"))
+        })?;
+    Ok(Json(validate_installation_upgrade_status(status, task_id)?))
+}
+
+fn validate_installation_upgrade_status(
+    status: UpgradeInstallationStatusResponse,
+    expected_task_id: &str,
+) -> Result<UpgradeInstallationStatusResponse, AppError> {
+    if status.task_id != expected_task_id {
+        return Err(AppError::Internal(
+            "client upgrade status taskId does not match".into(),
+        ));
+    }
+    if !matches!(status.status.as_str(), "running" | "success" | "failed") {
+        return Err(AppError::Internal(format!(
+            "client upgrade status is invalid: {}",
+            status.status
+        )));
+    }
+    Ok(status)
 }
 
 async fn bind_installation_owner_email(
@@ -1426,13 +1505,14 @@ async fn dashboard(
     State(state): State<ServerState>,
     headers: HeaderMap,
 ) -> Result<Json<DashboardResponse>, AppError> {
+    let viewer_email = extract_dashboard_session_email(&state, &headers).await?;
     let mut response = state
         .store
         .dashboard_snapshot(
             &state.config,
             &state.server_geo,
             &state.proxy,
-            extract_session_email(&state, &headers).await?.as_deref(),
+            viewer_email.as_deref(),
         )
         .await?;
     state
@@ -2188,6 +2268,60 @@ mod tests {
     use chrono::Utc;
 
     #[test]
+    fn dashboard_session_policy_accepts_valid_session() {
+        let viewer_email = require_dashboard_session_email(Some("owner@example.com".into()))
+            .expect("valid dashboard session should resolve");
+
+        assert_eq!(viewer_email, "owner@example.com");
+    }
+
+    #[test]
+    fn dashboard_session_policy_rejects_invalid_or_expired_credentials() {
+        let error = require_dashboard_session_email(None)
+            .expect_err("present but invalid dashboard credentials must be rejected");
+
+        assert_eq!(error.into_response().status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn client_upgrade_status_accepts_supported_terminal_and_running_states() {
+        for status in ["running", "success", "failed"] {
+            let response = UpgradeInstallationStatusResponse {
+                task_id: "task-1".into(),
+                status: status.into(),
+            };
+
+            let validated = validate_installation_upgrade_status(response, "task-1")
+                .expect("supported upgrade status");
+
+            assert_eq!(validated.status, status);
+        }
+    }
+
+    #[test]
+    fn client_upgrade_status_rejects_mismatched_task_or_unknown_state() {
+        let mismatched = validate_installation_upgrade_status(
+            UpgradeInstallationStatusResponse {
+                task_id: "task-other".into(),
+                status: "running".into(),
+            },
+            "task-1",
+        )
+        .expect_err("mismatched task must fail");
+        assert!(mismatched.to_string().contains("taskId does not match"));
+
+        let unknown = validate_installation_upgrade_status(
+            UpgradeInstallationStatusResponse {
+                task_id: "task-1".into(),
+                status: "timed_out".into(),
+            },
+            "task-1",
+        )
+        .expect_err("unknown status must fail");
+        assert!(unknown.to_string().contains("status is invalid"));
+    }
+
+    #[test]
     fn router_api_token_extraction_accepts_share_client_headers() {
         let mut headers = HeaderMap::new();
         headers.insert("x-goog-api-key", "gemini-router-token".parse().unwrap());
@@ -2204,6 +2338,26 @@ mod tests {
             "Bearer bearer-token".parse().unwrap(),
         );
         assert_eq!(extract_router_api_token(&headers), Some("bearer-token"));
+    }
+
+    #[test]
+    fn session_token_extraction_distinguishes_missing_cookie_and_bearer() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(extract_session_token(&headers), None);
+
+        headers.insert(
+            axum::http::header::COOKIE,
+            "other=value; cc_switch_router_access=cookie-token"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(extract_session_token(&headers), Some("cookie-token"));
+
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer bearer-token".parse().unwrap(),
+        );
+        assert_eq!(extract_session_token(&headers), Some("bearer-token"));
     }
 
     #[test]
@@ -3318,6 +3472,25 @@ async fn extract_session_email(
         .resolve_session_by_access_token(token)
         .await?
         .map(|session| session.email))
+}
+
+fn require_dashboard_session_email(email: Option<String>) -> Result<String, AppError> {
+    email.ok_or_else(|| AppError::Unauthorized("session not found".into()))
+}
+
+async fn extract_dashboard_session_email(
+    state: &ServerState,
+    headers: &HeaderMap,
+) -> Result<Option<String>, AppError> {
+    let Some(token) = extract_session_token(headers) else {
+        return Ok(dev_auth_bypass_enabled().then(dev_auth_email));
+    };
+    let email = state
+        .store
+        .resolve_session_by_access_token(token)
+        .await?
+        .map(|session| session.email);
+    require_dashboard_session_email(email).map(Some)
 }
 
 async fn require_session_email(

@@ -2273,6 +2273,13 @@ pub struct UpgradeInstallationResponse {
     pub task_id: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpgradeInstallationStatusResponse {
+    pub task_id: String,
+    pub status: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DashboardClientView {

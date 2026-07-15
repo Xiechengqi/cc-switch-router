@@ -217,12 +217,28 @@ export async function restartService() {
 export async function upgradeClientInstallation(
   installationId: string,
   restartAfter = true,
+  signal?: AbortSignal,
 ) {
   return parseJson<{ ok: boolean; taskId: string }>(
     await authFetch(`/v1/installations/${installationId}/upgrade`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ restartAfter }),
+      signal,
+    }),
+  );
+}
+
+export async function getClientInstallationUpgradeStatus(
+  installationId: string,
+  taskId: string,
+  signal?: AbortSignal,
+) {
+  const params = new URLSearchParams({ taskId });
+  return parseJson<{ taskId: string; status: "running" | "success" | "failed" }>(
+    await authFetch(`/v1/installations/${installationId}/upgrade/status?${params}`, {
+      cache: "no-store",
+      signal,
     }),
   );
 }

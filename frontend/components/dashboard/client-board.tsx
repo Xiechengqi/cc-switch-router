@@ -1,18 +1,18 @@
 "use client";
 
 import { Button, Card, Chip, Drawer, toast } from "@heroui/react";
-import { Check, ChevronDown, Copy, ExternalLink, Loader2, Rocket, Search, WalletCards } from "lucide-react";
+import { Check, ChevronDown, Copy, ExternalLink, Search, WalletCards } from "lucide-react";
 import * as React from "react";
 import { buildClientInstallCommand, InstallGuideDialog } from "@/components/dashboard/install-guide-dialog";
 import { SectionInstallButton } from "@/components/dashboard/section-install-button";
 import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog";
 import { ShareCard } from "@/components/dashboard/share-card";
+import { ClientUpgradeButton } from "@/components/dashboard/client-upgrade-button";
 import { ClientRemovalSchedule, clientOperationalSummary, OperationalDiagnosis, OperationalStatusPill, operationalReasonLabel, shareIsEnabled, shareOperationalSummary, useStableOperationalRanks } from "@/components/dashboard/operational-status";
 import { useClientConsole } from "@/components/dashboard/client-console";
 import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
 import { useDashboardViewState } from "@/components/dashboard/dashboard-view-state";
 import { useOperationVerification } from "@/components/dashboard/operation-verification";
-import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   ClientLinkedSharesPanel,
@@ -41,8 +41,7 @@ import {
 import type { DashboardClient, DashboardMarket, OperationalState, ShareView } from "@/lib/types";
 import { formatDateTime, formatRelativeTime } from "@/lib/utils";
 import { usePersistentState } from "@/lib/use-persistent-state";
-import { recordDashboardUxEvent, upgradeClientInstallation } from "@/lib/api";
-import { readAuthState } from "@/lib/auth";
+import { recordDashboardUxEvent } from "@/lib/api";
 import { CompactSelect } from "@/components/common/compact-select";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 
@@ -214,69 +213,6 @@ function ClientConsoleButton({ client }: { client: DashboardClient }) {
       <ClientConsoleIcon className="h-3 w-3 shrink-0" />
       <span>{t("dashboard.clientConsole")}</span>
     </ClientHeaderInlineButton>
-  );
-}
-
-function ClientUpgradeButton({ client }: { client: DashboardClient }) {
-  const { t } = useLocaleText();
-  const [busy, setBusy] = React.useState(false);
-  const [confirmOpen, setConfirmOpen] = React.useState(false);
-  const sessionEmail = readAuthState().email?.trim().toLowerCase();
-  const ownerEmail = clientOwnerEmail(client)?.trim().toLowerCase();
-  const tunnelUrl = clientTunnelDisplayUrl(client.clientTunnel?.tunnelUrl);
-  const delegateEnabled = client.installation.upgrade?.delegateUpgradeToRouterOwner !== false;
-  const upgradeCapable = client.installation.upgrade?.upgradeCapable;
-  const canUpgrade =
-    !!sessionEmail &&
-    !!ownerEmail &&
-    sessionEmail === ownerEmail &&
-    !!tunnelUrl &&
-    delegateEnabled &&
-    upgradeCapable !== false;
-
-  if (!canUpgrade) return null;
-
-  const upgradeTarget =
-    client.clientTunnel?.subdomain ||
-    client.installation.id.slice(0, 8);
-
-  async function runUpgrade() {
-    setBusy(true);
-    try {
-      const result = await upgradeClientInstallation(client.installation.id, true);
-      setConfirmOpen(false);
-      toast.success(t("dashboard.clientUpgradeStarted", { taskId: result.taskId }));
-    } catch (error) {
-      toast.danger(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <>
-      <ClientHeaderInlineButton
-        label={t("dashboard.clientUpgrade")}
-        onClick={() => setConfirmOpen(true)}
-        className="inline-flex h-6 shrink-0 items-center gap-1 rounded-full border border-violet-200 bg-violet-50 px-2.5 text-[11px] font-medium text-violet-700 transition-colors hover:border-violet-300 hover:bg-violet-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
-      >
-        {busy ? <Loader2 className="h-3 w-3 shrink-0 animate-spin" /> : <Rocket className="h-3 w-3 shrink-0" />}
-        <span>{t("dashboard.clientUpgrade")}</span>
-      </ClientHeaderInlineButton>
-      <ConfirmAlertDialog
-        open={confirmOpen}
-        title={t("dashboard.clientUpgradeConfirmTitle")}
-        description={t("dashboard.clientUpgradeConfirm", { target: upgradeTarget })}
-        confirmLabel={t("common.upgrade")}
-        cancelLabel={t("common.cancel")}
-        tone="warning"
-        busy={busy}
-        onConfirm={() => void runUpgrade()}
-        onOpenChange={(open) => {
-          if (!busy) setConfirmOpen(open);
-        }}
-      />
-    </>
   );
 }
 
@@ -739,6 +675,8 @@ export function ClientBoard({
 
   const selectedClient = selectedClientId ? clientById.get(selectedClientId) || null : null;
   const selectedShare = selectedShareId ? shareById.get(selectedShareId) || null : null;
+  const connectShareId = connectShare?.shareId || "";
+  const currentConnectShare = connectShareId ? shareById.get(connectShareId) || null : null;
   const selectedClientUrl = clientTunnelDisplayUrl(selectedClient?.clientTunnel?.tunnelUrl);
   const selectedApi = shareApiParts(selectedShare ?? undefined);
   const clientInstallCommand = React.useMemo(
@@ -749,6 +687,10 @@ export function ClientBoard({
       }),
     [installOpen, t],
   );
+
+  React.useEffect(() => {
+    if (connectShareId && !shareById.has(connectShareId)) setConnectShare(null);
+  }, [connectShareId, shareById]);
 
   return (
     <section className="grid gap-4">
@@ -901,7 +843,7 @@ export function ClientBoard({
       </Drawer>
 
       <ShareEditDialog share={editingShare} markets={markets} onClose={closeEditShare} onSaved={handleSaved} />
-      <ShareConnectDialog share={connectShare} open={!!connectShare} onOpenChange={closeConnectDialog} />
+      <ShareConnectDialog share={currentConnectShare} open={!!currentConnectShare} onOpenChange={closeConnectDialog} />
       <InstallGuideDialog
         open={installOpen}
         onOpenChange={setInstallOpen}
