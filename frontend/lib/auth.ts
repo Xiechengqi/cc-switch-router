@@ -3,6 +3,7 @@
 import type { SessionStatus } from "@/lib/types";
 
 const AUTH_KEY = "cc_switch_router_auth_v1";
+const PROTOCOL_EPOCH = "namespace-flat-1";
 const ACCESS_TOKEN_REFRESH_SKEW_MS = 10_000;
 const AUTH_REFRESH_LOCK_NAME = "cc-switch-router-auth-refresh-v1";
 const FALLBACK_REFRESH_RECHECK_MS = 200;
@@ -90,15 +91,48 @@ async function importPrivateKey(privateKeyBase64: string) {
   return crypto.subtle.importKey("pkcs8", base64ToBytes(privateKeyBase64), { name: "Ed25519" }, false, ["sign"]);
 }
 
-async function registerInstallationIdentity(publicKey: string) {
+async function signCanonicalPayload(
+  privateKeyBase64: string,
+  installationId: string,
+  action: string,
+  payloadJson: string,
+  timestampMs: number,
+  nonce: string,
+) {
+  const body = `${PROTOCOL_EPOCH}\n${installationId}\n${action}\n${payloadJson}\n${timestampMs}\n${nonce}`;
+  const privateKey = await importPrivateKey(privateKeyBase64);
+  return bytesToBase64(
+    new Uint8Array(await crypto.subtle.sign("Ed25519", privateKey, new TextEncoder().encode(body))),
+  );
+}
+
+async function registerInstallationIdentity(publicKey: string, privateKey: string) {
+  const platform = platformLabel();
+  const appVersion = "router-dashboard-next";
+  const instanceNonce = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
+  const timestampMs = Date.now();
+  const registrationCanonical = `${PROTOCOL_EPOCH}\nregister_installation_v2\n${publicKey}\n${platform}\n${appVersion}\n${instanceNonce}\n${timestampMs}`;
+  const registrationSignature = bytesToBase64(
+    new Uint8Array(
+      await crypto.subtle.sign(
+        "Ed25519",
+        await importPrivateKey(privateKey),
+        new TextEncoder().encode(registrationCanonical),
+      ),
+    ),
+  );
   const response = await fetch("/v1/installations/register", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
+      protocolEpoch: PROTOCOL_EPOCH,
       publicKey,
-      platform: platformLabel(),
-      appVersion: "router-dashboard-next",
-      instanceNonce: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`,
+      platform,
+      appVersion,
+      instanceNonce,
+      proofVersion: 2,
+      timestampMs,
+      signature: registrationSignature,
     }),
   });
   const data = await response.json().catch(() => ({}));
@@ -116,7 +150,7 @@ export async function ensureInstallationIdentity() {
     };
   }
   const keys = await generateInstallationKeys();
-  const installationId = await registerInstallationIdentity(keys.publicKey);
+  const installationId = await registerInstallationIdentity(keys.publicKey, keys.privateKey);
   const next = mergeAuthState({ installationId, publicKey: keys.publicKey, privateKey: keys.privateKey });
   return {
     installationId,
@@ -144,9 +178,14 @@ export async function signAuthPayload(action: string, payload: Record<string, un
   const timestampMs = Date.now();
   const nonce = crypto.randomUUID ? crypto.randomUUID() : `${timestampMs}-${Math.random()}`;
   const payloadJson = JSON.stringify(payload);
-  const body = `${identity.installationId}\n${action}\n${payloadJson}\n${timestampMs}\n${nonce}`;
-  const privateKey = await importPrivateKey(identity.privateKey);
-  const signature = bytesToBase64(new Uint8Array(await crypto.subtle.sign("Ed25519", privateKey, new TextEncoder().encode(body))));
+  const signature = await signCanonicalPayload(
+    identity.privateKey,
+    identity.installationId,
+    action,
+    payloadJson,
+    timestampMs,
+    nonce,
+  );
   return {
     installationId: identity.installationId,
     timestampMs,
