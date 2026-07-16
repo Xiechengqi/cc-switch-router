@@ -79,7 +79,7 @@ const TAB_LABELS: Record<MetricsTab, MessageKey> = {
 };
 
 export function MetricsPage() {
-  const { session, loading } = useAuth();
+  const { session, loading, refresh: refreshAuth } = useAuth();
   const { t } = useLocaleText();
   const [activeTab, setActiveTab] = React.useState<MetricsTab>("overview");
   const [range, setRange] = React.useState("1h");
@@ -123,11 +123,15 @@ export function MetricsPage() {
       if (nextTop) setTop(nextTop);
       if (nextFailover) setFailover(nextFailover);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      const message = err instanceof Error ? err.message : String(err);
+      if (/login required/i.test(message)) {
+        await refreshAuth().catch(() => undefined);
+      }
+      setError(message);
     } finally {
       if (!silent) setBusy("");
     }
-  }, [isAdmin, range, activeTab]);
+  }, [isAdmin, range, activeTab, refreshAuth]);
 
   React.useEffect(() => {
     load().catch(console.error);

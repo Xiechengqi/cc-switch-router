@@ -21,7 +21,8 @@ type TickerMeta = Partial<Omit<ShareRequestLog, "createdAt"> & Omit<MarketReques
   isInflight?: boolean;
 };
 
-const REQUEST_TICKER_LIMIT = 6;
+const REQUEST_TICKER_LIMIT = 100;
+const REQUEST_TICKER_MAX_HEIGHT_PX = 220;
 
 function projectLatLon(lat: number, lon: number): PlacedPoint {
   const x = ((lon + 180) / 360) * 100;
@@ -392,7 +393,12 @@ function RequestTicker({ data }: { data: DashboardResponse | null }) {
   if (!events.length) return null;
 
   return (
-    <div className="pointer-events-none absolute bottom-[52px] left-3 z-30 flex w-[min(72%,720px)] flex-col gap-1">
+    <div
+      data-map-control
+      className="pointer-events-auto absolute bottom-[52px] left-3 z-30 w-[min(72%,720px)] max-h-[220px] overflow-y-auto overscroll-contain rounded-lg border border-slate-200/80 bg-white/88 px-1 py-1 shadow-sm backdrop-blur-sm [scrollbar-gutter:stable]"
+      style={{ maxHeight: REQUEST_TICKER_MAX_HEIGHT_PX }}
+    >
+      <div className="flex flex-col gap-1">
       {events.map((event, index) => {
         const item = meta.get(event.requestId);
         const mergedItem: TickerMeta = {
@@ -428,6 +434,7 @@ function RequestTicker({ data }: { data: DashboardResponse | null }) {
           </div>
         );
       })}
+      </div>
     </div>
   );
 }

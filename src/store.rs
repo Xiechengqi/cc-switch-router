@@ -21,7 +21,7 @@ use uuid::Uuid;
 const MARKET_APP_AVAILABILITY_FAILURE_TTL_SECS: i64 = 30 * 60;
 
 use crate::ServerGeo;
-use crate::config::Config;
+use crate::config::{Config, tunnel_domain_host};
 use crate::ctl_client::authorize_control_request;
 use crate::dynamic_settings::BoardSettings;
 use crate::error::AppError;
@@ -64,12 +64,15 @@ use crate::models::{
     ShareRuntimeSnapshotResponse, ShareSettingsPatch, ShareSettingsUpdateResponse, ShareSignals,
     ShareSupport, ShareSyncRequest, ShareUpstreamProvider, ShareUpstreamQuota,
     ShareUsageByEmailResponse, ShareUsageDailyBucket, ShareUsageEmailRow, ShareView,
-    SubdomainAvailabilityResponse, TunnelLease, UserApiTokenResetResponse, UserApiTokenResponse,
-    UserApiTokenStatus, UserShareView, UserSharesResponse, VerifyEmailCodeRequest,
-    VerifyEmailCodeResponse,
+    SubdomainAvailabilityResponse, TunnelActivateRequest, TunnelLease, TunnelStateRequest,
+    TunnelStateResponse, UserApiTokenResetResponse, UserApiTokenResponse, UserApiTokenStatus,
+    UserShareView, UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 #[cfg(test)]
 use crate::models::{RenewLeasePayload, ShareAppProvider, ShareUpstreamModel};
+use crate::namespace::{
+    PROTOCOL_EPOCH, PublicHostKind, normalize_client_key, normalize_market_slug, parse_public_label,
+};
 use crate::notifications::{
     ClientNotificationBatch, ClientNotificationClaim, ClientNotificationDeliveryView,
     ClientNotificationPolicy, DigestEmailData, NotificationAggregateStats,
@@ -3691,6 +3694,7 @@ impl AppStore {
         installation_id: Option<&str>,
     ) -> Result<SubdomainAvailabilityResponse, AppError> {
         let subdomain = normalize_subdomain(subdomain)?;
+        normalize_client_key(&subdomain).map_err(|message| AppError::BadRequest(message.into()))?;
         ensure_subdomain_allowed(&subdomain, config)?;
         let conn = self.conn.lock().await;
         ensure_subdomain_not_registered_market(&conn, &subdomain)?;
@@ -3752,36 +3756,64 @@ impl AppStore {
         ensure_subdomain_allowed(&subdomain, config)?;
         let now = Utc::now();
 
-        let conn = self.conn.lock().await;
-        ensure_subdomain_not_registered_market(&conn, &subdomain)?;
-        ensure_subdomain_not_claimed_by_share(&conn, &subdomain)?;
-        let installation = get_installation(&conn, &installation_id)?
-            .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
-        let signed_payload = ClientTunnelConfig {
-            owner_email: requested_owner.clone(),
-            subdomain: subdomain.clone(),
-            enabled: tunnel.enabled,
-        };
-        verify_signed_share_request(
-            &conn,
-            &installation.public_key,
-            &installation_id,
-            action,
-            &signed_payload,
-            timestamp_ms,
-            &nonce,
-            &signature,
-        )?;
-        let owner_email = verified_installation_owner_email(&installation)?;
-        if requested_owner != owner_email {
-            return Err(AppError::Conflict(
-                "client tunnel owner must match the installation owner".into(),
-            ));
-        }
-        let should_refresh_geo =
-            should_refresh_installation_geo(&installation, metadata.ip.as_deref());
-        touch_installation_presence(&conn, &installation_id, &metadata, now)?;
-        conn.execute(
+        let (record, should_refresh_geo) = {
+            let conn = self.conn.lock().await;
+            ensure_subdomain_not_registered_market(&conn, &subdomain)?;
+            ensure_subdomain_not_claimed_by_share(&conn, &subdomain)?;
+            let installation = get_installation(&conn, &installation_id)?
+                .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
+            let signed_payload = ClientTunnelConfig {
+                owner_email: requested_owner.clone(),
+                subdomain: subdomain.clone(),
+                enabled: tunnel.enabled,
+            };
+            verify_signed_share_request(
+                &conn,
+                &installation.public_key,
+                &installation_id,
+                action,
+                &signed_payload,
+                timestamp_ms,
+                &nonce,
+                &signature,
+            )?;
+            let owner_email = verified_installation_owner_email(&installation)?;
+            if requested_owner != owner_email {
+                return Err(AppError::Conflict(
+                    "client tunnel owner must match the installation owner".into(),
+                ));
+            }
+            normalize_client_key(&subdomain)
+                .map_err(|message| AppError::BadRequest(message.into()))?;
+            let should_refresh_geo =
+                should_refresh_installation_geo(&installation, metadata.ip.as_deref());
+            touch_installation_presence(&conn, &installation_id, &metadata, now)?;
+            let tx = conn.unchecked_transaction().map_err(|e| {
+                AppError::Internal(format!("begin client tunnel claim tx failed: {e}"))
+            })?;
+            crate::public_hosts::claim(
+                &tx,
+                crate::public_hosts::NewPublicHost {
+                    label: &subdomain,
+                    route_id: &format!("client:{installation_id}"),
+                    kind: PublicHostKind::Client,
+                    subject_id: &installation_id,
+                    installation_id: Some(&installation_id),
+                    target_lane_id: &installation_id,
+                },
+            )
+            .map_err(map_public_host_error)?;
+            crate::public_hosts::set_lifecycle(
+                &tx,
+                &subdomain,
+                if signed_payload.enabled {
+                    crate::public_hosts::PublicHostLifecycle::Active
+                } else {
+                    crate::public_hosts::PublicHostLifecycle::Disabled
+                },
+            )
+            .map_err(map_public_host_error)?;
+            tx.execute(
             "INSERT INTO installation_client_tunnels (
                 installation_id, owner_email, subdomain, enabled, created_at, updated_at, last_seen_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?5, NULL)
@@ -3797,11 +3829,15 @@ impl AppStore {
                 if signed_payload.enabled { 1 } else { 0 },
                 now.to_rfc3339(),
             ],
-        )
-        .map_err(map_client_tunnel_constraint_error)?;
-        let record = get_client_tunnel_by_installation(&conn, &installation_id)?
-            .ok_or_else(|| AppError::Internal("client tunnel upsert did not persist".into()))?;
-        drop(conn);
+            )
+            .map_err(map_client_tunnel_constraint_error)?;
+            tx.commit().map_err(|e| {
+                AppError::Internal(format!("commit client tunnel claim failed: {e}"))
+            })?;
+            let record = get_client_tunnel_by_installation(&conn, &installation_id)?
+                .ok_or_else(|| AppError::Internal("client tunnel upsert did not persist".into()))?;
+            (record, should_refresh_geo)
+        };
         if should_refresh_geo {
             self.refresh_installation_geo(&installation_id, &metadata.ip, false)
                 .await?;
@@ -4663,6 +4699,8 @@ impl AppStore {
         _current_user_email: Option<&str>,
     ) -> Result<IssueLeaseResponse, AppError> {
         let now = Utc::now();
+        ensure_tunnel_protocol_epoch(&input.protocol_epoch)?;
+        ensure_tunnel_router_id(config, &input.router_id)?;
         let tunnel_type = input.tunnel_type.to_ascii_lowercase();
         let is_client_web_tunnel = tunnel_type == "client-web-http";
         if tunnel_type != "http" && !is_client_web_tunnel {
@@ -4678,6 +4716,15 @@ impl AppStore {
 
         let requested_subdomain = normalize_subdomain(&input.requested_subdomain)?;
         ensure_subdomain_allowed(&requested_subdomain, config)?;
+        let route_id = validate_tunnel_route_id(&input.route_id)?;
+        if Uuid::parse_str(input.rotation_id.trim()).is_err() {
+            return Err(AppError::BadRequest("rotationId must be a UUID".into()));
+        }
+        if input.generation == 0 || input.generation <= input.expected_generation {
+            return Err(AppError::BadRequest(
+                "generation must be greater than expectedGeneration".into(),
+            ));
+        }
         let installation = {
             let conn = self.conn.lock().await;
             let installation = get_installation(&conn, &input.installation_id)?
@@ -4736,30 +4783,68 @@ impl AppStore {
             }
             requested_subdomain
         };
-        let requested_share_id = input.share.as_ref().map(|share| share.share_id.as_str());
         {
             let conn = self.conn.lock().await;
-            conn.execute(
-                "DELETE FROM leases
-                 WHERE subdomain = ?1
-                   AND installation_id = ?2
-                   AND tunnel_type = ?3",
-                params![subdomain, input.installation_id, tunnel_type],
-            )
-            .map_err(|e| AppError::Internal(format!("delete stale client leases failed: {e}")))?;
-            let live_lease_exists: bool = conn
-                .query_row(
-                    "SELECT EXISTS(
-                        SELECT 1 FROM leases
-                        WHERE subdomain = ?1 AND expires_at > ?2
-                    )",
-                    params![subdomain, now.to_rfc3339()],
-                    |row| row.get(0),
-                )
-                .map_err(|e| AppError::Internal(format!("check live lease failed: {e}")))?;
-            if live_lease_exists {
-                return Err(AppError::Conflict("subdomain already leased".into()));
+            let host = crate::public_hosts::get_by_label(&conn, &subdomain)
+                .map_err(map_public_host_error)?
+                .ok_or_else(|| AppError::Conflict("public host is not claimed".into()))?;
+            if host.lifecycle != crate::public_hosts::PublicHostLifecycle::Active {
+                return Err(AppError::Conflict("public host is not active".into()));
             }
+            if host.route_id != route_id {
+                return Err(AppError::Conflict(
+                    "public host belongs to another route".into(),
+                ));
+            }
+            let identity_matches = if let Some(share) = input.share.as_ref() {
+                host.kind == PublicHostKind::Share
+                    && host.subject_id == share.share_id
+                    && host.installation_id.as_deref() == Some(input.installation_id.as_str())
+            } else {
+                host.kind == PublicHostKind::Client
+                    && host.subject_id == input.installation_id
+                    && host.installation_id.as_deref() == Some(input.installation_id.as_str())
+            };
+            if !identity_matches {
+                return Err(AppError::Conflict(
+                    "public host identity does not match the lease".into(),
+                ));
+            }
+        }
+        let requested_share_id = input.share.as_ref().map(|share| share.share_id.as_str());
+        let persisted_head = {
+            let conn = self.conn.lock().await;
+            conn.query_row(
+                "SELECT subdomain, active_generation
+                 FROM tunnel_route_heads WHERE router_id = ?1 AND route_id = ?2",
+                params![input.router_id, route_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64)),
+            )
+            .optional()
+            .map_err(|e| AppError::Internal(format!("read route generation head failed: {e}")))?
+        };
+        if let Some((head_subdomain, _)) = persisted_head.as_ref() {
+            if head_subdomain != &subdomain {
+                return Err(AppError::Conflict(
+                    "routeId is already bound to another tunnel target".into(),
+                ));
+            }
+        }
+        let persisted_generation = persisted_head
+            .as_ref()
+            .map(|(_, generation)| *generation)
+            .unwrap_or(0);
+        if persisted_generation != input.expected_generation {
+            return Err(AppError::Conflict(format!(
+                "route generation changed: expected {}, active {}",
+                input.expected_generation, persisted_generation
+            )));
+        }
+        let runtime_generation = proxy.active_generation(&subdomain).await;
+        if runtime_generation != 0 && runtime_generation != persisted_generation {
+            return Err(AppError::Conflict(format!(
+                "runtime route generation {runtime_generation} differs from persisted head {persisted_generation}"
+            )));
         }
         if let Some(route) = proxy
             .backend_for_host(
@@ -4774,9 +4859,7 @@ impl AppStore {
                 && route.is_client_web()
                 && route.installation_id() == Some(input.installation_id.as_str());
             if !is_same_share_route {
-                if is_same_client_web_route {
-                    proxy.remove_route(&subdomain).await;
-                } else {
+                if !is_same_client_web_route {
                     return Err(AppError::Conflict("subdomain already in use".into()));
                 }
             }
@@ -4818,14 +4901,69 @@ impl AppStore {
             .map_err(|e| AppError::Internal(format!("touch client tunnel failed: {e}")))?;
         }
 
+        let existing_rotation = {
+            let conn = self.conn.lock().await;
+            conn.query_row(
+                "SELECT protocol_epoch, router_id, id, installation_id, connection_id,
+                        route_id, rotation_id, generation, expected_generation, subdomain,
+                        tunnel_type, ssh_username, ssh_password, issued_at, expires_at,
+                        used_at, share_json, state
+                 FROM leases
+                 WHERE router_id = ?1 AND route_id = ?2 AND rotation_id = ?3",
+                params![input.router_id, route_id, input.rotation_id],
+                |row| Ok((map_lease_row(row)?, row.get::<_, String>(17)?)),
+            )
+            .optional()
+            .map_err(|e| AppError::Internal(format!("query existing rotation failed: {e}")))?
+        };
+        if let Some((existing, state)) = existing_rotation {
+            let same_share = serde_json::to_value(&existing.share).ok()
+                == serde_json::to_value(&normalized_share).ok();
+            let same_claim = existing.protocol_epoch == input.protocol_epoch
+                && existing.router_id == input.router_id
+                && existing.installation_id == input.installation_id
+                && existing.route_id == route_id
+                && existing.rotation_id == input.rotation_id
+                && existing.generation == input.generation
+                && existing.expected_generation == input.expected_generation
+                && existing.subdomain == subdomain
+                && existing.tunnel_type == tunnel_type
+                && same_share;
+            if !same_claim {
+                return Err(AppError::Conflict(
+                    "rotationId is already bound to different lease semantics".into(),
+                ));
+            }
+            if existing.expires_at <= Utc::now() || state == "retired" {
+                return Err(AppError::Conflict(
+                    "rotationId belongs to an expired or retired lease".into(),
+                ));
+            }
+            if state != "active" && state != "draining" {
+                proxy
+                    .mark_route_pending(
+                        subdomain,
+                        StdDuration::from_secs(ROUTE_REGISTRATION_PENDING_GRACE_SECS),
+                    )
+                    .await;
+            }
+            return Ok(issue_lease_response(config, &existing));
+        }
+
         let issued_at = Utc::now();
         let expires_at = issued_at + Duration::seconds(config.lease_ttl_secs);
         let connection_id = Uuid::new_v4().to_string();
         let ssh_password = Alphanumeric.sample_string(&mut rand::thread_rng(), 24);
         let lease = TunnelLease {
+            protocol_epoch: input.protocol_epoch.clone(),
+            router_id: input.router_id.clone(),
             id: Uuid::new_v4().to_string(),
             installation_id: installation.id.clone(),
             connection_id: connection_id.clone(),
+            route_id: route_id.clone(),
+            rotation_id: input.rotation_id.clone(),
+            generation: input.generation,
+            expected_generation: input.expected_generation,
             subdomain: subdomain.clone(),
             tunnel_type,
             ssh_username: connection_id.clone(),
@@ -4837,15 +4975,66 @@ impl AppStore {
         };
 
         let conn = self.conn.lock().await;
+        let max_generation = conn
+            .query_row(
+                "SELECT COALESCE(MAX(generation), 0) FROM leases
+                 WHERE router_id = ?1 AND route_id = ?2",
+                params![lease.router_id, lease.route_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| AppError::Internal(format!("read latest route generation failed: {e}")))?
+            as u64;
+        if lease.generation <= max_generation {
+            return Err(AppError::Conflict(format!(
+                "generation must be newer than persisted generation {max_generation}"
+            )));
+        }
+        let rotation_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM leases
+                 WHERE router_id = ?1 AND route_id = ?2 AND rotation_id = ?3)",
+                params![lease.router_id, lease.route_id, lease.rotation_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| AppError::Internal(format!("check rotation id failed: {e}")))?;
+        if rotation_exists {
+            return Err(AppError::Conflict(
+                "rotationId has already been used".into(),
+            ));
+        }
+        let live_candidate_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM leases
+                    WHERE router_id = ?1 AND route_id = ?2 AND expires_at > ?3
+                      AND state IN ('issued', 'authenticated', 'ready')
+                )",
+                params![lease.router_id, lease.route_id, issued_at.to_rfc3339()],
+                |row| row.get(0),
+            )
+            .map_err(|e| AppError::Internal(format!("check live route candidate failed: {e}")))?;
+        if live_candidate_exists {
+            return Err(AppError::Conflict(
+                "route already has a non-expired candidate rotation".into(),
+            ));
+        }
         conn.execute(
             "INSERT INTO leases (
-                id, installation_id, connection_id, subdomain, tunnel_type,
+                protocol_epoch, router_id, id, installation_id, connection_id, route_id,
+                rotation_id, generation, expected_generation, state, subdomain, tunnel_type,
                 ssh_username, ssh_password, issued_at, expires_at, used_at, share_json
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'issued', ?10, ?11,
+                      ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
+                lease.protocol_epoch,
+                lease.router_id,
                 lease.id,
                 lease.installation_id,
                 lease.connection_id,
+                lease.route_id,
+                lease.rotation_id,
+                lease.generation as i64,
+                lease.expected_generation as i64,
                 lease.subdomain,
                 lease.tunnel_type,
                 lease.ssh_username,
@@ -4871,8 +5060,14 @@ impl AppStore {
             .await;
 
         Ok(IssueLeaseResponse {
+            protocol_epoch: lease.protocol_epoch,
+            router_id: lease.router_id,
             lease_id: lease.id,
             connection_id: lease.connection_id,
+            route_id: lease.route_id,
+            rotation_id: lease.rotation_id,
+            generation: lease.generation,
+            expected_generation: lease.expected_generation,
             ssh_username: lease.ssh_username,
             ssh_password,
             ssh_addr: config.effective_ssh_public_addr(),
@@ -4889,10 +5084,10 @@ impl AppStore {
         proxy: &ProxyRegistry,
         market: &MarketRegistryRecord,
     ) -> Result<IssueLeaseResponse, AppError> {
-        let now = Utc::now();
         let subdomain = normalize_subdomain(&market.subdomain)?;
         let market_installation_id = format!("market:{}", market.id);
-        {
+        let market_route_id = format!("market:{}", market.id);
+        let persisted_generation = {
             let conn = self.conn.lock().await;
             let registered = get_market_by_email(&conn, &market.email)?
                 .filter(|stored| stored.status.eq_ignore_ascii_case("active"))
@@ -4903,52 +5098,34 @@ impl AppStore {
                     "market subdomain is not registered".into(),
                 ));
             }
-            conn.execute(
-                "DELETE FROM leases
-                 WHERE subdomain = ?1
-                   AND installation_id = ?2
-                   AND tunnel_type = 'market-http'",
-                params![subdomain, market_installation_id],
+            conn.query_row(
+                "SELECT COALESCE(MAX(generation), 0) FROM leases WHERE route_id = ?1",
+                params![market_route_id],
+                |row| row.get::<_, i64>(0),
             )
-            .map_err(|e| AppError::Internal(format!("delete stale market leases failed: {e}")))?;
-            let live_lease_exists: bool = conn
-                .query_row(
-                    "SELECT EXISTS(
-                        SELECT 1 FROM leases
-                        WHERE subdomain = ?1 AND expires_at > ?2
-                    )",
-                    params![subdomain, now.to_rfc3339()],
-                    |row| row.get(0),
-                )
-                .map_err(|e| AppError::Internal(format!("check live market lease failed: {e}")))?;
-            if live_lease_exists {
-                return Err(AppError::Conflict("market subdomain already leased".into()));
-            }
-        }
-        if proxy
-            .backend_for_host(
-                &format!("{subdomain}.{}", config.tunnel_domain),
-                &config.tunnel_domain,
-            )
+            .map_err(|e| AppError::Internal(format!("read market generation failed: {e}")))?
+                as u64
+        };
+        let expected_generation = proxy.active_generation(&subdomain).await;
+        let generation = proxy
+            .next_generation(&subdomain)
             .await
-            .is_some()
-        {
-            proxy.remove_route(&subdomain).await;
-            tracing::warn!(
-                subdomain = %subdomain,
-                market_email = %market.email,
-                "removed stale market route before issuing replacement lease"
-            );
-        }
+            .max(persisted_generation.saturating_add(1));
 
         let issued_at = Utc::now();
         let expires_at = issued_at + Duration::seconds(config.lease_ttl_secs);
         let connection_id = Uuid::new_v4().to_string();
         let ssh_password = Alphanumeric.sample_string(&mut rand::thread_rng(), 24);
         let lease = TunnelLease {
+            protocol_epoch: PROTOCOL_EPOCH.to_string(),
+            router_id: tunnel_router_id(config)?,
             id: Uuid::new_v4().to_string(),
-            installation_id: format!("market:{}", market.id),
+            installation_id: market_installation_id,
             connection_id: connection_id.clone(),
+            route_id: market_route_id,
+            rotation_id: Uuid::new_v4().to_string(),
+            generation,
+            expected_generation,
             subdomain: subdomain.clone(),
             tunnel_type: "market-http".to_string(),
             ssh_username: connection_id.clone(),
@@ -4962,13 +5139,21 @@ impl AppStore {
         let conn = self.conn.lock().await;
         conn.execute(
             "INSERT INTO leases (
-                id, installation_id, connection_id, subdomain, tunnel_type,
+                protocol_epoch, router_id, id, installation_id, connection_id, route_id,
+                rotation_id, generation, expected_generation, state, subdomain, tunnel_type,
                 ssh_username, ssh_password, issued_at, expires_at, used_at, share_json
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'issued', ?10, ?11,
+                      ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
+                lease.protocol_epoch,
+                lease.router_id,
                 lease.id,
                 lease.installation_id,
                 lease.connection_id,
+                lease.route_id,
+                lease.rotation_id,
+                lease.generation as i64,
+                lease.expected_generation as i64,
                 lease.subdomain,
                 lease.tunnel_type,
                 lease.ssh_username,
@@ -4987,10 +5172,23 @@ impl AppStore {
             params![market.email, issued_at.to_rfc3339()],
         )
         .map_err(|e| AppError::Internal(format!("touch market lease presence failed: {e}")))?;
+        drop(conn);
+        proxy
+            .mark_route_pending(
+                subdomain.clone(),
+                StdDuration::from_secs(ROUTE_REGISTRATION_PENDING_GRACE_SECS),
+            )
+            .await;
 
         Ok(IssueLeaseResponse {
+            protocol_epoch: lease.protocol_epoch,
+            router_id: lease.router_id,
             lease_id: lease.id,
             connection_id: lease.connection_id,
+            route_id: lease.route_id,
+            rotation_id: lease.rotation_id,
+            generation: lease.generation,
+            expected_generation: lease.expected_generation,
             ssh_username: lease.ssh_username,
             ssh_password,
             ssh_addr: config.effective_ssh_public_addr(),
@@ -5013,19 +5211,46 @@ impl AppStore {
         if lease.expires_at < now {
             return Err(AppError::Unauthorized("lease expired".into()));
         }
-        if lease.used_at.is_some() {
-            return Err(AppError::Unauthorized("lease already used".into()));
-        }
         if lease.ssh_password != password {
             return Err(AppError::Unauthorized("invalid ssh credentials".into()));
         }
+        ensure_tunnel_protocol_epoch(&lease.protocol_epoch)?;
         lease.used_at = Some(now);
         conn.execute(
-            "UPDATE leases SET used_at = ?2 WHERE connection_id = ?1",
+            "UPDATE leases
+             SET used_at = COALESCE(used_at, ?2),
+                 state = CASE WHEN state = 'issued' THEN 'authenticated' ELSE state END
+             WHERE connection_id = ?1",
             params![username, now.to_rfc3339()],
         )
         .map_err(|e| AppError::Internal(format!("update lease use failed: {e}")))?;
         Ok(lease)
+    }
+
+    pub async fn mark_lease_ready(
+        &self,
+        connection_id: &str,
+        route_id: &str,
+        generation: u64,
+    ) -> Result<(), AppError> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        let updated = conn
+            .execute(
+                "UPDATE leases
+                 SET state = CASE WHEN state = 'active' THEN 'active' ELSE 'ready' END,
+                     ready_at = COALESCE(ready_at, ?4)
+                 WHERE connection_id = ?1 AND route_id = ?2 AND generation = ?3
+                   AND used_at IS NOT NULL AND state IN ('authenticated', 'ready', 'active')",
+                params![connection_id, route_id, generation as i64, now],
+            )
+            .map_err(|e| AppError::Internal(format!("mark tunnel lease ready failed: {e}")))?;
+        if updated != 1 {
+            return Err(AppError::Conflict(
+                "tunnel lease changed before candidate became ready".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub async fn renew_lease(
@@ -5036,15 +5261,18 @@ impl AppStore {
         metadata: ClientMetadata,
     ) -> Result<RenewLeaseResponse, AppError> {
         let now = Utc::now();
+        ensure_tunnel_protocol_epoch(&input.renewal.protocol_epoch)?;
+        ensure_tunnel_router_id(config, &input.renewal.router_id)?;
+        validate_tunnel_route_id(&input.renewal.route_id)?;
         let (subdomain, tunnel_type) = {
             let conn = self.conn.lock().await;
             let installation = get_installation(&conn, &input.installation_id)?
                 .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
-            verify_signed_share_request(
+            verify_signed_tunnel_request(
                 &conn,
                 &installation.public_key,
                 &input.installation_id,
-                "renew_lease",
+                "tunnel_lease_renew",
                 &input.renewal,
                 input.timestamp_ms,
                 &input.nonce,
@@ -5052,19 +5280,28 @@ impl AppStore {
             )?;
             let lease = conn
                 .query_row(
-                    "SELECT subdomain, tunnel_type, used_at
+                    "SELECT subdomain, tunnel_type, used_at, state
                      FROM leases
-                     WHERE id = ?1 AND installation_id = ?2 AND connection_id = ?3",
+                     WHERE id = ?1 AND installation_id = ?2 AND connection_id = ?3
+                       AND protocol_epoch = ?4 AND router_id = ?5 AND route_id = ?6
+                       AND rotation_id = ?7 AND generation = ?8 AND expected_generation = ?9",
                     params![
                         input.renewal.lease_id,
                         input.installation_id,
-                        input.renewal.connection_id
+                        input.renewal.connection_id,
+                        input.renewal.protocol_epoch,
+                        input.renewal.router_id,
+                        input.renewal.route_id,
+                        input.renewal.rotation_id,
+                        input.renewal.generation as i64,
+                        input.renewal.expected_generation as i64,
                     ],
                     |row| {
                         Ok((
                             row.get::<_, String>(0)?,
                             row.get::<_, String>(1)?,
                             row.get::<_, Option<String>>(2)?,
+                            row.get::<_, String>(3)?,
                         ))
                     },
                 )
@@ -5076,6 +5313,28 @@ impl AppStore {
             if lease.2.is_none() {
                 return Err(AppError::Conflict(
                     "tunnel lease has not established an SSH session".into(),
+                ));
+            }
+            if lease.3 != "active" {
+                return Err(AppError::Conflict("tunnel generation is not active".into()));
+            }
+            let head_generation = conn
+                .query_row(
+                    "SELECT active_generation FROM tunnel_route_heads
+                     WHERE router_id = ?1 AND route_id = ?2 AND subdomain = ?3",
+                    params![input.renewal.router_id, input.renewal.route_id, lease.0],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "query tunnel route head for renewal failed: {error}"
+                    ))
+                })?
+                .ok_or_else(|| AppError::Conflict("tunnel route head is missing".into()))?;
+            if head_generation as u64 != input.renewal.generation {
+                return Err(AppError::Conflict(
+                    "tunnel route head belongs to another generation".into(),
                 ));
             }
             touch_installation_presence(&conn, &input.installation_id, &metadata, now)?;
@@ -5091,6 +5350,8 @@ impl AppStore {
             .ok_or_else(|| AppError::Conflict("tunnel route is not active".into()))?;
         if route.connection_id() != Some(input.renewal.connection_id.as_str())
             || route.installation_id() != Some(input.installation_id.as_str())
+            || route.generation() != input.renewal.generation
+            || route.rotation_id() != input.renewal.rotation_id
         {
             return Err(AppError::Conflict(
                 "tunnel route belongs to a different connection".into(),
@@ -5128,7 +5389,377 @@ impl AppStore {
                 AppError::Internal(format!("touch renewed client tunnel failed: {error}"))
             })?;
         }
-        Ok(RenewLeaseResponse { expires_at })
+        Ok(RenewLeaseResponse {
+            protocol_epoch: input.renewal.protocol_epoch,
+            router_id: input.renewal.router_id,
+            route_id: input.renewal.route_id,
+            rotation_id: input.renewal.rotation_id,
+            generation: input.renewal.generation,
+            expires_at,
+        })
+    }
+
+    pub async fn activate_tunnel(
+        &self,
+        config: &Config,
+        proxy: &ProxyRegistry,
+        probe_http: &reqwest::Client,
+        input: TunnelActivateRequest,
+    ) -> Result<TunnelStateResponse, AppError> {
+        ensure_tunnel_protocol_epoch(&input.activation.protocol_epoch)?;
+        ensure_tunnel_router_id(config, &input.activation.router_id)?;
+        let route_id = validate_tunnel_route_id(&input.activation.route_id)?;
+        let (lease_state, subdomain, persisted_generation) = {
+            let conn = self.conn.lock().await;
+            let installation = get_installation(&conn, &input.installation_id)?
+                .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
+            verify_signed_tunnel_request(
+                &conn,
+                &installation.public_key,
+                &input.installation_id,
+                "tunnel_activate",
+                &input.activation,
+                input.timestamp_ms,
+                &input.nonce,
+                &input.signature,
+            )?;
+            let (lease_state, subdomain) = conn
+                .query_row(
+                    "SELECT state, subdomain FROM leases
+                     WHERE id = ?1 AND installation_id = ?2 AND connection_id = ?3
+                       AND protocol_epoch = ?4 AND router_id = ?5 AND route_id = ?6
+                       AND rotation_id = ?7 AND generation = ?8 AND expected_generation = ?9",
+                    params![
+                        input.activation.lease_id,
+                        input.installation_id,
+                        input.activation.connection_id,
+                        input.activation.protocol_epoch,
+                        input.activation.router_id,
+                        input.activation.route_id,
+                        input.activation.rotation_id,
+                        input.activation.generation as i64,
+                        input.activation.expected_generation as i64,
+                    ],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()
+                .map_err(|e| AppError::Internal(format!("query activation lease failed: {e}")))?
+                .ok_or_else(|| AppError::Conflict("tunnel lease identity does not match".into()))?;
+            if lease_state != "ready" && lease_state != "active" {
+                return Err(AppError::Conflict(format!(
+                    "tunnel lease is not ready: {lease_state}"
+                )));
+            }
+            let persisted_generation = conn
+                .query_row(
+                    "SELECT active_generation FROM tunnel_route_heads
+                     WHERE router_id = ?1 AND route_id = ?2 AND subdomain = ?3",
+                    params![input.activation.router_id, route_id, subdomain],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|e| AppError::Internal(format!("read activation route head failed: {e}")))?
+                .unwrap_or(0) as u64;
+            (lease_state, subdomain, persisted_generation)
+        };
+
+        if lease_state == "active" && persisted_generation == input.activation.generation {
+            let mut runtime = proxy.route_state(&subdomain).await;
+            if runtime.as_ref().and_then(|state| state.active_generation)
+                != Some(input.activation.generation)
+            {
+                runtime = Some(
+                    proxy
+                        .promote_candidate(
+                            &subdomain,
+                            &input.activation.connection_id,
+                            &input.activation.rotation_id,
+                            input.activation.generation,
+                            input.activation.expected_generation,
+                        )
+                        .await
+                        .map_err(|error| AppError::Conflict(error.to_string()))?,
+                );
+            }
+            return Ok(TunnelStateResponse {
+                protocol_epoch: input.activation.protocol_epoch,
+                router_id: input.activation.router_id,
+                route_id,
+                rotation_id: input.activation.rotation_id,
+                generation: input.activation.generation,
+                expected_generation: input.activation.expected_generation,
+                state: "active".into(),
+                active_generation: Some(input.activation.generation),
+                candidate_generations: runtime
+                    .as_ref()
+                    .map(|state| state.candidate_generations.clone())
+                    .unwrap_or_default(),
+                draining_generations: runtime
+                    .as_ref()
+                    .map(|state| state.draining_generations.clone())
+                    .unwrap_or_default(),
+            });
+        }
+        if persisted_generation != input.activation.expected_generation {
+            return Err(AppError::Conflict(format!(
+                "route generation changed: expected {}, active {}",
+                input.activation.expected_generation, persisted_generation
+            )));
+        }
+
+        let candidate = proxy
+            .candidate_for_activation(
+                &subdomain,
+                &input.activation.connection_id,
+                &input.activation.rotation_id,
+                input.activation.generation,
+            )
+            .await
+            .ok_or_else(|| AppError::Conflict("tunnel candidate is not ready".into()))?;
+        if candidate.installation_id() != Some(input.installation_id.as_str()) {
+            return Err(AppError::Conflict(
+                "tunnel candidate belongs to another installation".into(),
+            ));
+        }
+        let control_secret = self
+            .installation_control_secret(&input.installation_id)
+            .await?
+            .filter(|secret| !secret.trim().is_empty())
+            .ok_or_else(|| {
+                AppError::ServiceUnavailable(
+                    "candidate probe unavailable: installation control secret is missing".into(),
+                )
+            })?;
+        const PROBE_PATH: &str = "/_share-router/health";
+        let probe_url = format!("http://{}{PROBE_PATH}", candidate.route_target());
+        let probe = crate::ctl_client::authorize_control_request(
+            probe_http
+                .get(&probe_url)
+                .header("X-Share-Router-Probe", "1"),
+            "GET",
+            PROBE_PATH,
+            &input.installation_id,
+            &control_secret,
+            &[],
+        );
+        let probe_response = tokio::time::timeout(StdDuration::from_secs(5), probe.send())
+            .await
+            .map_err(|_| AppError::ServiceUnavailable("candidate health probe timed out".into()))?
+            .map_err(|error| {
+                AppError::ServiceUnavailable(format!("candidate health probe failed: {error}"))
+            })?;
+        if !probe_response.status().is_success() {
+            return Err(AppError::ServiceUnavailable(format!(
+                "candidate health probe returned {}",
+                probe_response.status()
+            )));
+        }
+
+        let runtime = proxy
+            .promote_candidate(
+                &subdomain,
+                &input.activation.connection_id,
+                &input.activation.rotation_id,
+                input.activation.generation,
+                input.activation.expected_generation,
+            )
+            .await
+            .map_err(|error| AppError::Conflict(error.to_string()))?;
+
+        let now = Utc::now().to_rfc3339();
+        let persistence_result = {
+            let mut conn = self.conn.lock().await;
+            (|| -> Result<(), AppError> {
+                let tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(|e| {
+                        AppError::Internal(format!("begin tunnel activation tx failed: {e}"))
+                    })?;
+                let head_updated = tx
+                    .execute(
+                        "INSERT INTO tunnel_route_heads (
+                        router_id, route_id, subdomain, active_generation,
+                        active_connection_id, active_rotation_id, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(router_id, route_id) DO UPDATE SET
+                        subdomain = excluded.subdomain,
+                        active_generation = excluded.active_generation,
+                        active_connection_id = excluded.active_connection_id,
+                        active_rotation_id = excluded.active_rotation_id,
+                        updated_at = excluded.updated_at
+                     WHERE tunnel_route_heads.active_generation = ?8
+                       AND tunnel_route_heads.subdomain = excluded.subdomain",
+                        params![
+                            input.activation.router_id,
+                            route_id,
+                            subdomain,
+                            input.activation.generation as i64,
+                            input.activation.connection_id,
+                            input.activation.rotation_id,
+                            now,
+                            input.activation.expected_generation as i64,
+                        ],
+                    )
+                    .map_err(|e| {
+                        AppError::Internal(format!("advance tunnel route head failed: {e}"))
+                    })?;
+                if head_updated != 1 {
+                    return Err(AppError::Conflict(
+                        "persisted tunnel route head changed during activation".into(),
+                    ));
+                }
+                tx.execute(
+                    "UPDATE leases
+                 SET state = 'draining', retired_at = NULL
+                 WHERE router_id = ?1 AND route_id = ?2 AND state = 'active' AND generation != ?3",
+                    params![
+                        input.activation.router_id,
+                        route_id,
+                        input.activation.generation as i64
+                    ],
+                )
+                .map_err(|e| {
+                    AppError::Internal(format!("mark old tunnel generation draining failed: {e}"))
+                })?;
+                let updated = tx
+                .execute(
+                    "UPDATE leases
+                     SET state = 'active', activated_at = COALESCE(activated_at, ?2), retired_at = NULL
+                     WHERE id = ?1 AND state IN ('ready', 'active')",
+                    params![input.activation.lease_id, now],
+                )
+                .map_err(|e| {
+                    AppError::Internal(format!("mark tunnel generation active failed: {e}"))
+                })?;
+                if updated != 1 {
+                    return Err(AppError::Conflict(
+                        "tunnel lease changed during activation".into(),
+                    ));
+                }
+                tx.commit().map_err(|e| {
+                    AppError::Internal(format!("commit tunnel activation failed: {e}"))
+                })?;
+                Ok(())
+            })()
+        };
+        if let Err(error) = persistence_result {
+            proxy
+                .rollback_candidate_promotion(
+                    &subdomain,
+                    &input.activation.connection_id,
+                    &input.activation.rotation_id,
+                    input.activation.generation,
+                    input.activation.expected_generation,
+                )
+                .await;
+            return Err(error);
+        }
+
+        Ok(TunnelStateResponse {
+            protocol_epoch: input.activation.protocol_epoch,
+            router_id: input.activation.router_id,
+            route_id,
+            rotation_id: input.activation.rotation_id,
+            generation: input.activation.generation,
+            expected_generation: input.activation.expected_generation,
+            state: "active".into(),
+            active_generation: runtime.active_generation,
+            candidate_generations: runtime.candidate_generations,
+            draining_generations: runtime.draining_generations,
+        })
+    }
+
+    pub async fn tunnel_state(
+        &self,
+        config: &Config,
+        proxy: &ProxyRegistry,
+        input: TunnelStateRequest,
+    ) -> Result<TunnelStateResponse, AppError> {
+        ensure_tunnel_protocol_epoch(&input.query.protocol_epoch)?;
+        ensure_tunnel_router_id(config, &input.query.router_id)?;
+        let route_id = validate_tunnel_route_id(&input.query.route_id)?;
+        let (persisted_state, subdomain, persisted_active_generation) = {
+            let conn = self.conn.lock().await;
+            let installation = get_installation(&conn, &input.installation_id)?
+                .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
+            verify_signed_tunnel_request(
+                &conn,
+                &installation.public_key,
+                &input.installation_id,
+                "tunnel_state",
+                &input.query,
+                input.timestamp_ms,
+                &input.nonce,
+                &input.signature,
+            )?;
+            let (persisted_state, subdomain) = conn
+                .query_row(
+                    "SELECT state, subdomain FROM leases
+                 WHERE id = ?1 AND installation_id = ?2 AND connection_id = ?3
+                   AND protocol_epoch = ?4 AND router_id = ?5 AND route_id = ?6
+                   AND rotation_id = ?7 AND generation = ?8 AND expected_generation = ?9",
+                    params![
+                        input.query.lease_id,
+                        input.installation_id,
+                        input.query.connection_id,
+                        input.query.protocol_epoch,
+                        input.query.router_id,
+                        input.query.route_id,
+                        input.query.rotation_id,
+                        input.query.generation as i64,
+                        input.query.expected_generation as i64,
+                    ],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()
+                .map_err(|e| AppError::Internal(format!("query tunnel state failed: {e}")))?
+                .ok_or_else(|| AppError::NotFound("tunnel lease not found".into()))?;
+            let persisted_active_generation = conn
+                .query_row(
+                    "SELECT active_generation FROM tunnel_route_heads
+                     WHERE router_id = ?1 AND route_id = ?2 AND subdomain = ?3",
+                    params![input.query.router_id, route_id, subdomain],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|e| AppError::Internal(format!("read tunnel state head failed: {e}")))?
+                .map(|generation| generation as u64);
+            (persisted_state, subdomain, persisted_active_generation)
+        };
+        let runtime = proxy.route_state(&subdomain).await;
+        let active_generation = runtime
+            .as_ref()
+            .and_then(|state| state.active_generation)
+            .or(persisted_active_generation);
+        let candidate_generations = runtime
+            .as_ref()
+            .map(|state| state.candidate_generations.clone())
+            .unwrap_or_default();
+        let draining_generations = runtime
+            .as_ref()
+            .map(|state| state.draining_generations.clone())
+            .unwrap_or_default();
+        let state = if active_generation == Some(input.query.generation) {
+            "active".to_string()
+        } else if candidate_generations.contains(&input.query.generation) {
+            "ready".to_string()
+        } else if draining_generations.contains(&input.query.generation) {
+            "draining".to_string()
+        } else {
+            persisted_state
+        };
+        Ok(TunnelStateResponse {
+            protocol_epoch: input.query.protocol_epoch,
+            router_id: input.query.router_id,
+            route_id,
+            rotation_id: input.query.rotation_id,
+            generation: input.query.generation,
+            expected_generation: input.query.expected_generation,
+            state,
+            active_generation,
+            candidate_generations,
+            draining_generations,
+        })
     }
 
     pub async fn sync_share(
@@ -5218,6 +5849,20 @@ impl AppStore {
             &input.nonce,
             &input.signature,
         )?;
+        let parsed = parse_public_label(&subdomain)
+            .map_err(|message| AppError::BadRequest(message.into()))?;
+        if parsed.kind != PublicHostKind::Share {
+            return Err(AppError::BadRequest(
+                "share subdomain must use {share-slug}--{client-key}".into(),
+            ));
+        }
+        let client_tunnel = get_client_tunnel_by_installation(&conn, &input.installation_id)?
+            .ok_or_else(|| AppError::Conflict("client tunnel must be claimed first".into()))?;
+        if parsed.client_key.as_deref() != Some(client_tunnel.subdomain.as_str()) {
+            return Err(AppError::Conflict(
+                "share host client key does not belong to this installation".into(),
+            ));
+        }
         let should_refresh_geo =
             should_refresh_installation_geo(&installation, metadata.ip.as_deref());
         touch_installation_presence(&conn, &input.installation_id, &metadata, Utc::now())?;
@@ -5242,6 +5887,18 @@ impl AppStore {
             share.owner_email.as_deref(),
             &share.subdomain,
         )?;
+        crate::public_hosts::claim(
+            &tx,
+            crate::public_hosts::NewPublicHost {
+                label: &share.subdomain,
+                route_id: &format!("share:{}", share.share_id),
+                kind: PublicHostKind::Share,
+                subject_id: &share.share_id,
+                installation_id: Some(&input.installation_id),
+                target_lane_id: &input.installation_id,
+            },
+        )
+        .map_err(map_public_host_error)?;
         upsert_share_tx(&tx, &input.installation_id, share)?;
         tx.commit().map_err(map_share_constraint_error)?;
         Ok(())
@@ -6342,6 +6999,14 @@ impl AppStore {
         })
     }
 
+    pub(crate) async fn list_dashboard_ticker_request_logs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ShareRequestLogEntry>, AppError> {
+        let conn = self.conn.lock().await;
+        list_global_recent_share_request_logs(&conn, limit)
+    }
+
     pub async fn map_display_settings(&self) -> Result<MapDisplaySettings, AppError> {
         let conn = self.conn.lock().await;
         read_map_display_settings(&conn)
@@ -6390,9 +7055,7 @@ impl AppStore {
     ) -> Result<AnnouncementSettings, AppError> {
         let conn = self.conn.lock().await;
         let mut current = read_announcement_settings(&conn)?;
-        let content_updated = update.content_en.is_some() || update.content_zh_cn.is_some();
-        let enabled_update = update.enabled;
-        if let Some(enabled) = enabled_update {
+        if let Some(enabled) = update.enabled {
             current.enabled = enabled;
         }
         if let Some(content_en) = update.content_en {
@@ -6400,11 +7063,6 @@ impl AppStore {
         }
         if let Some(content_zh_cn) = update.content_zh_cn {
             current.content_zh_cn = content_zh_cn;
-        }
-        let has_content = !current.content_en.trim().is_empty()
-            || !current.content_zh_cn.trim().is_empty();
-        if has_content && !current.enabled && content_updated && enabled_update.is_none() {
-            current.enabled = true;
         }
         current = sanitize_announcement_settings(current);
         write_announcement_settings(&conn, &current)?;
@@ -7106,6 +7764,8 @@ impl AppStore {
     ) -> Result<PublicMarketConfig, AppError> {
         let email = normalize_email(email)?;
         let subdomain = normalize_subdomain(&input.subdomain)?;
+        normalize_market_slug(&subdomain)
+            .map_err(|message| AppError::BadRequest(message.into()))?;
         ensure_subdomain_not_reserved_word(&subdomain)?;
         let public_base_url = input.public_base_url.trim();
         if !public_base_url.starts_with("http://") && !public_base_url.starts_with("https://") {
@@ -7139,7 +7799,32 @@ impl AppStore {
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         let scopes_json = serde_json::to_string(MARKET_DEFAULT_SCOPES)
             .map_err(|e| AppError::Internal(format!("serialize market scopes failed: {e}")))?;
-        conn.execute(
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| AppError::Internal(format!("begin market registration tx failed: {e}")))?;
+        let market_route_id = format!("market:{id}");
+        let market_claim = crate::public_hosts::NewPublicHost {
+            label: &subdomain,
+            route_id: &market_route_id,
+            kind: PublicHostKind::Market,
+            subject_id: &id,
+            installation_id: None,
+            target_lane_id: &id,
+        };
+        if let Some(existing) = existing_market
+            .as_ref()
+            .filter(|existing| existing.subdomain != subdomain)
+        {
+            crate::public_hosts::replace_claim_in_transaction(
+                &tx,
+                &existing.subdomain,
+                market_claim,
+            )
+            .map_err(map_public_host_error)?;
+        } else {
+            crate::public_hosts::claim(&tx, market_claim).map_err(map_public_host_error)?;
+        }
+        tx.execute(
             "INSERT INTO router_markets (
                 id, display_name, email, subdomain, public_base_url, market_kind, scopes_json,
                 status, listed, created_at, updated_at, last_seen_at, offline_since, pricing_json
@@ -7169,6 +7854,8 @@ impl AppStore {
             ],
         )
         .map_err(|e| AppError::Internal(format!("register market failed: {e}")))?;
+        tx.commit()
+            .map_err(|e| AppError::Internal(format!("commit market registration failed: {e}")))?;
 
         Ok(PublicMarketConfig {
             id,
@@ -10435,6 +11122,7 @@ fn write_map_display_settings(
 }
 
 fn init_schema(conn: &Connection) -> Result<(), AppError> {
+    crate::public_hosts::init_schema(conn).map_err(map_public_host_error)?;
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS installations (
@@ -10490,6 +11178,13 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             id TEXT PRIMARY KEY,
             installation_id TEXT NOT NULL,
             connection_id TEXT NOT NULL UNIQUE,
+            protocol_epoch TEXT NOT NULL,
+            router_id TEXT NOT NULL,
+            route_id TEXT NOT NULL,
+            rotation_id TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            expected_generation INTEGER NOT NULL,
+            state TEXT NOT NULL DEFAULT 'issued',
             subdomain TEXT NOT NULL,
             tunnel_type TEXT NOT NULL,
             ssh_username TEXT NOT NULL,
@@ -10497,7 +11192,21 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             issued_at TEXT NOT NULL,
             expires_at TEXT NOT NULL,
             used_at TEXT,
+            ready_at TEXT,
+            activated_at TEXT,
+            retired_at TEXT,
             share_json TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS tunnel_route_heads (
+            router_id TEXT NOT NULL,
+            route_id TEXT NOT NULL,
+            subdomain TEXT NOT NULL,
+            active_generation INTEGER NOT NULL,
+            active_connection_id TEXT NOT NULL,
+            active_rotation_id TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (router_id, route_id)
         );
 
         CREATE TABLE IF NOT EXISTS shares (
@@ -11165,6 +11874,38 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         ",
     )
     .map_err(|e| AppError::Internal(format!("init schema failed: {e}")))?;
+    add_column_if_missing(
+        conn,
+        "leases",
+        "protocol_epoch",
+        "TEXT NOT NULL DEFAULT 'namespace-flat-1'",
+    )?;
+    add_column_if_missing(conn, "leases", "router_id", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(conn, "leases", "route_id", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(conn, "leases", "rotation_id", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(conn, "leases", "generation", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(
+        conn,
+        "leases",
+        "expected_generation",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(conn, "leases", "state", "TEXT NOT NULL DEFAULT 'issued'")?;
+    add_column_if_missing(conn, "leases", "ready_at", "TEXT")?;
+    add_column_if_missing(conn, "leases", "activated_at", "TEXT")?;
+    add_column_if_missing(conn, "leases", "retired_at", "TEXT")?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_leases_route_generation
+         ON leases(route_id, generation)",
+        [],
+    )
+    .map_err(|e| AppError::Internal(format!("index lease generations failed: {e}")))?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_leases_rotation
+         ON leases(route_id, rotation_id)",
+        [],
+    )
+    .map_err(|e| AppError::Internal(format!("index lease rotations failed: {e}")))?;
     conn.execute(
         "UPDATE router_markets
             SET scopes_json = '[\"market:shares:read\",\"market:proxy:use\",\"market:email:notify\",\"market:request_logs:write\"]'
@@ -12773,6 +13514,15 @@ async fn remove_stale_route_snapshots(
             continue;
         };
         if proxy
+            .active_route_connections()
+            .await
+            .get(&subdomain)
+            .and_then(|value| value.as_deref())
+            != Some(connection_id.as_str())
+        {
+            continue;
+        }
+        if proxy
             .remove_route_if_connection(&subdomain, connection_id)
             .await
         {
@@ -13309,7 +14059,8 @@ fn get_lease_by_connection_id(
     connection_id: &str,
 ) -> Result<Option<TunnelLease>, AppError> {
     conn.query_row(
-        "SELECT id, installation_id, connection_id, subdomain, tunnel_type, ssh_username,
+        "SELECT protocol_epoch, router_id, id, installation_id, connection_id, route_id, rotation_id,
+                generation, expected_generation, subdomain, tunnel_type, ssh_username,
                 ssh_password, issued_at, expires_at, used_at, share_json
          FROM leases WHERE connection_id = ?1",
         params![connection_id],
@@ -13317,6 +14068,26 @@ fn get_lease_by_connection_id(
     )
     .optional()
     .map_err(|e| AppError::Internal(format!("query lease failed: {e}")))
+}
+
+fn issue_lease_response(config: &Config, lease: &TunnelLease) -> IssueLeaseResponse {
+    IssueLeaseResponse {
+        protocol_epoch: lease.protocol_epoch.clone(),
+        router_id: lease.router_id.clone(),
+        lease_id: lease.id.clone(),
+        connection_id: lease.connection_id.clone(),
+        route_id: lease.route_id.clone(),
+        rotation_id: lease.rotation_id.clone(),
+        generation: lease.generation,
+        expected_generation: lease.expected_generation,
+        ssh_username: lease.ssh_username.clone(),
+        ssh_password: lease.ssh_password.clone(),
+        ssh_addr: config.effective_ssh_public_addr(),
+        expires_at: lease.expires_at,
+        tunnel_url: config.tunnel_url(&lease.subdomain),
+        subdomain: lease.subdomain.clone(),
+        ssh_host_fingerprint: None,
+    }
 }
 
 fn list_installations(conn: &Connection) -> Result<Vec<Installation>, AppError> {
@@ -16413,6 +17184,29 @@ fn record_market_share_model_failure_state_conn(
     Ok(())
 }
 
+fn list_global_recent_share_request_logs(
+    conn: &Connection,
+    limit: usize,
+) -> Result<Vec<ShareRequestLogEntry>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT request_id, share_id, share_name, provider_id, provider_name, app_type, model,
+                    request_model, request_agent, requested_model, actual_model, actual_model_source,
+                    status_code, latency_ms, first_token_ms, input_tokens,
+                    output_tokens, cache_read_tokens, cache_creation_tokens, is_streaming,
+                    session_id, user_country, user_country_iso3, user_email, is_health_check, created_at
+             FROM share_request_logs
+             WHERE COALESCE(is_health_check, 0) = 0
+             ORDER BY created_at DESC
+             LIMIT ?1",
+        )
+        .map_err(|e| AppError::Internal(format!("prepare global share request logs failed: {e}")))?;
+    let rows = stmt
+        .query_map(params![limit as i64], map_share_request_log_row)
+        .map_err(|e| AppError::Internal(format!("query global share request logs failed: {e}")))?;
+    collect_rows(rows)
+}
+
 fn list_recent_share_request_logs(
     conn: &Connection,
     per_share_limit: usize,
@@ -16438,39 +17232,41 @@ fn list_recent_share_request_logs(
         )
         .map_err(|e| AppError::Internal(format!("prepare recent share request logs failed: {e}")))?;
     let rows = stmt
-        .query_map(params![per_share_limit as i64], |row| {
-            Ok(ShareRequestLogEntry {
-                request_id: row.get(0)?,
-                share_id: row.get(1)?,
-                share_name: row.get(2)?,
-                provider_id: row.get(3)?,
-                provider_name: row.get(4)?,
-                app_type: row.get(5)?,
-                model: row.get(6)?,
-                request_model: row.get(7)?,
-                request_agent: row.get(8)?,
-                requested_model: row.get(9)?,
-                actual_model: row.get(10)?,
-                actual_model_source: row.get(11)?,
-                status_code: row.get::<_, i64>(12)? as u16,
-                latency_ms: row.get::<_, i64>(13)? as u64,
-                first_token_ms: row.get::<_, Option<i64>>(14)?.map(|v| v as u64),
-                input_tokens: row.get::<_, i64>(15)? as u32,
-                output_tokens: row.get::<_, i64>(16)? as u32,
-                cache_read_tokens: row.get::<_, i64>(17)? as u32,
-                cache_creation_tokens: row.get::<_, i64>(18)? as u32,
-                is_streaming: row.get::<_, i64>(19)? != 0,
-                session_id: row.get(20)?,
-                user_country: row.get(21)?,
-                user_country_iso3: row.get(22)?,
-                user_email: row.get(23)?,
-                is_health_check: row.get::<_, i64>(24)? != 0,
-                created_at: row.get(25)?,
-            })
-        })
+        .query_map(params![per_share_limit as i64], map_share_request_log_row)
         .map_err(|e| AppError::Internal(format!("query recent share request logs failed: {e}")))?;
     let logs = collect_rows(rows)?;
     Ok(deduplicate_recent_share_request_logs(logs))
+}
+
+fn map_share_request_log_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShareRequestLogEntry> {
+    Ok(ShareRequestLogEntry {
+        request_id: row.get(0)?,
+        share_id: row.get(1)?,
+        share_name: row.get(2)?,
+        provider_id: row.get(3)?,
+        provider_name: row.get(4)?,
+        app_type: row.get(5)?,
+        model: row.get(6)?,
+        request_model: row.get(7)?,
+        request_agent: row.get(8)?,
+        requested_model: row.get(9)?,
+        actual_model: row.get(10)?,
+        actual_model_source: row.get(11)?,
+        status_code: row.get::<_, i64>(12)? as u16,
+        latency_ms: row.get::<_, i64>(13)? as u64,
+        first_token_ms: row.get::<_, Option<i64>>(14)?.map(|v| v as u64),
+        input_tokens: row.get::<_, i64>(15)? as u32,
+        output_tokens: row.get::<_, i64>(16)? as u32,
+        cache_read_tokens: row.get::<_, i64>(17)? as u32,
+        cache_creation_tokens: row.get::<_, i64>(18)? as u32,
+        is_streaming: row.get::<_, i64>(19)? != 0,
+        session_id: row.get(20)?,
+        user_country: row.get(21)?,
+        user_country_iso3: row.get(22)?,
+        user_email: row.get(23)?,
+        is_health_check: row.get::<_, i64>(24)? != 0,
+        created_at: row.get(25)?,
+    })
 }
 
 fn sql_prefix(alias: &str) -> String {
@@ -17525,19 +18321,25 @@ fn list_online_minutes_10m(conn: &Connection) -> Result<HashMap<String, usize>, 
 }
 
 fn map_lease_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TunnelLease> {
-    let share_json: Option<String> = row.get(10)?;
+    let share_json: Option<String> = row.get(16)?;
     Ok(TunnelLease {
-        id: row.get(0)?,
-        installation_id: row.get(1)?,
-        connection_id: row.get(2)?,
-        subdomain: row.get(3)?,
-        tunnel_type: row.get(4)?,
-        ssh_username: row.get(5)?,
-        ssh_password: row.get(6)?,
-        issued_at: parse_dt_sql(&row.get::<_, String>(7)?)?,
-        expires_at: parse_dt_sql(&row.get::<_, String>(8)?)?,
+        protocol_epoch: row.get(0)?,
+        router_id: row.get(1)?,
+        id: row.get(2)?,
+        installation_id: row.get(3)?,
+        connection_id: row.get(4)?,
+        route_id: row.get(5)?,
+        rotation_id: row.get(6)?,
+        generation: row.get::<_, i64>(7)? as u64,
+        expected_generation: row.get::<_, i64>(8)? as u64,
+        subdomain: row.get(9)?,
+        tunnel_type: row.get(10)?,
+        ssh_username: row.get(11)?,
+        ssh_password: row.get(12)?,
+        issued_at: parse_dt_sql(&row.get::<_, String>(13)?)?,
+        expires_at: parse_dt_sql(&row.get::<_, String>(14)?)?,
         used_at: row
-            .get::<_, Option<String>>(9)?
+            .get::<_, Option<String>>(15)?
             .map(|value| parse_dt_sql(&value))
             .transpose()?,
         share: share_json
@@ -17545,7 +18347,7 @@ fn map_lease_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TunnelLease> {
             .transpose()
             .map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    10,
+                    16,
                     rusqlite::types::Type::Text,
                     Box::new(e),
                 )
@@ -17586,6 +18388,18 @@ fn normalize_subdomain(value: &str) -> Result<String, AppError> {
         return Err(AppError::BadRequest("invalid subdomain".into()));
     }
     Ok(value)
+}
+
+fn map_public_host_error(error: crate::public_hosts::PublicHostCatalogError) -> AppError {
+    use crate::public_hosts::PublicHostCatalogError;
+    match error {
+        PublicHostCatalogError::Invalid(message) => AppError::BadRequest(message.into()),
+        PublicHostCatalogError::Conflict(message) => AppError::Conflict(message),
+        PublicHostCatalogError::Corrupt(message) => AppError::Internal(message),
+        PublicHostCatalogError::Database(error) => {
+            AppError::Internal(format!("public host catalog database error: {error}"))
+        }
+    }
 }
 
 fn normalize_market_kind(value: Option<&str>) -> Result<String, AppError> {
@@ -19231,6 +20045,7 @@ fn verify_registration_signature(
     existing_installation_id: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<bool, AppError> {
+    ensure_tunnel_protocol_epoch(&input.protocol_epoch)?;
     if let Some(proof_version) = input.proof_version {
         if proof_version != 2 {
             return Err(AppError::BadRequest(
@@ -19248,7 +20063,7 @@ fn verify_registration_signature(
             return Err(AppError::Unauthorized("stale registration proof".into()));
         }
         let payload = format!(
-            "register_installation_v2\n{}\n{}\n{}\n{}\n{}",
+            "{PROTOCOL_EPOCH}\nregister_installation_v2\n{}\n{}\n{}\n{}\n{}",
             input.public_key.trim(),
             input.platform.trim(),
             input.app_version,
@@ -19284,7 +20099,7 @@ fn verify_registration_signature(
         ));
     }
     let payload = format!(
-        "{}\nregister_installation\n{}\n{}\n{}\n{}\n{}",
+        "{PROTOCOL_EPOCH}\n{}\nregister_installation\n{}\n{}\n{}\n{}\n{}",
         installation_id,
         input.public_key.trim(),
         input.platform.trim(),
@@ -19302,6 +20117,7 @@ fn verify_issue_lease_request(
     input: &IssueLeaseRequest,
     now: DateTime<Utc>,
 ) -> Result<(), AppError> {
+    ensure_tunnel_protocol_epoch(&input.protocol_epoch)?;
     let skew = (now.timestamp_millis() - input.timestamp_ms).abs();
     if skew > SIGNED_REQUEST_MAX_SKEW_MS {
         return Err(AppError::Unauthorized("stale lease request".into()));
@@ -19310,7 +20126,7 @@ fn verify_issue_lease_request(
     consume_authenticated_installation_nonce(
         conn,
         &input.installation_id,
-        "issue_lease",
+        "tunnel_lease_issue",
         &input.nonce,
         now,
     )
@@ -19321,15 +20137,82 @@ fn verify_issue_lease_signature(
     input: &IssueLeaseRequest,
 ) -> Result<(), AppError> {
     validate_request_nonce(&input.nonce)?;
-    let payload = format!(
-        "{}\n{}\n{}\n{}\n{}",
-        input.installation_id,
-        input.requested_subdomain,
-        input.tunnel_type,
+    let payload = IssueLeaseSignaturePayload {
+        protocol_epoch: &input.protocol_epoch,
+        router_id: &input.router_id,
+        route_id: &input.route_id,
+        rotation_id: &input.rotation_id,
+        generation: input.generation,
+        expected_generation: input.expected_generation,
+        requested_subdomain: &input.requested_subdomain,
+        tunnel_type: &input.tunnel_type,
+        share: &input.share,
+    };
+    verify_tunnel_signed_payload(
+        public_key,
+        &input.installation_id,
+        "tunnel_lease_issue",
+        &payload,
         input.timestamp_ms,
-        input.nonce
-    );
-    verify_detached_signature(public_key, payload.as_bytes(), &input.signature)
+        &input.nonce,
+        &input.signature,
+    )
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IssueLeaseSignaturePayload<'a> {
+    protocol_epoch: &'a str,
+    router_id: &'a str,
+    route_id: &'a str,
+    rotation_id: &'a str,
+    generation: u64,
+    expected_generation: u64,
+    requested_subdomain: &'a str,
+    tunnel_type: &'a str,
+    share: &'a Option<ShareDescriptor>,
+}
+
+fn ensure_tunnel_protocol_epoch(protocol_epoch: &str) -> Result<(), AppError> {
+    if protocol_epoch != PROTOCOL_EPOCH {
+        return Err(AppError::BadRequest(format!(
+            "unsupported protocolEpoch; expected {PROTOCOL_EPOCH}"
+        )));
+    }
+    Ok(())
+}
+
+fn tunnel_router_id(config: &Config) -> Result<String, AppError> {
+    tunnel_domain_host(&config.tunnel_domain)
+        .ok_or_else(|| AppError::Internal("tunnel domain does not contain a router host".into()))
+}
+
+fn ensure_tunnel_router_id(config: &Config, router_id: &str) -> Result<(), AppError> {
+    let expected = tunnel_router_id(config)?;
+    if router_id != expected {
+        return Err(AppError::BadRequest(format!(
+            "routerId does not match this Router; expected {expected}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_tunnel_route_id(route_id: &str) -> Result<String, AppError> {
+    let original = route_id;
+    let route_id = original.trim();
+    if route_id.is_empty()
+        || route_id != original
+        || route_id.len() > 128
+        || !route_id.is_ascii()
+        || !route_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'-'))
+    {
+        return Err(AppError::BadRequest(
+            "routeId must be 1-128 ASCII letters, digits, ':', '_' or '-'".into(),
+        ));
+    }
+    Ok(route_id.to_string())
 }
 
 fn verify_detached_signature(
@@ -19376,6 +20259,33 @@ fn verify_signed_share_request<T: Serialize>(
     }
 
     verify_signed_payload(
+        public_key,
+        installation_id,
+        action,
+        payload,
+        timestamp_ms,
+        nonce,
+        signature,
+    )?;
+    consume_authenticated_installation_nonce(conn, installation_id, action, nonce, now)
+}
+
+fn verify_signed_tunnel_request<T: Serialize>(
+    conn: &Connection,
+    public_key: &str,
+    installation_id: &str,
+    action: &str,
+    payload: &T,
+    timestamp_ms: i64,
+    nonce: &str,
+    signature: &str,
+) -> Result<(), AppError> {
+    let now = Utc::now();
+    let skew = (now.timestamp_millis() - timestamp_ms).abs();
+    if skew > SIGNED_REQUEST_MAX_SKEW_MS {
+        return Err(AppError::Unauthorized("stale signed tunnel request".into()));
+    }
+    verify_tunnel_signed_payload(
         public_key,
         installation_id,
         action,
@@ -19574,11 +20484,45 @@ fn verify_signed_payload<T: Serialize>(
     let payload_json = serde_json::to_string(payload)
         .map_err(|_| AppError::Unauthorized("invalid signed payload".into()))?;
     let payload = format!(
-        "{}\n{}\n{}\n{}\n{}",
+        "{PROTOCOL_EPOCH}\n{}\n{}\n{}\n{}\n{}",
         installation_id, action, payload_json, timestamp_ms, nonce
     );
     verifying_key
         .verify(payload.as_bytes(), &signature)
+        .map_err(|_| AppError::Unauthorized("signature verification failed".into()))
+}
+
+fn verify_tunnel_signed_payload<T: Serialize>(
+    public_key: &str,
+    installation_id: &str,
+    action: &str,
+    payload: &T,
+    timestamp_ms: i64,
+    nonce: &str,
+    signature: &str,
+) -> Result<(), AppError> {
+    let key_bytes = base64::engine::general_purpose::STANDARD
+        .decode(public_key)
+        .map_err(|_| AppError::Unauthorized("invalid stored public key".into()))?;
+    let key_array: [u8; 32] = key_bytes
+        .try_into()
+        .map_err(|_| AppError::Unauthorized("invalid public key length".into()))?;
+    let verifying_key = VerifyingKey::from_bytes(&key_array)
+        .map_err(|_| AppError::Unauthorized("invalid public key".into()))?;
+    let sig_bytes = base64::engine::general_purpose::STANDARD
+        .decode(signature)
+        .map_err(|_| AppError::Unauthorized("invalid signature".into()))?;
+    let sig_array: [u8; 64] = sig_bytes
+        .try_into()
+        .map_err(|_| AppError::Unauthorized("invalid signature length".into()))?;
+    let signature = Signature::from_bytes(&sig_array);
+    let payload_json = serde_json::to_string(payload)
+        .map_err(|_| AppError::Unauthorized("invalid signed tunnel payload".into()))?;
+    let canonical = format!(
+        "{PROTOCOL_EPOCH}\n{installation_id}\n{action}\n{payload_json}\n{timestamp_ms}\n{nonce}"
+    );
+    verifying_key
+        .verify(canonical.as_bytes(), &signature)
         .map_err(|_| AppError::Unauthorized("signature verification failed".into()))
 }
 
@@ -21203,6 +22147,26 @@ mod tests {
             params![installation_id, owner_email, subdomain, now],
         )
         .expect("insert client tunnel");
+        conn.execute(
+            "INSERT OR IGNORE INTO public_hosts (
+                label, route_id, kind, subject_id, installation_id, target_lane_id,
+                lifecycle, revision, created_at, updated_at
+             ) VALUES (?1, ?2, 'client', ?3, ?3, ?3, 'active', 1, ?4, ?4)",
+            params![
+                subdomain,
+                format!("client:{installation_id}"),
+                installation_id,
+                now,
+            ],
+        )
+        .expect("insert client public host");
+    }
+
+    const TEST_CLIENT_KEY: &str = "alpha-aaaaaaaaaaaaaaaaaaaa";
+    const TEST_CLIENT_KEY_BETA: &str = "beta-bbbbbbbbbbbbbbbbbbbb";
+
+    fn test_share_host(slug: &str) -> String {
+        format!("{slug}--{TEST_CLIENT_KEY}")
     }
 
     async fn insert_share(
@@ -21245,6 +22209,20 @@ mod tests {
             ],
         )
         .expect("insert share");
+        conn.execute(
+            "INSERT OR IGNORE INTO public_hosts (
+                label, route_id, kind, subject_id, installation_id, target_lane_id,
+                lifecycle, revision, created_at, updated_at
+             ) VALUES (?1, ?2, 'share', ?3, ?4, ?4, 'active', 1, ?5, ?5)",
+            params![
+                subdomain,
+                format!("share:{share_id}"),
+                share_id,
+                installation_id,
+                now.to_rfc3339(),
+            ],
+        )
+        .expect("insert share public host");
     }
 
     /// Override the bindings_json on an existing test share. Use for tests
@@ -23428,7 +24406,25 @@ mod tests {
         nonce: &str,
     ) -> String {
         let payload_json = serde_json::to_string(payload).expect("serialize test payload");
-        let body = format!("{installation_id}\n{action}\n{payload_json}\n{timestamp_ms}\n{nonce}");
+        let body = format!(
+            "{PROTOCOL_EPOCH}\n{installation_id}\n{action}\n{payload_json}\n{timestamp_ms}\n{nonce}"
+        );
+        let signature = signing_key.sign(body.as_bytes());
+        base64::engine::general_purpose::STANDARD.encode(signature.to_bytes())
+    }
+
+    fn sign_tunnel_test_payload<T: Serialize>(
+        signing_key: &SigningKey,
+        installation_id: &str,
+        action: &str,
+        payload: &T,
+        timestamp_ms: i64,
+        nonce: &str,
+    ) -> String {
+        let payload_json = serde_json::to_string(payload).expect("serialize tunnel test payload");
+        let body = format!(
+            "{PROTOCOL_EPOCH}\n{installation_id}\n{action}\n{payload_json}\n{timestamp_ms}\n{nonce}"
+        );
         let signature = signing_key.sign(body.as_bytes());
         base64::engine::general_purpose::STANDARD.encode(signature.to_bytes())
     }
@@ -23630,19 +24626,26 @@ mod tests {
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 
-    fn sign_issue_lease_request(
-        signing_key: &SigningKey,
-        installation_id: &str,
-        requested_subdomain: &str,
-        tunnel_type: &str,
-        timestamp_ms: i64,
-        nonce: &str,
-    ) -> String {
-        let body = format!(
-            "{installation_id}\n{requested_subdomain}\n{tunnel_type}\n{timestamp_ms}\n{nonce}"
-        );
-        let signature = signing_key.sign(body.as_bytes());
-        base64::engine::general_purpose::STANDARD.encode(signature.to_bytes())
+    fn sign_issue_lease_request(signing_key: &SigningKey, request: &IssueLeaseRequest) -> String {
+        let payload = IssueLeaseSignaturePayload {
+            protocol_epoch: &request.protocol_epoch,
+            router_id: &request.router_id,
+            route_id: &request.route_id,
+            rotation_id: &request.rotation_id,
+            generation: request.generation,
+            expected_generation: request.expected_generation,
+            requested_subdomain: &request.requested_subdomain,
+            tunnel_type: &request.tunnel_type,
+            share: &request.share,
+        };
+        sign_tunnel_test_payload(
+            signing_key,
+            &request.installation_id,
+            "tunnel_lease_issue",
+            &payload,
+            request.timestamp_ms,
+            &request.nonce,
+        )
     }
 
     fn public_key_b64(signing_key: &SigningKey) -> String {
@@ -23659,7 +24662,7 @@ mod tests {
         timestamp_ms: i64,
     ) -> String {
         let body = format!(
-            "{installation_id}\nregister_installation\n{public_key}\n{platform}\n{app_version}\n{instance_nonce}\n{timestamp_ms}"
+            "{PROTOCOL_EPOCH}\n{installation_id}\nregister_installation\n{public_key}\n{platform}\n{app_version}\n{instance_nonce}\n{timestamp_ms}"
         );
         let signature = signing_key.sign(body.as_bytes());
         base64::engine::general_purpose::STANDARD.encode(signature.to_bytes())
@@ -23674,7 +24677,7 @@ mod tests {
         timestamp_ms: i64,
     ) -> String {
         let body = format!(
-            "register_installation_v2\n{public_key}\n{platform}\n{app_version}\n{instance_nonce}\n{timestamp_ms}"
+            "{PROTOCOL_EPOCH}\nregister_installation_v2\n{public_key}\n{platform}\n{app_version}\n{instance_nonce}\n{timestamp_ms}"
         );
         let signature = signing_key.sign(body.as_bytes());
         base64::engine::general_purpose::STANDARD.encode(signature.to_bytes())
@@ -23699,6 +24702,7 @@ mod tests {
         store
             .register_installation(
                 RegisterInstallationRequest {
+                    protocol_epoch: PROTOCOL_EPOCH.into(),
                     public_key,
                     platform: "linux".into(),
                     app_version: app_version.into(),
@@ -23732,6 +24736,7 @@ mod tests {
             timestamp_ms,
         );
         RegisterInstallationRequest {
+            protocol_epoch: PROTOCOL_EPOCH.into(),
             public_key,
             platform: "linux".into(),
             app_version: app_version.into(),
@@ -23975,31 +24980,49 @@ mod tests {
                 None,
             )
             .await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO tunnel_route_heads (
+                    router_id, route_id, subdomain, active_generation,
+                    active_connection_id, active_rotation_id, updated_at
+                 ) VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6)",
+                params![
+                    "127.0.0.1",
+                    "share:share-renew",
+                    "aaa",
+                    "legacy-connection",
+                    "legacy-rotation",
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .expect("seed persisted route head");
+        }
 
         let timestamp_ms = Utc::now().timestamp_millis();
         let nonce = Uuid::new_v4().to_string();
-        let signature = sign_issue_lease_request(
-            &signing_key,
-            "inst-renew",
-            "aaa",
-            "http",
+        let mut request = IssueLeaseRequest {
+            protocol_epoch: PROTOCOL_EPOCH.into(),
+            router_id: "127.0.0.1".into(),
+            installation_id: "inst-renew".into(),
+            route_id: "share:share-renew".into(),
+            rotation_id: Uuid::new_v4().to_string(),
+            generation: 2,
+            expected_generation: 1,
+            requested_subdomain: "aaa".into(),
+            tunnel_type: "http".into(),
             timestamp_ms,
-            &nonce,
-        );
+            nonce,
+            signature: String::new(),
+            share: Some(test_share_descriptor("share-renew", "aaa")),
+        };
+        request.signature = sign_issue_lease_request(&signing_key, &request);
 
         let lease = store
             .issue_lease(
                 &config,
                 &proxy,
-                IssueLeaseRequest {
-                    installation_id: "inst-renew".into(),
-                    requested_subdomain: "aaa".into(),
-                    tunnel_type: "http".into(),
-                    timestamp_ms,
-                    nonce,
-                    signature,
-                    share: Some(test_share_descriptor("share-renew", "aaa")),
-                },
+                request,
                 ClientMetadata {
                     ip: Some("127.0.0.1".into()),
                     country_code: None,
@@ -24030,29 +25053,30 @@ mod tests {
         let proxy = ProxyRegistry::default();
         let issued_at_ms = Utc::now().timestamp_millis();
         let issue_nonce = Uuid::new_v4().to_string();
+        let mut issue_request = IssueLeaseRequest {
+            protocol_epoch: PROTOCOL_EPOCH.into(),
+            router_id: "127.0.0.1".into(),
+            installation_id: "inst-active-renew".into(),
+            route_id: "share:share-active-renew".into(),
+            rotation_id: Uuid::new_v4().to_string(),
+            generation: 1,
+            expected_generation: 0,
+            requested_subdomain: "active-renew-sub".into(),
+            tunnel_type: "http".into(),
+            timestamp_ms: issued_at_ms,
+            nonce: issue_nonce,
+            signature: String::new(),
+            share: Some(test_share_descriptor(
+                "share-active-renew",
+                "active-renew-sub",
+            )),
+        };
+        issue_request.signature = sign_issue_lease_request(&signing_key, &issue_request);
         let lease = store
             .issue_lease(
                 &config,
                 &proxy,
-                IssueLeaseRequest {
-                    installation_id: "inst-active-renew".into(),
-                    requested_subdomain: "active-renew-sub".into(),
-                    tunnel_type: "http".into(),
-                    timestamp_ms: issued_at_ms,
-                    nonce: issue_nonce.clone(),
-                    signature: sign_issue_lease_request(
-                        &signing_key,
-                        "inst-active-renew",
-                        "active-renew-sub",
-                        "http",
-                        issued_at_ms,
-                        &issue_nonce,
-                    ),
-                    share: Some(test_share_descriptor(
-                        "share-active-renew",
-                        "active-renew-sub",
-                    )),
-                },
+                issue_request,
                 ClientMetadata {
                     ip: Some("127.0.0.1".into()),
                     country_code: None,
@@ -24065,8 +25089,12 @@ mod tests {
             .consume_lease(&lease.ssh_username, &lease.ssh_password)
             .await
             .expect("consume active lease");
+        store
+            .mark_lease_ready(&lease.connection_id, &lease.route_id, lease.generation)
+            .await
+            .expect("mark lease ready");
         proxy
-            .set_route_with_kind(
+            .register_candidate_with_kind(
                 "active-renew-sub".into(),
                 "127.0.0.1:65530".into(),
                 RouteKind::Share,
@@ -24077,12 +25105,55 @@ mod tests {
                 false,
                 -1,
                 None,
+                lease.generation,
+                lease.rotation_id.clone(),
             )
-            .await;
+            .await
+            .expect("register active test candidate");
+        proxy
+            .promote_candidate(
+                "active-renew-sub",
+                &lease.connection_id,
+                &lease.rotation_id,
+                lease.generation,
+                lease.expected_generation,
+            )
+            .await
+            .expect("promote active test candidate");
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE leases SET state = 'active' WHERE id = ?1",
+                params![lease.lease_id],
+            )
+            .expect("mark test lease active");
+            conn.execute(
+                "INSERT INTO tunnel_route_heads (
+                    router_id, route_id, subdomain, active_generation,
+                    active_connection_id, active_rotation_id, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    lease.router_id,
+                    lease.route_id,
+                    lease.subdomain,
+                    lease.generation as i64,
+                    lease.connection_id,
+                    lease.rotation_id,
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .expect("seed active route head");
+        }
 
         let renewal = RenewLeasePayload {
+            protocol_epoch: lease.protocol_epoch.clone(),
+            router_id: lease.router_id.clone(),
             lease_id: lease.lease_id.clone(),
             connection_id: lease.connection_id.clone(),
+            route_id: lease.route_id.clone(),
+            rotation_id: lease.rotation_id.clone(),
+            generation: lease.generation,
+            expected_generation: lease.expected_generation,
         };
         let timestamp_ms = Utc::now().timestamp_millis();
         let nonce = Uuid::new_v4().to_string();
@@ -24090,10 +25161,10 @@ mod tests {
             installation_id: "inst-active-renew".into(),
             timestamp_ms,
             nonce: nonce.clone(),
-            signature: sign_test_payload(
+            signature: sign_tunnel_test_payload(
                 &signing_key,
                 "inst-active-renew",
-                "renew_lease",
+                "tunnel_lease_renew",
                 &renewal,
                 timestamp_ms,
                 &nonce,
@@ -24155,22 +25226,22 @@ mod tests {
 
         let timestamp_ms = Utc::now().timestamp_millis();
         let nonce = Uuid::new_v4().to_string();
-        let request = IssueLeaseRequest {
+        let mut request = IssueLeaseRequest {
+            protocol_epoch: PROTOCOL_EPOCH.into(),
+            router_id: "127.0.0.1".into(),
             installation_id: "inst-replay".into(),
+            route_id: "share:share-replay".into(),
+            rotation_id: Uuid::new_v4().to_string(),
+            generation: 1,
+            expected_generation: 0,
             requested_subdomain: "replay-sub".into(),
             tunnel_type: "http".into(),
             timestamp_ms,
             nonce: nonce.clone(),
-            signature: sign_issue_lease_request(
-                &signing_key,
-                "inst-replay",
-                "replay-sub",
-                "http",
-                timestamp_ms,
-                &nonce,
-            ),
+            signature: String::new(),
             share: Some(test_share_descriptor("share-replay", "replay-sub")),
         };
+        request.signature = sign_issue_lease_request(&signing_key, &request);
 
         let first = store
             .issue_lease(
@@ -24230,26 +25301,27 @@ mod tests {
 
         let timestamp_ms = Utc::now().timestamp_millis();
         let nonce = Uuid::new_v4().to_string();
+        let mut first_request = IssueLeaseRequest {
+            protocol_epoch: PROTOCOL_EPOCH.into(),
+            router_id: "127.0.0.1".into(),
+            installation_id: "inst-bad-sig".into(),
+            route_id: "share:share-bad-sig".into(),
+            rotation_id: Uuid::new_v4().to_string(),
+            generation: 1,
+            expected_generation: 0,
+            requested_subdomain: "bad-sig-sub".into(),
+            tunnel_type: "http".into(),
+            timestamp_ms,
+            nonce,
+            signature: String::new(),
+            share: Some(test_share_descriptor("share-bad-sig", "bad-sig-sub")),
+        };
+        first_request.signature = sign_issue_lease_request(&signing_key, &first_request);
         let first = store
             .issue_lease(
                 &config,
                 &proxy,
-                IssueLeaseRequest {
-                    installation_id: "inst-bad-sig".into(),
-                    requested_subdomain: "bad-sig-sub".into(),
-                    tunnel_type: "http".into(),
-                    timestamp_ms,
-                    nonce: nonce.clone(),
-                    signature: sign_issue_lease_request(
-                        &signing_key,
-                        "inst-bad-sig",
-                        "bad-sig-sub",
-                        "http",
-                        timestamp_ms,
-                        &nonce,
-                    ),
-                    share: Some(test_share_descriptor("share-bad-sig", "bad-sig-sub")),
-                },
+                first_request,
                 ClientMetadata {
                     ip: None,
                     country_code: None,
@@ -24264,7 +25336,13 @@ mod tests {
                 &config,
                 &proxy,
                 IssueLeaseRequest {
+                    protocol_epoch: PROTOCOL_EPOCH.into(),
+                    router_id: "127.0.0.1".into(),
                     installation_id: "inst-bad-sig".into(),
+                    route_id: "share:share-bad-sig".into(),
+                    rotation_id: Uuid::new_v4().to_string(),
+                    generation: 2,
+                    expected_generation: 0,
                     requested_subdomain: "bad-sig-sub".into(),
                     tunnel_type: "http".into(),
                     timestamp_ms: Utc::now().timestamp_millis(),
@@ -24300,13 +25378,14 @@ mod tests {
     fn cross_repo_registration_and_heartbeat_contract_vectors_verify() {
         let public_key = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=";
         let registration = RegisterInstallationRequest {
+            protocol_epoch: PROTOCOL_EPOCH.into(),
             public_key: public_key.into(),
             platform: "linux".into(),
             app_version: "1.2.3".into(),
             instance_nonce: "fixture-nonce-123".into(),
             timestamp_ms: Some(1_700_000_000_123),
             signature: Some(
-                "ZZXnKtvGo8dPqW7oRNH6p878npyjH7AOjQHnFEegYdgbtSmx0GYMVdVOehycNZxxkKgTuyBfM176MjtNsZhqDg=="
+                "nlRT3f2KJ0oZaI84N/naU1WYGv/bS7Pz0X7I0hDKxQg2U0RZ/eZhmpZ4yaCcTARWq7TRvaGbUe7vejXPnmkcBA=="
                     .into(),
             ),
             proof_version: Some(2),
@@ -24321,13 +25400,14 @@ mod tests {
         );
 
         let legacy = RegisterInstallationRequest {
+            protocol_epoch: PROTOCOL_EPOCH.into(),
             public_key: public_key.into(),
             platform: "linux".into(),
             app_version: "1.2.3".into(),
             instance_nonce: "fixture-legacy-123".into(),
             timestamp_ms: Some(1_700_000_000_234),
             signature: Some(
-                "Xa7QqLps3PE6UpT8xeTZTR7DP/2FQnJIUEZGl5dkK672YWMBzXBrm4UwXtc1YsgnUUYH+4e0gxgpugZEfbBMDQ=="
+                "+SCyz8ys5tyXjoTXYkzIyb9n/LBovygmFHz4wHoDF7uJF7jNKh7egVmaUGK9E34nyWytM1fPTyoMrl+TRh4tCg=="
                     .into(),
             ),
             proof_version: None,
@@ -24359,7 +25439,7 @@ mod tests {
             &heartbeat,
             1_700_000_000_456,
             "fixture-heartbeat-123",
-            "SKGGtibTy3D/Fbnclkw2sLlq3q+LtiLfELbnDTlj+mT68pGPpULSJjKM9J/5LKcFysxaA87tuesjPD9WhEOmDw==",
+            "Ax5dl8lsVWD1wh/8qxs72+hrPtRjjMdJzX/22gQDLxpwClbmIcUThVrGVQH5n1hVuwZsvKfYuoLCINMuGbg8Cg==",
         )
         .unwrap();
     }
@@ -24382,6 +25462,7 @@ mod tests {
         let registered = store
             .register_installation(
                 RegisterInstallationRequest {
+                    protocol_epoch: PROTOCOL_EPOCH.into(),
                     public_key: public_key.clone(),
                     platform: "linux".into(),
                     app_version: "2.0.0".into(),
@@ -24412,6 +25493,7 @@ mod tests {
         let recovered = store
             .register_installation(
                 RegisterInstallationRequest {
+                    protocol_epoch: PROTOCOL_EPOCH.into(),
                     public_key,
                     platform: "linux".into(),
                     app_version: "2.0.1".into(),
@@ -24539,6 +25621,7 @@ mod tests {
         store
             .register_installation_with_admission(
                 RegisterInstallationRequest {
+                    protocol_epoch: PROTOCOL_EPOCH.into(),
                     public_key: public_key_b64(&signing_key),
                     platform: "linux".into(),
                     app_version: "1.0.0".into(),
@@ -25067,6 +26150,7 @@ mod tests {
         let registered = store
             .register_installation(
                 RegisterInstallationRequest {
+                    protocol_epoch: PROTOCOL_EPOCH.into(),
                     public_key,
                     platform: "linux".into(),
                     app_version: "1.0.0".into(),
@@ -25305,6 +26389,7 @@ mod tests {
         let registered = store
             .register_installation(
                 RegisterInstallationRequest {
+                    protocol_epoch: PROTOCOL_EPOCH.into(),
                     public_key,
                     platform: "linux".into(),
                     app_version: "1.0.0".into(),
@@ -27798,6 +28883,7 @@ mod tests {
         let response = store
             .register_installation(
                 RegisterInstallationRequest {
+                    protocol_epoch: PROTOCOL_EPOCH.into(),
                     public_key,
                     platform: "macOS".into(),
                     app_version: "2.0.0".into(),
@@ -27850,6 +28936,7 @@ mod tests {
         let response = store
             .register_installation(
                 RegisterInstallationRequest {
+                    protocol_epoch: PROTOCOL_EPOCH.into(),
                     public_key,
                     platform: "macOS".into(),
                     app_version: "2.0.0".into(),
@@ -27906,11 +28993,11 @@ mod tests {
         assert_eq!(consumed.tunnel_type, "market-http");
         assert!(consumed.share.is_none());
 
-        let replay = store
+        let reconnected = store
             .consume_lease(&lease.ssh_username, &lease.ssh_password)
             .await
-            .expect_err("market lease cannot be reused");
-        assert!(replay.to_string().contains("lease already used"));
+            .expect("market lease may reconnect during its TTL");
+        assert_eq!(reconnected.connection_id, lease.connection_id);
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
@@ -28022,7 +29109,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn issue_market_lease_replaces_stale_market_lease_and_route() {
+    async fn issue_market_lease_stages_replacement_without_breaking_active_route() {
         let (store, config) = setup_store("market-lease-duplicate").await;
         let market = test_market();
         insert_market(&store, &market).await;
@@ -28053,13 +29140,13 @@ mod tests {
         let old_lease = store
             .consume_lease(&first.ssh_username, &first.ssh_password)
             .await
-            .expect_err("old market lease should be invalidated");
-        assert!(!old_lease.to_string().is_empty());
+            .expect("old market lease remains valid until replacement is ready");
+        assert_eq!(old_lease.connection_id, first.connection_id);
         assert!(
             proxy
                 .backend_for_host("market-a.127.0.0.1:8787", &config.tunnel_domain)
                 .await
-                .is_none()
+                .is_some()
         );
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
@@ -28144,6 +29231,7 @@ mod tests {
     async fn claim_share_subdomain_accepts_valid_signature_and_rejects_replay_and_tamper() {
         let (store, config) = setup_store("signed-share-claim").await;
         let signing_key = insert_signed_installation(&store, "inst-signed").await;
+        insert_client_tunnel(&store, "inst-signed", "owner@example.com", TEST_CLIENT_KEY).await;
 
         let share = ShareDescriptor {
             share_id: "share-1".into(),
@@ -28157,7 +29245,7 @@ mod tests {
             description: None,
             for_sale: "No".into(),
             sale_market_kind: "token".into(),
-            subdomain: "signed-sub".into(),
+            subdomain: test_share_host("signed"),
             app_type: "codex".into(),
             provider_id: Some("provider-signed".into()),
             bindings: BTreeMap::from([("codex".into(), "provider-signed".into())]),
@@ -28234,7 +29322,7 @@ mod tests {
         assert!(replay_err.to_string().contains("nonce already used"));
 
         let tampered_share = ShareDescriptor {
-            subdomain: "signed-sub-tampered".into(),
+            subdomain: test_share_host("tampered"),
             ..share
         };
         let tampered_err = store
@@ -28848,6 +29936,7 @@ mod tests {
     async fn claim_share_subdomain_accepts_minimal_claim_signature() {
         let (store, config) = setup_store("signed-share-minimal-claim").await;
         let signing_key = insert_signed_installation(&store, "inst-minimal").await;
+        insert_client_tunnel(&store, "inst-minimal", "owner@example.com", TEST_CLIENT_KEY).await;
 
         let share = ShareDescriptor {
             share_id: "share-minimal".into(),
@@ -28864,7 +29953,7 @@ mod tests {
             description: Some("metadata outside claim signature".into()),
             for_sale: "Yes".into(),
             sale_market_kind: "token".into(),
-            subdomain: "minimal-sub".into(),
+            subdomain: test_share_host("minimal"),
             app_type: "codex".into(),
             provider_id: Some("provider-minimal".into()),
             bindings: BTreeMap::from([("codex".into(), "provider-minimal".into())]),
@@ -28927,7 +30016,7 @@ mod tests {
             )
             .expect("query minimal claim share");
         assert_eq!(synced.0, "owner@example.com");
-        assert_eq!(synced.1, "minimal-sub");
+        assert_eq!(synced.1, test_share_host("minimal"));
         assert_eq!(synced.2, "Yes");
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
@@ -29013,8 +30102,16 @@ mod tests {
     #[tokio::test]
     async fn claim_share_subdomain_rejects_same_owner_reclaim_from_different_installation() {
         let (store, config) = setup_store("signed-share-reject-owner-reclaim").await;
-        insert_share(&store, "inst-old", "share-old", "owner-sub", "paused").await;
+        let owner_host = test_share_host("owner");
+        insert_share(&store, "inst-old", "share-old", &owner_host, "paused").await;
         let signing_key = insert_signed_installation(&store, "inst-new").await;
+        insert_client_tunnel(
+            &store,
+            "inst-new",
+            "owner@example.com",
+            TEST_CLIENT_KEY_BETA,
+        )
+        .await;
 
         let share = ShareDescriptor {
             share_id: "share-new".into(),
@@ -29028,7 +30125,7 @@ mod tests {
             description: None,
             for_sale: "No".into(),
             sale_market_kind: "token".into(),
-            subdomain: "owner-sub".into(),
+            subdomain: owner_host.clone(),
             app_type: "codex".into(),
             provider_id: Some("provider-owner".into()),
             bindings: BTreeMap::from([("codex".into(), "provider-owner".into())]),
@@ -29080,7 +30177,7 @@ mod tests {
             )
             .await
             .expect_err("different installation must not reclaim by self-reported owner email");
-        assert!(err.to_string().contains("subdomain already claimed"));
+        assert!(err.to_string().contains("does not belong"));
 
         let conn = store.conn.lock().await;
         let rows: Vec<(String, String, String)> = {
@@ -29088,17 +30185,19 @@ mod tests {
                 .prepare(
                     "SELECT share_id, installation_id, subdomain
                      FROM shares
-                     WHERE subdomain = 'owner-sub'",
+                     WHERE subdomain = ?1",
                 )
                 .expect("prepare reclaimed subdomain query");
-            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-                .expect("query reclaimed subdomain rows")
-                .collect::<Result<Vec<_>, _>>()
-                .expect("collect reclaimed subdomain rows")
+            stmt.query_map(params![owner_host], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .expect("query reclaimed subdomain rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect reclaimed subdomain rows")
         };
         assert_eq!(
             rows,
-            vec![("share-old".into(), "inst-old".into(), "owner-sub".into())]
+            vec![("share-old".into(), "inst-old".into(), owner_host)]
         );
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
@@ -29108,7 +30207,15 @@ mod tests {
     async fn claim_share_subdomain_heals_stale_owner_for_same_installation() {
         let (store, config) = setup_store("signed-share-heal-owner").await;
         let signing_key = insert_signed_installation(&store, "inst-heal").await;
-        insert_share(&store, "inst-heal", "share-heal", "heal-sub", "paused").await;
+        insert_client_tunnel(&store, "inst-heal", "owner@example.com", TEST_CLIENT_KEY).await;
+        insert_share(
+            &store,
+            "inst-heal",
+            "share-heal",
+            &test_share_host("heal"),
+            "paused",
+        )
+        .await;
         {
             let conn = store.conn.lock().await;
             conn.execute(
@@ -29135,7 +30242,7 @@ mod tests {
             description: None,
             for_sale: "No".into(),
             sale_market_kind: "token".into(),
-            subdomain: "heal-sub".into(),
+            subdomain: test_share_host("heal"),
             app_type: "codex".into(),
             provider_id: Some("provider-heal".into()),
             bindings: BTreeMap::from([("codex".into(), "provider-heal".into())]),
@@ -29198,10 +30305,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claim_share_subdomain_allows_same_installation_to_replace_deleted_share_claim() {
+    async fn claim_share_subdomain_never_reuses_a_previous_share_host() {
         let (store, config) = setup_store("signed-share-reclaim-installation").await;
         let signing_key = insert_signed_installation(&store, "inst-same").await;
-        insert_share(&store, "inst-same", "share-old", "reused-sub", "paused").await;
+        insert_client_tunnel(&store, "inst-same", "owner@example.com", TEST_CLIENT_KEY).await;
+        let reused_host = test_share_host("reused");
+        insert_share(&store, "inst-same", "share-old", &reused_host, "paused").await;
 
         let share = ShareDescriptor {
             share_id: "share-new".into(),
@@ -29215,7 +30324,7 @@ mod tests {
             description: None,
             for_sale: "No".into(),
             sale_market_kind: "token".into(),
-            subdomain: "reused-sub".into(),
+            subdomain: reused_host.clone(),
             app_type: "codex".into(),
             provider_id: Some("provider-reused".into()),
             bindings: BTreeMap::from([("codex".into(), "provider-reused".into())]),
@@ -29248,7 +30357,7 @@ mod tests {
             &nonce,
         );
 
-        store
+        let error = store
             .claim_share_subdomain(
                 &config,
                 ShareClaimSubdomainRequest {
@@ -29266,7 +30375,11 @@ mod tests {
                 "owner@example.com",
             )
             .await
-            .expect("claim reclaimed subdomain for same installation");
+            .expect_err("a previous share host must remain reserved");
+        assert!(
+            error.to_string().contains("already assigned")
+                || error.to_string().contains("already owns")
+        );
 
         let conn = store.conn.lock().await;
         let rows: Vec<(String, String, String)> = {
@@ -29274,17 +30387,19 @@ mod tests {
                 .prepare(
                     "SELECT share_id, installation_id, subdomain
                      FROM shares
-                     WHERE subdomain = 'reused-sub'",
+                     WHERE subdomain = ?1",
                 )
                 .expect("prepare reclaimed installation subdomain query");
-            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-                .expect("query reclaimed installation subdomain rows")
-                .collect::<Result<Vec<_>, _>>()
-                .expect("collect reclaimed installation subdomain rows")
+            stmt.query_map(params![reused_host], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .expect("query reclaimed installation subdomain rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect reclaimed installation subdomain rows")
         };
         assert_eq!(
             rows,
-            vec![("share-new".into(), "inst-same".into(), "reused-sub".into())]
+            vec![("share-old".into(), "inst-same".into(), reused_host)]
         );
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
@@ -32984,15 +34099,18 @@ mod tests {
         assert_eq!(updated.content_en, "<p>Hello</p>");
         assert_eq!(updated.content_zh_cn, "<p>你好</p>");
 
-        let response = store.announcement_response().await.expect("read announcement");
+        let response = store
+            .announcement_response()
+            .await
+            .expect("read announcement");
         assert_eq!(response.revision, updated.updated_at.to_rfc3339());
         assert_eq!(response.content_en, "<p>Hello</p>");
         assert_eq!(response.content_zh_cn, "<p>你好</p>");
     }
 
     #[tokio::test]
-    async fn announcement_content_update_auto_enables_when_switch_unset() {
-        let (store, _config) = setup_store("announcement-auto-enable").await;
+    async fn announcement_content_update_keeps_disabled_until_explicitly_enabled() {
+        let (store, _config) = setup_store("announcement-stays-disabled").await;
 
         let updated = store
             .update_announcement_settings(AnnouncementSettingsUpdate {
@@ -33003,8 +34121,12 @@ mod tests {
             .await
             .expect("update announcement");
 
-        assert!(updated.enabled);
-        let response = store.announcement_response().await.expect("read announcement");
-        assert!(response.enabled);
+        assert!(!updated.enabled);
+        let response = store
+            .announcement_response()
+            .await
+            .expect("read announcement");
+        assert!(!response.enabled);
+        assert_eq!(response.content_en, "<p>Hello</p>");
     }
 }

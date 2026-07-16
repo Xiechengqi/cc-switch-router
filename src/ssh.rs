@@ -109,6 +109,7 @@ struct ForwardHandle {
     metrics: Arc<MetricsRegistry>,
     subdomain: String,
     connection_id: String,
+    generation: u64,
     closed: bool,
 }
 
@@ -120,6 +121,7 @@ impl ForwardHandle {
         metrics: Arc<MetricsRegistry>,
         subdomain: String,
         connection_id: String,
+        generation: u64,
     ) -> Self {
         Self {
             task: Some(task),
@@ -128,6 +130,7 @@ impl ForwardHandle {
             metrics,
             subdomain,
             connection_id,
+            generation,
             closed: false,
         }
     }
@@ -144,9 +147,10 @@ impl ForwardHandle {
         let proxy = self.proxy.clone();
         let subdomain = self.subdomain.clone();
         let connection_id = self.connection_id.clone();
+        let generation = self.generation;
         tokio::spawn(async move {
             proxy
-                .remove_route_if_connection(&subdomain, &connection_id)
+                .remove_route_target_if_generation(&subdomain, &connection_id, generation)
                 .await;
         });
         self.metrics.forward_listener_shutdown();
@@ -249,7 +253,15 @@ impl server::Handler for ClientHandler {
         let Some(lease) = self.lease.clone() else {
             return Ok(false);
         };
-        self.shutdown_forward();
+        if self.forward.is_some() {
+            warn!(
+                subdomain = %lease.subdomain,
+                connection_id = %lease.connection_id,
+                generation = lease.generation,
+                "duplicate tcpip-forward request rejected for existing SSH session"
+            );
+            return Ok(false);
+        }
 
         let host = normalize_backend_host(address);
         let listener = match TcpListener::bind((host, *port as u16)).await {
@@ -279,7 +291,7 @@ impl server::Handler for ClientHandler {
         };
         let (route_shutdown, shutdown_rx) = RouteShutdown::new();
         self.proxy
-            .set_route_with_kind(
+            .register_candidate_with_kind(
                 lease.subdomain.clone(),
                 backend.clone(),
                 route_kind,
@@ -290,8 +302,25 @@ impl server::Handler for ClientHandler {
                 is_free_share,
                 parallel_limit,
                 Some(route_shutdown.clone()),
+                lease.generation,
+                lease.rotation_id.clone(),
             )
-            .await;
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        if let Err(error) = self
+            .store
+            .mark_lease_ready(&lease.connection_id, &lease.route_id, lease.generation)
+            .await
+        {
+            self.proxy
+                .remove_route_target_if_generation(
+                    &lease.subdomain,
+                    &lease.connection_id,
+                    lease.generation,
+                )
+                .await;
+            return Err(anyhow::anyhow!(error));
+        }
         self.backend = Some(backend.clone());
         let handle = session.handle();
         let connected_address = address.to_string();
@@ -299,6 +328,7 @@ impl server::Handler for ClientHandler {
         let metrics = self.metrics.clone();
         let subdomain = lease.subdomain.clone();
         let connection_id = lease.connection_id.clone();
+        let generation = lease.generation;
         let task = tokio::spawn(async move {
             if let Err(err) = serve_forward_listener(
                 listener,
@@ -309,6 +339,7 @@ impl server::Handler for ClientHandler {
                 metrics,
                 subdomain,
                 connection_id,
+                generation,
                 shutdown_rx,
             )
             .await
@@ -324,10 +355,27 @@ impl server::Handler for ClientHandler {
             self.metrics.clone(),
             lease.subdomain.clone(),
             lease.connection_id.clone(),
+            lease.generation,
         ));
+        if lease.tunnel_type == "market-http" {
+            if let Err(error) = self
+                .proxy
+                .promote_candidate(
+                    &lease.subdomain,
+                    &lease.connection_id,
+                    &lease.rotation_id,
+                    lease.generation,
+                    lease.expected_generation,
+                )
+                .await
+            {
+                self.shutdown_forward();
+                return Err(anyhow::anyhow!(error));
+            }
+        }
         info!(
-            "registered backend for subdomain={} connection_id={} backend={}",
-            lease.subdomain, lease.connection_id, backend
+            "registered backend candidate for subdomain={} connection_id={} generation={} backend={}",
+            lease.subdomain, lease.connection_id, lease.generation, backend
         );
         Ok(true)
     }
@@ -337,7 +385,8 @@ impl server::Handler for ClientHandler {
         _channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.shutdown_forward();
+        // A forwarded TCP channel closes after every proxied HTTP connection.
+        // It is not the lifetime signal for the session-level reverse forward.
         Ok(())
     }
 
@@ -371,6 +420,7 @@ async fn serve_forward_listener(
     metrics: Arc<MetricsRegistry>,
     subdomain: String,
     connection_id: String,
+    generation: u64,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     loop {
@@ -391,7 +441,7 @@ async fn serve_forward_listener(
             Err(err) => {
                 metrics.forward_accept_error(&err.to_string());
                 proxy
-                    .remove_route_if_connection(&subdomain, &connection_id)
+                    .remove_route_target_if_generation(&subdomain, &connection_id, generation)
                     .await;
                 return Err(err.into());
             }
@@ -411,14 +461,11 @@ async fn serve_forward_listener(
         {
             Ok(channel) => channel,
             Err(err) => {
-                proxy
-                    .remove_route_if_connection(&subdomain, &connection_id)
-                    .await;
-                error!(
-                    "failed to open forwarded tcp channel: {} subdomain={} connection_id={}, matching route removed if still current",
-                    err, subdomain, connection_id
+                warn!(
+                    "failed to open one forwarded tcp channel: {} subdomain={} connection_id={} generation={}; listener remains registered",
+                    err, subdomain, connection_id, generation
                 );
-                return Ok(());
+                continue;
             }
         };
 

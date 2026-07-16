@@ -66,9 +66,10 @@ use crate::models::{
     ShareMarketListingStatusSyncResponse, SharePendingEditsRequest, SharePruneRequest,
     ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRuntimeRefreshRequest,
     ShareSettingsPatch, ShareSettingsUpdateRequest, ShareSyncRequest,
-    SubdomainAvailabilityResponse, UpgradeInstallationRequest, UpgradeInstallationResponse,
-    UpgradeInstallationStatusResponse, UserApiTokenResetResponse, UserApiTokenResponse,
-    UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    SubdomainAvailabilityResponse, TunnelActivateRequest, TunnelStateRequest, TunnelStateResponse,
+    UpgradeInstallationRequest, UpgradeInstallationResponse, UpgradeInstallationStatusResponse,
+    UserApiTokenResetResponse, UserApiTokenResponse, UserSharesResponse, VerifyEmailCodeRequest,
+    VerifyEmailCodeResponse,
 };
 use crate::notifications::{
     ClientNotificationDeliveriesResponse, ClientNotificationPolicy, NotificationTemplateContext,
@@ -93,7 +94,7 @@ fn public_cors_layer() -> CorsLayer {
 const REGIONS: &str = include_str!("../regions");
 const SHARE_EDIT_WAKE_RETRY_INTERVAL_SECS: u64 = 20;
 const SHARE_EDIT_WAKE_RETRY_ATTEMPTS: usize = 3;
-const DASHBOARD_REQUEST_TICKER_LIMIT: usize = 5;
+const DASHBOARD_REQUEST_TICKER_LIMIT: usize = 100;
 const ROUTER_ACCESS_COOKIE: &str = "cc_switch_router_access";
 const INSTALLATION_CONTROL_BODY_LIMIT_BYTES: usize = 16 * 1024;
 
@@ -306,6 +307,8 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/me/shares", get(my_shares))
         .route("/v1/tunnels/lease", post(issue_lease))
         .route("/v1/tunnels/lease/renew", post(renew_lease))
+        .route("/v1/tunnels/activate", post(activate_tunnel))
+        .route("/v1/tunnels/state", post(tunnel_state))
         .route("/v1/shares/claim-subdomain", post(claim_share_subdomain))
         .route("/v1/shares/sync", post(sync_share))
         .route("/v1/shares/batch-sync", post(batch_sync_share))
@@ -1550,6 +1553,52 @@ async fn renew_lease(
     Ok(Json(response))
 }
 
+async fn activate_tunnel(
+    State(state): State<ServerState>,
+    Json(input): Json<TunnelActivateRequest>,
+) -> Result<Json<TunnelStateResponse>, AppError> {
+    let installation_id = input.installation_id.clone();
+    let route_id = input.activation.route_id.clone();
+    let rotation_id = input.activation.rotation_id.clone();
+    let generation = input.activation.generation;
+    let response = state
+        .store
+        .activate_tunnel(&state.config, &state.proxy, &state.proxy_http, input)
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                installation_id = %installation_id,
+                route_id = %route_id,
+                rotation_id = %rotation_id,
+                generation,
+                error = %error,
+                "tunnel candidate activation rejected"
+            );
+            error
+        })?;
+    tracing::info!(
+        installation_id = %installation_id,
+        route_id = %route_id,
+        rotation_id = %rotation_id,
+        generation,
+        active_generation = ?response.active_generation,
+        "tunnel candidate promoted"
+    );
+    Ok(Json(response))
+}
+
+async fn tunnel_state(
+    State(state): State<ServerState>,
+    Json(input): Json<TunnelStateRequest>,
+) -> Result<Json<TunnelStateResponse>, AppError> {
+    Ok(Json(
+        state
+            .store
+            .tunnel_state(&state.config, &state.proxy, input)
+            .await?,
+    ))
+}
+
 async fn dashboard(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -1570,8 +1619,12 @@ async fn dashboard(
         .await?;
     let snapshot = state.recent_traffic.snapshot().await;
     enrich_share_ticker_logs_with_live_country(&mut response.ticker_shares, &snapshot);
+    let global_ticker_logs = state
+        .store
+        .list_dashboard_ticker_request_logs(DASHBOARD_REQUEST_TICKER_LIMIT)
+        .await?;
     let (confirmed_events, confirmed_country_counts) =
-        confirmed_request_events(&snapshot, &response);
+        confirmed_request_events(&snapshot, &response, &global_ticker_logs);
     response.user_country_counts = confirmed_country_counts;
     response.recent_request_events = confirmed_events;
     Ok(Json(response))
@@ -1789,9 +1842,10 @@ async fn share_api_auth_response(
 fn confirmed_request_events(
     snapshot: &RecentTrafficSnapshot,
     response: &DashboardResponse,
+    global_share_logs: &[ShareRequestLogEntry],
 ) -> (Vec<RecentRequestEvent>, HashMap<String, usize>) {
     let mut events_by_id = HashMap::new();
-    for event in persisted_ticker_request_events(response) {
+    for event in persisted_ticker_request_events(response, global_share_logs) {
         if let Some(existing) = events_by_id.get_mut(&event.request_id) {
             merge_persisted_ticker_event(existing, event);
         } else {
@@ -1977,12 +2031,28 @@ fn merge_ticker_event_country(target: &mut RecentRequestEvent, source: &RecentRe
     }
 }
 
-fn persisted_ticker_request_events(response: &DashboardResponse) -> Vec<RecentRequestEvent> {
+fn persisted_ticker_request_events(
+    response: &DashboardResponse,
+    global_share_logs: &[ShareRequestLogEntry],
+) -> Vec<RecentRequestEvent> {
+    let share_lookup = response
+        .ticker_shares
+        .iter()
+        .map(|share| (share.share_id.as_str(), share))
+        .collect::<HashMap<_, _>>();
     let mut events = Vec::new();
-    for share in &response.ticker_shares {
-        for log in &share.recent_requests {
-            events.push(share_log_to_ticker_event(share, log));
-        }
+    for log in global_share_logs {
+        let fallback = DashboardTickerShare {
+            share_id: log.share_id.clone(),
+            share_name: log.share_name.clone(),
+            subdomain: String::new(),
+            recent_requests: Vec::new(),
+        };
+        let share = share_lookup
+            .get(log.share_id.as_str())
+            .copied()
+            .unwrap_or(&fallback);
+        events.push(share_log_to_ticker_event(share, log));
     }
     for log in &response.market_request_logs {
         events.push(market_log_to_ticker_event(log));
@@ -2220,12 +2290,10 @@ async fn session_me(
     if dev_auth_bypass_enabled() && extract_session_token(&headers).is_none() {
         return Ok(Json(dev_session_status()));
     }
+    let session_token = resolve_session_auth_token(&state, &headers).await?;
     let mut response = state
         .store
-        .session_status(
-            extract_session_token(&headers),
-            query.installation_id.as_deref(),
-        )
+        .session_status(session_token.as_deref(), query.installation_id.as_deref())
         .await?;
     if let Some(user) = response.user.as_ref() {
         response.is_admin = state.dynamic.read().await.is_admin(&user.email);
@@ -2726,6 +2794,7 @@ mod tests {
         share_log.output_tokens = 20;
         share_log.cache_read_tokens = 3;
         share_log.cache_creation_tokens = 4;
+        let global_share_logs = vec![share_log.clone()];
         let mut duplicate_market_log = market_log("req-duplicate", "codex");
         duplicate_market_log.share_id = None;
         duplicate_market_log.share_subdomain = None;
@@ -2739,7 +2808,7 @@ mod tests {
             recent_events: Vec::new(),
         };
 
-        let (events, _) = confirmed_request_events(&snapshot, &response);
+        let (events, _) = confirmed_request_events(&snapshot, &response, &global_share_logs);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].share_id, "share-1");
         assert_eq!(events[0].share_name.as_deref(), Some("Share"));
@@ -2759,11 +2828,7 @@ mod tests {
         response.market_request_logs[0].output_tokens = 20;
         response.market_request_logs[0].cache_read_tokens = 40;
         response.market_request_logs[0].cache_creation_tokens = 5;
-        let (events, _) = confirmed_request_events(&snapshot, &response);
-        assert_eq!(
-            events[0].user_email.as_deref(),
-            Some("market-user@example.com")
-        );
+        let (events, _) = confirmed_request_events(&snapshot, &response, &global_share_logs);
         assert_eq!(events[0].input_tokens, Some(100));
         assert_eq!(events[0].output_tokens, Some(20));
         assert_eq!(events[0].cache_read_tokens, Some(40));
@@ -2779,14 +2844,14 @@ mod tests {
             health.is_health_check = true;
             requests.push(health);
         }
-        let response = dashboard_response(vec![ticker_share(requests)], Vec::new());
+        let response = dashboard_response(vec![ticker_share(requests.clone())], Vec::new());
         let snapshot = RecentTrafficSnapshot {
             country_counts: HashMap::new(),
             events: Vec::new(),
             recent_events: Vec::new(),
         };
 
-        let (events, _) = confirmed_request_events(&snapshot, &response);
+        let (events, _) = confirmed_request_events(&snapshot, &response, &requests);
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].request_id, "req-user");
@@ -2871,14 +2936,14 @@ mod tests {
             }],
         };
 
-        let (events, country_counts) = confirmed_request_events(&snapshot, &response);
+        let (events, country_counts) = confirmed_request_events(&snapshot, &response, &[]);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].request_id, "req_market_confirmed");
         assert_eq!(country_counts.get("USA"), Some(&1));
     }
 
     #[test]
-    fn confirmed_request_events_restores_last_five_from_persisted_share_logs() {
+    fn confirmed_request_events_restores_persisted_share_logs_up_to_limit() {
         let response = DashboardResponse {
             generated_at: Utc::now(),
             stats: crate::models::DashboardStats {
@@ -2914,7 +2979,8 @@ mod tests {
             recent_events: Vec::new(),
         };
 
-        let (events, country_counts) = confirmed_request_events(&snapshot, &response);
+        let (events, country_counts) =
+            confirmed_request_events(&snapshot, &response, &global_logs_from_response(&response));
 
         assert_eq!(country_counts.len(), 0);
         assert_eq!(
@@ -2922,7 +2988,9 @@ mod tests {
                 .iter()
                 .map(|event| event.request_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["req-3", "req-4", "req-5", "req-6", "req-7"]
+            vec![
+                "req-1", "req-2", "req-3", "req-4", "req-5", "req-6", "req-7"
+            ]
         );
         assert!(events.iter().all(|event| !event.is_inflight));
     }
@@ -2965,7 +3033,8 @@ mod tests {
             recent_events: Vec::new(),
         };
 
-        let (events, _) = confirmed_request_events(&snapshot, &response);
+        let (events, _) =
+            confirmed_request_events(&snapshot, &response, &global_logs_from_response(&response));
 
         assert_eq!(events[0].user_country.as_deref(), Some("JP"));
         assert_eq!(events[0].user_country_iso3.as_deref(), Some("JPN"));
@@ -3026,7 +3095,8 @@ mod tests {
             market_request_logs: Vec::new(),
         };
 
-        let (events, country_counts) = confirmed_request_events(&snapshot, &response);
+        let (events, country_counts) =
+            confirmed_request_events(&snapshot, &response, &global_logs_from_response(&response));
 
         assert_eq!(events.len(), 1);
         assert!(events[0].is_inflight);
@@ -3089,7 +3159,8 @@ mod tests {
             market_request_logs: Vec::new(),
         };
 
-        let (events, _) = confirmed_request_events(&snapshot, &response);
+        let (events, _) =
+            confirmed_request_events(&snapshot, &response, &global_logs_from_response(&response));
 
         assert_eq!(events[0].user_country.as_deref(), Some("US"));
         assert_eq!(events[0].user_country_iso3.as_deref(), Some("USA"));
@@ -3124,6 +3195,14 @@ mod tests {
             created_at,
             is_health_check: false,
         }
+    }
+
+    fn global_logs_from_response(response: &DashboardResponse) -> Vec<ShareRequestLogEntry> {
+        response
+            .ticker_shares
+            .iter()
+            .flat_map(|share| share.recent_requests.iter().cloned())
+            .collect()
     }
 
     fn ticker_share(
@@ -4013,14 +4092,10 @@ async fn extract_session_email(
     state: &ServerState,
     headers: &HeaderMap,
 ) -> Result<Option<String>, AppError> {
-    let Some(token) = extract_session_token(headers) else {
-        return Ok(dev_auth_bypass_enabled().then(dev_auth_email));
-    };
-    Ok(state
-        .store
-        .resolve_session_by_access_token(token)
-        .await?
-        .map(|session| session.email))
+    if let Some(session) = resolve_router_session(state, headers).await? {
+        return Ok(Some(session.email));
+    }
+    Ok(dev_auth_bypass_enabled().then(dev_auth_email))
 }
 
 fn require_dashboard_session_email(email: Option<String>) -> Result<String, AppError> {
@@ -4031,15 +4106,10 @@ async fn extract_dashboard_session_email(
     state: &ServerState,
     headers: &HeaderMap,
 ) -> Result<Option<String>, AppError> {
-    let Some(token) = extract_session_token(headers) else {
-        return Ok(dev_auth_bypass_enabled().then(dev_auth_email));
-    };
-    let email = state
-        .store
-        .resolve_session_by_access_token(token)
-        .await?
-        .map(|session| session.email);
-    require_dashboard_session_email(email).map(Some)
+    if let Some(session) = resolve_router_session(state, headers).await? {
+        return require_dashboard_session_email(Some(session.email)).map(Some);
+    }
+    Ok(dev_auth_bypass_enabled().then(dev_auth_email))
 }
 
 async fn require_session_email(
@@ -4091,14 +4161,51 @@ struct BoardListQuery {
     since: Option<String>,
 }
 
+fn session_token_candidates(headers: &HeaderMap) -> Vec<&str> {
+    let mut candidates = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    if let Some(bearer) = extract_bearer_token(headers) {
+        seen.insert(bearer);
+        candidates.push(bearer);
+    }
+    if let Some(cookie) = extract_router_access_cookie(headers) {
+        if seen.insert(cookie) {
+            candidates.push(cookie);
+        }
+    }
+    candidates
+}
+
+async fn resolve_session_auth_token(
+    state: &ServerState,
+    headers: &HeaderMap,
+) -> Result<Option<String>, AppError> {
+    for token in session_token_candidates(headers) {
+        if state
+            .store
+            .resolve_session_by_access_token(token)
+            .await?
+            .is_some()
+        {
+            return Ok(Some(token.to_string()));
+        }
+    }
+    Ok(None)
+}
+
 pub(crate) async fn resolve_router_session(
     state: &ServerState,
     headers: &HeaderMap,
 ) -> Result<Option<AuthSession>, AppError> {
-    let Some(token) = extract_session_token(headers) else {
+    if session_token_candidates(headers).is_empty() {
         return Ok(dev_auth_bypass_enabled().then(dev_auth_session));
-    };
-    state.store.resolve_session_by_access_token(token).await
+    }
+    for token in session_token_candidates(headers) {
+        if let Some(session) = state.store.resolve_session_by_access_token(token).await? {
+            return Ok(Some(session));
+        }
+    }
+    Ok(None)
 }
 
 fn dev_auth_email() -> String {

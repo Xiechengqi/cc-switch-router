@@ -166,6 +166,17 @@ function accessTokenExpiresSoon(state: AuthState) {
   return Number.isFinite(expiresAt) && expiresAt <= Date.now() + ACCESS_TOKEN_REFRESH_SKEW_MS;
 }
 
+function accessTokenIsExpired(state: AuthState) {
+  if (!state.accessToken || !state.expiresAt) return false;
+  const expiresAt = Date.parse(state.expiresAt);
+  return Number.isFinite(expiresAt) && expiresAt <= Date.now();
+}
+
+function bearerTokenForRequest(state: AuthState) {
+  if (!state.accessToken || accessTokenIsExpired(state)) return null;
+  return state.accessToken;
+}
+
 function changedSessionResult(expected: AuthState, current = readAuthState()): boolean | null {
   const changed =
     current.installationId !== expected.installationId ||
@@ -275,26 +286,26 @@ export async function authFetch(input: RequestInfo | URL, init: RequestInit = {}
     state = readAuthState();
   }
 
-  const attemptedAccessToken = state.accessToken;
+  const attemptedAccessToken = bearerTokenForRequest(state);
   const response = await requestWithAccessToken(input, init, attemptedAccessToken);
   if (response.status !== 401) return response;
 
-  let currentAccessToken = readAuthState().accessToken;
+  let currentAccessToken = bearerTokenForRequest(readAuthState());
   if (currentAccessToken && currentAccessToken !== attemptedAccessToken) {
     return requestWithAccessToken(input, init, currentAccessToken);
   }
 
   if (await refreshAccessToken()) {
-    currentAccessToken = readAuthState().accessToken;
+    currentAccessToken = bearerTokenForRequest(readAuthState());
     if (currentAccessToken) return requestWithAccessToken(input, init, currentAccessToken);
   }
 
   // Another tab may have completed token rotation while this tab's refresh was rejected.
-  currentAccessToken = readAuthState().accessToken;
+  currentAccessToken = bearerTokenForRequest(readAuthState());
   if (currentAccessToken && currentAccessToken !== attemptedAccessToken) {
     return requestWithAccessToken(input, init, currentAccessToken);
   }
-  return response;
+  return requestWithAccessToken(input, init, null);
 }
 
 export async function sessionStatus(): Promise<SessionStatus> {

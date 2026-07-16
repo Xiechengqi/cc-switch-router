@@ -289,6 +289,10 @@ impl Config {
         format!("{scheme}://{subdomain}.{}", self.tunnel_domain)
     }
 
+    pub fn router_id(&self) -> String {
+        tunnel_domain_host(&self.tunnel_domain).unwrap_or_else(|| "router".to_string())
+    }
+
     pub fn effective_ssh_public_addr(&self) -> String {
         if !self.ssh_public_addr.is_empty() {
             return self.ssh_public_addr.clone();

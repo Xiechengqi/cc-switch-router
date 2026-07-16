@@ -88,9 +88,15 @@ pub struct AuthUser {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TunnelLease {
+    pub protocol_epoch: String,
+    pub router_id: String,
     pub id: String,
     pub installation_id: String,
     pub connection_id: String,
+    pub route_id: String,
+    pub rotation_id: String,
+    pub generation: u64,
+    pub expected_generation: u64,
     pub subdomain: String,
     pub tunnel_type: String,
     pub ssh_username: String,
@@ -104,6 +110,7 @@ pub struct TunnelLease {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RegisterInstallationRequest {
+    pub protocol_epoch: String,
     pub public_key: String,
     pub platform: String,
     pub app_version: String,
@@ -616,10 +623,16 @@ mod payout_profile_tests {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IssueLeaseRequest {
+    pub protocol_epoch: String,
+    pub router_id: String,
     pub installation_id: String,
+    pub route_id: String,
+    pub rotation_id: String,
+    pub generation: u64,
+    pub expected_generation: u64,
     pub requested_subdomain: String,
     pub tunnel_type: String,
     pub timestamp_ms: i64,
@@ -632,8 +645,14 @@ pub struct IssueLeaseRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RenewLeasePayload {
+    pub protocol_epoch: String,
+    pub router_id: String,
     pub lease_id: String,
     pub connection_id: String,
+    pub route_id: String,
+    pub rotation_id: String,
+    pub generation: u64,
+    pub expected_generation: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -650,7 +669,75 @@ pub struct RenewLeaseRequest {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RenewLeaseResponse {
+    pub protocol_epoch: String,
+    pub router_id: String,
+    pub route_id: String,
+    pub rotation_id: String,
+    pub generation: u64,
     pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TunnelActivatePayload {
+    pub protocol_epoch: String,
+    pub router_id: String,
+    pub lease_id: String,
+    pub connection_id: String,
+    pub route_id: String,
+    pub rotation_id: String,
+    pub generation: u64,
+    pub expected_generation: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TunnelActivateRequest {
+    pub installation_id: String,
+    pub timestamp_ms: i64,
+    pub nonce: String,
+    pub signature: String,
+    #[serde(flatten)]
+    pub activation: TunnelActivatePayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TunnelStatePayload {
+    pub protocol_epoch: String,
+    pub router_id: String,
+    pub lease_id: String,
+    pub connection_id: String,
+    pub route_id: String,
+    pub rotation_id: String,
+    pub generation: u64,
+    pub expected_generation: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TunnelStateRequest {
+    pub installation_id: String,
+    pub timestamp_ms: i64,
+    pub nonce: String,
+    pub signature: String,
+    #[serde(flatten)]
+    pub query: TunnelStatePayload,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TunnelStateResponse {
+    pub protocol_epoch: String,
+    pub router_id: String,
+    pub route_id: String,
+    pub rotation_id: String,
+    pub generation: u64,
+    pub expected_generation: u64,
+    pub state: String,
+    pub active_generation: Option<u64>,
+    pub candidate_generations: Vec<u64>,
+    pub draining_generations: Vec<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1159,8 +1246,14 @@ pub struct ShareUsageByEmailResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IssueLeaseResponse {
+    pub protocol_epoch: String,
+    pub router_id: String,
     pub lease_id: String,
     pub connection_id: String,
+    pub route_id: String,
+    pub rotation_id: String,
+    pub generation: u64,
+    pub expected_generation: u64,
     pub ssh_username: String,
     pub ssh_password: String,
     pub ssh_addr: String,

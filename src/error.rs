@@ -20,6 +20,8 @@ pub enum AppError {
     UnprocessableEntity(String),
     #[error("{0}")]
     TooManyRequests(String),
+    #[error("{0}")]
+    ServiceUnavailable(String),
     #[error("{message}")]
     RateLimited {
         message: String,
@@ -44,6 +46,7 @@ impl IntoResponse for AppError {
             AppError::Conflict(_) => StatusCode::CONFLICT,
             AppError::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
             AppError::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
+            AppError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             AppError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };

@@ -10,15 +10,17 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, RwLock, watch};
+use tokio::sync::{Mutex, Notify, RwLock, watch};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::ServerState;
 use crate::config::Config;
+use crate::metrics::MetricsRegistry;
+use crate::metrics::models::LlmRequestMetric;
 use crate::recent_traffic::RecentTraffic;
 use crate::store::{
     AppStore, IMAGE_GENERATION_REQUEST_LOG_RETAIN_PER_SHARE, NewImageGenerationRequestLog,
@@ -35,6 +37,7 @@ const SHARE_USER_COUNTRY_HEADER: &str = "X-CC-Switch-User-Country";
 const SHARE_USER_COUNTRY_ISO3_HEADER: &str = "X-CC-Switch-User-Country-Iso3";
 const SHARE_DATA_SOURCE_HEADER: &str = "X-CC-Switch-Data-Source";
 const IMAGE_JOB_MAX_RUNNING_PER_SHARE: usize = 1;
+const ROUTE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RouteKind {
@@ -72,6 +75,70 @@ pub(crate) struct RouteEntry {
     is_free_share: bool,
     parallel_limit: i64,
     shutdown: Option<RouteShutdown>,
+    generation: u64,
+    rotation_id: String,
+    transport: Arc<RouteTransportState>,
+}
+
+#[derive(Debug, Default)]
+struct RouteTransportState {
+    inflight: AtomicUsize,
+    idle: Notify,
+}
+
+#[derive(Debug)]
+struct RouteInflightGuard {
+    transport: Arc<RouteTransportState>,
+}
+
+impl Drop for RouteInflightGuard {
+    fn drop(&mut self) {
+        if self.transport.inflight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.transport.idle.notify_waiters();
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct LogicalRoute {
+    active: Option<RouteEntry>,
+    candidates: BTreeMap<u64, RouteEntry>,
+    draining: BTreeMap<u64, RouteEntry>,
+}
+
+#[derive(Debug)]
+enum RouteLookup {
+    Unknown,
+    Reconnecting,
+    Active(RouteEntry, RouteInflightGuard),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum RouteGenerationError {
+    #[error("route generation {generation} is stale; active generation is {active_generation}")]
+    StaleGeneration {
+        generation: u64,
+        active_generation: u64,
+    },
+    #[error("route generation {generation} is already registered by another connection")]
+    GenerationConflict { generation: u64 },
+    #[error("route candidate generation {generation} is not ready")]
+    CandidateNotReady { generation: u64 },
+    #[error("route candidate identity does not match the activation request")]
+    CandidateIdentityMismatch,
+    #[error("route generation changed: expected {expected_generation}, active {active_generation}")]
+    CompareAndSwapConflict {
+        expected_generation: u64,
+        active_generation: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProxyRouteState {
+    pub active_generation: Option<u64>,
+    pub active_connection_id: Option<String>,
+    pub candidate_generations: Vec<u64>,
+    pub draining_generations: Vec<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +147,45 @@ struct PendingRouteEntry {
 }
 
 impl RouteEntry {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        backend: String,
+        route_kind: RouteKind,
+        share_id: Option<String>,
+        share_name: Option<String>,
+        subdomain: String,
+        installation_id: Option<String>,
+        connection_id: Option<String>,
+        is_free_share: bool,
+        parallel_limit: i64,
+        shutdown: Option<RouteShutdown>,
+        generation: u64,
+        rotation_id: String,
+    ) -> Self {
+        Self {
+            backend,
+            route_kind,
+            share_id,
+            share_name,
+            subdomain,
+            installation_id,
+            connection_id,
+            is_free_share,
+            parallel_limit,
+            shutdown,
+            generation,
+            rotation_id,
+            transport: Arc::new(RouteTransportState::default()),
+        }
+    }
+
+    fn acquire(&self) -> RouteInflightGuard {
+        self.transport.inflight.fetch_add(1, Ordering::AcqRel);
+        RouteInflightGuard {
+            transport: self.transport.clone(),
+        }
+    }
+
     pub(crate) fn is_client_web(&self) -> bool {
         self.route_kind == RouteKind::ClientWeb
     }
@@ -109,6 +215,14 @@ impl RouteEntry {
     /// client's `/_ctl/*` API over the same reverse SSH forward.
     pub(crate) fn route_target(&self) -> &str {
         &self.backend
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn rotation_id(&self) -> &str {
+        &self.rotation_id
     }
 }
 
@@ -174,6 +288,106 @@ impl Drop for RecentTrafficGuard {
     }
 }
 
+/// Records a lightweight LLM metric row when a share API proxy request ends.
+/// Server-side log sync may later enrich the same `request_id` with token usage.
+#[derive(Debug)]
+struct ShareLlmProxyMetricsGuard {
+    metrics: Arc<MetricsRegistry>,
+    request_id: String,
+    share_id: String,
+    subdomain: String,
+    app_type: Option<String>,
+    status: u16,
+    started: Instant,
+}
+
+impl Drop for ShareLlmProxyMetricsGuard {
+    fn drop(&mut self) {
+        let latency_ms = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        let success = self.status < 400;
+        self.metrics.record_llm_request(LlmRequestMetric {
+            timestamp: chrono::Utc::now().timestamp(),
+            request_id: Some(self.request_id.clone()),
+            route_type: "direct".into(),
+            market_email: None,
+            share_id: Some(self.share_id.clone()),
+            subdomain: Some(self.subdomain.clone()),
+            app_type: self.app_type.clone(),
+            provider: None,
+            requested_model: None,
+            actual_model: None,
+            status: if success {
+                "success".into()
+            } else {
+                "error".into()
+            },
+            error_kind: if self.status == 429 {
+                Some("rate_limited".into())
+            } else if success {
+                None
+            } else {
+                Some("upstream_error".into())
+            },
+            http_status: Some(self.status),
+            latency_ms: Some(latency_ms),
+            ttft_ms: None,
+            stream_started: false,
+            stream_completed: success,
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            estimated_cost_usd: None,
+        });
+    }
+}
+
+fn should_record_share_llm_proxy_metric(
+    route: &RouteEntry,
+    path: &str,
+    is_share_router_probe: bool,
+    skips_share_edge_auth: bool,
+) -> bool {
+    route.is_share()
+        && !is_share_router_probe
+        && !skips_share_edge_auth
+        && is_allowed_direct_share_api_path(path)
+}
+
+fn share_llm_proxy_metrics_guard(
+    state: &ServerState,
+    route: &RouteEntry,
+    path: &str,
+    is_share_router_probe: bool,
+    skips_share_edge_auth: bool,
+    request_id: Option<&str>,
+    status: u16,
+    started: Instant,
+    app_type: Option<String>,
+) -> Option<ShareLlmProxyMetricsGuard> {
+    if !should_record_share_llm_proxy_metric(
+        route,
+        path,
+        is_share_router_probe,
+        skips_share_edge_auth,
+    ) {
+        return None;
+    }
+    let share_id = route.share_id.clone()?;
+    let request_id = request_id.filter(|value| !value.is_empty())?.to_string();
+    Some(ShareLlmProxyMetricsGuard {
+        metrics: state.metrics.clone(),
+        request_id,
+        share_id,
+        subdomain: route.subdomain.clone(),
+        app_type,
+        status,
+        started,
+    })
+}
+
 impl KeyedConcurrencyLimiter {
     /// Increment the in-flight counter for this key. Returns `None` when a
     /// non-negative `parallel_limit` has been reached (caller should reject the
@@ -206,7 +420,7 @@ impl KeyedConcurrencyLimiter {
 
 #[derive(Debug, Default)]
 pub struct ProxyRegistry {
-    routes: RwLock<HashMap<String, RouteEntry>>,
+    routes: Arc<RwLock<HashMap<String, LogicalRoute>>>,
     pending_routes: RwLock<HashMap<String, PendingRouteEntry>>,
     health_probe_failures: Mutex<HashMap<String, Instant>>,
     share_limiter: Arc<KeyedConcurrencyLimiter>,
@@ -273,36 +487,273 @@ impl ProxyRegistry {
         shutdown: Option<RouteShutdown>,
     ) {
         self.pending_routes.write().await.remove(&subdomain);
-        let old_route = {
+        let rotation_id = connection_id
+            .clone()
+            .unwrap_or_else(|| format!("legacy:{}", Uuid::new_v4()));
+        let (subdomain, old_route) = {
             let mut routes = self.routes.write().await;
-            routes.insert(
+            let slot = routes.entry(subdomain.clone()).or_default();
+            let generation = slot
+                .active
+                .iter()
+                .map(|route| route.generation)
+                .chain(slot.candidates.keys().copied())
+                .chain(slot.draining.keys().copied())
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
+            let route = RouteEntry::new(
+                backend,
+                route_kind,
+                share_id,
+                share_name,
                 subdomain.clone(),
-                RouteEntry {
-                    backend,
-                    route_kind,
-                    share_id,
-                    share_name,
-                    subdomain,
-                    installation_id,
-                    connection_id,
-                    is_free_share,
-                    parallel_limit,
-                    shutdown,
-                },
-            )
+                installation_id,
+                connection_id,
+                is_free_share,
+                parallel_limit,
+                shutdown,
+                generation,
+                rotation_id,
+            );
+            let old_route = slot.active.replace(route);
+            if let Some(old_route) = old_route.as_ref() {
+                slot.draining
+                    .insert(old_route.generation, old_route.clone());
+            }
+            (subdomain, old_route)
         };
-        if let Some(shutdown) = old_route.and_then(|route| route.shutdown) {
-            shutdown.shutdown();
+        if let Some(old_route) = old_route {
+            self.schedule_route_drain(subdomain, old_route);
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn register_candidate_with_kind(
+        &self,
+        subdomain: String,
+        backend: String,
+        route_kind: RouteKind,
+        installation_id: Option<String>,
+        connection_id: Option<String>,
+        share_id: Option<String>,
+        share_name: Option<String>,
+        is_free_share: bool,
+        parallel_limit: i64,
+        shutdown: Option<RouteShutdown>,
+        generation: u64,
+        rotation_id: String,
+    ) -> Result<(), RouteGenerationError> {
+        let mut routes = self.routes.write().await;
+        let slot = routes.entry(subdomain.clone()).or_default();
+        let active_generation = slot
+            .active
+            .as_ref()
+            .map(|route| route.generation)
+            .unwrap_or(0);
+        if generation <= active_generation {
+            return Err(RouteGenerationError::StaleGeneration {
+                generation,
+                active_generation,
+            });
+        }
+        if slot.candidates.contains_key(&generation) {
+            return Err(RouteGenerationError::GenerationConflict { generation });
+        }
+        slot.candidates.insert(
+            generation,
+            RouteEntry::new(
+                backend,
+                route_kind,
+                share_id,
+                share_name,
+                subdomain,
+                installation_id,
+                connection_id,
+                is_free_share,
+                parallel_limit,
+                shutdown,
+                generation,
+                rotation_id,
+            ),
+        );
+        Ok(())
+    }
+
+    pub(crate) async fn promote_candidate(
+        &self,
+        subdomain: &str,
+        connection_id: &str,
+        rotation_id: &str,
+        generation: u64,
+        expected_generation: u64,
+    ) -> Result<ProxyRouteState, RouteGenerationError> {
+        let (old_route, stale_candidates, state) = {
+            let mut routes = self.routes.write().await;
+            let slot = routes.entry(subdomain.to_string()).or_default();
+            let active_generation = slot
+                .active
+                .as_ref()
+                .map(|route| route.generation)
+                .unwrap_or(0);
+
+            if let Some(active) = slot.active.as_ref() {
+                if active.generation == generation
+                    && active.connection_id() == Some(connection_id)
+                    && active.rotation_id == rotation_id
+                {
+                    return Ok(proxy_route_state(slot));
+                }
+            }
+            let recovering_persisted_head = active_generation == 0 && expected_generation > 0;
+            if active_generation != expected_generation && !recovering_persisted_head {
+                return Err(RouteGenerationError::CompareAndSwapConflict {
+                    expected_generation,
+                    active_generation,
+                });
+            }
+
+            let candidate = slot
+                .candidates
+                .remove(&generation)
+                .ok_or(RouteGenerationError::CandidateNotReady { generation })?;
+            if candidate.connection_id() != Some(connection_id)
+                || candidate.rotation_id != rotation_id
+            {
+                slot.candidates.insert(generation, candidate);
+                return Err(RouteGenerationError::CandidateIdentityMismatch);
+            }
+            if generation <= active_generation {
+                slot.candidates.insert(generation, candidate);
+                return Err(RouteGenerationError::StaleGeneration {
+                    generation,
+                    active_generation,
+                });
+            }
+
+            let old_route = slot.active.replace(candidate);
+            if let Some(old_route) = old_route.as_ref() {
+                slot.draining
+                    .insert(old_route.generation, old_route.clone());
+            }
+            let stale_generations = slot
+                .candidates
+                .range(..=generation)
+                .map(|(generation, _)| *generation)
+                .collect::<Vec<_>>();
+            let stale_candidates = stale_generations
+                .into_iter()
+                .filter_map(|generation| slot.candidates.remove(&generation))
+                .collect::<Vec<_>>();
+            (old_route, stale_candidates, proxy_route_state(slot))
+        };
+        self.pending_routes.write().await.remove(subdomain);
+        for candidate in stale_candidates {
+            if let Some(shutdown) = candidate.shutdown {
+                shutdown.shutdown();
+            }
+        }
+        if let Some(old_route) = old_route {
+            self.schedule_route_drain(subdomain.to_string(), old_route);
+        }
+        Ok(state)
+    }
+
+    pub(crate) async fn rollback_candidate_promotion(
+        &self,
+        subdomain: &str,
+        connection_id: &str,
+        rotation_id: &str,
+        generation: u64,
+        expected_generation: u64,
+    ) {
+        let mut routes = self.routes.write().await;
+        let Some(slot) = routes.get_mut(subdomain) else {
+            return;
+        };
+        let promoted_matches = slot.active.as_ref().is_some_and(|route| {
+            route.generation == generation
+                && route.connection_id() == Some(connection_id)
+                && route.rotation_id() == rotation_id
+        });
+        if !promoted_matches {
+            return;
+        }
+        let Some(promoted) = slot.active.take() else {
+            return;
+        };
+        if expected_generation > 0 {
+            slot.active = slot.draining.remove(&expected_generation);
+        }
+        slot.candidates.insert(generation, promoted);
+    }
+
+    pub(crate) async fn route_state(&self, subdomain: &str) -> Option<ProxyRouteState> {
+        self.routes
+            .read()
+            .await
+            .get(subdomain)
+            .map(proxy_route_state)
+    }
+
+    pub(crate) async fn candidate_for_activation(
+        &self,
+        subdomain: &str,
+        connection_id: &str,
+        rotation_id: &str,
+        generation: u64,
+    ) -> Option<RouteEntry> {
+        self.routes
+            .read()
+            .await
+            .get(subdomain)
+            .and_then(|slot| slot.candidates.get(&generation))
+            .filter(|route| {
+                route.connection_id() == Some(connection_id) && route.rotation_id() == rotation_id
+            })
+            .cloned()
+    }
+
+    pub(crate) async fn next_generation(&self, subdomain: &str) -> u64 {
+        self.routes
+            .read()
+            .await
+            .get(subdomain)
+            .map(|slot| {
+                slot.active
+                    .iter()
+                    .map(|route| route.generation)
+                    .chain(slot.candidates.keys().copied())
+                    .chain(slot.draining.keys().copied())
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1)
+            })
+            .unwrap_or(1)
+    }
+
+    pub(crate) async fn active_generation(&self, subdomain: &str) -> u64 {
+        self.routes
+            .read()
+            .await
+            .get(subdomain)
+            .and_then(|slot| slot.active.as_ref())
+            .map(|route| route.generation)
+            .unwrap_or(0)
+    }
+
     pub async fn mark_route_pending(&self, subdomain: String, ttl: Duration) {
+        self.declare_known_route(subdomain.clone()).await;
         self.pending_routes.write().await.insert(
             subdomain,
             PendingRouteEntry {
                 expires_at: Instant::now() + ttl,
             },
         );
+    }
+
+    pub(crate) async fn declare_known_route(&self, subdomain: String) {
+        self.routes.write().await.entry(subdomain).or_default();
     }
 
     pub async fn has_pending_route(&self, subdomain: &str) -> bool {
@@ -314,36 +765,100 @@ impl ProxyRegistry {
 
     pub async fn remove_route(&self, subdomain: &str) {
         let old_route = self.routes.write().await.remove(subdomain);
-        if let Some(shutdown) = old_route.and_then(|route| route.shutdown) {
-            shutdown.shutdown();
-        }
+        self.pending_routes.write().await.remove(subdomain);
+        shutdown_logical_route(old_route);
     }
 
     pub async fn remove_route_if_present(&self, subdomain: &str) -> bool {
         let old_route = self.routes.write().await.remove(subdomain);
         let removed = old_route.is_some();
-        if let Some(shutdown) = old_route.and_then(|route| route.shutdown) {
-            shutdown.shutdown();
-        }
+        self.pending_routes.write().await.remove(subdomain);
+        shutdown_logical_route(old_route);
         removed
     }
 
     pub async fn remove_route_if_connection(&self, subdomain: &str, connection_id: &str) -> bool {
         let mut routes = self.routes.write().await;
-        let should_remove = routes
-            .get(subdomain)
-            .and_then(|route| route.connection_id())
-            == Some(connection_id);
-        let old_route = if should_remove {
-            routes.remove(subdomain)
-        } else {
-            None
+        let Some(slot) = routes.get_mut(subdomain) else {
+            return false;
         };
+        let mut removed = Vec::new();
+        if slot.active.as_ref().and_then(RouteEntry::connection_id) == Some(connection_id) {
+            if let Some(route) = slot.active.take() {
+                removed.push(route);
+            }
+        }
+        let candidate_generations = slot
+            .candidates
+            .iter()
+            .filter_map(|(generation, route)| {
+                (route.connection_id() == Some(connection_id)).then_some(*generation)
+            })
+            .collect::<Vec<_>>();
+        for generation in candidate_generations {
+            if let Some(route) = slot.candidates.remove(&generation) {
+                removed.push(route);
+            }
+        }
+        let draining_generations = slot
+            .draining
+            .iter()
+            .filter_map(|(generation, route)| {
+                (route.connection_id() == Some(connection_id)).then_some(*generation)
+            })
+            .collect::<Vec<_>>();
+        for generation in draining_generations {
+            if let Some(route) = slot.draining.remove(&generation) {
+                removed.push(route);
+            }
+        }
         drop(routes);
-        if let Some(shutdown) = old_route.and_then(|route| route.shutdown) {
-            shutdown.shutdown();
+        let should_remove = !removed.is_empty();
+        for route in removed {
+            if let Some(shutdown) = route.shutdown {
+                shutdown.shutdown();
+            }
         }
         should_remove
+    }
+
+    pub(crate) async fn remove_route_target_if_generation(
+        &self,
+        subdomain: &str,
+        connection_id: &str,
+        generation: u64,
+    ) -> bool {
+        let mut routes = self.routes.write().await;
+        let Some(slot) = routes.get_mut(subdomain) else {
+            return false;
+        };
+        let mut removed = None;
+        if slot.active.as_ref().is_some_and(|route| {
+            route.generation == generation && route.connection_id() == Some(connection_id)
+        }) {
+            removed = slot.active.take();
+        } else if slot
+            .candidates
+            .get(&generation)
+            .is_some_and(|route| route.connection_id() == Some(connection_id))
+        {
+            removed = slot.candidates.remove(&generation);
+        } else if slot
+            .draining
+            .get(&generation)
+            .is_some_and(|route| route.connection_id() == Some(connection_id))
+        {
+            removed = slot.draining.remove(&generation);
+        }
+        drop(routes);
+        if let Some(route) = removed {
+            if let Some(shutdown) = route.shutdown {
+                shutdown.shutdown();
+            }
+            true
+        } else {
+            false
+        }
     }
 
     pub async fn active_route_connections(&self) -> HashMap<String, Option<String>> {
@@ -351,7 +866,11 @@ impl ProxyRegistry {
             .read()
             .await
             .iter()
-            .map(|(subdomain, route)| (subdomain.clone(), route.connection_id.clone()))
+            .filter_map(|(subdomain, slot)| {
+                slot.active
+                    .as_ref()
+                    .map(|route| (subdomain.clone(), route.connection_id.clone()))
+            })
             .collect()
     }
 
@@ -361,7 +880,25 @@ impl ProxyRegistry {
         tunnel_domain: &str,
     ) -> Option<RouteEntry> {
         let subdomain = subdomain_for_host(host, tunnel_domain)?;
-        self.routes.read().await.get(&subdomain).cloned()
+        self.routes
+            .read()
+            .await
+            .get(&subdomain)
+            .and_then(|slot| slot.active.clone())
+    }
+
+    async fn route_for_host_request(&self, host: &str, tunnel_domain: &str) -> RouteLookup {
+        let Some(subdomain) = subdomain_for_host(host, tunnel_domain) else {
+            return RouteLookup::Unknown;
+        };
+        let routes = self.routes.read().await;
+        let Some(slot) = routes.get(&subdomain) else {
+            return RouteLookup::Unknown;
+        };
+        match slot.active.as_ref() {
+            Some(route) => RouteLookup::Active(route.clone(), route.acquire()),
+            None => RouteLookup::Reconnecting,
+        }
     }
 
     pub(crate) async fn route_by_share_id(&self, share_id: &str) -> Option<RouteEntry> {
@@ -369,12 +906,30 @@ impl ProxyRegistry {
             .read()
             .await
             .values()
+            .filter_map(|slot| slot.active.as_ref())
             .find(|route| route.share_id.as_deref() == Some(share_id))
             .cloned()
     }
 
+    async fn route_for_share_request(
+        &self,
+        share_id: &str,
+    ) -> Option<(RouteEntry, RouteInflightGuard)> {
+        let routes = self.routes.read().await;
+        let route = routes
+            .values()
+            .filter_map(|slot| slot.active.as_ref())
+            .find(|route| route.share_id.as_deref() == Some(share_id))?;
+        Some((route.clone(), route.acquire()))
+    }
+
     pub async fn active_subdomains(&self) -> Vec<String> {
-        self.routes.read().await.keys().cloned().collect()
+        self.routes
+            .read()
+            .await
+            .iter()
+            .filter_map(|(subdomain, slot)| slot.active.as_ref().map(|_| subdomain.clone()))
+            .collect()
     }
 
     pub async fn counts(&self) -> ProxyRegistryCounts {
@@ -384,10 +939,54 @@ impl ProxyRegistry {
         let mut failures = self.health_probe_failures.lock().await;
         failures.retain(|_, expires_at| *expires_at > now);
         ProxyRegistryCounts {
-            active_routes: self.routes.read().await.len(),
+            active_routes: self
+                .routes
+                .read()
+                .await
+                .values()
+                .filter(|slot| slot.active.is_some())
+                .count(),
             pending_routes: pending.len(),
             health_probe_failure_cache: failures.len(),
         }
+    }
+
+    fn schedule_route_drain(&self, subdomain: String, route: RouteEntry) {
+        let routes = self.routes.clone();
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + ROUTE_DRAIN_TIMEOUT;
+            loop {
+                if route.transport.inflight.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                if tokio::time::timeout_at(deadline, route.transport.idle.notified())
+                    .await
+                    .is_err()
+                {
+                    warn!(
+                        subdomain = %subdomain,
+                        generation = route.generation,
+                        connection_id = route.connection_id().unwrap_or("-"),
+                        inflight = route.transport.inflight.load(Ordering::Acquire),
+                        "route drain deadline reached; closing old transport"
+                    );
+                    break;
+                }
+            }
+            let mut routes = routes.write().await;
+            if let Some(slot) = routes.get_mut(&subdomain) {
+                let matches = slot.draining.get(&route.generation).is_some_and(|current| {
+                    current.connection_id == route.connection_id
+                        && current.rotation_id == route.rotation_id
+                });
+                if matches {
+                    slot.draining.remove(&route.generation);
+                    if let Some(shutdown) = route.shutdown.as_ref() {
+                        shutdown.shutdown();
+                    }
+                }
+            }
+        });
     }
 
     /// Snapshot of in-flight request counts per share_id. Share IDs absent from
@@ -509,6 +1108,34 @@ impl ProxyRegistry {
     }
 }
 
+fn proxy_route_state(slot: &LogicalRoute) -> ProxyRouteState {
+    ProxyRouteState {
+        active_generation: slot.active.as_ref().map(|route| route.generation),
+        active_connection_id: slot
+            .active
+            .as_ref()
+            .and_then(|route| route.connection_id.clone()),
+        candidate_generations: slot.candidates.keys().copied().collect(),
+        draining_generations: slot.draining.keys().copied().collect(),
+    }
+}
+
+fn shutdown_logical_route(route: Option<LogicalRoute>) {
+    let Some(route) = route else {
+        return;
+    };
+    for route in route
+        .active
+        .into_iter()
+        .chain(route.candidates.into_values())
+        .chain(route.draining.into_values())
+    {
+        if let Some(shutdown) = route.shutdown {
+            shutdown.shutdown();
+        }
+    }
+}
+
 pub async fn market_proxy_handler(
     State(state): State<ServerState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -624,7 +1251,8 @@ pub async fn market_proxy_handler(
         return simple_response(StatusCode::FORBIDDEN, "share-not-authorized-for-market");
     }
 
-    let Some(route) = state.proxy.route_by_share_id(&share_id).await else {
+    let Some((route, route_inflight_guard)) = state.proxy.route_for_share_request(&share_id).await
+    else {
         return simple_response(StatusCode::NOT_FOUND, "share-offline");
     };
     let backend = route.backend.clone();
@@ -734,6 +1362,79 @@ pub async fn market_proxy_handler(
     if let Some(ref request_id) = live_request_id {
         builder = builder.header("X-CC-Switch-Request-Id", request_id.as_str());
     }
+    if route.is_share() || route.is_client_web() {
+        let installation_id = route.installation_id().unwrap_or_default();
+        let control_secret = match state
+            .store
+            .installation_control_secret(installation_id)
+            .await
+        {
+            Ok(Some(secret)) if !secret.trim().is_empty() => secret,
+            Ok(_) => {
+                return simple_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ingress-control-secret-missing",
+                );
+            }
+            Err(error) => {
+                warn!(
+                    installation_id,
+                    error = %error,
+                    "proxy ingress context secret lookup failed"
+                );
+                return simple_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ingress-control-secret-lookup-failed",
+                );
+            }
+        };
+        let request_id = live_request_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let route_id = route
+            .share_id()
+            .map(|share_id| format!("share:{share_id}"))
+            .unwrap_or_else(|| format!("client:{installation_id}"));
+        let signed = match crate::ingress_context::sign(
+            crate::ingress_context::IngressContext {
+                protocol_epoch: crate::namespace::PROTOCOL_EPOCH.to_string(),
+                router_id: state
+                    .config
+                    .tunnel_domain
+                    .trim_end_matches('.')
+                    .to_ascii_lowercase(),
+                route_id,
+                installation_id: installation_id.to_string(),
+                target_lane_id: installation_id.to_string(),
+                public_host: format!("{}.{}", route.subdomain, state.config.tunnel_domain),
+                share_id: route.share_id.clone(),
+                request_id,
+                user_email: None,
+                user_role: None,
+                user_country: client_metadata.country_code.clone(),
+                issued_at_ms: chrono::Utc::now().timestamp_millis(),
+            },
+            &control_secret,
+        ) {
+            Ok(signed) => signed,
+            Err(error) => {
+                warn!(error, "proxy ingress context signing failed");
+                return simple_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ingress-context-signing-failed",
+                );
+            }
+        };
+        builder = builder
+            .header(
+                crate::ingress_context::INGRESS_CONTEXT_HEADER,
+                signed.encoded_context,
+            )
+            .header(
+                crate::ingress_context::INGRESS_SIGNATURE_HEADER,
+                signed.signature,
+            );
+    }
     builder = with_share_user_country_headers(builder, client_metadata.country_code.as_deref());
     let recent_traffic_guard = live_request_id.as_ref().map(|id| RecentTrafficGuard {
         traffic: state.recent_traffic.clone(),
@@ -775,6 +1476,7 @@ pub async fn market_proxy_handler(
     let body_stream = upstream
         .bytes_stream()
         .scan(false, move |stream_ended, chunk| {
+            let _route_inflight_guard = &route_inflight_guard;
             let _permit = &share_permit;
             let _free_share_ip_permit = &free_share_ip_permit;
             let _market_permit = &market_permit;
@@ -911,7 +1613,8 @@ pub async fn gateway_proxy_handler(
         return simple_response(StatusCode::FORBIDDEN, "share-not-authorized-for-gateway");
     }
 
-    let Some(route) = state.proxy.route_by_share_id(&share_id).await else {
+    let Some((route, route_inflight_guard)) = state.proxy.route_for_share_request(&share_id).await
+    else {
         return simple_response(StatusCode::NOT_FOUND, "share-offline");
     };
     let backend = route.backend.clone();
@@ -995,6 +1698,20 @@ pub async fn gateway_proxy_handler(
         )
         .await;
     builder = builder.header("X-CC-Switch-Request-Id", live_request_id.as_str());
+    builder = match with_signed_ingress_context(
+        &state,
+        builder,
+        &route,
+        format!("{}.{}", route.subdomain, state.config.tunnel_domain),
+        live_request_id.clone(),
+        None,
+        client_metadata.country_code.clone(),
+    )
+    .await
+    {
+        Ok(builder) => builder,
+        Err(response) => return response,
+    };
     let recent_traffic_guard = RecentTrafficGuard {
         traffic: state.recent_traffic.clone(),
         request_id: live_request_id,
@@ -1031,6 +1748,7 @@ pub async fn gateway_proxy_handler(
         use futures_util::StreamExt;
 
         upstream.bytes_stream().map(move |chunk| {
+            let _route_inflight_guard = &route_inflight_guard;
             let _permit = &share_permit;
             let _free_share_ip_permit = &free_share_ip_permit;
             let _recent_traffic_guard = &recent_traffic_guard;
@@ -1177,39 +1895,55 @@ pub async fn proxy_handler(
     }
 
     let route_subdomain = subdomain_for_host(&host, &state.config.tunnel_domain);
-    let Some(route) = state
+    let (route, route_inflight_guard) = match state
         .proxy
-        .backend_for_host(&host, &state.config.tunnel_domain)
+        .route_for_host_request(&host, &state.config.tunnel_domain)
         .await
-    else {
-        if is_share_router_probe {
-            if let Some(subdomain) = route_subdomain.as_deref() {
-                if state.proxy.has_pending_route(subdomain).await {
-                    debug!(
-                        method = %method,
-                        host = %host,
-                        path = %path_and_query,
-                        client_ip = %user_ip,
-                        client_country = %user_country,
-                        client_asn = %user_asn,
-                        user_agent = %user_agent,
-                        "proxy health probe accepted while route registration is pending"
-                    );
-                    return empty_response(StatusCode::NO_CONTENT);
+    {
+        RouteLookup::Active(route, guard) => (route, guard),
+        RouteLookup::Reconnecting => {
+            if is_share_router_probe {
+                if let Some(subdomain) = route_subdomain.as_deref() {
+                    if state.proxy.has_pending_route(subdomain).await {
+                        debug!(
+                            method = %method,
+                            host = %host,
+                            path = %path_and_query,
+                            client_ip = %user_ip,
+                            client_country = %user_country,
+                            client_asn = %user_asn,
+                            user_agent = %user_agent,
+                            "proxy health probe accepted while route registration is pending"
+                        );
+                        return empty_response(StatusCode::NO_CONTENT);
+                    }
                 }
             }
+            warn!(
+                method = %method,
+                host = %host,
+                path = %path_and_query,
+                client_ip = %user_ip,
+                client_country = %user_country,
+                client_asn = %user_asn,
+                user_agent = %user_agent,
+                "proxy request deferred: registered tunnel is reconnecting"
+            );
+            return reconnecting_response();
         }
-        warn!(
-            method = %method,
-            host = %host,
-            path = %path_and_query,
-            client_ip = %user_ip,
-            client_country = %user_country,
-            client_asn = %user_asn,
-            user_agent = %user_agent,
-            "proxy request rejected: unregistered subdomain"
-        );
-        return simple_response(StatusCode::NOT_FOUND, "unregistered-subdomain");
+        RouteLookup::Unknown => {
+            warn!(
+                method = %method,
+                host = %host,
+                path = %path_and_query,
+                client_ip = %user_ip,
+                client_country = %user_country,
+                client_asn = %user_asn,
+                user_agent = %user_agent,
+                "proxy request rejected: unregistered subdomain"
+            );
+            return simple_response(StatusCode::NOT_FOUND, "unregistered-subdomain");
+        }
     };
     if is_internal_share_router_path
         && method == axum::http::Method::GET
@@ -1474,6 +2208,7 @@ pub async fn proxy_handler(
             return handle_image_generation_stream_submit(
                 &state,
                 &route,
+                route_inflight_guard,
                 body_bytes,
                 api_user_email,
                 user_ip,
@@ -1670,6 +2405,88 @@ pub async fn proxy_handler(
     if let Some(ref request_id) = live_request_id {
         builder = builder.header("X-CC-Switch-Request-Id", request_id.as_str());
     }
+    if route.is_share() || route.is_client_web() {
+        let installation_id = route.installation_id().unwrap_or_default();
+        let control_secret = match state
+            .store
+            .installation_control_secret(installation_id)
+            .await
+        {
+            Ok(Some(secret)) if !secret.trim().is_empty() => secret,
+            Ok(_) => {
+                return simple_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ingress-control-secret-missing",
+                );
+            }
+            Err(error) => {
+                warn!(
+                    installation_id,
+                    error = %error,
+                    "proxy ingress context secret lookup failed"
+                );
+                return simple_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ingress-control-secret-lookup-failed",
+                );
+            }
+        };
+        let request_id = live_request_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let route_id = route
+            .share_id()
+            .map(|share_id| format!("share:{share_id}"))
+            .unwrap_or_else(|| format!("client:{installation_id}"));
+        let signed = match crate::ingress_context::sign(
+            crate::ingress_context::IngressContext {
+                protocol_epoch: crate::namespace::PROTOCOL_EPOCH.to_string(),
+                router_id: state
+                    .config
+                    .tunnel_domain
+                    .trim_end_matches('.')
+                    .to_ascii_lowercase(),
+                route_id,
+                installation_id: installation_id.to_string(),
+                target_lane_id: installation_id.to_string(),
+                public_host: host
+                    .split(':')
+                    .next()
+                    .unwrap_or_default()
+                    .trim_end_matches('.')
+                    .to_ascii_lowercase(),
+                share_id: route.share_id.clone(),
+                request_id,
+                user_email: api_user_email
+                    .clone()
+                    .or_else(|| client_web_session.as_ref().map(|(email, _)| email.clone())),
+                user_role: client_web_session
+                    .as_ref()
+                    .map(|(_, is_admin)| if *is_admin { "admin" } else { "owner" }.to_string()),
+                user_country: client_metadata.country_code.clone(),
+                issued_at_ms: chrono::Utc::now().timestamp_millis(),
+            },
+            &control_secret,
+        ) {
+            Ok(signed) => signed,
+            Err(error) => {
+                warn!(error, "proxy ingress context signing failed");
+                return simple_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ingress-context-signing-failed",
+                );
+            }
+        };
+        builder = builder
+            .header(
+                crate::ingress_context::INGRESS_CONTEXT_HEADER,
+                signed.encoded_context,
+            )
+            .header(
+                crate::ingress_context::INGRESS_SIGNATURE_HEADER,
+                signed.signature,
+            );
+    }
     // Bind a completion guard to the recorded request id. While this binding
     // lives at function scope it covers the early-return-on-upstream-error
     // path; once the body stream is constructed we move it into the streaming
@@ -1678,6 +2495,8 @@ pub async fn proxy_handler(
         traffic: state.recent_traffic.clone(),
         request_id: id.clone(),
     });
+    let share_proxy_started = Instant::now();
+    let share_request_app = infer_share_request_app(&path, &parts.headers);
 
     let upstream = match builder.body(body).send().await {
         Ok(response) => response,
@@ -1720,6 +2539,17 @@ pub async fn proxy_handler(
                 error = %err,
                 "proxy upstream request failed"
             );
+            let _share_llm_metrics_guard = share_llm_proxy_metrics_guard(
+                &state,
+                &route,
+                &path,
+                is_share_router_probe,
+                skips_share_edge_auth,
+                live_request_id.as_deref(),
+                StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                share_proxy_started,
+                share_request_app.clone(),
+            );
             return simple_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &format!("connection-lost: {err}"),
@@ -1729,6 +2559,17 @@ pub async fn proxy_handler(
 
     let status = upstream.status();
     state.metrics.record_proxy_status(status);
+    let share_llm_metrics_guard = share_llm_proxy_metrics_guard(
+        &state,
+        &route,
+        &path,
+        is_share_router_probe,
+        skips_share_edge_auth,
+        live_request_id.as_deref(),
+        status.as_u16(),
+        share_proxy_started,
+        share_request_app,
+    );
     if is_health_check_request {
         state
             .proxy
@@ -1763,12 +2604,14 @@ pub async fn proxy_handler(
     let body_stream = upstream
         .bytes_stream()
         .scan(false, move |stream_ended, chunk| {
+            let _route_inflight_guard = &route_inflight_guard;
             let _permit = &share_permit;
             let _free_share_ip_permit = &free_share_ip_permit;
             // Hold the recent-traffic guard until the upstream stream ends so
             // the dashboard ticker keeps the row marked in-flight for the full
             // request lifecycle (success, client disconnect, or chunk error).
             let _recent_traffic_guard = &recent_traffic_guard;
+            let _share_llm_metrics_guard = &share_llm_metrics_guard;
             let _metrics_permit = &metrics_permit;
             let output = proxy_body_chunk(is_event_stream, stream_ended, chunk);
             futures_util::future::ready(output)
@@ -1837,6 +2680,7 @@ fn image_generation_request_wants_stream(body: &[u8]) -> bool {
 async fn handle_image_generation_stream_submit(
     state: &ServerState,
     route: &RouteEntry,
+    route_inflight_guard: RouteInflightGuard,
     body: axum::body::Bytes,
     api_user_email: Option<String>,
     user_ip: String,
@@ -1970,18 +2814,33 @@ async fn handle_image_generation_stream_submit(
     builder = with_share_user_country_headers(builder, Some(user_country.as_str()));
 
     let metrics_permit = state.metrics.proxy_request_started();
+    let request_id = state
+        .recent_traffic
+        .record(
+            share_id.to_string(),
+            route.share_name.clone(),
+            Some(route.subdomain.clone()),
+            Some(user_country.clone()),
+            api_user_email.clone(),
+        )
+        .await;
+    builder = match with_signed_ingress_context(
+        state,
+        builder,
+        route,
+        format!("{}.{}", route.subdomain, state.config.tunnel_domain),
+        request_id.clone(),
+        api_user_email.clone(),
+        Some(user_country.clone()),
+    )
+    .await
+    {
+        Ok(builder) => builder,
+        Err(response) => return response,
+    };
     let recent_traffic_guard = Some(RecentTrafficGuard {
         traffic: state.recent_traffic.clone(),
-        request_id: state
-            .recent_traffic
-            .record(
-                share_id.to_string(),
-                route.share_name.clone(),
-                Some(route.subdomain.clone()),
-                Some(user_country.clone()),
-                None,
-            )
-            .await,
+        request_id,
     });
 
     let request_started = Instant::now();
@@ -2059,6 +2918,7 @@ async fn handle_image_generation_stream_submit(
     let stream = async_stream::stream! {
         use futures_util::StreamExt;
 
+        let _route_inflight_guard = route_inflight_guard;
         let _image_permit = image_permit;
         let _metrics_permit = metrics_permit;
         let _recent_traffic_guard = recent_traffic_guard;
@@ -2699,6 +3559,91 @@ fn simple_response(status: StatusCode, reason: &str) -> Response {
     response
 }
 
+fn reconnecting_response() -> Response {
+    let mut response = simple_response(StatusCode::SERVICE_UNAVAILABLE, "tunnel-reconnecting");
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    response
+}
+
+async fn with_signed_ingress_context(
+    state: &ServerState,
+    builder: reqwest::RequestBuilder,
+    route: &RouteEntry,
+    public_host: String,
+    request_id: String,
+    user_email: Option<String>,
+    user_country: Option<String>,
+) -> Result<reqwest::RequestBuilder, Response> {
+    let installation_id = route.installation_id().unwrap_or_default();
+    let control_secret = match state
+        .store
+        .installation_control_secret(installation_id)
+        .await
+    {
+        Ok(Some(secret)) if !secret.trim().is_empty() => secret,
+        Ok(_) => {
+            return Err(simple_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ingress-control-secret-missing",
+            ));
+        }
+        Err(error) => {
+            warn!(
+                installation_id,
+                error = %error,
+                "proxy ingress context secret lookup failed"
+            );
+            return Err(simple_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ingress-control-secret-lookup-failed",
+            ));
+        }
+    };
+    let route_id = route
+        .share_id()
+        .map(|share_id| format!("share:{share_id}"))
+        .unwrap_or_else(|| format!("client:{installation_id}"));
+    let signed = crate::ingress_context::sign(
+        crate::ingress_context::IngressContext {
+            protocol_epoch: crate::namespace::PROTOCOL_EPOCH.to_string(),
+            router_id: state
+                .config
+                .tunnel_domain
+                .trim_end_matches('.')
+                .to_ascii_lowercase(),
+            route_id,
+            installation_id: installation_id.to_string(),
+            target_lane_id: installation_id.to_string(),
+            public_host,
+            share_id: route.share_id.clone(),
+            request_id,
+            user_email,
+            user_role: None,
+            user_country,
+            issued_at_ms: chrono::Utc::now().timestamp_millis(),
+        },
+        &control_secret,
+    )
+    .map_err(|error| {
+        warn!(error, "proxy ingress context signing failed");
+        simple_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ingress-context-signing-failed",
+        )
+    })?;
+    Ok(builder
+        .header(
+            crate::ingress_context::INGRESS_CONTEXT_HEADER,
+            signed.encoded_context,
+        )
+        .header(
+            crate::ingress_context::INGRESS_SIGNATURE_HEADER,
+            signed.signature,
+        ))
+}
+
 fn empty_response(status: StatusCode) -> Response {
     let mut response = Response::new(Body::empty());
     *response.status_mut() = status;
@@ -3197,6 +4142,7 @@ mod tests {
             .store
             .register_installation(
                 crate::models::RegisterInstallationRequest {
+                    protocol_epoch: crate::namespace::PROTOCOL_EPOCH.into(),
                     public_key: base64::engine::general_purpose::STANDARD
                         .encode(signing_key.verifying_key().to_bytes()),
                     platform: "test".into(),
@@ -3629,6 +4575,209 @@ data: {"data":[{"b64_json":"iVBORw0KGgo="}]}
             .await
             .expect("removed route should receive shutdown");
         assert!(*new_rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn candidate_is_not_routable_until_generation_cas_promotes_it() {
+        let registry = ProxyRegistry::default();
+        registry
+            .set_route(
+                "demo".into(),
+                "127.0.0.1:3000".into(),
+                Some("old-connection".into()),
+                Some("share-1".into()),
+                None,
+                false,
+                5,
+                None,
+            )
+            .await;
+        registry
+            .register_candidate_with_kind(
+                "demo".into(),
+                "127.0.0.1:3001".into(),
+                RouteKind::Share,
+                Some("installation-1".into()),
+                Some("new-connection".into()),
+                Some("share-1".into()),
+                None,
+                false,
+                5,
+                None,
+                2,
+                "rotation-2".into(),
+            )
+            .await
+            .expect("register candidate");
+
+        let before = registry
+            .backend_for_host("demo.example.com", "example.com")
+            .await
+            .expect("old active route");
+        assert_eq!(before.backend, "127.0.0.1:3000");
+
+        let conflict = registry
+            .promote_candidate("demo", "new-connection", "rotation-2", 2, 0)
+            .await
+            .expect_err("wrong expected generation must fail");
+        assert!(matches!(
+            conflict,
+            RouteGenerationError::CompareAndSwapConflict { .. }
+        ));
+        let still_old = registry
+            .backend_for_host("demo.example.com", "example.com")
+            .await
+            .expect("old active survives failed CAS");
+        assert_eq!(still_old.backend, "127.0.0.1:3000");
+
+        registry
+            .promote_candidate("demo", "new-connection", "rotation-2", 2, 1)
+            .await
+            .expect("promote candidate");
+        let promoted = registry
+            .backend_for_host("demo.example.com", "example.com")
+            .await
+            .expect("promoted route");
+        assert_eq!(promoted.backend, "127.0.0.1:3001");
+        assert_eq!(promoted.generation(), 2);
+    }
+
+    #[tokio::test]
+    async fn promoted_route_drains_old_inflight_before_listener_shutdown() {
+        let registry = ProxyRegistry::default();
+        let (old_shutdown, mut old_rx) = RouteShutdown::new();
+        registry
+            .set_route(
+                "demo".into(),
+                "127.0.0.1:3000".into(),
+                Some("old-connection".into()),
+                Some("share-1".into()),
+                None,
+                false,
+                5,
+                Some(old_shutdown),
+            )
+            .await;
+        let inflight = match registry
+            .route_for_host_request("demo.example.com", "example.com")
+            .await
+        {
+            RouteLookup::Active(_, guard) => guard,
+            other => panic!("expected active route, got {other:?}"),
+        };
+        registry
+            .register_candidate_with_kind(
+                "demo".into(),
+                "127.0.0.1:3001".into(),
+                RouteKind::Share,
+                Some("installation-1".into()),
+                Some("new-connection".into()),
+                Some("share-1".into()),
+                None,
+                false,
+                5,
+                None,
+                2,
+                "rotation-2".into(),
+            )
+            .await
+            .expect("register candidate");
+        registry
+            .promote_candidate("demo", "new-connection", "rotation-2", 2, 1)
+            .await
+            .expect("promote candidate");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), old_rx.changed())
+                .await
+                .is_err(),
+            "old listener must remain while its selected request is in flight"
+        );
+        assert_eq!(
+            registry
+                .route_state("demo")
+                .await
+                .expect("route state")
+                .draining_generations,
+            vec![1]
+        );
+
+        drop(inflight);
+        tokio::time::timeout(Duration::from_secs(1), old_rx.changed())
+            .await
+            .expect("old listener shutdown after drain")
+            .expect("shutdown sender remains alive");
+        assert!(*old_rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn stale_generation_cleanup_cannot_remove_new_active_generation() {
+        let registry = ProxyRegistry::default();
+        registry
+            .set_route(
+                "demo".into(),
+                "127.0.0.1:3000".into(),
+                Some("old-connection".into()),
+                Some("share-1".into()),
+                None,
+                false,
+                5,
+                None,
+            )
+            .await;
+        registry
+            .register_candidate_with_kind(
+                "demo".into(),
+                "127.0.0.1:3001".into(),
+                RouteKind::Share,
+                None,
+                Some("new-connection".into()),
+                Some("share-1".into()),
+                None,
+                false,
+                5,
+                None,
+                2,
+                "rotation-2".into(),
+            )
+            .await
+            .expect("register candidate");
+        registry
+            .promote_candidate("demo", "new-connection", "rotation-2", 2, 1)
+            .await
+            .expect("promote candidate");
+
+        registry
+            .remove_route_target_if_generation("demo", "old-connection", 1)
+            .await;
+        let active = registry
+            .backend_for_host("demo.example.com", "example.com")
+            .await
+            .expect("new active remains");
+        assert_eq!(active.connection_id(), Some("new-connection"));
+        assert_eq!(active.generation(), 2);
+    }
+
+    #[tokio::test]
+    async fn known_route_without_target_is_reconnecting_not_unknown() {
+        let registry = ProxyRegistry::default();
+        registry.declare_known_route("known".into()).await;
+
+        assert!(matches!(
+            registry
+                .route_for_host_request("known.example.com", "example.com")
+                .await,
+            RouteLookup::Reconnecting
+        ));
+        assert!(matches!(
+            registry
+                .route_for_host_request("unknown.example.com", "example.com")
+                .await,
+            RouteLookup::Unknown
+        ));
+        let response = reconnecting_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
     }
 
     #[tokio::test]
