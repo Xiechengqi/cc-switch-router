@@ -26,7 +26,8 @@ use crate::ctl_client::authorize_control_request;
 use crate::dynamic_settings::BoardSettings;
 use crate::error::AppError;
 use crate::models::{
-    AuthSession, AuthUser, BindInstallationOwnerEmailRequest, BindInstallationOwnerEmailResponse,
+    AnnouncementResponse, AnnouncementSettings, AnnouncementSettingsUpdate, AuthSession, AuthUser,
+    BindInstallationOwnerEmailRequest, BindInstallationOwnerEmailResponse,
     BoardMessageListResponse, BoardMessageView, BoardMetaResponse,
     ChangeInstallationOwnerEmailRequest, ChangeInstallationOwnerEmailResponse, ClientMetadata,
     ClientTunnelClaimRequest, ClientTunnelConfig, ClientTunnelQuery, ClientTunnelResponse,
@@ -111,6 +112,7 @@ const MARKET_OFFLINE_GRACE_SECS: i64 = 24 * 60 * 60;
 const MARKET_ACTIVE_MISSING_GRACE_SECS: i64 = 5 * 60;
 const AUTH_CODE_DIGITS: usize = 6;
 const AUTH_PURPOSE_LOGIN: &str = "login";
+const SESSION_REFRESH_ROTATION_GRACE_SECS: i64 = 30;
 const MARKET_DEFAULT_SCOPES: &[&str] = &[
     "market:shares:read",
     "market:proxy:use",
@@ -3487,7 +3489,10 @@ impl AppStore {
         let now = Utc::now();
         let refresh_hash = hash_token(input.refresh_token.trim());
         let conn = self.conn.lock().await;
-        let current = get_session_by_refresh_hash(&conn, &refresh_hash)?
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| AppError::Internal(format!("begin refresh session failed: {e}")))?;
+        let current = get_refreshable_session_by_refresh_hash(&tx, &refresh_hash, now)?
             .ok_or_else(|| AppError::Unauthorized("refresh session not found".into()))?;
         if current.refresh_expires_at < now {
             return Err(AppError::Unauthorized("refresh session expired".into()));
@@ -3498,31 +3503,48 @@ impl AppStore {
             ));
         }
 
-        let user = get_user_by_id(&conn, &current.user_id)?
+        let user = get_user_by_id(&tx, &current.user_id)?
             .ok_or_else(|| AppError::Unauthorized("user not found".into()))?;
         let access_token = generate_secret(48);
         let refresh_token = generate_secret(64);
         let access_expires_at = now + Duration::seconds(config.auth_session_ttl_secs);
         let refresh_expires_at = now + Duration::seconds(config.auth_refresh_ttl_secs);
-        conn.execute(
-            "UPDATE user_sessions
-             SET access_token_hash = ?2,
-                 refresh_token_hash = ?3,
-                 access_expires_at = ?4,
-                 refresh_expires_at = ?5,
-                 last_used_at = ?6,
-                 revoked_at = NULL
-             WHERE id = ?1",
-            params![
-                current.session_id,
-                hash_token(&access_token),
-                hash_token(&refresh_token),
-                access_expires_at.to_rfc3339(),
-                refresh_expires_at.to_rfc3339(),
-                now.to_rfc3339(),
-            ],
-        )
-        .map_err(|e| AppError::Internal(format!("refresh session failed: {e}")))?;
+        let rotated = tx
+            .execute(
+                "UPDATE user_sessions
+             SET revoked_at = COALESCE(revoked_at, ?2),
+                 rotated_at = COALESCE(rotated_at, ?2),
+                 last_used_at = ?2
+             WHERE id = ?1
+               AND (revoked_at IS NULL OR rotated_at >= ?3)",
+                params![
+                    current.session_id,
+                    now.to_rfc3339(),
+                    (now - Duration::seconds(SESSION_REFRESH_ROTATION_GRACE_SECS)).to_rfc3339(),
+                ],
+            )
+            .map_err(|e| AppError::Internal(format!("refresh session failed: {e}")))?;
+        if rotated != 1 {
+            return Err(AppError::Unauthorized(
+                "refresh session already rotated".into(),
+            ));
+        }
+
+        let replacement = AuthSession {
+            session_id: Uuid::new_v4().to_string(),
+            user_id: current.user_id.clone(),
+            email: user.email.clone(),
+            installation_id: current.installation_id,
+            access_token_hash: hash_token(&access_token),
+            refresh_token_hash: hash_token(&refresh_token),
+            access_expires_at,
+            refresh_expires_at,
+            created_at: now,
+            last_used_at: now,
+        };
+        persist_session(&tx, &replacement)?;
+        tx.commit()
+            .map_err(|e| AppError::Internal(format!("commit refresh session failed: {e}")))?;
 
         Ok(VerifyEmailCodeResponse {
             user,
@@ -6347,6 +6369,41 @@ impl AppStore {
         Ok(current)
     }
 
+    pub async fn announcement_settings(&self) -> Result<AnnouncementSettings, AppError> {
+        let conn = self.conn.lock().await;
+        read_announcement_settings(&conn)
+    }
+
+    pub async fn announcement_response(&self) -> Result<AnnouncementResponse, AppError> {
+        let settings = self.announcement_settings().await?;
+        Ok(AnnouncementResponse {
+            enabled: settings.enabled,
+            revision: settings.updated_at.to_rfc3339(),
+            content_en: settings.content_en,
+            content_zh_cn: settings.content_zh_cn,
+        })
+    }
+
+    pub async fn update_announcement_settings(
+        &self,
+        update: AnnouncementSettingsUpdate,
+    ) -> Result<AnnouncementSettings, AppError> {
+        let conn = self.conn.lock().await;
+        let mut current = read_announcement_settings(&conn)?;
+        if let Some(enabled) = update.enabled {
+            current.enabled = enabled;
+        }
+        if let Some(content_en) = update.content_en {
+            current.content_en = content_en;
+        }
+        if let Some(content_zh_cn) = update.content_zh_cn {
+            current.content_zh_cn = content_zh_cn;
+        }
+        current = sanitize_announcement_settings(current);
+        write_announcement_settings(&conn, &current)?;
+        read_announcement_settings(&conn)
+    }
+
     async fn recover_missing_share_request_logs(
         &self,
         config: &Config,
@@ -6798,8 +6855,15 @@ impl AppStore {
             .map_err(|e| AppError::Internal(format!("delete stale auth challenges failed: {e}")))?;
             tx.execute(
                 "DELETE FROM user_sessions
-                 WHERE refresh_expires_at < ?1 OR revoked_at IS NOT NULL",
-                params![cutoff],
+                 WHERE refresh_expires_at < ?1
+                    OR (revoked_at IS NOT NULL AND (
+                        rotated_at IS NULL OR rotated_at < ?2
+                    ))",
+                params![
+                    cutoff,
+                    (Utc::now() - Duration::seconds(SESSION_REFRESH_ROTATION_GRACE_SECS))
+                        .to_rfc3339()
+                ],
             )
             .map_err(|e| AppError::Internal(format!("delete stale user sessions failed: {e}")))?;
 
@@ -10202,6 +10266,80 @@ fn upsert_market_request_log_tx(
     Ok(())
 }
 
+fn sanitize_announcement_settings(mut settings: AnnouncementSettings) -> AnnouncementSettings {
+    const MAX_CONTENT_LEN: usize = 50_000;
+    settings.content_en = settings.content_en.chars().take(MAX_CONTENT_LEN).collect();
+    settings.content_zh_cn = settings
+        .content_zh_cn
+        .chars()
+        .take(MAX_CONTENT_LEN)
+        .collect();
+    settings
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredAnnouncementSettings {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    content_en: String,
+    #[serde(default)]
+    content_zh_cn: String,
+}
+
+fn read_announcement_settings(conn: &Connection) -> Result<AnnouncementSettings, AppError> {
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT settings_json, updated_at FROM router_announcement_settings WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| AppError::Internal(format!("read announcement settings failed: {e}")))?;
+    match row {
+        Some((raw, updated_at_raw)) => {
+            let parsed = serde_json::from_str::<StoredAnnouncementSettings>(&raw).map_err(|e| {
+                AppError::Internal(format!("parse announcement settings failed: {e}"))
+            })?;
+            let updated_at = DateTime::parse_from_rfc3339(&updated_at_raw)
+                .map(|value| value.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            Ok(sanitize_announcement_settings(AnnouncementSettings {
+                enabled: parsed.enabled,
+                content_en: parsed.content_en,
+                content_zh_cn: parsed.content_zh_cn,
+                updated_at,
+            }))
+        }
+        None => Ok(AnnouncementSettings::default()),
+    }
+}
+
+fn write_announcement_settings(
+    conn: &Connection,
+    settings: &AnnouncementSettings,
+) -> Result<(), AppError> {
+    let payload = StoredAnnouncementSettings {
+        enabled: settings.enabled,
+        content_en: settings.content_en.clone(),
+        content_zh_cn: settings.content_zh_cn.clone(),
+    };
+    let json = serde_json::to_string(&payload)
+        .map_err(|e| AppError::Internal(format!("serialize announcement settings failed: {e}")))?;
+    let updated_at = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO router_announcement_settings (id, settings_json, updated_at)
+         VALUES (1, ?1, ?2)
+         ON CONFLICT(id) DO UPDATE SET
+            settings_json = excluded.settings_json,
+            updated_at = excluded.updated_at",
+        params![json, updated_at],
+    )
+    .map_err(|e| AppError::Internal(format!("write announcement settings failed: {e}")))?;
+    Ok(())
+}
+
 fn sanitize_map_display_settings(mut settings: MapDisplaySettings) -> MapDisplaySettings {
     settings.viewport.visible_start_px = settings.viewport.visible_start_px.clamp(0, 5000);
     settings
@@ -10780,6 +10918,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             access_expires_at TEXT NOT NULL,
             refresh_expires_at TEXT NOT NULL,
             revoked_at TEXT,
+            rotated_at TEXT,
             created_at TEXT NOT NULL,
             last_used_at TEXT NOT NULL
         );
@@ -11006,6 +11145,12 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         CREATE INDEX IF NOT EXISTS idx_admin_audit_created ON admin_audit_log(created_at DESC);
 
         CREATE TABLE IF NOT EXISTS router_map_display_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            settings_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS router_announcement_settings (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             settings_json TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -11514,6 +11659,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         "TEXT NOT NULL DEFAULT ''",
     )?;
     add_column_if_missing(conn, "user_api_tokens", "token_plaintext", "TEXT")?;
+    add_column_if_missing(conn, "user_sessions", "rotated_at", "TEXT")?;
     add_column_if_missing(
         conn,
         "email_delivery_batches",
@@ -20252,21 +20398,25 @@ fn get_session_by_access_hash(
     .map_err(|e| AppError::Internal(format!("query session by access hash failed: {e}")))
 }
 
-fn get_session_by_refresh_hash(
+fn get_refreshable_session_by_refresh_hash(
     conn: &Connection,
     refresh_hash: &str,
+    now: DateTime<Utc>,
 ) -> Result<Option<AuthSession>, AppError> {
+    let rotation_cutoff =
+        (now - Duration::seconds(SESSION_REFRESH_ROTATION_GRACE_SECS)).to_rfc3339();
     conn.query_row(
         "SELECT s.id, s.user_id, s.installation_id, s.access_token_hash, s.refresh_token_hash,
                 s.access_expires_at, s.refresh_expires_at, s.created_at, s.last_used_at, u.email_normalized
          FROM user_sessions s
          INNER JOIN users u ON u.id = s.user_id
-         WHERE s.refresh_token_hash = ?1 AND s.revoked_at IS NULL",
-        params![refresh_hash],
+         WHERE s.refresh_token_hash = ?1
+           AND (s.revoked_at IS NULL OR s.rotated_at >= ?2)",
+        params![refresh_hash, rotation_cutoff],
         map_auth_session_row,
     )
     .optional()
-    .map_err(|e| AppError::Internal(format!("query session by refresh hash failed: {e}")))
+    .map_err(|e| AppError::Internal(format!("query refreshable session failed: {e}")))
 }
 
 fn parse_scopes_json(value: String) -> Result<Vec<String>, rusqlite::Error> {
@@ -32804,5 +32954,32 @@ mod tests {
             )
             .await
             .expect("different IP gets a fresh bucket");
+    }
+
+    #[tokio::test]
+    async fn announcement_settings_round_trip_updates_revision() {
+        let (store, _config) = setup_store("announcement-settings-round-trip").await;
+        let initial = store.announcement_response().await.expect("read default");
+        assert!(!initial.enabled);
+        assert!(initial.content_en.is_empty());
+        assert!(initial.content_zh_cn.is_empty());
+
+        let updated = store
+            .update_announcement_settings(AnnouncementSettingsUpdate {
+                enabled: Some(true),
+                content_en: Some("<p>Hello</p>".into()),
+                content_zh_cn: Some("<p>你好</p>".into()),
+            })
+            .await
+            .expect("update announcement");
+
+        assert!(updated.enabled);
+        assert_eq!(updated.content_en, "<p>Hello</p>");
+        assert_eq!(updated.content_zh_cn, "<p>你好</p>");
+
+        let response = store.announcement_response().await.expect("read announcement");
+        assert_eq!(response.revision, updated.updated_at.to_rfc3339());
+        assert_eq!(response.content_en, "<p>Hello</p>");
+        assert_eq!(response.content_zh_cn, "<p>你好</p>");
     }
 }

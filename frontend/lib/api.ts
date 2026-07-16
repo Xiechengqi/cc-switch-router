@@ -31,6 +31,9 @@ import type {
   MetricEvent,
   MapDisplaySettings,
   MapDisplaySettingsUpdate,
+  AnnouncementSettings,
+  AnnouncementSettingsUpdate,
+  AnnouncementResponse,
   ClientNotificationDeliveriesResponse,
 } from "@/lib/types";
 
@@ -55,6 +58,21 @@ export async function getMapDisplay() {
 export async function updateMapDisplay(update: MapDisplaySettingsUpdate) {
   return parseJson<MapDisplaySettings>(
     await authFetch("/v1/admin/map-display", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(update),
+    }),
+  );
+}
+
+export async function getAnnouncement() {
+  const response = await fetch("/v1/announcement", { cache: "no-store" });
+  return parseJson<AnnouncementResponse>(response);
+}
+
+export async function updateAnnouncement(update: AnnouncementSettingsUpdate) {
+  return parseJson<AnnouncementSettings>(
+    await authFetch("/v1/admin/announcement", {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(update),

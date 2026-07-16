@@ -13,6 +13,7 @@ import { LocaleProvider, useLocaleText } from "@/components/i18n/locale-provider
 import { refreshAccessToken } from "@/lib/auth";
 import { getUserApiToken, resetUserApiToken } from "@/lib/api";
 import { DashboardDataProvider } from "@/components/dashboard/dashboard-data";
+import { AnnouncementDialog } from "@/components/announcement/announcement-dialog";
 import type { AppLocale } from "@/lib/i18n";
 import { DASHBOARD_CLIENTS_PATH, DASHBOARD_MARKETS_PATH, type DashboardShellActive } from "@/lib/dashboard-nav";
 import type { UserApiTokenStatus } from "@/lib/types";
@@ -420,6 +421,7 @@ export function AppShell({
         <DashboardDataProvider enabled={dashboardDataEnabled}>
           <Topbar active={active} />
           {children}
+          <AnnouncementDialog />
           <Toast.Provider placement="top end" />
         </DashboardDataProvider>
       </AuthProvider>

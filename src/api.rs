@@ -35,7 +35,8 @@ use crate::client_meta::extract_client_metadata;
 use crate::dynamic_settings::DynamicSettings;
 use crate::error::AppError;
 use crate::models::{
-    AuthSession, BindInstallationOwnerEmailRequest, BindInstallationOwnerEmailResponse,
+    AnnouncementResponse, AnnouncementSettings, AnnouncementSettingsUpdate, AuthSession,
+    BindInstallationOwnerEmailRequest, BindInstallationOwnerEmailResponse,
     BoardMessageListResponse, BoardMessageToggleRequest, BoardMessageView, BoardMetaResponse,
     ChangeInstallationOwnerEmailRequest, ChangeInstallationOwnerEmailResponse,
     ClientTunnelClaimRequest, ClientTunnelQuery, ClientTunnelResponse, ClientTunnelUpdateRequest,
@@ -163,6 +164,7 @@ pub fn router(state: ServerState) -> Router {
             get(public_installation_payout_profiles),
         )
         .route("/v1/regions", get(regions))
+        .route("/v1/announcement", get(announcement_get))
         .layer(public_cors_layer())
         .with_state(state.clone());
 
@@ -361,6 +363,7 @@ pub fn router(state: ServerState) -> Router {
             get(admin_client_notification_deliveries),
         )
         .route("/v1/admin/map-display", patch(admin_map_display_update))
+        .route("/v1/admin/announcement", patch(admin_announcement_update))
         .route(
             "/v1/admin/settings/values",
             get(admin_settings_values).patch(admin_settings_apply),
@@ -1582,6 +1585,12 @@ async fn map_display_get(
     Ok(Json(state.store.map_display_settings().await?))
 }
 
+async fn announcement_get(
+    State(state): State<ServerState>,
+) -> Result<Json<AnnouncementResponse>, AppError> {
+    Ok(Json(state.store.announcement_response().await?))
+}
+
 async fn admin_map_display_update(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -1597,6 +1606,28 @@ async fn admin_map_display_update(
         .record_admin_audit(
             Some(&session.email),
             "map_display.update",
+            Some(&payload),
+            metadata.ip.as_deref(),
+        )
+        .await;
+    Ok(Json(updated))
+}
+
+async fn admin_announcement_update(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(input): Json<AnnouncementSettingsUpdate>,
+) -> Result<Json<AnnouncementSettings>, AppError> {
+    let session = require_admin_session(&state, &headers).await?;
+    let updated = state.store.update_announcement_settings(input).await?;
+    let metadata = extract_client_metadata(&headers, addr);
+    let payload = serde_json::to_value(&updated).unwrap_or_else(|_| serde_json::json!({}));
+    let _ = state
+        .store
+        .record_admin_audit(
+            Some(&session.email),
+            "announcement.update",
             Some(&payload),
             metadata.ip.as_deref(),
         )

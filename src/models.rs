@@ -2020,6 +2020,43 @@ pub struct MapDisplaySettingsUpdate {
     pub viewport: Option<MapViewportSettingsUpdate>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnnouncementSettings {
+    pub enabled: bool,
+    pub content_en: String,
+    pub content_zh_cn: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl Default for AnnouncementSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            content_en: String::new(),
+            content_zh_cn: String::new(),
+            updated_at: Utc::now(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnnouncementSettingsUpdate {
+    pub enabled: Option<bool>,
+    pub content_en: Option<String>,
+    pub content_zh_cn: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnnouncementResponse {
+    pub enabled: bool,
+    pub revision: String,
+    pub content_en: String,
+    pub content_zh_cn: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DashboardResponse {

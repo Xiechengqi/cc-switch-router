@@ -12,6 +12,7 @@
   "dependencies": {
     "@heroui/react": "^3.0.4",
     "@heroui/styles": "^3.0.4",
+    "dompurify": "^3.2.6",
     "clsx": "latest",
     "lucide-react": "latest",
     "next": "latest",

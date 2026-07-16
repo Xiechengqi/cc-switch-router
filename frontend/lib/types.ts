@@ -27,6 +27,26 @@ export type MapDisplaySettingsUpdate = {
   viewport?: Partial<MapViewportSettings>;
 };
 
+export type AnnouncementSettings = {
+  enabled: boolean;
+  contentEn: string;
+  contentZhCn: string;
+  updatedAt: string;
+};
+
+export type AnnouncementSettingsUpdate = {
+  enabled?: boolean;
+  contentEn?: string;
+  contentZhCn?: string;
+};
+
+export type AnnouncementResponse = {
+  enabled: boolean;
+  revision: string;
+  contentEn: string;
+  contentZhCn: string;
+};
+
 export type DashboardResponse = {
   generatedAt: string;
   stats: {

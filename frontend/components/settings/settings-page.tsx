@@ -15,6 +15,7 @@ import {
 import { LogsPanel } from "@/components/settings/logs-panel";
 import { ClientNotificationDeliveriesPanel } from "@/components/settings/client-notification-deliveries-panel";
 import { MapDisplayPanel } from "@/components/settings/map-display-panel";
+import { AnnouncementPanel } from "@/components/settings/announcement-panel";
 import { VersionPanel } from "@/components/settings/version-panel";
 import { getSettingsSchema, getSettingsValues, saveSettings, testTelegram, restartService, getMapDisplay, updateMapDisplay } from "@/lib/api";
 import type { MapDisplaySettings, SettingValueEntry, SettingsField, SettingsSchema } from "@/lib/types";
@@ -23,6 +24,7 @@ import { DEFAULT_MAP_DISPLAY, sameMapDisplaySettings, toMapDisplayUpdate } from 
 type DirtyValue = string | boolean | null;
 const VERSION_GROUP = "__version";
 const MAP_GROUP = "__map";
+const ANNOUNCEMENT_GROUP = "__announcement";
 const LOGS_GROUP = "__logs";
 const NOTIFICATION_DELIVERIES_GROUP = "__notification_deliveries";
 
@@ -86,7 +88,7 @@ export function SettingsPage() {
   }
 
   const groups = schema?.groups || [];
-  const fields = activeGroup === VERSION_GROUP || activeGroup === MAP_GROUP || activeGroup === LOGS_GROUP || activeGroup === NOTIFICATION_DELIVERIES_GROUP
+  const fields = activeGroup === VERSION_GROUP || activeGroup === MAP_GROUP || activeGroup === ANNOUNCEMENT_GROUP || activeGroup === LOGS_GROUP || activeGroup === NOTIFICATION_DELIVERIES_GROUP
     ? []
     : (schema?.fields || []).filter((field) => field.group === activeGroup);
   const dirtyCount = Object.keys(dirty).length + (mapDirty ? 1 : 0);
@@ -136,6 +138,9 @@ export function SettingsPage() {
                   <span>{t("settings.map")}</span>
                   {mapDirty ? <Chip size="sm" variant="soft">1</Chip> : null}
                 </ListBox.Item>
+                <ListBox.Item id={ANNOUNCEMENT_GROUP} textValue={t("settings.announcement")} className={`flex items-center justify-between ${activeGroup === ANNOUNCEMENT_GROUP ? "bg-primary/10 text-foreground" : ""}`}>
+                  <span>{t("settings.announcement")}</span>
+                </ListBox.Item>
                 {groups.map((group) => {
                   const count = (schema?.fields || []).filter((field) => field.group === group && Object.prototype.hasOwnProperty.call(dirty, field.key)).length;
                   return (
@@ -172,6 +177,8 @@ export function SettingsPage() {
               dirty={mapDirty}
               loading={busy === "load" && !schema}
             />
+          ) : activeGroup === ANNOUNCEMENT_GROUP ? (
+            <AnnouncementPanel />
           ) : activeGroup === LOGS_GROUP ? (
             <LogsPanel />
           ) : activeGroup === NOTIFICATION_DELIVERIES_GROUP ? (
