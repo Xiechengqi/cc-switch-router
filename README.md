@@ -102,8 +102,7 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_RESEND_FROM` | 空 | 邮件发件人，可填裸邮箱或 `TokenSwitch <noreply@example.com>`；裸邮箱会自动显示为 `TokenSwitch <邮箱>` |
 | `CC_SWITCH_ROUTER_RESEND_FROM_NAME` | `TokenSwitch` | `CC_SWITCH_ROUTER_RESEND_FROM` 为裸邮箱时使用的发件人显示名 |
 | `CC_SWITCH_ROUTER_RESEND_REPLY_TO` | 空 | 验证码与 Client 生命周期邮件的 Reply-To |
-| `CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED` | `false` | Client 注册/离线邮件总开关；必须同时配置显式收件人才能生效 |
-| `CC_SWITCH_ROUTER_CLIENT_ALERT_EMAILS` | 空 | 逗号分隔的运维收件人；不会自动使用 `router@<domain>` |
+| `CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED` | `false` | Client 注册/离线邮件总开关；通知仅发送至对应 Client 已验证且账户有效的 Owner 邮箱 |
 | `CC_SWITCH_ROUTER_CLIENT_OFFLINE_ALERT_SECS` | `180` | 连续缺少可信签名心跳多久后确认离线；安全下限为 180 秒 |
 | `CC_SWITCH_ROUTER_CLIENT_RECOVERY_STABLE_SECS` | `120` | 离线 Client 恢复后持续稳定多久才结束原离线 episode |
 | `CC_SWITCH_ROUTER_CLIENT_ALERT_COOLDOWN_SECS` | `1800` | 同一 Client 两次离线通知的最短间隔 |
@@ -116,7 +115,6 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_CLIENT_ALERT_GLOBAL_HOURLY_LIMIT` | `50` | Offline lane 的 Router 全局每小时发送硬上限 |
 | `CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_RECIPIENT_HOURLY_LIMIT` | `3` | Registration lane 单收件人每小时发送硬上限 |
 | `CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_GLOBAL_HOURLY_LIMIT` | `10` | Registration lane 的 Router 全局每小时发送硬上限 |
-| `CC_SWITCH_ROUTER_CLIENT_OFFLINE_NOTIFY_OWNER` | `false` | Owner 邮箱存在有效登录用户时额外发送离线通知；注册通知仍只发给显式运维收件人 |
 | `CC_SWITCH_ROUTER_AUTH_CODE_TTL_SECS` | `300` | 邮件验证码有效期（秒） |
 | `CC_SWITCH_ROUTER_AUTH_CODE_COOLDOWN_SECS` | `60` | 同邮箱 / 设备发验证码冷却（秒） |
 | `CC_SWITCH_ROUTER_AUTH_SESSION_TTL_SECS` | `1800` | Access token 有效期（秒） |
@@ -142,7 +140,9 @@ CC_SWITCH_ROUTER_RESEND_FROM=noreply@example.com
 EOF
 ```
 
-Client 生命周期通知使用持久化 outbox、固定 Resend 幂等键和离线 episode 去重。关闭开关或清空显式收件人时，Router 会推进在线状态 baseline 并抑制待发记录；以后重新启用不会补发停用期间的历史通知。多 Client 在窗口内集中注册或离线时会合并为 digest。Offline lane 使用独立的单收件人/全局 `10/50` 小时额度，registration lane 使用独立的 `3/10` 小时额度，两者互不占用；显式运维收件人优先于可选 Owner，额度不足时只会抑制尚未发送的低优先级 Owner 记录。未完成的 outbox 会持续保留，已发送、dead-letter、取消和抑制记录保留 30 天供审计。
+Client 生命周期通知使用持久化 outbox、固定 Resend 幂等键和离线 episode 去重，注册与离线邮件都只发送至对应 Client 已验证且 Router 账户有效的 Owner 邮箱。关闭总开关时，Router 会推进在线状态 baseline 并抑制待发记录；以后重新启用不会补发停用期间的历史通知。多 Client 在窗口内集中注册或离线时会按 Owner 合并为 digest。Offline lane 使用独立的单收件人/全局 `10/50` 小时额度，registration lane 使用独立的 `3/10` 小时额度，两者互不占用。未完成的 outbox 会持续保留，已发送、dead-letter、取消和抑制记录保留 30 天供审计。
+
+升级兼容：`CC_SWITCH_ROUTER_CLIENT_ALERT_EMAILS` 与 `CC_SWITCH_ROUTER_CLIENT_OFFLINE_NOTIFY_OWNER` 已废弃并被忽略，即使旧 `.env` 仍保留这些键也不会生效。Owner-only 通知仅由 `CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED` 总开关控制；旧部署若保持该开关为 `true`，升级后收件人会切换为对应 Client 的有效 Owner。
 
 ### 启动
 

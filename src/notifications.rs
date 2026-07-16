@@ -26,7 +26,6 @@ pub(crate) const MIN_OFFLINE_ALERT_SECS: i64 = 180;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClientNotificationPolicy {
     pub enabled: bool,
-    pub alert_emails: Vec<String>,
     pub offline_alert_secs: i64,
     pub recovery_stable_secs: i64,
     pub cooldown_secs: i64,
@@ -39,20 +38,10 @@ pub struct ClientNotificationPolicy {
     pub global_hourly_limit: i64,
     pub registration_recipient_hourly_limit: i64,
     pub registration_global_hourly_limit: i64,
-    pub notify_owner: bool,
 }
 
 impl From<&ClientNotificationSettings> for ClientNotificationPolicy {
     fn from(settings: &ClientNotificationSettings) -> Self {
-        let mut alert_emails = settings
-            .alert_emails
-            .iter()
-            .map(|email| email.trim().to_ascii_lowercase())
-            .filter(|email| is_basic_email(email))
-            .collect::<Vec<_>>();
-        alert_emails.sort_unstable();
-        alert_emails.dedup();
-        let enabled = settings.enabled && !alert_emails.is_empty();
         let registration_recipient_hourly_limit =
             settings.registration_recipient_hourly_limit.clamp(1, 1_000);
         let registration_global_hourly_limit = settings
@@ -60,8 +49,7 @@ impl From<&ClientNotificationSettings> for ClientNotificationPolicy {
             .clamp(1, 10_000)
             .max(registration_recipient_hourly_limit);
         Self {
-            enabled,
-            alert_emails,
+            enabled: settings.enabled,
             offline_alert_secs: settings
                 .offline_alert_secs
                 .clamp(MIN_OFFLINE_ALERT_SECS, 86_400),
@@ -76,7 +64,6 @@ impl From<&ClientNotificationSettings> for ClientNotificationPolicy {
             global_hourly_limit: settings.global_hourly_limit.clamp(1, 100_000),
             registration_recipient_hourly_limit,
             registration_global_hourly_limit,
-            notify_owner: settings.notify_owner,
         }
     }
 }
@@ -87,15 +74,6 @@ impl ClientNotificationPolicy {
         config: &Config,
     ) -> (Self, Option<String>) {
         let mut policy = Self::from(settings);
-        if settings.enabled && !policy.enabled {
-            return (
-                policy,
-                Some(
-                    "client notifications disabled: at least one valid explicit alert recipient is required"
-                        .to_string(),
-                ),
-            );
-        }
         if !policy.enabled {
             return (policy, None);
         }
@@ -1415,7 +1393,6 @@ mod tests {
         };
         let policy = ClientNotificationPolicy::from(&ClientNotificationSettings {
             enabled: true,
-            alert_emails: vec!["ops@example.com".into()],
             ..ClientNotificationSettings::default()
         });
         let template = NotificationTemplateContext {
@@ -1488,14 +1465,9 @@ mod tests {
     }
 
     #[test]
-    fn policy_normalizes_unsafe_boot_values_and_recipients() {
+    fn policy_normalizes_unsafe_boot_values() {
         let settings = ClientNotificationSettings {
             enabled: true,
-            alert_emails: vec![
-                " Ops@Example.com ".into(),
-                "ops@example.com".into(),
-                "invalid".into(),
-            ],
             offline_alert_secs: -1,
             recovery_stable_secs: i64::MAX,
             storm_percent: 101,
@@ -1504,18 +1476,15 @@ mod tests {
             ..ClientNotificationSettings::default()
         };
         let policy = ClientNotificationPolicy::from(&settings);
-        assert_eq!(policy.alert_emails, vec!["ops@example.com"]);
+        assert!(policy.enabled);
         assert_eq!(policy.offline_alert_secs, MIN_OFFLINE_ALERT_SECS);
         assert_eq!(policy.recovery_stable_secs, 3_600);
         assert_eq!(policy.storm_percent, 100);
         assert_eq!(policy.registration_recipient_hourly_limit, 1_000);
         assert_eq!(policy.registration_global_hourly_limit, 1_000);
 
-        let no_recipients = ClientNotificationPolicy::from(&ClientNotificationSettings {
-            enabled: true,
-            ..ClientNotificationSettings::default()
-        });
-        assert!(!no_recipients.enabled);
+        let disabled = ClientNotificationPolicy::from(&ClientNotificationSettings::default());
+        assert!(!disabled.enabled);
     }
 
     #[test]
@@ -1525,7 +1494,6 @@ mod tests {
         config.cleanup_interval_secs = 300;
         let settings = ClientNotificationSettings {
             enabled: true,
-            alert_emails: vec!["ops@example.com".into()],
             registration_recipient_hourly_limit: 7,
             registration_global_hourly_limit: 4,
             ..ClientNotificationSettings::default()

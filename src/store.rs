@@ -1019,8 +1019,7 @@ impl NotificationLane {
     }
 }
 
-const EXPLICIT_NOTIFICATION_RECIPIENT_PRIORITY: i64 = 0;
-const OWNER_NOTIFICATION_RECIPIENT_PRIORITY: i64 = 1;
+const OWNER_NOTIFICATION_RECIPIENT_PRIORITY: i64 = 0;
 
 #[derive(Debug, Default)]
 pub struct CleanupResult {
@@ -1728,6 +1727,8 @@ impl AppStore {
         }
         if lane == NotificationLane::Registration {
             materialize_registration_overflow_events_tx(&tx, now)?;
+            expire_stale_registration_notification_events_tx(&tx, now)?;
+            activate_registration_events_with_verified_owner_tx(&tx, now)?;
         }
         let cutoff = now - Duration::seconds(policy.batch_window_secs.max(1));
         let events = load_pending_notification_events(&tx, now, cutoff, lane)?;
@@ -1740,38 +1741,26 @@ impl AppStore {
             return Ok(stats);
         }
 
-        let monitored_clients = tx
-            .query_row(
-                "SELECT COUNT(*) FROM installation_notification_state WHERE monitoring_enabled = 1",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(|error| {
-                AppError::Internal(format!(
-                    "count monitored notification clients failed: {error}"
-                ))
-            })?;
-        let offline_storm_threshold = policy.storm_min_clients.max(
-            (monitored_clients
-                .saturating_mul(policy.storm_percent.max(1))
-                .saturating_add(99))
-                / 100,
-        );
-
         let mut by_recipient =
             BTreeMap::<(i64, String), Vec<PendingClientNotificationEvent>>::new();
         for event in &events {
-            let recipients = notification_event_recipients(event, policy);
+            let recipients = notification_event_recipients(event);
             if recipients.is_empty() {
+                let (status, reason) = if event.kind == "client_registered" {
+                    ("awaiting_owner", "waiting for verified client owner")
+                } else {
+                    ("suppressed_no_recipient", "no verified client owner")
+                };
                 tx.execute(
                     "UPDATE client_notification_events
-                     SET status = 'suppressed_no_recipient',
-                         suppression_reason = 'no authorized recipient', updated_at = ?2
+                     SET status = ?2, suppression_reason = ?3, updated_at = ?4
                      WHERE id = ?1 AND status = 'pending'",
-                    params![event.id, now.to_rfc3339()],
+                    params![event.id, status, reason, now.to_rfc3339()],
                 )
                 .map_err(|error| {
-                    AppError::Internal(format!("suppress recipientless event failed: {error}"))
+                    AppError::Internal(format!(
+                        "defer or suppress ownerless notification event failed: {error}"
+                    ))
                 })?;
                 continue;
             }
@@ -1816,7 +1805,7 @@ impl AppStore {
             })?;
         for ((recipient_priority, recipient), mut recipient_events) in by_recipient {
             recipient_events.truncate(100);
-            let mut global_capped = global_count >= global_hourly_limit;
+            let global_capped = global_count >= global_hourly_limit;
             let recipient_count = tx
                 .query_row(
                     "SELECT COUNT(*) FROM email_delivery_batches
@@ -1842,23 +1831,8 @@ impl AppStore {
             let storm_kind = Some(lane.storm_event_kind());
             let storm_window_start =
                 (now - Duration::seconds(policy.storm_window_secs.max(1))).to_rfc3339();
-            let recipient_is_explicit =
-                recipient_priority == EXPLICIT_NOTIFICATION_RECIPIENT_PRIORITY;
-            let recent_storm_events = if recipient_is_explicit {
-                tx.query_row(
-                    "SELECT COUNT(DISTINCT installation_id)
-                     FROM client_notification_events
-                     WHERE occurred_at >= ?1
-                       AND occurred_at >= COALESCE(
-                           (SELECT enabled_since FROM client_notification_runtime WHERE id = 1), ?1
-                       )
-                       AND status IN ('pending', 'batched')
-                       AND (?2 IS NULL OR kind = ?2)",
-                    params![storm_window_start, storm_kind],
-                    |row| row.get::<_, i64>(0),
-                )
-            } else {
-                tx.query_row(
+            let recent_storm_events = tx
+                .query_row(
                     "SELECT COUNT(DISTINCT e.installation_id)
                      FROM client_notification_events e
                      INNER JOIN installations i ON i.id = e.installation_id
@@ -1878,14 +1852,39 @@ impl AppStore {
                     params![storm_window_start, storm_kind, recipient],
                     |row| row.get::<_, i64>(0),
                 )
-            }
-            .map_err(|error| {
-                AppError::Internal(format!("count notification storm window failed: {error}"))
-            })?;
+                .map_err(|error| {
+                    AppError::Internal(format!("count notification storm window failed: {error}"))
+                })?;
             let storm_threshold = if lane == NotificationLane::Registration {
                 policy.storm_min_clients
             } else {
-                offline_storm_threshold
+                let monitored_clients = tx
+                    .query_row(
+                        "SELECT COUNT(*)
+                         FROM installation_notification_state ns
+                         INNER JOIN installations i ON i.id = ns.installation_id
+                         WHERE ns.monitoring_enabled = 1
+                           AND i.owner_verified_at IS NOT NULL
+                           AND LOWER(i.owner_email) = LOWER(?1)
+                           AND EXISTS (
+                               SELECT 1 FROM users u
+                               WHERE u.email_normalized = LOWER(i.owner_email)
+                                 AND u.status = 'active'
+                           )",
+                        params![recipient],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(|error| {
+                        AppError::Internal(format!(
+                            "count owner notification clients failed: {error}"
+                        ))
+                    })?;
+                policy.storm_min_clients.max(
+                    (monitored_clients
+                        .saturating_mul(policy.storm_percent.max(1))
+                        .saturating_add(99))
+                        / 100,
+                )
             };
             let includes_overflow = recipient_events
                 .iter()
@@ -1914,21 +1913,6 @@ impl AppStore {
             } else {
                 false
             };
-            if global_capped && !recipient_capped && recipient_is_explicit && !storm_suppressed {
-                let reservations_needed = global_count
-                    .saturating_sub(global_hourly_limit)
-                    .saturating_add(1);
-                let preempted = preempt_lower_priority_notification_reservations(
-                    &tx,
-                    lane,
-                    recipient_priority,
-                    &hour_cutoff,
-                    &now.to_rfc3339(),
-                    reservations_needed,
-                )?;
-                global_count = global_count.saturating_sub(preempted);
-                global_capped = global_count >= global_hourly_limit;
-            }
             if global_capped {
                 stats.deferred_by_global_cap += recipient_events.len() as u64;
             }
@@ -1937,7 +1921,7 @@ impl AppStore {
                     &tx,
                     storm_kind,
                     &storm_window_start,
-                    (!recipient_is_explicit).then_some(recipient.as_str()),
+                    Some(recipient.as_str()),
                 )?;
                 render_digest_email(&DigestEmailData {
                     event_label: match event_family {
@@ -2040,7 +2024,7 @@ impl AppStore {
         }
 
         for event in &events {
-            let expected_recipients = notification_event_recipients(event, policy);
+            let expected_recipients = notification_event_recipients(event);
             if expected_recipients.is_empty() {
                 continue;
             }
@@ -2375,14 +2359,7 @@ impl AppStore {
             return Ok(false);
         }
 
-        let recipient_explicit = policy
-            .alert_emails
-            .iter()
-            .any(|value| value.eq_ignore_ascii_case(&recipient));
-        let recipient_owner = !recipient_explicit
-            && policy.notify_owner
-            && notification_batch_is_authorized_for_owner(&tx, batch_id, &recipient)?;
-        if !recipient_explicit && !recipient_owner {
+        if !notification_batch_is_authorized_for_current_owner(&tx, batch_id, &recipient)? {
             cancel_notification_batch_tx(
                 &tx,
                 batch_id,
@@ -2391,16 +2368,13 @@ impl AppStore {
                 "recipient authorization removed",
                 now,
             )?;
+            requeue_notification_batch_events_tx(&tx, batch_id, now)?;
             tx.commit().map_err(|error| {
                 AppError::Internal(format!("commit recipient cancellation failed: {error}"))
             })?;
             return Ok(false);
         }
-        let expected_priority = if recipient_explicit {
-            EXPLICIT_NOTIFICATION_RECIPIENT_PRIORITY
-        } else {
-            OWNER_NOTIFICATION_RECIPIENT_PRIORITY
-        };
+        let expected_priority = OWNER_NOTIFICATION_RECIPIENT_PRIORITY;
         if recipient_priority != expected_priority {
             tx.execute(
                 "UPDATE email_delivery_batches
@@ -2816,13 +2790,8 @@ impl AppStore {
     ) -> Result<(Installation, String), AppError> {
         let installation = get_installation(conn, installation_id)?
             .ok_or_else(|| AppError::NotFound("installation not found".into()))?;
-        let owner_email = installation
-            .owner_email
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_ascii_lowercase)
-            .ok_or_else(|| AppError::Forbidden("installation owner is not bound".into()))?;
+        let owner_email = verified_installation_owner_email(&installation)
+            .map_err(|_| AppError::Forbidden("installation owner is not verified".into()))?;
         if owner_email != session_email.trim().to_ascii_lowercase() {
             return Err(AppError::Forbidden(owner_error.into()));
         }
@@ -2887,16 +2856,7 @@ impl AppStore {
             &input.nonce,
             &input.signature,
         )?;
-        let owner_email = installation
-            .owner_email
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                AppError::Conflict(
-                    "installation owner email must be verified before publishing payout information"
-                        .into(),
-                )
-            })?;
+        let owner_email = verified_installation_owner_email(&installation)?;
 
         let existing = conn
             .query_row(
@@ -3026,15 +2986,22 @@ impl AppStore {
             &input.signature,
         )?;
 
-        if let Some(existing_owner_email) = installation.owner_email.as_deref() {
+        let already_bound = if let Some(existing_owner_email) = installation.owner_email.as_deref()
+        {
             if existing_owner_email != email {
                 return Err(AppError::Conflict(
                     "this installation is locked to a different owner email".into(),
                 ));
             }
+            true
+        } else {
+            false
+        };
+        if already_bound && installation.owner_verified_at.is_some() {
             return Ok(BindInstallationOwnerEmailResponse {
                 ok: true,
                 owner_email: email,
+                owner_verified: true,
                 already_bound: true,
             });
         }
@@ -3047,7 +3014,7 @@ impl AppStore {
                     "verification token does not match requested owner email".into(),
                 ));
             }
-            DateTime::<Utc>::from_timestamp(redeemed.verified_at, 0).unwrap_or(now)
+            Some(DateTime::<Utc>::from_timestamp(redeemed.verified_at, 0).unwrap_or(now))
         } else if let Some(access_token) = access_token
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -3061,39 +3028,59 @@ impl AppStore {
                     "authenticated session email does not match requested owner email".into(),
                 ));
             }
-            session.last_used_at
+            Some(session.last_used_at)
         } else {
-            let conn = self.conn.lock().await;
-            let installation = get_installation(&conn, &input.installation_id)?
-                .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
-            let missing_owner = installation
-                .owner_email
-                .as_deref()
-                .is_none_or(|value| value.trim().is_empty());
-            drop(conn);
-            if !missing_owner {
-                return Err(AppError::Unauthorized(
-                    "verification token or authenticated session is required to bind installation owner"
-                        .into(),
-                ));
+            if already_bound {
+                return Ok(BindInstallationOwnerEmailResponse {
+                    ok: true,
+                    owner_email: email,
+                    owner_verified: false,
+                    already_bound: true,
+                });
             }
-            now
+            None
         };
 
         let conn = self.conn.lock().await;
-        conn.execute(
-            "UPDATE installations
-             SET owner_email = ?2, owner_verified_at = ?3
+        let changed = conn
+            .execute(
+                "UPDATE installations
+             SET owner_email = ?2,
+                 owner_verified_at = CASE
+                     WHEN owner_email = ?2 THEN COALESCE(?3, owner_verified_at)
+                     ELSE ?3
+                 END
              WHERE id = ?1
                AND (owner_email IS NULL OR owner_email = '' OR owner_email = ?2)",
-            params![input.installation_id, email, verified_at.to_rfc3339()],
-        )
-        .map_err(|e| AppError::Internal(format!("bind installation owner email failed: {e}")))?;
+                params![
+                    input.installation_id,
+                    email,
+                    verified_at.map(|value| value.to_rfc3339())
+                ],
+            )
+            .map_err(|e| {
+                AppError::Internal(format!("bind installation owner email failed: {e}"))
+            })?;
+        if changed != 1 {
+            return Err(AppError::Conflict(
+                "this installation is locked to a different owner email".into(),
+            ));
+        }
+        let owner_verified = conn
+            .query_row(
+                "SELECT owner_verified_at IS NOT NULL FROM installations WHERE id = ?1",
+                params![input.installation_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|e| {
+                AppError::Internal(format!("read installation owner verification failed: {e}"))
+            })?;
 
         Ok(BindInstallationOwnerEmailResponse {
             ok: true,
             owner_email: email,
-            already_bound: false,
+            owner_verified,
+            already_bound,
         })
     }
 
@@ -3181,6 +3168,13 @@ impl AppStore {
         .map_err(|e| {
             AppError::Internal(format!("change payout profile owner email failed: {e}"))
         })?;
+        tx.execute(
+            "UPDATE installation_client_tunnels
+             SET owner_email = ?2, updated_at = ?3
+             WHERE installation_id = ?1",
+            params![input.installation_id, new_email, now.to_rfc3339()],
+        )
+        .map_err(|e| AppError::Internal(format!("change client tunnel owner failed: {e}")))?;
         tx.commit()
             .map_err(|e| AppError::Internal(format!("commit owner email change failed: {e}")))?;
 
@@ -3617,7 +3611,12 @@ impl AppStore {
         )?;
         Ok(GetInstallationOwnerEmailResponse {
             ok: true,
-            owner_email: installation.owner_email,
+            owner_email: installation
+                .owner_verified_at
+                .is_some()
+                .then_some(installation.owner_email)
+                .flatten(),
+            owner_verified: installation.owner_verified_at.is_some(),
         })
     }
 
@@ -3751,11 +3750,7 @@ impl AppStore {
             &nonce,
             &signature,
         )?;
-        let owner_email = installation
-            .owner_email
-            .as_deref()
-            .ok_or_else(|| AppError::Conflict("installation owner email is not configured".into()))
-            .and_then(normalize_email)?;
+        let owner_email = verified_installation_owner_email(&installation)?;
         if requested_owner != owner_email {
             return Err(AppError::Conflict(
                 "client tunnel owner must match the installation owner".into(),
@@ -3811,8 +3806,12 @@ impl AppStore {
         let conn = self.conn.lock().await;
         if let Some(email) = conn
             .query_row(
-                "SELECT owner_email FROM installation_client_tunnels
-                 WHERE subdomain = ?1 AND enabled = 1",
+                "SELECT i.owner_email
+                 FROM installation_client_tunnels t
+                 INNER JOIN installations i ON i.id = t.installation_id
+                 WHERE t.subdomain = ?1 AND t.enabled = 1
+                   AND i.owner_verified_at IS NOT NULL
+                   AND i.owner_email IS NOT NULL AND i.owner_email != ''",
                 params![subdomain],
                 |row| row.get(0),
             )
@@ -3825,12 +3824,18 @@ impl AppStore {
         if let Some(installation_id) = installation_id {
             if let Some(record) = get_client_tunnel_by_installation(&conn, installation_id)? {
                 if record.enabled {
-                    return Ok(Some(record.owner_email));
+                    if let Some(installation) = get_installation(&conn, installation_id)? {
+                        if installation.owner_verified_at.is_some() {
+                            return Ok(installation.owner_email);
+                        }
+                    }
                 }
             }
             if let Some(installation) = get_installation(&conn, installation_id)? {
-                if let Some(email) = installation.owner_email {
-                    return Ok(Some(email));
+                if installation.owner_verified_at.is_some() {
+                    if let Some(email) = installation.owner_email {
+                        return Ok(Some(email));
+                    }
                 }
             }
         }
@@ -5950,6 +5955,11 @@ impl AppStore {
         let mut installation_views = Vec::new();
         let mut active_installations = Vec::<ActiveInstallationGeo>::new();
         for installation in installations {
+            let verified_owner_email = installation
+                .owner_verified_at
+                .is_some()
+                .then(|| installation.owner_email.clone())
+                .flatten();
             let is_active = installation_visible_on_dashboard_map(
                 &installation.id,
                 &active_share_subdomains_by_installation,
@@ -5961,14 +5971,14 @@ impl AppStore {
                     platform: installation.platform.clone(),
                     country_code: installation.country_code.clone(),
                     country: installation.country.clone(),
-                    owner_email: installation.owner_email.clone(),
+                    owner_email: verified_owner_email.clone(),
                 });
             }
             installation_views.push(InstallationView {
                 id: installation.id.clone(),
                 platform: installation.platform.clone(),
                 app_version: installation.app_version.clone(),
-                owner_email: installation.owner_email.clone(),
+                owner_email: verified_owner_email,
                 region: installation.region.clone(),
                 country_code: installation.country_code.clone(),
                 created_at: installation.created_at,
@@ -9574,11 +9584,7 @@ fn upsert_share_tx(
     }
     let installation = get_installation(conn, installation_id)?
         .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
-    let installation_owner = installation
-        .owner_email
-        .as_deref()
-        .ok_or_else(|| AppError::Conflict("installation owner email is not configured".into()))
-        .and_then(normalize_email)?;
+    let installation_owner = verified_installation_owner_email(&installation)?;
     normalize_self_reported_share_owner(&mut share, &installation_owner)?;
     let description = normalize_share_description(share.description.clone())?;
     let for_sale = normalize_share_for_sale(&share.for_sale)?;
@@ -11820,7 +11826,7 @@ fn suppress_disabled_notification_work_tx(
             "UPDATE client_notification_events
              SET status = 'suppressed_disabled', suppression_reason = 'notifications disabled',
                  updated_at = ?1
-             WHERE status IN ('pending', 'batched')",
+             WHERE status IN ('pending', 'batched', 'awaiting_owner')",
             params![timestamp],
         )
         .map_err(|error| {
@@ -11931,28 +11937,13 @@ fn sync_client_notification_runtime_tx(
                 "UPDATE client_notification_events
                  SET status = 'suppressed_before_activation',
                      suppression_reason = 'event predates notification activation', updated_at = ?2
-                 WHERE status = 'pending' AND occurred_at < ?1",
+                 WHERE status IN ('pending', 'awaiting_owner') AND occurred_at < ?1",
                 params![enabled_since, timestamp],
             )
             .map_err(|error| {
                 AppError::Internal(format!("suppress pre-activation events failed: {error}"))
             })?;
         stats.suppressed_disabled += suppressed as u64;
-    }
-
-    if policy.alert_emails.is_empty() && !policy.notify_owner {
-        let suppressed = conn
-            .execute(
-                "UPDATE client_notification_events
-                 SET status = 'suppressed_no_recipient',
-                     suppression_reason = 'no notification recipients configured', updated_at = ?1
-                 WHERE status = 'pending'",
-                params![timestamp],
-            )
-            .map_err(|error| {
-                AppError::Internal(format!("suppress recipientless events failed: {error}"))
-            })?;
-        stats.suppressed_recipient_removed += suppressed as u64;
     }
 
     if template.is_some_and(|value| value.delivery_configured) {
@@ -12023,13 +12014,12 @@ fn sync_client_notification_runtime_tx(
         })?;
     }
 
-    suppress_removed_notification_recipients(conn, policy, now, stats)?;
+    suppress_removed_notification_recipients(conn, now, stats)?;
     Ok(())
 }
 
 fn suppress_removed_notification_recipients(
     conn: &Connection,
-    policy: &ClientNotificationPolicy,
     now: DateTime<Utc>,
     stats: &mut NotificationReconcileStats,
 ) -> Result<(), AppError> {
@@ -12054,22 +12044,14 @@ fn suppress_removed_notification_recipients(
             AppError::Internal(format!("read recipient revocation scan failed: {error}"))
         })?
     };
-    let explicit = policy
-        .alert_emails
-        .iter()
-        .map(|value| value.to_ascii_lowercase())
-        .collect::<HashSet<_>>();
     let timestamp = now.to_rfc3339();
     for (batch_id, recipient) in candidates {
-        let recipient_priority = if explicit.contains(&recipient.to_ascii_lowercase()) {
-            Some(EXPLICIT_NOTIFICATION_RECIPIENT_PRIORITY)
-        } else if policy.notify_owner
-            && notification_batch_is_authorized_for_owner(conn, &batch_id, &recipient)?
-        {
-            Some(OWNER_NOTIFICATION_RECIPIENT_PRIORITY)
-        } else {
-            None
-        };
+        let recipient_priority =
+            if notification_batch_is_authorized_for_current_owner(conn, &batch_id, &recipient)? {
+                Some(OWNER_NOTIFICATION_RECIPIENT_PRIORITY)
+            } else {
+                None
+            };
         if let Some(recipient_priority) = recipient_priority {
             conn.execute(
                 "UPDATE email_delivery_batches
@@ -12097,22 +12079,24 @@ fn suppress_removed_notification_recipients(
             .map_err(|error| {
                 AppError::Internal(format!("suppress removed recipient failed: {error}"))
             })?;
+        if changed > 0 {
+            requeue_notification_batch_events_tx(conn, &batch_id, now)?;
+        }
         stats.suppressed_recipient_removed += changed as u64;
     }
     Ok(())
 }
 
-fn notification_batch_is_authorized_for_owner(
+fn notification_batch_is_authorized_for_current_owner(
     conn: &Connection,
     batch_id: &str,
     recipient: &str,
 ) -> Result<bool, AppError> {
-    let (event_count, authorized_offline_event_count) = conn
+    let (event_count, authorized_event_count) = conn
         .query_row(
             "SELECT COUNT(*),
                     COALESCE(SUM(CASE
-                        WHEN e.kind = 'client_offline'
-                         AND i.owner_verified_at IS NOT NULL
+                        WHEN i.owner_verified_at IS NOT NULL
                          AND LOWER(i.owner_email) = LOWER(?2)
                          AND EXISTS (
                              SELECT 1 FROM users u
@@ -12132,7 +12116,7 @@ fn notification_batch_is_authorized_for_owner(
                 "validate notification owner event scope failed: {error}"
             ))
         })?;
-    Ok(event_count > 0 && authorized_offline_event_count == event_count)
+    Ok(event_count > 0 && authorized_event_count == event_count)
 }
 
 fn merge_notification_aggregate_stats(
@@ -12200,10 +12184,11 @@ fn materialize_registration_overflow_events_tx(
         conn.execute(
             "INSERT OR IGNORE INTO client_notification_events (
                 id, dedupe_key, kind, installation_id, episode, status,
-                occurred_at, not_before, snapshot_json, created_at, updated_at
+                occurred_at, not_before, snapshot_json, suppression_reason, created_at, updated_at
              ) VALUES (
-                ?1, ?2, 'client_registration_overflow', ?3, 0, 'pending',
-                ?4, ?5, ?6, ?7, ?7
+                ?1, ?2, 'client_registration_overflow', ?3, 0, 'suppressed_no_recipient',
+                ?4, ?5, ?6, 'owner-only notifications cannot route a global overflow summary',
+                ?7, ?7
              )",
             params![
                 event_id,
@@ -12244,6 +12229,59 @@ fn materialize_registration_overflow_events_tx(
         })?;
     }
     Ok(())
+}
+
+fn activate_registration_events_with_verified_owner_tx(
+    conn: &Connection,
+    now: DateTime<Utc>,
+) -> Result<usize, AppError> {
+    let timestamp = now.to_rfc3339();
+    conn.execute(
+        "UPDATE client_notification_events
+         SET status = 'pending', not_before = ?1, suppression_reason = NULL, updated_at = ?1
+         WHERE status = 'awaiting_owner' AND kind = 'client_registered'
+           AND EXISTS (
+               SELECT 1
+               FROM installations i
+               WHERE i.id = client_notification_events.installation_id
+                 AND i.owner_verified_at IS NOT NULL
+                 AND EXISTS (
+                     SELECT 1 FROM users u
+                     WHERE u.email_normalized = LOWER(i.owner_email)
+                       AND u.status = 'active'
+                 )
+           )",
+        params![timestamp],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "activate registration notification after owner verification failed: {error}"
+        ))
+    })
+}
+
+fn expire_stale_registration_notification_events_tx(
+    conn: &Connection,
+    now: DateTime<Utc>,
+) -> Result<usize, AppError> {
+    let timestamp = now.to_rfc3339();
+    let registration_cutoff =
+        (now - Duration::seconds(CLIENT_NOTIFICATION_REGISTRATION_PENDING_TTL_SECS)).to_rfc3339();
+    conn.execute(
+        "UPDATE client_notification_events
+         SET status = 'suppressed_expired',
+             suppression_reason = 'registration notification pending TTL expired',
+             updated_at = ?1
+         WHERE status IN ('pending', 'awaiting_owner')
+           AND kind IN ('client_registered', 'client_registration_overflow')
+           AND occurred_at < ?2",
+        params![timestamp, registration_cutoff],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "expire stale registration notification events failed: {error}"
+        ))
+    })
 }
 
 fn load_pending_notification_events(
@@ -12312,64 +12350,22 @@ fn load_pending_notification_events(
 
 fn notification_event_recipients(
     event: &PendingClientNotificationEvent,
-    policy: &ClientNotificationPolicy,
 ) -> Vec<ClientNotificationRecipient> {
-    let mut recipients = BTreeMap::<String, i64>::new();
-    for email in &policy.alert_emails {
-        recipients.insert(
-            email.to_ascii_lowercase(),
-            EXPLICIT_NOTIFICATION_RECIPIENT_PRIORITY,
-        );
+    if !matches!(event.kind.as_str(), "client_registered" | "client_offline") {
+        return Vec::new();
     }
-    if policy.notify_owner && event.kind == "client_offline" {
-        if let Some(owner) = event.verified_owner_email.as_deref() {
-            recipients
-                .entry(owner.to_ascii_lowercase())
-                .or_insert(OWNER_NOTIFICATION_RECIPIENT_PRIORITY);
-        }
-    }
-    recipients
-        .into_iter()
-        .map(|(email, priority)| ClientNotificationRecipient { email, priority })
-        .collect()
-}
-
-fn preempt_lower_priority_notification_reservations(
-    conn: &Connection,
-    lane: NotificationLane,
-    recipient_priority: i64,
-    hour_cutoff: &str,
-    now: &str,
-    limit: i64,
-) -> Result<i64, AppError> {
-    if limit <= 0 {
-        return Ok(0);
-    }
-    conn.execute(
-        "UPDATE email_delivery_batches
-         SET status = 'suppressed_rate_limit',
-             error_message = 'preempted by higher-priority explicit recipient',
-             next_attempt_at = NULL, claim_owner = NULL, claim_expires_at = NULL,
-             updated_at = ?3
-         WHERE id IN (
-             SELECT id FROM email_delivery_batches
-             WHERE created_at >= ?2 AND recipient_priority > ?1
-               AND notification_lane = ?5
-               AND (
-                   status IN ('pending', 'retry', 'blocked_config')
-                   OR (status = 'claimed' AND claim_expires_at <= ?3)
-               )
-             ORDER BY recipient_priority DESC, created_at DESC, id DESC
-             LIMIT ?4
-         )",
-        params![recipient_priority, hour_cutoff, now, limit, lane.as_str()],
-    )
-    .map(|changed| changed as i64)
-    .map_err(|error| {
-        AppError::Internal(format!(
-            "preempt lower-priority notification reservations failed: {error}"
-        ))
-    })
+    event
+        .verified_owner_email
+        .as_deref()
+        .map(str::trim)
+        .filter(|email| crate::notifications::is_basic_email(email))
+        .map(|email| {
+            vec![ClientNotificationRecipient {
+                email: email.to_ascii_lowercase(),
+                priority: OWNER_NOTIFICATION_RECIPIENT_PRIORITY,
+            }]
+        })
+        .unwrap_or_default()
 }
 
 fn load_incident_client_ids(
@@ -12556,6 +12552,61 @@ fn cancel_notification_batch_tx(
     Ok(())
 }
 
+fn requeue_notification_batch_events_tx(
+    conn: &Connection,
+    batch_id: &str,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let event_ids = {
+        let mut statement = conn
+            .prepare("SELECT DISTINCT event_id FROM email_delivery_batch_items WHERE batch_id = ?1")
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "prepare notification recipient requeue failed: {error}"
+                ))
+            })?;
+        let rows = statement
+            .query_map(params![batch_id], |row| row.get::<_, String>(0))
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "query notification recipient requeue failed: {error}"
+                ))
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+            AppError::Internal(format!(
+                "read notification recipient requeue failed: {error}"
+            ))
+        })?
+    };
+    if event_ids.is_empty() {
+        return Ok(());
+    }
+    conn.execute(
+        "DELETE FROM email_delivery_batch_items WHERE batch_id = ?1",
+        params![batch_id],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "release notification recipient batch items failed: {error}"
+        ))
+    })?;
+    let placeholders = repeat_vars(event_ids.len());
+    conn.execute(
+        &format!(
+            "UPDATE client_notification_events
+             SET status = 'pending', not_before = ?1, suppression_reason = NULL, updated_at = ?1
+             WHERE status = 'batched' AND id IN ({placeholders})"
+        ),
+        params_from_iter(std::iter::once(now.to_rfc3339()).chain(event_ids)),
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "requeue notification events for current owner failed: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
 async fn remove_stale_route_snapshots(
     proxy: &ProxyRegistry,
     stale_subdomains: Vec<String>,
@@ -12583,23 +12634,7 @@ fn cleanup_client_notification_queue_tx(
     now: DateTime<Utc>,
 ) -> Result<(usize, usize), AppError> {
     let timestamp = now.to_rfc3339();
-    let registration_cutoff =
-        (now - Duration::seconds(CLIENT_NOTIFICATION_REGISTRATION_PENDING_TTL_SECS)).to_rfc3339();
-    conn.execute(
-        "UPDATE client_notification_events
-         SET status = 'suppressed_expired',
-             suppression_reason = 'registration notification pending TTL expired',
-             updated_at = ?1
-         WHERE status = 'pending'
-           AND kind IN ('client_registered', 'client_registration_overflow')
-           AND occurred_at < ?2",
-        params![timestamp, registration_cutoff],
-    )
-    .map_err(|error| {
-        AppError::Internal(format!(
-            "expire stale registration notification events failed: {error}"
-        ))
-    })?;
+    expire_stale_registration_notification_events_tx(conn, now)?;
 
     let low_value_event_count = conn
         .query_row(
@@ -18936,7 +18971,7 @@ fn registration_overflow_should_capture_tx(
              FROM client_notification_events e
              WHERE e.kind IN ('client_registered', 'client_registration_overflow')
                AND (
-                   e.status = 'pending'
+                   e.status IN ('pending', 'awaiting_owner')
                    OR (e.status = 'batched' AND EXISTS (
                        SELECT 1
                        FROM email_delivery_batch_items bi
@@ -20383,12 +20418,27 @@ fn get_installation_owner_email(
          WHERE id = ?1
            AND owner_email IS NOT NULL
            AND owner_email != ''
+           AND owner_verified_at IS NOT NULL
          LIMIT 1",
         params![installation_id],
         |row| row.get(0),
     )
     .optional()
     .map_err(|e| AppError::Internal(format!("query installation owner email failed: {e}")))
+}
+
+fn verified_installation_owner_email(installation: &Installation) -> Result<String, AppError> {
+    let owner_email = installation
+        .owner_email
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| AppError::Conflict("installation owner email is not configured".into()))?;
+    if installation.owner_verified_at.is_none() {
+        return Err(AppError::Conflict(
+            "installation owner email must be verified".into(),
+        ));
+    }
+    normalize_email(owner_email)
 }
 
 fn share_visible_to_email(share: &ShareDescriptor, viewer_email: Option<&str>) -> bool {
@@ -20754,7 +20804,6 @@ mod tests {
     fn enabled_notification_config(name: &str) -> Config {
         let mut config = test_config(name);
         config.client_notifications.enabled = true;
-        config.client_notifications.alert_emails = vec!["ops@example.com".into()];
         config.resend_api_key = Some("test-api-key".into());
         config.resend_from = Some("router@example.com".into());
         config
@@ -20847,6 +20896,25 @@ mod tests {
         kind: &str,
         occurred_at: DateTime<Utc>,
     ) {
+        conn.execute(
+            "INSERT OR IGNORE INTO users (
+                id, email_normalized, status, created_at, last_login_at
+             ) VALUES ('notification-owner-user', 'owner@example.com', 'active', ?1, ?1)",
+            params![occurred_at.to_rfc3339()],
+        )
+        .expect("insert notification owner user");
+        conn.execute(
+            "INSERT OR IGNORE INTO installations (
+                id, public_key, platform, app_version, owner_email, owner_verified_at,
+                created_at, last_seen_at
+             ) VALUES (?1, ?2, 'linux', '1.0.0', 'owner@example.com', ?3, ?3, ?3)",
+            params![
+                id,
+                format!("notification-key-{id}"),
+                occurred_at.to_rfc3339()
+            ],
+        )
+        .expect("insert notification event installation");
         let snapshot = serde_json::json!({
             "installationId": id,
             "platform": "linux",
@@ -25077,7 +25145,7 @@ mod tests {
             &nonce,
             registered_at.timestamp_millis(),
         );
-        store
+        let registered = store
             .register_installation(
                 RegisterInstallationRequest {
                     public_key,
@@ -25095,6 +25163,22 @@ mod tests {
             )
             .await
             .expect("register notification client");
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO users (id, email_normalized, status, created_at, last_login_at)
+                 VALUES ('outbox-owner-user', 'owner@example.com', 'active', ?1, ?1)",
+                params![registered_at.to_rfc3339()],
+            )
+            .expect("insert outbox owner user");
+            conn.execute(
+                "UPDATE installations
+                 SET owner_email = 'owner@example.com', owner_verified_at = ?2
+                 WHERE id = ?1",
+                params![registered.installation_id, registered_at.to_rfc3339()],
+            )
+            .expect("bind outbox notification owner");
+        }
         let policy = notification_policy(&config);
         let template = notification_template();
         let delivery_at = registered_at + Duration::seconds(6);
@@ -25174,27 +25258,12 @@ mod tests {
             {
                 let conn = store.conn.lock().await;
                 for index in 0..5 {
-                    let installation_id = format!("storm-{wave}-{index}");
-                    conn.execute(
-                        "INSERT INTO client_notification_events (
-                            id, dedupe_key, kind, installation_id, episode, status,
-                            occurred_at, not_before, snapshot_json, created_at, updated_at
-                         ) VALUES (?1, ?2, 'client_registered', ?3, 0, 'pending', ?4, ?4, ?5, ?4, ?4)",
-                        params![
-                            Uuid::new_v4().to_string(),
-                            format!("storm-{wave}-{index}"),
-                            installation_id,
-                            occurred_at.to_rfc3339(),
-                            serde_json::json!({
-                                "installationId": installation_id,
-                                "platform": "linux",
-                                "appVersion": "1.0.0",
-                                "registeredAt": occurred_at,
-                            })
-                            .to_string(),
-                        ],
-                    )
-                    .expect("insert storm event");
+                    insert_test_notification_event(
+                        &conn,
+                        &format!("storm-{wave}-{index}"),
+                        "client_registered",
+                        occurred_at,
+                    );
                 }
             }
             store
@@ -25258,8 +25327,7 @@ mod tests {
                 .expect("insert owner registration event");
         }
         drop(signing_key);
-        let mut policy = notification_policy(&config);
-        policy.notify_owner = true;
+        let policy = notification_policy(&config);
         store
             .sync_client_notification_runtime(&policy, &notification_template(), now)
             .await
@@ -25280,7 +25348,16 @@ mod tests {
             .expect("query owner recipients")
             .collect::<Result<Vec<_>, _>>()
             .expect("read owner recipients");
-        assert_eq!(recipients, vec!["ops@example.com".to_string()]);
+        assert!(recipients.is_empty());
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM client_notification_events
+                 WHERE installation_id = 'inst-owner-recipient' AND kind = 'client_registered'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read ownerless registration status");
+        assert_eq!(status, "awaiting_owner");
         drop(conn);
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
@@ -25575,23 +25652,7 @@ mod tests {
         let now = Utc::now();
         {
             let conn = store.conn.lock().await;
-            conn.execute(
-                "INSERT INTO client_notification_events (
-                    id, dedupe_key, kind, installation_id, episode, status,
-                    occurred_at, not_before, snapshot_json, created_at, updated_at
-                 ) VALUES ('config-cap-event', 'config-cap-event', 'client_registered',
-                           'config-cap-installation', 0, 'pending', ?1, ?1, ?2, ?1, ?1)",
-                params![
-                    now.to_rfc3339(),
-                    serde_json::json!({
-                        "installationId": "config-cap-installation",
-                        "platform": "linux",
-                        "registeredAt": now,
-                    })
-                    .to_string(),
-                ],
-            )
-            .expect("insert config recovery event");
+            insert_test_notification_event(&conn, "config-cap-event", "client_registered", now);
         }
         let invalid_template = NotificationTemplateContext {
             dashboard_url: "https://router.example.com".into(),
@@ -25673,24 +25734,7 @@ mod tests {
                 )
                 .expect("insert disabled event");
             }
-            conn.execute(
-                "INSERT INTO client_notification_events (
-                    id, dedupe_key, kind, installation_id, episode, status,
-                    occurred_at, not_before, snapshot_json, created_at, updated_at
-                 ) VALUES (?1, 'active-registration', 'client_registered', 'active-inst', 0,
-                           'pending', ?2, ?2, ?3, ?2, ?2)",
-                params![
-                    Uuid::new_v4().to_string(),
-                    now.to_rfc3339(),
-                    serde_json::json!({
-                        "installationId": "active-inst",
-                        "platform": "linux",
-                        "registeredAt": now,
-                    })
-                    .to_string(),
-                ],
-            )
-            .expect("insert active registration");
+            insert_test_notification_event(&conn, "active-registration", "client_registered", now);
         }
         store
             .aggregate_client_notification_batches(
@@ -25714,7 +25758,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verified_active_owner_is_added_only_to_offline_notification() {
+    async fn verified_active_owner_is_the_only_offline_notification_recipient() {
         let config = enabled_notification_config("notification-owner-offline");
         let store = AppStore::new(&config).expect("create store");
         let _signing_key = insert_signed_installation(&store, "inst-owner-offline").await;
@@ -25756,8 +25800,7 @@ mod tests {
             )
             .expect("insert owner offline event");
         }
-        let mut policy = notification_policy(&config);
-        policy.notify_owner = true;
+        let policy = notification_policy(&config);
         store
             .sync_client_notification_runtime(&policy, &notification_template(), now)
             .await
@@ -25778,32 +25821,19 @@ mod tests {
             .expect("query offline recipients")
             .collect::<Result<Vec<_>, _>>()
             .expect("read offline recipients");
-        assert_eq!(
-            recipients,
-            vec![
-                "ops@example.com".to_string(),
-                "owner@example.com".to_string()
-            ]
-        );
+        assert_eq!(recipients, vec!["owner@example.com".to_string()]);
         drop(conn);
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 
     #[tokio::test]
-    async fn removed_explicit_recipient_cannot_receive_registration_as_owner() {
-        let mut config = enabled_notification_config("notification-owner-registration-scope");
-        config.client_notifications.alert_emails = vec!["owner@example.com".into()];
+    async fn registration_waits_for_verified_owner_then_sends_once() {
+        let config = enabled_notification_config("notification-owner-registration-wait");
         let store = AppStore::new(&config).expect("create store");
         insert_installation(&store, "inst-owner-registration").await;
         let now = Utc::now();
         {
             let conn = store.conn.lock().await;
-            conn.execute(
-                "INSERT INTO users (id, email_normalized, status, created_at, last_login_at)
-                 VALUES ('registration-owner-user', 'owner@example.com', 'active', ?1, ?1)",
-                params![now.to_rfc3339()],
-            )
-            .expect("insert registration owner user");
             conn.execute(
                 "INSERT INTO client_notification_events (
                     id, dedupe_key, kind, installation_id, episode, status,
@@ -25823,63 +25853,401 @@ mod tests {
             )
             .expect("insert owner registration event");
         }
-        let initial_policy = notification_policy(&config);
+        let policy = notification_policy(&config);
         let delivery_at = now + Duration::seconds(6);
         store
-            .aggregate_client_notification_batches(
-                &initial_policy,
-                &notification_template(),
-                delivery_at,
-            )
+            .aggregate_client_notification_batches(&policy, &notification_template(), delivery_at)
             .await
-            .expect("aggregate explicit registration batch");
-        let batch = expect_notification_batch(
-            store
-                .claim_client_notification_batch("owner-scope-worker", delivery_at, 30)
-                .await
-                .expect("claim explicit registration batch"),
-            "explicit registration batch",
-        );
-
-        let mut current_policy = initial_policy.clone();
-        current_policy.alert_emails = vec!["ops@example.com".into()];
-        current_policy.notify_owner = true;
-        store
-            .sync_client_notification_runtime(
-                &current_policy,
-                &notification_template(),
-                delivery_at + Duration::seconds(1),
-            )
-            .await
-            .expect("publish owner-only notification policy");
-        assert!(
-            !store
-                .validate_client_notification_batch(
-                    &batch.id,
-                    "owner-scope-worker",
-                    &current_policy,
-                    delivery_at + Duration::seconds(2),
+            .expect("defer registration without a verified owner user");
+        {
+            let conn = store.conn.lock().await;
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM client_notification_events
+                     WHERE id = 'owner-registration-event'",
+                    [],
+                    |row| row.get(0),
                 )
-                .await
-                .expect("validate registration recipient scope")
-        );
-        let conn = store.conn.lock().await;
-        let status: String = conn
-            .query_row(
-                "SELECT status FROM email_delivery_batches WHERE id = ?1",
-                params![batch.id],
-                |row| row.get(0),
+                .expect("read deferred registration event");
+            assert_eq!(status, "awaiting_owner");
+            let batches: i64 = conn
+                .query_row("SELECT COUNT(*) FROM email_delivery_batches", [], |row| {
+                    row.get(0)
+                })
+                .expect("count deferred registration batches");
+            assert_eq!(batches, 0);
+            conn.execute(
+                "INSERT INTO users (id, email_normalized, status, created_at, last_login_at)
+                 VALUES ('registration-owner-user', 'owner@example.com', 'active', ?1, ?1)",
+                params![delivery_at.to_rfc3339()],
             )
-            .expect("read rejected registration batch");
-        assert_eq!(status, "suppressed_recipient_removed");
+            .expect("activate registration owner user");
+        }
+        let owner_delivery_at = delivery_at + Duration::seconds(6);
+        store
+            .aggregate_client_notification_batches(
+                &policy,
+                &notification_template(),
+                owner_delivery_at,
+            )
+            .await
+            .expect("aggregate registration after owner verification");
+        store
+            .aggregate_client_notification_batches(
+                &policy,
+                &notification_template(),
+                owner_delivery_at + Duration::seconds(6),
+            )
+            .await
+            .expect("registration aggregation remains idempotent");
+        let conn = store.conn.lock().await;
+        let recipients = conn
+            .prepare("SELECT recipient FROM email_delivery_batches ORDER BY recipient")
+            .expect("prepare registration recipients")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query registration recipients")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read registration recipients");
+        assert_eq!(recipients, vec!["owner@example.com".to_string()]);
         drop(conn);
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 
     #[tokio::test]
-    async fn recipient_role_change_keeps_offline_capacity_isolated_from_registration() {
+    async fn disabling_notifications_suppresses_registration_waiting_for_owner() {
+        let config = enabled_notification_config("notification-owner-wait-disable");
+        let store = AppStore::new(&config).expect("create store");
+        insert_installation(&store, "inst-owner-wait-disable").await;
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO client_notification_events (
+                    id, dedupe_key, kind, installation_id, episode, status,
+                    occurred_at, not_before, snapshot_json, created_at, updated_at
+                 ) VALUES ('owner-wait-disable-event', 'owner-wait-disable-event',
+                           'client_registered', 'inst-owner-wait-disable', 0, 'pending',
+                           ?1, ?1, '{}', ?1, ?1)",
+                params![now.to_rfc3339()],
+            )
+            .expect("insert owner-wait event");
+        }
+        let policy = notification_policy(&config);
+        let delivery_at = now + Duration::seconds(6);
+        store
+            .aggregate_client_notification_batches(&policy, &notification_template(), delivery_at)
+            .await
+            .expect("defer owner-wait event");
+        let mut disabled = policy.clone();
+        disabled.enabled = false;
+        store
+            .sync_client_notification_runtime(
+                &disabled,
+                &notification_template(),
+                delivery_at + Duration::seconds(1),
+            )
+            .await
+            .expect("disable owner-wait notifications");
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO users (id, email_normalized, status, created_at, last_login_at)
+                 VALUES ('owner-wait-user', 'owner@example.com', 'active', ?1, ?1)",
+                params![(delivery_at + Duration::seconds(2)).to_rfc3339()],
+            )
+            .expect("activate owner after notifications disabled");
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM client_notification_events
+                     WHERE id = 'owner-wait-disable-event'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read disabled owner-wait event");
+            assert_eq!(status, "suppressed_disabled");
+        }
+        store
+            .sync_client_notification_runtime(
+                &policy,
+                &notification_template(),
+                delivery_at + Duration::seconds(3),
+            )
+            .await
+            .expect("re-enable owner notifications");
+        let stats = store
+            .aggregate_client_notification_batches(
+                &policy,
+                &notification_template(),
+                delivery_at + Duration::seconds(9),
+            )
+            .await
+            .expect("do not replay disabled owner-wait event");
+        assert_eq!(stats.batches_created, 0);
+        let conn = store.conn.lock().await;
+        let batch_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM email_delivery_batches", [], |row| {
+                row.get(0)
+            })
+            .expect("count disabled owner-wait batches");
+        assert_eq!(batch_count, 0);
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn owner_change_before_send_requeues_registration_for_current_owner() {
+        let config = enabled_notification_config("notification-registration-owner-change");
+        let store = AppStore::new(&config).expect("create store");
+        insert_installation(&store, "inst-registration-owner-change").await;
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO users (id, email_normalized, status, created_at, last_login_at)
+                 VALUES ('old-registration-owner', 'owner@example.com', 'active', ?1, ?1)",
+                params![now.to_rfc3339()],
+            )
+            .expect("insert original registration owner");
+            conn.execute(
+                "INSERT INTO client_notification_events (
+                    id, dedupe_key, kind, installation_id, episode, status,
+                    occurred_at, not_before, snapshot_json, created_at, updated_at
+                 ) VALUES ('registration-owner-change-event', 'registration-owner-change-event',
+                           'client_registered', 'inst-registration-owner-change', 0, 'pending',
+                           ?1, ?1, ?2, ?1, ?1)",
+                params![
+                    now.to_rfc3339(),
+                    serde_json::json!({
+                        "installationId": "inst-registration-owner-change",
+                        "platform": "linux",
+                        "registeredAt": now,
+                    })
+                    .to_string(),
+                ],
+            )
+            .expect("insert owner change registration event");
+        }
+        let policy = notification_policy(&config);
+        let delivery_at = now + Duration::seconds(6);
+        store
+            .aggregate_client_notification_batches(&policy, &notification_template(), delivery_at)
+            .await
+            .expect("aggregate original owner registration");
+        let original = expect_notification_batch(
+            store
+                .claim_client_notification_batch("owner-change-worker", delivery_at, 30)
+                .await
+                .expect("claim original owner registration"),
+            "original owner registration batch",
+        );
+        assert_eq!(original.recipient, "owner@example.com");
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO users (id, email_normalized, status, created_at, last_login_at)
+                 VALUES ('new-registration-owner', 'new-owner@example.com', 'active', ?1, ?1)",
+                params![delivery_at.to_rfc3339()],
+            )
+            .expect("insert replacement registration owner");
+            conn.execute(
+                "UPDATE installations
+                 SET owner_email = 'new-owner@example.com', owner_verified_at = ?2
+                 WHERE id = ?1",
+                params!["inst-registration-owner-change", delivery_at.to_rfc3339()],
+            )
+            .expect("replace registration owner");
+        }
+        assert!(
+            !store
+                .validate_client_notification_batch(
+                    &original.id,
+                    "owner-change-worker",
+                    &policy,
+                    delivery_at + Duration::seconds(1),
+                )
+                .await
+                .expect("revoke original owner delivery")
+        );
+        {
+            let conn = store.conn.lock().await;
+            let state: (String, String, i64) = conn
+                .query_row(
+                    "SELECT b.status, e.status,
+                            (SELECT COUNT(*) FROM email_delivery_batch_items WHERE batch_id = b.id)
+                     FROM email_delivery_batches b
+                     CROSS JOIN client_notification_events e
+                     WHERE b.id = ?1 AND e.id = 'registration-owner-change-event'",
+                    params![original.id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("read revoked owner batch state");
+            assert_eq!(
+                state,
+                ("suppressed_recipient_removed".into(), "pending".into(), 0)
+            );
+        }
+        store
+            .aggregate_client_notification_batches(
+                &policy,
+                &notification_template(),
+                delivery_at + Duration::seconds(2),
+            )
+            .await
+            .expect("reroute registration to current owner");
+        let conn = store.conn.lock().await;
+        let batches = conn
+            .prepare(
+                "SELECT recipient, status FROM email_delivery_batches
+                 ORDER BY created_at, recipient",
+            )
+            .expect("prepare rerouted owner batches")
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query rerouted owner batches")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read rerouted owner batches");
+        assert_eq!(
+            batches,
+            vec![
+                (
+                    "owner@example.com".into(),
+                    "suppressed_recipient_removed".into()
+                ),
+                ("new-owner@example.com".into(), "pending".into()),
+            ]
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn legacy_operations_batch_is_revoked_and_rerouted_to_owner() {
+        let config = enabled_notification_config("notification-legacy-operations-recipient");
+        let store = AppStore::new(&config).expect("create store");
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            insert_test_notification_event(
+                &conn,
+                "legacy-operations-event",
+                "client_registered",
+                now,
+            );
+            insert_test_notification_event(
+                &conn,
+                "legacy-operations-other-event",
+                "client_registered",
+                now,
+            );
+            conn.execute(
+                "INSERT INTO users (id, email_normalized, status, created_at, last_login_at)
+                 VALUES ('legacy-other-owner-user', 'other-owner@example.com', 'active', ?1, ?1)",
+                params![now.to_rfc3339()],
+            )
+            .expect("insert second legacy owner user");
+            conn.execute(
+                "UPDATE installations
+                 SET owner_email = 'other-owner@example.com', owner_verified_at = ?2
+                 WHERE id = ?1",
+                params!["legacy-operations-other-event", now.to_rfc3339()],
+            )
+            .expect("assign second legacy event owner");
+            insert_test_notification_batch_in_lane(
+                &conn,
+                "legacy-operations-batch",
+                NotificationLane::Registration,
+                "ops@example.com",
+                "pending",
+                now,
+                None,
+                None,
+                None,
+            );
+            conn.execute(
+                "INSERT INTO email_delivery_batch_items (batch_id, event_id, recipient)
+                 VALUES ('legacy-operations-batch', 'legacy-operations-event', 'ops@example.com'),
+                        ('legacy-operations-batch', 'legacy-operations-other-event', 'ops@example.com')",
+                [],
+            )
+            .expect("link legacy operations batch");
+            conn.execute(
+                "UPDATE client_notification_events SET status = 'batched'
+                 WHERE id IN ('legacy-operations-event', 'legacy-operations-other-event')",
+                [],
+            )
+            .expect("mark legacy operations event batched");
+        }
+        let policy = notification_policy(&config);
+        store
+            .sync_client_notification_runtime(&policy, &notification_template(), now)
+            .await
+            .expect("revoke legacy operations recipient");
+        store
+            .aggregate_client_notification_batches(
+                &policy,
+                &notification_template(),
+                now + Duration::seconds(6),
+            )
+            .await
+            .expect("reroute legacy notification to owner");
+        let conn = store.conn.lock().await;
+        let batches = conn
+            .prepare(
+                "SELECT recipient, status FROM email_delivery_batches
+                 ORDER BY created_at, recipient",
+            )
+            .expect("prepare migrated owner batches")
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query migrated owner batches")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read migrated owner batches");
+        assert_eq!(
+            batches,
+            vec![
+                (
+                    "ops@example.com".into(),
+                    "suppressed_recipient_removed".into()
+                ),
+                ("other-owner@example.com".into(), "pending".into()),
+                ("owner@example.com".into(), "pending".into()),
+            ]
+        );
+        let routed_events = conn
+            .prepare(
+                "SELECT b.recipient, e.id
+                 FROM email_delivery_batches b
+                 INNER JOIN email_delivery_batch_items bi ON bi.batch_id = b.id
+                 INNER JOIN client_notification_events e ON e.id = bi.event_id
+                 WHERE b.status = 'pending'
+                 ORDER BY b.recipient",
+            )
+            .expect("prepare migrated owner event routes")
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query migrated owner event routes")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read migrated owner event routes");
+        assert_eq!(
+            routed_events,
+            vec![
+                (
+                    "other-owner@example.com".into(),
+                    "legacy-operations-other-event".into()
+                ),
+                ("owner@example.com".into(), "legacy-operations-event".into()),
+            ]
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn owner_notification_lanes_keep_capacity_isolated() {
         let mut config = enabled_notification_config("notification-recipient-role-priority");
-        config.client_notifications.alert_emails = vec!["owner@example.com".into()];
         config.client_notifications.global_hourly_limit = 1;
         let store = AppStore::new(&config).expect("create store");
         insert_installation(&store, "inst-role-priority").await;
@@ -25931,9 +26299,7 @@ mod tests {
             .await
             .expect("aggregate former explicit owner batch");
 
-        let mut current_policy = initial_policy.clone();
-        current_policy.alert_emails = vec!["ops@example.com".into()];
-        current_policy.notify_owner = true;
+        let current_policy = initial_policy.clone();
         let policy_changed_at = first_delivery_at + Duration::seconds(1);
         store
             .sync_client_notification_runtime(
@@ -26005,9 +26371,9 @@ mod tests {
             batches,
             vec![
                 (
-                    "ops@example.com".into(),
+                    "owner@example.com".into(),
                     "pending".into(),
-                    EXPLICIT_NOTIFICATION_RECIPIENT_PRIORITY
+                    OWNER_NOTIFICATION_RECIPIENT_PRIORITY
                 ),
                 (
                     "owner@example.com".into(),
@@ -26021,7 +26387,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_recipient_preempts_existing_owner_reservation_at_global_cap() {
+    async fn owner_notification_does_not_preempt_global_cap_reservation() {
         let mut config = enabled_notification_config("notification-explicit-preemption");
         config.client_notifications.global_hourly_limit = 1;
         let store = AppStore::new(&config).expect("create store");
@@ -26043,23 +26409,7 @@ mod tests {
                 params!["owner-reservation", OWNER_NOTIFICATION_RECIPIENT_PRIORITY],
             )
             .expect("mark owner reservation priority");
-            conn.execute(
-                "INSERT INTO client_notification_events (
-                    id, dedupe_key, kind, installation_id, episode, status,
-                    occurred_at, not_before, snapshot_json, created_at, updated_at
-                 ) VALUES ('explicit-event', 'explicit-event', 'client_offline',
-                           'inst-explicit', 0, 'pending', ?1, ?1, ?2, ?1, ?1)",
-                params![
-                    now.to_rfc3339(),
-                    serde_json::json!({
-                        "installationId": "inst-explicit",
-                        "platform": "linux",
-                        "registeredAt": now,
-                    })
-                    .to_string(),
-                ],
-            )
-            .expect("insert explicit notification event");
+            insert_test_notification_event(&conn, "inst-owner-capped", "client_offline", now);
         }
         let policy = notification_policy(&config);
         let delivery_at = now + Duration::seconds(policy.batch_window_secs + 1);
@@ -26067,7 +26417,7 @@ mod tests {
             .aggregate_client_notification_batches(&policy, &notification_template(), delivery_at)
             .await
             .expect("aggregate explicit notification at global cap");
-        assert_eq!(stats.batches_created, 1);
+        assert_eq!(stats.batches_created, 0);
         {
             let conn = store.conn.lock().await;
             let owner_status: String = conn
@@ -26077,21 +26427,21 @@ mod tests {
                     |row| row.get(0),
                 )
                 .expect("read preempted owner reservation");
-            let explicit: (String, i64, String) = conn
+            let capped_owner: (String, i64, String) = conn
                 .query_row(
                     "SELECT status, recipient_priority, recipient
-                     FROM email_delivery_batches WHERE recipient = 'ops@example.com'",
+                     FROM email_delivery_batches WHERE recipient = 'owner@example.com'",
                     [],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
-                .expect("read explicit reservation");
-            assert_eq!(owner_status, "suppressed_rate_limit");
+                .expect("read capped owner reservation");
+            assert_eq!(owner_status, "pending");
             assert_eq!(
-                explicit,
+                capped_owner,
                 (
-                    "pending".into(),
-                    EXPLICIT_NOTIFICATION_RECIPIENT_PRIORITY,
-                    "ops@example.com".into()
+                    "suppressed_rate_limit".into(),
+                    OWNER_NOTIFICATION_RECIPIENT_PRIORITY,
+                    "owner@example.com".into()
                 )
             );
         }
@@ -26100,14 +26450,14 @@ mod tests {
                 .claim_client_notification_batch("priority-worker", delivery_at, 30)
                 .await
                 .expect("claim explicit notification"),
-            "explicit notification batch",
+            "existing owner notification batch",
         );
-        assert_eq!(claimed.recipient, "ops@example.com");
+        assert_eq!(claimed.recipient, "a-owner@example.com");
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 
     #[tokio::test]
-    async fn claim_orders_explicit_recipient_before_older_owner_batch() {
+    async fn claim_orders_owner_batches_by_creation_time() {
         let (store, config) = setup_store("notification-claim-priority").await;
         let now = Utc::now();
         {
@@ -26138,7 +26488,7 @@ mod tests {
                      WHEN 'a-owner-batch' THEN ?1 ELSE ?2 END",
                 params![
                     OWNER_NOTIFICATION_RECIPIENT_PRIORITY,
-                    EXPLICIT_NOTIFICATION_RECIPIENT_PRIORITY
+                    OWNER_NOTIFICATION_RECIPIENT_PRIORITY
                 ],
             )
             .expect("set notification recipient priorities");
@@ -26150,7 +26500,7 @@ mod tests {
                 .expect("claim prioritized notification"),
             "prioritized batch",
         );
-        assert_eq!(claimed.id, "z-explicit-batch");
+        assert_eq!(claimed.id, "a-owner-batch");
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 
@@ -26168,6 +26518,28 @@ mod tests {
         let now = Utc::now();
         {
             let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO users (id, email_normalized, status, created_at, last_login_at)
+                 VALUES ('scan-owner-user', 'owner@example.com', 'active', ?1, ?1)",
+                params![now.to_rfc3339()],
+            )
+            .expect("insert scan owner user");
+            conn.execute(
+                "WITH RECURSIVE registrations(value) AS (
+                     SELECT 0
+                     UNION ALL SELECT value + 1 FROM registrations WHERE value < 1000
+                 )
+                 INSERT INTO installations (
+                     id, public_key, platform, app_version, owner_email, owner_verified_at,
+                     created_at, last_seen_at
+                 )
+                 SELECT printf('registration-%04d', value),
+                        printf('registration-key-%04d', value),
+                        'linux', '1.0.0', 'owner@example.com', ?1, ?1, ?1
+                 FROM registrations",
+                params![now.to_rfc3339()],
+            )
+            .expect("insert registration backlog owners");
             conn.execute(
                 "WITH RECURSIVE registrations(value) AS (
                      SELECT 0
@@ -26412,7 +26784,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claim_prioritizes_offline_lane_then_recipient_role() {
+    async fn claim_prioritizes_offline_lane_then_creation_time() {
         let config = enabled_notification_config("notification-lane-claim-order");
         let store = AppStore::new(&config).expect("create store");
         let now = Utc::now();
@@ -26457,13 +26829,13 @@ mod tests {
                      WHEN 'offline-owner' THEN ?1 ELSE ?2 END",
                 params![
                     OWNER_NOTIFICATION_RECIPIENT_PRIORITY,
-                    EXPLICIT_NOTIFICATION_RECIPIENT_PRIORITY
+                    OWNER_NOTIFICATION_RECIPIENT_PRIORITY
                 ],
             )
             .expect("set lane claim priorities");
         }
 
-        for (index, expected_id) in ["offline-explicit", "offline-owner", "registration-explicit"]
+        for (index, expected_id) in ["offline-owner", "offline-explicit", "registration-explicit"]
             .into_iter()
             .enumerate()
         {
@@ -26582,8 +26954,24 @@ mod tests {
         )
         .expect("insert events below high watermark");
         assert!(!registration_overflow_should_capture_tx(&conn, now).expect("below high"));
+        conn.execute(
+            "UPDATE client_notification_events SET status = 'awaiting_owner'
+             WHERE kind = 'client_registered'",
+            [],
+        )
+        .expect("move registrations into awaiting-owner backlog");
+        assert!(
+            !registration_overflow_should_capture_tx(&conn, now)
+                .expect("awaiting-owner backlog below high")
+        );
         insert_test_notification_event(&conn, "watermark-4999", "client_registered", now);
-        assert!(registration_overflow_should_capture_tx(&conn, now).expect("at high"));
+        conn.execute(
+            "UPDATE client_notification_events SET status = 'awaiting_owner'
+             WHERE id = 'watermark-4999'",
+            [],
+        )
+        .expect("complete awaiting-owner high watermark");
+        assert!(registration_overflow_should_capture_tx(&conn, now).expect("awaiting-owner high"));
 
         conn.execute(
             "DELETE FROM client_notification_events
@@ -26636,7 +27024,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registration_overflow_window_materializes_once() {
+    async fn registration_overflow_window_is_audit_only_for_owner_notifications() {
         let config = enabled_notification_config("notification-overflow-window");
         let store = AppStore::new(&config).expect("create store");
         let now = Utc
@@ -26672,30 +27060,27 @@ mod tests {
             )
             .expect("read overflow window");
         assert_eq!(window, (2, "materialized".into()));
-        let event_count: i64 = conn
+        let event: (i64, String) = conn
             .query_row(
-                "SELECT COUNT(*) FROM client_notification_events
+                "SELECT COUNT(*), MIN(status) FROM client_notification_events
                  WHERE kind = 'client_registration_overflow'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("count overflow summary events");
-        let batch: (i64, String) = conn
-            .query_row(
-                "SELECT COUNT(*), MIN(notification_lane) FROM email_delivery_batches",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
+            .expect("count overflow summary events");
+        let batch_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM email_delivery_batches", [], |row| {
+                row.get(0)
+            })
             .expect("read overflow summary batch");
-        assert_eq!(event_count, 1);
-        assert_eq!(batch, (1, "registration".into()));
+        assert_eq!(event, (1, "suppressed_no_recipient".into()));
+        assert_eq!(batch_count, 0);
         drop(conn);
         let deliveries = store
             .list_client_notification_deliveries(10)
             .await
             .expect("list overflow delivery summary");
-        assert_eq!(deliveries.len(), 1);
-        assert_eq!(deliveries[0].event_count, 2);
+        assert!(deliveries.is_empty());
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 
@@ -26727,6 +27112,56 @@ mod tests {
                 ("retained-offline".into(), "pending".into()),
             ]
         );
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn registration_awaiting_owner_ttl_expires_before_activation() {
+        let config = enabled_notification_config("notification-awaiting-owner-ttl");
+        let store = AppStore::new(&config).expect("create store");
+        let now = Utc::now();
+        let expired_at =
+            now - Duration::seconds(CLIENT_NOTIFICATION_REGISTRATION_PENDING_TTL_SECS + 1);
+        {
+            let conn = store.conn.lock().await;
+            insert_test_notification_event(
+                &conn,
+                "expired-awaiting-owner",
+                "client_registered",
+                expired_at,
+            );
+            conn.execute(
+                "UPDATE client_notification_events SET status = 'awaiting_owner'
+                 WHERE id = 'expired-awaiting-owner'",
+                [],
+            )
+            .expect("mark expired registration as awaiting owner");
+        }
+
+        let policy = notification_policy(&config);
+        let stats = store
+            .aggregate_client_notification_batches(&policy, &notification_template(), now)
+            .await
+            .expect("expire registration before owner activation");
+        assert_eq!(stats.batches_created, 0);
+
+        let conn = store.conn.lock().await;
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM client_notification_events
+                 WHERE id = 'expired-awaiting-owner'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read expired awaiting-owner registration");
+        let batch_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM email_delivery_batches", [], |row| {
+                row.get(0)
+            })
+            .expect("count expired awaiting-owner batches");
+        assert_eq!(status, "suppressed_expired");
+        assert_eq!(batch_count, 0);
         drop(conn);
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
@@ -26853,8 +27288,7 @@ mod tests {
         let store = AppStore::new(&config).expect("create store");
         insert_installation(&store, "inst-owner-changed").await;
         let now = Utc::now();
-        let mut policy = notification_policy(&config);
-        policy.notify_owner = true;
+        let policy = notification_policy(&config);
         store
             .sync_client_notification_runtime(&policy, &notification_template(), now)
             .await
@@ -26906,7 +27340,7 @@ mod tests {
         let bodies = conn
             .prepare(
                 "SELECT recipient, html_body FROM email_delivery_batches
-                 WHERE recipient IN ('ops@example.com', 'new-owner@example.com')
+                 WHERE recipient = 'new-owner@example.com'
                  ORDER BY recipient",
             )
             .expect("prepare owner privacy bodies")
@@ -26916,7 +27350,7 @@ mod tests {
             .expect("query owner privacy bodies")
             .collect::<Result<Vec<_>, _>>()
             .expect("read owner privacy bodies");
-        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies.len(), 1);
         for (_, body) in &bodies {
             assert!(body.contains("new-owner@example.com"));
             assert!(!body.contains("old-owner@example.com"));
@@ -27084,6 +27518,12 @@ mod tests {
         let delivery_at = now + Duration::seconds(61);
         {
             let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO users (id, email_normalized, status, created_at, last_login_at)
+                 VALUES ('mixed-owner-user', 'owner@example.com', 'active', ?1, ?1)",
+                params![occurred_at.to_rfc3339()],
+            )
+            .expect("insert mixed notification owner");
             conn.execute(
                 "INSERT INTO installation_notification_state (
                     installation_id, registration_state, registration_verified_at,
@@ -27735,11 +28175,332 @@ mod tests {
 
         assert!(response.ok);
         assert_eq!(response.owner_email, email);
+        assert!(response.owner_verified);
         assert!(!response.already_bound);
+        let retry_timestamp_ms = timestamp_ms + 1;
+        let retry_nonce = Uuid::new_v4().to_string();
+        let retry_signature = sign_test_payload(
+            &signing_key,
+            installation_id,
+            "bind_installation_owner_email",
+            &payload,
+            retry_timestamp_ms,
+            &retry_nonce,
+        );
+        let retry = store
+            .bind_installation_owner_email(
+                &config,
+                BindInstallationOwnerEmailRequest {
+                    installation_id: installation_id.into(),
+                    email: email.into(),
+                    verification_token: None,
+                    timestamp_ms: retry_timestamp_ms,
+                    nonce: retry_nonce,
+                    signature: retry_signature,
+                },
+                Some("expired-or-revoked-access-token"),
+            )
+            .await
+            .expect("verified owner binding retry remains idempotent");
+        assert!(retry.owner_verified);
+        assert!(retry.already_bound);
         let conn = store.conn.lock().await;
         assert_eq!(
             get_installation_owner_email(&conn, installation_id).expect("owner email"),
             Some(email.into())
+        );
+        let verified_at: Option<String> = conn
+            .query_row(
+                "SELECT owner_verified_at FROM installations WHERE id = ?1",
+                params![installation_id],
+                |row| row.get(0),
+            )
+            .expect("read owner verification time");
+        assert!(verified_at.is_some());
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_owner_binding_waits_for_authenticated_email_before_notification() {
+        let config = enabled_notification_config("bootstrap-owner-notification-verification");
+        let store = AppStore::new(&config).expect("create store");
+        let installation_id = "inst-bootstrap-owner";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        let email = "victim@example.com";
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installations SET owner_email = NULL, owner_verified_at = ?2
+                 WHERE id = ?1",
+                params![installation_id, now.to_rfc3339()],
+            )
+            .expect("seed inconsistent legacy bootstrap owner state");
+            conn.execute(
+                "INSERT INTO users (id, email_normalized, status, created_at, last_login_at)
+                 VALUES ('bootstrap-victim-user', ?1, 'active', ?2, ?2)",
+                params![email, now.to_rfc3339()],
+            )
+            .expect("insert active victim user");
+        }
+
+        let timestamp_ms = now.timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let payload = BindOwnerEmailSignaturePayload {
+            email,
+            verification_token: None,
+        };
+        let signature = sign_test_payload(
+            &signing_key,
+            installation_id,
+            "bind_installation_owner_email",
+            &payload,
+            timestamp_ms,
+            &nonce,
+        );
+        let bootstrap = store
+            .bind_installation_owner_email(
+                &config,
+                BindInstallationOwnerEmailRequest {
+                    installation_id: installation_id.into(),
+                    email: email.into(),
+                    verification_token: None,
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                },
+                None,
+            )
+            .await
+            .expect("bootstrap owner address");
+        assert!(!bootstrap.already_bound);
+        assert!(!bootstrap.owner_verified);
+        {
+            let conn = store.conn.lock().await;
+            let binding: (Option<String>, Option<String>) = conn
+                .query_row(
+                    "SELECT owner_email, owner_verified_at FROM installations WHERE id = ?1",
+                    params![installation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read bootstrap owner binding");
+            assert_eq!(binding, (Some(email.into()), None));
+            let installation = get_installation(&conn, installation_id)
+                .expect("load bootstrap installation")
+                .expect("bootstrap installation");
+            insert_client_registration_event(&conn, &installation, now)
+                .expect("insert bootstrap registration event");
+        }
+        let status_timestamp_ms = timestamp_ms + 1;
+        let status_nonce = Uuid::new_v4().to_string();
+        let status_signature = sign_test_payload(
+            &signing_key,
+            installation_id,
+            "get_installation_owner_email",
+            &serde_json::json!({}),
+            status_timestamp_ms,
+            &status_nonce,
+        );
+        let tentative_status = store
+            .get_installation_owner_email_status(GetInstallationOwnerEmailQuery {
+                installation_id: installation_id.into(),
+                timestamp_ms: status_timestamp_ms,
+                nonce: status_nonce,
+                signature: status_signature,
+            })
+            .await
+            .expect("read tentative owner status");
+        assert!(tentative_status.owner_email.is_none());
+        assert!(!tentative_status.owner_verified);
+        let tentative_session_status = store
+            .session_status(None, Some(installation_id))
+            .await
+            .expect("read session status for tentative owner");
+        assert!(tentative_session_status.installation_owner_email.is_none());
+        let policy = notification_policy(&config);
+        let first_delivery_at = now + Duration::seconds(6);
+        store
+            .aggregate_client_notification_batches(
+                &policy,
+                &notification_template(),
+                first_delivery_at,
+            )
+            .await
+            .expect("defer bootstrap registration notification");
+        {
+            let conn = store.conn.lock().await;
+            let state: (String, i64) = conn
+                .query_row(
+                    "SELECT status, (SELECT COUNT(*) FROM email_delivery_batches)
+                     FROM client_notification_events
+                     WHERE installation_id = ?1 AND kind = 'client_registered'",
+                    params![installation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read deferred bootstrap event");
+            assert_eq!(state, ("awaiting_owner".into(), 0));
+        }
+
+        let access_token = "bootstrap-owner-access-token";
+        {
+            let conn = store.conn.lock().await;
+            let user = upsert_user_by_email(&conn, email, now).expect("load bootstrap owner user");
+            persist_session(
+                &conn,
+                &AuthSession {
+                    session_id: Uuid::new_v4().to_string(),
+                    user_id: user.id,
+                    email: email.into(),
+                    installation_id: installation_id.into(),
+                    access_token_hash: hash_token(access_token),
+                    refresh_token_hash: hash_token("bootstrap-owner-refresh-token"),
+                    access_expires_at: now + Duration::hours(1),
+                    refresh_expires_at: now + Duration::days(1),
+                    created_at: now,
+                    last_used_at: now,
+                },
+            )
+            .expect("persist bootstrap owner session");
+        }
+        let verified_timestamp_ms = timestamp_ms + 1;
+        let verified_nonce = Uuid::new_v4().to_string();
+        let verified_signature = sign_test_payload(
+            &signing_key,
+            installation_id,
+            "bind_installation_owner_email",
+            &payload,
+            verified_timestamp_ms,
+            &verified_nonce,
+        );
+        let verified = store
+            .bind_installation_owner_email(
+                &config,
+                BindInstallationOwnerEmailRequest {
+                    installation_id: installation_id.into(),
+                    email: email.into(),
+                    verification_token: None,
+                    timestamp_ms: verified_timestamp_ms,
+                    nonce: verified_nonce,
+                    signature: verified_signature,
+                },
+                Some(access_token),
+            )
+            .await
+            .expect("verify existing bootstrap owner");
+        assert!(verified.already_bound);
+        assert!(verified.owner_verified);
+        store
+            .aggregate_client_notification_batches(
+                &policy,
+                &notification_template(),
+                first_delivery_at + Duration::seconds(6),
+            )
+            .await
+            .expect("deliver registration after owner authentication");
+        let conn = store.conn.lock().await;
+        let delivery: (String, String) = conn
+            .query_row(
+                "SELECT b.recipient, e.status
+                 FROM email_delivery_batches b
+                 INNER JOIN email_delivery_batch_items bi ON bi.batch_id = b.id
+                 INNER JOIN client_notification_events e ON e.id = bi.event_id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read verified owner delivery");
+        assert_eq!(delivery, (email.into(), "batched".into()));
+        let verified_at: Option<String> = conn
+            .query_row(
+                "SELECT owner_verified_at FROM installations WHERE id = ?1",
+                params![installation_id],
+                |row| row.get(0),
+            )
+            .expect("read upgraded owner verification");
+        assert!(verified_at.is_some());
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn tentative_owner_cannot_claim_owner_privileges() {
+        let (store, config) = setup_store("tentative-owner-privileges").await;
+        let installation_id = "inst-tentative-owner";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installations SET owner_verified_at = NULL WHERE id = ?1",
+                params![installation_id],
+            )
+            .expect("make installation owner tentative");
+            let share_error = upsert_share_tx(
+                &conn,
+                installation_id,
+                test_share_descriptor("tentative-share", "tentative-share-sub"),
+            )
+            .expect_err("tentative owner must not publish a share");
+            assert!(share_error.to_string().contains("must be verified"));
+            let upgrade_error = AppStore::installation_upgrade_context(
+                &conn,
+                &config,
+                installation_id,
+                "owner@example.com",
+                "only verified owner can upgrade",
+            )
+            .expect_err("tentative owner must not authorize an upgrade");
+            assert!(upgrade_error.to_string().contains("not verified"));
+        }
+
+        let tunnel = ClientTunnelConfig {
+            owner_email: "owner@example.com".into(),
+            subdomain: "tentative-client".into(),
+            enabled: true,
+        };
+        let tunnel_timestamp_ms = Utc::now().timestamp_millis();
+        let tunnel_nonce = Uuid::new_v4().to_string();
+        let tunnel_signature = sign_test_payload(
+            &signing_key,
+            installation_id,
+            "client_tunnel_claim",
+            &tunnel,
+            tunnel_timestamp_ms,
+            &tunnel_nonce,
+        );
+        let tunnel_error = store
+            .claim_client_tunnel(
+                &config,
+                ClientTunnelClaimRequest {
+                    installation_id: installation_id.into(),
+                    timestamp_ms: tunnel_timestamp_ms,
+                    nonce: tunnel_nonce,
+                    signature: tunnel_signature,
+                    tunnel,
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+            )
+            .await
+            .expect_err("tentative owner must not claim a client tunnel");
+        assert!(tunnel_error.to_string().contains("must be verified"));
+
+        let payout_error = push_test_payout_update(
+            &store,
+            &signing_key,
+            installation_id,
+            payout_update(1, Some(test_payout_profile())),
+        )
+        .await
+        .expect_err("tentative owner must not publish payout information");
+        assert!(payout_error.to_string().contains("must be verified"));
+        assert!(
+            store
+                .resolve_client_tunnel_owner_email("tentative-client", Some(installation_id))
+                .await
+                .expect("resolve tentative tunnel owner")
+                .is_none()
         );
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
@@ -27820,6 +28581,7 @@ mod tests {
         .await;
         let old_email = "owner@example.com";
         let new_email = "new-owner@example.com";
+        insert_client_tunnel(&store, installation_id, old_email, "change-owner-client").await;
         let access_token = "access-token-for-change-owner";
         let now = Utc::now();
         {
@@ -27896,6 +28658,14 @@ mod tests {
             get_share_owner_email(&conn, "share-divergent-owner").expect("divergent share owner"),
             Some(new_email.into())
         );
+        let tunnel_owner: String = conn
+            .query_row(
+                "SELECT owner_email FROM installation_client_tunnels WHERE installation_id = ?1",
+                params![installation_id],
+                |row| row.get(0),
+            )
+            .expect("read rebound client tunnel owner");
+        assert_eq!(tunnel_owner, new_email);
         let shared_json: String = conn
             .query_row(
                 "SELECT shared_with_emails_json FROM shares WHERE share_id = 'share-divergent-owner'",
@@ -27905,6 +28675,15 @@ mod tests {
             .expect("read migrated share ACL");
         let shared: Vec<String> = serde_json::from_str(&shared_json).expect("parse migrated ACL");
         assert_eq!(shared, vec!["historical@example.com".to_string()]);
+        drop(conn);
+        assert_eq!(
+            store
+                .resolve_client_tunnel_owner_email("change-owner-client", Some(installation_id))
+                .await
+                .expect("resolve rebound client tunnel owner")
+                .as_deref(),
+            Some(new_email)
+        );
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 
@@ -30227,6 +31006,15 @@ mod tests {
         insert_installation(&store, "inst-kr").await;
         set_installation_country_code(&store, "inst-kr", "KR").await;
         insert_client_tunnel(&store, "inst-kr", "owner@example.com", "kr-tunnel").await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installations SET owner_email = 'tentative@example.com',
+                 owner_verified_at = NULL WHERE id = 'inst-us'",
+                [],
+            )
+            .expect("make US installation owner tentative");
+        }
 
         let server_geo = ServerGeo {
             lat: None,
@@ -30260,6 +31048,20 @@ mod tests {
         assert_eq!(snapshot.country_counts.get("KOR"), Some(&1));
         assert_eq!(snapshot.map.countries.len(), 3);
         assert_eq!(snapshot.clients.len(), 3);
+        assert!(
+            snapshot
+                .clients
+                .iter()
+                .find(|client| client.installation.id == "inst-us")
+                .is_some_and(|client| client.installation.owner_email.is_none())
+        );
+        assert!(
+            snapshot
+                .country_boards
+                .get("USA")
+                .and_then(|board| board.clients.first())
+                .is_some_and(|client| client.owner_email.is_none())
+        );
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
@@ -30955,7 +31757,7 @@ mod tests {
         {
             let conn = store.conn.lock().await;
             conn.execute(
-                "UPDATE installations SET last_seen_at = ?2 WHERE id = ?1",
+                "UPDATE installations SET last_seen_at = ?2, owner_verified_at = NULL WHERE id = ?1",
                 params!["inst-pending-offline", stale.to_rfc3339()],
             )
             .expect("backdate pending offline installation");
@@ -30992,6 +31794,43 @@ mod tests {
             .expect("read pending offline event");
         assert_eq!(retained, 1);
         assert_eq!(event_status, "pending");
+        drop(conn);
+
+        let policy = notification_policy(&config);
+        store
+            .aggregate_client_notification_batches(
+                &policy,
+                &notification_template(),
+                Utc::now() + Duration::seconds(policy.batch_window_secs + 1),
+            )
+            .await
+            .expect("suppress ownerless offline notification");
+        {
+            let conn = store.conn.lock().await;
+            let terminal_status: String = conn
+                .query_row(
+                    "SELECT status FROM client_notification_events
+                     WHERE installation_id = 'inst-pending-offline' AND kind = 'client_offline'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read ownerless offline terminal status");
+            assert_eq!(terminal_status, "suppressed_no_recipient");
+        }
+        let after_terminal = store
+            .cleanup_expired_data(&config, &ProxyRegistry::default())
+            .await
+            .expect("cleanup terminal ownerless offline installation");
+        assert_eq!(after_terminal.deleted_installations, 1);
+        let conn = store.conn.lock().await;
+        let retained_after_terminal: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM installations WHERE id = 'inst-pending-offline'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count installation after terminal notification");
+        assert_eq!(retained_after_terminal, 0);
         drop(conn);
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }

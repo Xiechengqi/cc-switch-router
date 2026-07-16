@@ -305,6 +305,7 @@ pub struct BindInstallationOwnerEmailRequest {
 pub struct BindInstallationOwnerEmailResponse {
     pub ok: bool,
     pub owner_email: String,
+    pub owner_verified: bool,
     pub already_bound: bool,
 }
 
@@ -343,6 +344,7 @@ pub struct GetInstallationOwnerEmailResponse {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_email: Option<String>,
+    pub owner_verified: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

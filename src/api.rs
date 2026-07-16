@@ -4373,13 +4373,6 @@ async fn admin_settings_apply(
                 || key == "CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS"
         });
     if needs_client_notification_validation {
-        let normalized_policy = ClientNotificationPolicy::from(&next_dynamic.client_notifications);
-        if next_dynamic.client_notifications.enabled && !normalized_policy.enabled {
-            return Err(AppError::BadRequest(
-                "client email notifications require at least one valid explicit alert recipient"
-                    .into(),
-            ));
-        }
         let mut validation_config = state.config.clone();
         if let Some(value) = outcome
             .new_env_kv

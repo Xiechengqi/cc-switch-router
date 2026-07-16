@@ -90,7 +90,7 @@ async fn main() -> Result<()> {
         client_installation_retention_secs = config.client_installation_retention_secs,
         paused_share_stale_secs = config.paused_share_stale_secs,
         client_email_notifications_enabled = config.client_notifications.enabled,
-        client_alert_recipients = config.client_notifications.alert_emails.len(),
+        client_notification_recipient_mode = "owner_email",
         client_offline_alert_secs = config.client_notifications.offline_alert_secs,
         db_exists = config.db_path.exists(),
         host_key_path = %config.host_key_path.display(),

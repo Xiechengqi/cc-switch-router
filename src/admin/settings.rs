@@ -509,20 +509,8 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         required: false,
         restart_required: false,
         default: Some("false"),
-        description: "Send lifecycle alerts for newly registered and offline clients.",
+        description: "Send registration and offline alerts to each client's verified owner with an active Router account.",
         placeholder: None,
-        dynamic_group: Some(DynamicGroup::ClientNotifications),
-    },
-    SettingsField {
-        key: "CC_SWITCH_ROUTER_CLIENT_ALERT_EMAILS",
-        label: "Alert recipients",
-        group: "Client notifications",
-        field_type: FieldType::EmailList,
-        required: false,
-        restart_required: false,
-        default: None,
-        description: "Explicit comma-separated operations recipients. No address is inferred from the router domain.",
-        placeholder: Some("ops@example.com,oncall@example.com"),
         dynamic_group: Some(DynamicGroup::ClientNotifications),
     },
     SettingsField {
@@ -667,18 +655,6 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         default: Some("10"),
         description: "Maximum registration notifications sent by this router per hour.",
         placeholder: Some("10"),
-        dynamic_group: Some(DynamicGroup::ClientNotifications),
-    },
-    SettingsField {
-        key: "CC_SWITCH_ROUTER_CLIENT_OFFLINE_NOTIFY_OWNER",
-        label: "Notify verified owner",
-        group: "Client notifications",
-        field_type: FieldType::Bool,
-        required: false,
-        restart_required: false,
-        default: Some("false"),
-        description: "Also send offline alerts when the owner email belongs to an active logged-in user.",
-        placeholder: None,
         dynamic_group: Some(DynamicGroup::ClientNotifications),
     },
     // ── Auth code / session ──
@@ -1349,12 +1325,7 @@ fn normalize_value(field: &SettingsField, raw: &str) -> Result<Option<String>, A
                 if part.is_empty() {
                     continue;
                 }
-                let valid = if field.key == "CC_SWITCH_ROUTER_CLIENT_ALERT_EMAILS" {
-                    crate::notifications::is_basic_email(part)
-                } else {
-                    part.contains('@')
-                };
-                if !valid {
+                if !part.contains('@') {
                     return Err(AppError::BadRequest(format!(
                         "{} contains an invalid email address: {part}",
                         field.key
@@ -1606,10 +1577,6 @@ pub fn apply_updates_to_dynamic(
                 current.client_notifications.enabled =
                     value.map(parse_bool_truthy).unwrap_or(false);
             }
-            "CC_SWITCH_ROUTER_CLIENT_ALERT_EMAILS" => {
-                current.client_notifications.alert_emails =
-                    value.map(parse_dynamic_email_list).unwrap_or_default();
-            }
             "CC_SWITCH_ROUTER_CLIENT_OFFLINE_ALERT_SECS" => {
                 current.client_notifications.offline_alert_secs =
                     value.and_then(|v| v.parse().ok()).unwrap_or(180);
@@ -1662,10 +1629,6 @@ pub fn apply_updates_to_dynamic(
                     .registration_global_hourly_limit =
                     value.and_then(|v| v.parse().ok()).unwrap_or(10);
             }
-            "CC_SWITCH_ROUTER_CLIENT_OFFLINE_NOTIFY_OWNER" => {
-                current.client_notifications.notify_owner =
-                    value.map(parse_bool_truthy).unwrap_or(false);
-            }
             // Restart-required fields (paths, addresses, TTLs, Resend API
             // key, auth limits, verification URLs, email From/Reply-To):
             // these have already been written to the .env file by the
@@ -1680,17 +1643,6 @@ fn parse_bool_truthy(v: &str) -> bool {
     matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
 }
 
-fn parse_dynamic_email_list(value: &str) -> Vec<String> {
-    let mut emails = value
-        .split(',')
-        .map(|email| email.trim().to_ascii_lowercase())
-        .filter(|email| !email.is_empty())
-        .collect::<Vec<_>>();
-    emails.sort_unstable();
-    emails.dedup();
-    emails
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1699,8 +1651,7 @@ mod tests {
     fn settings_update_json_contract_uses_strings_for_boolean_fields() {
         let parsed: SettingsUpdateRequest = serde_json::from_value(serde_json::json!({
             "updates": {
-                "CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED": "true",
-                "CC_SWITCH_ROUTER_CLIENT_OFFLINE_NOTIFY_OWNER": "false"
+                "CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED": "true"
             }
         }))
         .expect("string boolean settings should deserialize");
@@ -1749,17 +1700,9 @@ mod tests {
     }
 
     #[test]
-    fn client_notification_recipients_are_normalized_and_deduplicated() {
-        let field = field_by_key("CC_SWITCH_ROUTER_CLIENT_ALERT_EMAILS").unwrap();
-        assert_eq!(
-            normalize_value(
-                field,
-                " Ops@Example.com,ops@example.com, oncall@example.com "
-            )
-            .unwrap(),
-            Some("oncall@example.com,ops@example.com".into())
-        );
-        assert!(normalize_value(field, "ops@localhost").is_err());
+    fn legacy_client_notification_recipient_settings_are_not_exposed() {
+        assert!(field_by_key("CC_SWITCH_ROUTER_CLIENT_ALERT_EMAILS").is_none());
+        assert!(field_by_key("CC_SWITCH_ROUTER_CLIENT_OFFLINE_NOTIFY_OWNER").is_none());
     }
 
     #[test]
@@ -2078,17 +2021,13 @@ mod tests {
     }
 
     #[test]
-    fn client_notification_kill_switch_and_recipients_apply_immediately() {
+    fn client_notification_kill_switch_applies_immediately() {
         let static_config = test_static_config_with_board_overrides();
         let mut current = DynamicSettings::from_config(&static_config);
         let mut updates = BTreeMap::new();
         updates.insert(
             "CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED".into(),
             Some("true".into()),
-        );
-        updates.insert(
-            "CC_SWITCH_ROUTER_CLIENT_ALERT_EMAILS".into(),
-            Some(" OPS@example.com,ops@example.com ".into()),
         );
         updates.insert(
             "CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_RECIPIENT_HOURLY_LIMIT".into(),
@@ -2100,10 +2039,6 @@ mod tests {
         );
         apply_updates_to_dynamic(&mut current, &updates, &static_config);
         assert!(current.client_notifications.enabled);
-        assert_eq!(
-            current.client_notifications.alert_emails,
-            vec!["ops@example.com"]
-        );
         assert_eq!(
             current
                 .client_notifications
@@ -2121,10 +2056,8 @@ mod tests {
             "CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED".into(),
             None,
         );
-        updates.insert("CC_SWITCH_ROUTER_CLIENT_ALERT_EMAILS".into(), None);
         apply_updates_to_dynamic(&mut current, &updates, &static_config);
         assert!(!current.client_notifications.enabled);
-        assert!(current.client_notifications.alert_emails.is_empty());
     }
 
     #[test]
@@ -2134,7 +2067,6 @@ mod tests {
         config.client_stale_secs = 3_600;
         let mut settings = crate::config::ClientNotificationSettings::default();
         settings.enabled = true;
-        settings.alert_emails = vec!["ops@example.com".into()];
         assert!(
             crate::notifications::validate_notification_cleanup_window(&settings, &config).is_ok()
         );

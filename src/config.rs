@@ -19,7 +19,6 @@ pub struct MetricsConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientNotificationSettings {
     pub enabled: bool,
-    pub alert_emails: Vec<String>,
     pub offline_alert_secs: i64,
     pub recovery_stable_secs: i64,
     pub cooldown_secs: i64,
@@ -32,14 +31,12 @@ pub struct ClientNotificationSettings {
     pub global_hourly_limit: i64,
     pub registration_recipient_hourly_limit: i64,
     pub registration_global_hourly_limit: i64,
-    pub notify_owner: bool,
 }
 
 impl Default for ClientNotificationSettings {
     fn default() -> Self {
         Self {
             enabled: false,
-            alert_emails: Vec::new(),
             offline_alert_secs: 180,
             recovery_stable_secs: 120,
             cooldown_secs: 30 * 60,
@@ -52,7 +49,6 @@ impl Default for ClientNotificationSettings {
             global_hourly_limit: 50,
             registration_recipient_hourly_limit: 3,
             registration_global_hourly_limit: 10,
-            notify_owner: false,
         }
     }
 }
@@ -164,9 +160,6 @@ impl Config {
             resend_reply_to: env_var("CC_SWITCH_ROUTER_RESEND_REPLY_TO"),
             client_notifications: ClientNotificationSettings {
                 enabled: env_bool("CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED", false),
-                alert_emails: parse_email_list(
-                    env_var("CC_SWITCH_ROUTER_CLIENT_ALERT_EMAILS").as_deref(),
-                ),
                 offline_alert_secs: env_i64("CC_SWITCH_ROUTER_CLIENT_OFFLINE_ALERT_SECS", 180),
                 recovery_stable_secs: env_i64("CC_SWITCH_ROUTER_CLIENT_RECOVERY_STABLE_SECS", 120),
                 cooldown_secs: env_i64("CC_SWITCH_ROUTER_CLIENT_ALERT_COOLDOWN_SECS", 30 * 60),
@@ -197,7 +190,6 @@ impl Config {
                     "CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_GLOBAL_HOURLY_LIMIT",
                     10,
                 ),
-                notify_owner: env_bool("CC_SWITCH_ROUTER_CLIENT_OFFLINE_NOTIFY_OWNER", false),
             },
             auth_code_ttl_secs: env_var("CC_SWITCH_ROUTER_AUTH_CODE_TTL_SECS")
                 .and_then(|v| v.parse().ok())
@@ -428,9 +420,8 @@ CC_SWITCH_ROUTER_FREE_SHARE_IP_PARALLEL_LIMIT=1
 CC_SWITCH_ROUTER_RESEND_API_KEY=
 # CC_SWITCH_ROUTER_RESEND_FROM defaults to noreply@[CC_SWITCH_ROUTER_TUNNEL_DOMAIN]
 CC_SWITCH_ROUTER_RESEND_FROM=
-# Client lifecycle email notifications are opt-in and require explicit recipients.
+# Client lifecycle email notifications are opt-in and go to each verified owner with an active Router account.
 CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED=false
-CC_SWITCH_ROUTER_CLIENT_ALERT_EMAILS=
 CC_SWITCH_ROUTER_CLIENT_OFFLINE_ALERT_SECS=180
 CC_SWITCH_ROUTER_CLIENT_RECOVERY_STABLE_SECS=120
 CC_SWITCH_ROUTER_CLIENT_ALERT_COOLDOWN_SECS=1800
@@ -443,7 +434,6 @@ CC_SWITCH_ROUTER_CLIENT_ALERT_RECIPIENT_HOURLY_LIMIT=10
 CC_SWITCH_ROUTER_CLIENT_ALERT_GLOBAL_HOURLY_LIMIT=50
 CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_RECIPIENT_HOURLY_LIMIT=3
 CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_GLOBAL_HOURLY_LIMIT=10
-CC_SWITCH_ROUTER_CLIENT_OFFLINE_NOTIFY_OWNER=false
 # router@<tunnel_domain-host> is always treated as admin. Use this variable
 # to add additional admin emails (comma-separated, case-insensitive).
 # Admins post with an OFFICIAL badge and can pin/feature/delete any message.
@@ -493,18 +483,6 @@ fn env_i64(key: &str, default: i64) -> i64 {
     env_var(key)
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
-}
-
-fn parse_email_list(value: Option<&str>) -> Vec<String> {
-    let mut emails = value
-        .into_iter()
-        .flat_map(|raw| raw.split(','))
-        .map(|email| email.trim().to_ascii_lowercase())
-        .filter(|email| !email.is_empty())
-        .collect::<Vec<_>>();
-    emails.sort_unstable();
-    emails.dedup();
-    emails
 }
 
 fn parse_admin_emails(value: Option<&str>) -> HashSet<String> {
@@ -633,25 +611,50 @@ mod tests {
     }
 
     #[test]
-    fn parse_client_alert_emails_normalizes_sorts_and_deduplicates() {
-        assert_eq!(
-            parse_email_list(Some(
-                " Ops@Example.com, oncall@example.com,ops@example.com "
-            )),
-            vec!["oncall@example.com", "ops@example.com"]
-        );
-        assert!(parse_email_list(None).is_empty());
-    }
-
-    #[test]
     fn client_notification_defaults_are_opt_in_and_strictly_capped() {
         let settings = ClientNotificationSettings::default();
         assert!(!settings.enabled);
-        assert!(settings.alert_emails.is_empty());
         assert_eq!(settings.recipient_hourly_limit, 10);
         assert_eq!(settings.global_hourly_limit, 50);
         assert_eq!(settings.registration_recipient_hourly_limit, 3);
         assert_eq!(settings.registration_global_hourly_limit, 10);
+    }
+
+    #[test]
+    fn default_env_excludes_legacy_client_notification_recipient_switches() {
+        let contents = default_env_contents();
+        assert!(!contents.contains("CC_SWITCH_ROUTER_CLIENT_ALERT_EMAILS"));
+        assert!(!contents.contains("CC_SWITCH_ROUTER_CLIENT_OFFLINE_NOTIFY_OWNER"));
+    }
+
+    #[test]
+    fn legacy_recipient_env_vars_do_not_gate_owner_notifications() {
+        let keys = [
+            "CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED",
+            "CC_SWITCH_ROUTER_CLIENT_ALERT_EMAILS",
+            "CC_SWITCH_ROUTER_CLIENT_OFFLINE_NOTIFY_OWNER",
+        ];
+        let previous = keys.map(|key| (key, env::var_os(key)));
+        unsafe {
+            env::set_var(keys[0], "true");
+            env::set_var(keys[1], "");
+            env::set_var(keys[2], "false");
+        }
+
+        let policy = crate::notifications::ClientNotificationPolicy::from(
+            &Config::from_env().client_notifications,
+        );
+
+        for (key, value) in previous {
+            unsafe {
+                if let Some(value) = value {
+                    env::set_var(key, value);
+                } else {
+                    env::remove_var(key);
+                }
+            }
+        }
+        assert!(policy.enabled);
     }
 
     #[test]
