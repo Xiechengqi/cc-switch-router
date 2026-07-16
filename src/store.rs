@@ -20309,6 +20309,7 @@ struct IssueLeaseSignaturePayload<'a> {
     expected_generation: u64,
     requested_subdomain: &'a str,
     tunnel_type: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
     share: &'a Option<ShareDescriptor>,
 }
 
@@ -24794,6 +24795,23 @@ mod tests {
             request.timestamp_ms,
             &request.nonce,
         )
+    }
+
+    #[test]
+    fn issue_lease_signature_payload_omits_absent_share_field() {
+        let payload = IssueLeaseSignaturePayload {
+            protocol_epoch: PROTOCOL_EPOCH,
+            router_id: "router.example.com",
+            route_id: "client:inst-1",
+            rotation_id: "rotation",
+            generation: 2,
+            expected_generation: 1,
+            requested_subdomain: "client-a",
+            tunnel_type: "client-web-http",
+            share: &None,
+        };
+        let json = serde_json::to_string(&payload).expect("serialize lease signature payload");
+        assert!(!json.contains("share"));
     }
 
     fn public_key_b64(signing_key: &SigningKey) -> String {
