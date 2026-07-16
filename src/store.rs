@@ -71,7 +71,8 @@ use crate::models::{
 #[cfg(test)]
 use crate::models::{RenewLeasePayload, ShareAppProvider, ShareUpstreamModel};
 use crate::namespace::{
-    PROTOCOL_EPOCH, PublicHostKind, normalize_client_key, normalize_market_slug, parse_public_label,
+    PROTOCOL_EPOCH, PublicHostKind, normalize_client_subdomain, normalize_market_slug,
+    parse_share_label,
 };
 use crate::notifications::{
     ClientNotificationBatch, ClientNotificationClaim, ClientNotificationDeliveryView,
@@ -3689,13 +3690,14 @@ impl AppStore {
 
     pub async fn check_client_tunnel_subdomain_availability(
         &self,
-        config: &Config,
+        _config: &Config,
         subdomain: &str,
         installation_id: Option<&str>,
     ) -> Result<SubdomainAvailabilityResponse, AppError> {
         let subdomain = normalize_subdomain(subdomain)?;
-        normalize_client_key(&subdomain).map_err(|message| AppError::BadRequest(message.into()))?;
-        ensure_subdomain_allowed(&subdomain, config)?;
+        normalize_client_subdomain(&subdomain)
+            .map_err(|message| AppError::BadRequest(message.into()))?;
+        ensure_subdomain_allowed(&subdomain)?;
         let conn = self.conn.lock().await;
         ensure_subdomain_not_registered_market(&conn, &subdomain)?;
         ensure_subdomain_not_claimed_by_share(&conn, &subdomain)?;
@@ -3753,7 +3755,7 @@ impl AppStore {
     ) -> Result<ClientTunnelResponse, AppError> {
         let requested_owner = normalize_email(&tunnel.owner_email)?;
         let subdomain = normalize_subdomain(&tunnel.subdomain)?;
-        ensure_subdomain_allowed(&subdomain, config)?;
+        ensure_subdomain_allowed(&subdomain)?;
         let now = Utc::now();
 
         let (record, should_refresh_geo) = {
@@ -3783,7 +3785,15 @@ impl AppStore {
                     "client tunnel owner must match the installation owner".into(),
                 ));
             }
-            normalize_client_key(&subdomain)
+            if get_client_tunnel_by_installation(&conn, &installation_id)?
+                .is_some_and(|existing| existing.subdomain != subdomain)
+            {
+                return Err(AppError::Conflict(
+                    "client_subdomain_immutable: client subdomain can only be chosen during setup"
+                        .into(),
+                ));
+            }
+            normalize_client_subdomain(&subdomain)
                 .map_err(|message| AppError::BadRequest(message.into()))?;
             let should_refresh_geo =
                 should_refresh_installation_geo(&installation, metadata.ip.as_deref());
@@ -4715,7 +4725,7 @@ impl AppStore {
         }
 
         let requested_subdomain = normalize_subdomain(&input.requested_subdomain)?;
-        ensure_subdomain_allowed(&requested_subdomain, config)?;
+        ensure_subdomain_allowed(&requested_subdomain)?;
         let route_id = validate_tunnel_route_id(&input.route_id)?;
         if Uuid::parse_str(input.rotation_id.trim()).is_err() {
             return Err(AppError::BadRequest("rotationId must be a UUID".into()));
@@ -4823,13 +4833,6 @@ impl AppStore {
             .optional()
             .map_err(|e| AppError::Internal(format!("read route generation head failed: {e}")))?
         };
-        if let Some((head_subdomain, _)) = persisted_head.as_ref() {
-            if head_subdomain != &subdomain {
-                return Err(AppError::Conflict(
-                    "routeId is already bound to another tunnel target".into(),
-                ));
-            }
-        }
         let persisted_generation = persisted_head
             .as_ref()
             .map(|(_, generation)| *generation)
@@ -5587,8 +5590,7 @@ impl AppStore {
                         active_connection_id = excluded.active_connection_id,
                         active_rotation_id = excluded.active_rotation_id,
                         updated_at = excluded.updated_at
-                     WHERE tunnel_route_heads.active_generation = ?8
-                       AND tunnel_route_heads.subdomain = excluded.subdomain",
+                     WHERE tunnel_route_heads.active_generation = ?8",
                         params![
                             input.activation.router_id,
                             route_id,
@@ -5811,18 +5813,26 @@ impl AppStore {
             )?;
         }
         normalize_self_reported_share_owner(&mut share, &installation_owner)?;
+        {
+            let conn = self.conn.lock().await;
+            validate_share_namespace_for_installation(
+                &conn,
+                &input.installation_id,
+                &share.subdomain,
+            )?;
+        }
         self.upsert_share(&input.installation_id, share).await
     }
 
     pub async fn claim_share_subdomain(
         &self,
-        config: &Config,
+        _config: &Config,
         input: ShareClaimSubdomainRequest,
         metadata: ClientMetadata,
         _current_user_email: &str,
     ) -> Result<(), AppError> {
         let subdomain = normalize_subdomain(&input.share.subdomain)?;
-        ensure_subdomain_allowed(&subdomain, config)?;
+        ensure_subdomain_allowed(&subdomain)?;
         let conn = self.conn.lock().await;
         ensure_subdomain_not_registered_market(&conn, &subdomain)?;
         if get_client_tunnel_by_subdomain(&conn, &subdomain)?.is_some() {
@@ -5849,18 +5859,13 @@ impl AppStore {
             &input.nonce,
             &input.signature,
         )?;
-        let parsed = parse_public_label(&subdomain)
+        let parsed = parse_share_label(&subdomain)
             .map_err(|message| AppError::BadRequest(message.into()))?;
-        if parsed.kind != PublicHostKind::Share {
-            return Err(AppError::BadRequest(
-                "share subdomain must use {share-slug}--{client-key}".into(),
-            ));
-        }
         let client_tunnel = get_client_tunnel_by_installation(&conn, &input.installation_id)?
             .ok_or_else(|| AppError::Conflict("client tunnel must be claimed first".into()))?;
-        if parsed.client_key.as_deref() != Some(client_tunnel.subdomain.as_str()) {
+        if parsed.client_subdomain != client_tunnel.subdomain {
             return Err(AppError::Conflict(
-                "share host client key does not belong to this installation".into(),
+                "share host client subdomain does not belong to this installation".into(),
             ));
         }
         let should_refresh_geo =
@@ -5880,6 +5885,8 @@ impl AppStore {
         ensure_share_id_writable_by_installation(&tx, &share.share_id, &input.installation_id)?;
         normalize_self_reported_share_owner(&mut share, &installation_owner)?;
         share.subdomain = subdomain;
+        let previous_subdomain =
+            get_share_owned_subdomain(&tx, &input.installation_id, &share.share_id)?;
         release_reclaimable_subdomain_claim(
             &tx,
             &input.installation_id,
@@ -5887,18 +5894,24 @@ impl AppStore {
             share.owner_email.as_deref(),
             &share.subdomain,
         )?;
-        crate::public_hosts::claim(
-            &tx,
-            crate::public_hosts::NewPublicHost {
-                label: &share.subdomain,
-                route_id: &format!("share:{}", share.share_id),
-                kind: PublicHostKind::Share,
-                subject_id: &share.share_id,
-                installation_id: Some(&input.installation_id),
-                target_lane_id: &input.installation_id,
-            },
-        )
-        .map_err(map_public_host_error)?;
+        let route_id = format!("share:{}", share.share_id);
+        let host_claim = crate::public_hosts::NewPublicHost {
+            label: &share.subdomain,
+            route_id: &route_id,
+            kind: PublicHostKind::Share,
+            subject_id: &share.share_id,
+            installation_id: Some(&input.installation_id),
+            target_lane_id: &input.installation_id,
+        };
+        match previous_subdomain.as_deref() {
+            Some(previous) if previous != share.subdomain => {
+                crate::public_hosts::replace_claim_in_transaction(&tx, previous, host_claim)
+                    .map_err(map_public_host_error)?;
+            }
+            _ => {
+                crate::public_hosts::claim(&tx, host_claim).map_err(map_public_host_error)?;
+            }
+        }
         upsert_share_tx(&tx, &input.installation_id, share)?;
         tx.commit().map_err(map_share_constraint_error)?;
         Ok(())
@@ -6033,6 +6046,11 @@ impl AppStore {
                         &tx,
                         &share.share_id,
                         &input.installation_id,
+                    )?;
+                    validate_share_namespace_for_installation(
+                        &tx,
+                        &input.installation_id,
+                        &share.subdomain,
                     )?;
                     normalize_self_reported_share_owner(&mut share, &installation_owner)?;
                     upsert_share_tx(&tx, &input.installation_id, share)?;
@@ -10445,6 +10463,23 @@ fn upsert_share_tx(
         ],
     )
     .map_err(map_share_constraint_error)?;
+    Ok(())
+}
+
+fn validate_share_namespace_for_installation(
+    conn: &Connection,
+    installation_id: &str,
+    label: &str,
+) -> Result<(), AppError> {
+    let parsed =
+        parse_share_label(label).map_err(|message| AppError::BadRequest(message.into()))?;
+    let client_tunnel = get_client_tunnel_by_installation(conn, installation_id)?
+        .ok_or_else(|| AppError::Conflict("client tunnel must be claimed first".into()))?;
+    if parsed.client_subdomain != client_tunnel.subdomain {
+        return Err(AppError::Conflict(
+            "share host client subdomain does not belong to this installation".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -18414,9 +18449,9 @@ fn normalize_market_kind(value: Option<&str>) -> Result<String, AppError> {
     }
 }
 
-fn ensure_subdomain_allowed(value: &str, config: &Config) -> Result<(), AppError> {
+fn ensure_subdomain_allowed(value: &str) -> Result<(), AppError> {
     const RESERVED: &[&str] = &["admin", "api", "www", "cdn-cgi"];
-    if RESERVED.contains(&value) || config.is_market_subdomain(value) {
+    if RESERVED.contains(&value) {
         return Err(AppError::Conflict("subdomain is reserved".into()));
     }
     Ok(())
@@ -22162,11 +22197,15 @@ mod tests {
         .expect("insert client public host");
     }
 
-    const TEST_CLIENT_KEY: &str = "alpha-aaaaaaaaaaaaaaaaaaaa";
-    const TEST_CLIENT_KEY_BETA: &str = "beta-bbbbbbbbbbbbbbbbbbbb";
+    const TEST_CLIENT_SUBDOMAIN: &str = "client-alpha";
+    const TEST_CLIENT_SUBDOMAIN_BETA: &str = "client-beta";
 
     fn test_share_host(slug: &str) -> String {
-        format!("{slug}--{TEST_CLIENT_KEY}")
+        let mut slug = slug.to_string();
+        while slug.len() < crate::namespace::PUBLIC_SLUG_MIN_LEN {
+            slug.push('x');
+        }
+        format!("{slug}--{TEST_CLIENT_SUBDOMAIN}")
     }
 
     async fn insert_share(
@@ -22735,6 +22774,11 @@ mod tests {
     }
 
     fn test_share_descriptor(share_id: &str, subdomain: &str) -> ShareDescriptor {
+        let subdomain = if subdomain.contains("--") {
+            subdomain.to_string()
+        } else {
+            test_share_host(subdomain)
+        };
         ShareDescriptor {
             share_id: share_id.into(),
             share_name: format!("share-{share_id}"),
@@ -22747,7 +22791,7 @@ mod tests {
             description: None,
             for_sale: "No".into(),
             sale_market_kind: "token".into(),
-            subdomain: subdomain.into(),
+            subdomain,
             app_type: "codex".into(),
             provider_id: Some("provider-test".into()),
             bindings: BTreeMap::from([("codex".into(), "provider-test".into())]),
@@ -22797,8 +22841,8 @@ mod tests {
         share.parallel_limit = 9;
         share.tokens_used = 987_654;
 
+        let active_subdomains = HashSet::from([share.subdomain.clone()]);
         let shares = vec![("inst-1".into(), share)];
-        let active_subdomains = HashSet::from(["share-sub".to_string()]);
         let inflight_by_share = HashMap::from([("share-1".to_string(), 4_usize)]);
         let inflight_by_market_email = HashMap::from([(market_email.to_string(), 99_usize)]);
         let mut market = DashboardMarketView {
@@ -29231,7 +29275,13 @@ mod tests {
     async fn claim_share_subdomain_accepts_valid_signature_and_rejects_replay_and_tamper() {
         let (store, config) = setup_store("signed-share-claim").await;
         let signing_key = insert_signed_installation(&store, "inst-signed").await;
-        insert_client_tunnel(&store, "inst-signed", "owner@example.com", TEST_CLIENT_KEY).await;
+        insert_client_tunnel(
+            &store,
+            "inst-signed",
+            "owner@example.com",
+            TEST_CLIENT_SUBDOMAIN,
+        )
+        .await;
 
         let share = ShareDescriptor {
             share_id: "share-1".into(),
@@ -29804,6 +29854,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_tunnel_subdomain_is_immutable_after_first_claim() {
+        let (store, config) = setup_store("client-tunnel-subdomain-immutable").await;
+        let installation_id = "inst-client-subdomain-immutable";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        let initial = ClientTunnelConfig {
+            owner_email: "owner@example.com".into(),
+            subdomain: "client-alpha".into(),
+            enabled: true,
+        };
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            installation_id,
+            "client_tunnel_claim",
+            &initial,
+            timestamp_ms,
+            &nonce,
+        );
+        store
+            .claim_client_tunnel(
+                &config,
+                ClientTunnelClaimRequest {
+                    installation_id: installation_id.into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    tunnel: initial,
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+            )
+            .await
+            .expect("first Client subdomain claim must succeed");
+
+        let same_subdomain = ClientTunnelConfig {
+            owner_email: "owner@example.com".into(),
+            subdomain: "client-alpha".into(),
+            enabled: false,
+        };
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            installation_id,
+            "client_tunnel_update",
+            &same_subdomain,
+            timestamp_ms,
+            &nonce,
+        );
+        store
+            .update_client_tunnel(
+                &config,
+                ClientTunnelUpdateRequest {
+                    installation_id: installation_id.into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    tunnel: same_subdomain,
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+            )
+            .await
+            .expect("status update with the same Client subdomain must succeed");
+
+        let replacement = ClientTunnelConfig {
+            owner_email: "owner@example.com".into(),
+            subdomain: "client-beta".into(),
+            enabled: true,
+        };
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            &signing_key,
+            installation_id,
+            "client_tunnel_update",
+            &replacement,
+            timestamp_ms,
+            &nonce,
+        );
+        let error = store
+            .update_client_tunnel(
+                &config,
+                ClientTunnelUpdateRequest {
+                    installation_id: installation_id.into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    tunnel: replacement,
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+            )
+            .await
+            .expect_err("a different Client subdomain must be rejected");
+        assert!(error.to_string().contains("client_subdomain_immutable"));
+
+        let conn = store.conn.lock().await;
+        let stored = get_client_tunnel_by_installation(&conn, installation_id)
+            .expect("read Client tunnel")
+            .expect("Client tunnel exists");
+        assert_eq!(stored.subdomain, "client-alpha");
+        assert!(!stored.enabled);
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
     async fn change_installation_owner_email_uses_new_owner_session() {
         let (store, config) = setup_store("change-owner-session").await;
         let installation_id = "inst-change-owner";
@@ -29936,7 +30101,13 @@ mod tests {
     async fn claim_share_subdomain_accepts_minimal_claim_signature() {
         let (store, config) = setup_store("signed-share-minimal-claim").await;
         let signing_key = insert_signed_installation(&store, "inst-minimal").await;
-        insert_client_tunnel(&store, "inst-minimal", "owner@example.com", TEST_CLIENT_KEY).await;
+        insert_client_tunnel(
+            &store,
+            "inst-minimal",
+            "owner@example.com",
+            TEST_CLIENT_SUBDOMAIN,
+        )
+        .await;
 
         let share = ShareDescriptor {
             share_id: "share-minimal".into(),
@@ -30109,7 +30280,7 @@ mod tests {
             &store,
             "inst-new",
             "owner@example.com",
-            TEST_CLIENT_KEY_BETA,
+            TEST_CLIENT_SUBDOMAIN_BETA,
         )
         .await;
 
@@ -30207,7 +30378,13 @@ mod tests {
     async fn claim_share_subdomain_heals_stale_owner_for_same_installation() {
         let (store, config) = setup_store("signed-share-heal-owner").await;
         let signing_key = insert_signed_installation(&store, "inst-heal").await;
-        insert_client_tunnel(&store, "inst-heal", "owner@example.com", TEST_CLIENT_KEY).await;
+        insert_client_tunnel(
+            &store,
+            "inst-heal",
+            "owner@example.com",
+            TEST_CLIENT_SUBDOMAIN,
+        )
+        .await;
         insert_share(
             &store,
             "inst-heal",
@@ -30308,7 +30485,13 @@ mod tests {
     async fn claim_share_subdomain_never_reuses_a_previous_share_host() {
         let (store, config) = setup_store("signed-share-reclaim-installation").await;
         let signing_key = insert_signed_installation(&store, "inst-same").await;
-        insert_client_tunnel(&store, "inst-same", "owner@example.com", TEST_CLIENT_KEY).await;
+        insert_client_tunnel(
+            &store,
+            "inst-same",
+            "owner@example.com",
+            TEST_CLIENT_SUBDOMAIN,
+        )
+        .await;
         let reused_host = test_share_host("reused");
         insert_share(&store, "inst-same", "share-old", &reused_host, "paused").await;
 
@@ -30409,6 +30592,13 @@ mod tests {
     async fn batch_sync_shares_requires_valid_signature() {
         let (store, config) = setup_store("signed-share-batch").await;
         let signing_key = insert_signed_installation(&store, "inst-batch").await;
+        insert_client_tunnel(
+            &store,
+            "inst-batch",
+            "owner@example.com",
+            TEST_CLIENT_SUBDOMAIN,
+        )
+        .await;
 
         let share = ShareDescriptor {
             share_id: "share-batch-1".into(),
@@ -30425,7 +30615,7 @@ mod tests {
             description: Some("signed batch sync".into()),
             for_sale: "Yes".into(),
             sale_market_kind: "token".into(),
-            subdomain: "batch-sub".into(),
+            subdomain: test_share_host("batch-sub"),
             app_type: "codex".into(),
             provider_id: Some("provider-batch".into()),
             bindings: BTreeMap::from([("codex".into(), "provider-batch".into())]),
@@ -30496,7 +30686,7 @@ mod tests {
             .expect("query synced share");
         drop(conn);
         assert_eq!(synced.0, "owner@example.com");
-        assert_eq!(synced.1, "batch-sub");
+        assert_eq!(synced.1, test_share_host("batch-sub"));
         assert_eq!(synced.2, 2048);
         assert_eq!(synced.3, "Yes");
         assert_eq!(synced.4, "all");
@@ -30550,9 +30740,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_sync_rejects_raw_share_slugs_and_wrong_client_suffixes() {
+        let (store, config) = setup_store("share-batch-namespace-validation").await;
+        let installation_id = "inst-batch-namespace";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        insert_client_tunnel(
+            &store,
+            installation_id,
+            "owner@example.com",
+            TEST_CLIENT_SUBDOMAIN,
+        )
+        .await;
+
+        for (index, invalid_subdomain) in [
+            "raw-share-slug".to_string(),
+            format!("wrong-share--{TEST_CLIENT_SUBDOMAIN_BETA}"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut share = test_share_descriptor(
+                &format!("share-invalid-namespace-{index}"),
+                &test_share_host("temporary"),
+            );
+            share.subdomain = invalid_subdomain;
+            let ops = vec![ShareSyncOperation {
+                kind: "upsert".into(),
+                share: Some(share),
+                share_id: None,
+            }];
+            let timestamp_ms = Utc::now().timestamp_millis();
+            let nonce = Uuid::new_v4().to_string();
+            let signature = sign_test_payload(
+                &signing_key,
+                installation_id,
+                "share_batch_sync",
+                &ops,
+                timestamp_ms,
+                &nonce,
+            );
+            let error = store
+                .batch_sync_shares(
+                    ShareBatchSyncRequest {
+                        installation_id: installation_id.into(),
+                        timestamp_ms,
+                        nonce,
+                        signature,
+                        ops,
+                    },
+                    ClientMetadata {
+                        ip: None,
+                        country_code: None,
+                    },
+                    "owner@example.com",
+                )
+                .await
+                .expect_err("noncanonical Share host must be rejected");
+            assert!(
+                error.to_string().contains("exactly one '--'")
+                    || error.to_string().contains("does not belong")
+            );
+        }
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
     async fn legacy_delete_all_replaces_active_shares_without_erasing_history() {
         let (store, config) = setup_store("legacy-delete-all-preserves-history").await;
         let signing_key = insert_signed_installation(&store, "inst-legacy-delete-all").await;
+        insert_client_tunnel(
+            &store,
+            "inst-legacy-delete-all",
+            "owner@example.com",
+            TEST_CLIENT_SUBDOMAIN,
+        )
+        .await;
         insert_share(
             &store,
             "inst-legacy-delete-all",
@@ -30780,6 +31043,13 @@ mod tests {
     async fn legacy_delete_all_protects_same_batch_upsert_lifecycle() {
         let (store, config) = setup_store("legacy-delete-all-protected-upsert").await;
         let signing_key = insert_signed_installation(&store, "inst-protected-upsert").await;
+        insert_client_tunnel(
+            &store,
+            "inst-protected-upsert",
+            "owner@example.com",
+            TEST_CLIENT_SUBDOMAIN,
+        )
+        .await;
         insert_share(
             &store,
             "inst-protected-upsert",
@@ -30892,6 +31162,13 @@ mod tests {
         let installation_id = "inst-rebuild-lifecycle";
         let share_id = "share-rebuild-lifecycle";
         let signing_key = insert_signed_installation(&store, installation_id).await;
+        insert_client_tunnel(
+            &store,
+            installation_id,
+            "owner@example.com",
+            TEST_CLIENT_SUBDOMAIN,
+        )
+        .await;
         insert_share(
             &store,
             installation_id,
@@ -31481,6 +31758,13 @@ mod tests {
     async fn batch_sync_shares_accepts_model_health_checked_at_wire_format() {
         let (store, config) = setup_store("signed-share-batch-model-health").await;
         let signing_key = insert_signed_installation(&store, "inst-batch-health").await;
+        insert_client_tunnel(
+            &store,
+            "inst-batch-health",
+            "owner@example.com",
+            TEST_CLIENT_SUBDOMAIN,
+        )
+        .await;
 
         let ops: Vec<ShareSyncOperation> = serde_json::from_value(serde_json::json!([{
             "kind": "upsert",
@@ -31488,7 +31772,7 @@ mod tests {
                 "shareId": "share-batch-health-1",
                 "shareName": "Batch Health Share",
                 "ownerEmail": "owner@example.com",
-                "subdomain": "batch-health-sub",
+                "subdomain": test_share_host("batch-health-sub"),
                 "appType": "codex",
                 "providerId": "provider-batch-health",
                 "bindings": { "codex": "provider-batch-health" },
@@ -31762,6 +32046,13 @@ mod tests {
     async fn batch_sync_shares_accepts_multiple_upserts_for_one_installation() {
         let (store, config) = setup_store("batch-multiple-upsert").await;
         let signing_key = insert_signed_installation(&store, "inst-multi").await;
+        insert_client_tunnel(
+            &store,
+            "inst-multi",
+            "owner@example.com",
+            TEST_CLIENT_SUBDOMAIN,
+        )
+        .await;
         insert_share(
             &store,
             "inst-multi",
@@ -32747,6 +33038,13 @@ mod tests {
         let installation_id = "inst-stale-edit-lifecycle";
         let share_id = "share-stale-edit-lifecycle";
         let signing_key = insert_signed_installation(&store, installation_id).await;
+        insert_client_tunnel(
+            &store,
+            installation_id,
+            "owner@example.com",
+            TEST_CLIENT_SUBDOMAIN,
+        )
+        .await;
         insert_share(
             &store,
             installation_id,

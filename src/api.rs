@@ -2406,19 +2406,13 @@ async fn ui_or_proxy_handler(
     proxy_handler(State(state), ConnectInfo(peer), req).await
 }
 
-/// True if the request's Host belongs to a market subdomain. Used to skip the
-/// router's bundled "share landing UI" so the market's own web app reaches
-/// the user. Naming heuristic (`market` / `market-*`, see
-/// `Config::is_market_subdomain`) catches the common case cheaply; the DB
-/// lookup catches market deployments that registered under another name.
+/// True if the request's Host is cataloged as a Market. Used to skip the
+/// router's bundled Share UI so the Market's own web app reaches the user.
 async fn is_market_host(state: &ServerState, host: &str) -> bool {
     let Some(subdomain) = crate::proxy::subdomain_for_host(host, &state.config.tunnel_domain)
     else {
         return false;
     };
-    if state.config.is_market_subdomain(&subdomain) {
-        return true;
-    }
     state.store.is_market_subdomain(&subdomain).await
 }
 

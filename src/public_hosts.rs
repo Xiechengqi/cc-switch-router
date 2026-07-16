@@ -3,7 +3,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
 use crate::namespace::{
-    PublicHostKind, normalize_client_key, normalize_market_slug, parse_public_label,
+    PublicHostKind, normalize_client_subdomain, normalize_market_slug, parse_share_label,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +141,7 @@ pub fn claim(
     })
 }
 
+#[cfg(test)]
 pub fn replace_claim(
     conn: &mut Connection,
     old_label: &str,
@@ -227,6 +228,7 @@ pub fn get_by_label(
     .map_err(Into::into)
 }
 
+#[cfg(test)]
 pub fn list_non_tombstoned(
     conn: &Connection,
 ) -> Result<Vec<PublicHostRecord>, PublicHostCatalogError> {
@@ -271,15 +273,10 @@ fn validate_claim(input: &NewPublicHost<'_>) -> Result<(), PublicHostCatalogErro
     let label = input.label.trim().to_ascii_lowercase();
     match input.kind {
         PublicHostKind::Client => {
-            normalize_client_key(&label).map_err(PublicHostCatalogError::Invalid)?;
+            normalize_client_subdomain(&label).map_err(PublicHostCatalogError::Invalid)?;
         }
         PublicHostKind::Share => {
-            let parsed = parse_public_label(&label).map_err(PublicHostCatalogError::Invalid)?;
-            if parsed.kind != PublicHostKind::Share {
-                return Err(PublicHostCatalogError::Invalid(
-                    "share claim must use the share--client label grammar",
-                ));
-            }
+            parse_share_label(&label).map_err(PublicHostCatalogError::Invalid)?;
         }
         PublicHostKind::Market => {
             normalize_market_slug(&label).map_err(PublicHostCatalogError::Invalid)?;
@@ -352,7 +349,7 @@ fn kind_str(kind: PublicHostKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::namespace::{build_client_key, build_share_label};
+    use crate::namespace::build_share_label;
 
     fn database() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -374,7 +371,7 @@ mod tests {
     #[test]
     fn exact_label_claim_is_idempotent_but_conflicts_are_rejected() {
         let conn = database();
-        let label = build_client_key("alpha", &[7; 32]).unwrap();
+        let label = "alpha-main".to_string();
         let first = claim(&conn, client_claim(&label)).unwrap();
         let second = claim(&conn, client_claim(&label)).unwrap();
         assert_eq!(first, second);
@@ -395,8 +392,8 @@ mod tests {
     #[test]
     fn share_claim_targets_the_clients_namespace_lane() {
         let conn = database();
-        let client = build_client_key("alpha", &[7; 32]).unwrap();
-        let label = build_share_label("codex", &client).unwrap();
+        let client = "alpha-main".to_string();
+        let label = build_share_label("codexx", &client).unwrap();
         let share = claim(
             &conn,
             NewPublicHost {
@@ -416,8 +413,8 @@ mod tests {
     #[test]
     fn rename_tombstones_the_old_label_and_never_reuses_it() {
         let mut conn = database();
-        let old = build_client_key("alpha", &[7; 32]).unwrap();
-        let new = build_client_key("bravo", &[7; 32]).unwrap();
+        let old = "alpha-main".to_string();
+        let new = "bravo-main".to_string();
         claim(&conn, client_claim(&old)).unwrap();
         replace_claim(&mut conn, &old, client_claim(&new)).unwrap();
         assert_eq!(
@@ -434,7 +431,7 @@ mod tests {
     #[test]
     fn disabled_hosts_remain_known_and_can_be_reenabled() {
         let conn = database();
-        let label = build_client_key("alpha", &[7; 32]).unwrap();
+        let label = "alpha-main".to_string();
         claim(&conn, client_claim(&label)).unwrap();
         assert!(set_lifecycle(&conn, &label, PublicHostLifecycle::Disabled).unwrap());
         assert_eq!(list_non_tombstoned(&conn).unwrap().len(), 1);

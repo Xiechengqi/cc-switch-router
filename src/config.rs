@@ -304,11 +304,6 @@ impl Config {
     pub fn free_share_ip_limit_enabled(&self) -> bool {
         self.free_share_ip_parallel_limit > 0
     }
-
-    pub fn is_market_subdomain(&self, subdomain: &str) -> bool {
-        let subdomain = subdomain.trim().to_ascii_lowercase();
-        subdomain == "market" || subdomain.starts_with("market-")
-    }
 }
 
 pub fn default_env_path() -> PathBuf {
