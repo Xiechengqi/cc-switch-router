@@ -1,7 +1,7 @@
 "use client";
 
 import { Loader2, Save, Send, RotateCcw } from "lucide-react";
-import { Alert, Button, Card, Chip, Input, ListBox, ScrollShadow, Switch, TextArea } from "@heroui/react";
+import { Alert, Button, Card, Checkbox, Chip, Input, ListBox, ScrollShadow, TextArea } from "@heroui/react";
 import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
@@ -293,8 +293,20 @@ function SettingsFieldRow({
       <div className="grid content-start gap-2">
         {field.fieldType === "bool" ? (
           <div className="flex items-center gap-3 rounded-md border bg-background p-3">
-            <Switch isSelected={Boolean(value)} onChange={onChange} id={field.key} />
-            <span className="text-sm text-muted-foreground">{Boolean(value) ? t("common.enabled") : t("common.disabled")}</span>
+            <Checkbox
+              id={field.key}
+              isSelected={Boolean(value)}
+              onChange={(selected: boolean) => onChange(selected)}
+            >
+              <Checkbox.Control>
+                <Checkbox.Indicator />
+              </Checkbox.Control>
+              <Checkbox.Content>
+                <span className="text-sm text-muted-foreground">
+                  {Boolean(value) ? t("common.enabled") : t("common.disabled")}
+                </span>
+              </Checkbox.Content>
+            </Checkbox>
           </div>
         ) : field.fieldType === "email_list" || field.fieldType === "ip_list" ? (
           <TextArea id={field.key} value={String(value ?? "")} onChange={(event: React.ChangeEvent<HTMLTextAreaElement>) => onChange(event.target.value)} placeholder={field.placeholder || ""} />

@@ -509,7 +509,7 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         required: false,
         restart_required: false,
         default: Some("false"),
-        description: "Send registration and offline alerts to each client's verified owner with an active Router account.",
+        description: "Send registration and offline alerts to each client's currently verified owner email.",
         placeholder: None,
         dynamic_group: Some(DynamicGroup::ClientNotifications),
     },

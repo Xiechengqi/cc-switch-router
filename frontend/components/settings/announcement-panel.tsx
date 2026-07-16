@@ -1,7 +1,7 @@
 "use client";
 
 import { Eye, Loader2, RotateCcw, Save } from "lucide-react";
-import { Alert, Button, Card, Chip, Modal, ScrollShadow, Switch, TextArea } from "@heroui/react";
+import { Alert, Button, Card, Checkbox, Chip, Modal, ScrollShadow, TextArea } from "@heroui/react";
 import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getAnnouncement, updateAnnouncement } from "@/lib/api";
@@ -123,15 +123,19 @@ export function AnnouncementPanel() {
           </div>
         ) : (
           <>
-            <div className="flex items-center justify-between gap-3 rounded-md border bg-background p-3">
-              <div>
-                <div className="font-medium">{t("settings.announcementEnabled")}</div>
-                <p className="mt-1 text-sm text-muted-foreground">{t("settings.announcementEnabledDescription")}</p>
-              </div>
-              <Switch
+            <div className="grid gap-2 rounded-md border bg-background p-3">
+              <Checkbox
                 isSelected={draft.enabled}
-                onChange={(value) => setDraft((prev) => ({ ...prev, enabled: value }))}
-              />
+                onChange={(selected: boolean) => setDraft((prev) => ({ ...prev, enabled: selected }))}
+              >
+                <Checkbox.Control>
+                  <Checkbox.Indicator />
+                </Checkbox.Control>
+                <Checkbox.Content>
+                  <span className="font-medium">{t("settings.announcementEnabled")}</span>
+                </Checkbox.Content>
+              </Checkbox>
+              <p className="text-sm text-muted-foreground">{t("settings.announcementEnabledDescription")}</p>
             </div>
             <div className="grid gap-2">
               <label className="text-sm font-medium" htmlFor="announcement-content-zh">

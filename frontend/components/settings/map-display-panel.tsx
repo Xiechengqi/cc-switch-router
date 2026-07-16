@@ -1,9 +1,8 @@
 "use client";
 
 import { Loader2, RotateCcw } from "lucide-react";
-import { Alert, Button, Card, Chip, Input } from "@heroui/react";
+import { Alert, Button, Card, Checkbox, Chip, Input } from "@heroui/react";
 import * as React from "react";
-import { CompactSelect } from "@/components/common/compact-select";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getMapDisplay } from "@/lib/api";
 import { DEFAULT_MAP_DISPLAY } from "@/lib/map-display-settings";
@@ -85,7 +84,7 @@ export function MapDisplayPanel({
           </div>
         ) : (
           <>
-            <BoolSelectField
+            <BooleanCheckboxField
               id="map-show-flows"
               label={t("map.requestFlows")}
               description={t("settings.mapShowFlowsDescription")}
@@ -93,7 +92,7 @@ export function MapDisplayPanel({
               disabled={!canEdit}
               onChange={(next) => updateSettings((prev) => ({ ...prev, showFlows: next }))}
             />
-            <BoolSelectField
+            <BooleanCheckboxField
               id="map-show-heat"
               label={t("map.demandHeat")}
               description={t("settings.mapShowHeatDescription")}
@@ -139,12 +138,7 @@ export function MapDisplayPanel({
   );
 }
 
-const BOOL_SELECT_OPTIONS = [
-  { value: "true", label: "true" },
-  { value: "false", label: "false" },
-] as const;
-
-function BoolSelectField({
+function BooleanCheckboxField({
   id,
   label,
   description,
@@ -161,15 +155,19 @@ function BoolSelectField({
 }) {
   return (
     <div className="grid gap-2 rounded-lg border bg-background px-4 py-3">
-      <label className="text-sm font-medium" htmlFor={id}>{label}</label>
-      <CompactSelect
-        value={value ? "true" : "false"}
-        options={[...BOOL_SELECT_OPTIONS]}
-        disabled={disabled}
-        onChange={(next) => onChange(next === "true")}
-        ariaLabel={label}
-        triggerClassName="min-h-10 w-full max-w-[180px] text-sm"
-      />
+      <Checkbox
+        id={id}
+        isSelected={value}
+        isDisabled={disabled}
+        onChange={(selected: boolean) => onChange(selected)}
+      >
+        <Checkbox.Control>
+          <Checkbox.Indicator />
+        </Checkbox.Control>
+        <Checkbox.Content>
+          <span className="text-sm font-medium">{label}</span>
+        </Checkbox.Content>
+      </Checkbox>
       <span className="text-sm text-muted-foreground">{description}</span>
     </div>
   );
