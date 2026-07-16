@@ -77,13 +77,22 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
   const startGuardRef = React.useRef(false);
   const installationId = client.installation.id;
 
-  const updateState = React.useCallback((next: ClientUpgradeState) => {
-    setState(next);
-    writeStoredState(installationId, next);
+  const patchState = React.useCallback((
+    updater: ClientUpgradeState | ((prev: ClientUpgradeState) => ClientUpgradeState),
+  ) => {
+    setState((prev) => {
+      const next = typeof updater === "function" ? updater(prev) : updater;
+      writeStoredState(installationId, next);
+      return next;
+    });
   }, [installationId]);
 
   React.useEffect(() => {
-    setState(readStoredState(installationId));
+    const stored = readStoredState(installationId);
+    setState(stored);
+    if (stored.phase !== "idle") {
+      startGuardRef.current = true;
+    }
     setStateReady(true);
   }, [installationId]);
 
@@ -92,32 +101,38 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
       const detail = (event as CustomEvent<{ installationId?: unknown; state?: unknown }>).detail;
       if (detail?.installationId === installationId && isStoredClientUpgradeState(detail.state)) {
         setState(detail.state);
+        if (detail.state.phase !== "idle") {
+          startGuardRef.current = true;
+        }
       }
     };
     window.addEventListener(CLIENT_UPGRADE_STATE_EVENT, syncState);
     return () => window.removeEventListener(CLIENT_UPGRADE_STATE_EVENT, syncState);
   }, [installationId]);
 
+  const upgrading = state.phase === "starting" || state.phase === "running";
   const locked = state.phase !== "idle";
-  const running = state.phase === "starting" || state.phase === "running";
 
   React.useEffect(() => {
-    if (state.phase !== "starting" || startGuardRef.current) return;
-    const remaining = CLIENT_UPGRADE_START_TIMEOUT_MS - (Date.now() - state.startedAt);
+    if (state.phase !== "starting") return;
+    const startedAt = state.startedAt;
+    const remaining = CLIENT_UPGRADE_START_TIMEOUT_MS - (Date.now() - startedAt);
+    const markTimeout = () => {
+      patchState((prev) => (prev.phase === "starting" ? { ...prev, phase: "timeout" } : prev));
+      toast.warning(t("dashboard.clientUpgradeTimedOut"));
+    };
     if (remaining <= 0) {
-      updateState({ ...state, phase: "timeout" });
+      markTimeout();
       return;
     }
-    const timer = window.setTimeout(() => {
-      updateState({ ...state, phase: "timeout" });
-      toast.warning(t("dashboard.clientUpgradeTimedOut"));
-    }, remaining);
+    const timer = window.setTimeout(markTimeout, remaining);
     return () => window.clearTimeout(timer);
-  }, [state, t, updateState]);
+  }, [patchState, state.phase, state.startedAt, t]);
 
   React.useEffect(() => {
     if (state.phase !== "running" || !state.taskId) return;
     const taskId = state.taskId;
+    const startedAt = state.startedAt;
     let cancelled = false;
     let finished = false;
     let pollTimer: number | undefined;
@@ -126,7 +141,7 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
     const finish = (phase: Extract<ClientUpgradePhase, "success" | "failed" | "timeout">) => {
       if (cancelled || finished) return;
       finished = true;
-      updateState({ ...state, phase });
+      patchState((prev) => ({ ...prev, phase }));
       if (phase === "success") toast.success(t("dashboard.clientUpgradeSucceeded"));
       if (phase === "failed") toast.danger(t("dashboard.clientUpgradeFailed"));
       if (phase === "timeout") toast.warning(t("dashboard.clientUpgradeTimedOut"));
@@ -155,7 +170,7 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
         window.clearTimeout(requestTimeout);
       }
 
-      if (Date.now() - state.startedAt >= CLIENT_UPGRADE_TOTAL_TIMEOUT_MS) {
+      if (Date.now() - startedAt >= CLIENT_UPGRADE_TOTAL_TIMEOUT_MS) {
         finish("timeout");
         return;
       }
@@ -170,7 +185,7 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
       requestController?.abort();
       if (pollTimer != null) window.clearTimeout(pollTimer);
     };
-  }, [installationId, state, t, updateState]);
+  }, [installationId, patchState, state.phase, state.startedAt, state.taskId, t]);
 
   const sessionEmail = readAuthState().email?.trim().toLowerCase();
   const ownerEmail = clientOwnerEmail(client)?.trim().toLowerCase();
@@ -189,7 +204,7 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
 
   const upgradeTarget = client.clientTunnel?.subdomain || installationId.slice(0, 8);
   let buttonLabel = t("dashboard.clientUpgrade");
-  if (running) buttonLabel = t("dashboard.clientUpgrading");
+  if (upgrading) buttonLabel = t("dashboard.clientUpgrading");
   if (state.phase === "success") buttonLabel = t("dashboard.clientUpgradeSucceeded");
   if (state.phase === "failed") buttonLabel = t("dashboard.clientUpgradeFailed");
   if (state.phase === "timeout") buttonLabel = t("dashboard.clientUpgradeTimedOut");
@@ -199,25 +214,21 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
   if (state.phase === "success") buttonTone = "border-emerald-200 bg-emerald-50 text-emerald-700";
   if (state.phase === "failed") buttonTone = "border-rose-200 bg-rose-50 text-rose-700";
   if (state.phase === "timeout") buttonTone = "border-amber-200 bg-amber-50 text-amber-700";
+  if (locked) buttonTone += " pointer-events-none";
 
-  async function runUpgrade() {
-    if (locked || startGuardRef.current) return;
-    startGuardRef.current = true;
-    const startedAt = Date.now();
-    updateState({ phase: "starting", startedAt });
-    setConfirmOpen(false);
+  async function runUpgrade(startedAt: number) {
     const controller = new AbortController();
     const requestTimeout = window.setTimeout(() => controller.abort(), CLIENT_UPGRADE_START_TIMEOUT_MS);
     try {
       const result = await upgradeClientInstallation(installationId, true, controller.signal);
-      updateState({ phase: "running", startedAt, taskId: result.taskId });
+      patchState({ phase: "running", startedAt, taskId: result.taskId });
       toast.success(t("dashboard.clientUpgradeStarted", { taskId: result.taskId }));
     } catch (error) {
       if (controller.signal.aborted) {
-        updateState({ phase: "timeout", startedAt });
+        patchState({ phase: "timeout", startedAt });
         toast.warning(t("dashboard.clientUpgradeTimedOut"));
       } else {
-        updateState({ phase: "failed", startedAt });
+        patchState({ phase: "failed", startedAt });
         toast.danger(error instanceof Error ? error.message : String(error));
       }
     } finally {
@@ -225,16 +236,28 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
     }
   }
 
+  function beginUpgrade() {
+    if (startGuardRef.current || locked) return;
+    startGuardRef.current = true;
+    const startedAt = Date.now();
+    patchState({ phase: "starting", startedAt });
+    setConfirmOpen(false);
+    void runUpgrade(startedAt);
+  }
+
+  const buttonDisabled = !stateReady || locked || confirmOpen;
+
   return (
     <>
       <button
         type="button"
         data-no-row-drawer
         aria-label={buttonLabel}
-        aria-busy={running || undefined}
-        disabled={!stateReady || locked}
+        aria-busy={upgrading || undefined}
+        disabled={buttonDisabled}
         onClick={(event) => {
           event.stopPropagation();
+          if (buttonDisabled) return;
           setConfirmOpen(true);
         }}
         className={`inline-flex h-6 shrink-0 items-center gap-1 rounded-full border px-2.5 text-[11px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30 disabled:cursor-not-allowed disabled:opacity-65 ${buttonTone}`}
@@ -249,8 +272,8 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
         confirmLabel={t("common.upgrade")}
         cancelLabel={t("common.cancel")}
         tone="warning"
-        busy={state.phase === "starting"}
-        onConfirm={() => void runUpgrade()}
+        busy={upgrading}
+        onConfirm={beginUpgrade}
         onOpenChange={(open) => {
           if (!locked) setConfirmOpen(open);
         }}
