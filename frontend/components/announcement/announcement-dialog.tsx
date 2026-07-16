@@ -14,7 +14,7 @@ import { sanitizeAnnouncementHtml } from "@/lib/announcement-html";
 import type { AppLocale } from "@/lib/i18n";
 
 const DIALOG_CLASS =
-  "light !bg-white !text-slate-900 " +
+  "light z-[70] !bg-white !text-slate-900 " +
   "[--foreground:rgb(15,23,42)] [--muted:rgb(100,116,139)] [--overlay:#fff] [--overlay-foreground:rgb(15,23,42)] " +
   "[--surface:#fff] [--surface-foreground:rgb(15,23,42)]";
 
@@ -33,7 +33,9 @@ function sameRouterDomainClientRedirect(raw: string | null) {
 }
 
 function pickAnnouncementContent(locale: AppLocale, contentEn: string, contentZhCn: string) {
-  return locale === "zh-CN" ? contentZhCn : contentEn;
+  const primary = locale === "zh-CN" ? contentZhCn : contentEn;
+  if (primary.trim()) return primary;
+  return locale === "zh-CN" ? contentEn : contentZhCn;
 }
 
 export function AnnouncementDialog() {
@@ -42,25 +44,39 @@ export function AnnouncementDialog() {
   const [open, setOpen] = React.useState(false);
   const [revision, setRevision] = React.useState("");
   const [html, setHtml] = React.useState("");
-  const evaluatedRef = React.useRef(false);
+  const evaluatedRevisionRef = React.useRef<string | null>(null);
 
   React.useEffect(() => {
-    if (loading || evaluatedRef.current) return;
+    if (loading) return;
     const clientRedirect = sameRouterDomainClientRedirect(
       new URLSearchParams(window.location.search).get("clientRedirect"),
     );
     if (clientRedirect && !session?.authenticated) return;
 
-    evaluatedRef.current = true;
+    let cancelled = false;
     getAnnouncement()
       .then((data) => {
+        if (cancelled) return;
+        if (evaluatedRevisionRef.current === data.revision) return;
+        evaluatedRevisionRef.current = data.revision;
+
         const content = pickAnnouncementContent(locale, data.contentEn, data.contentZhCn);
         if (!shouldShowAnnouncement(data.enabled, data.revision, content)) return;
+
+        const sanitized = sanitizeAnnouncementHtml(content);
+        if (!sanitized.trim()) return;
+
         setRevision(data.revision);
-        setHtml(sanitizeAnnouncementHtml(content));
+        setHtml(sanitized);
         setOpen(true);
       })
-      .catch(() => undefined);
+      .catch((error) => {
+        console.error("announcement load failed", error);
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, [loading, locale, session?.authenticated]);
 
   const dismissToday = () => {
@@ -75,8 +91,8 @@ export function AnnouncementDialog() {
 
   return (
     <Modal isOpen={open} onOpenChange={setOpen}>
-      <Modal.Backdrop>
-        <Modal.Container placement="center">
+      <Modal.Backdrop className="z-[70]">
+        <Modal.Container placement="center" className="z-[70]">
           <Modal.Dialog className={`${DIALOG_CLASS} w-[min(640px,calc(100vw-2rem))] max-w-none`}>
             <Modal.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
             <Modal.Body className="pt-2">

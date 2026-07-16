@@ -6390,7 +6390,9 @@ impl AppStore {
     ) -> Result<AnnouncementSettings, AppError> {
         let conn = self.conn.lock().await;
         let mut current = read_announcement_settings(&conn)?;
-        if let Some(enabled) = update.enabled {
+        let content_updated = update.content_en.is_some() || update.content_zh_cn.is_some();
+        let enabled_update = update.enabled;
+        if let Some(enabled) = enabled_update {
             current.enabled = enabled;
         }
         if let Some(content_en) = update.content_en {
@@ -6398,6 +6400,11 @@ impl AppStore {
         }
         if let Some(content_zh_cn) = update.content_zh_cn {
             current.content_zh_cn = content_zh_cn;
+        }
+        let has_content = !current.content_en.trim().is_empty()
+            || !current.content_zh_cn.trim().is_empty();
+        if has_content && !current.enabled && content_updated && enabled_update.is_none() {
+            current.enabled = true;
         }
         current = sanitize_announcement_settings(current);
         write_announcement_settings(&conn, &current)?;
@@ -32981,5 +32988,23 @@ mod tests {
         assert_eq!(response.revision, updated.updated_at.to_rfc3339());
         assert_eq!(response.content_en, "<p>Hello</p>");
         assert_eq!(response.content_zh_cn, "<p>你好</p>");
+    }
+
+    #[tokio::test]
+    async fn announcement_content_update_auto_enables_when_switch_unset() {
+        let (store, _config) = setup_store("announcement-auto-enable").await;
+
+        let updated = store
+            .update_announcement_settings(AnnouncementSettingsUpdate {
+                enabled: None,
+                content_en: Some("<p>Hello</p>".into()),
+                content_zh_cn: Some("<p>你好</p>".into()),
+            })
+            .await
+            .expect("update announcement");
+
+        assert!(updated.enabled);
+        let response = store.announcement_response().await.expect("read announcement");
+        assert!(response.enabled);
     }
 }
