@@ -82,14 +82,10 @@ export function AnnouncementPanel() {
     setError("");
     setSuccess("");
     try {
-      const hasContent = Boolean(draft.contentEn.trim() || draft.contentZhCn.trim());
       const update: AnnouncementSettingsUpdate = {};
       if (draft.enabled !== saved.enabled) update.enabled = draft.enabled;
       if (draft.contentEn !== saved.contentEn) update.contentEn = draft.contentEn;
       if (draft.contentZhCn !== saved.contentZhCn) update.contentZhCn = draft.contentZhCn;
-      if (hasContent && !draft.enabled && (update.contentEn !== undefined || update.contentZhCn !== undefined)) {
-        update.enabled = true;
-      }
       if (!Object.keys(update).length) return;
       const savedSettings = await updateAnnouncement(update);
       const next: AnnouncementDraft = {

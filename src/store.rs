@@ -1849,12 +1849,9 @@ impl AppStore {
                        AND e.status IN ('pending', 'batched')
                        AND (?2 IS NULL OR e.kind = ?2)
                        AND i.owner_verified_at IS NOT NULL
-                       AND LOWER(i.owner_email) = LOWER(?3)
-                       AND EXISTS (
-                           SELECT 1 FROM users u
-                           WHERE u.email_normalized = LOWER(i.owner_email)
-                             AND u.status = 'active'
-                       )",
+                       AND i.owner_email IS NOT NULL
+                       AND TRIM(i.owner_email) != ''
+                       AND LOWER(i.owner_email) = LOWER(?3)",
                     params![storm_window_start, storm_kind, recipient],
                     |row| row.get::<_, i64>(0),
                 )
@@ -1871,12 +1868,9 @@ impl AppStore {
                          INNER JOIN installations i ON i.id = ns.installation_id
                          WHERE ns.monitoring_enabled = 1
                            AND i.owner_verified_at IS NOT NULL
-                           AND LOWER(i.owner_email) = LOWER(?1)
-                           AND EXISTS (
-                               SELECT 1 FROM users u
-                               WHERE u.email_normalized = LOWER(i.owner_email)
-                                 AND u.status = 'active'
-                           )",
+                           AND i.owner_email IS NOT NULL
+                           AND TRIM(i.owner_email) != ''
+                           AND LOWER(i.owner_email) = LOWER(?1)",
                         params![recipient],
                         |row| row.get::<_, i64>(0),
                     )
@@ -3036,15 +3030,8 @@ impl AppStore {
             }
             Some(session.last_used_at)
         } else {
-            if already_bound {
-                return Ok(BindInstallationOwnerEmailResponse {
-                    ok: true,
-                    owner_email: email,
-                    owner_verified: false,
-                    already_bound: true,
-                });
-            }
-            None
+            // Installation-signed bind: the operator already controls this server instance.
+            Some(now)
         };
 
         let conn = self.conn.lock().await;
@@ -3081,6 +3068,18 @@ impl AppStore {
             .map_err(|e| {
                 AppError::Internal(format!("read installation owner verification failed: {e}"))
             })?;
+        if owner_verified {
+            refresh_registration_notification_snapshots_tx(
+                &conn,
+                &input.installation_id,
+                &email,
+                now,
+            )?;
+            activate_registration_events_for_installation_tx(&conn, &input.installation_id, now)?;
+            if let Some(installation) = get_installation(&conn, &input.installation_id)? {
+                maybe_emit_client_registration_event(&conn, &installation, now)?;
+            }
+        }
 
         Ok(BindInstallationOwnerEmailResponse {
             ok: true,
@@ -3104,23 +3103,22 @@ impl AppStore {
         }
         let access_token = access_token
             .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                AppError::Unauthorized("authenticated new owner session is required".into())
-            })?;
-        let session = self
-            .resolve_session_by_access_token(access_token)
-            .await?
-            .ok_or_else(|| AppError::Unauthorized("session not found".into()))?;
-        if session.installation_id != input.installation_id {
-            return Err(AppError::Unauthorized(
-                "authenticated session installation mismatch".into(),
-            ));
-        }
-        if session.email != new_email {
-            return Err(AppError::Unauthorized(
-                "authenticated session email does not match new owner email".into(),
-            ));
+            .filter(|value| !value.is_empty());
+        if let Some(access_token) = access_token {
+            let session = self
+                .resolve_session_by_access_token(access_token)
+                .await?
+                .ok_or_else(|| AppError::Unauthorized("session not found".into()))?;
+            if session.installation_id != input.installation_id {
+                return Err(AppError::Unauthorized(
+                    "authenticated session installation mismatch".into(),
+                ));
+            }
+            if session.email != new_email {
+                return Err(AppError::Unauthorized(
+                    "authenticated session email does not match new owner email".into(),
+                ));
+            }
         }
 
         let now = Utc::now();
@@ -13026,12 +13024,9 @@ fn notification_batch_is_authorized_for_current_owner(
             "SELECT COUNT(*),
                     COALESCE(SUM(CASE
                         WHEN i.owner_verified_at IS NOT NULL
+                         AND i.owner_email IS NOT NULL
+                         AND TRIM(i.owner_email) != ''
                          AND LOWER(i.owner_email) = LOWER(?2)
-                         AND EXISTS (
-                             SELECT 1 FROM users u
-                             WHERE u.email_normalized = LOWER(i.owner_email)
-                               AND u.status = 'active'
-                         )
                         THEN 1 ELSE 0 END), 0)
              FROM email_delivery_batch_items bi
              INNER JOIN client_notification_events e ON e.id = bi.event_id
@@ -13160,6 +13155,88 @@ fn materialize_registration_overflow_events_tx(
     Ok(())
 }
 
+fn refresh_registration_notification_snapshots_tx(
+    conn: &Connection,
+    installation_id: &str,
+    owner_email: &str,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT id, snapshot_json FROM client_notification_events
+             WHERE installation_id = ?1 AND kind = 'client_registered'
+               AND status IN ('pending', 'awaiting_owner')",
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "prepare registration notification snapshot refresh failed: {error}"
+            ))
+        })?;
+    let rows = statement
+        .query_map(params![installation_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "query registration notification snapshot refresh failed: {error}"
+            ))
+        })?;
+    let timestamp = now.to_rfc3339();
+    for row in rows {
+        let (event_id, snapshot_json) = row.map_err(|error| {
+            AppError::Internal(format!(
+                "read registration notification snapshot refresh failed: {error}"
+            ))
+        })?;
+        let mut snapshot =
+            serde_json::from_str::<serde_json::Value>(&snapshot_json).map_err(|error| {
+                AppError::Internal(format!("parse registration snapshot failed: {error}"))
+            })?;
+        if let Some(object) = snapshot.as_object_mut() {
+            object.insert("ownerEmail".to_string(), serde_json::json!(owner_email));
+        }
+        conn.execute(
+            "UPDATE client_notification_events
+             SET snapshot_json = ?2, updated_at = ?3
+             WHERE id = ?1",
+            params![event_id, snapshot.to_string(), timestamp],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "update registration notification snapshot failed: {error}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn activate_registration_events_for_installation_tx(
+    conn: &Connection,
+    installation_id: &str,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let timestamp = now.to_rfc3339();
+    conn.execute(
+        "UPDATE client_notification_events
+         SET status = 'pending', not_before = ?2, suppression_reason = NULL, updated_at = ?2
+         WHERE installation_id = ?1 AND status = 'awaiting_owner' AND kind = 'client_registered'
+           AND EXISTS (
+               SELECT 1 FROM installations i
+               WHERE i.id = ?1
+                 AND i.owner_verified_at IS NOT NULL
+                 AND i.owner_email IS NOT NULL
+                 AND TRIM(i.owner_email) != ''
+           )",
+        params![installation_id, timestamp],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "activate registration notifications for installation failed: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
 fn activate_registration_events_with_verified_owner_tx(
     conn: &Connection,
     now: DateTime<Utc>,
@@ -13174,11 +13251,8 @@ fn activate_registration_events_with_verified_owner_tx(
                FROM installations i
                WHERE i.id = client_notification_events.installation_id
                  AND i.owner_verified_at IS NOT NULL
-                 AND EXISTS (
-                     SELECT 1 FROM users u
-                     WHERE u.email_normalized = LOWER(i.owner_email)
-                       AND u.status = 'active'
-                 )
+                 AND i.owner_email IS NOT NULL
+                 AND TRIM(i.owner_email) != ''
            )",
         params![timestamp],
     )
@@ -13227,11 +13301,8 @@ fn load_pending_notification_events(
         .prepare(&format!(
             "SELECT e.id, e.kind, e.installation_id, e.occurred_at, e.snapshot_json,
                     CASE WHEN i.owner_verified_at IS NOT NULL
-                               AND EXISTS (
-                                   SELECT 1 FROM users u
-                                   WHERE u.email_normalized = LOWER(i.owner_email)
-                                     AND u.status = 'active'
-                               )
+                               AND i.owner_email IS NOT NULL
+                               AND TRIM(i.owner_email) != ''
                          THEN LOWER(i.owner_email) ELSE NULL END
              FROM client_notification_events e
              LEFT JOIN installations i ON i.id = e.installation_id
@@ -13317,12 +13388,9 @@ fn load_incident_client_ids(
                AND (
                    ?3 IS NULL OR (
                        i.owner_verified_at IS NOT NULL
+                       AND i.owner_email IS NOT NULL
+                       AND TRIM(i.owner_email) != ''
                        AND LOWER(i.owner_email) = LOWER(?3)
-                       AND EXISTS (
-                           SELECT 1 FROM users u
-                           WHERE u.email_normalized = LOWER(i.owner_email)
-                             AND u.status = 'active'
-                       )
                    )
                )
              GROUP BY e.installation_id
@@ -19888,9 +19956,45 @@ fn record_authenticated_installation_presence(
     })?;
 
     if matches!(previous_registration_state.as_deref(), Some("provisional")) {
-        insert_client_registration_event(conn, installation, now)?;
+        maybe_emit_client_registration_event(conn, installation, now)?;
     }
     Ok(())
+}
+
+fn installation_has_verified_owner(installation: &Installation) -> bool {
+    installation.owner_verified_at.is_some()
+        && installation
+            .owner_email
+            .as_deref()
+            .is_some_and(|email| !email.trim().is_empty())
+}
+
+fn maybe_emit_client_registration_event(
+    conn: &Connection,
+    installation: &Installation,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    if !installation_has_verified_owner(installation) {
+        return Ok(());
+    }
+    let already_emitted = conn
+        .query_row(
+            "SELECT 1 FROM client_notification_events
+             WHERE installation_id = ?1 AND kind = 'client_registered' LIMIT 1",
+            params![installation.id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "check existing client registration notification failed: {error}"
+            ))
+        })?
+        .is_some();
+    if already_emitted {
+        return Ok(());
+    }
+    insert_client_registration_event(conn, installation, now)
 }
 
 fn insert_client_registration_event(
@@ -26583,7 +26687,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owner_notification_requires_a_real_logged_in_user() {
+    async fn owner_notification_waits_for_installation_verified_owner() {
         let config = enabled_notification_config("notification-owner-verification");
         let store = AppStore::new(&config).expect("create store");
         let signing_key = insert_signed_installation(&store, "inst-owner-recipient").await;
@@ -26592,11 +26696,11 @@ mod tests {
             let conn = store.conn.lock().await;
             conn.execute(
                 "UPDATE installations
-                 SET owner_email = 'unverified-owner@example.com', owner_verified_at = ?2
+                 SET owner_email = 'unverified-owner@example.com', owner_verified_at = NULL
                  WHERE id = ?1",
-                params!["inst-owner-recipient", now.to_rfc3339()],
+                params!["inst-owner-recipient"],
             )
-            .expect("set legacy owner marker");
+            .expect("set tentative owner marker");
             conn.execute(
                 "INSERT INTO installation_notification_state (
                     installation_id, registration_state, registration_verified_at,
@@ -27113,7 +27217,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registration_waits_for_verified_owner_then_sends_once() {
+    async fn registration_sends_to_installation_verified_owner_without_router_login() {
         let config = enabled_notification_config("notification-owner-registration-wait");
         let store = AppStore::new(&config).expect("create store");
         insert_installation(&store, "inst-owner-registration").await;
@@ -27144,48 +27248,7 @@ mod tests {
         store
             .aggregate_client_notification_batches(&policy, &notification_template(), delivery_at)
             .await
-            .expect("defer registration without a verified owner user");
-        {
-            let conn = store.conn.lock().await;
-            let status: String = conn
-                .query_row(
-                    "SELECT status FROM client_notification_events
-                     WHERE id = 'owner-registration-event'",
-                    [],
-                    |row| row.get(0),
-                )
-                .expect("read deferred registration event");
-            assert_eq!(status, "awaiting_owner");
-            let batches: i64 = conn
-                .query_row("SELECT COUNT(*) FROM email_delivery_batches", [], |row| {
-                    row.get(0)
-                })
-                .expect("count deferred registration batches");
-            assert_eq!(batches, 0);
-            conn.execute(
-                "INSERT INTO users (id, email_normalized, status, created_at, last_login_at)
-                 VALUES ('registration-owner-user', 'owner@example.com', 'active', ?1, ?1)",
-                params![delivery_at.to_rfc3339()],
-            )
-            .expect("activate registration owner user");
-        }
-        let owner_delivery_at = delivery_at + Duration::seconds(6);
-        store
-            .aggregate_client_notification_batches(
-                &policy,
-                &notification_template(),
-                owner_delivery_at,
-            )
-            .await
-            .expect("aggregate registration after owner verification");
-        store
-            .aggregate_client_notification_batches(
-                &policy,
-                &notification_template(),
-                owner_delivery_at + Duration::seconds(6),
-            )
-            .await
-            .expect("registration aggregation remains idempotent");
+            .expect("send registration to installation-verified owner");
         let conn = store.conn.lock().await;
         let recipients = conn
             .prepare("SELECT recipient FROM email_delivery_batches ORDER BY recipient")
@@ -29517,27 +29580,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_owner_binding_waits_for_authenticated_email_before_notification() {
-        let config = enabled_notification_config("bootstrap-owner-notification-verification");
+    async fn bootstrap_owner_binding_trusts_installation_signature() {
+        let config = enabled_notification_config("bootstrap-owner-installation-trust");
         let store = AppStore::new(&config).expect("create store");
         let installation_id = "inst-bootstrap-owner";
         let signing_key = insert_signed_installation(&store, installation_id).await;
-        let email = "victim@example.com";
+        let email = "owner@example.com";
         let now = Utc::now();
         {
             let conn = store.conn.lock().await;
             conn.execute(
-                "UPDATE installations SET owner_email = NULL, owner_verified_at = ?2
-                 WHERE id = ?1",
-                params![installation_id, now.to_rfc3339()],
+                "UPDATE installations SET owner_email = NULL, owner_verified_at = NULL WHERE id = ?1",
+                params![installation_id],
             )
-            .expect("seed inconsistent legacy bootstrap owner state");
-            conn.execute(
-                "INSERT INTO users (id, email_normalized, status, created_at, last_login_at)
-                 VALUES ('bootstrap-victim-user', ?1, 'active', ?2, ?2)",
-                params![email, now.to_rfc3339()],
-            )
-            .expect("insert active victim user");
+            .expect("clear owner");
         }
 
         let timestamp_ms = now.timestamp_millis();
@@ -29570,23 +29626,8 @@ mod tests {
             .await
             .expect("bootstrap owner address");
         assert!(!bootstrap.already_bound);
-        assert!(!bootstrap.owner_verified);
-        {
-            let conn = store.conn.lock().await;
-            let binding: (Option<String>, Option<String>) = conn
-                .query_row(
-                    "SELECT owner_email, owner_verified_at FROM installations WHERE id = ?1",
-                    params![installation_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .expect("read bootstrap owner binding");
-            assert_eq!(binding, (Some(email.into()), None));
-            let installation = get_installation(&conn, installation_id)
-                .expect("load bootstrap installation")
-                .expect("bootstrap installation");
-            insert_client_registration_event(&conn, &installation, now)
-                .expect("insert bootstrap registration event");
-        }
+        assert!(bootstrap.owner_verified);
+
         let status_timestamp_ms = timestamp_ms + 1;
         let status_nonce = Uuid::new_v4().to_string();
         let status_signature = sign_test_payload(
@@ -29597,7 +29638,7 @@ mod tests {
             status_timestamp_ms,
             &status_nonce,
         );
-        let tentative_status = store
+        let status = store
             .get_installation_owner_email_status(GetInstallationOwnerEmailQuery {
                 installation_id: installation_id.into(),
                 timestamp_ms: status_timestamp_ms,
@@ -29605,115 +29646,43 @@ mod tests {
                 signature: status_signature,
             })
             .await
-            .expect("read tentative owner status");
-        assert!(tentative_status.owner_email.is_none());
-        assert!(!tentative_status.owner_verified);
-        let tentative_session_status = store
-            .session_status(None, Some(installation_id))
-            .await
-            .expect("read session status for tentative owner");
-        assert!(tentative_session_status.installation_owner_email.is_none());
-        let policy = notification_policy(&config);
-        let first_delivery_at = now + Duration::seconds(6);
-        store
-            .aggregate_client_notification_batches(
-                &policy,
-                &notification_template(),
-                first_delivery_at,
-            )
-            .await
-            .expect("defer bootstrap registration notification");
-        {
-            let conn = store.conn.lock().await;
-            let state: (String, i64) = conn
-                .query_row(
-                    "SELECT status, (SELECT COUNT(*) FROM email_delivery_batches)
-                     FROM client_notification_events
-                     WHERE installation_id = ?1 AND kind = 'client_registered'",
-                    params![installation_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .expect("read deferred bootstrap event");
-            assert_eq!(state, ("awaiting_owner".into(), 0));
-        }
+            .expect("read bootstrap owner status");
+        assert_eq!(status.owner_email.as_deref(), Some(email));
+        assert!(status.owner_verified);
 
-        let access_token = "bootstrap-owner-access-token";
-        {
-            let conn = store.conn.lock().await;
-            let user = upsert_user_by_email(&conn, email, now).expect("load bootstrap owner user");
-            persist_session(
-                &conn,
-                &AuthSession {
-                    session_id: Uuid::new_v4().to_string(),
-                    user_id: user.id,
-                    email: email.into(),
-                    installation_id: installation_id.into(),
-                    access_token_hash: hash_token(access_token),
-                    refresh_token_hash: hash_token("bootstrap-owner-refresh-token"),
-                    access_expires_at: now + Duration::hours(1),
-                    refresh_expires_at: now + Duration::days(1),
-                    created_at: now,
-                    last_used_at: now,
-                },
-            )
-            .expect("persist bootstrap owner session");
-        }
-        let verified_timestamp_ms = timestamp_ms + 1;
-        let verified_nonce = Uuid::new_v4().to_string();
-        let verified_signature = sign_test_payload(
+        let tunnel = ClientTunnelConfig {
+            owner_email: email.into(),
+            subdomain: "bootstrap-client".into(),
+            enabled: true,
+        };
+        let tunnel_timestamp_ms = timestamp_ms + 2;
+        let tunnel_nonce = Uuid::new_v4().to_string();
+        let tunnel_signature = sign_test_payload(
             &signing_key,
             installation_id,
-            "bind_installation_owner_email",
-            &payload,
-            verified_timestamp_ms,
-            &verified_nonce,
+            "client_tunnel_claim",
+            &tunnel,
+            tunnel_timestamp_ms,
+            &tunnel_nonce,
         );
-        let verified = store
-            .bind_installation_owner_email(
-                &config,
-                BindInstallationOwnerEmailRequest {
-                    installation_id: installation_id.into(),
-                    email: email.into(),
-                    verification_token: None,
-                    timestamp_ms: verified_timestamp_ms,
-                    nonce: verified_nonce,
-                    signature: verified_signature,
-                },
-                Some(access_token),
-            )
-            .await
-            .expect("verify existing bootstrap owner");
-        assert!(verified.already_bound);
-        assert!(verified.owner_verified);
         store
-            .aggregate_client_notification_batches(
-                &policy,
-                &notification_template(),
-                first_delivery_at + Duration::seconds(6),
+            .claim_client_tunnel(
+                &config,
+                ClientTunnelClaimRequest {
+                    installation_id: installation_id.into(),
+                    timestamp_ms: tunnel_timestamp_ms,
+                    nonce: tunnel_nonce,
+                    signature: tunnel_signature,
+                    tunnel,
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
             )
             .await
-            .expect("deliver registration after owner authentication");
-        let conn = store.conn.lock().await;
-        let delivery: (String, String) = conn
-            .query_row(
-                "SELECT b.recipient, e.status
-                 FROM email_delivery_batches b
-                 INNER JOIN email_delivery_batch_items bi ON bi.batch_id = b.id
-                 INNER JOIN client_notification_events e ON e.id = bi.event_id",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .expect("read verified owner delivery");
-        assert_eq!(delivery, (email.into(), "batched".into()));
-        let verified_at: Option<String> = conn
-            .query_row(
-                "SELECT owner_verified_at FROM installations WHERE id = ?1",
-                params![installation_id],
-                |row| row.get(0),
-            )
-            .expect("read upgraded owner verification");
-        assert!(verified_at.is_some());
-        drop(conn);
+            .expect("verified bootstrap owner can claim client tunnel");
+
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 
@@ -30094,6 +30063,63 @@ mod tests {
                 .as_deref(),
             Some(new_email)
         );
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn change_installation_owner_email_accepts_installation_signature_only() {
+        let (store, config) = setup_store("change-owner-installation-only").await;
+        let installation_id = "inst-change-owner-installation";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        let old_email = "owner@example.com";
+        let new_email = "new-owner@example.com";
+        insert_client_tunnel(
+            &store,
+            installation_id,
+            old_email,
+            "change-owner-installation",
+        )
+        .await;
+
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let payload = ChangeOwnerEmailSignaturePayload {
+            old_email,
+            new_email,
+        };
+        let signature = sign_test_payload(
+            &signing_key,
+            installation_id,
+            "change_installation_owner_email",
+            &payload,
+            timestamp_ms,
+            &nonce,
+        );
+
+        let response = store
+            .change_installation_owner_email(
+                ChangeInstallationOwnerEmailRequest {
+                    installation_id: installation_id.into(),
+                    old_email: old_email.into(),
+                    new_email: new_email.into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                },
+                None,
+            )
+            .await
+            .expect("installation-signed owner change");
+
+        assert!(response.ok);
+        assert_eq!(response.old_email, old_email);
+        assert_eq!(response.new_email, new_email);
+        let conn = store.conn.lock().await;
+        assert_eq!(
+            get_installation_owner_email(&conn, installation_id).expect("owner email"),
+            Some(new_email.into())
+        );
+        drop(conn);
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 
