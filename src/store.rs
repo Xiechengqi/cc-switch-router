@@ -4976,6 +4976,14 @@ impl AppStore {
         };
 
         let conn = self.conn.lock().await;
+        retire_reclaimable_route_candidates_tx(
+            &conn,
+            &lease.router_id,
+            &lease.route_id,
+            &lease.installation_id,
+            lease.generation,
+            issued_at,
+        )?;
         let max_generation = conn
             .query_row(
                 "SELECT COALESCE(MAX(generation), 0) FROM leases
@@ -20250,6 +20258,41 @@ fn verify_registration_signature(
     Ok(true)
 }
 
+fn retire_reclaimable_route_candidates_tx(
+    conn: &Connection,
+    router_id: &str,
+    route_id: &str,
+    installation_id: &str,
+    new_generation: u64,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let now_text = now.to_rfc3339();
+    conn.execute(
+        "UPDATE leases
+         SET state = 'retired', retired_at = ?5
+         WHERE router_id = ?1 AND route_id = ?2 AND installation_id = ?3
+           AND state IN ('issued', 'authenticated', 'ready')
+           AND expires_at > ?5
+           AND (
+             generation < ?4
+             OR (state = 'issued' AND used_at IS NULL)
+           )",
+        params![
+            router_id,
+            route_id,
+            installation_id,
+            i64::try_from(new_generation).unwrap_or(i64::MAX),
+            now_text,
+        ],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "retire reclaimable route candidates failed: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
 fn verify_issue_lease_request(
     conn: &Connection,
     public_key: &str,
@@ -25446,6 +25489,96 @@ mod tests {
             )
             .expect("count first lease");
         assert_eq!(lease_count, 1);
+        drop(conn);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn issue_lease_reclaims_abandoned_client_candidate_on_restart() {
+        let (store, config) = setup_store("issue-lease-reclaim-abandoned").await;
+        let signing_key = insert_signed_installation(&store, "inst-reclaim").await;
+        insert_client_tunnel(
+            &store,
+            "inst-reclaim",
+            "owner@example.com",
+            TEST_CLIENT_SUBDOMAIN,
+        )
+        .await;
+        let proxy = ProxyRegistry::default();
+        let route_id = "client:inst-reclaim".to_string();
+
+        let mut first = IssueLeaseRequest {
+            protocol_epoch: PROTOCOL_EPOCH.into(),
+            router_id: "127.0.0.1".into(),
+            installation_id: "inst-reclaim".into(),
+            route_id: route_id.clone(),
+            rotation_id: Uuid::new_v4().to_string(),
+            generation: 3,
+            expected_generation: 0,
+            requested_subdomain: TEST_CLIENT_SUBDOMAIN.into(),
+            tunnel_type: "client-web-http".into(),
+            timestamp_ms: Utc::now().timestamp_millis(),
+            nonce: Uuid::new_v4().to_string(),
+            signature: String::new(),
+            share: None,
+        };
+        first.signature = sign_issue_lease_request(&signing_key, &first);
+        store
+            .issue_lease(
+                &config,
+                &proxy,
+                first,
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                None,
+            )
+            .await
+            .expect("seed abandoned client candidate");
+
+        let mut second = IssueLeaseRequest {
+            protocol_epoch: PROTOCOL_EPOCH.into(),
+            router_id: "127.0.0.1".into(),
+            installation_id: "inst-reclaim".into(),
+            route_id,
+            rotation_id: Uuid::new_v4().to_string(),
+            generation: 4,
+            expected_generation: 0,
+            requested_subdomain: TEST_CLIENT_SUBDOMAIN.into(),
+            tunnel_type: "client-web-http".into(),
+            timestamp_ms: Utc::now().timestamp_millis(),
+            nonce: Uuid::new_v4().to_string(),
+            signature: String::new(),
+            share: None,
+        };
+        second.signature = sign_issue_lease_request(&signing_key, &second);
+        let renewed = store
+            .issue_lease(
+                &config,
+                &proxy,
+                second,
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+                None,
+            )
+            .await
+            .expect("reclaim abandoned client candidate on restart");
+
+        assert_eq!(renewed.generation, 4);
+        let conn = store.conn.lock().await;
+        let retired: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM leases
+                 WHERE installation_id = 'inst-reclaim' AND generation = 3 AND state = 'retired'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count retired abandoned lease");
+        assert_eq!(retired, 1);
         drop(conn);
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
