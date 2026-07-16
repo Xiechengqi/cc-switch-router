@@ -103,7 +103,7 @@ EXEC "/usr/local/bin/${binary} init --router-url ${ROUTER} --owner-email ${OWNER
 EXEC "nohup /usr/local/bin/${binary} &> /dev/null &"
 EXEC "sleep 3"
 SUBDOMAIN=$(grep tunnelSubdomain $HOME/.cc-switch-server/server.json  | awk -F '"' '{print $(NF-1)}')
-SUBDOMAIN_URL=$(echo ${ROUTER} | "s/:\/\//:\/\/${SUBDOMAIN}\./")
+SUBDOMAIN_URL=$(echo ${ROUTER} | sed "s/:\/\//:\/\/${SUBDOMAIN}\./")
 
 # info
 YELLOW "Please visit ${SUBDOMAIN_URL} with the browser ..."
