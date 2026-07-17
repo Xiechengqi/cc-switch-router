@@ -230,6 +230,7 @@ pub struct ClientNotificationBatch {
     pub reply_to: Option<String>,
     pub subject: String,
     pub html: String,
+    pub text: String,
     pub idempotency_key: String,
     pub attempts: u32,
 }
@@ -636,6 +637,8 @@ struct ResendEmailRequest<'a> {
     subject: &'a str,
     html: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reply_to: Option<&'a str>,
 }
 
@@ -669,6 +672,7 @@ async fn send_resend_email_to(
             to: [&batch.recipient],
             subject: &batch.subject,
             html: &batch.html,
+            text: (!batch.text.trim().is_empty()).then_some(batch.text.as_str()),
             reply_to: batch.reply_to.as_deref(),
         })
         .send()
@@ -773,6 +777,7 @@ fn valid_frozen_batch(batch: &ClientNotificationBatch) -> bool {
         && !contains_header_controls(&batch.subject)
         && !batch.html.trim().is_empty()
         && batch.html.len() <= 256 * 1024
+        && batch.text.len() <= 128 * 1024
         && (1..=256).contains(&batch.idempotency_key.len())
         && !contains_header_controls(&batch.idempotency_key)
         && batch
@@ -985,6 +990,7 @@ fn sanitize_delivery_error(value: &str) -> String {
 pub struct RenderedNotificationEmail {
     pub subject: String,
     pub html: String,
+    pub text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -994,6 +1000,8 @@ pub struct RegistrationEmailData {
     pub version: Option<String>,
     pub country_code: Option<String>,
     pub registered_at: String,
+    pub owner_email: Option<String>,
+    pub client_url: Option<String>,
     pub dashboard_url: String,
 }
 
@@ -1011,38 +1019,63 @@ pub struct OfflineEmailData {
     pub tunnel_subdomain: Option<String>,
     pub owner_email: Option<String>,
     pub version: Option<String>,
+    pub client_url: Option<String>,
     pub last_authenticated_seen_at: String,
     pub offline_since: String,
     pub dashboard_url: String,
 }
 
 #[derive(Debug, Clone)]
+pub struct DigestEmailClient {
+    pub installation_id: String,
+    pub client_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct DigestEmailData {
     pub event_label: String,
     pub incident: bool,
-    pub clients: Vec<String>,
+    pub clients: Vec<DigestEmailClient>,
     pub occurred_at: String,
     pub dashboard_url: String,
 }
 
 pub fn render_registration_email(data: &RegistrationEmailData) -> RenderedNotificationEmail {
     let id = short_installation_id(&data.installation_id);
-    let subject = format!("New client registered: {id}");
+    let subject = format!("Client registered and ready: {id}");
     let rows = vec![
         ("Client", id),
+        ("Client URL", display_value(data.client_url.as_deref())),
+        ("Owner", display_value(data.owner_email.as_deref())),
         ("Platform", display_value(Some(&data.platform))),
         ("Version", display_value(data.version.as_deref())),
         ("Country", display_value(data.country_code.as_deref())),
         ("Registered", display_value(Some(&data.registered_at))),
     ];
+    let action_url = data.client_url.as_deref().unwrap_or(&data.dashboard_url);
+    let action_label = if data.client_url.is_some() {
+        "Open Client Web"
+    } else {
+        "Open Router dashboard"
+    };
+    let (html, text) = render_email_document(EmailDocument {
+        title: "Client registration completed",
+        preheader: "A Client completed trusted registration and is ready to use.",
+        introduction: "A Client owned by this email address completed trusted registration with the Router.",
+        rows: &rows,
+        action_label,
+        action_url,
+        dashboard_url: &data.dashboard_url,
+        note: Some(
+            "Use the Web password configured on the Client to sign in. For security, the Router never receives or emails that password.",
+        ),
+        extra_html: "",
+        extra_text: "",
+    });
     RenderedNotificationEmail {
         subject,
-        html: render_email_document(
-            "New client registered",
-            "A client completed authenticated registration with this router.",
-            &rows,
-            &data.dashboard_url,
-        ),
+        html,
+        text,
     }
 }
 
@@ -1055,14 +1088,22 @@ pub fn render_registration_overflow_email(
         ("Window start", display_value(Some(&data.window_start))),
         ("Window end", display_value(Some(&data.window_end))),
     ];
+    let (html, text) = render_email_document(EmailDocument {
+        title: "Client registration summary",
+        preheader: "Multiple Clients completed trusted registration.",
+        introduction: "Registration volume exceeded the individual notification lane, so the Router combined the activity into this summary.",
+        rows: &rows,
+        action_label: "Review Clients",
+        action_url: &data.dashboard_url,
+        dashboard_url: &data.dashboard_url,
+        note: None,
+        extra_html: "",
+        extra_text: "",
+    });
     RenderedNotificationEmail {
         subject,
-        html: render_email_document(
-            "Client registration notification summary",
-            "Registration activity exceeded the configured delivery lane. This summary replaces the individual notifications that could not be sent.",
-            &rows,
-            &display_value(Some(&data.dashboard_url)),
-        ),
+        html,
+        text,
     }
 }
 
@@ -1071,7 +1112,8 @@ pub fn render_offline_email(data: &OfflineEmailData) -> RenderedNotificationEmai
     let subject = format!("Client offline: {id}");
     let rows = vec![
         ("Client", id),
-        ("Tunnel", display_value(data.tunnel_subdomain.as_deref())),
+        ("Client URL", display_value(data.client_url.as_deref())),
+        ("Subdomain", display_value(data.tunnel_subdomain.as_deref())),
         ("Owner", display_value(data.owner_email.as_deref())),
         ("Version", display_value(data.version.as_deref())),
         (
@@ -1083,14 +1125,24 @@ pub fn render_offline_email(data: &OfflineEmailData) -> RenderedNotificationEmai
             display_value(Some(&data.offline_since)),
         ),
     ];
+    let (html, text) = render_email_document(EmailDocument {
+        title: "Client offline",
+        preheader: "The Router confirmed that a Client is offline.",
+        introduction: "The Router stopped receiving authenticated heartbeats from this Client for the configured confirmation window.",
+        rows: &rows,
+        action_label: "Review Client status",
+        action_url: &data.dashboard_url,
+        dashboard_url: &data.dashboard_url,
+        note: Some(
+            "Check that the Client service is running and can reach the Router. A recovery notification is intentionally not sent; the dashboard reflects recovery after stable heartbeats resume.",
+        ),
+        extra_html: "",
+        extra_text: "",
+    });
     RenderedNotificationEmail {
         subject,
-        html: render_email_document(
-            "Client offline",
-            "The router did not receive an authenticated heartbeat within the configured window.",
-            &rows,
-            &data.dashboard_url,
-        ),
+        html,
+        text,
     }
 }
 
@@ -1105,53 +1157,153 @@ pub fn render_digest_email(data: &DigestEmailData) -> RenderedNotificationEmail 
         .chars()
         .take(150)
         .collect();
-    let mut clients = data
+    let mut clients_html = data
         .clients
         .iter()
         .take(MAX_DIGEST_CLIENTS)
-        .map(|id| format!("<li>{}</li>", html_escape(&short_installation_id(id))))
+        .map(|client| {
+            let id = html_escape(&short_installation_id(&client.installation_id));
+            match client.client_url.as_deref() {
+                Some(url) => format!(
+                    "<li style=\"margin:0 0 6px\"><a href=\"{}\" style=\"color:#0f766e\">{}</a></li>",
+                    html_escape(url),
+                    id
+                ),
+                None => format!("<li style=\"margin:0 0 6px\">{id}</li>"),
+            }
+        })
         .collect::<Vec<_>>()
         .join("");
+    let mut clients_text = data
+        .clients
+        .iter()
+        .take(MAX_DIGEST_CLIENTS)
+        .map(|client| match client.client_url.as_deref() {
+            Some(url) => format!(
+                "- {}: {url}",
+                short_installation_id(&client.installation_id)
+            ),
+            None => format!("- {}", short_installation_id(&client.installation_id)),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     let remaining = data.clients.len().saturating_sub(MAX_DIGEST_CLIENTS);
     if remaining > 0 {
-        clients.push_str(&format!("<li>+{remaining} more</li>"));
+        clients_html.push_str(&format!(
+            "<li style=\"margin:0 0 6px\">+{remaining} more</li>"
+        ));
+        clients_text.push_str(&format!("\n- +{remaining} more"));
     }
-    let html = format!(
-        "<!doctype html><html><body style=\"font-family:Arial,sans-serif;color:#202124\"><h1 style=\"font-size:20px\">{}</h1><p>{} clients reported {} at {}.</p><ul>{}</ul><p><a href=\"{}\">Open router dashboard</a></p></body></html>",
-        html_escape(prefix),
-        data.clients.len(),
-        html_escape(&event_label),
-        html_escape(&data.occurred_at),
-        clients,
-        html_escape(&data.dashboard_url),
+    let rows = vec![
+        ("Event", event_label.clone()),
+        ("Clients", data.clients.len().to_string()),
+        ("Observed", display_value(Some(&data.occurred_at))),
+    ];
+    let extra_html = format!(
+        "<h2 style=\"font-size:16px;line-height:24px;margin:24px 0 8px;color:#172033\">Affected Clients</h2><ul style=\"margin:0;padding-left:20px;color:#334155\">{clients_html}</ul>"
     );
-    RenderedNotificationEmail { subject, html }
+    let extra_text = format!("Affected Clients:\n{clients_text}");
+    let introduction = format!(
+        "The Router grouped {} related Client {} into one notification.",
+        data.clients.len(),
+        event_label
+    );
+    let (html, text) = render_email_document(EmailDocument {
+        title: prefix,
+        preheader: &format!(
+            "{} Client {} require review.",
+            data.clients.len(),
+            event_label
+        ),
+        introduction: &introduction,
+        rows: &rows,
+        action_label: "Open Router dashboard",
+        action_url: &data.dashboard_url,
+        dashboard_url: &data.dashboard_url,
+        note: None,
+        extra_html: &extra_html,
+        extra_text: &extra_text,
+    });
+    RenderedNotificationEmail {
+        subject,
+        html,
+        text,
+    }
 }
 
-fn render_email_document(
-    title: &str,
-    introduction: &str,
-    rows: &[(&str, String)],
-    dashboard_url: &str,
-) -> String {
-    let rows = rows
+struct EmailDocument<'a> {
+    title: &'a str,
+    preheader: &'a str,
+    introduction: &'a str,
+    rows: &'a [(&'a str, String)],
+    action_label: &'a str,
+    action_url: &'a str,
+    dashboard_url: &'a str,
+    note: Option<&'a str>,
+    extra_html: &'a str,
+    extra_text: &'a str,
+}
+
+fn render_email_document(document: EmailDocument<'_>) -> (String, String) {
+    let rows_html = document
+        .rows
         .iter()
         .map(|(label, value)| {
             format!(
-                "<tr><th align=\"left\" style=\"padding:6px 12px 6px 0\">{}</th><td style=\"padding:6px 0\">{}</td></tr>",
+                "<tr><th align=\"left\" valign=\"top\" style=\"width:150px;padding:10px 16px 10px 0;border-bottom:1px solid #e2e8f0;color:#64748b;font-size:13px;font-weight:600\">{}</th><td style=\"padding:10px 0;border-bottom:1px solid #e2e8f0;color:#172033;font-size:14px;word-break:break-word\">{}</td></tr>",
                 html_escape(label),
                 html_escape(value)
             )
         })
         .collect::<Vec<_>>()
         .join("");
-    format!(
-        "<!doctype html><html><body style=\"font-family:Arial,sans-serif;color:#202124\"><h1 style=\"font-size:20px\">{}</h1><p>{}</p><table>{}</table><p><a href=\"{}\">Open router dashboard</a></p></body></html>",
-        html_escape(title),
-        html_escape(introduction),
-        rows,
-        html_escape(dashboard_url),
+    let note_html = document.note.map_or_else(String::new, |note| {
+        format!(
+            "<div style=\"margin-top:20px;padding:12px 14px;background:#f8fafc;border-left:3px solid #94a3b8;color:#475569;font-size:13px;line-height:20px\">{}</div>",
+            html_escape(note)
+        )
+    });
+    let html = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{title}</title></head><body style=\"margin:0;padding:0;background:#f1f5f9;font-family:Arial,sans-serif;color:#172033\"><div style=\"display:none;max-height:0;overflow:hidden;opacity:0\">{preheader}</div><table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"background:#f1f5f9\"><tr><td align=\"center\" style=\"padding:24px 12px\"><table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"max-width:620px;background:#ffffff;border:1px solid #dbe3ee\"><tr><td style=\"padding:20px 28px;border-bottom:1px solid #e2e8f0;font-size:14px;font-weight:700;color:#0f766e\">CC-Switch Router</td></tr><tr><td style=\"padding:28px\"><h1 style=\"margin:0 0 12px;font-size:24px;line-height:32px;color:#172033\">{title}</h1><p style=\"margin:0 0 20px;font-size:15px;line-height:24px;color:#475569\">{introduction}</p><table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\">{rows_html}</table>{extra_html}{note_html}<p style=\"margin:24px 0 0\"><a href=\"{action_url}\" style=\"display:inline-block;padding:11px 18px;background:#0f766e;color:#ffffff;text-decoration:none;font-size:14px;font-weight:700\">{action_label}</a></p><p style=\"margin:16px 0 0;font-size:12px;line-height:18px;color:#64748b\">Router dashboard: <a href=\"{dashboard_url}\" style=\"color:#0f766e\">{dashboard_url}</a></p></td></tr><tr><td style=\"padding:16px 28px;background:#f8fafc;color:#64748b;font-size:11px;line-height:17px\">This transactional email was sent because this address is the currently verified Owner of the affected Client.</td></tr></table></td></tr></table></body></html>",
+        title = html_escape(document.title),
+        preheader = html_escape(document.preheader),
+        introduction = html_escape(document.introduction),
+        rows_html = rows_html,
+        extra_html = document.extra_html,
+        note_html = note_html,
+        action_url = html_escape(document.action_url),
+        action_label = html_escape(document.action_label),
+        dashboard_url = html_escape(document.dashboard_url),
+    );
+    let rows_text = document
+        .rows
+        .iter()
+        .map(|(label, value)| format!("{label}: {value}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let note_text = document
+        .note
+        .map(|note| format!("\n\nSecurity note: {note}"))
+        .unwrap_or_default();
+    let extra_text = if document.extra_text.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n\n{}", document.extra_text.trim())
+    };
+    let text = format!(
+        "CC-Switch Router\n\n{title}\n\n{introduction}\n\n{rows_text}{extra_text}{note_text}\n\n{action_label}: {action_url}\nRouter dashboard: {dashboard_url}\n\nThis transactional email was sent because this address is the currently verified Owner of the affected Client.",
+        title = document.title,
+        introduction = document.introduction,
+        rows_text = rows_text,
+        extra_text = extra_text,
+        note_text = note_text,
+        action_label = document.action_label,
+        action_url = document.action_url,
+        dashboard_url = document.dashboard_url,
     )
+    .trim()
+    .to_string();
+    (html, text)
 }
 
 fn short_installation_id(value: &str) -> String {
@@ -1368,6 +1520,7 @@ mod tests {
             reply_to: Some("support@example.com".into()),
             subject: "Client offline".into(),
             html: "<p>offline</p>".into(),
+            text: "offline".into(),
             idempotency_key: "client-notification/b1".into(),
             attempts: 1,
         }
@@ -1483,7 +1636,10 @@ mod tests {
         assert_eq!(policy.registration_recipient_hourly_limit, 1_000);
         assert_eq!(policy.registration_global_hourly_limit, 1_000);
 
-        let disabled = ClientNotificationPolicy::from(&ClientNotificationSettings::default());
+        let disabled = ClientNotificationPolicy::from(&ClientNotificationSettings {
+            enabled: false,
+            ..ClientNotificationSettings::default()
+        });
         assert!(!disabled.enabled);
     }
 
@@ -1548,6 +1704,7 @@ mod tests {
             tunnel_subdomain: Some("client<script>".into()),
             owner_email: Some("owner@example.com".into()),
             version: Some("1.2.3".into()),
+            client_url: Some("https://client.example.com/".into()),
             last_authenticated_seen_at: "2026-07-15T12:00:00Z".into(),
             offline_since: "2026-07-15T12:03:00Z".into(),
             dashboard_url: "https://router.example.com".into(),
@@ -1563,13 +1720,39 @@ mod tests {
         let email = render_digest_email(&DigestEmailData {
             event_label: "offline clients".into(),
             incident: true,
-            clients: (0..55).map(|index| format!("client-{index:04}")).collect(),
+            clients: (0..55)
+                .map(|index| DigestEmailClient {
+                    installation_id: format!("client-{index:04}"),
+                    client_url: Some(format!("https://client-{index:04}.example.com/")),
+                })
+                .collect(),
             occurred_at: "2026-07-15T12:00:00Z".into(),
             dashboard_url: "https://router.example.com".into(),
         });
-        assert_eq!(email.html.matches("<li>").count(), MAX_DIGEST_CLIENTS + 1);
+        assert_eq!(email.html.matches("<li").count(), MAX_DIGEST_CLIENTS + 1);
         assert!(email.html.contains("+5 more"));
+        assert!(email.text.contains("https://client-0000.example.com/"));
         assert!(email.subject.chars().count() <= 150);
+    }
+
+    #[test]
+    fn registration_template_includes_client_url_but_never_a_web_password() {
+        let email = render_registration_email(&RegistrationEmailData {
+            installation_id: "12345678-secret-rest".into(),
+            platform: "linux".into(),
+            version: Some("1.2.3".into()),
+            country_code: Some("US".into()),
+            registered_at: "2026-07-15T12:00:00Z".into(),
+            owner_email: Some("owner@example.com".into()),
+            client_url: Some("https://client.example.com/".into()),
+            dashboard_url: "https://router.example.com/".into(),
+        });
+
+        for body in [&email.html, &email.text] {
+            assert!(body.contains("https://client.example.com/"));
+            assert!(body.contains("Router never receives or emails"));
+            assert!(!body.to_ascii_lowercase().contains("plaintext password"));
+        }
     }
 
     #[test]
@@ -1584,7 +1767,8 @@ mod tests {
         assert_eq!(email.subject, "Client registration summary");
         assert!(!email.html.contains("<script>"));
         assert!(email.html.contains("&lt;script&gt;"));
-        assert!(email.html.len() < 3_000);
+        assert!(email.html.len() < 10_000);
+        assert!(email.text.len() < 3_000);
     }
 
     #[test]
@@ -1630,7 +1814,7 @@ mod tests {
 
     #[tokio::test]
     async fn resend_success_returns_provider_message_id() {
-        let (endpoint, _requests, server) =
+        let (endpoint, requests, server) =
             start_mock_resend(StatusCode::OK, r#"{"id":"email_123"}"#, None).await;
         let result =
             send_resend_email_to(&reqwest::Client::new(), "re_test", &test_batch(), &endpoint)
@@ -1638,6 +1822,12 @@ mod tests {
                 .unwrap();
         server.abort();
         assert_eq!(result, "email_123");
+        let requests = requests.lock().await;
+        let payload: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            payload.get("text").and_then(|value| value.as_str()),
+            Some("offline")
+        );
     }
 
     #[tokio::test]

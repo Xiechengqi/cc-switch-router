@@ -76,7 +76,7 @@ use crate::namespace::{
 };
 use crate::notifications::{
     ClientNotificationBatch, ClientNotificationClaim, ClientNotificationDeliveryView,
-    ClientNotificationPolicy, DigestEmailData, NotificationAggregateStats,
+    ClientNotificationPolicy, DigestEmailClient, DigestEmailData, NotificationAggregateStats,
     NotificationReconcileStats, NotificationTemplateContext, OfflineEmailData,
     RegistrationEmailData, RegistrationOverflowEmailData, mask_email_address,
     mask_email_like_tokens, render_digest_email, render_offline_email, render_registration_email,
@@ -966,6 +966,7 @@ struct PendingClientNotificationEvent {
     occurred_at: DateTime<Utc>,
     snapshot: serde_json::Value,
     verified_owner_email: Option<String>,
+    tunnel_subdomain: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1917,11 +1918,12 @@ impl AppStore {
                 stats.deferred_by_global_cap += recipient_events.len() as u64;
             }
             let rendered = if incident {
-                let incident_clients = load_incident_client_ids(
+                let incident_clients = load_incident_clients(
                     &tx,
                     storm_kind,
                     &storm_window_start,
                     Some(recipient.as_str()),
+                    &template.dashboard_url,
                 )?;
                 render_digest_email(&DigestEmailData {
                     event_label: match event_family {
@@ -1972,11 +1974,11 @@ impl AppStore {
             tx.execute(
                 "INSERT INTO email_delivery_batches (
                     id, notification_lane, recipient, recipient_priority,
-                    from_address, reply_to, subject, html_body,
+                    from_address, reply_to, subject, html_body, text_body,
                     idempotency_key, status, attempts, not_before, next_attempt_at,
                     template_fingerprint, delivery_kind, incident_key, error_message,
                     created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, ?12, ?13, ?14, ?15, ?16, ?11, ?11)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12, ?13, ?14, ?15, ?16, ?17, ?12, ?12)",
                 params![
                     batch_id,
                     lane.as_str(),
@@ -1986,6 +1988,7 @@ impl AppStore {
                     template.reply_to,
                     rendered.subject,
                     rendered.html,
+                    rendered.text,
                     idempotency_key,
                     batch_status,
                     timestamp,
@@ -2242,11 +2245,11 @@ impl AppStore {
         let batch = tx
             .query_row(
                 "SELECT id, recipient, from_address, reply_to, subject, html_body,
-                        idempotency_key, attempts
+                        text_body, idempotency_key, attempts
                  FROM email_delivery_batches WHERE id = ?1",
                 params![batch_id],
                 |row| {
-                    let attempts = row.get::<_, i64>(7)?;
+                    let attempts = row.get::<_, i64>(8)?;
                     Ok(ClientNotificationBatch {
                         id: row.get(0)?,
                         recipient: row.get(1)?,
@@ -2254,7 +2257,8 @@ impl AppStore {
                         reply_to: row.get(3)?,
                         subject: row.get(4)?,
                         html: row.get(5)?,
-                        idempotency_key: row.get(6)?,
+                        text: row.get(6)?,
+                        idempotency_key: row.get(7)?,
                         attempts: attempts.max(0) as u32,
                     })
                 },
@@ -11588,6 +11592,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             reply_to TEXT,
             subject TEXT NOT NULL,
             html_body TEXT NOT NULL,
+            text_body TEXT NOT NULL DEFAULT '',
             idempotency_key TEXT NOT NULL UNIQUE,
             status TEXT NOT NULL,
             attempts INTEGER NOT NULL DEFAULT 0,
@@ -12503,6 +12508,12 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
     add_column_if_missing(
         conn,
         "email_delivery_batches",
+        "text_body",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column_if_missing(
+        conn,
+        "email_delivery_batches",
         "delivery_kind",
         "TEXT NOT NULL DEFAULT 'lifecycle'",
     )?;
@@ -13311,9 +13322,12 @@ fn load_pending_notification_events(
                     CASE WHEN i.owner_verified_at IS NOT NULL
                                AND i.owner_email IS NOT NULL
                                AND TRIM(i.owner_email) != ''
-                         THEN LOWER(i.owner_email) ELSE NULL END
+                         THEN LOWER(i.owner_email) ELSE NULL END,
+                    ict.subdomain
              FROM client_notification_events e
              LEFT JOIN installations i ON i.id = e.installation_id
+             LEFT JOIN installation_client_tunnels ict
+               ON ict.installation_id = e.installation_id AND ict.enabled = 1
              WHERE e.status = 'pending' AND e.not_before <= ?1
                AND {} AND e.occurred_at <= ?2
              ORDER BY CASE WHEN e.kind = 'client_registration_overflow' THEN 0 ELSE 1 END,
@@ -13345,6 +13359,7 @@ fn load_pending_notification_events(
                     occurred_at: parse_dt_sql(&row.get::<_, String>(3)?)?,
                     snapshot,
                     verified_owner_email: row.get(5)?,
+                    tunnel_subdomain: row.get(6)?,
                 })
             },
         )
@@ -13376,17 +13391,20 @@ fn notification_event_recipients(
         .unwrap_or_default()
 }
 
-fn load_incident_client_ids(
+fn load_incident_clients(
     conn: &Connection,
     event_kind: Option<&str>,
     window_start: &str,
     owner_recipient: Option<&str>,
-) -> Result<Vec<String>, AppError> {
+    dashboard_url: &str,
+) -> Result<Vec<DigestEmailClient>, AppError> {
     let mut statement = conn
         .prepare(
-            "SELECT e.installation_id
+            "SELECT e.installation_id, ict.subdomain
              FROM client_notification_events e
              LEFT JOIN installations i ON i.id = e.installation_id
+             LEFT JOIN installation_client_tunnels ict
+               ON ict.installation_id = e.installation_id AND ict.enabled = 1
              WHERE e.occurred_at >= ?1
                AND e.occurred_at >= COALESCE(
                    (SELECT enabled_since FROM client_notification_runtime WHERE id = 1), ?1
@@ -13410,7 +13428,12 @@ fn load_incident_client_ids(
         })?;
     let rows = statement
         .query_map(params![window_start, event_kind, owner_recipient], |row| {
-            row.get::<_, String>(0)
+            let installation_id = row.get::<_, String>(0)?;
+            let subdomain = row.get::<_, Option<String>>(1)?;
+            Ok(DigestEmailClient {
+                installation_id,
+                client_url: notification_client_url(dashboard_url, subdomain.as_deref()),
+            })
         })
         .map_err(|error| {
             AppError::Internal(format!("query incident client list failed: {error}"))
@@ -13424,6 +13447,20 @@ fn notification_snapshot_string(snapshot: &serde_json::Value, key: &str) -> Opti
         .get(key)
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
+}
+
+fn notification_client_url(dashboard_url: &str, subdomain: Option<&str>) -> Option<String> {
+    let subdomain = subdomain.map(str::trim).filter(|value| !value.is_empty())?;
+    let url = url::Url::parse(dashboard_url).ok()?;
+    let host = url.host_str()?;
+    if host.contains(':') {
+        return None;
+    }
+    let port = url
+        .port()
+        .map(|value| format!(":{value}"))
+        .unwrap_or_default();
+    Some(format!("{}://{subdomain}.{host}{port}/", url.scheme()))
 }
 
 fn render_client_notification_batch(
@@ -13479,6 +13516,13 @@ fn render_client_notification_batch(
         ));
     }
     if events.len() == 1 && !incident {
+        let tunnel_subdomain = first.tunnel_subdomain.as_deref().or_else(|| {
+            first
+                .snapshot
+                .get("tunnelSubdomain")
+                .and_then(serde_json::Value::as_str)
+        });
+        let client_url = notification_client_url(dashboard_url, tunnel_subdomain);
         return match first.kind.as_str() {
             "client_registered" => Ok(render_registration_email(&RegistrationEmailData {
                 installation_id: first.installation_id.clone(),
@@ -13488,13 +13532,16 @@ fn render_client_notification_batch(
                 country_code: notification_snapshot_string(&first.snapshot, "countryCode"),
                 registered_at: notification_snapshot_string(&first.snapshot, "registeredAt")
                     .unwrap_or_else(|| first.occurred_at.to_rfc3339()),
+                owner_email: first.verified_owner_email.clone(),
+                client_url,
                 dashboard_url: dashboard_url.to_string(),
             })),
             "client_offline" => Ok(render_offline_email(&OfflineEmailData {
                 installation_id: first.installation_id.clone(),
-                tunnel_subdomain: notification_snapshot_string(&first.snapshot, "tunnelSubdomain"),
+                tunnel_subdomain: tunnel_subdomain.map(str::to_string),
                 owner_email: first.verified_owner_email.clone(),
                 version: notification_snapshot_string(&first.snapshot, "appVersion"),
+                client_url,
                 last_authenticated_seen_at: notification_snapshot_string(
                     &first.snapshot,
                     "lastAuthenticatedSeenAt",
@@ -13523,7 +13570,18 @@ fn render_client_notification_batch(
         incident,
         clients: events
             .iter()
-            .map(|event| event.installation_id.clone())
+            .map(|event| DigestEmailClient {
+                installation_id: event.installation_id.clone(),
+                client_url: notification_client_url(
+                    dashboard_url,
+                    event.tunnel_subdomain.as_deref().or_else(|| {
+                        event
+                            .snapshot
+                            .get("tunnelSubdomain")
+                            .and_then(serde_json::Value::as_str)
+                    }),
+                ),
+            })
             .collect(),
         occurred_at: now.to_rfc3339(),
         dashboard_url: dashboard_url.to_string(),
@@ -29007,6 +29065,23 @@ mod tests {
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 
+    #[test]
+    fn notification_client_url_uses_the_client_subdomain_and_router_origin() {
+        assert_eq!(
+            notification_client_url(
+                "https://router.example.com/settings?tab=clients",
+                Some("client-alpha"),
+            )
+            .as_deref(),
+            Some("https://client-alpha.router.example.com/"),
+        );
+        assert_eq!(
+            notification_client_url("http://127.0.0.1:8787/", Some("client-alpha")).as_deref(),
+            Some("http://client-alpha.127.0.0.1:8787/"),
+        );
+        assert!(notification_client_url("https://router.example.com", None).is_none());
+    }
+
     #[tokio::test]
     async fn recovered_offline_batch_does_not_requeue_registration_lane() {
         let config = enabled_notification_config("notification-mixed-recovery");
@@ -29129,6 +29204,7 @@ mod tests {
             "unaffected registration batch",
         );
         assert!(registration_batch.subject.contains("registered"));
+        assert!(registration_batch.text.contains("CC-Switch Router"));
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 

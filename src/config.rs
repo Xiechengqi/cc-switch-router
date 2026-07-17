@@ -36,7 +36,7 @@ pub struct ClientNotificationSettings {
 impl Default for ClientNotificationSettings {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             offline_alert_secs: 180,
             recovery_stable_secs: 120,
             cooldown_secs: 30 * 60,
@@ -159,7 +159,7 @@ impl Config {
             resend_from_name: env_var("CC_SWITCH_ROUTER_RESEND_FROM_NAME"),
             resend_reply_to: env_var("CC_SWITCH_ROUTER_RESEND_REPLY_TO"),
             client_notifications: ClientNotificationSettings {
-                enabled: env_bool("CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED", false),
+                enabled: env_bool("CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED", true),
                 offline_alert_secs: env_i64("CC_SWITCH_ROUTER_CLIENT_OFFLINE_ALERT_SECS", 180),
                 recovery_stable_secs: env_i64("CC_SWITCH_ROUTER_CLIENT_RECOVERY_STABLE_SECS", 120),
                 cooldown_secs: env_i64("CC_SWITCH_ROUTER_CLIENT_ALERT_COOLDOWN_SECS", 30 * 60),
@@ -419,8 +419,8 @@ CC_SWITCH_ROUTER_FREE_SHARE_IP_PARALLEL_LIMIT=1
 CC_SWITCH_ROUTER_RESEND_API_KEY=
 # CC_SWITCH_ROUTER_RESEND_FROM defaults to noreply@[CC_SWITCH_ROUTER_TUNNEL_DOMAIN]
 CC_SWITCH_ROUTER_RESEND_FROM=
-# Client lifecycle email notifications are opt-in and go to each verified owner with an active Router account.
-CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED=false
+# Client lifecycle email notifications default to enabled and go to each currently verified owner.
+CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED=true
 CC_SWITCH_ROUTER_CLIENT_OFFLINE_ALERT_SECS=180
 CC_SWITCH_ROUTER_CLIENT_RECOVERY_STABLE_SECS=120
 CC_SWITCH_ROUTER_CLIENT_ALERT_COOLDOWN_SECS=1800
@@ -610,9 +610,9 @@ mod tests {
     }
 
     #[test]
-    fn client_notification_defaults_are_opt_in_and_strictly_capped() {
+    fn client_notification_defaults_are_enabled_and_strictly_capped() {
         let settings = ClientNotificationSettings::default();
-        assert!(!settings.enabled);
+        assert!(settings.enabled);
         assert_eq!(settings.recipient_hourly_limit, 10);
         assert_eq!(settings.global_hourly_limit, 50);
         assert_eq!(settings.registration_recipient_hourly_limit, 3);

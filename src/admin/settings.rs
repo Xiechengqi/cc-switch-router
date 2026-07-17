@@ -472,7 +472,7 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         required: false,
         restart_required: true,
         default: Some("noreply@[CC_SWITCH_ROUTER_TUNNEL_DOMAIN]"),
-        description: "From: address used for outgoing mail. Defaults to noreply@<tunnel-domain-host>.",
+        description: "From: address used for outgoing mail. Use a Resend-verified domain with aligned SPF, DKIM, and DMARC; defaults to noreply@<tunnel-domain-host>.",
         placeholder: Some("noreply@example.com"),
         dynamic_group: None,
     },
@@ -508,7 +508,7 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         field_type: FieldType::Bool,
         required: false,
         restart_required: false,
-        default: Some("false"),
+        default: Some("true"),
         description: "Send registration and offline alerts to each client's currently verified owner email.",
         placeholder: None,
         dynamic_group: Some(DynamicGroup::ClientNotifications),
@@ -1574,8 +1574,7 @@ pub fn apply_updates_to_dynamic(
                     value.and_then(|v| v.parse::<i64>().ok()).unwrap_or(300);
             }
             "CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED" => {
-                current.client_notifications.enabled =
-                    value.map(parse_bool_truthy).unwrap_or(false);
+                current.client_notifications.enabled = value.map(parse_bool_truthy).unwrap_or(true);
             }
             "CC_SWITCH_ROUTER_CLIENT_OFFLINE_ALERT_SECS" => {
                 current.client_notifications.offline_alert_secs =
@@ -2057,7 +2056,7 @@ mod tests {
             None,
         );
         apply_updates_to_dynamic(&mut current, &updates, &static_config);
-        assert!(!current.client_notifications.enabled);
+        assert!(current.client_notifications.enabled);
     }
 
     #[test]
