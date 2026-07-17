@@ -58,6 +58,18 @@ pub struct RecentRequestEvent {
     pub cache_creation_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<u16>,
     pub started_at: DateTime<Utc>,
     /// True while the underlying proxy request is still streaming. Stamped at
     /// snapshot time from the `inflight_request_ids` set, not stored on the
@@ -71,6 +83,37 @@ pub struct RecentRequestEvent {
     pub health_app_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_model: Option<String>,
+}
+
+impl Default for RecentRequestEvent {
+    fn default() -> Self {
+        Self {
+            request_id: String::new(),
+            share_id: String::new(),
+            share_name: None,
+            share_subdomain: None,
+            user_country: None,
+            user_country_iso3: None,
+            user_email: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            total_tokens: None,
+            request_agent: None,
+            requested_model: None,
+            actual_model: None,
+            model: None,
+            latency_ms: None,
+            status_code: None,
+            started_at: Utc::now(),
+            is_inflight: false,
+            is_health_check: false,
+            health_status: None,
+            health_app_type: None,
+            health_model: None,
+        }
+    }
 }
 
 #[derive(Default, Debug)]
@@ -150,6 +193,12 @@ impl RecentTraffic {
             cache_read_tokens: None,
             cache_creation_tokens: None,
             total_tokens: None,
+            request_agent: None,
+            requested_model: None,
+            actual_model: None,
+            model: None,
+            latency_ms: None,
+            status_code: None,
             started_at: Utc::now(),
             is_inflight: true,
             is_health_check: false,
@@ -195,6 +244,12 @@ impl RecentTraffic {
             cache_read_tokens: None,
             cache_creation_tokens: None,
             total_tokens: None,
+            request_agent: None,
+            requested_model: None,
+            actual_model: None,
+            model: None,
+            latency_ms: None,
+            status_code: None,
             started_at: Utc::now(),
             is_inflight: false,
             is_health_check: true,

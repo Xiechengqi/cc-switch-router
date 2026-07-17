@@ -1979,6 +1979,24 @@ fn merge_persisted_ticker_event(target: &mut RecentRequestEvent, mut source: Rec
         source.cache_creation_tokens = target.cache_creation_tokens;
         source.total_tokens = target.total_tokens;
     }
+    if source.request_agent.is_none() {
+        source.request_agent = target.request_agent.clone();
+    }
+    if source.requested_model.is_none() {
+        source.requested_model = target.requested_model.clone();
+    }
+    if source.actual_model.is_none() {
+        source.actual_model = target.actual_model.clone();
+    }
+    if source.model.is_none() {
+        source.model = target.model.clone();
+    }
+    if source.latency_ms.unwrap_or(0) == 0 {
+        source.latency_ms = target.latency_ms;
+    }
+    if source.status_code.unwrap_or(0) == 0 {
+        source.status_code = target.status_code;
+    }
     if target.started_at < source.started_at {
         source.started_at = target.started_at;
     }
@@ -2073,6 +2091,47 @@ fn merge_ticker_event_country(target: &mut RecentRequestEvent, source: &RecentRe
     if let Some(user_email) = source.user_email.as_ref() {
         target.user_email = Some(user_email.clone());
     }
+    merge_ticker_event_usage(target, source);
+}
+
+fn merge_ticker_event_usage(target: &mut RecentRequestEvent, source: &RecentRequestEvent) {
+    let source_total = source.total_tokens.unwrap_or_else(|| {
+        u64::from(source.input_tokens.unwrap_or(0))
+            + u64::from(source.output_tokens.unwrap_or(0))
+            + u64::from(source.cache_read_tokens.unwrap_or(0))
+            + u64::from(source.cache_creation_tokens.unwrap_or(0))
+    });
+    let target_total = target.total_tokens.unwrap_or_else(|| {
+        u64::from(target.input_tokens.unwrap_or(0))
+            + u64::from(target.output_tokens.unwrap_or(0))
+            + u64::from(target.cache_read_tokens.unwrap_or(0))
+            + u64::from(target.cache_creation_tokens.unwrap_or(0))
+    });
+    if source_total > target_total {
+        target.input_tokens = source.input_tokens;
+        target.output_tokens = source.output_tokens;
+        target.cache_read_tokens = source.cache_read_tokens;
+        target.cache_creation_tokens = source.cache_creation_tokens;
+        target.total_tokens = Some(source_total);
+    }
+    if target.request_agent.is_none() {
+        target.request_agent = source.request_agent.clone();
+    }
+    if target.requested_model.is_none() {
+        target.requested_model = source.requested_model.clone();
+    }
+    if target.actual_model.is_none() {
+        target.actual_model = source.actual_model.clone();
+    }
+    if target.model.is_none() {
+        target.model = source.model.clone();
+    }
+    if target.latency_ms.unwrap_or(0) == 0 {
+        target.latency_ms = source.latency_ms;
+    }
+    if target.status_code.unwrap_or(0) == 0 {
+        target.status_code = source.status_code;
+    }
 }
 
 fn persisted_ticker_request_events(
@@ -2125,6 +2184,12 @@ fn share_log_to_ticker_event(
         cache_read_tokens: Some(log.cache_read_tokens),
         cache_creation_tokens: Some(log.cache_creation_tokens),
         total_tokens: Some(share_log_total_tokens(log)),
+        request_agent: (!log.request_agent.is_empty()).then(|| log.request_agent.clone()),
+        requested_model: (!log.requested_model.is_empty()).then(|| log.requested_model.clone()),
+        actual_model: (!log.actual_model.is_empty()).then(|| log.actual_model.clone()),
+        model: (!log.model.is_empty()).then(|| log.model.clone()),
+        latency_ms: (log.latency_ms > 0).then_some(log.latency_ms),
+        status_code: (log.status_code > 0).then_some(log.status_code),
         started_at: chrono::DateTime::<chrono::Utc>::from_timestamp(log.created_at, 0)
             .unwrap_or_else(chrono::Utc::now),
         is_inflight: false,
@@ -2161,6 +2226,15 @@ fn market_log_to_ticker_event(log: &DashboardMarketRequestLogView) -> RecentRequ
         cache_read_tokens: Some(log.cache_read_tokens),
         cache_creation_tokens: Some(log.cache_creation_tokens),
         total_tokens: Some(market_log_total_tokens(log)),
+        request_agent: (!log.request_agent.is_empty()).then(|| log.request_agent.clone()),
+        requested_model: (!log.requested_model.is_empty()).then(|| log.requested_model.clone()),
+        actual_model: (!log.actual_model.is_empty()).then(|| log.actual_model.clone()),
+        model: log
+            .model
+            .clone()
+            .filter(|value| !value.trim().is_empty()),
+        latency_ms: log.latency_ms.filter(|value| *value > 0),
+        status_code: log.status_code.filter(|value| *value > 0),
         started_at: parse_dashboard_log_time(&log.created_at),
         is_inflight: false,
         is_health_check: false,
@@ -2748,6 +2822,58 @@ mod tests {
         assert_eq!(json["cacheReadTokens"], 3);
         assert_eq!(json["cacheCreationTokens"], 4);
         assert_eq!(json["totalTokens"], 37);
+        assert_eq!(json["actualModel"], "gpt-5");
+        assert_eq!(json["latencyMs"], 1);
+    }
+
+    #[test]
+    fn confirmed_request_events_keep_display_fields_without_ticker_share_log() {
+        let mut log = share_log("req-display", 1);
+        log.actual_model = "gpt-5.6-sol".into();
+        log.request_agent = "codex".into();
+        log.latency_ms = 14_600;
+        log.input_tokens = 86_000;
+        let response = DashboardResponse {
+            generated_at: Utc::now(),
+            stats: crate::models::DashboardStats {
+                clients: 0,
+                active_shares: 0,
+                total_active_requests: 0,
+            },
+            map: crate::models::DashboardMap {
+                server: None,
+                countries: Vec::new(),
+            },
+            map_display: MapDisplaySettings::default(),
+            clients: Vec::new(),
+            shares: Vec::new(),
+            markets: Vec::new(),
+            ticker_shares: vec![crate::models::DashboardTickerShare {
+                share_id: "share-1".into(),
+                share_name: "Share".into(),
+                subdomain: "share-sub".into(),
+                recent_requests: Vec::new(),
+            }],
+            country_counts: HashMap::new(),
+            country_boards: HashMap::new(),
+            user_country_counts: HashMap::new(),
+            recent_request_events: Vec::new(),
+            market_request_logs: Vec::new(),
+        };
+        let snapshot = RecentTrafficSnapshot {
+            country_counts: HashMap::new(),
+            events: Vec::new(),
+            recent_events: Vec::new(),
+        };
+        let (events, _) = confirmed_request_events(&snapshot, &response, &[log]);
+        let event = events
+            .iter()
+            .find(|event| event.request_id == "req-display")
+            .expect("persisted event");
+        assert_eq!(event.actual_model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(event.request_agent.as_deref(), Some("codex"));
+        assert_eq!(event.latency_ms, Some(14_600));
+        assert_eq!(event.total_tokens, Some(86_000));
     }
 
     #[test]
@@ -2925,17 +3051,9 @@ mod tests {
             user_country: Some("US".into()),
             user_country_iso3: Some("USA".into()),
             user_email: Some("user@example.com".into()),
-            input_tokens: None,
-            output_tokens: None,
-            cache_read_tokens: None,
-            cache_creation_tokens: None,
-            total_tokens: None,
             started_at: Utc::now(),
             is_inflight: true,
-            is_health_check: false,
-            health_status: None,
-            health_app_type: None,
-            health_model: None,
+            ..Default::default()
         };
         let snapshot = RecentTrafficSnapshot {
             country_counts: HashMap::new(),
@@ -3107,17 +3225,9 @@ mod tests {
             user_country: Some("US".into()),
             user_country_iso3: Some("USA".into()),
             user_email: Some("live-user@example.com".into()),
-            input_tokens: None,
-            output_tokens: None,
-            cache_read_tokens: None,
-            cache_creation_tokens: None,
-            total_tokens: None,
             started_at: Utc::now(),
             is_inflight: true,
-            is_health_check: false,
-            health_status: None,
-            health_app_type: None,
-            health_model: None,
+            ..Default::default()
         };
         let snapshot = RecentTrafficSnapshot {
             country_counts: HashMap::new(),
@@ -3170,18 +3280,8 @@ mod tests {
             share_subdomain: Some("share-sub".into()),
             user_country: Some("US".into()),
             user_country_iso3: Some("USA".into()),
-            user_email: None,
-            input_tokens: None,
-            output_tokens: None,
-            cache_read_tokens: None,
-            cache_creation_tokens: None,
-            total_tokens: None,
             started_at: Utc::now(),
-            is_inflight: false,
-            is_health_check: false,
-            health_status: None,
-            health_app_type: None,
-            health_model: None,
+            ..Default::default()
         };
         let snapshot = RecentTrafficSnapshot {
             country_counts: HashMap::new(),
@@ -3354,17 +3454,9 @@ mod tests {
             user_country: user_country.map(str::to_string),
             user_country_iso3: user_country_iso3.map(str::to_string),
             user_email: user_email.map(str::to_string),
-            input_tokens: None,
-            output_tokens: None,
-            cache_read_tokens: None,
-            cache_creation_tokens: None,
-            total_tokens: None,
             started_at: Utc::now(),
             is_inflight: true,
-            is_health_check: false,
-            health_status: None,
-            health_app_type: None,
-            health_model: None,
+            ..Default::default()
         }
     }
 

@@ -651,6 +651,11 @@ export type RecentRequestEvent = {
   createdAt?: string;
   isInflight?: boolean;
   latencyMs?: number;
+  requestAgent?: string;
+  requestedModel?: string;
+  actualModel?: string;
+  model?: string;
+  statusCode?: number;
   inputTokens?: number;
   outputTokens?: number;
   cacheReadTokens?: number;

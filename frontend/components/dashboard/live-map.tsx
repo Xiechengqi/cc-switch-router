@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { ChevronUp } from "lucide-react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { recordDashboardUxEvent } from "@/lib/api";
 import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
@@ -9,6 +10,7 @@ import { MapCountryTooltip } from "@/components/dashboard/map-country-tooltip";
 import type { CountryBoard, CountryMapPoint, DashboardResponse, MapPoint, MarketRequestLog, RecentRequestEvent, ShareRequestLog } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { computeMapOffsetY, DEFAULT_MAP_DISPLAY, MAP_VIEWPORT_HEIGHT_PX } from "@/lib/map-display-settings";
+import { usePersistentState } from "@/lib/use-persistent-state";
 import { StatsStrip } from "@/components/dashboard/stats-strip";
 
 type PlacedPoint = { x: number; y: number; xPct: number; yPct: number };
@@ -22,7 +24,11 @@ type TickerMeta = Partial<Omit<ShareRequestLog, "createdAt"> & Omit<MarketReques
 };
 
 const REQUEST_TICKER_LIMIT = 100;
-const REQUEST_TICKER_MAX_HEIGHT_PX = 220;
+const REQUEST_TICKER_VISIBLE_ROWS = 5;
+const REQUEST_TICKER_ROW_HEIGHT_PX = 22;
+const REQUEST_TICKER_MAX_HEIGHT_PX =
+  REQUEST_TICKER_VISIBLE_ROWS * REQUEST_TICKER_ROW_HEIGHT_PX + (REQUEST_TICKER_VISIBLE_ROWS - 1) * 4;
+const MAP_REQUEST_TICKER_EXPANDED_KEY = "cc_switch_router_map_request_ticker_expanded_v1";
 
 function projectLatLon(lat: number, lon: number): PlacedPoint {
   const x = ((lon + 180) / 360) * 100;
@@ -380,7 +386,9 @@ function resolveIso3FromElement(element: Element | null) {
   return Array.from(countryElement.classList).find((name) => /^[A-Z]{3}$/.test(name)) || null;
 }
 
-function RequestTicker({ data }: { data: DashboardResponse | null }) {
+function RequestTickerPanel({ data }: { data: DashboardResponse | null }) {
+  const { t } = useLocaleText();
+  const [expanded, setExpanded] = usePersistentState(MAP_REQUEST_TICKER_EXPANDED_KEY, true);
   const meta = React.useMemo(() => buildRequestMeta(data), [data]);
   const events = React.useMemo(() => {
     return [...(data?.recentRequestEvents || [])]
@@ -393,48 +401,68 @@ function RequestTicker({ data }: { data: DashboardResponse | null }) {
   if (!events.length) return null;
 
   return (
-    <div
-      data-map-control
-      className="pointer-events-auto absolute bottom-[52px] left-3 z-30 w-[min(72%,720px)] max-h-[220px] overflow-y-auto overscroll-contain bg-transparent px-1 py-1 [scrollbar-gutter:stable]"
-      style={{ maxHeight: REQUEST_TICKER_MAX_HEIGHT_PX }}
-    >
-      <div className="flex flex-col gap-1">
-      {events.map((event, index) => {
-        const item = meta.get(event.requestId);
-        const mergedItem: TickerMeta = {
-          ...(item || {}),
-          userEmail: event.userEmail || item?.userEmail,
-          userCountry: item?.userCountry || event.userCountry,
-          userCountryIso3: item?.userCountryIso3 || event.userCountryIso3,
-          latencyMs: event.latencyMs ?? item?.latencyMs,
-          inputTokens: event.inputTokens ?? item?.inputTokens,
-          outputTokens: event.outputTokens ?? item?.outputTokens,
-          cacheReadTokens: event.cacheReadTokens ?? item?.cacheReadTokens,
-          cacheCreationTokens: event.cacheCreationTokens ?? item?.cacheCreationTokens,
-          totalTokens: eventTotalTokens(event) ?? item?.totalTokens,
-          isInflight: event.isInflight,
-        };
-        const countryCode = resolveTickerCountry(event, mergedItem, data);
-        const flag = countryFlag(countryCode);
-        const subdomain = event.shareSubdomain || event.subdomain || event.shareName || mergedItem?.shareName || "share";
-        const eventKey = [event.requestId, event.startedAt || event.createdAt || ""].join(":");
-        const statusCode = Number(mergedItem?.statusCode || 0);
-        const rawStatus = String(mergedItem?.status || "").toLowerCase();
-        const failed = statusCode >= 400 || ["failed", "error", "offline"].includes(rawStatus);
-        const badge = statusCode ? String(statusCode) : rawStatus ? rawStatus.slice(0, 3).toUpperCase() : "—";
-        return (
-          <div
-            data-map-control
-            key={eventKey}
-            className={`pointer-events-auto flex w-full select-text items-start gap-2 rounded-md bg-transparent px-1 py-0.5 text-left text-[10px] leading-relaxed text-slate-700 ${index === events.length - 1 ? "activity-feed-enter" : ""}`}
-          >
-            <span className="shrink-0 select-text font-mono text-slate-500">{formatTickerTime(event.startedAt || event.createdAt, item?.createdAt)}</span>
-            <span className={`inline-flex h-[15px] shrink-0 select-none items-center rounded px-1.5 font-mono text-[9px] font-semibold ${failed ? "bg-rose-100 text-rose-700" : "bg-emerald-100 text-emerald-700"}`}>{badge}</span>
-            <span className="min-w-0 flex-1 select-text whitespace-normal break-words text-[11px] text-slate-700"><strong className="font-semibold">{subdomain}</strong>{flag ? <> · <span role="img" title={countryCode} aria-label={countryCode}>{flag}</span></> : null} · {tickerDetail(mergedItem)}</span>
+    <div className="pointer-events-none absolute bottom-3 left-3 z-30 flex max-w-[min(72%,720px)] flex-col items-start gap-1">
+      {expanded ? (
+        <div
+          data-map-control
+          className="pointer-events-auto w-full overflow-y-auto overscroll-contain bg-transparent px-1 py-1 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
+          style={{ maxHeight: REQUEST_TICKER_MAX_HEIGHT_PX }}
+        >
+          <div className="flex flex-col gap-1">
+            {events.map((event, index) => {
+              const item = meta.get(event.requestId);
+              const mergedItem: TickerMeta = {
+                ...(item || {}),
+                userEmail: event.userEmail || item?.userEmail,
+                userCountry: item?.userCountry || event.userCountry,
+                userCountryIso3: item?.userCountryIso3 || event.userCountryIso3,
+                requestAgent: event.requestAgent || item?.requestAgent,
+                requestedModel: event.requestedModel || item?.requestedModel,
+                actualModel: event.actualModel || item?.actualModel,
+                model: event.model || item?.model,
+                latencyMs: event.latencyMs ?? item?.latencyMs,
+                statusCode: event.statusCode ?? item?.statusCode,
+                inputTokens: event.inputTokens ?? item?.inputTokens,
+                outputTokens: event.outputTokens ?? item?.outputTokens,
+                cacheReadTokens: event.cacheReadTokens ?? item?.cacheReadTokens,
+                cacheCreationTokens: event.cacheCreationTokens ?? item?.cacheCreationTokens,
+                totalTokens: eventTotalTokens(event) ?? item?.totalTokens,
+                isInflight: event.isInflight,
+              };
+              const countryCode = resolveTickerCountry(event, mergedItem, data);
+              const flag = countryFlag(countryCode);
+              const subdomain = event.shareSubdomain || event.subdomain || event.shareName || mergedItem?.shareName || "share";
+              const eventKey = [event.requestId, event.startedAt || event.createdAt || ""].join(":");
+              const statusCode = Number(mergedItem?.statusCode || 0);
+              const rawStatus = String(mergedItem?.status || "").toLowerCase();
+              const failed = statusCode >= 400 || ["failed", "error", "offline"].includes(rawStatus);
+              const badge = statusCode ? String(statusCode) : rawStatus ? rawStatus.slice(0, 3).toUpperCase() : "—";
+              return (
+                <div
+                  data-map-control
+                  key={eventKey}
+                  className={`pointer-events-auto flex w-full select-text items-start gap-2 rounded-md bg-transparent px-1 py-0.5 text-left text-[10px] leading-relaxed text-slate-700 ${index === events.length - 1 ? "activity-feed-enter" : ""}`}
+                >
+                  <span className="shrink-0 select-text font-mono text-slate-500">{formatTickerTime(event.startedAt || event.createdAt, item?.createdAt)}</span>
+                  <span className={`inline-flex h-[15px] shrink-0 select-none items-center rounded px-1.5 font-mono text-[9px] font-semibold ${failed ? "bg-rose-100 text-rose-700" : "bg-emerald-100 text-emerald-700"}`}>{badge}</span>
+                  <span className="min-w-0 flex-1 select-text whitespace-normal break-words text-[11px] text-slate-700"><strong className="font-semibold">{subdomain}</strong>{flag ? <> · <span role="img" title={countryCode} aria-label={countryCode}>{flag}</span></> : null} · {tickerDetail(mergedItem)}</span>
+                </div>
+              );
+            })}
           </div>
-        );
-      })}
-      </div>
+        </div>
+      ) : null}
+      <button
+        type="button"
+        data-map-control
+        className="pointer-events-auto inline-flex items-center gap-1 rounded-md bg-transparent px-1 py-0.5 text-[10px] font-medium text-slate-500 transition-colors hover:text-slate-800"
+        aria-expanded={expanded}
+        aria-label={t("map.requestTicker.toggleAria")}
+        onClick={() => setExpanded((current) => !current)}
+      >
+        <ChevronUp className={cn("h-3 w-3 shrink-0 transition-transform duration-200", !expanded && "rotate-180")} aria-hidden="true" />
+        <span>{expanded ? t("map.requestTicker.collapse") : t("map.requestTicker.expand")}</span>
+      </button>
     </div>
   );
 }
@@ -678,7 +706,7 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
         data={data}
         className="pointer-events-auto absolute left-3 top-3 z-30 max-w-[min(72%,560px)] select-text"
       />
-      <RequestTicker data={data} />
+      <RequestTickerPanel data={data} />
       <div
         ref={mapLayerRef}
         className="absolute left-1/2 top-1/2 z-20 aspect-[2/1] w-full origin-center"
