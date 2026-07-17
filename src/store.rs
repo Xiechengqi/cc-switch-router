@@ -22263,6 +22263,7 @@ mod tests {
             board_guest_self_delete_secs: 300,
             ux_telemetry_enabled: false,
             ux_telemetry_retention_days: 7,
+            footer_telegram_url: crate::config::DEFAULT_FOOTER_TELEGRAM_URL.to_string(),
             metrics: crate::config::MetricsConfig {
                 enabled: true,
                 db_path: std::env::temp_dir().join(format!(

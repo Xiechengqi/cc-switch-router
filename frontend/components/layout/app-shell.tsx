@@ -419,8 +419,10 @@ export function AppShell({
     <LocaleProvider>
       <AuthProvider>
         <DashboardDataProvider enabled={dashboardDataEnabled}>
-          <Topbar active={active} />
-          {children}
+          <div className="flex min-h-dvh flex-col">
+            <Topbar active={active} />
+            <div className="flex flex-1 flex-col">{children}</div>
+          </div>
           <AnnouncementDialog />
           <Toast.Provider placement="top end" />
         </DashboardDataProvider>

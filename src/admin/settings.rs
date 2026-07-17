@@ -963,6 +963,18 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         dynamic_group: None,
     },
     SettingsField {
+        key: "CC_SWITCH_ROUTER_FOOTER_TELEGRAM_URL",
+        label: "Footer Telegram URL",
+        group: "Dashboard UX",
+        field_type: FieldType::Url,
+        required: false,
+        restart_required: false,
+        default: Some("https://t.me/tokenswitchorg"),
+        description: "Telegram link shown in the dashboard footer next to GitHub. Clear to hide.",
+        placeholder: Some("https://t.me/tokenswitchorg"),
+        dynamic_group: None,
+    },
+    SettingsField {
         key: "CC_SWITCH_ROUTER_METRICS_ENABLED",
         label: "Enable metrics",
         group: "Metrics",
@@ -1573,6 +1585,9 @@ pub fn apply_updates_to_dynamic(
                 current.board.guest_self_delete_secs =
                     value.and_then(|v| v.parse::<i64>().ok()).unwrap_or(300);
             }
+            "CC_SWITCH_ROUTER_FOOTER_TELEGRAM_URL" => {
+                current.footer_telegram_url = value.map(str::to_string).unwrap_or_default();
+            }
             "CC_SWITCH_ROUTER_CLIENT_EMAIL_NOTIFICATIONS_ENABLED" => {
                 current.client_notifications.enabled = value.map(parse_bool_truthy).unwrap_or(true);
             }
@@ -2137,6 +2152,7 @@ mod tests {
             board_guest_self_delete_secs: 600,
             ux_telemetry_enabled: false,
             ux_telemetry_retention_days: 7,
+            footer_telegram_url: crate::config::DEFAULT_FOOTER_TELEGRAM_URL.to_string(),
             metrics: crate::config::MetricsConfig {
                 enabled: true,
                 db_path: std::env::temp_dir().join("cc-switch-router-rebuild-test-metrics.db"),

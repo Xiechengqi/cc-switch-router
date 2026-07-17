@@ -16,8 +16,10 @@ export function DashboardLayout({ children }: { children: React.ReactNode }) {
       <DashboardViewStateProvider>
         <OperationVerificationProvider data={data}>
           <ClientConsoleManagerProvider>
-            {children}
-            <PresenceFooter />
+            <div className="flex flex-1 flex-col">
+              <div className="flex-1">{children}</div>
+              <PresenceFooter />
+            </div>
             <ClientConsoleWindowLayer />
             <ClientConsoleDock />
             <BoardDock />

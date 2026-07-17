@@ -2196,9 +2196,11 @@ async fn dashboard_presence(
 ) -> Result<Json<DashboardPresenceResponse>, AppError> {
     let online_count = state.store.record_dashboard_presence(input).await?;
     let email_sent_24h = state.store.count_sent_emails_last_24h().await?;
+    let telegram_url = state.dynamic.read().await.footer_telegram_link();
     Ok(Json(DashboardPresenceResponse {
         online_count,
         email_sent_24h,
+        telegram_url,
     }))
 }
 

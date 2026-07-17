@@ -16,6 +16,7 @@ pub struct DynamicSettings {
     pub telegram: TelegramSettings,
     pub board: BoardSettings,
     pub client_notifications: ClientNotificationSettings,
+    pub footer_telegram_url: String,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +70,16 @@ impl DynamicSettings {
                 guest_self_delete_secs: config.board_guest_self_delete_secs,
             },
             client_notifications: config.client_notifications.clone(),
+            footer_telegram_url: config.footer_telegram_url.clone(),
+        }
+    }
+
+    pub fn footer_telegram_link(&self) -> Option<String> {
+        let trimmed = self.footer_telegram_url.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
         }
     }
 

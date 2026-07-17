@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 const APP_NAME: &str = "cc-switch-router";
+pub const DEFAULT_FOOTER_TELEGRAM_URL: &str = "https://t.me/tokenswitchorg";
 
 #[derive(Debug, Clone)]
 pub struct MetricsConfig {
@@ -98,6 +99,7 @@ pub struct Config {
     pub board_guest_self_delete_secs: i64,
     pub ux_telemetry_enabled: bool,
     pub ux_telemetry_retention_days: u32,
+    pub footer_telegram_url: String,
     pub metrics: MetricsConfig,
 }
 
@@ -254,6 +256,10 @@ impl Config {
             ux_telemetry_retention_days: env_var("CC_SWITCH_ROUTER_UX_TELEMETRY_RETENTION_DAYS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(7),
+            footer_telegram_url: env_var("CC_SWITCH_ROUTER_FOOTER_TELEGRAM_URL")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| DEFAULT_FOOTER_TELEGRAM_URL.to_string()),
             metrics: MetricsConfig {
                 enabled: env_bool("CC_SWITCH_ROUTER_METRICS_ENABLED", true),
                 db_path: env_var("CC_SWITCH_ROUTER_METRICS_DB_PATH")
@@ -450,6 +456,7 @@ CC_SWITCH_ROUTER_BOARD_PIN_LIMIT=3
 CC_SWITCH_ROUTER_BOARD_GUEST_SELF_DELETE_SECS=300
 CC_SWITCH_ROUTER_UX_TELEMETRY_ENABLED=false
 CC_SWITCH_ROUTER_UX_TELEMETRY_RETENTION_DAYS=7
+CC_SWITCH_ROUTER_FOOTER_TELEGRAM_URL=https://t.me/tokenswitchorg
 CC_SWITCH_ROUTER_METRICS_ENABLED=true
 CC_SWITCH_ROUTER_METRICS_DB_PATH={}
 CC_SWITCH_ROUTER_METRICS_RETENTION_DAYS=7
@@ -584,6 +591,7 @@ mod tests {
             board_guest_self_delete_secs: 300,
             ux_telemetry_enabled: false,
             ux_telemetry_retention_days: 7,
+            footer_telegram_url: DEFAULT_FOOTER_TELEGRAM_URL.to_string(),
             metrics: MetricsConfig {
                 enabled: true,
                 db_path: PathBuf::from("/tmp/test-metrics.db"),

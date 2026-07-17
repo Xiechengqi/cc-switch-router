@@ -1637,6 +1637,8 @@ pub struct DashboardPresenceRequest {
 pub struct DashboardPresenceResponse {
     pub online_count: usize,
     pub email_sent_24h: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telegram_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
