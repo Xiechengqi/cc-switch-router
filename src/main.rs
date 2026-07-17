@@ -758,9 +758,9 @@ Environment:
   CC_SWITCH_ROUTER_LEASE_TTL_SECS        Tunnel lease ttl, default 60
   CC_SWITCH_ROUTER_DB_PATH               SQLite path, default $HOME/.cc-switch-router/cc-switch-router.db
   CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS Cleanup interval, default 300
-  CC_SWITCH_ROUTER_LEASE_RETENTION_SECS  Lease retention period, default 604800
+  CC_SWITCH_ROUTER_LEASE_RETENTION_SECS  Lease retention period, default 86400
   CC_SWITCH_ROUTER_CLIENT_STALE_SECS     Mark clients offline and purge shares after no heartbeat, default 3600
-  CC_SWITCH_ROUTER_CLIENT_INSTALLATION_RETENTION_SECS Delete installation records after offline retention, default 86400
+  CC_SWITCH_ROUTER_CLIENT_INSTALLATION_RETENTION_SECS Delete installation records after offline retention, default 21600
   CC_SWITCH_ROUTER_PAUSED_SHARE_STALE_SECS Delete paused shares after no update, default 3600
 Default env file:
   $HOME/.cc-switch-router/.env

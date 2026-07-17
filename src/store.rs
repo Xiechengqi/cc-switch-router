@@ -6099,16 +6099,25 @@ impl AppStore {
         let current_user_email = normalize_email(current_user_email)?;
         let now = Utc::now();
         let conn = self.conn.lock().await;
-        let (installation_id, owner_email, shared_with_emails_json, current_sale_market_kind): (
+        let (
+            installation_id,
+            owner_email,
+            shared_with_emails_json,
+            current_for_sale,
+            current_sale_market_kind,
+            current_app_type,
+        ): (
+            String,
+            String,
             String,
             String,
             String,
             String,
         ) = conn
             .query_row(
-                "SELECT installation_id, owner_email, shared_with_emails_json, sale_market_kind FROM shares WHERE share_id = ?1",
+                "SELECT installation_id, owner_email, shared_with_emails_json, for_sale, sale_market_kind, app_type FROM shares WHERE share_id = ?1",
                 params![share_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
             )
             .optional()
             .map_err(|e| AppError::Internal(format!("query share owner failed: {e}")))?
@@ -6120,7 +6129,9 @@ impl AppStore {
             patch,
             Some(&owner_email),
             Some(&shared_with_emails),
+            Some(&current_for_sale),
             Some(&current_sale_market_kind),
+            Some(&current_app_type),
         )?;
         if share_settings_patch_is_empty(&patch) {
             return Err(AppError::BadRequest("share settings patch is empty".into()));
@@ -8627,7 +8638,9 @@ impl AppStore {
                 },
                 Some(&owner_email),
                 Some(&current_shared),
+                Some(&for_sale),
                 Some(&sale_market_kind),
+                None,
             )?
         } else {
             let mut next_shared = normalize_email_list(&current_shared, &owner_email);
@@ -8658,7 +8671,9 @@ impl AppStore {
                 },
                 Some(&owner_email),
                 Some(&current_shared),
+                Some(&for_sale),
                 Some(&sale_market_kind),
+                None,
             )?
         };
         let revision = next_share_edit_revision(&conn, share_id)?;
@@ -10376,6 +10391,22 @@ fn upsert_share_tx(
     let for_sale = normalize_share_for_sale(&share.for_sale)?;
     let market_access_mode = normalize_market_access_mode(&share.market_access_mode)?;
     let sale_market_kind = normalize_sale_market_kind(&share.sale_market_kind)?;
+    if share
+        .for_sale_official_price_percent_by_app
+        .iter()
+        .any(|(app, percent)| app != &share.app_type || !(1..=100).contains(percent))
+    {
+        return Err(AppError::BadRequest(
+            "official price percent must target the share app and be between 1 and 100".into(),
+        ));
+    }
+    if !share.for_sale_official_price_percent_by_app.is_empty()
+        && (for_sale != "Yes" || sale_market_kind != "token")
+    {
+        return Err(AppError::BadRequest(
+            "official price percent requires forSale=Yes and saleMarketKind=token".into(),
+        ));
+    }
     let upstream_provider_json = share
         .upstream_provider
         .as_ref()
@@ -15219,10 +15250,8 @@ fn validate_returned_share_against_patch(
         }
     }
     if let Some(pricing) = patch.for_sale_official_price_percent_by_app.as_ref() {
-        for (app, percent) in pricing {
-            if share.for_sale_official_price_percent_by_app.get(app) != Some(percent) {
-                return Err("forSaleOfficialPricePercentByApp");
-            }
+        if &share.for_sale_official_price_percent_by_app != pricing {
+            return Err("forSaleOfficialPricePercentByApp");
         }
     }
     if let Some(auto_start) = patch.auto_start {
@@ -15237,7 +15266,9 @@ fn normalize_share_settings_patch(
     patch: ShareSettingsPatch,
     owner_email: Option<&str>,
     current_shared_with_emails: Option<&[String]>,
+    current_for_sale: Option<&str>,
     current_sale_market_kind: Option<&str>,
+    current_app_type: Option<&str>,
 ) -> Result<ShareSettingsPatch, AppError> {
     if patch.owner_email.is_some() {
         return Err(AppError::Conflict(
@@ -15246,6 +15277,11 @@ fn normalize_share_settings_patch(
     }
     let current_owner_email = owner_email.unwrap_or("");
     let next_owner_email = None;
+    let for_sale = match patch.for_sale {
+        Some(value) => Some(normalize_share_for_sale(&value)?),
+        None => None,
+    };
+    let current_for_sale = current_for_sale.map(normalize_share_for_sale).transpose()?;
     let sale_market_kind = match patch.sale_market_kind {
         Some(value) => Some(normalize_sale_market_kind(&value)?),
         None => None,
@@ -15343,7 +15379,7 @@ fn normalize_share_settings_patch(
         Some(values) => Some(normalize_share_app_settings(values, effective_owner_email)?),
         None => None,
     };
-    let pricing = match patch.for_sale_official_price_percent_by_app {
+    let mut pricing = match patch.for_sale_official_price_percent_by_app {
         Some(values) => {
             let mut normalized = BTreeMap::new();
             for (app, percent) in values {
@@ -15351,6 +15387,11 @@ fn normalize_share_settings_patch(
                 if !matches!(app.as_str(), "claude" | "codex" | "gemini") {
                     return Err(AppError::BadRequest(
                         "official price percent app must be claude, codex, or gemini".into(),
+                    ));
+                }
+                if current_app_type.is_some_and(|current| app != current) {
+                    return Err(AppError::BadRequest(
+                        "official price percent must only contain the share app".into(),
                     ));
                 }
                 if !(1..=100).contains(&percent) {
@@ -15364,6 +15405,21 @@ fn normalize_share_settings_patch(
         }
         None => None,
     };
+    let pricing_eligible = for_sale.as_deref().or(current_for_sale.as_deref()) == Some("Yes")
+        && sale_market_kind
+            .as_deref()
+            .or(current_sale_market_kind.as_deref())
+            == Some("token");
+    if !pricing_eligible {
+        if pricing.as_ref().is_some_and(|values| !values.is_empty()) {
+            return Err(AppError::BadRequest(
+                "official price percent requires forSale=Yes and saleMarketKind=token".into(),
+            ));
+        }
+        if pricing.is_none() && (for_sale.is_some() || sale_market_kind.is_some()) {
+            pricing = Some(BTreeMap::new());
+        }
+    }
     if let Some(token_limit) = patch.token_limit {
         if token_limit <= 0 && token_limit != -1 {
             return Err(AppError::BadRequest(
@@ -15394,10 +15450,7 @@ fn normalize_share_settings_patch(
             Some(value) => Some(normalize_share_description(value)?),
             None => None,
         },
-        for_sale: match patch.for_sale {
-            Some(value) => Some(normalize_share_for_sale(&value)?),
-            None => None,
-        },
+        for_sale,
         sale_market_kind,
         market_access_mode: match patch.market_access_mode {
             Some(value) => Some(normalize_market_access_mode(&value)?),
@@ -22026,8 +22079,15 @@ mod tests {
             ..Default::default()
         };
 
-        let normalized =
-            normalize_share_settings_patch(patch, Some(owner), Some(&[]), None).expect("normalize");
+        let normalized = normalize_share_settings_patch(
+            patch,
+            Some(owner),
+            Some(&[]),
+            Some("Yes"),
+            None,
+            Some("codex"),
+        )
+        .expect("normalize");
 
         assert_eq!(normalized.sale_market_kind.as_deref(), Some("share"));
         assert_eq!(
@@ -22059,9 +22119,15 @@ mod tests {
             ..Default::default()
         };
 
-        let normalized =
-            normalize_share_settings_patch(patch, Some(owner), Some(&[]), Some("share"))
-                .expect("normalize");
+        let normalized = normalize_share_settings_patch(
+            patch,
+            Some(owner),
+            Some(&[]),
+            Some("Yes"),
+            Some("share"),
+            Some("codex"),
+        )
+        .expect("normalize");
 
         assert_eq!(
             normalized.shared_with_emails.as_deref(),
@@ -22074,6 +22140,78 @@ mod tests {
                 .and_then(|access| access.get("codex"))
                 .map(|access| access.shared_with_emails.as_slice()),
             Some(&[owner.to_string()][..])
+        );
+    }
+
+    #[test]
+    fn token_market_pricing_requires_eligible_final_sale_state() {
+        let pricing = BTreeMap::from([("codex".to_string(), 80)]);
+        let normalized = normalize_share_settings_patch(
+            ShareSettingsPatch {
+                for_sale_official_price_percent_by_app: Some(pricing.clone()),
+                ..Default::default()
+            },
+            Some("owner@example.com"),
+            Some(&[]),
+            Some("Yes"),
+            Some("token"),
+            Some("codex"),
+        )
+        .expect("eligible pricing");
+        assert_eq!(
+            normalized.for_sale_official_price_percent_by_app,
+            Some(pricing.clone())
+        );
+
+        let rejected = normalize_share_settings_patch(
+            ShareSettingsPatch {
+                for_sale: Some("No".to_string()),
+                for_sale_official_price_percent_by_app: Some(pricing),
+                ..Default::default()
+            },
+            Some("owner@example.com"),
+            Some(&[]),
+            Some("Yes"),
+            Some("token"),
+            Some("codex"),
+        );
+        assert!(matches!(rejected, Err(AppError::BadRequest(_))));
+
+        let wrong_app = normalize_share_settings_patch(
+            ShareSettingsPatch {
+                for_sale_official_price_percent_by_app: Some(BTreeMap::from([(
+                    "claude".to_string(),
+                    80,
+                )])),
+                ..Default::default()
+            },
+            Some("owner@example.com"),
+            Some(&[]),
+            Some("Yes"),
+            Some("token"),
+            Some("codex"),
+        );
+        assert!(matches!(wrong_app, Err(AppError::BadRequest(_))));
+    }
+
+    #[test]
+    fn sale_state_transition_clears_token_market_pricing() {
+        let normalized = normalize_share_settings_patch(
+            ShareSettingsPatch {
+                sale_market_kind: Some("share".to_string()),
+                ..Default::default()
+            },
+            Some("owner@example.com"),
+            Some(&[]),
+            Some("Yes"),
+            Some("token"),
+            Some("codex"),
+        )
+        .expect("transition");
+
+        assert_eq!(
+            normalized.for_sale_official_price_percent_by_app,
+            Some(BTreeMap::new())
         );
     }
 
@@ -22091,9 +22229,9 @@ mod tests {
             host_key_path: std::env::temp_dir()
                 .join(format!("cc-switch-router-{name}-{}.key", Uuid::new_v4())),
             cleanup_interval_secs: 300,
-            lease_retention_secs: 7 * 24 * 60 * 60,
+            lease_retention_secs: 24 * 60 * 60,
             client_stale_secs: 60 * 60,
-            client_installation_retention_secs: 24 * 60 * 60,
+            client_installation_retention_secs: 6 * 60 * 60,
             paused_share_stale_secs: 60 * 60,
             resend_api_key: None,
             resend_from: None,
@@ -30370,10 +30508,10 @@ mod tests {
             market_access_mode: "all".into(),
             access_by_app: Default::default(),
             app_settings: Default::default(),
-            for_sale_official_price_percent_by_app: std::collections::BTreeMap::from([
-                ("claude".to_string(), 5),
-                ("codex".to_string(), 5),
-            ]),
+            for_sale_official_price_percent_by_app: std::collections::BTreeMap::from([(
+                "codex".to_string(),
+                5,
+            )]),
             description: Some("metadata outside claim signature".into()),
             for_sale: "Yes".into(),
             sale_market_kind: "token".into(),
@@ -30861,10 +30999,10 @@ mod tests {
             market_access_mode: "all".into(),
             access_by_app: Default::default(),
             app_settings: Default::default(),
-            for_sale_official_price_percent_by_app: std::collections::BTreeMap::from([
-                ("claude".to_string(), 10),
-                ("codex".to_string(), 20),
-            ]),
+            for_sale_official_price_percent_by_app: std::collections::BTreeMap::from([(
+                "codex".to_string(),
+                20,
+            )]),
             description: Some("signed batch sync".into()),
             for_sale: "Yes".into(),
             sale_market_kind: "token".into(),

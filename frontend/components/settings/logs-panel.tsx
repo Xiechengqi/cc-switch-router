@@ -138,7 +138,7 @@ export function LogsPanel() {
             {t("logs.reconnect")}
           </Button>
         </div>
-        <div className="rounded-lg border bg-slate-950 text-slate-100">
+        <div className="rounded-lg border border-slate-200 bg-white text-slate-900">
           <ScrollShadow className="h-[560px]">
             <pre ref={viewportRef} className="h-[560px] overflow-auto whitespace-pre-wrap break-words p-4 font-mono text-xs leading-5">
               {lines.length ? (
@@ -265,35 +265,35 @@ function ansiColorClass(code: number) {
     case 30:
       return "text-slate-500";
     case 31:
-      return "text-red-400";
+      return "text-red-600";
     case 32:
-      return "text-emerald-400";
+      return "text-emerald-700";
     case 33:
-      return "text-amber-300";
+      return "text-amber-700";
     case 34:
-      return "text-sky-400";
+      return "text-sky-700";
     case 35:
-      return "text-fuchsia-400";
+      return "text-fuchsia-700";
     case 36:
-      return "text-cyan-300";
+      return "text-cyan-700";
     case 37:
-      return "text-slate-100";
+      return "text-slate-900";
     case 90:
       return "text-slate-500";
     case 91:
-      return "text-red-300";
+      return "text-red-600";
     case 92:
-      return "text-emerald-300";
+      return "text-emerald-600";
     case 93:
-      return "text-yellow-200";
+      return "text-amber-700";
     case 94:
-      return "text-sky-300";
+      return "text-sky-600";
     case 95:
-      return "text-fuchsia-300";
+      return "text-fuchsia-600";
     case 96:
-      return "text-cyan-200";
+      return "text-cyan-600";
     case 97:
-      return "text-white";
+      return "text-slate-900";
     default:
       return "";
   }

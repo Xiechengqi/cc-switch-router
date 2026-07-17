@@ -77,7 +77,8 @@ export function buildShareSettingsPatch(draft: ShareSettingsDraft): ShareSetting
     tokenLimit: draft.tokenLimit,
     parallelLimit: draft.parallelLimit,
     expiresAt: draft.expiresAt,
-    forSaleOfficialPricePercentByApp: draft.saleMarketKind === "share" ? {} : draft.pricing,
+    forSaleOfficialPricePercentByApp:
+      draft.forSale === "Yes" && draft.saleMarketKind === "token" ? draft.pricing : {},
   };
 }
 
@@ -107,9 +108,9 @@ export function validateShareSettingsDraft(draft: ShareSettingsDraft) {
   }
   const expires = new Date(draft.expiresAt).getTime();
   if (!draft.expiresAt || !Number.isFinite(expires)) errors.push("Expiration time is invalid.");
-  if (draft.saleMarketKind === "token") {
+  if (draft.forSale === "Yes" && draft.saleMarketKind === "token") {
     for (const value of Object.values(draft.pricing)) {
-      if (!Number.isFinite(value) || value < 1 || value > 100) {
+      if (!Number.isInteger(value) || value < 1 || value > 100) {
         errors.push("Model pricing must be between 1 and 100.");
         break;
       }

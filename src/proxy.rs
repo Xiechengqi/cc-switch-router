@@ -4262,9 +4262,9 @@ mod tests {
                 Uuid::new_v4()
             )),
             cleanup_interval_secs: 300,
-            lease_retention_secs: 7 * 24 * 60 * 60,
+            lease_retention_secs: 24 * 60 * 60,
             client_stale_secs: 60 * 60,
-            client_installation_retention_secs: 24 * 60 * 60,
+            client_installation_retention_secs: 6 * 60 * 60,
             paused_share_stale_secs: 60 * 60,
             resend_api_key: None,
             resend_from: None,

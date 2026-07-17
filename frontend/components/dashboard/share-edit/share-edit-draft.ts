@@ -199,14 +199,14 @@ export function buildShareEditDraft(
 }
 
 function buildShareEditPricingPayload(draft: ShareEditDraft, share?: ShareView | null) {
-  if (draft.saleMarketKind === "share") return {};
+  if (draft.forSale !== "Yes" || draft.saleMarketKind !== "token") return {};
   const result: Record<string, number> = {};
   for (const app of shareAccessApps(share ?? null)) {
     if (!share?.support?.[app]) continue;
     const raw = draft.priceInputs[app];
     if (!raw || !raw.trim()) continue;
-    const value = Number.parseInt(raw, 10);
-    if (Number.isFinite(value) && value >= 1 && value <= 100) result[app] = value;
+    if (!/^(?:[1-9]|[1-9][0-9]|100)$/.test(raw)) continue;
+    result[app] = Number(raw);
   }
   return result;
 }

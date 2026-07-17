@@ -165,7 +165,14 @@ export function useShareEditForm({
         return;
       }
       onDraftChange((current) => {
-        const updated = { ...current, forSale: next };
+        const updated = {
+          ...current,
+          forSale: next,
+          priceInputs:
+            next === "Yes"
+              ? current.priceInputs
+              : { claude: "", codex: "", gemini: "" },
+        };
         if (next === "Yes") {
           return applyRecommendedMarketDefaults(updated, tokenMarkets, shareMarkets);
         }
@@ -176,7 +183,11 @@ export function useShareEditForm({
   );
 
   const confirmFree = React.useCallback(() => {
-    onDraftChange((current) => ({ ...current, forSale: "Free" }));
+    onDraftChange((current) => ({
+      ...current,
+      forSale: "Free",
+      priceInputs: { claude: "", codex: "", gemini: "" },
+    }));
     setConfirmFreeOpen(false);
   }, [onDraftChange]);
 
@@ -276,12 +287,12 @@ export function useShareEditForm({
     !draft.parallelLimitUnlimited && (!Number.isFinite(parallelParsed) || parallelParsed <= 0);
   const expiryInvalid = !draft.expiresPermanent && !draft.expiresAtInput.trim();
   const pricingInvalid =
-    draft.saleMarketKind !== "share" &&
+    draft.forSale === "Yes" &&
+    draft.saleMarketKind === "token" &&
     activeShareApps.some((app) => {
       const raw = draft.priceInputs[app];
-      if (!raw || !raw.trim()) return false;
-      const value = Number.parseInt(raw, 10);
-      return !(Number.isFinite(value) && value >= 1 && value <= 100);
+      if (!raw) return false;
+      return !/^(?:[1-9]|[1-9][0-9]|100)$/.test(raw);
     });
   const shareMarketInvalid =
     draft.forSale === "Yes" && draft.saleMarketKind === "share" && !draft.selectedShareMarketEmail;
