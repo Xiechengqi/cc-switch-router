@@ -9,6 +9,7 @@ import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
 import {
   averageRecentLatencyMs,
   formatLatencySeconds,
+  latencyResponseToneClass,
   modelHealthTitle,
   modelHealthTone,
   providerActualModelNames,
@@ -242,9 +243,12 @@ export const ShareCard = React.memo(function ShareCard({
           <div className="grid grid-cols-2 gap-2">
             <div className="min-w-0">
               <span className="block text-muted-foreground">{t("dashboard.response")}</span>
-              <span className={`block truncate tabular-nums ${issue ? "font-medium text-amber-700" : "text-foreground"}`} title={issue || undefined}>
-                {issue ? `${issue}${summary.additionalReasonCount ? ` · +${summary.additionalReasonCount}` : ""}` : formatLatencySeconds(averageLatency)}
-              </span>
+              <strong
+                className={`block truncate tabular-nums font-medium ${latencyResponseToneClass(averageLatency)}`}
+                title={formatLatencySeconds(averageLatency)}
+              >
+                {formatLatencySeconds(averageLatency)}
+              </strong>
             </div>
             <div className="min-w-0">
               <span className="block text-muted-foreground">{t("dashboard.forSale")}</span>

@@ -3583,7 +3583,6 @@ impl AppStore {
             "share_located_from_request",
             "market_located_from_share",
             "drawer_opened",
-            "diagnosis_evidence_opened",
             "filter_applied",
             "operation_submitted",
             "operation_verified",
@@ -21212,7 +21211,7 @@ fn verify_issue_lease_signature(
         expected_generation: input.expected_generation,
         requested_subdomain: &input.requested_subdomain,
         tunnel_type: &input.tunnel_type,
-        share: &input.share,
+        share: issue_lease_signature_share(input),
     };
     verify_tunnel_signed_payload(
         public_key,
@@ -21237,7 +21236,22 @@ struct IssueLeaseSignaturePayload<'a> {
     requested_subdomain: &'a str,
     tunnel_type: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    share: &'a Option<ShareDescriptor>,
+    share: Option<IssueLeaseSignatureShare<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum IssueLeaseSignatureShare<'a> {
+    Raw(&'a serde_json::value::RawValue),
+    Parsed(&'a ShareDescriptor),
+}
+
+fn issue_lease_signature_share(input: &IssueLeaseRequest) -> Option<IssueLeaseSignatureShare<'_>> {
+    input
+        .signed_share
+        .as_deref()
+        .map(IssueLeaseSignatureShare::Raw)
+        .or_else(|| input.share.as_ref().map(IssueLeaseSignatureShare::Parsed))
 }
 
 fn ensure_tunnel_protocol_epoch(protocol_epoch: &str) -> Result<(), AppError> {
@@ -27240,7 +27254,7 @@ mod tests {
             expected_generation: request.expected_generation,
             requested_subdomain: &request.requested_subdomain,
             tunnel_type: &request.tunnel_type,
-            share: &request.share,
+            share: issue_lease_signature_share(request),
         };
         sign_tunnel_test_payload(
             signing_key,
@@ -27263,14 +27277,14 @@ mod tests {
             expected_generation: 1,
             requested_subdomain: "client-a",
             tunnel_type: "client-web-http",
-            share: &None,
+            share: None,
         };
         let json = serde_json::to_string(&payload).expect("serialize lease signature payload");
         assert!(!json.contains("share"));
     }
 
     #[test]
-    fn issue_lease_signature_payload_preserves_server_model_health_field_order() {
+    fn issue_lease_signature_payload_preserves_server_share_json() {
         let signed = include_str!("../tests/fixtures/us04_share_lease_signed_payload.json");
         let http = include_str!("../tests/fixtures/us04_share_lease_request.json");
         let request: IssueLeaseRequest =
@@ -27284,10 +27298,55 @@ mod tests {
             expected_generation: request.expected_generation,
             requested_subdomain: &request.requested_subdomain,
             tunnel_type: &request.tunnel_type,
-            share: &request.share,
+            share: issue_lease_signature_share(&request),
         };
         let router_json = serde_json::to_string(&payload).expect("serialize router verify payload");
         assert_eq!(signed, router_json);
+    }
+
+    #[test]
+    fn issue_lease_signature_accepts_signed_future_share_fields() {
+        let fixture = include_str!("../tests/fixtures/us04_share_lease_signed_payload.json").trim();
+        let mut signed_payload = fixture
+            .strip_suffix("}}")
+            .expect("fixture closes share and payload")
+            .to_string();
+        signed_payload.push_str(r#","futureLeaseMetadata":{"schema":2}}}"#);
+
+        let signing_key = SigningKey::from_bytes(&[23_u8; 32]);
+        let installation_id = "inst-future-share-field";
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = "future-share-field-nonce";
+        let raw_payload = serde_json::value::RawValue::from_string(signed_payload.clone())
+            .expect("valid raw signed payload");
+        let signature = sign_tunnel_test_payload(
+            &signing_key,
+            installation_id,
+            "tunnel_lease_issue",
+            &raw_payload,
+            timestamp_ms,
+            nonce,
+        );
+        let request_json = format!(
+            r#"{{"installationId":"{installation_id}","timestampMs":{timestamp_ms},"nonce":"{nonce}","signature":"{signature}",{}"#,
+            &signed_payload[1..]
+        );
+        let request: IssueLeaseRequest =
+            serde_json::from_str(&request_json).expect("deserialize future lease request");
+
+        assert!(
+            request
+                .signed_share
+                .as_ref()
+                .is_some_and(|raw| raw.get().contains("futureLeaseMetadata"))
+        );
+        assert!(
+            !serde_json::to_string(request.share.as_ref().expect("parsed share"))
+                .expect("serialize parsed share")
+                .contains("futureLeaseMetadata")
+        );
+        verify_issue_lease_signature(&public_key_b64(&signing_key), &request)
+            .expect("verify exact signed share JSON");
     }
 
     #[test]
@@ -27698,6 +27757,7 @@ mod tests {
             nonce,
             signature: String::new(),
             share: Some(test_share_descriptor("share-renew", "aaa")),
+            signed_share: None,
         };
         request.signature = sign_issue_lease_request(&signing_key, &request);
 
@@ -27753,6 +27813,7 @@ mod tests {
                 "share-active-renew",
                 "active-renew-sub",
             )),
+            signed_share: None,
         };
         issue_request.signature = sign_issue_lease_request(&signing_key, &issue_request);
         let lease = store
@@ -27923,6 +27984,7 @@ mod tests {
             nonce: nonce.clone(),
             signature: String::new(),
             share: Some(test_share_descriptor("share-replay", "replay-sub")),
+            signed_share: None,
         };
         request.signature = sign_issue_lease_request(&signing_key, &request);
 
@@ -27996,6 +28058,7 @@ mod tests {
             nonce: Uuid::new_v4().to_string(),
             signature: String::new(),
             share: None,
+            signed_share: None,
         };
         first.signature = sign_issue_lease_request(&signing_key, &first);
         store
@@ -28026,6 +28089,7 @@ mod tests {
             nonce: Uuid::new_v4().to_string(),
             signature: String::new(),
             share: None,
+            signed_share: None,
         };
         second.signature = sign_issue_lease_request(&signing_key, &second);
         let renewed = store
@@ -28088,6 +28152,7 @@ mod tests {
             nonce,
             signature: String::new(),
             share: Some(test_share_descriptor("share-bad-sig", "bad-sig-sub")),
+            signed_share: None,
         };
         first_request.signature = sign_issue_lease_request(&signing_key, &first_request);
         let first = store
@@ -28122,6 +28187,7 @@ mod tests {
                     nonce: Uuid::new_v4().to_string(),
                     signature: "not-a-valid-signature".into(),
                     share: Some(test_share_descriptor("share-bad-sig", "bad-sig-sub")),
+                    signed_share: None,
                 },
                 ClientMetadata {
                     ip: None,

@@ -137,6 +137,16 @@ export function formatLatencySeconds(latencyMs: number | null) {
   return `${seconds < 1 ? seconds.toFixed(2) : seconds.toFixed(1)}s`;
 }
 
+export function latencyResponseToneClass(latencyMs: number | null | undefined) {
+  if (latencyMs == null || !Number.isFinite(latencyMs) || latencyMs <= 0) {
+    return "text-foreground";
+  }
+  const seconds = latencyMs / 1000;
+  if (seconds < 15) return "text-emerald-700";
+  if (seconds < 30) return "text-amber-700";
+  return "text-rose-700";
+}
+
 export function formatImageLogTimestamp(value?: number | null) {
   if (!value) return "-";
   const date = new Date(value * 1000);

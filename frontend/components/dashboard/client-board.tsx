@@ -29,7 +29,6 @@ import {
   clientRunningDurationMs,
   clientTotalTokensLabel,
   clientTotalTokensUsed,
-  HealthTimelineStrip,
   ShareClientPanel,
   ShareEditDialog,
   ShareMarkets,
@@ -797,8 +796,7 @@ export function ClientBoard({
               <Drawer.Body className="overflow-y-auto">
                 {selectedClient ? (
                   <div className="grid gap-5">
-                    <OperationalDiagnosis summary={clientOperationalSummary(selectedClient, sharesForClient(selectedClient))} kind="client" removalAt={selectedClient.removalAt} onEvidence={() => { document.getElementById("client-health-evidence")?.scrollIntoView({ behavior: "smooth" }); void recordDashboardUxEvent({ eventType: "diagnosis_evidence_opened", source: "drawer", targetType: "client" }); }} />
-                    <div id="client-health-evidence"><HealthTimelineStrip timeline={selectedClient.healthTimeline || []} /></div>
+                    <OperationalDiagnosis summary={clientOperationalSummary(selectedClient, sharesForClient(selectedClient))} kind="client" removalAt={selectedClient.removalAt} />
                     <DrawerSection label={t("dashboard.client")}>
                       <div className="grid gap-1 text-xs text-muted-foreground">
                         <span>URL: <strong className="break-all text-foreground">{selectedClientUrl || "-"}</strong></span>
@@ -848,8 +846,7 @@ export function ClientBoard({
               <Drawer.Body className="overflow-y-auto">
                 {selectedShare ? (
                   <div className="grid gap-5">
-                    <OperationalDiagnosis summary={shareOperationalSummary(selectedShare)} kind="share" onEvidence={() => { document.getElementById("share-health-evidence")?.scrollIntoView({ behavior: "smooth" }); void recordDashboardUxEvent({ eventType: "diagnosis_evidence_opened", source: "drawer", targetType: "share" }); }} />
-                    <div id="share-health-evidence"><HealthTimelineStrip timeline={selectedShare.healthTimeline} /></div>
+                    <OperationalDiagnosis summary={shareOperationalSummary(selectedShare)} kind="share" />
                     <DrawerSection label={t("dashboard.client")}>
                       <ShareClientPanel client={clientByShareId.get(selectedShare.shareId)} currentShare={selectedShare} shares={sharesForClient(clientByShareId.get(selectedShare.shareId))} onEdit={openEditShare} t={t} locale={locale} />
                     </DrawerSection>

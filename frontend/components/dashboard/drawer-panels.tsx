@@ -7,7 +7,7 @@ import { ShareClientTag } from "@/components/dashboard/share-client-tag";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getShareImageGenerationRequestLogs, getShareUsageByEmail } from "@/lib/api";
 import type { AppLocale } from "@/lib/i18n";
-import type { DashboardClient, HealthTimelineBucket, ImageGenerationRequestLog, MarketRequestLog, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareMarketListingStatus, ShareModelHealthCheck, ShareRequestLog, ShareUpstreamProvider, ShareUsageByEmailResponse, ShareView } from "@/lib/types";
+import type { DashboardClient, ImageGenerationRequestLog, MarketRequestLog, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareMarketListingStatus, ShareModelHealthCheck, ShareRequestLog, ShareUpstreamProvider, ShareUsageByEmailResponse, ShareView } from "@/lib/types";
 import { compactTokens, formatDateTime, formatNumber, formatRelativeTime } from "@/lib/utils";
 import { resolveShareCoreApp, SHARE_APP_LABELS } from "@/lib/share-app";
 import { averageRecentLatencyMs, boundProviderIdForApp, cacheHitRate, clientPlatformLabel, clientTunnelDisplayUrl, configuredUpstreamPercent, CORE_SHARE_APPS, expiryTitle, formatAgeDaysOrHours, formatImageLogSizeMb, formatImageLogSpendSeconds, formatImageLogTimestamp, formatLatencySeconds, formatMinutesShort, formatPercent, formatShareStatus, HealthDots, isUnlimited, mergeStandaloneOAuthRuntime, modelHealthTitle, modelHealthTone, providerAccountIdentity, providerAccountLevel, providerModelMap, requestBelongsToApp, requestModelRoute, resolveShareAppRuntime, runtimeEndpointSummary, shareApiParts, shareAppExists, shareAppProviderRuntime, shareAppSettings, shareAppTokensUsed, shareExpiryProgress, tokenCount, usageBucketTotalTokens, type CoreShareApp, type TFn } from "@/components/dashboard/share-dashboard-utils";
@@ -40,87 +40,6 @@ export function UsageBar({ used, limit, t }: { used: number; limit: number; t: T
         <ProgressBar.Fill className="rounded bg-primary" />
       </ProgressBar.Track>
     </ProgressBar>
-  );
-}
-
-export function healthTimelineTone(status?: string) {
-  switch (status) {
-    case "healthy":
-      return "border-emerald-600 bg-emerald-500";
-    case "degraded":
-      return "border-lime-500 bg-lime-300";
-    case "unhealthy":
-      return "border-amber-500 bg-amber-400";
-    case "offline":
-      return "border-rose-600 bg-rose-500";
-    default:
-      return "border-slate-300 bg-slate-200 dark:border-slate-700 dark:bg-slate-800";
-  }
-}
-
-export function healthTimelineLabel(status?: string, locale: AppLocale = "en") {
-  const zh = locale.startsWith("zh");
-  switch (status) {
-    case "healthy":
-      return zh ? "健康" : "Healthy";
-    case "degraded":
-      return zh ? "轻微降级" : "Degraded";
-    case "unhealthy":
-      return zh ? "不稳定" : "Unhealthy";
-    case "offline":
-      return zh ? "离线" : "Offline";
-    default:
-      return zh ? "未知" : "Unknown";
-  }
-}
-
-export function HealthTimelineStrip({ timeline = [] }: { timeline?: HealthTimelineBucket[] }) {
-  const { locale, t } = useLocaleText();
-  const buckets = timeline.length
-    ? timeline.slice(-48)
-    : Array.from({ length: 48 }, (_, index) => ({
-        startAt: "",
-        endAt: "",
-        status: "unknown",
-        score: 0,
-        onlineMinutes: 0,
-        observedMinutes: 0,
-        requestCount: 0,
-        failureCount: 0,
-      }));
-  const latest = [...buckets].reverse().find((bucket) => bucket.status !== "unknown");
-  const latestLabel = healthTimelineLabel(latest?.status, locale);
-  const latestScore = latest ? `${Math.round(latest.score || 0)}%` : "--";
-  return (
-    <div className="grid gap-3">
-      <div className="flex items-center justify-between gap-3 text-xs">
-        <span className="font-semibold text-foreground">{t("dashboard.health")} · 24h</span>
-        <span className="font-mono text-[11px] text-muted-foreground">{latestLabel} {latestScore}</span>
-      </div>
-      <div className="grid grid-cols-[repeat(24,minmax(0,1fr))] gap-1 max-sm:grid-cols-[repeat(12,minmax(0,1fr))]">
-        {buckets.map((bucket, index) => {
-          const title = [
-            bucket.startAt && bucket.endAt ? `${formatDateTime(bucket.startAt)} - ${formatDateTime(bucket.endAt)}` : "",
-            healthTimelineLabel(bucket.status, locale),
-            `${Math.round(bucket.score || 0)}%`,
-            `${bucket.onlineMinutes || 0}/30m`,
-            bucket.requestCount ? `${bucket.requestCount} req · ${bucket.failureCount || 0} failed` : "",
-          ].filter(Boolean).join(" · ");
-          return (
-            <span
-              key={`${bucket.startAt || "unknown"}-${index}`}
-              title={title}
-              className={`aspect-square min-h-2 rounded-[3px] border ${healthTimelineTone(bucket.status)}`}
-            />
-          );
-        })}
-      </div>
-      <div className="flex items-center justify-between gap-2 font-mono text-[10px] uppercase tracking-[0.08em] text-muted-foreground">
-        <span>-24h</span>
-        <span>{formatMinutesShort(30, locale)}</span>
-        <span>now</span>
-      </div>
-    </div>
   );
 }
 

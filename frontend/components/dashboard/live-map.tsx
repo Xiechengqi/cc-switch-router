@@ -389,6 +389,8 @@ function resolveIso3FromElement(element: Element | null) {
 function RequestTickerPanel({ data }: { data: DashboardResponse | null }) {
   const { t } = useLocaleText();
   const [expanded, setExpanded] = usePersistentState(MAP_REQUEST_TICKER_EXPANDED_KEY, true);
+  const [isHovering, setIsHovering] = React.useState(false);
+  const tickerScrollRef = React.useRef<HTMLDivElement | null>(null);
   const meta = React.useMemo(() => buildRequestMeta(data), [data]);
   const events = React.useMemo(() => {
     return [...(data?.recentRequestEvents || [])]
@@ -398,18 +400,47 @@ function RequestTickerPanel({ data }: { data: DashboardResponse | null }) {
       .reverse();
   }, [data]);
 
+  const scrollTickerToLatest = React.useCallback(() => {
+    const node = tickerScrollRef.current;
+    if (!node) return;
+    node.scrollTop = node.scrollHeight;
+  }, []);
+
+  const visibleEvents = React.useMemo(() => {
+    if (isHovering) return events;
+    return events.slice(-REQUEST_TICKER_VISIBLE_ROWS);
+  }, [events, isHovering]);
+
+  const newestRequestId = events[events.length - 1]?.requestId;
+
+  React.useLayoutEffect(() => {
+    if (!expanded || !isHovering) return;
+    scrollTickerToLatest();
+  }, [expanded, events, isHovering, scrollTickerToLatest]);
+
   if (!events.length) return null;
 
   return (
     <div className="pointer-events-none absolute bottom-3 left-3 z-30 flex max-w-[min(72%,720px)] flex-col items-start gap-1">
       {expanded ? (
         <div
+          ref={tickerScrollRef}
           data-map-control
-          className="pointer-events-auto w-full overflow-y-auto overscroll-contain bg-transparent px-1 py-1 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
+          className={cn(
+            "pointer-events-auto w-full overscroll-contain bg-transparent px-1 py-1 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden",
+            isHovering ? "overflow-y-auto" : "overflow-hidden",
+          )}
           style={{ maxHeight: REQUEST_TICKER_MAX_HEIGHT_PX }}
+          onPointerEnter={() => {
+            setIsHovering(true);
+            requestAnimationFrame(scrollTickerToLatest);
+          }}
+          onPointerLeave={() => {
+            setIsHovering(false);
+          }}
         >
           <div className="flex flex-col gap-1">
-            {events.map((event, index) => {
+            {visibleEvents.map((event, index) => {
               const item = meta.get(event.requestId);
               const mergedItem: TickerMeta = {
                 ...(item || {}),
@@ -441,7 +472,7 @@ function RequestTickerPanel({ data }: { data: DashboardResponse | null }) {
                 <div
                   data-map-control
                   key={eventKey}
-                  className={`pointer-events-auto flex w-full select-text items-start gap-2 rounded-md bg-transparent px-1 py-0.5 text-left text-[10px] leading-relaxed text-slate-700 ${index === events.length - 1 ? "activity-feed-enter" : ""}`}
+                  className={`pointer-events-auto flex w-full select-text items-start gap-2 rounded-md bg-transparent px-1 py-0.5 text-left text-[10px] leading-relaxed text-slate-700 ${index === visibleEvents.length - 1 && event.requestId === newestRequestId ? "activity-feed-enter" : ""}`}
                 >
                   <span className="shrink-0 select-text font-mono text-slate-500">{formatTickerTime(event.startedAt || event.createdAt, item?.createdAt)}</span>
                   <span className={`inline-flex h-[15px] shrink-0 select-none items-center rounded px-1.5 font-mono text-[9px] font-semibold ${failed ? "bg-rose-100 text-rose-700" : "bg-emerald-100 text-emerald-700"}`}>{badge}</span>

@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use sha3::{Digest, Keccak256};
 use std::collections::BTreeMap;
 
@@ -660,7 +661,7 @@ mod payout_profile_tests {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IssueLeaseRequest {
     pub protocol_epoch: String,
@@ -677,6 +678,57 @@ pub struct IssueLeaseRequest {
     pub signature: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub share: Option<ShareDescriptor>,
+    #[serde(skip)]
+    pub(crate) signed_share: Option<Box<RawValue>>,
+}
+
+impl<'de> Deserialize<'de> for IssueLeaseRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct WireRequest {
+            protocol_epoch: String,
+            router_id: String,
+            installation_id: String,
+            route_id: String,
+            rotation_id: String,
+            generation: u64,
+            expected_generation: u64,
+            requested_subdomain: String,
+            tunnel_type: String,
+            timestamp_ms: i64,
+            nonce: String,
+            signature: String,
+            #[serde(default)]
+            share: Option<Box<RawValue>>,
+        }
+
+        let wire = WireRequest::deserialize(deserializer)?;
+        let share = wire
+            .share
+            .as_ref()
+            .map(|raw| serde_json::from_str(raw.get()).map_err(serde::de::Error::custom))
+            .transpose()?;
+        Ok(Self {
+            protocol_epoch: wire.protocol_epoch,
+            router_id: wire.router_id,
+            installation_id: wire.installation_id,
+            route_id: wire.route_id,
+            rotation_id: wire.rotation_id,
+            generation: wire.generation,
+            expected_generation: wire.expected_generation,
+            requested_subdomain: wire.requested_subdomain,
+            tunnel_type: wire.tunnel_type,
+            timestamp_ms: wire.timestamp_ms,
+            nonce: wire.nonce,
+            signature: wire.signature,
+            share,
+            signed_share: wire.share,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

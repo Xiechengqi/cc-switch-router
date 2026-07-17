@@ -3,7 +3,7 @@
 import { ChevronRight, ExternalLink, Loader2, Pencil, Save, Search, X } from "lucide-react";
 import { Button, Card, Checkbox, Chip, Drawer, Modal, Tabs, TextArea } from "@heroui/react";
 import * as React from "react";
-import { DrawerSection, EmptyBlock, HealthTimelineStrip, Info, TokenGrid } from "@/components/dashboard/drawer-panels";
+import { DrawerSection, EmptyBlock, Info, TokenGrid } from "@/components/dashboard/drawer-panels";
 import { FieldGroup } from "@/components/dashboard/share-edit/share-edit-shared";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { marketOperationalSummary, OperationalDiagnosis, operationalReasonLabel, operationalStateLabel, useStableOperationalRanks } from "@/components/dashboard/operational-status";
@@ -298,15 +298,12 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
                 {selected ? (
                   <div className="grid gap-4">
                     <div className="flex justify-end"><MarketEditAction market={selected} onEdit={setEditingMarket} t={t} /></div>
-                    <OperationalDiagnosis summary={marketOperationalSummary(selected)} kind="market" onEvidence={() => { document.getElementById("market-health-evidence")?.scrollIntoView({ behavior: "smooth" }); void recordDashboardUxEvent({ eventType: "diagnosis_evidence_opened", source: "drawer", targetType: "market" }); }} />
-                    <div id="market-health-evidence">{isUsageMarket(selected) ? (
-                      <>
-                        <HealthTimelineStrip timeline={selected.healthTimeline} />
-                        <DrawerSection label={t("dashboard.officialPrice")}>
-                          <MarketPricingCell market={selected} t={t} />
-                        </DrawerSection>
-                      </>
-                    ) : null}</div>
+                    <OperationalDiagnosis summary={marketOperationalSummary(selected)} kind="market" />
+                    {isUsageMarket(selected) ? (
+                      <DrawerSection label={t("dashboard.officialPrice")}>
+                        <MarketPricingCell market={selected} t={t} />
+                      </DrawerSection>
+                    ) : null}
                     <DrawerSection label={canShowMarketSharePriority(selected) ? t("dashboard.sharePriority") : t("dashboard.linkedShares")}>
                       {canShowMarketSharePriority(selected) ? <MarketSharePriorityPanel market={selected} t={t} /> : <MarketLinkedShares market={selected} t={t} />}
                     </DrawerSection>

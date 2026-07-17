@@ -222,12 +222,10 @@ export function OperationalStatusPill({ summary, className = "" }: { summary: Op
 export function OperationalDiagnosis({
   summary,
   kind,
-  onEvidence,
   removalAt,
 }: {
   summary: OperationalSummary;
   kind: "client" | "share" | "market";
-  onEvidence?: () => void;
   removalAt?: string;
 }) {
   const { locale, t } = useLocaleText();
@@ -246,7 +244,6 @@ export function OperationalDiagnosis({
         ) : null}
         {summary.additionalReasonCount > 0 ? <span className="text-[11px] font-medium text-amber-700">{t("dashboard.otherIssues", { count: summary.additionalReasonCount })}</span> : null}
       </div>
-      {onEvidence && reason ? <button type="button" className="justify-self-start text-xs font-medium text-primary hover:underline" onClick={onEvidence}>{t("dashboard.viewEvidence")}</button> : null}
     </section>
   );
 }
