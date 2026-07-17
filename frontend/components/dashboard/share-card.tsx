@@ -117,7 +117,7 @@ export const ShareCard = React.memo(function ShareCard({
   const dimmed = Boolean(focus.target) && !related;
   const stateTone = summary.state === "offline" ? "border-rose-200" : summary.state === "degraded" ? "border-amber-300" : summary.state === "disabled" ? "border-slate-300 opacity-70" : "border-slate-200";
   const statusDot = summary.state === "offline" ? "bg-rose-500" : summary.state === "degraded" ? "bg-amber-400" : summary.state === "disabled" ? "bg-slate-400" : "bg-emerald-500";
-  const connectDisabled = summary.state === "offline" || summary.state === "disabled";
+  const connectDisabled = summary.state === "disabled";
   const editLabel = editPending
     ? t("dashboard.pendingApply")
     : editRejected
@@ -177,7 +177,7 @@ export const ShareCard = React.memo(function ShareCard({
               {app ? <span className="rounded bg-primary/10 px-1.5 py-0.5 text-[9px] font-semibold text-primary">{SHARE_APP_LABELS[app]}</span> : null}
             </div>
             <div className="flex shrink-0 items-center gap-1">
-              <button type="button" data-no-row-drawer disabled={connectDisabled} title={connectDisabled ? issue || t("common.offline") : undefined} className="inline-flex h-6 items-center gap-1 rounded-md border border-primary/20 bg-primary/5 px-2 text-[10px] font-semibold text-primary hover:bg-primary/10 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-50 disabled:text-slate-400" onClick={(event) => { event.stopPropagation(); if (!connectDisabled) onConnect(share); }}>
+              <button type="button" data-no-row-drawer disabled={connectDisabled} title={connectDisabled ? issue || t("common.disabled") : undefined} className="inline-flex h-6 items-center gap-1 rounded-md border border-primary/20 bg-primary/5 px-2 text-[10px] font-semibold text-primary hover:bg-primary/10 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-50 disabled:text-slate-400" onClick={(event) => { event.stopPropagation(); if (!connectDisabled) onConnect(share); }}>
                 <Link2 className="h-3 w-3" />{t("dashboard.connect")}
               </button>
               <button

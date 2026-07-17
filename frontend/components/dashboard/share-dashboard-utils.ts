@@ -763,8 +763,11 @@ export function providerSubscriptionExpiry(
   if (!subscriptionEnd) return null;
   if (isUnlimitedExpiry(subscriptionEnd)) return "∞";
   const remaining =
-    countdownStr(subscriptionEnd) || formatDurationShort(subscriptionEnd, locale, "remaining");
-  return remaining === "--" ? null : remaining;
+    countdownStr(subscriptionEnd) ||
+    formatDurationShort(subscriptionEnd, locale, "remaining");
+  if (!remaining || remaining === "--") return null;
+  if (remaining === "expired" || remaining === "已过期") return remaining;
+  return `expire in ${remaining}`;
 }
 
 export function providerAccountLevel(runtime?: ShareUpstreamProvider, locale: AppLocale = "en") {
