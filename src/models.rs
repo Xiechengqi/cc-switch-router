@@ -1813,9 +1813,9 @@ pub struct ShareUpstreamProvider {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_blocked: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota: Option<ShareUpstreamQuota>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_url: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ShareUpstreamModel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1838,8 +1838,8 @@ impl Default for ShareUpstreamProvider {
             subscription_remaining_ms: None,
             quota_percent: None,
             quota_blocked: None,
-            api_url: None,
             quota: None,
+            api_url: None,
             models: Vec::new(),
             health: None,
             available: None,
@@ -1878,9 +1878,9 @@ pub struct ShareAppProvider {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_blocked: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota: Option<ShareUpstreamQuota>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_url: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ShareUpstreamModel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1907,8 +1907,8 @@ impl Default for ShareAppProvider {
             subscription_remaining_ms: None,
             quota_percent: None,
             quota_blocked: None,
-            api_url: None,
             quota: None,
+            api_url: None,
             models: Vec::new(),
             health: None,
             available: None,

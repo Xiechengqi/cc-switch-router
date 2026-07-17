@@ -27290,6 +27290,47 @@ mod tests {
         assert_eq!(signed, router_json);
     }
 
+    #[test]
+    fn upstream_provider_field_order_matches_server_signer() {
+        use crate::models::{ShareUpstreamModel, ShareUpstreamProvider, ShareUpstreamQuota};
+        let value = ShareUpstreamProvider {
+            kind: "codex_oauth".into(),
+            app: "codex".into(),
+            provider_name: Some("OpenAI OAuth".into()),
+            provider_type: Some("codex_oauth".into()),
+            for_sale_official_price_percent: None,
+            account_email: Some("a@b.c".into()),
+            subscription_level: None,
+            subscription_expires_at: None,
+            subscription_remaining_ms: None,
+            quota_percent: Some(100.0),
+            quota_blocked: Some(true),
+            quota: Some(ShareUpstreamQuota {
+                status: "ok".into(),
+                plan: None,
+                queried_at: None,
+                subscription_period_end: None,
+                availability: None,
+                blocked_until: None,
+                blocked_reason: None,
+                blocked_scope: None,
+                dispatch_limit_percent: None,
+                tiers: vec![],
+            }),
+            api_url: Some("https://example.com".into()),
+            models: vec![ShareUpstreamModel {
+                slot: "model".into(),
+                actual_model: "gpt".into(),
+            }],
+            health: None,
+            available: None,
+        };
+        let json = serde_json::to_string(&value).expect("serialize provider");
+        let api = json.find("apiUrl").expect("apiUrl");
+        let models = json.find("models").expect("models");
+        assert!(api < models, "expected apiUrl before models, got {json}");
+    }
+
     fn public_key_b64(signing_key: &SigningKey) -> String {
         base64::engine::general_purpose::STANDARD.encode(signing_key.verifying_key().to_bytes())
     }
