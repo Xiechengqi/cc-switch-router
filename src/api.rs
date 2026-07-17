@@ -5,11 +5,11 @@ use std::net::SocketAddr;
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::Event;
 use axum::response::{IntoResponse, Response, Sse};
-use axum::routing::{MethodRouter, any, delete, get, patch, post};
+use axum::routing::{MethodRouter, any, delete, get, patch, post, put};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -37,26 +37,30 @@ use crate::error::AppError;
 use crate::models::{
     AnnouncementResponse, AnnouncementSettings, AnnouncementSettingsUpdate, AuthSession,
     BindInstallationOwnerEmailRequest, BindInstallationOwnerEmailResponse,
-    BoardMessageListResponse, BoardMessageToggleRequest, BoardMessageView, BoardMetaResponse,
+    BoardMessageListResponse, BoardMessageView, BoardMetaResponse,
     ChangeInstallationOwnerEmailRequest, ChangeInstallationOwnerEmailResponse,
+    ClientChatDeliveriesResponse, ClientChatMessageListResponse, ClientChatReadRequest,
+    ClientChatReadResponse, ClientChatRoomListResponse, ClientChatRoomLookupRequest,
+    ClientChatRoomResponse, ClientChatVisitImportRequest, ClientChatVisitImportResponse,
     ClientTunnelClaimRequest, ClientTunnelQuery, ClientTunnelResponse, ClientTunnelUpdateRequest,
     DashboardMarketRequestLogView, DashboardPresenceRequest, DashboardPresenceResponse,
     DashboardResponse, DashboardTickerShare, DashboardUxEventRequest, DashboardUxEventResponse,
     GatewayRegistryRecord, GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse,
     HealthResponse, ImageGenerationRequestLogEntry, InstallationHeartbeatRequest,
     InstallationHeartbeatResponse, InstallationPayoutProfileUpdateRequest,
-    InstallationPayoutProfileUpdateResponse, IssueLeaseRequest, IssueLeaseResponse,
-    MapDisplaySettings, MapDisplaySettingsUpdate, MarketDisabledSharesUpdateRequest,
+    InstallationPayoutProfileUpdateResponse, InstallationSetupCompletedRequest,
+    InstallationSetupCompletedResponse, IssueLeaseRequest, IssueLeaseResponse, MapDisplaySettings,
+    MapDisplaySettingsUpdate, MarketDisabledSharesUpdateRequest,
     MarketDisabledSharesUpdateResponse, MarketMaintenanceUpdateRequest,
     MarketMaintenanceUpdateResponse, MarketNotificationEmailLogView,
     MarketNotificationEmailRequest, MarketNotificationEmailResponse,
     MarketRequestLogBatchSyncRequest, MarketShareRuntimeStateReleaseRequest,
     MarketShareRuntimeStateReleaseResponse, MarketShareRuntimeStateSyncRequest,
-    MarketShareRuntimeStateSyncResponse, MarketShareView, MarketsResponse, PostBoardMessageRequest,
-    PublicMapPointsResponse, PublicNetworkStatsResponse, PublicPayoutProfilesQuery,
-    RefreshSessionRequest, RegisterGatewayRequest, RegisterGatewayResponse,
-    RegisterInstallationRequest, RegisterInstallationResponse, RegisterMarketRequest,
-    RenewLeaseRequest, RenewLeaseResponse, ReportInstallationStatusRequest,
+    MarketShareRuntimeStateSyncResponse, MarketShareView, MarketsResponse,
+    PostClientChatMessageRequest, PublicMapPointsResponse, PublicNetworkStatsResponse,
+    PublicPayoutProfilesQuery, RefreshSessionRequest, RegisterGatewayRequest,
+    RegisterGatewayResponse, RegisterInstallationRequest, RegisterInstallationResponse,
+    RegisterMarketRequest, RenewLeaseRequest, RenewLeaseResponse, ReportInstallationStatusRequest,
     ReportInstallationStatusResponse, RequestEmailCodeRequest, RequestEmailCodeResponse,
     SessionStatusResponse, ShareApiAuthResponse, ShareApiAuthUser, ShareApiContextResponse,
     ShareApiShareResponse, ShareBatchSyncRequest, ShareClaimSubdomainRequest, ShareDeleteRequest,
@@ -81,7 +85,7 @@ use crate::scheduling_signals::{
     ShareFeedbackKind, ShareFeedbackRequest, ShareFeedbackResponse, ShareHeadroomEntry,
     ShareHeadroomRequest, ShareHeadroomResponse,
 };
-use crate::store::{BoardAuthor, ShareForTest, image_result_path};
+use crate::store::{ShareForTest, image_result_path};
 use tower_http::cors::{Any, CorsLayer};
 
 fn public_cors_layer() -> CorsLayer {
@@ -166,6 +170,14 @@ pub fn router(state: ServerState) -> Router {
         )
         .route("/v1/regions", get(regions))
         .route("/v1/announcement", get(announcement_get))
+        .route(
+            "/v1/chat/clients/:installation_id/room",
+            get(client_chat_room),
+        )
+        .route(
+            "/v1/chat/rooms/:room_id/messages",
+            get(list_client_chat_messages).post(post_client_chat_message),
+        )
         .layer(public_cors_layer())
         .with_state(state.clone());
 
@@ -245,6 +257,10 @@ pub fn router(state: ServerState) -> Router {
         .route(
             "/v1/installations/heartbeat",
             installation_control_body_limited(post(installation_heartbeat)),
+        )
+        .route(
+            "/v1/installations/setup-completed",
+            installation_control_body_limited(post(installation_setup_completed)),
         )
         .route(
             "/v1/installations/report-status",
@@ -360,6 +376,27 @@ pub fn router(state: ServerState) -> Router {
         )
         .route("/v1/board/messages/:id", delete(delete_board_message))
         .route("/v1/board/meta", get(board_meta))
+        .route("/v1/chat/rooms/lookup", post(lookup_client_chat_rooms))
+        .route("/v1/chat/rooms", get(list_visited_client_chat_rooms))
+        .route("/v1/chat/meta", get(client_chat_meta))
+        .route(
+            "/v1/chat/rooms/:room_id/visit",
+            put(record_client_chat_visit),
+        )
+        .route("/v1/chat/visits/import", post(import_client_chat_visits))
+        .route("/v1/chat/rooms/:room_id/read", put(mark_client_chat_read))
+        .route(
+            "/v1/admin/chat/messages/:message_id",
+            delete(admin_delete_client_chat_message),
+        )
+        .route(
+            "/v1/admin/chat/deliveries",
+            get(admin_client_chat_deliveries),
+        )
+        .route(
+            "/v1/admin/chat/deliveries/:delivery_id/requeue",
+            post(admin_requeue_client_chat_delivery),
+        )
         .route("/v1/admin/settings/schema", get(admin_settings_schema))
         .route(
             "/v1/admin/client-notifications/deliveries",
@@ -1122,6 +1159,13 @@ async fn installation_heartbeat(
     Ok(Json(
         state.store.record_installation_heartbeat(input).await?,
     ))
+}
+
+async fn installation_setup_completed(
+    State(state): State<ServerState>,
+    Json(input): Json<InstallationSetupCompletedRequest>,
+) -> Result<Json<InstallationSetupCompletedResponse>, AppError> {
+    Ok(Json(state.store.complete_installation_setup(input).await?))
 }
 
 async fn upgrade_installation(
@@ -2531,6 +2575,23 @@ mod tests {
             .expect("valid dashboard session should resolve");
 
         assert_eq!(viewer_email, "owner@example.com");
+    }
+
+    #[test]
+    fn public_chat_responses_are_not_cached_or_indexed() {
+        let headers = public_chat_headers();
+        assert_eq!(
+            headers
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        assert_eq!(
+            headers
+                .get("x-robots-tag")
+                .and_then(|value| value.to_str().ok()),
+            Some("noindex, noarchive")
+        );
     }
 
     #[test]
@@ -4157,6 +4218,17 @@ struct BoardListQuery {
     since: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClientChatMessageQuery {
+    #[serde(default)]
+    before_seq: Option<i64>,
+    #[serde(default)]
+    after_seq: Option<i64>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
 fn session_token_candidates(headers: &HeaderMap) -> Vec<&str> {
     let mut candidates = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -4287,6 +4359,228 @@ async fn require_admin_session(
     Ok(session)
 }
 
+async fn require_client_chat_session(
+    state: &ServerState,
+    headers: &HeaderMap,
+) -> Result<AuthSession, AppError> {
+    resolve_router_session(state, headers)
+        .await?
+        .ok_or_else(|| AppError::Unauthorized("login required to send chat messages".into()))
+}
+
+fn public_chat_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        HeaderName::from_static("x-robots-tag"),
+        HeaderValue::from_static("noindex, noarchive"),
+    );
+    headers
+}
+
+async fn client_chat_room(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path(installation_id): Path<String>,
+) -> Result<(HeaderMap, Json<ClientChatRoomResponse>), AppError> {
+    let metadata = extract_client_metadata(&headers, addr);
+    state
+        .store
+        .enforce_client_chat_public_read_rate(metadata.ip.as_deref())
+        .await?;
+    let session = resolve_router_session(&state, &headers).await?;
+    let room = state
+        .store
+        .get_client_chat_room_by_installation(
+            &installation_id,
+            session.as_ref().map(|session| session.user_id.as_str()),
+        )
+        .await?;
+    Ok((public_chat_headers(), Json(ClientChatRoomResponse { room })))
+}
+
+async fn lookup_client_chat_rooms(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(input): Json<ClientChatRoomLookupRequest>,
+) -> Result<(HeaderMap, Json<ClientChatRoomListResponse>), AppError> {
+    let metadata = extract_client_metadata(&headers, addr);
+    state
+        .store
+        .enforce_client_chat_public_read_rate(metadata.ip.as_deref())
+        .await?;
+    let session = resolve_router_session(&state, &headers).await?;
+    Ok((
+        public_chat_headers(),
+        Json(
+            state
+                .store
+                .lookup_client_chat_rooms(
+                    input.installation_ids,
+                    input.last_read_seq_by_installation,
+                    session.as_ref().map(|session| session.user_id.as_str()),
+                )
+                .await?,
+        ),
+    ))
+}
+
+async fn list_visited_client_chat_rooms(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<ClientChatRoomListResponse>, AppError> {
+    let session = require_client_chat_session(&state, &headers).await?;
+    Ok(Json(
+        state
+            .store
+            .list_visited_client_chat_rooms(&session.user_id)
+            .await?,
+    ))
+}
+
+async fn client_chat_meta(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let session = require_client_chat_session(&state, &headers).await?;
+    let rooms = state
+        .store
+        .list_visited_client_chat_rooms(&session.user_id)
+        .await?;
+    Ok(Json(serde_json::json!({
+        "totalUnread": rooms.total_unread,
+    })))
+}
+
+async fn record_client_chat_visit(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(room_id): Path<String>,
+) -> Result<Json<ClientChatRoomResponse>, AppError> {
+    let session = require_client_chat_session(&state, &headers).await?;
+    let room = state
+        .store
+        .record_client_chat_visit(&room_id, &session.user_id)
+        .await?;
+    Ok(Json(ClientChatRoomResponse { room }))
+}
+
+async fn import_client_chat_visits(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<ClientChatVisitImportRequest>,
+) -> Result<Json<ClientChatVisitImportResponse>, AppError> {
+    let session = require_client_chat_session(&state, &headers).await?;
+    let imported = state
+        .store
+        .import_client_chat_visits(&session.user_id, input.visits)
+        .await?;
+    Ok(Json(ClientChatVisitImportResponse { imported }))
+}
+
+async fn list_client_chat_messages(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path(room_id): Path<String>,
+    Query(query): Query<ClientChatMessageQuery>,
+) -> Result<(HeaderMap, Json<ClientChatMessageListResponse>), AppError> {
+    let metadata = extract_client_metadata(&headers, addr);
+    state
+        .store
+        .enforce_client_chat_public_read_rate(metadata.ip.as_deref())
+        .await?;
+    let session = resolve_router_session(&state, &headers).await?;
+    Ok((
+        public_chat_headers(),
+        Json(
+            state
+                .store
+                .list_client_chat_messages(
+                    &room_id,
+                    session.as_ref().map(|session| session.user_id.as_str()),
+                    query.before_seq,
+                    query.after_seq,
+                    query.limit.unwrap_or(50),
+                )
+                .await?,
+        ),
+    ))
+}
+
+async fn post_client_chat_message(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(room_id): Path<String>,
+    Json(input): Json<PostClientChatMessageRequest>,
+) -> Result<Json<crate::models::ClientChatMessageView>, AppError> {
+    let session = require_client_chat_session(&state, &headers).await?;
+    if !NotificationTemplateContext::from_config(&state.config).delivery_configured {
+        return Err(AppError::ServiceUnavailable(
+            "chat sending is unavailable until Router email delivery is configured".into(),
+        ));
+    }
+    Ok(Json(
+        state
+            .store
+            .create_client_chat_message(&room_id, &session, input.body, input.client_message_id)
+            .await?,
+    ))
+}
+
+async fn mark_client_chat_read(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(room_id): Path<String>,
+    Json(input): Json<ClientChatReadRequest>,
+) -> Result<Json<ClientChatReadResponse>, AppError> {
+    let session = require_client_chat_session(&state, &headers).await?;
+    Ok(Json(
+        state
+            .store
+            .mark_client_chat_read(&room_id, &session.user_id, input.last_read_seq)
+            .await?,
+    ))
+}
+
+async fn admin_delete_client_chat_message(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(message_id): Path<String>,
+) -> Result<Json<crate::models::ClientChatMessageView>, AppError> {
+    let session = require_admin_session(&state, &headers).await?;
+    Ok(Json(
+        state
+            .store
+            .delete_client_chat_message(&message_id, &session.email)
+            .await?,
+    ))
+}
+
+async fn admin_client_chat_deliveries(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<ClientChatDeliveriesResponse>, AppError> {
+    require_admin_session(&state, &headers).await?;
+    let deliveries = state.store.list_client_chat_deliveries(100).await?;
+    Ok(Json(ClientChatDeliveriesResponse { deliveries }))
+}
+
+async fn admin_requeue_client_chat_delivery(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(delivery_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_admin_session(&state, &headers).await?;
+    state
+        .store
+        .requeue_client_chat_delivery(&delivery_id, chrono::Utc::now())
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
 async fn list_board_messages(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -4314,118 +4608,43 @@ async fn list_board_messages(
 }
 
 async fn post_board_message(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Json(input): Json<PostBoardMessageRequest>,
+    State(_state): State<ServerState>,
+    _headers: HeaderMap,
+    ConnectInfo(_addr): ConnectInfo<SocketAddr>,
 ) -> Result<Json<BoardMessageView>, AppError> {
-    let session = resolve_router_session(&state, &headers).await?;
-    let metadata = extract_client_metadata(&headers, addr);
-    let client_ip = metadata.ip.clone();
-    let (board_settings, telegram_notify_all, is_admin_session) = {
-        let dynamic = state.dynamic.read().await;
-        let admin = session
-            .as_ref()
-            .map(|s| dynamic.is_admin(&s.email))
-            .unwrap_or(false);
-        (dynamic.board.clone(), dynamic.telegram.notify_all, admin)
-    };
-    let author = if let Some(session) = session.as_ref() {
-        if is_admin_session {
-            BoardAuthor::Admin {
-                user_id: session.user_id.clone(),
-                email: session.email.clone(),
-            }
-        } else {
-            BoardAuthor::User {
-                user_id: session.user_id.clone(),
-                email: session.email.clone(),
-            }
-        }
-    } else {
-        let guest_id = extract_guest_id(&headers).ok_or_else(|| {
-            AppError::BadRequest("anonymous posts require an X-Board-Guest-Id header".into())
-        })?;
-        BoardAuthor::Guest {
-            guest_id,
-            name: input.guest_name.clone(),
-        }
-    };
-    let message = state
-        .store
-        .create_board_message(&board_settings, author, input.body, client_ip.as_deref())
-        .await?;
-
-    if telegram_notify_all {
-        let notifier = state.telegram.read().await.clone();
-        if let Some(notifier) = notifier {
-            let payload = message.clone();
-            tokio::spawn(async move {
-                notifier.notify_new_message(&payload).await;
-            });
-        }
-    }
-
-    Ok(Json(message))
+    Err(AppError::Gone(
+        "the message board is read-only; use a Client chat room".into(),
+    ))
 }
 
 async fn pin_board_message(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Json(input): Json<BoardMessageToggleRequest>,
+    State(_state): State<ServerState>,
+    _headers: HeaderMap,
+    Path(_id): Path<String>,
 ) -> Result<Json<BoardMessageView>, AppError> {
-    require_admin_session(&state, &headers).await?;
-    let board_settings = state.dynamic.read().await.board.clone();
-    let view = state
-        .store
-        .set_board_pinned(&board_settings, &id, input.value)
-        .await?;
-    Ok(Json(view))
+    Err(AppError::Gone(
+        "the message board is read-only; use a Client chat room".into(),
+    ))
 }
 
 async fn feature_board_message(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Json(input): Json<BoardMessageToggleRequest>,
+    State(_state): State<ServerState>,
+    _headers: HeaderMap,
+    Path(_id): Path<String>,
 ) -> Result<Json<BoardMessageView>, AppError> {
-    require_admin_session(&state, &headers).await?;
-    let view = state.store.set_board_featured(&id, input.value).await?;
-    Ok(Json(view))
+    Err(AppError::Gone(
+        "the message board is read-only; use a Client chat room".into(),
+    ))
 }
 
 async fn delete_board_message(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
+    State(_state): State<ServerState>,
+    _headers: HeaderMap,
+    Path(_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let session = resolve_router_session(&state, &headers).await?;
-    let (board_settings, is_admin) = {
-        let dynamic = state.dynamic.read().await;
-        let admin = session
-            .as_ref()
-            .map(|s| dynamic.is_admin(&s.email))
-            .unwrap_or(false);
-        (dynamic.board.clone(), admin)
-    };
-    let admin_email = if is_admin {
-        session.as_ref().map(|s| s.email.clone())
-    } else {
-        None
-    };
-    let guest_id = extract_guest_id(&headers);
-    state
-        .store
-        .delete_board_message(
-            &board_settings,
-            &id,
-            is_admin,
-            admin_email.as_deref(),
-            guest_id.as_deref(),
-        )
-        .await?;
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Err(AppError::Gone(
+        "the message board is read-only; use a Client chat room".into(),
+    ))
 }
 
 async fn board_meta(

@@ -173,6 +173,7 @@ export type OperationalSummary = {
 };
 
 export type DashboardClient = {
+  chatAvailable?: boolean;
   installation: {
     id: string;
     platform: string;
@@ -843,6 +844,25 @@ export type ClientNotificationDeliveriesResponse = {
   deliveries: ClientNotificationDelivery[];
 };
 
+export type ClientChatDelivery = {
+  id: string;
+  roomId: string;
+  installationId: string;
+  clientLabel: string;
+  recipientMasked: string;
+  messageCount: number;
+  status: string;
+  attempts: number;
+  createdAt: string;
+  nextAttemptAt?: string | null;
+  sentAt?: string | null;
+  errorMessage?: string | null;
+};
+
+export type ClientChatDeliveriesResponse = {
+  deliveries: ClientChatDelivery[];
+};
+
 export type VersionResponse = {
   version: string;
   commit: string;
@@ -1079,6 +1099,51 @@ export type BoardMeta = {
   canPostAsAdmin: boolean;
   maxBodyLength: number;
   guestSelfDeleteSecs: number;
+};
+
+export type ClientChatMessage = {
+  id: string;
+  seq: number;
+  body: string;
+  authorLabel: string;
+  isMine: boolean;
+  status: "visible" | "deleted" | string;
+  createdAt: string;
+};
+
+export type ClientChatMessagePreview = {
+  seq: number;
+  body: string;
+  authorLabel: string;
+  createdAt: string;
+};
+
+export type ClientChatRoom = {
+  id: string;
+  installationId: string;
+  clientLabel: string;
+  status: "active" | "archived" | string;
+  latestSeq: number;
+  unreadCount: number;
+  lastMessageAt?: string | null;
+  lastMessage?: ClientChatMessagePreview | null;
+  archivedAt?: string | null;
+};
+
+export type ClientChatRoomListResponse = {
+  rooms: ClientChatRoom[];
+  totalUnread: number;
+};
+
+export type ClientChatMessageListResponse = {
+  messages: ClientChatMessage[];
+  latestSeq: number;
+  hasMore: boolean;
+};
+
+export type ClientChatVisit = {
+  installationId: string;
+  lastReadSeq: number;
 };
 
 // P18: test-connection types

@@ -135,6 +135,43 @@ pub struct RegisterInstallationResponse {
     pub control_secret: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InstallationSetupCompletedPayload {
+    pub protocol_version: i64,
+    pub setup_id: String,
+    pub password_hint: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InstallationSetupCompletedRequest {
+    pub protocol_epoch: String,
+    pub installation_id: String,
+    pub timestamp_ms: i64,
+    pub nonce: String,
+    pub signature: String,
+    pub setup: InstallationSetupCompletedPayload,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum InstallationSetupCompletedStatus {
+    #[serde(rename = "queued")]
+    Queued,
+    #[serde(rename = "already_recorded")]
+    AlreadyRecorded,
+    #[serde(rename = "suppressed_disabled")]
+    SuppressedDisabled,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallationSetupCompletedResponse {
+    pub ok: bool,
+    pub setup_id: String,
+    pub status: InstallationSetupCompletedStatus,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestEmailCodeRequest {
@@ -2457,6 +2494,8 @@ pub struct UpgradeInstallationStatusResponse {
 #[serde(rename_all = "camelCase")]
 pub struct DashboardClientView {
     pub installation: InstallationView,
+    #[serde(default)]
+    pub chat_available: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_tunnel: Option<DashboardClientTunnelView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2905,6 +2944,7 @@ pub struct BoardMessageListResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct PostBoardMessageRequest {
     pub body: String,
     #[serde(default)]
@@ -2913,6 +2953,7 @@ pub struct PostBoardMessageRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct BoardMessageToggleRequest {
     pub value: bool,
 }
@@ -2926,4 +2967,131 @@ pub struct BoardMetaResponse {
     pub can_post_as_admin: bool,
     pub max_body_length: usize,
     pub guest_self_delete_secs: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientChatMessageView {
+    pub id: String,
+    pub seq: i64,
+    pub body: String,
+    pub author_label: String,
+    pub is_mine: bool,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientChatMessagePreview {
+    pub seq: i64,
+    pub body: String,
+    pub author_label: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientChatRoomView {
+    pub id: String,
+    pub installation_id: String,
+    pub client_label: String,
+    pub status: String,
+    pub latest_seq: i64,
+    pub unread_count: usize,
+    pub last_message_at: Option<DateTime<Utc>>,
+    pub last_message: Option<ClientChatMessagePreview>,
+    pub archived_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientChatRoomResponse {
+    pub room: ClientChatRoomView,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientChatRoomListResponse {
+    pub rooms: Vec<ClientChatRoomView>,
+    pub total_unread: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClientChatRoomLookupRequest {
+    pub installation_ids: Vec<String>,
+    #[serde(default)]
+    pub last_read_seq_by_installation: BTreeMap<String, i64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientChatMessageListResponse {
+    pub messages: Vec<ClientChatMessageView>,
+    pub latest_seq: i64,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PostClientChatMessageRequest {
+    pub body: String,
+    pub client_message_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClientChatReadRequest {
+    pub last_read_seq: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientChatReadResponse {
+    pub ok: bool,
+    pub last_read_seq: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClientChatVisitImportItem {
+    pub installation_id: String,
+    #[serde(default)]
+    pub last_read_seq: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClientChatVisitImportRequest {
+    pub visits: Vec<ClientChatVisitImportItem>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientChatVisitImportResponse {
+    pub imported: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientChatDeliveryView {
+    pub id: String,
+    pub room_id: String,
+    pub installation_id: String,
+    pub client_label: String,
+    pub recipient_masked: String,
+    pub message_count: usize,
+    pub status: String,
+    pub attempts: u32,
+    pub created_at: DateTime<Utc>,
+    pub next_attempt_at: Option<DateTime<Utc>>,
+    pub sent_at: Option<DateTime<Utc>>,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientChatDeliveriesResponse {
+    pub deliveries: Vec<ClientChatDeliveryView>,
 }

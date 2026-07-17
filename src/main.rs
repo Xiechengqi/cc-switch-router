@@ -3,6 +3,7 @@ mod admin;
 mod api;
 mod board_telegram;
 mod cf;
+mod client_chat;
 mod client_meta;
 mod config;
 mod ctl_client;
@@ -115,7 +116,7 @@ async fn main() -> Result<()> {
         admin_emails = config.admin_emails.len(),
         default_admin = default_admin_email.as_deref().unwrap_or("-"),
         telegram_enabled = telegram.is_some(),
-        "message board configured"
+        "legacy board compatibility configured"
     );
     if let Some(ref fp) = ssh_host_fingerprint {
         info!("ssh host key fingerprint: {}", fp);
@@ -184,6 +185,8 @@ async fn main() -> Result<()> {
     let notification_store = state.store.clone();
     let notification_dynamic = state.dynamic.clone();
     let notification_config = config.clone();
+    let chat_notification_store = state.store.clone();
+    let chat_notification_config = config.clone();
 
     let http_listener = TcpListener::bind(config.api_addr).await?;
     let ssh_listener = TcpListener::bind(config.ssh_addr).await?;
@@ -227,6 +230,7 @@ async fn main() -> Result<()> {
                         notification_batches = result.deleted_notification_batches,
                         notification_events = result.deleted_notification_events,
                         notification_send_logs = result.deleted_notification_send_logs,
+                        chat_rooms = result.deleted_chat_rooms,
                         routes = result.removed_routes,
                         "cleanup removed stale data"
                     );
@@ -323,6 +327,17 @@ async fn main() -> Result<()> {
         }
         result
     });
+    let chat_notification_task = tokio::spawn(async move {
+        let result = crate::client_chat::run_client_chat_email_service(
+            chat_notification_store,
+            chat_notification_config,
+        )
+        .await;
+        if let Err(error) = &result {
+            tracing::error!(error = %error, "client chat email service stopped");
+        }
+        result
+    });
     let ssh_task = tokio::spawn(async move { ssh_server.run_with_listener(ssh_listener).await });
     let http_task = tokio::spawn(async move {
         axum::serve(
@@ -342,6 +357,7 @@ async fn main() -> Result<()> {
             resend_usage_task.abort();
             metrics_task.abort();
             notification_task.abort();
+            chat_notification_task.abort();
             ssh_result??;
             Ok(())
         }
@@ -353,6 +369,7 @@ async fn main() -> Result<()> {
             resend_usage_task.abort();
             metrics_task.abort();
             notification_task.abort();
+            chat_notification_task.abort();
             http_result??;
             Ok(())
         }

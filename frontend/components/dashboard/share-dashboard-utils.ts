@@ -749,7 +749,22 @@ export function quotaSummary(runtime?: ShareUpstreamProvider, locale: AppLocale 
     .map((tier) => formatCompactQuotaTier(tier, locale))
     .filter(Boolean)
     .join(" · ");
-  return [quotaPlanLabel(runtime, quota.plan || quota.credentialMessage), tierText].filter(Boolean).join(" · ");
+  const expireText = providerSubscriptionExpiry(runtime, locale);
+  return [quotaPlanLabel(runtime, quota.plan || quota.credentialMessage), expireText, tierText]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+export function providerSubscriptionExpiry(
+  runtime?: ShareUpstreamProvider,
+  locale: AppLocale = "en",
+): string | null {
+  const subscriptionEnd = runtime?.quota?.subscriptionPeriodEnd;
+  if (!subscriptionEnd) return null;
+  if (isUnlimitedExpiry(subscriptionEnd)) return "∞";
+  const remaining =
+    countdownStr(subscriptionEnd) || formatDurationShort(subscriptionEnd, locale, "remaining");
+  return remaining === "--" ? null : remaining;
 }
 
 export function providerAccountLevel(runtime?: ShareUpstreamProvider, locale: AppLocale = "en") {

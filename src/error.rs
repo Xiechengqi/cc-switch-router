@@ -15,6 +15,8 @@ pub enum AppError {
     #[error("{0}")]
     NotFound(String),
     #[error("{0}")]
+    Gone(String),
+    #[error("{0}")]
     Conflict(String),
     #[error("{0}")]
     UnprocessableEntity(String),
@@ -43,6 +45,7 @@ impl IntoResponse for AppError {
             AppError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             AppError::Forbidden(_) => StatusCode::FORBIDDEN,
             AppError::NotFound(_) => StatusCode::NOT_FOUND,
+            AppError::Gone(_) => StatusCode::GONE,
             AppError::Conflict(_) => StatusCode::CONFLICT,
             AppError::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
             AppError::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,

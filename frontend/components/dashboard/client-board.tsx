@@ -1,7 +1,7 @@
 "use client";
 
 import { Button, Card, Chip, Drawer, toast } from "@heroui/react";
-import { Check, ChevronDown, Copy, ExternalLink, Search, WalletCards } from "lucide-react";
+import { Check, ChevronDown, Copy, ExternalLink, MessageCircle, Search, WalletCards } from "lucide-react";
 import * as React from "react";
 import { buildClientInstallCommand, InstallGuideDialog } from "@/components/dashboard/install-guide-dialog";
 import { SectionInstallButton } from "@/components/dashboard/section-install-button";
@@ -44,6 +44,7 @@ import { usePersistentState } from "@/lib/use-persistent-state";
 import { recordDashboardUxEvent } from "@/lib/api";
 import { CompactSelect } from "@/components/common/compact-select";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
+import { useClientChat } from "@/components/chat/client-chat";
 
 const PAYOUT_NETWORK_LABELS: Record<string, string> = {
   "eip155:56": "BSC",
@@ -229,6 +230,22 @@ function ClientDetailsButton({ onOpen }: { onOpen: () => void }) {
   );
 }
 
+function ClientChatButton({ client }: { client: DashboardClient }) {
+  const { t } = useLocaleText();
+  const { openChat } = useClientChat();
+  if (!client.chatAvailable) return null;
+  return (
+    <ClientHeaderInlineButton
+      label={t("dashboard.chat")}
+      onClick={() => void openChat(client.installation.id)}
+      className="inline-flex h-6 shrink-0 items-center gap-1 rounded-full border border-blue-200 bg-blue-50 px-2.5 text-[11px] font-medium text-blue-700 transition-colors hover:border-blue-300 hover:bg-blue-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
+    >
+      <MessageCircle className="h-3 w-3" />
+      <span>{t("dashboard.chat")}</span>
+    </ClientHeaderInlineButton>
+  );
+}
+
 function ClientCollapseIndicator({ collapsed }: { collapsed: boolean }) {
   return (
     <span
@@ -408,6 +425,7 @@ function ClientCard({
               {tunnelUrl ? <ClientConsoleButton client={client} /> : null}
               <ClientUpgradeButton client={client} />
               <ClientDetailsButton onOpen={openClientDrawer} />
+              <ClientChatButton client={client} />
               {summary.primaryReason ? <span className={`truncate text-[11px] font-medium ${state === "offline" ? "text-rose-700" : "text-amber-700"}`} title={operationalReasonLabel(summary.primaryReason, t)}>{operationalReasonLabel(summary.primaryReason, t)}</span> : null}
               {showRemoval ? <ClientRemovalSchedule removalAt={client.removalAt} className="text-[11px]" /> : null}
             </div>

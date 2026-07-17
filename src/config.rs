@@ -441,9 +441,10 @@ CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_RECIPIENT_HOURLY_LIMIT=3
 CC_SWITCH_ROUTER_CLIENT_ALERT_REGISTRATION_GLOBAL_HOURLY_LIMIT=10
 # router@<tunnel_domain-host> is always treated as admin. Use this variable
 # to add additional admin emails (comma-separated, case-insensitive).
-# Admins post with an OFFICIAL badge and can pin/feature/delete any message.
+# Legacy board settings below are retained for one read-only compatibility release.
+# All legacy board mutations now return HTTP 410; Client chat has independent limits.
 CC_SWITCH_ROUTER_ADMIN_EMAILS=
-# Telegram bot push for new board messages. Leave the token empty to disable.
+# Telegram settings no longer receive Client chat content.
 CC_SWITCH_ROUTER_TELEGRAM_BOT_TOKEN=
 CC_SWITCH_ROUTER_TELEGRAM_CHAT_ID=
 # CC_SWITCH_ROUTER_TELEGRAM_TOPIC_ID=

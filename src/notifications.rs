@@ -642,11 +642,22 @@ struct ResendEmailRequest<'a> {
     reply_to: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FrozenEmailEnvelope<'a> {
+    pub from: &'a str,
+    pub recipient: &'a str,
+    pub subject: &'a str,
+    pub html: &'a str,
+    pub text: &'a str,
+    pub reply_to: Option<&'a str>,
+    pub idempotency_key: &'a str,
+}
+
 #[derive(Debug)]
-struct DeliveryFailure {
-    retryable: bool,
-    retry_at: Option<DateTime<Utc>>,
-    message: String,
+pub(crate) struct DeliveryFailure {
+    pub retryable: bool,
+    pub retry_at: Option<DateTime<Utc>>,
+    pub message: String,
 }
 
 async fn send_resend_email(
@@ -663,17 +674,48 @@ async fn send_resend_email_to(
     batch: &ClientNotificationBatch,
     endpoint: &str,
 ) -> Result<String, DeliveryFailure> {
+    send_resend_frozen_email_to(
+        http,
+        api_key,
+        FrozenEmailEnvelope {
+            from: &batch.from,
+            recipient: &batch.recipient,
+            subject: &batch.subject,
+            html: &batch.html,
+            text: &batch.text,
+            reply_to: batch.reply_to.as_deref(),
+            idempotency_key: &batch.idempotency_key,
+        },
+        endpoint,
+    )
+    .await
+}
+
+pub(crate) async fn send_resend_frozen_email(
+    http: &reqwest::Client,
+    api_key: &str,
+    envelope: FrozenEmailEnvelope<'_>,
+) -> Result<String, DeliveryFailure> {
+    send_resend_frozen_email_to(http, api_key, envelope, RESEND_EMAILS_ENDPOINT).await
+}
+
+async fn send_resend_frozen_email_to(
+    http: &reqwest::Client,
+    api_key: &str,
+    envelope: FrozenEmailEnvelope<'_>,
+    endpoint: &str,
+) -> Result<String, DeliveryFailure> {
     let response = http
         .post(endpoint)
         .bearer_auth(api_key)
-        .header("Idempotency-Key", &batch.idempotency_key)
+        .header("Idempotency-Key", envelope.idempotency_key)
         .json(&ResendEmailRequest {
-            from: &batch.from,
-            to: [&batch.recipient],
-            subject: &batch.subject,
-            html: &batch.html,
-            text: (!batch.text.trim().is_empty()).then_some(batch.text.as_str()),
-            reply_to: batch.reply_to.as_deref(),
+            from: envelope.from,
+            to: [envelope.recipient],
+            subject: envelope.subject,
+            html: envelope.html,
+            text: (!envelope.text.trim().is_empty()).then_some(envelope.text),
+            reply_to: envelope.reply_to,
         })
         .send()
         .await
@@ -759,7 +801,7 @@ fn parse_retry_after(value: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         .map(|value| value.min(now + chrono::Duration::hours(24)))
 }
 
-fn retry_delay_secs(attempts: u32, stable_id: &str) -> i64 {
+pub(crate) fn retry_delay_secs(attempts: u32, stable_id: &str) -> i64 {
     let exponent = attempts.min(9);
     let base = 30_i64.saturating_mul(1_i64 << exponent).min(6 * 60 * 60);
     let jitter_seed = stable_id.bytes().fold(0_u64, |acc, byte| {
@@ -982,7 +1024,7 @@ fn truncate_error(value: &str) -> String {
     value.chars().take(1_000).collect()
 }
 
-fn sanitize_delivery_error(value: &str) -> String {
+pub(crate) fn sanitize_delivery_error(value: &str) -> String {
     truncate_error(&mask_email_like_tokens(value))
 }
 
@@ -999,9 +1041,10 @@ pub struct RegistrationEmailData {
     pub platform: String,
     pub version: Option<String>,
     pub country_code: Option<String>,
-    pub registered_at: String,
+    pub setup_completed_at: String,
     pub owner_email: Option<String>,
     pub client_url: Option<String>,
+    pub password_hint: Option<String>,
     pub dashboard_url: String,
 }
 
@@ -1029,6 +1072,7 @@ pub struct OfflineEmailData {
 pub struct DigestEmailClient {
     pub installation_id: String,
     pub client_url: Option<String>,
+    pub password_hint: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1046,11 +1090,15 @@ pub fn render_registration_email(data: &RegistrationEmailData) -> RenderedNotifi
     let rows = vec![
         ("Client", id),
         ("Client URL", display_value(data.client_url.as_deref())),
+        ("Web 密码提示", display_value(data.password_hint.as_deref())),
         ("Owner", display_value(data.owner_email.as_deref())),
         ("Platform", display_value(Some(&data.platform))),
         ("Version", display_value(data.version.as_deref())),
         ("Country", display_value(data.country_code.as_deref())),
-        ("Registered", display_value(Some(&data.registered_at))),
+        (
+            "Setup completed",
+            display_value(Some(&data.setup_completed_at)),
+        ),
     ];
     let action_url = data.client_url.as_deref().unwrap_or(&data.dashboard_url);
     let action_label = if data.client_url.is_some() {
@@ -1067,7 +1115,7 @@ pub fn render_registration_email(data: &RegistrationEmailData) -> RenderedNotifi
         action_url,
         dashboard_url: &data.dashboard_url,
         note: Some(
-            "Use the Web password configured on the Client to sign in. For security, the Router never receives or emails that password.",
+            "这不是完整密码。This is not the complete password. Use the full Web password configured during setup; the Router never receives or emails the complete password.",
         ),
         extra_html: "",
         extra_text: "",
@@ -1163,14 +1211,24 @@ pub fn render_digest_email(data: &DigestEmailData) -> RenderedNotificationEmail 
         .take(MAX_DIGEST_CLIENTS)
         .map(|client| {
             let id = html_escape(&short_installation_id(&client.installation_id));
-            match client.client_url.as_deref() {
-                Some(url) => format!(
-                    "<li style=\"margin:0 0 6px\"><a href=\"{}\" style=\"color:#0f766e\">{}</a></li>",
-                    html_escape(url),
-                    id
-                ),
-                None => format!("<li style=\"margin:0 0 6px\">{id}</li>"),
-            }
+            let client_url = client.client_url.as_deref().map_or_else(
+                || "Not available".to_string(),
+                |url| {
+                    let escaped = html_escape(url);
+                    format!(
+                        "<a href=\"{escaped}\" style=\"color:#0f766e;word-break:break-all\">{escaped}</a>"
+                    )
+                },
+            );
+            let password_hint = client.password_hint.as_deref().map_or_else(String::new, |hint| {
+                format!(
+                    "<br><span style=\"color:#64748b\">Web 密码提示:</span> <code>{}</code>",
+                    html_escape(hint)
+                )
+            });
+            format!(
+                "<li style=\"margin:0 0 14px\"><strong>{id}</strong><br><span style=\"color:#64748b\">Client URL:</span> {client_url}{password_hint}</li>"
+            )
         })
         .collect::<Vec<_>>()
         .join("");
@@ -1178,12 +1236,16 @@ pub fn render_digest_email(data: &DigestEmailData) -> RenderedNotificationEmail 
         .clients
         .iter()
         .take(MAX_DIGEST_CLIENTS)
-        .map(|client| match client.client_url.as_deref() {
-            Some(url) => format!(
-                "- {}: {url}",
+        .map(|client| {
+            let url = client.client_url.as_deref().unwrap_or("Not available");
+            let hint = client
+                .password_hint
+                .as_deref()
+                .map_or_else(String::new, |hint| format!("\n  Web 密码提示: {hint}"));
+            format!(
+                "- {}\n  Client URL: {url}{hint}",
                 short_installation_id(&client.installation_id)
-            ),
-            None => format!("- {}", short_installation_id(&client.installation_id)),
+            )
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -1208,6 +1270,10 @@ pub fn render_digest_email(data: &DigestEmailData) -> RenderedNotificationEmail 
         data.clients.len(),
         event_label
     );
+    let includes_password_hints = data
+        .clients
+        .iter()
+        .any(|client| client.password_hint.is_some());
     let (html, text) = render_email_document(EmailDocument {
         title: prefix,
         preheader: &format!(
@@ -1220,7 +1286,9 @@ pub fn render_digest_email(data: &DigestEmailData) -> RenderedNotificationEmail 
         action_label: "Open Router dashboard",
         action_url: &data.dashboard_url,
         dashboard_url: &data.dashboard_url,
-        note: None,
+        note: includes_password_hints.then_some(
+            "这不是完整密码。Each Web password hint is partial, not the complete password. Use the full password configured during that Client's setup.",
+        ),
         extra_html: &extra_html,
         extra_text: &extra_text,
     });
@@ -1724,6 +1792,7 @@ mod tests {
                 .map(|index| DigestEmailClient {
                     installation_id: format!("client-{index:04}"),
                     client_url: Some(format!("https://client-{index:04}.example.com/")),
+                    password_hint: None,
                 })
                 .collect(),
             occurred_at: "2026-07-15T12:00:00Z".into(),
@@ -1736,22 +1805,54 @@ mod tests {
     }
 
     #[test]
-    fn registration_template_includes_client_url_but_never_a_web_password() {
+    fn registration_template_includes_authoritative_url_and_partial_password_hint() {
         let email = render_registration_email(&RegistrationEmailData {
             installation_id: "12345678-secret-rest".into(),
             platform: "linux".into(),
             version: Some("1.2.3".into()),
             country_code: Some("US".into()),
-            registered_at: "2026-07-15T12:00:00Z".into(),
+            setup_completed_at: "2026-07-15T12:00:00Z".into(),
             owner_email: Some("owner@example.com".into()),
             client_url: Some("https://client.example.com/".into()),
+            password_hint: Some("p******w".into()),
             dashboard_url: "https://router.example.com/".into(),
         });
 
         for body in [&email.html, &email.text] {
             assert!(body.contains("https://client.example.com/"));
-            assert!(body.contains("Router never receives or emails"));
-            assert!(!body.to_ascii_lowercase().contains("plaintext password"));
+            assert!(body.contains("p******w"));
+            assert!(body.contains("not the complete password"));
+            assert!(!body.contains("paraview"));
+        }
+    }
+
+    #[test]
+    fn registration_digest_lists_each_url_and_partial_password_hint() {
+        let email = render_digest_email(&DigestEmailData {
+            event_label: "registrations".into(),
+            incident: false,
+            clients: vec![
+                DigestEmailClient {
+                    installation_id: "client-a-long-id".into(),
+                    client_url: Some("https://client-a.example.com/".into()),
+                    password_hint: Some("p******w".into()),
+                },
+                DigestEmailClient {
+                    installation_id: "client-b-long-id".into(),
+                    client_url: Some("https://client-b.example.com/".into()),
+                    password_hint: Some("s******t".into()),
+                },
+            ],
+            occurred_at: "2026-07-15T12:00:00Z".into(),
+            dashboard_url: "https://router.example.com/".into(),
+        });
+
+        for body in [&email.html, &email.text] {
+            assert!(body.contains("https://client-a.example.com/"));
+            assert!(body.contains("https://client-b.example.com/"));
+            assert!(body.contains("p******w"));
+            assert!(body.contains("s******t"));
+            assert!(body.contains("partial"));
         }
     }
 

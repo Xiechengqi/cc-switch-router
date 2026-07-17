@@ -1,6 +1,6 @@
 "use client";
 
-import { BoardDock } from "@/components/board/board-dock";
+import { ClientChatProvider } from "@/components/chat/client-chat";
 import { ClientConsoleDock, ClientConsoleManagerProvider, ClientConsoleWindowLayer } from "@/components/dashboard/client-console";
 import { PresenceFooter } from "@/components/dashboard/data-tables";
 import { DashboardFocusProvider } from "@/components/dashboard/dashboard-focus";
@@ -14,17 +14,18 @@ export function DashboardLayout({ children }: { children: React.ReactNode }) {
   return (
     <DashboardFocusProvider data={data}>
       <DashboardViewStateProvider>
-        <OperationVerificationProvider data={data}>
-          <ClientConsoleManagerProvider>
-            <div className="flex flex-1 flex-col">
-              <div className="flex-1">{children}</div>
-              <PresenceFooter />
-            </div>
-            <ClientConsoleWindowLayer />
-            <ClientConsoleDock />
-            <BoardDock />
-          </ClientConsoleManagerProvider>
-        </OperationVerificationProvider>
+        <ClientChatProvider>
+          <OperationVerificationProvider data={data}>
+            <ClientConsoleManagerProvider>
+              <div className="flex flex-1 flex-col">
+                <div className="flex-1">{children}</div>
+                <PresenceFooter />
+              </div>
+              <ClientConsoleWindowLayer />
+              <ClientConsoleDock />
+            </ClientConsoleManagerProvider>
+          </OperationVerificationProvider>
+        </ClientChatProvider>
       </DashboardViewStateProvider>
     </DashboardFocusProvider>
   );

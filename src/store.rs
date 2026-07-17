@@ -40,8 +40,10 @@ use crate::models::{
     HealthTimelineBucket, ImageGenerationRequestLogEntry, Installation,
     InstallationHeartbeatRequest, InstallationHeartbeatResponse,
     InstallationPayoutProfileUpdateRequest, InstallationPayoutProfileUpdateResponse,
-    InstallationUpgradeView, InstallationView, IssueLeaseRequest, IssueLeaseResponse, LatLonPoint,
-    MapDisplaySettings, MapDisplaySettingsUpdate, MapViewportSettings, MarketAppAvailability,
+    InstallationSetupCompletedPayload, InstallationSetupCompletedRequest,
+    InstallationSetupCompletedResponse, InstallationSetupCompletedStatus, InstallationUpgradeView,
+    InstallationView, IssueLeaseRequest, IssueLeaseResponse, LatLonPoint, MapDisplaySettings,
+    MapDisplaySettingsUpdate, MapViewportSettings, MarketAppAvailability,
     MarketAppAvailabilityEntry, MarketDisabledSharesUpdateRequest,
     MarketDisabledSharesUpdateResponse, MarketLinkedShareView, MarketMaintenanceUpdateRequest,
     MarketMaintenanceUpdateResponse, MarketRegistryRecord, MarketRequestLogBatchSyncRequest,
@@ -89,6 +91,8 @@ use crate::registration_admission::{
     RegistrationAdmissionPolicy, RegistrationQuotaWindow, registration_source_scope,
 };
 
+mod client_chat;
+
 const SHARE_REQUEST_LOG_RECOVERY_LIMIT: usize = 10;
 pub const IMAGE_GENERATION_REQUEST_LOG_RETAIN_PER_SHARE: usize = 10;
 const SHARE_MODEL_HEALTH_CHECK_LIMIT: usize = 10;
@@ -105,10 +109,18 @@ const SHARE_PRUNE_MAX_ID_BYTES: usize = 512;
 const NONCE_RETENTION_SECS: i64 = 10 * 60;
 const CLIENT_NOTIFICATION_AUDIT_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 const CLIENT_NOTIFICATION_REGISTRATION_PENDING_TTL_SECS: i64 = 60 * 60;
+// Temporary mixed-version bridge. Remove after every supported Server release
+// reports setup completion explicitly and the oldest deployed version is retired.
+const LEGACY_SETUP_FALLBACK_GRACE_SECS: i64 = 30 * 60;
+#[cfg(test)]
 const CLIENT_NOTIFICATION_REGISTRATION_EVENT_HIGH_WATERMARK: i64 = 5_000;
+#[cfg(test)]
 const CLIENT_NOTIFICATION_REGISTRATION_EVENT_LOW_WATERMARK: i64 = 4_000;
+#[cfg(test)]
 const CLIENT_NOTIFICATION_REGISTRATION_BATCH_HIGH_WATERMARK: i64 = 500;
+#[cfg(test)]
 const CLIENT_NOTIFICATION_REGISTRATION_BATCH_LOW_WATERMARK: i64 = 400;
+#[cfg(test)]
 const CLIENT_NOTIFICATION_REGISTRATION_OVERFLOW_WINDOW_SECS: i64 = 5 * 60;
 const CLIENT_NOTIFICATION_AUDIT_HIGH_WATERMARK: i64 = 100_000;
 const CLIENT_NOTIFICATION_AUDIT_TARGET: i64 = 80_000;
@@ -967,12 +979,31 @@ struct PendingClientNotificationEvent {
     snapshot: serde_json::Value,
     verified_owner_email: Option<String>,
     tunnel_subdomain: Option<String>,
+    password_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ClientNotificationRecipient {
     email: String,
     priority: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LegacySetupNotificationState {
+    None,
+    Adopt {
+        event_id: String,
+    },
+    InFlight {
+        event_id: String,
+    },
+    Sent {
+        event_id: String,
+    },
+    Terminal {
+        event_id: String,
+        suppressed_disabled: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1036,6 +1067,7 @@ pub struct CleanupResult {
     pub deleted_notification_batches: usize,
     pub deleted_notification_events: usize,
     pub deleted_notification_send_logs: usize,
+    pub deleted_chat_rooms: usize,
     pub removed_routes: usize,
 }
 
@@ -1047,6 +1079,7 @@ impl CleanupResult {
             || self.deleted_notification_batches > 0
             || self.deleted_notification_events > 0
             || self.deleted_notification_send_logs > 0
+            || self.deleted_chat_rooms > 0
             || self.removed_routes > 0
     }
 }
@@ -1441,6 +1474,294 @@ impl AppStore {
         })
     }
 
+    pub async fn complete_installation_setup(
+        &self,
+        input: InstallationSetupCompletedRequest,
+    ) -> Result<InstallationSetupCompletedResponse, AppError> {
+        if input.protocol_epoch != PROTOCOL_EPOCH {
+            return Err(AppError::BadRequest(
+                "unsupported installation setup protocol epoch".into(),
+            ));
+        }
+        validate_installation_setup_completed_payload(&input.setup)?;
+        validate_request_nonce(&input.nonce)?;
+
+        let now = Utc::now();
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "begin installation setup completion failed: {error}"
+                ))
+            })?;
+        let installation = get_installation(&tx, &input.installation_id)?
+            .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
+        verify_signed_share_request(
+            &tx,
+            &installation.public_key,
+            &input.installation_id,
+            "installation_setup_completed_v1",
+            &input.setup,
+            input.timestamp_ms,
+            &input.nonce,
+            &input.signature,
+        )?;
+
+        let existing_setup = tx
+            .query_row(
+                "SELECT setup_id, notification_status, source, event_id
+                 FROM installation_setup_completions
+                 WHERE installation_id = ?1",
+                params![input.installation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "query installation setup completion failed: {error}"
+                ))
+            })?;
+        if let Some((setup_id, notification_status, source, _)) = &existing_setup
+            && source == "explicit"
+        {
+            tx.commit().map_err(|error| {
+                AppError::Internal(format!(
+                    "commit duplicate installation setup completion failed: {error}"
+                ))
+            })?;
+            return Ok(InstallationSetupCompletedResponse {
+                ok: true,
+                setup_id: setup_id.clone(),
+                status: if notification_status == "suppressed_disabled" {
+                    InstallationSetupCompletedStatus::SuppressedDisabled
+                } else {
+                    InstallationSetupCompletedStatus::AlreadyRecorded
+                },
+            });
+        }
+        if let Some((_, _, source, _)) = &existing_setup
+            && source != "legacy_fallback"
+        {
+            return Err(AppError::Internal(format!(
+                "invalid setup completion source stored in database: {source}"
+            )));
+        }
+
+        let owner_email = verified_installation_owner_email(&installation)?;
+        let tunnel = get_client_tunnel_by_installation(&tx, &input.installation_id)?
+            .filter(|tunnel| tunnel.enabled)
+            .ok_or_else(|| {
+                AppError::Conflict(
+                    "an enabled client tunnel is required before setup can complete".into(),
+                )
+            })?;
+        if !tunnel.owner_email.eq_ignore_ascii_case(&owner_email) {
+            return Err(AppError::Conflict(
+                "client tunnel owner does not match installation owner".into(),
+            ));
+        }
+
+        let snapshot = serde_json::json!({
+            "installationId": installation.id,
+            "platform": installation.platform,
+            "appVersion": installation.app_version,
+            "countryCode": installation.country_code,
+            "registeredAt": installation.created_at,
+            "setupId": input.setup.setup_id,
+            "setupCompletedAt": now,
+            "triggerSource": "server_setup",
+            "tunnelSubdomain": tunnel.subdomain,
+        });
+        let legacy_state =
+            prepare_legacy_setup_notification_adoption_tx(&tx, &installation.id, now)?;
+        let notifications_enabled = client_notification_runtime_enabled(&tx)?;
+        let (event_id, notification_status, response_status, retain_password_hint) =
+            match legacy_state {
+                LegacySetupNotificationState::Sent { event_id }
+                | LegacySetupNotificationState::InFlight { event_id } => (
+                    Some(event_id),
+                    "queued",
+                    InstallationSetupCompletedStatus::AlreadyRecorded,
+                    false,
+                ),
+                LegacySetupNotificationState::Terminal {
+                    event_id,
+                    suppressed_disabled,
+                } => (
+                    Some(event_id),
+                    if suppressed_disabled {
+                        "suppressed_disabled"
+                    } else {
+                        "queued"
+                    },
+                    if suppressed_disabled {
+                        InstallationSetupCompletedStatus::SuppressedDisabled
+                    } else {
+                        InstallationSetupCompletedStatus::AlreadyRecorded
+                    },
+                    false,
+                ),
+                LegacySetupNotificationState::Adopt { event_id } => {
+                    let event_status = if notifications_enabled {
+                        "pending"
+                    } else {
+                        "suppressed_disabled"
+                    };
+                    tx.execute(
+                        "UPDATE client_notification_events
+                         SET dedupe_key = ?2, status = ?3, occurred_at = ?4, not_before = ?4,
+                             snapshot_json = ?5, suppression_reason = ?6, updated_at = ?4
+                         WHERE id = ?1",
+                        params![
+                            event_id,
+                            format!("setup:{}", installation.id),
+                            event_status,
+                            now.to_rfc3339(),
+                            snapshot.to_string(),
+                            (!notifications_enabled).then_some("notifications disabled"),
+                        ],
+                    )
+                    .map_err(|error| {
+                        AppError::Internal(format!(
+                            "adopt legacy setup notification event failed: {error}"
+                        ))
+                    })?;
+                    (
+                        Some(event_id),
+                        if notifications_enabled {
+                            "queued"
+                        } else {
+                            "suppressed_disabled"
+                        },
+                        if notifications_enabled {
+                            InstallationSetupCompletedStatus::Queued
+                        } else {
+                            InstallationSetupCompletedStatus::SuppressedDisabled
+                        },
+                        notifications_enabled,
+                    )
+                }
+                LegacySetupNotificationState::None if existing_setup.is_some() => {
+                    let (_, notification_status, _, event_id) = existing_setup
+                        .as_ref()
+                        .expect("legacy setup receipt checked above");
+                    (
+                        event_id.clone(),
+                        notification_status.as_str(),
+                        if notification_status == "suppressed_disabled" {
+                            InstallationSetupCompletedStatus::SuppressedDisabled
+                        } else {
+                            InstallationSetupCompletedStatus::AlreadyRecorded
+                        },
+                        false,
+                    )
+                }
+                LegacySetupNotificationState::None => {
+                    let event_id = Uuid::new_v4().to_string();
+                    let event_status = if notifications_enabled {
+                        "pending"
+                    } else {
+                        "suppressed_disabled"
+                    };
+                    tx.execute(
+                        "INSERT INTO client_notification_events (
+                            id, dedupe_key, kind, installation_id, episode, status, occurred_at,
+                            not_before, snapshot_json, suppression_reason, created_at, updated_at
+                         ) VALUES (?1, ?2, 'client_registered', ?3, 0, ?4, ?5, ?5, ?6, ?7, ?5, ?5)",
+                        params![
+                            event_id,
+                            format!("setup:{}", installation.id),
+                            installation.id,
+                            event_status,
+                            now.to_rfc3339(),
+                            snapshot.to_string(),
+                            (!notifications_enabled).then_some("notifications disabled"),
+                        ],
+                    )
+                    .map_err(|error| {
+                        AppError::Internal(format!(
+                            "insert setup-completed client notification failed: {error}"
+                        ))
+                    })?;
+                    (
+                        Some(event_id),
+                        if notifications_enabled {
+                            "queued"
+                        } else {
+                            "suppressed_disabled"
+                        },
+                        if notifications_enabled {
+                            InstallationSetupCompletedStatus::Queued
+                        } else {
+                            InstallationSetupCompletedStatus::SuppressedDisabled
+                        },
+                        notifications_enabled,
+                    )
+                }
+            };
+        if existing_setup.is_some() {
+            tx.execute(
+                "UPDATE installation_setup_completions
+                 SET setup_id = ?2, source = 'explicit', password_hint = ?3,
+                     notification_status = ?4, event_id = COALESCE(?5, event_id),
+                     completed_at = ?6, updated_at = ?6
+                 WHERE installation_id = ?1 AND source = 'legacy_fallback'",
+                params![
+                    input.installation_id,
+                    input.setup.setup_id,
+                    retain_password_hint.then_some(input.setup.password_hint.as_str()),
+                    notification_status,
+                    event_id,
+                    now.to_rfc3339(),
+                ],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "replace legacy setup completion receipt failed: {error}"
+                ))
+            })?;
+        } else {
+            tx.execute(
+                "INSERT INTO installation_setup_completions (
+                    installation_id, setup_id, source, password_hint, notification_status,
+                    event_id, completed_at, created_at, updated_at
+                 ) VALUES (?1, ?2, 'explicit', ?3, ?4, ?5, ?6, ?6, ?6)",
+                params![
+                    input.installation_id,
+                    input.setup.setup_id,
+                    retain_password_hint.then_some(input.setup.password_hint.as_str()),
+                    notification_status,
+                    event_id,
+                    now.to_rfc3339(),
+                ],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "persist installation setup completion failed: {error}"
+                ))
+            })?;
+        }
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!(
+                "commit installation setup completion failed: {error}"
+            ))
+        })?;
+
+        Ok(InstallationSetupCompletedResponse {
+            ok: true,
+            setup_id: input.setup.setup_id,
+            status: response_status,
+        })
+    }
+
     pub async fn sync_client_notification_runtime(
         &self,
         policy: &ClientNotificationPolicy,
@@ -1671,6 +1992,8 @@ impl AppStore {
             }
         }
 
+        clear_inactive_setup_password_hints_tx(&tx, now)?;
+
         tx.commit().map_err(|error| {
             AppError::Internal(format!(
                 "commit client notification reconcile failed: {error}"
@@ -1734,8 +2057,10 @@ impl AppStore {
         }
         if lane == NotificationLane::Registration {
             materialize_registration_overflow_events_tx(&tx, now)?;
+            activate_legacy_setup_fallback_events_tx(&tx, now)?;
             expire_stale_registration_notification_events_tx(&tx, now)?;
             activate_registration_events_with_verified_owner_tx(&tx, now)?;
+            clear_inactive_setup_password_hints_tx(&tx, now)?;
         }
         let cutoff = now - Duration::seconds(policy.batch_window_secs.max(1));
         let events = load_pending_notification_events(&tx, now, cutoff, lane)?;
@@ -2053,6 +2378,7 @@ impl AppStore {
                 })?;
             }
         }
+        clear_inactive_setup_password_hints_tx(&tx, now)?;
         tx.commit().map_err(|error| {
             AppError::Internal(format!("commit notification aggregation failed: {error}"))
         })?;
@@ -2662,6 +2988,7 @@ impl AppStore {
                 AppError::Internal(format!("record sent client notification failed: {error}"))
             })?;
         }
+        clear_inactive_setup_password_hints_tx(&tx, now)?;
         tx.commit().map_err(|error| {
             AppError::Internal(format!("commit notification batch finish failed: {error}"))
         })?;
@@ -3002,6 +3329,12 @@ impl AppStore {
             false
         };
         if already_bound && installation.owner_verified_at.is_some() {
+            client_chat::ensure_room_for_verified_owner_tx(
+                &conn,
+                &input.installation_id,
+                &email,
+                now,
+            )?;
             return Ok(BindInstallationOwnerEmailResponse {
                 ok: true,
                 owner_email: email,
@@ -3073,6 +3406,12 @@ impl AppStore {
                 AppError::Internal(format!("read installation owner verification failed: {e}"))
             })?;
         if owner_verified {
+            client_chat::ensure_room_for_verified_owner_tx(
+                &conn,
+                &input.installation_id,
+                &email,
+                now,
+            )?;
             refresh_registration_notification_snapshots_tx(
                 &conn,
                 &input.installation_id,
@@ -3080,9 +3419,6 @@ impl AppStore {
                 now,
             )?;
             activate_registration_events_for_installation_tx(&conn, &input.installation_id, now)?;
-            if let Some(installation) = get_installation(&conn, &input.installation_id)? {
-                maybe_emit_client_registration_event(&conn, &installation, now)?;
-            }
         }
 
         Ok(BindInstallationOwnerEmailResponse {
@@ -3183,6 +3519,12 @@ impl AppStore {
             params![input.installation_id, new_email, now.to_rfc3339()],
         )
         .map_err(|e| AppError::Internal(format!("change client tunnel owner failed: {e}")))?;
+        client_chat::ensure_room_for_verified_owner_tx(
+            &tx,
+            &input.installation_id,
+            &new_email,
+            now,
+        )?;
         tx.commit()
             .map_err(|e| AppError::Internal(format!("commit owner email change failed: {e}")))?;
 
@@ -3843,6 +4185,14 @@ impl AppStore {
             ],
             )
             .map_err(map_client_tunnel_constraint_error)?;
+            if action == "client_tunnel_claim" && signed_payload.enabled {
+                insert_legacy_setup_fallback_tx(
+                    &tx,
+                    &installation,
+                    &signed_payload.subdomain,
+                    now,
+                )?;
+            }
             tx.commit().map_err(|e| {
                 AppError::Internal(format!("commit client tunnel claim failed: {e}"))
             })?;
@@ -6932,6 +7282,7 @@ impl AppStore {
                     health_timeline = current_online_health_timeline(health_timeline_start);
                 }
                 let mut view = DashboardClientView {
+                    chat_available: installation.owner_email.is_some(),
                     share_count,
                     share_ids,
                     client_tunnel,
@@ -7288,10 +7639,10 @@ impl AppStore {
                            AND NOT EXISTS (
                                SELECT 1 FROM client_notification_events e
                                WHERE e.installation_id = i.id
-                                 AND e.kind = 'client_offline'
                                  AND (
-                                     e.status = 'pending'
-                                     OR (e.status = 'batched' AND EXISTS (
+                                     (e.kind = 'client_registered' AND e.status = 'awaiting_setup')
+                                     OR (e.kind = 'client_offline' AND e.status = 'pending')
+                                     OR (e.kind = 'client_offline' AND e.status = 'batched' AND EXISTS (
                                          SELECT 1
                                          FROM email_delivery_batch_items bi
                                          INNER JOIN email_delivery_batches b ON b.id = bi.batch_id
@@ -7636,7 +7987,8 @@ impl AppStore {
             let deleted_notification_events = bounded_notification_events
                 + tx.execute(
                     "DELETE FROM client_notification_events
-                     WHERE updated_at < ?1 AND status != 'pending'
+                     WHERE updated_at < ?1
+                       AND status NOT IN ('pending', 'awaiting_owner', 'awaiting_setup')
                        AND NOT EXISTS (
                            SELECT 1 FROM email_delivery_batch_items bi
                            WHERE bi.event_id = client_notification_events.id
@@ -7660,6 +8012,10 @@ impl AppStore {
                     ))
                 })? as usize;
 
+            let deleted_chat_rooms = client_chat::cleanup_expired_rooms_tx(&tx, Utc::now())?;
+
+            clear_inactive_setup_password_hints_tx(&tx, Utc::now())?;
+
             tx.commit()
                 .map_err(|e| AppError::Internal(format!("commit cleanup tx failed: {e}")))?;
 
@@ -7676,6 +8032,7 @@ impl AppStore {
                     deleted_notification_batches,
                     deleted_notification_events,
                     deleted_notification_send_logs,
+                    deleted_chat_rooms,
                     removed_routes: 0,
                 },
                 stale_subdomains,
@@ -10687,6 +11044,7 @@ fn delete_share_auxiliary_rows_tx(conn: &Connection, share_id: &str) -> Result<(
 }
 
 fn purge_installation_data_tx(conn: &Connection, installation_id: &str) -> Result<(), AppError> {
+    client_chat::archive_room_for_installation_tx(conn, installation_id, Utc::now())?;
     let share_ids = {
         let mut stmt = conn
             .prepare("SELECT share_id FROM shares WHERE installation_id = ?1")
@@ -11613,6 +11971,22 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             updated_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS installation_setup_completions (
+            installation_id TEXT PRIMARY KEY,
+            setup_id TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'explicit'
+                CHECK (source IN ('explicit', 'legacy_fallback')),
+            password_hint TEXT,
+            notification_status TEXT NOT NULL
+                CHECK (notification_status IN ('queued', 'suppressed_disabled')),
+            event_id TEXT,
+            completed_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (installation_id) REFERENCES installations(id) ON DELETE CASCADE,
+            FOREIGN KEY (event_id) REFERENCES client_notification_events(id) ON DELETE SET NULL
+        );
+
         CREATE TABLE IF NOT EXISTS email_delivery_batches (
             id TEXT PRIMARY KEY,
             notification_lane TEXT NOT NULL DEFAULT 'registration'
@@ -11846,6 +12220,8 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             ON client_notification_events(installation_id, kind, status);
         CREATE INDEX IF NOT EXISTS idx_client_notification_events_storm
             ON client_notification_events(status, occurred_at, kind, installation_id);
+        CREATE INDEX IF NOT EXISTS idx_installation_setup_completions_event
+            ON installation_setup_completions(event_id);
         CREATE INDEX IF NOT EXISTS idx_email_delivery_batches_claim
             ON email_delivery_batches(status, next_attempt_at, not_before, claim_expires_at);
         CREATE INDEX IF NOT EXISTS idx_email_delivery_batches_send_cap
@@ -11956,6 +12332,12 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         "leases",
         "protocol_epoch",
         "TEXT NOT NULL DEFAULT 'namespace-flat-1'",
+    )?;
+    add_column_if_missing(
+        conn,
+        "installation_setup_completions",
+        "source",
+        "TEXT NOT NULL DEFAULT 'explicit' CHECK (source IN ('explicit', 'legacy_fallback'))",
     )?;
     add_column_if_missing(conn, "leases", "router_id", "TEXT NOT NULL DEFAULT ''")?;
     add_column_if_missing(conn, "leases", "route_id", "TEXT NOT NULL DEFAULT ''")?;
@@ -12667,6 +13049,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         [],
     )
     .map_err(|e| AppError::Internal(format!("backfill installation owner email failed: {e}")))?;
+    client_chat::init_schema(conn)?;
     conn.execute(
         "INSERT OR IGNORE INTO installation_notification_state (
             installation_id, registration_state, monitoring_enabled, presence_state,
@@ -12792,18 +13175,430 @@ fn client_notification_runtime_enabled(conn: &Connection) -> Result<bool, AppErr
     })
 }
 
+fn insert_legacy_setup_fallback_tx(
+    conn: &Connection,
+    installation: &Installation,
+    tunnel_subdomain: &str,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    if now.signed_duration_since(installation.created_at)
+        > Duration::seconds(LEGACY_SETUP_FALLBACK_GRACE_SECS)
+    {
+        return Ok(());
+    }
+    let already_tracked = conn
+        .query_row(
+            "SELECT
+                EXISTS(SELECT 1 FROM installation_setup_completions WHERE installation_id = ?1)
+                OR EXISTS(
+                    SELECT 1 FROM client_notification_events
+                    WHERE installation_id = ?1 AND kind = 'client_registered'
+                )",
+            params![installation.id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("check legacy setup fallback state failed: {error}"))
+        })?;
+    if already_tracked {
+        return Ok(());
+    }
+
+    let notifications_enabled = client_notification_runtime_enabled(conn)?;
+    let status = if notifications_enabled {
+        "awaiting_setup"
+    } else {
+        "suppressed_disabled"
+    };
+    let not_before = if notifications_enabled {
+        now + Duration::seconds(LEGACY_SETUP_FALLBACK_GRACE_SECS)
+    } else {
+        now
+    };
+    let snapshot = serde_json::json!({
+        "installationId": installation.id,
+        "platform": installation.platform,
+        "appVersion": installation.app_version,
+        "countryCode": installation.country_code,
+        "registeredAt": installation.created_at,
+        "setupCompletedAt": now,
+        "triggerSource": "legacy_client_tunnel_claim",
+        "tunnelSubdomain": tunnel_subdomain,
+    });
+    let event_id = Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO client_notification_events (
+            id, dedupe_key, kind, installation_id, episode, status, occurred_at,
+            not_before, snapshot_json, suppression_reason, created_at, updated_at
+         ) VALUES (?1, ?2, 'client_registered', ?3, 0, ?4, ?5, ?6, ?7, ?8, ?5, ?5)",
+        params![
+            event_id,
+            format!("legacy-setup-fallback:{}", installation.id),
+            installation.id,
+            status,
+            now.to_rfc3339(),
+            not_before.to_rfc3339(),
+            snapshot.to_string(),
+            (!notifications_enabled).then_some("notifications disabled"),
+        ],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "insert legacy setup notification fallback failed: {error}"
+        ))
+    })?;
+    if !notifications_enabled {
+        insert_legacy_setup_completion_receipt_tx(
+            conn,
+            &installation.id,
+            &event_id,
+            "suppressed_disabled",
+            now,
+        )?;
+    }
+    Ok(())
+}
+
+fn insert_legacy_setup_completion_receipt_tx(
+    conn: &Connection,
+    installation_id: &str,
+    event_id: &str,
+    notification_status: &str,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    conn.execute(
+        "INSERT INTO installation_setup_completions (
+            installation_id, setup_id, source, password_hint, notification_status,
+            event_id, completed_at, created_at, updated_at
+         ) VALUES (?1, ?2, 'legacy_fallback', NULL, ?3, ?4, ?5, ?5, ?5)",
+        params![
+            installation_id,
+            Uuid::new_v4().to_string(),
+            notification_status,
+            event_id,
+            now.to_rfc3339(),
+        ],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "persist legacy setup notification receipt failed: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+fn activate_legacy_setup_fallback_events_tx(
+    conn: &Connection,
+    now: DateTime<Utc>,
+) -> Result<usize, AppError> {
+    let timestamp = now.to_rfc3339();
+    let cutoff = (now - Duration::seconds(LEGACY_SETUP_FALLBACK_GRACE_SECS)).to_rfc3339();
+    let candidates = {
+        let mut statement = conn
+            .prepare(
+                "SELECT e.id, e.installation_id
+                 FROM client_notification_events e
+                 WHERE e.status = 'awaiting_setup'
+                   AND e.dedupe_key LIKE 'legacy-setup-fallback:%'
+                   AND e.occurred_at <= ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM installation_setup_completions isc
+                       WHERE isc.installation_id = e.installation_id
+                   )
+                   AND EXISTS (
+                       SELECT 1 FROM installations i
+                       WHERE i.id = e.installation_id
+                         AND i.owner_verified_at IS NOT NULL
+                         AND i.owner_email IS NOT NULL
+                         AND TRIM(i.owner_email) != ''
+                   )
+                   AND EXISTS (
+                       SELECT 1 FROM installation_client_tunnels ict
+                       WHERE ict.installation_id = e.installation_id AND ict.enabled = 1
+                   )
+                 ORDER BY e.occurred_at, e.id",
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "prepare legacy setup fallback activation failed: {error}"
+                ))
+            })?;
+        let rows = statement
+            .query_map(params![cutoff], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "query legacy setup fallback activation failed: {error}"
+                ))
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+            AppError::Internal(format!(
+                "read legacy setup fallback activation failed: {error}"
+            ))
+        })?
+    };
+    let mut activated = 0;
+    for (event_id, installation_id) in candidates {
+        let changed = conn
+            .execute(
+                "UPDATE client_notification_events
+                 SET status = 'pending', occurred_at = ?2, not_before = ?2,
+                     suppression_reason = NULL, updated_at = ?2
+                 WHERE id = ?1 AND status = 'awaiting_setup'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM installation_setup_completions isc
+                       WHERE isc.installation_id = client_notification_events.installation_id
+                   )",
+                params![event_id, timestamp],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "activate legacy setup notification fallback failed: {error}"
+                ))
+            })?;
+        if changed == 0 {
+            continue;
+        }
+        insert_legacy_setup_completion_receipt_tx(
+            conn,
+            &installation_id,
+            &event_id,
+            "queued",
+            now,
+        )?;
+        activated += 1;
+    }
+    Ok(activated)
+}
+
+fn prepare_legacy_setup_notification_adoption_tx(
+    conn: &Connection,
+    installation_id: &str,
+    now: DateTime<Utc>,
+) -> Result<LegacySetupNotificationState, AppError> {
+    let events = {
+        let mut statement = conn
+            .prepare(
+                "SELECT e.id, e.status,
+                        EXISTS(
+                            SELECT 1 FROM email_delivery_batch_items bi
+                            INNER JOIN email_delivery_batches b ON b.id = bi.batch_id
+                            WHERE bi.event_id = e.id AND b.status = 'sent'
+                        ),
+                        EXISTS(
+                            SELECT 1 FROM email_delivery_batch_items bi
+                            INNER JOIN email_delivery_batches b ON b.id = bi.batch_id
+                            WHERE bi.event_id = e.id
+                              AND b.status = 'claimed'
+                        ),
+                        EXISTS(
+                            SELECT 1 FROM email_delivery_batch_items bi
+                            INNER JOIN email_delivery_batches b ON b.id = bi.batch_id
+                            WHERE bi.event_id = e.id
+                              AND b.status IN ('pending', 'retry', 'blocked_config')
+                        ),
+                        EXISTS(
+                            SELECT 1 FROM email_delivery_batch_items bi
+                            INNER JOIN email_delivery_batches b ON b.id = bi.batch_id
+                            WHERE bi.event_id = e.id AND b.status = 'suppressed_disabled'
+                        )
+                 FROM client_notification_events e
+                 WHERE e.installation_id = ?1 AND e.kind = 'client_registered'
+                 ORDER BY e.occurred_at, e.id",
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "prepare legacy setup notification adoption failed: {error}"
+                ))
+            })?;
+        let rows = statement
+            .query_map(params![installation_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, bool>(4)?,
+                    row.get::<_, bool>(5)?,
+                ))
+            })
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "query legacy setup notification adoption failed: {error}"
+                ))
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+            AppError::Internal(format!(
+                "read legacy setup notification adoption failed: {error}"
+            ))
+        })?
+    };
+    if events.is_empty() {
+        return Ok(LegacySetupNotificationState::None);
+    }
+    if let Some((event_id, _, _, _, _, _)) = events.iter().find(|event| event.2) {
+        return Ok(LegacySetupNotificationState::Sent {
+            event_id: event_id.clone(),
+        });
+    }
+    if let Some((event_id, _, _, _, _, _)) = events.iter().find(|event| event.3) {
+        return Ok(LegacySetupNotificationState::InFlight {
+            event_id: event_id.clone(),
+        });
+    }
+
+    let mut adoptable_event_id = None;
+    let mut terminal = None;
+    for (event_id, status, _, _, has_cancelable_batch, has_disabled_batch) in &events {
+        let adoptable = matches!(
+            status.as_str(),
+            "pending" | "awaiting_setup" | "awaiting_owner"
+        ) || (status == "batched" && *has_cancelable_batch);
+        if adoptable && adoptable_event_id.is_none() {
+            adoptable_event_id = Some(event_id.clone());
+        } else if !adoptable && terminal.is_none() {
+            terminal = Some((
+                event_id.clone(),
+                status == "suppressed_disabled" || *has_disabled_batch,
+            ));
+        }
+    }
+    if let Some((event_id, suppressed_disabled)) = terminal {
+        return Ok(LegacySetupNotificationState::Terminal {
+            event_id,
+            suppressed_disabled,
+        });
+    }
+    let Some(event_id) = adoptable_event_id else {
+        return Ok(LegacySetupNotificationState::None);
+    };
+
+    let active_batch_ids = {
+        let mut statement = conn
+            .prepare(
+                "SELECT DISTINCT b.id
+                 FROM email_delivery_batches b
+                 INNER JOIN email_delivery_batch_items bi ON bi.batch_id = b.id
+                 INNER JOIN client_notification_events e ON e.id = bi.event_id
+                 WHERE e.installation_id = ?1 AND e.kind = 'client_registered'
+                   AND b.status IN ('pending', 'retry', 'blocked_config')",
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "prepare active legacy setup batches failed: {error}"
+                ))
+            })?;
+        let rows = statement
+            .query_map(params![installation_id], |row| row.get::<_, String>(0))
+            .map_err(|error| {
+                AppError::Internal(format!("query active legacy setup batches failed: {error}"))
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+            AppError::Internal(format!("read active legacy setup batches failed: {error}"))
+        })?
+    };
+    let timestamp = now.to_rfc3339();
+    for batch_id in active_batch_ids {
+        conn.execute(
+            "UPDATE email_delivery_batches
+             SET status = 'suppressed_config_changed',
+                 error_message = 'superseded by explicit setup completion',
+                 next_attempt_at = NULL, claim_owner = NULL, claim_expires_at = NULL,
+                 updated_at = ?2
+             WHERE id = ?1",
+            params![batch_id, timestamp],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "cancel legacy setup notification batch failed: {error}"
+            ))
+        })?;
+        conn.execute(
+            "DELETE FROM email_delivery_batch_items WHERE batch_id = ?1",
+            params![batch_id],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("release legacy setup batch items failed: {error}"))
+        })?;
+    }
+    conn.execute(
+        "UPDATE client_notification_events
+         SET status = 'suppressed_superseded',
+             suppression_reason = 'superseded by explicit setup completion', updated_at = ?3
+         WHERE installation_id = ?1 AND kind = 'client_registered' AND id != ?2
+           AND status IN ('pending', 'awaiting_setup', 'awaiting_owner', 'batched')",
+        params![installation_id, event_id, timestamp],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "suppress duplicate legacy setup events failed: {error}"
+        ))
+    })?;
+    Ok(LegacySetupNotificationState::Adopt { event_id })
+}
+
+fn record_disabled_legacy_setup_fallback_receipts_tx(
+    conn: &Connection,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let events = {
+        let mut statement = conn
+            .prepare(
+                "SELECT e.id, e.installation_id
+                 FROM client_notification_events e
+                 WHERE e.status = 'awaiting_setup'
+                   AND e.dedupe_key LIKE 'legacy-setup-fallback:%'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM installation_setup_completions isc
+                       WHERE isc.installation_id = e.installation_id
+                   )",
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "prepare disabled legacy setup receipts failed: {error}"
+                ))
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "query disabled legacy setup receipts failed: {error}"
+                ))
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+            AppError::Internal(format!(
+                "read disabled legacy setup receipts failed: {error}"
+            ))
+        })?
+    };
+    for (event_id, installation_id) in events {
+        insert_legacy_setup_completion_receipt_tx(
+            conn,
+            &installation_id,
+            &event_id,
+            "suppressed_disabled",
+            now,
+        )?;
+    }
+    Ok(())
+}
+
 fn suppress_disabled_notification_work_tx(
     conn: &Connection,
     now: DateTime<Utc>,
     stats: &mut NotificationReconcileStats,
 ) -> Result<(), AppError> {
     let timestamp = now.to_rfc3339();
+    record_disabled_legacy_setup_fallback_receipts_tx(conn, now)?;
     let suppressed = conn
         .execute(
             "UPDATE client_notification_events
              SET status = 'suppressed_disabled', suppression_reason = 'notifications disabled',
                  updated_at = ?1
-             WHERE status IN ('pending', 'batched', 'awaiting_owner')",
+             WHERE status IN ('pending', 'batched', 'awaiting_owner', 'awaiting_setup')",
             params![timestamp],
         )
         .map_err(|error| {
@@ -12827,6 +13622,43 @@ fn suppress_disabled_notification_work_tx(
         ))
     })?;
     Ok(())
+}
+
+fn clear_inactive_setup_password_hints_tx(
+    conn: &Connection,
+    now: DateTime<Utc>,
+) -> Result<usize, AppError> {
+    conn.execute(
+        "UPDATE installation_setup_completions
+         SET password_hint = NULL, updated_at = ?1
+         WHERE password_hint IS NOT NULL
+           AND (
+               event_id IS NULL
+               OR NOT EXISTS (
+                   SELECT 1 FROM client_notification_events e
+                   WHERE e.id = installation_setup_completions.event_id
+                     AND (
+                         e.status IN ('pending', 'awaiting_owner', 'awaiting_setup')
+                         OR (
+                             e.status = 'batched'
+                             AND EXISTS (
+                                 SELECT 1
+                                 FROM email_delivery_batch_items bi
+                                 INNER JOIN email_delivery_batches b ON b.id = bi.batch_id
+                                 WHERE bi.event_id = e.id
+                                   AND b.status IN ('pending', 'claimed', 'retry', 'blocked_config')
+                             )
+                         )
+                     )
+               )
+           )",
+        params![now.to_rfc3339()],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "clear inactive setup password hints failed: {error}"
+        ))
+    })
 }
 
 fn sync_client_notification_runtime_tx(
@@ -12905,6 +13737,7 @@ fn sync_client_notification_runtime_tx(
 
     if !policy.enabled {
         suppress_disabled_notification_work_tx(conn, now, stats)?;
+        clear_inactive_setup_password_hints_tx(conn, now)?;
         return Ok(());
     }
 
@@ -12914,7 +13747,8 @@ fn sync_client_notification_runtime_tx(
                 "UPDATE client_notification_events
                  SET status = 'suppressed_before_activation',
                      suppression_reason = 'event predates notification activation', updated_at = ?2
-                 WHERE status IN ('pending', 'awaiting_owner') AND occurred_at < ?1",
+                 WHERE status IN ('pending', 'awaiting_owner', 'awaiting_setup')
+                   AND occurred_at < ?1",
                 params![enabled_since, timestamp],
             )
             .map_err(|error| {
@@ -12992,6 +13826,7 @@ fn sync_client_notification_runtime_tx(
     }
 
     suppress_removed_notification_recipients(conn, now, stats)?;
+    clear_inactive_setup_password_hints_tx(conn, now)?;
     Ok(())
 }
 
@@ -13215,7 +14050,7 @@ fn refresh_registration_notification_snapshots_tx(
         .prepare(
             "SELECT id, snapshot_json FROM client_notification_events
              WHERE installation_id = ?1 AND kind = 'client_registered'
-               AND status IN ('pending', 'awaiting_owner')",
+               AND status IN ('pending', 'awaiting_owner', 'awaiting_setup')",
         )
         .map_err(|error| {
             AppError::Internal(format!(
@@ -13354,13 +14189,15 @@ fn load_pending_notification_events(
                                AND i.owner_email IS NOT NULL
                                AND TRIM(i.owner_email) != ''
                          THEN LOWER(i.owner_email) ELSE NULL END,
-                    ict.subdomain
+                    ict.subdomain,
+                    isc.password_hint
              FROM client_notification_events e
              LEFT JOIN installations i ON i.id = e.installation_id
              LEFT JOIN installation_client_tunnels ict
                ON ict.installation_id = e.installation_id AND ict.enabled = 1
+             LEFT JOIN installation_setup_completions isc ON isc.event_id = e.id
              WHERE e.status = 'pending' AND e.not_before <= ?1
-               AND {} AND e.occurred_at <= ?2
+               AND {} AND (e.occurred_at <= ?2 OR isc.source = 'legacy_fallback')
              ORDER BY CASE WHEN e.kind = 'client_registration_overflow' THEN 0 ELSE 1 END,
                       e.occurred_at, e.id
              LIMIT 1000",
@@ -13391,6 +14228,7 @@ fn load_pending_notification_events(
                     snapshot,
                     verified_owner_email: row.get(5)?,
                     tunnel_subdomain: row.get(6)?,
+                    password_hint: row.get(7)?,
                 })
             },
         )
@@ -13431,11 +14269,12 @@ fn load_incident_clients(
 ) -> Result<Vec<DigestEmailClient>, AppError> {
     let mut statement = conn
         .prepare(
-            "SELECT e.installation_id, ict.subdomain
+            "SELECT e.installation_id, ict.subdomain, MAX(isc.password_hint)
              FROM client_notification_events e
              LEFT JOIN installations i ON i.id = e.installation_id
              LEFT JOIN installation_client_tunnels ict
                ON ict.installation_id = e.installation_id AND ict.enabled = 1
+             LEFT JOIN installation_setup_completions isc ON isc.event_id = e.id
              WHERE e.occurred_at >= ?1
                AND e.occurred_at >= COALESCE(
                    (SELECT enabled_since FROM client_notification_runtime WHERE id = 1), ?1
@@ -13464,6 +14303,7 @@ fn load_incident_clients(
             Ok(DigestEmailClient {
                 installation_id,
                 client_url: notification_client_url(dashboard_url, subdomain.as_deref()),
+                password_hint: row.get(2)?,
             })
         })
         .map_err(|error| {
@@ -13561,10 +14401,15 @@ fn render_client_notification_batch(
                     .unwrap_or_else(|| "unknown".into()),
                 version: notification_snapshot_string(&first.snapshot, "appVersion"),
                 country_code: notification_snapshot_string(&first.snapshot, "countryCode"),
-                registered_at: notification_snapshot_string(&first.snapshot, "registeredAt")
-                    .unwrap_or_else(|| first.occurred_at.to_rfc3339()),
+                setup_completed_at: notification_snapshot_string(
+                    &first.snapshot,
+                    "setupCompletedAt",
+                )
+                .or_else(|| notification_snapshot_string(&first.snapshot, "registeredAt"))
+                .unwrap_or_else(|| first.occurred_at.to_rfc3339()),
                 owner_email: first.verified_owner_email.clone(),
                 client_url,
+                password_hint: first.password_hint.clone(),
                 dashboard_url: dashboard_url.to_string(),
             })),
             "client_offline" => Ok(render_offline_email(&OfflineEmailData {
@@ -13612,6 +14457,7 @@ fn render_client_notification_batch(
                             .and_then(serde_json::Value::as_str)
                     }),
                 ),
+                password_hint: event.password_hint.clone(),
             })
             .collect(),
         occurred_at: now.to_rfc3339(),
@@ -19809,6 +20655,39 @@ fn validate_request_nonce(nonce: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+fn validate_installation_setup_completed_payload(
+    payload: &InstallationSetupCompletedPayload,
+) -> Result<(), AppError> {
+    if payload.protocol_version != 1 {
+        return Err(AppError::BadRequest(
+            "unsupported installation setup completion protocol version".into(),
+        ));
+    }
+
+    let parsed_setup_id = Uuid::parse_str(&payload.setup_id)
+        .map_err(|_| AppError::BadRequest("setup_id must be a canonical UUID".into()))?;
+    if parsed_setup_id.get_version_num() != 4
+        || parsed_setup_id.hyphenated().to_string() != payload.setup_id
+    {
+        return Err(AppError::BadRequest(
+            "setup_id must be a canonical lowercase hyphenated UUID v4".into(),
+        ));
+    }
+
+    let hint = payload.password_hint.as_bytes();
+    let valid_edge = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'*';
+    if hint.len() != 8
+        || !valid_edge(hint[0])
+        || !hint[1..7].iter().all(|byte| *byte == b'*')
+        || !valid_edge(hint[7])
+    {
+        return Err(AppError::BadRequest(
+            "password_hint must match ^[A-Za-z0-9*]\\*{6}[A-Za-z0-9*]$".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_registration_client_fields(platform: &str, app_version: &str) -> Result<(), AppError> {
     let normalized_platform = platform.trim();
     if normalized_platform.is_empty() {
@@ -20024,20 +20903,6 @@ fn record_authenticated_installation_presence(
     enable_monitoring: bool,
     boot_id: Option<&str>,
 ) -> Result<(), AppError> {
-    let previous_registration_state = conn
-        .query_row(
-            "SELECT registration_state
-             FROM installation_notification_state
-             WHERE installation_id = ?1",
-            params![installation.id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(|error| {
-            AppError::Internal(format!(
-                "read installation notification state failed: {error}"
-            ))
-        })?;
     insert_installation_notification_baseline(conn, &installation.id, now)?;
 
     let timestamp = now.to_rfc3339();
@@ -20074,103 +20939,10 @@ fn record_authenticated_installation_presence(
         ))
     })?;
 
-    if matches!(previous_registration_state.as_deref(), Some("provisional")) {
-        maybe_emit_client_registration_event(conn, installation, now)?;
-    }
     Ok(())
 }
 
-fn installation_has_verified_owner(installation: &Installation) -> bool {
-    installation.owner_verified_at.is_some()
-        && installation
-            .owner_email
-            .as_deref()
-            .is_some_and(|email| !email.trim().is_empty())
-}
-
-fn maybe_emit_client_registration_event(
-    conn: &Connection,
-    installation: &Installation,
-    now: DateTime<Utc>,
-) -> Result<(), AppError> {
-    if !installation_has_verified_owner(installation) {
-        return Ok(());
-    }
-    let already_emitted = conn
-        .query_row(
-            "SELECT 1 FROM client_notification_events
-             WHERE installation_id = ?1 AND kind = 'client_registered' LIMIT 1",
-            params![installation.id],
-            |_| Ok(()),
-        )
-        .optional()
-        .map_err(|error| {
-            AppError::Internal(format!(
-                "check existing client registration notification failed: {error}"
-            ))
-        })?
-        .is_some();
-    if already_emitted {
-        return Ok(());
-    }
-    insert_client_registration_event(conn, installation, now)
-}
-
-fn insert_client_registration_event(
-    conn: &Connection,
-    installation: &Installation,
-    now: DateTime<Utc>,
-) -> Result<(), AppError> {
-    let notifications_enabled =
-        conn.query_row(
-            "SELECT enabled FROM client_notification_runtime WHERE id = 1",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()
-        .map_err(|error| {
-            AppError::Internal(format!("read client notification runtime failed: {error}"))
-        })? == Some(1);
-    if notifications_enabled && registration_overflow_should_capture_tx(conn, now)? {
-        record_registration_notification_overflow_tx(conn, now)?;
-        return Ok(());
-    }
-    let status = if notifications_enabled {
-        "pending"
-    } else {
-        "suppressed_disabled"
-    };
-    let suppression_reason = (!notifications_enabled).then_some("notifications disabled");
-    let snapshot = serde_json::json!({
-        "installationId": installation.id,
-        "platform": installation.platform,
-        "appVersion": installation.app_version,
-        "ownerEmail": installation.owner_email,
-        "countryCode": installation.country_code,
-        "registeredAt": installation.created_at,
-    });
-    let timestamp = now.to_rfc3339();
-    conn.execute(
-        "INSERT OR IGNORE INTO client_notification_events (
-            id, dedupe_key, kind, installation_id, episode, status, occurred_at,
-            not_before, snapshot_json, suppression_reason, created_at, updated_at
-         ) VALUES (?1, ?2, 'client_registered', ?3, 0, ?4, ?5, ?5, ?6, ?7, ?5, ?5)",
-        params![
-            Uuid::new_v4().to_string(),
-            format!("register:{}", installation.id),
-            installation.id,
-            status,
-            timestamp,
-            snapshot.to_string(),
-            suppression_reason,
-        ],
-    )
-    .map_err(|error| {
-        AppError::Internal(format!("insert client registration event failed: {error}"))
-    })?;
-    Ok(())
-}
-
+#[cfg(test)]
 fn registration_overflow_should_capture_tx(
     conn: &Connection,
     now: DateTime<Utc>,
@@ -20196,7 +20968,7 @@ fn registration_overflow_should_capture_tx(
              FROM client_notification_events e
              WHERE e.kind IN ('client_registered', 'client_registration_overflow')
                AND (
-                   e.status IN ('pending', 'awaiting_owner')
+                   e.status IN ('pending', 'awaiting_owner', 'awaiting_setup')
                    OR (e.status = 'batched' AND EXISTS (
                        SELECT 1
                        FROM email_delivery_batch_items bi
@@ -20250,6 +21022,7 @@ fn registration_overflow_should_capture_tx(
     Ok(should_capture)
 }
 
+#[cfg(test)]
 fn record_registration_notification_overflow_tx(
     conn: &Connection,
     now: DateTime<Utc>,
@@ -24786,6 +25559,95 @@ mod tests {
         signing_key
     }
 
+    async fn insert_setup_client_tunnel(store: &AppStore, installation_id: &str, subdomain: &str) {
+        let now = Utc::now().to_rfc3339();
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "INSERT INTO installation_client_tunnels (
+                installation_id, owner_email, subdomain, enabled, created_at, updated_at
+             ) VALUES (?1, 'owner@example.com', ?2, 1, ?3, ?3)",
+            params![installation_id, subdomain, now],
+        )
+        .expect("insert setup client tunnel");
+    }
+
+    async fn claim_setup_client_tunnel(
+        store: &AppStore,
+        config: &Config,
+        signing_key: &SigningKey,
+        installation_id: &str,
+        subdomain: &str,
+    ) {
+        let tunnel = ClientTunnelConfig {
+            owner_email: "owner@example.com".into(),
+            subdomain: subdomain.into(),
+            enabled: true,
+        };
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = sign_test_payload(
+            signing_key,
+            installation_id,
+            "client_tunnel_claim",
+            &tunnel,
+            timestamp_ms,
+            &nonce,
+        );
+        store
+            .claim_client_tunnel(
+                config,
+                ClientTunnelClaimRequest {
+                    installation_id: installation_id.into(),
+                    timestamp_ms,
+                    nonce,
+                    signature,
+                    tunnel,
+                },
+                ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+            )
+            .await
+            .expect("claim setup client tunnel");
+    }
+
+    fn setup_completed_payload(
+        setup_id: &str,
+        password_hint: &str,
+    ) -> InstallationSetupCompletedPayload {
+        InstallationSetupCompletedPayload {
+            protocol_version: 1,
+            setup_id: setup_id.into(),
+            password_hint: password_hint.into(),
+        }
+    }
+
+    fn signed_setup_completed_request(
+        signing_key: &SigningKey,
+        installation_id: &str,
+        setup: InstallationSetupCompletedPayload,
+        timestamp_ms: i64,
+        nonce: &str,
+    ) -> InstallationSetupCompletedRequest {
+        let signature = sign_test_payload(
+            signing_key,
+            installation_id,
+            "installation_setup_completed_v1",
+            &setup,
+            timestamp_ms,
+            nonce,
+        );
+        InstallationSetupCompletedRequest {
+            protocol_epoch: PROTOCOL_EPOCH.into(),
+            installation_id: installation_id.into(),
+            timestamp_ms,
+            nonce: nonce.into(),
+            signature,
+            setup,
+        }
+    }
+
     fn sign_test_payload<T: Serialize>(
         signing_key: &SigningKey,
         installation_id: &str,
@@ -24816,6 +25678,1359 @@ mod tests {
         );
         let signature = signing_key.sign(body.as_bytes());
         base64::engine::general_purpose::STANDARD.encode(signature.to_bytes())
+    }
+
+    #[test]
+    fn setup_completed_payload_validation_is_strict() {
+        let valid = setup_completed_payload("123e4567-e89b-42d3-a456-426614174000", "p******w");
+        validate_installation_setup_completed_payload(&valid).expect("valid setup payload");
+
+        for (setup_id, hint) in [
+            ("123e4567-e89b-12d3-a456-426614174000", "p******w"),
+            ("123E4567-E89B-42D3-A456-426614174000", "p******w"),
+            ("not-a-uuid", "p******w"),
+            ("123e4567-e89b-42d3-a456-426614174000", "password"),
+            ("123e4567-e89b-42d3-a456-426614174000", "p*****w"),
+            ("123e4567-e89b-42d3-a456-426614174000", "p******!"),
+        ] {
+            let invalid = setup_completed_payload(setup_id, hint);
+            assert!(validate_installation_setup_completed_payload(&invalid).is_err());
+        }
+
+        let mut wrong_version = valid;
+        wrong_version.protocol_version = 2;
+        assert!(validate_installation_setup_completed_payload(&wrong_version).is_err());
+        assert!(validate_request_nonce("short").is_err());
+        assert!(validate_request_nonce("invalid nonce value").is_err());
+    }
+
+    #[test]
+    fn setup_completed_request_rejects_unknown_envelope_and_payload_fields() {
+        let base = serde_json::json!({
+            "protocolEpoch": PROTOCOL_EPOCH,
+            "installationId": "fixture-installation",
+            "timestampMs": 1_700_000_000_789_i64,
+            "nonce": "fixture-setup-123",
+            "signature": "fixture-signature",
+            "setup": {
+                "protocolVersion": 1,
+                "setupId": "123e4567-e89b-42d3-a456-426614174000",
+                "passwordHint": "p******w"
+            }
+        });
+        serde_json::from_value::<InstallationSetupCompletedRequest>(base.clone())
+            .expect("strict request without extras");
+
+        let mut extra_envelope = base.clone();
+        extra_envelope["unexpected"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<InstallationSetupCompletedRequest>(extra_envelope).is_err()
+        );
+
+        let mut extra_payload = base;
+        extra_payload["setup"]["unexpected"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<InstallationSetupCompletedRequest>(extra_payload).is_err()
+        );
+    }
+
+    #[test]
+    fn setup_completed_signature_fixture_matches_server_contract() {
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let public_key = base64::engine::general_purpose::STANDARD
+            .encode(signing_key.verifying_key().to_bytes());
+        assert_eq!(public_key, "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=");
+        let payload = setup_completed_payload("123e4567-e89b-42d3-a456-426614174000", "p******w");
+        let signature = sign_test_payload(
+            &signing_key,
+            "fixture-installation",
+            "installation_setup_completed_v1",
+            &payload,
+            1_700_000_000_789,
+            "fixture-setup-123",
+        );
+        assert_eq!(
+            signature,
+            "q48WYcP91n3DWTvRyw9WysgC9AN5T3GM/2DyaDz18x2yKzyz/4iBkbXD+DYup6MtBtSGi+vEuaWhtO8kC4znCg=="
+        );
+    }
+
+    #[test]
+    fn setup_completed_response_statuses_are_stable() {
+        for (status, expected) in [
+            (InstallationSetupCompletedStatus::Queued, "queued"),
+            (
+                InstallationSetupCompletedStatus::AlreadyRecorded,
+                "already_recorded",
+            ),
+            (
+                InstallationSetupCompletedStatus::SuppressedDisabled,
+                "suppressed_disabled",
+            ),
+        ] {
+            let value = serde_json::to_value(InstallationSetupCompletedResponse {
+                ok: true,
+                setup_id: "123e4567-e89b-42d3-a456-426614174000".into(),
+                status,
+            })
+            .expect("serialize setup completion response");
+            assert_eq!(value["status"], expected);
+            assert_eq!(value["setupId"], "123e4567-e89b-42d3-a456-426614174000");
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_completed_queues_one_redacted_notification_and_freezes_hint() {
+        let config = enabled_notification_config("setup-completed-notification");
+        let store = AppStore::new(&config).expect("create store");
+        let installation_id = "inst-setup-completed";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        insert_setup_client_tunnel(&store, installation_id, "setupclient").await;
+        let setup_id = Uuid::new_v4().to_string();
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let request = signed_setup_completed_request(
+            &signing_key,
+            installation_id,
+            setup_completed_payload(&setup_id, "p******w"),
+            timestamp_ms,
+            "setup-notification-1",
+        );
+        let response = store
+            .complete_installation_setup(request)
+            .await
+            .expect("complete setup");
+        assert!(response.ok);
+        assert_eq!(response.setup_id, setup_id);
+        assert_eq!(response.status, InstallationSetupCompletedStatus::Queued);
+
+        {
+            let conn = store.conn.lock().await;
+            let (dedupe_key, status, snapshot, password_hint): (
+                String,
+                String,
+                String,
+                Option<String>,
+            ) = conn
+                .query_row(
+                    "SELECT e.dedupe_key, e.status, e.snapshot_json, isc.password_hint
+                     FROM client_notification_events e
+                     INNER JOIN installation_setup_completions isc ON isc.event_id = e.id
+                     WHERE e.installation_id = ?1",
+                    params![installation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("read queued setup event");
+            assert_eq!(dedupe_key, format!("setup:{installation_id}"));
+            assert_eq!(status, "pending");
+            assert_eq!(password_hint.as_deref(), Some("p******w"));
+            assert!(!snapshot.contains("p******w"));
+            assert!(!snapshot.contains("passwordHint"));
+            assert!(snapshot.contains("setupCompletedAt"));
+        }
+
+        let duplicate_nonce = "setup-notification-2";
+        let duplicate = signed_setup_completed_request(
+            &signing_key,
+            installation_id,
+            setup_completed_payload(&Uuid::new_v4().to_string(), "x******y"),
+            Utc::now().timestamp_millis(),
+            duplicate_nonce,
+        );
+        let duplicate_response = store
+            .complete_installation_setup(duplicate)
+            .await
+            .expect("duplicate completion remains idempotent");
+        assert_eq!(
+            duplicate_response.status,
+            InstallationSetupCompletedStatus::AlreadyRecorded
+        );
+        assert_eq!(duplicate_response.setup_id, setup_id);
+
+        let policy = notification_policy(&config);
+        let delivery_at = Utc::now() + Duration::seconds(6);
+        store
+            .aggregate_client_notification_batches(&policy, &notification_template(), delivery_at)
+            .await
+            .expect("aggregate setup completion");
+        let conn = store.conn.lock().await;
+        let (html, text): (String, String) = conn
+            .query_row(
+                "SELECT html_body, text_body FROM email_delivery_batches LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read frozen setup email");
+        for body in [&html, &text] {
+            assert!(body.contains("https://setupclient.router.example.com/"));
+            assert!(body.contains("Web 密码提示"));
+            assert!(body.contains("p******w"));
+            assert!(body.contains("这不是完整密码"));
+        }
+        let retained_hint: Option<String> = conn
+            .query_row(
+                "SELECT password_hint FROM installation_setup_completions
+                 WHERE installation_id = ?1",
+                params![installation_id],
+                |row| row.get(0),
+            )
+            .expect("read retained setup hint");
+        assert_eq!(retained_hint.as_deref(), Some("p******w"));
+        drop(conn);
+
+        let batch = expect_notification_batch(
+            store
+                .claim_client_notification_batch("setup-worker", delivery_at, 30)
+                .await
+                .expect("claim setup notification"),
+            "setup notification batch",
+        );
+        assert!(
+            store
+                .validate_client_notification_batch(
+                    &batch.id,
+                    "setup-worker",
+                    &policy,
+                    delivery_at,
+                )
+                .await
+                .expect("validate setup notification")
+        );
+        store
+            .mark_client_notification_batch_sent(
+                &batch.id,
+                "setup-worker",
+                "resend-setup-message",
+                delivery_at,
+            )
+            .await
+            .expect("mark setup notification sent");
+        let conn = store.conn.lock().await;
+        let cleared_hint: Option<String> = conn
+            .query_row(
+                "SELECT password_hint FROM installation_setup_completions
+                 WHERE installation_id = ?1",
+                params![installation_id],
+                |row| row.get(0),
+            )
+            .expect("read cleared setup hint");
+        assert!(cleared_hint.is_none());
+        drop(conn);
+
+        let deliveries = store
+            .list_client_notification_deliveries(100)
+            .await
+            .expect("list setup deliveries");
+        let admin_json = serde_json::to_string(&deliveries).expect("serialize admin deliveries");
+        assert!(!admin_json.contains("p******w"));
+        assert!(!admin_json.contains("htmlBody"));
+        assert!(!admin_json.contains("textBody"));
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn setup_completed_disabled_is_audited_without_retaining_hint() {
+        let mut config = enabled_notification_config("setup-completed-disabled");
+        config.client_notifications.enabled = false;
+        let store = AppStore::new(&config).expect("create store");
+        let installation_id = "inst-setup-disabled";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        insert_setup_client_tunnel(&store, installation_id, "disabledclient").await;
+        let setup_id = Uuid::new_v4().to_string();
+        let request = signed_setup_completed_request(
+            &signing_key,
+            installation_id,
+            setup_completed_payload(&setup_id, "p******w"),
+            Utc::now().timestamp_millis(),
+            "setup-disabled-1",
+        );
+
+        let response = store
+            .complete_installation_setup(request)
+            .await
+            .expect("record disabled setup completion");
+        assert_eq!(
+            response.status,
+            InstallationSetupCompletedStatus::SuppressedDisabled
+        );
+        let conn = store.conn.lock().await;
+        let (event_status, completion_status, hint): (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT e.status, isc.notification_status, isc.password_hint
+                 FROM installation_setup_completions isc
+                 INNER JOIN client_notification_events e ON e.id = isc.event_id
+                 WHERE isc.installation_id = ?1",
+                params![installation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read suppressed setup completion");
+        assert_eq!(event_status, "suppressed_disabled");
+        assert_eq!(completion_status, "suppressed_disabled");
+        assert!(hint.is_none());
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn legacy_setup_fallback_waits_for_grace_and_enabled_tunnel_before_first_batch() {
+        let config = enabled_notification_config("legacy-setup-fallback-grace");
+        let store = AppStore::new(&config).expect("create store");
+        let installation_id = "inst-legacy-setup-grace";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        claim_setup_client_tunnel(
+            &store,
+            &config,
+            &signing_key,
+            installation_id,
+            "legacygrace",
+        )
+        .await;
+        let claimed_at = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            let state: (String, i64) = conn
+                .query_row(
+                    "SELECT e.status,
+                            (SELECT COUNT(*) FROM installation_setup_completions isc
+                             WHERE isc.installation_id = e.installation_id)
+                     FROM client_notification_events e
+                     WHERE e.installation_id = ?1",
+                    params![installation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read initial legacy setup fallback");
+            assert_eq!(state, ("awaiting_setup".into(), 0));
+        }
+
+        let policy = notification_policy(&config);
+        let before_grace = claimed_at + Duration::minutes(29);
+        let stats = store
+            .aggregate_client_notification_batches(&policy, &notification_template(), before_grace)
+            .await
+            .expect("aggregate before legacy grace");
+        assert_eq!(stats.batches_created, 0);
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installation_client_tunnels SET enabled = 0 WHERE installation_id = ?1",
+                params![installation_id],
+            )
+            .expect("disable legacy tunnel during grace");
+        }
+
+        let delayed_cycle = claimed_at + Duration::hours(2);
+        let stats = store
+            .aggregate_client_notification_batches(&policy, &notification_template(), delayed_cycle)
+            .await
+            .expect("skip disabled legacy tunnel after grace");
+        assert_eq!(stats.batches_created, 0);
+        {
+            let conn = store.conn.lock().await;
+            let state: (String, i64) = conn
+                .query_row(
+                    "SELECT e.status,
+                            (SELECT COUNT(*) FROM installation_setup_completions isc
+                             WHERE isc.installation_id = e.installation_id)
+                     FROM client_notification_events e
+                     WHERE e.installation_id = ?1",
+                    params![installation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read disabled legacy fallback state");
+            assert_eq!(state, ("awaiting_setup".into(), 0));
+            conn.execute(
+                "UPDATE installation_client_tunnels SET enabled = 1 WHERE installation_id = ?1",
+                params![installation_id],
+            )
+            .expect("re-enable legacy tunnel");
+        }
+
+        let activation_at = delayed_cycle + Duration::seconds(1);
+        let stats = store
+            .aggregate_client_notification_batches(&policy, &notification_template(), activation_at)
+            .await
+            .expect("activate delayed legacy fallback");
+        assert_eq!(stats.batches_created, 1);
+        let conn = store.conn.lock().await;
+        let state: (String, String, String, String, String, i64) = conn
+            .query_row(
+                "SELECT e.status, e.occurred_at, e.not_before, isc.source, isc.setup_id,
+                        (SELECT COUNT(*) FROM email_delivery_batches)
+                 FROM client_notification_events e
+                 INNER JOIN installation_setup_completions isc ON isc.event_id = e.id
+                 WHERE e.installation_id = ?1",
+                params![installation_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .expect("read activated legacy fallback");
+        assert_eq!(state.0, "batched");
+        assert_eq!(state.1, activation_at.to_rfc3339());
+        assert_eq!(state.2, activation_at.to_rfc3339());
+        assert_eq!(state.3, "legacy_fallback");
+        assert_eq!(Uuid::parse_str(&state.4).unwrap().get_version_num(), 4);
+        assert_eq!(state.5, 1);
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn explicit_setup_adopts_grace_fallback_and_freezes_hint_once() {
+        let config = enabled_notification_config("explicit-setup-adopts-fallback");
+        let store = AppStore::new(&config).expect("create store");
+        let installation_id = "inst-explicit-adopts-fallback";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        claim_setup_client_tunnel(
+            &store,
+            &config,
+            &signing_key,
+            installation_id,
+            "explicitadopt",
+        )
+        .await;
+        let setup_id = Uuid::new_v4().to_string();
+        let response = store
+            .complete_installation_setup(signed_setup_completed_request(
+                &signing_key,
+                installation_id,
+                setup_completed_payload(&setup_id, "a******z"),
+                Utc::now().timestamp_millis(),
+                "explicit-adopt-fallback",
+            ))
+            .await
+            .expect("explicit setup adopts fallback");
+        assert_eq!(response.status, InstallationSetupCompletedStatus::Queued);
+
+        let conn = store.conn.lock().await;
+        let state: (i64, String, String, String, Option<String>) = conn
+            .query_row(
+                "SELECT COUNT(*), e.dedupe_key, e.status, isc.source, isc.password_hint
+                 FROM client_notification_events e
+                 INNER JOIN installation_setup_completions isc ON isc.event_id = e.id
+                 WHERE e.installation_id = ?1",
+                params![installation_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("read adopted explicit setup");
+        assert_eq!(state.0, 1);
+        assert_eq!(state.1, format!("setup:{installation_id}"));
+        assert_eq!(state.2, "pending");
+        assert_eq!(state.3, "explicit");
+        assert_eq!(state.4.as_deref(), Some("a******z"));
+        drop(conn);
+
+        let delivery_at = Utc::now() + Duration::seconds(6);
+        store
+            .aggregate_client_notification_batches(
+                &notification_policy(&config),
+                &notification_template(),
+                delivery_at,
+            )
+            .await
+            .expect("aggregate adopted explicit setup");
+        let conn = store.conn.lock().await;
+        let (batch_count, html): (i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(html_body) FROM email_delivery_batches",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read adopted explicit batch");
+        assert_eq!(batch_count, 1);
+        assert!(html.contains("a******z"));
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn explicit_setup_rebuilds_only_unclaimed_legacy_batch() {
+        let config = enabled_notification_config("explicit-setup-rebuilds-legacy-batch");
+        let store = AppStore::new(&config).expect("create store");
+        let installation_id = "inst-rebuild-legacy-batch";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        claim_setup_client_tunnel(
+            &store,
+            &config,
+            &signing_key,
+            installation_id,
+            "rebuildlegacy",
+        )
+        .await;
+        let activation_at = Utc::now() + Duration::hours(2);
+        store
+            .aggregate_client_notification_batches(
+                &notification_policy(&config),
+                &notification_template(),
+                activation_at,
+            )
+            .await
+            .expect("freeze legacy fallback batch");
+
+        let setup_id = Uuid::new_v4().to_string();
+        let response = store
+            .complete_installation_setup(signed_setup_completed_request(
+                &signing_key,
+                installation_id,
+                setup_completed_payload(&setup_id, "r******d"),
+                Utc::now().timestamp_millis(),
+                "explicit-rebuild-legacy",
+            ))
+            .await
+            .expect("replace pending legacy batch");
+        assert_eq!(response.status, InstallationSetupCompletedStatus::Queued);
+        {
+            let conn = store.conn.lock().await;
+            let state: (String, String, i64, Option<String>) = conn
+                .query_row(
+                    "SELECT b.status, e.status,
+                            (SELECT COUNT(*) FROM email_delivery_batch_items WHERE batch_id = b.id),
+                            isc.password_hint
+                     FROM email_delivery_batches b
+                     CROSS JOIN client_notification_events e
+                     INNER JOIN installation_setup_completions isc ON isc.event_id = e.id
+                     WHERE e.installation_id = ?1",
+                    params![installation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("read replaced legacy batch");
+            assert_eq!(
+                state,
+                (
+                    "suppressed_config_changed".into(),
+                    "pending".into(),
+                    0,
+                    Some("r******d".into())
+                )
+            );
+        }
+
+        store
+            .aggregate_client_notification_batches(
+                &notification_policy(&config),
+                &notification_template(),
+                Utc::now() + Duration::seconds(6),
+            )
+            .await
+            .expect("build explicit replacement batch");
+        let conn = store.conn.lock().await;
+        let state: (i64, i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*),
+                        SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END),
+                        MAX(CASE WHEN status = 'pending' THEN html_body ELSE '' END)
+                 FROM email_delivery_batches",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read explicit replacement delivery");
+        assert_eq!((state.0, state.1), (2, 1));
+        assert!(state.2.contains("r******d"));
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn claimed_legacy_batch_keeps_delivery_ownership_when_explicit_setup_arrives() {
+        let config = enabled_notification_config("claimed-legacy-setup-race");
+        let store = AppStore::new(&config).expect("create store");
+        let installation_id = "inst-claimed-legacy-race";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        claim_setup_client_tunnel(
+            &store,
+            &config,
+            &signing_key,
+            installation_id,
+            "claimedlegacy",
+        )
+        .await;
+        let delivery_at = Utc::now() + Duration::hours(2);
+        let policy = notification_policy(&config);
+        store
+            .aggregate_client_notification_batches(&policy, &notification_template(), delivery_at)
+            .await
+            .expect("aggregate claimed legacy fixture");
+        let batch = expect_notification_batch(
+            store
+                .claim_client_notification_batch("claimed-legacy-worker", delivery_at, 30)
+                .await
+                .expect("claim legacy batch"),
+            "claimed legacy batch",
+        );
+        assert!(
+            store
+                .validate_client_notification_batch(
+                    &batch.id,
+                    "claimed-legacy-worker",
+                    &policy,
+                    delivery_at,
+                )
+                .await
+                .expect("validate claimed legacy batch")
+        );
+
+        let response = store
+            .complete_installation_setup(signed_setup_completed_request(
+                &signing_key,
+                installation_id,
+                setup_completed_payload(&Uuid::new_v4().to_string(), "c******m"),
+                Utc::now().timestamp_millis(),
+                "claimed-legacy-explicit",
+            ))
+            .await
+            .expect("record explicit setup during claimed delivery");
+        assert_eq!(
+            response.status,
+            InstallationSetupCompletedStatus::AlreadyRecorded
+        );
+        {
+            let conn = store.conn.lock().await;
+            let state: (String, String, i64, Option<String>) = conn
+                .query_row(
+                    "SELECT b.status, e.status,
+                            (SELECT COUNT(*) FROM email_delivery_batch_items WHERE batch_id = b.id),
+                            isc.password_hint
+                     FROM email_delivery_batches b
+                     INNER JOIN email_delivery_batch_items bi ON bi.batch_id = b.id
+                     INNER JOIN client_notification_events e ON e.id = bi.event_id
+                     INNER JOIN installation_setup_completions isc ON isc.event_id = e.id
+                     WHERE b.id = ?1",
+                    params![batch.id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("read claimed delivery ownership");
+            assert_eq!(state, ("claimed".into(), "batched".into(), 1, None));
+        }
+        store
+            .mark_client_notification_batch_sent(
+                &batch.id,
+                "claimed-legacy-worker",
+                "claimed-legacy-message",
+                delivery_at,
+            )
+            .await
+            .expect("finish original claimed legacy delivery");
+        let stats = store
+            .aggregate_client_notification_batches(
+                &policy,
+                &notification_template(),
+                delivery_at + Duration::minutes(1),
+            )
+            .await
+            .expect("do not create a second claimed legacy delivery");
+        assert_eq!(stats.batches_created, 0);
+        let conn = store.conn.lock().await;
+        let counts: (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM client_notification_events WHERE installation_id = ?1),
+                        (SELECT COUNT(*) FROM email_delivery_batches)",
+                params![installation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("count claimed legacy lifecycle");
+        assert_eq!(counts, (1, 1));
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn disabled_legacy_receipt_survives_event_cleanup_and_reclaim() {
+        let mut config = enabled_notification_config("disabled-legacy-receipt");
+        config.client_notifications.enabled = false;
+        let store = AppStore::new(&config).expect("create store");
+        let installation_id = "inst-disabled-legacy-receipt";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        claim_setup_client_tunnel(
+            &store,
+            &config,
+            &signing_key,
+            installation_id,
+            "disabledreceipt",
+        )
+        .await;
+        {
+            let conn = store.conn.lock().await;
+            let state: (String, String, Option<String>) = conn
+                .query_row(
+                    "SELECT e.status, isc.source, isc.password_hint
+                     FROM client_notification_events e
+                     INNER JOIN installation_setup_completions isc ON isc.event_id = e.id
+                     WHERE e.installation_id = ?1",
+                    params![installation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("read disabled legacy receipt");
+            assert_eq!(
+                state,
+                ("suppressed_disabled".into(), "legacy_fallback".into(), None)
+            );
+            conn.execute(
+                "DELETE FROM client_notification_events WHERE installation_id = ?1",
+                params![installation_id],
+            )
+            .expect("clean legacy notification event audit");
+        }
+
+        let mut enabled = config.clone();
+        enabled.client_notifications.enabled = true;
+        store
+            .sync_client_notification_runtime(
+                &notification_policy(&enabled),
+                &notification_template(),
+                Utc::now(),
+            )
+            .await
+            .expect("enable notifications after disabled decision");
+        claim_setup_client_tunnel(
+            &store,
+            &enabled,
+            &signing_key,
+            installation_id,
+            "disabledreceipt",
+        )
+        .await;
+        {
+            let conn = store.conn.lock().await;
+            let event_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM client_notification_events WHERE installation_id = ?1",
+                    params![installation_id],
+                    |row| row.get(0),
+                )
+                .expect("count fallback after audit cleanup and reclaim");
+            assert_eq!(event_count, 0);
+        }
+
+        let setup_id = Uuid::new_v4().to_string();
+        let response = store
+            .complete_installation_setup(signed_setup_completed_request(
+                &signing_key,
+                installation_id,
+                setup_completed_payload(&setup_id, "d******d"),
+                Utc::now().timestamp_millis(),
+                "disabled-receipt-explicit",
+            ))
+            .await
+            .expect("record explicit completion after disabled receipt");
+        assert_eq!(
+            response.status,
+            InstallationSetupCompletedStatus::SuppressedDisabled
+        );
+        assert_eq!(response.setup_id, setup_id);
+        let duplicate = store
+            .complete_installation_setup(signed_setup_completed_request(
+                &signing_key,
+                installation_id,
+                setup_completed_payload(&Uuid::new_v4().to_string(), "x******x"),
+                Utc::now().timestamp_millis(),
+                "disabled-receipt-duplicate",
+            ))
+            .await
+            .expect("repeat disabled explicit completion");
+        assert_eq!(
+            duplicate.status,
+            InstallationSetupCompletedStatus::SuppressedDisabled
+        );
+        assert_eq!(duplicate.setup_id, setup_id);
+        let conn = store.conn.lock().await;
+        let state: (String, String, Option<String>, i64) = conn
+            .query_row(
+                "SELECT source, notification_status, password_hint,
+                        (SELECT COUNT(*) FROM client_notification_events WHERE installation_id = ?1)
+                 FROM installation_setup_completions WHERE installation_id = ?1",
+                params![installation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read final disabled setup receipt");
+        assert_eq!(
+            state,
+            ("explicit".into(), "suppressed_disabled".into(), None, 0)
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn disabling_during_legacy_grace_records_a_terminal_receipt() {
+        let config = enabled_notification_config("disable-during-legacy-grace");
+        let store = AppStore::new(&config).expect("create store");
+        let installation_id = "inst-disable-during-legacy-grace";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        claim_setup_client_tunnel(
+            &store,
+            &config,
+            &signing_key,
+            installation_id,
+            "disablegrace",
+        )
+        .await;
+
+        let mut disabled = config.clone();
+        disabled.client_notifications.enabled = false;
+        let disabled_at = Utc::now();
+        store
+            .sync_client_notification_runtime(
+                &notification_policy(&disabled),
+                &notification_template(),
+                disabled_at,
+            )
+            .await
+            .expect("disable notifications during legacy grace");
+        {
+            let conn = store.conn.lock().await;
+            let state: (String, String, String, Option<String>) = conn
+                .query_row(
+                    "SELECT e.status, isc.source, isc.notification_status, isc.password_hint
+                     FROM client_notification_events e
+                     INNER JOIN installation_setup_completions isc ON isc.event_id = e.id
+                     WHERE e.installation_id = ?1",
+                    params![installation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("read disabled grace receipt");
+            assert_eq!(
+                state,
+                (
+                    "suppressed_disabled".into(),
+                    "legacy_fallback".into(),
+                    "suppressed_disabled".into(),
+                    None
+                )
+            );
+        }
+
+        store
+            .sync_client_notification_runtime(
+                &notification_policy(&config),
+                &notification_template(),
+                disabled_at + Duration::seconds(1),
+            )
+            .await
+            .expect("re-enable notifications after terminal legacy decision");
+        let stats = store
+            .aggregate_client_notification_batches(
+                &notification_policy(&config),
+                &notification_template(),
+                disabled_at + Duration::hours(2),
+            )
+            .await
+            .expect("do not replay disabled legacy fallback");
+        assert_eq!(stats.batches_created, 0);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn old_installation_tunnel_reclaim_does_not_create_setup_fallback() {
+        let config = enabled_notification_config("old-installation-no-fallback");
+        let store = AppStore::new(&config).expect("create store");
+        let installation_id = "inst-old-reclaim-no-fallback";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installations SET created_at = ?2 WHERE id = ?1",
+                params![
+                    installation_id,
+                    (Utc::now() - Duration::minutes(31)).to_rfc3339()
+                ],
+            )
+            .expect("age existing installation");
+        }
+        claim_setup_client_tunnel(&store, &config, &signing_key, installation_id, "oldreclaim")
+            .await;
+        let conn = store.conn.lock().await;
+        let tracked: i64 = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM client_notification_events WHERE installation_id = ?1) +
+                    (SELECT COUNT(*) FROM installation_setup_completions WHERE installation_id = ?1)",
+                params![installation_id],
+                |row| row.get(0),
+            )
+            .expect("count old reclaim setup tracking");
+        assert_eq!(tracked, 0);
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn sent_legacy_receipt_prevents_reclaim_after_audit_cleanup() {
+        let config = enabled_notification_config("sent-legacy-receipt-cleanup");
+        let store = AppStore::new(&config).expect("create store");
+        let installation_id = "inst-sent-legacy-cleanup";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        claim_setup_client_tunnel(&store, &config, &signing_key, installation_id, "sentlegacy")
+            .await;
+        let delivery_at = Utc::now() + Duration::hours(2);
+        let policy = notification_policy(&config);
+        store
+            .aggregate_client_notification_batches(&policy, &notification_template(), delivery_at)
+            .await
+            .expect("aggregate sent legacy fixture");
+        let batch = expect_notification_batch(
+            store
+                .claim_client_notification_batch("sent-legacy-worker", delivery_at, 30)
+                .await
+                .expect("claim sent legacy fixture"),
+            "sent legacy fixture",
+        );
+        assert!(
+            store
+                .validate_client_notification_batch(
+                    &batch.id,
+                    "sent-legacy-worker",
+                    &policy,
+                    delivery_at,
+                )
+                .await
+                .expect("validate sent legacy fixture")
+        );
+        store
+            .mark_client_notification_batch_sent(
+                &batch.id,
+                "sent-legacy-worker",
+                "sent-legacy-message",
+                delivery_at,
+            )
+            .await
+            .expect("mark legacy fixture sent");
+        {
+            let conn = store.conn.lock().await;
+            assert!(matches!(
+                prepare_legacy_setup_notification_adoption_tx(&conn, installation_id, delivery_at)
+                    .expect("classify sent legacy delivery"),
+                LegacySetupNotificationState::Sent { .. }
+            ));
+            conn.execute("DELETE FROM email_delivery_batches", [])
+                .expect("clean sent legacy batch audit");
+            conn.execute(
+                "DELETE FROM client_notification_events WHERE installation_id = ?1",
+                params![installation_id],
+            )
+            .expect("clean sent legacy event audit");
+        }
+
+        claim_setup_client_tunnel(&store, &config, &signing_key, installation_id, "sentlegacy")
+            .await;
+        {
+            let conn = store.conn.lock().await;
+            let state: (i64, i64, String) = conn
+                .query_row(
+                    "SELECT
+                        (SELECT COUNT(*) FROM client_notification_events WHERE installation_id = ?1),
+                        (SELECT COUNT(*) FROM installation_setup_completions WHERE installation_id = ?1),
+                        (SELECT source FROM installation_setup_completions WHERE installation_id = ?1)",
+                    params![installation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("read sent receipt after reclaim");
+            assert_eq!(state, (0, 1, "legacy_fallback".into()));
+        }
+
+        let setup_id = Uuid::new_v4().to_string();
+        let response = store
+            .complete_installation_setup(signed_setup_completed_request(
+                &signing_key,
+                installation_id,
+                setup_completed_payload(&setup_id, "s******t"),
+                Utc::now().timestamp_millis(),
+                "sent-legacy-explicit",
+            ))
+            .await
+            .expect("record explicit completion after legacy delivery");
+        assert_eq!(
+            response.status,
+            InstallationSetupCompletedStatus::AlreadyRecorded
+        );
+        assert_eq!(response.setup_id, setup_id);
+        let conn = store.conn.lock().await;
+        let state: (String, Option<String>, i64) = conn
+            .query_row(
+                "SELECT source, password_hint,
+                        (SELECT COUNT(*) FROM client_notification_events WHERE installation_id = ?1)
+                 FROM installation_setup_completions WHERE installation_id = ?1",
+                params![installation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read explicit receipt after legacy delivery");
+        assert_eq!(state, ("explicit".into(), None, 0));
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn explicit_setup_does_not_bypass_terminal_legacy_decisions() {
+        let config = enabled_notification_config("terminal-legacy-setup-decisions");
+        let store = AppStore::new(&config).expect("create store");
+        for (index, (event_status, expected_response)) in [
+            (
+                "suppressed_rate_limit",
+                InstallationSetupCompletedStatus::AlreadyRecorded,
+            ),
+            (
+                "suppressed_storm",
+                InstallationSetupCompletedStatus::AlreadyRecorded,
+            ),
+            (
+                "dead_letter",
+                InstallationSetupCompletedStatus::AlreadyRecorded,
+            ),
+            (
+                "suppressed_expired",
+                InstallationSetupCompletedStatus::AlreadyRecorded,
+            ),
+            (
+                "suppressed_disabled",
+                InstallationSetupCompletedStatus::SuppressedDisabled,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let installation_id = format!("inst-terminal-legacy-{index}");
+            let subdomain = format!("terminallegacy{index}");
+            let signing_key = insert_signed_installation(&store, &installation_id).await;
+            claim_setup_client_tunnel(&store, &config, &signing_key, &installation_id, &subdomain)
+                .await;
+            {
+                let conn = store.conn.lock().await;
+                conn.execute(
+                    "UPDATE client_notification_events SET status = ?2 WHERE installation_id = ?1",
+                    params![installation_id, event_status],
+                )
+                .expect("set terminal legacy decision");
+            }
+            let response = store
+                .complete_installation_setup(signed_setup_completed_request(
+                    &signing_key,
+                    &installation_id,
+                    setup_completed_payload(&Uuid::new_v4().to_string(), "t******l"),
+                    Utc::now().timestamp_millis(),
+                    &format!("terminal-legacy-{index}"),
+                ))
+                .await
+                .expect("record explicit setup after terminal legacy decision");
+            assert_eq!(response.status, expected_response);
+            let conn = store.conn.lock().await;
+            let state: (i64, String, Option<String>, String) = conn
+                .query_row(
+                    "SELECT COUNT(*), MAX(e.status), MAX(isc.password_hint),
+                            MAX(isc.notification_status)
+                     FROM client_notification_events e
+                     INNER JOIN installation_setup_completions isc ON isc.event_id = e.id
+                     WHERE e.installation_id = ?1",
+                    params![installation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("read terminal legacy setup state");
+            assert_eq!(state.0, 1);
+            assert_eq!(state.1, event_status);
+            assert!(state.2.is_none());
+            assert_eq!(
+                state.3,
+                if event_status == "suppressed_disabled" {
+                    "suppressed_disabled"
+                } else {
+                    "queued"
+                }
+            );
+        }
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn setup_completed_rejects_epoch_and_nonce_before_mutating_state() {
+        let config = enabled_notification_config("setup-completed-envelope-validation");
+        let store = AppStore::new(&config).expect("create store");
+        let installation_id = "inst-setup-envelope";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        let setup_id = Uuid::new_v4().to_string();
+
+        let mut wrong_epoch = signed_setup_completed_request(
+            &signing_key,
+            installation_id,
+            setup_completed_payload(&setup_id, "p******w"),
+            Utc::now().timestamp_millis(),
+            "setup-envelope-epoch",
+        );
+        wrong_epoch.protocol_epoch = "unsupported-epoch".into();
+        let error = store
+            .complete_installation_setup(wrong_epoch)
+            .await
+            .expect_err("protocol epoch mismatch must fail");
+        assert!(error.to_string().contains("protocol epoch"));
+
+        let invalid_nonce = signed_setup_completed_request(
+            &signing_key,
+            installation_id,
+            setup_completed_payload(&setup_id, "p******w"),
+            Utc::now().timestamp_millis(),
+            "bad nonce",
+        );
+        let error = store
+            .complete_installation_setup(invalid_nonce)
+            .await
+            .expect_err("invalid nonce format must fail");
+        assert!(error.to_string().contains("nonce must be"));
+
+        let conn = store.conn.lock().await;
+        let mutated: i64 = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM request_nonces WHERE installation_id = ?1) +
+                    (SELECT COUNT(*) FROM client_notification_events WHERE installation_id = ?1) +
+                    (SELECT COUNT(*) FROM installation_setup_completions WHERE installation_id = ?1)",
+                params![installation_id],
+                |row| row.get(0),
+            )
+            .expect("count setup envelope mutations");
+        assert_eq!(mutated, 0);
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn setup_completion_conflict_rolls_back_nonce_for_exact_retry() {
+        let config = enabled_notification_config("setup-completed-nonce-rollback");
+        let store = AppStore::new(&config).expect("create store");
+        let installation_id = "inst-setup-retry";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        let setup_id = Uuid::new_v4().to_string();
+        let request = signed_setup_completed_request(
+            &signing_key,
+            installation_id,
+            setup_completed_payload(&setup_id, "p******w"),
+            Utc::now().timestamp_millis(),
+            "setup-exact-retry",
+        );
+        let error = store
+            .complete_installation_setup(request)
+            .await
+            .expect_err("missing tunnel must reject completion");
+        assert!(error.to_string().contains("enabled client tunnel"));
+        {
+            let conn = store.conn.lock().await;
+            let nonce_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM request_nonces
+                     WHERE installation_id = ?1
+                       AND action = 'installation_setup_completed_v1'",
+                    params![installation_id],
+                    |row| row.get(0),
+                )
+                .expect("count rolled back setup nonce");
+            assert_eq!(nonce_count, 0);
+        }
+
+        insert_setup_client_tunnel(&store, installation_id, "retryclient").await;
+        let retry = signed_setup_completed_request(
+            &signing_key,
+            installation_id,
+            setup_completed_payload(&setup_id, "p******w"),
+            Utc::now().timestamp_millis(),
+            "setup-exact-retry",
+        );
+        let response = store
+            .complete_installation_setup(retry)
+            .await
+            .expect("same nonce can retry after rollback");
+        assert_eq!(response.status, InstallationSetupCompletedStatus::Queued);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn owner_binding_and_authenticated_presence_do_not_emit_registration_email() {
+        let config = enabled_notification_config("setup-no-early-registration-event");
+        let store = AppStore::new(&config).expect("create store");
+        let installation_id = "inst-no-early-event";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installations SET owner_email = NULL, owner_verified_at = NULL
+                 WHERE id = ?1",
+                params![installation_id],
+            )
+            .expect("clear installation owner");
+        }
+
+        let owner_payload = BindOwnerEmailSignaturePayload {
+            email: "owner@example.com",
+            verification_token: None,
+        };
+        let owner_timestamp_ms = Utc::now().timestamp_millis();
+        let owner_nonce = "setup-owner-bind-1";
+        let owner_signature = sign_test_payload(
+            &signing_key,
+            installation_id,
+            "bind_installation_owner_email",
+            &owner_payload,
+            owner_timestamp_ms,
+            owner_nonce,
+        );
+        store
+            .bind_installation_owner_email(
+                &config,
+                BindInstallationOwnerEmailRequest {
+                    installation_id: installation_id.into(),
+                    email: "owner@example.com".into(),
+                    verification_token: None,
+                    timestamp_ms: owner_timestamp_ms,
+                    nonce: owner_nonce.into(),
+                    signature: owner_signature,
+                },
+                None,
+            )
+            .await
+            .expect("bind installation owner");
+
+        let heartbeat = crate::models::InstallationHeartbeatPayload {
+            protocol_version: 1,
+            boot_id: "setup-boot-id".into(),
+            app_version: "1.0.1".into(),
+            commit_id: "setup-commit".into(),
+        };
+        let heartbeat_timestamp_ms = Utc::now().timestamp_millis();
+        let heartbeat_nonce = "setup-heartbeat-1";
+        let heartbeat_signature = sign_test_payload(
+            &signing_key,
+            installation_id,
+            "installation_heartbeat_v1",
+            &heartbeat,
+            heartbeat_timestamp_ms,
+            heartbeat_nonce,
+        );
+        store
+            .record_installation_heartbeat(InstallationHeartbeatRequest {
+                installation_id: installation_id.into(),
+                timestamp_ms: heartbeat_timestamp_ms,
+                nonce: heartbeat_nonce.into(),
+                signature: heartbeat_signature,
+                payload: heartbeat,
+            })
+            .await
+            .expect("record authenticated heartbeat");
+
+        let conn = store.conn.lock().await;
+        let registration_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM client_notification_events
+                 WHERE installation_id = ?1 AND kind = 'client_registered'",
+                params![installation_id],
+                |row| row.get(0),
+            )
+            .expect("count early registration events");
+        let registration_state: String = conn
+            .query_row(
+                "SELECT registration_state FROM installation_notification_state
+                 WHERE installation_id = ?1",
+                params![installation_id],
+                |row| row.get(0),
+            )
+            .expect("read authenticated registration state");
+        assert_eq!(registration_events, 0);
+        assert_eq!(registration_state, "verified");
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn setup_password_hint_cleanup_retains_pending_and_clears_inactive_rows() {
+        let config = enabled_notification_config("setup-password-hint-cleanup");
+        let store = AppStore::new(&config).expect("create store");
+        let installation_id = "inst-hint-cleanup";
+        let signing_key = insert_signed_installation(&store, installation_id).await;
+        insert_setup_client_tunnel(&store, installation_id, "hintcleanup").await;
+        let request = signed_setup_completed_request(
+            &signing_key,
+            installation_id,
+            setup_completed_payload(&Uuid::new_v4().to_string(), "p******w"),
+            Utc::now().timestamp_millis(),
+            "setup-hint-cleanup",
+        );
+        store
+            .complete_installation_setup(request)
+            .await
+            .expect("complete setup for hint cleanup");
+
+        let conn = store.conn.lock().await;
+        let tx = conn.unchecked_transaction().expect("begin hint cleanup tx");
+        assert_eq!(
+            clear_inactive_setup_password_hints_tx(&tx, Utc::now()).unwrap(),
+            0
+        );
+        let pending_hint: Option<String> = tx
+            .query_row(
+                "SELECT password_hint FROM installation_setup_completions
+                 WHERE installation_id = ?1",
+                params![installation_id],
+                |row| row.get(0),
+            )
+            .expect("read pending setup hint");
+        assert_eq!(pending_hint.as_deref(), Some("p******w"));
+
+        tx.execute(
+            "UPDATE client_notification_events SET status = 'suppressed_expired'
+             WHERE installation_id = ?1",
+            params![installation_id],
+        )
+        .expect("expire setup event");
+        assert_eq!(
+            clear_inactive_setup_password_hints_tx(&tx, Utc::now()).unwrap(),
+            1
+        );
+        let terminal_hint: Option<String> = tx
+            .query_row(
+                "SELECT password_hint FROM installation_setup_completions
+                 WHERE installation_id = ?1",
+                params![installation_id],
+                |row| row.get(0),
+            )
+            .expect("read terminal setup hint");
+        assert!(terminal_hint.is_none());
+
+        tx.execute(
+            "UPDATE installation_setup_completions SET password_hint = 'x******y'
+             WHERE installation_id = ?1",
+            params![installation_id],
+        )
+        .expect("restore orphan hint fixture");
+        tx.execute(
+            "DELETE FROM client_notification_events WHERE installation_id = ?1",
+            params![installation_id],
+        )
+        .expect("orphan setup completion");
+        assert_eq!(
+            clear_inactive_setup_password_hints_tx(&tx, Utc::now()).unwrap(),
+            1
+        );
+        let orphan_hint: Option<String> = tx
+            .query_row(
+                "SELECT password_hint FROM installation_setup_completions
+                 WHERE installation_id = ?1",
+                params![installation_id],
+                |row| row.get(0),
+            )
+            .expect("read orphaned setup hint");
+        assert!(orphan_hint.is_none());
+        tx.commit().expect("commit hint cleanup tx");
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 
     fn payout_update(
@@ -26025,7 +28240,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("count registration events");
-        assert_eq!(event_count, 1);
+        assert_eq!(event_count, 0);
         drop(conn);
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
@@ -26544,6 +28759,27 @@ mod tests {
         let signing_key = SigningKey::generate(&mut OsRng);
         let policy = notification_policy(&config);
         let first = register_v2_with_key(&store, &signing_key, "1.0.0").await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installations SET owner_email = 'owner@example.com', owner_verified_at = ?2
+                 WHERE id = ?1",
+                params![first.installation_id, Utc::now().to_rfc3339()],
+            )
+            .expect("bind first lifecycle owner");
+        }
+        insert_setup_client_tunnel(&store, &first.installation_id, "firstlifecycle").await;
+        let first_setup = signed_setup_completed_request(
+            &signing_key,
+            &first.installation_id,
+            setup_completed_payload(&Uuid::new_v4().to_string(), "p******w"),
+            Utc::now().timestamp_millis(),
+            "first-lifecycle-setup",
+        );
+        store
+            .complete_installation_setup(first_setup)
+            .await
+            .expect("complete first lifecycle setup");
         let first_seen = Utc::now();
         {
             let conn = store.conn.lock().await;
@@ -26578,6 +28814,27 @@ mod tests {
 
         let second = register_v2_with_key(&store, &signing_key, "2.0.0").await;
         assert_ne!(first.installation_id, second.installation_id);
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installations SET owner_email = 'owner@example.com', owner_verified_at = ?2
+                 WHERE id = ?1",
+                params![second.installation_id, Utc::now().to_rfc3339()],
+            )
+            .expect("bind second lifecycle owner");
+        }
+        insert_setup_client_tunnel(&store, &second.installation_id, "secondlifecycle").await;
+        let second_setup = signed_setup_completed_request(
+            &signing_key,
+            &second.installation_id,
+            setup_completed_payload(&Uuid::new_v4().to_string(), "s******t"),
+            Utc::now().timestamp_millis(),
+            "second-lifecycle-setup",
+        );
+        store
+            .complete_installation_setup(second_setup)
+            .await
+            .expect("complete second lifecycle setup");
         let second_seen = Utc::now();
         {
             let conn = store.conn.lock().await;
@@ -26714,7 +28971,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("read authenticated legacy state");
-        assert_eq!(state, ("verified".into(), 0, 1));
+        assert_eq!(state, ("verified".into(), 0, 0));
         drop(conn);
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
@@ -26916,6 +29173,26 @@ mod tests {
                 params![registered.installation_id, registered_at.to_rfc3339()],
             )
             .expect("bind outbox notification owner");
+            conn.execute(
+                "INSERT INTO client_notification_events (
+                    id, dedupe_key, kind, installation_id, episode, status,
+                    occurred_at, not_before, snapshot_json, created_at, updated_at
+                 ) VALUES ('outbox-registration-event', ?1, 'client_registered', ?2, 0,
+                           'pending', ?3, ?3, ?4, ?3, ?3)",
+                params![
+                    format!("setup:{}", registered.installation_id),
+                    registered.installation_id,
+                    registered_at.to_rfc3339(),
+                    serde_json::json!({
+                        "installationId": registered.installation_id,
+                        "platform": "linux",
+                        "appVersion": "1.0.0",
+                        "setupCompletedAt": registered_at,
+                    })
+                    .to_string(),
+                ],
+            )
+            .expect("insert explicit setup notification event");
         }
         let policy = notification_policy(&config);
         let template = notification_template();
@@ -27058,11 +29335,16 @@ mod tests {
                 params!["inst-owner-recipient", now.to_rfc3339()],
             )
             .expect("insert owner notification state");
-            let installation = get_installation(&conn, "inst-owner-recipient")
-                .expect("load owner installation")
-                .expect("owner installation");
-            insert_client_registration_event(&conn, &installation, now)
-                .expect("insert owner registration event");
+            conn.execute(
+                "INSERT INTO client_notification_events (
+                    id, dedupe_key, kind, installation_id, episode, status,
+                    occurred_at, not_before, snapshot_json, created_at, updated_at
+                 ) VALUES ('owner-registration', 'setup:inst-owner-recipient',
+                           'client_registered', 'inst-owner-recipient', 0, 'pending',
+                           ?1, ?1, '{}', ?1, ?1)",
+                params![now.to_rfc3339()],
+            )
+            .expect("insert owner registration event");
         }
         drop(signing_key);
         let policy = notification_policy(&config);
@@ -27496,7 +29778,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verified_active_owner_is_the_only_offline_notification_recipient() {
+    async fn verified_owner_is_the_only_offline_notification_recipient() {
         let config = enabled_notification_config("notification-owner-offline");
         let store = AppStore::new(&config).expect("create store");
         let _signing_key = insert_signed_installation(&store, "inst-owner-offline").await;
@@ -27619,6 +29901,12 @@ mod tests {
         {
             let conn = store.conn.lock().await;
             conn.execute(
+                "UPDATE installations SET owner_email = NULL, owner_verified_at = NULL
+                 WHERE id = 'inst-owner-wait-disable'",
+                [],
+            )
+            .expect("remove owner from waiting registration fixture");
+            conn.execute(
                 "INSERT INTO client_notification_events (
                     id, dedupe_key, kind, installation_id, episode, status,
                     occurred_at, not_before, snapshot_json, created_at, updated_at
@@ -27696,6 +29984,12 @@ mod tests {
         let config = enabled_notification_config("notification-registration-owner-change");
         let store = AppStore::new(&config).expect("create store");
         insert_installation(&store, "inst-registration-owner-change").await;
+        insert_setup_client_tunnel(
+            &store,
+            "inst-registration-owner-change",
+            "ownerchangeclient",
+        )
+        .await;
         let now = Utc::now();
         {
             let conn = store.conn.lock().await;
@@ -27709,7 +30003,7 @@ mod tests {
                 "INSERT INTO client_notification_events (
                     id, dedupe_key, kind, installation_id, episode, status,
                     occurred_at, not_before, snapshot_json, created_at, updated_at
-                 ) VALUES ('registration-owner-change-event', 'registration-owner-change-event',
+                 ) VALUES ('registration-owner-change-event', 'setup:inst-registration-owner-change',
                            'client_registered', 'inst-registration-owner-change', 0, 'pending',
                            ?1, ?1, ?2, ?1, ?1)",
                 params![
@@ -27723,6 +30017,16 @@ mod tests {
                 ],
             )
             .expect("insert owner change registration event");
+            conn.execute(
+                "INSERT INTO installation_setup_completions (
+                    installation_id, setup_id, password_hint, notification_status, event_id,
+                    completed_at, created_at, updated_at
+                 ) VALUES ('inst-registration-owner-change',
+                           '123e4567-e89b-42d3-a456-426614174000', 'p******w', 'queued',
+                           'registration-owner-change-event', ?1, ?1, ?1)",
+                params![now.to_rfc3339()],
+            )
+            .expect("insert owner change setup completion");
         }
         let policy = notification_policy(&config);
         let delivery_at = now + Duration::seconds(6);
@@ -27738,6 +30042,7 @@ mod tests {
             "original owner registration batch",
         );
         assert_eq!(original.recipient, "owner@example.com");
+        assert!(original.html.contains("p******w"));
         {
             let conn = store.conn.lock().await;
             conn.execute(
@@ -27767,20 +30072,27 @@ mod tests {
         );
         {
             let conn = store.conn.lock().await;
-            let state: (String, String, i64) = conn
+            let state: (String, String, i64, Option<String>) = conn
                 .query_row(
                     "SELECT b.status, e.status,
-                            (SELECT COUNT(*) FROM email_delivery_batch_items WHERE batch_id = b.id)
+                            (SELECT COUNT(*) FROM email_delivery_batch_items WHERE batch_id = b.id),
+                            isc.password_hint
                      FROM email_delivery_batches b
                      CROSS JOIN client_notification_events e
+                     INNER JOIN installation_setup_completions isc ON isc.event_id = e.id
                      WHERE b.id = ?1 AND e.id = 'registration-owner-change-event'",
                     params![original.id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .expect("read revoked owner batch state");
             assert_eq!(
                 state,
-                ("suppressed_recipient_removed".into(), "pending".into(), 0)
+                (
+                    "suppressed_recipient_removed".into(),
+                    "pending".into(),
+                    0,
+                    Some("p******w".into())
+                )
             );
         }
         store
@@ -27794,25 +30106,35 @@ mod tests {
         let conn = store.conn.lock().await;
         let batches = conn
             .prepare(
-                "SELECT recipient, status FROM email_delivery_batches
+                "SELECT recipient, status, html_body FROM email_delivery_batches
                  ORDER BY created_at, recipient",
             )
             .expect("prepare rerouted owner batches")
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })
             .expect("query rerouted owner batches")
             .collect::<Result<Vec<_>, _>>()
             .expect("read rerouted owner batches");
         assert_eq!(
-            batches,
+            batches
+                .iter()
+                .map(|(recipient, status, _)| (recipient.as_str(), status.as_str()))
+                .collect::<Vec<_>>(),
             vec![
-                (
-                    "owner@example.com".into(),
-                    "suppressed_recipient_removed".into()
-                ),
-                ("new-owner@example.com".into(), "pending".into()),
+                ("owner@example.com", "suppressed_recipient_removed"),
+                ("new-owner@example.com", "pending"),
             ]
+        );
+        assert!(batches[1].2.contains("p******w"));
+        assert!(
+            batches[1]
+                .2
+                .contains("https://ownerchangeclient.router.example.com/")
         );
         drop(conn);
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
@@ -34818,5 +37140,511 @@ mod tests {
             .expect("read announcement");
         assert!(!response.enabled);
         assert_eq!(response.content_en, "<p>Hello</p>");
+    }
+
+    fn chat_test_session(user_id: &str, email: &str) -> AuthSession {
+        let now = Utc::now();
+        AuthSession {
+            session_id: format!("session-{user_id}"),
+            user_id: user_id.to_string(),
+            email: email.to_string(),
+            installation_id: format!("browser-{user_id}"),
+            access_token_hash: format!("access-{user_id}"),
+            refresh_token_hash: format!("refresh-{user_id}"),
+            access_expires_at: now + Duration::hours(1),
+            refresh_expires_at: now + Duration::days(1),
+            created_at: now,
+            last_used_at: now,
+        }
+    }
+
+    async fn ensure_test_chat_room(store: &AppStore, installation_id: &str) -> String {
+        let conn = store.conn.lock().await;
+        client_chat::ensure_room_for_verified_owner_tx(
+            &conn,
+            installation_id,
+            "owner@example.com",
+            Utc::now(),
+        )
+        .expect("create chat room")
+    }
+
+    #[tokio::test]
+    async fn client_chat_room_is_one_to_one_with_verified_client() {
+        let (store, config) = setup_store("client-chat-one-to-one").await;
+        let installation_id = "chat-client-one";
+        insert_installation(&store, installation_id).await;
+
+        let first = ensure_test_chat_room(&store, installation_id).await;
+        let second = ensure_test_chat_room(&store, installation_id).await;
+        assert_eq!(first, second);
+
+        let room = store
+            .get_client_chat_room_by_installation(installation_id, None)
+            .await
+            .expect("public room");
+        assert_eq!(room.id, first);
+        assert_eq!(room.status, "active");
+
+        let count = {
+            let conn = store.conn.lock().await;
+            conn.query_row(
+                "SELECT COUNT(*) FROM client_chat_rooms WHERE installation_id = ?1",
+                params![installation_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count chat rooms")
+        };
+        assert_eq!(count, 1);
+
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installations SET owner_verified_at = NULL WHERE id = ?1",
+                params![installation_id],
+            )
+            .expect("remove owner verification");
+            client_chat::init_schema(&conn).expect("reconcile ownerless chat room");
+            let status = conn
+                .query_row(
+                    "SELECT status FROM client_chat_rooms WHERE id = ?1",
+                    params![first],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read archived chat room");
+            assert_eq!(status, "archived");
+
+            conn.execute(
+                "UPDATE installations SET owner_verified_at = ?2 WHERE id = ?1",
+                params![installation_id, Utc::now().to_rfc3339()],
+            )
+            .expect("restore owner verification");
+            client_chat::init_schema(&conn).expect("reactivate verified chat room");
+            let reactivated = conn
+                .query_row(
+                    "SELECT id, status FROM client_chat_rooms WHERE installation_id = ?1",
+                    params![installation_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .expect("read reactivated chat room");
+            assert_eq!(reactivated, (first, "active".into()));
+        }
+        let _ = std::fs::remove_file(config.db_path);
+    }
+
+    #[tokio::test]
+    async fn client_chat_messages_are_public_idempotent_and_recent_is_per_user() {
+        let (store, config) = setup_store("client-chat-public-idempotent").await;
+        let installation_id = "chat-client-public";
+        insert_installation(&store, installation_id).await;
+        let room_id = ensure_test_chat_room(&store, installation_id).await;
+        let sender = chat_test_session("user-alice", "alice@example.com");
+        let client_message_id = Uuid::new_v4().to_string();
+
+        let first = store
+            .create_client_chat_message(
+                &room_id,
+                &sender,
+                "hello from chat".into(),
+                client_message_id.clone(),
+            )
+            .await
+            .expect("create chat message");
+        let duplicate = store
+            .create_client_chat_message(
+                &room_id,
+                &sender,
+                "ignored duplicate body".into(),
+                client_message_id,
+            )
+            .await
+            .expect("idempotent chat message");
+        assert_eq!(first.id, duplicate.id);
+
+        let public = store
+            .list_client_chat_messages(&room_id, None, None, None, 50)
+            .await
+            .expect("public chat history");
+        assert_eq!(public.messages.len(), 1);
+        assert_eq!(public.messages[0].author_label, "alice");
+        assert!(!public.messages[0].is_mine);
+
+        store
+            .record_client_chat_visit(&room_id, "viewer-one")
+            .await
+            .expect("record visit");
+        assert_eq!(
+            store
+                .list_visited_client_chat_rooms("viewer-one")
+                .await
+                .expect("viewer one rooms")
+                .rooms
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .list_visited_client_chat_rooms("viewer-two")
+                .await
+                .expect("viewer two rooms")
+                .rooms
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .import_client_chat_visits(
+                    "viewer-two",
+                    vec![crate::models::ClientChatVisitImportItem {
+                        installation_id: installation_id.into(),
+                        last_read_seq: first.seq,
+                    }],
+                )
+                .await
+                .expect("import anonymous visit"),
+            1
+        );
+        let imported = store
+            .list_visited_client_chat_rooms("viewer-two")
+            .await
+            .expect("imported viewer rooms");
+        assert_eq!(imported.rooms.len(), 1);
+        assert_eq!(imported.total_unread, 0);
+        let event_count = {
+            let conn = store.conn.lock().await;
+            conn.query_row("SELECT COUNT(*) FROM client_chat_email_events", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("count chat events")
+        };
+        assert_eq!(event_count, 1);
+        let _ = std::fs::remove_file(config.db_path);
+    }
+
+    #[tokio::test]
+    async fn client_chat_anonymous_unread_counts_messages_in_that_room_only() {
+        let (store, config) = setup_store("client-chat-anonymous-unread").await;
+        insert_installation(&store, "chat-client-unread-a").await;
+        insert_installation(&store, "chat-client-unread-b").await;
+        let room_a = ensure_test_chat_room(&store, "chat-client-unread-a").await;
+        let room_b = ensure_test_chat_room(&store, "chat-client-unread-b").await;
+        let sender = chat_test_session("unread-sender", "sender@example.com");
+
+        let first_a = store
+            .create_client_chat_message(
+                &room_a,
+                &sender,
+                "first room A message".into(),
+                Uuid::new_v4().to_string(),
+            )
+            .await
+            .expect("first room A message");
+        for index in 0..3 {
+            store
+                .create_client_chat_message(
+                    &room_b,
+                    &sender,
+                    format!("room B message {index}"),
+                    Uuid::new_v4().to_string(),
+                )
+                .await
+                .expect("room B message");
+        }
+        store
+            .create_client_chat_message(
+                &room_a,
+                &sender,
+                "second room A message".into(),
+                Uuid::new_v4().to_string(),
+            )
+            .await
+            .expect("second room A message");
+
+        let rooms = store
+            .lookup_client_chat_rooms(
+                vec!["chat-client-unread-a".into()],
+                BTreeMap::from([("chat-client-unread-a".into(), first_a.seq)]),
+                None,
+            )
+            .await
+            .expect("anonymous room lookup");
+        assert_eq!(rooms.rooms.len(), 1);
+        assert_eq!(rooms.rooms[0].unread_count, 1);
+        assert_eq!(rooms.total_unread, 1);
+        let _ = std::fs::remove_file(config.db_path);
+    }
+
+    #[tokio::test]
+    async fn client_chat_owner_is_suppressed_and_one_minute_window_is_complete() {
+        let (store, config) = setup_store("client-chat-email-window").await;
+        let installation_id = "chat-client-email";
+        insert_installation(&store, installation_id).await;
+        let room_id = ensure_test_chat_room(&store, installation_id).await;
+        let owner = chat_test_session("owner-user", "owner@example.com");
+        let alice = chat_test_session("alice-user", "alice@example.com");
+        let bob = chat_test_session("bob-user", "bob@example.com");
+
+        store
+            .create_client_chat_message(
+                &room_id,
+                &owner,
+                "owner reply".into(),
+                Uuid::new_v4().to_string(),
+            )
+            .await
+            .expect("owner message");
+        store
+            .create_client_chat_message(
+                &room_id,
+                &alice,
+                "first external message".into(),
+                Uuid::new_v4().to_string(),
+            )
+            .await
+            .expect("alice message");
+        store
+            .create_client_chat_message(
+                &room_id,
+                &bob,
+                "second external message".into(),
+                Uuid::new_v4().to_string(),
+            )
+            .await
+            .expect("bob message");
+
+        {
+            let conn = store.conn.lock().await;
+            let events = conn
+                .query_row("SELECT COUNT(*) FROM client_chat_email_events", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("count email events");
+            assert_eq!(events, 2, "owner message must not create an email event");
+            conn.execute(
+                "UPDATE client_chat_email_events SET window_ends_at = ?1",
+                params![(Utc::now() - Duration::seconds(1)).to_rfc3339()],
+            )
+            .expect("close email window");
+        }
+
+        let stats = store
+            .aggregate_client_chat_deliveries(&notification_template(), Utc::now())
+            .await
+            .expect("aggregate chat email");
+        assert_eq!(stats.deliveries_created, 1);
+        assert_eq!(stats.events_batched, 2);
+        let claim = store
+            .claim_client_chat_delivery("chat-worker", Utc::now(), 90)
+            .await
+            .expect("claim chat email")
+            .expect("chat delivery");
+        assert!(claim.html.contains("first external message"));
+        assert!(claim.html.contains("second external message"));
+        assert!(!claim.html.contains("owner reply"));
+        assert_eq!(claim.recipient, "owner@example.com");
+        let _ = std::fs::remove_file(config.db_path);
+    }
+
+    #[tokio::test]
+    async fn client_chat_owner_change_requeues_unsent_events_and_archive_expires() {
+        let (store, config) = setup_store("client-chat-owner-archive").await;
+        let installation_id = "chat-client-owner-change";
+        insert_installation(&store, installation_id).await;
+        let room_id = ensure_test_chat_room(&store, installation_id).await;
+        let sender = chat_test_session("sender-user", "sender@example.com");
+        store
+            .create_client_chat_message(
+                &room_id,
+                &sender,
+                "pending owner notification".into(),
+                Uuid::new_v4().to_string(),
+            )
+            .await
+            .expect("pending message");
+
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE client_chat_email_events SET window_ends_at = ?1 WHERE room_id = ?2",
+                params![(Utc::now() - Duration::seconds(1)).to_rfc3339(), room_id],
+            )
+            .expect("close old owner window");
+        }
+        store
+            .aggregate_client_chat_deliveries(&notification_template(), Utc::now())
+            .await
+            .expect("aggregate old owner delivery");
+        let old_owner_delivery = store
+            .claim_client_chat_delivery("old-owner-worker", Utc::now(), 90)
+            .await
+            .expect("claim old owner delivery")
+            .expect("old owner delivery");
+        store
+            .mark_client_chat_delivery_dead_letter(
+                &old_owner_delivery.id,
+                "old-owner-worker",
+                "test failure",
+                Utc::now(),
+            )
+            .await
+            .expect("dead-letter old owner delivery");
+
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE installations SET owner_email = 'next-owner@example.com', owner_verified_at = ?2 WHERE id = ?1",
+                params![installation_id, Utc::now().to_rfc3339()],
+            )
+            .expect("change owner");
+            client_chat::ensure_room_for_verified_owner_tx(
+                &conn,
+                installation_id,
+                "next-owner@example.com",
+                Utc::now(),
+            )
+            .expect("sync chat owner");
+            let recipient = conn
+                .query_row(
+                    "SELECT recipient FROM client_chat_email_events WHERE room_id = ?1",
+                    params![room_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read requeued recipient");
+            assert_eq!(recipient, "next-owner@example.com");
+            let old_status = conn
+                .query_row(
+                    "SELECT status FROM client_chat_email_deliveries WHERE id = ?1",
+                    params![old_owner_delivery.id],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read stale delivery status");
+            assert_eq!(old_status, "cancelled_owner_changed");
+            conn.execute(
+                "UPDATE client_chat_email_events SET window_ends_at = ?1 WHERE room_id = ?2 AND status = 'pending'",
+                params![
+                    (Utc::now() - Duration::seconds(1)).to_rfc3339(),
+                    room_id
+                ],
+            )
+            .expect("close new owner window");
+        }
+
+        store
+            .aggregate_client_chat_deliveries(&notification_template(), Utc::now())
+            .await
+            .expect("aggregate new owner delivery");
+        let new_owner_delivery = store
+            .claim_client_chat_delivery("new-owner-worker", Utc::now(), 90)
+            .await
+            .expect("claim new owner delivery")
+            .expect("new owner delivery");
+        assert_eq!(new_owner_delivery.recipient, "next-owner@example.com");
+        assert!(matches!(
+            store
+                .requeue_client_chat_delivery(&old_owner_delivery.id, Utc::now())
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+
+        let archived_at =
+            Utc::now() - Duration::seconds(crate::client_chat::CHAT_ARCHIVE_RETENTION_SECS + 1);
+        {
+            let conn = store.conn.lock().await;
+            client_chat::archive_room_for_installation_tx(&conn, installation_id, archived_at)
+                .expect("archive room");
+            assert_eq!(
+                client_chat::cleanup_expired_rooms_tx(&conn, Utc::now())
+                    .expect("expire archived room"),
+                1
+            );
+        }
+        assert!(matches!(
+            store
+                .get_client_chat_room_by_installation(installation_id, None)
+                .await,
+            Err(AppError::NotFound(_))
+        ));
+        let _ = std::fs::remove_file(config.db_path);
+    }
+
+    #[tokio::test]
+    async fn client_chat_deleted_dead_letter_is_cancelled_without_losing_siblings() {
+        let (store, config) = setup_store("client-chat-delete-dead-letter").await;
+        let installation_id = "chat-client-delete-dead-letter";
+        insert_installation(&store, installation_id).await;
+        let room_id = ensure_test_chat_room(&store, installation_id).await;
+        let sender = chat_test_session("delete-sender", "sender@example.com");
+        let deleted_message = store
+            .create_client_chat_message(
+                &room_id,
+                &sender,
+                "message that will be deleted".into(),
+                Uuid::new_v4().to_string(),
+            )
+            .await
+            .expect("message to delete");
+        store
+            .create_client_chat_message(
+                &room_id,
+                &sender,
+                "sibling that must still be delivered".into(),
+                Uuid::new_v4().to_string(),
+            )
+            .await
+            .expect("sibling message");
+
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE client_chat_email_events SET window_ends_at = ?1",
+                params![(Utc::now() - Duration::seconds(1)).to_rfc3339()],
+            )
+            .expect("close chat email window");
+        }
+        store
+            .aggregate_client_chat_deliveries(&notification_template(), Utc::now())
+            .await
+            .expect("aggregate original delivery");
+        let original = store
+            .claim_client_chat_delivery("dead-letter-worker", Utc::now(), 90)
+            .await
+            .expect("claim original delivery")
+            .expect("original delivery");
+        store
+            .mark_client_chat_delivery_dead_letter(
+                &original.id,
+                "dead-letter-worker",
+                "test failure",
+                Utc::now(),
+            )
+            .await
+            .expect("dead-letter original delivery");
+
+        store
+            .delete_client_chat_message(&deleted_message.id, "admin@example.com")
+            .await
+            .expect("delete message");
+        assert!(matches!(
+            store
+                .requeue_client_chat_delivery(&original.id, Utc::now())
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+
+        store
+            .aggregate_client_chat_deliveries(&notification_template(), Utc::now())
+            .await
+            .expect("rebuild sibling delivery");
+        let rebuilt = store
+            .claim_client_chat_delivery("rebuilt-worker", Utc::now(), 90)
+            .await
+            .expect("claim rebuilt delivery")
+            .expect("rebuilt delivery");
+        assert!(
+            rebuilt
+                .html
+                .contains("sibling that must still be delivered")
+        );
+        assert!(!rebuilt.html.contains("message that will be deleted"));
+        let _ = std::fs::remove_file(config.db_path);
     }
 }

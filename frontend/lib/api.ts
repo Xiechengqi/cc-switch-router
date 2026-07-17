@@ -35,6 +35,12 @@ import type {
   AnnouncementSettingsUpdate,
   AnnouncementResponse,
   ClientNotificationDeliveriesResponse,
+  ClientChatDeliveriesResponse,
+  ClientChatMessage,
+  ClientChatMessageListResponse,
+  ClientChatRoom,
+  ClientChatRoomListResponse,
+  ClientChatVisit,
 } from "@/lib/types";
 
 export type { BoardListResponse, BoardMessage, BoardMeta };
@@ -215,6 +221,20 @@ export async function getClientNotificationDeliveries() {
   );
 }
 
+export async function getClientChatDeliveries() {
+  return parseJson<ClientChatDeliveriesResponse>(
+    await authFetch("/v1/admin/chat/deliveries", { cache: "no-store" }),
+  );
+}
+
+export async function requeueClientChatDelivery(deliveryId: string) {
+  return parseJson<{ ok: boolean }>(
+    await authFetch(`/v1/admin/chat/deliveries/${encodeURIComponent(deliveryId)}/requeue`, {
+      method: "POST",
+    }),
+  );
+}
+
 export async function saveSettings(updates: Record<string, string | null>) {
   return parseJson<SettingsUpdateResponse>(
     await authFetch("/v1/admin/settings/values", {
@@ -343,6 +363,112 @@ export async function getMetricEvents(limit = 100) {
 
 export async function clearMetrics() {
   return parseJson<ClearMetricsResponse>(await authFetch("/v1/admin/metrics", { method: "DELETE" }));
+}
+
+export async function getClientChatRoom(installationId: string, signal?: AbortSignal) {
+  const data = await parseJson<{ room: ClientChatRoom }>(
+    await authFetch(`/v1/chat/clients/${encodeURIComponent(installationId)}/room`, {
+      cache: "no-store",
+      signal,
+    }),
+  );
+  return data.room;
+}
+
+export async function lookupClientChatRooms(visits: ClientChatVisit[], signal?: AbortSignal) {
+  const lastReadSeqByInstallation = Object.fromEntries(
+    visits.map((visit) => [visit.installationId, visit.lastReadSeq]),
+  );
+  return parseJson<ClientChatRoomListResponse>(
+    await authFetch("/v1/chat/rooms/lookup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        installationIds: visits.map((visit) => visit.installationId),
+        lastReadSeqByInstallation,
+      }),
+      cache: "no-store",
+      signal,
+    }),
+  );
+}
+
+export async function getVisitedClientChatRooms(signal?: AbortSignal) {
+  return parseJson<ClientChatRoomListResponse>(
+    await authFetch("/v1/chat/rooms", { cache: "no-store", signal }),
+  );
+}
+
+export async function getClientChatMeta(signal?: AbortSignal) {
+  return parseJson<{ totalUnread: number }>(
+    await authFetch("/v1/chat/meta", { cache: "no-store", signal }),
+  );
+}
+
+export async function recordClientChatVisit(roomId: string) {
+  const data = await parseJson<{ room: ClientChatRoom }>(
+    await authFetch(`/v1/chat/rooms/${encodeURIComponent(roomId)}/visit`, {
+      method: "PUT",
+    }),
+  );
+  return data.room;
+}
+
+export async function importClientChatVisits(visits: ClientChatVisit[]) {
+  return parseJson<{ imported: number }>(
+    await authFetch("/v1/chat/visits/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ visits }),
+    }),
+  );
+}
+
+export async function getClientChatMessages(
+  roomId: string,
+  options: { beforeSeq?: number; afterSeq?: number; limit?: number; signal?: AbortSignal } = {},
+) {
+  const params = new URLSearchParams({ limit: String(options.limit || 50) });
+  if (options.beforeSeq != null) params.set("beforeSeq", String(options.beforeSeq));
+  if (options.afterSeq != null) params.set("afterSeq", String(options.afterSeq));
+  return parseJson<ClientChatMessageListResponse>(
+    await authFetch(`/v1/chat/rooms/${encodeURIComponent(roomId)}/messages?${params}`, {
+      cache: "no-store",
+      signal: options.signal,
+    }),
+  );
+}
+
+export async function postClientChatMessage(
+  roomId: string,
+  body: string,
+  clientMessageId: string,
+) {
+  return parseJson<ClientChatMessage>(
+    await authFetch(`/v1/chat/rooms/${encodeURIComponent(roomId)}/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ body, clientMessageId }),
+    }),
+  );
+}
+
+export async function markClientChatRead(roomId: string, lastReadSeq: number) {
+  return parseJson<{ ok: boolean; lastReadSeq: number }>(
+    await authFetch(`/v1/chat/rooms/${encodeURIComponent(roomId)}/read`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ lastReadSeq }),
+    }),
+  );
+}
+
+export async function deleteClientChatMessage(messageId: string) {
+  return parseJson<ClientChatMessage>(
+    await authFetch(`/v1/admin/chat/messages/${encodeURIComponent(messageId)}`, {
+      method: "DELETE",
+    }),
+  );
 }
 
 const BOARD_GUEST_KEY = "cc_switch_router_board_guest_v1";
