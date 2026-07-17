@@ -2,7 +2,7 @@
 
 import { Trash2, X } from "lucide-react";
 import * as React from "react";
-import { CONSOLE_DOCK_HEIGHT, useClientConsole } from "@/components/dashboard/client-console/client-console-manager";
+import { CONSOLE_DOCK_BOTTOM_INSET, CONSOLE_DOCK_HEIGHT, useClientConsole } from "@/components/dashboard/client-console/client-console-manager";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { cn } from "@/lib/utils";
 
@@ -15,13 +15,13 @@ export function ClientConsoleDock() {
   return (
     <div
       data-console-dock
-      className="fixed bottom-4 left-1/2 z-50 -translate-x-1/2"
-      style={{ maxWidth: "min(calc(100vw - 2rem), 720px)" }}
+      className="fixed left-1/2 z-50 -translate-x-1/2"
+      style={{ bottom: CONSOLE_DOCK_BOTTOM_INSET, maxWidth: "min(calc(100vw - 2rem), 720px)" }}
       role="toolbar"
       aria-label={t("dashboard.clientConsole.dockLabel")}
     >
       <div
-        className="flex items-center gap-2 overflow-x-auto rounded-2xl border border-white/50 bg-white/55 px-3 py-2 shadow-[0_12px_40px_rgba(15,23,42,0.14)] backdrop-blur-xl backdrop-saturate-150"
+        className="flex items-center gap-2 overflow-x-auto rounded-2xl border border-white/45 bg-white/22 px-3 py-2 shadow-[0_10px_40px_rgba(15,23,42,0.12),inset_0_1px_0_rgba(255,255,255,0.55)] backdrop-blur-2xl backdrop-saturate-150"
         style={{ minHeight: CONSOLE_DOCK_HEIGHT - 16 }}
       >
         {windows.map((window) => {
@@ -35,8 +35,8 @@ export function ClientConsoleDock() {
                 className={cn(
                   "inline-flex h-9 max-w-[200px] items-center gap-2 rounded-xl border px-3 text-left text-[11px] font-medium transition-colors",
                   isActive
-                    ? "border-sky-400/80 bg-sky-50/80 text-sky-900 ring-2 ring-sky-200/80 backdrop-blur-sm"
-                    : "border-slate-200/70 bg-white/45 text-slate-700 backdrop-blur-sm hover:border-sky-200 hover:bg-sky-50/70 hover:text-sky-800",
+                    ? "border-sky-300/70 bg-white/45 text-sky-900 ring-2 ring-sky-200/70 backdrop-blur-md"
+                    : "border-white/45 bg-white/28 text-slate-700 backdrop-blur-md hover:border-sky-200/70 hover:bg-white/40 hover:text-sky-800",
                 )}
                 title={suspended ? t("dashboard.clientConsole.resumeHint") : window.url}
                 aria-current={isActive ? "true" : undefined}
@@ -76,11 +76,11 @@ export function ClientConsoleDock() {
             </div>
           );
         })}
-        <div className="ml-1 flex shrink-0 items-center border-l border-slate-200/80 pl-2">
+        <div className="ml-1 flex shrink-0 items-center border-l border-white/35 pl-2">
           <button
             type="button"
             onClick={() => closeAllConsoles()}
-            className="inline-flex h-9 w-9 items-center justify-center rounded-xl border border-slate-200/70 bg-white/45 text-slate-600 backdrop-blur-sm transition-colors hover:border-rose-200 hover:bg-rose-50/70 hover:text-rose-700"
+            className="inline-flex h-9 w-9 items-center justify-center rounded-xl border border-white/45 bg-white/28 text-slate-600 backdrop-blur-md transition-colors hover:border-rose-200/70 hover:bg-rose-50/35 hover:text-rose-700"
             aria-label={t("dashboard.clientConsole.cleanAll")}
             title={t("dashboard.clientConsole.cleanAll")}
           >

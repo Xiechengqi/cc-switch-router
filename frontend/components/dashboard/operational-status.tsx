@@ -10,6 +10,31 @@ export function shareIsEnabled(share: ShareView) {
   return String(share.shareStatus || "").trim().toLowerCase() === "active";
 }
 
+export function summarizeShareAvailability(shares: ShareView[]) {
+  const enabledShares = shares.filter(shareIsEnabled);
+  let availableCount = 0;
+  let degradedCount = 0;
+  let offlineCount = 0;
+  let routeOnlineCount = 0;
+
+  for (const share of enabledShares) {
+    if (share.isOnline) routeOnlineCount += 1;
+    const state = shareOperationalSummary(share).state;
+    if (state === "online") availableCount += 1;
+    else if (state === "degraded") degradedCount += 1;
+    else if (state === "offline") offlineCount += 1;
+  }
+
+  return {
+    enabledCount: enabledShares.length,
+    availableCount,
+    degradedCount,
+    offlineCount,
+    routeOnlineCount,
+    issueCount: enabledShares.length - availableCount,
+  };
+}
+
 function fallbackShareSummary(share: ShareView): OperationalSummary {
   const status = String(share.shareStatus || "").trim().toLowerCase();
   if (status !== "active") {

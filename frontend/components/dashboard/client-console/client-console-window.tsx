@@ -7,6 +7,7 @@ import { ClientConsoleIframe } from "@/components/dashboard/client-console/clien
 import { ClientConsoleTrafficLights } from "@/components/dashboard/client-console/client-console-traffic-lights";
 import {
   CONSOLE_DOCK_HEIGHT,
+  CONSOLE_DOCK_RESERVED_HEIGHT,
   type ConsoleWindow,
   type NormalRect,
   useClientConsole,
@@ -21,11 +22,14 @@ const RESIZE_HANDLE = 14;
 function clampRect(rect: NormalRect): NormalRect {
   if (typeof globalThis.window === "undefined") return rect;
   const maxW = globalThis.window.innerWidth - 24;
-  const maxH = globalThis.window.innerHeight - CONSOLE_DOCK_HEIGHT - 24;
+  const maxH = globalThis.window.innerHeight - CONSOLE_DOCK_RESERVED_HEIGHT - 24;
   const width = Math.min(Math.max(rect.width, MIN_WIDTH), maxW);
   const height = Math.min(Math.max(rect.height, MIN_HEIGHT), maxH);
   const x = Math.min(Math.max(rect.x, 8), Math.max(8, globalThis.window.innerWidth - width - 8));
-  const y = Math.min(Math.max(rect.y, 8), Math.max(8, globalThis.window.innerHeight - height - CONSOLE_DOCK_HEIGHT - 8));
+  const y = Math.min(
+    Math.max(rect.y, 8),
+    Math.max(8, globalThis.window.innerHeight - height - CONSOLE_DOCK_RESERVED_HEIGHT - 8),
+  );
   return { x, y, width, height };
 }
 
@@ -88,7 +92,7 @@ export function ClientConsoleWindowLayer() {
     updateConsoleRect,
   } = useClientConsole();
 
-  const dockOffset = dockVisible ? CONSOLE_DOCK_HEIGHT + 12 : 0;
+  const dockOffset = dockVisible ? CONSOLE_DOCK_RESERVED_HEIGHT + 12 : 0;
   const mountedWindows = windows.filter((window) => window.activated);
 
   useConsoleClickOutsideMinimize({

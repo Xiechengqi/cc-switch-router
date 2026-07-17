@@ -332,13 +332,13 @@ export function BoardDock() {
         type="button"
         onClick={() => setOpen(true)}
         aria-label={t("board.open")}
-        className="group flex h-11 w-11 items-center justify-center rounded-full border border-slate-200/80 bg-white/75 text-slate-600 shadow-[0_4px_16px_rgba(15,23,42,0.08)] backdrop-blur-md transition-all duration-200 ease-out hover:border-sky-200/80 hover:bg-sky-50/85 hover:text-sky-700 hover:shadow-[0_6px_20px_rgba(15,23,42,0.1)] active:scale-[0.97]"
+        className="group flex h-11 w-11 items-center justify-center rounded-full border border-white/45 bg-white/25 text-slate-600 shadow-[0_8px_24px_rgba(15,23,42,0.10),inset_0_1px_0_rgba(255,255,255,0.5)] backdrop-blur-2xl backdrop-saturate-150 transition-all duration-200 ease-out hover:border-sky-200/70 hover:bg-white/35 hover:text-sky-700 hover:shadow-[0_10px_28px_rgba(15,23,42,0.12)] active:scale-[0.97]"
       >
         <MessageSquare className="h-[18px] w-[18px] transition-transform duration-200 group-hover:scale-105" />
       </button>
     );
     return (
-      <div className="fixed bottom-5 right-5 z-40" data-board-dock>
+      <div className="fixed bottom-20 right-5 z-40" data-board-dock>
         {unread > 0 ? (
           <Badge color="danger" aria-label={t("board.unread", { count: unread })}>
             <Badge.Anchor className="block">{fabButton}</Badge.Anchor>
@@ -368,7 +368,7 @@ export function BoardDock() {
         role="dialog"
         aria-modal="true"
         aria-labelledby="board-dock-title"
-        className="fixed bottom-5 right-5 z-40 flex h-[min(640px,calc(100vh-2rem))] w-[min(420px,calc(100vw-2rem))] flex-col gap-0 overflow-hidden rounded-2xl border border-[rgba(0,82,255,0.18)] bg-card p-0 shadow-xl"
+        className="fixed bottom-20 right-5 z-40 flex h-[min(640px,calc(100vh-6rem))] w-[min(420px,calc(100vw-2rem))] flex-col gap-0 overflow-hidden rounded-2xl border border-[rgba(0,82,255,0.18)] bg-card p-0 shadow-xl"
         data-board-dock
       >
         <Card.Header className="flex-row items-center justify-between gap-3 border-b p-4">

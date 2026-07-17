@@ -8,6 +8,9 @@ import { DASHBOARD_CLIENTS_PATH, isClientsRoute, isMarketsRoute } from "@/lib/da
 
 export const MAX_CONSOLE_WINDOWS = 5;
 export const CONSOLE_DOCK_HEIGHT = 56;
+/** Keep the dock above the dashboard presence footer (~72px tall). */
+export const CONSOLE_DOCK_BOTTOM_INSET = 80;
+export const CONSOLE_DOCK_RESERVED_HEIGHT = CONSOLE_DOCK_BOTTOM_INSET + CONSOLE_DOCK_HEIGHT;
 export const CONSOLE_BASE_Z_INDEX = 45;
 const SESSION_STORAGE_KEY = "cc_switch_router_console_windows_v2";
 const CHROME_HEIGHT = 88;

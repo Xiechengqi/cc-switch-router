@@ -8,7 +8,7 @@ import { SectionInstallButton } from "@/components/dashboard/section-install-but
 import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog";
 import { ShareCard } from "@/components/dashboard/share-card";
 import { ClientUpgradeButton } from "@/components/dashboard/client-upgrade-button";
-import { ClientRemovalSchedule, clientOperationalSummary, OperationalDiagnosis, OperationalStatusPill, operationalReasonLabel, shareIsEnabled, shareOperationalSummary, useStableOperationalRanks } from "@/components/dashboard/operational-status";
+import { ClientRemovalSchedule, clientOperationalSummary, OperationalDiagnosis, OperationalStatusPill, operationalReasonLabel, shareIsEnabled, shareOperationalSummary, summarizeShareAvailability, useStableOperationalRanks } from "@/components/dashboard/operational-status";
 import { useClientConsole } from "@/components/dashboard/client-console";
 import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
 import { useDashboardViewState } from "@/components/dashboard/dashboard-view-state";
@@ -273,8 +273,7 @@ const ShareScroller = React.memo(function ShareScroller({
   const { t } = useLocaleText();
   if (!shares.length) return <EmptyBlock>{t("dashboard.noLinkedShares")}</EmptyBlock>;
 
-  const enabledCount = shares.filter(shareIsEnabled).length;
-  const onlineCount = shares.filter((share) => shareIsEnabled(share) && share.isOnline).length;
+  const { enabledCount, availableCount, degradedCount, offlineCount } = summarizeShareAvailability(shares);
   const disabledCount = shares.length - enabledCount;
 
   return (
@@ -284,8 +283,9 @@ const ShareScroller = React.memo(function ShareScroller({
           <span className="font-semibold text-foreground">{t("dashboard.shares")}</span>
           <span>{shares.length === totalCount ? shares.length : `${shares.length}/${totalCount}`}</span>
           <span aria-hidden>·</span>
-          <span className="text-emerald-700">{onlineCount} {t("common.online")}</span>
-          {enabledCount - onlineCount > 0 ? <span className="text-rose-700">{enabledCount - onlineCount} {t("common.offline")}</span> : null}
+          <span className="text-emerald-700">{availableCount} {t("dashboard.available")}</span>
+          {degradedCount > 0 ? <span className="text-amber-700">{degradedCount} {t("dashboard.degraded")}</span> : null}
+          {offlineCount > 0 ? <span className="text-rose-700">{offlineCount} {t("common.offline")}</span> : null}
           {disabledCount > 0 ? <span>{disabledCount} {t("common.disabled")}</span> : null}
         </div>
       </div>
@@ -327,9 +327,16 @@ function ClientCard({
   const onlineTitle = `${onlineRate.toFixed(1)}% online in last 24h (${client.onlineMinutes24h || 0} / 1440 min)`;
   const summary = clientOperationalSummary(client, allShares);
   const state = summary.state;
-  const enabledShares = allShares.filter(shareIsEnabled);
-  const onlineShares = enabledShares.filter((share) => share.isOnline);
-  const issueCount = enabledShares.length - onlineShares.length;
+  const shareAvailability = summarizeShareAvailability(allShares);
+  const { enabledCount: enabledShareCount, availableCount, issueCount, routeOnlineCount } = shareAvailability;
+  const enabledSharesTotal = enabledShareCount || allShares.length;
+  const sharesMetricTitle = enabledShareCount
+    ? t("dashboard.sharesAvailableDetail", {
+        available: availableCount,
+        total: enabledShareCount,
+        routeOnline: routeOnlineCount,
+      })
+    : undefined;
   const identity = client.clientTunnel?.subdomain || client.installation.id;
   const identityUrl = client.clientTunnel?.subdomain ? tunnelUrl : "";
   const versionLabel = clientPlatformLabel(client);
@@ -428,7 +435,7 @@ function ClientCard({
             />
             <Metric label={t("dashboard.version")} value={versionLabel} title={client.installation.appVersion || versionLabel} preserveValue />
             <Metric label={t("dashboard.uptime24h")} value={`${onlineRate.toFixed(1)}%`} title={onlineTitle} tone={onlineRate < 90 ? "warning" : "success"} />
-            <Metric label={t("dashboard.shares")} value={`${onlineShares.length}/${enabledShares.length || allShares.length} ${t("common.online")}`} tone={issueCount ? "danger" : "default"} />
+            <Metric label={t("dashboard.shares")} value={`${availableCount}/${enabledSharesTotal} ${t("dashboard.available")}`} title={sharesMetricTitle} tone={issueCount ? "danger" : "default"} />
             <Metric label={t("dashboard.lastSeen")} value={formatRelativeTime(client.installation.lastSeenAt, locale)} tone={state === "offline" ? "danger" : "default"} />
             {showRemoval ? (
               <Metric
@@ -611,8 +618,11 @@ export function ClientBoard({
     const normalizedQuery = query.trim().toLocaleLowerCase();
     return orphanShares.filter((share) => {
       if (normalizedQuery && !shareMatchesQuery(share, normalizedQuery)) return false;
-      if (statusFilter === "online" && !(shareIsEnabled(share) && share.isOnline)) return false;
-      if ((statusFilter === "offline" || statusFilter === "degraded" || issuesOnly) && shareIsEnabled(share) && share.isOnline) return false;
+      const shareState = shareOperationalSummary(share).state;
+      if (statusFilter === "online" && shareState !== "online") return false;
+      if (statusFilter === "degraded" && shareState !== "degraded") return false;
+      if (statusFilter === "offline" && shareState !== "offline") return false;
+      if (issuesOnly && shareState === "online") return false;
       return true;
     });
   }, [issuesOnly, orphanShares, query, statusFilter]);
