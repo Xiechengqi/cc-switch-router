@@ -395,7 +395,7 @@ function RequestTicker({ data }: { data: DashboardResponse | null }) {
   return (
     <div
       data-map-control
-      className="pointer-events-auto absolute bottom-[52px] left-3 z-30 w-[min(72%,720px)] max-h-[220px] overflow-y-auto overscroll-contain rounded-lg border border-slate-200/80 bg-white/88 px-1 py-1 shadow-sm backdrop-blur-sm [scrollbar-gutter:stable]"
+      className="pointer-events-auto absolute bottom-[52px] left-3 z-30 w-[min(72%,720px)] max-h-[220px] overflow-y-auto overscroll-contain bg-transparent px-1 py-1 [scrollbar-gutter:stable]"
       style={{ maxHeight: REQUEST_TICKER_MAX_HEIGHT_PX }}
     >
       <div className="flex flex-col gap-1">
