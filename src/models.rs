@@ -1198,6 +1198,12 @@ pub struct ModelHealthSummary {
     pub status: String,
     #[serde(default)]
     pub recent_results: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<u16>,
+    #[serde(default)]
+    pub latency_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
     #[serde(
         rename = "checkedAt",
         alias = "lastCheckedAt",
@@ -1209,12 +1215,6 @@ pub struct ModelHealthSummary {
     pub last_success_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_failed_at: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error_message: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status_code: Option<u16>,
-    #[serde(default)]
-    pub latency_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

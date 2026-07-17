@@ -27269,6 +27269,27 @@ mod tests {
         assert!(!json.contains("share"));
     }
 
+    #[test]
+    fn issue_lease_signature_payload_preserves_server_model_health_field_order() {
+        let signed = include_str!("../tests/fixtures/us04_share_lease_signed_payload.json");
+        let http = include_str!("../tests/fixtures/us04_share_lease_request.json");
+        let request: IssueLeaseRequest =
+            serde_json::from_str(http).expect("deserialize lease request");
+        let payload = IssueLeaseSignaturePayload {
+            protocol_epoch: &request.protocol_epoch,
+            router_id: &request.router_id,
+            route_id: &request.route_id,
+            rotation_id: &request.rotation_id,
+            generation: request.generation,
+            expected_generation: request.expected_generation,
+            requested_subdomain: &request.requested_subdomain,
+            tunnel_type: &request.tunnel_type,
+            share: &request.share,
+        };
+        let router_json = serde_json::to_string(&payload).expect("serialize router verify payload");
+        assert_eq!(signed, router_json);
+    }
+
     fn public_key_b64(signing_key: &SigningKey) -> String {
         base64::engine::general_purpose::STANDARD.encode(signing_key.verifying_key().to_bytes())
     }
