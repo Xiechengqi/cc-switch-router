@@ -231,16 +231,22 @@ function ClientDetailsButton({ onOpen }: { onOpen: () => void }) {
 
 function ClientChatButton({ client }: { client: DashboardClient }) {
   const { t } = useLocaleText();
-  const { openChat } = useClientChat();
+  const { openChat, unreadByInstallation } = useClientChat();
+  const unread = unreadByInstallation.get(client.installation.id) || 0;
   if (!client.chatAvailable) return null;
   return (
     <ClientHeaderInlineButton
       label={t("dashboard.chat")}
       onClick={() => void openChat(client.installation.id)}
-      className="inline-flex h-6 shrink-0 items-center gap-1 rounded-full border border-blue-200 bg-blue-50 px-2.5 text-[11px] font-medium text-blue-700 transition-colors hover:border-blue-300 hover:bg-blue-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
+      className="relative inline-flex h-6 shrink-0 items-center gap-1 rounded-full border border-blue-200 bg-blue-50 px-2.5 text-[11px] font-medium text-blue-700 transition-colors hover:border-blue-300 hover:bg-blue-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
     >
       <MessageCircle className="h-3 w-3" />
       <span>{t("dashboard.chat")}</span>
+      {unread > 0 ? (
+        <span className="absolute -right-1 -top-1 inline-flex min-h-4 min-w-4 items-center justify-center rounded-full bg-red-500 px-1 text-[9px] font-semibold text-white">
+          {unread > 99 ? "99+" : unread}
+        </span>
+      ) : null}
     </ClientHeaderInlineButton>
   );
 }

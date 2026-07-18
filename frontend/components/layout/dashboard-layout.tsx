@@ -14,18 +14,18 @@ export function DashboardLayout({ children }: { children: React.ReactNode }) {
   return (
     <DashboardFocusProvider data={data}>
       <DashboardViewStateProvider>
-        <ClientChatProvider>
-          <OperationVerificationProvider data={data}>
-            <ClientConsoleManagerProvider>
+        <OperationVerificationProvider data={data}>
+          <ClientConsoleManagerProvider>
+            <ClientChatProvider>
               <div className="flex flex-1 flex-col">
                 <div className="flex-1">{children}</div>
                 <PresenceFooter />
               </div>
               <ClientConsoleWindowLayer />
               <ClientConsoleDock />
-            </ClientConsoleManagerProvider>
-          </OperationVerificationProvider>
-        </ClientChatProvider>
+            </ClientChatProvider>
+          </ClientConsoleManagerProvider>
+        </OperationVerificationProvider>
       </DashboardViewStateProvider>
     </DashboardFocusProvider>
   );

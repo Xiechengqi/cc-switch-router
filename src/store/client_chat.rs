@@ -709,6 +709,29 @@ impl AppStore {
         })
     }
 
+    pub async fn get_client_chat_room_latest_seq(&self, room_id: &str) -> Result<i64, AppError> {
+        validate_public_id(room_id, "room id")?;
+        let conn = self.conn.lock().await;
+        let exists = conn
+            .query_row(
+                "SELECT 1 FROM client_chat_rooms WHERE id = ?1",
+                params![room_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| AppError::Internal(format!("check chat room failed: {error}")))?
+            .is_some();
+        if !exists {
+            return Err(AppError::NotFound("client chat room not found".into()));
+        }
+        conn.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM client_chat_messages WHERE room_id = ?1",
+            params![room_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| AppError::Internal(format!("read latest chat sequence failed: {error}")))
+    }
+
     pub async fn create_client_chat_message(
         &self,
         room_id: &str,

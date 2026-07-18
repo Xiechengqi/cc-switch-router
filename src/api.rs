@@ -178,6 +178,10 @@ pub fn router(state: ServerState) -> Router {
             "/v1/chat/rooms/:room_id/messages",
             get(list_client_chat_messages).post(post_client_chat_message),
         )
+        .route(
+            "/v1/chat/rooms/:room_id/stream",
+            get(client_chat_room_stream),
+        )
         .layer(public_cors_layer())
         .with_state(state.clone());
 
@@ -4321,6 +4325,13 @@ struct ClientChatMessageQuery {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClientChatStreamQuery {
+    #[serde(default)]
+    after_seq: Option<i64>,
+}
+
 fn session_token_candidates(headers: &HeaderMap) -> Vec<&str> {
     let mut candidates = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -4570,6 +4581,46 @@ async fn import_client_chat_visits(
         .import_client_chat_visits(&session.user_id, input.visits)
         .await?;
     Ok(Json(ClientChatVisitImportResponse { imported }))
+}
+
+async fn client_chat_room_stream(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path(room_id): Path<String>,
+    Query(query): Query<ClientChatStreamQuery>,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>>, AppError>
+{
+    use std::time::Duration;
+
+    let metadata = extract_client_metadata(&headers, addr);
+    state
+        .store
+        .enforce_client_chat_public_read_rate(metadata.ip.as_deref())
+        .await?;
+    let room_id = room_id.trim().to_string();
+    let mut cursor = query.after_seq.unwrap_or(0).max(0);
+    let store = state.store.clone();
+    let stream = async_stream::stream! {
+        yield Ok(axum::response::sse::Event::default().event("ready").data("{}"));
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            match store.get_client_chat_room_latest_seq(&room_id).await {
+                Ok(latest_seq) if latest_seq > cursor => {
+                    cursor = latest_seq;
+                    let payload = serde_json::json!({ "latestSeq": latest_seq }).to_string();
+                    yield Ok(axum::response::sse::Event::default().event("update").data(payload));
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    };
+    Ok(Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keepalive"),
+    ))
 }
 
 async fn list_client_chat_messages(
