@@ -148,7 +148,8 @@ const USER_DEFAULT_API_TOKEN_SCOPES: &[&str] = &["share:read", "share:write", "s
 const USER_DEFAULT_API_TOKEN_NAME: &str = "default";
 const DASHBOARD_EXPIRY_WARNING_DAYS: i64 = 7;
 const DASHBOARD_CAPACITY_WARNING_RATIO: f64 = 0.9;
-const DASHBOARD_HIGH_LATENCY_MS: u64 = 2_000;
+const DASHBOARD_MEDIUM_LATENCY_MS: u64 = 15_000;
+const DASHBOARD_HIGH_LATENCY_MS: u64 = 30_000;
 
 fn operational_reason(
     code: &str,
@@ -390,6 +391,19 @@ fn share_operational_summary(share: &ShareView, now: DateTime<Utc>) -> Operation
                 Some(&share.share_id),
                 Some(average.to_string()),
                 Some(DASHBOARD_HIGH_LATENCY_MS.to_string()),
+            ));
+        } else if average >= DASHBOARD_MEDIUM_LATENCY_MS {
+            reasons.push(operational_reason(
+                "medium_latency",
+                "warning",
+                share
+                    .recent_requests
+                    .last()
+                    .and_then(|request| unix_timestamp_rfc3339(request.created_at)),
+                Some("share"),
+                Some(&share.share_id),
+                Some(average.to_string()),
+                Some(DASHBOARD_MEDIUM_LATENCY_MS.to_string()),
             ));
         }
     }

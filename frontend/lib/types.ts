@@ -149,6 +149,7 @@ export type OperationalReasonCode =
   | "expired"
   | "expires_soon"
   | "provider_unavailable"
+  | "medium_latency"
   | "high_latency"
   | "edit_pending"
   | "edit_failed"

@@ -159,7 +159,8 @@ export function operationalReasonLabel(reason: OperationalReason | undefined, t:
     case "expired": return t("dashboard.reason.expired");
     case "expires_soon": return t("dashboard.reason.expiresSoon");
     case "provider_unavailable": return t("dashboard.reason.providerUnavailable");
-    case "high_latency": return t("dashboard.reason.highLatency", { value: current });
+    case "medium_latency": return t("dashboard.reason.mediumLatency", { value: formatOperationalLatencyValue(current) });
+    case "high_latency": return t("dashboard.reason.highLatency", { value: formatOperationalLatencyValue(current) });
     case "edit_pending": return t("dashboard.reason.editPending");
     case "edit_failed": return t("dashboard.reason.editFailed");
     case "maintenance_enabled": return t("dashboard.reason.maintenance");
@@ -175,6 +176,15 @@ export function operationalImpactLabel(kind: "client" | "share" | "market", reas
   if (reason.code === "provider_unavailable") return t("dashboard.impact.providerUnavailable");
   if (reason.code === "maintenance_enabled" || reason.code === "manually_disabled") return t("dashboard.impact.disabled");
   return t("dashboard.impact.degraded");
+}
+
+function formatOperationalLatencyValue(value: string) {
+  const ms = Number(value);
+  if (!Number.isFinite(ms) || ms <= 0) return value;
+  const seconds = ms / 1000;
+  if (seconds < 10) return `${seconds.toFixed(2)}s`;
+  if (seconds < 100) return `${seconds.toFixed(1)}s`;
+  return `${Math.round(seconds)}s`;
 }
 
 export function ClientRemovalSchedule({
