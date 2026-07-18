@@ -540,6 +540,21 @@ impl AppStore {
             .ok_or_else(|| AppError::NotFound("client chat room not found".into()))
     }
 
+    pub async fn remove_client_chat_visit(
+        &self,
+        room_id: &str,
+        user_id: &str,
+    ) -> Result<(), AppError> {
+        validate_public_id(room_id, "room id")?;
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "DELETE FROM client_chat_visits WHERE user_id = ?1 AND room_id = ?2",
+            params![user_id, room_id],
+        )
+        .map_err(|error| AppError::Internal(format!("remove chat visit failed: {error}")))?;
+        Ok(())
+    }
+
     pub async fn import_client_chat_visits(
         &self,
         user_id: &str,

@@ -54,6 +54,24 @@ export function upsertAnonymousVisit(installationId: string, lastReadSeq?: numbe
   return next;
 }
 
+export function removeAnonymousVisit(installationId: string) {
+  writeAnonymousVisits(readAnonymousVisits().filter((visit) => visit.installationId !== installationId));
+}
+
+export function clearChatDraft(roomId: string) {
+  if (typeof window === "undefined") return;
+  try {
+    localStorage.removeItem(`${DRAFT_PREFIX}${roomId}`);
+  } catch {
+    // Optional persistence.
+  }
+}
+
+export function clearRecentChatLocalCache(room: Pick<ClientChatRoom, "id" | "installationId">) {
+  removeAnonymousVisit(room.installationId);
+  clearChatDraft(room.id);
+}
+
 export function initialsForLabel(label: string) {
   const trimmed = label.trim();
   if (!trimmed) return "?";

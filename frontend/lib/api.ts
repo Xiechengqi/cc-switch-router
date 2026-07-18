@@ -414,6 +414,12 @@ export async function recordClientChatVisit(roomId: string) {
   return data.room;
 }
 
+export async function removeClientChatVisit(roomId: string) {
+  await authFetch(`/v1/chat/rooms/${encodeURIComponent(roomId)}/visit`, {
+    method: "DELETE",
+  });
+}
+
 export async function importClientChatVisits(visits: ClientChatVisit[]) {
   return parseJson<{ imported: number }>(
     await authFetch("/v1/chat/visits/import", {

@@ -1,7 +1,7 @@
 "use client";
 
 import { Avatar, ScrollShadow, Tabs } from "@heroui/react";
-import { ChevronDown, ChevronUp, Loader2, MessageCircle } from "lucide-react";
+import { ChevronDown, ChevronUp, Loader2, MessageCircle, X } from "lucide-react";
 import Link from "next/link";
 import * as React from "react";
 import { initialsForLabel } from "@/components/chat/client-chat-helpers";
@@ -16,49 +16,66 @@ function RoomListRow({
   locale,
   t,
   onSelect,
+  onRemove,
 }: {
   room: ClientChatRoom;
   locale: string;
   t: (key: MessageKey, values?: Record<string, string | number>) => string;
   onSelect: () => void;
+  onRemove?: () => void;
 }) {
   const author = room.lastMessage?.authorLabel || "?";
   return (
-    <button
-      type="button"
-      onClick={onSelect}
-      className={cn(
-        "grid w-full grid-cols-[auto_minmax(0,1fr)_auto] gap-3 px-4 py-3 text-left transition hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary/30",
-        room.status === "archived" && "opacity-70",
-      )}
-    >
-      <Avatar size="sm" className="bg-slate-100 text-[10px] font-semibold text-slate-600">
-        <Avatar.Fallback>{initialsForLabel(room.clientLabel)}</Avatar.Fallback>
-      </Avatar>
-      <span className="min-w-0">
-        <span className="flex items-center gap-2">
-          <strong className="truncate text-sm font-medium text-slate-900">{room.clientLabel}</strong>
-          {room.status === "archived" ? (
-            <span className="shrink-0 text-[10px] font-medium uppercase text-amber-700">{t("chat.archived")}</span>
+    <div className="group relative">
+      <button
+        type="button"
+        onClick={onSelect}
+        className={cn(
+          "grid w-full grid-cols-[auto_minmax(0,1fr)_auto] gap-3 px-4 py-3 pr-10 text-left transition hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary/30",
+          room.status === "archived" && "opacity-70",
+        )}
+      >
+        <Avatar size="sm" className="bg-slate-100 text-[10px] font-semibold text-slate-600">
+          <Avatar.Fallback>{initialsForLabel(room.clientLabel)}</Avatar.Fallback>
+        </Avatar>
+        <span className="min-w-0">
+          <span className="flex items-center gap-2">
+            <strong className="truncate text-sm font-medium text-slate-900">{room.clientLabel}</strong>
+            {room.status === "archived" ? (
+              <span className="shrink-0 text-[10px] font-medium uppercase text-amber-700">{t("chat.archived")}</span>
+            ) : null}
+          </span>
+          <span className="mt-1 block truncate text-xs text-slate-500">
+            {room.lastMessage ? `${author}: ${room.lastMessage.body || t("chat.deleted")}` : t("chat.noMessages")}
+          </span>
+        </span>
+        <span className="flex min-w-10 flex-col items-end gap-1 text-[10px] text-slate-400">
+          {room.lastMessageAt ? (
+            <span title={formatDateTime(room.lastMessageAt)}>{formatRelativeTime(room.lastMessageAt, locale)}</span>
+          ) : (
+            ""
+          )}
+          {room.unreadCount > 0 ? (
+            <span className="rounded-full bg-primary px-1.5 py-0.5 font-semibold text-white">
+              {room.unreadCount > 99 ? "99+" : room.unreadCount}
+            </span>
           ) : null}
         </span>
-        <span className="mt-1 block truncate text-xs text-slate-500">
-          {room.lastMessage ? `${author}: ${room.lastMessage.body || t("chat.deleted")}` : t("chat.noMessages")}
-        </span>
-      </span>
-      <span className="flex min-w-10 flex-col items-end gap-1 text-[10px] text-slate-400">
-        {room.lastMessageAt ? (
-          <span title={formatDateTime(room.lastMessageAt)}>{formatRelativeTime(room.lastMessageAt, locale)}</span>
-        ) : (
-          ""
-        )}
-        {room.unreadCount > 0 ? (
-          <span className="rounded-full bg-primary px-1.5 py-0.5 font-semibold text-white">
-            {room.unreadCount > 99 ? "99+" : room.unreadCount}
-          </span>
-        ) : null}
-      </span>
-    </button>
+      </button>
+      {onRemove ? (
+        <button
+          type="button"
+          onClick={(event) => {
+            event.stopPropagation();
+            onRemove();
+          }}
+          className="absolute right-3 top-1/2 inline-flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-md text-slate-400 opacity-0 transition hover:bg-red-50 hover:text-red-600 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-200 group-hover:opacity-100"
+          aria-label={t("chat.removeRecent")}
+        >
+          <X className="h-4 w-4" />
+        </button>
+      ) : null}
+    </div>
   );
 }
 
@@ -85,6 +102,7 @@ export function ClientChatRoomList({
   error,
   onSelectRoom,
   onOpenInstallation,
+  onRemoveRecent,
 }: {
   rooms: ClientChatRoom[];
   clients: DashboardClient[];
@@ -92,6 +110,7 @@ export function ClientChatRoomList({
   error: string | null;
   onSelectRoom: (room: ClientChatRoom) => void;
   onOpenInstallation: (installationId: string) => void;
+  onRemoveRecent?: (room: ClientChatRoom) => void;
 }) {
   const { t, locale } = useLocaleText();
   const [tab, setTab] = React.useState<"recent" | "all">("recent");
@@ -114,6 +133,9 @@ export function ClientChatRoomList({
   const archivedRooms = rooms.filter((room) => room.status === "archived");
   const visibleRooms = showArchived ? rooms : activeRooms;
 
+  const tabClass =
+    "rounded-md border border-transparent px-2 py-1.5 text-xs font-medium text-slate-500 transition-colors hover:text-slate-700 data-[selected=true]:border-primary/30 data-[selected=true]:bg-primary/10 data-[selected=true]:text-primary";
+
   if (loading && !rooms.length && tab === "recent") {
     return (
       <div className="flex flex-1 items-center justify-center">
@@ -124,11 +146,15 @@ export function ClientChatRoomList({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <Tabs selectedKey={tab} onSelectionChange={(key) => setTab(key as "recent" | "all")} className="px-3 pt-2">
+      <Tabs selectedKey={tab} onSelectionChange={(key) => setTab(key as "recent" | "all")} className="px-3 pt-2 text-foreground">
         <Tabs.ListContainer>
-          <Tabs.List aria-label={t("chat.title")}>
-            <Tabs.Tab id="recent">{t("chat.tabRecent")}</Tabs.Tab>
-            <Tabs.Tab id="all">{t("chat.tabAll")}</Tabs.Tab>
+          <Tabs.List aria-label={t("chat.title")} className="text-foreground">
+            <Tabs.Tab id="recent" className={tabClass}>
+              {t("chat.tabRecent")}
+            </Tabs.Tab>
+            <Tabs.Tab id="all" className={tabClass}>
+              {t("chat.tabAll")}
+            </Tabs.Tab>
           </Tabs.List>
         </Tabs.ListContainer>
       </Tabs>
@@ -139,7 +165,14 @@ export function ClientChatRoomList({
             {visibleRooms.length ? (
               <div className="divide-y divide-slate-100">
                 {visibleRooms.map((room) => (
-                  <RoomListRow key={room.id} room={room} locale={locale} t={t} onSelect={() => onSelectRoom(room)} />
+                  <RoomListRow
+                    key={room.id}
+                    room={room}
+                    locale={locale}
+                    t={t}
+                    onSelect={() => onSelectRoom(room)}
+                    onRemove={onRemoveRecent ? () => onRemoveRecent(room) : undefined}
+                  />
                 ))}
               </div>
             ) : (

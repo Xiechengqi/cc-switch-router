@@ -6,6 +6,7 @@ import * as React from "react";
 import {
   CLOSED_POLL_MS,
   LIST_POLL_MS,
+  clearRecentChatLocalCache,
   findDashboardClient,
   readAnonymousVisits,
   sortRooms,
@@ -28,6 +29,7 @@ import {
   getVisitedClientChatRooms,
   importClientChatVisits,
   lookupClientChatRooms,
+  removeClientChatVisit,
   recordClientChatVisit,
 } from "@/lib/api";
 import type { ClientChatRoom } from "@/lib/types";
@@ -152,6 +154,29 @@ export function ClientChatProvider({ children }: { children: React.ReactNode }) 
     void loadRooms().catch(console.error);
   }, [loadRooms]);
 
+  const removeFromRecent = React.useCallback(
+    async (room: ClientChatRoom) => {
+      clearRecentChatLocalCache(room);
+      setRooms((current) => current.filter((item) => item.id !== room.id));
+      setTotalUnread((current) => Math.max(0, current - room.unreadCount));
+      if (selectedRoom?.id === room.id) {
+        backToList();
+      }
+      if (openedDeepLinkRef.current === room.installationId) {
+        openedDeepLinkRef.current = null;
+      }
+      try {
+        if (session?.authenticated) {
+          await removeClientChatVisit(room.id);
+        }
+      } catch (cause) {
+        console.error(cause);
+        void loadRooms().catch(console.error);
+      }
+    },
+    [backToList, loadRooms, selectedRoom?.id, session?.authenticated],
+  );
+
   const minimize = React.useCallback(() => {
     setOpen(false);
   }, []);
@@ -251,6 +276,7 @@ export function ClientChatProvider({ children }: { children: React.ReactNode }) 
         onBackToList={backToList}
         onMinimize={minimize}
         onClose={close}
+        onRemoveRecent={(room) => void removeFromRecent(room)}
       />
     </ClientChatContext.Provider>
   );
@@ -278,6 +304,7 @@ function ClientChatDock({
   onBackToList,
   onMinimize,
   onClose,
+  onRemoveRecent,
 }: {
   open: boolean;
   opening: boolean;
@@ -294,6 +321,7 @@ function ClientChatDock({
   onBackToList: () => void;
   onMinimize: () => void;
   onClose: () => void;
+  onRemoveRecent: (room: ClientChatRoom) => void;
 }) {
   const { t } = useLocaleText();
   const { data } = useDashboardData();
@@ -388,6 +416,7 @@ function ClientChatDock({
           error={error}
           onSelectRoom={onSelectRoom}
           onOpenInstallation={onOpenInstallation}
+          onRemoveRecent={onRemoveRecent}
         />
       )}
     </div>

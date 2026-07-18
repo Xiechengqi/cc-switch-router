@@ -37410,6 +37410,18 @@ mod tests {
                 .len(),
             1
         );
+        store
+            .remove_client_chat_visit(&room_id, "viewer-one")
+            .await
+            .expect("remove visit");
+        assert!(
+            store
+                .list_visited_client_chat_rooms("viewer-one")
+                .await
+                .expect("viewer one rooms after remove")
+                .rooms
+                .is_empty()
+        );
         assert!(
             store
                 .list_visited_client_chat_rooms("viewer-two")

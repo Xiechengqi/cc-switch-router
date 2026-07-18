@@ -385,7 +385,7 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/chat/meta", get(client_chat_meta))
         .route(
             "/v1/chat/rooms/:room_id/visit",
-            put(record_client_chat_visit),
+            put(record_client_chat_visit).delete(remove_client_chat_visit),
         )
         .route("/v1/chat/visits/import", post(import_client_chat_visits))
         .route("/v1/chat/rooms/:room_id/read", put(mark_client_chat_read))
@@ -4568,6 +4568,19 @@ async fn record_client_chat_visit(
         .record_client_chat_visit(&room_id, &session.user_id)
         .await?;
     Ok(Json(ClientChatRoomResponse { room }))
+}
+
+async fn remove_client_chat_visit(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(room_id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    let session = require_client_chat_session(&state, &headers).await?;
+    state
+        .store
+        .remove_client_chat_visit(&room_id, &session.user_id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn import_client_chat_visits(
