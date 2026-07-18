@@ -7,6 +7,7 @@ import { useLocaleText } from "@/components/i18n/locale-provider";
 import { downloadRouterLog } from "@/lib/api";
 import { readAuthState } from "@/lib/auth";
 import type { MessageKey } from "@/lib/i18n";
+import { cn } from "@/lib/utils";
 
 type LogStatus = "connecting" | "live" | "paused" | "disconnected";
 
@@ -19,9 +20,13 @@ type LogPayload = {
 
 const MAX_LINES = 1000;
 
+const LOG_LEVELS = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"] as const;
+type LogLevel = (typeof LOG_LEVELS)[number];
+
 export function LogsPanel() {
   const { t } = useLocaleText();
   const [lines, setLines] = React.useState<string[]>([]);
+  const [selectedLevels, setSelectedLevels] = React.useState<Set<LogLevel>>(() => new Set(LOG_LEVELS));
   const [status, setStatus] = React.useState<LogStatus>("connecting");
   const [error, setError] = React.useState("");
   const [paused, setPaused] = React.useState(false);
@@ -88,12 +93,19 @@ export function LogsPanel() {
     };
   }, [connect]);
 
+  const filteredLines = React.useMemo(
+    () => lines.filter((line) => matchesLevelFilter(line, selectedLevels)),
+    [lines, selectedLevels],
+  );
+
+  const levelFilterActive = selectedLevels.size < LOG_LEVELS.length;
+
   React.useEffect(() => {
     if (paused) return;
     const viewport = viewportRef.current;
     if (!viewport) return;
     viewport.scrollTop = viewport.scrollHeight;
-  }, [lines, paused]);
+  }, [filteredLines, paused]);
 
   async function download() {
     setBusy(true);
@@ -138,16 +150,65 @@ export function LogsPanel() {
             {t("logs.reconnect")}
           </Button>
         </div>
+        <div className="grid gap-2 rounded-lg border border-slate-200 bg-slate-50/70 p-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="text-xs font-medium text-slate-600">{t("logs.filterLevels")}</span>
+            {levelFilterActive ? (
+              <span className="text-xs tabular-nums text-slate-500">
+                {t("logs.filteredCount", { visible: filteredLines.length, total: lines.length })}
+              </span>
+            ) : null}
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Button size="sm" variant="outline" onClick={() => setSelectedLevels(new Set(LOG_LEVELS))}>
+              {t("logs.filterAll")}
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setSelectedLevels(new Set(["TRACE", "DEBUG", "WARN", "ERROR"]))}
+            >
+              {t("logs.filterNonInfo")}
+            </Button>
+            <Button size="sm" variant="outline" onClick={() => setSelectedLevels(new Set(["WARN", "ERROR"]))}>
+              {t("logs.filterWarnUp")}
+            </Button>
+            <Button size="sm" variant="outline" onClick={() => setSelectedLevels(new Set(["ERROR"]))}>
+              {t("logs.filterErrorOnly")}
+            </Button>
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {LOG_LEVELS.map((level) => {
+              const active = selectedLevels.has(level);
+              return (
+                <button
+                  key={level}
+                  type="button"
+                  onClick={() => toggleLogLevel(level, setSelectedLevels)}
+                  className={cn(
+                    "inline-flex h-7 items-center rounded-md border px-2.5 text-[11px] font-semibold tracking-wide transition-colors",
+                    active ? logLevelActiveClass(level) : "border-slate-200 bg-white text-slate-400 hover:border-slate-300 hover:text-slate-600",
+                  )}
+                  aria-pressed={active}
+                >
+                  {level}
+                </button>
+              );
+            })}
+          </div>
+        </div>
         <div className="rounded-lg border border-slate-200 bg-white text-slate-900">
           <ScrollShadow className="h-[560px]">
             <pre ref={viewportRef} className="h-[560px] overflow-auto whitespace-pre-wrap break-words p-4 font-mono text-xs leading-5">
-              {lines.length ? (
-                lines.map((line, index) => (
+              {filteredLines.length ? (
+                filteredLines.map((line, index) => (
                   <React.Fragment key={`${index}-${line.slice(0, 24)}`}>
                     <AnsiLogLine line={line} />
-                    {index < lines.length - 1 ? "\n" : null}
+                    {index < filteredLines.length - 1 ? "\n" : null}
                   </React.Fragment>
                 ))
+              ) : lines.length ? (
+                t("logs.noMatchingLines")
               ) : (
                 t("logs.waiting")
               )}
@@ -309,5 +370,60 @@ function logStatusKey(status: LogStatus): MessageKey {
       return "logs.paused";
     case "disconnected":
       return "logs.disconnected";
+  }
+}
+
+function stripAnsi(input: string) {
+  return input.replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+function detectLogLevel(line: string): LogLevel | null {
+  const stripped = stripAnsi(line);
+  const tracingMatch = stripped.match(/\s(ERROR|WARN|INFO|DEBUG|TRACE)\s/);
+  if (tracingMatch) return tracingMatch[1] as LogLevel;
+  const bracketMatch = stripped.match(/\[(ERROR|WARN|INFO|DEBUG|TRACE)\]/i);
+  if (bracketMatch) return bracketMatch[1].toUpperCase() as LogLevel;
+  const jsonMatch = stripped.match(/"level"\s*:\s*"(trace|debug|info|warn|error)"/i);
+  if (jsonMatch) return jsonMatch[1].toUpperCase() as LogLevel;
+  return null;
+}
+
+function isPanelMetaLine(line: string) {
+  const stripped = stripAnsi(line).trimStart();
+  return stripped.startsWith("[");
+}
+
+function matchesLevelFilter(line: string, selectedLevels: Set<LogLevel>) {
+  if (selectedLevels.size === LOG_LEVELS.length) return true;
+  const level = detectLogLevel(line);
+  if (!level) return isPanelMetaLine(line);
+  return selectedLevels.has(level);
+}
+
+function toggleLogLevel(level: LogLevel, setSelectedLevels: React.Dispatch<React.SetStateAction<Set<LogLevel>>>) {
+  setSelectedLevels((current) => {
+    const next = new Set(current);
+    if (next.has(level)) {
+      if (next.size === 1) return current;
+      next.delete(level);
+    } else {
+      next.add(level);
+    }
+    return next;
+  });
+}
+
+function logLevelActiveClass(level: LogLevel) {
+  switch (level) {
+    case "TRACE":
+      return "border-slate-300 bg-slate-100 text-slate-700";
+    case "DEBUG":
+      return "border-cyan-200 bg-cyan-50 text-cyan-800";
+    case "INFO":
+      return "border-emerald-200 bg-emerald-50 text-emerald-800";
+    case "WARN":
+      return "border-amber-200 bg-amber-50 text-amber-800";
+    case "ERROR":
+      return "border-red-200 bg-red-50 text-red-800";
   }
 }
