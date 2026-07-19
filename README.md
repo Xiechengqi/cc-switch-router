@@ -218,6 +218,10 @@ EnvironmentFile=%h/.cc-switch-router/.env
 ExecStart=/opt/cc-switch-router/cc-switch-router
 Restart=always
 RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=45
+StandardOutput=append:/var/log/cc-switch-router.log
+StandardError=inherit
 
 [Install]
 WantedBy=multi-user.target
@@ -229,6 +233,10 @@ sudo systemctl enable cc-switch-router
 sudo systemctl start cc-switch-router
 sudo systemctl status cc-switch-router
 ```
+
+Router 收到 `SIGTERM` 后先停止 HTTP 接入并最多排空 30 秒，再关闭 SSH
+listener。日志使用 append 模式；生产环境应由 `logrotate` 或 journald 负责轮转，
+不要在重启脚本中截断日志。
 
 ## 当前限制
 

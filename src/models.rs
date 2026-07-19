@@ -1651,6 +1651,9 @@ pub struct MarketShareView {
     pub market_access_mode: String,
     pub share_status: String,
     pub online: bool,
+    pub route_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_state_since: Option<String>,
     pub active_requests: usize,
     pub token_limit: i64,
     pub tokens_used: i64,
@@ -1658,6 +1661,8 @@ pub struct MarketShareView {
     pub parallel_limit: i64,
     pub expires_at: String,
     pub online_rate_24h: f64,
+    pub observed_minutes_24h: usize,
+    pub observation_coverage_24h: f64,
     pub last_seen_at: String,
     /// RFC3339 timestamp from `shares.created_at`. Used by markets as a
     /// freshness/seniority input for diversification profiles.
@@ -2676,6 +2681,10 @@ pub struct DashboardClientView {
     #[serde(default)]
     pub online_rate_24h: f64,
     #[serde(default)]
+    pub observed_minutes_24h: usize,
+    #[serde(default)]
+    pub observation_coverage_24h: f64,
+    #[serde(default)]
     pub health_checks: Vec<HealthCheckEntry>,
     #[serde(default)]
     pub health_timeline: Vec<HealthTimelineBucket>,
@@ -2703,6 +2712,9 @@ pub struct DashboardClientTunnelView {
     pub tunnel_url: String,
     pub enabled: bool,
     pub online: bool,
+    pub route_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_state_since: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2716,6 +2728,9 @@ pub struct DashboardMarketView {
     pub market_kind: String,
     pub status: String,
     pub online: bool,
+    pub route_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_state_since: Option<String>,
     #[serde(default)]
     pub can_manage: bool,
     #[serde(default)]
@@ -2735,6 +2750,8 @@ pub struct DashboardMarketView {
     /// the last 24h, capped at 1440. Drives the ONLINE % and tooltip.
     pub online_minutes_24h: usize,
     pub online_rate_24h: f64,
+    pub observed_minutes_24h: usize,
+    pub observation_coverage_24h: f64,
     pub usage_tokens: u64,
     pub usage_amount_usd: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2763,9 +2780,14 @@ pub struct MarketLinkedShareView {
     pub owner_email: Option<String>,
     pub app_type: String,
     pub online: bool,
+    pub route_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_state_since: Option<String>,
     pub active_requests: usize,
     pub parallel_limit: i64,
     pub online_rate_24h: f64,
+    pub observed_minutes_24h: usize,
+    pub observation_coverage_24h: f64,
     #[serde(default)]
     pub disabled_by_market: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2960,6 +2982,9 @@ pub struct ShareMarketLinkView {
     pub market_kind: String,
     pub status: String,
     pub online: bool,
+    pub route_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_state_since: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub listing_status_by_app: BTreeMap<String, ShareMarketListingStatusView>,
 }
@@ -3019,6 +3044,9 @@ pub struct ShareView {
     pub app_providers: ShareAppProviders,
     pub installation_id: String,
     pub is_online: bool,
+    pub route_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_state_since: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleanup_at: Option<DateTime<Utc>>,
     /// Number of HTTP requests currently in-flight against this share. This is
@@ -3035,6 +3063,8 @@ pub struct ShareView {
     pub requests_count_by_app: BTreeMap<String, i64>,
     pub online_minutes_24h: usize,
     pub online_rate_24h: f64,
+    pub observed_minutes_24h: usize,
+    pub observation_coverage_24h: f64,
     pub recent_requests: Vec<ShareRequestLogEntry>,
     pub health_checks: Vec<HealthCheckEntry>,
     #[serde(default)]

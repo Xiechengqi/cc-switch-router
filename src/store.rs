@@ -85,9 +85,9 @@ use crate::notifications::{
     mask_email_like_tokens, render_digest_email, render_offline_email, render_registration_email,
     render_registration_overflow_email,
 };
-use crate::proxy::ProxyRegistry;
 #[cfg(test)]
 use crate::proxy::RouteKind;
+use crate::proxy::{ProxyRegistry, RouteAvailability, RouteAvailabilitySnapshot};
 use crate::registration_admission::{
     RegistrationAdmissionPolicy, RegistrationQuotaWindow, registration_source_scope,
 };
@@ -151,6 +151,30 @@ const DASHBOARD_EXPIRY_WARNING_DAYS: i64 = 7;
 const DASHBOARD_CAPACITY_WARNING_RATIO: f64 = 0.9;
 const DASHBOARD_MEDIUM_LATENCY_MS: u64 = 15_000;
 const DASHBOARD_HIGH_LATENCY_MS: u64 = 30_000;
+const DASHBOARD_LATENCY_MIN_SAMPLES: usize = 3;
+
+fn observed_online_rate(healthy_minutes: usize, observed_minutes: usize) -> f64 {
+    if observed_minutes == 0 {
+        0.0
+    } else {
+        (healthy_minutes as f64 / observed_minutes as f64 * 100.0).clamp(0.0, 100.0)
+    }
+}
+
+fn observation_coverage(observed_minutes: usize) -> f64 {
+    (observed_minutes as f64 / ONLINE_WINDOW_MINUTES as f64 * 100.0).clamp(0.0, 100.0)
+}
+
+fn dashboard_route_state(snapshot: Option<&RouteAvailabilitySnapshot>) -> (String, Option<String>) {
+    snapshot
+        .map(|snapshot| {
+            (
+                snapshot.state.as_str().to_string(),
+                Some(snapshot.since.to_rfc3339()),
+            )
+        })
+        .unwrap_or_else(|| ("offline".to_string(), None))
+}
 
 fn operational_reason(
     code: &str,
@@ -208,6 +232,40 @@ fn share_model_health_failed(share: &ShareView) -> bool {
         })
 }
 
+fn representative_recent_latency(
+    requests: &[ShareRequestLogEntry],
+) -> Option<(u64, Option<String>)> {
+    let mut samples = requests
+        .iter()
+        .filter(|request| !request.is_health_check && request.status_code < 400)
+        .filter_map(|request| {
+            let latency = if request.is_streaming {
+                request.first_token_ms
+            } else {
+                Some(request.latency_ms)
+            }?;
+            (latency > 0).then_some((latency, request.created_at))
+        })
+        .take(10)
+        .collect::<Vec<_>>();
+    if samples.len() < DASHBOARD_LATENCY_MIN_SAMPLES {
+        return None;
+    }
+    let latest_at = samples
+        .iter()
+        .map(|(_, created_at)| *created_at)
+        .max()
+        .and_then(unix_timestamp_rfc3339);
+    samples.sort_unstable_by_key(|(latency, _)| *latency);
+    let middle = samples.len() / 2;
+    let median = if samples.len() % 2 == 0 {
+        ((samples[middle - 1].0 as u128 + samples[middle].0 as u128) / 2) as u64
+    } else {
+        samples[middle].0
+    };
+    Some((median, latest_at))
+}
+
 fn share_operational_summary(share: &ShareView, now: DateTime<Utc>) -> OperationalSummary {
     let status = share.share_status.trim().to_ascii_lowercase();
     if status != "active" {
@@ -230,8 +288,23 @@ fn share_operational_summary(share: &ShareView, now: DateTime<Utc>) -> Operation
         );
     }
 
+    if share.route_state == "reconnecting" {
+        return operational_summary(
+            "reconnecting",
+            vec![operational_reason(
+                "route_reconnecting",
+                "info",
+                share.route_state_since.clone(),
+                Some("share"),
+                Some(&share.share_id),
+                None,
+                None,
+            )],
+        );
+    }
+
     let mut reasons = Vec::new();
-    if !share.is_online {
+    if share.route_state == "offline" {
         reasons.push(operational_reason(
             "route_offline",
             "critical",
@@ -369,41 +442,25 @@ fn share_operational_summary(share: &ShareView, now: DateTime<Utc>) -> Operation
             None,
         ));
     }
-    let recent_latency = share
-        .recent_requests
-        .iter()
-        .rev()
-        .take(10)
-        .filter(|request| !request.is_health_check)
-        .map(|request| request.latency_ms)
-        .filter(|value| *value > 0)
-        .collect::<Vec<_>>();
-    if !recent_latency.is_empty() {
-        let average = recent_latency.iter().sum::<u64>() / recent_latency.len() as u64;
-        if average >= DASHBOARD_HIGH_LATENCY_MS {
+    if let Some((latency, latest_at)) = representative_recent_latency(&share.recent_requests) {
+        if latency >= DASHBOARD_HIGH_LATENCY_MS {
             reasons.push(operational_reason(
                 "high_latency",
                 "warning",
-                share
-                    .recent_requests
-                    .last()
-                    .and_then(|request| unix_timestamp_rfc3339(request.created_at)),
+                latest_at,
                 Some("share"),
                 Some(&share.share_id),
-                Some(average.to_string()),
+                Some(latency.to_string()),
                 Some(DASHBOARD_HIGH_LATENCY_MS.to_string()),
             ));
-        } else if average >= DASHBOARD_MEDIUM_LATENCY_MS {
+        } else if latency >= DASHBOARD_MEDIUM_LATENCY_MS {
             reasons.push(operational_reason(
                 "medium_latency",
                 "warning",
-                share
-                    .recent_requests
-                    .last()
-                    .and_then(|request| unix_timestamp_rfc3339(request.created_at)),
+                latest_at,
                 Some("share"),
                 Some(&share.share_id),
-                Some(average.to_string()),
+                Some(latency.to_string()),
                 Some(DASHBOARD_MEDIUM_LATENCY_MS.to_string()),
             ));
         }
@@ -423,6 +480,24 @@ fn client_operational_summary(
     stale_seconds: i64,
     now: DateTime<Utc>,
 ) -> OperationalSummary {
+    if let Some(tunnel) = client
+        .client_tunnel
+        .as_ref()
+        .filter(|tunnel| tunnel.enabled && tunnel.route_state == "reconnecting")
+    {
+        return operational_summary(
+            "reconnecting",
+            vec![operational_reason(
+                "route_reconnecting",
+                "info",
+                tunnel.route_state_since.clone(),
+                Some("client"),
+                Some(&client.installation.id),
+                None,
+                None,
+            )],
+        );
+    }
     let mut reasons = Vec::new();
     let tunnel_offline = client
         .client_tunnel
@@ -506,6 +581,20 @@ fn market_operational_summary(market: &DashboardMarketView) -> OperationalSummar
                 Some("market"),
                 Some(&market.id),
                 market.maintenance_message.clone(),
+                None,
+            )],
+        );
+    }
+    if market.route_state == "reconnecting" {
+        return operational_summary(
+            "reconnecting",
+            vec![operational_reason(
+                "route_reconnecting",
+                "info",
+                market.route_state_since.clone(),
+                Some("market"),
+                Some(&market.id),
+                None,
                 None,
             )],
         );
@@ -966,6 +1055,41 @@ pub struct ShareRouteTarget {
 pub struct ClientTunnelRouteTarget {
     pub installation_id: String,
     pub subdomain: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteIntentKind {
+    Share,
+    Client,
+    Market,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteIntent {
+    pub subdomain: String,
+    pub kind: RouteIntentKind,
+    pub subject_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteHealthStatus {
+    Healthy,
+    Unhealthy,
+    Unknown,
+}
+
+impl RouteHealthStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Unhealthy => "unhealthy",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn legacy_is_healthy(self) -> bool {
+        matches!(self, Self::Healthy)
+    }
 }
 
 #[derive(Debug)]
@@ -4759,6 +4883,8 @@ impl AppStore {
             app_providers: share.app_providers,
             installation_id: String::new(),
             is_online,
+            route_state: if is_online { "active" } else { "offline" }.to_string(),
+            route_state_since: None,
             cleanup_at: None,
             active_requests,
             active_requests_by_app: BTreeMap::new(),
@@ -4767,6 +4893,8 @@ impl AppStore {
             requests_count_by_app: BTreeMap::new(),
             online_minutes_24h: 0,
             online_rate_24h: 0.0,
+            observed_minutes_24h: 0,
+            observation_coverage_24h: 0.0,
             recent_requests: Vec::new(),
             health_checks: Vec::new(),
             health_timeline: Vec::new(),
@@ -6958,10 +7086,16 @@ impl AppStore {
         proxy: &ProxyRegistry,
         viewer_email: Option<&str>,
     ) -> Result<DashboardResponse, AppError> {
-        let active_subdomains = proxy
-            .active_subdomains()
-            .await
-            .into_iter()
+        let route_availability = proxy
+            .route_availability_snapshots(crate::notifications::route_reconnect_grace(
+                &config.client_notifications,
+            ))
+            .await;
+        let active_subdomains = route_availability
+            .iter()
+            .filter_map(|(subdomain, snapshot)| {
+                (snapshot.state == RouteAvailability::Active).then_some(subdomain.clone())
+            })
             .collect::<HashSet<_>>();
         let inflight_by_share = proxy.inflight_by_share().await;
         let inflight_by_share_app = proxy.inflight_by_share_app().await;
@@ -6976,9 +7110,11 @@ impl AppStore {
             health_by_share,
             health_timeline_by_share,
             online_by_share,
+            observed_by_share,
             health_by_installation,
             health_timeline_by_installation,
             online_by_installation,
+            observed_by_installation,
             recent_logs,
             recent_model_health_checks,
             market_logs,
@@ -6996,9 +7132,11 @@ impl AppStore {
                 list_health_checks(&conn, 10)?,
                 list_share_health_timeline_24h(&conn, now)?,
                 list_online_minutes_24h(&conn)?,
+                list_observed_minutes_24h(&conn)?,
                 list_installation_health_checks(&conn, 10)?,
                 list_installation_health_timeline_24h(&conn, now)?,
                 list_installation_online_minutes_24h(&conn)?,
+                list_installation_observed_minutes_24h(&conn)?,
                 list_recent_share_request_logs(&conn, SHARE_REQUEST_LOG_RECOVERY_LIMIT)?,
                 list_recent_share_model_health_checks(&conn, SHARE_MODEL_HEALTH_CHECK_LIMIT)?,
                 list_recent_market_request_logs(&conn, 200)?,
@@ -7022,15 +7160,17 @@ impl AppStore {
                 acc
             },
         );
-        let markets = {
+        let mut markets = {
             let conn = self.conn.lock().await;
             list_dashboard_markets(
                 &conn,
                 viewer_email,
                 &active_subdomains,
+                &route_availability,
                 &shares,
                 &inflight_by_share,
                 &online_by_share,
+                &observed_by_share,
                 &health_by_share,
                 &health_timeline_by_share,
                 &inflight_by_market_email,
@@ -7039,6 +7179,14 @@ impl AppStore {
                 health_timeline_start,
             )?
         };
+        for market in &mut markets {
+            let (route_state, route_state_since) =
+                dashboard_route_state(route_availability.get(&market.subdomain));
+            market.online = route_state == "active";
+            market.route_state = route_state;
+            market.route_state_since = route_state_since;
+            market.operational_summary = market_operational_summary(market);
+        }
         let logs_by_share = recent_logs.into_iter().fold(
             HashMap::<String, Vec<ShareRequestLogEntry>>::new(),
             |mut acc, log| {
@@ -7171,11 +7319,20 @@ impl AppStore {
                     .get(&share.share_id)
                     .cloned()
                     .unwrap_or_default();
-                let is_online =
-                    share.share_status == "active" && active_subdomains.contains(&share.subdomain);
-                let online_minutes_24h = online_by_share.get(&share.share_id).copied().unwrap_or(0);
+                let (route_state, route_state_since) =
+                    dashboard_route_state(route_availability.get(&share.subdomain));
+                let is_online = share.share_status == "active" && route_state == "active";
+                let mut online_minutes_24h =
+                    online_by_share.get(&share.share_id).copied().unwrap_or(0);
+                let mut observed_minutes_24h =
+                    observed_by_share.get(&share.share_id).copied().unwrap_or(0);
+                if is_online && observed_minutes_24h == 0 {
+                    online_minutes_24h = 1;
+                    observed_minutes_24h = 1;
+                }
                 let online_rate_24h =
-                    ((online_minutes_24h as f64 / ONLINE_WINDOW_MINUTES as f64) * 100.0).min(100.0);
+                    observed_online_rate(online_minutes_24h, observed_minutes_24h);
+                let observation_coverage_24h = observation_coverage(observed_minutes_24h);
                 let can_view_share = share_visible_to_email(&share, viewer_email);
                 let can_view_secret = can_view_share;
                 let can_manage = can_manage_share(&share, viewer_email);
@@ -7294,7 +7451,9 @@ impl AppStore {
                     app_providers: share.app_providers,
                     installation_id: installation_id.clone(),
                     is_online,
-                    cleanup_at: (!is_online)
+                    route_state: route_state.clone(),
+                    route_state_since,
+                    cleanup_at: (route_state == "offline")
                         .then(|| installation_cleanup_at.get(&installation_id).copied())
                         .flatten(),
                     active_requests,
@@ -7304,6 +7463,8 @@ impl AppStore {
                     requests_count_by_app,
                     online_minutes_24h,
                     online_rate_24h,
+                    observed_minutes_24h,
+                    observation_coverage_24h,
                     recent_requests,
                     health_checks,
                     health_timeline,
@@ -7345,24 +7506,35 @@ impl AppStore {
                     .unwrap_or_default();
                 let share_count = share_ids.len();
                 let tunnel_record = client_tunnels_by_installation.get(&installation.id);
+                let (client_route_state, client_route_state_since) = tunnel_record
+                    .map(|tunnel| dashboard_route_state(route_availability.get(&tunnel.subdomain)))
+                    .unwrap_or_else(|| ("offline".to_string(), None));
                 let client_tunnel_online = tunnel_record
-                    .map(|tunnel| tunnel.enabled && active_subdomains.contains(&tunnel.subdomain))
+                    .map(|tunnel| tunnel.enabled && client_route_state == "active")
                     .unwrap_or(false);
                 let mut online_minutes_24h = online_by_installation
                     .get(&installation.id)
                     .copied()
                     .unwrap_or(0);
-                if online_minutes_24h == 0 && client_tunnel_online {
+                let mut observed_minutes_24h = observed_by_installation
+                    .get(&installation.id)
+                    .copied()
+                    .unwrap_or(0);
+                if observed_minutes_24h == 0 && client_tunnel_online {
                     online_minutes_24h = 1;
+                    observed_minutes_24h = 1;
                 }
                 let online_rate_24h =
-                    ((online_minutes_24h as f64 / ONLINE_WINDOW_MINUTES as f64) * 100.0).min(100.0);
+                    observed_online_rate(online_minutes_24h, observed_minutes_24h);
+                let observation_coverage_24h = observation_coverage(observed_minutes_24h);
                 let client_tunnel = tunnel_record.map(|tunnel| DashboardClientTunnelView {
                     owner_email: tunnel.owner_email.clone(),
                     subdomain: tunnel.subdomain.clone(),
                     tunnel_url: config.tunnel_url(&tunnel.subdomain),
                     enabled: tunnel.enabled,
                     online: client_tunnel_online,
+                    route_state: client_route_state.clone(),
+                    route_state_since: client_route_state_since.clone(),
                 });
                 let payout_profile = payout_profiles.get(&installation.id).cloned();
                 let mut health_checks = health_by_installation
@@ -7391,6 +7563,8 @@ impl AppStore {
                     payout_profile,
                     online_minutes_24h,
                     online_rate_24h,
+                    observed_minutes_24h,
+                    observation_coverage_24h,
                     health_checks,
                     health_timeline,
                     installation,
@@ -7852,6 +8026,9 @@ impl AppStore {
                         AppError::Internal(format!("query stale active offline shares failed: {e}"))
                     })?;
                 collect_rows(rows)?
+                    .into_iter()
+                    .filter(|(_, _, subdomain)| !active_route_connections.contains_key(subdomain))
+                    .collect::<Vec<_>>()
             };
             let (deleted_stale_active_offline_shares, deleted_stale_active_offline_leases) =
                 if stale_active_offline_shares.is_empty() {
@@ -8239,6 +8416,72 @@ impl AppStore {
             })
             .map_err(|e| AppError::Internal(format!("query client tunnel targets failed: {e}")))?;
         collect_rows(rows)
+    }
+
+    /// Rebuilds the in-memory routing namespace from authoritative entities.
+    /// Persisted public-host rows enforce ownership but are not sufficient for
+    /// startup hydration because a retired entity may leave historical rows.
+    pub async fn list_route_intents(&self) -> Result<Vec<RouteIntent>, AppError> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT subdomain, kind, subject_id
+                 FROM (
+                     SELECT subdomain, 'share' AS kind, share_id AS subject_id
+                     FROM shares
+                     WHERE share_status = 'active'
+                       AND subdomain IS NOT NULL
+                       AND subdomain != ''
+                       AND subdomain != '-'
+                     UNION ALL
+                     SELECT subdomain, 'client' AS kind, installation_id AS subject_id
+                     FROM installation_client_tunnels
+                     WHERE enabled = 1
+                       AND subdomain IS NOT NULL
+                       AND subdomain != ''
+                     UNION ALL
+                     SELECT subdomain, 'market' AS kind, id AS subject_id
+                     FROM router_markets
+                     WHERE status = 'active'
+                       AND subdomain IS NOT NULL
+                       AND subdomain != ''
+                 )
+                 ORDER BY subdomain ASC, kind ASC",
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("prepare startup route intents failed: {error}"))
+            })?;
+        let rows = stmt
+            .query_map([], |row| {
+                let kind = match row.get::<_, String>(1)?.as_str() {
+                    "share" => RouteIntentKind::Share,
+                    "client" => RouteIntentKind::Client,
+                    "market" => RouteIntentKind::Market,
+                    _ => unreachable!("route intent query returns fixed kinds"),
+                };
+                Ok(RouteIntent {
+                    subdomain: row.get(0)?,
+                    kind,
+                    subject_id: row.get(2)?,
+                })
+            })
+            .map_err(|error| {
+                AppError::Internal(format!("query startup route intents failed: {error}"))
+            })?;
+        let intents = collect_rows(rows)?;
+        let mut owners = HashMap::<String, (RouteIntentKind, String)>::new();
+        for intent in &intents {
+            let subdomain = intent.subdomain.trim().to_ascii_lowercase();
+            if let Some((kind, subject_id)) =
+                owners.insert(subdomain.clone(), (intent.kind, intent.subject_id.clone()))
+            {
+                return Err(AppError::Internal(format!(
+                    "public route {subdomain} is assigned to both {kind:?} {subject_id} and {:?} {}",
+                    intent.kind, intent.subject_id
+                )));
+            }
+        }
+        Ok(intents)
     }
 
     /// True if the given subdomain is currently bound to a registered market
@@ -8712,6 +8955,7 @@ impl AppStore {
     ) -> Result<Vec<MarketShareView>, AppError> {
         let conn = self.conn.lock().await;
         let online_minutes = list_online_minutes_24h(&conn)?;
+        let observed_minutes = list_observed_minutes_24h(&conn)?;
         let samples_10m = list_online_minutes_10m(&conn)?;
         let model_health_by_share = list_model_health_summaries(&conn)?;
         let market_email_lower = market_email.to_ascii_lowercase();
@@ -8748,10 +8992,15 @@ impl AppStore {
                 let subdomain: String = row.get(13)?;
                 let parallel_limit: i64 = row.get(14)?;
                 let active_requests = *inflight_by_share.get(&share_id).unwrap_or(&0);
-                let online_rate_24h = online_minutes
-                    .get(&share_id)
-                    .map(|minutes| *minutes as f64 / ONLINE_WINDOW_MINUTES as f64)
-                    .unwrap_or(0.0);
+                let mut healthy_minutes_24h = online_minutes.get(&share_id).copied().unwrap_or(0);
+                let mut observed_minutes_24h =
+                    observed_minutes.get(&share_id).copied().unwrap_or(0);
+                if observed_minutes_24h == 0 && active_subdomains.contains(&subdomain) {
+                    healthy_minutes_24h = 1;
+                    observed_minutes_24h = 1;
+                }
+                let online_rate_24h =
+                    observed_online_rate(healthy_minutes_24h, observed_minutes_24h) / 100.0;
                 let samples = samples_10m.get(&share_id).copied().unwrap_or(0);
                 let upstream_provider: Option<ShareUpstreamProvider> =
                     parse_upstream_provider(row.get(19)?)?;
@@ -8812,6 +9061,8 @@ impl AppStore {
                         sale_market_kind: row.get(11)?,
                         share_status: row.get(12)?,
                         online: false,
+                        route_state: "offline".into(),
+                        route_state_since: None,
                         active_requests,
                         token_limit: row.get(23)?,
                         tokens_used: row.get(24)?,
@@ -8819,6 +9070,8 @@ impl AppStore {
                         parallel_limit,
                         expires_at: row.get(26)?,
                         online_rate_24h,
+                        observed_minutes_24h,
+                        observation_coverage_24h: observation_coverage(observed_minutes_24h),
                         last_seen_at: row.get(15)?,
                         share_created_at: row.get(22)?,
                         disabled_by_market: row.get::<_, Option<String>>(21)?.is_some(),
@@ -8882,6 +9135,7 @@ impl AppStore {
                 continue;
             }
             share.online = active_subdomains.contains(&subdomain);
+            share.route_state = if share.online { "active" } else { "offline" }.into();
             shares.push(share);
         }
         Ok(shares)
@@ -9816,13 +10070,24 @@ impl AppStore {
     pub async fn record_share_route_health(
         &self,
         share_id: &str,
-        is_healthy: bool,
+        status: RouteHealthStatus,
+        reason: &str,
+        router_epoch: &str,
     ) -> Result<(), AppError> {
         let now = Utc::now().timestamp();
         let conn = self.conn.lock().await;
         conn.execute(
-            "INSERT INTO share_health_checks (share_id, checked_at, is_healthy) VALUES (?1, ?2, ?3)",
-            params![share_id, now, if is_healthy { 1 } else { 0 }],
+            "INSERT INTO share_health_checks (
+                share_id, checked_at, is_healthy, status, reason, router_epoch
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                share_id,
+                now,
+                i64::from(status.legacy_is_healthy()),
+                status.as_str(),
+                reason,
+                router_epoch,
+            ],
         )
         .map_err(|e| AppError::Internal(format!("insert route health failed: {e}")))?;
         conn.execute(
@@ -9836,13 +10101,24 @@ impl AppStore {
     pub async fn record_installation_route_health(
         &self,
         installation_id: &str,
-        is_healthy: bool,
+        status: RouteHealthStatus,
+        reason: &str,
+        router_epoch: &str,
     ) -> Result<(), AppError> {
         let now = Utc::now().timestamp();
         let conn = self.conn.lock().await;
         conn.execute(
-            "INSERT INTO installation_health_checks (installation_id, checked_at, is_healthy) VALUES (?1, ?2, ?3)",
-            params![installation_id, now, if is_healthy { 1 } else { 0 }],
+            "INSERT INTO installation_health_checks (
+                installation_id, checked_at, is_healthy, status, reason, router_epoch
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                installation_id,
+                now,
+                i64::from(status.legacy_is_healthy()),
+                status.as_str(),
+                reason,
+                router_epoch,
+            ],
         )
         .map_err(|e| AppError::Internal(format!("insert installation route health failed: {e}")))?;
         conn.execute(
@@ -11293,6 +11569,9 @@ fn retire_share_tx(
         return Ok(false);
     }
 
+    crate::public_hosts::tombstone_subject(conn, PublicHostKind::Share, share_id)
+        .map_err(map_public_host_error)?;
+
     let retired_at = Utc::now().to_rfc3339();
     conn.execute(
         "UPDATE share_edit_requests
@@ -11892,14 +12171,20 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             share_id TEXT NOT NULL,
             checked_at INTEGER NOT NULL,
-            is_healthy INTEGER NOT NULL
+            is_healthy INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'unknown',
+            reason TEXT,
+            router_epoch TEXT NOT NULL DEFAULT 'legacy'
         );
 
         CREATE TABLE IF NOT EXISTS installation_health_checks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             installation_id TEXT NOT NULL,
             checked_at INTEGER NOT NULL,
-            is_healthy INTEGER NOT NULL
+            is_healthy INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'unknown',
+            reason TEXT,
+            router_epoch TEXT NOT NULL DEFAULT 'legacy'
         );
 
         CREATE TABLE IF NOT EXISTS share_model_health_checks (
@@ -12314,6 +12599,8 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         CREATE INDEX IF NOT EXISTS idx_image_request_logs_status_created ON image_generation_request_logs(status, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_share_health_checks ON share_health_checks(share_id, checked_at DESC);
         CREATE INDEX IF NOT EXISTS idx_installation_health_checks ON installation_health_checks(installation_id, checked_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_share_health_checks_checked_at ON share_health_checks(checked_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_installation_health_checks_checked_at ON installation_health_checks(checked_at DESC);
         CREATE INDEX IF NOT EXISTS idx_share_model_health_checks_share ON share_model_health_checks(share_id, app_type, requested_model, checked_at DESC);
         CREATE INDEX IF NOT EXISTS idx_share_model_health_state_share ON share_model_health_state(share_id, app_type, last_status);
         CREATE INDEX IF NOT EXISTS idx_dashboard_presence_last_seen ON dashboard_presence(last_seen_at DESC);
@@ -12955,6 +13242,30 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         "is_health_check",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    for table in ["share_health_checks", "installation_health_checks"] {
+        add_column_if_missing(conn, table, "status", "TEXT NOT NULL DEFAULT 'unknown'")?;
+        add_column_if_missing(conn, table, "reason", "TEXT")?;
+        add_column_if_missing(
+            conn,
+            table,
+            "router_epoch",
+            "TEXT NOT NULL DEFAULT 'legacy'",
+        )?;
+        conn.execute(
+            &format!(
+                "UPDATE {table}
+                 SET status = CASE WHEN is_healthy = 1 THEN 'healthy' ELSE 'unhealthy' END,
+                     reason = COALESCE(reason, 'legacy_probe')
+                 WHERE router_epoch = 'legacy' AND status = 'unknown'"
+            ),
+            [],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "backfill {table} observation status failed: {error}"
+            ))
+        })?;
+    }
     add_column_if_missing(
         conn,
         "market_request_logs",
@@ -14674,16 +14985,7 @@ async fn remove_stale_route_snapshots(
             continue;
         };
         if proxy
-            .active_route_connections()
-            .await
-            .get(&subdomain)
-            .and_then(|value| value.as_deref())
-            != Some(connection_id.as_str())
-        {
-            continue;
-        }
-        if proxy
-            .remove_route_if_connection(&subdomain, connection_id)
+            .remove_route_intent_if_connection(&subdomain, connection_id)
             .await
         {
             removed += 1;
@@ -19100,9 +19402,9 @@ fn list_health_checks(
     let cutoff = (current_bucket - (minutes as i64 - 1)) * 60;
     let mut stmt = conn
         .prepare(
-            "SELECT share_id, checked_at, is_healthy
+            "SELECT share_id, checked_at, status
              FROM share_health_checks
-             WHERE checked_at >= ?1
+             WHERE checked_at >= ?1 AND status != 'unknown'
              ORDER BY checked_at ASC",
         )
         .map_err(|e| AppError::Internal(format!("prepare health checks failed: {e}")))?;
@@ -19112,7 +19414,7 @@ fn list_health_checks(
                 row.get::<_, String>(0)?,
                 HealthCheckEntry {
                     checked_at: row.get(1)?,
-                    is_healthy: row.get::<_, i64>(2)? != 0,
+                    is_healthy: row.get::<_, String>(2)? == "healthy",
                 },
             ))
         })
@@ -19132,7 +19434,7 @@ fn list_online_minutes_24h(conn: &Connection) -> Result<HashMap<String, usize>, 
         .prepare(
             "SELECT share_id, COUNT(DISTINCT checked_at / 60) AS online_minutes
              FROM share_health_checks
-             WHERE checked_at >= ?1 AND is_healthy = 1
+             WHERE checked_at >= ?1 AND status = 'healthy'
              GROUP BY share_id",
         )
         .map_err(|e| AppError::Internal(format!("prepare online minutes failed: {e}")))?;
@@ -19150,6 +19452,35 @@ fn list_online_minutes_24h(conn: &Connection) -> Result<HashMap<String, usize>, 
     Ok(map)
 }
 
+fn list_observed_minutes_24h(conn: &Connection) -> Result<HashMap<String, usize>, AppError> {
+    let cutoff = Utc::now().timestamp() - 24 * 60 * 60;
+    let mut stmt = conn
+        .prepare(
+            "SELECT share_id, COUNT(DISTINCT checked_at / 60) AS observed_minutes
+             FROM share_health_checks
+             WHERE checked_at >= ?1 AND status IN ('healthy', 'unhealthy')
+             GROUP BY share_id",
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("prepare observed share minutes failed: {error}"))
+        })?;
+    let rows = stmt
+        .query_map(params![cutoff], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+        })
+        .map_err(|error| {
+            AppError::Internal(format!("query observed share minutes failed: {error}"))
+        })?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let (share_id, observed_minutes) = row.map_err(|error| {
+            AppError::Internal(format!("read observed share minute failed: {error}"))
+        })?;
+        map.insert(share_id, observed_minutes.min(ONLINE_WINDOW_MINUTES));
+    }
+    Ok(map)
+}
+
 fn list_installation_health_checks(
     conn: &Connection,
     minutes: usize,
@@ -19158,9 +19489,9 @@ fn list_installation_health_checks(
     let cutoff = (current_bucket - (minutes as i64 - 1)) * 60;
     let mut stmt = conn
         .prepare(
-            "SELECT installation_id, checked_at, is_healthy
+            "SELECT installation_id, checked_at, status
              FROM installation_health_checks
-             WHERE checked_at >= ?1
+             WHERE checked_at >= ?1 AND status != 'unknown'
              ORDER BY checked_at ASC",
         )
         .map_err(|e| {
@@ -19172,7 +19503,7 @@ fn list_installation_health_checks(
                 row.get::<_, String>(0)?,
                 HealthCheckEntry {
                     checked_at: row.get(1)?,
-                    is_healthy: row.get::<_, i64>(2)? != 0,
+                    is_healthy: row.get::<_, String>(2)? == "healthy",
                 },
             ))
         })
@@ -19195,7 +19526,7 @@ fn list_installation_online_minutes_24h(
         .prepare(
             "SELECT installation_id, COUNT(DISTINCT checked_at / 60) AS online_minutes
              FROM installation_health_checks
-             WHERE checked_at >= ?1 AND is_healthy = 1
+             WHERE checked_at >= ?1 AND status = 'healthy'
              GROUP BY installation_id",
         )
         .map_err(|e| {
@@ -19214,6 +19545,41 @@ fn list_installation_online_minutes_24h(
             AppError::Internal(format!("read installation online minute row failed: {e}"))
         })?;
         map.insert(installation_id, online_minutes.min(ONLINE_WINDOW_MINUTES));
+    }
+    Ok(map)
+}
+
+fn list_installation_observed_minutes_24h(
+    conn: &Connection,
+) -> Result<HashMap<String, usize>, AppError> {
+    let cutoff = Utc::now().timestamp() - 24 * 60 * 60;
+    let mut stmt = conn
+        .prepare(
+            "SELECT installation_id, COUNT(DISTINCT checked_at / 60) AS observed_minutes
+             FROM installation_health_checks
+             WHERE checked_at >= ?1 AND status IN ('healthy', 'unhealthy')
+             GROUP BY installation_id",
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "prepare observed installation minutes failed: {error}"
+            ))
+        })?;
+    let rows = stmt
+        .query_map(params![cutoff], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+        })
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "query observed installation minutes failed: {error}"
+            ))
+        })?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let (installation_id, observed_minutes) = row.map_err(|error| {
+            AppError::Internal(format!("read observed installation minute failed: {error}"))
+        })?;
+        map.insert(installation_id, observed_minutes.min(ONLINE_WINDOW_MINUTES));
     }
     Ok(map)
 }
@@ -19283,7 +19649,11 @@ fn health_timeline_status_for_values(score: f64, has_data: bool) -> &'static str
 }
 
 fn health_timeline_score(stats: &HealthTimelineBucketStats) -> f64 {
-    let online_ratio = (stats.healthy_minutes.len() as f64 / 30.0).clamp(0.0, 1.0);
+    let online_ratio = if stats.observed_minutes.is_empty() {
+        0.0
+    } else {
+        (stats.healthy_minutes.len() as f64 / stats.observed_minutes.len() as f64).clamp(0.0, 1.0)
+    };
     if stats.request_count == 0 {
         return online_ratio * 100.0;
     }
@@ -19410,7 +19780,7 @@ fn list_share_health_timeline_24h(
 
     let mut stmt = conn
         .prepare(
-            "SELECT share_id, checked_at, is_healthy
+            "SELECT share_id, checked_at, status
              FROM share_health_checks
              WHERE checked_at >= ?1 AND checked_at <= ?2",
         )
@@ -19420,12 +19790,12 @@ fn list_share_health_timeline_24h(
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)? != 0,
+                row.get::<_, String>(2)?,
             ))
         })
         .map_err(|e| AppError::Internal(format!("query health timeline failed: {e}")))?;
     for row in rows {
-        let (share_id, checked_at, is_healthy) =
+        let (share_id, checked_at, status) =
             row.map_err(|e| AppError::Internal(format!("read health timeline row failed: {e}")))?;
         let Some(index) = health_timeline_bucket_index(checked_at, start, end) else {
             continue;
@@ -19434,8 +19804,10 @@ fn list_share_health_timeline_24h(
         let bucket = &mut by_share
             .entry(share_id)
             .or_insert_with(empty_health_timeline_stats)[index];
-        bucket.observed_minutes.insert(minute);
-        if is_healthy {
+        if status != "unknown" {
+            bucket.observed_minutes.insert(minute);
+        }
+        if status == "healthy" {
             bucket.healthy_minutes.insert(minute);
         }
     }
@@ -19487,7 +19859,7 @@ fn list_installation_health_timeline_24h(
 
     let mut stmt = conn
         .prepare(
-            "SELECT installation_id, checked_at, is_healthy
+            "SELECT installation_id, checked_at, status
              FROM installation_health_checks
              WHERE checked_at >= ?1 AND checked_at <= ?2",
         )
@@ -19499,14 +19871,14 @@ fn list_installation_health_timeline_24h(
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)? != 0,
+                row.get::<_, String>(2)?,
             ))
         })
         .map_err(|e| {
             AppError::Internal(format!("query installation health timeline failed: {e}"))
         })?;
     for row in rows {
-        let (installation_id, checked_at, is_healthy) = row.map_err(|e| {
+        let (installation_id, checked_at, status) = row.map_err(|e| {
             AppError::Internal(format!("read installation health timeline row failed: {e}"))
         })?;
         let Some(index) = health_timeline_bucket_index(checked_at, start, end) else {
@@ -19516,8 +19888,10 @@ fn list_installation_health_timeline_24h(
         let bucket = &mut by_installation
             .entry(installation_id)
             .or_insert_with(empty_health_timeline_stats)[index];
-        bucket.observed_minutes.insert(minute);
-        if is_healthy {
+        if status != "unknown" {
+            bucket.observed_minutes.insert(minute);
+        }
+        if status == "healthy" {
             bucket.healthy_minutes.insert(minute);
         }
     }
@@ -19582,7 +19956,7 @@ fn list_online_minutes_10m(conn: &Connection) -> Result<HashMap<String, usize>, 
         .prepare(
             "SELECT share_id, COUNT(DISTINCT checked_at / 60) AS online_minutes
              FROM share_health_checks
-             WHERE checked_at >= ?1 AND is_healthy = 1
+             WHERE checked_at >= ?1 AND status = 'healthy'
              GROUP BY share_id",
         )
         .map_err(|e| AppError::Internal(format!("prepare online minutes 10m failed: {e}")))?;
@@ -19838,9 +20212,11 @@ fn list_dashboard_markets(
     conn: &Connection,
     viewer_email: Option<&str>,
     active_subdomains: &HashSet<String>,
+    route_availability: &HashMap<String, RouteAvailabilitySnapshot>,
     shares: &[(String, ShareDescriptor)],
     inflight_by_share: &HashMap<String, usize>,
     online_by_share: &HashMap<String, usize>,
+    observed_by_share: &HashMap<String, usize>,
     health_by_share: &HashMap<String, Vec<HealthCheckEntry>>,
     health_timeline_by_share: &HashMap<String, Vec<HealthTimelineBucket>>,
     inflight_by_market_email: &HashMap<String, usize>,
@@ -19884,6 +20260,8 @@ fn list_dashboard_markets(
                 market_kind: row.get(5)?,
                 status: row.get(6)?,
                 online: active_subdomains.contains(&subdomain),
+                route_state: "offline".to_string(),
+                route_state_since: None,
                 can_manage: false,
                 maintenance_enabled: row.get::<_, i64>(12)? != 0,
                 maintenance_message: row.get(13)?,
@@ -19897,6 +20275,8 @@ fn list_dashboard_markets(
                 parallel_capacity: 0,
                 online_minutes_24h: 0,
                 online_rate_24h: 0.0,
+                observed_minutes_24h: 0,
+                observation_coverage_24h: 0.0,
                 usage_tokens: row.get::<_, i64>(14)?.max(0) as u64,
                 usage_amount_usd: format!("{:.8}", row.get::<_, f64>(15)?.max(0.0)),
                 pricing_summary: parse_json_value(row.get(11)?)?,
@@ -19921,9 +20301,10 @@ fn list_dashboard_markets(
             market,
             shares,
             &disabled_by_market,
-            active_subdomains,
+            route_availability,
             inflight_by_share,
             online_by_share,
+            observed_by_share,
             health_by_share,
             health_timeline_by_share,
             inflight_by_market_email,
@@ -19942,9 +20323,10 @@ fn enrich_dashboard_market(
     market: &mut DashboardMarketView,
     shares: &[(String, ShareDescriptor)],
     disabled_by_market: &HashMap<String, HashMap<String, String>>,
-    active_subdomains: &HashSet<String>,
+    route_availability: &HashMap<String, RouteAvailabilitySnapshot>,
     inflight_by_share: &HashMap<String, usize>,
     online_by_share: &HashMap<String, usize>,
+    observed_by_share: &HashMap<String, usize>,
     health_by_share: &HashMap<String, Vec<HealthCheckEntry>>,
     health_timeline_by_share: &HashMap<String, Vec<HealthTimelineBucket>>,
     inflight_by_market_email: &HashMap<String, usize>,
@@ -19981,11 +20363,17 @@ fn enrich_dashboard_market(
                     share_market_usage_tokens.saturating_add(share.tokens_used.max(0) as u64);
             }
             let active_requests = inflight_by_share.get(&share.share_id).copied().unwrap_or(0);
-            let online =
-                share.share_status == "active" && active_subdomains.contains(&share.subdomain);
-            let online_minutes_24h = online_by_share.get(&share.share_id).copied().unwrap_or(0);
-            let online_rate_24h =
-                ((online_minutes_24h as f64 / ONLINE_WINDOW_MINUTES as f64) * 100.0).min(100.0);
+            let (route_state, route_state_since) =
+                dashboard_route_state(route_availability.get(&share.subdomain));
+            let online = share.share_status == "active" && route_state == "active";
+            let mut online_minutes_24h = online_by_share.get(&share.share_id).copied().unwrap_or(0);
+            let mut observed_minutes_24h =
+                observed_by_share.get(&share.share_id).copied().unwrap_or(0);
+            if online && observed_minutes_24h == 0 {
+                online_minutes_24h = 1;
+                observed_minutes_24h = 1;
+            }
+            let online_rate_24h = observed_online_rate(online_minutes_24h, observed_minutes_24h);
             let market_disabled_at =
                 disabled_for_market.and_then(|disabled| disabled.get(&share.share_id).cloned());
             Some(MarketLinkedShareView {
@@ -19995,9 +20383,13 @@ fn enrich_dashboard_market(
                 owner_email: share.owner_email.clone(),
                 app_type: share.app_type.clone(),
                 online,
+                route_state,
+                route_state_since,
                 active_requests,
                 parallel_limit: share.parallel_limit,
                 online_rate_24h,
+                observed_minutes_24h,
+                observation_coverage_24h: observation_coverage(observed_minutes_24h),
                 disabled_by_market: market_disabled_at.is_some(),
                 market_disabled_at,
                 support: share.support.clone(),
@@ -20069,29 +20461,37 @@ fn enrich_dashboard_market(
     // the market could route through. Approximates the union of healthy
     // minutes without an additional per-minute SQL pass; stays exact when the
     // market only has one linked share (the common case).
-    market.online_minutes_24h = linked_shares
+    let best_observed_path = linked_shares
         .iter()
         .filter(|share| !share.disabled_by_market)
-        .map(|share| {
-            online_by_share
-                .get(&share.share_id)
-                .copied()
-                .unwrap_or(0)
-                .min(ONLINE_WINDOW_MINUTES as usize)
+        .max_by(|left, right| {
+            left.online_rate_24h
+                .total_cmp(&right.online_rate_24h)
+                .then_with(|| left.observed_minutes_24h.cmp(&right.observed_minutes_24h))
         })
-        .max()
+        .cloned();
+    market.online_minutes_24h = best_observed_path
+        .as_ref()
+        .map(|share| {
+            ((share.online_rate_24h / 100.0) * share.observed_minutes_24h as f64).round() as usize
+        })
         .unwrap_or(0);
-    if is_share_market && market.online_minutes_24h == 0 {
+    market.observed_minutes_24h = best_observed_path
+        .as_ref()
+        .map(|share| share.observed_minutes_24h)
+        .unwrap_or(0);
+    if is_share_market && market.observed_minutes_24h == 0 {
         if enabled_linked_share_count > 0 {
-            market.online_minutes_24h = (market.online_share_count * ONLINE_WINDOW_MINUTES
-                + enabled_linked_share_count / 2)
-                / enabled_linked_share_count;
+            market.observed_minutes_24h = 1;
+            market.online_minutes_24h = usize::from(market.online_share_count > 0);
         } else if market.online {
-            market.online_minutes_24h = ONLINE_WINDOW_MINUTES;
+            market.observed_minutes_24h = 1;
+            market.online_minutes_24h = 1;
         }
     }
     market.online_rate_24h =
-        ((market.online_minutes_24h as f64 / ONLINE_WINDOW_MINUTES as f64) * 100.0).min(100.0);
+        observed_online_rate(market.online_minutes_24h, market.observed_minutes_24h);
+    market.observation_coverage_24h = observation_coverage(market.observed_minutes_24h);
     market.health_checks = aggregate_market_health_checks(&linked_shares, health_by_share);
     if is_share_market && (market.online || market.online_share_count > 0) {
         if market.health_checks.is_empty() {
@@ -20223,6 +20623,8 @@ fn dashboard_market_to_share_link(market: &DashboardMarketView) -> ShareMarketLi
         market_kind: market.market_kind.clone(),
         status: market.status.clone(),
         online: market.online,
+        route_state: market.route_state.clone(),
+        route_state_since: market.route_state_since.clone(),
         listing_status_by_app: BTreeMap::new(),
     }
 }
@@ -24009,8 +24411,15 @@ mod tests {
     ) {
         let conn = store.conn.lock().await;
         conn.execute(
-            "INSERT INTO share_health_checks (share_id, checked_at, is_healthy) VALUES (?1, ?2, ?3)",
-            params![share_id, checked_at, if is_healthy { 1 } else { 0 }],
+            "INSERT INTO share_health_checks (
+                share_id, checked_at, is_healthy, status, reason, router_epoch
+             ) VALUES (?1, ?2, ?3, ?4, 'test', 'test-epoch')",
+            params![
+                share_id,
+                checked_at,
+                if is_healthy { 1 } else { 0 },
+                if is_healthy { "healthy" } else { "unhealthy" },
+            ],
         )
         .expect("insert health check");
     }
@@ -24068,11 +24477,14 @@ mod tests {
     ) {
         let conn = store.conn.lock().await;
         conn.execute(
-            "INSERT INTO installation_health_checks (installation_id, checked_at, is_healthy) VALUES (?1, ?2, ?3)",
+            "INSERT INTO installation_health_checks (
+                installation_id, checked_at, is_healthy, status, reason, router_epoch
+             ) VALUES (?1, ?2, ?3, ?4, 'test', 'test-epoch')",
             params![
                 installation_id,
                 checked_at,
-                if is_healthy { 1 } else { 0 }
+                if is_healthy { 1 } else { 0 },
+                if is_healthy { "healthy" } else { "unhealthy" },
             ],
         )
         .expect("insert installation health check");
@@ -24419,7 +24831,13 @@ mod tests {
         share.parallel_limit = 9;
         share.tokens_used = 987_654;
 
-        let active_subdomains = HashSet::from([share.subdomain.clone()]);
+        let route_availability = HashMap::from([(
+            share.subdomain.clone(),
+            RouteAvailabilitySnapshot {
+                state: RouteAvailability::Active,
+                since: Utc::now(),
+            },
+        )]);
         let shares = vec![("inst-1".into(), share)];
         let inflight_by_share = HashMap::from([("share-1".to_string(), 4_usize)]);
         let inflight_by_market_email = HashMap::from([(market_email.to_string(), 99_usize)]);
@@ -24432,6 +24850,8 @@ mod tests {
             market_kind: "share".into(),
             status: "active".into(),
             online: true,
+            route_state: "active".into(),
+            route_state_since: Some(Utc::now().to_rfc3339()),
             can_manage: false,
             maintenance_enabled: false,
             maintenance_message: None,
@@ -24445,6 +24865,8 @@ mod tests {
             parallel_capacity: 0,
             online_minutes_24h: 0,
             online_rate_24h: 0.0,
+            observed_minutes_24h: 0,
+            observation_coverage_24h: 0.0,
             usage_tokens: 0,
             usage_amount_usd: "12.34000000".into(),
             pricing_summary: None,
@@ -24459,8 +24881,9 @@ mod tests {
             &mut market,
             &shares,
             &HashMap::new(),
-            &active_subdomains,
+            &route_availability,
             &inflight_by_share,
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -24478,7 +24901,8 @@ mod tests {
         assert_eq!(market.parallel_capacity, 9);
         assert_eq!(market.usage_tokens, 987_654);
         assert_eq!(market.usage_amount_usd, "0.00000000");
-        assert_eq!(market.online_minutes_24h, ONLINE_WINDOW_MINUTES);
+        assert_eq!(market.online_minutes_24h, 1);
+        assert_eq!(market.observed_minutes_24h, 1);
         assert_eq!(market.online_rate_24h, 100.0);
         assert!(
             market
@@ -24511,6 +24935,8 @@ mod tests {
             market_kind: "share".into(),
             status: "active".into(),
             online: true,
+            route_state: "active".into(),
+            route_state_since: Some(Utc::now().to_rfc3339()),
             can_manage: false,
             maintenance_enabled: false,
             maintenance_message: None,
@@ -24524,6 +24950,8 @@ mod tests {
             parallel_capacity: 0,
             online_minutes_24h: 0,
             online_rate_24h: 0.0,
+            observed_minutes_24h: 0,
+            observation_coverage_24h: 0.0,
             usage_tokens: 0,
             usage_amount_usd: "0.00000000".into(),
             pricing_summary: None,
@@ -24538,7 +24966,8 @@ mod tests {
             &mut market,
             &[],
             &HashMap::new(),
-            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -24553,7 +24982,8 @@ mod tests {
 
         assert_eq!(market.share_count, 0);
         assert_eq!(market.online_share_count, 0);
-        assert_eq!(market.online_minutes_24h, ONLINE_WINDOW_MINUTES);
+        assert_eq!(market.online_minutes_24h, 1);
+        assert_eq!(market.observed_minutes_24h, 1);
         assert_eq!(market.online_rate_24h, 100.0);
         assert_eq!(market.health_checks.len(), 10);
         assert!(
@@ -25138,6 +25568,40 @@ mod tests {
             created_at,
             is_health_check: false,
         }
+    }
+
+    #[test]
+    fn representative_latency_uses_streaming_ttft_median_and_requires_three_samples() {
+        let now = Utc::now().timestamp();
+        let mut first = test_share_request_log_entry("req-latency-1", "share-latency", now);
+        first.is_streaming = true;
+        first.latency_ms = 60_000;
+        first.first_token_ms = Some(1_000);
+
+        let mut second = test_share_request_log_entry("req-latency-2", "share-latency", now - 1);
+        second.is_streaming = true;
+        second.latency_ms = 70_000;
+        second.first_token_ms = Some(2_000);
+
+        assert!(representative_recent_latency(&[first.clone(), second.clone()]).is_none());
+
+        let mut third = test_share_request_log_entry("req-latency-3", "share-latency", now - 2);
+        third.latency_ms = 3_000;
+        let mut failed = test_share_request_log_entry("req-latency-4", "share-latency", now - 3);
+        failed.status_code = 500;
+        failed.latency_ms = 99_000;
+        let mut health = test_share_request_log_entry("req-latency-5", "share-latency", now - 4);
+        health.is_health_check = true;
+        health.latency_ms = 99_000;
+
+        let mut fourth = test_share_request_log_entry("req-latency-6", "share-latency", now - 5);
+        fourth.latency_ms = 5_000;
+
+        let (median, latest_at) =
+            representative_recent_latency(&[failed, health, first, second, third, fourth])
+                .expect("four valid latency samples");
+        assert_eq!(median, 2_500);
+        assert_eq!(latest_at, unix_timestamp_rfc3339(now));
     }
 
     fn test_image_request_log(index: usize) -> NewImageGenerationRequestLog {
@@ -25990,6 +26454,14 @@ mod tests {
         assert_eq!(shares.len(), 1);
         assert_eq!(shares[0].subdomain, "online-share-sub");
         assert!(shares[0].online);
+        assert_eq!(shares[0].online_rate_24h, 1.0);
+        assert_eq!(shares[0].observed_minutes_24h, 1);
+        assert!(
+            (shares[0].observation_coverage_24h - (1.0 / ONLINE_WINDOW_MINUTES as f64 * 100.0))
+                .abs()
+                < 0.01
+        );
+        assert_eq!(shares[0].signals.stability, 1.0);
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
@@ -28047,6 +28519,38 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(subdomains, vec!["active-sub".to_string()]);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn startup_route_intents_only_include_authoritative_active_entities() {
+        let (store, config) = setup_store("startup-route-intents").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-active", "active-sub", "active").await;
+        insert_share(&store, "inst-1", "share-paused", "paused-sub", "paused").await;
+        insert_client_tunnel(&store, "inst-1", "owner@example.com", "client-sub").await;
+        insert_market(&store, &test_market()).await;
+
+        let intents = store
+            .list_route_intents()
+            .await
+            .expect("list startup route intents");
+        let by_subdomain = intents
+            .into_iter()
+            .map(|intent| (intent.subdomain, intent.kind))
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            by_subdomain.get("active-sub"),
+            Some(&RouteIntentKind::Share)
+        );
+        assert_eq!(
+            by_subdomain.get("client-sub"),
+            Some(&RouteIntentKind::Client)
+        );
+        assert_eq!(by_subdomain.get("market-a"), Some(&RouteIntentKind::Market));
+        assert!(!by_subdomain.contains_key("paused-sub"));
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
@@ -34963,6 +35467,13 @@ mod tests {
             Some("share was deleted before the edit could be applied")
         );
         assert!(edit.2.is_some());
+        let public_host = crate::public_hosts::get_by_label(&conn, "prune-missing-sub")
+            .expect("read pruned public host")
+            .expect("pruned public host remains reserved");
+        assert_eq!(
+            public_host.lifecycle,
+            crate::public_hosts::PublicHostLifecycle::Tombstoned
+        );
         drop(conn);
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
@@ -35832,8 +36343,11 @@ mod tests {
                 .is_some_and(|tunnel| tunnel.online)
         );
         assert_eq!(client.online_minutes_24h, 30);
+        assert_eq!(client.observed_minutes_24h, 30);
+        assert_eq!(client.online_rate_24h, 100.0);
         assert!(
-            (client.online_rate_24h - (30.0 / ONLINE_WINDOW_MINUTES as f64 * 100.0)).abs() < 0.01
+            (client.observation_coverage_24h - (30.0 / ONLINE_WINDOW_MINUTES as f64 * 100.0)).abs()
+                < 0.01
         );
         assert_eq!(client.health_checks.len(), 10);
         assert!(client.health_checks.iter().all(|entry| entry.is_healthy));
@@ -36880,10 +37394,10 @@ mod tests {
                 (Utc::now() - Duration::seconds(config.client_stale_secs + 600)).to_rfc3339();
             let conn = store.conn.lock().await;
             conn.execute(
-                "UPDATE shares SET updated_at = ?1 WHERE share_id = ?2",
-                params![stale, "share-offline-old"],
+                "UPDATE shares SET updated_at = ?1 WHERE share_id IN (?2, ?3)",
+                params![stale, "share-offline-old", "share-online"],
             )
-            .expect("backdate offline-old");
+            .expect("backdate online and offline shares");
         }
 
         let proxy = ProxyRegistry::default();
@@ -36981,6 +37495,54 @@ mod tests {
         drop(conn);
 
         assert_eq!(online.get("share-1"), Some(&2));
+    }
+
+    #[tokio::test]
+    async fn unknown_route_health_is_excluded_from_uptime_and_coverage() {
+        let (store, config) = setup_store("route-health-observation-coverage").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-1", "share-sub", "active").await;
+
+        let now = Utc::now().timestamp();
+        insert_health_check(&store, "share-1", now, true).await;
+        insert_health_check(&store, "share-1", now - 60, false).await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO share_health_checks (
+                    share_id, checked_at, is_healthy, status, reason, router_epoch
+                 ) VALUES ('share-1', ?1, 0, 'unknown', 'route_reconnecting', 'epoch-2')",
+                params![now - 120],
+            )
+            .expect("insert unknown route observation");
+
+            let observed = list_observed_minutes_24h(&conn).expect("list observed minutes");
+            let online = list_online_minutes_24h(&conn).expect("list online minutes");
+            assert_eq!(observed.get("share-1"), Some(&2));
+            assert_eq!(online.get("share-1"), Some(&1));
+        }
+
+        let snapshot = store
+            .dashboard_snapshot(
+                &config,
+                &ServerGeo {
+                    lat: None,
+                    lon: None,
+                },
+                &ProxyRegistry::default(),
+                None,
+            )
+            .await
+            .expect("dashboard snapshot");
+        let share = snapshot.shares.first().expect("share view");
+        assert_eq!(share.observed_minutes_24h, 2);
+        assert_eq!(share.online_rate_24h, 50.0);
+        assert!(
+            (share.observation_coverage_24h - (2.0 / ONLINE_WINDOW_MINUTES as f64 * 100.0)).abs()
+                < 0.01
+        );
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 
     #[tokio::test]

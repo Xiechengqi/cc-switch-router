@@ -136,9 +136,12 @@ export type CountryBoard = {
   overflowClientCount?: number;
 };
 
-export type OperationalState = "available" | "online" | "degraded" | "offline" | "maintenance" | "disabled";
+export type RouteState = "active" | "reconnecting" | "offline";
+
+export type OperationalState = "available" | "online" | "reconnecting" | "degraded" | "offline" | "maintenance" | "disabled";
 
 export type OperationalReasonCode =
+  | "route_reconnecting"
   | "route_offline"
   | "health_check_failed"
   | "no_online_shares"
@@ -197,6 +200,8 @@ export type DashboardClient = {
     tunnelUrl: string;
     enabled: boolean;
     online: boolean;
+    routeState: RouteState;
+    routeStateSince?: string;
   };
   payoutProfile?: {
     addressType: "evm";
@@ -212,6 +217,8 @@ export type DashboardClient = {
   shareCount?: number;
   onlineMinutes24h?: number;
   onlineRate24h?: number;
+  observedMinutes24h?: number;
+  observationCoverage24h?: number;
   healthChecks?: HealthCheckEntry[];
   healthTimeline?: HealthTimelineBucket[];
   operationalSummary?: OperationalSummary;
@@ -275,6 +282,8 @@ export type ShareView = {
   createdAt: string;
   expiresAt: string;
   isOnline: boolean;
+  routeState: RouteState;
+  routeStateSince?: string;
   activeRequests: number;
   activeRequestsByApp?: Record<string, number>;
   activeRequestsByUser?: Record<string, Record<string, number>>;
@@ -282,6 +291,8 @@ export type ShareView = {
   requestsCountByApp?: Record<string, number>;
   onlineMinutes24h?: number;
   onlineRate24h: number;
+  observedMinutes24h?: number;
+  observationCoverage24h?: number;
   recentRequests?: ShareRequestLog[];
   healthChecks?: HealthCheckEntry[];
   healthTimeline?: HealthTimelineBucket[];
@@ -391,6 +402,8 @@ export type ShareMarketLink = {
   marketKind?: string;
   status: string;
   online: boolean;
+  routeState: RouteState;
+  routeStateSince?: string;
   listingStatusByApp?: Record<string, ShareMarketListingStatus>;
 };
 
@@ -415,6 +428,8 @@ export type DashboardMarket = {
   marketKind?: string;
   status: string;
   online: boolean;
+  routeState: RouteState;
+  routeStateSince?: string;
   canManage?: boolean;
   maintenanceEnabled?: boolean;
   maintenanceMessage?: string;
@@ -428,6 +443,8 @@ export type DashboardMarket = {
   parallelCapacity: number;
   onlineMinutes24h?: number;
   onlineRate24h: number;
+  observedMinutes24h?: number;
+  observationCoverage24h?: number;
   usageTokens: number;
   usageAmountUsd: string;
   pricingSummary?: Record<string, string | number | null>;
@@ -440,9 +457,13 @@ export type DashboardMarket = {
     ownerEmail?: string;
     appType: string;
     online: boolean;
+    routeState: RouteState;
+    routeStateSince?: string;
     activeRequests: number;
     parallelLimit: number;
     onlineRate24h: number;
+    observedMinutes24h?: number;
+    observationCoverage24h?: number;
     disabledByMarket?: boolean;
     marketDisabledAt?: string;
     support?: ShareSupport;
@@ -468,9 +489,13 @@ export type MarketShare = {
   marketAccessMode: string;
   shareStatus: string;
   online: boolean;
+  routeState: RouteState;
+  routeStateSince?: string;
   activeRequests: number;
   parallelLimit: number;
   onlineRate24h: number;
+  observedMinutes24h?: number;
+  observationCoverage24h?: number;
   lastSeenAt: string;
   shareCreatedAt?: string;
   disabledByMarket?: boolean;

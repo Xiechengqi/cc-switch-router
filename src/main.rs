@@ -33,13 +33,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use anyhow::Result;
-use proxy::ProxyRegistry;
+use proxy::{ProxyRegistry, RouteAvailability};
 use resend_rs::Resend;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock, broadcast, watch};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
+use uuid::Uuid;
 
 use crate::abuse::AbuseTracker;
 use crate::board_telegram::TelegramNotifier;
@@ -53,12 +54,15 @@ use crate::registration_admission::RegistrationAdmissionLimiter;
 use crate::scheduling_signals::OverrideStore;
 use crate::startup_config::{StartupConfigMode, ensure_startup_config};
 use crate::store::{
-    AppStore, ClientTunnelRouteTarget, ShareRouteTarget, fetch_share_runtime_snapshot_from_route,
+    AppStore, ClientTunnelRouteTarget, RouteHealthStatus, RouteIntentKind, ShareRouteTarget,
+    fetch_share_runtime_snapshot_from_route,
 };
 
 pub use crate::server_state::{ResendUsageCache, ServerGeo, ServerState};
 
 const APP_NAME: &str = "cc-switch-router";
+const HTTP_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const SSH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -157,6 +161,37 @@ async fn main() -> Result<()> {
         ),
         registration_admission: Arc::new(RegistrationAdmissionLimiter::from_env()),
     };
+    let startup_reconnect_grace =
+        crate::notifications::route_reconnect_grace(&config.client_notifications);
+
+    let route_intents = state.store.list_route_intents().await?;
+    let share_route_count = route_intents
+        .iter()
+        .filter(|intent| intent.kind == RouteIntentKind::Share)
+        .count();
+    let client_route_count = route_intents
+        .iter()
+        .filter(|intent| intent.kind == RouteIntentKind::Client)
+        .count();
+    let market_route_count = route_intents
+        .iter()
+        .filter(|intent| intent.kind == RouteIntentKind::Market)
+        .count();
+    state
+        .proxy
+        .declare_known_routes(
+            route_intents
+                .iter()
+                .map(|intent| intent.subdomain.trim().to_ascii_lowercase()),
+        )
+        .await;
+    info!(
+        total = route_intents.len(),
+        shares = share_route_count,
+        clients = client_route_count,
+        markets = market_route_count,
+        "restored known route intentions"
+    );
 
     let ssh_server = ssh::SshServer {
         store: state.store.clone(),
@@ -173,6 +208,8 @@ async fn main() -> Result<()> {
     let probe_store = state.store.clone();
     let probe_proxy = state.proxy.clone();
     let probe_config = config.clone();
+    let probe_dynamic = state.dynamic.clone();
+    let router_epoch = Uuid::new_v4().to_string();
     let runtime_store = state.store.clone();
     let runtime_proxy = state.proxy.clone();
     let runtime_config = config.clone();
@@ -210,8 +247,10 @@ async fn main() -> Result<()> {
     });
 
     let cleanup_task = tokio::spawn(async move {
+        tokio::time::sleep(startup_reconnect_grace).await;
         let mut interval =
             tokio::time::interval(Duration::from_secs(cleanup_config.cleanup_interval_secs));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
             cleanup_overrides.cleanup_expired();
@@ -249,12 +288,21 @@ async fn main() -> Result<()> {
             .build()?;
 
         let mut interval = tokio::time::interval(Duration::from_secs(30));
-        interval.tick().await;
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            if let Err(err) =
-                run_route_health_probe_cycle(&probe_store, &probe_proxy, &probe_config, &client)
-                    .await
+            let reconnect_grace = crate::notifications::route_reconnect_grace(
+                &probe_dynamic.read().await.client_notifications,
+            );
+            if let Err(err) = run_route_health_probe_cycle(
+                &probe_store,
+                &probe_proxy,
+                &probe_config,
+                &client,
+                reconnect_grace,
+                &router_epoch,
+            )
+            .await
             {
                 tracing::warn!("route health probe failed: {err}");
             }
@@ -320,6 +368,7 @@ async fn main() -> Result<()> {
             notification_store,
             notification_dynamic,
             notification_config,
+            startup_reconnect_grace,
         )
         .await;
         if let Err(error) = &result {
@@ -338,41 +387,145 @@ async fn main() -> Result<()> {
         }
         result
     });
-    let ssh_task = tokio::spawn(async move { ssh_server.run_with_listener(ssh_listener).await });
-    let http_task = tokio::spawn(async move {
+    let (http_shutdown_tx, http_shutdown_rx) = watch::channel(false);
+    let (ssh_shutdown_tx, ssh_shutdown_rx) = watch::channel(false);
+    let mut ssh_task = tokio::spawn(async move {
+        ssh_server
+            .run_with_listener(ssh_listener, ssh_shutdown_rx)
+            .await
+    });
+    let mut http_task = tokio::spawn(async move {
         axum::serve(
             http_listener,
             api::router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
+        .with_graceful_shutdown(wait_for_shutdown(http_shutdown_rx))
         .await?;
         Ok::<_, anyhow::Error>(())
     });
 
-    tokio::select! {
-        ssh_result = ssh_task => {
-            cleanup_task.abort();
-            ip_blacklist_log_task.abort();
-            probe_task.abort();
-            runtime_task.abort();
-            resend_usage_task.abort();
-            metrics_task.abort();
-            notification_task.abort();
-            chat_notification_task.abort();
-            ssh_result??;
+    enum ServiceExit {
+        Signal(&'static str),
+        Http(Result<Result<()>, tokio::task::JoinError>),
+        Ssh(Result<Result<()>, tokio::task::JoinError>),
+    }
+
+    let exit = tokio::select! {
+        signal = shutdown_signal() => ServiceExit::Signal(signal?),
+        result = &mut ssh_task => ServiceExit::Ssh(result),
+        result = &mut http_task => ServiceExit::Http(result),
+    };
+
+    let service_result = match exit {
+        ServiceExit::Signal(signal) => {
+            info!(signal, "graceful shutdown started");
+            let _ = http_shutdown_tx.send(true);
+            let http_result =
+                stop_service_task("http", &mut http_task, HTTP_SHUTDOWN_DRAIN_TIMEOUT).await;
+            let _ = ssh_shutdown_tx.send(true);
+            let ssh_result = stop_service_task("ssh", &mut ssh_task, SSH_SHUTDOWN_TIMEOUT).await;
+            info!("graceful shutdown completed");
+            combine_service_results(http_result, ssh_result)
+        }
+        ServiceExit::Http(result) => {
+            let _ = ssh_shutdown_tx.send(true);
+            let http_result = service_task_result("http", result);
+            let ssh_result = stop_service_task("ssh", &mut ssh_task, SSH_SHUTDOWN_TIMEOUT).await;
+            combine_service_results(http_result, ssh_result)
+        }
+        ServiceExit::Ssh(result) => {
+            let _ = http_shutdown_tx.send(true);
+            let ssh_result = service_task_result("ssh", result);
+            let http_result =
+                stop_service_task("http", &mut http_task, HTTP_SHUTDOWN_DRAIN_TIMEOUT).await;
+            combine_service_results(ssh_result, http_result)
+        }
+    };
+
+    cleanup_task.abort();
+    ip_blacklist_log_task.abort();
+    probe_task.abort();
+    runtime_task.abort();
+    resend_usage_task.abort();
+    metrics_task.abort();
+    notification_task.abort();
+    chat_notification_task.abort();
+    service_result
+}
+
+fn service_task_result(
+    service: &str,
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+) -> Result<()> {
+    match result {
+        Ok(result) => result.with_context(|| format!("{service} service stopped with an error")),
+        Err(error) => {
+            Err(anyhow::Error::new(error)).with_context(|| format!("{service} service task failed"))
+        }
+    }
+}
+
+async fn stop_service_task(
+    service: &str,
+    task: &mut tokio::task::JoinHandle<Result<()>>,
+    deadline: Duration,
+) -> Result<()> {
+    match tokio::time::timeout(deadline, &mut *task).await {
+        Ok(result) => service_task_result(service, result),
+        Err(_) => {
+            tracing::warn!(
+                service,
+                timeout_secs = deadline.as_secs(),
+                "service shutdown deadline reached"
+            );
+            task.abort();
+            let _ = task.await;
             Ok(())
         }
-        http_result = http_task => {
-            cleanup_task.abort();
-            ip_blacklist_log_task.abort();
-            probe_task.abort();
-            runtime_task.abort();
-            resend_usage_task.abort();
-            metrics_task.abort();
-            notification_task.abort();
-            chat_notification_task.abort();
-            http_result??;
-            Ok(())
+    }
+}
+
+fn combine_service_results(primary: Result<()>, secondary: Result<()>) -> Result<()> {
+    if let Err(error) = secondary {
+        tracing::error!(error = %error, "secondary service shutdown failed");
+        if primary.is_ok() {
+            return Err(error);
         }
+    }
+    primary
+}
+
+async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
+    if *shutdown.borrow() {
+        return;
+    }
+    while shutdown.changed().await.is_ok() {
+        if *shutdown.borrow() {
+            return;
+        }
+    }
+}
+
+async fn shutdown_signal() -> Result<&'static str> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .context("install SIGTERM handler failed")?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.context("install Ctrl-C handler failed")?;
+                Ok("ctrl-c")
+            }
+            _ = terminate.recv() => Ok("sigterm"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .context("install Ctrl-C handler failed")?;
+        Ok("ctrl-c")
     }
 }
 
@@ -457,21 +610,27 @@ async fn run_route_health_probe_cycle(
     proxy: &ProxyRegistry,
     config: &Config,
     client: &reqwest::Client,
+    reconnect_grace: Duration,
+    router_epoch: &str,
 ) -> Result<()> {
-    let active = proxy
-        .active_subdomains()
-        .await
-        .into_iter()
-        .collect::<HashSet<_>>();
     let targets = store.list_share_route_targets().await?;
     for target in targets {
-        let is_healthy = if active.contains(&target.subdomain) {
-            active_route_is_healthy(probe_share_route(store, config, client, &target).await)
-        } else {
-            false
+        let (status, reason) = match proxy
+            .route_availability(&target.subdomain, reconnect_grace)
+            .await
+            .map(|snapshot| snapshot.state)
+        {
+            Some(RouteAvailability::Active) => {
+                route_probe_observation(probe_share_route(store, config, client, &target).await)
+            }
+            Some(RouteAvailability::Reconnecting) => {
+                (RouteHealthStatus::Unknown, "route_reconnecting")
+            }
+            Some(RouteAvailability::Offline) => (RouteHealthStatus::Unhealthy, "route_offline"),
+            None => (RouteHealthStatus::Unknown, "route_not_hydrated"),
         };
         if let Err(err) = store
-            .record_share_route_health(&target.share_id, is_healthy)
+            .record_share_route_health(&target.share_id, status, reason, router_epoch)
             .await
         {
             tracing::warn!(share_id = %target.share_id, "record route health failed: {err}");
@@ -479,13 +638,22 @@ async fn run_route_health_probe_cycle(
     }
     let client_targets = store.list_client_tunnel_route_targets().await?;
     for target in client_targets {
-        let is_healthy = if active.contains(&target.subdomain) {
-            active_route_is_healthy(probe_client_tunnel_route(store, config, client, &target).await)
-        } else {
-            false
+        let (status, reason) = match proxy
+            .route_availability(&target.subdomain, reconnect_grace)
+            .await
+            .map(|snapshot| snapshot.state)
+        {
+            Some(RouteAvailability::Active) => route_probe_observation(
+                probe_client_tunnel_route(store, config, client, &target).await,
+            ),
+            Some(RouteAvailability::Reconnecting) => {
+                (RouteHealthStatus::Unknown, "route_reconnecting")
+            }
+            Some(RouteAvailability::Offline) => (RouteHealthStatus::Unhealthy, "route_offline"),
+            None => (RouteHealthStatus::Unknown, "route_not_hydrated"),
         };
         if let Err(err) = store
-            .record_installation_route_health(&target.installation_id, is_healthy)
+            .record_installation_route_health(&target.installation_id, status, reason, router_epoch)
             .await
         {
             tracing::warn!(
@@ -587,8 +755,17 @@ enum TunnelRouteProbe {
     Unavailable,
 }
 
+#[cfg(test)]
 fn active_route_is_healthy(probe: TunnelRouteProbe) -> bool {
     !matches!(probe, TunnelRouteProbe::Unhealthy)
+}
+
+fn route_probe_observation(probe: TunnelRouteProbe) -> (RouteHealthStatus, &'static str) {
+    match probe {
+        TunnelRouteProbe::Healthy => (RouteHealthStatus::Healthy, "probe_succeeded"),
+        TunnelRouteProbe::Unhealthy => (RouteHealthStatus::Unhealthy, "probe_failed"),
+        TunnelRouteProbe::Unavailable => (RouteHealthStatus::Healthy, "active_route_unprobeable"),
+    }
 }
 
 async fn probe_share_route(

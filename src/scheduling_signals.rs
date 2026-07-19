@@ -42,7 +42,7 @@ const OVERRIDE_DEFAULT_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// Compute the rolled-up [`ShareSignals`] for one share.
 ///
-/// `online_rate_24h` is the existing ratio (`online_minutes_24h / 1440`).
+/// `online_rate_24h` is the healthy ratio across observed (non-unknown) minutes.
 /// `samples_10m` is the count of distinct healthy minutes in the last
 /// 10 minutes — also the numerator of `online_rate_10m` since one check
 /// per minute is expected.

@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { AlertTriangle, CheckCircle2, CircleOff, Clock3, PauseCircle } from "lucide-react";
+import { AlertTriangle, CheckCircle2, CircleOff, Clock3, PauseCircle, RefreshCw } from "lucide-react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import type { DashboardClient, DashboardMarket, OperationalReason, OperationalState, OperationalSummary, ShareView } from "@/lib/types";
 import { formatDateTime, formatRelativeTime } from "@/lib/utils";
@@ -14,6 +14,7 @@ export function summarizeShareAvailability(shares: ShareView[]) {
   const enabledShares = shares.filter(shareIsEnabled);
   let availableCount = 0;
   let degradedCount = 0;
+  let reconnectingCount = 0;
   let offlineCount = 0;
   let routeOnlineCount = 0;
 
@@ -21,6 +22,7 @@ export function summarizeShareAvailability(shares: ShareView[]) {
     if (share.isOnline) routeOnlineCount += 1;
     const state = shareOperationalSummary(share).state;
     if (state === "online") availableCount += 1;
+    else if (state === "reconnecting") reconnectingCount += 1;
     else if (state === "degraded") degradedCount += 1;
     else if (state === "offline") offlineCount += 1;
   }
@@ -29,6 +31,7 @@ export function summarizeShareAvailability(shares: ShareView[]) {
     enabledCount: enabledShares.length,
     availableCount,
     degradedCount,
+    reconnectingCount,
     offlineCount,
     routeOnlineCount,
     issueCount: enabledShares.length - availableCount,
@@ -43,6 +46,9 @@ function fallbackShareSummary(share: ShareView): OperationalSummary {
       primaryReason: { code: status === "expired" ? "expired" : "manually_disabled", severity: status === "expired" ? "critical" : "info", entityType: "share", entityId: share.shareId },
       additionalReasonCount: 0,
     };
+  }
+  if (share.routeState === "reconnecting") {
+    return { state: "reconnecting", primaryReason: { code: "route_reconnecting", severity: "info", entityType: "share", entityId: share.shareId, startedAt: share.routeStateSince }, additionalReasonCount: 0 };
   }
   if (!share.isOnline) {
     return { state: "offline", primaryReason: { code: "route_offline", severity: "critical", entityType: "share", entityId: share.shareId }, additionalReasonCount: 0 };
@@ -80,6 +86,13 @@ export function clientOperationalSummary(client: DashboardClient, _shares: Share
     };
   }
   if (client.clientTunnel) {
+    if (client.clientTunnel.enabled && client.clientTunnel.routeState === "reconnecting") {
+      return {
+        state: "reconnecting",
+        primaryReason: { code: "route_reconnecting", severity: "info", entityType: "client", entityId: client.installation.id, startedAt: client.clientTunnel.routeStateSince },
+        additionalReasonCount: 0,
+      };
+    }
     if (client.clientTunnel.enabled && !client.clientTunnel.online) {
       return {
         state: "offline",
@@ -97,6 +110,7 @@ export function marketOperationalSummary(market: DashboardMarket): OperationalSu
   const status = String(market.status || "").trim().toLowerCase();
   if (status === "disabled") return { state: "disabled", primaryReason: { code: "manually_disabled", severity: "info", entityType: "market", entityId: market.id }, additionalReasonCount: 0 };
   if (market.maintenanceEnabled) return { state: "maintenance", primaryReason: { code: "maintenance_enabled", severity: "info", entityType: "market", entityId: market.id }, additionalReasonCount: 0 };
+  if (market.routeState === "reconnecting") return { state: "reconnecting", primaryReason: { code: "route_reconnecting", severity: "info", entityType: "market", entityId: market.id, startedAt: market.routeStateSince }, additionalReasonCount: 0 };
   if (!market.online || status === "offline") return { state: "offline", primaryReason: { code: "route_offline", severity: "critical", entityType: "market", entityId: market.id, startedAt: market.offlineSince }, additionalReasonCount: 0 };
   if (market.onlineShareCount === 0) return { state: "degraded", primaryReason: { code: "no_online_shares", severity: "critical", entityType: "market", entityId: market.id, currentValue: "0", threshold: String(Math.max(1, market.shareCount)) }, additionalReasonCount: 0 };
   if (market.parallelCapacity > 0 && market.activeRequests / market.parallelCapacity >= 0.9) {
@@ -106,7 +120,7 @@ export function marketOperationalSummary(market: DashboardMarket): OperationalSu
 }
 
 export function operationalStateRank(state: OperationalState) {
-  return state === "offline" ? 0 : state === "degraded" ? 1 : state === "maintenance" ? 2 : state === "online" || state === "available" ? 3 : 4;
+  return state === "offline" ? 0 : state === "degraded" ? 1 : state === "reconnecting" ? 2 : state === "maintenance" ? 3 : state === "online" || state === "available" ? 4 : 5;
 }
 
 export function useStableOperationalRanks(entries: Array<{ id: string; state: OperationalState }>, settleMs = 15_000) {
@@ -138,6 +152,7 @@ export function useStableOperationalRanks(entries: Array<{ id: string; state: Op
 export function operationalStateLabel(state: OperationalState, t: ReturnType<typeof useLocaleText>["t"]) {
   if (state === "online") return t("common.online");
   if (state === "available") return t("dashboard.available");
+  if (state === "reconnecting") return t("dashboard.reconnecting");
   if (state === "degraded") return t("dashboard.degraded");
   if (state === "offline") return t("common.offline");
   if (state === "maintenance") return t("dashboard.maintenance");
@@ -149,6 +164,7 @@ export function operationalReasonLabel(reason: OperationalReason | undefined, t:
   const current = reason.currentValue || "-";
   const threshold = reason.threshold || "-";
   switch (reason.code) {
+    case "route_reconnecting": return t("dashboard.reason.routeReconnecting");
     case "route_offline": return t("dashboard.reason.routeOffline");
     case "health_check_failed": return t("dashboard.reason.healthCheckFailed");
     case "no_online_shares": return t("dashboard.reason.noOnlineShares");
@@ -171,6 +187,7 @@ export function operationalReasonLabel(reason: OperationalReason | undefined, t:
 
 export function operationalImpactLabel(kind: "client" | "share" | "market", reason: OperationalReason | undefined, t: ReturnType<typeof useLocaleText>["t"]) {
   if (!reason) return t("dashboard.impact.none");
+  if (reason.code === "route_reconnecting") return t("dashboard.impact.routeReconnecting");
   if (reason.code === "route_offline" || reason.code === "no_online_shares") return kind === "market" ? t("dashboard.impact.marketOffline") : t("dashboard.impact.routeOffline");
   if (reason.code === "parallel_capacity_full") return t("dashboard.impact.capacityFull");
   if (reason.code === "provider_unavailable") return t("dashboard.impact.providerUnavailable");
@@ -218,6 +235,8 @@ export function OperationalStatusPill({ summary, className = "" }: { summary: Op
   const state = summary.state;
   const style = state === "online" || state === "available"
     ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+    : state === "reconnecting"
+      ? "border-sky-200 bg-sky-50 text-sky-700"
     : state === "degraded"
       ? "border-amber-200 bg-amber-50 text-amber-700"
       : state === "offline"
@@ -225,7 +244,7 @@ export function OperationalStatusPill({ summary, className = "" }: { summary: Op
         : state === "maintenance"
           ? "border-blue-200 bg-blue-50 text-blue-700"
           : "border-slate-200 bg-slate-100 text-slate-600";
-  const Icon = state === "online" || state === "available" ? CheckCircle2 : state === "degraded" ? AlertTriangle : state === "offline" ? CircleOff : state === "maintenance" ? Clock3 : PauseCircle;
+  const Icon = state === "online" || state === "available" ? CheckCircle2 : state === "reconnecting" ? RefreshCw : state === "degraded" ? AlertTriangle : state === "offline" ? CircleOff : state === "maintenance" ? Clock3 : PauseCircle;
   return <span className={`inline-flex h-6 shrink-0 items-center gap-1.5 rounded-full border px-2.5 text-[11px] font-semibold ${style} ${className}`}><Icon className="h-3 w-3" />{operationalStateLabel(state, t)}</span>;
 }
 

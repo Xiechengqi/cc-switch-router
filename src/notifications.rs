@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -99,6 +99,10 @@ impl ClientNotificationPolicy {
         }
         (policy, None)
     }
+}
+
+pub(crate) fn route_reconnect_grace(settings: &ClientNotificationSettings) -> Duration {
+    Duration::from_secs(ClientNotificationPolicy::from(settings).offline_alert_secs as u64)
 }
 
 pub fn validate_notification_cleanup_window(
@@ -433,6 +437,7 @@ pub async fn run_client_notification_service(
     store: AppStore,
     dynamic: Arc<RwLock<DynamicSettings>>,
     config: Config,
+    presence_grace: Duration,
 ) -> anyhow::Result<()> {
     let http = reqwest::Client::builder()
         .user_agent("cc-switch-router/0.1 client-notifications")
@@ -445,6 +450,7 @@ pub async fn run_client_notification_service(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_policy_warning: Option<String> = None;
     let mut tick_index = 0_u64;
+    let started_at = Instant::now();
 
     loop {
         interval.tick().await;
@@ -463,7 +469,7 @@ pub async fn run_client_notification_service(
             config.resend_api_key.as_deref(),
             &http,
             &worker_id,
-            presence_reconcile_due(tick_index),
+            should_reconcile_presence(tick_index, started_at.elapsed(), presence_grace),
         )
         .await
         {
@@ -628,6 +634,10 @@ async fn record_delivery_failure<S: ClientNotificationStore>(
 fn presence_reconcile_due(tick_index: u64) -> bool {
     let ticks_per_reconcile = (PRESENCE_RECONCILE_INTERVAL_SECS / DELIVERY_INTERVAL_SECS).max(1);
     tick_index % ticks_per_reconcile == 0
+}
+
+fn should_reconcile_presence(tick_index: u64, elapsed: Duration, presence_grace: Duration) -> bool {
+    presence_reconcile_due(tick_index) && elapsed >= presence_grace
 }
 
 #[derive(Serialize)]
@@ -1762,6 +1772,20 @@ mod tests {
         assert_eq!(DELIVERY_INTERVAL_SECS, 5);
         assert_eq!(PRESENCE_RECONCILE_INTERVAL_SECS, 20);
         assert_eq!(due, vec![0, 4, 8]);
+    }
+
+    #[test]
+    fn presence_reconciliation_waits_for_startup_grace_without_blocking_delivery_ticks() {
+        let grace = Duration::from_secs(180);
+
+        assert!(!should_reconcile_presence(0, Duration::ZERO, grace));
+        assert!(!should_reconcile_presence(
+            4,
+            Duration::from_secs(179),
+            grace
+        ));
+        assert!(should_reconcile_presence(4, grace, grace));
+        assert!(!should_reconcile_presence(5, grace, grace));
     }
 
     #[test]

@@ -108,7 +108,9 @@ export const ShareCard = React.memo(function ShareCard({
   const description = share.description?.trim() || "";
   const usagePercent = !isUnlimited(tokenLimit) && Number(tokenLimit) > 0 ? Math.min(100, Math.max(0, (tokensUsed / Number(tokenLimit)) * 100)) : null;
   const onlineRate = share.onlineRate24h || 0;
-  const onlineTitle = `${onlineRate.toFixed(1)}% online in last 24h (${share.onlineMinutes24h || 0} / 1440 min)`;
+  const observedMinutes = share.observedMinutes24h || 0;
+  const observationCoverage = share.observationCoverage24h || 0;
+  const onlineTitle = t("dashboard.uptimeObservation", { healthy: onlineRate.toFixed(1), observed: observedMinutes, coverage: observationCoverage.toFixed(1) });
   const expiryLabel = shareExpiryProgress(share, locale);
   const expiryHint = `${formatDateTime(share.createdAt)} / ${expiryTitle(share.expiresAt)}`;
   const parallelTitle = parallelOccupancyTitle(share, app, t);
@@ -118,8 +120,8 @@ export const ShareCard = React.memo(function ShareCard({
   const focused = focus.isFocused("share", share.shareId);
   const related = focus.isRelated("share", share.shareId);
   const dimmed = Boolean(focus.target) && !related;
-  const stateTone = summary.state === "offline" ? "border-rose-200" : summary.state === "degraded" ? "border-amber-300" : summary.state === "disabled" ? "border-slate-300 opacity-70" : "border-slate-200";
-  const statusDot = summary.state === "offline" ? "bg-rose-500" : summary.state === "degraded" ? "bg-amber-400" : summary.state === "disabled" ? "bg-slate-400" : "bg-emerald-500";
+  const stateTone = summary.state === "offline" ? "border-rose-200" : summary.state === "reconnecting" ? "border-sky-300" : summary.state === "degraded" ? "border-amber-300" : summary.state === "disabled" ? "border-slate-300 opacity-70" : "border-slate-200";
+  const statusDot = summary.state === "offline" ? "bg-rose-500" : summary.state === "reconnecting" ? "bg-sky-500" : summary.state === "degraded" ? "bg-amber-400" : summary.state === "disabled" ? "bg-slate-400" : "bg-emerald-500";
   const connectDisabled = summary.state === "disabled";
   const editLabel = editPending
     ? t("dashboard.pendingApply")

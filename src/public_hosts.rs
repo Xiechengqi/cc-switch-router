@@ -213,6 +213,21 @@ pub fn set_lifecycle(
     Ok(changed == 1)
 }
 
+pub fn tombstone_subject(
+    conn: &Connection,
+    kind: PublicHostKind,
+    subject_id: &str,
+) -> Result<bool, PublicHostCatalogError> {
+    let now = Utc::now().to_rfc3339();
+    let changed = conn.execute(
+        "UPDATE public_hosts
+         SET lifecycle = 'tombstoned', revision = revision + 1, updated_at = ?3
+         WHERE kind = ?1 AND subject_id = ?2 AND lifecycle != 'tombstoned'",
+        params![kind_str(kind), subject_id, now],
+    )?;
+    Ok(changed > 0)
+}
+
 pub fn get_by_label(
     conn: &Connection,
     label: &str,

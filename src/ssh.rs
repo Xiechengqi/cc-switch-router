@@ -172,7 +172,11 @@ impl ClientHandler {
 }
 
 impl SshServer {
-    pub async fn run_with_listener(self, listener: TcpListener) -> Result<()> {
+    pub async fn run_with_listener(
+        self,
+        listener: TcpListener,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<()> {
         let mut config = server::Config {
             inactivity_timeout: Some(std::time::Duration::from_secs(300)),
             auth_rejection_time: std::time::Duration::from_secs(1),
@@ -182,7 +186,19 @@ impl SshServer {
         let config = Arc::new(config);
         info!("ssh listening on {}", listener.local_addr()?);
         loop {
-            let (socket, peer) = listener.accept().await?;
+            let accepted = tokio::select! {
+                changed = shutdown.changed() => {
+                    match changed {
+                        Ok(()) if !*shutdown.borrow() => continue,
+                        Ok(()) | Err(_) => {
+                            info!("ssh listener stopped for graceful shutdown");
+                            return Ok(());
+                        }
+                    }
+                }
+                accepted = listener.accept() => accepted,
+            };
+            let (socket, peer) = accepted?;
             let config = config.clone();
             let handler = ClientHandler {
                 store: self.store.clone(),

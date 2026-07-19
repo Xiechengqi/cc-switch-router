@@ -4,6 +4,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use base64::Engine;
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -38,6 +39,8 @@ const SHARE_USER_COUNTRY_ISO3_HEADER: &str = "X-CC-Switch-User-Country-Iso3";
 const SHARE_DATA_SOURCE_HEADER: &str = "X-CC-Switch-Data-Source";
 const IMAGE_JOB_MAX_RUNNING_PER_SHARE: usize = 1;
 const ROUTE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const ROUTE_RECONNECT_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
+const ROUTE_RECONNECT_MAX_WAITERS: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RouteKind {
@@ -99,11 +102,122 @@ impl Drop for RouteInflightGuard {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct LogicalRoute {
     active: Option<RouteEntry>,
     candidates: BTreeMap<u64, RouteEntry>,
     draining: BTreeMap<u64, RouteEntry>,
+    state_since: DateTime<Utc>,
+    reconnecting_since: Instant,
+    transition: Arc<RouteTransition>,
+}
+
+impl Default for LogicalRoute {
+    fn default() -> Self {
+        Self {
+            active: None,
+            candidates: BTreeMap::new(),
+            draining: BTreeMap::new(),
+            state_since: Utc::now(),
+            reconnecting_since: Instant::now(),
+            transition: Arc::new(RouteTransition::default()),
+        }
+    }
+}
+
+impl LogicalRoute {
+    fn mark_active(&mut self, was_active: bool) {
+        if !was_active {
+            self.state_since = Utc::now();
+        }
+        self.transition.notify();
+    }
+
+    fn mark_reconnecting(&mut self) {
+        self.state_since = Utc::now();
+        self.reconnecting_since = Instant::now();
+        self.transition.notify();
+    }
+
+    fn availability(&self, reconnect_grace: Duration) -> RouteAvailabilitySnapshot {
+        if self.active.is_some() {
+            return RouteAvailabilitySnapshot {
+                state: RouteAvailability::Active,
+                since: self.state_since,
+            };
+        }
+        if self.reconnecting_since.elapsed() < reconnect_grace {
+            return RouteAvailabilitySnapshot {
+                state: RouteAvailability::Reconnecting,
+                since: self.state_since,
+            };
+        }
+        let grace = chrono::Duration::from_std(reconnect_grace).unwrap_or(chrono::Duration::MAX);
+        RouteAvailabilitySnapshot {
+            state: RouteAvailability::Offline,
+            since: self
+                .state_since
+                .checked_add_signed(grace)
+                .unwrap_or(self.state_since),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RouteTransition {
+    revision: watch::Sender<u64>,
+    waiters: AtomicUsize,
+}
+
+impl Default for RouteTransition {
+    fn default() -> Self {
+        let (revision, _) = watch::channel(0);
+        Self {
+            revision,
+            waiters: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl RouteTransition {
+    fn notify(&self) {
+        self.revision.send_modify(|revision| {
+            *revision = revision.wrapping_add(1);
+        });
+    }
+
+    fn try_acquire_waiter(self: &Arc<Self>) -> Option<RouteWaiterGuard> {
+        let mut current = self.waiters.load(Ordering::Acquire);
+        loop {
+            if current >= ROUTE_RECONNECT_MAX_WAITERS {
+                return None;
+            }
+            match self.waiters.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(RouteWaiterGuard {
+                        transition: self.clone(),
+                    });
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RouteWaiterGuard {
+    transition: Arc<RouteTransition>,
+}
+
+impl Drop for RouteWaiterGuard {
+    fn drop(&mut self) {
+        self.transition.waiters.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[derive(Debug)]
@@ -111,6 +225,29 @@ enum RouteLookup {
     Unknown,
     Reconnecting,
     Active(RouteEntry, RouteInflightGuard),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RouteAvailability {
+    Active,
+    Reconnecting,
+    Offline,
+}
+
+impl RouteAvailability {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Reconnecting => "reconnecting",
+            Self::Offline => "offline",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RouteAvailabilitySnapshot {
+    pub state: RouteAvailability,
+    pub since: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -518,11 +655,13 @@ impl ProxyRegistry {
                 generation,
                 rotation_id,
             );
+            let was_active = slot.active.is_some();
             let old_route = slot.active.replace(route);
             if let Some(old_route) = old_route.as_ref() {
                 slot.draining
                     .insert(old_route.generation, old_route.clone());
             }
+            slot.mark_active(was_active);
             (subdomain, old_route)
         };
         if let Some(old_route) = old_route {
@@ -633,6 +772,7 @@ impl ProxyRegistry {
                 });
             }
 
+            let was_active = slot.active.is_some();
             let old_route = slot.active.replace(candidate);
             if let Some(old_route) = old_route.as_ref() {
                 slot.draining
@@ -647,6 +787,7 @@ impl ProxyRegistry {
                 .into_iter()
                 .filter_map(|generation| slot.candidates.remove(&generation))
                 .collect::<Vec<_>>();
+            slot.mark_active(was_active);
             (old_route, stale_candidates, proxy_route_state(slot))
         };
         self.pending_routes.write().await.remove(subdomain);
@@ -688,6 +829,11 @@ impl ProxyRegistry {
             slot.active = slot.draining.remove(&expected_generation);
         }
         slot.candidates.insert(generation, promoted);
+        if slot.active.is_some() {
+            slot.transition.notify();
+        } else {
+            slot.mark_reconnecting();
+        }
     }
 
     pub(crate) async fn route_state(&self, subdomain: &str) -> Option<ProxyRouteState> {
@@ -758,6 +904,40 @@ impl ProxyRegistry {
         self.routes.write().await.entry(subdomain).or_default();
     }
 
+    pub(crate) async fn declare_known_routes<I>(&self, subdomains: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut routes = self.routes.write().await;
+        for subdomain in subdomains {
+            routes.entry(subdomain).or_default();
+        }
+    }
+
+    pub(crate) async fn route_availability(
+        &self,
+        subdomain: &str,
+        reconnect_grace: Duration,
+    ) -> Option<RouteAvailabilitySnapshot> {
+        self.routes
+            .read()
+            .await
+            .get(subdomain)
+            .map(|slot| slot.availability(reconnect_grace))
+    }
+
+    pub(crate) async fn route_availability_snapshots(
+        &self,
+        reconnect_grace: Duration,
+    ) -> HashMap<String, RouteAvailabilitySnapshot> {
+        self.routes
+            .read()
+            .await
+            .iter()
+            .map(|(subdomain, slot)| (subdomain.clone(), slot.availability(reconnect_grace)))
+            .collect()
+    }
+
     pub async fn has_pending_route(&self, subdomain: &str) -> bool {
         let now = Instant::now();
         let mut pending = self.pending_routes.write().await;
@@ -767,6 +947,9 @@ impl ProxyRegistry {
 
     pub async fn remove_route(&self, subdomain: &str) {
         let old_route = self.routes.write().await.remove(subdomain);
+        if let Some(route) = old_route.as_ref() {
+            route.transition.notify();
+        }
         self.pending_routes.write().await.remove(subdomain);
         shutdown_logical_route(old_route);
     }
@@ -774,6 +957,9 @@ impl ProxyRegistry {
     pub async fn remove_route_if_present(&self, subdomain: &str) -> bool {
         let old_route = self.routes.write().await.remove(subdomain);
         let removed = old_route.is_some();
+        if let Some(route) = old_route.as_ref() {
+            route.transition.notify();
+        }
         self.pending_routes.write().await.remove(subdomain);
         shutdown_logical_route(old_route);
         removed
@@ -785,9 +971,11 @@ impl ProxyRegistry {
             return false;
         };
         let mut removed = Vec::new();
+        let mut active_removed = false;
         if slot.active.as_ref().and_then(RouteEntry::connection_id) == Some(connection_id) {
             if let Some(route) = slot.active.take() {
                 removed.push(route);
+                active_removed = true;
             }
         }
         let candidate_generations = slot
@@ -814,6 +1002,9 @@ impl ProxyRegistry {
                 removed.push(route);
             }
         }
+        if active_removed {
+            slot.mark_reconnecting();
+        }
         drop(routes);
         let should_remove = !removed.is_empty();
         for route in removed {
@@ -822,6 +1013,44 @@ impl ProxyRegistry {
             }
         }
         should_remove
+    }
+
+    pub(crate) async fn remove_route_intent_if_connection(
+        &self,
+        subdomain: &str,
+        connection_id: &str,
+    ) -> bool {
+        let old_route = {
+            let mut routes = self.routes.write().await;
+            let removable = routes.get(subdomain).is_some_and(|slot| {
+                let activatable_routes = slot.active.iter().chain(slot.candidates.values());
+                let mut has_snapshot_connection = false;
+                let mut has_replacement_connection = false;
+                for route in activatable_routes {
+                    if route.connection_id() == Some(connection_id) {
+                        has_snapshot_connection = true;
+                    } else {
+                        has_replacement_connection = true;
+                    }
+                }
+
+                // The old connection may disappear between the cleanup snapshot
+                // and the committed database deletion. An empty logical route is
+                // still that snapshot's stale intent, while any active/candidate
+                // replacement must win the race and remain registered.
+                !has_replacement_connection
+                    && (has_snapshot_connection
+                        || (slot.active.is_none() && slot.candidates.is_empty()))
+            });
+            removable.then(|| routes.remove(subdomain)).flatten()
+        };
+        let Some(old_route) = old_route else {
+            return false;
+        };
+        old_route.transition.notify();
+        self.pending_routes.write().await.remove(subdomain);
+        shutdown_logical_route(Some(old_route));
+        true
     }
 
     pub(crate) async fn remove_route_target_if_generation(
@@ -839,6 +1068,7 @@ impl ProxyRegistry {
             route.generation == generation && route.connection_id() == Some(connection_id)
         }) {
             removed = slot.active.take();
+            slot.mark_reconnecting();
         } else if slot
             .candidates
             .get(&generation)
@@ -900,6 +1130,39 @@ impl ProxyRegistry {
         match slot.active.as_ref() {
             Some(route) => RouteLookup::Active(route.clone(), route.acquire()),
             None => RouteLookup::Reconnecting,
+        }
+    }
+
+    async fn wait_for_active_subdomain_request(&self, subdomain: &str) -> RouteLookup {
+        let (mut revision, _waiter) = {
+            let routes = self.routes.read().await;
+            let Some(slot) = routes.get(subdomain) else {
+                return RouteLookup::Unknown;
+            };
+            if let Some(route) = slot.active.as_ref() {
+                return RouteLookup::Active(route.clone(), route.acquire());
+            }
+            let Some(waiter) = slot.transition.try_acquire_waiter() else {
+                return RouteLookup::Reconnecting;
+            };
+            (slot.transition.revision.subscribe(), waiter)
+        };
+
+        let deadline = tokio::time::Instant::now() + ROUTE_RECONNECT_WAIT_TIMEOUT;
+        loop {
+            {
+                let routes = self.routes.read().await;
+                let Some(slot) = routes.get(subdomain) else {
+                    return RouteLookup::Unknown;
+                };
+                if let Some(route) = slot.active.as_ref() {
+                    return RouteLookup::Active(route.clone(), route.acquire());
+                }
+            }
+            match tokio::time::timeout_at(deadline, revision.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => return RouteLookup::Reconnecting,
+            }
         }
     }
 
@@ -1972,17 +2235,44 @@ pub async fn proxy_handler(
                     }
                 }
             }
-            warn!(
-                method = %method,
-                host = %host,
-                path = %path_and_query,
-                client_ip = %user_ip,
-                client_country = %user_country,
-                client_asn = %user_asn,
-                user_agent = %user_agent,
-                "proxy request deferred: registered tunnel is reconnecting"
-            );
-            return reconnecting_response();
+            if let Some(subdomain) = route_subdomain.as_deref() {
+                match state
+                    .proxy
+                    .wait_for_active_subdomain_request(subdomain)
+                    .await
+                {
+                    RouteLookup::Active(route, guard) => (route, guard),
+                    RouteLookup::Unknown => {
+                        warn!(
+                            method = %method,
+                            host = %host,
+                            path = %path_and_query,
+                            client_ip = %user_ip,
+                            client_country = %user_country,
+                            client_asn = %user_asn,
+                            user_agent = %user_agent,
+                            "proxy request rejected: route removed while waiting for reconnect"
+                        );
+                        return simple_response(StatusCode::NOT_FOUND, "unregistered-subdomain");
+                    }
+                    RouteLookup::Reconnecting => {
+                        warn!(
+                            method = %method,
+                            host = %host,
+                            path = %path_and_query,
+                            client_ip = %user_ip,
+                            client_country = %user_country,
+                            client_asn = %user_asn,
+                            user_agent = %user_agent,
+                            wait_timeout_ms = ROUTE_RECONNECT_WAIT_TIMEOUT.as_millis(),
+                            "proxy request deferred: registered tunnel is reconnecting"
+                        );
+                        return reconnecting_response();
+                    }
+                }
+            } else {
+                return simple_response(StatusCode::NOT_FOUND, "unregistered-subdomain");
+            }
         }
         RouteLookup::Unknown => {
             warn!(
@@ -4837,6 +5127,243 @@ data: {"data":[{"b64_json":"iVBORw0KGgo="}]}
         let response = reconnecting_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+    }
+
+    #[tokio::test]
+    async fn hydrated_route_transitions_from_reconnecting_to_active_and_back() {
+        let registry = ProxyRegistry::default();
+        registry
+            .declare_known_routes(vec!["known".into(), "second".into()])
+            .await;
+
+        assert_eq!(
+            registry
+                .route_availability("known", Duration::from_secs(180))
+                .await
+                .expect("known route")
+                .state,
+            RouteAvailability::Reconnecting
+        );
+        assert_eq!(
+            registry
+                .route_availability("known", Duration::ZERO)
+                .await
+                .expect("known route after grace")
+                .state,
+            RouteAvailability::Offline
+        );
+
+        registry
+            .set_route(
+                "known".into(),
+                "127.0.0.1:3000".into(),
+                Some("connection-1".into()),
+                Some("share-1".into()),
+                None,
+                false,
+                5,
+                None,
+            )
+            .await;
+        assert_eq!(
+            registry
+                .route_availability("known", Duration::from_secs(180))
+                .await
+                .expect("active route")
+                .state,
+            RouteAvailability::Active
+        );
+
+        registry
+            .remove_route_if_connection("known", "connection-1")
+            .await;
+        assert_eq!(
+            registry
+                .route_availability("known", Duration::from_secs(180))
+                .await
+                .expect("retained route intention")
+                .state,
+            RouteAvailability::Reconnecting
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnecting_request_waits_for_route_activation() {
+        let registry = Arc::new(ProxyRegistry::default());
+        registry.declare_known_route("known".into()).await;
+        let waiting_registry = registry.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_registry
+                .wait_for_active_subdomain_request("known")
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        registry
+            .set_route(
+                "known".into(),
+                "127.0.0.1:3000".into(),
+                Some("connection-1".into()),
+                Some("share-1".into()),
+                None,
+                false,
+                5,
+                None,
+            )
+            .await;
+
+        let lookup = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter wakes before timeout")
+            .expect("wait task succeeds");
+        match lookup {
+            RouteLookup::Active(route, _) => assert_eq!(route.backend, "127.0.0.1:3000"),
+            other => panic!("expected active route after reconnect, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnecting_request_wakes_as_unknown_when_intent_is_removed() {
+        let registry = Arc::new(ProxyRegistry::default());
+        registry.declare_known_route("known".into()).await;
+        let waiting_registry = registry.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_registry
+                .wait_for_active_subdomain_request("known")
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        registry.remove_route("known").await;
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("waiter wakes before timeout")
+                .expect("wait task succeeds"),
+            RouteLookup::Unknown
+        ));
+    }
+
+    #[tokio::test]
+    async fn authoritative_cleanup_removes_only_the_snapshotted_connection_and_intent() {
+        let registry = ProxyRegistry::default();
+        registry
+            .set_route(
+                "known".into(),
+                "127.0.0.1:3000".into(),
+                Some("connection-1".into()),
+                Some("share-1".into()),
+                None,
+                false,
+                5,
+                None,
+            )
+            .await;
+
+        assert!(
+            !registry
+                .remove_route_intent_if_connection("known", "connection-2")
+                .await
+        );
+        assert!(
+            registry
+                .route_availability("known", Duration::ZERO)
+                .await
+                .is_some()
+        );
+
+        assert!(
+            registry
+                .remove_route_intent_if_connection("known", "connection-1")
+                .await
+        );
+        assert!(
+            registry
+                .route_availability("known", Duration::ZERO)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_cleanup_removes_empty_intent_after_snapshotted_connection_closes() {
+        let registry = ProxyRegistry::default();
+        registry
+            .set_route(
+                "known".into(),
+                "127.0.0.1:3000".into(),
+                Some("connection-1".into()),
+                Some("share-1".into()),
+                None,
+                false,
+                5,
+                None,
+            )
+            .await;
+        assert!(
+            registry
+                .remove_route_if_connection("known", "connection-1")
+                .await
+        );
+
+        assert!(
+            registry
+                .remove_route_intent_if_connection("known", "connection-1")
+                .await
+        );
+        assert!(
+            registry
+                .route_availability("known", Duration::ZERO)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_cleanup_preserves_replacement_candidate() {
+        let registry = ProxyRegistry::default();
+        registry
+            .set_route(
+                "known".into(),
+                "127.0.0.1:3000".into(),
+                Some("connection-1".into()),
+                Some("share-1".into()),
+                None,
+                false,
+                5,
+                None,
+            )
+            .await;
+        registry
+            .register_candidate_with_kind(
+                "known".into(),
+                "127.0.0.1:3001".into(),
+                RouteKind::Share,
+                None,
+                Some("connection-2".into()),
+                Some("share-1".into()),
+                None,
+                false,
+                5,
+                None,
+                2,
+                "rotation-2".into(),
+            )
+            .await
+            .expect("register replacement candidate");
+
+        assert!(
+            !registry
+                .remove_route_intent_if_connection("known", "connection-1")
+                .await
+        );
+        assert!(
+            registry
+                .candidate_for_activation("known", "connection-2", "rotation-2", 2)
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]

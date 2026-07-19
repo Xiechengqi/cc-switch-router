@@ -77,9 +77,9 @@ use crate::models::{
 };
 use crate::notifications::{
     ClientNotificationDeliveriesResponse, ClientNotificationPolicy, NotificationTemplateContext,
-    validate_notification_cleanup_window,
+    route_reconnect_grace, validate_notification_cleanup_window,
 };
-use crate::proxy::{gateway_proxy_handler, market_proxy_handler, proxy_handler};
+use crate::proxy::{RouteAvailability, gateway_proxy_handler, market_proxy_handler, proxy_handler};
 use crate::recent_traffic::{RecentRequestEvent, RecentTrafficSnapshot};
 use crate::scheduling_signals::{
     ShareFeedbackKind, ShareFeedbackRequest, ShareFeedbackResponse, ShareHeadroomEntry,
@@ -93,6 +93,29 @@ fn public_cors_layer() -> CorsLayer {
         .allow_origin(Any)
         .allow_methods([Method::GET, Method::OPTIONS])
         .allow_headers(Any)
+}
+
+async fn apply_market_share_route_availability(
+    state: &ServerState,
+    shares: &mut [MarketShareView],
+) {
+    let reconnect_grace = {
+        let dynamic = state.dynamic.read().await;
+        route_reconnect_grace(&dynamic.client_notifications)
+    };
+    let routes = state
+        .proxy
+        .route_availability_snapshots(reconnect_grace)
+        .await;
+    for share in shares {
+        let snapshot = routes.get(&share.subdomain);
+        share.online = snapshot.is_some_and(|route| route.state == RouteAvailability::Active);
+        share.route_state = snapshot
+            .map(|route| route.state.as_str())
+            .unwrap_or("offline")
+            .to_string();
+        share.route_state_since = snapshot.map(|route| route.since.to_rfc3339());
+    }
 }
 
 const REGIONS: &str = include_str!("../regions");
@@ -542,6 +565,7 @@ async fn market_shares(
             }
         }
     }
+    apply_market_share_route_availability(&state, &mut shares).await;
     Ok(Json(shares))
 }
 
@@ -557,17 +581,17 @@ async fn share_market_shares(
     }
     let active_subdomains = state.proxy.active_subdomains().await.into_iter().collect();
     let inflight_by_share = state.proxy.inflight_by_share().await;
-    Ok(Json(
-        state
-            .store
-            .list_share_market_delegated_shares(
-                &market.email,
-                "main",
-                &active_subdomains,
-                &inflight_by_share,
-            )
-            .await?,
-    ))
+    let mut shares = state
+        .store
+        .list_share_market_delegated_shares(
+            &market.email,
+            "main",
+            &active_subdomains,
+            &inflight_by_share,
+        )
+        .await?;
+    apply_market_share_route_availability(&state, &mut shares).await;
+    Ok(Json(shares))
 }
 
 async fn share_market_create_grant(
@@ -797,6 +821,7 @@ async fn gateway_shares(
             share.signals.owner_penalty = (share.signals.owner_penalty * penalty).clamp(0.05, 1.0);
         }
     }
+    apply_market_share_route_availability(&state, &mut shares).await;
     Ok(Json(shares))
 }
 
@@ -864,18 +889,18 @@ async fn admin_market_linked_shares(
 ) -> Result<Json<Vec<MarketShareView>>, AppError> {
     let current_user_email = require_session_email(&state, &headers).await?;
     let is_admin = state.dynamic.read().await.is_admin(&current_user_email);
-    Ok(Json(
-        state
-            .store
-            .list_manageable_market_shares(
-                &market_email,
-                &current_user_email,
-                is_admin,
-                &state.proxy.active_subdomains().await.into_iter().collect(),
-                &state.proxy.inflight_by_share().await,
-            )
-            .await?,
-    ))
+    let mut shares = state
+        .store
+        .list_manageable_market_shares(
+            &market_email,
+            &current_user_email,
+            is_admin,
+            &state.proxy.active_subdomains().await.into_iter().collect(),
+            &state.proxy.inflight_by_share().await,
+        )
+        .await?;
+    apply_market_share_route_availability(&state, &mut shares).await;
+    Ok(Json(shares))
 }
 
 async fn public_market_share_priority(
@@ -883,17 +908,17 @@ async fn public_market_share_priority(
     Path(market_email): Path<String>,
     Query(query): Query<PublicMarketSharePriorityQuery>,
 ) -> Result<Json<Vec<MarketShareView>>, AppError> {
-    Ok(Json(
-        state
-            .store
-            .list_public_market_share_priority(
-                &market_email,
-                query.app.as_deref(),
-                &state.proxy.active_subdomains().await.into_iter().collect(),
-                &state.proxy.inflight_by_share().await,
-            )
-            .await?,
-    ))
+    let mut shares = state
+        .store
+        .list_public_market_share_priority(
+            &market_email,
+            query.app.as_deref(),
+            &state.proxy.active_subdomains().await.into_iter().collect(),
+            &state.proxy.inflight_by_share().await,
+        )
+        .await?;
+    apply_market_share_route_availability(&state, &mut shares).await;
+    Ok(Json(shares))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1652,10 +1677,12 @@ async fn dashboard(
     headers: HeaderMap,
 ) -> Result<Json<DashboardResponse>, AppError> {
     let viewer_email = extract_dashboard_session_email(&state, &headers).await?;
+    let mut runtime_config = state.config.clone();
+    runtime_config.client_notifications = state.dynamic.read().await.client_notifications.clone();
     let mut response = state
         .store
         .dashboard_snapshot(
-            &state.config,
+            &runtime_config,
             &state.server_geo,
             &state.proxy,
             viewer_email.as_deref(),

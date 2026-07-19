@@ -222,21 +222,25 @@ export function ShareStatusCell({ share, t, locale }: { share?: ShareView; t: TF
       </div>
     </div>
   );
-  if (!share.isOnline) {
-    return (
-      <div className="grid min-w-0 gap-2 text-sm">
-        <Chip size="sm" variant="tertiary">{t("common.offline")}</Chip>
-      </div>
-    );
-  }
+  const routeStatus = share.routeState === "reconnecting"
+    ? <Chip color="accent" size="sm" variant="soft">{t("dashboard.reconnecting")}</Chip>
+    : !share.isOnline
+      ? <Chip size="sm" variant="tertiary">{t("common.offline")}</Chip>
+      : null;
+  const onlineTitle = t("dashboard.uptimeObservation", {
+    healthy: (share.onlineRate24h || 0).toFixed(1),
+    observed: share.observedMinutes24h || 0,
+    coverage: (share.observationCoverage24h || 0).toFixed(1),
+  });
   return (
     <div className="grid min-w-0 gap-2 text-sm">
+      {routeStatus}
       {saleRow}
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.usage")}</span><div><strong>{compactTokens(share.tokensUsed)} / {isUnlimited(share.tokenLimit) ? "∞" : compactTokens(share.tokenLimit)}</strong><UsageBar used={share.tokensUsed} limit={share.tokenLimit} t={t} /></div></div>
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.expires")}</span><strong title={`${formatDateTime(share.createdAt)} / ${expiryTitle(share.expiresAt)}`}>{shareExpiryProgress(share, locale)}</strong></div>
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.parallel")}</span><strong>{share.activeRequests || 0}<span className="text-muted-foreground">/{limit}</span></strong></div>
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.response")}</span><strong>{formatLatencySeconds(averageLatency)}</strong></div>
-      <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.online")}</span><strong title={`${share.onlineMinutes24h || 0} / 1440 min with successful route probes in last 24h`}>{(share.onlineRate24h || 0).toFixed(1)}%</strong></div>
+      <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.online")}</span><strong title={onlineTitle}>{(share.onlineRate24h || 0).toFixed(1)}%</strong></div>
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.health")}</span><HealthDots entries={share.healthChecks} /></div>
     </div>
   );
@@ -490,17 +494,20 @@ export function ShareMarkets({ share, t }: { share?: ShareView; t: TFn }) {
   return (
     <div className="grid gap-2">
       <Chip size="sm" variant="tertiary">{saleMarketKind === "share" ? t("dashboard.shareMarket") : t("dashboard.tokenMarket")}</Chip>
-      {links.map((market) => (
-        <Card key={market.id || market.email} className="rounded-lg border p-0 shadow-none">
-          <Card.Content className="flex-row items-center justify-between gap-3 p-3">
-            <div className="min-w-0">
-              <div className="truncate font-medium">{market.publicBaseUrl || market.email || "-"}</div>
-              <div className="truncate text-xs text-muted-foreground">{market.email || "-"}</div>
-            </div>
-            <Chip color={market.online ? "success" : "default"} size="sm" variant={market.online ? "soft" : "tertiary"}>{market.online ? t("common.online") : t("common.offline")}</Chip>
-          </Card.Content>
-        </Card>
-      ))}
+      {links.map((market) => {
+        const reconnecting = market.routeState === "reconnecting";
+        return (
+          <Card key={market.id || market.email} className="rounded-lg border p-0 shadow-none">
+            <Card.Content className="flex-row items-center justify-between gap-3 p-3">
+              <div className="min-w-0">
+                <div className="truncate font-medium">{market.publicBaseUrl || market.email || "-"}</div>
+                <div className="truncate text-xs text-muted-foreground">{market.email || "-"}</div>
+              </div>
+              <Chip color={market.online ? "success" : reconnecting ? "accent" : "default"} size="sm" variant={market.online || reconnecting ? "soft" : "tertiary"}>{market.online ? t("common.online") : reconnecting ? t("dashboard.reconnecting") : t("common.offline")}</Chip>
+            </Card.Content>
+          </Card>
+        );
+      })}
       {unknown.map((email) => <EmptyBlock key={email}>{t("dashboard.unknownMarket")}: {email}</EmptyBlock>)}
       {!links.length && !unknown.length && share.marketAccessMode !== "all" ? <EmptyBlock>{t("dashboard.noLinkedShares")}</EmptyBlock> : null}
     </div>

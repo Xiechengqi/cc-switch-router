@@ -295,7 +295,7 @@ const ShareScroller = React.memo(function ShareScroller({
   const { t } = useLocaleText();
   if (!shares.length) return <EmptyBlock>{t("dashboard.noLinkedShares")}</EmptyBlock>;
 
-  const { enabledCount, availableCount, degradedCount, offlineCount } = summarizeShareAvailability(shares);
+  const { enabledCount, availableCount, reconnectingCount, degradedCount, offlineCount } = summarizeShareAvailability(shares);
   const disabledCount = shares.length - enabledCount;
 
   return (
@@ -306,6 +306,7 @@ const ShareScroller = React.memo(function ShareScroller({
           <span>{shares.length === totalCount ? shares.length : `${shares.length}/${totalCount}`}</span>
           <span aria-hidden>·</span>
           <span className="text-emerald-700">{availableCount} {t("dashboard.available")}</span>
+          {reconnectingCount > 0 ? <span className="text-sky-700">{reconnectingCount} {t("dashboard.reconnecting")}</span> : null}
           {degradedCount > 0 ? <span className="text-amber-700">{degradedCount} {t("dashboard.degraded")}</span> : null}
           {offlineCount > 0 ? <span className="text-rose-700">{offlineCount} {t("common.offline")}</span> : null}
           {disabledCount > 0 ? <span>{disabledCount} {t("common.disabled")}</span> : null}
@@ -346,7 +347,7 @@ function ClientCard({
   const owner = clientOwnerEmail(client);
   const allShares = summaryShares || shares;
   const onlineRate = client.onlineRate24h || 0;
-  const onlineTitle = `${onlineRate.toFixed(1)}% online in last 24h (${client.onlineMinutes24h || 0} / 1440 min)`;
+  const onlineTitle = t("dashboard.uptimeObservation", { healthy: onlineRate.toFixed(1), observed: client.observedMinutes24h || 0, coverage: (client.observationCoverage24h || 0).toFixed(1) });
   const summary = clientOperationalSummary(client, allShares);
   const state = summary.state;
   const shareAvailability = summarizeShareAvailability(allShares);
@@ -363,7 +364,7 @@ function ClientCard({
   const identityUrl = client.clientTunnel?.subdomain ? tunnelUrl : "";
   const versionLabel = clientPlatformLabel(client);
   const showRemoval = state === "offline" && !!client.removalAt;
-  const borderTone = state === "offline" ? "border-l-rose-500" : state === "degraded" ? "border-l-amber-400" : "border-l-slate-200";
+  const borderTone = state === "offline" ? "border-l-rose-500" : state === "reconnecting" ? "border-l-sky-500" : state === "degraded" ? "border-l-amber-400" : "border-l-slate-200";
   const headerPointerDownRef = React.useRef<{ x: number; y: number } | null>(null);
 
   const openClientDrawer = React.useCallback(() => {
@@ -409,7 +410,7 @@ function ClientCard({
         >
           <div className="grid min-w-0 gap-1.5">
             <div className="flex min-w-0 flex-wrap items-center gap-2">
-              <span className={`h-2 w-2 shrink-0 rounded-full ${state === "offline" ? "bg-rose-500" : state === "degraded" ? "bg-amber-400" : "bg-emerald-500"}`} />
+              <span className={`h-2 w-2 shrink-0 rounded-full ${state === "offline" ? "bg-rose-500" : state === "reconnecting" ? "bg-sky-500" : state === "degraded" ? "bg-amber-400" : "bg-emerald-500"}`} />
               {identityUrl ? (
                 <a
                   href={identityUrl}
@@ -431,7 +432,7 @@ function ClientCard({
               <ClientUpgradeButton client={client} />
               <ClientDetailsButton onOpen={openClientDrawer} />
               <ClientChatButton client={client} />
-              {summary.primaryReason ? <span className={`truncate text-[11px] font-medium ${state === "offline" ? "text-rose-700" : "text-amber-700"}`} title={operationalReasonLabel(summary.primaryReason, t)}>{operationalReasonLabel(summary.primaryReason, t)}</span> : null}
+              {summary.primaryReason ? <span className={`truncate text-[11px] font-medium ${state === "offline" ? "text-rose-700" : state === "reconnecting" ? "text-sky-700" : "text-amber-700"}`} title={operationalReasonLabel(summary.primaryReason, t)}>{operationalReasonLabel(summary.primaryReason, t)}</span> : null}
               {showRemoval ? <ClientRemovalSchedule removalAt={client.removalAt} className="text-[11px]" /> : null}
             </div>
             <div className="flex min-w-0 items-center text-xs text-muted-foreground">
@@ -512,7 +513,7 @@ export function ClientBoard({
   const [connectShare, setConnectShare] = React.useState<ShareView | null>(null);
   const [installOpen, setInstallOpen] = React.useState(false);
   const [query, setQuery] = React.useState("");
-  const [statusFilter, setStatusFilter] = usePersistentState<"all" | Extract<OperationalState, "online" | "degraded" | "offline">>("cc_switch_router_client_status_v1", "all");
+  const [statusFilter, setStatusFilter] = usePersistentState<"all" | Extract<OperationalState, "online" | "reconnecting" | "degraded" | "offline">>("cc_switch_router_client_status_v1", "all");
   const [sortOrder, setSortOrder] = usePersistentState("cc_switch_router_client_sort_v1", "issues");
   const [expandedClientIds, setExpandedClientIds] = usePersistentState<string[] | null>(
     CLIENT_EXPANDED_STORAGE_KEY,
@@ -631,6 +632,7 @@ export function ClientBoard({
     const states = sortedClients.map((client) => clientOperationalSummary(client, sharesForClient(client)).state);
     return {
       online: states.filter((state) => state === "online").length,
+      reconnecting: states.filter((state) => state === "reconnecting").length,
       degraded: states.filter((state) => state === "degraded").length,
       offline: states.filter((state) => state === "offline").length,
       issues: states.filter((state) => state !== "online").length,
@@ -643,6 +645,7 @@ export function ClientBoard({
       if (normalizedQuery && !shareMatchesQuery(share, normalizedQuery)) return false;
       const shareState = shareOperationalSummary(share).state;
       if (statusFilter === "online" && shareState !== "online") return false;
+      if (statusFilter === "reconnecting" && shareState !== "reconnecting") return false;
       if (statusFilter === "degraded" && shareState !== "degraded") return false;
       if (statusFilter === "offline" && shareState !== "offline") return false;
       if (issuesOnly && shareState === "online") return false;
@@ -732,8 +735,8 @@ export function ClientBoard({
           <div className="inline-flex rounded-lg bg-slate-100 p-1 text-[11px]">
             {([[
               "all", t("dashboard.all"), sortedClients.length,
-            ], ["online", t("common.online"), clientSummary.online], ["degraded", t("dashboard.degraded"), clientSummary.degraded], ["offline", t("common.offline"), clientSummary.offline]] as const).map(([value, label, count]) => (
-              <button key={value} type="button" onClick={() => { setStatusFilter(value); if (value === "online") setIssuesOnly(false); }} className={`rounded-md px-2.5 py-1.5 transition-colors ${statusFilter === value ? "bg-white font-medium text-foreground shadow-sm" : value === "offline" ? "text-rose-700" : value === "degraded" ? "text-amber-700" : "text-muted-foreground"}`}>{label} · {count}</button>
+            ], ["online", t("common.online"), clientSummary.online], ["reconnecting", t("dashboard.reconnecting"), clientSummary.reconnecting], ["degraded", t("dashboard.degraded"), clientSummary.degraded], ["offline", t("common.offline"), clientSummary.offline]] as const).map(([value, label, count]) => (
+              <button key={value} type="button" onClick={() => { setStatusFilter(value); if (value === "online") setIssuesOnly(false); }} className={`rounded-md px-2.5 py-1.5 transition-colors ${statusFilter === value ? "bg-white font-medium text-foreground shadow-sm" : value === "offline" ? "text-rose-700" : value === "reconnecting" ? "text-sky-700" : value === "degraded" ? "text-amber-700" : "text-muted-foreground"}`}>{label} · {count}</button>
             ))}
           </div>
           <SectionInstallButton label={t("dashboard.installClient")} onClick={() => setInstallOpen(true)} />

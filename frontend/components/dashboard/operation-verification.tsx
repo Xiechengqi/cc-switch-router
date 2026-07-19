@@ -61,7 +61,7 @@ export function OperationVerificationProvider({ data, children }: { data: Dashbo
           continue;
         }
         const summary = shareOperationalSummary(share);
-        if (item.requireHealthyRoute && (summary.state === "offline" || summary.primaryReason?.code === "route_offline")) {
+        if (item.requireHealthyRoute && (["offline", "reconnecting"].includes(summary.state) || ["route_offline", "route_reconnecting"].includes(summary.primaryReason?.code || ""))) {
           remaining.push(item);
           continue;
         }

@@ -148,7 +148,7 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
     const states = stableMarkets.map((market) => marketOperationalSummary(market).state);
     return {
       available: states.filter((state) => state === "available").length,
-      issues: states.filter((state) => state === "degraded" || state === "offline" || state === "maintenance").length,
+      issues: states.filter((state) => state === "reconnecting" || state === "degraded" || state === "offline" || state === "maintenance").length,
       disabled: states.filter((state) => state === "disabled").length,
     };
   }, [stableMarkets]);
@@ -164,7 +164,7 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
         market.publicBaseUrl,
         market.marketKind,
       ].some((value) => String(value || "").toLocaleLowerCase().includes(normalizedQuery))) return false;
-      const issue = state === "degraded" || state === "offline" || state === "maintenance";
+      const issue = state === "reconnecting" || state === "degraded" || state === "offline" || state === "maintenance";
       if (statusFilter === "available" && state !== "available") return false;
       if (statusFilter === "issues" && !issue) return false;
       if (statusFilter === "disabled" && state !== "disabled") return false;
@@ -237,7 +237,8 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
                 const capacityPercent = marketCapacityPercent(market);
                 const capacityLimit = isUnlimited(market.parallelCapacity) ? "∞" : market.parallelCapacity > 0 ? String(market.parallelCapacity) : "-";
                 const usageValue = isShareMarket(market) ? compactTokens(market.usageTokens) : `${compactTokens(market.usageTokens)} · ${formatUsdOneDecimal(market.usageAmountUsd)}`;
-                const rowTone = state === "offline" ? "border-l-rose-500" : state === "degraded" ? "border-l-amber-400" : state === "maintenance" ? "border-l-blue-400" : state === "disabled" ? "border-l-slate-300 opacity-70" : "border-l-transparent";
+                const rowTone = state === "offline" ? "border-l-rose-500" : state === "reconnecting" ? "border-l-sky-500" : state === "degraded" ? "border-l-amber-400" : state === "maintenance" ? "border-l-blue-400" : state === "disabled" ? "border-l-slate-300 opacity-70" : "border-l-transparent";
+                const uptimeTitle = t("dashboard.uptimeObservation", { healthy: (market.onlineRate24h || 0).toFixed(1), observed: market.observedMinutes24h || 0, coverage: (market.observationCoverage24h || 0).toFixed(1) });
                 const focused = focus.isFocused("market", market.id);
                 const related = focus.isRelated("market", market.id);
                 const dimmed = Boolean(focus.target) && !related;
@@ -245,8 +246,8 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
                   <tr id={`dashboard-market-${market.id}`} key={market.id} tabIndex={0} className={`cursor-pointer border-b border-l-[3px] outline-none transition-opacity last:border-b-0 hover:bg-primary/[0.03] focus-visible:bg-primary/[0.05] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary/30 ${rowTone} ${focused ? "bg-primary/[0.07] ring-2 ring-inset ring-primary/20" : ""} ${dimmed ? "opacity-40" : "opacity-100"}`} onClick={(event) => { if (shouldOpenRowDrawer(event)) { focus.setFocus({ kind: "market", id: market.id, source: "market-table" }); focus.openDrawer("market", market.id); setSelected(market); void recordDashboardUxEvent({ eventType: "drawer_opened", source: "market-table", targetType: "market" }); } }} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); focus.setFocus({ kind: "market", id: market.id, source: "market-table" }); focus.openDrawer("market", market.id); setSelected(market); void recordDashboardUxEvent({ eventType: "drawer_opened", source: "market-table", targetType: "market", keyboard: true }); } }}>
                     <td className="px-3 py-2.5 align-middle"><MarketIdentityCell market={market} t={t} /></td>
                     <td className="px-3 py-2.5 align-middle">
-                      <strong className={`block text-xs ${state === "offline" ? "text-rose-700" : state === "degraded" ? "text-amber-700" : state === "maintenance" ? "text-blue-700" : "text-emerald-700"}`}>{operationalStateLabel(state, t)}</strong>
-                      <span className={`block truncate text-[10px] ${state === "offline" ? "text-rose-700" : state === "degraded" ? "text-amber-700" : "text-muted-foreground"}`} title={operationalReasonLabel(operational.primaryReason, t)}>{operationalReasonLabel(operational.primaryReason, t)} · {(market.onlineRate24h || 0).toFixed(1)}% 24h</span>
+                      <strong className={`block text-xs ${state === "offline" ? "text-rose-700" : state === "reconnecting" ? "text-sky-700" : state === "degraded" ? "text-amber-700" : state === "maintenance" ? "text-blue-700" : "text-emerald-700"}`}>{operationalStateLabel(state, t)}</strong>
+                      <span className={`block truncate text-[10px] ${state === "offline" ? "text-rose-700" : state === "reconnecting" ? "text-sky-700" : state === "degraded" ? "text-amber-700" : "text-muted-foreground"}`} title={`${operationalReasonLabel(operational.primaryReason, t)} · ${uptimeTitle}`}>{operationalReasonLabel(operational.primaryReason, t)} · {(market.onlineRate24h || 0).toFixed(1)}% 24h</span>
                     </td>
                     <td className="px-3 py-2.5 align-middle">
                       <div className="grid gap-1">
@@ -693,7 +694,7 @@ function MarketEditDialog({ market, onClose, onSaved }: { market: DashboardMarke
                           </td>
                           <td className="px-3 py-2 align-middle">
                             <div className="flex flex-wrap gap-1">
-                              <Chip color={share.online ? "success" : "default"} size="sm" variant={share.online ? "soft" : "tertiary"}>{share.online ? t("common.online") : t("common.offline")}</Chip>
+                              <Chip color={share.online ? "success" : share.routeState === "reconnecting" ? "accent" : "default"} size="sm" variant={share.online || share.routeState === "reconnecting" ? "soft" : "tertiary"}>{share.online ? t("common.online") : share.routeState === "reconnecting" ? t("dashboard.reconnecting") : t("common.offline")}</Chip>
                               {disabled ? <Chip color="warning" size="sm" variant="soft">{t("dashboard.disabled")}</Chip> : null}
                             </div>
                           </td>
@@ -747,7 +748,7 @@ function MarketLinkedShares({ market, t }: { market: DashboardMarket; t: TFn }) 
                 <div className="truncate text-xs text-muted-foreground">{share.ownerEmail || "-"}</div>
               </div>
               <div className="grid justify-items-end gap-1">
-                <Chip color={share.online ? "success" : "default"} size="sm" variant={share.online ? "soft" : "tertiary"}>{share.online ? t("common.online") : t("common.offline")}</Chip>
+                <Chip color={share.online ? "success" : share.routeState === "reconnecting" ? "accent" : "default"} size="sm" variant={share.online || share.routeState === "reconnecting" ? "soft" : "tertiary"}>{share.online ? t("common.online") : share.routeState === "reconnecting" ? t("dashboard.reconnecting") : t("common.offline")}</Chip>
                 {share.disabledByMarket ? <Chip color="warning" size="sm" variant="soft">{t("dashboard.disabled")}</Chip> : null}
                 {visibleApps.length ? (
                   <div className="flex gap-1">
@@ -954,7 +955,11 @@ function marketSharePriorityItem(share: MarketShare, app: MarketShareAppKey, t: 
   const parallelFull = !isUnlimited(share.parallelLimit) && Number(share.parallelLimit || 0) > 0 && Number(share.activeRequests || 0) >= Number(share.parallelLimit || 0);
   const reasons = [
     !supported ? t("dashboard.sharePriorityUnsupported") : undefined,
-    !share.online ? t("dashboard.sharePriorityOffline") : undefined,
+    share.routeState === "reconnecting"
+      ? t("dashboard.reason.routeReconnecting")
+      : !share.online
+        ? t("dashboard.sharePriorityOffline")
+        : undefined,
     share.disabledByMarket ? t("dashboard.sharePriorityDisabled") : undefined,
     parallelFull ? t("dashboard.sharePriorityParallelFull") : undefined,
     cooldownStates.length ? t("dashboard.sharePriorityCooldown") : undefined,
