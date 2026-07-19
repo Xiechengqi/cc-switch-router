@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import type { AppLocale } from "@/lib/i18n";
+import type { AppLocale, MessageKey } from "@/lib/i18n";
 import type { DashboardClient, DashboardMarket, HealthCheckEntry, MarketRequestLog, ModelHealthSummary, ShareAppProvider, ShareAppRuntimes, ShareRequestLog, ShareUpstreamProvider, ShareView } from "@/lib/types";
 import { compactTokens, formatDateTime } from "@/lib/utils";
 
@@ -145,6 +145,45 @@ export function latencyResponseToneClass(latencyMs: number | null | undefined) {
   if (seconds < 15) return "text-emerald-700";
   if (seconds < 30) return "text-amber-700";
   return "text-rose-700";
+}
+
+export function parallelOccupancyByUser(
+  share: Pick<ShareView, "activeRequestsByUser">,
+  app?: CoreShareApp | null,
+) {
+  const byApp = share.activeRequestsByUser || {};
+  if (app) return byApp[app] || {};
+  const merged = new Map<string, number>();
+  for (const users of Object.values(byApp)) {
+    for (const [email, count] of Object.entries(users || {})) {
+      if (!count) continue;
+      merged.set(email, (merged.get(email) || 0) + count);
+    }
+  }
+  return Object.fromEntries(merged);
+}
+
+export function parallelOccupancyTitle(
+  share: Pick<ShareView, "activeRequests" | "activeRequestsByApp" | "activeRequestsByUser">,
+  app: CoreShareApp | null | undefined,
+  t: (key: MessageKey, values?: Record<string, string | number>) => string,
+) {
+  const byUser = parallelOccupancyByUser(share, app);
+  const entries = Object.entries(byUser)
+    .filter(([, count]) => count > 0)
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]));
+  const active = app ? share.activeRequestsByApp?.[app] ?? 0 : share.activeRequests ?? 0;
+  if (!entries.length) {
+    if (active > 0) return t("dashboard.parallelOccupancyUnknown");
+    return t("dashboard.parallelOccupancyEmpty");
+  }
+  const lines = entries.map(([email, count]) => `${email}: ${count}`).join("\n");
+  const accounted = entries.reduce((sum, [, count]) => sum + count, 0);
+  const remainder = active - accounted;
+  if (remainder > 0) {
+    return `${lines}\n${t("dashboard.parallelOccupancyUnattributed", { count: remainder })}`;
+  }
+  return lines;
 }
 
 export function formatImageLogTimestamp(value?: number | null) {

@@ -220,6 +220,29 @@ export type DashboardClient = {
 
 export type ShareSaleMarketKind = "token" | "share";
 
+export type ShareTokenPeriod = "lifetime" | "day" | "week" | "calendarMonth";
+
+export type ShareUserPolicy = {
+  parallelLimit?: number;
+  tokenLimit?: number;
+  tokenPeriod: ShareTokenPeriod;
+  expiresAt?: number;
+};
+
+export type ShareUserGrant = {
+  email: string;
+  role: "owner" | "shareto";
+  active: boolean;
+  policy: ShareUserPolicy;
+  usage?: Record<string, unknown>;
+  createdAtMs?: number;
+  updatedAtMs?: number;
+  revokedAtMs?: number;
+  revision?: number;
+};
+
+export type ShareUserGrantMap = Record<string, ShareUserGrant>;
+
 export type ShareView = {
   routerId?: string;
   shareId: string;
@@ -254,6 +277,7 @@ export type ShareView = {
   isOnline: boolean;
   activeRequests: number;
   activeRequestsByApp?: Record<string, number>;
+  activeRequestsByUser?: Record<string, Record<string, number>>;
   tokensUsedByApp?: Record<string, number>;
   requestsCountByApp?: Record<string, number>;
   onlineMinutes24h?: number;
@@ -267,6 +291,8 @@ export type ShareView = {
   appProviders?: ShareAppProviders;
   modelHealth?: ShareModelHealthSummary;
   operationalSummary?: OperationalSummary;
+  userGrants?: ShareUserGrantMap;
+  configRevision?: number;
 };
 
 export type ShareAppAccess = {
@@ -302,6 +328,7 @@ export type ShareSettingsPatch = {
   parallelLimit?: number;
   expiresAt?: string;
   autoStart?: boolean;
+  userGrants?: ShareUserGrantMap;
 };
 
 export type ShareApiAuthResponse = {

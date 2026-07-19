@@ -10,6 +10,7 @@ import {
   averageRecentLatencyMs,
   formatLatencySeconds,
   latencyResponseToneClass,
+  parallelOccupancyTitle,
   modelHealthTitle,
   modelHealthTone,
   providerActualModelNames,
@@ -110,6 +111,7 @@ export const ShareCard = React.memo(function ShareCard({
   const onlineTitle = `${onlineRate.toFixed(1)}% online in last 24h (${share.onlineMinutes24h || 0} / 1440 min)`;
   const expiryLabel = shareExpiryProgress(share, locale);
   const expiryHint = `${formatDateTime(share.createdAt)} / ${expiryTitle(share.expiresAt)}`;
+  const parallelTitle = parallelOccupancyTitle(share, app, t);
   const saleLabel = share.forSale === "No" ? t("dashboard.notListed") : marketCount == null ? t("dashboard.allMarkets") : t("dashboard.marketsCount", { count: marketCount });
   const editPending = share.canManage && share.activeEdit?.status === "pending";
   const editRejected = share.canManage && share.activeEdit?.status === "rejected";
@@ -225,9 +227,9 @@ export const ShareCard = React.memo(function ShareCard({
               <strong className="tabular-nums">{compactTokens(tokensUsed)} / {isUnlimited(tokenLimit) ? "∞" : compactTokens(tokenLimit)}</strong>
               {usagePercent != null ? <div className="mt-1 h-1 overflow-hidden rounded-full bg-slate-100"><div className={`h-full rounded-full ${usagePercent >= 90 ? "bg-rose-500" : "bg-primary/70"}`} style={{ width: `${usagePercent}%` }} /></div> : null}
             </div>
-            <div className="min-w-0">
+            <div className="min-w-0" title={parallelTitle}>
               <span className="block text-muted-foreground">{t("dashboard.parallel")}</span>
-              <strong className="tabular-nums">{activeRequests}<span className="text-muted-foreground">/{isUnlimited(parallelLimit) ? "∞" : parallelLimit || 0}</span></strong>
+              <strong className="cursor-help tabular-nums">{activeRequests}<span className="text-muted-foreground">/{isUnlimited(parallelLimit) ? "∞" : parallelLimit || 0}</span></strong>
             </div>
           </div>
           <div className="grid grid-cols-2 gap-2">

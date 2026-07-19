@@ -65,10 +65,11 @@ use crate::models::{
     ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload, ShareRuntimeRefreshRequest,
     ShareRuntimeSnapshotResponse, ShareSettingsPatch, ShareSettingsUpdateResponse, ShareSignals,
     ShareSupport, ShareSyncRequest, ShareUpstreamProvider, ShareUpstreamQuota,
-    ShareUsageByEmailResponse, ShareUsageDailyBucket, ShareUsageEmailRow, ShareView,
-    SubdomainAvailabilityResponse, TunnelActivateRequest, TunnelLease, TunnelStateRequest,
-    TunnelStateResponse, UserApiTokenResetResponse, UserApiTokenResponse, UserApiTokenStatus,
-    UserShareView, UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    ShareUsageByEmailResponse, ShareUsageDailyBucket, ShareUsageEmailRow, ShareUserGrant,
+    ShareView, SubdomainAvailabilityResponse, TunnelActivateRequest, TunnelLease,
+    TunnelStateRequest, TunnelStateResponse, UserApiTokenResetResponse, UserApiTokenResponse,
+    UserApiTokenStatus, UserShareView, UserSharesResponse, VerifyEmailCodeRequest,
+    VerifyEmailCodeResponse,
 };
 #[cfg(test)]
 use crate::models::{RenewLeasePayload, ShareAppProvider, ShareUpstreamModel};
@@ -4611,10 +4612,7 @@ impl AppStore {
                 .owner_email
                 .as_deref()
                 .is_some_and(|owner| owner.eq_ignore_ascii_case(&email));
-            let shared = share
-                .shared_with_emails
-                .iter()
-                .any(|shared| shared.eq_ignore_ascii_case(&email));
+            let shared = !owner && share_visible_to_email(&share, Some(&email));
             if !owner && !shared {
                 continue;
             }
@@ -4623,12 +4621,25 @@ impl AppStore {
                 .get(&share.share_id)
                 .copied()
                 .unwrap_or_default();
+            let user_grants = if owner {
+                share.user_grants.clone()
+            } else {
+                share
+                    .user_grants
+                    .get(&email)
+                    .map(|grant| BTreeMap::from([(email.clone(), grant.clone())]))
+                    .unwrap_or_default()
+            };
             shares.push(UserShareView {
                 router_id: "main".to_string(),
                 share_id: share.share_id.clone(),
                 share_name: share.share_name.clone(),
                 owner_email: share.owner_email.clone(),
-                shared_with_emails: share.shared_with_emails.clone(),
+                shared_with_emails: if owner {
+                    share.shared_with_emails.clone()
+                } else {
+                    vec![email.clone()]
+                },
                 role,
                 can_invoke: true,
                 can_manage: owner,
@@ -4649,7 +4660,11 @@ impl AppStore {
                 expires_at: share.expires_at.clone(),
                 is_online: active_subdomains.contains(&share.subdomain),
                 active_requests,
-                active_edit: active_edits.get(&share.share_id).cloned(),
+                active_edit: owner
+                    .then(|| active_edits.get(&share.share_id).cloned())
+                    .flatten(),
+                user_grants,
+                config_revision: share.config_revision,
             });
         }
         Ok(UserSharesResponse { shares })
@@ -4678,22 +4693,40 @@ impl AppStore {
         let is_online =
             share.share_status == "active" && active_subdomains.contains(&share.subdomain);
         let active_requests = inflight_by_share.get(&share.share_id).copied().unwrap_or(0);
+        let visible_user_grants = if can_manage {
+            share.user_grants.clone()
+        } else {
+            viewer_email
+                .and_then(|email| normalize_email(email).ok())
+                .and_then(|email| {
+                    share
+                        .user_grants
+                        .get(&email)
+                        .map(|grant| BTreeMap::from([(email, grant.clone())]))
+                })
+                .unwrap_or_default()
+        };
         let mut view = ShareView {
             router_id: "main".to_string(),
             share_id: share.share_id,
             share_name: share.share_name,
             owner_email: share.owner_email,
-            shared_with_emails: if can_view_share {
+            shared_with_emails: if can_manage {
                 share.shared_with_emails
+            } else if can_view_share {
+                viewer_email
+                    .and_then(|email| normalize_email(email).ok())
+                    .into_iter()
+                    .collect()
             } else {
                 Vec::new()
             },
-            access_by_app: if can_view_share {
+            access_by_app: if can_manage {
                 share.access_by_app
             } else {
                 BTreeMap::new()
             },
-            app_settings: if can_view_share {
+            app_settings: if can_manage {
                 share.app_settings
             } else {
                 BTreeMap::new()
@@ -4709,7 +4742,7 @@ impl AppStore {
             can_view_secret: false,
             can_manage,
             can_edit_settings,
-            active_edit,
+            active_edit: can_manage.then_some(active_edit).flatten(),
             app_type: share.app_type,
             provider_id: share.provider_id,
             bindings: share.bindings,
@@ -4729,6 +4762,7 @@ impl AppStore {
             cleanup_at: None,
             active_requests,
             active_requests_by_app: BTreeMap::new(),
+            active_requests_by_user: BTreeMap::new(),
             tokens_used_by_app: BTreeMap::new(),
             requests_count_by_app: BTreeMap::new(),
             online_minutes_24h: 0,
@@ -4739,6 +4773,8 @@ impl AppStore {
             recent_model_health_checks: Vec::new(),
             model_health: ShareModelHealthSummary::default(),
             operational_summary: OperationalSummary::healthy("online"),
+            user_grants: visible_user_grants,
+            config_revision: share.config_revision,
         };
         view.operational_summary = share_operational_summary(&view, Utc::now());
         Ok(view)
@@ -4752,16 +4788,17 @@ impl AppStore {
     ) -> Result<bool, AppError> {
         let email = normalize_email(user_email)?;
         let conn = self.conn.lock().await;
-        let Some((owner_email, shared_with_emails_json, access_by_app_json, for_sale)): Option<(
-            Option<String>,
-            String,
-            String,
-            String,
-        )> = conn
+        let Some((
+            owner_email,
+            shared_with_emails_json,
+            access_by_app_json,
+            app_settings_json,
+            for_sale,
+        )): Option<(Option<String>, String, String, String, String)> = conn
             .query_row(
-                "SELECT owner_email, shared_with_emails_json, COALESCE(access_by_app_json, '{}'), for_sale FROM shares WHERE share_id = ?1",
+                "SELECT owner_email, shared_with_emails_json, COALESCE(access_by_app_json, '{}'), COALESCE(app_settings_json, '{}'), for_sale FROM shares WHERE share_id = ?1",
                 params![share_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .optional()
             .map_err(|e| AppError::Internal(format!("query share invoke acl failed: {e}")))?
@@ -4779,7 +4816,15 @@ impl AppStore {
         }
         let access_by_app: BTreeMap<String, ShareAppAccess> =
             serde_json::from_str(&access_by_app_json).unwrap_or_default();
+        let app_settings: BTreeMap<String, ShareAppSettings> =
+            serde_json::from_str(&app_settings_json).unwrap_or_default();
         if let Some(app_type) = app_type.map(|value| value.trim().to_ascii_lowercase()) {
+            if let Some(settings) = app_settings.get(&app_type) {
+                return Ok(settings
+                    .shared_with_emails
+                    .iter()
+                    .any(|shared| shared.eq_ignore_ascii_case(&email)));
+            }
             if !access_by_app.is_empty() {
                 return Ok(access_by_app.get(&app_type).is_some_and(|access| {
                     access
@@ -6459,6 +6504,17 @@ impl AppStore {
         current_user_email: &str,
         patch: ShareSettingsPatch,
     ) -> Result<ShareSettingsUpdateResponse, AppError> {
+        self.create_share_settings_edit_at_revision(share_id, current_user_email, patch, None)
+            .await
+    }
+
+    pub async fn create_share_settings_edit_at_revision(
+        &self,
+        share_id: &str,
+        current_user_email: &str,
+        patch: ShareSettingsPatch,
+        base_config_revision: Option<u64>,
+    ) -> Result<ShareSettingsUpdateResponse, AppError> {
         let current_user_email = normalize_email(current_user_email)?;
         let now = Utc::now();
         let conn = self.conn.lock().await;
@@ -6469,6 +6525,7 @@ impl AppStore {
             current_for_sale,
             current_sale_market_kind,
             current_app_type,
+            current_config_revision,
         ): (
             String,
             String,
@@ -6476,15 +6533,21 @@ impl AppStore {
             String,
             String,
             String,
+            i64,
         ) = conn
             .query_row(
-                "SELECT installation_id, owner_email, shared_with_emails_json, for_sale, sale_market_kind, app_type FROM shares WHERE share_id = ?1",
+                "SELECT installation_id, owner_email, shared_with_emails_json, for_sale, sale_market_kind, app_type, config_revision FROM shares WHERE share_id = ?1",
                 params![share_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
             )
             .optional()
             .map_err(|e| AppError::Internal(format!("query share owner failed: {e}")))?
             .ok_or_else(|| AppError::NotFound("share not found".into()))?;
+        if base_config_revision.is_some_and(|base| base != current_config_revision.max(0) as u64) {
+            return Err(AppError::Conflict(
+                "share settings changed after this editor was opened; reload and try again".into(),
+            ));
+        }
         let owner_email = normalize_email(&owner_email)?;
         let shared_with_emails = parse_string_vec(Some(shared_with_emails_json))
             .map_err(|e| AppError::Internal(format!("parse share acl failed: {e}")))?;
@@ -6902,6 +6965,7 @@ impl AppStore {
             .collect::<HashSet<_>>();
         let inflight_by_share = proxy.inflight_by_share().await;
         let inflight_by_share_app = proxy.inflight_by_share_app().await;
+        let inflight_by_share_user = proxy.inflight_by_share_user().await;
         let inflight_by_market_email = proxy.inflight_by_market_email().await;
         let now = Utc::now();
         let (health_timeline_start, _) = health_timeline_window(now);
@@ -7083,6 +7147,10 @@ impl AppStore {
                     .get(&share.share_id)
                     .cloned()
                     .unwrap_or_default();
+                let active_requests_by_user = inflight_by_share_user
+                    .get(&share.share_id)
+                    .cloned()
+                    .unwrap_or_default();
                 let (tokens_used_by_app, requests_count_by_app) = share_usage_by_app
                     .get(&share.share_id)
                     .cloned()
@@ -7159,22 +7227,40 @@ impl AppStore {
                     .get(&share.share_id)
                     .cloned()
                     .unwrap_or_default();
+                let visible_user_grants = if can_manage {
+                    share.user_grants.clone()
+                } else {
+                    viewer_email
+                        .and_then(|email| normalize_email(email).ok())
+                        .and_then(|email| {
+                            share
+                                .user_grants
+                                .get(&email)
+                                .map(|grant| BTreeMap::from([(email, grant.clone())]))
+                        })
+                        .unwrap_or_default()
+                };
                 let mut view = ShareView {
                     router_id: "main".to_string(),
                     share_id: share.share_id,
                     share_name: share.share_name,
                     owner_email: share.owner_email,
-                    shared_with_emails: if can_view_share {
+                    shared_with_emails: if can_manage {
                         share.shared_with_emails
+                    } else if can_view_share {
+                        viewer_email
+                            .and_then(|email| normalize_email(email).ok())
+                            .into_iter()
+                            .collect()
                     } else {
                         Vec::new()
                     },
-                    access_by_app: if can_view_share {
+                    access_by_app: if can_manage {
                         share.access_by_app
                     } else {
                         BTreeMap::new()
                     },
-                    app_settings: if can_view_share {
+                    app_settings: if can_manage {
                         share.app_settings
                     } else {
                         BTreeMap::new()
@@ -7192,7 +7278,7 @@ impl AppStore {
                     can_view_secret,
                     can_manage,
                     can_edit_settings,
-                    active_edit,
+                    active_edit: can_manage.then_some(active_edit).flatten(),
                     provider_id: share.provider_id,
                     bindings: share.bindings,
                     token_limit: share.token_limit,
@@ -7213,6 +7299,7 @@ impl AppStore {
                         .flatten(),
                     active_requests,
                     active_requests_by_app,
+                    active_requests_by_user,
                     tokens_used_by_app,
                     requests_count_by_app,
                     online_minutes_24h,
@@ -7223,6 +7310,8 @@ impl AppStore {
                     recent_model_health_checks,
                     model_health,
                     operational_summary: OperationalSummary::healthy("online"),
+                    user_grants: visible_user_grants,
+                    config_revision: share.config_revision,
                 };
                 view.operational_summary = share_operational_summary(&view, Utc::now());
                 view
@@ -10785,6 +10874,8 @@ fn upsert_share_tx(
         .map_err(|e| AppError::Internal(format!("serialize upstream provider failed: {e}")))?;
     let shared_with_emails_json = serde_json::to_string(&share.shared_with_emails)
         .map_err(|e| AppError::Internal(format!("serialize shared_with_emails failed: {e}")))?;
+    let user_grants_json = serde_json::to_string(&share.user_grants)
+        .map_err(|e| AppError::Internal(format!("serialize user_grants failed: {e}")))?;
     let access_by_app_json = serde_json::to_string(&share.access_by_app)
         .map_err(|e| AppError::Internal(format!("serialize access_by_app failed: {e}")))?;
     let app_settings = effective_share_app_settings(&share);
@@ -10806,8 +10897,8 @@ fn upsert_share_tx(
         "INSERT INTO shares (
             share_id, installation_id, share_name, owner_email, shared_with_emails_json, market_access_mode, access_by_app_json, app_settings_json, description, for_sale, sale_market_kind, subdomain, app_type, provider_id,
             enabled_claude, enabled_codex, enabled_gemini,
-            token_limit, parallel_limit, tokens_used, requests_count, share_status, created_at, expires_at, upstream_provider_json, app_runtimes_json, app_providers_json, bindings_json, config_revision, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)
+            token_limit, parallel_limit, tokens_used, requests_count, share_status, created_at, expires_at, upstream_provider_json, app_runtimes_json, app_providers_json, bindings_json, config_revision, user_grants_json, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)
         ON CONFLICT(share_id) DO UPDATE SET
             installation_id = excluded.installation_id,
             share_name = excluded.share_name,
@@ -10837,6 +10928,7 @@ fn upsert_share_tx(
             app_providers_json = excluded.app_providers_json,
             bindings_json = excluded.bindings_json,
             config_revision = excluded.config_revision,
+            user_grants_json = excluded.user_grants_json,
             runtime_refreshed_at = shares.runtime_refreshed_at,
             updated_at = excluded.updated_at
         WHERE excluded.config_revision >= shares.config_revision",
@@ -10870,6 +10962,7 @@ fn upsert_share_tx(
             app_providers_json,
             bindings_json,
             i64::try_from(share.config_revision).unwrap_or(i64::MAX),
+            user_grants_json,
             Utc::now().to_rfc3339(),
         ],
     )
@@ -11686,6 +11779,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             app_providers_json TEXT,
             -- Share 的单一 app/provider 绑定快照（JSON: {app_type: provider_id}）。
             bindings_json TEXT,
+            user_grants_json TEXT NOT NULL DEFAULT '{}',
             runtime_refreshed_at TEXT,
             config_revision INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT NOT NULL
@@ -12616,6 +12710,13 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         .map_err(|e| {
             AppError::Internal(format!("add shares shared_with_emails_json failed: {e}"))
         })?;
+    }
+    if !columns.iter().any(|name| name == "user_grants_json") {
+        conn.execute(
+            "ALTER TABLE shares ADD COLUMN user_grants_json TEXT NOT NULL DEFAULT '{}'",
+            [],
+        )
+        .map_err(|e| AppError::Internal(format!("add shares user_grants_json failed: {e}")))?;
     }
     if !columns.iter().any(|name| name == "market_access_mode") {
         conn.execute(
@@ -15782,7 +15883,7 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                     s.owner_email, s.shared_with_emails_json,
                     s.enabled_claude, s.enabled_codex, s.enabled_gemini,
                     s.token_limit, s.parallel_limit, s.tokens_used, s.requests_count, s.share_status, s.created_at, s.expires_at, s.upstream_provider_json, s.app_runtimes_json, s.app_providers_json,
-                    s.bindings_json, s.config_revision
+                    s.bindings_json, s.config_revision, COALESCE(s.user_grants_json, '{}')
              FROM shares s
              ORDER BY s.share_name ASC",
         )
@@ -15827,6 +15928,7 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                     model_health: ShareModelHealthSummary::default(),
                     auto_start: false,
                     config_revision: row.get::<_, i64>(28)?.max(0) as u64,
+                    user_grants: parse_share_user_grants(row.get(29)?)?,
                 },
             ))
         })
@@ -15970,6 +16072,7 @@ fn share_settings_patch_is_empty(patch: &ShareSettingsPatch) -> bool {
         && patch.parallel_limit.is_none()
         && patch.expires_at.is_none()
         && patch.auto_start.is_none()
+        && patch.user_grants.is_none()
 }
 
 /// Verifies that the descriptor the client reported back through the control
@@ -15999,12 +16102,12 @@ fn validate_returned_share_against_patch(
             .iter()
             .filter_map(|value| normalize_email(value).ok())
             .collect();
-        for email in list {
-            if let Ok(normalized) = normalize_email(email) {
-                if !got.contains(&normalized) {
-                    return Err("sharedWithEmails");
-                }
-            }
+        let expected = list
+            .iter()
+            .filter_map(|value| normalize_email(value).ok())
+            .collect::<HashSet<_>>();
+        if got != expected {
+            return Err("sharedWithEmails");
         }
     }
     if let Some(access_by_app) = patch.access_by_app.as_ref() {
@@ -16018,12 +16121,13 @@ fn validate_returned_share_against_patch(
                 .iter()
                 .filter_map(|value| normalize_email(value).ok())
                 .collect();
-            for email in &access.shared_with_emails {
-                if let Ok(normalized) = normalize_email(email) {
-                    if !got_emails.contains(&normalized) {
-                        return Err("accessByApp");
-                    }
-                }
+            let expected_emails = access
+                .shared_with_emails
+                .iter()
+                .filter_map(|value| normalize_email(value).ok())
+                .collect::<HashSet<_>>();
+            if got_emails != expected_emails {
+                return Err("accessByApp");
             }
         }
     }
@@ -16043,12 +16147,13 @@ fn validate_returned_share_against_patch(
                 .iter()
                 .filter_map(|value| normalize_email(value).ok())
                 .collect();
-            for email in &setting.shared_with_emails {
-                if let Ok(normalized) = normalize_email(email) {
-                    if !got_emails.contains(&normalized) {
-                        return Err("appSettings");
-                    }
-                }
+            let expected_emails = setting
+                .shared_with_emails
+                .iter()
+                .filter_map(|value| normalize_email(value).ok())
+                .collect::<HashSet<_>>();
+            if got_emails != expected_emails {
+                return Err("appSettings");
             }
             if !setting.expires_at.is_empty() {
                 let matches = match (
@@ -16118,7 +16223,82 @@ fn validate_returned_share_against_patch(
             return Err("autoStart");
         }
     }
+    if let Some(user_grants) = patch.user_grants.as_ref() {
+        let expected_active = user_grants
+            .iter()
+            .filter(|(_, grant)| grant.active)
+            .map(|(email, _)| email.as_str())
+            .collect::<HashSet<_>>();
+        let returned_active = share
+            .user_grants
+            .iter()
+            .filter(|(_, grant)| grant.active)
+            .map(|(email, _)| email.as_str())
+            .collect::<HashSet<_>>();
+        if expected_active != returned_active {
+            return Err("userGrants");
+        }
+        for (email, expected) in user_grants.iter().filter(|(_, grant)| grant.active) {
+            let Some(returned) = share.user_grants.get(email).filter(|grant| grant.active) else {
+                return Err("userGrants");
+            };
+            if returned.email != expected.email
+                || returned.role != expected.role
+                || returned.policy != expected.policy
+            {
+                return Err("userGrants");
+            }
+        }
+    }
     Ok(())
+}
+
+fn normalize_share_user_grants(
+    grants: BTreeMap<String, ShareUserGrant>,
+    owner_email: &str,
+) -> Result<BTreeMap<String, ShareUserGrant>, AppError> {
+    let mut normalized = BTreeMap::new();
+    for (key, mut grant) in grants {
+        if !grant.active {
+            continue;
+        }
+        let source_email = if grant.email.trim().is_empty() {
+            key.as_str()
+        } else {
+            grant.email.as_str()
+        };
+        let email = normalize_email(source_email)?;
+        if grant.policy.parallel_limit == Some(0) || grant.policy.token_limit == Some(0) {
+            return Err(AppError::BadRequest(
+                "user limits must be positive or unlimited".into(),
+            ));
+        }
+        grant.email = email.clone();
+        grant.role = if email == owner_email {
+            "owner".to_string()
+        } else {
+            "shareto".to_string()
+        };
+        grant.active = true;
+        grant.usage = Default::default();
+        grant.created_at_ms = 0;
+        grant.updated_at_ms = 0;
+        grant.revoked_at_ms = None;
+        grant.revision = 0;
+        if normalized.insert(email, grant).is_some() {
+            return Err(AppError::BadRequest("duplicate ShareTo email".into()));
+        }
+    }
+    if !owner_email.is_empty()
+        && !normalized
+            .get(owner_email)
+            .is_some_and(|grant| grant.role == "owner")
+    {
+        return Err(AppError::BadRequest(
+            "userGrants must include the share owner".into(),
+        ));
+    }
+    Ok(normalized)
 }
 
 fn normalize_share_settings_patch(
@@ -16238,6 +16418,10 @@ fn normalize_share_settings_patch(
         Some(values) => Some(normalize_share_app_settings(values, effective_owner_email)?),
         None => None,
     };
+    let user_grants = match patch.user_grants {
+        Some(values) => Some(normalize_share_user_grants(values, effective_owner_email)?),
+        None => None,
+    };
     let mut pricing = match patch.for_sale_official_price_percent_by_app {
         Some(values) => {
             let mut normalized = BTreeMap::new();
@@ -16323,6 +16507,7 @@ fn normalize_share_settings_patch(
         parallel_limit: patch.parallel_limit,
         expires_at: patch.expires_at,
         auto_start: patch.auto_start,
+        user_grants,
     })
 }
 
@@ -16582,6 +16767,20 @@ fn parse_share_access_by_app(
 fn parse_share_app_settings(
     value: Option<String>,
 ) -> Result<BTreeMap<String, ShareAppSettings>, rusqlite::Error> {
+    let Some(value) = value else {
+        return Ok(BTreeMap::new());
+    };
+    if value.trim().is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    serde_json::from_str(&value).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+    })
+}
+
+fn parse_share_user_grants(
+    value: Option<String>,
+) -> Result<BTreeMap<String, ShareUserGrant>, rusqlite::Error> {
     let Some(value) = value else {
         return Ok(BTreeMap::new());
     };
@@ -22652,6 +22851,12 @@ fn share_visible_to_email(share: &ShareDescriptor, viewer_email: Option<&str>) -
                 .iter()
                 .any(|email| email == viewer_email)
         })
+        || share.app_settings.values().any(|settings| {
+            settings
+                .shared_with_emails
+                .iter()
+                .any(|email| email == viewer_email)
+        })
 }
 
 fn can_manage_share(share: &ShareDescriptor, viewer_email: Option<&str>) -> bool {
@@ -22665,6 +22870,9 @@ fn share_acl_emails(share: &ShareDescriptor) -> Vec<String> {
     let mut emails = share.shared_with_emails.clone();
     for access in share.access_by_app.values() {
         emails.extend(access.shared_with_emails.iter().cloned());
+    }
+    for settings in share.app_settings.values() {
+        emails.extend(settings.shared_with_emails.iter().cloned());
     }
     emails.sort();
     emails.dedup();
@@ -23718,6 +23926,37 @@ mod tests {
                 .expect("legacy denied with app acl")
         );
 
+        {
+            let app_settings = BTreeMap::from([(
+                "codex".to_string(),
+                ShareAppSettings {
+                    shared_with_emails: vec!["buyer@example.com".to_string()],
+                    ..ShareAppSettings::default()
+                },
+            )]);
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET app_settings_json = ?2 WHERE share_id = ?1",
+                params![
+                    "share-app-acl",
+                    serde_json::to_string(&app_settings).expect("serialize app settings")
+                ],
+            )
+            .expect("set app settings acl");
+        }
+        assert!(
+            store
+                .user_can_invoke_share("buyer@example.com", "share-app-acl", Some("codex"))
+                .await
+                .expect("app settings grant")
+        );
+        assert!(
+            !store
+                .user_can_invoke_share("codex@example.com", "share-app-acl", Some("codex"))
+                .await
+                .expect("app settings override accessByApp")
+        );
+
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 
@@ -23961,7 +24200,200 @@ mod tests {
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
             config_revision: 0,
+            user_grants: BTreeMap::new(),
         }
+    }
+
+    fn test_share_user_grant(email: &str, role: &str, token_limit: u64) -> ShareUserGrant {
+        ShareUserGrant {
+            email: email.to_string(),
+            role: role.to_string(),
+            active: true,
+            policy: crate::models::ShareUserPolicy {
+                parallel_limit: Some(2),
+                token_limit: Some(token_limit),
+                token_period: crate::models::ShareTokenPeriod::Day,
+                expires_at: Some(1_900_000_000_000),
+            },
+            usage: crate::models::ShareUserUsage {
+                lifetime: crate::models::ShareUserUsageBucket {
+                    started_at_ms: 0,
+                    tokens_used: 123,
+                    requests_count: 4,
+                },
+                ..Default::default()
+            },
+            created_at_ms: 10,
+            updated_at_ms: 20,
+            revoked_at_ms: None,
+            revision: 3,
+        }
+    }
+
+    #[test]
+    fn share_settings_patch_normalizes_user_grants_as_untrusted_input() {
+        let owner = test_share_user_grant("OWNER@example.com", "shareto", 1000);
+        let user = test_share_user_grant("User@example.com", "owner", 500);
+        let normalized = normalize_share_settings_patch(
+            ShareSettingsPatch {
+                user_grants: Some(BTreeMap::from([
+                    ("OWNER@example.com".to_string(), owner),
+                    ("User@example.com".to_string(), user),
+                ])),
+                ..Default::default()
+            },
+            Some("owner@example.com"),
+            Some(&[]),
+            Some("No"),
+            Some("token"),
+            Some("codex"),
+        )
+        .expect("normalize user grants");
+        let grants = normalized.user_grants.expect("normalized grants");
+        let owner = &grants["owner@example.com"];
+        let user = &grants["user@example.com"];
+
+        assert_eq!(owner.role, "owner");
+        assert_eq!(user.role, "shareto");
+        for grant in [owner, user] {
+            assert_eq!(grant.usage, Default::default());
+            assert_eq!(grant.created_at_ms, 0);
+            assert_eq!(grant.updated_at_ms, 0);
+            assert_eq!(grant.revision, 0);
+        }
+    }
+
+    #[test]
+    fn returned_descriptor_must_exactly_apply_acl_and_user_grants() {
+        let owner = test_share_user_grant("owner@example.com", "owner", 1000);
+        let user = test_share_user_grant("user@example.com", "shareto", 500);
+        let expected_grants = BTreeMap::from([
+            (owner.email.clone(), owner.clone()),
+            (user.email.clone(), user.clone()),
+        ]);
+        let patch = ShareSettingsPatch {
+            shared_with_emails: Some(Vec::new()),
+            app_settings: Some(BTreeMap::from([(
+                "codex".to_string(),
+                ShareAppSettings::default(),
+            )])),
+            user_grants: Some(expected_grants.clone()),
+            ..Default::default()
+        };
+        let mut returned = test_share_descriptor("exact-patch", "exact-patch-sub");
+        returned
+            .app_settings
+            .insert("codex".to_string(), ShareAppSettings::default());
+        returned.user_grants = expected_grants;
+
+        assert!(validate_returned_share_against_patch(&patch, &returned).is_ok());
+
+        returned.shared_with_emails = vec!["stale@example.com".to_string()];
+        assert_eq!(
+            validate_returned_share_against_patch(&patch, &returned),
+            Err("sharedWithEmails")
+        );
+        returned.shared_with_emails.clear();
+        returned
+            .app_settings
+            .get_mut("codex")
+            .unwrap()
+            .shared_with_emails = vec!["stale@example.com".to_string()];
+        assert_eq!(
+            validate_returned_share_against_patch(&patch, &returned),
+            Err("appSettings")
+        );
+        returned
+            .app_settings
+            .get_mut("codex")
+            .unwrap()
+            .shared_with_emails
+            .clear();
+        returned.user_grants.remove("user@example.com");
+        assert_eq!(
+            validate_returned_share_against_patch(&patch, &returned),
+            Err("userGrants")
+        );
+        returned
+            .user_grants
+            .insert("user@example.com".to_string(), user.clone());
+        returned
+            .user_grants
+            .get_mut("user@example.com")
+            .unwrap()
+            .policy
+            .token_limit = Some(999);
+        assert_eq!(
+            validate_returned_share_against_patch(&patch, &returned),
+            Err("userGrants")
+        );
+    }
+
+    #[tokio::test]
+    async fn app_scoped_shareto_list_only_exposes_viewers_user_grant() {
+        let (store, config) = setup_store("app-shareto-private-grant").await;
+        insert_installation(&store, "inst-private-grant").await;
+        insert_share(
+            &store,
+            "inst-private-grant",
+            "share-private-grant",
+            "private-grant-sub",
+            "active",
+        )
+        .await;
+        let app_settings = BTreeMap::from([(
+            "codex".to_string(),
+            ShareAppSettings {
+                shared_with_emails: vec!["viewer@example.com".to_string()],
+                ..ShareAppSettings::default()
+            },
+        )]);
+        let grants = BTreeMap::from([
+            (
+                "owner@example.com".to_string(),
+                test_share_user_grant("owner@example.com", "owner", 1000),
+            ),
+            (
+                "viewer@example.com".to_string(),
+                test_share_user_grant("viewer@example.com", "shareto", 500),
+            ),
+            (
+                "other@example.com".to_string(),
+                test_share_user_grant("other@example.com", "shareto", 200),
+            ),
+        ]);
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET app_settings_json = ?2, user_grants_json = ?3 WHERE share_id = ?1",
+                params![
+                    "share-private-grant",
+                    serde_json::to_string(&app_settings).expect("app settings json"),
+                    serde_json::to_string(&grants).expect("user grants json"),
+                ],
+            )
+            .expect("set private grant fixture");
+        }
+
+        let response = store
+            .list_user_shares(
+                &config,
+                "viewer@example.com",
+                &HashSet::new(),
+                &HashMap::new(),
+            )
+            .await
+            .expect("list app-scoped shareto shares");
+        assert_eq!(response.shares.len(), 1);
+        let share = &response.shares[0];
+        assert_eq!(share.shared_with_emails, vec!["viewer@example.com"]);
+        assert_eq!(
+            share.user_grants.keys().cloned().collect::<Vec<_>>(),
+            vec!["viewer@example.com"]
+        );
+        assert!(share.active_edit.is_none());
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
 
     #[test]
@@ -32128,6 +32560,7 @@ mod tests {
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
             config_revision: 0,
+            user_grants: BTreeMap::new(),
         };
         let timestamp_ms = Utc::now().timestamp_millis();
         let nonce = Uuid::new_v4().to_string();
@@ -32208,6 +32641,7 @@ mod tests {
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
             config_revision: 0,
+            user_grants: BTreeMap::new(),
         };
 
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -33000,6 +33434,7 @@ mod tests {
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
             config_revision: 0,
+            user_grants: BTreeMap::new(),
         };
         let claim = share_claim_payload(&share);
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -33086,6 +33521,7 @@ mod tests {
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
             config_revision: 0,
+            user_grants: BTreeMap::new(),
         };
         let claim = ShareClaimPayload {
             subdomain: "other-sub".into(),
@@ -33172,6 +33608,7 @@ mod tests {
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
             config_revision: 0,
+            user_grants: BTreeMap::new(),
         };
 
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -33295,6 +33732,7 @@ mod tests {
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
             config_revision: 0,
+            user_grants: BTreeMap::new(),
         };
 
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -33383,6 +33821,7 @@ mod tests {
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
             config_revision: 0,
+            user_grants: BTreeMap::new(),
         };
 
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -33495,6 +33934,7 @@ mod tests {
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
             config_revision: 0,
+            user_grants: BTreeMap::new(),
         };
         let ops = vec![ShareSyncOperation {
             kind: "upsert".into(),

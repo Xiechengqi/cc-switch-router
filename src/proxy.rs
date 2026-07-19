@@ -241,6 +241,7 @@ struct KeyedConcurrencyPermit {
 struct ShareConcurrencyPermit {
     _share: KeyedConcurrencyPermit,
     _app: Option<KeyedConcurrencyPermit>,
+    _user: Option<KeyedConcurrencyPermit>,
 }
 
 impl Drop for KeyedConcurrencyPermit {
@@ -425,6 +426,7 @@ pub struct ProxyRegistry {
     health_probe_failures: Mutex<HashMap<String, Instant>>,
     share_limiter: Arc<KeyedConcurrencyLimiter>,
     share_app_limiter: Arc<KeyedConcurrencyLimiter>,
+    share_user_inflight: Arc<KeyedConcurrencyLimiter>,
     free_share_ip_limiter: Arc<KeyedConcurrencyLimiter>,
     image_limiter: Arc<KeyedConcurrencyLimiter>,
     /// Tracks requests that actually traversed the market proxy path, keyed by
@@ -1013,6 +1015,34 @@ impl ProxyRegistry {
         result
     }
 
+    /// Snapshot of in-flight request counts per share, app, and user email.
+    /// Keys are `{share_id}:{app}:{email}`; unknown app is stored as `_`.
+    pub async fn inflight_by_share_user(
+        &self,
+    ) -> HashMap<String, BTreeMap<String, BTreeMap<String, usize>>> {
+        let snapshot = self.share_user_inflight.snapshot().await;
+        let mut result = HashMap::<String, BTreeMap<String, BTreeMap<String, usize>>>::new();
+        for (key, count) in snapshot {
+            let mut parts = key.splitn(3, ':');
+            let Some(share_id) = parts.next() else {
+                continue;
+            };
+            let Some(app) = parts.next() else {
+                continue;
+            };
+            let Some(user) = parts.next() else {
+                continue;
+            };
+            result
+                .entry(share_id.to_string())
+                .or_default()
+                .entry(app.to_string())
+                .or_default()
+                .insert(user.to_string(), count);
+        }
+        result
+    }
+
     /// Snapshot of in-flight request counts per market email (lowercased).
     /// Only requests that came through the market proxy handler are counted —
     /// direct share-subdomain traffic is not.
@@ -1041,7 +1071,10 @@ impl ProxyRegistry {
     #[cfg(test)]
     pub async fn set_share_inflight_for_test(&self, share_id: &str, count: usize) {
         for _ in 0..count {
-            if let Some(permit) = self.try_acquire_share_permit(share_id, None, -1).await {
+            if let Some(permit) = self
+                .try_acquire_share_permit(share_id, None, -1, None)
+                .await
+            {
                 std::mem::forget(permit);
             }
         }
@@ -1065,6 +1098,7 @@ impl ProxyRegistry {
         share_id: &str,
         app_type: Option<&str>,
         parallel_limit: i64,
+        user_email: Option<&str>,
     ) -> Option<ShareConcurrencyPermit> {
         let share = self
             .share_limiter
@@ -1074,16 +1108,25 @@ impl ProxyRegistry {
             .map(str::trim)
             .map(str::to_ascii_lowercase)
             .filter(|value| matches!(value.as_str(), "claude" | "codex" | "gemini"));
-        let app = match app {
+        let app_permit = match app.as_deref() {
             Some(app) => {
                 let key = format!("{share_id}:{app}");
                 self.share_app_limiter.try_acquire(&key, -1).await
             }
             None => None,
         };
+        let user = match user_email.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(email) => {
+                let app_key = app.clone().unwrap_or_else(|| "_".to_string());
+                let key = format!("{share_id}:{app_key}:{}", email.to_ascii_lowercase());
+                self.share_user_inflight.try_acquire(&key, -1).await
+            }
+            None => None,
+        };
         Some(ShareConcurrencyPermit {
             _share: share,
-            _app: app,
+            _app: app_permit,
+            _user: user,
         })
     }
 
@@ -1279,7 +1322,12 @@ pub async fn market_proxy_handler(
     let request_app = infer_share_request_app(&path_and_query, &parts.headers);
     let share_permit = match state
         .proxy
-        .try_acquire_share_permit(&share_id, request_app.as_deref(), route.parallel_limit)
+        .try_acquire_share_permit(
+            &share_id,
+            request_app.as_deref(),
+            route.parallel_limit,
+            Some(market_email.as_str()),
+        )
         .await
     {
         Some(permit) => permit,
@@ -1624,7 +1672,12 @@ pub async fn gateway_proxy_handler(
     let request_app = infer_share_request_app(&path_and_query, &parts.headers);
     let share_permit = match state
         .proxy
-        .try_acquire_share_permit(&share_id, request_app.as_deref(), route.parallel_limit)
+        .try_acquire_share_permit(
+            &share_id,
+            request_app.as_deref(),
+            route.parallel_limit,
+            None,
+        )
         .await
     {
         Some(permit) => permit,
@@ -2297,7 +2350,12 @@ pub async fn proxy_handler(
         let request_app = infer_share_request_app(&path, &parts.headers);
         match state
             .proxy
-            .try_acquire_share_permit(share_id, request_app.as_deref(), route.parallel_limit)
+            .try_acquire_share_permit(
+                share_id,
+                request_app.as_deref(),
+                route.parallel_limit,
+                api_user_email.as_deref(),
+            )
             .await
         {
             Some(permit) => Some(permit),

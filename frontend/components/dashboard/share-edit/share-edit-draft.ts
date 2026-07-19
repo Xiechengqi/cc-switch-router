@@ -1,5 +1,12 @@
 import { shareAccessApps, SHARE_APP_LABELS, type CoreShareApp } from "@/lib/share-app";
-import type { DashboardMarket, ShareAccessByApp, ShareSettingsPatch, ShareView } from "@/lib/types";
+import type {
+  DashboardMarket,
+  ShareAccessByApp,
+  ShareSettingsPatch,
+  ShareUserGrantMap,
+  ShareUserPolicy,
+  ShareView,
+} from "@/lib/types";
 import {
   DEFAULT_PARALLEL_LIMIT,
   DEFAULT_TOKEN_LIMIT,
@@ -39,6 +46,8 @@ export type ShareEditDraft = {
   expiresAtInput: string;
   expiresPermanent: boolean;
   priceInputs: Record<PriceApp, string>;
+  userGrantsSupported: boolean;
+  userGrants: ShareUserGrantMap;
 };
 
 export function splitEmails(value: string) {
@@ -152,6 +161,37 @@ export function buildShareEditDraft(
   const parallelLimit = Number.isFinite(share.parallelLimit) ? share.parallelLimit : UNLIMITED_PARALLEL_LIMIT;
   const parallelLimitUnlimited = isUnlimitedParallelLimit(parallelLimit);
   const expiresPermanent = isPermanentExpiryDate(share.expiresAt) || isUnlimitedExpiry(share.expiresAt);
+  const defaultUserPolicy: ShareUserPolicy = {
+    parallelLimit: parallelLimitUnlimited ? undefined : parallelLimit,
+    tokenLimit: tokenLimitUnlimited ? undefined : tokenLimit,
+    tokenPeriod: "lifetime",
+    expiresAt: expiresPermanent ? undefined : new Date(share.expiresAt).getTime(),
+  };
+  const userGrantsSupported = Object.keys(share.userGrants || {}).length > 0;
+  const userGrants: ShareUserGrantMap = { ...(share.userGrants || {}) };
+  const ownerEmail = (share.ownerEmail || "").trim().toLowerCase();
+  if (userGrantsSupported && ownerEmail && !userGrants[ownerEmail]) {
+    userGrants[ownerEmail] = {
+      email: ownerEmail,
+      role: "owner",
+      active: true,
+      policy: { ...defaultUserPolicy },
+    };
+  }
+  const accessEmails = normalizedUniqueEmails(
+    Object.values(accessByApp)
+      .flatMap((access) => access?.sharedWithEmails || []),
+  );
+  for (const email of userGrantsSupported ? accessEmails : []) {
+    if (!userGrants[email]) {
+      userGrants[email] = {
+        email,
+        role: "shareto",
+        active: true,
+        policy: { ...defaultUserPolicy },
+      };
+    }
+  }
 
   const draft: ShareEditDraft = {
     description: share.description || "",
@@ -193,6 +233,8 @@ export function buildShareEditDraft(
     expiresAtInput: expiresPermanent ? "" : toLocalDateTimeValue(share.expiresAt),
     expiresPermanent,
     priceInputs,
+    userGrantsSupported,
+    userGrants,
   };
 
   return draft;
@@ -226,14 +268,23 @@ export function buildShareEditPatch(
   const expiresIso = draft.expiresPermanent ? PERMANENT_EXPIRES_AT_ISO : fromLocalDateTimeValue(draft.expiresAtInput);
   const accessByApp: ShareAccessByApp = {};
   const appSettings: NonNullable<ShareSettingsPatch["appSettings"]> = {};
+  const directShareToEmails = normalizedUniqueEmails(
+    Object.values(draft.shareToEmailsByApp).flat(),
+  );
+  const activeGrantEmails = new Set<string>();
+  const ownerEmail = (share.ownerEmail || "").trim().toLowerCase();
+  if (ownerEmail) activeGrantEmails.add(ownerEmail);
   for (const app of activeShareApps) {
-    const shareToEmails = (draft.shareToEmailsByApp[app] ?? []).filter((email) => !publicMarketEmails.has(email));
+    const shareToEmails = directShareToEmails.filter((email) => !publicMarketEmails.has(email));
     const saleEmails =
       draft.forSale === "Yes" && effectiveSaleMarketKind === "token" && effectiveMarketAccessMode === "selected"
         ? draft.selectedMarketEmails
         : draft.forSale === "Yes" && effectiveSaleMarketKind === "share" && draft.selectedShareMarketEmail
           ? [draft.selectedShareMarketEmail]
           : [];
+    for (const email of [...shareToEmails, ...saleEmails]) {
+      activeGrantEmails.add(email);
+    }
     accessByApp[app] = {
       sharedWithEmails: normalizedUniqueEmails([...shareToEmails, ...saleEmails]),
       marketAccessMode: effectiveMarketAccessMode,
@@ -246,6 +297,26 @@ export function buildShareEditPatch(
       tokenLimit,
       parallelLimit,
       expiresAt: expiresIso || share.expiresAt,
+    };
+  }
+  const defaultUserPolicy: ShareUserPolicy = {
+    parallelLimit: parallelLimit >= 0 ? parallelLimit : undefined,
+    tokenLimit: tokenLimit >= 0 ? tokenLimit : undefined,
+    tokenPeriod: "lifetime",
+    expiresAt:
+      !draft.expiresPermanent && expiresIso
+        ? new Date(expiresIso).getTime()
+        : undefined,
+  };
+  const userGrants: ShareUserGrantMap = {};
+  for (const email of activeGrantEmails) {
+    const previous = draft.userGrants[email];
+    userGrants[email] = {
+      ...previous,
+      email,
+      role: email === ownerEmail ? "owner" : "shareto",
+      active: true,
+      policy: previous?.policy ?? { ...defaultUserPolicy },
     };
   }
   const patch: ShareSettingsPatch = {
@@ -262,6 +333,7 @@ export function buildShareEditPatch(
     parallelLimit,
     forSaleOfficialPricePercentByApp: buildShareEditPricingPayload(draft, share),
   };
+  if (draft.userGrantsSupported) patch.userGrants = userGrants;
   if (expiresIso) patch.expiresAt = expiresIso;
   return patch;
 }

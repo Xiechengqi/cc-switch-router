@@ -26,6 +26,7 @@ import {
 import { ShareEditMarketFields } from "./share-edit-market-fields";
 import { EmailTagsField, FieldGroup } from "./share-edit-shared";
 import { ShareEditSection } from "./share-edit-section";
+import { ShareUserGrantsEditor } from "./share-user-grants-editor";
 
 export type ShareEditFormApi = {
   draft: ShareEditDraft;
@@ -318,7 +319,11 @@ export function useShareEditForm({
     setError("");
     setNotice("");
     try {
-      const res = await updateShareSettings(share.shareId, currentPatch);
+      const res = await updateShareSettings(
+        share.shareId,
+        currentPatch,
+        share.configRevision,
+      );
       await onSaved({ appliedSynchronously: res.appliedSynchronously });
       if (res.appliedSynchronously) {
         onClose();
@@ -373,7 +378,7 @@ export function useShareEditForm({
         accessByApp,
         saleMarketKind: effectiveSaleMarketKind,
         marketAccessMode: effectiveMarketAccessMode,
-      });
+      }, share.configRevision);
       await onSaved({ appliedSynchronously: res.appliedSynchronously });
       setTransferTargetEmail("");
       if (res.appliedSynchronously) {
@@ -441,6 +446,18 @@ export function ShareEditFormBody({
   if (!shareApp) {
     return <EmptyBlock>{t("dashboard.shareEditNoAppType")}</EmptyBlock>;
   }
+  const defaultUserPolicy = {
+    parallelLimit: draft.parallelLimitUnlimited
+      ? undefined
+      : Number.parseInt(draft.parallelLimitInput, 10),
+    tokenLimit: draft.tokenLimitUnlimited
+      ? undefined
+      : Number.parseInt(draft.tokenLimitInput, 10),
+    tokenPeriod: "lifetime" as const,
+    expiresAt: draft.expiresPermanent
+      ? undefined
+      : new Date(draft.expiresAtInput).getTime(),
+  };
 
   return (
     <>
@@ -463,21 +480,26 @@ export function ShareEditFormBody({
       />
 
       <ShareEditSection title={t("dashboard.shareEdit.section.access")}>
-        <FieldGroup label={t("dashboard.field.sharedWith")} hint={t("dashboard.hint.sharedWith")}>
-          <EmailTagsField
-            value={draft.shareToEmailsByApp[shareApp] ?? []}
-            placeholder="friend@example.com, teammate@example.com"
-            onChange={(emails) =>
-              form.onDraftChange((current) => ({
-                ...current,
-                shareToEmailsByApp: { ...current.shareToEmailsByApp, [shareApp]: emails },
-              }))
-            }
-            onPromote={(email) => form.setTransferTargetEmail(email)}
-            promotableEmails={form.transferableShareEmails}
-            promoteLabel={t("dashboard.setAsOwner")}
-          />
-        </FieldGroup>
+        {!draft.userGrantsSupported ? (
+          <FieldGroup label={t("dashboard.field.sharedWith")} hint={t("dashboard.hint.sharedWith")}>
+            <EmailTagsField
+              value={draft.shareToEmailsByApp[shareApp] ?? []}
+              placeholder="friend@example.com, teammate@example.com"
+              onChange={(emails) =>
+                form.onDraftChange((current) => ({
+                  ...current,
+                  shareToEmailsByApp: {
+                    ...current.shareToEmailsByApp,
+                    [shareApp]: emails,
+                  },
+                }))
+              }
+              onPromote={(email) => form.setTransferTargetEmail(email)}
+              promotableEmails={form.transferableShareEmails}
+              promoteLabel={t("dashboard.setAsOwner")}
+            />
+          </FieldGroup>
+        ) : null}
 
         <div className="grid gap-3 md:grid-cols-3">
           <FieldGroup label={t("dashboard.field.tokenLimit")} invalid={form.tokenInvalid}>
@@ -576,6 +598,17 @@ export function ShareEditFormBody({
             </div>
           </FieldGroup>
         </div>
+
+        {draft.userGrantsSupported ? (
+          <ShareUserGrantsEditor
+            draft={draft}
+            shareApp={shareApp}
+            ownerEmail={share.ownerEmail || ""}
+            defaultPolicy={defaultUserPolicy}
+            t={t}
+            onDraftChange={form.onDraftChange}
+          />
+        ) : null}
       </ShareEditSection>
     </>
   );

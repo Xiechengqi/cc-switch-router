@@ -326,6 +326,10 @@ pub struct UserShareView {
     pub active_requests: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_edit: Option<ShareEditView>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub user_grants: BTreeMap<String, ShareUserGrant>,
+    #[serde(default)]
+    pub config_revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1043,6 +1047,108 @@ pub struct ShareSettingsPatch {
     pub expires_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_start: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_grants: Option<BTreeMap<String, ShareUserGrant>>,
+}
+
+#[cfg(test)]
+mod share_settings_patch_tests {
+    use super::*;
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct LegacyShareSettingsPatch {
+        #[serde(default)]
+        description: Option<Option<String>>,
+    }
+
+    #[test]
+    fn absent_user_grants_stays_compatible_with_legacy_server_patch() {
+        let patch = ShareSettingsPatch {
+            description: Some(Some("updated".to_string())),
+            ..ShareSettingsPatch::default()
+        };
+
+        let value = serde_json::to_value(&patch).expect("serialize share patch");
+        assert!(value.get("userGrants").is_none());
+
+        let legacy: LegacyShareSettingsPatch =
+            serde_json::from_value(value).expect("legacy server accepts patch");
+        assert_eq!(legacy.description, Some(Some("updated".to_string())));
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ShareTokenPeriod {
+    #[default]
+    Lifetime,
+    Day,
+    Week,
+    CalendarMonth,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareUserPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_limit: Option<u64>,
+    #[serde(default)]
+    pub token_period: ShareTokenPeriod,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareUserUsageBucket {
+    #[serde(default)]
+    pub started_at_ms: i64,
+    #[serde(default)]
+    pub tokens_used: u64,
+    #[serde(default)]
+    pub requests_count: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareUserUsage {
+    #[serde(default)]
+    pub lifetime: ShareUserUsageBucket,
+    #[serde(default)]
+    pub day: ShareUserUsageBucket,
+    #[serde(default)]
+    pub week: ShareUserUsageBucket,
+    #[serde(default)]
+    pub calendar_month: ShareUserUsageBucket,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareUserGrant {
+    pub email: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default = "default_true")]
+    pub active: bool,
+    #[serde(default)]
+    pub policy: ShareUserPolicy,
+    #[serde(default)]
+    pub usage: ShareUserUsage,
+    #[serde(default)]
+    pub created_at_ms: u128,
+    #[serde(default)]
+    pub updated_at_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at_ms: Option<u128>,
+    #[serde(default)]
+    pub revision: u64,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1067,6 +1173,8 @@ pub struct ShareEditView {
 #[serde(rename_all = "camelCase")]
 pub struct ShareSettingsUpdateRequest {
     pub patch: ShareSettingsPatch,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_config_revision: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2106,6 +2214,8 @@ pub struct ShareDescriptor {
     pub auto_start: bool,
     #[serde(default, skip_serializing_if = "is_zero_revision")]
     pub config_revision: u64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub user_grants: BTreeMap<String, ShareUserGrant>,
 }
 
 fn is_zero_revision(value: &u64) -> bool {
@@ -2918,6 +3028,8 @@ pub struct ShareView {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub active_requests_by_app: BTreeMap<String, usize>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub active_requests_by_user: BTreeMap<String, BTreeMap<String, usize>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tokens_used_by_app: BTreeMap<String, i64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub requests_count_by_app: BTreeMap<String, i64>,
@@ -2932,6 +3044,10 @@ pub struct ShareView {
     #[serde(default)]
     pub model_health: ShareModelHealthSummary,
     pub operational_summary: OperationalSummary,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub user_grants: BTreeMap<String, ShareUserGrant>,
+    #[serde(default)]
+    pub config_revision: u64,
 }
 
 #[derive(Debug, Deserialize)]

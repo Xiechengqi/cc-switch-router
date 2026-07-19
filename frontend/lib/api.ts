@@ -104,12 +104,16 @@ export function recordDashboardUxEvent(event: DashboardUxEvent) {
   }).catch(() => undefined);
 }
 
-export async function updateShareSettings(shareId: string, patch: ShareSettingsPatch) {
+export async function updateShareSettings(
+  shareId: string,
+  patch: ShareSettingsPatch,
+  baseConfigRevision?: number,
+) {
   return parseJson<{ ok: boolean; edit: ShareEditView; appliedSynchronously: boolean }>(
     await authFetch(`/v1/shares/${encodeURIComponent(shareId)}/settings`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ patch }),
+      body: JSON.stringify({ patch, baseConfigRevision }),
     }),
   );
 }

@@ -1819,7 +1819,14 @@ async fn share_api_update_settings(
         .user
         .map(|user| user.email)
         .ok_or_else(|| AppError::Unauthorized("api token required".into()))?;
-    let response = update_share_settings_with_email(&state, &share_id, &email, input.patch).await?;
+    let response = update_share_settings_with_email(
+        &state,
+        &share_id,
+        &email,
+        input.patch,
+        input.base_config_revision,
+    )
+    .await?;
     Ok(Json(response))
 }
 
@@ -2233,10 +2240,7 @@ fn market_log_to_ticker_event(log: &DashboardMarketRequestLogView) -> RecentRequ
         request_agent: (!log.request_agent.is_empty()).then(|| log.request_agent.clone()),
         requested_model: (!log.requested_model.is_empty()).then(|| log.requested_model.clone()),
         actual_model: (!log.actual_model.is_empty()).then(|| log.actual_model.clone()),
-        model: log
-            .model
-            .clone()
-            .filter(|value| !value.trim().is_empty()),
+        model: log.model.clone().filter(|value| !value.trim().is_empty()),
         latency_ms: log.latency_ms.filter(|value| *value > 0),
         status_code: log.status_code.filter(|value| *value > 0),
         started_at: parse_dashboard_log_time(&log.created_at),
@@ -3792,8 +3796,14 @@ async fn update_share_settings(
 ) -> Result<Json<crate::models::ShareSettingsUpdateResponse>, AppError> {
     let current_user_email = require_user_email(&state, &headers, "share:write").await?;
     Ok(Json(
-        update_share_settings_with_email(&state, &share_id, &current_user_email, input.patch)
-            .await?,
+        update_share_settings_with_email(
+            &state,
+            &share_id,
+            &current_user_email,
+            input.patch,
+            input.base_config_revision,
+        )
+        .await?,
     ))
 }
 
@@ -3819,10 +3829,16 @@ async fn update_share_settings_with_email(
     share_id: &str,
     current_user_email: &str,
     patch: ShareSettingsPatch,
+    base_config_revision: Option<u64>,
 ) -> Result<crate::models::ShareSettingsUpdateResponse, AppError> {
     let mut response = state
         .store
-        .create_share_settings_edit(share_id, current_user_email, patch)
+        .create_share_settings_edit_at_revision(
+            share_id,
+            current_user_email,
+            patch,
+            base_config_revision,
+        )
         .await?;
 
     // Happy path: if the owning installation is online and supports the control
@@ -4602,8 +4618,12 @@ async fn client_chat_room_stream(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path(room_id): Path<String>,
     Query(query): Query<ClientChatStreamQuery>,
-) -> Result<Sse<impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>>, AppError>
-{
+) -> Result<
+    Sse<
+        impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+    >,
+    AppError,
+> {
     use std::time::Duration;
 
     let metadata = extract_client_metadata(&headers, addr);

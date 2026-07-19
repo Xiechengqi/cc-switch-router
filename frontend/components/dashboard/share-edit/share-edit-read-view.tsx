@@ -13,7 +13,6 @@ import {
 import { shareAccessApps, resolveShareCoreApp } from "@/lib/share-app";
 import type { DashboardMarket, ShareView } from "@/lib/types";
 import { formatDateTime } from "@/lib/utils";
-import { effectiveShareAccessByApp } from "./share-edit-draft";
 import {
   forSaleOptionLabel,
   ReadOnlyChipList,
@@ -39,10 +38,6 @@ export function ShareEditReadView({
   const shareApp = resolveShareCoreApp(share) ?? shareAccessApps(share)[0];
   const tokenMarkets = React.useMemo(() => markets.filter((market) => !isShareMarket(market)), [markets]);
   const shareMarkets = React.useMemo(() => markets.filter(isShareMarket), [markets]);
-  const publicMarketEmails = React.useMemo(
-    () => new Set(markets.map((market) => (market.email || "").toLowerCase()).filter(Boolean)),
-    [markets],
-  );
   const tokenMarketEmails = React.useMemo(
     () => new Set(tokenMarkets.map((market) => (market.email || "").toLowerCase()).filter(Boolean)),
     [tokenMarkets],
@@ -78,21 +73,23 @@ export function ShareEditReadView({
     return meta ? marketLabel(meta) : email;
   }, [forSale, marketLinks, saleMarketKind, shareMarkets, tokenMarketEmails]);
 
-  const sharedEmails = React.useMemo(() => {
-    if (!shareApp) return [];
-    const access = effectiveShareAccessByApp(share);
-    const raw = access[shareApp]?.sharedWithEmails || share.sharedWithEmails || [];
-    return raw
-      .map((email) => email.trim().toLowerCase())
-      .filter((email) => email && !publicMarketEmails.has(email));
-  }, [publicMarketEmails, share, shareApp]);
-
   const pricingPercent = shareApp ? share.forSaleOfficialPricePercentByApp?.[shareApp] : undefined;
 
   const tokenLimit = share.tokenLimit;
   const parallelLimit = share.parallelLimit;
   const tokenUnlimited = isUnlimitedTokenLimit(tokenLimit);
   const parallelUnlimited = isUnlimitedParallelLimit(parallelLimit);
+  const currentGrant = Object.values(share.userGrants || {}).find(
+    (grant) => grant.active !== false,
+  );
+  const userPeriodLabel = currentGrant
+    ? {
+        lifetime: t("dashboard.userLimit.periodLifetime"),
+        day: t("dashboard.userLimit.periodDay"),
+        week: t("dashboard.userLimit.periodWeek"),
+        calendarMonth: t("dashboard.userLimit.periodMonth"),
+      }[currentGrant.policy.tokenPeriod]
+    : "—";
 
   const marketAccessDisplay = React.useMemo(() => {
     if (forSale === "Free") return t("dashboard.publicFreeShare");
@@ -161,10 +158,6 @@ export function ShareEditReadView({
           </ShareEditSection>
 
           <ShareEditSection title={t("dashboard.shareEdit.section.access")}>
-            <ReadOnlyField
-              label={t("dashboard.field.sharedWith")}
-              value={<ReadOnlyChipList items={sharedEmails} />}
-            />
             <div className="grid gap-3 sm:grid-cols-3">
               <ReadOnlyField
                 label={t("dashboard.field.tokenLimit")}
@@ -179,6 +172,35 @@ export function ShareEditReadView({
                 value={expiryTitle(share.expiresAt) || formatDateTime(share.expiresAt) || "—"}
               />
             </div>
+            {currentGrant ? (
+              <div className="grid gap-3 border-t border-slate-200 pt-3 sm:grid-cols-2 lg:grid-cols-4">
+                <ReadOnlyField label="Email" value={currentGrant.email} />
+                <ReadOnlyField
+                  label={t("dashboard.field.parallelLimit")}
+                  value={formatLimitDisplay(
+                    currentGrant.policy.parallelLimit,
+                    currentGrant.policy.parallelLimit == null,
+                    t,
+                  )}
+                />
+                <ReadOnlyField
+                  label={t("dashboard.field.tokenLimit")}
+                  value={`${formatLimitDisplay(
+                    currentGrant.policy.tokenLimit,
+                    currentGrant.policy.tokenLimit == null,
+                    t,
+                  )} · ${userPeriodLabel}`}
+                />
+                <ReadOnlyField
+                  label={t("dashboard.field.expiresAt")}
+                  value={
+                    currentGrant.policy.expiresAt
+                      ? formatDateTime(new Date(currentGrant.policy.expiresAt).toISOString())
+                      : t("dashboard.permanent")
+                  }
+                />
+              </div>
+            ) : null}
           </ShareEditSection>
         </>
       ) : (
