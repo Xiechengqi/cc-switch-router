@@ -8,6 +8,9 @@ use anyhow::{Context, Result};
 
 const APP_NAME: &str = "cc-switch-router";
 pub const DEFAULT_FOOTER_TELEGRAM_URL: &str = "https://t.me/tokenswitchorg";
+pub const DEFAULT_REQUEST_LOG_RETENTION_DAYS: u32 = 30;
+pub const MIN_REQUEST_LOG_RETENTION_DAYS: u32 = 1;
+pub const MAX_REQUEST_LOG_RETENTION_DAYS: u32 = 365;
 
 #[derive(Debug, Clone)]
 pub struct MetricsConfig {
@@ -66,6 +69,7 @@ pub struct Config {
     pub host_key_path: PathBuf,
     pub cleanup_interval_secs: u64,
     pub lease_retention_secs: i64,
+    pub request_log_retention_days: u32,
     pub client_stale_secs: i64,
     pub client_installation_retention_secs: i64,
     pub paused_share_stale_secs: i64,
@@ -140,6 +144,10 @@ impl Config {
             lease_retention_secs: env_var("CC_SWITCH_ROUTER_LEASE_RETENTION_SECS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(24 * 60 * 60),
+            request_log_retention_days: parse_request_log_retention_days(
+                env_var("CC_SWITCH_ROUTER_REQUEST_LOG_RETENTION_DAYS").as_deref(),
+            )
+            .unwrap_or_else(|message| panic!("{message}")),
             client_stale_secs: env_var("CC_SWITCH_ROUTER_CLIENT_STALE_SECS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60 * 60),
@@ -393,6 +401,7 @@ CC_SWITCH_ROUTER_LEASE_TTL_SECS=60
 CC_SWITCH_ROUTER_DB_PATH={}
 CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS=300
 CC_SWITCH_ROUTER_LEASE_RETENTION_SECS=86400
+CC_SWITCH_ROUTER_REQUEST_LOG_RETENTION_DAYS=30
 CC_SWITCH_ROUTER_CLIENT_STALE_SECS=3600
 CC_SWITCH_ROUTER_CLIENT_INSTALLATION_RETENTION_SECS=21600
 CC_SWITCH_ROUTER_REGISTRATION_SOURCE_RATE_PER_MINUTE=60
@@ -492,6 +501,25 @@ fn env_i64(key: &str, default: i64) -> i64 {
         .unwrap_or(default)
 }
 
+fn parse_request_log_retention_days(value: Option<&str>) -> std::result::Result<u32, String> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_REQUEST_LOG_RETENTION_DAYS);
+    };
+    let days = value.parse::<u32>().map_err(|_| {
+        format!(
+            "invalid CC_SWITCH_ROUTER_REQUEST_LOG_RETENTION_DAYS: expected an integer between {} and {}",
+            MIN_REQUEST_LOG_RETENTION_DAYS, MAX_REQUEST_LOG_RETENTION_DAYS
+        )
+    })?;
+    if !(MIN_REQUEST_LOG_RETENTION_DAYS..=MAX_REQUEST_LOG_RETENTION_DAYS).contains(&days) {
+        return Err(format!(
+            "invalid CC_SWITCH_ROUTER_REQUEST_LOG_RETENTION_DAYS: expected an integer between {} and {}, got {days}",
+            MIN_REQUEST_LOG_RETENTION_DAYS, MAX_REQUEST_LOG_RETENTION_DAYS
+        ));
+    }
+    Ok(days)
+}
+
 fn parse_admin_emails(value: Option<&str>) -> HashSet<String> {
     let mut set = HashSet::new();
     let Some(raw) = value else { return set };
@@ -559,6 +587,7 @@ mod tests {
             host_key_path: PathBuf::from("/tmp/test.key"),
             cleanup_interval_secs: 300,
             lease_retention_secs: 60,
+            request_log_retention_days: DEFAULT_REQUEST_LOG_RETENTION_DAYS,
             client_stale_secs: 60,
             client_installation_retention_secs: 6 * 60 * 60,
             paused_share_stale_secs: 60,
@@ -633,6 +662,24 @@ mod tests {
         let contents = default_env_contents();
         assert!(!contents.contains("CC_SWITCH_ROUTER_CLIENT_ALERT_EMAILS"));
         assert!(!contents.contains("CC_SWITCH_ROUTER_CLIENT_OFFLINE_NOTIFY_OWNER"));
+    }
+
+    #[test]
+    fn default_env_includes_request_log_retention_default() {
+        assert!(default_env_contents().contains("CC_SWITCH_ROUTER_REQUEST_LOG_RETENTION_DAYS=30"));
+    }
+
+    #[test]
+    fn request_log_retention_parser_is_strict_and_bounded() {
+        assert_eq!(
+            parse_request_log_retention_days(None),
+            Ok(DEFAULT_REQUEST_LOG_RETENTION_DAYS)
+        );
+        assert_eq!(parse_request_log_retention_days(Some("1")), Ok(1));
+        assert_eq!(parse_request_log_retention_days(Some("365")), Ok(365));
+        assert!(parse_request_log_retention_days(Some("0")).is_err());
+        assert!(parse_request_log_retention_days(Some("366")).is_err());
+        assert!(parse_request_log_retention_days(Some("invalid")).is_err());
     }
 
     #[test]

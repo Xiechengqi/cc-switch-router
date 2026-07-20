@@ -1028,13 +1028,6 @@ export function requestBelongsToApp(request: ShareRequestLog, app: CoreShareApp)
   return agent === app;
 }
 
-export function shareAppTokensUsed(share: ShareView, app: CoreShareApp) {
-  const value = share.tokensUsedByApp?.[app];
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  const appCount = CORE_SHARE_APPS.filter(([key]) => shareAppExists(share, key)).length;
-  return appCount <= 1 && share.appType === app ? share.tokensUsed || 0 : 0;
-}
-
 export function formatMinutesShort(minutes?: number, locale: AppLocale = "en") {
   const value = Math.max(0, Number(minutes || 0));
   const isZh = locale.startsWith("zh");

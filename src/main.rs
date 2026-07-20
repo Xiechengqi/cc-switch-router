@@ -94,6 +94,7 @@ async fn main() -> Result<()> {
         use_localhost = config.use_localhost,
         cleanup_interval_secs = config.cleanup_interval_secs,
         lease_retention_secs = config.lease_retention_secs,
+        request_log_retention_days = config.request_log_retention_days,
         client_stale_secs = config.client_stale_secs,
         client_installation_retention_secs = config.client_installation_retention_secs,
         paused_share_stale_secs = config.paused_share_stale_secs,
@@ -953,6 +954,7 @@ Environment:
   CC_SWITCH_ROUTER_DB_PATH               SQLite path, default $HOME/.cc-switch-router/cc-switch-router.db
   CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS Cleanup interval, default 300
   CC_SWITCH_ROUTER_LEASE_RETENTION_SECS  Lease retention period, default 86400
+  CC_SWITCH_ROUTER_REQUEST_LOG_RETENTION_DAYS Request history retention, default 30 (1-365)
   CC_SWITCH_ROUTER_CLIENT_STALE_SECS     Mark clients offline and purge shares after no heartbeat, default 3600
   CC_SWITCH_ROUTER_CLIENT_INSTALLATION_RETENTION_SECS Delete installation records after offline retention, default 21600
   CC_SWITCH_ROUTER_PAUSED_SHARE_STALE_SECS Delete paused shares after no update, default 3600

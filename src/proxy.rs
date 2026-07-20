@@ -4611,6 +4611,7 @@ mod tests {
             )),
             cleanup_interval_secs: 300,
             lease_retention_secs: 24 * 60 * 60,
+            request_log_retention_days: 30,
             client_stale_secs: 60 * 60,
             client_installation_retention_secs: 6 * 60 * 60,
             paused_share_stale_secs: 60 * 60,

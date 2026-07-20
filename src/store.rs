@@ -4830,6 +4830,7 @@ impl AppStore {
                 })
                 .unwrap_or_default()
         };
+        let (tokens_used_by_app, requests_count_by_app) = authoritative_share_usage_by_app(&share);
         let mut view = ShareView {
             router_id: "main".to_string(),
             share_id: share.share_id,
@@ -4889,8 +4890,8 @@ impl AppStore {
             active_requests,
             active_requests_by_app: BTreeMap::new(),
             active_requests_by_user: BTreeMap::new(),
-            tokens_used_by_app: BTreeMap::new(),
-            requests_count_by_app: BTreeMap::new(),
+            tokens_used_by_app,
+            requests_count_by_app,
             online_minutes_24h: 0,
             online_rate_24h: 0.0,
             observed_minutes_24h: 0,
@@ -7120,7 +7121,6 @@ impl AppStore {
             market_logs,
             market_request_timeline_by_market,
             model_health_by_share,
-            share_usage_by_app,
             client_tunnels,
             payout_profiles,
         ) = {
@@ -7142,7 +7142,6 @@ impl AppStore {
                 list_recent_market_request_logs(&conn, 200)?,
                 list_market_request_timeline_stats_24h(&conn, now)?,
                 list_model_health_summaries(&conn)?,
-                list_share_usage_by_app(&conn)?,
                 list_client_tunnels(&conn)?,
                 list_dashboard_payout_profiles(&conn)?,
             )
@@ -7299,10 +7298,8 @@ impl AppStore {
                     .get(&share.share_id)
                     .cloned()
                     .unwrap_or_default();
-                let (tokens_used_by_app, requests_count_by_app) = share_usage_by_app
-                    .get(&share.share_id)
-                    .cloned()
-                    .unwrap_or_default();
+                let (tokens_used_by_app, requests_count_by_app) =
+                    authoritative_share_usage_by_app(&share);
                 let recent_requests = logs_by_share
                     .get(&share.share_id)
                     .cloned()
@@ -7865,9 +7862,8 @@ impl AppStore {
         let active_route_connections = proxy.active_route_connections().await;
         let active_subdomains = active_route_connections.keys().cloned().collect::<Vec<_>>();
         let cutoff = (Utc::now() - Duration::seconds(config.lease_retention_secs)).to_rfc3339();
-        let log_cutoff_ts = DateTime::parse_from_rfc3339(&cutoff)
-            .map(|dt| dt.timestamp())
-            .unwrap_or_default();
+        let log_cutoff_ts =
+            (Utc::now() - Duration::days(i64::from(config.request_log_retention_days))).timestamp();
         let stale_cutoff = (Utc::now() - Duration::seconds(config.client_stale_secs)).to_rfc3339();
         let installation_retention_cutoff = (Utc::now()
             - Duration::seconds(config.client_installation_retention_secs))
@@ -12589,6 +12585,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         CREATE INDEX IF NOT EXISTS idx_shares_installation_id ON shares(installation_id);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_shares_subdomain_unique ON shares(subdomain) WHERE subdomain IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_share_request_logs_share_id ON share_request_logs(share_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_share_request_logs_created_at ON share_request_logs(created_at);
         CREATE INDEX IF NOT EXISTS idx_image_jobs_share_queued ON image_generation_jobs(share_id, queued_at DESC);
         CREATE INDEX IF NOT EXISTS idx_image_jobs_provider_queued ON image_generation_jobs(provider_id, queued_at DESC);
         CREATE INDEX IF NOT EXISTS idx_image_jobs_installation_queued ON image_generation_jobs(installation_id, queued_at DESC);
@@ -12597,6 +12594,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         CREATE INDEX IF NOT EXISTS idx_image_request_logs_share_created ON image_generation_request_logs(share_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_image_request_logs_provider_created ON image_generation_request_logs(provider_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_image_request_logs_status_created ON image_generation_request_logs(status, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_image_request_logs_created_at ON image_generation_request_logs(created_at);
         CREATE INDEX IF NOT EXISTS idx_share_health_checks ON share_health_checks(share_id, checked_at DESC);
         CREATE INDEX IF NOT EXISTS idx_installation_health_checks ON installation_health_checks(installation_id, checked_at DESC);
         CREATE INDEX IF NOT EXISTS idx_share_health_checks_checked_at ON share_health_checks(checked_at DESC);
@@ -16178,6 +16176,19 @@ fn parse_ip_im_geo(body: &str) -> Option<GeoLookupResult> {
     Some(result)
 }
 
+fn authoritative_share_usage_by_app(
+    share: &ShareDescriptor,
+) -> (BTreeMap<String, i64>, BTreeMap<String, i64>) {
+    let app = share.app_type.trim().to_ascii_lowercase();
+    if app.is_empty() {
+        return (BTreeMap::new(), BTreeMap::new());
+    }
+    (
+        BTreeMap::from([(app.clone(), share.tokens_used)]),
+        BTreeMap::from([(app, share.requests_count)]),
+    )
+}
+
 fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppError> {
     let mut stmt = conn
         .prepare(
@@ -18883,91 +18894,6 @@ fn market_log_total_tokens_expr(alias: &str) -> String {
           + COALESCE({prefix}cache_read_tokens, 0)
           + COALESCE({prefix}cache_creation_tokens, 0))"
     )
-}
-
-fn share_log_total_tokens_expr(alias: &str) -> String {
-    let prefix = sql_prefix(alias);
-    format!(
-        "(COALESCE({prefix}input_tokens, 0)
-          + COALESCE({prefix}output_tokens, 0)
-          + COALESCE({prefix}cache_read_tokens, 0)
-          + COALESCE({prefix}cache_creation_tokens, 0))"
-    )
-}
-
-fn list_share_usage_by_app(
-    conn: &Connection,
-) -> Result<HashMap<String, (BTreeMap<String, i64>, BTreeMap<String, i64>)>, AppError> {
-    let market_total_expr = market_log_total_tokens_expr("ml");
-    let share_total_expr = share_log_total_tokens_expr("sl");
-    let mut stmt = conn
-        .prepare(&format!(
-            "WITH usage_rows AS (
-                SELECT sl.share_id AS share_id,
-                       lower(CASE
-                           WHEN COALESCE(sl.request_agent, '') != '' THEN sl.request_agent
-                           ELSE sl.app_type
-                       END) AS app,
-                       sl.request_id AS request_id,
-                       'share' AS source,
-                       {share_total_expr} AS total_tokens
-                  FROM share_request_logs sl
-                 WHERE sl.is_health_check = 0
-                UNION ALL
-                SELECT ml.share_id AS share_id,
-                       lower(ml.request_agent) AS app,
-                       ml.request_id AS request_id,
-                       'market' AS source,
-                       {market_total_expr} AS total_tokens
-                  FROM market_request_logs ml
-                 WHERE ml.share_id IS NOT NULL
-                   AND trim(ml.share_id) != ''
-             ),
-             per_request AS (
-                SELECT share_id,
-                       app,
-                       request_id,
-                       MAX(CASE WHEN source = 'market' THEN total_tokens END) AS market_total,
-                       MAX(CASE WHEN source = 'share' THEN total_tokens END) AS share_total
-                  FROM usage_rows
-                 WHERE app IN ('claude', 'codex', 'gemini')
-                 GROUP BY share_id, app, request_id
-             )
-             SELECT share_id,
-                    app,
-                    COUNT(*) AS requests_count,
-                    COALESCE(SUM(
-                        CASE
-                            WHEN COALESCE(market_total, 0) > 0 THEN market_total
-                            ELSE COALESCE(share_total, market_total, 0)
-                        END
-                    ), 0) AS total_tokens
-              FROM per_request
-              GROUP BY share_id, app",
-        ))
-        .map_err(|e| AppError::Internal(format!("prepare share usage by app failed: {e}")))?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-            ))
-        })
-        .map_err(|e| AppError::Internal(format!("query share usage by app failed: {e}")))?;
-    let mut result = HashMap::<String, (BTreeMap<String, i64>, BTreeMap<String, i64>)>::new();
-    for row in rows {
-        let (share_id, app, requests_count, total_tokens) = row
-            .map_err(|e| AppError::Internal(format!("read share usage by app row failed: {e}")))?;
-        if !matches!(app.as_str(), "claude" | "codex" | "gemini") {
-            continue;
-        }
-        let entry = result.entry(share_id).or_default();
-        entry.0.insert(app.clone(), total_tokens);
-        entry.1.insert(app, requests_count);
-    }
-    Ok(result)
 }
 
 fn map_image_generation_request_log_row(
@@ -23641,6 +23567,7 @@ mod tests {
                 .join(format!("cc-switch-router-{name}-{}.key", Uuid::new_v4())),
             cleanup_interval_secs: 300,
             lease_retention_secs: 24 * 60 * 60,
+            request_log_retention_days: 30,
             client_stale_secs: 60 * 60,
             client_installation_retention_secs: 6 * 60 * 60,
             paused_share_stale_secs: 60 * 60,
@@ -25891,83 +25818,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn share_usage_by_app_merges_market_and_share_logs_by_request() {
-        let (store, config) = setup_store("share-usage-by-app-merged").await;
+    async fn dashboard_share_usage_uses_authoritative_counters_not_request_logs() {
+        let (store, config) = setup_store("dashboard-authoritative-share-usage").await;
         insert_installation(&store, "inst-1").await;
         insert_share(&store, "inst-1", "share-usage", "usage-sub", "active").await;
-        let market = test_market();
-        insert_market(&store, &market).await;
         {
             let conn = store.conn.lock().await;
-            let now = Utc::now().timestamp();
+            conn.execute(
+                "UPDATE shares
+                 SET app_type = 'codex', provider_id = 'provider-test',
+                     bindings_json = '{\"codex\":\"provider-test\"}',
+                     tokens_used = 1000, requests_count = 7
+                 WHERE share_id = 'share-usage'",
+                [],
+            )
+            .expect("set authoritative share usage");
 
-            let mut codex_market = test_market_request_log("req_usage_codex_market", "share-usage");
-            codex_market.input_tokens = 220;
-            codex_market.output_tokens = 80;
-            codex_market.cache_read_tokens = 100;
-            upsert_market_request_log_tx(&conn, &market, codex_market)
-                .expect("insert codex market log");
-
-            let mut duplicate_codex_share =
-                test_share_request_log_entry("req_usage_codex_market", "share-usage", now);
-            duplicate_codex_share.app_type = "codex".into();
-            duplicate_codex_share.request_agent = "codex".into();
-            duplicate_codex_share.input_tokens = 900;
-            duplicate_codex_share.output_tokens = 0;
-            upsert_share_request_log_tx(&conn, "inst-1", duplicate_codex_share)
-                .expect("insert duplicate codex share log");
-
-            let mut direct_codex =
-                test_share_request_log_entry("req_usage_codex_direct", "share-usage", now);
-            direct_codex.app_type = "codex".into();
-            direct_codex.request_agent = "codex".into();
-            direct_codex.input_tokens = 40;
-            direct_codex.output_tokens = 10;
-            upsert_share_request_log_tx(&conn, "inst-1", direct_codex)
-                .expect("insert direct codex share log");
-
-            let mut claude_market = test_market_request_log("req_usage_claude_zero", "share-usage");
-            claude_market.request_agent = "claude".into();
-            claude_market.requested_model = "claude-opus-4-7".into();
-            claude_market.actual_model = "claude-opus-4-7".into();
-            claude_market.input_tokens = 0;
-            claude_market.output_tokens = 0;
-            claude_market.cache_read_tokens = 0;
-            claude_market.cache_creation_tokens = 0;
-            upsert_market_request_log_tx(&conn, &market, claude_market)
-                .expect("insert zero claude market log");
-
-            let mut claude_share =
-                test_share_request_log_entry("req_usage_claude_zero", "share-usage", now);
-            claude_share.app_type = "claude".into();
-            claude_share.request_agent = "claude".into();
-            claude_share.input_tokens = 1;
-            claude_share.output_tokens = 2;
-            claude_share.cache_read_tokens = 100;
-            upsert_share_request_log_tx(&conn, "inst-1", claude_share)
-                .expect("insert matching claude share log");
-
-            let mut gemini_market =
-                test_market_request_log("req_usage_gemini_market", "share-usage");
-            gemini_market.request_agent = "gemini".into();
-            gemini_market.requested_model = "gemini-2.5-pro".into();
-            gemini_market.actual_model = "gemini-2.5-pro".into();
-            gemini_market.input_tokens = 4;
-            gemini_market.output_tokens = 5;
-            gemini_market.cache_read_tokens = 6;
-            upsert_market_request_log_tx(&conn, &market, gemini_market)
-                .expect("insert gemini market log");
-
-            let usage = list_share_usage_by_app(&conn).expect("list share usage");
-            let (tokens_by_app, requests_by_app) =
-                usage.get("share-usage").expect("share usage row");
-            assert_eq!(tokens_by_app.get("codex"), Some(&350));
-            assert_eq!(requests_by_app.get("codex"), Some(&2));
-            assert_eq!(tokens_by_app.get("claude"), Some(&103));
-            assert_eq!(requests_by_app.get("claude"), Some(&1));
-            assert_eq!(tokens_by_app.get("gemini"), Some(&15));
-            assert_eq!(requests_by_app.get("gemini"), Some(&1));
+            let mut partial_log = test_share_request_log_entry(
+                "req_usage_partial",
+                "share-usage",
+                Utc::now().timestamp(),
+            );
+            partial_log.app_type = "codex".into();
+            partial_log.request_agent = "codex".into();
+            partial_log.input_tokens = 40;
+            partial_log.output_tokens = 10;
+            upsert_share_request_log_tx(&conn, "inst-1", partial_log)
+                .expect("insert partial request history");
         }
+
+        let snapshot = store
+            .dashboard_snapshot(
+                &config,
+                &ServerGeo {
+                    lat: None,
+                    lon: None,
+                },
+                &ProxyRegistry::default(),
+                None,
+            )
+            .await
+            .expect("dashboard snapshot");
+        let share = snapshot
+            .shares
+            .iter()
+            .find(|share| share.share_id == "share-usage")
+            .expect("share view");
+        assert_eq!(share.tokens_used, 1000);
+        assert_eq!(share.requests_count, 7);
+        assert_eq!(share.tokens_used_by_app.get("codex"), Some(&1000));
+        assert_eq!(share.requests_count_by_app.get("codex"), Some(&7));
+
+        let share_url_view = store
+            .share_view_for_share_url("share-usage", &HashSet::new(), &HashMap::new(), None)
+            .await
+            .expect("share URL view");
+        assert_eq!(share_url_view.tokens_used_by_app.get("codex"), Some(&1000));
+        assert_eq!(share_url_view.requests_count_by_app.get("codex"), Some(&7));
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
@@ -36838,6 +36745,89 @@ mod tests {
         let active_subdomains = proxy.active_subdomains().await;
         assert!(!active_subdomains.contains(&"stale-sub".to_string()));
         assert!(active_subdomains.contains(&"fresh-sub".to_string()));
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn cleanup_uses_request_history_retention_independently_from_lease_retention() {
+        let (store, mut config) = setup_store("cleanup-request-history-retention").await;
+        config.lease_retention_secs = 60;
+        config.request_log_retention_days = 30;
+        insert_installation(&store, "inst-history").await;
+        insert_share(
+            &store,
+            "inst-history",
+            "share-history",
+            "history-sub",
+            "active",
+        )
+        .await;
+
+        {
+            let conn = store.conn.lock().await;
+            for (request_id, age_days) in [("req-history-recent", 2), ("req-history-old", 31)] {
+                let log = test_share_request_log_entry(
+                    request_id,
+                    "share-history",
+                    (Utc::now() - Duration::days(age_days)).timestamp(),
+                );
+                upsert_share_request_log_tx(&conn, "inst-history", log)
+                    .expect("insert share request history");
+            }
+            for (request_id, age_days) in [("img-history-recent", 2), ("img-history-old", 31)] {
+                conn.execute(
+                    "INSERT INTO image_generation_request_logs (
+                        request_id, share_id, installation_id, share_name, provider_id,
+                        provider_name, app_type, model, status, created_at
+                     ) VALUES (?1, 'share-history', 'inst-history', 'History Share',
+                               'provider-test', 'Provider Test', 'codex', 'gpt-image-1',
+                               'completed', ?2)",
+                    params![
+                        request_id,
+                        (Utc::now() - Duration::days(age_days)).timestamp()
+                    ],
+                )
+                .expect("insert image request history");
+            }
+        }
+
+        store
+            .cleanup_expired_data(&config, &ProxyRegistry::default())
+            .await
+            .expect("cleanup request history");
+
+        let conn = store.conn.lock().await;
+        let indexes = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
+            .expect("prepare request history indexes")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query request history indexes")
+            .collect::<Result<HashSet<_>, _>>()
+            .expect("read request history indexes");
+        for expected in [
+            "idx_share_request_logs_created_at",
+            "idx_image_request_logs_created_at",
+        ] {
+            assert!(indexes.contains(expected), "missing {expected}");
+        }
+        let share_request_ids = conn
+            .prepare("SELECT request_id FROM share_request_logs ORDER BY request_id")
+            .expect("prepare retained share request history")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query retained share request history")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read retained share request history");
+        let image_request_ids = conn
+            .prepare("SELECT request_id FROM image_generation_request_logs ORDER BY request_id")
+            .expect("prepare retained image request history")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query retained image request history")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read retained image request history");
+        assert_eq!(share_request_ids, vec!["req-history-recent"]);
+        assert_eq!(image_request_ids, vec!["img-history-recent"]);
+        drop(conn);
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }

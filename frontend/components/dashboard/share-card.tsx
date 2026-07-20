@@ -22,7 +22,6 @@ import {
   shareDisplayTitle,
   subdomainTunnelUrl,
   shareAppSettings,
-  shareAppTokensUsed,
   shareExpiryProgress,
   expiryTitle,
   type CoreShareApp,
@@ -85,7 +84,7 @@ export const ShareCard = React.memo(function ShareCard({
   const app = resolveShareCoreApp(share);
   const settings = app ? shareAppSettings(share, app) : null;
   const appRequests = app ? (share.recentRequests || []).filter((request) => requestBelongsToApp(request, app)) : share.recentRequests || [];
-  const tokensUsed = app ? shareAppTokensUsed(share, app) : share.tokensUsed || 0;
+  const tokensUsed = share.tokensUsed || 0;
   const tokenLimit = settings?.tokenLimit ?? share.tokenLimit;
   const parallelLimit = settings?.parallelLimit ?? share.parallelLimit;
   const activeRequests = app ? share.activeRequestsByApp?.[app] ?? 0 : share.activeRequests || 0;

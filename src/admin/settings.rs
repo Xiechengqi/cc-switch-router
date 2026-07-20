@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
-use crate::config::Config;
+use crate::config::{Config, MAX_REQUEST_LOG_RETENTION_DAYS, MIN_REQUEST_LOG_RETENTION_DAYS};
 use crate::dynamic_settings::DynamicSettings;
 use crate::error::AppError;
 
@@ -232,6 +232,18 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         default: Some("86400"),
         description: "Historical leases are kept this long before deletion. Default 1 day.",
         placeholder: Some("86400"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_REQUEST_LOG_RETENTION_DAYS",
+        label: "Request history retention (days)",
+        group: "Lease & Cleanup",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("30"),
+        description: "Share and image request history is kept for this many days (1-365).",
+        placeholder: Some("30"),
         dynamic_group: None,
     },
     SettingsField {
@@ -1309,6 +1321,16 @@ fn normalize_value(field: &SettingsField, raw: &str) -> Result<Option<String>, A
             let value = trimmed.parse::<i64>().map_err(|_| {
                 AppError::BadRequest(format!("{} must be an integer, got: {raw}", field.key))
             })?;
+            if field.key == "CC_SWITCH_ROUTER_REQUEST_LOG_RETENTION_DAYS"
+                && !(i64::from(MIN_REQUEST_LOG_RETENTION_DAYS)
+                    ..=i64::from(MAX_REQUEST_LOG_RETENTION_DAYS))
+                    .contains(&value)
+            {
+                return Err(AppError::BadRequest(format!(
+                    "{} must be between {} and {}, got: {value}",
+                    field.key, MIN_REQUEST_LOG_RETENTION_DAYS, MAX_REQUEST_LOG_RETENTION_DAYS
+                )));
+            }
             validate_client_notification_integer(field.key, value)?;
             validate_registration_admission_integer(field.key, value)?;
             Ok(Some(trimmed.to_string()))
@@ -1693,6 +1715,15 @@ mod tests {
             normalize_value(field, " 1500 ").unwrap(),
             Some("1500".into())
         );
+    }
+
+    #[test]
+    fn request_history_retention_enforces_supported_range() {
+        let field = field_by_key("CC_SWITCH_ROUTER_REQUEST_LOG_RETENTION_DAYS").unwrap();
+        assert!(normalize_value(field, "0").is_err());
+        assert_eq!(normalize_value(field, "1").unwrap(), Some("1".into()));
+        assert_eq!(normalize_value(field, "365").unwrap(), Some("365".into()));
+        assert!(normalize_value(field, "366").is_err());
     }
 
     #[test]
@@ -2116,6 +2147,7 @@ mod tests {
             host_key_path: std::env::temp_dir().join("cc-switch-router-rebuild-test.key"),
             cleanup_interval_secs: 300,
             lease_retention_secs: 24 * 60 * 60,
+            request_log_retention_days: 30,
             client_stale_secs: 60 * 60,
             client_installation_retention_secs: 6 * 60 * 60,
             paused_share_stale_secs: 60 * 60,
