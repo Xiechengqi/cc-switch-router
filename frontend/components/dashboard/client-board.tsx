@@ -514,7 +514,7 @@ export function ClientBoard({
   const [installOpen, setInstallOpen] = React.useState(false);
   const [query, setQuery] = React.useState("");
   const [statusFilter, setStatusFilter] = usePersistentState<"all" | Extract<OperationalState, "online" | "reconnecting" | "degraded" | "offline">>("cc_switch_router_client_status_v1", "all");
-  const [sortOrder, setSortOrder] = usePersistentState("cc_switch_router_client_sort_v1", "issues");
+  const [sortOrder, setSortOrder] = usePersistentState("cc_switch_router_client_sort_v1", "tokens");
   const [expandedClientIds, setExpandedClientIds] = usePersistentState<string[] | null>(
     CLIENT_EXPANDED_STORAGE_KEY,
     null,

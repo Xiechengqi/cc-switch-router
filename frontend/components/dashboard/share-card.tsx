@@ -28,7 +28,8 @@ import {
 } from "@/components/dashboard/data-tables";
 import type { ShareRequestLog, ShareView } from "@/lib/types";
 import { compactTokens, formatDateTime } from "@/lib/utils";
-import { resolveShareCoreApp, SHARE_APP_LABELS } from "@/lib/share-app";
+import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
+import { resolveShareCoreApp } from "@/lib/share-app";
 import { recordDashboardUxEvent } from "@/lib/api";
 
 function requestBelongsToApp(request: ShareRequestLog, app: CoreShareApp) {
@@ -178,7 +179,7 @@ export const ShareCard = React.memo(function ShareCard({
               ) : (
                 <strong className="truncate text-sm font-semibold text-foreground" title={title}>{title}</strong>
               )}
-              {app ? <span className="rounded bg-primary/10 px-1.5 py-0.5 text-[9px] font-semibold text-primary">{SHARE_APP_LABELS[app]}</span> : null}
+              {app ? <ShareAppLogo app={app} size={14} /> : null}
             </div>
             <div className="flex shrink-0 items-center gap-1">
               <button type="button" data-no-row-drawer disabled={connectDisabled} title={connectDisabled ? issue || t("common.disabled") : undefined} className="inline-flex h-6 items-center gap-1 rounded-md border border-primary/20 bg-primary/5 px-2 text-[10px] font-semibold text-primary hover:bg-primary/10 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-50 disabled:text-slate-400" onClick={(event) => { event.stopPropagation(); if (!connectDisabled) onConnect(share); }}>

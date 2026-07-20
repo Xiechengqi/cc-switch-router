@@ -51,9 +51,7 @@ export function ShareEditDialog({
                       </span>
                     ) : null}
                   </div>
-                  {readOnly ? (
-                    <p className="mt-2 text-xs text-muted-foreground">{t("dashboard.shareReadOnlyNotice")}</p>
-                  ) : share?.ownerEmail ? (
+                  {share?.ownerEmail ? (
                     <p className="mt-1 text-xs text-muted-foreground">{share.ownerEmail}</p>
                   ) : null}
                 </div>
