@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { EmptyBlock } from "@/components/dashboard/drawer-panels";
+import { EmptyBlock, ShareUserLimitsTable } from "@/components/dashboard/drawer-panels";
 import {
   expiryTitle,
   isShareMarket,
@@ -11,7 +11,7 @@ import {
   type TFn,
 } from "@/components/dashboard/share-dashboard-utils";
 import { shareAccessApps, resolveShareCoreApp } from "@/lib/share-app";
-import type { DashboardMarket, ShareView } from "@/lib/types";
+import type { DashboardMarket, ShareUserGrant, ShareView } from "@/lib/types";
 import { formatDateTime } from "@/lib/utils";
 import {
   forSaleOptionLabel,
@@ -24,6 +24,16 @@ function formatLimitDisplay(value: number | undefined | null, unlimited: boolean
   if (unlimited) return t("common.unlimited");
   if (typeof value === "number" && Number.isFinite(value) && value > 0) return String(value);
   return "—";
+}
+
+function activeUserLimitGrants(share: ShareView): ShareUserGrant[] {
+  return Object.values(share.userGrants || {})
+    .filter((grant) => grant.active !== false)
+    .sort((left, right) => {
+      if (left.role === "owner") return -1;
+      if (right.role === "owner") return 1;
+      return left.email.localeCompare(right.email);
+    });
 }
 
 export function ShareEditReadView({
@@ -79,17 +89,7 @@ export function ShareEditReadView({
   const parallelLimit = share.parallelLimit;
   const tokenUnlimited = isUnlimitedTokenLimit(tokenLimit);
   const parallelUnlimited = isUnlimitedParallelLimit(parallelLimit);
-  const currentGrant = Object.values(share.userGrants || {}).find(
-    (grant) => grant.active !== false,
-  );
-  const userPeriodLabel = currentGrant
-    ? {
-        lifetime: t("dashboard.userLimit.periodLifetime"),
-        day: t("dashboard.userLimit.periodDay"),
-        week: t("dashboard.userLimit.periodWeek"),
-        calendarMonth: t("dashboard.userLimit.periodMonth"),
-      }[currentGrant.policy.tokenPeriod]
-    : "—";
+  const limitGrants = React.useMemo(() => activeUserLimitGrants(share), [share]);
 
   const marketAccessDisplay = React.useMemo(() => {
     if (forSale === "Free") return t("dashboard.publicFreeShare");
@@ -172,35 +172,17 @@ export function ShareEditReadView({
                 value={expiryTitle(share.expiresAt) || formatDateTime(share.expiresAt) || "—"}
               />
             </div>
-            {currentGrant ? (
-              <div className="grid gap-3 border-t border-slate-200 pt-3 sm:grid-cols-2 lg:grid-cols-4">
-                <ReadOnlyField label="Email" value={currentGrant.email} />
-                <ReadOnlyField
-                  label={t("dashboard.field.parallelLimit")}
-                  value={formatLimitDisplay(
-                    currentGrant.policy.parallelLimit,
-                    currentGrant.policy.parallelLimit == null,
-                    t,
-                  )}
-                />
-                <ReadOnlyField
-                  label={t("dashboard.field.tokenLimit")}
-                  value={`${formatLimitDisplay(
-                    currentGrant.policy.tokenLimit,
-                    currentGrant.policy.tokenLimit == null,
-                    t,
-                  )} · ${userPeriodLabel}`}
-                />
-                <ReadOnlyField
-                  label={t("dashboard.field.expiresAt")}
-                  value={
-                    currentGrant.policy.expiresAt
-                      ? formatDateTime(new Date(currentGrant.policy.expiresAt).toISOString())
-                      : t("dashboard.permanent")
-                  }
-                />
+            <div className="grid gap-2 border-t border-slate-200 pt-3">
+              <div>
+                <div className="text-sm font-semibold text-slate-900">{t("dashboard.userLimit.title")}</div>
+                <p className="mt-1 text-xs text-muted-foreground">{t("dashboard.userLimit.hint")}</p>
               </div>
-            ) : null}
+              {limitGrants.length ? (
+                <ShareUserLimitsTable grants={limitGrants} t={t} />
+              ) : (
+                <EmptyBlock>{t("dashboard.userLimit.empty")}</EmptyBlock>
+              )}
+            </div>
           </ShareEditSection>
         </>
       ) : (

@@ -7,7 +7,7 @@ import { ShareClientTag } from "@/components/dashboard/share-client-tag";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getShareImageGenerationRequestLogs, getShareUsageByEmail } from "@/lib/api";
 import type { AppLocale } from "@/lib/i18n";
-import type { DashboardClient, ImageGenerationRequestLog, MarketRequestLog, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareMarketListingStatus, ShareModelHealthCheck, ShareRequestLog, ShareUpstreamProvider, ShareUsageByEmailResponse, ShareView } from "@/lib/types";
+import type { DashboardClient, ImageGenerationRequestLog, MarketRequestLog, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareMarketListingStatus, ShareModelHealthCheck, ShareRequestLog, ShareTokenPeriod, ShareUpstreamProvider, ShareUsageByEmailResponse, ShareUserGrant, ShareView } from "@/lib/types";
 import { compactTokens, formatDateTime, formatNumber, formatRelativeTime } from "@/lib/utils";
 import { resolveShareCoreApp, SHARE_APP_LABELS } from "@/lib/share-app";
 import { averageRecentLatencyMs, boundProviderIdForApp, cacheHitRate, clientPlatformLabel, clientTunnelDisplayUrl, configuredUpstreamPercent, CORE_SHARE_APPS, expiryTitle, formatAgeDaysOrHours, formatImageLogSizeMb, formatImageLogSpendSeconds, formatImageLogTimestamp, formatLatencySeconds, formatMinutesShort, formatPercent, formatShareStatus, HealthDots, isUnlimited, mergeStandaloneOAuthRuntime, modelHealthTitle, modelHealthTone, providerAccountIdentity, providerAccountLevel, providerModelMap, requestBelongsToApp, requestModelRoute, resolveShareAppRuntime, runtimeEndpointSummary, shareApiParts, shareAppExists, shareAppProviderRuntime, shareAppSettings, shareExpiryProgress, tokenCount, usageBucketTotalTokens, type CoreShareApp, type TFn } from "@/components/dashboard/share-dashboard-utils";
@@ -606,8 +606,38 @@ export function ShareProvidersPanel({ share }: { share?: ShareView }) {
 }
 
 type ShareUsagePeriod = "24h" | "1w" | "30d";
-type ShareUsageViewMode = "table" | "trend";
+type ShareUsageViewMode = "limits" | "table" | "trend";
 const SHARE_USAGE_PERIODS: readonly ShareUsagePeriod[] = ["24h", "1w", "30d"];
+const SHARE_USAGE_VIEW_MODES: readonly ShareUsageViewMode[] = ["limits", "table", "trend"];
+
+function normalizeLimitEmail(value?: string | null) {
+  return (value || "").trim().toLowerCase();
+}
+
+function activeUserLimitGrants(share: ShareView, app: keyof ShareAppProviders): ShareUserGrant[] {
+  const grants = Object.values(share.userGrants || {}).filter((grant) => grant.active !== false);
+  if (!grants.length) return [];
+
+  const owner = normalizeLimitEmail(share.ownerEmail);
+  const appKey = CORE_SHARE_APPS.some(([key]) => key === app) ? (app as CoreShareApp) : null;
+  const appEmails = new Set(
+    (appKey ? shareAppSettings(share, appKey).sharedWithEmails : share.sharedWithEmails || [])
+      .map(normalizeLimitEmail)
+      .filter(Boolean),
+  );
+  if (owner) appEmails.add(owner);
+
+  return grants
+    .filter((grant) => {
+      const email = normalizeLimitEmail(grant.email);
+      return grant.role === "owner" || appEmails.has(email);
+    })
+    .sort((left, right) => {
+      if (left.role === "owner") return -1;
+      if (right.role === "owner") return 1;
+      return left.email.localeCompare(right.email);
+    });
+}
 
 export function ShareEmailUsagePanel({
   share,
@@ -622,8 +652,11 @@ export function ShareEmailUsagePanel({
   const [usage, setUsage] = React.useState<ShareUsageByEmailResponse | null>(null);
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState("");
+  const showUsage = mode === "table" || mode === "trend";
+  const limitGrants = React.useMemo(() => activeUserLimitGrants(share, app), [share, app]);
 
   React.useEffect(() => {
+    if (!showUsage) return;
     let cancelled = false;
     setLoading(true);
     setError("");
@@ -643,48 +676,140 @@ export function ShareEmailUsagePanel({
     return () => {
       cancelled = true;
     };
-  }, [share.shareId, app, period]);
+  }, [share.shareId, app, period, showUsage]);
 
   const total = usage?.totalTokens ?? 0;
+  const modeLabel = (item: ShareUsageViewMode) => {
+    if (item === "limits") return t("dashboard.usageView.limits");
+    if (item === "trend") return t("dashboard.usageView.trend");
+    return t("dashboard.usageView.table");
+  };
   return (
     <div className="grid gap-3 rounded-lg border bg-background p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
-          <div className="text-sm font-semibold">{t("dashboard.emailTokenUsage")}</div>
-          <div className="text-xs text-muted-foreground">{t("dashboard.emailTokenUsageSubtitle", { app: PROVIDER_APP_TABS.find((tab) => tab.key === app)?.label ?? app, total: compactTokens(total) })}</div>
+          <div className="text-sm font-semibold">
+            {mode === "limits" ? t("dashboard.userLimit.title") : t("dashboard.emailTokenUsage")}
+          </div>
+          <div className="text-xs text-muted-foreground">
+            {mode === "limits"
+              ? t("dashboard.userLimit.hint")
+              : t("dashboard.emailTokenUsageSubtitle", {
+                  app: PROVIDER_APP_TABS.find((tab) => tab.key === app)?.label ?? app,
+                  total: compactTokens(total),
+                })}
+          </div>
         </div>
         <div className="flex flex-wrap items-center gap-1">
-          {SHARE_USAGE_PERIODS.map((item) => (
-            <button
-              key={item}
-              type="button"
-              className={`rounded-md border px-2 py-1 text-xs transition-colors ${period === item ? "border-primary/40 bg-primary/10 text-primary" : "border-border bg-muted/20 text-muted-foreground hover:bg-muted/40"}`}
-              onClick={() => setPeriod(item)}
-            >
-              {t(`dashboard.usagePeriod.${item}`)}
-            </button>
-          ))}
-          {(["table", "trend"] as const).map((item) => (
+          {showUsage
+            ? SHARE_USAGE_PERIODS.map((item) => (
+                <button
+                  key={item}
+                  type="button"
+                  className={`rounded-md border px-2 py-1 text-xs transition-colors ${period === item ? "border-primary/40 bg-primary/10 text-primary" : "border-border bg-muted/20 text-muted-foreground hover:bg-muted/40"}`}
+                  onClick={() => setPeriod(item)}
+                >
+                  {t(`dashboard.usagePeriod.${item}`)}
+                </button>
+              ))
+            : null}
+          {SHARE_USAGE_VIEW_MODES.map((item) => (
             <button
               key={item}
               type="button"
               className={`rounded-md border px-2 py-1 text-xs transition-colors ${mode === item ? "border-primary/40 bg-primary/10 text-primary" : "border-border bg-muted/20 text-muted-foreground hover:bg-muted/40"}`}
               onClick={() => setMode(item)}
             >
-              {item === "table" ? t("dashboard.usageView.table") : t("dashboard.usageView.trend")}
+              {modeLabel(item)}
             </button>
           ))}
         </div>
       </div>
-      {loading ? <EmptyBlock>{t("dashboard.usageEmail.loading")}</EmptyBlock> : null}
-      {error ? <EmptyBlock>{error}</EmptyBlock> : null}
-      {!loading && !error && usage ? (
+      {mode === "limits" ? (
+        limitGrants.length ? (
+          <ShareUserLimitsTable grants={limitGrants} t={t} />
+        ) : (
+          <EmptyBlock>{t("dashboard.userLimit.empty")}</EmptyBlock>
+        )
+      ) : null}
+      {showUsage && loading ? <EmptyBlock>{t("dashboard.usageEmail.loading")}</EmptyBlock> : null}
+      {showUsage && error ? <EmptyBlock>{error}</EmptyBlock> : null}
+      {showUsage && !loading && !error && usage ? (
         usage.rows.length ? (
           mode === "table" ? <ShareUsageTable usage={usage} t={t} /> : <ShareUsageTrend usage={usage} t={t} />
         ) : (
           <EmptyBlock>{t("dashboard.usageEmail.noAclEmails")}</EmptyBlock>
         )
       ) : null}
+    </div>
+  );
+}
+
+function displayUserLimitValue(value: number | undefined, unlimited: string) {
+  return value == null ? unlimited : value.toLocaleString();
+}
+
+function displayUserLimitExpiry(value: number | undefined, permanent: string) {
+  return value == null ? permanent : formatDateTime(value);
+}
+
+export function ShareUserLimitsTable({ grants, t }: { grants: ShareUserGrant[]; t: TFn }) {
+  const unlimited = t("common.unlimited");
+  const permanent = t("dashboard.userLimit.permanent");
+  const periodLabels: Record<ShareTokenPeriod, string> = {
+    lifetime: t("dashboard.userLimit.periodLifetime"),
+    day: t("dashboard.userLimit.periodDay"),
+    week: t("dashboard.userLimit.periodWeek"),
+    calendarMonth: t("dashboard.userLimit.periodMonth"),
+  };
+  return (
+    <div className="overflow-hidden rounded-md border">
+      <table className="w-full table-fixed border-collapse text-[11px]">
+        <colgroup>
+          <col className="w-[36%]" />
+          <col className="w-[14%]" />
+          <col className="w-[28%]" />
+          <col className="w-[22%]" />
+        </colgroup>
+        <thead className="bg-muted/50 text-left font-mono uppercase tracking-[0.08em] text-muted-foreground">
+          <tr>
+            <th className="px-1.5 py-2">{t("dashboard.usageEmail.email")}</th>
+            <th className="px-1.5 py-2">{t("dashboard.userLimit.parallel")}</th>
+            <th className="px-1.5 py-2">{t("dashboard.userLimit.token")}</th>
+            <th className="px-1.5 py-2">{t("dashboard.userLimit.expiry")}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {grants.map((grant) => {
+            const period = grant.policy?.tokenPeriod || "lifetime";
+            return (
+              <tr key={grant.email} className="border-t">
+                <td className="px-1.5 py-2">
+                  <div className="flex min-w-0 items-center gap-1.5">
+                    <span className="min-w-0 whitespace-normal break-all font-medium leading-4">{grant.email}</span>
+                    {grant.role === "owner" ? (
+                      <Chip size="sm" variant="tertiary" className="shrink-0">
+                        Owner
+                      </Chip>
+                    ) : null}
+                  </div>
+                </td>
+                <td className="overflow-hidden px-1.5 py-2 font-mono">
+                  {displayUserLimitValue(grant.policy?.parallelLimit, unlimited)}
+                </td>
+                <td className="overflow-hidden px-1.5 py-2 font-mono">
+                  {displayUserLimitValue(grant.policy?.tokenLimit, unlimited)}
+                  {" · "}
+                  {periodLabels[period] || period}
+                </td>
+                <td className="overflow-hidden px-1.5 py-2 text-muted-foreground">
+                  {displayUserLimitExpiry(grant.policy?.expiresAt, permanent)}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
     </div>
   );
 }
