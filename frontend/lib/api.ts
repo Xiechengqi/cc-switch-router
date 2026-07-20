@@ -278,13 +278,31 @@ export async function upgradeClientInstallation(
   );
 }
 
+export type ClientInstallationUpgradeLog = {
+  taskId: string;
+  step: number;
+  totalSteps: number;
+  level: "info" | "progress" | "success" | "warn" | "error";
+  message: string;
+  progress: number | null;
+  at: string;
+};
+
+export type ClientInstallationUpgradeStatus = {
+  taskId: string;
+  status: "running" | "success" | "failed";
+  restartPending: boolean;
+  targetCommitId: string | null;
+  logs: ClientInstallationUpgradeLog[];
+};
+
 export async function getClientInstallationUpgradeStatus(
   installationId: string,
   taskId: string,
   signal?: AbortSignal,
 ) {
   const params = new URLSearchParams({ taskId });
-  return parseJson<{ taskId: string; status: "running" | "success" | "failed" }>(
+  return parseJson<ClientInstallationUpgradeStatus>(
     await authFetch(`/v1/installations/${installationId}/upgrade/status?${params}`, {
       cache: "no-store",
       signal,

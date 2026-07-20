@@ -7,7 +7,11 @@ import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { clientOwnerEmail, clientTunnelDisplayUrl } from "@/components/dashboard/data-tables";
 import { clientOperationalSummary } from "@/components/dashboard/operational-status";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { getClientInstallationUpgradeStatus, upgradeClientInstallation } from "@/lib/api";
+import {
+  type ClientInstallationUpgradeLog,
+  getClientInstallationUpgradeStatus,
+  upgradeClientInstallation,
+} from "@/lib/api";
 import { readAuthState } from "@/lib/auth";
 import type { DashboardClient } from "@/lib/types";
 
@@ -17,6 +21,7 @@ type ClientUpgradeState = {
   phase: ClientUpgradePhase;
   startedAt: number;
   taskId?: string;
+  errorMessage?: string;
 };
 
 const CLIENT_UPGRADE_START_TIMEOUT_MS = 30_000;
@@ -36,7 +41,21 @@ function isStoredClientUpgradeState(value: unknown): value is ClientUpgradeState
   if (!["starting", "running", "failed", "timeout"].includes(candidate.phase || "")) return false;
   if (typeof candidate.startedAt !== "number" || !Number.isFinite(candidate.startedAt) || candidate.startedAt <= 0) return false;
   if (candidate.taskId != null && typeof candidate.taskId !== "string") return false;
+  if (candidate.errorMessage != null && typeof candidate.errorMessage !== "string") return false;
   return candidate.phase !== "running" || !!candidate.taskId?.trim();
+}
+
+function upgradeFailureMessage(logs: ClientInstallationUpgradeLog[]) {
+  let message = "";
+  for (let index = logs.length - 1; index >= 0; index -= 1) {
+    const entry = logs[index];
+    if (entry.level === "error" && entry.message.trim()) {
+      message = entry.message.trim();
+      break;
+    }
+  }
+  if (!message) return undefined;
+  return message.length > 800 ? `${message.slice(0, 797)}...` : message;
 }
 
 function readStoredState(installationId: string) {
@@ -177,7 +196,7 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
     let pollTimer: number | undefined;
     let requestController: AbortController | undefined;
 
-    const finish = (phase: "success" | "failed" | "timeout") => {
+    const finish = (phase: "success" | "failed" | "timeout", errorMessage?: string) => {
       if (cancelled || finished) return;
       finished = true;
       if (phase === "success") {
@@ -185,8 +204,12 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
         resetUpgradeState();
         return;
       }
-      patchState((prev) => ({ ...prev, phase }));
-      if (phase === "failed") toast.danger(t("dashboard.clientUpgradeFailed", { target: upgradeTarget }));
+      patchState((prev) => ({ ...prev, phase, errorMessage }));
+      if (phase === "failed") {
+        toast.danger(t("dashboard.clientUpgradeFailed", { target: upgradeTarget }), errorMessage ? {
+          description: errorMessage,
+        } : undefined);
+      }
       if (phase === "timeout") toast.warning(t("dashboard.clientUpgradeTimedOut", { target: upgradeTarget }));
     };
 
@@ -204,7 +227,7 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
         );
         if (cancelled) return;
         if (result.status === "success" || result.status === "failed") {
-          finish(result.status);
+          finish(result.status, result.status === "failed" ? upgradeFailureMessage(result.logs) : undefined);
           return;
         }
       } catch {
@@ -247,8 +270,11 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
 
   let buttonLabel = t("dashboard.clientUpgrade");
   if (upgrading) buttonLabel = t("dashboard.clientUpgrading");
-  if (state.phase === "failed") buttonLabel = t("dashboard.clientUpgradeFailed");
-  if (state.phase === "timeout") buttonLabel = t("dashboard.clientUpgradeTimedOut");
+  if (state.phase === "failed") buttonLabel = t("dashboard.clientUpgradeFailedButton");
+  if (state.phase === "timeout") buttonLabel = t("dashboard.clientUpgradeTimedOutButton");
+  let buttonAriaLabel = buttonLabel;
+  if (state.phase === "failed") buttonAriaLabel = t("dashboard.clientUpgradeFailed", { target: upgradeTarget });
+  if (state.phase === "timeout") buttonAriaLabel = t("dashboard.clientUpgradeTimedOut", { target: upgradeTarget });
 
   let buttonTone = "border-violet-200 bg-violet-50 text-violet-700";
   if (state.phase === "idle") buttonTone += " hover:border-violet-300 hover:bg-violet-100";
@@ -268,8 +294,9 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
         patchState({ phase: "timeout", startedAt });
         toast.warning(t("dashboard.clientUpgradeTimedOut", { target: upgradeTarget }));
       } else {
-        patchState({ phase: "failed", startedAt });
-        toast.danger(error instanceof Error ? error.message : String(error));
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        patchState({ phase: "failed", startedAt, errorMessage });
+        toast.danger(errorMessage);
       }
     } finally {
       window.clearTimeout(requestTimeout);
@@ -292,8 +319,9 @@ export function ClientUpgradeButton({ client }: { client: DashboardClient }) {
       <button
         type="button"
         data-no-row-drawer
-        aria-label={buttonLabel}
+        aria-label={buttonAriaLabel}
         aria-busy={upgrading || undefined}
+        title={state.errorMessage}
         disabled={buttonDisabled}
         onClick={(event) => {
           event.stopPropagation();

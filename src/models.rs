@@ -2652,9 +2652,27 @@ pub struct UpgradeInstallationResponse {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct InstallationUpgradeLogEntry {
+    pub task_id: String,
+    pub step: usize,
+    pub total_steps: usize,
+    pub level: String,
+    pub message: String,
+    pub progress: Option<u8>,
+    pub at: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpgradeInstallationStatusResponse {
     pub task_id: String,
     pub status: String,
+    #[serde(default)]
+    pub restart_pending: bool,
+    #[serde(default)]
+    pub target_commit_id: Option<String>,
+    #[serde(default)]
+    pub logs: Vec<InstallationUpgradeLogEntry>,
 }
 
 #[derive(Debug, Serialize)]

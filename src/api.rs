@@ -2717,13 +2717,58 @@ mod tests {
             let response = UpgradeInstallationStatusResponse {
                 task_id: "task-1".into(),
                 status: status.into(),
+                restart_pending: status == "success",
+                target_commit_id: Some("aabbccddeeff".into()),
+                logs: Vec::new(),
             };
 
             let validated = validate_installation_upgrade_status(response, "task-1")
                 .expect("supported upgrade status");
 
             assert_eq!(validated.status, status);
+            assert_eq!(validated.target_commit_id.as_deref(), Some("aabbccddeeff"));
         }
+    }
+
+    #[test]
+    fn client_upgrade_status_preserves_client_diagnostics() {
+        let response = UpgradeInstallationStatusResponse {
+            task_id: "task-1".into(),
+            status: "failed".into(),
+            restart_pending: false,
+            target_commit_id: Some("aabbccddeeff".into()),
+            logs: vec![crate::models::InstallationUpgradeLogEntry {
+                task_id: "task-1".into(),
+                step: 1,
+                total_steps: 7,
+                level: "error".into(),
+                message: "checksum request HTTP 403 Forbidden".into(),
+                progress: None,
+                at: "2026-07-20T10:14:17Z".into(),
+            }],
+        };
+
+        let validated = validate_installation_upgrade_status(response, "task-1")
+            .expect("client diagnostics should be preserved");
+        let payload = serde_json::to_value(validated).unwrap();
+
+        assert_eq!(payload["targetCommitId"], "aabbccddeeff");
+        assert_eq!(payload["restartPending"], false);
+        assert_eq!(
+            payload["logs"][0]["message"],
+            "checksum request HTTP 403 Forbidden"
+        );
+    }
+
+    #[test]
+    fn client_upgrade_status_defaults_diagnostics_from_older_clients() {
+        let response: UpgradeInstallationStatusResponse =
+            serde_json::from_value(serde_json::json!({ "taskId": "task-1", "status": "running" }))
+                .unwrap();
+
+        assert!(!response.restart_pending);
+        assert!(response.target_commit_id.is_none());
+        assert!(response.logs.is_empty());
     }
 
     #[test]
@@ -2732,6 +2777,9 @@ mod tests {
             UpgradeInstallationStatusResponse {
                 task_id: "task-other".into(),
                 status: "running".into(),
+                restart_pending: false,
+                target_commit_id: None,
+                logs: Vec::new(),
             },
             "task-1",
         )
@@ -2742,6 +2790,9 @@ mod tests {
             UpgradeInstallationStatusResponse {
                 task_id: "task-1".into(),
                 status: "timed_out".into(),
+                restart_pending: false,
+                target_commit_id: None,
+                logs: Vec::new(),
             },
             "task-1",
         )
