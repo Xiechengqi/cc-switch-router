@@ -1400,6 +1400,7 @@ impl AppStore {
                     update_available: None,
                     upgrade_capable: None,
                     status_reported_at: None,
+                    public_ip: None,
                 };
                 tx.execute(
             "INSERT INTO installations (
@@ -1560,6 +1561,12 @@ impl AppStore {
                 "heartbeat version fields must not exceed 128 characters".into(),
             ));
         }
+        let public_ip = match input.payload.public_ip.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(value) => Some(normalize_reported_public_ipv4(value).ok_or_else(|| {
+                AppError::BadRequest("heartbeat public_ip must be an IPv4 address".into())
+            })?),
+        };
 
         let now = Utc::now();
         let mut conn = self.conn.lock().await;
@@ -1591,13 +1598,15 @@ impl AppStore {
             "UPDATE installations
              SET app_version = ?2,
                  app_commit_id = CASE WHEN ?3 = '' THEN app_commit_id ELSE ?3 END,
-                 last_seen_at = ?4
+                 last_seen_at = ?4,
+                 public_ip = COALESCE(?5, public_ip)
              WHERE id = ?1",
             params![
                 input.installation_id,
                 input.payload.app_version,
                 input.payload.commit_id,
-                now.to_rfc3339()
+                now.to_rfc3339(),
+                public_ip,
             ],
         )
         .map_err(|error| {
@@ -7273,6 +7282,7 @@ impl AppStore {
                 owner_email: verified_owner_email,
                 region: installation.region.clone(),
                 country_code: installation.country_code.clone(),
+                public_ip: installation.public_ip.clone(),
                 created_at: installation.created_at,
                 last_seen_at: installation.last_seen_at,
                 upgrade: installation_upgrade_view(&installation),
@@ -12968,6 +12978,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
     add_column_if_missing(conn, "installations", "update_available", "INTEGER")?;
     add_column_if_missing(conn, "installations", "upgrade_capable", "INTEGER")?;
     add_column_if_missing(conn, "installations", "status_reported_at", "TEXT")?;
+    add_column_if_missing(conn, "installations", "public_ip", "TEXT")?;
     let columns = conn
         .prepare("PRAGMA table_info(shares)")
         .and_then(|mut stmt| {
@@ -15372,6 +15383,13 @@ fn add_column_if_missing(
     Ok(())
 }
 
+fn normalize_reported_public_ipv4(value: &str) -> Option<String> {
+    value
+        .parse::<std::net::Ipv4Addr>()
+        .ok()
+        .map(|ip| ip.to_string())
+}
+
 fn get_installation(
     conn: &Connection,
     installation_id: &str,
@@ -15392,7 +15410,7 @@ const INSTALLATION_SELECT_COLUMNS: &str = "id, public_key, platform, app_version
                 geo_candidate_country_code, geo_candidate_country, geo_candidate_region, geo_candidate_city,
                 geo_candidate_latitude, geo_candidate_longitude, geo_candidate_hits, geo_candidate_first_seen_at,
                 geo_last_changed_at, created_at, last_seen_at,
-                delegate_upgrade_to_router_owner, app_commit_id, update_available, upgrade_capable, status_reported_at";
+                delegate_upgrade_to_router_owner, app_commit_id, update_available, upgrade_capable, status_reported_at, public_ip";
 
 fn map_installation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Installation> {
     Ok(Installation {
@@ -15477,6 +15495,7 @@ fn map_installation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Installatio
                     Box::new(error),
                 )
             })?,
+        public_ip: row.get(29)?,
     })
 }
 
@@ -27743,6 +27762,7 @@ mod tests {
             boot_id: "setup-boot-id".into(),
             app_version: "1.0.1".into(),
             commit_id: "setup-commit".into(),
+            public_ip: None,
         };
         let heartbeat_timestamp_ms = Utc::now().timestamp_millis();
         let heartbeat_nonce = "setup-heartbeat-1";
@@ -29127,6 +29147,7 @@ mod tests {
             boot_id: "fixture-boot".into(),
             app_version: "1.2.3".into(),
             commit_id: "abcdef123456".into(),
+            public_ip: None,
         };
         verify_signed_payload(
             public_key,
@@ -29970,6 +29991,7 @@ mod tests {
             boot_id: "boot-1".into(),
             app_version: "3.0.0".into(),
             commit_id: "abc123".into(),
+            public_ip: None,
         };
         let timestamp_ms = Utc::now().timestamp_millis();
         let nonce = Uuid::new_v4().to_string();
@@ -29996,6 +30018,7 @@ mod tests {
             boot_id: "boot-1".into(),
             app_version: "3.0.0".into(),
             commit_id: "abc123".into(),
+            public_ip: None,
         };
         let replay = store
             .record_installation_heartbeat(crate::models::InstallationHeartbeatRequest {
@@ -30022,6 +30045,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heartbeat_public_ip_updates_and_absent_value_keeps_previous() {
+        let (store, config) = setup_store("installation-heartbeat-public-ip").await;
+        let signing_key = insert_signed_installation(&store, "inst-public-ip").await;
+
+        let first = crate::models::InstallationHeartbeatPayload {
+            protocol_version: 1,
+            boot_id: "boot-ip-1".into(),
+            app_version: "3.0.0".into(),
+            commit_id: "abc123".into(),
+            public_ip: Some("203.0.113.10".into()),
+        };
+        let first_ts = Utc::now().timestamp_millis();
+        let first_nonce = Uuid::new_v4().to_string();
+        let first_signature = sign_test_payload(
+            &signing_key,
+            "inst-public-ip",
+            "installation_heartbeat_v1",
+            &first,
+            first_ts,
+            &first_nonce,
+        );
+        store
+            .record_installation_heartbeat(crate::models::InstallationHeartbeatRequest {
+                installation_id: "inst-public-ip".into(),
+                timestamp_ms: first_ts,
+                nonce: first_nonce,
+                signature: first_signature,
+                payload: first,
+            })
+            .await
+            .expect("record heartbeat with public ip");
+
+        let second = crate::models::InstallationHeartbeatPayload {
+            protocol_version: 1,
+            boot_id: "boot-ip-2".into(),
+            app_version: "3.0.0".into(),
+            commit_id: "abc123".into(),
+            public_ip: None,
+        };
+        let second_ts = Utc::now().timestamp_millis();
+        let second_nonce = Uuid::new_v4().to_string();
+        let second_signature = sign_test_payload(
+            &signing_key,
+            "inst-public-ip",
+            "installation_heartbeat_v1",
+            &second,
+            second_ts,
+            &second_nonce,
+        );
+        store
+            .record_installation_heartbeat(crate::models::InstallationHeartbeatRequest {
+                installation_id: "inst-public-ip".into(),
+                timestamp_ms: second_ts,
+                nonce: second_nonce,
+                signature: second_signature,
+                payload: second,
+            })
+            .await
+            .expect("record heartbeat without public ip");
+
+        let conn = store.conn.lock().await;
+        let public_ip: Option<String> = conn
+            .query_row(
+                "SELECT public_ip FROM installations WHERE id = 'inst-public-ip'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read public ip");
+        assert_eq!(public_ip.as_deref(), Some("203.0.113.10"));
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
     async fn offline_reconcile_is_episode_idempotent_and_recovery_is_delayed() {
         let config = enabled_notification_config("offline-presence-episodes");
         let store = AppStore::new(&config).expect("create store");
@@ -30031,6 +30128,7 @@ mod tests {
             boot_id: "boot-presence".into(),
             app_version: "1.0.0".into(),
             commit_id: "commit".into(),
+            public_ip: None,
         };
         let heartbeat_at = Utc::now();
         let nonce = Uuid::new_v4().to_string();

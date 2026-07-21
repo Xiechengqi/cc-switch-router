@@ -57,6 +57,9 @@ pub struct Installation {
     pub upgrade_capable: Option<bool>,
     #[serde(default)]
     pub status_reported_at: Option<DateTime<Utc>>,
+    /// Self-reported public IPv4 from the server process (startup probe).
+    #[serde(default)]
+    pub public_ip: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2562,6 +2565,8 @@ pub struct InstallationView {
     pub region: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub country_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_ip: Option<String>,
     pub created_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2612,6 +2617,9 @@ pub struct InstallationHeartbeatPayload {
     pub boot_id: String,
     pub app_version: String,
     pub commit_id: String,
+    /// Optional self-reported public IPv4. Absent/empty keeps the previous value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_ip: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

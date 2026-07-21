@@ -402,7 +402,7 @@ function ClientCard({
     <Card id={`dashboard-client-${client.installation.id}`} className={`overflow-hidden rounded-lg border border-l-[3px] bg-white p-0 shadow-sm transition-[border-color,box-shadow] ${borderTone}`}>
       <Card.Content className="grid gap-3 p-3.5">
         <div
-          className="group/client-header grid min-h-16 cursor-pointer select-text grid-cols-[minmax(300px,1.3fr)_minmax(680px,1.15fr)_auto] items-center gap-6 rounded-md px-1.5 py-1 outline-none transition-colors hover:bg-primary/[0.03] focus-visible:ring-2 focus-visible:ring-primary/30"
+          className="group/client-header grid min-h-16 cursor-pointer select-text grid-cols-[minmax(300px,1.3fr)_minmax(760px,1.15fr)_auto] items-center gap-6 rounded-md px-1.5 py-1 outline-none transition-colors hover:bg-primary/[0.03] focus-visible:ring-2 focus-visible:ring-primary/30"
           aria-expanded={!collapsed}
           onMouseDown={handleHeaderPointerDown}
           onClick={handleHeaderClick}
@@ -440,8 +440,14 @@ function ClientCard({
             </div>
           </div>
 
-          <div className={`grid min-w-0 gap-3 ${showRemoval ? "grid-cols-8" : "grid-cols-7"}`}>
+          <div className={`grid min-w-0 gap-3 ${showRemoval ? "grid-cols-9" : "grid-cols-8"}`}>
             <Metric label={t("dashboard.region")} value={client.installation.countryCode || client.installation.region || "-"} />
+            <Metric
+              label={t("dashboard.publicIp")}
+              value={client.installation.publicIp || "-"}
+              title={client.installation.publicIp || undefined}
+              preserveValue
+            />
             <Metric
               label={t("dashboard.runningDuration")}
               value={clientRunningDurationLabel(client, locale)}
@@ -811,6 +817,7 @@ export function ClientBoard({
                         <span>URL: <strong className="break-all text-foreground">{selectedClientUrl || "-"}</strong></span>
                         <span>{t("dashboard.owner")}: <strong className="text-foreground">{clientOwnerEmail(selectedClient)}</strong></span>
                         <span>{t("dashboard.region")}: <strong className="text-foreground">{selectedClient.installation.countryCode || selectedClient.installation.region || "-"}</strong></span>
+                        <span>{t("dashboard.publicIp")}: <strong className="font-mono text-foreground">{selectedClient.installation.publicIp || "-"}</strong></span>
                         <span>{t("dashboard.version")}: <strong className="font-mono text-foreground">{clientPlatformLabel(selectedClient)}</strong></span>
                         <span>{t("dashboard.online")}: <strong className="text-foreground">{(selectedClient.onlineRate24h || 0).toFixed(1)}% / {formatAgeDaysOrHours(selectedClient.installation.createdAt, locale)}</strong></span>
                         {selectedClient.removalAt ? (

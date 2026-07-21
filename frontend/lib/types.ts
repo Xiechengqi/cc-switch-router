@@ -185,6 +185,7 @@ export type DashboardClient = {
     ownerEmail?: string;
     region?: string;
     countryCode?: string;
+    publicIp?: string;
     createdAt: string;
     lastSeenAt: string;
     upgrade?: {
