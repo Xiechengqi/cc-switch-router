@@ -751,6 +751,13 @@ fn installation_visible_on_dashboard_map(
     has_active_share || has_enabled_tunnel
 }
 
+fn dashboard_installation_ip(
+    self_reported: Option<&str>,
+    router_observed: Option<&str>,
+) -> Option<String> {
+    self_reported.or(router_observed).map(str::to_string)
+}
+
 fn is_map_active_client(operational_state: &str) -> bool {
     operational_state != "offline"
 }
@@ -7282,7 +7289,10 @@ impl AppStore {
                 owner_email: verified_owner_email,
                 region: installation.region.clone(),
                 country_code: installation.country_code.clone(),
-                public_ip: installation.public_ip.clone(),
+                public_ip: dashboard_installation_ip(
+                    installation.public_ip.as_deref(),
+                    installation.last_seen_ip.as_deref(),
+                ),
                 created_at: installation.created_at,
                 last_seen_at: installation.last_seen_at,
                 upgrade: installation_upgrade_view(&installation),
@@ -23346,6 +23356,19 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    #[test]
+    fn dashboard_ip_prefers_self_report_and_falls_back_to_router_observation() {
+        assert_eq!(
+            dashboard_installation_ip(Some("203.0.113.10"), Some("198.51.100.7")).as_deref(),
+            Some("203.0.113.10")
+        );
+        assert_eq!(
+            dashboard_installation_ip(None, Some("198.51.100.7")).as_deref(),
+            Some("198.51.100.7")
+        );
+        assert_eq!(dashboard_installation_ip(None, None), None);
+    }
 
     #[test]
     fn resend_from_address_adds_default_display_name_for_plain_email() {

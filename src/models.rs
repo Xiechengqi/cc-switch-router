@@ -2565,6 +2565,7 @@ pub struct InstallationView {
     pub region: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub country_code: Option<String>,
+    /// Preferred self-reported public IP, falling back to the router-observed source IP.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_ip: Option<String>,
     pub created_at: DateTime<Utc>,

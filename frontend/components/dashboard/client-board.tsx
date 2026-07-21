@@ -128,6 +128,11 @@ function includesQuery(values: Array<string | undefined>, query: string) {
   return values.some((value) => String(value || "").toLocaleLowerCase().includes(query));
 }
 
+function clientRegionLabel(installation: DashboardClient["installation"]) {
+  const region = installation.countryCode || installation.region;
+  return [region, installation.publicIp].filter(Boolean).join(" · ") || "-";
+}
+
 function shouldToggleClientHeader(
   event: React.MouseEvent<HTMLElement>,
   pointerDown: { x: number; y: number } | null,
@@ -440,13 +445,11 @@ function ClientCard({
             </div>
           </div>
 
-          <div className={`grid min-w-0 gap-3 ${showRemoval ? "grid-cols-9" : "grid-cols-8"}`}>
-            <Metric label={t("dashboard.region")} value={client.installation.countryCode || client.installation.region || "-"} />
+          <div className={`grid min-w-0 gap-3 ${showRemoval ? "grid-cols-8" : "grid-cols-7"}`}>
             <Metric
-              label={t("dashboard.publicIp")}
-              value={client.installation.publicIp || "-"}
-              title={client.installation.publicIp || undefined}
-              preserveValue
+              label={t("dashboard.region")}
+              value={clientRegionLabel(client.installation)}
+              title={clientRegionLabel(client.installation)}
             />
             <Metric
               label={t("dashboard.runningDuration")}
@@ -816,8 +819,7 @@ export function ClientBoard({
                       <div className="grid gap-1 text-xs text-muted-foreground">
                         <span>URL: <strong className="break-all text-foreground">{selectedClientUrl || "-"}</strong></span>
                         <span>{t("dashboard.owner")}: <strong className="text-foreground">{clientOwnerEmail(selectedClient)}</strong></span>
-                        <span>{t("dashboard.region")}: <strong className="text-foreground">{selectedClient.installation.countryCode || selectedClient.installation.region || "-"}</strong></span>
-                        <span>{t("dashboard.publicIp")}: <strong className="font-mono text-foreground">{selectedClient.installation.publicIp || "-"}</strong></span>
+                        <span>{t("dashboard.region")}: <strong className="text-foreground">{clientRegionLabel(selectedClient.installation)}</strong></span>
                         <span>{t("dashboard.version")}: <strong className="font-mono text-foreground">{clientPlatformLabel(selectedClient)}</strong></span>
                         <span>{t("dashboard.online")}: <strong className="text-foreground">{(selectedClient.onlineRate24h || 0).toFixed(1)}% / {formatAgeDaysOrHours(selectedClient.installation.createdAt, locale)}</strong></span>
                         {selectedClient.removalAt ? (
