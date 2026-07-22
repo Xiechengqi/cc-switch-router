@@ -312,7 +312,6 @@ mod tests {
             blocked_until: None,
             blocked_reason: None,
             blocked_scope: None,
-            dispatch_limit_percent: None,
             tiers: vec![crate::models::ShareUpstreamQuotaTier {
                 label: "5h".into(),
                 utilization: 90.0,
@@ -337,7 +336,6 @@ mod tests {
             blocked_until: None,
             blocked_reason: None,
             blocked_scope: None,
-            dispatch_limit_percent: None,
             tiers: vec![
                 crate::models::ShareUpstreamQuotaTier {
                     label: "weekly".into(),

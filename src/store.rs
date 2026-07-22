@@ -17739,18 +17739,18 @@ fn market_provider_quota_health(
     provider: &ShareUpstreamProvider,
     now: DateTime<Utc>,
 ) -> Option<f64> {
-    if provider_has_display_only_quota(provider) {
+    let quota = provider.quota.as_ref();
+    if quota.is_some_and(|quota| quota_block_is_active(quota, now)) {
+        Some(0.0)
+    } else if provider_has_display_only_quota(provider) {
         Some(crate::scheduling_signals::compute_quota_health(None, now))
     } else {
-        provider
-            .quota
-            .as_ref()
-            .map(|quota| market_quota_health(quota, now))
+        quota.map(|quota| market_quota_health(quota, now))
     }
 }
 
 fn market_quota_health(quota: &ShareUpstreamQuota, now: DateTime<Utc>) -> f64 {
-    if quota_block_is_active(quota, now) || quota_dispatch_limit_reached(quota, now) {
+    if quota_block_is_active(quota, now) {
         0.0
     } else {
         crate::scheduling_signals::compute_quota_health(Some(quota), now)
@@ -17924,23 +17924,13 @@ fn quota_blocked_app_availability(
     health: &[ModelHealthSummary],
     now: DateTime<Utc>,
 ) -> Option<MarketAppAvailabilityEntry> {
-    if provider
-        .map(provider_has_display_only_quota)
-        .unwrap_or(false)
-    {
-        return None;
-    }
     if let Some(quota) = provider.and_then(|provider| provider.quota.as_ref()) {
-        if quota_block_is_active(quota, now) || quota_dispatch_limit_reached(quota, now) {
-            let reason = if quota_block_is_active(quota, now) {
-                quota
-                    .blocked_reason
-                    .clone()
-                    .or_else(|| quota.availability.clone())
-                    .unwrap_or_else(|| "quota exhausted".to_string())
-            } else {
-                quota_dispatch_limit_reason(quota)
-            };
+        if quota_block_is_active(quota, now) {
+            let reason = quota
+                .blocked_reason
+                .clone()
+                .or_else(|| quota.availability.clone())
+                .unwrap_or_else(|| "quota exhausted".to_string());
             return Some(MarketAppAvailabilityEntry {
                 status: "unavailable".to_string(),
                 reason: Some(reason),
@@ -17950,6 +17940,12 @@ fn quota_blocked_app_availability(
                 recent_results: vec!["quota_blocked".to_string()],
             });
         }
+    }
+    if provider
+        .map(provider_has_display_only_quota)
+        .unwrap_or(false)
+    {
+        return None;
     }
 
     health
@@ -18164,18 +18160,11 @@ fn filter_provider_by_quota(
     provider: Option<ShareUpstreamProvider>,
     now: DateTime<Utc>,
 ) -> Option<ShareUpstreamProvider> {
-    if provider
-        .as_ref()
-        .map(provider_has_display_only_quota)
-        .unwrap_or(false)
-    {
-        return provider;
-    }
     let provider = provider?;
     if provider
         .quota
         .as_ref()
-        .map(|quota| quota_block_is_active(quota, now) || quota_dispatch_limit_reached(quota, now))
+        .map(|quota| quota_block_is_active(quota, now))
         .unwrap_or(false)
     {
         None
@@ -18184,44 +18173,11 @@ fn filter_provider_by_quota(
     }
 }
 
-fn quota_dispatch_limit_reached(quota: &ShareUpstreamQuota, now: DateTime<Utc>) -> bool {
-    let Some(limit) = quota.dispatch_limit_percent else {
-        return false;
-    };
-    if limit <= 0.0 {
-        return false;
-    }
-    let limit = limit.clamp(0.0, 100.0);
-    quota.tiers.iter().any(|tier| {
-        if tier.utilization < limit {
-            return false;
-        }
-        match tier.resets_at.as_deref() {
-            Some(value) => DateTime::parse_from_rfc3339(value)
-                .map(|dt| dt.with_timezone(&Utc) > now)
-                .unwrap_or(true),
-            None => true,
-        }
-    })
-}
-
-fn quota_dispatch_limit_reason(quota: &ShareUpstreamQuota) -> String {
-    let limit = quota
-        .dispatch_limit_percent
-        .unwrap_or_default()
-        .clamp(0.0, 100.0);
-    if limit > 0.0 {
-        format!("quota dispatch limit reached ({limit:.0}%)")
-    } else {
-        "quota dispatch limit reached".to_string()
-    }
-}
-
 fn quota_block_is_active(quota: &ShareUpstreamQuota, now: DateTime<Utc>) -> bool {
     let availability = quota.availability.as_deref().unwrap_or("available");
     if !matches!(
         availability,
-        "short_window_exhausted" | "long_window_exhausted"
+        "short_window_exhausted" | "long_window_exhausted" | "rate_limited" | "quota_exhausted"
     ) {
         return false;
     }
@@ -18321,7 +18277,6 @@ mod quota_runtime_filter_tests {
                 blocked_until,
                 blocked_reason: Some("five hour quota exhausted".to_string()),
                 blocked_scope: Some("five_hour".to_string()),
-                dispatch_limit_percent: None,
                 tiers: Vec::new(),
             }),
             models: Vec::new(),
@@ -18329,11 +18284,7 @@ mod quota_runtime_filter_tests {
         }
     }
 
-    fn provider_with_quota_tier(
-        utilization: f64,
-        resets_at: String,
-        dispatch_limit_percent: Option<f64>,
-    ) -> ShareUpstreamProvider {
+    fn provider_with_quota_tier(utilization: f64, resets_at: String) -> ShareUpstreamProvider {
         ShareUpstreamProvider {
             kind: "official_oauth".to_string(),
             app: "codex".to_string(),
@@ -18351,7 +18302,6 @@ mod quota_runtime_filter_tests {
                 blocked_until: None,
                 blocked_reason: None,
                 blocked_scope: None,
-                dispatch_limit_percent,
                 tiers: vec![crate::models::ShareUpstreamQuotaTier {
                     label: "1w".to_string(),
                     utilization,
@@ -18384,7 +18334,6 @@ mod quota_runtime_filter_tests {
                 blocked_until: None,
                 blocked_reason: None,
                 blocked_scope: None,
-                dispatch_limit_percent: Some(1.0),
                 tiers: vec![crate::models::ShareUpstreamQuotaTier {
                     label: "xiechengqi01@gmail.com".to_string(),
                     utilization: 100.0,
@@ -18428,67 +18377,23 @@ mod quota_runtime_filter_tests {
     }
 
     #[test]
-    fn dispatch_limited_runtime_is_filtered_until_reset() {
+    fn explicit_server_usage_blocks_are_filtered_until_expiry() {
         let now = Utc::now();
-        let runtimes = ShareAppRuntimes {
-            codex: Some(provider_with_quota_tier(
-                90.0,
-                (now + Duration::days(2)).to_rfc3339(),
-                Some(90.0),
-            )),
-            ..Default::default()
-        };
+        for availability in ["rate_limited", "quota_exhausted"] {
+            let mut provider =
+                provider_with_quota(Some((now + Duration::minutes(30)).to_rfc3339()));
+            provider.quota.as_mut().unwrap().availability = Some(availability.to_string());
+            let runtimes = ShareAppRuntimes {
+                codex: Some(provider),
+                ..Default::default()
+            };
 
-        let filtered = filter_app_runtimes_by_quota(runtimes, now);
-        assert!(filtered.codex.is_none());
-    }
-
-    #[test]
-    fn runtime_below_dispatch_limit_is_kept() {
-        let now = Utc::now();
-        let runtimes = ShareAppRuntimes {
-            codex: Some(provider_with_quota_tier(
-                89.0,
-                (now + Duration::days(2)).to_rfc3339(),
-                Some(90.0),
-            )),
-            ..Default::default()
-        };
-
-        let filtered = filter_app_runtimes_by_quota(runtimes, now);
-        assert!(filtered.codex.is_some());
-    }
-
-    #[test]
-    fn expired_dispatch_limit_runtime_is_kept() {
-        let now = Utc::now();
-        let runtimes = ShareAppRuntimes {
-            codex: Some(provider_with_quota_tier(
-                95.0,
-                (now - Duration::minutes(1)).to_rfc3339(),
-                Some(90.0),
-            )),
-            ..Default::default()
-        };
-
-        let filtered = filter_app_runtimes_by_quota(runtimes, now);
-        assert!(filtered.codex.is_some());
-    }
-
-    #[test]
-    fn zero_dispatch_limit_runtime_is_kept() {
-        let now = Utc::now();
-        let runtimes = ShareAppRuntimes {
-            codex: Some(provider_with_quota_tier(
-                95.0,
-                (now + Duration::days(2)).to_rfc3339(),
-                Some(0.0),
-            )),
-            ..Default::default()
-        };
-
-        let filtered = filter_app_runtimes_by_quota(runtimes, now);
-        assert!(filtered.codex.is_some());
+            let filtered = filter_app_runtimes_by_quota(runtimes, now);
+            assert!(
+                filtered.codex.is_none(),
+                "{availability} should block the runtime"
+            );
+        }
     }
 
     #[test]
@@ -18498,7 +18403,6 @@ mod quota_runtime_filter_tests {
             codex: Some(provider_with_quota_tier(
                 95.0,
                 (now + Duration::days(2)).to_rfc3339(),
-                None,
             )),
             ..Default::default()
         };
@@ -18511,7 +18415,7 @@ mod quota_runtime_filter_tests {
     }
 
     #[test]
-    fn ollama_display_only_quota_is_not_used_for_filtering_or_health() {
+    fn ollama_display_only_percentage_is_not_used_for_filtering_or_health() {
         let now = Utc::now();
         let runtimes = ShareAppRuntimes {
             codex: Some(ollama_provider_with_display_only_quota()),
@@ -18529,18 +18433,39 @@ mod quota_runtime_filter_tests {
     }
 
     #[test]
+    fn ollama_explicit_rate_limit_still_blocks_runtime_and_health() {
+        let now = Utc::now();
+        let mut provider = ollama_provider_with_display_only_quota();
+        let quota = provider.quota.as_mut().unwrap();
+        quota.availability = Some("rate_limited".to_string());
+        quota.blocked_until = Some((now + Duration::minutes(1)).to_rfc3339());
+        let availability =
+            quota_blocked_app_availability("codex", Some(&provider), &[], now).unwrap();
+        assert_eq!(availability.status, "unavailable");
+        let runtimes = ShareAppRuntimes {
+            codex: Some(provider),
+            ..Default::default()
+        };
+
+        let filtered = filter_app_runtimes_by_quota(runtimes.clone(), now);
+        assert!(filtered.codex.is_none());
+        assert_eq!(
+            compute_market_share_quota_health(Some("codex"), &runtimes, None, now),
+            0.0
+        );
+    }
+
+    #[test]
     fn market_share_quota_health_without_app_uses_worst_runtime_quota() {
         let now = Utc::now();
         let runtimes = ShareAppRuntimes {
             claude: Some(provider_with_quota_tier(
                 5.0,
                 (now + Duration::days(2)).to_rfc3339(),
-                None,
             )),
             codex: Some(provider_with_quota_tier(
                 95.0,
                 (now + Duration::days(2)).to_rfc3339(),
-                None,
             )),
             ..Default::default()
         };
@@ -25456,7 +25381,6 @@ mod tests {
             blocked_until: Some((now + Duration::days(4)).to_rfc3339()),
             blocked_reason: Some("weekly quota exhausted".into()),
             blocked_scope: Some("weekly".into()),
-            dispatch_limit_percent: None,
             tiers: Vec::new(),
         });
         let runtimes_json = serde_json::to_string(&ShareAppRuntimes {
@@ -28241,7 +28165,6 @@ mod tests {
                 blocked_until: None,
                 blocked_reason: None,
                 blocked_scope: None,
-                dispatch_limit_percent: None,
                 tiers: vec![],
             }),
             api_url: Some("https://example.com".into()),

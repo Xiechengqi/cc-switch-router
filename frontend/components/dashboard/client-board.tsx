@@ -435,10 +435,10 @@ function ClientCard({
               ) : (
                 <strong className="truncate text-sm font-semibold text-foreground" title={identity}>{identity}</strong>
               )}
-              <OperationalStatusPill summary={summary} />
-              {tunnelUrl ? <ClientConsoleButton client={client} /> : null}
-              <ClientUpgradeButton client={client} />
-              <span className="inline-flex shrink-0 items-center gap-2">
+              <span className="inline-flex shrink-0 flex-nowrap items-center gap-2">
+                <OperationalStatusPill summary={summary} />
+                {tunnelUrl ? <ClientConsoleButton client={client} /> : null}
+                <ClientUpgradeButton client={client} />
                 <ClientDetailsButton onOpen={openClientDrawer} />
                 <ClientChatButton client={client} />
               </span>
