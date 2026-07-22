@@ -435,8 +435,10 @@ function ClientCard({
               <OperationalStatusPill summary={summary} />
               {tunnelUrl ? <ClientConsoleButton client={client} /> : null}
               <ClientUpgradeButton client={client} />
-              <ClientDetailsButton onOpen={openClientDrawer} />
-              <ClientChatButton client={client} />
+              <span className="inline-flex shrink-0 items-center gap-2">
+                <ClientDetailsButton onOpen={openClientDrawer} />
+                <ClientChatButton client={client} />
+              </span>
               {summary.primaryReason ? <span className={`truncate text-[11px] font-medium ${state === "offline" ? "text-rose-700" : state === "reconnecting" ? "text-sky-700" : "text-amber-700"}`} title={operationalReasonLabel(summary.primaryReason, t)}>{operationalReasonLabel(summary.primaryReason, t)}</span> : null}
               {showRemoval ? <ClientRemovalSchedule removalAt={client.removalAt} className="text-[11px]" /> : null}
             </div>
