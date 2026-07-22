@@ -11,6 +11,7 @@ import type { CountryBoard, CountryMapPoint, DashboardResponse, MapPoint, Market
 import { cn } from "@/lib/utils";
 import { computeMapOffsetY, DEFAULT_MAP_DISPLAY, MAP_VIEWPORT_HEIGHT_PX } from "@/lib/map-display-settings";
 import { usePersistentState } from "@/lib/use-persistent-state";
+import { CountryFlag, countryFlagIso2 } from "@/components/common/country-flag";
 import { StatsStrip } from "@/components/dashboard/stats-strip";
 
 type PlacedPoint = { x: number; y: number; xPct: number; yPct: number };
@@ -68,12 +69,6 @@ function resolveTickerCountry(
   }
 
   return strictIso2(event.countryCode);
-}
-
-function countryFlag(code?: string) {
-  const cc = (code || "").trim().toUpperCase();
-  if (!/^[A-Z]{2}$/.test(cc)) return "";
-  return String.fromCodePoint(...[...cc].map((ch) => 127397 + ch.charCodeAt(0)));
 }
 
 function formatTickerTime(value?: string | number, fallbackSeconds?: string | number) {
@@ -461,7 +456,7 @@ function RequestTickerPanel({ data }: { data: DashboardResponse | null }) {
                 isInflight: event.isInflight,
               };
               const countryCode = resolveTickerCountry(event, mergedItem, data);
-              const flag = countryFlag(countryCode);
+              const flagCode = countryFlagIso2(countryCode);
               const subdomain = event.shareSubdomain || event.subdomain || event.shareName || mergedItem?.shareName || "share";
               const eventKey = [event.requestId, event.startedAt || event.createdAt || ""].join(":");
               const statusCode = Number(mergedItem?.statusCode || 0);
@@ -476,7 +471,7 @@ function RequestTickerPanel({ data }: { data: DashboardResponse | null }) {
                 >
                   <span className="shrink-0 select-text font-mono text-slate-500">{formatTickerTime(event.startedAt || event.createdAt, item?.createdAt)}</span>
                   <span className={`inline-flex h-[15px] shrink-0 select-none items-center rounded px-1.5 font-mono text-[9px] font-semibold ${failed ? "bg-rose-100 text-rose-700" : "bg-emerald-100 text-emerald-700"}`}>{badge}</span>
-                  <span className="min-w-0 flex-1 select-text whitespace-normal break-words text-[11px] text-slate-700"><strong className="font-semibold">{subdomain}</strong>{flag ? <> · <span role="img" title={countryCode} aria-label={countryCode}>{flag}</span></> : null} · {tickerDetail(mergedItem)}</span>
+                  <span className="min-w-0 flex-1 select-text whitespace-normal break-words text-[11px] text-slate-700"><strong className="font-semibold">{subdomain}</strong>{flagCode ? <> · <CountryFlag code={flagCode} title={flagCode} /></> : null} · {tickerDetail(mergedItem)}</span>
                 </div>
               );
             })}

@@ -1,15 +1,10 @@
 "use client";
 
 import * as React from "react";
+import { CountryFlag } from "@/components/common/country-flag";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import type { CountryBoard } from "@/lib/types";
 import { cn } from "@/lib/utils";
-
-function countryFlag(code?: string) {
-  const cc = (code || "").trim().slice(0, 2).toUpperCase();
-  if (!/^[A-Z]{2}$/.test(cc)) return "·";
-  return String.fromCodePoint(...[...cc].map((ch) => 127397 + ch.charCodeAt(0)));
-}
 
 export const MapCountryTooltip = React.forwardRef(function MapCountryTooltip(
   {
@@ -36,8 +31,9 @@ export const MapCountryTooltip = React.forwardRef(function MapCountryTooltip(
       style={style}
       data-map-country-tooltip
     >
-      <div className="truncate text-[12px] font-semibold text-foreground">
-        {countryFlag(board.countryCode)} {title}
+      <div className="flex items-center gap-1.5 truncate text-[12px] font-semibold text-foreground">
+        <CountryFlag code={board.countryCode} title={title} />
+        <span className="truncate">{title}</span>
       </div>
       <div className="mt-1 truncate text-[11px] text-muted-foreground">
         {t("map.countrySummary", {

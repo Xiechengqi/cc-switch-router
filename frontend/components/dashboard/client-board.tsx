@@ -129,8 +129,11 @@ function includesQuery(values: Array<string | undefined>, query: string) {
 }
 
 function clientRegionLabel(installation: DashboardClient["installation"]) {
-  const region = installation.countryCode || installation.region;
-  return [region, installation.publicIp].filter(Boolean).join(" · ") || "-";
+  return installation.countryCode || installation.region || "-";
+}
+
+function clientRegionIpTitle(installation: DashboardClient["installation"]) {
+  return installation.publicIp ? `IP: ${installation.publicIp}` : undefined;
 }
 
 function shouldToggleClientHeader(
@@ -451,7 +454,7 @@ function ClientCard({
             <Metric
               label={t("dashboard.region")}
               value={clientRegionLabel(client.installation)}
-              title={clientRegionLabel(client.installation)}
+              title={clientRegionIpTitle(client.installation)}
             />
             <Metric
               label={t("dashboard.runningDuration")}
@@ -821,7 +824,7 @@ export function ClientBoard({
                       <div className="grid gap-1 text-xs text-muted-foreground">
                         <span>URL: <strong className="break-all text-foreground">{selectedClientUrl || "-"}</strong></span>
                         <span>{t("dashboard.owner")}: <strong className="text-foreground">{clientOwnerEmail(selectedClient)}</strong></span>
-                        <span>{t("dashboard.region")}: <strong className="text-foreground">{clientRegionLabel(selectedClient.installation)}</strong></span>
+                        <span>{t("dashboard.region")}: <strong className="text-foreground" title={clientRegionIpTitle(selectedClient.installation)}>{clientRegionLabel(selectedClient.installation)}</strong></span>
                         <span>{t("dashboard.version")}: <strong className="font-mono text-foreground">{clientPlatformLabel(selectedClient)}</strong></span>
                         <span>{t("dashboard.online")}: <strong className="text-foreground">{(selectedClient.onlineRate24h || 0).toFixed(1)}% / {formatAgeDaysOrHours(selectedClient.installation.createdAt, locale)}</strong></span>
                         {selectedClient.removalAt ? (
