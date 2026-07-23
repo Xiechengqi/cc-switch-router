@@ -1,27 +1,34 @@
 "use client";
 
-import { TerminalSquare, Trash2, X } from "lucide-react";
+import { Trash2, X } from "lucide-react";
 import * as React from "react";
 import {
   CONSOLE_DOCK_BOTTOM_INSET,
   CONSOLE_DOCK_HEIGHT,
-  useWebTerminal,
-} from "@/components/dashboard/web-terminal/web-terminal-manager";
+  useClientConsole,
+} from "@/components/dashboard/client-console/client-console-manager";
+import { useWebTerminal } from "@/components/dashboard/web-terminal/web-terminal-manager";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { cn } from "@/lib/utils";
 
 export function WebTerminalDock() {
   const { windows, focusedId, dockVisible, restoreTerminal, closeTerminal, closeAllTerminals } =
     useWebTerminal();
+  const { dockVisible: consoleDockVisible } = useClientConsole();
   const { t } = useLocaleText();
 
   if (!dockVisible || windows.length === 0) return null;
+
+  // Sit above the client-console dock when both are on /clients.
+  const bottom = consoleDockVisible
+    ? CONSOLE_DOCK_BOTTOM_INSET + CONSOLE_DOCK_HEIGHT + 8
+    : CONSOLE_DOCK_BOTTOM_INSET;
 
   return (
     <div
       data-web-terminal-dock
       className="fixed left-1/2 z-50 -translate-x-1/2"
-      style={{ bottom: CONSOLE_DOCK_BOTTOM_INSET, maxWidth: "min(calc(100vw - 2rem), 720px)" }}
+      style={{ bottom, maxWidth: "min(calc(100vw - 2rem), 720px)" }}
       role="toolbar"
       aria-label={t("clientMarket.terminal.dockLabel")}
     >
@@ -54,7 +61,6 @@ export function WebTerminalDock() {
                       : t("clientMarket.terminal.switchNamed", { name: window.title })
                 }
               >
-                <TerminalSquare className="h-3.5 w-3.5 shrink-0 opacity-80" aria-hidden />
                 <span
                   className={cn(
                     "h-2 w-2 shrink-0 rounded-full",

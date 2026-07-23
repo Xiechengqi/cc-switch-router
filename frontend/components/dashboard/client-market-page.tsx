@@ -2,12 +2,13 @@
 
 import * as React from "react";
 import { Button, Chip, Dropdown, Modal, Tabs, toast } from "@heroui/react";
-import { Check, ChevronDown, Circle, Loader2, MoreHorizontal, Plus, RefreshCw, TerminalSquare, Trash2, X } from "lucide-react";
+import { Check, ChevronDown, Circle, Loader2, MoreHorizontal, Plus, RefreshCw, Trash2, X } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { CopyableCodeField } from "@/components/common/copyable-code-field";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { CountryFlag } from "@/components/common/country-flag";
+import { WebTerminalGlyph } from "@/components/dashboard/web-terminal/web-terminal-glyph";
 import { useWebTerminal } from "@/components/dashboard/web-terminal";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
@@ -652,6 +653,7 @@ function HostRow({
     (host.status === "unreachable" || host.status === "disabled" || host.status === "abnormal");
   const canOpenTerminal = host.canWebTerminal === true || canManageHost;
   const hostLabel = host.hostname || host.ip || host.id.slice(0, 8);
+  const terminalTitle = host.ip || hostLabel;
   const countryName = host.countryCode
     ? new Intl.DisplayNames([locale], { type: "region" }).of(host.countryCode) || host.countryCode
     : "";
@@ -751,12 +753,12 @@ function HostRow({
               onClick={() =>
                 openTerminal({
                   hostId: host.id,
-                  title: hostLabel,
+                  title: terminalTitle,
                 })
               }
               aria-label={t("clientMarket.webTerminal")}
             >
-              <TerminalSquare className="h-4 w-4" />
+              <WebTerminalGlyph className="h-4 w-4 text-muted-foreground" />
             </Button>
           ) : null}
           {locationLabel || host.countryCode ? (

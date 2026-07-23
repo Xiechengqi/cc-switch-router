@@ -1,18 +1,20 @@
 "use client";
 
-import { TerminalSquare } from "lucide-react";
 import { usePathname } from "next/navigation";
 import * as React from "react";
+import { useClientConsole } from "@/components/dashboard/client-console/client-console-manager";
 import { ClientConsoleTrafficLights } from "@/components/dashboard/client-console/client-console-traffic-lights";
 import { WebTerminalSession } from "@/components/dashboard/web-terminal/web-terminal-session";
 import {
+  CONSOLE_DOCK_HEIGHT,
   CONSOLE_DOCK_RESERVED_HEIGHT,
   type WebTerminalRect,
   type WebTerminalWindow,
+  isWebTerminalShellRoute,
   useWebTerminal,
 } from "@/components/dashboard/web-terminal/web-terminal-manager";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { DASHBOARD_CLIENT_MARKET_PATH, isClientMarketRoute } from "@/lib/dashboard-nav";
+import { DASHBOARD_CLIENT_MARKET_PATH } from "@/lib/dashboard-nav";
 
 const MIN_WIDTH = 420;
 const MIN_HEIGHT = 280;
@@ -80,7 +82,7 @@ function useTerminalClickOutsideMinimize({
 
 export function WebTerminalWindowLayer() {
   const pathname = usePathname() || DASHBOARD_CLIENT_MARKET_PATH;
-  const onClientMarketPage = isClientMarketRoute(pathname);
+  const onShellPage = isWebTerminalShellRoute(pathname);
   const {
     windows,
     dockVisible,
@@ -91,12 +93,14 @@ export function WebTerminalWindowLayer() {
     focusTerminal,
     updateTerminalRect,
   } = useWebTerminal();
+  const { dockVisible: consoleDockVisible } = useClientConsole();
 
-  const dockOffset = dockVisible ? CONSOLE_DOCK_RESERVED_HEIGHT + 12 : 0;
+  const peerDockExtra = consoleDockVisible ? CONSOLE_DOCK_HEIGHT + 8 : 0;
+  const dockOffset = dockVisible ? CONSOLE_DOCK_RESERVED_HEIGHT + 12 + peerDockExtra : 0;
   const mountedWindows = windows.filter((window) => window.activated);
 
   useTerminalClickOutsideMinimize({
-    enabled: onClientMarketPage,
+    enabled: onShellPage,
     windows,
     focusedId,
     minimizeTerminal,
@@ -108,8 +112,8 @@ export function WebTerminalWindowLayer() {
         <WebTerminalWindowShell
           key={window.id}
           window={window}
-          minimized={window.state === "minimized" || !onClientMarketPage}
-          focused={onClientMarketPage && window.id === focusedId}
+          minimized={window.state === "minimized" || !onShellPage}
+          focused={onShellPage && window.id === focusedId}
           dockOffset={dockOffset}
           onClose={() => closeTerminal(window.id)}
           onMinimize={() => minimizeTerminal(window.id)}
@@ -263,10 +267,7 @@ function WebTerminalWindowShell({
           onToggleMaximize={onToggleMaximize}
         />
         <div className="min-w-0 flex-1 text-center">
-          <div className="inline-flex max-w-full items-center justify-center gap-1.5">
-            <TerminalSquare className="h-3.5 w-3.5 shrink-0 text-slate-500" aria-hidden />
-            <p className="truncate text-[12px] font-medium text-slate-700">{window.title}</p>
-          </div>
+          <p className="truncate font-mono text-[12px] font-medium text-slate-700">{window.title}</p>
         </div>
         <span className="inline-block h-7 w-7 shrink-0" aria-hidden />
       </div>

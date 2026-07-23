@@ -12,6 +12,7 @@ import {
   type NormalRect,
   useClientConsole,
 } from "@/components/dashboard/client-console/client-console-manager";
+import { useWebTerminalOptional } from "@/components/dashboard/web-terminal";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { DASHBOARD_CLIENTS_PATH, isClientsRoute } from "@/lib/dashboard-nav";
 
@@ -93,8 +94,11 @@ export function ClientConsoleWindowLayer() {
     refreshConsole,
     updateConsoleRect,
   } = useClientConsole();
+  const webTerminal = useWebTerminalOptional();
 
-  const dockOffset = dockVisible ? CONSOLE_DOCK_RESERVED_HEIGHT + 12 : 0;
+  const peerDockExtra =
+    webTerminal?.dockVisible ? CONSOLE_DOCK_HEIGHT + 8 : 0;
+  const dockOffset = dockVisible ? CONSOLE_DOCK_RESERVED_HEIGHT + 12 + peerDockExtra : 0;
   const mountedWindows = windows.filter((window) => window.activated);
 
   useConsoleClickOutsideMinimize({

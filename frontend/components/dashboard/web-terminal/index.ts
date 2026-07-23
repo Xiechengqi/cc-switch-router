@@ -1,4 +1,5 @@
 export { WebTerminalDock } from "@/components/dashboard/web-terminal/web-terminal-dock";
+export { WebTerminalGlyph } from "@/components/dashboard/web-terminal/web-terminal-glyph";
 export {
   WebTerminalManagerProvider,
   useWebTerminal,

@@ -11,6 +11,7 @@ import {
 import {
   DASHBOARD_CLIENT_MARKET_PATH,
   isClientMarketRoute,
+  isClientsRoute,
 } from "@/lib/dashboard-nav";
 
 export {
@@ -21,6 +22,11 @@ export {
 
 export const MAX_WEB_TERMINAL_WINDOWS = 5;
 export const WEB_TERMINAL_BASE_Z_INDEX = CONSOLE_BASE_Z_INDEX + 20;
+
+/** Dock + floating windows stay available on Client Market and Clients. */
+export function isWebTerminalShellRoute(pathname: string) {
+  return isClientMarketRoute(pathname) || isClientsRoute(pathname);
+}
 const SESSION_STORAGE_KEY = "cc_switch_router_web_terminal_windows_v1";
 const CHROME_HEIGHT = 52;
 const DEFAULT_BODY_HEIGHT = 420;
@@ -306,8 +312,8 @@ export function WebTerminalManagerProvider({ children }: { children: React.React
   const windowsRef = React.useRef(state.windows);
   windowsRef.current = state.windows;
 
-  const ensureClientMarketRoute = React.useCallback(() => {
-    if (!isClientMarketRoute(pathname)) {
+  const ensureShellRoute = React.useCallback(() => {
+    if (!isWebTerminalShellRoute(pathname)) {
       router.push(DASHBOARD_CLIENT_MARKET_PATH);
     }
   }, [pathname, router]);
@@ -315,11 +321,11 @@ export function WebTerminalManagerProvider({ children }: { children: React.React
   React.useLayoutEffect(() => {
     const previousPath = prevPathRef.current;
     prevPathRef.current = pathname;
-    if (isClientMarketRoute(pathname)) {
+    if (isWebTerminalShellRoute(pathname)) {
       autoMinimizeNotifiedRef.current = false;
       return;
     }
-    if (!isClientMarketRoute(previousPath)) return;
+    if (!isWebTerminalShellRoute(previousPath)) return;
     const hadVisible = windowsRef.current.some(
       (window) => window.activated && window.state !== "minimized",
     );
@@ -365,18 +371,18 @@ export function WebTerminalManagerProvider({ children }: { children: React.React
         toast.warning(t("clientMarket.terminal.maxWindows", { count: MAX_WEB_TERMINAL_WINDOWS }));
         return;
       }
-      ensureClientMarketRoute();
+      ensureShellRoute();
       dispatch({ type: "OPEN", payload });
     },
-    [ensureClientMarketRoute, state.windows, t],
+    [ensureShellRoute, state.windows, t],
   );
 
   const restoreTerminal = React.useCallback(
     (id: string) => {
-      ensureClientMarketRoute();
+      ensureShellRoute();
       dispatch({ type: "RESTORE", payload: id });
     },
-    [ensureClientMarketRoute],
+    [ensureShellRoute],
   );
 
   const value = React.useMemo<WebTerminalContextValue>(() => {
@@ -385,14 +391,14 @@ export function WebTerminalManagerProvider({ children }: { children: React.React
       windows: state.windows,
       focusedId: state.focusedId,
       dockCount,
-      dockVisible: dockCount > 0 && isClientMarketRoute(pathname),
+      dockVisible: dockCount > 0 && isWebTerminalShellRoute(pathname),
       openTerminal,
       closeTerminal: (id) => dispatch({ type: "CLOSE", payload: id }),
       minimizeTerminal: (id) => dispatch({ type: "MINIMIZE", payload: id }),
       restoreTerminal,
       toggleMaximizeTerminal: (id) => {
-        if (!isClientMarketRoute(pathname)) {
-          ensureClientMarketRoute();
+        if (!isWebTerminalShellRoute(pathname)) {
+          ensureShellRoute();
         }
         dispatch({ type: "TOGGLE_MAXIMIZE", payload: id });
       },
@@ -400,7 +406,7 @@ export function WebTerminalManagerProvider({ children }: { children: React.React
       updateTerminalRect: (id, rect) => dispatch({ type: "UPDATE_RECT", payload: { id, rect } }),
       closeAllTerminals: () => dispatch({ type: "CLOSE_ALL" }),
     };
-  }, [ensureClientMarketRoute, openTerminal, pathname, restoreTerminal, state.focusedId, state.windows]);
+  }, [ensureShellRoute, openTerminal, pathname, restoreTerminal, state.focusedId, state.windows]);
 
   return <WebTerminalContext.Provider value={value}>{children}</WebTerminalContext.Provider>;
 }
