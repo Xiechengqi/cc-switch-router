@@ -131,12 +131,13 @@ async fn create_terminal_session(
     AxumPath(host_id): AxumPath<String>,
 ) -> Result<Json<TerminalSessionResponse>, AppError> {
     let viewer = require_session_email(&state, &headers).await?;
+    let is_admin = state.dynamic.read().await.is_admin(&viewer);
     let host = state
         .store
         .client_market_get_host(&host_id)
         .await?
         .ok_or_else(|| AppError::NotFound("host not found".into()))?;
-    authorize_client_owner_terminal(&host, &viewer)?;
+    authorize_web_terminal(&host, &viewer, is_admin)?;
 
     let mut manager = state.client_market_terminal.lock().await;
     let ticket = manager.issue_ticket(TerminalTicket {
@@ -449,27 +450,22 @@ async fn send_ws_notice(mut socket: WebSocket, message: &str) -> Result<(), Stri
     Ok(())
 }
 
-fn authorize_client_owner_terminal(
+fn authorize_web_terminal(
     host: &RouterSshHostRecord,
     viewer_email: &str,
+    is_admin: bool,
 ) -> Result<(), AppError> {
+    if is_admin {
+        return Ok(());
+    }
     let viewer = viewer_email.trim().to_ascii_lowercase();
-    let Some(owner) = host.client_owner_email.as_deref() else {
-        return Err(AppError::Forbidden(
-            "web terminal is only available to the client owner".into(),
-        ));
-    };
-    if owner.trim().to_ascii_lowercase() != viewer {
-        return Err(AppError::Forbidden(
-            "web terminal is only available to the client owner".into(),
-        ));
+    let is_host_owner = host.host_owner_email.trim().to_ascii_lowercase() == viewer;
+    if is_host_owner {
+        return Ok(());
     }
-    if host.installation_id.as_deref().is_none_or(str::is_empty) {
-        return Err(AppError::Conflict(
-            "host has no active client installation".into(),
-        ));
-    }
-    Ok(())
+    Err(AppError::Forbidden(
+        "web terminal is only available to the host owner".into(),
+    ))
 }
 
 async fn require_session_email(
@@ -515,18 +511,17 @@ mod tests {
     }
 
     #[test]
-    fn authorize_rejects_non_client_owner_and_missing_installation() {
+    fn authorize_allows_host_owner_only() {
         let host = sample_host(Some("client@example.com"), Some("inst-1"));
-        assert!(authorize_client_owner_terminal(&host, "client@example.com").is_ok());
-        assert!(authorize_client_owner_terminal(&host, "CLIENT@example.com").is_ok());
-        assert!(authorize_client_owner_terminal(&host, "host@example.com").is_err());
-        assert!(authorize_client_owner_terminal(&host, "other@example.com").is_err());
+        assert!(authorize_web_terminal(&host, "host@example.com", false).is_ok());
+        assert!(authorize_web_terminal(&host, "HOST@example.com", false).is_ok());
+        assert!(authorize_web_terminal(&host, "client@example.com", false).is_err());
+        assert!(authorize_web_terminal(&host, "other@example.com", false).is_err());
+        assert!(authorize_web_terminal(&host, "admin@example.com", true).is_ok());
 
-        let no_owner = sample_host(None, Some("inst-1"));
-        assert!(authorize_client_owner_terminal(&no_owner, "client@example.com").is_err());
-
-        let no_install = sample_host(Some("client@example.com"), None);
-        assert!(authorize_client_owner_terminal(&no_install, "client@example.com").is_err());
+        let idle = sample_host(None, None);
+        assert!(authorize_web_terminal(&idle, "host@example.com", false).is_ok());
+        assert!(authorize_web_terminal(&idle, "client@example.com", false).is_err());
     }
 
     #[test]

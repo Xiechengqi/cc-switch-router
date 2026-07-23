@@ -650,9 +650,7 @@ function HostRow({
     canManageHost &&
     (isAdmin || !host.installationId) &&
     (host.status === "unreachable" || host.status === "disabled" || host.status === "abnormal");
-  const canOpenTerminal =
-    host.canWebTerminal === true ||
-    (isClientOwner && !!host.installationId);
+  const canOpenTerminal = host.canWebTerminal === true || canManageHost;
   const countryName = host.countryCode
     ? new Intl.DisplayNames([locale], { type: "region" }).of(host.countryCode) || host.countryCode
     : "";

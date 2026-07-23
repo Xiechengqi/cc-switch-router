@@ -733,11 +733,8 @@ async fn list_hosts(
                     .is_some_and(|owner| value.eq_ignore_ascii_case(owner))
             });
             let reveal_installation = reveal_operations || is_client_owner;
-            let can_web_terminal = is_client_owner
-                && host
-                    .installation_id
-                    .as_deref()
-                    .is_some_and(|id| !id.trim().is_empty());
+            // Web Terminal is host-owner (and admin) only — not client owners.
+            let can_web_terminal = reveal_operations;
             let ip_intel = host_ip_intel_for_viewer(
                 host.ip_intel_json.as_deref(),
                 &host.ip,
