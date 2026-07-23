@@ -535,7 +535,7 @@ export function CreateClientDialog({
                         variant="outline"
                         isIconOnly
                         className="h-8 w-8 min-w-8 rounded-md p-0"
-                        isDisabled={quantity <= 1 || phase === "running"}
+                        isDisabled={quantity <= 1 || busy}
                         aria-label={t("createClient.decreaseQuantity")}
                         onClick={() => setQuantity((q) => Math.max(1, q - 1))}
                       >
@@ -547,7 +547,7 @@ export function CreateClientDialog({
                         variant="outline"
                         isIconOnly
                         className="h-8 w-8 min-w-8 rounded-md p-0"
-                        isDisabled={quantity >= Math.max(1, selectedIdleCapacity) || phase === "running"}
+                        isDisabled={quantity >= Math.max(1, selectedIdleCapacity) || busy}
                         aria-label={t("createClient.increaseQuantity")}
                         onClick={() =>
                           setQuantity((q) => Math.min(Math.max(1, selectedIdleCapacity), q + 1))
