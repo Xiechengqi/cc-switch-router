@@ -1100,7 +1100,7 @@ pub fn render_registration_email(data: &RegistrationEmailData) -> RenderedNotifi
     let rows = vec![
         ("Client", id),
         ("Client URL", display_value(data.client_url.as_deref())),
-        ("Web 密码提示", display_value(data.password_hint.as_deref())),
+        ("Web password hint", display_value(data.password_hint.as_deref())),
         ("Owner", display_value(data.owner_email.as_deref())),
         ("Platform", display_value(Some(&data.platform))),
         ("Version", display_value(data.version.as_deref())),
@@ -1125,7 +1125,7 @@ pub fn render_registration_email(data: &RegistrationEmailData) -> RenderedNotifi
         action_url,
         dashboard_url: &data.dashboard_url,
         note: Some(
-            "这不是完整密码。This is not the complete password. Use the full Web password configured during setup; the Router never receives or emails the complete password.",
+            "This is not the complete password. Use the full Web password configured during setup; the Router never receives or emails the complete password.",
         ),
         extra_html: "",
         extra_text: "",
@@ -1232,7 +1232,7 @@ pub fn render_digest_email(data: &DigestEmailData) -> RenderedNotificationEmail 
             );
             let password_hint = client.password_hint.as_deref().map_or_else(String::new, |hint| {
                 format!(
-                    "<br><span style=\"color:#64748b\">Web 密码提示:</span> <code>{}</code>",
+                    "<br><span style=\"color:#64748b\">Web password hint:</span> <code>{}</code>",
                     html_escape(hint)
                 )
             });
@@ -1251,7 +1251,7 @@ pub fn render_digest_email(data: &DigestEmailData) -> RenderedNotificationEmail 
             let hint = client
                 .password_hint
                 .as_deref()
-                .map_or_else(String::new, |hint| format!("\n  Web 密码提示: {hint}"));
+                .map_or_else(String::new, |hint| format!("\n  Web password hint: {hint}"));
             format!(
                 "- {}\n  Client URL: {url}{hint}",
                 short_installation_id(&client.installation_id)
@@ -1297,7 +1297,7 @@ pub fn render_digest_email(data: &DigestEmailData) -> RenderedNotificationEmail 
         action_url: &data.dashboard_url,
         dashboard_url: &data.dashboard_url,
         note: includes_password_hints.then_some(
-            "这不是完整密码。Each Web password hint is partial, not the complete password. Use the full password configured during that Client's setup.",
+            "Each Web password hint is partial, not the complete password. Use the full password configured during that Client's setup.",
         ),
         extra_html: &extra_html,
         extra_text: &extra_text,

@@ -26767,9 +26767,11 @@ mod tests {
             .expect("read frozen setup email");
         for body in [&html, &text] {
             assert!(body.contains("https://setupclient.router.example.com/"));
-            assert!(body.contains("Web 密码提示"));
+            assert!(body.contains("Web password hint"));
             assert!(body.contains("p******w"));
-            assert!(body.contains("这不是完整密码"));
+            assert!(body.contains("This is not the complete password"));
+            assert!(!body.contains("这不是完整密码"));
+            assert!(!body.contains("Web 密码提示"));
         }
         let retained_hint: Option<String> = conn
             .query_row(
