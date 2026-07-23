@@ -517,6 +517,7 @@ pub fn router() -> Router<ServerState> {
             get(get_provision_ssh_key),
         )
         .route("/v1/client-market/hosts", get(list_hosts).post(create_host))
+        .route("/v1/client-market/hosts/test-ssh", post(test_host_ssh))
         .route("/v1/client-market/supply-summary", get(supply_summary))
         .route("/v1/client-market/hosts/:id", delete(delete_host))
         .route("/v1/client-market/hosts/:id/reverify", post(reverify_host))
@@ -670,6 +671,58 @@ struct CreateHostRequest {
     ip: String,
     port: Option<u16>,
     note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TestHostSshRequest {
+    ip: String,
+    port: Option<u16>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TestHostSshResponse {
+    ok: bool,
+}
+
+async fn test_host_ssh(
+    State(state): State<ServerState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(input): Json<TestHostSshRequest>,
+) -> Result<Json<TestHostSshResponse>, AppError> {
+    let owner = require_session_email(&state, &headers).await?;
+    let ip = parse_host_ip(&input.ip)?;
+    let source_ip = crate::client_meta::extract_client_metadata(&headers, addr)
+        .ip
+        .as_deref()
+        .and_then(|value| value.parse::<IpAddr>().ok())
+        .unwrap_or_else(|| addr.ip());
+    let port = input.port.unwrap_or(22);
+    if port == 0 {
+        return Err(AppError::BadRequest(
+            "ssh port must be greater than zero".into(),
+        ));
+    }
+    if !state
+        .client_market_job_secrets
+        .lock()
+        .await
+        .allow_host_registration(&owner, ip, source_ip)
+    {
+        return Err(AppError::TooManyRequests(
+            "host verification rate limit exceeded".into(),
+        ));
+    }
+    ssh_test_login(
+        &state,
+        &ip.to_string(),
+        port,
+        &known_hosts_path(&state.config),
+    )
+    .await?;
+    Ok(Json(TestHostSshResponse { ok: true }))
 }
 
 async fn create_host(
@@ -1486,6 +1539,32 @@ async fn poll_for_installation(
         }
         tokio::time::sleep(interval).await;
     }
+}
+
+async fn ssh_test_login(
+    state: &ServerState,
+    ip: &str,
+    port: u16,
+    known_hosts: &Path,
+) -> Result<(), AppError> {
+    let _known_hosts_guard = PROVISION_KNOWN_HOSTS_LOCK.lock().await;
+    let output = ssh_run_remote_with_input(
+        &state.provision_ssh_key_path,
+        known_hosts,
+        ip,
+        port,
+        "set -eu; printf 'ok\\n'",
+        None,
+        SSH_VERIFY_TIMEOUT,
+        SshHostKeyPolicy::AcceptNew,
+    )
+    .await?;
+    if !output.lines().any(|line| line.trim() == "ok") {
+        return Err(AppError::BadRequest(
+            "ssh login test succeeded but returned an unexpected response".into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn ssh_verify_host(

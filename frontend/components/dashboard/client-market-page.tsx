@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { Button, Card, Chip, Modal, toast } from "@heroui/react";
-import { Loader2, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { ChevronDown, Loader2, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CopyableCodeField } from "@/components/common/copyable-code-field";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
@@ -16,6 +16,7 @@ import {
   getClientMarketJob,
   getProvisionSshKey,
   reverifyClientMarketHost,
+  testClientMarketHostSsh,
 } from "@/lib/api";
 import type { ClientMarketHost, ProvisionSshKey } from "@/lib/types";
 import type { MessageKey } from "@/lib/i18n";
@@ -35,6 +36,11 @@ function statusLabelKey(status: string): MessageKey {
   return (known[status as keyof typeof known] || "clientMarket.status.idle") as MessageKey;
 }
 
+function authorizedKeysInstallCommand(line: string): string {
+  const escaped = line.replace(/'/g, `'\\''`);
+  return `echo '${escaped}' >> $HOME/.ssh/authorized_keys`;
+}
+
 function AddHostDialog({
   open,
   onOpenChange,
@@ -45,23 +51,82 @@ function AddHostDialog({
   onAdded: () => void;
 }) {
   const { t } = useLocaleText();
+  const [sshKey, setSshKey] = React.useState<ProvisionSshKey | null>(null);
+  const [sshKeyLoading, setSshKeyLoading] = React.useState(false);
+  const [sshKeyOpen, setSshKeyOpen] = React.useState(true);
   const [ip, setIp] = React.useState("");
   const [port, setPort] = React.useState("22");
   const [note, setNote] = React.useState("");
   const [busy, setBusy] = React.useState(false);
+  const [testing, setTesting] = React.useState(false);
   const [error, setError] = React.useState("");
 
   React.useEffect(() => {
     if (!open) return;
     setError("");
+    setBusy(false);
+    setTesting(false);
+    setSshKeyOpen(true);
+    let cancelled = false;
+    setSshKeyLoading(true);
+    void getProvisionSshKey()
+      .then((key) => {
+        if (!cancelled) setSshKey(key);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : String(err));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setSshKeyLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [open]);
 
-  const submit = async () => {
+  const parsePort = () => {
     const parsedPort = port.trim() ? Number(port) : 22;
     if (!Number.isInteger(parsedPort) || parsedPort < 1 || parsedPort > 65535) {
       setError(t("clientMarket.invalidPort"));
+      return null;
+    }
+    return parsedPort;
+  };
+
+  const mapHostError = (message: string) => {
+    if (/cc-switch-server process is already running/i.test(message)) {
+      return t("clientMarket.hostAlreadyRunning");
+    }
+    return message;
+  };
+
+  const testSsh = async () => {
+    if (!ip.trim()) {
+      setError(t("clientMarket.testSshNeedIp"));
       return;
     }
+    const parsedPort = parsePort();
+    if (parsedPort == null) return;
+    setTesting(true);
+    setError("");
+    try {
+      await testClientMarketHostSsh({
+        ip: ip.trim(),
+        port: parsedPort,
+      });
+      toast.success(t("clientMarket.testSshOk"));
+    } catch (err) {
+      setError(mapHostError(err instanceof Error ? err.message : String(err)));
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const submit = async () => {
+    const parsedPort = parsePort();
+    if (parsedPort == null) return;
     if (note.length > 500) {
       setError(t("clientMarket.noteTooLong"));
       return;
@@ -81,31 +146,65 @@ function AddHostDialog({
       setNote("");
       onAdded();
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      if (/cc-switch-server process is already running/i.test(message)) {
-        setError(t("clientMarket.hostAlreadyRunning"));
-      } else {
-        setError(message);
-      }
+      setError(mapHostError(err instanceof Error ? err.message : String(err)));
     } finally {
       setBusy(false);
     }
   };
 
+  const installCommand = sshKey
+    ? authorizedKeysInstallCommand(sshKey.authorizedKeysLine)
+    : "";
+
   return (
     <Modal.Backdrop isOpen={open} onOpenChange={onOpenChange}>
-        <Modal.Container placement="center">
-          <Modal.Dialog className="w-[min(520px,calc(100vw-2rem))] max-w-none">
-            <Modal.Header>
-              <Modal.Heading>{t("clientMarket.addHostTitle")}</Modal.Heading>
-            </Modal.Header>
-            <Modal.Body className="grid gap-3">
-              <label className="grid gap-1 text-sm">
+      <Modal.Container placement="center">
+        <Modal.Dialog className="w-[min(560px,calc(100vw-2rem))] max-w-none">
+          <Modal.Header>
+            <Modal.Heading>{t("clientMarket.addHostTitle")}</Modal.Heading>
+          </Modal.Header>
+          <Modal.Body className="grid gap-3">
+            <div className="overflow-hidden rounded-xl border border-border">
+              <button
+                type="button"
+                className="flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left text-sm font-medium text-foreground transition-colors hover:bg-muted/60"
+                aria-expanded={sshKeyOpen}
+                onClick={() => setSshKeyOpen((value) => !value)}
+              >
+                <span>{t("clientMarket.addSshKeyTitle")}</span>
+                <ChevronDown
+                  className={`h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-200 ${
+                    sshKeyOpen ? "rotate-180" : ""
+                  }`}
+                />
+              </button>
+              {sshKeyOpen ? (
+                <div className="grid gap-3 border-t border-border px-3 py-3">
+                  <p className="text-sm text-muted-foreground">{t("clientMarket.addSshKeyHint")}</p>
+                  {sshKeyLoading ? (
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      …
+                    </div>
+                  ) : installCommand ? (
+                    <CopyableCodeField
+                      label={t("clientMarket.authorizedKeysCommand")}
+                      value={installCommand}
+                      copyLabel={t("clientMarket.copy")}
+                      copiedLabel={t("clientMarket.copied")}
+                    />
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
+
+            <div className="grid grid-cols-[minmax(0,1fr)_9rem] gap-3">
+              <label className="grid min-w-0 gap-1 text-sm">
                 <span className="text-muted-foreground">{t("clientMarket.hostIp")}</span>
                 <input
                   value={ip}
                   onChange={(e) => setIp(e.target.value)}
-                  className="h-11 rounded-lg border px-3 outline-none focus:ring-2 focus:ring-primary/30"
+                  className="h-11 w-full rounded-lg border px-3 outline-none focus:ring-2 focus:ring-primary/30"
                   autoComplete="off"
                 />
               </label>
@@ -114,34 +213,47 @@ function AddHostDialog({
                 <input
                   value={port}
                   onChange={(e) => setPort(e.target.value)}
-                  className="h-11 rounded-lg border px-3 outline-none focus:ring-2 focus:ring-primary/30"
+                  className="h-11 w-full rounded-lg border px-3 outline-none focus:ring-2 focus:ring-primary/30"
                   inputMode="numeric"
                   min={1}
                   max={65535}
                 />
               </label>
-              <label className="grid gap-1 text-sm">
-                <span className="text-muted-foreground">{t("clientMarket.hostNote")}</span>
-                <input
-                  value={note}
-                  onChange={(e) => setNote(e.target.value)}
-                  className="h-11 rounded-lg border px-3 outline-none focus:ring-2 focus:ring-primary/30"
-                  maxLength={500}
-                />
-              </label>
-              {error ? <p className="text-sm text-rose-600">{error}</p> : null}
-            </Modal.Body>
-            <Modal.Footer>
-              <Button variant="ghost" onClick={() => onOpenChange(false)}>
-                {t("common.close")}
-              </Button>
-              <Button variant="primary" isDisabled={busy || !ip.trim()} onClick={() => void submit()}>
-                {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                {t("clientMarket.addHost")}
-              </Button>
-            </Modal.Footer>
-          </Modal.Dialog>
-        </Modal.Container>
+            </div>
+            <label className="grid gap-1 text-sm">
+              <span className="text-muted-foreground">{t("clientMarket.hostNote")}</span>
+              <input
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+                className="h-11 rounded-lg border px-3 outline-none focus:ring-2 focus:ring-primary/30"
+                maxLength={500}
+              />
+            </label>
+            {error ? <p className="text-sm text-rose-600">{error}</p> : null}
+          </Modal.Body>
+          <Modal.Footer className="flex-wrap">
+            <Button variant="ghost" isDisabled={busy || testing} onClick={() => onOpenChange(false)}>
+              {t("common.close")}
+            </Button>
+            <Button
+              variant="outline"
+              isDisabled={busy || testing || !ip.trim()}
+              onClick={() => void testSsh()}
+            >
+              {testing ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+              {t("clientMarket.testSsh")}
+            </Button>
+            <Button
+              variant="primary"
+              isDisabled={busy || testing || !ip.trim()}
+              onClick={() => void submit()}
+            >
+              {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+              {t("clientMarket.addHost")}
+            </Button>
+          </Modal.Footer>
+        </Modal.Dialog>
+      </Modal.Container>
     </Modal.Backdrop>
   );
 }
@@ -331,7 +443,6 @@ export function ClientMarketPage() {
   const viewerEmail = session?.user?.email;
   const isAdmin = !!session?.isAdmin;
 
-  const [sshKey, setSshKey] = React.useState<ProvisionSshKey | null>(null);
   const [hosts, setHosts] = React.useState<ClientMarketHost[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [addOpen, setAddOpen] = React.useState(false);
@@ -343,9 +454,7 @@ export function ClientMarketPage() {
     setLoading(true);
     setError("");
     try {
-      const [key, list] = await Promise.all([getProvisionSshKey(), getClientMarketHosts()]);
-      setSshKey(key);
-      setHosts(list);
+      setHosts(await getClientMarketHosts());
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -388,32 +497,6 @@ export function ClientMarketPage() {
 
   return (
     <div className="mx-auto grid w-[calc(100%-2rem)] max-w-7xl gap-6 pb-10">
-      <div className="grid gap-1">
-        <h1 className="text-2xl font-semibold">{t("clientMarket.title")}</h1>
-        <p className="text-sm text-muted-foreground">{t("clientMarket.subtitle")}</p>
-      </div>
-
-      {sshKey ? (
-        <Card className="p-5">
-          <h2 className="mb-3 text-sm font-semibold">{t("clientMarket.sshKeyTitle")}</h2>
-          <p className="mb-3 text-xs text-muted-foreground">{t("clientMarket.sshKeyHint")}</p>
-          <div className="grid gap-3">
-            <CopyableCodeField
-              label={t("clientMarket.publicKey")}
-              value={sshKey.publicKey}
-              copyLabel={t("clientMarket.copy")}
-              copiedLabel={t("clientMarket.copied")}
-            />
-            <CopyableCodeField
-              label={t("clientMarket.authorizedKeysLine")}
-              value={sshKey.authorizedKeysLine}
-              copyLabel={t("clientMarket.copy")}
-              copiedLabel={t("clientMarket.copied")}
-            />
-          </div>
-        </Card>
-      ) : null}
-
       <div className="flex flex-wrap items-center justify-between gap-3">
         <h2 className="text-sm font-semibold">{t("clientMarket.hostOwner")}</h2>
         <div className="flex items-center gap-2">

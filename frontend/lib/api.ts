@@ -649,6 +649,16 @@ export async function createClientMarketHost(body: { ip: string; port?: number; 
   );
 }
 
+export async function testClientMarketHostSsh(body: { ip: string; port?: number }) {
+  return parseJson<{ ok: boolean }>(
+    await authFetch("/v1/client-market/hosts/test-ssh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
 export async function deleteClientMarketHost(id: string) {
   return parseJson<{ ok: boolean }>(
     await authFetch(`/v1/client-market/hosts/${encodeURIComponent(id)}`, { method: "DELETE" }),

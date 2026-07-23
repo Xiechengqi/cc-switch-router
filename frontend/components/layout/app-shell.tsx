@@ -29,6 +29,13 @@ function normalizeRegionUrl(url: string) {
   return /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
 }
 
+/** Nav trigger label: keep short so long emails never stretch the header. */
+function shortEmailLabel(email: string, maxChars = 10): string {
+  const trimmed = email.trim();
+  if (trimmed.length <= maxChars) return trimmed;
+  return `${trimmed.slice(0, maxChars)}…`;
+}
+
 function currentRegionName(regions: RegionOption[]) {
   if (typeof window === "undefined") return "";
   const hostname = window.location.hostname || "";
@@ -362,9 +369,14 @@ function Topbar({ active }: { active: DashboardShellActive }) {
         <LanguageSwitcher />
         {authed ? (
           <Dropdown>
-            <Dropdown.Trigger className="button button--sm button--outline gap-2">
-              <UserRound className="h-4 w-4" />
-              <span className="hidden max-w-48 truncate sm:inline">{session?.user?.email}</span>
+            <Dropdown.Trigger className="button button--sm button--outline max-w-[11rem] gap-2 overflow-hidden">
+              <UserRound className="h-4 w-4 shrink-0" />
+              <span
+                className="hidden min-w-0 truncate sm:inline"
+                title={session?.user?.email || undefined}
+              >
+                {session?.user?.email ? shortEmailLabel(session.user.email) : null}
+              </span>
             </Dropdown.Trigger>
             <Dropdown.Popover placement="bottom right">
               <Dropdown.Menu aria-label={t("nav.userMenu")}>

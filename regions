@@ -1,3 +1,4 @@
 japan:jptokenswitch.cc
 singapore:sgptokenswitch.cc
 hongkong:hktokenswitch.cc
+usa:ustokenswitch.cc
