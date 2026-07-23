@@ -44,8 +44,7 @@ export function ConfirmAlertDialog({
   const confirmVariant = tone === "primary" ? "primary" : tone === "danger" ? "danger" : "outline";
 
   return (
-    <AlertDialog isOpen={open} onOpenChange={onOpenChange}>
-      <AlertDialog.Backdrop>
+    <AlertDialog.Backdrop isOpen={open} onOpenChange={onOpenChange}>
         <AlertDialog.Container>
           <AlertDialog.Dialog className={DIALOG_CLASS}>
             <AlertDialog.Header>
@@ -75,7 +74,6 @@ export function ConfirmAlertDialog({
             </AlertDialog.Footer>
           </AlertDialog.Dialog>
         </AlertDialog.Container>
-      </AlertDialog.Backdrop>
-    </AlertDialog>
+    </AlertDialog.Backdrop>
   );
 }

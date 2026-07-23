@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -67,6 +67,10 @@ pub struct Config {
     pub lease_ttl_secs: i64,
     pub db_path: PathBuf,
     pub host_key_path: PathBuf,
+    /// Outbound Client Market SSH private key (default `$HOME/.ssh/cc-switch-router-provision`).
+    pub provision_ssh_private_key_path: PathBuf,
+    /// Matching OpenSSH public key (defaults to `<private key path>.pub`).
+    pub provision_ssh_public_key_path: PathBuf,
     pub cleanup_interval_secs: u64,
     pub lease_retention_secs: i64,
     pub request_log_retention_days: u32,
@@ -115,6 +119,17 @@ impl Config {
         if let Some(default_admin) = derive_default_admin_email(&tunnel_domain) {
             admin_emails.insert(default_admin);
         }
+        let provision_ssh_private_key_path =
+            env_var("CC_SWITCH_ROUTER_PROVISION_SSH_PRIVATE_KEY_PATH")
+                .or_else(|| env_var("CC_SWITCH_ROUTER_PROVISION_SSH_KEY_PATH"))
+                .map(PathBuf::from)
+                .unwrap_or_else(default_provision_ssh_private_key_path);
+        let provision_ssh_public_key_path =
+            env_var("CC_SWITCH_ROUTER_PROVISION_SSH_PUBLIC_KEY_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    provision_ssh_public_path_for_private(&provision_ssh_private_key_path)
+                });
         Self {
             api_addr: env_var("CC_SWITCH_ROUTER_API_ADDR")
                 .unwrap_or_else(|| "0.0.0.0:80".to_string())
@@ -138,6 +153,8 @@ impl Config {
             host_key_path: env_var("CC_SWITCH_ROUTER_HOST_KEY_PATH")
                 .map(PathBuf::from)
                 .unwrap_or_else(default_host_key_path),
+            provision_ssh_private_key_path,
+            provision_ssh_public_key_path,
             cleanup_interval_secs: env_var("CC_SWITCH_ROUTER_CLEANUP_INTERVAL_SECS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(300),
@@ -342,6 +359,27 @@ pub fn default_metrics_db_path() -> PathBuf {
 pub fn default_host_key_path() -> PathBuf {
     path_in_home("ssh_host_ed25519_key")
         .unwrap_or_else(|| PathBuf::from("./data/ssh_host_ed25519_key"))
+}
+
+pub fn default_provision_ssh_private_key_path() -> PathBuf {
+    path_in_user_ssh("cc-switch-router-provision")
+        .unwrap_or_else(|| default_data_dir().join("cc-switch-router-provision"))
+}
+
+pub fn default_provision_ssh_public_key_path() -> PathBuf {
+    provision_ssh_public_path_for_private(&default_provision_ssh_private_key_path())
+}
+
+fn provision_ssh_public_path_for_private(private_key_path: &Path) -> PathBuf {
+    let mut value = private_key_path.as_os_str().to_os_string();
+    value.push(".pub");
+    PathBuf::from(value)
+}
+
+fn path_in_user_ssh(leaf: &str) -> Option<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".ssh").join(leaf))
 }
 
 pub fn ensure_default_env_file() -> Result<PathBuf> {
@@ -585,6 +623,8 @@ mod tests {
             lease_ttl_secs: 60,
             db_path: PathBuf::from("/tmp/test.db"),
             host_key_path: PathBuf::from("/tmp/test.key"),
+            provision_ssh_private_key_path: PathBuf::from("/tmp/test_id_rsa"),
+            provision_ssh_public_key_path: PathBuf::from("/tmp/test_id_rsa.pub"),
             cleanup_interval_secs: 300,
             lease_retention_secs: 60,
             request_log_retention_days: DEFAULT_REQUEST_LOG_RETENTION_DAYS,

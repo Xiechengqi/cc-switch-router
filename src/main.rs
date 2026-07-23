@@ -4,6 +4,7 @@ mod api;
 mod board_telegram;
 mod cf;
 mod client_chat;
+mod client_market;
 mod client_meta;
 mod config;
 mod ctl_client;
@@ -16,6 +17,7 @@ mod metrics;
 mod models;
 mod namespace;
 mod notifications;
+mod provision_ssh;
 mod proxy;
 mod public_hosts;
 mod recent_traffic;
@@ -44,6 +46,7 @@ use uuid::Uuid;
 
 use crate::abuse::AbuseTracker;
 use crate::board_telegram::TelegramNotifier;
+use crate::client_market::ClientMarketJobSecrets;
 use crate::config::{Config, ensure_default_env_file, load_env_file};
 use crate::dynamic_settings::DynamicSettings;
 use crate::ip_blacklist_stats::{IpBlacklistStats, format_top_counts};
@@ -104,12 +107,25 @@ async fn main() -> Result<()> {
         db_exists = config.db_path.exists(),
         host_key_path = %config.host_key_path.display(),
         host_key_exists = config.host_key_path.exists(),
+        provision_ssh_private_key_path = %config.provision_ssh_private_key_path.display(),
+        provision_ssh_public_key_path = %config.provision_ssh_public_key_path.display(),
         env_exists = env_path.exists(),
         "starting cc-switch-router"
     );
     // 预加载 SSH host key 并计算指纹，提前失败在配置错误；也作为 lease 响应返回给客户端。
     let ssh_host_key = ssh::load_or_generate_host_key(&config.host_key_path)?;
     let ssh_host_fingerprint = ssh::host_key_fingerprint(&ssh_host_key).ok();
+    // Load or generate the dedicated outbound Client Market SSH keypair.
+    provision_ssh::require_provision_ssh_keys(
+        &config.provision_ssh_private_key_path,
+        &config.provision_ssh_public_key_path,
+    )?;
+    let provision_ssh_authorized_keys_line = provision_ssh::authorized_keys_line_from_public_path(
+        &config.provision_ssh_public_key_path,
+        "cc-switch-router-provision",
+    )?;
+    let provision_ssh_public_key =
+        provision_ssh::public_key_openssh_from_public_path(&config.provision_ssh_public_key_path)?;
     let resend = config
         .resend_api_key
         .as_deref()
@@ -147,6 +163,10 @@ async fn main() -> Result<()> {
         resend_usage_cache: Arc::new(Mutex::new(None)),
         dynamic: Arc::new(RwLock::new(DynamicSettings::from_config(&config))),
         ssh_host_fingerprint: ssh_host_fingerprint.clone(),
+        provision_ssh_key_path: config.provision_ssh_private_key_path.clone(),
+        provision_ssh_authorized_keys_line,
+        provision_ssh_public_key,
+        client_market_job_secrets: Arc::new(Mutex::new(ClientMarketJobSecrets::default())),
         recent_traffic: RecentTraffic::new(),
         abuse: Arc::new(AbuseTracker::new()),
         ip_blacklist_stats: Arc::new(IpBlacklistStats::new()),
@@ -193,6 +213,7 @@ async fn main() -> Result<()> {
         markets = market_route_count,
         "restored known route intentions"
     );
+    crate::client_market::reconcile_interrupted_jobs(state.clone()).await?;
 
     let ssh_server = ssh::SshServer {
         store: state.store.clone(),

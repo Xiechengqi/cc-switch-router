@@ -913,7 +913,7 @@ fn build_dashboard_country_aggregation(
 
 #[derive(Clone)]
 pub struct AppStore {
-    conn: Arc<Mutex<Connection>>,
+    pub(crate) conn: Arc<Mutex<Connection>>,
     share_log_recovery_attempts: Arc<Mutex<HashMap<String, i64>>>,
     ip_hash_salt: Arc<String>,
     geo_lookup_base_url: Arc<String>,
@@ -1263,6 +1263,60 @@ impl AppStore {
         })
     }
 
+    pub async fn lookup_geo_country_code_for_ip(&self, ip: &str) -> Option<String> {
+        let base = self.geo_lookup_base_url.clone();
+        lookup_ip_im_geo_at(&base, ip)
+            .await
+            .and_then(|geo| geo.country_code)
+    }
+
+    pub async fn installation_provision_source(
+        &self,
+        installation_id: &str,
+    ) -> Result<Option<String>, AppError> {
+        let conn = self.conn.lock().await;
+        Ok(conn
+            .query_row(
+                "SELECT provision_source FROM installations WHERE id = ?1",
+                params![installation_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|e| AppError::Internal(format!("read provision_source failed: {e}")))?
+            .flatten())
+    }
+
+    pub async fn purge_installation_for_client_market(
+        &self,
+        installation_id: &str,
+    ) -> Result<(), AppError> {
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction()
+            .map_err(|e| AppError::Internal(format!("begin purge tx failed: {e}")))?;
+        let provision_source: Option<Option<String>> = tx
+            .query_row(
+                "SELECT provision_source FROM installations WHERE id = ?1",
+                params![installation_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| AppError::Internal(format!("read purge installation failed: {e}")))?;
+        if provision_source.as_ref().is_some_and(|source| {
+            source.as_deref() != Some(crate::client_market::PROVISION_SOURCE_ROUTER_MARKET)
+        }) {
+            return Err(AppError::Forbidden(
+                "installation is not managed by Client Market".into(),
+            ));
+        }
+        crate::public_hosts::tombstone_subject(&tx, PublicHostKind::Client, installation_id)
+            .map_err(map_public_host_error)?;
+        purge_installation_data_tx(&tx, installation_id)?;
+        tx.commit()
+            .map_err(|e| AppError::Internal(format!("commit purge tx failed: {e}")))?;
+        Ok(())
+    }
+
     pub async fn register_installation(
         &self,
         input: RegisterInstallationRequest,
@@ -1408,6 +1462,7 @@ impl AppStore {
                     upgrade_capable: None,
                     status_reported_at: None,
                     public_ip: None,
+                    provision_source: None,
                 };
                 tx.execute(
             "INSERT INTO installations (
@@ -4191,6 +4246,7 @@ impl AppStore {
         _config: &Config,
         subdomain: &str,
         installation_id: Option<&str>,
+        source_ip: Option<&str>,
     ) -> Result<SubdomainAvailabilityResponse, AppError> {
         let subdomain = normalize_subdomain(subdomain)?;
         normalize_client_subdomain(&subdomain)
@@ -4199,6 +4255,17 @@ impl AppStore {
         let conn = self.conn.lock().await;
         ensure_subdomain_not_registered_market(&conn, &subdomain)?;
         ensure_subdomain_not_claimed_by_share(&conn, &subdomain)?;
+        if !crate::client_market::client_market_subdomain_available_to_source(
+            &conn,
+            &subdomain,
+            installation_id,
+            source_ip,
+        )? {
+            return Ok(SubdomainAvailabilityResponse {
+                available: false,
+                reason: Some("reserved".into()),
+            });
+        }
         if let Some(existing) = get_client_tunnel_by_subdomain(&conn, &subdomain)? {
             if installation_id
                 .map(str::trim)
@@ -4213,6 +4280,15 @@ impl AppStore {
             return Ok(SubdomainAvailabilityResponse {
                 available: false,
                 reason: Some("already_claimed".into()),
+            });
+        }
+        if crate::public_hosts::get_by_label(&conn, &subdomain)
+            .map_err(map_public_host_error)?
+            .is_some()
+        {
+            return Ok(SubdomainAvailabilityResponse {
+                available: false,
+                reason: Some("previously_claimed".into()),
             });
         }
         Ok(SubdomainAvailabilityResponse {
@@ -4299,6 +4375,13 @@ impl AppStore {
             let tx = conn.unchecked_transaction().map_err(|e| {
                 AppError::Internal(format!("begin client tunnel claim tx failed: {e}"))
             })?;
+            crate::client_market::authorize_client_market_subdomain_claim(
+                &tx,
+                &subdomain,
+                &installation_id,
+                &owner_email,
+                metadata.ip.as_deref(),
+            )?;
             crate::public_hosts::claim(
                 &tx,
                 crate::public_hosts::NewPublicHost {
@@ -7296,6 +7379,7 @@ impl AppStore {
                 created_at: installation.created_at,
                 last_seen_at: installation.last_seen_at,
                 upgrade: installation_upgrade_view(&installation),
+                provision_source: installation.provision_source.clone(),
             });
         }
         installation_views.sort_by(|a, b| b.last_seen_at.cmp(&a.last_seen_at));
@@ -11958,6 +12042,7 @@ fn write_map_display_settings(
 
 fn init_schema(conn: &Connection) -> Result<(), AppError> {
     crate::public_hosts::init_schema(conn).map_err(map_public_host_error)?;
+    crate::client_market::init_schema(conn).map_err(map_client_market_schema_error)?;
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS installations (
@@ -13470,6 +13555,8 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     add_column_if_missing(conn, "router_markets", "maintenance_message", "TEXT")?;
+    add_column_if_missing(conn, "installations", "provision_source", "TEXT")?;
+    add_column_if_missing(conn, "installations", "provision_host_id", "TEXT")?;
     conn.execute(
         "UPDATE installations
          SET owner_email = (
@@ -15420,7 +15507,7 @@ const INSTALLATION_SELECT_COLUMNS: &str = "id, public_key, platform, app_version
                 geo_candidate_country_code, geo_candidate_country, geo_candidate_region, geo_candidate_city,
                 geo_candidate_latitude, geo_candidate_longitude, geo_candidate_hits, geo_candidate_first_seen_at,
                 geo_last_changed_at, created_at, last_seen_at,
-                delegate_upgrade_to_router_owner, app_commit_id, update_available, upgrade_capable, status_reported_at, public_ip";
+                delegate_upgrade_to_router_owner, app_commit_id, update_available, upgrade_capable, status_reported_at, public_ip, provision_source";
 
 fn map_installation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Installation> {
     Ok(Installation {
@@ -15506,6 +15593,7 @@ fn map_installation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Installatio
                 )
             })?,
         public_ip: row.get(29)?,
+        provision_source: row.get(30)?,
     })
 }
 
@@ -19924,6 +20012,12 @@ fn normalize_subdomain(value: &str) -> Result<String, AppError> {
     Ok(value)
 }
 
+fn map_client_market_schema_error(
+    error: crate::client_market::ClientMarketSchemaError,
+) -> AppError {
+    AppError::Internal(error.to_string())
+}
+
 fn map_public_host_error(error: crate::public_hosts::PublicHostCatalogError) -> AppError {
     use crate::public_hosts::PublicHostCatalogError;
     match error {
@@ -23532,6 +23626,12 @@ mod tests {
             db_path,
             host_key_path: std::env::temp_dir()
                 .join(format!("cc-switch-router-{name}-{}.key", Uuid::new_v4())),
+            provision_ssh_private_key_path: std::env::temp_dir()
+                .join(format!("cc-switch-router-{name}-{}-id_rsa", Uuid::new_v4())),
+            provision_ssh_public_key_path: std::env::temp_dir().join(format!(
+                "cc-switch-router-{name}-{}-id_rsa.pub",
+                Uuid::new_v4()
+            )),
             cleanup_interval_secs: 300,
             lease_retention_secs: 24 * 60 * 60,
             request_log_retention_days: 30,

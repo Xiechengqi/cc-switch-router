@@ -235,8 +235,11 @@ export function ShareUserGrantsEditor({
         </table>
       </div>
 
-      <Modal isOpen={!!grantDraft} onOpenChange={(open) => !open && setGrantDraft(null)}>
-        <Modal.Backdrop className="z-[70]">
+      <Modal.Backdrop
+        isOpen={!!grantDraft}
+        onOpenChange={(open) => !open && setGrantDraft(null)}
+        className="z-[70]"
+      >
           <Modal.Container placement="center" className="z-[70]">
             <Modal.Dialog className="light w-[min(620px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
               <Modal.CloseTrigger />
@@ -277,8 +280,7 @@ export function ShareUserGrantsEditor({
               </Modal.Footer>
             </Modal.Dialog>
           </Modal.Container>
-        </Modal.Backdrop>
-      </Modal>
+      </Modal.Backdrop>
     </div>
   );
 }

@@ -35,8 +35,10 @@ export function ShareEditDialog({
 
   return (
     <>
-      <Modal isOpen={!!share} onOpenChange={(open) => !open && !form?.busy && onClose()}>
-        <Modal.Backdrop>
+      <Modal.Backdrop
+        isOpen={!!share}
+        onOpenChange={(open) => !open && !form?.busy && onClose()}
+      >
           <Modal.Container placement="center">
             <Modal.Dialog className="share-edit-surface light flex max-h-[min(88vh,calc(100vh-2rem))] w-[min(960px,calc(100vw-2rem))] max-w-none flex-col !bg-white !text-slate-900">
               <Modal.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
@@ -110,8 +112,7 @@ export function ShareEditDialog({
               </Modal.Footer>
             </Modal.Dialog>
           </Modal.Container>
-        </Modal.Backdrop>
-      </Modal>
+      </Modal.Backdrop>
 
       {form ? (
         <>

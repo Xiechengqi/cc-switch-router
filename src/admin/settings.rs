@@ -193,8 +193,32 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         required: false,
         restart_required: true,
         default: None,
-        description: "Ed25519 SSH host key. Auto-generated on first start when missing.",
+        description: "Ed25519 SSH host key for inbound client tunnels. Auto-generated on first start when missing.",
         placeholder: Some("/var/lib/cc-switch-router/ssh_host_ed25519_key"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_PROVISION_SSH_PRIVATE_KEY_PATH",
+        label: "Client Market SSH private key",
+        group: "Persistence",
+        field_type: FieldType::Path,
+        required: false,
+        restart_required: true,
+        default: None,
+        description: "Dedicated outbound SSH private key used to verify and provision Client Market hosts. Generated as Ed25519 on first start when missing.",
+        placeholder: Some("~/.ssh/cc-switch-router-provision"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_PROVISION_SSH_PUBLIC_KEY_PATH",
+        label: "Client Market SSH public key",
+        group: "Persistence",
+        field_type: FieldType::Path,
+        required: false,
+        restart_required: true,
+        default: None,
+        description: "Matching OpenSSH public key shown on Client Market for authorized_keys. Derived from the private key when missing.",
+        placeholder: Some("~/.ssh/cc-switch-router-provision.pub"),
         dynamic_group: None,
     },
     // ── Lease / cleanup ──
@@ -1056,6 +1080,20 @@ pub fn schema_response() -> SettingsSchemaResponse {
                     }
                     "CC_SWITCH_ROUTER_HOST_KEY_PATH" => {
                         let path = crate::config::default_host_key_path().display().to_string();
+                        view.placeholder = Some(path);
+                    }
+                    "CC_SWITCH_ROUTER_PROVISION_SSH_PRIVATE_KEY_PATH" => {
+                        let path = crate::config::default_provision_ssh_private_key_path()
+                            .display()
+                            .to_string();
+                        view.default = Some(path.clone());
+                        view.placeholder = Some(path);
+                    }
+                    "CC_SWITCH_ROUTER_PROVISION_SSH_PUBLIC_KEY_PATH" => {
+                        let path = crate::config::default_provision_ssh_public_key_path()
+                            .display()
+                            .to_string();
+                        view.default = Some(path.clone());
                         view.placeholder = Some(path);
                     }
                     "CC_SWITCH_ROUTER_METRICS_DB_PATH" => {
@@ -2145,6 +2183,10 @@ mod tests {
             lease_ttl_secs: 60,
             db_path: std::env::temp_dir().join("cc-switch-router-rebuild-test.db"),
             host_key_path: std::env::temp_dir().join("cc-switch-router-rebuild-test.key"),
+            provision_ssh_private_key_path: std::env::temp_dir()
+                .join("cc-switch-router-rebuild-test-id_rsa"),
+            provision_ssh_public_key_path: std::env::temp_dir()
+                .join("cc-switch-router-rebuild-test-id_rsa.pub"),
             cleanup_interval_secs: 300,
             lease_retention_secs: 24 * 60 * 60,
             request_log_retention_days: 30,

@@ -10,6 +10,7 @@ use tokio::sync::{Mutex, RwLock, broadcast};
 use crate::abuse::AbuseTracker;
 use crate::admin::upgrade::SharedUpgradeRegistry;
 use crate::board_telegram::TelegramNotifier;
+use crate::client_market::ClientMarketJobSecrets;
 use crate::config::Config;
 use crate::dynamic_settings::DynamicSettings;
 use crate::ip_blacklist_stats::IpBlacklistStats;
@@ -35,6 +36,14 @@ pub struct ServerState {
     pub dynamic: Arc<RwLock<DynamicSettings>>,
     /// SSH host key 指纹（`SHA256:<base64-nopad>` 格式），在 /lease 响应中回传给客户端。
     pub ssh_host_fingerprint: Option<String>,
+    /// Outbound Client Market SSH private key path (IdentityFile for host provisioning).
+    pub provision_ssh_key_path: PathBuf,
+    /// OpenSSH public key line for router market host `authorized_keys`.
+    pub provision_ssh_authorized_keys_line: String,
+    /// Public key material (algorithm + base64) without comment.
+    pub provision_ssh_public_key: String,
+    /// One-time provision tokens for remote install scripts (passwords kept in memory).
+    pub client_market_job_secrets: Arc<Mutex<ClientMarketJobSecrets>>,
     /// In-memory rolling tracker of proxy traffic by user origin. Drives the dashboard
     /// "demand" overlay and burst-arc animation; not persisted across restarts.
     pub recent_traffic: RecentTraffic,

@@ -15,7 +15,7 @@ export function ShareClientTag({
 }) {
   const { openConsole } = useClientConsole();
   const url = clientTunnelDisplayUrl(client?.clientTunnel?.tunnelUrl);
-  if (!url || !client) return null;
+  if (!url || !client || client.installation.provisionSource === "router_market") return null;
   const title = client.clientTunnel?.subdomain || url;
   const handle = (event: React.MouseEvent) => {
     event.stopPropagation();

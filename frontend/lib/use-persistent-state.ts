@@ -26,5 +26,5 @@ export function usePersistentState<T>(key: string, initialValue: T) {
     }
   }, [hydrated, key, value]);
 
-  return [value, setValue] as const;
+  return [value, setValue, hydrated] as const;
 }

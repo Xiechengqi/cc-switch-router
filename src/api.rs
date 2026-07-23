@@ -210,6 +210,7 @@ pub fn router(state: ServerState) -> Router {
 
     Router::new()
         .merge(public_api)
+        .merge(crate::client_market::router())
         .route("/", any(root_handler))
         .route("/install-client.sh", get(install_client_script))
         .route("/favicon.ico", get(favicon))
@@ -1370,8 +1371,11 @@ struct SubdomainAvailabilityQuery {
 
 async fn check_client_tunnel_subdomain_availability(
     State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Query(query): Query<SubdomainAvailabilityQuery>,
 ) -> Result<Json<SubdomainAvailabilityResponse>, AppError> {
+    let metadata = extract_client_metadata(&headers, addr);
     Ok(Json(
         state
             .store
@@ -1379,6 +1383,7 @@ async fn check_client_tunnel_subdomain_availability(
                 &state.config,
                 &query.subdomain,
                 query.installation_id.as_deref(),
+                metadata.ip.as_deref(),
             )
             .await?,
     ))

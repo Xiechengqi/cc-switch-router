@@ -41,6 +41,13 @@ import type {
   ClientChatRoom,
   ClientChatRoomListResponse,
   ClientChatVisit,
+  ClientMarketHost,
+  SupplySummaryEntry,
+  ProvisionSshKey,
+  ProvisioningJob,
+  CreateClientMarketClientRequest,
+  CreateClientMarketClientResponse,
+  ClientTunnelSubdomainAvailability,
 } from "@/lib/types";
 
 export type { BoardListResponse, BoardMessage, BoardMeta };
@@ -603,4 +610,87 @@ export async function getShareImageGenerationRequestLogs(
     }),
   );
   return data.logs || [];
+}
+
+export async function getProvisionSshKey() {
+  return parseJson<ProvisionSshKey>(
+    await authFetch("/v1/client-market/provision-ssh-key", { cache: "no-store" }),
+  );
+}
+
+export async function getClientMarketHosts(params?: {
+  ownerEmail?: string;
+  country?: string;
+  status?: string;
+}) {
+  const search = new URLSearchParams();
+  if (params?.ownerEmail) search.set("ownerEmail", params.ownerEmail);
+  if (params?.country) search.set("country", params.country);
+  if (params?.status) search.set("status", params.status);
+  const query = search.toString();
+  return parseJson<ClientMarketHost[]>(
+    await authFetch(`/v1/client-market/hosts${query ? `?${query}` : ""}`, { cache: "no-store" }),
+  );
+}
+
+export async function getClientMarketSupplySummary() {
+  return parseJson<SupplySummaryEntry[]>(
+    await authFetch("/v1/client-market/supply-summary", { cache: "no-store" }),
+  );
+}
+
+export async function createClientMarketHost(body: { ip: string; port?: number; note?: string }) {
+  return parseJson<ClientMarketHost>(
+    await authFetch("/v1/client-market/hosts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function deleteClientMarketHost(id: string) {
+  return parseJson<{ ok: boolean }>(
+    await authFetch(`/v1/client-market/hosts/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  );
+}
+
+export async function reverifyClientMarketHost(id: string) {
+  return parseJson<ClientMarketHost>(
+    await authFetch(`/v1/client-market/hosts/${encodeURIComponent(id)}/reverify`, {
+      method: "POST",
+    }),
+  );
+}
+
+export async function createClientMarketClient(body: CreateClientMarketClientRequest) {
+  return parseJson<CreateClientMarketClientResponse>(
+    await authFetch("/v1/client-market/clients", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function getClientMarketJob(id: string) {
+  return parseJson<ProvisioningJob>(
+    await authFetch(`/v1/client-market/jobs/${encodeURIComponent(id)}`, { cache: "no-store" }),
+  );
+}
+
+export async function cleanupClientMarketClient(installationId: string) {
+  return parseJson<CreateClientMarketClientResponse>(
+    await authFetch(`/v1/client-market/clients/${encodeURIComponent(installationId)}/cleanup`, {
+      method: "POST",
+    }),
+  );
+}
+
+export async function checkClientTunnelSubdomainAvailability(subdomain: string, installationId?: string) {
+  const params = new URLSearchParams({ subdomain });
+  if (installationId) params.set("installationId", installationId);
+  return parseJson<ClientTunnelSubdomainAvailability>(
+    await authFetch(`/v1/client-tunnel/subdomain-availability?${params}`, { cache: "no-store" }),
+  );
 }

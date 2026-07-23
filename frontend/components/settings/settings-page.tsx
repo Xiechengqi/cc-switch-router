@@ -4,6 +4,7 @@ import { Loader2, Save, Send, RotateCcw } from "lucide-react";
 import { Alert, Button, Card, Checkbox, Chip, Input, ListBox, ScrollShadow, TextArea } from "@heroui/react";
 import * as React from "react";
 import { useAuth } from "@/components/auth/auth-provider";
+import { CopyableCodeField } from "@/components/common/copyable-code-field";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   settingsFieldDescription,
@@ -17,8 +18,8 @@ import { ClientNotificationDeliveriesPanel } from "@/components/settings/client-
 import { MapDisplayPanel } from "@/components/settings/map-display-panel";
 import { AnnouncementPanel } from "@/components/settings/announcement-panel";
 import { VersionPanel } from "@/components/settings/version-panel";
-import { getSettingsSchema, getSettingsValues, saveSettings, testTelegram, restartService, getMapDisplay, updateMapDisplay } from "@/lib/api";
-import type { MapDisplaySettings, SettingValueEntry, SettingsField, SettingsSchema } from "@/lib/types";
+import { getSettingsSchema, getSettingsValues, saveSettings, testTelegram, restartService, getMapDisplay, updateMapDisplay, getProvisionSshKey } from "@/lib/api";
+import type { MapDisplaySettings, ProvisionSshKey, SettingValueEntry, SettingsField, SettingsSchema } from "@/lib/types";
 import { DEFAULT_MAP_DISPLAY, sameMapDisplaySettings, toMapDisplayUpdate } from "@/lib/map-display-settings";
 
 type DirtyValue = string | boolean | null;
@@ -27,6 +28,7 @@ const MAP_GROUP = "__map";
 const ANNOUNCEMENT_GROUP = "__announcement";
 const LOGS_GROUP = "__logs";
 const NOTIFICATION_DELIVERIES_GROUP = "__notification_deliveries";
+const PERSISTENCE_GROUP = "Persistence";
 
 export function SettingsPage() {
   const { session, loading } = useAuth();
@@ -39,6 +41,7 @@ export function SettingsPage() {
   const [banner, setBanner] = React.useState<{ kind: "default" | "success" | "destructive"; text: string } | null>(null);
   const [mapSaved, setMapSaved] = React.useState<MapDisplaySettings>(DEFAULT_MAP_DISPLAY);
   const [mapDraft, setMapDraft] = React.useState<MapDisplaySettings>(DEFAULT_MAP_DISPLAY);
+  const [provisionSshKey, setProvisionSshKey] = React.useState<ProvisionSshKey | null>(null);
 
   const isAdmin = !!session?.isAdmin;
   const mapDirty = !sameMapDisplaySettings(mapDraft, mapSaved);
@@ -46,15 +49,17 @@ export function SettingsPage() {
   const load = React.useCallback(async () => {
     setBusy("load");
     try {
-      const [nextSchema, nextValues, nextMap] = await Promise.all([
+      const [nextSchema, nextValues, nextMap, nextProvisionSshKey] = await Promise.all([
         getSettingsSchema(),
         getSettingsValues(),
         getMapDisplay(),
+        getProvisionSshKey(),
       ]);
       setSchema(nextSchema);
       setValues(Object.fromEntries(nextValues.values.map((entry) => [entry.key, entry])));
       setMapSaved(nextMap);
       setMapDraft(nextMap);
+      setProvisionSshKey(nextProvisionSshKey);
       setActiveGroup((current) => current || VERSION_GROUP);
       setDirty({});
       setBanner(null);
@@ -191,6 +196,26 @@ export function SettingsPage() {
               </Card.Header>
               <Card.Content className="grid gap-4">
                 {busy === "load" && !schema ? <div className="text-sm text-muted-foreground">{t("settings.loading")}</div> : null}
+                {activeGroup === PERSISTENCE_GROUP && provisionSshKey ? (
+                  <div className="grid gap-3 border-b pb-5">
+                    <div>
+                      <h3 className="text-sm font-semibold">{t("settings.provisionSshKeyTitle")}</h3>
+                      <p className="mt-1 text-sm text-muted-foreground">{t("settings.provisionSshKeyDesc")}</p>
+                    </div>
+                    <CopyableCodeField
+                      label={t("clientMarket.publicKey")}
+                      value={provisionSshKey.publicKey}
+                      copyLabel={t("clientMarket.copy")}
+                      copiedLabel={t("clientMarket.copied")}
+                    />
+                    <CopyableCodeField
+                      label={t("clientMarket.authorizedKeysLine")}
+                      value={provisionSshKey.authorizedKeysLine}
+                      copyLabel={t("clientMarket.copy")}
+                      copiedLabel={t("clientMarket.copied")}
+                    />
+                  </div>
+                ) : null}
                 {fields.map((field) => (
                   <SettingsFieldRow
                     key={field.key}

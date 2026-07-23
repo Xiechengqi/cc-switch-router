@@ -90,8 +90,7 @@ export function AnnouncementDialog() {
   };
 
   return (
-    <Modal isOpen={open} onOpenChange={setOpen}>
-      <Modal.Backdrop className="z-[70]">
+    <Modal.Backdrop isOpen={open} onOpenChange={setOpen} className="z-[70]">
         <Modal.Container placement="center" className="z-[70]">
           <Modal.Dialog className={`${DIALOG_CLASS} w-[min(640px,calc(100vw-2rem))] max-w-none`}>
             <Modal.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
@@ -113,7 +112,6 @@ export function AnnouncementDialog() {
             </Modal.Footer>
           </Modal.Dialog>
         </Modal.Container>
-      </Modal.Backdrop>
-    </Modal>
+    </Modal.Backdrop>
   );
 }

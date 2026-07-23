@@ -188,6 +188,7 @@ export type DashboardClient = {
     publicIp?: string;
     createdAt: string;
     lastSeenAt: string;
+    provisionSource?: string;
     upgrade?: {
       delegateUpgradeToRouterOwner: boolean;
       updateAvailable: boolean;
@@ -1249,4 +1250,91 @@ export type ShareUsageRefreshResponse = {
     refreshed: boolean;
     error?: string | null;
   }>;
+};
+
+export type ClientMarketHostStatus =
+  | "idle"
+  | "allocated"
+  | "locked"
+  | "draining"
+  | "disabled"
+  | "unreachable"
+  | "abnormal";
+
+export type ClientMarketHost = {
+  id: string;
+  ip?: string;
+  port?: number;
+  hostOwnerEmail: string;
+  countryCode?: string;
+  hostname?: string;
+  sshHostKeyFingerprint?: string;
+  status: ClientMarketHostStatus | string;
+  clientSubdomain?: string;
+  clientOwnerEmail?: string;
+  installationId?: string;
+  lastVerifiedAt?: string;
+  lastError?: string;
+  note?: string;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+export type SupplySummaryEntry = {
+  hostOwnerEmail: string;
+  countryCode?: string;
+  idleCount: number;
+  totalCount: number;
+};
+
+export type ProvisionSshKey = {
+  publicKey: string;
+  authorizedKeysLine: string;
+};
+
+export type ProvisioningJobStatus = "pending" | "running" | "succeeded" | "failed";
+
+export type ProvisioningJob = {
+  id: string;
+  jobType: string;
+  hostId?: string;
+  hostOwnerEmail?: string;
+  clientOwnerEmail?: string;
+  subdomain?: string;
+  installationId?: string;
+  status: ProvisioningJobStatus;
+  phase: string;
+  failureCode?: string;
+  countryCode?: string;
+  clientUrl?: string;
+  log: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type CreateClientMarketClientRequest = {
+  hostOwnerEmails: string[];
+  countryCodes: string[];
+  subdomain: string;
+  password: string;
+  count?: number;
+};
+
+export type CreateClientMarketClientResponse = {
+  jobId: string;
+};
+
+export type ClientTunnelSubdomainAvailability = {
+  available: boolean;
+  reason?: string;
+};
+
+export type CreateClientSelectionPersist = {
+  mode: "all" | "subset";
+  emails: string[];
+};
+
+export type CreateClientRegionsPersist = {
+  mode: "all" | "subset";
+  codes: string[];
 };

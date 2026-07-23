@@ -894,8 +894,7 @@ export function ShareUsageTrend({ usage, t }: { usage: ShareUsageByEmailResponse
           </div>
         ))}
       </div>
-      <Modal isOpen={expanded} onOpenChange={setExpanded}>
-        <Modal.Backdrop>
+      <Modal.Backdrop isOpen={expanded} onOpenChange={setExpanded}>
           <Modal.Container placement="center">
             <Modal.Dialog className="light w-[min(1120px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900 [--foreground:rgb(15,23,42)] [--muted:rgb(100,116,139)] [--overlay:#fff] [--overlay-foreground:rgb(15,23,42)] [--surface:#fff] [--surface-foreground:rgb(15,23,42)]">
               <Modal.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
@@ -909,8 +908,7 @@ export function ShareUsageTrend({ usage, t }: { usage: ShareUsageByEmailResponse
               </Modal.Body>
             </Modal.Dialog>
           </Modal.Container>
-        </Modal.Backdrop>
-      </Modal>
+      </Modal.Backdrop>
     </div>
   );
 }

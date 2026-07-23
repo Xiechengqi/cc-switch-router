@@ -142,8 +142,7 @@ export const ShareConnectDialog = React.memo(function ShareConnectDialog({
   if (!share) return null;
 
   return (
-    <Modal isOpen={open} onOpenChange={onOpenChange}>
-      <Modal.Backdrop>
+    <Modal.Backdrop isOpen={open} onOpenChange={onOpenChange}>
         <Modal.Container placement="center">
           <Modal.Dialog className="light w-[min(920px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900 [--foreground:rgb(15,23,42)] [--muted:rgb(100,116,139)] [--overlay:#fff] [--overlay-foreground:rgb(15,23,42)] [--surface:#fff] [--surface-foreground:rgb(15,23,42)]">
             <Modal.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
@@ -242,8 +241,7 @@ export const ShareConnectDialog = React.memo(function ShareConnectDialog({
             </Modal.Footer>
           </Modal.Dialog>
         </Modal.Container>
-      </Modal.Backdrop>
-    </Modal>
+    </Modal.Backdrop>
   );
 });
 

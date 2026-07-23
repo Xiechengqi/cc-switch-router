@@ -1,9 +1,10 @@
 "use client";
 
 import { Button, Card, Chip, Drawer, toast } from "@heroui/react";
-import { Check, ChevronDown, Copy, ExternalLink, MessageCircle, Search, WalletCards } from "lucide-react";
+import { Check, ChevronDown, Copy, ExternalLink, MessageCircle, Plus, Search, WalletCards } from "lucide-react";
 import * as React from "react";
 import { buildClientInstallCommand, InstallGuideDialog } from "@/components/dashboard/install-guide-dialog";
+import { CreateClientDialog } from "@/components/dashboard/create-client-dialog";
 import { SectionInstallButton } from "@/components/dashboard/section-install-button";
 import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog";
 import { ShareCard } from "@/components/dashboard/share-card";
@@ -203,6 +204,7 @@ function ClientHeaderInlineButton({
 function ClientConsoleButton({ client }: { client: DashboardClient }) {
   const { t } = useLocaleText();
   const { openConsole } = useClientConsole();
+  if (client.installation.provisionSource === "router_market") return null;
   const tunnelUrl = clientTunnelDisplayUrl(client.clientTunnel?.tunnelUrl);
   if (!tunnelUrl) return null;
   const title = client.clientTunnel?.subdomain || tunnelUrl;
@@ -526,6 +528,7 @@ export function ClientBoard({
   const [editingShare, setEditingShare] = React.useState<ShareView | null>(null);
   const [connectShare, setConnectShare] = React.useState<ShareView | null>(null);
   const [installOpen, setInstallOpen] = React.useState(false);
+  const [createClientOpen, setCreateClientOpen] = React.useState(false);
   const [query, setQuery] = React.useState("");
   const [statusFilter, setStatusFilter] = usePersistentState<"all" | Extract<OperationalState, "online" | "reconnecting" | "degraded" | "offline">>("cc_switch_router_client_status_v1", "all");
   const [sortOrder, setSortOrder] = usePersistentState("cc_switch_router_client_sort_v1", "tokens");
@@ -733,7 +736,6 @@ export function ClientBoard({
     () =>
       buildClientInstallCommand({
         ownerEmailPlaceholder: t("dashboard.installClientCommandOwnerPlaceholder"),
-        webPasswordPlaceholder: t("dashboard.installClientCommandWebPasswordPlaceholder"),
       }),
     [installOpen, t],
   );
@@ -744,9 +746,9 @@ export function ClientBoard({
 
   return (
     <section className="grid gap-4">
-      <div className="flex items-center justify-between gap-4">
-        <div className="flex items-center gap-3">
-          <div className="inline-flex rounded-lg bg-slate-100 p-1 text-[11px]">
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <div className="flex min-w-0 flex-wrap items-center gap-3">
+          <div className="inline-flex max-w-full overflow-x-auto rounded-lg bg-slate-100 p-1 text-[11px]">
             {([[
               "all", t("dashboard.all"), sortedClients.length,
             ], ["online", t("common.online"), clientSummary.online], ["reconnecting", t("dashboard.reconnecting"), clientSummary.reconnecting], ["degraded", t("dashboard.degraded"), clientSummary.degraded], ["offline", t("common.offline"), clientSummary.offline]] as const).map(([value, label, count]) => (
@@ -754,9 +756,13 @@ export function ClientBoard({
             ))}
           </div>
           <SectionInstallButton label={t("dashboard.installClient")} onClick={() => setInstallOpen(true)} />
+          <Button variant="primary" size="sm" className="h-7 px-3 text-xs" onClick={() => setCreateClientOpen(true)}>
+            <Plus className="h-3.5 w-3.5" />
+            {t("createClient.newClient")}
+          </Button>
         </div>
-        <div className="flex items-center gap-2">
-          <label className="flex h-9 min-w-64 flex-1 items-center gap-2 rounded-md border bg-white px-3 text-sm focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-primary/10">
+        <div className="flex w-full min-w-0 items-center gap-2 sm:w-auto">
+          <label className="flex h-9 min-w-0 flex-1 items-center gap-2 rounded-md border bg-white px-3 text-sm focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-primary/10 sm:min-w-64">
             <Search className="h-4 w-4 shrink-0 text-muted-foreground" />
             <input value={query} onChange={(event) => setQuery(event.target.value)} className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground" placeholder={t("dashboard.searchClients")} aria-label={t("dashboard.searchClients")} />
           </label>
@@ -805,8 +811,7 @@ export function ClientBoard({
         </div>
       ) : null}
 
-      <Drawer isOpen={!!selectedClient} onOpenChange={closeClientDrawer}>
-        <Drawer.Backdrop>
+      <Drawer.Backdrop isOpen={!!selectedClient} onOpenChange={closeClientDrawer}>
           <Drawer.Content placement="right">
             <Drawer.Dialog className={drawerDialogClassName}>
               <Drawer.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
@@ -852,11 +857,9 @@ export function ClientBoard({
               </Drawer.Body>
             </Drawer.Dialog>
           </Drawer.Content>
-        </Drawer.Backdrop>
-      </Drawer>
+      </Drawer.Backdrop>
 
-      <Drawer isOpen={!!selectedShare} onOpenChange={closeShareDrawer}>
-        <Drawer.Backdrop>
+      <Drawer.Backdrop isOpen={!!selectedShare} onOpenChange={closeShareDrawer}>
           <Drawer.Content placement="right">
             <Drawer.Dialog className={drawerDialogClassName}>
               <Drawer.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
@@ -887,8 +890,7 @@ export function ClientBoard({
               </Drawer.Body>
             </Drawer.Dialog>
           </Drawer.Content>
-        </Drawer.Backdrop>
-      </Drawer>
+      </Drawer.Backdrop>
 
       <ShareEditDialog share={editingShare} markets={markets} onClose={closeEditShare} onSaved={handleSaved} />
       <ShareConnectDialog share={currentConnectShare} open={!!currentConnectShare} onOpenChange={closeConnectDialog} />
@@ -900,6 +902,7 @@ export function ClientBoard({
         commandLabelKey="dashboard.installClientCommandLabel"
         command={clientInstallCommand}
       />
+      <CreateClientDialog open={createClientOpen} onOpenChange={setCreateClientOpen} />
     </section>
   );
 }

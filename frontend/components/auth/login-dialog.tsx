@@ -84,8 +84,7 @@ export function LoginDialog({ open, onOpenChange }: { open: boolean; onOpenChang
   const isCodeStep = step === "code";
 
   return (
-    <Modal isOpen={open} onOpenChange={onOpenChange}>
-      <Modal.Backdrop>
+    <Modal.Backdrop isOpen={open} onOpenChange={onOpenChange}>
         <Modal.Container placement="center">
           <Modal.Dialog>
             <Modal.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
@@ -176,7 +175,6 @@ export function LoginDialog({ open, onOpenChange }: { open: boolean; onOpenChang
             </Form>
           </Modal.Dialog>
         </Modal.Container>
-      </Modal.Backdrop>
-    </Modal>
+    </Modal.Backdrop>
   );
 }

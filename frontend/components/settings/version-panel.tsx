@@ -208,8 +208,7 @@ export function VersionPanel({ isAdmin }: { isAdmin: boolean }) {
           </div>
         ) : null}
       </Card.Content>
-      <Modal isOpen={upgradeOpen} onOpenChange={setUpgradeOpen}>
-        <Modal.Backdrop>
+      <Modal.Backdrop isOpen={upgradeOpen} onOpenChange={setUpgradeOpen}>
           <Modal.Container placement="center" size="lg">
             <Modal.Dialog className="!bg-white !text-slate-900">
               <Modal.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
@@ -228,8 +227,7 @@ export function VersionPanel({ isAdmin }: { isAdmin: boolean }) {
               </Modal.Body>
             </Modal.Dialog>
           </Modal.Container>
-        </Modal.Backdrop>
-      </Modal>
+      </Modal.Backdrop>
       {confirmCopy ? (
         <ConfirmAlertDialog
           open={!!confirmAction}

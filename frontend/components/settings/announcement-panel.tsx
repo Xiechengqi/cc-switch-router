@@ -181,8 +181,7 @@ export function AnnouncementPanel() {
         )}
       </Card.Content>
 
-      <Modal isOpen={previewOpen} onOpenChange={setPreviewOpen}>
-        <Modal.Backdrop>
+      <Modal.Backdrop isOpen={previewOpen} onOpenChange={setPreviewOpen}>
           <Modal.Container placement="center">
             <Modal.Dialog className={`${DIALOG_CLASS} w-[min(640px,calc(100vw-2rem))] max-w-none`}>
               <Modal.Header>
@@ -203,8 +202,7 @@ export function AnnouncementPanel() {
               </Modal.Footer>
             </Modal.Dialog>
           </Modal.Container>
-        </Modal.Backdrop>
-      </Modal>
+      </Modal.Backdrop>
     </Card>
   );
 }

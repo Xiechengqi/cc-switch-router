@@ -60,6 +60,8 @@ pub struct Installation {
     /// Self-reported public IPv4 from the server process (startup probe).
     #[serde(default)]
     pub public_ip: Option<String>,
+    #[serde(default)]
+    pub provision_source: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2570,6 +2572,8 @@ pub struct InstallationView {
     pub last_seen_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upgrade: Option<InstallationUpgradeView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provision_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -9,15 +9,15 @@ import type { MessageKey } from "@/lib/i18n";
 export function buildClientInstallCommand(options?: {
   origin?: string;
   ownerEmailPlaceholder?: string;
-  webPasswordPlaceholder?: string;
 }) {
   const base = (options?.origin ?? (typeof window === "undefined" ? "https://[router_url]" : window.location.origin)).replace(
     /\/$/,
     "",
   );
   const ownerEmail = options?.ownerEmailPlaceholder ?? "owner@example.com";
-  const webPassword = options?.webPasswordPlaceholder ?? "web-login-password";
-  return `curl -SsL ${base}/install-client.sh | bash -s ${base} ${ownerEmail} ${webPassword}`;
+  const shellQuote = (value: string) => `'${value.replaceAll("'", `'"'"'`)}'`;
+  const scriptUrl = shellQuote(`${base}/install-client.sh`);
+  return `(tmp=$(mktemp) && trap 'rm -f "$tmp"; unset CC_SWITCH_PASSWORD' EXIT && curl -fSsL ${scriptUrl} -o "$tmp" && read -rsp 'Client Web password: ' CC_SWITCH_PASSWORD && printf '\\n' && printf '%s\\n' "$CC_SWITCH_PASSWORD" | bash "$tmp" ${shellQuote(base)} ${shellQuote(ownerEmail)} --password-stdin)`;
 }
 
 export function InstallGuideDialog({
@@ -51,8 +51,7 @@ export function InstallGuideDialog({
   }, [command]);
 
   return (
-    <Modal isOpen={open} onOpenChange={onOpenChange}>
-      <Modal.Backdrop>
+    <Modal.Backdrop isOpen={open} onOpenChange={onOpenChange}>
         <Modal.Container>
           <Modal.Dialog className="w-[min(720px,calc(100vw-2rem))] max-w-none">
             <Modal.Header>
@@ -91,7 +90,6 @@ export function InstallGuideDialog({
             </Modal.Footer>
           </Modal.Dialog>
         </Modal.Container>
-      </Modal.Backdrop>
-    </Modal>
+    </Modal.Backdrop>
   );
 }

@@ -283,8 +283,10 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
           </table>
         </Card.Content>
       </Card>
-      <Drawer isOpen={!!selected} onOpenChange={(open) => { if (!open) { setSelected(null); focus.closeDrawer(); } }}>
-        <Drawer.Backdrop>
+      <Drawer.Backdrop
+        isOpen={!!selected}
+        onOpenChange={(open) => { if (!open) { setSelected(null); focus.closeDrawer(); } }}
+      >
           <Drawer.Content placement="right">
             <Drawer.Dialog className={drawerDialogClassName}>
               <Drawer.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
@@ -316,8 +318,7 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
               </Drawer.Body>
             </Drawer.Dialog>
           </Drawer.Content>
-        </Drawer.Backdrop>
-      </Drawer>
+      </Drawer.Backdrop>
       <MarketEditDialog market={editingMarket} onClose={() => setEditingMarket(null)} onSaved={async (verification) => {
         if (editingMarket) trackOperation({ kind: "market", id: editingMarket.id, expectedState: verification?.expectedState });
         await onChanged?.();
@@ -536,8 +537,10 @@ function MarketEditDialog({ market, onClose, onSaved }: { market: DashboardMarke
     return save(next);
   };
   return (
-    <Modal isOpen={!!market} onOpenChange={(open) => !open && !working && onClose()}>
-      <Modal.Backdrop>
+    <Modal.Backdrop
+      isOpen={!!market}
+      onOpenChange={(open) => !open && !working && onClose()}
+    >
         <Modal.Container>
           <Modal.Dialog className="share-edit-surface light w-[min(1080px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
             <Modal.Header>
@@ -712,8 +715,7 @@ function MarketEditDialog({ market, onClose, onSaved }: { market: DashboardMarke
             </Modal.Footer>
           </Modal.Dialog>
         </Modal.Container>
-      </Modal.Backdrop>
-    </Modal>
+    </Modal.Backdrop>
   );
 }
 
