@@ -640,7 +640,12 @@ export async function getClientMarketSupplySummary() {
   );
 }
 
-export async function createClientMarketHost(body: { ip: string; port?: number; note?: string }) {
+export async function createClientMarketHost(body: {
+  ip: string;
+  port?: number;
+  note?: string;
+  rootPassword?: string;
+}) {
   return parseJson<ClientMarketHost>(
     await authFetch("/v1/client-market/hosts", {
       method: "POST",
@@ -650,7 +655,11 @@ export async function createClientMarketHost(body: { ip: string; port?: number; 
   );
 }
 
-export async function testClientMarketHostSsh(body: { ip: string; port?: number }) {
+export async function testClientMarketHostSsh(body: {
+  ip: string;
+  port?: number;
+  rootPassword?: string;
+}) {
   return parseJson<{ ok: boolean }>(
     await authFetch("/v1/client-market/hosts/test-ssh", {
       method: "POST",

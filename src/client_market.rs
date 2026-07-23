@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::fs;
 use std::net::{IpAddr, SocketAddr};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -789,6 +791,9 @@ struct CreateHostRequest {
     ip: String,
     port: Option<u16>,
     note: Option<String>,
+    /// Optional root password used only to install the provision public key.
+    /// Never persisted; dropped when the request handler returns.
+    root_password: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -796,6 +801,7 @@ struct CreateHostRequest {
 struct TestHostSshRequest {
     ip: String,
     port: Option<u16>,
+    root_password: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -833,13 +839,13 @@ async fn test_host_ssh(
             "host verification rate limit exceeded".into(),
         ));
     }
-    ssh_test_login(
-        &state,
-        &ip.to_string(),
-        port,
-        &known_hosts_path(&state.config),
-    )
-    .await?;
+    let known_hosts = known_hosts_path(&state.config);
+    if let Some(password) = input.root_password.as_deref() {
+        validate_root_password(password)?;
+        ssh_test_login_with_password(&ip.to_string(), port, password, &known_hosts).await?;
+    } else {
+        ssh_test_login(&state, &ip.to_string(), port, &known_hosts).await?;
+    }
     Ok(Json(TestHostSshResponse { ok: true }))
 }
 
@@ -898,13 +904,20 @@ async fn create_host(
             "host verification rate limit exceeded".into(),
         ));
     }
-    let (hostname, fingerprint) = ssh_verify_host(
-        &state,
-        &ip.to_string(),
-        port,
-        &known_hosts_path(&state.config),
-    )
-    .await?;
+    let known_hosts = known_hosts_path(&state.config);
+    if let Some(password) = input.root_password.as_deref() {
+        validate_root_password(password)?;
+        ssh_install_provision_key_with_password(
+            &ip.to_string(),
+            port,
+            password,
+            &state.provision_ssh_authorized_keys_line,
+            &known_hosts,
+        )
+        .await?;
+    }
+    let (hostname, fingerprint) =
+        ssh_verify_host(&state, &ip.to_string(), port, &known_hosts).await?;
     let intel = crate::ip_iq::lookup_host_ip_intel(&ip.to_string()).await?;
     let intel_json = serde_json::to_string(&intel).map_err(|e| {
         AppError::Internal(format!("serialize host ip intel failed: {e}"))
@@ -1684,6 +1697,281 @@ async fn ssh_test_login(
         ));
     }
     Ok(())
+}
+
+fn validate_root_password(password: &str) -> Result<(), AppError> {
+    if password.is_empty() {
+        return Err(AppError::BadRequest("root password is required".into()));
+    }
+    if password.len() > MAX_PASSWORD_BYTES {
+        return Err(AppError::BadRequest(
+            "root password cannot exceed 1024 bytes".into(),
+        ));
+    }
+    if password.chars().any(char::is_control) {
+        return Err(AppError::BadRequest(
+            "root password must not contain control characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn install_provision_key_remote_command(authorized_keys_line: &str) -> String {
+    format!(
+        "set -eu; \
+         mkdir -p \"$HOME/.ssh\"; \
+         chmod 700 \"$HOME/.ssh\"; \
+         touch \"$HOME/.ssh/authorized_keys\"; \
+         chmod 600 \"$HOME/.ssh/authorized_keys\"; \
+         line={line}; \
+         if ! grep -qxF \"$line\" \"$HOME/.ssh/authorized_keys\" 2>/dev/null; then \
+           printf '%s\\n' \"$line\" >> \"$HOME/.ssh/authorized_keys\"; \
+         fi; \
+         printf 'ok\\n'",
+        line = shell_quote(authorized_keys_line),
+    )
+}
+
+async fn ssh_test_login_with_password(
+    ip: &str,
+    port: u16,
+    password: &str,
+    known_hosts: &Path,
+) -> Result<(), AppError> {
+    let _known_hosts_guard = PROVISION_KNOWN_HOSTS_LOCK.lock().await;
+    let output = ssh_run_remote_with_password(
+        password,
+        known_hosts,
+        ip,
+        port,
+        "set -eu; printf 'ok\\n'",
+        SSH_VERIFY_TIMEOUT,
+        SshHostKeyPolicy::AcceptNew,
+    )
+    .await?;
+    if !output.lines().any(|line| line.trim() == "ok") {
+        return Err(AppError::BadRequest(
+            "ssh password login test succeeded but returned an unexpected response".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn ssh_install_provision_key_with_password(
+    ip: &str,
+    port: u16,
+    password: &str,
+    authorized_keys_line: &str,
+    known_hosts: &Path,
+) -> Result<(), AppError> {
+    let _known_hosts_guard = PROVISION_KNOWN_HOSTS_LOCK.lock().await;
+    let command = install_provision_key_remote_command(authorized_keys_line);
+    let output = ssh_run_remote_with_password(
+        password,
+        known_hosts,
+        ip,
+        port,
+        &command,
+        SSH_VERIFY_TIMEOUT,
+        SshHostKeyPolicy::AcceptNew,
+    )
+    .await?;
+    if !output.lines().any(|line| line.trim() == "ok") {
+        return Err(AppError::BadRequest(
+            "provision SSH key install succeeded but returned an unexpected response".into(),
+        ));
+    }
+    Ok(())
+}
+
+struct PasswordAskpassMaterial {
+    dir: PathBuf,
+}
+
+impl PasswordAskpassMaterial {
+    fn create(password: &str) -> Result<(Self, PathBuf), AppError> {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-switch-router-ssh-askpass-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir(&dir).map_err(|e| {
+            AppError::Internal(format!("create ssh askpass directory failed: {e}"))
+        })?;
+        let material = Self { dir: dir.clone() };
+        let password_path = dir.join("password");
+        let askpass_path = dir.join("askpass.sh");
+        fs::write(&password_path, password.as_bytes()).map_err(|e| {
+            AppError::Internal(format!("write ssh askpass password file failed: {e}"))
+        })?;
+        fs::set_permissions(&password_path, fs::Permissions::from_mode(0o600)).map_err(|e| {
+            AppError::Internal(format!("chmod ssh askpass password file failed: {e}"))
+        })?;
+        let script = format!(
+            "#!/bin/sh\nexec cat {}\n",
+            shell_quote(&password_path.display().to_string())
+        );
+        fs::write(&askpass_path, script).map_err(|e| {
+            AppError::Internal(format!("write ssh askpass script failed: {e}"))
+        })?;
+        fs::set_permissions(&askpass_path, fs::Permissions::from_mode(0o700)).map_err(|e| {
+            AppError::Internal(format!("chmod ssh askpass script failed: {e}"))
+        })?;
+        Ok((material, askpass_path))
+    }
+}
+
+impl Drop for PasswordAskpassMaterial {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+async fn ssh_run_remote_with_password(
+    password: &str,
+    known_hosts: &Path,
+    ip: &str,
+    port: u16,
+    remote_command: &str,
+    timeout: Duration,
+    host_key_policy: SshHostKeyPolicy,
+) -> Result<String, AppError> {
+    if let Some(parent) = known_hosts.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            AppError::Internal(format!(
+                "create provisioning known_hosts directory failed: {e}"
+            ))
+        })?;
+    }
+    let (_askpass_material, askpass_path) = PasswordAskpassMaterial::create(password)?;
+    let wrapped_command = format!(
+        "export PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${{PATH:+:$PATH}}\"; \
+         if command -v bash >/dev/null 2>&1; then \
+           exec bash --noprofile --norc -c {}; \
+         else \
+           exec sh -c {}; \
+         fi",
+        shell_quote(remote_command),
+        shell_quote(remote_command)
+    );
+    let target = format!("root@{ip}");
+    let mut command = Command::new("ssh");
+    command
+        .env("SSH_ASKPASS", &askpass_path)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .env("DISPLAY", "cc-switch-router:0")
+        .env_remove("SSH_AUTH_SOCK")
+        .arg("-F")
+        .arg("/dev/null")
+        .arg("-T")
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-o")
+        .arg("BatchMode=no")
+        .arg("-o")
+        .arg("NumberOfPasswordPrompts=1")
+        .arg("-o")
+        .arg("PubkeyAuthentication=no")
+        .arg("-o")
+        .arg("PreferredAuthentications=password")
+        .arg("-o")
+        .arg("KbdInteractiveAuthentication=no")
+        .arg("-o")
+        .arg("ChallengeResponseAuthentication=no")
+        .arg("-o")
+        .arg(match host_key_policy {
+            SshHostKeyPolicy::AcceptNew => "StrictHostKeyChecking=accept-new",
+            SshHostKeyPolicy::RequireKnown => "StrictHostKeyChecking=yes",
+        })
+        .arg("-o")
+        .arg(format!("UserKnownHostsFile={}", known_hosts.display()))
+        .arg("-o")
+        .arg("GlobalKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("UpdateHostKeys=no")
+        .arg("-o")
+        .arg("ConnectTimeout=30")
+        .arg("-o")
+        .arg("ServerAliveInterval=10")
+        .arg("-o")
+        .arg("ServerAliveCountMax=3")
+        .arg("-o")
+        .arg("LogLevel=ERROR")
+        .arg(&target)
+        .arg(&wrapped_command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .map_err(|e| AppError::ServiceUnavailable(format!("start ssh command failed: {e}")))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AppError::Internal("ssh stdout was not available".into()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| AppError::Internal("ssh stderr was not available".into()))?;
+    let completed = tokio::time::timeout(timeout, async {
+        let (status, stdout, stderr) = tokio::join!(
+            child.wait(),
+            read_bounded(stdout, SSH_OUTPUT_LIMIT),
+            read_bounded(stderr, SSH_OUTPUT_LIMIT),
+        );
+        (status, stdout, stderr)
+    })
+    .await;
+    let (status, stdout, stderr) = match completed {
+        Ok(result) => result,
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(AppError::ServiceUnavailable(
+                "ssh command exceeded its execution timeout".into(),
+            ));
+        }
+    };
+    let status = status
+        .map_err(|e| AppError::ServiceUnavailable(format!("wait for ssh command failed: {e}")))?;
+    let stdout =
+        stdout.map_err(|e| AppError::ServiceUnavailable(format!("read ssh stdout failed: {e}")))?;
+    let stderr =
+        stderr.map_err(|e| AppError::ServiceUnavailable(format!("read ssh stderr failed: {e}")))?;
+    let stdout = String::from_utf8_lossy(&stdout);
+    let stderr = String::from_utf8_lossy(&stderr);
+    if !status.success() {
+        let detail = sanitize_ssh_password_error(&format!("{stdout}{stderr}"));
+        return Err(AppError::BadRequest(format!(
+            "ssh password auth failed ({}): {detail}",
+            status
+        )));
+    }
+    Ok(format!("{stdout}{stderr}"))
+}
+
+fn sanitize_ssh_password_error(detail: &str) -> String {
+    let mut output = String::new();
+    for line in detail.lines().take(40) {
+        if job_log_line_looks_sensitive(line) {
+            output.push_str("[sensitive output redacted]\n");
+            continue;
+        }
+        for character in line.chars().take(500) {
+            if !character.is_control() || character == '\t' {
+                output.push(character);
+            }
+        }
+        output.push('\n');
+        if output.len() >= 4 * 1024 {
+            break;
+        }
+    }
+    if output.trim().is_empty() {
+        "authentication or remote command failed".into()
+    } else {
+        output
+    }
 }
 
 async fn ssh_verify_host(
@@ -4868,5 +5156,45 @@ mod tests {
             parse_host_ip("2606:4700:4700::1111").unwrap(),
             "2606:4700:4700::1111".parse::<IpAddr>().unwrap()
         );
+    }
+
+    #[test]
+    fn validate_root_password_rejects_empty_control_and_oversized() {
+        assert!(validate_root_password("ok").is_ok());
+        assert!(validate_root_password("").is_err());
+        assert!(validate_root_password("bad\npass").is_err());
+        assert!(validate_root_password(&"x".repeat(MAX_PASSWORD_BYTES + 1)).is_err());
+        assert!(validate_root_password(&"x".repeat(MAX_PASSWORD_BYTES)).is_ok());
+    }
+
+    #[test]
+    fn install_provision_key_remote_command_is_idempotent_and_quotes_line() {
+        let command = install_provision_key_remote_command(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest cc-switch-router-provision",
+        );
+        assert!(command.contains("mkdir -p \"$HOME/.ssh\""));
+        assert!(command.contains("authorized_keys"));
+        assert!(command.contains("grep -qxF"));
+        assert!(command.contains("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest cc-switch-router-provision"));
+        assert!(command.contains("printf 'ok\\n'"));
+        let with_quote = install_provision_key_remote_command("line'with'quote");
+        assert!(with_quote.contains("'\"'\"'"));
+    }
+
+    #[test]
+    fn create_host_request_deserializes_optional_root_password() {
+        let with_password: CreateHostRequest = serde_json::from_str(
+            r#"{"ip":"8.8.8.8","port":22,"note":"n","rootPassword":"secret"}"#,
+        )
+        .unwrap();
+        assert_eq!(with_password.root_password.as_deref(), Some("secret"));
+        let without: CreateHostRequest =
+            serde_json::from_str(r#"{"ip":"8.8.8.8"}"#).unwrap();
+        assert!(without.root_password.is_none());
+        let test_req: TestHostSshRequest = serde_json::from_str(
+            r#"{"ip":"8.8.8.8","rootPassword":"pw"}"#,
+        )
+        .unwrap();
+        assert_eq!(test_req.root_password.as_deref(), Some("pw"));
     }
 }

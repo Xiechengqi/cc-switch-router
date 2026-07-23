@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Button, Chip, Dropdown, Modal, toast } from "@heroui/react";
+import { Button, Chip, Dropdown, Modal, Tabs, toast } from "@heroui/react";
 import { Check, ChevronDown, Circle, Loader2, MoreHorizontal, Plus, RefreshCw, Trash2, X } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
@@ -26,6 +26,19 @@ import { usePersistentState } from "@/lib/use-persistent-state";
 
 const ROUTER_OPEN_LOGIN_EVENT = "router-open-login";
 const ADD_HOST_SSH_KEY_OPEN_KEY = "cc-switch.client-market.add-host.ssh-key-open";
+const ADD_HOST_MODE_KEY = "cc-switch.client-market.add-host.mode";
+
+type AddHostMode = "password" | "manual";
+type StepKey = "installKey" | "connectivity" | "ipInfo" | "register";
+type StepStatus = "pending" | "running" | "done" | "failed";
+type StepStatusMap = Record<StepKey, StepStatus>;
+
+const IDLE_STEP_STATUS: StepStatusMap = {
+  installKey: "pending",
+  connectivity: "pending",
+  ipInfo: "pending",
+  register: "pending",
+};
 
 const IP_RISK_LABEL_KEYS: Record<string, MessageKey> = {
   中性: "clientMarket.ipRisk.neutral",
@@ -151,21 +164,19 @@ function AddHostDialog({
   onAdded: () => void;
 }) {
   const { locale, t } = useLocaleText();
+  const [mode, setMode] = usePersistentState<AddHostMode>(ADD_HOST_MODE_KEY, "password");
   const [sshKey, setSshKey] = React.useState<ProvisionSshKey | null>(null);
   const [sshKeyLoading, setSshKeyLoading] = React.useState(false);
   const [sshKeyOpen, setSshKeyOpen] = usePersistentState(ADD_HOST_SSH_KEY_OPEN_KEY, false);
   const [ip, setIp] = React.useState("");
   const [port, setPort] = React.useState("22");
+  const [rootPassword, setRootPassword] = React.useState("");
   const [note, setNote] = React.useState("");
   const [busy, setBusy] = React.useState(false);
   const [testing, setTesting] = React.useState(false);
   const [error, setError] = React.useState("");
   const [phase, setPhase] = React.useState<"form" | "progress" | "success">("form");
-  const [stepStatus, setStepStatus] = React.useState<{
-    connectivity: "pending" | "running" | "done" | "failed";
-    ipInfo: "pending" | "running" | "done" | "failed";
-    register: "pending" | "running" | "done" | "failed";
-  }>({ connectivity: "pending", ipInfo: "pending", register: "pending" });
+  const [stepStatus, setStepStatus] = React.useState<StepStatusMap>(IDLE_STEP_STATUS);
   const [ipIntel, setIpIntel] = React.useState<HostIpIntel | null>(null);
 
   React.useEffect(() => {
@@ -174,7 +185,7 @@ function AddHostDialog({
     setBusy(false);
     setTesting(false);
     setPhase("form");
-    setStepStatus({ connectivity: "pending", ipInfo: "pending", register: "pending" });
+    setStepStatus(IDLE_STEP_STATUS);
     setIpIntel(null);
     let cancelled = false;
     setSshKeyLoading(true);
@@ -211,9 +222,21 @@ function AddHostDialog({
     return message;
   };
 
+  const markStepFailed = (prev: StepStatusMap): StepStatusMap => {
+    if (prev.installKey === "running") return { ...prev, installKey: "failed" };
+    if (prev.connectivity === "running") return { ...prev, connectivity: "failed" };
+    if (prev.ipInfo === "running") return { ...prev, ipInfo: "failed" };
+    if (prev.register === "running") return { ...prev, register: "failed" };
+    return prev;
+  };
+
   const testSsh = async () => {
     if (!ip.trim()) {
       setError(t("clientMarket.testSshNeedIp"));
+      return;
+    }
+    if (mode === "password" && !rootPassword) {
+      setError(t("clientMarket.rootPasswordRequired"));
       return;
     }
     const parsedPort = parsePort();
@@ -224,6 +247,7 @@ function AddHostDialog({
       await testClientMarketHostSsh({
         ip: ip.trim(),
         port: parsedPort,
+        rootPassword: mode === "password" ? rootPassword : undefined,
       });
       toast.success(t("clientMarket.testSshOk"));
     } catch (err) {
@@ -240,37 +264,78 @@ function AddHostDialog({
       setError(t("clientMarket.noteTooLong"));
       return;
     }
+    if (mode === "password" && !rootPassword) {
+      setError(t("clientMarket.rootPasswordRequired"));
+      return;
+    }
     const hostIp = ip.trim();
     setBusy(true);
     setError("");
     setPhase("progress");
     setIpIntel(null);
-    setStepStatus({ connectivity: "running", ipInfo: "pending", register: "pending" });
     try {
-      await testClientMarketHostSsh({ ip: hostIp, port: parsedPort });
-      setStepStatus({ connectivity: "done", ipInfo: "running", register: "pending" });
+      if (mode === "password") {
+        setStepStatus({
+          installKey: "running",
+          connectivity: "pending",
+          ipInfo: "pending",
+          register: "pending",
+        });
+        const host = await createClientMarketHost({
+          ip: hostIp,
+          port: parsedPort,
+          note: note.trim() || undefined,
+          rootPassword,
+        });
+        setIpIntel(host.ipIntel || null);
+        setStepStatus({
+          installKey: "done",
+          connectivity: "done",
+          ipInfo: "done",
+          register: "done",
+        });
+      } else {
+        setStepStatus({
+          installKey: "pending",
+          connectivity: "running",
+          ipInfo: "pending",
+          register: "pending",
+        });
+        await testClientMarketHostSsh({ ip: hostIp, port: parsedPort });
+        setStepStatus({
+          installKey: "pending",
+          connectivity: "done",
+          ipInfo: "running",
+          register: "pending",
+        });
 
-      const intel = await lookupClientMarketHostIpInfo({ ip: hostIp });
-      setIpIntel(intel);
-      setStepStatus({ connectivity: "done", ipInfo: "done", register: "running" });
+        const intel = await lookupClientMarketHostIpInfo({ ip: hostIp });
+        setIpIntel(intel);
+        setStepStatus({
+          installKey: "pending",
+          connectivity: "done",
+          ipInfo: "done",
+          register: "running",
+        });
 
-      await createClientMarketHost({
-        ip: hostIp,
-        port: parsedPort,
-        note: note.trim() || undefined,
-      });
-      setStepStatus({ connectivity: "done", ipInfo: "done", register: "done" });
+        await createClientMarketHost({
+          ip: hostIp,
+          port: parsedPort,
+          note: note.trim() || undefined,
+        });
+        setStepStatus({
+          installKey: "pending",
+          connectivity: "done",
+          ipInfo: "done",
+          register: "done",
+        });
+      }
       setPhase("success");
       onAdded();
     } catch (err) {
       const message = mapHostError(err instanceof Error ? err.message : String(err));
       setError(message);
-      setStepStatus((prev) => {
-        if (prev.connectivity === "running") return { ...prev, connectivity: "failed" };
-        if (prev.ipInfo === "running") return { ...prev, ipInfo: "failed" };
-        if (prev.register === "running") return { ...prev, register: "failed" };
-        return prev;
-      });
+      setStepStatus(markStepFailed);
     } finally {
       setBusy(false);
     }
@@ -282,10 +347,12 @@ function AddHostDialog({
     if (!nextOpen) {
       setIp("");
       setPort("22");
+      setRootPassword("");
       setNote("");
       setPhase("form");
       setError("");
       setIpIntel(null);
+      setStepStatus(IDLE_STEP_STATUS);
     }
   };
 
@@ -294,7 +361,7 @@ function AddHostDialog({
     : "";
 
   const stepMeta = (
-    status: "pending" | "running" | "done" | "failed",
+    status: StepStatus,
   ): { label: string; icon: React.ReactNode; className: string } => {
     if (status === "running") {
       return {
@@ -324,11 +391,7 @@ function AddHostDialog({
     };
   };
 
-  const renderStep = (
-    key: "connectivity" | "ipInfo" | "register",
-    title: string,
-    detail?: React.ReactNode,
-  ) => {
+  const renderStep = (key: StepKey, title: string, detail?: React.ReactNode) => {
     const meta = stepMeta(stepStatus[key]);
     return (
       <div key={key} className={`rounded-xl border px-3 py-3 ${meta.className}`}>
@@ -343,6 +406,9 @@ function AddHostDialog({
       </div>
     );
   };
+
+  const canSubmit =
+    !!ip.trim() && (mode === "manual" || !!rootPassword) && !busy && !testing;
 
   return (
     <Modal.Backdrop isOpen={open} onOpenChange={closeDialog}>
@@ -360,39 +426,63 @@ function AddHostDialog({
           {phase === "form" ? (
             <>
               <Modal.Body className="grid gap-3 text-slate-900">
-                <div className="overflow-hidden rounded-xl border border-border">
-                  <button
-                    type="button"
-                    className="flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left text-sm font-medium text-slate-900 transition-colors hover:bg-muted/60"
-                    aria-expanded={sshKeyOpen}
-                    onClick={() => setSshKeyOpen((value) => !value)}
-                  >
-                    <span>{t("clientMarket.addSshKeyTitle")}</span>
-                    <ChevronDown
-                      className={`h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-200 ${
-                        sshKeyOpen ? "rotate-180" : ""
-                      }`}
-                    />
-                  </button>
-                  {sshKeyOpen ? (
-                    <div className="grid gap-3 border-t border-border px-3 py-3">
-                      <p className="text-sm text-muted-foreground">{t("clientMarket.addSshKeyHint")}</p>
-                      {sshKeyLoading ? (
-                        <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                          <Loader2 className="h-4 w-4 animate-spin" />
-                          …
-                        </div>
-                      ) : installCommand ? (
-                        <CopyableCodeField
-                          label={t("clientMarket.authorizedKeysCommand")}
-                          value={installCommand}
-                          copyLabel={t("clientMarket.copy")}
-                          copiedLabel={t("clientMarket.copied")}
-                        />
-                      ) : null}
-                    </div>
-                  ) : null}
-                </div>
+                <Tabs
+                  selectedKey={mode}
+                  onSelectionChange={(key: React.Key) => setMode(String(key) as AddHostMode)}
+                  variant="secondary"
+                  className="text-foreground"
+                >
+                  <Tabs.List className="grid w-full grid-cols-2 text-foreground">
+                    <Tabs.Tab
+                      id="password"
+                      className="rounded-md border border-transparent px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors data-[selected=true]:border-primary/30 data-[selected=true]:bg-primary/10 data-[selected=true]:text-primary"
+                    >
+                      {t("clientMarket.tabPassword")}
+                    </Tabs.Tab>
+                    <Tabs.Tab
+                      id="manual"
+                      className="rounded-md border border-transparent px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors data-[selected=true]:border-primary/30 data-[selected=true]:bg-primary/10 data-[selected=true]:text-primary"
+                    >
+                      {t("clientMarket.tabManual")}
+                    </Tabs.Tab>
+                  </Tabs.List>
+                </Tabs>
+
+                {mode === "manual" ? (
+                  <div className="overflow-hidden rounded-xl border border-border">
+                    <button
+                      type="button"
+                      className="flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left text-sm font-medium text-slate-900 transition-colors hover:bg-muted/60"
+                      aria-expanded={sshKeyOpen}
+                      onClick={() => setSshKeyOpen((value) => !value)}
+                    >
+                      <span>{t("clientMarket.addSshKeyTitle")}</span>
+                      <ChevronDown
+                        className={`h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-200 ${
+                          sshKeyOpen ? "rotate-180" : ""
+                        }`}
+                      />
+                    </button>
+                    {sshKeyOpen ? (
+                      <div className="grid gap-3 border-t border-border px-3 py-3">
+                        <p className="text-sm text-muted-foreground">{t("clientMarket.addSshKeyHint")}</p>
+                        {sshKeyLoading ? (
+                          <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                            …
+                          </div>
+                        ) : installCommand ? (
+                          <CopyableCodeField
+                            label={t("clientMarket.authorizedKeysCommand")}
+                            value={installCommand}
+                            copyLabel={t("clientMarket.copy")}
+                            copiedLabel={t("clientMarket.copied")}
+                          />
+                        ) : null}
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
 
                 <div className="grid grid-cols-[minmax(0,1fr)_9rem] gap-3">
                   <label className="grid min-w-0 gap-1 text-sm">
@@ -416,6 +506,19 @@ function AddHostDialog({
                     />
                   </label>
                 </div>
+                {mode === "password" ? (
+                  <label className="grid gap-1 text-sm">
+                    <span className="text-muted-foreground">{t("clientMarket.rootPassword")}</span>
+                    <input
+                      type="password"
+                      value={rootPassword}
+                      onChange={(e) => setRootPassword(e.target.value)}
+                      className="h-11 rounded-lg border border-border bg-white px-3 text-slate-900 outline-none focus:ring-2 focus:ring-primary/30"
+                      autoComplete="new-password"
+                    />
+                    <span className="text-xs text-muted-foreground">{t("clientMarket.rootPasswordHint")}</span>
+                  </label>
+                ) : null}
                 <label className="grid gap-1 text-sm">
                   <span className="text-muted-foreground">{t("clientMarket.hostNote")}</span>
                   <input
@@ -433,7 +536,7 @@ function AddHostDialog({
                 </Button>
                 <Button
                   variant="outline"
-                  isDisabled={busy || testing || !ip.trim()}
+                  isDisabled={busy || testing || !ip.trim() || (mode === "password" && !rootPassword)}
                   onClick={() => void testSsh()}
                 >
                   {testing ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
@@ -441,7 +544,7 @@ function AddHostDialog({
                 </Button>
                 <Button
                   variant="primary"
-                  isDisabled={busy || testing || !ip.trim()}
+                  isDisabled={!canSubmit}
                   onClick={() => void submit()}
                 >
                   {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
@@ -452,6 +555,7 @@ function AddHostDialog({
           ) : (
             <>
               <Modal.Body className="grid gap-3 text-slate-900">
+                {mode === "password" ? renderStep("installKey", t("clientMarket.stepInstallKey")) : null}
                 {renderStep("connectivity", t("clientMarket.stepConnectivity"))}
                 {renderStep(
                   "ipInfo",
@@ -491,11 +595,7 @@ function AddHostDialog({
                       } else {
                         setPhase("form");
                         setError("");
-                        setStepStatus({
-                          connectivity: "pending",
-                          ipInfo: "pending",
-                          register: "pending",
-                        });
+                        setStepStatus(IDLE_STEP_STATUS);
                       }
                     }}
                   >
