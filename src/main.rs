@@ -231,6 +231,7 @@ async fn main() -> Result<()> {
     let cleanup_dynamic = state.dynamic.clone();
     let cleanup_proxy = state.proxy.clone();
     let cleanup_overrides = state.scheduling_overrides.clone();
+    let market_reconcile_state = state.clone();
     let ip_blacklist_stats = state.ip_blacklist_stats.clone();
     let probe_store = state.store.clone();
     let probe_proxy = state.proxy.clone();
@@ -305,6 +306,12 @@ async fn main() -> Result<()> {
                 Err(err) => {
                     tracing::warn!("cleanup failed: {err}");
                 }
+            }
+            if let Err(err) =
+                crate::client_market::reconcile_stale_market_hosts(market_reconcile_state.clone())
+                    .await
+            {
+                tracing::warn!("client market host reconcile failed: {err}");
             }
         }
     });

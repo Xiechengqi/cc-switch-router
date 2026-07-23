@@ -53,9 +53,28 @@ const JOB_PHASE_PENDING: &str = "pending";
 const JOB_PHASE_LOCKED: &str = "locked";
 const JOB_PHASE_INSTALLING: &str = "installing";
 const JOB_PHASE_WAITING: &str = "waiting_for_client";
+/// Legacy / umbrella cleanup phase (still accepted when resuming older jobs).
 const JOB_PHASE_CLEANUP: &str = "cleanup_remote";
+const JOB_PHASE_CLEANUP_STOP: &str = "cleanup_stop";
+const JOB_PHASE_CLEANUP_WIPE: &str = "cleanup_wipe";
+const JOB_PHASE_CLEANUP_PURGE: &str = "cleanup_purge";
 const JOB_PHASE_COMPLETE: &str = "complete";
 const JOB_PHASE_ROLLBACK: &str = "rollback";
+
+const CLEANUP_FAILURE_SSH_TIMEOUT: &str = "cleanup_ssh_timeout";
+const CLEANUP_FAILURE_STOP: &str = "cleanup_stop_failed";
+const CLEANUP_FAILURE_WIPE: &str = "cleanup_wipe_failed";
+const CLEANUP_FAILURE_PURGE: &str = "cleanup_purge_failed";
+const CLEANUP_FAILURE_FINGERPRINT: &str = "cleanup_fingerprint_mismatch";
+const CLEANUP_FAILURE_BINDING: &str = "cleanup_host_binding_mismatch";
+const CLEANUP_FAILURE_GENERIC: &str = "cleanup_failed";
+
+const CLEANUP_PURGE_ATTEMPTS: u32 = 3;
+const CLEANUP_PURGE_RETRY_BASE: Duration = Duration::from_secs(1);
+/// Draining hosts without an active cleanup job longer than this are repaired.
+const STALE_DRAINING_AFTER: Duration = Duration::from_secs(10 * 60);
+/// Unreachable hosts that look remotely clean are auto-healed after this age.
+const UNREACHABLE_AUTO_HEAL_AFTER: Duration = Duration::from_secs(5 * 60);
 
 const SUBDOMAIN_RESERVATION_TTL_MS: i64 = 30 * 60 * 1000;
 const PROVISION_POLL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -165,6 +184,39 @@ cc_switch_server_stop() {
     fi
     sleep 1
   fi
+  return 0
+}
+cc_switch_server_home() {
+  home="${HOME:-}"
+  if [ -z "$home" ]; then
+    user="$(id -un 2>/dev/null || echo root)"
+    home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6 || true)"
+  fi
+  if [ -z "$home" ]; then
+    home=/root
+  fi
+  printf '%s\n' "$home"
+}
+cc_switch_server_wipe_files() {
+  home="$(cc_switch_server_home)"
+  rm -f /usr/local/bin/cc-switch-server
+  rm -rf "${home}/.cc-switch-server"
+  # Unmatched globs must not abort under `set -e`.
+  for path in "${home}"/.cc-switch-server.bak.*; do
+    [ -e "$path" ] || continue
+    rm -rf "$path"
+  done
+}
+cc_switch_server_has_install_files() {
+  home="$(cc_switch_server_home)"
+  if [ -e /usr/local/bin/cc-switch-server ] || [ -e "${home}/.cc-switch-server" ]; then
+    return 0
+  fi
+  for path in "${home}"/.cc-switch-server.bak.*; do
+    [ -e "$path" ] || continue
+    return 0
+  done
+  return 1
 }
 "#;
 const MAX_PASSWORD_BYTES: usize = 1024;
@@ -983,11 +1035,6 @@ async fn reverify_host(
         .store
         .client_market_get_host_for_operator(&id, &viewer, is_admin)
         .await?;
-    if host.installation_id.is_some() && !is_admin {
-        return Err(AppError::Conflict(
-            "host still has an installation; retry client cleanup instead".into(),
-        ));
-    }
     if !matches!(
         host.status.as_str(),
         HOST_STATUS_UNREACHABLE
@@ -999,13 +1046,29 @@ async fn reverify_host(
             "host cannot be reverified in its current state".into(),
         ));
     }
-    let (hostname, fingerprint) = ssh_verify_host(
-        &state,
-        &host.ip,
-        host.port,
-        &known_hosts_path(&state.config),
-    )
-    .await?;
+    // Unreachable / abnormal hosts often still carry an installation_id after a
+    // failed cleanup. Host owners must be able to recover without admin help.
+    if host.installation_id.is_some()
+        && !matches!(
+            host.status.as_str(),
+            HOST_STATUS_UNREACHABLE | HOST_STATUS_ABNORMAL
+        )
+        && !is_admin
+    {
+        return Err(AppError::Conflict(
+            "host still has an installation; retry client cleanup instead".into(),
+        ));
+    }
+    let known_hosts = known_hosts_path(&state.config);
+    let wipe_policy = if host.ssh_host_key_fingerprint.is_some() {
+        SshHostKeyPolicy::RequireKnown
+    } else {
+        SshHostKeyPolicy::AcceptNew
+    };
+    // Wipe remnants first — reverify is a recovery path, not a "must already be clean" gate.
+    ssh_wipe_cc_switch_server(&state, &host.ip, host.port, &known_hosts, wipe_policy).await?;
+    let (hostname, fingerprint) =
+        ssh_probe_host_identity(&state, &host.ip, host.port, &known_hosts).await?;
     if host
         .ssh_host_key_fingerprint
         .as_deref()
@@ -1300,6 +1363,153 @@ pub async fn reconcile_interrupted_jobs(state: ServerState) -> Result<(), AppErr
     Ok(())
 }
 
+/// Periodic repair for stuck draining / remotely-clean unreachable hosts.
+pub async fn reconcile_stale_market_hosts(state: ServerState) -> Result<(), AppError> {
+    let draining = state
+        .store
+        .client_market_list_hosts_by_status(HOST_STATUS_DRAINING)
+        .await?;
+    let now = Utc::now();
+    for host in draining {
+        let updated = chrono::DateTime::parse_from_rfc3339(&host.updated_at)
+            .ok()
+            .map(|ts| ts.with_timezone(&Utc));
+        let Some(updated) = updated else {
+            continue;
+        };
+        if now.signed_duration_since(updated)
+            < chrono::Duration::from_std(STALE_DRAINING_AFTER).unwrap_or(chrono::Duration::minutes(10))
+        {
+            continue;
+        }
+        let has_active = state
+            .store
+            .client_market_host_has_active_job(&host.id)
+            .await?;
+        if has_active {
+            continue;
+        }
+        let Some(installation_id) = host.installation_id.clone() else {
+            warn!(
+                host_id = %host.id,
+                "stale draining host has no installation; marking unreachable"
+            );
+            let _ = state
+                .store
+                .client_market_force_host_status(
+                    &host.id,
+                    HOST_STATUS_UNREACHABLE,
+                    "stale_draining_without_installation",
+                )
+                .await;
+            continue;
+        };
+        info!(
+            host_id = %host.id,
+            installation_id = %installation_id,
+            "spawning cleanup for stale draining host"
+        );
+        let owner = host.host_owner_email.clone();
+        match state
+            .store
+            .client_market_begin_cleanup_job(&installation_id, &owner, true)
+            .await
+        {
+            Ok(job_id) => {
+                let runner_state = state.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = run_cleanup_job(runner_state, job_id.clone()).await {
+                        error!(job_id = %job_id, error = %err, "stale draining cleanup failed");
+                    }
+                });
+            }
+            Err(err) => {
+                warn!(
+                    host_id = %host.id,
+                    error = %err,
+                    "failed to begin cleanup for stale draining host"
+                );
+            }
+        }
+    }
+
+    let unreachable = state
+        .store
+        .client_market_list_hosts_by_status(HOST_STATUS_UNREACHABLE)
+        .await?;
+    for host in unreachable {
+        let Some(installation_id) = host.installation_id.clone() else {
+            continue;
+        };
+        let updated = chrono::DateTime::parse_from_rfc3339(&host.updated_at)
+            .ok()
+            .map(|ts| ts.with_timezone(&Utc));
+        let Some(updated) = updated else {
+            continue;
+        };
+        if now.signed_duration_since(updated)
+            < chrono::Duration::from_std(UNREACHABLE_AUTO_HEAL_AFTER)
+                .unwrap_or(chrono::Duration::minutes(5))
+        {
+            continue;
+        }
+        match ssh_remote_is_market_clean(&state, &host).await {
+            Ok(true) => {
+                info!(
+                    host_id = %host.id,
+                    installation_id = %installation_id,
+                    "auto-healing unreachable host that is remotely clean"
+                );
+                if let Some(subdomain) = host.client_subdomain.as_deref() {
+                    state.proxy.remove_route(subdomain).await;
+                } else if let Ok(Some(subdomain)) = state
+                    .store
+                    .client_market_subdomain_for_installation(&installation_id)
+                    .await
+                {
+                    state.proxy.remove_route(&subdomain).await;
+                }
+                if let Err(err) = state
+                    .store
+                    .purge_installation_for_client_market(&installation_id)
+                    .await
+                {
+                    warn!(
+                        host_id = %host.id,
+                        error = %err,
+                        "auto-heal purge failed"
+                    );
+                    continue;
+                }
+                if let Err(err) = state
+                    .store
+                    .client_market_complete_host_reverify(
+                        &host.id,
+                        host.hostname.as_deref(),
+                        host.ssh_host_key_fingerprint.as_deref(),
+                    )
+                    .await
+                {
+                    warn!(
+                        host_id = %host.id,
+                        error = %err,
+                        "auto-heal reverify finalize failed"
+                    );
+                }
+            }
+            Ok(false) => {}
+            Err(err) => {
+                warn!(
+                    host_id = %host.id,
+                    error = %err,
+                    "auto-heal remote probe failed"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn resume_interrupted_create_job(state: &ServerState, job: ProvisioningJobRecord) {
     if job.status == JOB_STATUS_RUNNING
         && job.phase == JOB_PHASE_WAITING
@@ -1584,6 +1794,39 @@ async fn run_cleanup_job(state: ServerState, job_id: String) -> Result<(), AppEr
     result
 }
 
+fn is_cleanup_phase(phase: &str) -> bool {
+    matches!(
+        phase,
+        JOB_PHASE_CLEANUP
+            | JOB_PHASE_CLEANUP_STOP
+            | JOB_PHASE_CLEANUP_WIPE
+            | JOB_PHASE_CLEANUP_PURGE
+    )
+}
+
+fn classify_cleanup_failure(error: &AppError) -> &'static str {
+    let detail = error.to_string();
+    let lower = detail.to_ascii_lowercase();
+    if lower.contains("fingerprint") {
+        CLEANUP_FAILURE_FINGERPRINT
+    } else if lower.contains("binding") || lower.contains("installation mismatch") {
+        CLEANUP_FAILURE_BINDING
+    } else if lower.contains("exceeded its execution timeout") || lower.contains("timeout") {
+        CLEANUP_FAILURE_SSH_TIMEOUT
+    } else if lower.contains("failed to stop")
+        || lower.contains("respawned")
+        || lower.contains("process is already running")
+    {
+        CLEANUP_FAILURE_STOP
+    } else if lower.contains("failed to remove") || lower.contains("installation files") {
+        CLEANUP_FAILURE_WIPE
+    } else if lower.contains("purge") {
+        CLEANUP_FAILURE_PURGE
+    } else {
+        CLEANUP_FAILURE_GENERIC
+    }
+}
+
 async fn run_cleanup_job_inner(
     state: &ServerState,
     job_id: &str,
@@ -1604,9 +1847,7 @@ async fn run_cleanup_job_inner(
         .client_market_get_job_record(job_id)
         .await?
         .ok_or_else(|| AppError::NotFound("job not found".into()))?;
-    if job.job_type != JOB_TYPE_CLEANUP
-        || job.status != JOB_STATUS_RUNNING
-        || job.phase != JOB_PHASE_CLEANUP
+    if job.job_type != JOB_TYPE_CLEANUP || job.status != JOB_STATUS_RUNNING || !is_cleanup_phase(&job.phase)
     {
         return Err(AppError::Conflict(
             "cleanup job is not runnable in its current state".into(),
@@ -1616,6 +1857,10 @@ async fn run_cleanup_job_inner(
         .host_id
         .clone()
         .ok_or_else(|| AppError::Internal("cleanup job missing host".into()))?;
+    let installation_id = job
+        .installation_id
+        .clone()
+        .ok_or_else(|| AppError::Internal("cleanup job missing installation".into()))?;
     let host = state
         .store
         .client_market_get_host(&host_id)
@@ -1624,21 +1869,127 @@ async fn run_cleanup_job_inner(
     if host.status != HOST_STATUS_DRAINING {
         return Err(AppError::Conflict("cleanup host is not draining".into()));
     }
-    ssh_cleanup_remote(state, &host).await?;
-    state
-        .store
-        .client_market_append_job_log(job_id, "remote client files removed\n")
-        .await?;
-    let installation_id = job
-        .installation_id
-        .as_deref()
-        .ok_or_else(|| AppError::Internal("cleanup job missing installation".into()))?;
-    if let Some(subdomain) = job.subdomain.as_deref() {
-        state.proxy.remove_route(subdomain).await;
+    // Safety: refuse to wipe if host no longer points at this installation.
+    if host.installation_id.as_deref() != Some(installation_id.as_str()) {
+        return Err(AppError::Conflict(
+            "cleanup host installation binding mismatch".into(),
+        ));
+    }
+    if let (Some(job_sub), Some(host_sub)) = (job.subdomain.as_deref(), host.client_subdomain.as_deref())
+    {
+        if !job_sub.eq_ignore_ascii_case(host_sub) {
+            return Err(AppError::Conflict(
+                "cleanup host subdomain binding mismatch".into(),
+            ));
+        }
+    }
+
+    let mut phase = job.phase.clone();
+    if matches!(
+        phase.as_str(),
+        JOB_PHASE_CLEANUP | JOB_PHASE_CLEANUP_STOP | JOB_PHASE_CLEANUP_WIPE
+    ) {
+        if phase == JOB_PHASE_CLEANUP {
+            state
+                .store
+                .client_market_set_job_phase(job_id, JOB_PHASE_CLEANUP_STOP)
+                .await?;
+            phase = JOB_PHASE_CLEANUP_STOP.to_string();
+        }
+        if phase == JOB_PHASE_CLEANUP_STOP {
+            state
+                .store
+                .client_market_append_job_log(job_id, "phase: stop cc-switch-server\n")
+                .await?;
+            ssh_stop_cc_switch_server(state, &host).await?;
+            state
+                .store
+                .client_market_append_job_log(job_id, "remote process stopped (or already stopped)\n")
+                .await?;
+            state
+                .store
+                .client_market_set_job_phase(job_id, JOB_PHASE_CLEANUP_WIPE)
+                .await?;
+            phase = JOB_PHASE_CLEANUP_WIPE.to_string();
+        }
+        if phase == JOB_PHASE_CLEANUP_WIPE {
+            state
+                .store
+                .client_market_append_job_log(job_id, "phase: wipe install files\n")
+                .await?;
+            ssh_wipe_cc_switch_files(state, &host).await?;
+            state
+                .store
+                .client_market_append_job_log(
+                    job_id,
+                    "remote client files removed (binary, data, backups)\n",
+                )
+                .await?;
+            state
+                .store
+                .client_market_set_job_phase(job_id, JOB_PHASE_CLEANUP_PURGE)
+                .await?;
+            phase = JOB_PHASE_CLEANUP_PURGE.to_string();
+        }
+    }
+
+    if phase != JOB_PHASE_CLEANUP_PURGE {
+        state
+            .store
+            .client_market_set_job_phase(job_id, JOB_PHASE_CLEANUP_PURGE)
+            .await?;
     }
     state
         .store
-        .purge_installation_for_client_market(installation_id)
+        .client_market_append_job_log(job_id, "phase: purge router installation\n")
+        .await?;
+    if let Some(subdomain) = job.subdomain.as_deref() {
+        state.proxy.remove_route(subdomain).await;
+        state
+            .store
+            .client_market_append_job_log(job_id, &format!("proxy route removed: {subdomain}\n"))
+            .await?;
+    }
+    let mut last_purge_error = None;
+    for attempt in 1..=CLEANUP_PURGE_ATTEMPTS {
+        match state
+            .store
+            .purge_installation_for_client_market(&installation_id)
+            .await
+        {
+            Ok(()) => {
+                last_purge_error = None;
+                break;
+            }
+            Err(err) => {
+                warn!(
+                    job_id = %job_id,
+                    attempt,
+                    error = %err,
+                    "cleanup purge attempt failed"
+                );
+                state
+                    .store
+                    .client_market_append_job_log(
+                        job_id,
+                        &format!("purge attempt {attempt}/{CLEANUP_PURGE_ATTEMPTS} failed: {err}\n"),
+                    )
+                    .await?;
+                last_purge_error = Some(err);
+                if attempt < CLEANUP_PURGE_ATTEMPTS {
+                    tokio::time::sleep(CLEANUP_PURGE_RETRY_BASE * attempt).await;
+                }
+            }
+        }
+    }
+    if let Some(err) = last_purge_error {
+        return Err(AppError::Internal(format!(
+            "purge installation failed after {CLEANUP_PURGE_ATTEMPTS} attempts: {err}"
+        )));
+    }
+    state
+        .store
+        .client_market_append_job_log(job_id, "installation purged from router; marking host idle\n")
         .await?;
     state
         .store
@@ -1649,6 +2000,15 @@ async fn run_cleanup_job_inner(
 
 async fn handle_cleanup_job_failure(state: &ServerState, job_id: &str, error: &AppError) {
     warn!(job_id = %job_id, error = %error, "client market cleanup failed");
+    let detail = error.to_string();
+    let failure_code = classify_cleanup_failure(error);
+    let _ = state
+        .store
+        .client_market_append_job_log(
+            job_id,
+            &format!("cleanup error [{failure_code}]: {detail}\n"),
+        )
+        .await;
     let Ok(Some(job)) = state.store.client_market_get_job_record(job_id).await else {
         return;
     };
@@ -1665,14 +2025,33 @@ async fn handle_cleanup_job_failure(state: &ServerState, job_id: &str, error: &A
             .await;
         return;
     };
+    // Remote already wiped but DB purge failed: keep a precise code so UI can guide reverify.
+    let last_error = if failure_code == CLEANUP_FAILURE_PURGE {
+        format!("{failure_code}: remote wipe ok; {detail}")
+            .chars()
+            .take(500)
+            .collect::<String>()
+    } else {
+        format!("{failure_code}: {detail}")
+            .chars()
+            .take(500)
+            .collect::<String>()
+    };
+    let guidance = match failure_code {
+        CLEANUP_FAILURE_PURGE => {
+            "cleanup failed after remote wipe; use Retry cleanup or Re-verify to finish\n"
+        }
+        CLEANUP_FAILURE_SSH_TIMEOUT | CLEANUP_FAILURE_STOP | CLEANUP_FAILURE_WIPE => {
+            "cleanup failed on the host; retry cleanup, or re-verify after manual cleanup\n"
+        }
+        CLEANUP_FAILURE_FINGERPRINT | CLEANUP_FAILURE_BINDING => {
+            "cleanup blocked by host safety checks; operator intervention is required\n"
+        }
+        _ => "cleanup failed; host remains unavailable until retry or re-verify\n",
+    };
     if let Err(finalize_error) = state
         .store
-        .client_market_fail_cleanup_job(
-            job_id,
-            host_id,
-            "cleanup_failed",
-            "cleanup failed; host remains unavailable until operator verification\n",
-        )
+        .client_market_fail_cleanup_job(job_id, host_id, &last_error, guidance)
         .await
     {
         error!(job_id = %job_id, error = %finalize_error, "failed to persist cleanup failure");
@@ -2024,6 +2403,55 @@ async fn ssh_verify_host(
                 .into(),
         ));
     }
+    // Registering a host must not silently wipe an existing install.
+    let output = ssh_run_remote_with_input(
+        &state.provision_ssh_key_path,
+        known_hosts,
+        ip,
+        port,
+        &format!(
+            "{helpers}\
+             set -eu; \
+             home=\"$(cc_switch_server_home)\"; \
+             if cc_switch_server_has_install_files; then \
+             echo \"host already contains a cc-switch-server installation under $home\" >&2; exit 42; fi; \
+             uname -n",
+            helpers = REMOTE_CC_SWITCH_SERVER_HELPERS,
+        ),
+        None,
+        SSH_VERIFY_TIMEOUT,
+        SshHostKeyPolicy::AcceptNew,
+    )
+    .await?;
+    let hostname = parse_remote_hostname(&output)?;
+    // Ensure package deps for later market installs, then pin host key.
+    let _ = ssh_run_remote_with_input(
+        &state.provision_ssh_key_path,
+        known_hosts,
+        ip,
+        port,
+        &format!(
+            "{deps}\
+             set -eu; \
+             ensure_client_market_deps",
+            deps = REMOTE_ENSURE_CLIENT_MARKET_DEPS,
+        ),
+        None,
+        SSH_VERIFY_TIMEOUT,
+        SshHostKeyPolicy::AcceptNew,
+    )
+    .await?;
+    let fingerprint = ssh_fetch_host_fingerprint(ip, port, known_hosts).await?;
+    Ok((Some(hostname), Some(fingerprint)))
+}
+
+async fn ssh_probe_host_identity(
+    state: &ServerState,
+    ip: &str,
+    port: u16,
+    known_hosts: &Path,
+) -> Result<(Option<String>, Option<String>), AppError> {
+    let _known_hosts_guard = PROVISION_KNOWN_HOSTS_LOCK.lock().await;
     let output = ssh_run_remote_with_input(
         &state.provision_ssh_key_path,
         known_hosts,
@@ -2033,14 +2461,6 @@ async fn ssh_verify_host(
             "{deps}\
              set -eu; \
              ensure_client_market_deps; \
-             home=\"${{HOME:-}}\"; \
-             if [ -e /usr/local/bin/cc-switch-server ] || {{ [ -n \"$home\" ] && [ -e \"$home/.cc-switch-server\" ]; }}; then \
-             echo 'host already contains a cc-switch-server installation' >&2; exit 42; fi; \
-             if [ -n \"$home\" ]; then \
-               set -- \"$home\"/.cc-switch-server.bak.*; \
-               if [ -e \"$1\" ]; then \
-               echo 'host contains a cc-switch-server backup' >&2; exit 42; fi; \
-             fi; \
              uname -n",
             deps = REMOTE_ENSURE_CLIENT_MARKET_DEPS,
         ),
@@ -2049,7 +2469,13 @@ async fn ssh_verify_host(
         SshHostKeyPolicy::AcceptNew,
     )
     .await?;
-    let hostname = output
+    let hostname = parse_remote_hostname(&output)?;
+    let fingerprint = ssh_fetch_host_fingerprint(ip, port, known_hosts).await?;
+    Ok((Some(hostname), Some(fingerprint)))
+}
+
+fn parse_remote_hostname(output: &str) -> Result<String, AppError> {
+    output
         .lines()
         .next()
         .map(str::trim)
@@ -2060,9 +2486,162 @@ async fn ssh_verify_host(
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
         })
-        .ok_or_else(|| AppError::BadRequest("ssh hostname response was invalid".into()))?;
-    let fingerprint = ssh_fetch_host_fingerprint(ip, port, known_hosts).await?;
-    Ok((Some(hostname.to_string()), Some(fingerprint)))
+        .map(str::to_string)
+        .ok_or_else(|| AppError::BadRequest("ssh hostname response was invalid".into()))
+}
+
+/// Stop cc-switch-server and remove install/data/backup files. Idempotent: succeeds when already clean.
+async fn ssh_wipe_cc_switch_server(
+    state: &ServerState,
+    ip: &str,
+    port: u16,
+    known_hosts: &Path,
+    host_key_policy: SshHostKeyPolicy,
+) -> Result<(), AppError> {
+    let command = format!(
+        "{helpers}\
+         set -eu; \
+         if cc_switch_server_is_running; then \
+           cc_switch_server_stop; \
+         fi; \
+         if cc_switch_server_is_running; then \
+           echo 'failed to stop cc-switch-server' >&2; exit 43; \
+         fi; \
+         cc_switch_server_wipe_files; \
+         if cc_switch_server_is_running; then \
+           echo 'cc-switch-server respawned during wipe' >&2; exit 43; \
+         fi; \
+         if cc_switch_server_has_install_files; then \
+           echo 'failed to remove cc-switch-server installation files' >&2; exit 44; \
+         fi",
+        helpers = REMOTE_CC_SWITCH_SERVER_HELPERS,
+    );
+    ssh_run_remote_with_input(
+        &state.provision_ssh_key_path,
+        known_hosts,
+        ip,
+        port,
+        &command,
+        None,
+        SSH_CLEANUP_TIMEOUT,
+        host_key_policy,
+    )
+    .await
+    .map(|_| ())
+}
+
+async fn ssh_stop_cc_switch_server(
+    state: &ServerState,
+    host: &RouterSshHostRecord,
+) -> Result<(), AppError> {
+    let known_hosts = known_hosts_path(&state.config);
+    require_pinned_host_fingerprint(host, &known_hosts).await?;
+    let command = format!(
+        "{helpers}\
+         set -eu; \
+         if cc_switch_server_is_running; then \
+           cc_switch_server_stop; \
+         fi; \
+         if cc_switch_server_is_running; then \
+           echo 'failed to stop cc-switch-server' >&2; exit 43; \
+         fi",
+        helpers = REMOTE_CC_SWITCH_SERVER_HELPERS,
+    );
+    ssh_run_remote_with_input(
+        &state.provision_ssh_key_path,
+        &known_hosts,
+        &host.ip,
+        host.port,
+        &command,
+        None,
+        SSH_CLEANUP_TIMEOUT,
+        SshHostKeyPolicy::RequireKnown,
+    )
+    .await
+    .map(|_| ())
+}
+
+async fn ssh_wipe_cc_switch_files(
+    state: &ServerState,
+    host: &RouterSshHostRecord,
+) -> Result<(), AppError> {
+    let known_hosts = known_hosts_path(&state.config);
+    require_pinned_host_fingerprint(host, &known_hosts).await?;
+    let command = format!(
+        "{helpers}\
+         set -eu; \
+         if cc_switch_server_is_running; then \
+           cc_switch_server_stop; \
+         fi; \
+         if cc_switch_server_is_running; then \
+           echo 'failed to stop cc-switch-server' >&2; exit 43; \
+         fi; \
+         cc_switch_server_wipe_files; \
+         if cc_switch_server_has_install_files; then \
+           echo 'failed to remove cc-switch-server installation files' >&2; exit 44; \
+         fi",
+        helpers = REMOTE_CC_SWITCH_SERVER_HELPERS,
+    );
+    ssh_run_remote_with_input(
+        &state.provision_ssh_key_path,
+        &known_hosts,
+        &host.ip,
+        host.port,
+        &command,
+        None,
+        SSH_CLEANUP_TIMEOUT,
+        SshHostKeyPolicy::RequireKnown,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// True when the remote host has no running process and no install/backup files.
+async fn ssh_remote_is_market_clean(
+    state: &ServerState,
+    host: &RouterSshHostRecord,
+) -> Result<bool, AppError> {
+    let known_hosts = known_hosts_path(&state.config);
+    let command = format!(
+        "{helpers}\
+         set -eu; \
+         if cc_switch_server_is_running; then echo dirty; exit 0; fi; \
+         if cc_switch_server_has_install_files; then echo dirty; exit 0; fi; \
+         echo clean",
+        helpers = REMOTE_CC_SWITCH_SERVER_HELPERS,
+    );
+    let output = ssh_run_remote_with_input(
+        &state.provision_ssh_key_path,
+        &known_hosts,
+        &host.ip,
+        host.port,
+        &command,
+        None,
+        SSH_VERIFY_TIMEOUT,
+        if host.ssh_host_key_fingerprint.is_some() {
+            SshHostKeyPolicy::RequireKnown
+        } else {
+            SshHostKeyPolicy::AcceptNew
+        },
+    )
+    .await?;
+    Ok(output.lines().any(|line| line.trim() == "clean"))
+}
+
+async fn ssh_cleanup_remote(
+    state: &ServerState,
+    host: &RouterSshHostRecord,
+) -> Result<(), AppError> {
+    let known_hosts = known_hosts_path(&state.config);
+    require_pinned_host_fingerprint(host, &known_hosts).await?;
+    ssh_wipe_cc_switch_server(
+        state,
+        &host.ip,
+        host.port,
+        &known_hosts,
+        SshHostKeyPolicy::RequireKnown,
+    )
+    .await
 }
 
 /// `ps -ef | grep cc-switch-server | grep -v grep` — exit 0 means a process is running.
@@ -2222,36 +2801,6 @@ async fn ssh_fetch_host_fingerprint(
     Err(AppError::Internal(
         "could not read host key fingerprint from known_hosts".into(),
     ))
-}
-
-async fn ssh_cleanup_remote(
-    state: &ServerState,
-    host: &RouterSshHostRecord,
-) -> Result<(), AppError> {
-    require_pinned_host_fingerprint(host, &known_hosts_path(&state.config)).await?;
-    let command = format!(
-        "{helpers}\
-         set -eu; \
-         if cc_switch_server_is_running; then \
-           cc_switch_server_stop; \
-         fi; \
-         if cc_switch_server_is_running; then exit 43; fi; \
-         rm -f /usr/local/bin/cc-switch-server; \
-         rm -rf \"$HOME/.cc-switch-server\" \"$HOME\"/.cc-switch-server.bak.*",
-        helpers = REMOTE_CC_SWITCH_SERVER_HELPERS,
-    );
-    ssh_run_remote_with_input(
-        &state.provision_ssh_key_path,
-        &known_hosts_path(&state.config),
-        &host.ip,
-        host.port,
-        &command,
-        None,
-        SSH_CLEANUP_TIMEOUT,
-        SshHostKeyPolicy::RequireKnown,
-    )
-    .await
-    .map(|_| ())
 }
 
 async fn require_pinned_host_fingerprint(
@@ -2432,9 +2981,17 @@ async fn ssh_run_remote_with_input(
         let detail = format!("{stdout}{stderr}");
         if code == Some(HOST_HAS_RUNNING_SERVER_EXIT)
             || detail.contains("cc-switch-server process is already running")
+            || detail.contains("failed to stop cc-switch-server")
+            || detail.contains("cc-switch-server respawned during wipe")
         {
             return Err(AppError::Conflict(
                 "cc-switch-server process is already running".into(),
+            ));
+        }
+        if code == Some(44) || detail.contains("failed to remove cc-switch-server installation files")
+        {
+            return Err(AppError::Conflict(
+                "failed to remove cc-switch-server installation files".into(),
             ));
         }
         return Err(AppError::BadRequest(format!(
@@ -3175,6 +3732,28 @@ impl AppStore {
         Ok(())
     }
 
+    pub async fn client_market_set_job_phase(
+        &self,
+        job_id: &str,
+        phase: &str,
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().await;
+        let changed = conn
+            .execute(
+                "UPDATE provisioning_jobs
+                 SET phase = ?2, updated_at = ?3
+                 WHERE id = ?1 AND status = 'running'",
+                params![job_id, phase, Utc::now().to_rfc3339()],
+            )
+            .map_err(|e| AppError::Internal(format!("set provisioning job phase failed: {e}")))?;
+        if changed != 1 {
+            return Err(AppError::Conflict(
+                "provisioning job is not running".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn client_market_set_running_phase(
         &self,
         job_id: &str,
@@ -3451,6 +4030,66 @@ impl AppStore {
     ) -> Result<Option<RouterSshHostRecord>, AppError> {
         let conn = self.conn.lock().await;
         get_router_ssh_host(&conn, id)
+    }
+
+    pub async fn client_market_list_hosts_by_status(
+        &self,
+        status: &str,
+    ) -> Result<Vec<RouterSshHostRecord>, AppError> {
+        let conn = self.conn.lock().await;
+        let mut statement = conn
+            .prepare(
+                "SELECT h.id, h.ip, h.port, h.host_owner_email, h.country_code, h.hostname,
+                        h.ssh_host_key_fingerprint, h.status, h.installation_id,
+                        h.last_verified_at, h.last_error, h.note, h.created_at, h.updated_at,
+                        h.ip_intel_json, t.subdomain,
+                        COALESCE(NULLIF(TRIM(t.owner_email), ''), NULLIF(TRIM(i.owner_email), ''))
+                 FROM router_ssh_hosts h
+                 LEFT JOIN installation_client_tunnels t ON t.installation_id = h.installation_id
+                 LEFT JOIN installations i ON i.id = h.installation_id
+                 WHERE h.status = ?1
+                 ORDER BY h.updated_at ASC",
+            )
+            .map_err(|e| AppError::Internal(format!("prepare hosts by status failed: {e}")))?;
+        let rows = statement
+            .query_map(params![status], map_router_ssh_host_row)
+            .map_err(|e| AppError::Internal(format!("query hosts by status failed: {e}")))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| AppError::Internal(format!("read hosts by status failed: {e}")))
+    }
+
+    pub async fn client_market_host_has_active_job(&self, host_id: &str) -> Result<bool, AppError> {
+        let conn = self.conn.lock().await;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM provisioning_jobs
+                 WHERE host_id = ?1 AND status IN ('pending', 'running')",
+                params![host_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| AppError::Internal(format!("count active host jobs failed: {e}")))?;
+        Ok(count > 0)
+    }
+
+    pub async fn client_market_force_host_status(
+        &self,
+        host_id: &str,
+        status: &str,
+        last_error: &str,
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().await;
+        let changed = conn
+            .execute(
+                "UPDATE router_ssh_hosts
+                 SET status = ?2, last_error = ?3, updated_at = ?4
+                 WHERE id = ?1",
+                params![host_id, status, last_error, Utc::now().to_rfc3339()],
+            )
+            .map_err(|e| AppError::Internal(format!("force host status failed: {e}")))?;
+        if changed != 1 {
+            return Err(AppError::NotFound("host not found".into()));
+        }
+        Ok(())
     }
 
     pub async fn client_market_get_host_for_operator(
@@ -3900,11 +4539,26 @@ impl AppStore {
         }
         if !matches!(
             host.2.as_str(),
-            HOST_STATUS_ALLOCATED | HOST_STATUS_UNREACHABLE
+            HOST_STATUS_ALLOCATED | HOST_STATUS_UNREACHABLE | HOST_STATUS_DRAINING
         ) {
             return Err(AppError::Conflict(
                 "client host is already being cleaned or is unavailable".into(),
             ));
+        }
+        if host.2 == HOST_STATUS_DRAINING {
+            let active: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM provisioning_jobs
+                     WHERE host_id = ?1 AND status IN ('pending', 'running')",
+                    params![host.0],
+                    |row| row.get(0),
+                )
+                .map_err(|e| AppError::Internal(format!("count active cleanup jobs failed: {e}")))?;
+            if active > 0 {
+                return Err(AppError::Conflict(
+                    "client host already has an active cleanup job".into(),
+                ));
+            }
         }
         let job_id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
@@ -3923,7 +4577,7 @@ impl AppStore {
                 subdomain,
                 installation_id,
                 JOB_STATUS_PENDING,
-                JOB_PHASE_CLEANUP,
+                JOB_PHASE_CLEANUP_STOP,
                 now,
             ],
         )
@@ -3932,7 +4586,7 @@ impl AppStore {
             .execute(
                 "UPDATE router_ssh_hosts
                  SET status = ?2, updated_at = ?3
-                 WHERE id = ?1 AND status IN ('allocated', 'unreachable') AND installation_id = ?4",
+                 WHERE id = ?1 AND status IN ('allocated', 'unreachable', 'draining') AND installation_id = ?4",
                 params![host.0, HOST_STATUS_DRAINING, now, installation_id],
             )
             .map_err(|e| AppError::Internal(format!("mark cleanup host draining failed: {e}")))?;
@@ -5245,5 +5899,45 @@ mod tests {
         )
         .unwrap();
         assert_eq!(test_req.root_password.as_deref(), Some("pw"));
+    }
+
+    #[test]
+    fn classify_cleanup_failure_maps_known_cases() {
+        assert_eq!(
+            classify_cleanup_failure(&AppError::ServiceUnavailable(
+                "ssh command exceeded its execution timeout".into()
+            )),
+            CLEANUP_FAILURE_SSH_TIMEOUT
+        );
+        assert_eq!(
+            classify_cleanup_failure(&AppError::Conflict(
+                "failed to stop cc-switch-server".into()
+            )),
+            CLEANUP_FAILURE_STOP
+        );
+        assert_eq!(
+            classify_cleanup_failure(&AppError::Conflict(
+                "failed to remove cc-switch-server installation files".into()
+            )),
+            CLEANUP_FAILURE_WIPE
+        );
+        assert_eq!(
+            classify_cleanup_failure(&AppError::Internal(
+                "purge installation failed after 3 attempts: db locked".into()
+            )),
+            CLEANUP_FAILURE_PURGE
+        );
+        assert_eq!(
+            classify_cleanup_failure(&AppError::Conflict(
+                "cleanup host installation binding mismatch".into()
+            )),
+            CLEANUP_FAILURE_BINDING
+        );
+        assert_eq!(
+            classify_cleanup_failure(&AppError::Conflict(
+                "ssh host key fingerprint does not match the registered host".into()
+            )),
+            CLEANUP_FAILURE_FINGERPRINT
+        );
     }
 }

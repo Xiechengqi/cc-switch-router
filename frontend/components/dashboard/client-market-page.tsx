@@ -8,6 +8,7 @@ import { CompactRegionMultiSelect } from "@/components/common/compact-region-mul
 import { CopyableCodeField } from "@/components/common/copyable-code-field";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { CountryFlag } from "@/components/common/country-flag";
+import { ProvisionJobLog } from "@/components/dashboard/provision-job-log";
 import { WebTerminalGlyph } from "@/components/dashboard/web-terminal/web-terminal-glyph";
 import { useWebTerminal } from "@/components/dashboard/web-terminal";
 import { useLocaleText } from "@/components/i18n/locale-provider";
@@ -22,7 +23,7 @@ import {
   reverifyClientMarketHost,
   testClientMarketHostSsh,
 } from "@/lib/api";
-import type { ClientMarketHost, HostIpIntel, ProvisionSshKey } from "@/lib/types";
+import type { ClientMarketHost, HostIpIntel, ProvisionSshKey, ProvisioningJob } from "@/lib/types";
 import type { MessageKey } from "@/lib/i18n";
 import { usePersistentState } from "@/lib/use-persistent-state";
 
@@ -645,6 +646,41 @@ function AddHostDialog({
   );
 }
 
+function cleanupPhaseLabelKey(phase: string): MessageKey {
+  switch (phase) {
+    case "cleanup_stop":
+      return "clientMarket.cleanupPhase.stop";
+    case "cleanup_wipe":
+      return "clientMarket.cleanupPhase.wipe";
+    case "cleanup_purge":
+      return "clientMarket.cleanupPhase.purge";
+    case "complete":
+      return "clientMarket.cleanupPhase.complete";
+    case "cleanup_remote":
+    default:
+      return "clientMarket.cleanupPhase.remote";
+  }
+}
+
+function cleanupFailureGuidanceKey(failureCode?: string): MessageKey {
+  if (!failureCode) return "clientMarket.cleanupFailedGuidance";
+  if (failureCode.startsWith("cleanup_purge_failed")) return "clientMarket.cleanupFailedGuidance.purge";
+  if (
+    failureCode.startsWith("cleanup_ssh_timeout") ||
+    failureCode.startsWith("cleanup_stop_failed") ||
+    failureCode.startsWith("cleanup_wipe_failed")
+  ) {
+    return "clientMarket.cleanupFailedGuidance.remote";
+  }
+  if (
+    failureCode.startsWith("cleanup_fingerprint_mismatch") ||
+    failureCode.startsWith("cleanup_host_binding_mismatch")
+  ) {
+    return "clientMarket.cleanupFailedGuidance.safety";
+  }
+  return "clientMarket.cleanupFailedGuidance";
+}
+
 function HostRow({
   host,
   viewerEmail,
@@ -660,6 +696,8 @@ function HostRow({
   const { openTerminal } = useWebTerminal();
   const [busy, setBusy] = React.useState(false);
   const [confirmAction, setConfirmAction] = React.useState<"delete" | "cleanup" | null>(null);
+  const [cleanupJob, setCleanupJob] = React.useState<ProvisioningJob | null>(null);
+  const [cleanupOpen, setCleanupOpen] = React.useState(false);
   const canManageHost =
     !!viewerEmail &&
     (isAdmin || viewerEmail.toLowerCase() === host.hostOwnerEmail.toLowerCase());
@@ -672,11 +710,12 @@ function HostRow({
     viewerEmail.toLowerCase() === host.clientOwnerEmail.toLowerCase();
   const canCleanup =
     !!host.installationId &&
-    (host.status === "allocated" || host.status === "unreachable") &&
+    (host.status === "allocated" || host.status === "unreachable" || host.status === "draining") &&
     (canManageHost || isClientOwner);
+  const isRetryCleanup =
+    canCleanup && (host.status === "unreachable" || host.status === "draining");
   const canReverify =
     canManageHost &&
-    (isAdmin || !host.installationId) &&
     (host.status === "unreachable" || host.status === "disabled" || host.status === "abnormal");
   const canOpenTerminal = host.canWebTerminal === true;
   const hostLabel = host.hostname || host.ip || host.id.slice(0, 8);
@@ -685,21 +724,33 @@ function HostRow({
     ? new Intl.DisplayNames([locale], { type: "region" }).of(host.countryCode) || host.countryCode
     : "";
 
-  const pollJob = async (jobId: string) => {
-    for (let i = 0; i < 120; i++) {
-      await new Promise((r) => setTimeout(r, 1500));
-      let job;
+  const pollCleanupJob = async (jobId: string) => {
+    let latest: ProvisioningJob | null = null;
+    for (let i = 0; i < 180; i++) {
+      await new Promise((r) => setTimeout(r, 1200));
       try {
-        job = await getClientMarketJob(jobId);
+        latest = await getClientMarketJob(jobId);
       } catch {
         continue;
       }
-      if (job.status === "succeeded") break;
-      if (job.status === "failed") {
-        toast.danger(t("clientMarket.cleanupFailed"));
-        break;
+      setCleanupJob(latest);
+      if (latest.status === "succeeded") {
+        toast.success(t("clientMarket.cleanupSucceeded"));
+        onChanged();
+        return;
+      }
+      if (latest.status === "failed") {
+        const detail = latest.failureCode || latest.log.split("\n").filter(Boolean).at(-1) || "";
+        toast.danger(
+          detail
+            ? `${t("clientMarket.cleanupFailed")}: ${detail}`
+            : t("clientMarket.cleanupFailed"),
+        );
+        onChanged();
+        return;
       }
     }
+    toast.danger(t("clientMarket.cleanupTimedOut"));
     onChanged();
   };
 
@@ -720,12 +771,17 @@ function HostRow({
     if (!host.installationId) return;
     setConfirmAction(null);
     setBusy(true);
+    setCleanupJob(null);
+    setCleanupOpen(true);
     try {
       const { jobId } = await cleanupClientMarketClient(host.installationId);
       toast.info(t("clientMarket.cleanupStarted"));
-      await pollJob(jobId);
+      const initial = await getClientMarketJob(jobId).catch(() => null);
+      if (initial) setCleanupJob(initial);
+      await pollCleanupJob(jobId);
     } catch (err) {
       toast.danger(err instanceof Error ? err.message : String(err));
+      setCleanupOpen(false);
     } finally {
       setBusy(false);
     }
@@ -746,9 +802,12 @@ function HostRow({
 
   const confirmCopy = confirmAction === "cleanup"
     ? {
-        title: t("clientMarket.cleanupConfirmTitle"),
-        description: t("clientMarket.cleanupConfirmDesc", { host: hostLabel }),
-        confirmLabel: t("clientMarket.cleanup"),
+        title: t(isRetryCleanup ? "clientMarket.retryCleanupConfirmTitle" : "clientMarket.cleanupConfirmTitle"),
+        description: t(
+          isRetryCleanup ? "clientMarket.retryCleanupConfirmDesc" : "clientMarket.cleanupConfirmDesc",
+          { host: hostLabel },
+        ),
+        confirmLabel: t(isRetryCleanup ? "clientMarket.retryCleanup" : "clientMarket.cleanup"),
       }
     : confirmAction === "delete"
       ? {
@@ -763,6 +822,9 @@ function HostRow({
   const locationLabel = formatHostIpLocation(intel, countryName, locale);
   const secondaryIntelParts = formatHostIpIntelSecondary(intel, t);
   const subdomain = host.clientSubdomain?.trim() || "";
+  const cleanupPhase = cleanupJob?.phase || "";
+  const cleanupTone =
+    cleanupJob?.status === "failed" ? "failed" : cleanupJob?.status === "succeeded" ? "success" : "running";
 
   return (
     <>
@@ -852,7 +914,7 @@ function HostRow({
                   ) : null}
                   {canCleanup ? (
                     <Dropdown.Item id="cleanup" onAction={() => setConfirmAction("cleanup")}>
-                      {t("clientMarket.cleanup")}
+                      {t(isRetryCleanup ? "clientMarket.retryCleanup" : "clientMarket.cleanup")}
                     </Dropdown.Item>
                   ) : null}
                   {canDelete ? (
@@ -872,7 +934,7 @@ function HostRow({
             <span className="h-8 w-8 shrink-0" aria-hidden />
           )}
         </div>
-        {secondaryIntelParts.length || host.note ? (
+        {secondaryIntelParts.length || host.note || host.lastError ? (
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1 pl-0.5 text-[11px] leading-4 text-muted-foreground">
             {secondaryIntelParts.length ? (
               <span className="whitespace-normal break-words">{secondaryIntelParts.join(" · ")}</span>
@@ -882,7 +944,20 @@ function HostRow({
                 {host.note}
               </span>
             ) : null}
+            {host.lastError ? (
+              <span
+                className="min-w-0 whitespace-normal break-words text-destructive/90"
+                title={host.lastError}
+              >
+                {host.lastError}
+              </span>
+            ) : null}
           </div>
+        ) : null}
+        {host.status === "unreachable" && host.installationId ? (
+          <p className="pl-0.5 text-[11px] leading-4 text-amber-700">
+            {t(cleanupFailureGuidanceKey(host.lastError))}
+          </p>
         ) : null}
       </div>
       {confirmCopy ? (
@@ -903,6 +978,55 @@ function HostRow({
           }}
         />
       ) : null}
+      <Modal.Backdrop
+        isOpen={cleanupOpen}
+        onOpenChange={(next) => {
+          if (!next && !busy) setCleanupOpen(false);
+        }}
+      >
+        <Modal.Container placement="center">
+          <Modal.Dialog className="light w-[min(640px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
+            <Modal.Header>
+              <Modal.Heading className="!text-slate-900">
+                {t("clientMarket.cleanupProgressTitle", { host: hostLabel })}
+              </Modal.Heading>
+            </Modal.Header>
+            <Modal.Body className="grid gap-3 !text-slate-900">
+              <div className="flex flex-wrap items-center gap-2 text-sm">
+                <Chip size="sm" variant="soft">
+                  {cleanupJob
+                    ? t(cleanupPhaseLabelKey(cleanupPhase))
+                    : t("clientMarket.cleanupPhase.starting")}
+                </Chip>
+                {cleanupJob?.status ? (
+                  <span className="text-xs text-muted-foreground">{cleanupJob.status}</span>
+                ) : null}
+              </div>
+              <ProvisionJobLog
+                log={cleanupJob?.log || ""}
+                phase={cleanupTone === "failed" ? "failed" : cleanupTone === "success" ? "success" : "running"}
+              />
+              {cleanupJob?.status === "failed" ? (
+                <p className="text-sm text-rose-600">
+                  {t(cleanupFailureGuidanceKey(cleanupJob.failureCode || cleanupJob.log))}
+                </p>
+              ) : null}
+              {cleanupJob?.status === "succeeded" ? (
+                <p className="text-sm text-emerald-700">{t("clientMarket.cleanupSucceeded")}</p>
+              ) : null}
+            </Modal.Body>
+            <Modal.Footer>
+              <Button
+                variant="ghost"
+                isDisabled={busy && cleanupJob?.status !== "failed" && cleanupJob?.status !== "succeeded"}
+                onClick={() => setCleanupOpen(false)}
+              >
+                {t("common.close")}
+              </Button>
+            </Modal.Footer>
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
     </>
   );
 }
