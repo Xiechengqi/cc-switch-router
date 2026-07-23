@@ -416,7 +416,7 @@ function ClientCard({
           onDoubleClick={handleHeaderDoubleClick}
         >
           <div className="grid min-w-0 gap-1.5">
-            <div className="flex min-w-0 flex-wrap items-center gap-2">
+            <div className="flex min-w-0 items-center gap-2">
               <span className={`h-2 w-2 shrink-0 rounded-full ${state === "offline" ? "bg-rose-500" : state === "reconnecting" ? "bg-sky-500" : state === "degraded" ? "bg-amber-400" : "bg-emerald-500"}`} />
               {identityUrl ? (
                 <a
@@ -434,15 +434,22 @@ function ClientCard({
               ) : (
                 <strong className="truncate text-sm font-semibold text-foreground" title={identity}>{identity}</strong>
               )}
-              <span className="inline-flex shrink-0 flex-nowrap items-center gap-2">
-                <OperationalStatusPill summary={summary} />
-                {tunnelUrl ? <ClientConsoleButton client={client} /> : null}
-                <ClientUpgradeButton client={client} />
-                <ClientDetailsButton onOpen={openClientDrawer} />
-                <ClientChatButton client={client} />
-              </span>
-              {summary.primaryReason ? <span className={`truncate text-[11px] font-medium ${state === "offline" ? "text-rose-700" : state === "reconnecting" ? "text-sky-700" : "text-amber-700"}`} title={operationalReasonLabel(summary.primaryReason, t)}>{operationalReasonLabel(summary.primaryReason, t)}</span> : null}
+              {summary.primaryReason ? (
+                <span
+                  className={`min-w-0 truncate text-[11px] font-medium ${state === "offline" ? "text-rose-700" : state === "reconnecting" ? "text-sky-700" : "text-amber-700"}`}
+                  title={operationalReasonLabel(summary.primaryReason, t)}
+                >
+                  {operationalReasonLabel(summary.primaryReason, t)}
+                </span>
+              ) : null}
               {showRemoval ? <ClientRemovalSchedule removalAt={client.removalAt} className="text-[11px]" /> : null}
+            </div>
+            <div className="flex min-w-0 flex-wrap items-center gap-2 pl-4">
+              <OperationalStatusPill summary={summary} />
+              {tunnelUrl ? <ClientConsoleButton client={client} /> : null}
+              <ClientUpgradeButton client={client} />
+              <ClientDetailsButton onOpen={openClientDrawer} />
+              <ClientChatButton client={client} />
             </div>
             <div className="flex min-w-0 items-center text-xs text-muted-foreground">
               <span className="truncate" title={owner}>{owner}</span>

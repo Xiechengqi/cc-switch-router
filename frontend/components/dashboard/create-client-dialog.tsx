@@ -86,7 +86,7 @@ export function CreateClientDialog({
     session?.installationOwnerEmail?.trim() ||
     t("dashboard.installClientCommandOwnerPlaceholder");
 
-  const [mode, setMode] = React.useState<CreateMode>("manual");
+  const [mode, setMode] = React.useState<CreateMode>("online");
   const [copied, setCopied] = React.useState(false);
   const [supply, setSupply] = React.useState<SupplySummaryEntry[]>([]);
   const [supplyLoading, setSupplyLoading] = React.useState(false);
@@ -216,7 +216,7 @@ export function CreateClientDialog({
     previousOwnerSignatureRef.current = "";
     pollGenerationRef.current += 1;
     setPhase("form");
-    setMode("manual");
+    setMode("online");
     setCopied(false);
     setJobLog("");
     setError("");

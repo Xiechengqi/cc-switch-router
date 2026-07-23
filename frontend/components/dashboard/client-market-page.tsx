@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { Button, Chip, Dropdown, Modal, Tabs, toast } from "@heroui/react";
-import { Check, ChevronDown, Circle, Loader2, MoreHorizontal, Plus, RefreshCw, Trash2, X } from "lucide-react";
+import { Check, ChevronDown, ChevronLeft, ChevronRight, Circle, Loader2, MoreHorizontal, Plus, RefreshCw, Trash2, X } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { CopyableCodeField } from "@/components/common/copyable-code-field";
@@ -149,6 +149,33 @@ function statusLabelKey(status: string): MessageKey {
     abnormal: "clientMarket.status.abnormal",
   } as const;
   return (known[status as keyof typeof known] || "clientMarket.status.idle") as MessageKey;
+}
+
+const HOST_STATUS_TABS = [
+  "all",
+  "idle",
+  "allocated",
+  "locked",
+  "draining",
+  "disabled",
+  "unreachable",
+  "abnormal",
+] as const;
+
+type HostStatusFilter = (typeof HOST_STATUS_TABS)[number];
+
+function statusHintKey(status: HostStatusFilter): MessageKey {
+  const known = {
+    all: "clientMarket.statusHint.all",
+    idle: "clientMarket.statusHint.idle",
+    allocated: "clientMarket.statusHint.allocated",
+    locked: "clientMarket.statusHint.locked",
+    draining: "clientMarket.statusHint.draining",
+    disabled: "clientMarket.statusHint.disabled",
+    unreachable: "clientMarket.statusHint.unreachable",
+    abnormal: "clientMarket.statusHint.abnormal",
+  } as const;
+  return known[status];
 }
 
 function authorizedKeysInstallCommand(line: string): string {
@@ -741,7 +768,16 @@ function HostRow({
     <>
       <div className="grid gap-1.5 rounded-lg border border-border bg-white px-3 py-2.5 text-sm">
         <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-          <Chip size="sm" variant="soft" className="shrink-0">
+          <Chip
+            size="sm"
+            variant="soft"
+            className="shrink-0"
+            title={
+              (HOST_STATUS_TABS as readonly string[]).includes(host.status)
+                ? t(statusHintKey(host.status as HostStatusFilter))
+                : undefined
+            }
+          >
             {t(statusLabelKey(host.status))}
           </Chip>
           {canOpenTerminal ? (
@@ -873,6 +909,36 @@ function HostRow({
 
 const OWNER_FILTER_KEY = "cc_switch_router_client_market_owner_filter_v1";
 const REGION_FILTER_KEY = "cc_switch_router_client_market_region_filter_v1";
+const STATUS_FILTER_KEY = "cc_switch_router_client_market_status_filter_v1";
+const HOST_PAGE_SIZE = 10;
+
+function normalizeHostStatusFilter(value: unknown): HostStatusFilter {
+  if (typeof value === "string" && (HOST_STATUS_TABS as readonly string[]).includes(value)) {
+    return value as HostStatusFilter;
+  }
+  return "all";
+}
+
+function hostStatusTabTone(status: HostStatusFilter, active: boolean) {
+  if (active) return "bg-white font-medium text-foreground shadow-sm";
+  switch (status) {
+    case "unreachable":
+    case "abnormal":
+      return "text-rose-700";
+    case "locked":
+      return "text-sky-700";
+    case "draining":
+      return "text-amber-700";
+    case "disabled":
+      return "text-slate-500";
+    case "idle":
+      return "text-emerald-700";
+    case "allocated":
+      return "text-slate-700";
+    default:
+      return "text-muted-foreground";
+  }
+}
 
 export function ClientMarketPage() {
   const { locale, t } = useLocaleText();
@@ -888,6 +954,9 @@ export function ClientMarketPage() {
   const [mineOnly, setMineOnly] = React.useState(false);
   const [ownerFilters, setOwnerFilters] = usePersistentState<string[]>(OWNER_FILTER_KEY, []);
   const [regionFilters, setRegionFilters] = usePersistentState<string[]>(REGION_FILTER_KEY, []);
+  const [statusFilterRaw, setStatusFilter] = usePersistentState<HostStatusFilter>(STATUS_FILTER_KEY, "all");
+  const statusFilter = normalizeHostStatusFilter(statusFilterRaw);
+  const [page, setPage] = React.useState(1);
   const [error, setError] = React.useState("");
 
   const load = React.useCallback(async () => {
@@ -928,21 +997,43 @@ export function ClientMarketPage() {
     }));
   }, [hosts, locale]);
 
-  const visibleHosts = React.useMemo(() => {
+  const scopedHosts = React.useMemo(() => {
     const ownerSet = new Set(ownerFilters.map((email) => email.toLowerCase()));
     const regionSet = new Set(regionFilters.map((code) => code.toUpperCase()));
-    return hosts
-      .filter((host) => {
-        if (mineOnly && viewerEmail) {
-          if (host.hostOwnerEmail.toLowerCase() !== viewerEmail.toLowerCase()) return false;
-        }
-        if (ownerSet.size > 0 && !ownerSet.has(host.hostOwnerEmail.toLowerCase())) return false;
-        if (regionSet.size > 0) {
-          const code = (host.countryCode || "").trim().toUpperCase();
-          if (!code || !regionSet.has(code)) return false;
-        }
-        return true;
-      })
+    return hosts.filter((host) => {
+      if (mineOnly && viewerEmail) {
+        if (host.hostOwnerEmail.toLowerCase() !== viewerEmail.toLowerCase()) return false;
+      }
+      if (ownerSet.size > 0 && !ownerSet.has(host.hostOwnerEmail.toLowerCase())) return false;
+      if (regionSet.size > 0) {
+        const code = (host.countryCode || "").trim().toUpperCase();
+        if (!code || !regionSet.has(code)) return false;
+      }
+      return true;
+    });
+  }, [hosts, mineOnly, ownerFilters, regionFilters, viewerEmail]);
+
+  const statusCounts = React.useMemo(() => {
+    const counts: Record<HostStatusFilter, number> = {
+      all: scopedHosts.length,
+      idle: 0,
+      allocated: 0,
+      locked: 0,
+      draining: 0,
+      disabled: 0,
+      unreachable: 0,
+      abnormal: 0,
+    };
+    for (const host of scopedHosts) {
+      const key = host.status as HostStatusFilter;
+      if (key in counts && key !== "all") counts[key] += 1;
+    }
+    return counts;
+  }, [scopedHosts]);
+
+  const visibleHosts = React.useMemo(() => {
+    return scopedHosts
+      .filter((host) => statusFilter === "all" || host.status === statusFilter)
       .sort((a, b) => {
         const ownerCmp = a.hostOwnerEmail.localeCompare(b.hostOwnerEmail);
         if (ownerCmp !== 0) return ownerCmp;
@@ -950,7 +1041,22 @@ export function ClientMarketPage() {
         if (ipCmp !== 0) return ipCmp;
         return a.id.localeCompare(b.id);
       });
-  }, [hosts, mineOnly, ownerFilters, regionFilters, viewerEmail]);
+  }, [scopedHosts, statusFilter]);
+
+  const totalPages = Math.max(1, Math.ceil(visibleHosts.length / HOST_PAGE_SIZE));
+  const safePage = Math.min(page, totalPages);
+  const pagedHosts = React.useMemo(() => {
+    const start = (safePage - 1) * HOST_PAGE_SIZE;
+    return visibleHosts.slice(start, start + HOST_PAGE_SIZE);
+  }, [safePage, visibleHosts]);
+
+  React.useEffect(() => {
+    setPage(1);
+  }, [mineOnly, ownerFilters, regionFilters, statusFilter]);
+
+  React.useEffect(() => {
+    if (page > totalPages) setPage(totalPages);
+  }, [page, totalPages]);
 
   React.useEffect(() => {
     if (!pendingAddAfterLogin || !authed) return;
@@ -967,10 +1073,37 @@ export function ClientMarketPage() {
     setAddOpen(true);
   };
 
+  const statusTabs = React.useMemo(
+    () =>
+      HOST_STATUS_TABS.map((value) => ({
+        value,
+        label: value === "all" ? t("dashboard.all") : t(statusLabelKey(value)),
+        hint: t(statusHintKey(value)),
+        count: statusCounts[value],
+      })),
+    [statusCounts, t],
+  );
+
   return (
     <div className="mx-auto grid w-[calc(100%-2rem)] max-w-7xl gap-5 pb-10">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+          <div className="inline-flex max-w-full overflow-x-auto rounded-lg bg-slate-100 p-1 text-[11px]">
+            {statusTabs.map((tab) => (
+              <button
+                key={tab.value}
+                type="button"
+                title={tab.hint}
+                aria-label={`${tab.label}. ${tab.hint}`}
+                onClick={() => setStatusFilter(tab.value)}
+                className={`rounded-md px-2.5 py-1.5 transition-colors ${hostStatusTabTone(tab.value, statusFilter === tab.value)}`}
+              >
+                {tab.label} · {tab.count}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
           <CompactRegionMultiSelect
             values={ownerFilters}
             onChange={setOwnerFilters}
@@ -991,8 +1124,6 @@ export function ClientMarketPage() {
             ariaLabel={t("clientMarket.filterRegions")}
             className="w-full sm:w-44"
           />
-        </div>
-        <div className="flex items-center gap-2">
           {authed ? (
             <Button
               variant={mineOnly ? "primary" : "outline"}
@@ -1021,20 +1152,74 @@ export function ClientMarketPage() {
       ) : error ? (
         <p className="text-sm text-rose-600">{error}</p>
       ) : visibleHosts.length === 0 ? (
-        <p className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">
-          {t("clientMarket.noHosts")}
-        </p>
+        <div className="grid justify-items-center gap-2 rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">
+          <span>{scopedHosts.length ? t("dashboard.noFilterResults") : t("clientMarket.noHosts")}</span>
+          {scopedHosts.length || ownerFilters.length || regionFilters.length || statusFilter !== "all" || mineOnly ? (
+            <button
+              type="button"
+              className="text-xs font-medium text-primary hover:underline"
+              onClick={() => {
+                setStatusFilter("all");
+                setOwnerFilters([]);
+                setRegionFilters([]);
+                setMineOnly(false);
+              }}
+            >
+              {t("dashboard.clearFilters")}
+            </button>
+          ) : null}
+        </div>
       ) : (
-        <div className="grid gap-2">
-          {visibleHosts.map((host) => (
-            <HostRow
-              key={host.id}
-              host={host}
-              viewerEmail={viewerEmail}
-              isAdmin={isAdmin}
-              onChanged={() => void load()}
-            />
-          ))}
+        <div className="grid gap-3">
+          <div className="grid gap-2">
+            {pagedHosts.map((host) => (
+              <HostRow
+                key={host.id}
+                host={host}
+                viewerEmail={viewerEmail}
+                isAdmin={isAdmin}
+                onChanged={() => void load()}
+              />
+            ))}
+          </div>
+          {visibleHosts.length > HOST_PAGE_SIZE ? (
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-white px-3 py-2 text-sm">
+              <span className="text-muted-foreground">
+                {t("clientMarket.paginationSummary", {
+                  start: (safePage - 1) * HOST_PAGE_SIZE + 1,
+                  end: Math.min(safePage * HOST_PAGE_SIZE, visibleHosts.length),
+                  total: visibleHosts.length,
+                })}
+              </span>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  isIconOnly
+                  className="h-8 w-8 min-w-8"
+                  isDisabled={safePage <= 1}
+                  aria-label={t("clientMarket.paginationPrev")}
+                  onClick={() => setPage((current) => Math.max(1, current - 1))}
+                >
+                  <ChevronLeft className="h-4 w-4" />
+                </Button>
+                <span className="min-w-16 text-center font-mono text-xs text-slate-700">
+                  {t("clientMarket.paginationPage", { page: safePage, pages: totalPages })}
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  isIconOnly
+                  className="h-8 w-8 min-w-8"
+                  isDisabled={safePage >= totalPages}
+                  aria-label={t("clientMarket.paginationNext")}
+                  onClick={() => setPage((current) => Math.min(totalPages, current + 1))}
+                >
+                  <ChevronRight className="h-4 w-4" />
+                </Button>
+              </div>
+            </div>
+          ) : null}
         </div>
       )}
 
