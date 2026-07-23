@@ -86,10 +86,12 @@ INFO "Location: ${countryCode}"
 [ "${countryCode}" = "China" ] && downloadUrl="${GITHUB_PROXY}/${downloadUrl}"
 binary="cc-switch-server"
 
-# check process
-if ps -ef | grep ${binary} | grep -v grep &> /dev/null
+# check process (exact name; avoid matching this script's own argv/cmdline)
+if { command -v pgrep >/dev/null 2>&1 && pgrep -x "${binary}" >/dev/null 2>&1; } \
+  || { command -v pidof >/dev/null 2>&1 && pidof "${binary}" >/dev/null 2>&1; }
 then
-YELLOW "${binary} is running, exit installing ..." && ps -ef | grep ${binary} | grep -v grep
+YELLOW "${binary} is running, exit installing ..."
+command -v pgrep >/dev/null 2>&1 && pgrep -ax "${binary}" 2>/dev/null || ps -ef | grep "[c]c-switch-server" || true
 exit 0
 fi
 

@@ -453,7 +453,7 @@ function HostRow({
     (host.status === "unreachable" || host.status === "disabled" || host.status === "abnormal");
   const countryName = host.countryCode
     ? new Intl.DisplayNames([locale], { type: "region" }).of(host.countryCode) || host.countryCode
-    : "—";
+    : "";
 
   const pollJob = async (jobId: string) => {
     for (let i = 0; i < 120; i++) {
@@ -529,72 +529,111 @@ function HostRow({
         }
       : null;
   const hasActions = canDelete || canCleanup || canReverify;
-  const ipPort = host.ip
-    ? `${host.ip}${host.port ? `:${host.port}` : ""}`
-    : "—";
+  const ipPort = host.ip ? `${host.ip}${host.port ? `:${host.port}` : ""}` : "";
+  const intel = host.ipIntel;
+  const locationLabel =
+    intel?.location ||
+    [intel?.city, intel?.region, intel?.country || countryName].filter(Boolean).join(" · ") ||
+    countryName;
+  const ispAsnLabel = [intel?.isp || intel?.asName, intel?.asn].filter(Boolean).join(" · ");
+  const riskClassLabel = [intel?.riskLevel, intel?.classificationType || intel?.networkType]
+    .filter(Boolean)
+    .join(" · ");
+  const subdomain = host.clientSubdomain?.trim() || "";
 
   return (
     <>
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border border-border bg-white px-3 py-2.5 text-sm">
-        <Chip size="sm" variant="soft" className="shrink-0">
-          {t(statusLabelKey(host.status))}
-        </Chip>
-        <span className="inline-flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
-          <CountryFlag code={host.countryCode} className="h-3.5 w-5 shrink-0 rounded-sm object-cover" />
-          <span className="truncate">{countryName}</span>
-        </span>
-        <span
-          className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground"
-          title={host.installationId || host.hostname || undefined}
-        >
-          {host.clientSubdomain || "—"}
-        </span>
-        <span className="shrink-0 font-mono text-xs text-foreground" title={host.hostname || undefined}>
-          {ipPort}
-        </span>
-        {hasActions ? (
-          <Dropdown>
-            <Dropdown.Trigger className="shrink-0 outline-none">
-              <Button
-                variant="ghost"
-                size="sm"
-                isIconOnly
-                className="h-8 w-8 min-w-8"
-                isDisabled={busy}
-                aria-label={t("clientMarket.hostActions")}
-              >
-                {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <MoreHorizontal className="h-4 w-4" />}
-              </Button>
-            </Dropdown.Trigger>
-            <Dropdown.Popover placement="bottom right">
-              <Dropdown.Menu aria-label={t("clientMarket.hostActions")}>
-                {canReverify ? (
-                  <Dropdown.Item id="reverify" onAction={() => void onReverify()}>
-                    <RefreshCw className="h-4 w-4" />
-                    {t("clientMarket.reverifyHost")}
-                  </Dropdown.Item>
-                ) : null}
-                {canCleanup ? (
-                  <Dropdown.Item id="cleanup" onAction={() => setConfirmAction("cleanup")}>
-                    {t("clientMarket.cleanup")}
-                  </Dropdown.Item>
-                ) : null}
-                {canDelete ? (
-                  <Dropdown.Item
-                    id="delete"
-                    className="text-destructive"
-                    onAction={() => setConfirmAction("delete")}
-                  >
-                    <Trash2 className="h-4 w-4" />
-                    {t("clientMarket.deleteHost")}
-                  </Dropdown.Item>
-                ) : null}
-              </Dropdown.Menu>
-            </Dropdown.Popover>
-          </Dropdown>
-        ) : (
-          <span className="h-8 w-8 shrink-0" aria-hidden />
-        )}
+      <div className="grid gap-1.5 rounded-lg border border-border bg-white px-3 py-2.5 text-sm">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+          <Chip size="sm" variant="soft" className="shrink-0">
+            {t(statusLabelKey(host.status))}
+          </Chip>
+          {locationLabel || host.countryCode ? (
+            <span className="inline-flex min-w-0 max-w-[14rem] items-center gap-1.5 text-xs text-muted-foreground">
+              <CountryFlag code={host.countryCode} className="h-3.5 w-5 shrink-0 rounded-sm object-cover" />
+              {locationLabel ? (
+                <span className="truncate" title={locationLabel}>
+                  {locationLabel}
+                </span>
+              ) : null}
+            </span>
+          ) : null}
+          <span
+            className="min-w-0 max-w-[16rem] truncate text-xs font-medium text-foreground"
+            title={host.hostOwnerEmail}
+          >
+            {host.hostOwnerEmail}
+          </span>
+          {subdomain ? (
+            <span
+              className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground"
+              title={host.installationId || host.hostname || undefined}
+            >
+              {subdomain}
+            </span>
+          ) : (
+            <span className="min-w-0 flex-1" aria-hidden />
+          )}
+          {ipPort ? (
+            <span className="shrink-0 font-mono text-xs text-foreground" title={host.hostname || undefined}>
+              {ipPort}
+            </span>
+          ) : null}
+          {hasActions ? (
+            <Dropdown>
+              <Dropdown.Trigger className="shrink-0 outline-none">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  isIconOnly
+                  className="h-8 w-8 min-w-8"
+                  isDisabled={busy}
+                  aria-label={t("clientMarket.hostActions")}
+                >
+                  {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <MoreHorizontal className="h-4 w-4" />}
+                </Button>
+              </Dropdown.Trigger>
+              <Dropdown.Popover placement="bottom right">
+                <Dropdown.Menu aria-label={t("clientMarket.hostActions")}>
+                  {canReverify ? (
+                    <Dropdown.Item id="reverify" onAction={() => void onReverify()}>
+                      <RefreshCw className="h-4 w-4" />
+                      {t("clientMarket.reverifyHost")}
+                    </Dropdown.Item>
+                  ) : null}
+                  {canCleanup ? (
+                    <Dropdown.Item id="cleanup" onAction={() => setConfirmAction("cleanup")}>
+                      {t("clientMarket.cleanup")}
+                    </Dropdown.Item>
+                  ) : null}
+                  {canDelete ? (
+                    <Dropdown.Item
+                      id="delete"
+                      className="text-destructive"
+                      onAction={() => setConfirmAction("delete")}
+                    >
+                      <Trash2 className="h-4 w-4" />
+                      {t("clientMarket.deleteHost")}
+                    </Dropdown.Item>
+                  ) : null}
+                </Dropdown.Menu>
+              </Dropdown.Popover>
+            </Dropdown>
+          ) : (
+            <span className="h-8 w-8 shrink-0" aria-hidden />
+          )}
+        </div>
+        {ispAsnLabel || riskClassLabel || host.note ? (
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 pl-0.5 text-[11px] leading-4 text-muted-foreground">
+            {ispAsnLabel ? <span className="truncate">{ispAsnLabel}</span> : null}
+            {riskClassLabel ? <span className="truncate">{riskClassLabel}</span> : null}
+            {host.note ? (
+              <span className="min-w-0 truncate" title={host.note}>
+                {host.note}
+              </span>
+            ) : null}
+          </div>
+        ) : null}
       </div>
       {confirmCopy ? (
         <ConfirmAlertDialog

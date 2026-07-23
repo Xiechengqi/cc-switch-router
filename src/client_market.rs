@@ -111,6 +111,60 @@ ensure_client_market_deps() {
   return 0
 }
 "#;
+
+/// Detect/stop a live cc-switch-server without matching this SSH checker's own cmdline.
+/// `pgrep -f /usr/local/bin/cc-switch-server` false-positives because the remote
+/// `sh -c '...'` argument itself contains that path string.
+const REMOTE_CC_SWITCH_SERVER_HELPERS: &str = r#"
+cc_switch_server_is_running() {
+  if command -v pgrep >/dev/null 2>&1 && pgrep -x cc-switch-server >/dev/null 2>&1; then
+    return 0
+  fi
+  if command -v pidof >/dev/null 2>&1 && pidof cc-switch-server >/dev/null 2>&1; then
+    return 0
+  fi
+  for comm in /proc/[0-9]*/comm; do
+    [ -r "$comm" ] || continue
+    name=$(cat "$comm" 2>/dev/null) || continue
+    [ "$name" = "cc-switch-server" ] && return 0
+  done
+  return 1
+}
+cc_switch_server_stop() {
+  if command -v pkill >/dev/null 2>&1; then
+    pkill -TERM -x cc-switch-server 2>/dev/null || true
+  else
+    for comm in /proc/[0-9]*/comm; do
+      [ -r "$comm" ] || continue
+      name=$(cat "$comm" 2>/dev/null) || continue
+      [ "$name" = "cc-switch-server" ] || continue
+      pid=${comm#/proc/}
+      pid=${pid%/comm}
+      kill -TERM "$pid" 2>/dev/null || true
+    done
+  fi
+  i=0
+  while cc_switch_server_is_running && [ "$i" -lt 20 ]; do
+    sleep 1
+    i=$((i + 1))
+  done
+  if cc_switch_server_is_running; then
+    if command -v pkill >/dev/null 2>&1; then
+      pkill -KILL -x cc-switch-server 2>/dev/null || true
+    else
+      for comm in /proc/[0-9]*/comm; do
+        [ -r "$comm" ] || continue
+        name=$(cat "$comm" 2>/dev/null) || continue
+        [ "$name" = "cc-switch-server" ] || continue
+        pid=${comm#/proc/}
+        pid=${pid%/comm}
+        kill -KILL "$pid" 2>/dev/null || true
+      done
+    fi
+    sleep 1
+  fi
+}
+"#;
 const MAX_PASSWORD_BYTES: usize = 1024;
 const HOST_REGISTRATIONS_PER_OWNER_HOUR: u32 = 20;
 const HOST_REGISTRATIONS_PER_TARGET_HOUR: u32 = 5;
@@ -1699,15 +1753,12 @@ async fn ssh_host_has_running_cc_switch_server(
         ip,
         port,
         &format!(
-            "set +e; \
-             if command -v pgrep >/dev/null 2>&1; then \
-               pgrep -f /usr/local/bin/cc-switch-server >/dev/null 2>&1; \
-             else \
-               ps 2>/dev/null | grep '[c]c-switch-server' >/dev/null 2>&1; \
-             fi; \
-             status=$?; if [ \"$status\" -eq 0 ]; then \
+            "{helpers}\
+             set +e; \
+             if cc_switch_server_is_running; then \
              echo 'cc-switch-server process is already running' >&2; exit {HOST_HAS_RUNNING_SERVER_EXIT}; \
-             fi; exit 0"
+             fi; exit 0",
+            helpers = REMOTE_CC_SWITCH_SERVER_HELPERS,
         ),
         None,
         SSH_VERIFY_TIMEOUT,
@@ -1852,21 +1903,23 @@ async fn ssh_cleanup_remote(
     host: &RouterSshHostRecord,
 ) -> Result<(), AppError> {
     require_pinned_host_fingerprint(host, &known_hosts_path(&state.config)).await?;
-    let command = "set -eu; \
-        if pgrep -f /usr/local/bin/cc-switch-server >/dev/null 2>&1; then \
-          pkill -TERM -f /usr/local/bin/cc-switch-server || true; \
-          i=0; while pgrep -f /usr/local/bin/cc-switch-server >/dev/null 2>&1 && [ \"$i\" -lt 20 ]; do sleep 1; i=$((i + 1)); done; \
-          if pgrep -f /usr/local/bin/cc-switch-server >/dev/null 2>&1; then pkill -KILL -f /usr/local/bin/cc-switch-server || true; sleep 1; fi; \
-        fi; \
-        if pgrep -f /usr/local/bin/cc-switch-server >/dev/null 2>&1; then exit 43; fi; \
-        rm -f /usr/local/bin/cc-switch-server; \
-        rm -rf \"$HOME/.cc-switch-server\" \"$HOME\"/.cc-switch-server.bak.*";
+    let command = format!(
+        "{helpers}\
+         set -eu; \
+         if cc_switch_server_is_running; then \
+           cc_switch_server_stop; \
+         fi; \
+         if cc_switch_server_is_running; then exit 43; fi; \
+         rm -f /usr/local/bin/cc-switch-server; \
+         rm -rf \"$HOME/.cc-switch-server\" \"$HOME\"/.cc-switch-server.bak.*",
+        helpers = REMOTE_CC_SWITCH_SERVER_HELPERS,
+    );
     ssh_run_remote_with_input(
         &state.provision_ssh_key_path,
         &known_hosts_path(&state.config),
         &host.ip,
         host.port,
-        command,
+        &command,
         None,
         SSH_CLEANUP_TIMEOUT,
         SshHostKeyPolicy::RequireKnown,
