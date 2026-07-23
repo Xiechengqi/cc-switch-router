@@ -8,7 +8,7 @@ import { CompactRegionMultiSelect } from "@/components/common/compact-region-mul
 import { CopyableCodeField } from "@/components/common/copyable-code-field";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { CountryFlag } from "@/components/common/country-flag";
-import { ClientMarketTerminalDialog } from "@/components/dashboard/client-market-terminal-dialog";
+import { useWebTerminal } from "@/components/dashboard/web-terminal";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   cleanupClientMarketClient,
@@ -629,9 +629,9 @@ function HostRow({
   onChanged: () => void;
 }) {
   const { locale, t } = useLocaleText();
+  const { openTerminal } = useWebTerminal();
   const [busy, setBusy] = React.useState(false);
   const [confirmAction, setConfirmAction] = React.useState<"delete" | "cleanup" | null>(null);
-  const [terminalOpen, setTerminalOpen] = React.useState(false);
   const canManageHost =
     !!viewerEmail &&
     (isAdmin || viewerEmail.toLowerCase() === host.hostOwnerEmail.toLowerCase());
@@ -651,6 +651,7 @@ function HostRow({
     (isAdmin || !host.installationId) &&
     (host.status === "unreachable" || host.status === "disabled" || host.status === "abnormal");
   const canOpenTerminal = host.canWebTerminal === true || canManageHost;
+  const hostLabel = host.hostname || host.ip || host.id.slice(0, 8);
   const countryName = host.countryCode
     ? new Intl.DisplayNames([locale], { type: "region" }).of(host.countryCode) || host.countryCode
     : "";
@@ -714,7 +715,6 @@ function HostRow({
     }
   };
 
-  const hostLabel = host.hostname || host.ip || host.id.slice(0, 8);
   const confirmCopy = confirmAction === "cleanup"
     ? {
         title: t("clientMarket.cleanupConfirmTitle"),
@@ -744,13 +744,19 @@ function HostRow({
           </Chip>
           {canOpenTerminal ? (
             <Button
-              variant="outline"
+              variant="ghost"
               size="sm"
-              className="shrink-0"
-              onClick={() => setTerminalOpen(true)}
+              isIconOnly
+              className="h-8 w-8 min-w-8 shrink-0 border-0 shadow-none"
+              onClick={() =>
+                openTerminal({
+                  hostId: host.id,
+                  title: hostLabel,
+                })
+              }
+              aria-label={t("clientMarket.webTerminal")}
             >
-              <TerminalSquare className="h-3.5 w-3.5" />
-              {t("clientMarket.webTerminal")}
+              <TerminalSquare className="h-4 w-4" />
             </Button>
           ) : null}
           {locationLabel || host.countryCode ? (
@@ -859,12 +865,6 @@ function HostRow({
           }}
         />
       ) : null}
-      <ClientMarketTerminalDialog
-        open={terminalOpen}
-        hostId={terminalOpen ? host.id : null}
-        hostLabel={hostLabel}
-        onOpenChange={setTerminalOpen}
-      />
     </>
   );
 }

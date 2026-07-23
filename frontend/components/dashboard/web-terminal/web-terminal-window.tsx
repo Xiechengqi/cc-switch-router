@@ -1,25 +1,24 @@
 "use client";
 
-import { ExternalLink, RotateCw } from "lucide-react";
+import { TerminalSquare } from "lucide-react";
 import { usePathname } from "next/navigation";
 import * as React from "react";
-import { ClientConsoleIframe } from "@/components/dashboard/client-console/client-console-iframe";
 import { ClientConsoleTrafficLights } from "@/components/dashboard/client-console/client-console-traffic-lights";
+import { WebTerminalSession } from "@/components/dashboard/web-terminal/web-terminal-session";
 import {
-  CONSOLE_DOCK_HEIGHT,
   CONSOLE_DOCK_RESERVED_HEIGHT,
-  type ConsoleWindow,
-  type NormalRect,
-  useClientConsole,
-} from "@/components/dashboard/client-console/client-console-manager";
+  type WebTerminalRect,
+  type WebTerminalWindow,
+  useWebTerminal,
+} from "@/components/dashboard/web-terminal/web-terminal-manager";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { DASHBOARD_CLIENTS_PATH, isClientsRoute } from "@/lib/dashboard-nav";
+import { DASHBOARD_CLIENT_MARKET_PATH, isClientMarketRoute } from "@/lib/dashboard-nav";
 
 const MIN_WIDTH = 420;
 const MIN_HEIGHT = 280;
 const RESIZE_HANDLE = 14;
 
-function clampRect(rect: NormalRect): NormalRect {
+function clampRect(rect: WebTerminalRect): WebTerminalRect {
   if (typeof globalThis.window === "undefined") return rect;
   const maxW = globalThis.window.innerWidth - 24;
   const maxH = globalThis.window.innerHeight - CONSOLE_DOCK_RESERVED_HEIGHT - 24;
@@ -33,25 +32,25 @@ function clampRect(rect: NormalRect): NormalRect {
   return { x, y, width, height };
 }
 
-function useConsoleClickOutsideMinimize({
+function useTerminalClickOutsideMinimize({
   enabled,
   windows,
   focusedId,
-  minimizeConsole,
+  minimizeTerminal,
 }: {
   enabled: boolean;
-  windows: ConsoleWindow[];
+  windows: WebTerminalWindow[];
   focusedId: string | null;
-  minimizeConsole: (id: string) => void;
+  minimizeTerminal: (id: string) => void;
 }) {
   React.useEffect(() => {
     if (!enabled) return;
 
     function shouldIgnoreClickOutside(target: Element) {
-      if (target.closest("[data-console-window]")) return true;
-      if (target.closest("[data-console-dock]")) return true;
       if (target.closest("[data-web-terminal-window]")) return true;
       if (target.closest("[data-web-terminal-dock]")) return true;
+      if (target.closest("[data-console-window]")) return true;
+      if (target.closest("[data-console-dock]")) return true;
       if (target.closest("[data-board-dock]")) return true;
       if (target.closest("[data-rac]")) return true;
       if (target.closest("[role='dialog']")) return true;
@@ -71,61 +70,59 @@ function useConsoleClickOutsideMinimize({
       if (!id || !visible.some((window) => window.id === id)) {
         id = visible.reduce((best, window) => (!best || window.zIndex > best.zIndex ? window : best)).id;
       }
-      minimizeConsole(id);
+      minimizeTerminal(id);
     }
 
     document.addEventListener("pointerdown", handlePointerDown);
     return () => document.removeEventListener("pointerdown", handlePointerDown);
-  }, [enabled, focusedId, minimizeConsole, windows]);
+  }, [enabled, focusedId, minimizeTerminal, windows]);
 }
 
-export function ClientConsoleWindowLayer() {
-  const pathname = usePathname() || DASHBOARD_CLIENTS_PATH;
-  const onClientsPage = isClientsRoute(pathname);
+export function WebTerminalWindowLayer() {
+  const pathname = usePathname() || DASHBOARD_CLIENT_MARKET_PATH;
+  const onClientMarketPage = isClientMarketRoute(pathname);
   const {
     windows,
     dockVisible,
     focusedId,
-    closeConsole,
-    minimizeConsole,
-    toggleMaximizeConsole,
-    focusConsole,
-    refreshConsole,
-    updateConsoleRect,
-  } = useClientConsole();
+    closeTerminal,
+    minimizeTerminal,
+    toggleMaximizeTerminal,
+    focusTerminal,
+    updateTerminalRect,
+  } = useWebTerminal();
 
   const dockOffset = dockVisible ? CONSOLE_DOCK_RESERVED_HEIGHT + 12 : 0;
   const mountedWindows = windows.filter((window) => window.activated);
 
-  useConsoleClickOutsideMinimize({
-    enabled: onClientsPage,
+  useTerminalClickOutsideMinimize({
+    enabled: onClientMarketPage,
     windows,
     focusedId,
-    minimizeConsole,
+    minimizeTerminal,
   });
 
   return (
     <>
       {mountedWindows.map((window) => (
-        <ClientConsoleWindowShell
+        <WebTerminalWindowShell
           key={window.id}
           window={window}
-          minimized={window.state === "minimized" || !onClientsPage}
-          focused={onClientsPage && window.id === focusedId}
+          minimized={window.state === "minimized" || !onClientMarketPage}
+          focused={onClientMarketPage && window.id === focusedId}
           dockOffset={dockOffset}
-          onClose={() => closeConsole(window.id)}
-          onMinimize={() => minimizeConsole(window.id)}
-          onToggleMaximize={() => toggleMaximizeConsole(window.id)}
-          onRefresh={() => refreshConsole(window.id)}
-          onFocus={() => focusConsole(window.id)}
-          onRectChange={(rect) => updateConsoleRect(window.id, rect)}
+          onClose={() => closeTerminal(window.id)}
+          onMinimize={() => minimizeTerminal(window.id)}
+          onToggleMaximize={() => toggleMaximizeTerminal(window.id)}
+          onFocus={() => focusTerminal(window.id)}
+          onRectChange={(rect) => updateTerminalRect(window.id, rect)}
         />
       ))}
     </>
   );
 }
 
-function ClientConsoleWindowShell({
+function WebTerminalWindowShell({
   window,
   minimized,
   focused,
@@ -133,25 +130,25 @@ function ClientConsoleWindowShell({
   onClose,
   onMinimize,
   onToggleMaximize,
-  onRefresh,
   onFocus,
   onRectChange,
 }: {
-  window: ConsoleWindow;
+  window: WebTerminalWindow;
   minimized: boolean;
   focused: boolean;
   dockOffset: number;
   onClose: () => void;
   onMinimize: () => void;
   onToggleMaximize: () => void;
-  onRefresh: () => void;
   onFocus: () => void;
-  onRectChange: (rect: NormalRect) => void;
+  onRectChange: (rect: WebTerminalRect) => void;
 }) {
   const { t } = useLocaleText();
   const maximized = window.state === "maximized";
-  const dragRef = React.useRef<{ startX: number; startY: number; origin: NormalRect } | null>(null);
-  const resizeRef = React.useRef<{ startX: number; startY: number; origin: NormalRect } | null>(null);
+  const dragRef = React.useRef<{ startX: number; startY: number; origin: WebTerminalRect } | null>(null);
+  const resizeRef = React.useRef<{ startX: number; startY: number; origin: WebTerminalRect } | null>(
+    null,
+  );
 
   const onDragPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
     if (minimized || maximized) return;
@@ -224,31 +221,31 @@ function ClientConsoleWindowShell({
         pointerEvents: "none",
       }
     : maximized
-    ? {
-        position: "fixed",
-        top: "0.75rem",
-        left: "0.75rem",
-        right: "0.75rem",
-        bottom: `calc(0.75rem + ${dockOffset}px)`,
-        zIndex: window.zIndex,
-      }
-    : {
-        position: "fixed",
-        top: window.normalRect.y,
-        left: window.normalRect.x,
-        width: window.normalRect.width,
-        height: window.normalRect.height,
-        zIndex: window.zIndex,
-      };
+      ? {
+          position: "fixed",
+          top: "0.75rem",
+          left: "0.75rem",
+          right: "0.75rem",
+          bottom: `calc(0.75rem + ${dockOffset}px)`,
+          zIndex: window.zIndex,
+        }
+      : {
+          position: "fixed",
+          top: window.normalRect.y,
+          left: window.normalRect.x,
+          width: window.normalRect.width,
+          height: window.normalRect.height,
+          zIndex: window.zIndex,
+        };
 
   return (
     <div
-      data-console-window
+      data-web-terminal-window
       className={`${shellClass} ${focused && !minimized ? "ring-2 ring-primary/20" : ""}`}
       style={style}
       onPointerDown={minimized ? undefined : onFocus}
       role="dialog"
-      aria-label={`${t("dashboard.clientConsole")} ${window.title}`}
+      aria-label={`${t("clientMarket.webTerminal")} ${window.title}`}
       aria-modal={maximized && !minimized ? "true" : "false"}
       aria-hidden={minimized}
     >
@@ -259,47 +256,29 @@ function ClientConsoleWindowShell({
         onPointerUp={onDragPointerUp}
         onPointerCancel={onDragPointerUp}
       >
-        <ClientConsoleTrafficLights maximized={maximized} onClose={onClose} onMinimize={onMinimize} onToggleMaximize={onToggleMaximize} />
+        <ClientConsoleTrafficLights
+          maximized={maximized}
+          onClose={onClose}
+          onMinimize={onMinimize}
+          onToggleMaximize={onToggleMaximize}
+        />
         <div className="min-w-0 flex-1 text-center">
-          <div className="inline-flex max-w-full items-center justify-center gap-1">
+          <div className="inline-flex max-w-full items-center justify-center gap-1.5">
+            <TerminalSquare className="h-3.5 w-3.5 shrink-0 text-slate-500" aria-hidden />
             <p className="truncate text-[12px] font-medium text-slate-700">{window.title}</p>
-            <a
-              href={window.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              data-no-drag
-              className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-md text-slate-500 transition-colors hover:bg-slate-200/80 hover:text-slate-800"
-              title={t("dashboard.clientFrame.openNewTab")}
-              aria-label={t("dashboard.clientFrame.openNewTab")}
-              onClick={(event) => event.stopPropagation()}
-            >
-              <ExternalLink className="h-3 w-3" />
-            </a>
           </div>
         </div>
-        <button
-          type="button"
-          data-no-drag
-          onClick={(event) => {
-            event.stopPropagation();
-            onRefresh();
-          }}
-          className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-slate-500 transition-colors hover:bg-slate-200/80 hover:text-slate-800"
-          aria-label={t("dashboard.clientConsole.refresh")}
-          title={t("dashboard.clientConsole.refresh")}
-        >
-          <RotateCw className="h-3.5 w-3.5" />
-        </button>
+        <span className="inline-block h-7 w-7 shrink-0" aria-hidden />
       </div>
 
       <div className="relative min-h-0 flex-1 bg-slate-50 p-3">
         <div className="h-full overflow-hidden rounded-xl border border-slate-200/80 bg-white shadow-[inset_0_1px_0_rgba(255,255,255,0.7)]">
-          <ClientConsoleIframe window={window} paused={minimized} />
+          <WebTerminalSession hostId={window.hostId} active={!minimized} />
         </div>
         {!maximized ? (
           <button
             type="button"
-            aria-label={t("dashboard.clientConsole.resize")}
+            aria-label={t("clientMarket.terminal.resize")}
             className="absolute bottom-1 right-1 z-10 cursor-se-resize rounded-sm bg-transparent"
             style={{ width: RESIZE_HANDLE, height: RESIZE_HANDLE }}
             onPointerDown={onResizePointerDown}

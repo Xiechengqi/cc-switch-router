@@ -1,7 +1,6 @@
 "use client";
 
 import * as React from "react";
-import { Button, Modal } from "@heroui/react";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import { Loader2 } from "lucide-react";
@@ -40,7 +39,6 @@ function decodeOutput(payload: string) {
   return bytes;
 }
 
-/** Scale monospace size with the terminal viewport (roughly 80×24 reference). */
 function adaptiveFontSize(container: HTMLElement): number {
   const width = container.clientWidth || 640;
   const height = container.clientHeight || 360;
@@ -49,16 +47,13 @@ function adaptiveFontSize(container: HTMLElement): number {
   return Math.max(11, Math.min(20, Math.round(Math.min(byWidth, byHeight))));
 }
 
-export function ClientMarketTerminalDialog({
-  open,
+export function WebTerminalSession({
   hostId,
-  hostLabel,
-  onOpenChange,
+  active,
 }: {
-  open: boolean;
-  hostId: string | null;
-  hostLabel: string;
-  onOpenChange: (open: boolean) => void;
+  hostId: string;
+  /** When false (minimized / off-route), keep session but skip fit churn. */
+  active: boolean;
 }) {
   const { t } = useLocaleText();
   const containerRef = React.useRef<HTMLDivElement | null>(null);
@@ -68,31 +63,6 @@ export function ClientMarketTerminalDialog({
   const pingTimerRef = React.useRef<ReturnType<typeof setInterval> | null>(null);
   const [status, setStatus] = React.useState<"connecting" | "connected" | "error">("connecting");
   const [error, setError] = React.useState("");
-
-  const cleanup = React.useCallback(() => {
-    if (pingTimerRef.current) {
-      clearInterval(pingTimerRef.current);
-      pingTimerRef.current = null;
-    }
-    if (socketRef.current) {
-      socketRef.current.onopen = null;
-      socketRef.current.onmessage = null;
-      socketRef.current.onerror = null;
-      socketRef.current.onclose = null;
-      if (
-        socketRef.current.readyState === WebSocket.OPEN ||
-        socketRef.current.readyState === WebSocket.CONNECTING
-      ) {
-        socketRef.current.close();
-      }
-      socketRef.current = null;
-    }
-    if (termRef.current) {
-      termRef.current.dispose();
-      termRef.current = null;
-    }
-    fitRef.current = null;
-  }, []);
 
   const sendResize = React.useCallback(() => {
     const term = termRef.current;
@@ -121,8 +91,6 @@ export function ClientMarketTerminalDialog({
   }, [sendResize]);
 
   React.useEffect(() => {
-    if (!open || !hostId) return;
-
     let cancelled = false;
     setStatus("connecting");
     setError("");
@@ -131,7 +99,6 @@ export function ClientMarketTerminalDialog({
       try {
         const session = await createClientMarketTerminalSession(hostId);
         if (cancelled) return;
-
         const container = containerRef.current;
         if (!container) {
           throw new Error(t("clientMarket.terminalMountFailed"));
@@ -190,13 +157,12 @@ export function ClientMarketTerminalDialog({
         };
 
         socket.onmessage = (event) => {
-          const raw = typeof event.data === "string" ? event.data : new TextDecoder().decode(event.data);
+          const raw =
+            typeof event.data === "string" ? event.data : new TextDecoder().decode(event.data);
           if (!raw) return;
-          const type = raw[0];
-          const payload = raw.slice(1);
-          if (type === MSG_OUTPUT) {
+          if (raw[0] === MSG_OUTPUT) {
             try {
-              term.write(decodeOutput(payload));
+              term.write(decodeOutput(raw.slice(1)));
             } catch {
               // Ignore malformed frames.
             }
@@ -228,9 +194,7 @@ export function ClientMarketTerminalDialog({
         const onWindowResize = () => fitTerminal();
         window.addEventListener("resize", onWindowResize);
         const resizeObserver =
-          typeof ResizeObserver !== "undefined"
-            ? new ResizeObserver(() => fitTerminal())
-            : null;
+          typeof ResizeObserver !== "undefined" ? new ResizeObserver(() => fitTerminal()) : null;
         resizeObserver?.observe(container);
 
         return () => {
@@ -252,54 +216,51 @@ export function ClientMarketTerminalDialog({
     return () => {
       cancelled = true;
       removeResize?.();
-      cleanup();
+      if (pingTimerRef.current) {
+        clearInterval(pingTimerRef.current);
+        pingTimerRef.current = null;
+      }
+      if (socketRef.current) {
+        socketRef.current.onopen = null;
+        socketRef.current.onmessage = null;
+        socketRef.current.onerror = null;
+        socketRef.current.onclose = null;
+        if (
+          socketRef.current.readyState === WebSocket.OPEN ||
+          socketRef.current.readyState === WebSocket.CONNECTING
+        ) {
+          socketRef.current.close();
+        }
+        socketRef.current = null;
+      }
+      if (termRef.current) {
+        termRef.current.dispose();
+        termRef.current = null;
+      }
+      fitRef.current = null;
     };
-    // status intentionally omitted — only reconnect when dialog opens / host changes
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, hostId, cleanup, fitTerminal, t]);
+  }, [fitTerminal, hostId, t]);
+
+  React.useEffect(() => {
+    if (!active) return;
+    const id = window.requestAnimationFrame(() => fitTerminal());
+    return () => window.cancelAnimationFrame(id);
+  }, [active, fitTerminal]);
 
   return (
-    <Modal.Backdrop
-      isOpen={open}
-      onOpenChange={(next) => {
-        if (!next) cleanup();
-        onOpenChange(next);
-      }}
-    >
-      <Modal.Container placement="center">
-        <Modal.Dialog className="light flex h-[min(80vh,720px)] w-[min(960px,calc(100vw-2rem))] max-w-none flex-col !bg-white !text-slate-900">
-          <Modal.Header className="border-b border-border">
-            <Modal.Heading className="!text-slate-900">
-              {t("clientMarket.terminalTitle", { host: hostLabel })}
-            </Modal.Heading>
-          </Modal.Header>
-          <Modal.Body className="relative min-h-0 flex-1 !bg-white !p-0">
-            {status === "connecting" ? (
-              <div className="absolute inset-0 z-10 flex items-center justify-center gap-2 bg-white/90 text-sm text-muted-foreground">
-                <Loader2 className="h-4 w-4 animate-spin text-primary" />
-                {t("clientMarket.terminalConnecting")}
-              </div>
-            ) : null}
-            {status === "error" && error ? (
-              <div className="absolute inset-x-0 top-0 z-10 border-b border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
-                {error}
-              </div>
-            ) : null}
-            <div ref={containerRef} className="h-full w-full bg-white p-2" />
-          </Modal.Body>
-          <Modal.Footer className="border-t border-border bg-white">
-            <Button
-              variant="primary"
-              onClick={() => {
-                cleanup();
-                onOpenChange(false);
-              }}
-            >
-              {t("common.close")}
-            </Button>
-          </Modal.Footer>
-        </Modal.Dialog>
-      </Modal.Container>
-    </Modal.Backdrop>
+    <div className="relative h-full w-full bg-white">
+      {status === "connecting" ? (
+        <div className="absolute inset-0 z-10 flex items-center justify-center gap-2 bg-white/90 text-sm text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin text-primary" />
+          {t("clientMarket.terminalConnecting")}
+        </div>
+      ) : null}
+      {status === "error" && error ? (
+        <div className="absolute inset-x-0 top-0 z-10 border-b border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+          {error}
+        </div>
+      ) : null}
+      <div ref={containerRef} className="h-full w-full p-1" />
+    </div>
   );
 }
