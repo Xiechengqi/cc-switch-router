@@ -3,8 +3,12 @@
 set -Eeuo pipefail
 
 if [[ -r /etc/profile ]]; then
+  # Profile.d hooks (notably byobu's Z97-byobu.sh) may expand unset LC_* vars.
+  # Keep nounset off while sourcing so those optional hooks cannot abort install.
+  set +u
   # Some distributions return a non-zero status from optional profile hooks.
   source /etc/profile || true
+  set -u
 fi
 
 readonly BINARY="cc-switch-server"
