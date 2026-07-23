@@ -759,8 +759,10 @@ async fn list_hosts(
                     .is_some_and(|owner| value.eq_ignore_ascii_case(owner))
             });
             let reveal_installation = reveal_operations || is_client_owner;
-            // Web Terminal is host-owner (and admin) only — not client owners.
-            let can_web_terminal = reveal_operations;
+            // Web Terminal is host-owner only — not admins or client owners.
+            let can_web_terminal = viewer
+                .as_deref()
+                .is_some_and(|v| v.eq_ignore_ascii_case(&host.host_owner_email));
             let ip_intel = host_ip_intel_for_viewer(
                 host.ip_intel_json.as_deref(),
                 &host.ip,
@@ -3874,11 +3876,6 @@ impl AppStore {
             .map_err(|e| AppError::Internal(format!("read tunnel owner failed: {e}")))?;
         let (owner_email, subdomain) =
             tunnel.ok_or_else(|| AppError::NotFound("client not found".into()))?;
-        if owner_email != viewer && !is_admin {
-            return Err(AppError::Forbidden(
-                "not allowed to cleanup this client".into(),
-            ));
-        }
         let host = tx
             .query_row(
                 "SELECT id, host_owner_email, status FROM router_ssh_hosts WHERE installation_id = ?1",
@@ -3894,6 +3891,13 @@ impl AppStore {
             .optional()
             .map_err(|e| AppError::Internal(format!("lookup provision host failed: {e}")))?
             .ok_or_else(|| AppError::NotFound("provision host not found".into()))?;
+        let is_host_owner = host.1 == viewer;
+        let is_client_owner = owner_email == viewer;
+        if !is_admin && !is_host_owner && !is_client_owner {
+            return Err(AppError::Forbidden(
+                "not allowed to cleanup this client".into(),
+            ));
+        }
         if !matches!(
             host.2.as_str(),
             HOST_STATUS_ALLOCATED | HOST_STATUS_UNREACHABLE
@@ -4957,12 +4961,16 @@ mod tests {
         }
         assert!(matches!(
             store
-                .client_market_begin_cleanup_job("cleanup-installation", "host@example.com", false,)
+                .client_market_begin_cleanup_job(
+                    "cleanup-installation",
+                    "stranger@example.com",
+                    false,
+                )
                 .await,
             Err(AppError::Forbidden(_))
         ));
         let job_id = store
-            .client_market_begin_cleanup_job("cleanup-installation", "client@example.com", false)
+            .client_market_begin_cleanup_job("cleanup-installation", "host@example.com", false)
             .await
             .unwrap();
         assert_eq!(

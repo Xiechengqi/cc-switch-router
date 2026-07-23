@@ -673,7 +673,7 @@ function HostRow({
   const canCleanup =
     !!host.installationId &&
     (host.status === "allocated" || host.status === "unreachable") &&
-    (isAdmin || isClientOwner);
+    (canManageHost || isClientOwner);
   const canReverify =
     canManageHost &&
     (isAdmin || !host.installationId) &&

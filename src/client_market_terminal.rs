@@ -131,13 +131,12 @@ async fn create_terminal_session(
     AxumPath(host_id): AxumPath<String>,
 ) -> Result<Json<TerminalSessionResponse>, AppError> {
     let viewer = require_session_email(&state, &headers).await?;
-    let is_admin = state.dynamic.read().await.is_admin(&viewer);
     let host = state
         .store
         .client_market_get_host(&host_id)
         .await?
         .ok_or_else(|| AppError::NotFound("host not found".into()))?;
-    authorize_web_terminal(&host, &viewer, is_admin)?;
+    authorize_web_terminal(&host, &viewer)?;
 
     let mut manager = state.client_market_terminal.lock().await;
     let ticket = manager.issue_ticket(TerminalTicket {
@@ -450,14 +449,7 @@ async fn send_ws_notice(mut socket: WebSocket, message: &str) -> Result<(), Stri
     Ok(())
 }
 
-fn authorize_web_terminal(
-    host: &RouterSshHostRecord,
-    viewer_email: &str,
-    is_admin: bool,
-) -> Result<(), AppError> {
-    if is_admin {
-        return Ok(());
-    }
+fn authorize_web_terminal(host: &RouterSshHostRecord, viewer_email: &str) -> Result<(), AppError> {
     let viewer = viewer_email.trim().to_ascii_lowercase();
     let is_host_owner = host.host_owner_email.trim().to_ascii_lowercase() == viewer;
     if is_host_owner {
@@ -513,15 +505,16 @@ mod tests {
     #[test]
     fn authorize_allows_host_owner_only() {
         let host = sample_host(Some("client@example.com"), Some("inst-1"));
-        assert!(authorize_web_terminal(&host, "host@example.com", false).is_ok());
-        assert!(authorize_web_terminal(&host, "HOST@example.com", false).is_ok());
-        assert!(authorize_web_terminal(&host, "client@example.com", false).is_err());
-        assert!(authorize_web_terminal(&host, "other@example.com", false).is_err());
-        assert!(authorize_web_terminal(&host, "admin@example.com", true).is_ok());
+        assert!(authorize_web_terminal(&host, "host@example.com").is_ok());
+        assert!(authorize_web_terminal(&host, "HOST@example.com").is_ok());
+        assert!(authorize_web_terminal(&host, "client@example.com").is_err());
+        assert!(authorize_web_terminal(&host, "other@example.com").is_err());
+        // Admins (including router owner) are intentionally excluded.
+        assert!(authorize_web_terminal(&host, "admin@example.com").is_err());
 
         let idle = sample_host(None, None);
-        assert!(authorize_web_terminal(&idle, "host@example.com", false).is_ok());
-        assert!(authorize_web_terminal(&idle, "client@example.com", false).is_err());
+        assert!(authorize_web_terminal(&idle, "host@example.com").is_ok());
+        assert!(authorize_web_terminal(&idle, "client@example.com").is_err());
     }
 
     #[test]
