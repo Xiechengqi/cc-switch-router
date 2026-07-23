@@ -730,7 +730,11 @@ async fn list_hosts(
             let reveal_installation = reveal_operations || is_client_owner;
             RouterSshHostView {
                 id: host.id,
-                ip: reveal_operations.then_some(host.ip),
+                ip: Some(if reveal_operations {
+                    host.ip
+                } else {
+                    mask_public_host_ip(&host.ip)
+                }),
                 port: reveal_operations.then_some(host.port),
                 host_owner_email: host.host_owner_email,
                 country_code: host.country_code,
@@ -2250,6 +2254,32 @@ fn normalize_ip_for_compare(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// Public market listing mask: keep first/last IPv4 octets, hide the middle.
+/// Example: `154.219.101.173` → `154.xx.xx.173`
+fn mask_public_host_ip(ip: &str) -> String {
+    let trimmed = ip.trim();
+    if let Ok(parsed) = trimmed.parse::<IpAddr>() {
+        return match parsed {
+            IpAddr::V4(v4) => {
+                let octets = v4.octets();
+                format!("{}.xx.xx.{}", octets[0], octets[3])
+            }
+            IpAddr::V6(v6) => {
+                let segments = v6.segments();
+                format!(
+                    "{:x}:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:{:x}",
+                    segments[0], segments[7]
+                )
+            }
+        };
+    }
+    let parts: Vec<&str> = trimmed.split('.').collect();
+    if parts.len() == 4 && parts.iter().all(|part| !part.is_empty()) {
+        return format!("{}.xx.xx.{}", parts[0], parts[3]);
+    }
+    "xx.xx.xx.xx".to_string()
+}
+
 fn host_to_view(host: RouterSshHostRecord, reveal: bool) -> RouterSshHostView {
     let ip_intel = reveal
         .then(|| {
@@ -2260,7 +2290,11 @@ fn host_to_view(host: RouterSshHostRecord, reveal: bool) -> RouterSshHostView {
         .flatten();
     RouterSshHostView {
         id: host.id,
-        ip: reveal.then_some(host.ip),
+        ip: Some(if reveal {
+            host.ip
+        } else {
+            mask_public_host_ip(&host.ip)
+        }),
         port: reveal.then_some(host.port),
         host_owner_email: host.host_owner_email,
         country_code: host.country_code,
@@ -4681,7 +4715,6 @@ mod tests {
         };
         let public = serde_json::to_value(host_to_view(host.clone(), false)).unwrap();
         for key in [
-            "ip",
             "port",
             "sshHostKeyFingerprint",
             "clientOwnerEmail",
@@ -4694,6 +4727,10 @@ mod tests {
         ] {
             assert!(public.get(key).is_none(), "public view leaked {key}");
         }
+        assert_eq!(
+            public.get("ip").and_then(|value| value.as_str()),
+            Some("203.xx.xx.9")
+        );
         assert_eq!(
             public
                 .get("clientSubdomain")
@@ -4710,6 +4747,16 @@ mod tests {
                 .get("clientOwnerEmail")
                 .and_then(|value| value.as_str()),
             Some("client@example.com")
+        );
+    }
+
+    #[test]
+    fn mask_public_host_ip_keeps_first_and_last_octets() {
+        assert_eq!(mask_public_host_ip("154.219.101.173"), "154.xx.xx.173");
+        assert_eq!(mask_public_host_ip("8.8.8.8"), "8.xx.xx.8");
+        assert_eq!(
+            mask_public_host_ip("2001:db8:85a3::8a2e:370:7334"),
+            "2001:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:7334"
         );
     }
 

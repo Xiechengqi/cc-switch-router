@@ -27,6 +27,102 @@ import { usePersistentState } from "@/lib/use-persistent-state";
 const ROUTER_OPEN_LOGIN_EVENT = "router-open-login";
 const ADD_HOST_SSH_KEY_OPEN_KEY = "cc-switch.client-market.add-host.ssh-key-open";
 
+const IP_RISK_LABEL_KEYS: Record<string, MessageKey> = {
+  中性: "clientMarket.ipRisk.neutral",
+  轻微风险: "clientMarket.ipRisk.low",
+  低风险: "clientMarket.ipRisk.low",
+  稍高风险: "clientMarket.ipRisk.elevated",
+  中风险: "clientMarket.ipRisk.medium",
+  高风险: "clientMarket.ipRisk.high",
+  极高风险: "clientMarket.ipRisk.critical",
+  风险: "clientMarket.ipRisk.risky",
+  neutral: "clientMarket.ipRisk.neutral",
+  low: "clientMarket.ipRisk.low",
+  "low risk": "clientMarket.ipRisk.low",
+  elevated: "clientMarket.ipRisk.elevated",
+  medium: "clientMarket.ipRisk.medium",
+  high: "clientMarket.ipRisk.high",
+  critical: "clientMarket.ipRisk.critical",
+  risky: "clientMarket.ipRisk.risky",
+};
+
+const IP_CLASS_LABEL_KEYS: Record<string, MessageKey> = {
+  "IDC 机房 IP": "clientMarket.ipClass.idc",
+  "IDC机房IP": "clientMarket.ipClass.idc",
+  数据中心: "clientMarket.ipClass.datacenter",
+  "住宅 IP": "clientMarket.ipClass.residential",
+  住宅IP: "clientMarket.ipClass.residential",
+  "VPN 出口节点": "clientMarket.ipClass.vpnExit",
+  VPN出口节点: "clientMarket.ipClass.vpnExit",
+  代理: "clientMarket.ipClass.proxy",
+  VPN: "clientMarket.ipClass.vpn",
+  托管: "clientMarket.ipClass.hosting",
+  Tor: "clientMarket.ipClass.tor",
+  business: "clientMarket.ipClass.business",
+  hosting: "clientMarket.ipClass.hosting",
+  datacenter: "clientMarket.ipClass.datacenter",
+  residential: "clientMarket.ipClass.residential",
+  proxy: "clientMarket.ipClass.proxy",
+  vpn: "clientMarket.ipClass.vpn",
+  tor: "clientMarket.ipClass.tor",
+  idc: "clientMarket.ipClass.idc",
+};
+
+function containsCjk(value: string) {
+  return /[\u3400-\u9fff]/.test(value);
+}
+
+function translateMappedLabel(
+  raw: string | undefined,
+  map: Record<string, MessageKey>,
+  t: (key: MessageKey) => string,
+): string | null {
+  const value = raw?.trim();
+  if (!value) return null;
+  const key = map[value] || map[value.toLowerCase()];
+  return key ? t(key) : null;
+}
+
+function formatHostIpIntelSecondary(
+  intel: HostIpIntel | undefined,
+  t: (key: MessageKey) => string,
+): string[] {
+  if (!intel) return [];
+  const parts: string[] = [];
+  const ispAsn = [intel.isp || intel.asName, intel.asn].filter(Boolean).join(" · ");
+  if (ispAsn) parts.push(ispAsn);
+
+  const risk = translateMappedLabel(intel.riskLevel, IP_RISK_LABEL_KEYS, t);
+  if (risk) parts.push(risk);
+
+  const classification =
+    translateMappedLabel(intel.classificationType, IP_CLASS_LABEL_KEYS, t) ||
+    translateMappedLabel(intel.networkType, IP_CLASS_LABEL_KEYS, t) ||
+    (intel.vpn ? t("clientMarket.ipClass.vpn") : null) ||
+    (intel.hosting ? t("clientMarket.ipClass.hosting") : null) ||
+    (intel.proxy ? t("clientMarket.ipClass.proxy") : null) ||
+    (intel.tor ? t("clientMarket.ipClass.tor") : null);
+  if (classification) parts.push(classification);
+
+  return parts;
+}
+
+function formatHostIpLocation(
+  intel: HostIpIntel | undefined,
+  countryName: string,
+  locale: string,
+): string {
+  if (!intel) return countryName;
+  const preferLatin = locale.toLowerCase().startsWith("en");
+  if (intel.location && !(preferLatin && containsCjk(intel.location))) {
+    return intel.location;
+  }
+  const parts = [intel.city, intel.region, intel.country || countryName]
+    .filter((part): part is string => !!part && !(preferLatin && containsCjk(part)));
+  if (parts.length) return parts.join(" · ");
+  return countryName;
+}
+
 function statusLabelKey(status: string): MessageKey {
   const known = {
     idle: "clientMarket.status.idle",
@@ -54,7 +150,7 @@ function AddHostDialog({
   onOpenChange: (open: boolean) => void;
   onAdded: () => void;
 }) {
-  const { t } = useLocaleText();
+  const { locale, t } = useLocaleText();
   const [sshKey, setSshKey] = React.useState<ProvisionSshKey | null>(null);
   const [sshKeyLoading, setSshKeyLoading] = React.useState(false);
   const [sshKeyOpen, setSshKeyOpen] = usePersistentState(ADD_HOST_SSH_KEY_OPEN_KEY, false);
@@ -364,20 +460,21 @@ function AddHostDialog({
                     <div className="grid gap-1">
                       <div>
                         {t("clientMarket.ipInfoSummary", {
-                          location: ipIntel.location || ipIntel.country || ipIntel.query,
+                          location:
+                            formatHostIpLocation(
+                              ipIntel,
+                              ipIntel.countryCode
+                                ? new Intl.DisplayNames([locale], { type: "region" }).of(ipIntel.countryCode) ||
+                                    ipIntel.countryCode
+                                : ipIntel.query,
+                              locale,
+                            ) || ipIntel.query,
                           countryCode: ipIntel.countryCode,
                         })}
                       </div>
-                      {ipIntel.isp || ipIntel.asn ? (
-                        <div>
-                          {[ipIntel.isp, ipIntel.asn].filter(Boolean).join(" · ")}
-                        </div>
-                      ) : null}
-                      {ipIntel.riskLevel || ipIntel.classificationType ? (
-                        <div>
-                          {[ipIntel.riskLevel, ipIntel.classificationType].filter(Boolean).join(" · ")}
-                        </div>
-                      ) : null}
+                      {formatHostIpIntelSecondary(ipIntel, t).map((line) => (
+                        <div key={line}>{line}</div>
+                      ))}
                     </div>
                   ) : null,
                 )}
@@ -531,14 +628,8 @@ function HostRow({
   const hasActions = canDelete || canCleanup || canReverify;
   const ipPort = host.ip ? `${host.ip}${host.port ? `:${host.port}` : ""}` : "";
   const intel = host.ipIntel;
-  const locationLabel =
-    intel?.location ||
-    [intel?.city, intel?.region, intel?.country || countryName].filter(Boolean).join(" · ") ||
-    countryName;
-  const ispAsnLabel = [intel?.isp || intel?.asName, intel?.asn].filter(Boolean).join(" · ");
-  const riskClassLabel = [intel?.riskLevel, intel?.classificationType || intel?.networkType]
-    .filter(Boolean)
-    .join(" · ");
+  const locationLabel = formatHostIpLocation(intel, countryName, locale);
+  const secondaryIntelParts = formatHostIpIntelSecondary(intel, t);
   const subdomain = host.clientSubdomain?.trim() || "";
 
   return (
@@ -623,12 +714,13 @@ function HostRow({
             <span className="h-8 w-8 shrink-0" aria-hidden />
           )}
         </div>
-        {ispAsnLabel || riskClassLabel || host.note ? (
+        {secondaryIntelParts.length || host.note ? (
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1 pl-0.5 text-[11px] leading-4 text-muted-foreground">
-            {ispAsnLabel ? <span className="truncate">{ispAsnLabel}</span> : null}
-            {riskClassLabel ? <span className="truncate">{riskClassLabel}</span> : null}
+            {secondaryIntelParts.length ? (
+              <span className="whitespace-normal break-words">{secondaryIntelParts.join(" · ")}</span>
+            ) : null}
             {host.note ? (
-              <span className="min-w-0 truncate" title={host.note}>
+              <span className="min-w-0 whitespace-normal break-words" title={host.note}>
                 {host.note}
               </span>
             ) : null}
