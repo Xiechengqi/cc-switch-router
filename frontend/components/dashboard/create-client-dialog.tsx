@@ -1,11 +1,12 @@
 "use client";
 
 import * as React from "react";
-import { Button, Modal, toast } from "@heroui/react";
-import { Dices, ExternalLink, Loader2, LogIn, Minus, Plus } from "lucide-react";
+import { Button, Modal, Tabs, toast } from "@heroui/react";
+import { Check, Copy, Dices, ExternalLink, Loader2, LogIn, Minus, Plus } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CountryFlag } from "@/components/common/country-flag";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import { buildClientInstallCommand } from "@/components/dashboard/install-guide-dialog";
 import {
   checkClientTunnelSubdomainAvailability,
   createClientMarketClient,
@@ -67,6 +68,7 @@ function normalizeRegionPersist(value: unknown): CreateClientRegionsPersist {
 }
 
 type Phase = "form" | "running" | "success" | "failed";
+type CreateMode = "manual" | "online";
 
 export function CreateClientDialog({
   open,
@@ -78,7 +80,13 @@ export function CreateClientDialog({
   const { locale, t } = useLocaleText();
   const { session, loading: authLoading } = useAuth();
   const authed = !!session?.authenticated;
+  const ownerEmail =
+    session?.user?.email?.trim() ||
+    session?.installationOwnerEmail?.trim() ||
+    t("dashboard.installClientCommandOwnerPlaceholder");
 
+  const [mode, setMode] = React.useState<CreateMode>("manual");
+  const [copied, setCopied] = React.useState(false);
   const [supply, setSupply] = React.useState<SupplySummaryEntry[]>([]);
   const [supplyLoading, setSupplyLoading] = React.useState(false);
   const [hostOwnersPersist, setHostOwnersPersist, ownersHydrated] = usePersistentState<CreateClientSelectionPersist>(
@@ -207,6 +215,8 @@ export function CreateClientDialog({
     previousOwnerSignatureRef.current = "";
     pollGenerationRef.current += 1;
     setPhase("form");
+    setMode("manual");
+    setCopied(false);
     setJobLog("");
     setError("");
     setSuccessInfo({});
@@ -345,6 +355,25 @@ export function CreateClientDialog({
     if (!nextOpen && phase === "running") return;
     onOpenChange(nextOpen);
   };
+  const installCommand = React.useMemo(
+    () =>
+      buildClientInstallCommand({
+        ownerEmail,
+        passwordPlaceholder: t("createClient.manualPasswordPlaceholder"),
+      }),
+    [ownerEmail, t],
+  );
+  const copyInstallCommand = React.useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(installCommand);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 2000);
+    } catch {
+      setCopied(false);
+    }
+  }, [installCommand]);
+  const showOnlineProgress = phase === "running" || phase === "failed" || phase === "success";
+  const activeMode: CreateMode = showOnlineProgress ? "online" : mode;
 
   return (
     <Modal.Backdrop
@@ -358,6 +387,30 @@ export function CreateClientDialog({
               <Modal.Heading className="!text-slate-900">{t("createClient.title")}</Modal.Heading>
             </Modal.Header>
             <Modal.Body className="grid max-h-[min(70vh,560px)] gap-4 overflow-y-auto !text-slate-900">
+              {!showOnlineProgress ? (
+                <Tabs
+                  selectedKey={mode}
+                  onSelectionChange={(key: React.Key) => setMode(String(key) as CreateMode)}
+                  variant="secondary"
+                  className="text-foreground"
+                >
+                  <Tabs.List className="grid w-full grid-cols-2 text-foreground">
+                    <Tabs.Tab
+                      id="manual"
+                      className="rounded-md border border-transparent px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors data-[selected=true]:border-primary/30 data-[selected=true]:bg-primary/10 data-[selected=true]:text-primary"
+                    >
+                      {t("createClient.tabManual")}
+                    </Tabs.Tab>
+                    <Tabs.Tab
+                      id="online"
+                      className="rounded-md border border-transparent px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors data-[selected=true]:border-primary/30 data-[selected=true]:bg-primary/10 data-[selected=true]:text-primary"
+                    >
+                      {t("createClient.tabOnline")}
+                    </Tabs.Tab>
+                  </Tabs.List>
+                </Tabs>
+              ) : null}
+
               {phase === "success" ? (
                 <div className="grid gap-2 rounded-lg border border-emerald-200 bg-emerald-50 p-4 text-sm">
                   <p className="font-semibold text-emerald-900">{t("createClient.successTitle")}</p>
@@ -413,6 +466,18 @@ export function CreateClientDialog({
                       {error}
                     </p>
                   ) : null}
+                </div>
+              ) : activeMode === "manual" ? (
+                <div className="grid gap-3">
+                  <p className="text-sm text-muted-foreground">{t("createClient.manualDescription")}</p>
+                  <div className="rounded-lg border bg-slate-50 p-3">
+                    <div className="mb-2 font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
+                      {t("createClient.manualCommandLabel")}
+                    </div>
+                    <pre className="overflow-x-auto whitespace-pre-wrap break-all font-mono text-[12px] leading-6 text-slate-900">
+                      {installCommand}
+                    </pre>
+                  </div>
                 </div>
               ) : (
                 <>
@@ -609,7 +674,13 @@ export function CreateClientDialog({
               <Button variant="ghost" isDisabled={phase === "running"} onClick={() => handleOpenChange(false)}>
                 {phase === "success" ? t("createClient.close") : t("common.close")}
               </Button>
-              {phase === "form" || phase === "running" ? (
+              {phase === "form" && activeMode === "manual" ? (
+                <Button variant="primary" onClick={() => void copyInstallCommand()}>
+                  {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+                  {copied ? t("dashboard.connectDialog.copyOk") : t("dashboard.connectDialog.copy")}
+                </Button>
+              ) : null}
+              {(phase === "form" && activeMode === "online") || phase === "running" ? (
                 <Button
                   variant="primary"
                   isDisabled={

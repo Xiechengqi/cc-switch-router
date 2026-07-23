@@ -1,9 +1,10 @@
 "use client";
 
 import * as React from "react";
-import { Button, Card, Chip, Modal, toast } from "@heroui/react";
-import { Check, ChevronDown, Circle, Loader2, Plus, RefreshCw, Trash2, X } from "lucide-react";
+import { Button, Chip, Dropdown, Modal, toast } from "@heroui/react";
+import { Check, ChevronDown, Circle, Loader2, MoreHorizontal, Plus, RefreshCw, Trash2, X } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
+import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { CopyableCodeField } from "@/components/common/copyable-code-field";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { CountryFlag } from "@/components/common/country-flag";
@@ -454,10 +455,6 @@ function HostRow({
     ? new Intl.DisplayNames([locale], { type: "region" }).of(host.countryCode) || host.countryCode
     : "—";
 
-  const installationSnippet = host.installationId
-    ? `${host.installationId.slice(0, 8)}…`
-    : "—";
-
   const pollJob = async (jobId: string) => {
     for (let i = 0; i < 120; i++) {
       await new Promise((r) => setTimeout(r, 1500));
@@ -531,48 +528,73 @@ function HostRow({
           confirmLabel: t("clientMarket.deleteHost"),
         }
       : null;
+  const hasActions = canDelete || canCleanup || canReverify;
+  const ipPort = host.ip
+    ? `${host.ip}${host.port ? `:${host.port}` : ""}`
+    : "—";
 
   return (
     <>
-      <div className="flex flex-wrap items-center gap-3 rounded-lg border bg-white px-3 py-2 text-sm">
-      <CountryFlag code={host.countryCode} className="h-4 w-6 shrink-0 rounded-sm object-cover" />
-      <span className="text-xs text-muted-foreground">{countryName}</span>
-      <span className="min-w-0 flex-1 truncate font-medium">{host.hostname || host.ip || host.id.slice(0, 8)}</span>
-      <Chip size="sm" variant="soft">
-        {t(statusLabelKey(host.status))}
-      </Chip>
-      {host.clientSubdomain ? (
-        <span className="max-w-48 truncate font-mono text-xs text-muted-foreground" title={host.installationId}>
-          {host.clientSubdomain}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border border-border bg-white px-3 py-2.5 text-sm">
+        <Chip size="sm" variant="soft" className="shrink-0">
+          {t(statusLabelKey(host.status))}
+        </Chip>
+        <span className="inline-flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+          <CountryFlag code={host.countryCode} className="h-3.5 w-5 shrink-0 rounded-sm object-cover" />
+          <span className="truncate">{countryName}</span>
         </span>
-      ) : host.installationId ? (
-        <span className="font-mono text-xs text-muted-foreground" title={host.installationId}>
-          {installationSnippet}
+        <span
+          className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground"
+          title={host.installationId || host.hostname || undefined}
+        >
+          {host.clientSubdomain || "—"}
         </span>
-      ) : null}
-      {host.ip ? (
-        <span className="font-mono text-xs text-muted-foreground">
-          {host.ip}
-          {host.port ? `:${host.port}` : ""}
+        <span className="shrink-0 font-mono text-xs text-foreground" title={host.hostname || undefined}>
+          {ipPort}
         </span>
-      ) : null}
-      {canDelete ? (
-        <Button variant="outline" size="sm" isDisabled={busy} onClick={() => setConfirmAction("delete")}>
-          <Trash2 className="h-3.5 w-3.5" />
-          {t("clientMarket.deleteHost")}
-        </Button>
-      ) : null}
-      {canCleanup ? (
-        <Button variant="outline" size="sm" isDisabled={busy} onClick={() => setConfirmAction("cleanup")}>
-          {t("clientMarket.cleanup")}
-        </Button>
-      ) : null}
-      {canReverify ? (
-        <Button variant="outline" size="sm" isDisabled={busy} onClick={() => void onReverify()}>
-          <RefreshCw className="h-3.5 w-3.5" />
-          {t("clientMarket.reverifyHost")}
-        </Button>
-      ) : null}
+        {hasActions ? (
+          <Dropdown>
+            <Dropdown.Trigger className="shrink-0 outline-none">
+              <Button
+                variant="ghost"
+                size="sm"
+                isIconOnly
+                className="h-8 w-8 min-w-8"
+                isDisabled={busy}
+                aria-label={t("clientMarket.hostActions")}
+              >
+                {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <MoreHorizontal className="h-4 w-4" />}
+              </Button>
+            </Dropdown.Trigger>
+            <Dropdown.Popover placement="bottom right">
+              <Dropdown.Menu aria-label={t("clientMarket.hostActions")}>
+                {canReverify ? (
+                  <Dropdown.Item id="reverify" onAction={() => void onReverify()}>
+                    <RefreshCw className="h-4 w-4" />
+                    {t("clientMarket.reverifyHost")}
+                  </Dropdown.Item>
+                ) : null}
+                {canCleanup ? (
+                  <Dropdown.Item id="cleanup" onAction={() => setConfirmAction("cleanup")}>
+                    {t("clientMarket.cleanup")}
+                  </Dropdown.Item>
+                ) : null}
+                {canDelete ? (
+                  <Dropdown.Item
+                    id="delete"
+                    className="text-destructive"
+                    onAction={() => setConfirmAction("delete")}
+                  >
+                    <Trash2 className="h-4 w-4" />
+                    {t("clientMarket.deleteHost")}
+                  </Dropdown.Item>
+                ) : null}
+              </Dropdown.Menu>
+            </Dropdown.Popover>
+          </Dropdown>
+        ) : (
+          <span className="h-8 w-8 shrink-0" aria-hidden />
+        )}
       </div>
       {confirmCopy ? (
         <ConfirmAlertDialog
@@ -596,8 +618,11 @@ function HostRow({
   );
 }
 
+const OWNER_FILTER_KEY = "cc_switch_router_client_market_owner_filter_v1";
+const REGION_FILTER_KEY = "cc_switch_router_client_market_region_filter_v1";
+
 export function ClientMarketPage() {
-  const { t } = useLocaleText();
+  const { locale, t } = useLocaleText();
   const { session } = useAuth();
   const authed = !!session?.authenticated;
   const viewerEmail = session?.user?.email;
@@ -608,6 +633,8 @@ export function ClientMarketPage() {
   const [addOpen, setAddOpen] = React.useState(false);
   const [pendingAddAfterLogin, setPendingAddAfterLogin] = React.useState(false);
   const [mineOnly, setMineOnly] = React.useState(false);
+  const [ownerFilters, setOwnerFilters] = usePersistentState<string[]>(OWNER_FILTER_KEY, []);
+  const [regionFilters, setRegionFilters] = usePersistentState<string[]>(REGION_FILTER_KEY, []);
   const [error, setError] = React.useState("");
 
   const load = React.useCallback(async () => {
@@ -626,19 +653,51 @@ export function ClientMarketPage() {
     void load();
   }, [isAdmin, load, viewerEmail]);
 
-  const grouped = React.useMemo(() => {
-    const map = new Map<string, ClientMarketHost[]>();
-    const visibleHosts = mineOnly && viewerEmail
-      ? hosts.filter((host) => host.hostOwnerEmail.toLowerCase() === viewerEmail.toLowerCase())
-      : hosts;
-    for (const host of visibleHosts) {
-      const key = host.hostOwnerEmail;
-      const bucket = map.get(key) || [];
-      bucket.push(host);
-      map.set(key, bucket);
-    }
-    return Array.from(map.entries()).sort(([a], [b]) => a.localeCompare(b));
-  }, [hosts, mineOnly, viewerEmail]);
+  const ownerOptions = React.useMemo(() => {
+    const emails = Array.from(new Set(hosts.map((host) => host.hostOwnerEmail))).sort((a, b) =>
+      a.localeCompare(b),
+    );
+    return emails.map((email) => ({ value: email, label: email }));
+  }, [hosts]);
+
+  const regionOptions = React.useMemo(() => {
+    const regionNames = new Intl.DisplayNames([locale], { type: "region" });
+    const codes = Array.from(
+      new Set(
+        hosts
+          .map((host) => (host.countryCode || "").trim().toUpperCase())
+          .filter(Boolean),
+      ),
+    ).sort((a, b) => a.localeCompare(b));
+    return codes.map((code) => ({
+      value: code,
+      label: regionNames.of(code) || code,
+    }));
+  }, [hosts, locale]);
+
+  const visibleHosts = React.useMemo(() => {
+    const ownerSet = new Set(ownerFilters.map((email) => email.toLowerCase()));
+    const regionSet = new Set(regionFilters.map((code) => code.toUpperCase()));
+    return hosts
+      .filter((host) => {
+        if (mineOnly && viewerEmail) {
+          if (host.hostOwnerEmail.toLowerCase() !== viewerEmail.toLowerCase()) return false;
+        }
+        if (ownerSet.size > 0 && !ownerSet.has(host.hostOwnerEmail.toLowerCase())) return false;
+        if (regionSet.size > 0) {
+          const code = (host.countryCode || "").trim().toUpperCase();
+          if (!code || !regionSet.has(code)) return false;
+        }
+        return true;
+      })
+      .sort((a, b) => {
+        const ownerCmp = a.hostOwnerEmail.localeCompare(b.hostOwnerEmail);
+        if (ownerCmp !== 0) return ownerCmp;
+        const ipCmp = (a.ip || "").localeCompare(b.ip || "");
+        if (ipCmp !== 0) return ipCmp;
+        return a.id.localeCompare(b.id);
+      });
+  }, [hosts, mineOnly, ownerFilters, regionFilters, viewerEmail]);
 
   React.useEffect(() => {
     if (!pendingAddAfterLogin || !authed) return;
@@ -656,21 +715,52 @@ export function ClientMarketPage() {
   };
 
   return (
-    <div className="mx-auto grid w-[calc(100%-2rem)] max-w-7xl gap-6 pb-10">
+    <div className="mx-auto grid w-[calc(100%-2rem)] max-w-7xl gap-5 pb-10">
+      <header className="grid gap-1">
+        <h1 className="text-lg font-semibold tracking-tight text-foreground">{t("clientMarket.title")}</h1>
+        <p className="text-sm text-muted-foreground">{t("clientMarket.subtitle")}</p>
+      </header>
+
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <h2 className="text-sm font-semibold">{t("clientMarket.hostOwner")}</h2>
+        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+          <CompactRegionMultiSelect
+            values={ownerFilters}
+            onChange={setOwnerFilters}
+            options={ownerOptions}
+            allLabel={t("clientMarket.allOwners")}
+            moreLabel={(count) => t("clientMarket.ownersMore", { count })}
+            clearLabel={t("clientMarket.clearOwnerSelection")}
+            ariaLabel={t("clientMarket.filterOwners")}
+            className="w-full sm:w-56"
+          />
+          <CompactRegionMultiSelect
+            values={regionFilters}
+            onChange={setRegionFilters}
+            options={regionOptions}
+            allLabel={t("clientMarket.allRegions")}
+            moreLabel={(count) => t("clientMarket.regionsMore", { count })}
+            clearLabel={t("clientMarket.clearRegionSelection")}
+            ariaLabel={t("clientMarket.filterRegions")}
+            className="w-full sm:w-44"
+          />
+        </div>
         <div className="flex items-center gap-2">
           {authed ? (
-            <Button variant={mineOnly ? "primary" : "outline"} size="sm" onClick={() => setMineOnly((value) => !value)}>
+            <Button
+              variant={mineOnly ? "primary" : "outline"}
+              size="sm"
+              onClick={() => setMineOnly((value) => !value)}
+            >
               {mineOnly ? t("clientMarket.allHosts") : t("clientMarket.myHosts")}
             </Button>
           ) : null}
-          <Button variant="primary" size="sm" onClick={openAddHost}>
+          <Button variant="outline" size="sm" onClick={openAddHost}>
             <Plus className="h-4 w-4" />
             {t("clientMarket.addHost")}
           </Button>
         </div>
       </div>
+
       {!authed ? (
         <p className="text-sm text-muted-foreground">{t("clientMarket.loginToAddHost")}</p>
       ) : null}
@@ -682,33 +772,20 @@ export function ClientMarketPage() {
         </div>
       ) : error ? (
         <p className="text-sm text-rose-600">{error}</p>
-      ) : grouped.length === 0 ? (
-        <p className="text-sm text-muted-foreground">{t("clientMarket.noHosts")}</p>
+      ) : visibleHosts.length === 0 ? (
+        <p className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">
+          {t("clientMarket.noHosts")}
+        </p>
       ) : (
-        <div className="grid gap-4">
-          {grouped.map(([owner, ownerHosts]) => (
-            <Card key={owner} className="p-4">
-              <div className="mb-3 flex flex-wrap items-center justify-between gap-2 text-sm">
-                <span className="font-medium text-foreground">{owner}</span>
-                <span className="font-mono text-xs text-muted-foreground">
-                  {t("clientMarket.ownerCapacity", {
-                    idle: ownerHosts.filter((host) => host.status === "idle").length,
-                    total: ownerHosts.length,
-                  })}
-                </span>
-              </div>
-              <div className="grid gap-2">
-                {ownerHosts.map((host) => (
-                  <HostRow
-                    key={host.id}
-                    host={host}
-                    viewerEmail={viewerEmail}
-                    isAdmin={isAdmin}
-                    onChanged={() => void load()}
-                  />
-                ))}
-              </div>
-            </Card>
+        <div className="grid gap-2">
+          {visibleHosts.map((host) => (
+            <HostRow
+              key={host.id}
+              host={host}
+              viewerEmail={viewerEmail}
+              isAdmin={isAdmin}
+              onChanged={() => void load()}
+            />
           ))}
         </div>
       )}

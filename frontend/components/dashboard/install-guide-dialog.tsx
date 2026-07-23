@@ -8,16 +8,16 @@ import type { MessageKey } from "@/lib/i18n";
 
 export function buildClientInstallCommand(options?: {
   origin?: string;
-  ownerEmailPlaceholder?: string;
+  ownerEmail?: string;
+  passwordPlaceholder?: string;
 }) {
   const base = (options?.origin ?? (typeof window === "undefined" ? "https://[router_url]" : window.location.origin)).replace(
     /\/$/,
     "",
   );
-  const ownerEmail = options?.ownerEmailPlaceholder ?? "owner@example.com";
-  const shellQuote = (value: string) => `'${value.replaceAll("'", `'"'"'`)}'`;
-  const scriptUrl = shellQuote(`${base}/install-client.sh`);
-  return `(tmp=$(mktemp) && trap 'rm -f "$tmp"; unset CC_SWITCH_PASSWORD' EXIT && curl -fSsL ${scriptUrl} -o "$tmp" && read -rsp 'Client Web password: ' CC_SWITCH_PASSWORD && printf '\\n' && printf '%s\\n' "$CC_SWITCH_PASSWORD" | bash "$tmp" ${shellQuote(base)} ${shellQuote(ownerEmail)} --password-stdin)`;
+  const ownerEmail = options?.ownerEmail?.trim() || "owner@example.com";
+  const password = options?.passwordPlaceholder?.trim() || "web登陆密码";
+  return `curl -SsL ${base}/install-client.sh | bash -s ${base} ${ownerEmail} ${password}`;
 }
 
 export function InstallGuideDialog({

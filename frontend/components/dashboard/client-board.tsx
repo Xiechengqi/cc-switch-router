@@ -3,9 +3,7 @@
 import { Button, Card, Chip, Drawer, toast } from "@heroui/react";
 import { Check, ChevronDown, Copy, ExternalLink, MessageCircle, Plus, Search, WalletCards } from "lucide-react";
 import * as React from "react";
-import { buildClientInstallCommand, InstallGuideDialog } from "@/components/dashboard/install-guide-dialog";
 import { CreateClientDialog } from "@/components/dashboard/create-client-dialog";
-import { SectionInstallButton } from "@/components/dashboard/section-install-button";
 import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog";
 import { ShareCard } from "@/components/dashboard/share-card";
 import { ClientUpgradeButton } from "@/components/dashboard/client-upgrade-button";
@@ -527,7 +525,6 @@ export function ClientBoard({
   const [selectedShareId, setSelectedShareId] = React.useState("");
   const [editingShare, setEditingShare] = React.useState<ShareView | null>(null);
   const [connectShare, setConnectShare] = React.useState<ShareView | null>(null);
-  const [installOpen, setInstallOpen] = React.useState(false);
   const [createClientOpen, setCreateClientOpen] = React.useState(false);
   const [query, setQuery] = React.useState("");
   const [statusFilter, setStatusFilter] = usePersistentState<"all" | Extract<OperationalState, "online" | "reconnecting" | "degraded" | "offline">>("cc_switch_router_client_status_v1", "all");
@@ -732,13 +729,6 @@ export function ClientBoard({
   const currentConnectShare = connectShareId ? shareById.get(connectShareId) || null : null;
   const selectedClientUrl = clientTunnelDisplayUrl(selectedClient?.clientTunnel?.tunnelUrl);
   const selectedApi = shareApiParts(selectedShare ?? undefined);
-  const clientInstallCommand = React.useMemo(
-    () =>
-      buildClientInstallCommand({
-        ownerEmailPlaceholder: t("dashboard.installClientCommandOwnerPlaceholder"),
-      }),
-    [installOpen, t],
-  );
 
   React.useEffect(() => {
     if (connectShareId && !shareById.has(connectShareId)) setConnectShare(null);
@@ -755,8 +745,7 @@ export function ClientBoard({
               <button key={value} type="button" onClick={() => { setStatusFilter(value); if (value === "online") setIssuesOnly(false); }} className={`rounded-md px-2.5 py-1.5 transition-colors ${statusFilter === value ? "bg-white font-medium text-foreground shadow-sm" : value === "offline" ? "text-rose-700" : value === "reconnecting" ? "text-sky-700" : value === "degraded" ? "text-amber-700" : "text-muted-foreground"}`}>{label} · {count}</button>
             ))}
           </div>
-          <SectionInstallButton label={t("dashboard.installClient")} onClick={() => setInstallOpen(true)} />
-          <Button variant="primary" size="sm" className="h-7 px-3 text-xs" onClick={() => setCreateClientOpen(true)}>
+          <Button variant="outline" size="sm" className="h-7 px-3 text-xs" onClick={() => setCreateClientOpen(true)}>
             <Plus className="h-3.5 w-3.5" />
             {t("createClient.newClient")}
           </Button>
@@ -894,14 +883,6 @@ export function ClientBoard({
 
       <ShareEditDialog share={editingShare} markets={markets} onClose={closeEditShare} onSaved={handleSaved} />
       <ShareConnectDialog share={currentConnectShare} open={!!currentConnectShare} onOpenChange={closeConnectDialog} />
-      <InstallGuideDialog
-        open={installOpen}
-        onOpenChange={setInstallOpen}
-        titleKey="dashboard.installClientTitle"
-        descriptionKey="dashboard.installClientDescription"
-        commandLabelKey="dashboard.installClientCommandLabel"
-        command={clientInstallCommand}
-      />
       <CreateClientDialog open={createClientOpen} onOpenChange={setCreateClientOpen} />
     </section>
   );

@@ -11,7 +11,6 @@ use axum::http::{HeaderMap, header};
 use axum::routing::{delete, get, post};
 use base64::Engine;
 use chrono::Utc;
-use rand::RngCore;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -61,13 +60,57 @@ const PROVISION_POLL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const PROVISION_POLL_INTERVAL: Duration = Duration::from_secs(15);
 const PROVISION_SECRET_TTL: Duration = Duration::from_secs(15 * 60);
 const PROVISION_REDEEM_RETRY_TTL: Duration = Duration::from_secs(2 * 60);
-const SSH_VERIFY_TIMEOUT: Duration = Duration::from_secs(45);
+const SSH_VERIFY_TIMEOUT: Duration = Duration::from_secs(180);
 const SSH_INSTALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const SSH_CLEANUP_TIMEOUT: Duration = Duration::from_secs(90);
 const SSH_OUTPUT_LIMIT: usize = 64 * 1024;
 const JOB_LOG_LIMIT: usize = 128 * 1024;
 const MAX_SELECTION_ITEMS: usize = 100;
 const MAX_NOTE_BYTES: usize = 500;
+
+/// POSIX snippet used on remote hosts (Alpine ash or bash) to install market deps.
+/// Most Client Market hosts are Alpine Docker images without bash/curl by default.
+const REMOTE_ENSURE_CLIENT_MARKET_DEPS: &str = r#"
+ensure_client_market_deps() {
+  need_bash=0; need_curl=0; need_ping=0
+  command -v bash >/dev/null 2>&1 || need_bash=1
+  command -v curl >/dev/null 2>&1 || need_curl=1
+  command -v ping >/dev/null 2>&1 || need_ping=1
+  if [ "$need_bash$need_curl$need_ping" = "000" ]; then
+    return 0
+  fi
+  if command -v apk >/dev/null 2>&1; then
+    set --
+    [ "$need_bash" -eq 1 ] && set -- "$@" bash
+    [ "$need_curl" -eq 1 ] && set -- "$@" curl ca-certificates
+    [ "$need_ping" -eq 1 ] && set -- "$@" iputils
+    echo "installing host dependencies via apk: $*" >&2
+    apk add --no-cache "$@" || return 1
+    if [ "$need_curl" -eq 1 ] && command -v update-ca-certificates >/dev/null 2>&1; then
+      update-ca-certificates >/dev/null 2>&1 || true
+    fi
+  elif command -v apt-get >/dev/null 2>&1; then
+    set --
+    [ "$need_bash" -eq 1 ] && set -- "$@" bash
+    [ "$need_curl" -eq 1 ] && set -- "$@" curl ca-certificates
+    [ "$need_ping" -eq 1 ] && set -- "$@" iputils-ping
+    echo "installing host dependencies via apt-get: $*" >&2
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq || return 1
+    apt-get install -y -qq "$@" || return 1
+  else
+    echo "missing required commands and no apk/apt-get available to install them" >&2
+    [ "$need_bash" -eq 1 ] && echo "  - bash" >&2
+    [ "$need_curl" -eq 1 ] && echo "  - curl" >&2
+    [ "$need_ping" -eq 1 ] && echo "  - ping" >&2
+    return 127
+  fi
+  command -v bash >/dev/null 2>&1 || { echo "required command still missing: bash" >&2; return 127; }
+  command -v curl >/dev/null 2>&1 || { echo "required command still missing: curl" >&2; return 127; }
+  command -v ping >/dev/null 2>&1 || { echo "required command still missing: ping" >&2; return 127; }
+  return 0
+}
+"#;
 const MAX_PASSWORD_BYTES: usize = 1024;
 const HOST_REGISTRATIONS_PER_OWNER_HOUR: u32 = 20;
 const HOST_REGISTRATIONS_PER_TARGET_HOUR: u32 = 5;
@@ -1233,43 +1276,28 @@ async fn run_create_job_inner(state: &ServerState, job_id: &str) -> Result<(), A
                 "provisioning secret expired or was lost during router restart".into(),
             )
         })?;
-    let token = new_provision_token();
-    let token_hash = provision_token_hash(&token);
-    let host_ip = host
-        .ip
-        .parse::<IpAddr>()
-        .map_err(|_| AppError::Internal("selected host has an invalid IP address".into()))?;
-    state
-        .store
-        .client_market_activate_token(job_id, &token_hash)
-        .await?;
-    {
-        state
-            .client_market_job_secrets
-            .lock()
-            .await
-            .insert_token_hash(
-                token_hash.clone(),
-                ProvisionTokenSecret {
-                    password,
-                    owner_email: job.client_owner_email.clone().unwrap_or_default(),
-                    subdomain: job.subdomain.clone().unwrap_or_default(),
-                    job_id: job_id.to_string(),
-                    host_ip,
-                    expires_at: Instant::now() + PROVISION_SECRET_TTL,
-                    redeemed_at: None,
-                },
-            );
+    let owner_email = job.client_owner_email.clone().unwrap_or_default();
+    let subdomain = job.subdomain.clone().unwrap_or_default();
+    if owner_email.is_empty() || subdomain.is_empty() {
+        return Err(AppError::Internal(
+            "create job is missing owner email or subdomain".into(),
+        ));
     }
     let router_url = router_public_url(&state.config);
-    let ip_family = if host_ip.is_ipv4() { "4" } else { "6" };
     let install_cmd = format!(
-        "set -eu; script=$(mktemp); trap 'rm -f \"$script\"' EXIT; \
+        "{deps}\
+         set -eu; \
+         ensure_client_market_deps; \
+         mkdir -p /usr/local/bin /tmp; \
+         script=$(mktemp); trap 'rm -f \"$script\"' EXIT; \
          curl --fail --silent --show-error --location --max-time 120 {} -o \"$script\"; \
-         CC_SWITCH_PROVISION_IP_FAMILY={} bash \"$script\" --provision-token-stdin {} disableWebTerminal",
+         bash \"$script\" {} {} {} {} disableWebTerminal",
         shell_quote(&format!("{router_url}/install-client.sh")),
-        ip_family,
         shell_quote(&router_url),
+        shell_quote(&owner_email),
+        shell_quote(&password),
+        shell_quote(&subdomain),
+        deps = REMOTE_ENSURE_CLIENT_MARKET_DEPS,
     );
     let install_result = ssh_run_remote_with_input(
         &state.provision_ssh_key_path,
@@ -1277,7 +1305,7 @@ async fn run_create_job_inner(state: &ServerState, job_id: &str) -> Result<(), A
         &host.ip,
         host.port,
         &install_cmd,
-        Some(format!("{token}\n").into_bytes()),
+        None,
         SSH_INSTALL_TIMEOUT,
         SshHostKeyPolicy::RequireKnown,
     )
@@ -1302,7 +1330,6 @@ async fn run_create_job_inner(state: &ServerState, job_id: &str) -> Result<(), A
         .store
         .client_market_append_job_log(job_id, "remote installer completed; waiting for tunnel\n")
         .await?;
-    let subdomain = job.subdomain.clone().unwrap_or_default();
     let installation_id = poll_for_installation(
         state,
         job_id,
@@ -1622,12 +1649,21 @@ async fn ssh_verify_host(
         known_hosts,
         ip,
         port,
-        "set -eu; command -v pgrep >/dev/null; command -v curl >/dev/null; \
-             command -v bash >/dev/null; command -v python3 >/dev/null; \
-             if [ -e /usr/local/bin/cc-switch-server ] || [ -e \"$HOME/.cc-switch-server\" ]; then \
+        &format!(
+            "{deps}\
+             set -eu; \
+             ensure_client_market_deps; \
+             home=\"${{HOME:-}}\"; \
+             if [ -e /usr/local/bin/cc-switch-server ] || {{ [ -n \"$home\" ] && [ -e \"$home/.cc-switch-server\" ]; }}; then \
              echo 'host already contains a cc-switch-server installation' >&2; exit 42; fi; \
-             if find \"$HOME\" -maxdepth 1 -name '.cc-switch-server.bak.*' -print -quit | grep -q .; then \
-             echo 'host contains a cc-switch-server backup' >&2; exit 42; fi; hostname",
+             if [ -n \"$home\" ]; then \
+               set -- \"$home\"/.cc-switch-server.bak.*; \
+               if [ -e \"$1\" ]; then \
+               echo 'host contains a cc-switch-server backup' >&2; exit 42; fi; \
+             fi; \
+             uname -n",
+            deps = REMOTE_ENSURE_CLIENT_MARKET_DEPS,
+        ),
         None,
         SSH_VERIFY_TIMEOUT,
         SshHostKeyPolicy::AcceptNew,
@@ -1663,7 +1699,12 @@ async fn ssh_host_has_running_cc_switch_server(
         ip,
         port,
         &format!(
-            "set +e; ps -ef | grep cc-switch-server | grep -v grep >/dev/null 2>&1; \
+            "set +e; \
+             if command -v pgrep >/dev/null 2>&1; then \
+               pgrep -f /usr/local/bin/cc-switch-server >/dev/null 2>&1; \
+             else \
+               ps 2>/dev/null | grep '[c]c-switch-server' >/dev/null 2>&1; \
+             fi; \
              status=$?; if [ \"$status\" -eq 0 ]; then \
              echo 'cc-switch-server process is already running' >&2; exit {HOST_HAS_RUNNING_SERVER_EXIT}; \
              fi; exit 0"
@@ -1812,12 +1853,12 @@ async fn ssh_cleanup_remote(
 ) -> Result<(), AppError> {
     require_pinned_host_fingerprint(host, &known_hosts_path(&state.config)).await?;
     let command = "set -eu; \
-        if pgrep -f '^/usr/local/bin/cc-switch-server( |$)' >/dev/null 2>&1; then \
-          pkill -TERM -f '^/usr/local/bin/cc-switch-server( |$)' || true; \
-          i=0; while pgrep -f '^/usr/local/bin/cc-switch-server( |$)' >/dev/null 2>&1 && [ \"$i\" -lt 20 ]; do sleep 1; i=$((i + 1)); done; \
-          if pgrep -f '^/usr/local/bin/cc-switch-server( |$)' >/dev/null 2>&1; then pkill -KILL -f '^/usr/local/bin/cc-switch-server( |$)' || true; sleep 1; fi; \
+        if pgrep -f /usr/local/bin/cc-switch-server >/dev/null 2>&1; then \
+          pkill -TERM -f /usr/local/bin/cc-switch-server || true; \
+          i=0; while pgrep -f /usr/local/bin/cc-switch-server >/dev/null 2>&1 && [ \"$i\" -lt 20 ]; do sleep 1; i=$((i + 1)); done; \
+          if pgrep -f /usr/local/bin/cc-switch-server >/dev/null 2>&1; then pkill -KILL -f /usr/local/bin/cc-switch-server || true; sleep 1; fi; \
         fi; \
-        if pgrep -f '^/usr/local/bin/cc-switch-server( |$)' >/dev/null 2>&1; then exit 43; fi; \
+        if pgrep -f /usr/local/bin/cc-switch-server >/dev/null 2>&1; then exit 43; fi; \
         rm -f /usr/local/bin/cc-switch-server; \
         rm -rf \"$HOME/.cc-switch-server\" \"$HOME\"/.cc-switch-server.bak.*";
     ssh_run_remote_with_input(
@@ -1892,6 +1933,18 @@ async fn ssh_run_remote_with_input(
             ))
         })?;
     }
+    // Non-interactive SSH often gets a stripped PATH. Prefer bash when present
+    // (install-client.sh needs it); fall back to POSIX sh for Alpine before deps exist.
+    let wrapped_command = format!(
+        "export PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${{PATH:+:$PATH}}\"; \
+         if command -v bash >/dev/null 2>&1; then \
+           exec bash --noprofile --norc -c {}; \
+         else \
+           exec sh -c {}; \
+         fi",
+        shell_quote(remote_command),
+        shell_quote(remote_command)
+    );
     let target = format!("root@{ip}");
     let mut command = Command::new("ssh");
     command
@@ -1934,7 +1987,7 @@ async fn ssh_run_remote_with_input(
         .arg("-o")
         .arg("LogLevel=ERROR")
         .arg(&target)
-        .arg(remote_command)
+        .arg(&wrapped_command)
         .stdin(if stdin.is_some() {
             Stdio::piped()
         } else {
@@ -2093,12 +2146,6 @@ fn allow_rate_bucket<K: std::hash::Hash + Eq>(
     true
 }
 
-fn new_provision_token() -> String {
-    let mut bytes = [0_u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-}
-
 fn provision_token_hash(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
 }
@@ -2134,6 +2181,7 @@ fn job_log_line_looks_sensitive(line: &str) -> bool {
     // Only redact lines that look like they embed secret material.
     lower.contains("password=")
         || lower.contains("password:")
+        || lower.contains("--password ")
         || lower.contains("token=")
         || lower.contains("authorization:")
         || lower.contains("bearer ")
