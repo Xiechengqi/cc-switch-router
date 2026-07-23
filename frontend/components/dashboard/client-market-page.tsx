@@ -847,11 +847,6 @@ export function ClientMarketPage() {
 
   return (
     <div className="mx-auto grid w-[calc(100%-2rem)] max-w-7xl gap-5 pb-10">
-      <header className="grid gap-1">
-        <h1 className="text-lg font-semibold tracking-tight text-foreground">{t("clientMarket.title")}</h1>
-        <p className="text-sm text-muted-foreground">{t("clientMarket.subtitle")}</p>
-      </header>
-
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
           <CompactRegionMultiSelect

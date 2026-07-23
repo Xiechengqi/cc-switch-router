@@ -728,13 +728,19 @@ async fn list_hosts(
                     .is_some_and(|owner| value.eq_ignore_ascii_case(owner))
             });
             let reveal_installation = reveal_operations || is_client_owner;
+            let ip_intel = host_ip_intel_for_viewer(
+                host.ip_intel_json.as_deref(),
+                &host.ip,
+                reveal_operations,
+            );
+            let display_ip = if reveal_operations {
+                host.ip.clone()
+            } else {
+                mask_public_host_ip(&host.ip)
+            };
             RouterSshHostView {
                 id: host.id,
-                ip: Some(if reveal_operations {
-                    host.ip
-                } else {
-                    mask_public_host_ip(&host.ip)
-                }),
+                ip: Some(display_ip),
                 port: reveal_operations.then_some(host.port),
                 host_owner_email: host.host_owner_email,
                 country_code: host.country_code,
@@ -753,13 +759,7 @@ async fn list_hosts(
                 last_verified_at: reveal_operations.then_some(host.last_verified_at).flatten(),
                 last_error: reveal_operations.then_some(host.last_error).flatten(),
                 note: reveal_operations.then_some(host.note).flatten(),
-                ip_intel: reveal_operations
-                    .then(|| {
-                        host.ip_intel_json.as_deref().and_then(|raw| {
-                            serde_json::from_str::<crate::ip_iq::HostIpIntel>(raw).ok()
-                        })
-                    })
-                    .flatten(),
+                ip_intel,
                 created_at: reveal_operations.then_some(host.created_at),
                 updated_at: reveal_operations.then_some(host.updated_at),
             }
@@ -2280,21 +2280,69 @@ fn mask_public_host_ip(ip: &str) -> String {
     "xx.xx.xx.xx".to_string()
 }
 
+fn parse_host_ip_intel(raw: Option<&str>) -> Option<crate::ip_iq::HostIpIntel> {
+    raw.and_then(|value| serde_json::from_str(value).ok())
+}
+
+/// Non-owners still see market-useful ISP / risk / classification, without exact IP or geo coords.
+fn public_host_ip_intel(
+    intel: crate::ip_iq::HostIpIntel,
+    host_ip: &str,
+) -> crate::ip_iq::HostIpIntel {
+    let masked = mask_public_host_ip(host_ip);
+    crate::ip_iq::HostIpIntel {
+        query: masked.clone(),
+        ip: Some(masked),
+        location: intel.location,
+        score: None,
+        level: intel.level,
+        risk_score: None,
+        risk_level: intel.risk_level,
+        confidence: None,
+        country_code: intel.country_code,
+        country: intel.country,
+        region: intel.region,
+        city: intel.city,
+        latitude: None,
+        longitude: None,
+        timezone: intel.timezone,
+        asn: intel.asn,
+        as_name: intel.as_name,
+        isp: intel.isp,
+        owner: None,
+        network_type: intel.network_type,
+        classification_type: intel.classification_type,
+        proxy: intel.proxy,
+        vpn: intel.vpn,
+        hosting: intel.hosting,
+        tor: intel.tor,
+        source: intel.source,
+    }
+}
+
+fn host_ip_intel_for_viewer(
+    raw: Option<&str>,
+    host_ip: &str,
+    reveal: bool,
+) -> Option<crate::ip_iq::HostIpIntel> {
+    let intel = parse_host_ip_intel(raw)?;
+    Some(if reveal {
+        intel
+    } else {
+        public_host_ip_intel(intel, host_ip)
+    })
+}
+
 fn host_to_view(host: RouterSshHostRecord, reveal: bool) -> RouterSshHostView {
-    let ip_intel = reveal
-        .then(|| {
-            host.ip_intel_json.as_deref().and_then(|raw| {
-                serde_json::from_str::<crate::ip_iq::HostIpIntel>(raw).ok()
-            })
-        })
-        .flatten();
+    let ip_intel = host_ip_intel_for_viewer(host.ip_intel_json.as_deref(), &host.ip, reveal);
+    let display_ip = if reveal {
+        host.ip.clone()
+    } else {
+        mask_public_host_ip(&host.ip)
+    };
     RouterSshHostView {
         id: host.id,
-        ip: Some(if reveal {
-            host.ip
-        } else {
-            mask_public_host_ip(&host.ip)
-        }),
+        ip: Some(display_ip),
         port: reveal.then_some(host.port),
         host_owner_email: host.host_owner_email,
         country_code: host.country_code,
@@ -4709,7 +4757,10 @@ mod tests {
             last_verified_at: Some("verified-at".into()),
             last_error: Some("diagnostic".into()),
             note: Some("operator note".into()),
-            ip_intel_json: None,
+            ip_intel_json: Some(
+                r#"{"query":"203.0.113.9","location":"United States · Texas","riskLevel":"轻微风险","countryCode":"US","asn":"AS401701","isp":"Cognetcloud INC","classificationType":"IDC 机房 IP","source":"iq"}"#
+                    .into(),
+            ),
             created_at: "created-at".into(),
             updated_at: "updated-at".into(),
         };
@@ -4731,6 +4782,26 @@ mod tests {
             public.get("ip").and_then(|value| value.as_str()),
             Some("203.xx.xx.9")
         );
+        let public_intel = public.get("ipIntel").expect("public view should expose ip intel");
+        assert_eq!(
+            public_intel.get("isp").and_then(|value| value.as_str()),
+            Some("Cognetcloud INC")
+        );
+        assert_eq!(
+            public_intel.get("asn").and_then(|value| value.as_str()),
+            Some("AS401701")
+        );
+        assert_eq!(
+            public_intel
+                .get("riskLevel")
+                .and_then(|value| value.as_str()),
+            Some("轻微风险")
+        );
+        assert_eq!(
+            public_intel.get("ip").and_then(|value| value.as_str()),
+            Some("203.xx.xx.9")
+        );
+        assert!(public_intel.get("latitude").is_none());
         assert_eq!(
             public
                 .get("clientSubdomain")
