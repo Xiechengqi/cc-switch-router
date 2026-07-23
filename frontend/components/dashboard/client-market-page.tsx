@@ -651,7 +651,7 @@ function HostRow({
     canManageHost &&
     (isAdmin || !host.installationId) &&
     (host.status === "unreachable" || host.status === "disabled" || host.status === "abnormal");
-  const canOpenTerminal = host.canWebTerminal === true || canManageHost;
+  const canOpenTerminal = host.canWebTerminal === true;
   const hostLabel = host.hostname || host.ip || host.id.slice(0, 8);
   const terminalTitle = host.ip || hostLabel;
   const countryName = host.countryCode

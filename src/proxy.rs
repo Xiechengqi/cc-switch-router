@@ -4233,30 +4233,12 @@ async fn resolve_client_web_bearer(
     headers: &HeaderMap,
     owner_email: &str,
     required_api_token_scope: &str,
-    installation_id: Option<&str>,
+    _installation_id: Option<&str>,
 ) -> Result<Option<(String, bool)>, crate::error::AppError> {
-    let provision_source = if let Some(installation_id) = installation_id {
-        state
-            .store
-            .installation_provision_source(installation_id)
-            .await?
-    } else {
-        None
-    };
-    let is_router_market_client =
-        provision_source.as_deref() == Some(crate::client_market::PROVISION_SOURCE_ROUTER_MARKET);
     let Some(token) = client_web_bearer_token(headers) else {
         return Ok(None);
     };
     if let Some(session) = state.store.resolve_session_by_access_token(token).await? {
-        if is_router_market_client {
-            if !router_market_session_matches_client(&session, owner_email, installation_id) {
-                return Err(crate::error::AppError::Forbidden(
-                    "router sessions cannot be delegated to this provisioned client".into(),
-                ));
-            }
-            return Ok(Some((session.email, false)));
-        }
         let email = session.email;
         let is_admin = state.dynamic.read().await.is_admin(&email);
         return Ok(Some((email, is_admin)));
@@ -4266,11 +4248,6 @@ async fn resolve_client_web_bearer(
         .resolve_user_api_token(token, required_api_token_scope)
         .await?
     {
-        if is_router_market_client {
-            return Err(crate::error::AppError::Forbidden(
-                "router API tokens cannot be delegated to this provisioned client".into(),
-            ));
-        }
         let email = principal.email;
         let is_admin = state.dynamic.read().await.is_admin(&email);
         if email == owner_email || is_admin {
@@ -4284,11 +4261,6 @@ async fn resolve_client_web_bearer(
             .resolve_user_api_token(token, "share:read")
             .await?
         {
-            if is_router_market_client {
-                return Err(crate::error::AppError::Forbidden(
-                    "router API tokens cannot be delegated to this provisioned client".into(),
-                ));
-            }
             let email = principal.email;
             let is_admin = state.dynamic.read().await.is_admin(&email);
             if email.eq_ignore_ascii_case(owner_email) || is_admin {
@@ -4297,15 +4269,6 @@ async fn resolve_client_web_bearer(
         }
     }
     Ok(None)
-}
-
-fn router_market_session_matches_client(
-    session: &crate::models::AuthSession,
-    owner_email: &str,
-    installation_id: Option<&str>,
-) -> bool {
-    installation_id.is_some_and(|expected| session.installation_id == expected)
-        && session.email.eq_ignore_ascii_case(owner_email)
 }
 
 fn client_web_bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -4397,43 +4360,6 @@ mod tests {
     use axum::routing::any;
 
     use super::*;
-
-    #[test]
-    fn router_market_sessions_are_scoped_to_exact_client_and_owner() {
-        let now = Utc::now();
-        let session = crate::models::AuthSession {
-            session_id: "session".into(),
-            user_id: "user".into(),
-            email: "Owner@Example.com".into(),
-            installation_id: "installation-a".into(),
-            access_token_hash: "access".into(),
-            refresh_token_hash: "refresh".into(),
-            access_expires_at: now,
-            refresh_expires_at: now,
-            created_at: now,
-            last_used_at: now,
-        };
-        assert!(router_market_session_matches_client(
-            &session,
-            "owner@example.com",
-            Some("installation-a")
-        ));
-        assert!(!router_market_session_matches_client(
-            &session,
-            "other@example.com",
-            Some("installation-a")
-        ));
-        assert!(!router_market_session_matches_client(
-            &session,
-            "owner@example.com",
-            Some("installation-b")
-        ));
-        assert!(!router_market_session_matches_client(
-            &session,
-            "owner@example.com",
-            None
-        ));
-    }
 
     #[tokio::test]
     async fn forged_health_check_header_cannot_reach_share_backend() {

@@ -202,7 +202,6 @@ function ClientHeaderInlineButton({
 function ClientConsoleButton({ client }: { client: DashboardClient }) {
   const { t } = useLocaleText();
   const { openConsole } = useClientConsole();
-  if (client.installation.provisionSource === "router_market") return null;
   const tunnelUrl = clientTunnelDisplayUrl(client.clientTunnel?.tunnelUrl);
   if (!tunnelUrl) return null;
   const title = client.clientTunnel?.subdomain || tunnelUrl;
