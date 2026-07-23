@@ -241,6 +241,7 @@ pub fn init_schema(conn: &Connection) -> Result<(), ClientMarketSchemaError> {
     add_column_if_missing(conn, "subdomain_reservations", "host_id", "TEXT")?;
     add_column_if_missing(conn, "subdomain_reservations", "client_owner_email", "TEXT")?;
     add_column_if_missing(conn, "subdomain_reservations", "installation_id", "TEXT")?;
+    add_column_if_missing(conn, "router_ssh_hosts", "ip_intel_json", "TEXT")?;
     conn.execute(
         "UPDATE router_ssh_hosts SET status = ?1 WHERE status = 'provisioning'",
         params![HOST_STATUS_LOCKED],
@@ -518,6 +519,7 @@ pub fn router() -> Router<ServerState> {
         )
         .route("/v1/client-market/hosts", get(list_hosts).post(create_host))
         .route("/v1/client-market/hosts/test-ssh", post(test_host_ssh))
+        .route("/v1/client-market/hosts/ip-info", post(lookup_host_ip_info))
         .route("/v1/client-market/supply-summary", get(supply_summary))
         .route("/v1/client-market/hosts/:id", delete(delete_host))
         .route("/v1/client-market/hosts/:id/reverify", post(reverify_host))
@@ -584,6 +586,8 @@ struct RouterSshHostView {
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    ip_intel: Option<crate::ip_iq::HostIpIntel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     created_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     updated_at: Option<String>,
@@ -642,6 +646,13 @@ async fn list_hosts(
                 last_verified_at: reveal_operations.then_some(host.last_verified_at).flatten(),
                 last_error: reveal_operations.then_some(host.last_error).flatten(),
                 note: reveal_operations.then_some(host.note).flatten(),
+                ip_intel: reveal_operations
+                    .then(|| {
+                        host.ip_intel_json.as_deref().and_then(|raw| {
+                            serde_json::from_str::<crate::ip_iq::HostIpIntel>(raw).ok()
+                        })
+                    })
+                    .flatten(),
                 created_at: reveal_operations.then_some(host.created_at),
                 updated_at: reveal_operations.then_some(host.updated_at),
             }
@@ -725,6 +736,23 @@ async fn test_host_ssh(
     Ok(Json(TestHostSshResponse { ok: true }))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HostIpInfoRequest {
+    ip: String,
+}
+
+async fn lookup_host_ip_info(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<HostIpInfoRequest>,
+) -> Result<Json<crate::ip_iq::HostIpIntel>, AppError> {
+    let _owner = require_session_email(&state, &headers).await?;
+    let ip = parse_host_ip(&input.ip)?;
+    let intel = crate::ip_iq::lookup_host_ip_intel(&ip.to_string()).await?;
+    Ok(Json(intel))
+}
+
 async fn create_host(
     State(state): State<ServerState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -770,24 +798,21 @@ async fn create_host(
         &known_hosts_path(&state.config),
     )
     .await?;
-    let country_code = state
-        .store
-        .lookup_geo_country_code_for_ip(&ip.to_string())
-        .await
-        .filter(|code| code.len() == 2)
-        .ok_or_else(|| {
-            AppError::ServiceUnavailable("could not determine host country; retry later".into())
-        })?;
+    let intel = crate::ip_iq::lookup_host_ip_intel(&ip.to_string()).await?;
+    let intel_json = serde_json::to_string(&intel).map_err(|e| {
+        AppError::Internal(format!("serialize host ip intel failed: {e}"))
+    })?;
     let host = state
         .store
         .client_market_insert_host(
             &owner,
             &ip.to_string(),
             port,
-            Some(&country_code),
+            Some(&intel.country_code),
             hostname.as_deref(),
             fingerprint.as_deref(),
             input.note.as_deref(),
+            Some(&intel_json),
         )
         .await?;
     Ok(Json(host_to_view(host, true)))
@@ -2105,6 +2130,13 @@ fn sanitize_job_log_chunk(chunk: &str) -> String {
 }
 
 fn host_to_view(host: RouterSshHostRecord, reveal: bool) -> RouterSshHostView {
+    let ip_intel = reveal
+        .then(|| {
+            host.ip_intel_json.as_deref().and_then(|raw| {
+                serde_json::from_str::<crate::ip_iq::HostIpIntel>(raw).ok()
+            })
+        })
+        .flatten();
     RouterSshHostView {
         id: host.id,
         ip: reveal.then_some(host.ip),
@@ -2120,6 +2152,7 @@ fn host_to_view(host: RouterSshHostRecord, reveal: bool) -> RouterSshHostView {
         last_verified_at: reveal.then_some(host.last_verified_at).flatten(),
         last_error: reveal.then_some(host.last_error).flatten(),
         note: reveal.then_some(host.note).flatten(),
+        ip_intel,
         created_at: reveal.then_some(host.created_at),
         updated_at: reveal.then_some(host.updated_at),
     }
@@ -2160,6 +2193,7 @@ pub struct RouterSshHostRecord {
     pub last_verified_at: Option<String>,
     pub last_error: Option<String>,
     pub note: Option<String>,
+    pub ip_intel_json: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -2216,7 +2250,7 @@ impl AppStore {
             "SELECT h.id, h.ip, h.port, h.host_owner_email, h.country_code, h.hostname,
                     h.ssh_host_key_fingerprint, h.status, h.installation_id,
                     h.last_verified_at, h.last_error, h.note, h.created_at, h.updated_at,
-                    t.subdomain, t.owner_email
+                    h.ip_intel_json, t.subdomain, t.owner_email
              FROM router_ssh_hosts h
              LEFT JOIN installation_client_tunnels t ON t.installation_id = h.installation_id
              WHERE 1=1",
@@ -2287,6 +2321,7 @@ impl AppStore {
         hostname: Option<&str>,
         fingerprint: Option<&str>,
         note: Option<&str>,
+        ip_intel_json: Option<&str>,
     ) -> Result<RouterSshHostRecord, AppError> {
         let owner = normalize_market_email(owner_email)?;
         let now = Utc::now().to_rfc3339();
@@ -2295,8 +2330,9 @@ impl AppStore {
         conn.execute(
             "INSERT INTO router_ssh_hosts (
                 id, ip, port, host_owner_email, country_code, hostname, ssh_host_key_fingerprint,
-                status, installation_id, last_verified_at, last_error, note, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, NULL, ?10, ?9, ?9)",
+                status, installation_id, last_verified_at, last_error, note, ip_intel_json,
+                created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, NULL, ?10, ?11, ?9, ?9)",
             params![
                 id,
                 ip,
@@ -2308,6 +2344,7 @@ impl AppStore {
                 HOST_STATUS_IDLE,
                 now,
                 note,
+                ip_intel_json,
             ],
         )
         .map_err(|e| {
@@ -3611,7 +3648,7 @@ fn get_router_ssh_host(
         "SELECT h.id, h.ip, h.port, h.host_owner_email, h.country_code, h.hostname,
                 h.ssh_host_key_fingerprint, h.status, h.installation_id,
                 h.last_verified_at, h.last_error, h.note, h.created_at, h.updated_at,
-                t.subdomain, t.owner_email
+                h.ip_intel_json, t.subdomain, t.owner_email
          FROM router_ssh_hosts h
          LEFT JOIN installation_client_tunnels t ON t.installation_id = h.installation_id
          WHERE h.id = ?1",
@@ -3648,14 +3685,15 @@ fn map_router_ssh_host_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouterSs
         hostname: row.get(5)?,
         ssh_host_key_fingerprint: row.get(6)?,
         status: row.get(7)?,
-        client_subdomain: row.get(14)?,
-        client_owner_email: row.get(15)?,
         installation_id: row.get(8)?,
         last_verified_at: row.get(9)?,
         last_error: row.get(10)?,
         note: row.get(11)?,
         created_at: row.get(12)?,
         updated_at: row.get(13)?,
+        ip_intel_json: row.get(14)?,
+        client_subdomain: row.get(15)?,
+        client_owner_email: row.get(16)?,
     })
 }
 
@@ -3795,6 +3833,7 @@ mod tests {
                 Some("test-host"),
                 Some("SHA256:test"),
                 Some("test note"),
+                None,
             )
             .await
             .expect("insert host")
@@ -4511,6 +4550,7 @@ mod tests {
             last_verified_at: Some("verified-at".into()),
             last_error: Some("diagnostic".into()),
             note: Some("operator note".into()),
+            ip_intel_json: None,
             created_at: "created-at".into(),
             updated_at: "updated-at".into(),
         };

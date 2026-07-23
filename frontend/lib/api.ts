@@ -42,6 +42,7 @@ import type {
   ClientChatRoomListResponse,
   ClientChatVisit,
   ClientMarketHost,
+  HostIpIntel,
   SupplySummaryEntry,
   ProvisionSshKey,
   ProvisioningJob,
@@ -652,6 +653,16 @@ export async function createClientMarketHost(body: { ip: string; port?: number; 
 export async function testClientMarketHostSsh(body: { ip: string; port?: number }) {
   return parseJson<{ ok: boolean }>(
     await authFetch("/v1/client-market/hosts/test-ssh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function lookupClientMarketHostIpInfo(body: { ip: string }) {
+  return parseJson<HostIpIntel>(
+    await authFetch("/v1/client-market/hosts/ip-info", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),

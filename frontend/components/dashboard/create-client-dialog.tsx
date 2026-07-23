@@ -343,7 +343,7 @@ export function CreateClientDialog({
       isDismissable={phase !== "running"}
     >
         <Modal.Container placement="center">
-          <Modal.Dialog className="w-[min(640px,calc(100vw-2rem))] max-w-none">
+          <Modal.Dialog className="light w-[min(640px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
             <Modal.Header>
               <Modal.Heading>{t("createClient.title")}</Modal.Heading>
             </Modal.Header>
@@ -430,7 +430,7 @@ export function CreateClientDialog({
                         {t("createClient.clearOwners")}
                       </Button>
                     </div>
-                    <div className="grid max-h-32 gap-1 overflow-y-auto rounded-lg border p-2">
+                    <div className="grid max-h-32 gap-1 overflow-y-auto rounded-lg border p-2 text-slate-900">
                       {allOwners.length === 0 ? (
                         <p className="px-1 py-2 text-xs text-muted-foreground">—</p>
                       ) : (
@@ -439,7 +439,7 @@ export function CreateClientDialog({
                             safeHostOwnersPersist.mode === "all" ||
                             safeHostOwnersPersist.emails.some((selected) => selected.toLowerCase() === email.toLowerCase());
                           return (
-                            <label key={email} className="flex cursor-pointer items-center gap-2 text-sm">
+                            <label key={email} className="flex cursor-pointer items-center gap-2 text-sm text-slate-900">
                               <input
                                 type="checkbox"
                                 checked={checked}
@@ -482,7 +482,7 @@ export function CreateClientDialog({
                         </Button>
                       </div>
                     </div>
-                    <div className="grid max-h-44 gap-1 overflow-y-auto rounded-lg border p-2">
+                    <div className="grid max-h-44 gap-1 overflow-y-auto rounded-lg border p-2 text-slate-900">
                       {regionOptions.length === 0 ? (
                         <p className="px-1 py-2 text-xs text-muted-foreground">—</p>
                       ) : (
@@ -490,7 +490,7 @@ export function CreateClientDialog({
                           const checked =
                             safeRegionsPersist.mode === "all" || safeRegionsPersist.codes.includes(region.code);
                           return (
-                            <label key={region.code} className="flex cursor-pointer items-center gap-2 rounded-md px-1 py-1 text-sm hover:bg-slate-50">
+                            <label key={region.code} className="flex cursor-pointer items-center gap-2 rounded-md px-1 py-1 text-sm text-slate-900 hover:bg-slate-50">
                               <input
                                 type="checkbox"
                                 checked={checked}
@@ -553,7 +553,7 @@ export function CreateClientDialog({
                     <input
                       value={subdomain}
                       onChange={(e) => setSubdomain(e.target.value)}
-                      className="h-11 rounded-lg border px-3 font-mono outline-none focus:ring-2 focus:ring-primary/30"
+                      className="h-11 rounded-lg border border-border bg-white px-3 font-mono text-slate-900 outline-none focus:ring-2 focus:ring-primary/30"
                       autoComplete="off"
                     />
                   </label>
@@ -563,7 +563,7 @@ export function CreateClientDialog({
                       type="password"
                       value={password}
                       onChange={(e) => setPassword(e.target.value)}
-                      className="h-11 rounded-lg border px-3 outline-none focus:ring-2 focus:ring-primary/30"
+                      className="h-11 rounded-lg border border-border bg-white px-3 text-slate-900 outline-none focus:ring-2 focus:ring-primary/30"
                       autoComplete="new-password"
                     />
                     <span className="text-xs text-muted-foreground">{t("createClient.passwordHint")}</span>

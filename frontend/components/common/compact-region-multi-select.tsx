@@ -99,8 +99,8 @@ export function CompactRegionMultiSelect({
         </button>
       </div>
       {open ? (
-        <div className="absolute right-0 top-[calc(100%+4px)] z-50 max-h-64 min-w-full overflow-y-auto rounded-lg border bg-white py-1 shadow-lg">
-          <label className="flex cursor-pointer items-center gap-2 px-3 py-2 text-xs hover:bg-slate-50">
+        <div className="absolute right-0 top-[calc(100%+4px)] z-50 max-h-64 min-w-full overflow-y-auto rounded-lg border bg-white py-1 text-slate-900 shadow-lg">
+          <label className="flex cursor-pointer items-center gap-2 px-3 py-2 text-xs text-slate-900 hover:bg-slate-50">
             <input
               type="checkbox"
               checked={values.length === 0}
@@ -109,7 +109,7 @@ export function CompactRegionMultiSelect({
             <span>{allLabel}</span>
           </label>
           {options.map((option) => (
-            <label key={option.value} className="flex cursor-pointer items-center gap-2 px-3 py-2 text-xs hover:bg-slate-50">
+            <label key={option.value} className="flex cursor-pointer items-center gap-2 px-3 py-2 text-xs text-slate-900 hover:bg-slate-50">
               <input
                 type="checkbox"
                 checked={values.includes(option.value)}

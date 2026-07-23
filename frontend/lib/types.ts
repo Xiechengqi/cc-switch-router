@@ -1261,6 +1261,35 @@ export type ClientMarketHostStatus =
   | "unreachable"
   | "abnormal";
 
+export type HostIpIntel = {
+  query: string;
+  ip?: string;
+  location?: string;
+  score?: number;
+  level?: string;
+  riskScore?: number;
+  riskLevel?: string;
+  confidence?: number;
+  countryCode: string;
+  country?: string;
+  region?: string;
+  city?: string;
+  latitude?: number;
+  longitude?: number;
+  timezone?: string;
+  asn?: string;
+  asName?: string;
+  isp?: string;
+  owner?: string;
+  networkType?: string;
+  classificationType?: string;
+  proxy?: boolean;
+  vpn?: boolean;
+  hosting?: boolean;
+  tor?: boolean;
+  source: string;
+};
+
 export type ClientMarketHost = {
   id: string;
   ip?: string;
@@ -1276,6 +1305,7 @@ export type ClientMarketHost = {
   lastVerifiedAt?: string;
   lastError?: string;
   note?: string;
+  ipIntel?: HostIpIntel;
   createdAt?: string;
   updatedAt?: string;
 };

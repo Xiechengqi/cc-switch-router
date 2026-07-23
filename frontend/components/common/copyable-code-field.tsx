@@ -31,7 +31,7 @@ export function CopyableCodeField({
     <div className="rounded-lg border bg-slate-50 p-3">
       <div className="mb-2 font-mono text-[10px] uppercase text-muted-foreground">{label}</div>
       <div className="flex items-start gap-2">
-        <pre className="min-w-0 flex-1 overflow-x-auto whitespace-pre-wrap break-all font-mono text-[12px] leading-6 text-foreground">
+        <pre className="min-w-0 flex-1 overflow-x-auto whitespace-pre-wrap break-all font-mono text-[12px] leading-6 text-slate-900">
           {value}
         </pre>
         <Button

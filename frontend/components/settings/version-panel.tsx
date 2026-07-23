@@ -210,11 +210,11 @@ export function VersionPanel({ isAdmin }: { isAdmin: boolean }) {
       </Card.Content>
       <Modal.Backdrop isOpen={upgradeOpen} onOpenChange={setUpgradeOpen}>
           <Modal.Container placement="center" size="lg">
-            <Modal.Dialog className="!bg-white !text-slate-900">
+            <Modal.Dialog className="light !bg-white !text-slate-900">
               <Modal.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
               <Modal.Header>
                 <div>
-                  <Modal.Heading>{t("version.upgradeLog")}</Modal.Heading>
+                  <Modal.Heading className="!text-slate-900">{t("version.upgradeLog")}</Modal.Heading>
                   <p className="mt-1 text-sm text-muted-foreground">{t("version.upgradeLogDesc")}</p>
                 </div>
               </Modal.Header>

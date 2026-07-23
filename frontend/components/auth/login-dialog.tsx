@@ -86,11 +86,11 @@ export function LoginDialog({ open, onOpenChange }: { open: boolean; onOpenChang
   return (
     <Modal.Backdrop isOpen={open} onOpenChange={onOpenChange}>
         <Modal.Container placement="center">
-          <Modal.Dialog>
+          <Modal.Dialog className="light !bg-white !text-slate-900">
             <Modal.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
             <Modal.Header>
               <div>
-                <Modal.Heading>{isCodeStep ? t("auth.verifyTitle") : t("auth.title")}</Modal.Heading>
+                <Modal.Heading className="!text-slate-900">{isCodeStep ? t("auth.verifyTitle") : t("auth.title")}</Modal.Heading>
                 <p className="mt-1 text-sm text-muted-foreground">
                   {isCodeStep
                     ? t("auth.verifySubtitle", { destination: maskedDestination || fallbackMask(email) })

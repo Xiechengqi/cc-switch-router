@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { Button, Card, Chip, Modal, toast } from "@heroui/react";
-import { ChevronDown, Loader2, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { Check, ChevronDown, Circle, Loader2, Plus, RefreshCw, Trash2, X } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CopyableCodeField } from "@/components/common/copyable-code-field";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
@@ -15,13 +15,16 @@ import {
   getClientMarketHosts,
   getClientMarketJob,
   getProvisionSshKey,
+  lookupClientMarketHostIpInfo,
   reverifyClientMarketHost,
   testClientMarketHostSsh,
 } from "@/lib/api";
-import type { ClientMarketHost, ProvisionSshKey } from "@/lib/types";
+import type { ClientMarketHost, HostIpIntel, ProvisionSshKey } from "@/lib/types";
 import type { MessageKey } from "@/lib/i18n";
+import { usePersistentState } from "@/lib/use-persistent-state";
 
 const ROUTER_OPEN_LOGIN_EVENT = "router-open-login";
+const ADD_HOST_SSH_KEY_OPEN_KEY = "cc-switch.client-market.add-host.ssh-key-open";
 
 function statusLabelKey(status: string): MessageKey {
   const known = {
@@ -53,20 +56,29 @@ function AddHostDialog({
   const { t } = useLocaleText();
   const [sshKey, setSshKey] = React.useState<ProvisionSshKey | null>(null);
   const [sshKeyLoading, setSshKeyLoading] = React.useState(false);
-  const [sshKeyOpen, setSshKeyOpen] = React.useState(true);
+  const [sshKeyOpen, setSshKeyOpen] = usePersistentState(ADD_HOST_SSH_KEY_OPEN_KEY, false);
   const [ip, setIp] = React.useState("");
   const [port, setPort] = React.useState("22");
   const [note, setNote] = React.useState("");
   const [busy, setBusy] = React.useState(false);
   const [testing, setTesting] = React.useState(false);
   const [error, setError] = React.useState("");
+  const [phase, setPhase] = React.useState<"form" | "progress" | "success">("form");
+  const [stepStatus, setStepStatus] = React.useState<{
+    connectivity: "pending" | "running" | "done" | "failed";
+    ipInfo: "pending" | "running" | "done" | "failed";
+    register: "pending" | "running" | "done" | "failed";
+  }>({ connectivity: "pending", ipInfo: "pending", register: "pending" });
+  const [ipIntel, setIpIntel] = React.useState<HostIpIntel | null>(null);
 
   React.useEffect(() => {
     if (!open) return;
     setError("");
     setBusy(false);
     setTesting(false);
-    setSshKeyOpen(true);
+    setPhase("form");
+    setStepStatus({ connectivity: "pending", ipInfo: "pending", register: "pending" });
+    setIpIntel(null);
     let cancelled = false;
     setSshKeyLoading(true);
     void getProvisionSshKey()
@@ -131,24 +143,52 @@ function AddHostDialog({
       setError(t("clientMarket.noteTooLong"));
       return;
     }
+    const hostIp = ip.trim();
     setBusy(true);
     setError("");
+    setPhase("progress");
+    setIpIntel(null);
+    setStepStatus({ connectivity: "running", ipInfo: "pending", register: "pending" });
     try {
+      await testClientMarketHostSsh({ ip: hostIp, port: parsedPort });
+      setStepStatus({ connectivity: "done", ipInfo: "running", register: "pending" });
+
+      const intel = await lookupClientMarketHostIpInfo({ ip: hostIp });
+      setIpIntel(intel);
+      setStepStatus({ connectivity: "done", ipInfo: "done", register: "running" });
+
       await createClientMarketHost({
-        ip: ip.trim(),
+        ip: hostIp,
         port: parsedPort,
         note: note.trim() || undefined,
       });
-      toast.success(t("clientMarket.hostAdded"));
-      onOpenChange(false);
+      setStepStatus({ connectivity: "done", ipInfo: "done", register: "done" });
+      setPhase("success");
+      onAdded();
+    } catch (err) {
+      const message = mapHostError(err instanceof Error ? err.message : String(err));
+      setError(message);
+      setStepStatus((prev) => {
+        if (prev.connectivity === "running") return { ...prev, connectivity: "failed" };
+        if (prev.ipInfo === "running") return { ...prev, ipInfo: "failed" };
+        if (prev.register === "running") return { ...prev, register: "failed" };
+        return prev;
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const closeDialog = (nextOpen: boolean) => {
+    if (busy) return;
+    onOpenChange(nextOpen);
+    if (!nextOpen) {
       setIp("");
       setPort("22");
       setNote("");
-      onAdded();
-    } catch (err) {
-      setError(mapHostError(err instanceof Error ? err.message : String(err)));
-    } finally {
-      setBusy(false);
+      setPhase("form");
+      setError("");
+      setIpIntel(null);
     }
   };
 
@@ -156,102 +196,222 @@ function AddHostDialog({
     ? authorizedKeysInstallCommand(sshKey.authorizedKeysLine)
     : "";
 
+  const stepMeta = (
+    status: "pending" | "running" | "done" | "failed",
+  ): { label: string; icon: React.ReactNode; className: string } => {
+    if (status === "running") {
+      return {
+        label: t("clientMarket.stepRunning"),
+        icon: <Loader2 className="h-4 w-4 animate-spin text-primary" />,
+        className: "border-primary/30 bg-primary/5",
+      };
+    }
+    if (status === "done") {
+      return {
+        label: t("clientMarket.stepDone"),
+        icon: <Check className="h-4 w-4 text-emerald-600" />,
+        className: "border-emerald-200 bg-emerald-50",
+      };
+    }
+    if (status === "failed") {
+      return {
+        label: t("clientMarket.stepFailed"),
+        icon: <X className="h-4 w-4 text-rose-600" />,
+        className: "border-rose-200 bg-rose-50",
+      };
+    }
+    return {
+      label: t("clientMarket.stepPending"),
+      icon: <Circle className="h-4 w-4 text-slate-300" />,
+      className: "border-border bg-white",
+    };
+  };
+
+  const renderStep = (
+    key: "connectivity" | "ipInfo" | "register",
+    title: string,
+    detail?: React.ReactNode,
+  ) => {
+    const meta = stepMeta(stepStatus[key]);
+    return (
+      <div key={key} className={`rounded-xl border px-3 py-3 ${meta.className}`}>
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2 text-sm font-medium text-slate-900">
+            {meta.icon}
+            <span>{title}</span>
+          </div>
+          <span className="text-xs text-muted-foreground">{meta.label}</span>
+        </div>
+        {detail ? <div className="mt-2 text-xs leading-5 text-slate-600">{detail}</div> : null}
+      </div>
+    );
+  };
+
   return (
-    <Modal.Backdrop isOpen={open} onOpenChange={onOpenChange}>
+    <Modal.Backdrop isOpen={open} onOpenChange={closeDialog}>
       <Modal.Container placement="center">
-        <Modal.Dialog className="w-[min(560px,calc(100vw-2rem))] max-w-none">
+        <Modal.Dialog className="light w-[min(560px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
           <Modal.Header>
-            <Modal.Heading>{t("clientMarket.addHostTitle")}</Modal.Heading>
+            <Modal.Heading>
+              {phase === "form"
+                ? t("clientMarket.addHostTitle")
+                : phase === "success"
+                  ? t("clientMarket.registerSuccess")
+                  : t("clientMarket.registerProgressTitle")}
+            </Modal.Heading>
           </Modal.Header>
-          <Modal.Body className="grid gap-3">
-            <div className="overflow-hidden rounded-xl border border-border">
-              <button
-                type="button"
-                className="flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left text-sm font-medium text-foreground transition-colors hover:bg-muted/60"
-                aria-expanded={sshKeyOpen}
-                onClick={() => setSshKeyOpen((value) => !value)}
-              >
-                <span>{t("clientMarket.addSshKeyTitle")}</span>
-                <ChevronDown
-                  className={`h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-200 ${
-                    sshKeyOpen ? "rotate-180" : ""
-                  }`}
-                />
-              </button>
-              {sshKeyOpen ? (
-                <div className="grid gap-3 border-t border-border px-3 py-3">
-                  <p className="text-sm text-muted-foreground">{t("clientMarket.addSshKeyHint")}</p>
-                  {sshKeyLoading ? (
-                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                      …
-                    </div>
-                  ) : installCommand ? (
-                    <CopyableCodeField
-                      label={t("clientMarket.authorizedKeysCommand")}
-                      value={installCommand}
-                      copyLabel={t("clientMarket.copy")}
-                      copiedLabel={t("clientMarket.copied")}
+          {phase === "form" ? (
+            <>
+              <Modal.Body className="grid gap-3 text-slate-900">
+                <div className="overflow-hidden rounded-xl border border-border">
+                  <button
+                    type="button"
+                    className="flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left text-sm font-medium text-slate-900 transition-colors hover:bg-muted/60"
+                    aria-expanded={sshKeyOpen}
+                    onClick={() => setSshKeyOpen((value) => !value)}
+                  >
+                    <span>{t("clientMarket.addSshKeyTitle")}</span>
+                    <ChevronDown
+                      className={`h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-200 ${
+                        sshKeyOpen ? "rotate-180" : ""
+                      }`}
                     />
+                  </button>
+                  {sshKeyOpen ? (
+                    <div className="grid gap-3 border-t border-border px-3 py-3">
+                      <p className="text-sm text-muted-foreground">{t("clientMarket.addSshKeyHint")}</p>
+                      {sshKeyLoading ? (
+                        <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                          …
+                        </div>
+                      ) : installCommand ? (
+                        <CopyableCodeField
+                          label={t("clientMarket.authorizedKeysCommand")}
+                          value={installCommand}
+                          copyLabel={t("clientMarket.copy")}
+                          copiedLabel={t("clientMarket.copied")}
+                        />
+                      ) : null}
+                    </div>
                   ) : null}
                 </div>
-              ) : null}
-            </div>
 
-            <div className="grid grid-cols-[minmax(0,1fr)_9rem] gap-3">
-              <label className="grid min-w-0 gap-1 text-sm">
-                <span className="text-muted-foreground">{t("clientMarket.hostIp")}</span>
-                <input
-                  value={ip}
-                  onChange={(e) => setIp(e.target.value)}
-                  className="h-11 w-full rounded-lg border px-3 outline-none focus:ring-2 focus:ring-primary/30"
-                  autoComplete="off"
-                />
-              </label>
-              <label className="grid gap-1 text-sm">
-                <span className="text-muted-foreground">{t("clientMarket.hostPort")}</span>
-                <input
-                  value={port}
-                  onChange={(e) => setPort(e.target.value)}
-                  className="h-11 w-full rounded-lg border px-3 outline-none focus:ring-2 focus:ring-primary/30"
-                  inputMode="numeric"
-                  min={1}
-                  max={65535}
-                />
-              </label>
-            </div>
-            <label className="grid gap-1 text-sm">
-              <span className="text-muted-foreground">{t("clientMarket.hostNote")}</span>
-              <input
-                value={note}
-                onChange={(e) => setNote(e.target.value)}
-                className="h-11 rounded-lg border px-3 outline-none focus:ring-2 focus:ring-primary/30"
-                maxLength={500}
-              />
-            </label>
-            {error ? <p className="text-sm text-rose-600">{error}</p> : null}
-          </Modal.Body>
-          <Modal.Footer className="flex-wrap">
-            <Button variant="ghost" isDisabled={busy || testing} onClick={() => onOpenChange(false)}>
-              {t("common.close")}
-            </Button>
-            <Button
-              variant="outline"
-              isDisabled={busy || testing || !ip.trim()}
-              onClick={() => void testSsh()}
-            >
-              {testing ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-              {t("clientMarket.testSsh")}
-            </Button>
-            <Button
-              variant="primary"
-              isDisabled={busy || testing || !ip.trim()}
-              onClick={() => void submit()}
-            >
-              {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-              {t("clientMarket.addHost")}
-            </Button>
-          </Modal.Footer>
+                <div className="grid grid-cols-[minmax(0,1fr)_9rem] gap-3">
+                  <label className="grid min-w-0 gap-1 text-sm">
+                    <span className="text-muted-foreground">{t("clientMarket.hostIp")}</span>
+                    <input
+                      value={ip}
+                      onChange={(e) => setIp(e.target.value)}
+                      className="h-11 w-full rounded-lg border border-border bg-white px-3 text-slate-900 outline-none focus:ring-2 focus:ring-primary/30"
+                      autoComplete="off"
+                    />
+                  </label>
+                  <label className="grid gap-1 text-sm">
+                    <span className="text-muted-foreground">{t("clientMarket.hostPort")}</span>
+                    <input
+                      value={port}
+                      onChange={(e) => setPort(e.target.value)}
+                      className="h-11 w-full rounded-lg border border-border bg-white px-3 text-slate-900 outline-none focus:ring-2 focus:ring-primary/30"
+                      inputMode="numeric"
+                      min={1}
+                      max={65535}
+                    />
+                  </label>
+                </div>
+                <label className="grid gap-1 text-sm">
+                  <span className="text-muted-foreground">{t("clientMarket.hostNote")}</span>
+                  <input
+                    value={note}
+                    onChange={(e) => setNote(e.target.value)}
+                    className="h-11 rounded-lg border border-border bg-white px-3 text-slate-900 outline-none focus:ring-2 focus:ring-primary/30"
+                    maxLength={500}
+                  />
+                </label>
+                {error ? <p className="text-sm text-rose-600">{error}</p> : null}
+              </Modal.Body>
+              <Modal.Footer className="flex-wrap">
+                <Button variant="ghost" isDisabled={busy || testing} onClick={() => closeDialog(false)}>
+                  {t("common.close")}
+                </Button>
+                <Button
+                  variant="outline"
+                  isDisabled={busy || testing || !ip.trim()}
+                  onClick={() => void testSsh()}
+                >
+                  {testing ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                  {t("clientMarket.testSsh")}
+                </Button>
+                <Button
+                  variant="primary"
+                  isDisabled={busy || testing || !ip.trim()}
+                  onClick={() => void submit()}
+                >
+                  {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                  {t("clientMarket.addHost")}
+                </Button>
+              </Modal.Footer>
+            </>
+          ) : (
+            <>
+              <Modal.Body className="grid gap-3 text-slate-900">
+                {renderStep("connectivity", t("clientMarket.stepConnectivity"))}
+                {renderStep(
+                  "ipInfo",
+                  t("clientMarket.stepIpInfo"),
+                  ipIntel ? (
+                    <div className="grid gap-1">
+                      <div>
+                        {t("clientMarket.ipInfoSummary", {
+                          location: ipIntel.location || ipIntel.country || ipIntel.query,
+                          countryCode: ipIntel.countryCode,
+                        })}
+                      </div>
+                      {ipIntel.isp || ipIntel.asn ? (
+                        <div>
+                          {[ipIntel.isp, ipIntel.asn].filter(Boolean).join(" · ")}
+                        </div>
+                      ) : null}
+                      {ipIntel.riskLevel || ipIntel.classificationType ? (
+                        <div>
+                          {[ipIntel.riskLevel, ipIntel.classificationType].filter(Boolean).join(" · ")}
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null,
+                )}
+                {renderStep("register", t("clientMarket.stepRegister"))}
+                {error ? <p className="text-sm text-rose-600">{error}</p> : null}
+              </Modal.Body>
+              <Modal.Footer>
+                {phase === "success" || error ? (
+                  <Button
+                    variant="primary"
+                    onClick={() => {
+                      if (phase === "success") {
+                        closeDialog(false);
+                      } else {
+                        setPhase("form");
+                        setError("");
+                        setStepStatus({
+                          connectivity: "pending",
+                          ipInfo: "pending",
+                          register: "pending",
+                        });
+                      }
+                    }}
+                  >
+                    {phase === "success" ? t("common.close") : t("clientMarket.back")}
+                  </Button>
+                ) : (
+                  <Button variant="ghost" isDisabled>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    {t("clientMarket.stepRunning")}
+                  </Button>
+                )}
+              </Modal.Footer>
+            </>
+          )}
         </Modal.Dialog>
       </Modal.Container>
     </Modal.Backdrop>

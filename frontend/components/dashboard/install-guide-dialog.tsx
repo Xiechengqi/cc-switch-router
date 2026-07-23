@@ -53,17 +53,17 @@ export function InstallGuideDialog({
   return (
     <Modal.Backdrop isOpen={open} onOpenChange={onOpenChange}>
         <Modal.Container>
-          <Modal.Dialog className="w-[min(720px,calc(100vw-2rem))] max-w-none">
+          <Modal.Dialog className="light w-[min(720px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
             <Modal.Header>
-              <Modal.Heading>{t(titleKey)}</Modal.Heading>
+              <Modal.Heading className="!text-slate-900">{t(titleKey)}</Modal.Heading>
             </Modal.Header>
-            <Modal.Body className="grid gap-3">
+            <Modal.Body className="grid gap-3 text-slate-900">
               <p className="text-sm text-muted-foreground">{t(descriptionKey)}</p>
               <div className="rounded-lg border bg-slate-50 p-3">
                 <div className="mb-2 font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
                   {t(commandLabelKey)}
                 </div>
-                <pre className="overflow-x-auto whitespace-pre-wrap break-all font-mono text-[12px] leading-6 text-foreground">
+                <pre className="overflow-x-auto whitespace-pre-wrap break-all font-mono text-[12px] leading-6 text-slate-900">
                   {command}
                 </pre>
               </div>

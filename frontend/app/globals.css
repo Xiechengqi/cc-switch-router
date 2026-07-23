@@ -87,6 +87,7 @@
 
 html {
   background: rgb(var(--router-background));
+  color-scheme: light;
 }
 
 body {
@@ -96,6 +97,7 @@ body {
     radial-gradient(circle at top left, rgba(0, 82, 255, 0.08), transparent 34rem),
     rgb(var(--router-background));
   color: rgb(var(--router-foreground));
+  color-scheme: light;
   font-family: var(--font-inter), Inter, system-ui, sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
@@ -134,6 +136,133 @@ textarea,
 select {
   font-family: var(--font-inter), Inter, system-ui, sans-serif;
   font-variant-numeric: tabular-nums;
+}
+
+/*
+ * Light-only product surfaces: keep ink dark on light fills.
+ * Native controls and HeroUI overlays can otherwise inherit near-white text
+ * (browser color-scheme / overlay tokens), which disappears on white backgrounds.
+ */
+input:not(
+  [type="button"],
+  [type="submit"],
+  [type="reset"],
+  [type="checkbox"],
+  [type="radio"],
+  [type="range"],
+  [type="file"],
+  [type="color"],
+  [type="hidden"],
+  [type="image"]
+),
+textarea,
+select {
+  color: rgb(var(--router-foreground));
+  caret-color: rgb(var(--router-foreground));
+  color-scheme: light;
+}
+
+input:not(
+  [type="button"],
+  [type="submit"],
+  [type="reset"],
+  [type="checkbox"],
+  [type="radio"],
+  [type="range"],
+  [type="file"],
+  [type="color"],
+  [type="hidden"],
+  [type="image"]
+)::placeholder,
+textarea::placeholder {
+  color: rgb(var(--router-muted-foreground));
+  opacity: 1;
+}
+
+input:not(
+  [type="button"],
+  [type="submit"],
+  [type="reset"],
+  [type="checkbox"],
+  [type="radio"],
+  [type="range"],
+  [type="file"],
+  [type="color"],
+  [type="hidden"],
+  [type="image"]
+):-webkit-autofill,
+input:not(
+  [type="button"],
+  [type="submit"],
+  [type="reset"],
+  [type="checkbox"],
+  [type="radio"],
+  [type="range"],
+  [type="file"],
+  [type="color"],
+  [type="hidden"],
+  [type="image"]
+):-webkit-autofill:hover,
+input:not(
+  [type="button"],
+  [type="submit"],
+  [type="reset"],
+  [type="checkbox"],
+  [type="radio"],
+  [type="range"],
+  [type="file"],
+  [type="color"],
+  [type="hidden"],
+  [type="image"]
+):-webkit-autofill:focus,
+textarea:-webkit-autofill,
+textarea:-webkit-autofill:hover,
+textarea:-webkit-autofill:focus {
+  -webkit-text-fill-color: rgb(var(--router-foreground));
+  caret-color: rgb(var(--router-foreground));
+  box-shadow: 0 0 0 1000px #ffffff inset;
+  transition: background-color 99999s ease-out;
+}
+
+.modal__dialog,
+.drawer__dialog,
+.alert-dialog__dialog,
+.dropdown__popover,
+.select__popover,
+.popover {
+  color-scheme: light;
+  --foreground: rgb(var(--router-foreground));
+  --muted: rgb(var(--router-muted-foreground));
+  --overlay: #ffffff;
+  --overlay-foreground: rgb(var(--router-foreground));
+  --surface: #ffffff;
+  --surface-foreground: rgb(var(--router-foreground));
+  --surface-secondary: rgb(var(--router-muted));
+  --surface-secondary-foreground: rgb(var(--router-foreground));
+  --surface-tertiary: rgb(226 232 240);
+  --surface-tertiary-foreground: rgb(var(--router-foreground));
+  --default: rgb(var(--router-muted));
+  --default-foreground: rgb(var(--router-foreground));
+  --field-background: #ffffff;
+  --field-foreground: rgb(var(--router-foreground));
+  --field-placeholder: rgb(var(--router-muted-foreground));
+  --accent-foreground: #ffffff;
+  color: rgb(var(--router-foreground));
+}
+
+.modal__dialog,
+.drawer__dialog,
+.alert-dialog__dialog {
+  background-color: #ffffff;
+}
+
+.input,
+.textarea,
+.input-otp__slot,
+.number-field__input,
+.combo-box__input {
+  color: rgb(var(--router-foreground));
+  color-scheme: light;
 }
 
 .font-display {

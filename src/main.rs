@@ -13,6 +13,7 @@ mod error;
 mod geo;
 mod ingress_context;
 mod ip_blacklist_stats;
+mod ip_iq;
 mod metrics;
 mod models;
 mod namespace;
