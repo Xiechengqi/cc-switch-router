@@ -442,12 +442,43 @@ fn reservation_source_matches_host(
         .map_err(|e| AppError::Internal(format!("read reservation host failed: {e}")))?;
     Ok(host_ip
         .and_then(|value| value.parse::<IpAddr>().ok())
-        .is_some_and(|value| value == source_ip))
+        .is_some_and(|value| {
+            normalize_ip_for_compare(value) == normalize_ip_for_compare(source_ip)
+        }))
+}
+
+fn reservation_has_active_create_job(
+    conn: &Connection,
+    reservation: &ActiveSubdomainReservation,
+) -> Result<bool, AppError> {
+    let Some(host_id) = reservation.host_id.as_deref() else {
+        return Ok(false);
+    };
+    let active_job: Option<(String, String)> = conn
+        .query_row(
+            "SELECT status, phase FROM provisioning_jobs
+             WHERE id = ?1 AND host_id = ?2 AND type = 'create'",
+            params![reservation.job_id, host_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| AppError::Internal(format!("read reservation job failed: {e}")))?;
+    Ok(active_job.is_some_and(|(status, phase)| {
+        status == JOB_STATUS_RUNNING
+            && matches!(
+                phase.as_str(),
+                JOB_PHASE_LOCKED | JOB_PHASE_INSTALLING | JOB_PHASE_WAITING
+            )
+    }))
 }
 
 /// Apply the global Client Market reservation to the public availability API.
 /// Calls from the selected host are allowed through so the setup preflight can run;
 /// every other installation sees the label as unavailable.
+///
+/// When peer IP cannot be trusted (e.g. cloudflared → localhost hides CF headers),
+/// an unbound reservation with an active create job still passes preflight. Claim
+/// remains gated by matching owner email + active job.
 pub(crate) fn client_market_subdomain_available_to_source(
     conn: &Connection,
     subdomain: &str,
@@ -457,7 +488,13 @@ pub(crate) fn client_market_subdomain_available_to_source(
     let Some(reservation) = get_active_subdomain_reservation(conn, subdomain)? else {
         return Ok(true);
     };
-    if !reservation_source_matches_host(conn, &reservation, source_ip)? {
+    let ip_ok = reservation_source_matches_host(conn, &reservation, source_ip)?;
+    if !ip_ok {
+        if reservation.installation_id.is_none()
+            && reservation_has_active_create_job(conn, &reservation)?
+        {
+            return Ok(true);
+        }
         return Ok(false);
     }
     Ok(match reservation.installation_id.as_deref() {
@@ -478,9 +515,13 @@ pub(crate) fn authorize_client_market_subdomain_claim(
     let Some(reservation) = get_active_subdomain_reservation(conn, subdomain)? else {
         return Ok(());
     };
-    if reservation.client_owner_email.as_deref() != Some(owner_email)
-        || !reservation_source_matches_host(conn, &reservation, source_ip)?
-    {
+    if reservation.client_owner_email.as_deref() != Some(owner_email) {
+        return Err(AppError::Conflict(
+            "subdomain is reserved for another provisioning job".into(),
+        ));
+    }
+    let ip_ok = reservation_source_matches_host(conn, &reservation, source_ip)?;
+    if !ip_ok && !reservation_has_active_create_job(conn, &reservation)? {
         return Err(AppError::Conflict(
             "subdomain is reserved for another provisioning job".into(),
         ));
@@ -497,22 +538,7 @@ pub(crate) fn authorize_client_market_subdomain_claim(
         .host_id
         .as_deref()
         .ok_or_else(|| AppError::Conflict("subdomain reservation has no selected host".into()))?;
-    let active_job: Option<(String, String)> = conn
-        .query_row(
-            "SELECT status, phase FROM provisioning_jobs
-             WHERE id = ?1 AND host_id = ?2 AND type = 'create'",
-            params![reservation.job_id, host_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()
-        .map_err(|e| AppError::Internal(format!("read reservation job failed: {e}")))?;
-    if !active_job.is_some_and(|(status, phase)| {
-        status == JOB_STATUS_RUNNING
-            && matches!(
-                phase.as_str(),
-                JOB_PHASE_LOCKED | JOB_PHASE_INSTALLING | JOB_PHASE_WAITING
-            )
-    }) {
+    if !reservation_has_active_create_job(conn, &reservation)? {
         return Err(AppError::Conflict(
             "subdomain provisioning job is no longer active".into(),
         ));
@@ -4588,25 +4614,27 @@ mod tests {
                 ),
                 Err(AppError::Conflict(_))
             ));
-            assert!(matches!(
-                authorize_client_market_subdomain_claim(
+            // Peer IP may differ from the SSH host address (cloudflared / dual-stack).
+            // Owner + active create job is enough to authorize claim.
+            assert!(
+                client_market_subdomain_available_to_source(
                     &conn,
                     "bound-client",
-                    "installation-bound",
-                    "client@example.com",
+                    None,
                     Some("198.18.2.2"),
-                ),
-                Err(AppError::Conflict(_))
-            ));
+                )
+                .unwrap(),
+                "unbound active reservation should pass preflight even with mismatched peer IP"
+            );
             let tx = conn.transaction().unwrap();
             authorize_client_market_subdomain_claim(
                 &tx,
                 "bound-client",
                 "installation-bound",
                 "client@example.com",
-                Some("198.18.2.1"),
+                Some("198.18.2.2"),
             )
-            .expect("bind reservation");
+            .expect("bind reservation without matching peer IP");
             tx.commit().unwrap();
 
             assert!(
@@ -4634,7 +4662,8 @@ mod tests {
                     Some("installation-bound"),
                     Some("198.18.2.2"),
                 )
-                .unwrap()
+                .unwrap(),
+                "after binding, mismatched peer IP must not unlock another caller"
             );
 
             insert_tunnel_and_public_host(
