@@ -7,6 +7,7 @@ import { useAuth } from "@/components/auth/auth-provider";
 import { CountryFlag } from "@/components/common/country-flag";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { buildClientInstallCommand } from "@/components/dashboard/install-guide-dialog";
+import { ProvisionJobLog } from "@/components/dashboard/provision-job-log";
 import {
   checkClientTunnelSubdomainAvailability,
   createClientMarketClient,
@@ -455,12 +456,7 @@ export function CreateClientDialog({
                 </div>
               ) : phase === "running" || phase === "failed" ? (
                 <div className="grid gap-2">
-                  <div className="font-mono text-[10px] uppercase text-muted-foreground">
-                    {t("createClient.log")}
-                  </div>
-                  <pre className="max-h-48 overflow-auto rounded-lg border bg-slate-950 p-3 font-mono text-[11px] leading-5 text-slate-100">
-                    {jobLog || "…"}
-                  </pre>
+                  <ProvisionJobLog log={jobLog} phase={phase === "failed" ? "failed" : "running"} />
                   {error ? (
                     <p className={phase === "failed" ? "text-sm text-rose-600" : "text-sm text-amber-600"}>
                       {error}
