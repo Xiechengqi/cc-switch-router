@@ -109,7 +109,7 @@ export function LoginDialog({ open, onOpenChange }: { open: boolean; onOpenChang
                 }
               }}
             >
-              <Modal.Body className="grid gap-4">
+              <Modal.Body className="grid gap-4 !text-slate-900">
                 {isCodeStep ? (
                   <div className="grid justify-items-center gap-3 pt-6">
                     <InputOTP

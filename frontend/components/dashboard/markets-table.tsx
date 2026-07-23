@@ -547,7 +547,7 @@ function MarketEditDialog({ market, onClose, onSaved }: { market: DashboardMarke
               <Modal.Heading>{t("dashboard.editMarketShares")}</Modal.Heading>
               <p className="mt-1 break-all text-sm text-muted-foreground">{market?.publicBaseUrl || market?.email}</p>
             </Modal.Header>
-            <Modal.Body className="grid max-h-[72vh] gap-4 overflow-y-auto">
+            <Modal.Body className="grid max-h-[72vh] gap-4 overflow-y-auto !text-slate-900">
               {error ? <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div> : null}
               <div className="grid gap-3 sm:grid-cols-4">
                 <Info label={t("dashboard.market")} value={market?.email} />

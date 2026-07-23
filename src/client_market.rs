@@ -140,14 +140,20 @@ impl ClientMarketJobSecrets {
         &mut self,
         token_hash: &str,
         source_ip: IpAddr,
-    ) -> Option<ProvisionTokenSecret> {
+    ) -> Result<ProvisionTokenSecret, AppError> {
         self.prune();
-        let secret = self.tokens.get_mut(token_hash)?;
-        if secret.host_ip != source_ip {
-            return None;
+        let secret = self.tokens.get_mut(token_hash).ok_or_else(|| {
+            AppError::NotFound("provision credential not found or expired".into())
+        })?;
+        let expected = normalize_ip_for_compare(secret.host_ip);
+        let actual = normalize_ip_for_compare(source_ip);
+        if expected != actual {
+            return Err(AppError::Unauthorized(format!(
+                "provisioning host IP mismatch (expected {expected}, got {actual})"
+            )));
         }
         secret.redeemed_at.get_or_insert_with(Instant::now);
-        Some(secret.clone())
+        Ok(secret.clone())
     }
 
     fn allow_host_registration(&mut self, owner: &str, target: IpAddr, source: IpAddr) -> bool {
@@ -1071,15 +1077,14 @@ async fn redeem_provision_token(
         .ok_or_else(|| AppError::Unauthorized("provision token source is unavailable".into()))?;
     let secret = {
         let mut secrets = state.client_market_job_secrets.lock().await;
-        secrets.redeem_token(&token_hash, source_ip)
-    }
-    .ok_or_else(|| AppError::NotFound("provision token not found or expired".into()))?;
+        secrets.redeem_token(&token_hash, source_ip)?
+    };
     state
         .store
         .client_market_validate_token_redemption(
             &secret.job_id,
             &token_hash,
-            &source_ip.to_string(),
+            &normalize_ip_for_compare(source_ip).to_string(),
         )
         .await?;
     Ok((
@@ -1333,6 +1338,10 @@ async fn run_create_job_inner(state: &ServerState, job_id: &str) -> Result<(), A
 
 async fn handle_create_job_failure(state: &ServerState, job_id: &str, error: &AppError) {
     warn!(job_id = %job_id, error = %error, "rolling back failed client market provisioning");
+    let _ = state
+        .store
+        .client_market_append_job_log(job_id, &format!("provisioning error: {error}\n"))
+        .await;
     state
         .client_market_job_secrets
         .lock()
@@ -2101,17 +2110,7 @@ fn shell_quote(value: &str) -> String {
 fn sanitize_job_log_chunk(chunk: &str) -> String {
     let mut output = String::new();
     for line in chunk.lines().take(200) {
-        let lower = line.to_ascii_lowercase();
-        if [
-            "password",
-            "token",
-            "authorization",
-            "bearer",
-            "provision-tokens",
-        ]
-        .iter()
-        .any(|needle| lower.contains(needle))
-        {
+        if job_log_line_looks_sensitive(line) {
             output.push_str("[sensitive output redacted]\n");
             continue;
         }
@@ -2127,6 +2126,27 @@ fn sanitize_job_log_chunk(chunk: &str) -> String {
         }
     }
     output
+}
+
+fn job_log_line_looks_sensitive(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    // Keep prose like "provision token redemption failed" visible in job logs.
+    // Only redact lines that look like they embed secret material.
+    lower.contains("password=")
+        || lower.contains("password:")
+        || lower.contains("token=")
+        || lower.contains("authorization:")
+        || lower.contains("bearer ")
+}
+
+fn normalize_ip_for_compare(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+        other => other,
+    }
 }
 
 fn host_to_view(host: RouterSshHostRecord, reveal: bool) -> RouterSshHostView {
@@ -2753,8 +2773,8 @@ impl AppStore {
             .optional()
             .map_err(|e| AppError::Internal(format!("validate provision token failed: {e}")))?;
         if valid.is_none() {
-            return Err(AppError::NotFound(
-                "provision token not found or expired".into(),
+            return Err(AppError::Unauthorized(
+                "provision credential rejected for this host IP or job state".into(),
             ));
         }
         Ok(())
@@ -4282,7 +4302,7 @@ mod tests {
         assert!(
             secrets
                 .redeem_token(&token_hash, "198.18.3.2".parse().unwrap())
-                .is_none()
+                .is_err()
         );
         assert_eq!(
             secrets.redeem_token(&token_hash, host_ip).unwrap().password,
@@ -4290,8 +4310,12 @@ mod tests {
         );
         secrets.tokens.get_mut(&token_hash).unwrap().expires_at =
             Instant::now() - Duration::from_secs(1);
-        assert!(secrets.redeem_token(&token_hash, host_ip).is_none());
+        assert!(secrets.redeem_token(&token_hash, host_ip).is_err());
         assert!(!sanitize_job_log_chunk(&format!("token={raw_token}")).contains(&raw_token));
+        assert!(
+            sanitize_job_log_chunk("Provision token redemption failed\n")
+                .contains("Provision token redemption failed")
+        );
         drop(store);
         let _ = std::fs::remove_dir_all(root);
     }

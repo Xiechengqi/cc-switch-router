@@ -64,14 +64,21 @@ fetch_provision_credentials() {
     4) address_family=(-4) ;;
     6) address_family=(-6) ;;
   esac
+  local http_code=0
   response=$(printf '{"token":"%s"}' "${token}" | \
-    curl "${address_family[@]}" --fail --silent --show-error \
+    curl "${address_family[@]}" --silent --show-error \
       --retry 3 --retry-all-errors --connect-timeout 15 --max-time 60 \
       -H 'content-type: application/json' \
       -H 'accept: application/json' \
       --data-binary @- \
+      -w '\n%{http_code}' \
       "${ROUTER}/v1/client-market/provision-tokens/redeem") \
-    || die "Provision token redemption failed"
+    || die "Provision credential redemption request failed"
+  http_code="${response##*$'\n'}"
+  response="${response%$'\n'*}"
+  if [[ "${http_code}" != "200" ]]; then
+    die "Provision credential redemption failed (HTTP ${http_code}): ${response}"
+  fi
 
   local -a credentials=()
   mapfile -d '' -t credentials < <(

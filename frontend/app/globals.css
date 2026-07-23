@@ -265,6 +265,38 @@ textarea:-webkit-autofill:focus {
   color-scheme: light;
 }
 
+/*
+ * Token collision fix:
+ * - Our Tailwind/shadcn theme maps --color-muted to a LIGHT SURFACE (slate-100).
+ * - HeroUI utilities/components use `text-muted` expecting readable secondary TEXT.
+ * - Result: modal/drawer/card body copy inherits near-white ink on white backgrounds.
+ * Keep `bg-muted` as the surface token; force textual `text-muted` to muted-foreground.
+ */
+.text-muted {
+  color: rgb(var(--router-muted-foreground)) !important;
+}
+
+.modal__heading,
+.drawer__heading,
+.alert-dialog__heading,
+.modal__body,
+.drawer__body,
+.alert-dialog__body,
+.modal__footer,
+.drawer__footer,
+.alert-dialog__footer {
+  color: rgb(var(--router-foreground)) !important;
+}
+
+.card__description,
+.description,
+.modal__body .text-muted-foreground,
+.drawer__body .text-muted-foreground,
+.alert-dialog__body .text-muted-foreground {
+  color: rgb(var(--router-muted-foreground)) !important;
+}
+
+
 .font-display {
   font-family: var(--font-inter), Inter, system-ui, sans-serif !important;
   font-weight: 700;

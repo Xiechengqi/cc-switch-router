@@ -246,7 +246,7 @@ export function ShareUserGrantsEditor({
               <Modal.Header>
                 <Modal.Heading>{editingEmail ? t("dashboard.userLimit.edit") : t("dashboard.userLimit.add")}</Modal.Heading>
               </Modal.Header>
-              <Modal.Body className="grid gap-4 sm:grid-cols-2">
+              <Modal.Body className="grid gap-4 !text-slate-900 sm:grid-cols-2">
                 <div className="grid gap-1.5 sm:col-span-2">
                   <span className="mono-label text-muted-foreground">Email</span>
                   <Input type="email" value={grantDraft?.email || ""} disabled={!!editingEmail} onChange={(event) => grantDraft && setGrantDraft({ ...grantDraft, email: event.target.value })} />

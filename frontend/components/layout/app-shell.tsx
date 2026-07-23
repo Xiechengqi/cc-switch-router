@@ -202,7 +202,7 @@ function ApiTokenDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (
                 </p>
               </div>
             </Modal.Header>
-            <Modal.Body className="grid gap-4">
+            <Modal.Body className="grid gap-4 !text-slate-900">
               {error ? <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div> : null}
               <div className="grid gap-2 rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-900">
                 <div className="flex justify-between gap-3">

@@ -58,7 +58,7 @@ export function ShareEditDialog({
                   ) : null}
                 </div>
               </Modal.Header>
-              <Modal.Body className="min-h-0 flex-1 overflow-y-auto">
+              <Modal.Body className="min-h-0 flex-1 overflow-y-auto !text-slate-900">
                 {readOnly && share ? (
                   <ShareEditReadView share={share} markets={markets} t={t} />
                 ) : share && form ? (

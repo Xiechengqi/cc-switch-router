@@ -158,7 +158,7 @@ export const ShareConnectDialog = React.memo(function ShareConnectDialog({
                 </p>
               </div>
             </Modal.Header>
-            <Modal.Body className="grid gap-4">
+            <Modal.Body className="grid gap-4 !text-slate-900">
               <BaseUrlRow t={t} baseUrl={baseUrl} />
               <ApiKeyRow
                 t={t}

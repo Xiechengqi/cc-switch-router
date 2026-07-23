@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { Button, Modal, toast } from "@heroui/react";
-import { ExternalLink, Loader2, LogIn, Minus, Plus } from "lucide-react";
+import { Dices, ExternalLink, Loader2, LogIn, Minus, Plus } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CountryFlag } from "@/components/common/country-flag";
 import { useLocaleText } from "@/components/i18n/locale-provider";
@@ -20,9 +20,10 @@ const HOST_OWNERS_KEY = "cc_switch_router_create_client_host_owners_v1";
 const REGIONS_KEY = "cc_switch_router_create_client_regions_v1";
 
 function randomSubdomain() {
+  const letters = "abcdefghijklmnopqrstuvwxyz";
   const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
-  let out = "";
-  for (let i = 0; i < 10; i++) out += alphabet[Math.floor(Math.random() * alphabet.length)];
+  let out = letters[Math.floor(Math.random() * letters.length)];
+  for (let i = 1; i < 10; i++) out += alphabet[Math.floor(Math.random() * alphabet.length)];
   return out;
 }
 
@@ -297,14 +298,23 @@ export function CreateClientDialog({
       setError(t("createClient.noCapacity"));
       return;
     }
+    if (quantity > 1) {
+      toast.info(t("createClient.batchSoon"));
+      return;
+    }
     if (password.length < 8) {
       setError(t("createClient.passwordHint"));
+      return;
+    }
+    const nextSubdomain = subdomain.trim();
+    if (!nextSubdomain) {
+      setError(t("createClient.subdomainRequired"));
       return;
     }
     setBusy(true);
     setError("");
     try {
-      const availability = await checkClientTunnelSubdomainAvailability(subdomain.trim());
+      const availability = await checkClientTunnelSubdomainAvailability(nextSubdomain);
       if (!availability.available) {
         setError(t("createClient.subdomainTaken"));
         setBusy(false);
@@ -313,7 +323,7 @@ export function CreateClientDialog({
       const { jobId } = await createClientMarketClient({
         hostOwnerEmails: resolvedOwnerEmails,
         countryCodes: resolvedCountryCodes,
-        subdomain: subdomain.trim(),
+        subdomain: nextSubdomain,
         password,
         count: 1,
       });
@@ -345,9 +355,9 @@ export function CreateClientDialog({
         <Modal.Container placement="center">
           <Modal.Dialog className="light w-[min(640px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
             <Modal.Header>
-              <Modal.Heading>{t("createClient.title")}</Modal.Heading>
+              <Modal.Heading className="!text-slate-900">{t("createClient.title")}</Modal.Heading>
             </Modal.Header>
-            <Modal.Body className="grid max-h-[min(70vh,560px)] gap-4 overflow-y-auto">
+            <Modal.Body className="grid max-h-[min(70vh,560px)] gap-4 overflow-y-auto !text-slate-900">
               {phase === "success" ? (
                 <div className="grid gap-2 rounded-lg border border-emerald-200 bg-emerald-50 p-4 text-sm">
                   <p className="font-semibold text-emerald-900">{t("createClient.successTitle")}</p>
@@ -413,7 +423,7 @@ export function CreateClientDialog({
                     </div>
                   ) : null}
                   <section className="grid gap-2">
-                    <div className="text-sm font-medium">{t("createClient.hostOwners")}</div>
+                    <div className="text-sm font-medium text-slate-900">{t("createClient.hostOwners")}</div>
                     <div className="flex flex-wrap gap-2">
                       <Button
                         size="sm"
@@ -464,7 +474,7 @@ export function CreateClientDialog({
 
                   <section className="grid gap-2">
                     <div className="flex flex-wrap items-center justify-between gap-2">
-                      <div className="text-sm font-medium">{t("createClient.regions")}</div>
+                      <div className="text-sm font-medium text-slate-900">{t("createClient.regions")}</div>
                       <div className="flex flex-wrap gap-2">
                         <Button
                           size="sm"
@@ -518,27 +528,30 @@ export function CreateClientDialog({
                   </section>
 
                   <section className="grid gap-2">
-                    <div className="text-sm font-medium">{t("createClient.quantity")}</div>
+                    <div className="text-sm font-medium text-slate-900">{t("createClient.quantity")}</div>
                     <div className="inline-flex items-center gap-2">
                       <Button
                         size="sm"
                         variant="outline"
                         isIconOnly
                         className="h-8 w-8 min-w-8 rounded-md p-0"
-                        isDisabled
+                        isDisabled={quantity <= 1 || phase === "running"}
                         aria-label={t("createClient.decreaseQuantity")}
                         onClick={() => setQuantity((q) => Math.max(1, q - 1))}
                       >
                         <Minus className="h-4 w-4" />
                       </Button>
-                      <span className="min-w-8 text-center font-mono text-sm">{quantity}</span>
+                      <span className="min-w-8 text-center font-mono text-sm text-slate-900">{quantity}</span>
                       <Button
                         size="sm"
                         variant="outline"
                         isIconOnly
                         className="h-8 w-8 min-w-8 rounded-md p-0"
+                        isDisabled={quantity >= Math.max(1, selectedIdleCapacity) || phase === "running"}
                         aria-label={t("createClient.increaseQuantity")}
-                        onClick={() => toast.info(t("createClient.batchSoon"))}
+                        onClick={() =>
+                          setQuantity((q) => Math.min(Math.max(1, selectedIdleCapacity), q + 1))
+                        }
                       >
                         <Plus className="h-4 w-4" />
                       </Button>
@@ -549,16 +562,36 @@ export function CreateClientDialog({
                   </section>
 
                   <label className="grid gap-1 text-sm">
-                    <span className="font-medium">{t("createClient.subdomain")}</span>
-                    <input
-                      value={subdomain}
-                      onChange={(e) => setSubdomain(e.target.value)}
-                      className="h-11 rounded-lg border border-border bg-white px-3 font-mono text-slate-900 outline-none focus:ring-2 focus:ring-primary/30"
-                      autoComplete="off"
-                    />
+                    <span className="font-medium text-slate-900">{t("createClient.subdomain")}</span>
+                    <div className="flex items-center gap-2">
+                      <input
+                        value={quantity > 1 ? t("createClient.subdomainRandom") : subdomain}
+                        onChange={(e) => {
+                          if (quantity > 1) return;
+                          setSubdomain(e.target.value);
+                        }}
+                        readOnly={quantity > 1}
+                        disabled={quantity > 1}
+                        className="h-11 min-w-0 flex-1 rounded-lg border border-border bg-white px-3 font-mono text-slate-900 outline-none focus:ring-2 focus:ring-primary/30 disabled:cursor-not-allowed disabled:bg-slate-50 disabled:text-slate-500"
+                        autoComplete="off"
+                      />
+                      {quantity === 1 ? (
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          className="h-11 shrink-0 gap-1.5 px-3"
+                          aria-label={t("createClient.randomSubdomain")}
+                          onClick={() => setSubdomain(randomSubdomain())}
+                        >
+                          <Dices className="h-4 w-4" />
+                          {t("createClient.randomSubdomain")}
+                        </Button>
+                      ) : null}
+                    </div>
                   </label>
                   <label className="grid gap-1 text-sm">
-                    <span className="font-medium">{t("createClient.password")}</span>
+                    <span className="font-medium text-slate-900">{t("createClient.password")}</span>
                     <input
                       type="password"
                       value={password}

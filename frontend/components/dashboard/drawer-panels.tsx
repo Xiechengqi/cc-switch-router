@@ -901,7 +901,7 @@ export function ShareUsageTrend({ usage, t }: { usage: ShareUsageByEmailResponse
               <Modal.Header>
                 <Modal.Heading>{t("dashboard.usageEmail.trendTitle")}</Modal.Heading>
               </Modal.Header>
-              <Modal.Body className="grid gap-3">
+              <Modal.Body className="grid gap-3 !text-slate-900">
                 <div className="overflow-x-auto rounded-md border bg-muted/10 p-3">
                   <ShareUsageTrendChart usage={usage} rows={rows} colors={colors} t={t} size="expanded" />
                 </div>

@@ -94,7 +94,7 @@ export function AnnouncementDialog() {
         <Modal.Container placement="center" className="z-[70]">
           <Modal.Dialog className={`${DIALOG_CLASS} w-[min(640px,calc(100vw-2rem))] max-w-none`}>
             <Modal.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
-            <Modal.Body className="pt-2">
+            <Modal.Body className="pt-2 !text-slate-900">
               <ScrollShadow className="max-h-[min(60vh,480px)] pr-1">
                 <div
                   className="announcement-content text-sm leading-7 text-slate-800 [&_a]:text-primary [&_a]:underline [&_blockquote]:border-l-2 [&_blockquote]:border-slate-200 [&_blockquote]:pl-3 [&_h1]:text-xl [&_h1]:font-semibold [&_h2]:text-lg [&_h2]:font-semibold [&_h3]:text-base [&_h3]:font-semibold [&_li]:ml-4 [&_ol]:list-decimal [&_p+_p]:mt-3 [&_pre]:overflow-x-auto [&_pre]:rounded-md [&_pre]:bg-slate-100 [&_pre]:p-3 [&_ul]:list-disc"
