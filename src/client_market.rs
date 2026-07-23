@@ -684,6 +684,9 @@ struct RouterSshHostView {
     client_owner_email: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     installation_id: Option<String>,
+    /// True when the current viewer may open Web Terminal for this host.
+    #[serde(default)]
+    can_web_terminal: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_verified_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -730,6 +733,11 @@ async fn list_hosts(
                     .is_some_and(|owner| value.eq_ignore_ascii_case(owner))
             });
             let reveal_installation = reveal_operations || is_client_owner;
+            let can_web_terminal = is_client_owner
+                && host
+                    .installation_id
+                    .as_deref()
+                    .is_some_and(|id| !id.trim().is_empty());
             let ip_intel = host_ip_intel_for_viewer(
                 host.ip_intel_json.as_deref(),
                 &host.ip,
@@ -758,6 +766,7 @@ async fn list_hosts(
                 installation_id: reveal_installation
                     .then_some(host.installation_id)
                     .flatten(),
+                can_web_terminal,
                 last_verified_at: reveal_operations.then_some(host.last_verified_at).flatten(),
                 last_error: reveal_operations.then_some(host.last_error).flatten(),
                 note: reveal_operations.then_some(host.note).flatten(),
@@ -2640,6 +2649,8 @@ fn host_to_view(host: RouterSshHostRecord, reveal: bool) -> RouterSshHostView {
         client_subdomain: host.client_subdomain,
         client_owner_email: reveal.then_some(host.client_owner_email).flatten(),
         installation_id: reveal.then_some(host.installation_id).flatten(),
+        // Caller-specific; list_hosts sets this from the viewer session.
+        can_web_terminal: false,
         last_verified_at: reveal.then_some(host.last_verified_at).flatten(),
         last_error: reveal.then_some(host.last_error).flatten(),
         note: reveal.then_some(host.note).flatten(),
@@ -2741,9 +2752,11 @@ impl AppStore {
             "SELECT h.id, h.ip, h.port, h.host_owner_email, h.country_code, h.hostname,
                     h.ssh_host_key_fingerprint, h.status, h.installation_id,
                     h.last_verified_at, h.last_error, h.note, h.created_at, h.updated_at,
-                    h.ip_intel_json, t.subdomain, t.owner_email
+                    h.ip_intel_json, t.subdomain,
+                    COALESCE(NULLIF(TRIM(t.owner_email), ''), NULLIF(TRIM(i.owner_email), ''))
              FROM router_ssh_hosts h
              LEFT JOIN installation_client_tunnels t ON t.installation_id = h.installation_id
+             LEFT JOIN installations i ON i.id = h.installation_id
              WHERE 1=1",
         );
         let mut binds: Vec<String> = Vec::new();
@@ -4139,9 +4152,11 @@ fn get_router_ssh_host(
         "SELECT h.id, h.ip, h.port, h.host_owner_email, h.country_code, h.hostname,
                 h.ssh_host_key_fingerprint, h.status, h.installation_id,
                 h.last_verified_at, h.last_error, h.note, h.created_at, h.updated_at,
-                h.ip_intel_json, t.subdomain, t.owner_email
+                h.ip_intel_json, t.subdomain,
+                COALESCE(NULLIF(TRIM(t.owner_email), ''), NULLIF(TRIM(i.owner_email), ''))
          FROM router_ssh_hosts h
          LEFT JOIN installation_client_tunnels t ON t.installation_id = h.installation_id
+         LEFT JOIN installations i ON i.id = h.installation_id
          WHERE h.id = ?1",
         params![id],
         map_router_ssh_host_row,

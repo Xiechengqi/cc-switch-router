@@ -650,7 +650,9 @@ function HostRow({
     canManageHost &&
     (isAdmin || !host.installationId) &&
     (host.status === "unreachable" || host.status === "disabled" || host.status === "abnormal");
-  const canOpenTerminal = isClientOwner && !!host.installationId;
+  const canOpenTerminal =
+    host.canWebTerminal === true ||
+    (isClientOwner && !!host.installationId);
   const countryName = host.countryCode
     ? new Intl.DisplayNames([locale], { type: "region" }).of(host.countryCode) || host.countryCode
     : "";
@@ -742,6 +744,17 @@ function HostRow({
           <Chip size="sm" variant="soft" className="shrink-0">
             {t(statusLabelKey(host.status))}
           </Chip>
+          {canOpenTerminal ? (
+            <Button
+              variant="outline"
+              size="sm"
+              className="shrink-0"
+              onClick={() => setTerminalOpen(true)}
+            >
+              <TerminalSquare className="h-3.5 w-3.5" />
+              {t("clientMarket.webTerminal")}
+            </Button>
+          ) : null}
           {locationLabel || host.countryCode ? (
             <span className="inline-flex min-w-0 max-w-[14rem] items-center gap-1.5 text-xs text-muted-foreground">
               <CountryFlag code={host.countryCode} className="h-3.5 w-5 shrink-0 rounded-sm object-cover" />
@@ -772,17 +785,6 @@ function HostRow({
             <span className="shrink-0 font-mono text-xs text-foreground" title={host.hostname || undefined}>
               {ipPort}
             </span>
-          ) : null}
-          {canOpenTerminal ? (
-            <Button
-              variant="outline"
-              size="sm"
-              className="shrink-0"
-              onClick={() => setTerminalOpen(true)}
-            >
-              <TerminalSquare className="h-3.5 w-3.5" />
-              {t("clientMarket.webTerminal")}
-            </Button>
           ) : null}
           {hasActions ? (
             <Dropdown>

@@ -1302,6 +1302,7 @@ export type ClientMarketHost = {
   clientSubdomain?: string;
   clientOwnerEmail?: string;
   installationId?: string;
+  canWebTerminal?: boolean;
   lastVerifiedAt?: string;
   lastError?: string;
   note?: string;
