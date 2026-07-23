@@ -4654,6 +4654,9 @@ mod tests {
             client_market_job_secrets: Arc::new(Mutex::new(
                 crate::client_market::ClientMarketJobSecrets::default(),
             )),
+            client_market_terminal: Arc::new(Mutex::new(
+                crate::client_market_terminal::TerminalSessionManager::default(),
+            )),
             recent_traffic: RecentTraffic::new(),
             abuse: Arc::new(crate::abuse::AbuseTracker::new()),
             ip_blacklist_stats: Arc::new(crate::ip_blacklist_stats::IpBlacklistStats::new()),

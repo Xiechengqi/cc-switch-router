@@ -11,6 +11,7 @@ use crate::abuse::AbuseTracker;
 use crate::admin::upgrade::SharedUpgradeRegistry;
 use crate::board_telegram::TelegramNotifier;
 use crate::client_market::ClientMarketJobSecrets;
+use crate::client_market_terminal::TerminalSessionManager;
 use crate::config::Config;
 use crate::dynamic_settings::DynamicSettings;
 use crate::ip_blacklist_stats::IpBlacklistStats;
@@ -44,6 +45,8 @@ pub struct ServerState {
     pub provision_ssh_public_key: String,
     /// One-time provision tokens for remote install scripts (passwords kept in memory).
     pub client_market_job_secrets: Arc<Mutex<ClientMarketJobSecrets>>,
+    /// Short-lived web terminal tickets and per-owner session counters.
+    pub client_market_terminal: Arc<Mutex<TerminalSessionManager>>,
     /// In-memory rolling tracker of proxy traffic by user origin. Drives the dashboard
     /// "demand" overlay and burst-arc animation; not persisted across restarts.
     pub recent_traffic: RecentTraffic,

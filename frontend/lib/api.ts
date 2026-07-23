@@ -693,6 +693,14 @@ export async function reverifyClientMarketHost(id: string) {
   );
 }
 
+export async function createClientMarketTerminalSession(hostId: string) {
+  return parseJson<{ ticket: string; expiresInSec: number }>(
+    await authFetch(`/v1/client-market/hosts/${encodeURIComponent(hostId)}/terminal-session`, {
+      method: "POST",
+    }),
+  );
+}
+
 export async function createClientMarketClient(body: CreateClientMarketClientRequest) {
   return parseJson<CreateClientMarketClientResponse>(
     await authFetch("/v1/client-market/clients", {

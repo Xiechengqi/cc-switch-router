@@ -5,6 +5,7 @@ mod board_telegram;
 mod cf;
 mod client_chat;
 mod client_market;
+mod client_market_terminal;
 mod client_meta;
 mod config;
 mod ctl_client;
@@ -168,6 +169,9 @@ async fn main() -> Result<()> {
         provision_ssh_authorized_keys_line,
         provision_ssh_public_key,
         client_market_job_secrets: Arc::new(Mutex::new(ClientMarketJobSecrets::default())),
+        client_market_terminal: Arc::new(Mutex::new(
+            crate::client_market_terminal::TerminalSessionManager::default(),
+        )),
         recent_traffic: RecentTraffic::new(),
         abuse: Arc::new(AbuseTracker::new()),
         ip_blacklist_stats: Arc::new(IpBlacklistStats::new()),

@@ -2,12 +2,13 @@
 
 import * as React from "react";
 import { Button, Chip, Dropdown, Modal, Tabs, toast } from "@heroui/react";
-import { Check, ChevronDown, Circle, Loader2, MoreHorizontal, Plus, RefreshCw, Trash2, X } from "lucide-react";
+import { Check, ChevronDown, Circle, Loader2, MoreHorizontal, Plus, RefreshCw, TerminalSquare, Trash2, X } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { CopyableCodeField } from "@/components/common/copyable-code-field";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { CountryFlag } from "@/components/common/country-flag";
+import { ClientMarketTerminalDialog } from "@/components/dashboard/client-market-terminal-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   cleanupClientMarketClient,
@@ -630,6 +631,7 @@ function HostRow({
   const { locale, t } = useLocaleText();
   const [busy, setBusy] = React.useState(false);
   const [confirmAction, setConfirmAction] = React.useState<"delete" | "cleanup" | null>(null);
+  const [terminalOpen, setTerminalOpen] = React.useState(false);
   const canManageHost =
     !!viewerEmail &&
     (isAdmin || viewerEmail.toLowerCase() === host.hostOwnerEmail.toLowerCase());
@@ -648,6 +650,7 @@ function HostRow({
     canManageHost &&
     (isAdmin || !host.installationId) &&
     (host.status === "unreachable" || host.status === "disabled" || host.status === "abnormal");
+  const canOpenTerminal = isClientOwner && !!host.installationId;
   const countryName = host.countryCode
     ? new Intl.DisplayNames([locale], { type: "region" }).of(host.countryCode) || host.countryCode
     : "";
@@ -770,6 +773,17 @@ function HostRow({
               {ipPort}
             </span>
           ) : null}
+          {canOpenTerminal ? (
+            <Button
+              variant="outline"
+              size="sm"
+              className="shrink-0"
+              onClick={() => setTerminalOpen(true)}
+            >
+              <TerminalSquare className="h-3.5 w-3.5" />
+              {t("clientMarket.webTerminal")}
+            </Button>
+          ) : null}
           {hasActions ? (
             <Dropdown>
               <Dropdown.Trigger className="shrink-0 outline-none">
@@ -845,6 +859,12 @@ function HostRow({
           }}
         />
       ) : null}
+      <ClientMarketTerminalDialog
+        open={terminalOpen}
+        hostId={terminalOpen ? host.id : null}
+        hostLabel={hostLabel}
+        onOpenChange={setTerminalOpen}
+      />
     </>
   );
 }
