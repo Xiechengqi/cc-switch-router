@@ -1005,9 +1005,8 @@ async fn create_host(
     let (hostname, fingerprint) =
         ssh_verify_host(&state, &ip.to_string(), port, &known_hosts).await?;
     let intel = crate::ip_iq::lookup_host_ip_intel(&ip.to_string()).await?;
-    let intel_json = serde_json::to_string(&intel).map_err(|e| {
-        AppError::Internal(format!("serialize host ip intel failed: {e}"))
-    })?;
+    let intel_json = serde_json::to_string(&intel)
+        .map_err(|e| AppError::Internal(format!("serialize host ip intel failed: {e}")))?;
     let host = state
         .store
         .client_market_insert_host(
@@ -1037,10 +1036,7 @@ async fn reverify_host(
         .await?;
     if !matches!(
         host.status.as_str(),
-        HOST_STATUS_UNREACHABLE
-            | HOST_STATUS_DISABLED
-            | HOST_STATUS_IDLE
-            | HOST_STATUS_ABNORMAL
+        HOST_STATUS_UNREACHABLE | HOST_STATUS_DISABLED | HOST_STATUS_IDLE | HOST_STATUS_ABNORMAL
     ) {
         return Err(AppError::Conflict(
             "host cannot be reverified in its current state".into(),
@@ -1378,7 +1374,8 @@ pub async fn reconcile_stale_market_hosts(state: ServerState) -> Result<(), AppE
             continue;
         };
         if now.signed_duration_since(updated)
-            < chrono::Duration::from_std(STALE_DRAINING_AFTER).unwrap_or(chrono::Duration::minutes(10))
+            < chrono::Duration::from_std(STALE_DRAINING_AFTER)
+                .unwrap_or(chrono::Duration::minutes(10))
         {
             continue;
         }
@@ -1847,7 +1844,9 @@ async fn run_cleanup_job_inner(
         .client_market_get_job_record(job_id)
         .await?
         .ok_or_else(|| AppError::NotFound("job not found".into()))?;
-    if job.job_type != JOB_TYPE_CLEANUP || job.status != JOB_STATUS_RUNNING || !is_cleanup_phase(&job.phase)
+    if job.job_type != JOB_TYPE_CLEANUP
+        || job.status != JOB_STATUS_RUNNING
+        || !is_cleanup_phase(&job.phase)
     {
         return Err(AppError::Conflict(
             "cleanup job is not runnable in its current state".into(),
@@ -1875,7 +1874,8 @@ async fn run_cleanup_job_inner(
             "cleanup host installation binding mismatch".into(),
         ));
     }
-    if let (Some(job_sub), Some(host_sub)) = (job.subdomain.as_deref(), host.client_subdomain.as_deref())
+    if let (Some(job_sub), Some(host_sub)) =
+        (job.subdomain.as_deref(), host.client_subdomain.as_deref())
     {
         if !job_sub.eq_ignore_ascii_case(host_sub) {
             return Err(AppError::Conflict(
@@ -1904,7 +1904,10 @@ async fn run_cleanup_job_inner(
             ssh_stop_cc_switch_server(state, &host).await?;
             state
                 .store
-                .client_market_append_job_log(job_id, "remote process stopped (or already stopped)\n")
+                .client_market_append_job_log(
+                    job_id,
+                    "remote process stopped (or already stopped)\n",
+                )
                 .await?;
             state
                 .store
@@ -1972,7 +1975,9 @@ async fn run_cleanup_job_inner(
                     .store
                     .client_market_append_job_log(
                         job_id,
-                        &format!("purge attempt {attempt}/{CLEANUP_PURGE_ATTEMPTS} failed: {err}\n"),
+                        &format!(
+                            "purge attempt {attempt}/{CLEANUP_PURGE_ATTEMPTS} failed: {err}\n"
+                        ),
                     )
                     .await?;
                 last_purge_error = Some(err);
@@ -1989,7 +1994,10 @@ async fn run_cleanup_job_inner(
     }
     state
         .store
-        .client_market_append_job_log(job_id, "installation purged from router; marking host idle\n")
+        .client_market_append_job_log(
+            job_id,
+            "installation purged from router; marking host idle\n",
+        )
         .await?;
     state
         .store
@@ -2203,13 +2211,10 @@ struct PasswordAskpassMaterial {
 
 impl PasswordAskpassMaterial {
     fn create(password: &str) -> Result<(Self, PathBuf), AppError> {
-        let dir = std::env::temp_dir().join(format!(
-            "cc-switch-router-ssh-askpass-{}",
-            Uuid::new_v4()
-        ));
-        fs::create_dir(&dir).map_err(|e| {
-            AppError::Internal(format!("create ssh askpass directory failed: {e}"))
-        })?;
+        let dir =
+            std::env::temp_dir().join(format!("cc-switch-router-ssh-askpass-{}", Uuid::new_v4()));
+        fs::create_dir(&dir)
+            .map_err(|e| AppError::Internal(format!("create ssh askpass directory failed: {e}")))?;
         let material = Self { dir: dir.clone() };
         let password_path = dir.join("password");
         let askpass_path = dir.join("askpass.sh");
@@ -2223,12 +2228,10 @@ impl PasswordAskpassMaterial {
             "#!/bin/sh\nexec cat {}\n",
             shell_quote(&password_path.display().to_string())
         );
-        fs::write(&askpass_path, script).map_err(|e| {
-            AppError::Internal(format!("write ssh askpass script failed: {e}"))
-        })?;
-        fs::set_permissions(&askpass_path, fs::Permissions::from_mode(0o700)).map_err(|e| {
-            AppError::Internal(format!("chmod ssh askpass script failed: {e}"))
-        })?;
+        fs::write(&askpass_path, script)
+            .map_err(|e| AppError::Internal(format!("write ssh askpass script failed: {e}")))?;
+        fs::set_permissions(&askpass_path, fs::Permissions::from_mode(0o700))
+            .map_err(|e| AppError::Internal(format!("chmod ssh askpass script failed: {e}")))?;
         Ok((material, askpass_path))
     }
 }
@@ -2395,8 +2398,14 @@ async fn ssh_verify_host(
 ) -> Result<(Option<String>, Option<String>), AppError> {
     let _known_hosts_guard = PROVISION_KNOWN_HOSTS_LOCK.lock().await;
     // Reject hosts that already run cc-switch-server (same check used when claiming).
-    if ssh_host_has_running_cc_switch_server(state, ip, port, known_hosts, SshHostKeyPolicy::AcceptNew)
-        .await?
+    if ssh_host_has_running_cc_switch_server(
+        state,
+        ip,
+        port,
+        known_hosts,
+        SshHostKeyPolicy::AcceptNew,
+    )
+    .await?
     {
         return Err(AppError::Conflict(
             "host is already running cc-switch-server; stop the process before adding it to Client Market"
@@ -2713,11 +2722,7 @@ async fn claim_idle_host_without_running_server(
                 let reason = "cc-switch-server process is already running; host marked abnormal";
                 state
                     .store
-                    .client_market_mark_host_abnormal_and_detach_job(
-                        job_id,
-                        &host.id,
-                        reason,
-                    )
+                    .client_market_mark_host_abnormal_and_detach_job(job_id, &host.id, reason)
                     .await?;
                 state
                     .store
@@ -2734,11 +2739,7 @@ async fn claim_idle_host_without_running_server(
                 let reason = format!("host process check failed: {error}");
                 state
                     .store
-                    .client_market_mark_host_unreachable_and_detach_job(
-                        job_id,
-                        &host.id,
-                        &reason,
-                    )
+                    .client_market_mark_host_unreachable_and_detach_job(job_id, &host.id, &reason)
                     .await?;
                 state
                     .store
@@ -2988,7 +2989,8 @@ async fn ssh_run_remote_with_input(
                 "cc-switch-server process is already running".into(),
             ));
         }
-        if code == Some(44) || detail.contains("failed to remove cc-switch-server installation files")
+        if code == Some(44)
+            || detail.contains("failed to remove cc-switch-server installation files")
         {
             return Err(AppError::Conflict(
                 "failed to remove cc-switch-server installation files".into(),
@@ -3747,9 +3749,7 @@ impl AppStore {
             )
             .map_err(|e| AppError::Internal(format!("set provisioning job phase failed: {e}")))?;
         if changed != 1 {
-            return Err(AppError::Conflict(
-                "provisioning job is not running".into(),
-            ));
+            return Err(AppError::Conflict("provisioning job is not running".into()));
         }
         Ok(())
     }
@@ -4185,9 +4185,9 @@ impl AppStore {
         reason: &str,
     ) -> Result<(), AppError> {
         let mut conn = self.conn.lock().await;
-        let tx = conn.transaction().map_err(|e| {
-            AppError::Internal(format!("begin quarantine host tx failed: {e}"))
-        })?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| AppError::Internal(format!("begin quarantine host tx failed: {e}")))?;
         let now = Utc::now().to_rfc3339();
         let clipped = if reason.len() > 500 {
             format!("{}…", &reason[..497])
@@ -4553,7 +4553,9 @@ impl AppStore {
                     params![host.0],
                     |row| row.get(0),
                 )
-                .map_err(|e| AppError::Internal(format!("count active cleanup jobs failed: {e}")))?;
+                .map_err(|e| {
+                    AppError::Internal(format!("count active cleanup jobs failed: {e}"))
+                })?;
             if active > 0 {
                 return Err(AppError::Conflict(
                     "client host already has an active cleanup job".into(),
@@ -5773,7 +5775,9 @@ mod tests {
             public.get("ip").and_then(|value| value.as_str()),
             Some("203.xx.xx.9")
         );
-        let public_intel = public.get("ipIntel").expect("public view should expose ip intel");
+        let public_intel = public
+            .get("ipIntel")
+            .expect("public view should expose ip intel");
         assert_eq!(
             public_intel.get("isp").and_then(|value| value.as_str()),
             Some("Cognetcloud INC")
@@ -5878,7 +5882,10 @@ mod tests {
         assert!(command.contains("mkdir -p \"$HOME/.ssh\""));
         assert!(command.contains("authorized_keys"));
         assert!(command.contains("grep -qxF"));
-        assert!(command.contains("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest cc-switch-router-provision"));
+        assert!(
+            command
+                .contains("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest cc-switch-router-provision")
+        );
         assert!(command.contains("printf 'ok\\n'"));
         let with_quote = install_provision_key_remote_command("line'with'quote");
         assert!(with_quote.contains("'\"'\"'"));
@@ -5891,13 +5898,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(with_password.root_password.as_deref(), Some("secret"));
-        let without: CreateHostRequest =
-            serde_json::from_str(r#"{"ip":"8.8.8.8"}"#).unwrap();
+        let without: CreateHostRequest = serde_json::from_str(r#"{"ip":"8.8.8.8"}"#).unwrap();
         assert!(without.root_password.is_none());
-        let test_req: TestHostSshRequest = serde_json::from_str(
-            r#"{"ip":"8.8.8.8","rootPassword":"pw"}"#,
-        )
-        .unwrap();
+        let test_req: TestHostSshRequest =
+            serde_json::from_str(r#"{"ip":"8.8.8.8","rootPassword":"pw"}"#).unwrap();
         assert_eq!(test_req.root_password.as_deref(), Some("pw"));
     }
 

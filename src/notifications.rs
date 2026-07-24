@@ -1100,7 +1100,10 @@ pub fn render_registration_email(data: &RegistrationEmailData) -> RenderedNotifi
     let rows = vec![
         ("Client", id),
         ("Client URL", display_value(data.client_url.as_deref())),
-        ("Web password hint", display_value(data.password_hint.as_deref())),
+        (
+            "Web password hint",
+            display_value(data.password_hint.as_deref()),
+        ),
         ("Owner", display_value(data.owner_email.as_deref())),
         ("Platform", display_value(Some(&data.platform))),
         ("Version", display_value(data.version.as_deref())),

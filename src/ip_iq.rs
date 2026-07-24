@@ -135,11 +135,7 @@ pub async fn lookup_host_ip_intel(ip: &str) -> Result<HostIpIntel, AppError> {
     )))
 }
 
-async fn lookup_one(
-    client: &reqwest::Client,
-    host: &str,
-    ip: &str,
-) -> Result<HostIpIntel, String> {
+async fn lookup_one(client: &reqwest::Client, host: &str, ip: &str) -> Result<HostIpIntel, String> {
     let url = format!("http://{host}/iq?ip={ip}");
     let mut response = timeout(IQ_TIMEOUT, client.get(&url).send())
         .await
@@ -182,9 +178,7 @@ async fn lookup_one(
     let network = payload.network;
     let classification = payload.classification;
     Ok(HostIpIntel {
-        query: payload
-            .query
-            .unwrap_or_else(|| ip.to_string()),
+        query: payload.query.unwrap_or_else(|| ip.to_string()),
         ip: payload.ip,
         location: payload.location,
         score: payload.score,
@@ -206,9 +200,7 @@ async fn lookup_one(
         network_type: network
             .as_ref()
             .and_then(|value| value.network_type.clone()),
-        classification_type: classification
-            .as_ref()
-            .and_then(|value| value.kind.clone()),
+        classification_type: classification.as_ref().and_then(|value| value.kind.clone()),
         proxy: classification.as_ref().and_then(|value| value.proxy),
         vpn: classification.as_ref().and_then(|value| value.vpn),
         hosting: classification.as_ref().and_then(|value| value.hosting),
@@ -257,7 +249,10 @@ mod tests {
             }
         }"#;
         let payload: IqResponse = serde_json::from_str(raw).unwrap();
-        assert_eq!(payload.geo.as_ref().unwrap().country_code.as_deref(), Some("JP"));
+        assert_eq!(
+            payload.geo.as_ref().unwrap().country_code.as_deref(),
+            Some("JP")
+        );
         assert_eq!(payload.classification.as_ref().unwrap().vpn, Some(true));
     }
 }

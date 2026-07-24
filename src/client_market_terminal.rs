@@ -401,7 +401,9 @@ async fn handle_client_message(
             writer
                 .write_all(&decoded)
                 .map_err(|e| format!("write pty failed: {e}"))?;
-            writer.flush().map_err(|e| format!("flush pty failed: {e}"))?;
+            writer
+                .flush()
+                .map_err(|e| format!("flush pty failed: {e}"))?;
         }
         MSG_RESIZE => {
             if bytes.len() == 1 {

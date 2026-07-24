@@ -18000,10 +18000,53 @@ fn apply_quota_blocks_to_app_availability(
             model_health.gemini.as_slice(),
         ),
     ] {
-        if let Some(entry) = quota_blocked_app_availability(app_type, provider, health, now) {
+        if let Some(entry) = quota_blocked_app_availability(app_type, provider, health, now)
+            .or_else(|| provider_unavailable_app_availability(app_type, provider, health, now))
+        {
             set_market_app_availability_entry(availability, app_type, entry);
         }
     }
+}
+
+fn provider_unavailable_app_availability(
+    app_type: &str,
+    provider: Option<&ShareUpstreamProvider>,
+    health: &[ModelHealthSummary],
+    now: DateTime<Utc>,
+) -> Option<MarketAppAvailabilityEntry> {
+    let provider = provider?;
+    if provider.available != Some(false) {
+        return None;
+    }
+    let latest = health
+        .iter()
+        .max_by_key(|entry| entry.last_checked_at.unwrap_or_default());
+    Some(MarketAppAvailabilityEntry {
+        status: "unavailable".to_string(),
+        reason: provider
+            .health
+            .as_ref()
+            .and_then(|health| health.reason.clone())
+            .or_else(|| latest.and_then(|entry| entry.error_message.clone()))
+            .or_else(|| Some("provider health check failed".to_string())),
+        requested_model: Some(
+            latest
+                .map(|entry| entry.requested_model.clone())
+                .unwrap_or_else(|| app_type.to_string()),
+        ),
+        actual_model: Some(
+            latest
+                .map(|entry| entry.actual_model.clone())
+                .unwrap_or_else(|| app_type.to_string()),
+        ),
+        last_checked_at: latest
+            .and_then(|entry| entry.last_checked_at)
+            .or_else(|| Some(now.timestamp())),
+        recent_results: latest
+            .map(|entry| entry.recent_results.clone())
+            .filter(|results| !results.is_empty())
+            .unwrap_or_else(|| vec!["failed".to_string()]),
+    })
 }
 
 fn quota_blocked_app_availability(
@@ -18284,7 +18327,7 @@ fn filter_provider_by_app_health(
     now: DateTime<Utc>,
 ) -> Option<ShareUpstreamProvider> {
     let provider = provider?;
-    if app_health_blocks_runtime(health, app_type, now) {
+    if provider.available == Some(false) || app_health_blocks_runtime(health, app_type, now) {
         None
     } else {
         Some(provider)
@@ -37784,6 +37827,45 @@ mod tests {
         let filtered = filter_app_runtimes_by_model_health(runtimes, &health, Utc::now());
 
         assert!(filtered.codex.is_none());
+    }
+
+    #[test]
+    fn market_runtime_filter_honors_server_confirmed_provider_unavailability() {
+        let mut provider = test_upstream_provider("gpt-5.5");
+        provider.available = Some(false);
+        let runtimes = ShareAppRuntimes {
+            codex: Some(provider),
+            ..ShareAppRuntimes::default()
+        };
+        let health = ShareModelHealthSummary {
+            codex: vec![test_model_summary("gpt-5.5", &["failed"])],
+            ..ShareModelHealthSummary::default()
+        };
+
+        let filtered = filter_app_runtimes_by_model_health(runtimes, &health, Utc::now());
+
+        assert!(filtered.codex.is_none());
+    }
+
+    #[test]
+    fn server_confirmed_provider_unavailability_blocks_market_scheduling() {
+        let mut provider = test_upstream_provider("gpt-5.5");
+        provider.available = Some(false);
+        provider.health = Some(crate::models::ShareProviderHealth {
+            reason: Some("authentication failed".into()),
+            ..Default::default()
+        });
+        let health = vec![test_model_summary("gpt-5.5", &["failed"])];
+
+        let availability =
+            provider_unavailable_app_availability("codex", Some(&provider), &health, Utc::now())
+                .expect("confirmed unavailable Provider should block the app");
+
+        assert_eq!(availability.status, "unavailable");
+        assert_eq!(
+            availability.reason.as_deref(),
+            Some("authentication failed")
+        );
     }
 
     #[test]
