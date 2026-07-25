@@ -31,6 +31,7 @@ import {
   testClientMarketHostSsh,
   updateClientMarketHostOffer,
 } from "@/lib/api";
+import { billingUrgencyTier } from "@/lib/billing-urgency";
 import { mergeBillingMap, mergeHosts } from "@/lib/client-market-refresh";
 import { DASHBOARD_ACCOUNT_PATH } from "@/lib/dashboard-nav";
 import type {
@@ -1301,12 +1302,19 @@ function HostRow({
   const cleanupPhase = cleanupJob?.phase || "";
   const cleanupTone =
     cleanupJob?.status === "failed" ? "failed" : cleanupJob?.status === "succeeded" ? "success" : "running";
-  const hasBillingCountdown = !!(
+  // Keep the subrow in sync with what ClientMarketBillingBanner actually paints:
+  // silent (>7d) and non-owner billing render nothing and must not leave an empty row.
+  const urgency = billingUrgencyTier(billing);
+  const showBillingRow = !!(
     billing &&
-    billing.priceCents &&
-    (billing.status === "payment_due" ? billing.paymentDeadline : billing.currentPeriodEnd)
+    billing.isClientOwner &&
+    billing.status !== "released" &&
+    (billing.status === "releasing" ||
+      billing.status === "release_failed" ||
+      (urgency != null && urgency !== "silent"))
   );
-  const showSubrow = hasBillingCountdown || !!host.note;
+  const noteText = host.note?.trim() || "";
+  const showSubrow = showBillingRow || !!noteText;
   const ipIntelSubtitle = secondaryIntelParts.length ? secondaryIntelParts.join(" · ") : "";
   const statusGuidanceKey = hostStatusGuidanceKey(host.status, host.lastError);
   const statusGuidanceSubtitle = statusGuidanceKey ? t(statusGuidanceKey) : "";
@@ -1483,10 +1491,12 @@ function HostRow({
         <tr className="border-b border-border/60 bg-muted/20">
           <td colSpan={colSpan} className="px-2 py-1.5 align-middle">
             <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] leading-4 text-muted-foreground">
-              <ClientMarketBillingBanner billing={billing} onChanged={onChanged} compact showPayButton />
-              {host.note ? (
-                <span className="min-w-0 whitespace-normal break-words" title={host.note}>
-                  {host.note}
+              {showBillingRow ? (
+                <ClientMarketBillingBanner billing={billing} onChanged={onChanged} compact showPayButton />
+              ) : null}
+              {noteText ? (
+                <span className="min-w-0 whitespace-normal break-words" title={noteText}>
+                  {noteText}
                 </span>
               ) : null}
             </div>
