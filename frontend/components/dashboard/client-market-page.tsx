@@ -1306,10 +1306,7 @@ function HostRow({
     billing.priceCents &&
     (billing.status === "payment_due" ? billing.paymentDeadline : billing.currentPeriodEnd)
   );
-  const showSubrow =
-    !!host.clientOwnerEmail ||
-    hasBillingCountdown ||
-    !!host.note;
+  const showSubrow = hasBillingCountdown || !!host.note;
   const ipIntelSubtitle = secondaryIntelParts.length ? secondaryIntelParts.join(" · ") : "";
   const statusGuidanceKey = hostStatusGuidanceKey(host.status, host.lastError);
   const statusGuidanceSubtitle = statusGuidanceKey ? t(statusGuidanceKey) : "";
@@ -1370,17 +1367,22 @@ function HostRow({
             {formatHostOffer(host.priceCents, host.rentalPeriodDays, locale)}
           </span>
         </td>
-        <td className="max-w-[10rem] px-2 py-2 align-middle">
-          {subdomain ? (
+        <td className="max-w-[12rem] px-2 py-2 align-middle">
+          <div
+            className="min-w-0"
+            title={[subdomain || undefined, host.clientOwnerEmail || undefined].filter(Boolean).join(" · ") || undefined}
+          >
             <span
-              className="block truncate font-mono text-xs text-muted-foreground"
-              title={host.installationId || host.hostname || undefined}
+              className={`block truncate font-mono text-xs ${subdomain ? "text-muted-foreground" : "text-muted-foreground/50"}`}
             >
-              {subdomain}
+              {subdomain || "—"}
             </span>
-          ) : (
-            <span className="text-xs text-muted-foreground/50">—</span>
-          )}
+            {host.clientOwnerEmail ? (
+              <span className="mt-0.5 block truncate text-[11px] leading-4 text-muted-foreground">
+                {t("clientMarket.rentedBy", { email: host.clientOwnerEmail })}
+              </span>
+            ) : null}
+          </div>
         </td>
         <td className="max-w-[14rem] px-2 py-2 align-middle">
           {ipPort ? (
@@ -1481,11 +1483,6 @@ function HostRow({
         <tr className="border-b border-border/60 bg-muted/20">
           <td colSpan={colSpan} className="px-2 py-1.5 align-middle">
             <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] leading-4 text-muted-foreground">
-              {host.clientOwnerEmail ? (
-                <span className="min-w-0 whitespace-normal break-words" title={host.clientOwnerEmail}>
-                  {t("clientMarket.rentedBy", { email: host.clientOwnerEmail })}
-                </span>
-              ) : null}
               <ClientMarketBillingBanner billing={billing} onChanged={onChanged} compact showPayButton />
               {host.note ? (
                 <span className="min-w-0 whitespace-normal break-words" title={host.note}>
