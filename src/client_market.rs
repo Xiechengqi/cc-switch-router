@@ -866,7 +866,11 @@ async fn list_hosts(
             // Host operations (port, SSH details, notes, etc.) are host-owner only.
             // Admins / Router owners do not get elevated market host privileges.
             let is_host_owner = viewer.as_ref().is_some_and(|session| {
-                host.provider_id.as_deref() == Some(session.user_id.as_str())
+                session_is_host_owner(
+                    session,
+                    host.provider_id.as_deref(),
+                    &host.host_owner_email,
+                )
             });
             let is_client_owner = viewer.as_ref().is_some_and(|session| {
                 host.client_owner_user_id.as_deref() == Some(session.user_id.as_str())
@@ -1175,7 +1179,13 @@ async fn export_hosts(
         .await?;
     let hosts = hosts
         .into_iter()
-        .filter(|host| host.provider_id.as_deref() == Some(session.user_id.as_str()))
+        .filter(|host| {
+            session_is_host_owner(
+                &session,
+                host.provider_id.as_deref(),
+                &host.host_owner_email,
+            )
+        })
         .map(|host| HostTransferEntry {
             ip: host.ip,
             port: host.port,
@@ -1419,7 +1429,7 @@ async fn reverify_host(
     let session = require_session(&state, &headers).await?;
     let host = state
         .store
-        .client_market_get_host_for_operator(&id, &session.user_id)
+        .client_market_get_host_for_operator(&id, &session)
         .await?;
     if !matches!(
         host.status.as_str(),
@@ -1492,7 +1502,7 @@ async fn delete_host(
     let session = require_session(&state, &headers).await?;
     state
         .store
-        .client_market_delete_host(&id, &session.user_id)
+        .client_market_delete_host(&id, &session)
         .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -3781,6 +3791,26 @@ fn normalize_market_email(value: &str) -> Result<String, AppError> {
     Ok(email)
 }
 
+/// Host ownership for market ops: stable provider user id, legacy `email:` provider
+/// key, or current host_owner_email matching the session.
+pub(crate) fn session_is_host_owner(
+    session: &crate::models::AuthSession,
+    provider_id: Option<&str>,
+    host_owner_email: &str,
+) -> bool {
+    if provider_id == Some(session.user_id.as_str()) {
+        return true;
+    }
+    let Ok(session_email) = normalize_market_email(&session.email) else {
+        return false;
+    };
+    let email_keyed = format!("email:{session_email}");
+    if provider_id == Some(email_keyed.as_str()) {
+        return true;
+    }
+    normalize_market_email(host_owner_email).is_ok_and(|host_email| host_email == session_email)
+}
+
 fn placeholders(count: usize) -> String {
     std::iter::repeat_n("?", count)
         .collect::<Vec<_>>()
@@ -4260,12 +4290,16 @@ impl AppStore {
     pub async fn client_market_delete_host(
         &self,
         id: &str,
-        viewer_user_id: &str,
+        session: &crate::models::AuthSession,
     ) -> Result<(), AppError> {
         let conn = self.conn.lock().await;
         let host = get_router_ssh_host(&conn, id)?
             .ok_or_else(|| AppError::NotFound("host not found".into()))?;
-        if host.provider_id.as_deref() != Some(viewer_user_id) {
+        if !session_is_host_owner(
+            session,
+            host.provider_id.as_deref(),
+            &host.host_owner_email,
+        ) {
             return Err(AppError::Forbidden(
                 "not allowed to delete this host".into(),
             ));
@@ -4930,12 +4964,16 @@ impl AppStore {
     pub async fn client_market_get_host_for_operator(
         &self,
         id: &str,
-        viewer_user_id: &str,
+        session: &crate::models::AuthSession,
     ) -> Result<RouterSshHostRecord, AppError> {
         let conn = self.conn.lock().await;
         let host = get_router_ssh_host(&conn, id)?
             .ok_or_else(|| AppError::NotFound("host not found".into()))?;
-        if host.provider_id.as_deref() != Some(viewer_user_id) {
+        if !session_is_host_owner(
+            session,
+            host.provider_id.as_deref(),
+            &host.host_owner_email,
+        ) {
             return Err(AppError::Forbidden(
                 "not allowed to operate this host".into(),
             ));
@@ -5506,11 +5544,28 @@ impl AppStore {
                 ));
             }
         }
-        let is_host_owner = actor_user_id.is_some_and(|user_id| host.1.as_deref() == Some(user_id));
+        let is_host_owner = actor_user_id.is_some_and(|user_id| host.1.as_deref() == Some(user_id))
+            || normalize_market_email(&viewer)
+                .ok()
+                .and_then(|viewer_email| {
+                    normalize_market_email(&host.2)
+                        .ok()
+                        .map(|host_email| host_email == viewer_email)
+                })
+                .unwrap_or(false);
         let is_client_owner = actor_user_id.is_some_and(|user_id| {
             subscription_owner
                 .as_ref()
                 .is_some_and(|owner| owner.0 == user_id)
+        }) || subscription_owner.as_ref().is_some_and(|owner| {
+            normalize_market_email(&viewer)
+                .ok()
+                .and_then(|viewer_email| {
+                    normalize_market_email(&owner.1)
+                        .ok()
+                        .map(|client_email| client_email == viewer_email)
+                })
+                .unwrap_or(false)
         });
         // `is_admin` here means Router system automation only (no session actor).
         // Human admins / Router owners are never elevated for market Host cleanup.

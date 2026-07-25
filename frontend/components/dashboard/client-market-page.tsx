@@ -109,35 +109,39 @@ function hostDisplayLabel(host: ClientMarketHost) {
   return host.hostname || host.ip || host.id.slice(0, 8);
 }
 
-function hostCanManage(host: ClientMarketHost) {
-  return host.isHostOwner === true;
+function hostCanManage(host: ClientMarketHost, viewerEmail?: string | null) {
+  if (host.isHostOwner === true) return true;
+  // Fallback when API ownership flags lag behind host_owner_email.
+  const viewer = viewerEmail?.trim().toLowerCase();
+  const owner = host.hostOwnerEmail?.trim().toLowerCase();
+  return !!viewer && !!owner && viewer === owner;
 }
 
-function hostCanCleanup(host: ClientMarketHost) {
+function hostCanCleanup(host: ClientMarketHost, viewerEmail?: string | null) {
   return (
     !!host.installationId &&
     (host.status === "allocated" || host.status === "unreachable" || host.status === "draining") &&
-    (hostCanManage(host) || host.isClientOwner === true)
+    (hostCanManage(host, viewerEmail) || host.isClientOwner === true)
   );
 }
 
-function hostCanReverify(host: ClientMarketHost) {
+function hostCanReverify(host: ClientMarketHost, viewerEmail?: string | null) {
   return (
-    hostCanManage(host) &&
+    hostCanManage(host, viewerEmail) &&
     (host.status === "unreachable" || host.status === "disabled" || host.status === "abnormal")
   );
 }
 
-function hostCanDelete(host: ClientMarketHost) {
+function hostCanDelete(host: ClientMarketHost, viewerEmail?: string | null) {
   return (
-    hostCanManage(host) &&
+    hostCanManage(host, viewerEmail) &&
     !host.installationId &&
     (host.status === "idle" || host.status === "disabled" || host.status === "abnormal")
   );
 }
 
-function hostCanExport(host: ClientMarketHost) {
-  return host.isHostOwner === true && !!host.ip && host.port != null;
+function hostCanExport(host: ClientMarketHost, viewerEmail?: string | null) {
+  return hostCanManage(host, viewerEmail) && !!host.ip && host.port != null;
 }
 
 function hostExportKey(host: { ip?: string | null; port?: number | null }) {
@@ -1180,25 +1184,27 @@ function HostRow({
   onCreate: (host: ClientMarketHost) => void;
 }) {
   const { locale, t } = useLocaleText();
+  const { session } = useAuth();
+  const viewerEmail = session?.user?.email;
   const { openTerminal } = useWebTerminal();
   const [busy, setBusy] = React.useState(false);
   const [confirmAction, setConfirmAction] = React.useState<"delete" | "cleanup" | "unpaid" | null>(null);
   const [cleanupJob, setCleanupJob] = React.useState<ProvisioningJob | null>(null);
   const [cleanupOpen, setCleanupOpen] = React.useState(false);
   const [offerOpen, setOfferOpen] = React.useState(false);
-  const canManageHost = hostCanManage(host);
-  const canDelete = hostCanDelete(host);
+  const canManageHost = hostCanManage(host, viewerEmail);
+  const canDelete = hostCanDelete(host, viewerEmail);
   const isClientOwner = host.isClientOwner === true;
-  const canCleanup = hostCanCleanup(host);
+  const canCleanup = hostCanCleanup(host, viewerEmail);
   const canMarkUnpaid =
     !!host.installationId &&
     host.status === "allocated" &&
-    host.isHostOwner === true &&
+    canManageHost &&
     !isClientOwner;
   const isRetryCleanup =
     canCleanup && (host.status === "unreachable" || host.status === "draining");
-  const canReverify = hostCanReverify(host);
-  const canOpenTerminal = host.canWebTerminal === true;
+  const canReverify = hostCanReverify(host, viewerEmail);
+  const canOpenTerminal = host.canWebTerminal === true || canManageHost;
   const hostLabel = hostDisplayLabel(host);
   const terminalTitle = host.ip || hostLabel;
   const countryName = host.countryCode
@@ -1793,6 +1799,7 @@ export function ClientMarketPage() {
   const { session } = useAuth();
   const authed = !!session?.authenticated;
   const viewerUserId = session?.user?.id;
+  const viewerEmail = session?.user?.email;
 
   const [hosts, setHosts] = React.useState<ClientMarketHost[]>([]);
   const [billingByInstallation, setBillingByInstallation] = React.useState<Map<string, ClientMarketBilling>>(new Map());
@@ -1955,20 +1962,20 @@ export function ClientMarketPage() {
   );
   const selectedCount = selectedIds.size;
   const cleanupEligible = React.useMemo(
-    () => selectedHosts.filter((host) => hostCanCleanup(host)),
-    [selectedHosts],
+    () => selectedHosts.filter((host) => hostCanCleanup(host, viewerEmail)),
+    [selectedHosts, viewerEmail],
   );
   const reverifyEligible = React.useMemo(
-    () => selectedHosts.filter((host) => hostCanReverify(host)),
-    [selectedHosts],
+    () => selectedHosts.filter((host) => hostCanReverify(host, viewerEmail)),
+    [selectedHosts, viewerEmail],
   );
   const deleteEligible = React.useMemo(
-    () => selectedHosts.filter((host) => hostCanDelete(host)),
-    [selectedHosts],
+    () => selectedHosts.filter((host) => hostCanDelete(host, viewerEmail)),
+    [selectedHosts, viewerEmail],
   );
   const exportEligible = React.useMemo(
-    () => selectedHosts.filter((host) => hostCanExport(host)),
-    [selectedHosts],
+    () => selectedHosts.filter((host) => hostCanExport(host, viewerEmail)),
+    [selectedHosts, viewerEmail],
   );
 
   const setHostSelected = React.useCallback((hostId: string, selected: boolean) => {
@@ -2071,7 +2078,7 @@ export function ClientMarketPage() {
 
   const runBatchCleanup = async () => {
     const targets = cleanupEligible;
-    const skippedHosts = selectedHosts.filter((host) => !hostCanCleanup(host));
+    const skippedHosts = selectedHosts.filter((host) => !hostCanCleanup(host, viewerEmail));
     const { byId, patch } = beginBatchProgress("cleanup", targets, skippedHosts);
     setBatchBusy(true);
     try {
@@ -2104,7 +2111,7 @@ export function ClientMarketPage() {
 
   const runBatchReverify = async () => {
     const targets = reverifyEligible;
-    const skippedHosts = selectedHosts.filter((host) => !hostCanReverify(host));
+    const skippedHosts = selectedHosts.filter((host) => !hostCanReverify(host, viewerEmail));
     const { byId, patch } = beginBatchProgress("reverify", targets, skippedHosts);
     setBatchBusy(true);
     try {
@@ -2128,7 +2135,7 @@ export function ClientMarketPage() {
 
   const runBatchDelete = async () => {
     const targets = deleteEligible;
-    const skippedHosts = selectedHosts.filter((host) => !hostCanDelete(host));
+    const skippedHosts = selectedHosts.filter((host) => !hostCanDelete(host, viewerEmail));
     const { byId, patch } = beginBatchProgress("delete", targets, skippedHosts);
     setBatchBusy(true);
     try {

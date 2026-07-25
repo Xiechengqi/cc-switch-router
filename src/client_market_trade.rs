@@ -1980,9 +1980,9 @@ impl AppStore {
         let tx = conn
             .transaction()
             .map_err(|error| AppError::Internal(format!("begin offer update failed: {error}")))?;
-        let host: Option<(Option<String>, Option<i64>, Option<i64>, i64, String)> = tx
+        let host: Option<(Option<String>, String, Option<i64>, Option<i64>, i64, String)> = tx
             .query_row(
-                "SELECT provider_id, price_cents, rental_period_days, offer_revision, status
+                "SELECT provider_id, host_owner_email, price_cents, rental_period_days, offer_revision, status
                  FROM router_ssh_hosts WHERE id = ?1",
                 params![host_id],
                 |row| {
@@ -1992,19 +1992,24 @@ impl AppStore {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
                     ))
                 },
             )
             .optional()
             .map_err(|error| AppError::Internal(format!("read host offer failed: {error}")))?;
-        let (provider_id, old_price, old_period, old_revision, host_status) =
+        let (provider_id, host_owner_email, old_price, old_period, old_revision, host_status) =
             host.ok_or_else(|| AppError::NotFound("host not found".into()))?;
-        if provider_id.as_deref() != Some(session.user_id.as_str()) {
+        if !crate::client_market::session_is_host_owner(
+            session,
+            provider_id.as_deref(),
+            &host_owner_email,
+        ) {
             return Err(AppError::Forbidden(
                 "not allowed to edit this Host offer".into(),
             ));
         }
-        if provider_id.as_deref() == Some(session.user_id.as_str()) {
+        {
             let email = normalize_email(&session.email)?;
             tx.execute(
                 "INSERT INTO host_provider_profiles
@@ -2018,6 +2023,23 @@ impl AppStore {
             .map_err(|error| {
                 AppError::Internal(format!("sync offer Provider profile failed: {error}"))
             })?;
+            // Heal legacy email-keyed / drifted provider_id onto the session user.
+            if provider_id.as_deref() != Some(session.user_id.as_str()) {
+                tx.execute(
+                    "UPDATE router_ssh_hosts
+                     SET provider_id = ?2, host_owner_email = ?3, updated_at = ?4
+                     WHERE id = ?1",
+                    params![
+                        host_id,
+                        session.user_id,
+                        email,
+                        Utc::now().to_rfc3339()
+                    ],
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!("heal Host provider identity failed: {error}"))
+                })?;
+            }
         }
         if old_price == price_cents && old_period == rental_period_days {
             tx.commit().map_err(|error| {
@@ -2039,12 +2061,7 @@ impl AppStore {
         // Paid offers require the Host owner's Account payment details so renters
         // have a way to pay. Free forever does not require a payment profile.
         if price_cents.is_some() {
-            let Some(host_provider_id) = provider_id.as_deref() else {
-                return Err(AppError::Conflict(
-                    "host is missing a Provider identity".into(),
-                ));
-            };
-            require_payment_profile_for_offer(&tx, host_provider_id)?;
+            require_payment_profile_for_offer(&tx, &session.user_id)?;
         }
         let revision = old_revision + 1;
         tx.execute(

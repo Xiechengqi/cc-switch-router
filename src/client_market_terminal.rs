@@ -140,7 +140,7 @@ async fn create_terminal_session(
         .client_market_get_host(&host_id)
         .await?
         .ok_or_else(|| AppError::NotFound("host not found".into()))?;
-    authorize_web_terminal(&host, &session.user_id)?;
+    authorize_web_terminal(&host, &session)?;
 
     let mut manager = state.client_market_terminal.lock().await;
     let ticket = manager.issue_ticket(TerminalTicket {
@@ -457,9 +457,13 @@ async fn send_ws_notice(mut socket: WebSocket, message: &str) -> Result<(), Stri
 
 fn authorize_web_terminal(
     host: &RouterSshHostRecord,
-    viewer_user_id: &str,
+    session: &crate::models::AuthSession,
 ) -> Result<(), AppError> {
-    if host.provider_id.as_deref() == Some(viewer_user_id) {
+    if crate::client_market::session_is_host_owner(
+        session,
+        host.provider_id.as_deref(),
+        &host.host_owner_email,
+    ) {
         return Ok(());
     }
     Err(AppError::Forbidden(
@@ -514,18 +518,36 @@ mod tests {
         }
     }
 
+    fn session(user_id: &str, email: &str) -> crate::models::AuthSession {
+        use chrono::Utc;
+        crate::models::AuthSession {
+            session_id: "s".into(),
+            user_id: user_id.into(),
+            email: email.into(),
+            installation_id: String::new(),
+            access_token_hash: String::new(),
+            refresh_token_hash: String::new(),
+            access_expires_at: Utc::now(),
+            refresh_expires_at: Utc::now(),
+            created_at: Utc::now(),
+            last_used_at: Utc::now(),
+        }
+    }
+
     #[test]
     fn authorize_allows_host_owner_only() {
         let host = sample_host(Some("client@example.com"), Some("inst-1"));
-        assert!(authorize_web_terminal(&host, "provider-1").is_ok());
-        assert!(authorize_web_terminal(&host, "client-1").is_err());
-        assert!(authorize_web_terminal(&host, "other-user").is_err());
-        // Admins (including router owner) are intentionally excluded.
-        assert!(authorize_web_terminal(&host, "admin-1").is_err());
+        assert!(authorize_web_terminal(&host, &session("provider-1", "host@example.com")).is_ok());
+        assert!(authorize_web_terminal(&host, &session("client-1", "client@example.com")).is_err());
+        assert!(authorize_web_terminal(&host, &session("other-user", "other@example.com")).is_err());
+        // Admins (including router owner) are intentionally excluded unless they own the host.
+        assert!(authorize_web_terminal(&host, &session("admin-1", "admin@example.com")).is_err());
+        // Legacy ownership: email matches even when provider_id differs.
+        assert!(authorize_web_terminal(&host, &session("uuid-host", "host@example.com")).is_ok());
 
         let idle = sample_host(None, None);
-        assert!(authorize_web_terminal(&idle, "provider-1").is_ok());
-        assert!(authorize_web_terminal(&idle, "client-1").is_err());
+        assert!(authorize_web_terminal(&idle, &session("provider-1", "host@example.com")).is_ok());
+        assert!(authorize_web_terminal(&idle, &session("client-1", "client@example.com")).is_err());
     }
 
     #[test]
