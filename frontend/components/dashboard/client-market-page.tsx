@@ -9,7 +9,6 @@ import { CompactRegionMultiSelect } from "@/components/common/compact-region-mul
 import { CopyableCodeField } from "@/components/common/copyable-code-field";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { CountryFlag } from "@/components/common/country-flag";
-import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
 import { CreateClientDialog } from "@/components/dashboard/create-client-dialog";
 import { ProvisionJobLog } from "@/components/dashboard/provision-job-log";
 import { WebTerminalGlyph } from "@/components/dashboard/web-terminal/web-terminal-glyph";
@@ -1326,7 +1325,6 @@ function HostRow({
   const cleanupPhase = cleanupJob?.phase || "";
   const cleanupTone =
     cleanupJob?.status === "failed" ? "failed" : cleanupJob?.status === "succeeded" ? "success" : "running";
-  const paymentKinds = host.paymentMethodKinds || [];
   const hasBillingCountdown = !!(
     billing &&
     billing.priceCents &&
@@ -1392,14 +1390,9 @@ function HostRow({
           </span>
         </td>
         <td className="max-w-[9rem] whitespace-nowrap px-2 py-2 align-middle">
-          <div className="min-w-0">
-            <span className="block text-xs font-semibold text-foreground" title={t("clientMarket.currentOffer")}>
-              {formatHostOffer(host.priceCents, host.rentalPeriodDays, locale)}
-            </span>
-            {paymentKinds.length ? (
-              <PaymentMethodIcons kinds={paymentKinds} className="mt-0.5" />
-            ) : null}
-          </div>
+          <span className="block text-xs font-semibold text-foreground" title={t("clientMarket.currentOffer")}>
+            {formatHostOffer(host.priceCents, host.rentalPeriodDays, locale)}
+          </span>
         </td>
         <td className="max-w-[10rem] px-2 py-2 align-middle">
           {subdomain ? (
@@ -1611,9 +1604,40 @@ function HostRow({
 
 const OWNER_FILTER_KEY = "cc_switch_router_client_market_owner_filter_v1";
 const REGION_FILTER_KEY = "cc_switch_router_client_market_region_filter_v1";
+const PAYMENT_FILTER_KEY = "cc_switch_router_client_market_payment_filter_v1";
 const STATUS_FILTER_KEY = "cc_switch_router_client_market_status_filter_v2";
 const SORT_PREFS_KEY = "cc_switch_router_client_market_sort_v1";
 const HOST_PAGE_SIZE = 10;
+
+const PAYMENT_FILTER_KINDS = ["alipay", "wechat", "binance", "crypto", "custom"] as const;
+
+function paymentKindLabelKey(kind: string): MessageKey {
+  switch (kind) {
+    case "alipay":
+      return "billing.payment.alipay";
+    case "wechat":
+      return "billing.payment.wechat";
+    case "binance":
+      return "billing.payment.binance";
+    case "crypto":
+      return "billing.payment.crypto";
+    case "custom":
+      return "billing.payment.custom";
+    default:
+      return "billing.payment.custom";
+  }
+}
+
+function hostSupportsPaymentKind(hostKinds: string[] | undefined, required: string): boolean {
+  const kinds = new Set((hostKinds || []).map((kind) => kind.toLowerCase()));
+  if (required === "crypto") {
+    return kinds.has("crypto") || kinds.has("usdt") || kinds.has("usdc");
+  }
+  if (required === "usdt" || required === "usdc") {
+    return kinds.has(required) || kinds.has("crypto");
+  }
+  return kinds.has(required);
+}
 
 /** Compact page list: 1 … 4 5 6 … 12 */
 function buildHostPageItems(current: number, total: number): Array<number | "ellipsis"> {
@@ -1766,7 +1790,7 @@ function HostSortHeader({
       aria-sort={ariaSort}
       className="sticky top-0 z-10 border-b border-border bg-card px-2 py-2 text-left text-xs font-medium text-muted-foreground"
     >
-      <div className="grid gap-1.5">
+      <div className={`grid ${filter ? "gap-1" : "gap-1.5"}`}>
         <button
           type="button"
           className="inline-flex items-center gap-1 rounded-md px-1 py-0.5 text-left transition-colors hover:bg-muted/60 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2"
@@ -1808,6 +1832,7 @@ export function ClientMarketPage() {
   const [pendingAddAfterLogin, setPendingAddAfterLogin] = React.useState(false);
   const [ownerFilters, setOwnerFilters] = usePersistentState<string[]>(OWNER_FILTER_KEY, []);
   const [regionFilters, setRegionFilters] = usePersistentState<string[]>(REGION_FILTER_KEY, []);
+  const [paymentFilters, setPaymentFilters] = usePersistentState<string[]>(PAYMENT_FILTER_KEY, []);
   const [statusFilterRaw, setStatusFilter] = usePersistentState<HostStatusFilter>(STATUS_FILTER_KEY, "all");
   const [sortPrefsRaw, setSortPrefs] = usePersistentState<HostSortPrefs>(SORT_PREFS_KEY, DEFAULT_HOST_SORT);
   const sortPrefs = React.useMemo(() => normalizeHostSortPrefs(sortPrefsRaw), [sortPrefsRaw]);
@@ -1872,6 +1897,15 @@ export function ClientMarketPage() {
     }));
   }, [hosts, locale]);
 
+  const paymentOptions = React.useMemo(
+    () =>
+      PAYMENT_FILTER_KINDS.map((kind) => ({
+        value: kind,
+        label: t(paymentKindLabelKey(kind)),
+      })),
+    [t],
+  );
+
   const scopedHosts = React.useMemo(() => {
     const ownerSet = new Set(ownerFilters.map((email) => email.toLowerCase()));
     const regionSet = new Set(regionFilters.map((code) => code.toUpperCase()));
@@ -1881,9 +1915,15 @@ export function ClientMarketPage() {
         const code = (host.countryCode || "").trim().toUpperCase();
         if (!code || !regionSet.has(code)) return false;
       }
+      if (
+        paymentFilters.length > 0 &&
+        !paymentFilters.every((kind) => hostSupportsPaymentKind(host.paymentMethodKinds, kind))
+      ) {
+        return false;
+      }
       return true;
     });
-  }, [hosts, ownerFilters, regionFilters]);
+  }, [hosts, ownerFilters, paymentFilters, regionFilters]);
 
   const statusCounts = React.useMemo(() => {
     const counts: Record<HostStatusFilter, number> = {
@@ -1922,7 +1962,7 @@ export function ClientMarketPage() {
 
   React.useEffect(() => {
     setPage(1);
-  }, [ownerFilters, regionFilters, sortPrefs.key, sortPrefs.dir, statusFilter]);
+  }, [ownerFilters, paymentFilters, regionFilters, sortPrefs.key, sortPrefs.dir, statusFilter]);
 
   React.useEffect(() => {
     if (page > totalPages) setPage(totalPages);
@@ -2465,7 +2505,11 @@ export function ClientMarketPage() {
       ) : visibleHosts.length === 0 ? (
         <div className="grid justify-items-center gap-2 rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">
           <span>{scopedHosts.length ? t("dashboard.noFilterResults") : t("clientMarket.noHosts")}</span>
-          {scopedHosts.length || ownerFilters.length || regionFilters.length || statusFilter !== "all" ? (
+          {scopedHosts.length ||
+          ownerFilters.length ||
+          regionFilters.length ||
+          paymentFilters.length ||
+          statusFilter !== "all" ? (
             <button
               type="button"
               className="text-xs font-medium text-primary hover:underline"
@@ -2473,6 +2517,7 @@ export function ClientMarketPage() {
                 setStatusFilter("all");
                 setOwnerFilters([]);
                 setRegionFilters([]);
+                setPaymentFilters([]);
               }}
             >
               {t("dashboard.clearFilters")}
@@ -2533,7 +2578,7 @@ export function ClientMarketPage() {
                         moreLabel={(count) => t("clientMarket.regionsMore", { count })}
                         clearLabel={t("clientMarket.clearRegionSelection")}
                         ariaLabel={t("clientMarket.filterRegions")}
-                        className="min-w-[7.5rem] max-w-[11rem]"
+                        className="w-full max-w-[10.5rem]"
                       />
                     }
                   />
@@ -2551,11 +2596,28 @@ export function ClientMarketPage() {
                         moreLabel={(count) => t("clientMarket.ownersMore", { count })}
                         clearLabel={t("clientMarket.clearOwnerSelection")}
                         ariaLabel={t("clientMarket.filterOwners")}
-                        className="min-w-[8rem] max-w-[14rem]"
+                        className="w-full max-w-[12rem]"
                       />
                     }
                   />
-                  <HostSortHeader columnKey="offer" sortPrefs={sortPrefs} onSort={toggleHostSort} />
+                  <HostSortHeader
+                    columnKey="offer"
+                    sortPrefs={sortPrefs}
+                    onSort={toggleHostSort}
+                    filter={
+                      <CompactRegionMultiSelect
+                        compact
+                        values={paymentFilters}
+                        onChange={setPaymentFilters}
+                        options={paymentOptions}
+                        allLabel={t("clientMarket.allPayments")}
+                        moreLabel={(count) => t("clientMarket.paymentsMore", { count })}
+                        clearLabel={t("clientMarket.clearPaymentSelection")}
+                        ariaLabel={t("clientMarket.filterPayments")}
+                        className="w-full max-w-[10.5rem]"
+                      />
+                    }
+                  />
                   <HostSortHeader columnKey="subdomain" sortPrefs={sortPrefs} onSort={toggleHostSort} />
                   <HostSortHeader columnKey="ip" sortPrefs={sortPrefs} onSort={toggleHostSort} />
                   <th
