@@ -413,7 +413,6 @@ function ClientCard({
 
   return (
     <Card id={`dashboard-client-${client.installation.id}`} className={`min-w-0 max-w-full overflow-hidden rounded-lg border border-l-[3px] bg-white p-0 shadow-sm transition-[border-color,box-shadow] ${borderTone}`}>
-      <ClientMarketBillingBanner billing={billing} onChanged={onBillingChanged} />
       <Card.Content className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-3 p-3.5">
         <div
           className="group/client-header grid min-h-16 cursor-pointer select-text grid-cols-[minmax(0,1fr)_auto] items-start gap-3 rounded-md px-1.5 py-1 outline-none transition-colors hover:bg-primary/[0.03] focus-visible:ring-2 focus-visible:ring-primary/30 xl:grid-cols-[minmax(280px,1.1fr)_minmax(0,2.4fr)_auto] xl:items-center xl:gap-6"
@@ -458,6 +457,7 @@ function ClientCard({
             </div>
             <div className="flex min-w-0 flex-wrap items-center gap-2 pl-4">
               <OperationalStatusPill summary={summary} />
+              <ClientMarketBillingBanner billing={billing} onChanged={onBillingChanged} />
               {tunnelUrl ? <ClientConsoleButton client={client} /> : null}
               <ClientUpgradeButton client={client} />
               <ClientDetailsButton onOpen={openClientDrawer} />

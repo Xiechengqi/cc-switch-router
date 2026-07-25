@@ -3,12 +3,13 @@
 import * as React from "react";
 import { createPortal } from "react-dom";
 import { Button, Checkbox, Chip, Dropdown, Modal, Tabs, toast, Tooltip } from "@heroui/react";
-import { ArrowDown, ArrowUp, Check, CheckSquare, ChevronDown, ChevronLeft, ChevronRight, Circle, Clock3, Download, Loader2, MoreHorizontal, Pencil, Plus, RefreshCw, Trash2, Upload, X } from "lucide-react";
+import { ArrowDown, ArrowUp, Check, CheckSquare, ChevronDown, ChevronLeft, ChevronRight, Circle, Download, Loader2, MoreHorizontal, Pencil, Plus, RefreshCw, Trash2, Upload, X } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { CopyableCodeField } from "@/components/common/copyable-code-field";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { CountryFlag } from "@/components/common/country-flag";
+import { ClientMarketBillingBanner } from "@/components/dashboard/client-market-billing-banner";
 import { CreateClientDialog } from "@/components/dashboard/create-client-dialog";
 import { ProvisionJobLog } from "@/components/dashboard/provision-job-log";
 import { WebTerminalGlyph } from "@/components/dashboard/web-terminal/web-terminal-glyph";
@@ -392,42 +393,6 @@ function formatHostOffer(priceCents: number | undefined, rentalPeriodDays: numbe
   if (!priceCents || !rentalPeriodDays) return locale.startsWith("zh") ? "免费 · 永久" : "Free · forever";
   const amount = new Intl.NumberFormat(locale, { style: "currency", currency: "USD" }).format(priceCents / 100);
   return locale.startsWith("zh") ? `${amount} · ${rentalPeriodDays} 天` : `${amount} · ${rentalPeriodDays}d`;
-}
-
-function compactCountdown(value: string, locale: string) {
-  const remainingMinutes = Math.max(0, Math.ceil((Date.parse(value) - Date.now()) / 60_000));
-  const days = Math.floor(remainingMinutes / 1_440);
-  const hours = Math.floor((remainingMinutes % 1_440) / 60);
-  const minutes = remainingMinutes % 60;
-  if (locale.startsWith("zh")) {
-    if (days) return `${days}天 ${hours}小时`;
-    if (hours) return `${hours}小时 ${minutes}分钟`;
-    return `${minutes}分钟`;
-  }
-  if (days) return `${days}d ${hours}h`;
-  if (hours) return `${hours}h ${minutes}m`;
-  return `${minutes}m`;
-}
-
-function HostBillingCountdown({ billing }: { billing?: ClientMarketBilling }) {
-  const { locale, t } = useLocaleText();
-  const [, tick] = React.useState(0);
-  const target = billing?.status === "payment_due" ? billing.paymentDeadline : billing?.currentPeriodEnd;
-
-  React.useEffect(() => {
-    if (!target) return;
-    const timer = window.setInterval(() => tick((value) => value + 1), 30_000);
-    return () => window.clearInterval(timer);
-  }, [target]);
-
-  if (!billing || !target || !billing.priceCents) return null;
-  const key = billing.status === "payment_due" ? "clientMarket.paymentDueCountdown" : "clientMarket.nextBillCountdown";
-  return (
-    <span className={`inline-flex shrink-0 items-center gap-1 text-xs ${billing.status === "payment_due" ? "text-amber-700" : "text-muted-foreground"}`} title={new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(target))}>
-      <Clock3 className="h-3.5 w-3.5" />
-      {t(key, { countdown: compactCountdown(target, locale) })}
-    </span>
-  );
 }
 
 function parseHostOffer(priceUsd: string, periodDays: string, t: Translate) {
@@ -1521,7 +1486,7 @@ function HostRow({
                   {t("clientMarket.rentedBy", { email: host.clientOwnerEmail })}
                 </span>
               ) : null}
-              <HostBillingCountdown billing={billing} />
+              <ClientMarketBillingBanner billing={billing} onChanged={onChanged} compact showPayButton />
               {host.note ? (
                 <span className="min-w-0 whitespace-normal break-words" title={host.note}>
                   {host.note}

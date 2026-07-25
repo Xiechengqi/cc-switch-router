@@ -7940,6 +7940,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_supply_counts_drifted_free_forever_hosts_as_idle() {
+        let (store, _config, root) = test_store("provider-supply-drifted-free-idle");
+        store
+            .client_market_ensure_provider("provider-stable", "provider@example.com")
+            .await
+            .expect("create Provider profile");
+        let paid = add_provider_host(
+            &store,
+            "provider-stable",
+            "provider@example.com",
+            "198.18.25.1",
+            "US",
+            Some(500),
+            Some(30),
+        )
+        .await;
+        let free = add_provider_host(
+            &store,
+            "provider-stable",
+            "provider@example.com",
+            "198.18.25.2",
+            "JP",
+            None,
+            None,
+        )
+        .await;
+        {
+            let conn = store.conn.lock().await;
+            // Simulate legacy/drifted provider_id that never got healed by a paid offer edit.
+            conn.execute(
+                "UPDATE router_ssh_hosts
+                 SET provider_id = 'email:provider@example.com', price_cents = NULL, rental_period_days = NULL
+                 WHERE id = ?1",
+                params![free.id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE router_ssh_hosts SET status = 'idle' WHERE id IN (?1, ?2)",
+                params![paid.id, free.id],
+            )
+            .unwrap();
+        }
+
+        let supply = store
+            .client_market_provider_supply(Some("provider@example.com"))
+            .await
+            .expect("load Provider supply");
+        let provider = supply
+            .providers
+            .iter()
+            .find(|item| item.provider_id == "provider-stable")
+            .expect("stable provider");
+        assert_eq!(provider.host_total, 2);
+        assert_eq!(provider.idle_total, 2);
+        assert_eq!(provider.free_host_total, 1);
+        assert_eq!(provider.paid_host_total, 1);
+        let japan = provider
+            .countries
+            .iter()
+            .find(|country| country.code == "JP")
+            .expect("Japan capacity from free host");
+        assert_eq!(japan.idle, 1);
+        assert_eq!(japan.total, 1);
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn billing_reconcile_opens_one_renewal_and_reports_overdue_client() {
         let (store, _config, root) = test_store("trade-renewal");
         let host = add_provider_host(

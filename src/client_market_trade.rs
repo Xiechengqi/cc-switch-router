@@ -647,6 +647,59 @@ pub(crate) fn require_payment_profile_for_offer(
     Err(AppError::BadRequest(PAYMENT_PROFILE_REQUIRED_FOR_OFFER.into()))
 }
 
+/// Reattach hosts that belong to this owner email onto the canonical provider id.
+/// Free/forever hosts often keep a drifted `provider_id` because offer edits (which
+/// heal identity) are never applied to them.
+fn heal_hosts_onto_provider_tx(
+    tx: &Transaction<'_>,
+    provider_id: &str,
+    owner_email: &str,
+    email_keyed_provider_id: &str,
+    now: &str,
+) -> Result<(), AppError> {
+    tx.execute(
+        "UPDATE router_ssh_hosts
+         SET provider_id = ?1, host_owner_email = ?2, updated_at = ?3
+         WHERE provider_id = ?1
+            OR provider_id = ?4
+            OR lower(host_owner_email) = lower(?2)",
+        params![provider_id, owner_email, now, email_keyed_provider_id],
+    )
+    .map_err(|error| AppError::Internal(format!("heal Host Provider bindings failed: {error}")))?;
+    Ok(())
+}
+
+fn heal_all_provider_host_bindings_tx(tx: &Transaction<'_>, now: &str) -> Result<(), AppError> {
+    // Prefer stable (non email:) profiles when multiple could match.
+    tx.execute(
+        "UPDATE router_ssh_hosts
+         SET provider_id = (
+                SELECT p.provider_id
+                FROM host_provider_profiles p
+                WHERE lower(p.owner_email) = lower(router_ssh_hosts.host_owner_email)
+                ORDER BY CASE WHEN p.provider_id LIKE 'email:%' THEN 1 ELSE 0 END, p.created_at
+                LIMIT 1
+             ),
+             updated_at = ?1
+         WHERE EXISTS (
+                SELECT 1 FROM host_provider_profiles p
+                WHERE lower(p.owner_email) = lower(router_ssh_hosts.host_owner_email)
+             )
+           AND provider_id != (
+                SELECT p.provider_id
+                FROM host_provider_profiles p
+                WHERE lower(p.owner_email) = lower(router_ssh_hosts.host_owner_email)
+                ORDER BY CASE WHEN p.provider_id LIKE 'email:%' THEN 1 ELSE 0 END, p.created_at
+                LIMIT 1
+             )",
+        params![now],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!("heal all Host Provider bindings failed: {error}"))
+    })?;
+    Ok(())
+}
+
 fn normalize_payment_method(mut method: PaymentMethod) -> Result<PaymentMethod, AppError> {
     method.kind = method.kind.trim().to_ascii_lowercase();
     method.account = clean_optional(method.account, 200)?;
@@ -1371,30 +1424,131 @@ impl AppStore {
         owner_email: &str,
     ) -> Result<String, AppError> {
         let email = normalize_email(owner_email)?;
+        let email_key = format!("email:{email}");
         let now = Utc::now().to_rfc3339();
         let mut conn = self.conn.lock().await;
         let tx = conn
             .transaction()
             .map_err(|error| AppError::Internal(format!("begin Provider sync failed: {error}")))?;
-        tx.execute(
-            "INSERT INTO host_provider_profiles (provider_id, owner_email, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?3)
-             ON CONFLICT(provider_id) DO UPDATE SET owner_email = excluded.owner_email, updated_at = excluded.updated_at",
-            params![user_id, email, now],
-        )
-        .map_err(|error| {
-            if error.to_string().contains("UNIQUE constraint failed") {
-                AppError::Conflict("this email is already bound to a different Provider identity".into())
+        // owner_email is UNIQUE. Prefer re-keying a legacy email: profile onto the
+        // stable user id instead of failing the upsert.
+        let existing_by_email: Option<String> = tx
+            .query_row(
+                "SELECT provider_id FROM host_provider_profiles WHERE owner_email = ?1",
+                params![email],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!("lookup Provider by email failed: {error}"))
+            })?;
+        if let Some(existing_id) = existing_by_email {
+            if existing_id != user_id {
+                let target_exists: bool = tx
+                    .query_row(
+                        "SELECT 1 FROM host_provider_profiles WHERE provider_id = ?1",
+                        params![user_id],
+                        |_| Ok(true),
+                    )
+                    .optional()
+                    .map_err(|error| {
+                        AppError::Internal(format!("lookup target Provider failed: {error}"))
+                    })?
+                    .unwrap_or(false);
+                if target_exists {
+                    tx.execute(
+                        "UPDATE router_ssh_hosts
+                         SET provider_id = ?1, host_owner_email = ?2, updated_at = ?3
+                         WHERE provider_id = ?4",
+                        params![user_id, email, now, existing_id],
+                    )
+                    .map_err(|error| {
+                        AppError::Internal(format!("merge legacy Host Provider failed: {error}"))
+                    })?;
+                    tx.execute(
+                        "UPDATE client_market_subscriptions
+                         SET provider_id = ?1, host_owner_email = ?2, updated_at = ?3
+                         WHERE provider_id = ?4 AND status != 'released'",
+                        params![user_id, email, now, existing_id],
+                    )
+                    .map_err(|error| {
+                        AppError::Internal(format!(
+                            "merge legacy subscription Provider failed: {error}"
+                        ))
+                    })?;
+                    tx.execute(
+                        "DELETE FROM host_provider_profiles WHERE provider_id = ?1",
+                        params![existing_id],
+                    )
+                    .map_err(|error| {
+                        AppError::Internal(format!("remove legacy Provider profile failed: {error}"))
+                    })?;
+                } else {
+                    tx.execute(
+                        "UPDATE host_provider_profiles
+                         SET provider_id = ?1, updated_at = ?2
+                         WHERE provider_id = ?3",
+                        params![user_id, now, existing_id],
+                    )
+                    .map_err(|error| {
+                        AppError::Internal(format!("re-key Provider profile failed: {error}"))
+                    })?;
+                    tx.execute(
+                        "UPDATE router_ssh_hosts
+                         SET provider_id = ?1, host_owner_email = ?2, updated_at = ?3
+                         WHERE provider_id = ?4",
+                        params![user_id, email, now, existing_id],
+                    )
+                    .map_err(|error| {
+                        AppError::Internal(format!("re-key Host Provider failed: {error}"))
+                    })?;
+                    tx.execute(
+                        "UPDATE client_market_subscriptions
+                         SET provider_id = ?1, host_owner_email = ?2, updated_at = ?3
+                         WHERE provider_id = ?4 AND status != 'released'",
+                        params![user_id, email, now, existing_id],
+                    )
+                    .map_err(|error| {
+                        AppError::Internal(format!(
+                            "re-key subscription Provider failed: {error}"
+                        ))
+                    })?;
+                }
             } else {
-                AppError::Internal(format!("upsert Provider profile failed: {error}"))
+                tx.execute(
+                    "UPDATE host_provider_profiles
+                     SET owner_email = ?2, updated_at = ?3
+                     WHERE provider_id = ?1",
+                    params![user_id, email, now],
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!("refresh Provider email failed: {error}"))
+                })?;
             }
-        })?;
-        tx.execute(
-            "UPDATE router_ssh_hosts SET host_owner_email = ?2, updated_at = ?3
-             WHERE provider_id = ?1",
-            params![user_id, email, now],
-        )
-        .map_err(|error| AppError::Internal(format!("sync Host Provider email failed: {error}")))?;
+        } else {
+            tx.execute(
+                "INSERT INTO host_provider_profiles (provider_id, owner_email, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?3)
+                 ON CONFLICT(provider_id) DO UPDATE SET
+                    owner_email = excluded.owner_email,
+                    updated_at = excluded.updated_at",
+                params![user_id, email, now],
+            )
+            .map_err(|error| {
+                if error.to_string().contains("UNIQUE constraint failed") {
+                    AppError::Conflict(
+                        "this email is already bound to a different Provider identity".into(),
+                    )
+                } else {
+                    AppError::Internal(format!("upsert Provider profile failed: {error}"))
+                }
+            })?;
+        }
+        // Pull free/forever hosts (and any other drifted rows) whose owner email
+        // matches this Provider back onto the stable provider_id. Paid hosts are
+        // often healed via offer edits; free hosts otherwise stay orphaned and
+        // disappear from Create Client idle capacity.
+        heal_hosts_onto_provider_tx(&tx, user_id, &email, &email_key, &now)?;
         tx.execute(
             "UPDATE client_market_subscriptions SET host_owner_email = ?2, updated_at = ?3
              WHERE provider_id = ?1 AND status != 'released'",
@@ -1705,7 +1859,16 @@ impl AppStore {
         official_email: Option<&str>,
     ) -> Result<ProviderSupplyResponse, AppError> {
         let official_email = official_email.map(|value| value.trim().to_ascii_lowercase());
-        let conn = self.conn.lock().await;
+        let mut conn = self.conn.lock().await;
+        {
+            let tx = conn.transaction().map_err(|error| {
+                AppError::Internal(format!("begin Provider supply heal failed: {error}"))
+            })?;
+            heal_all_provider_host_bindings_tx(&tx, &Utc::now().to_rfc3339())?;
+            tx.commit().map_err(|error| {
+                AppError::Internal(format!("commit Provider supply heal failed: {error}"))
+            })?;
+        }
         let mut statement = conn
             .prepare(
                 "SELECT p.provider_id, p.owner_email, p.created_at,
@@ -2164,6 +2327,7 @@ impl AppStore {
             AppError::Internal(format!("begin allocation quote failed: {error}"))
         })?;
         expire_quotes_tx(&tx, now)?;
+        heal_all_provider_host_bindings_tx(&tx, &now.to_rfc3339())?;
         ensure_creation_allowed_tx(&tx, &session.user_id, &session.email)?;
         let active_quote: i64 = tx
             .query_row(
