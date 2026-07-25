@@ -3,9 +3,8 @@
 import { toast } from "@heroui/react";
 import { usePathname, useRouter } from "next/navigation";
 import * as React from "react";
-import { useDashboardData } from "@/components/dashboard/dashboard-data";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { DASHBOARD_CLIENTS_PATH, isClientsRoute, isMarketsRoute } from "@/lib/dashboard-nav";
+import { DASHBOARD_CLIENTS_PATH, isClientsRoute } from "@/lib/dashboard-nav";
 
 export const MAX_CONSOLE_WINDOWS = 5;
 export const CONSOLE_DOCK_HEIGHT = 56;
@@ -295,6 +294,19 @@ function reducer(state: ManagerState, action: { type: string; payload?: unknown 
         focusedId: null,
       };
     }
+    case "SUSPEND_ALL": {
+      const hasActive = state.windows.some((window) => window.activated);
+      if (!hasActive) return state;
+      return {
+        ...state,
+        windows: state.windows.map((window) =>
+          window.activated
+            ? { ...window, activated: false, state: "minimized" as const }
+            : window,
+        ),
+        focusedId: null,
+      };
+    }
     case "UPDATE_RECT": {
       const { id, rect } = action.payload as { id: string; rect: NormalRect };
       return {
@@ -309,12 +321,11 @@ function reducer(state: ManagerState, action: { type: string; payload?: unknown 
 
 export function ClientConsoleManagerProvider({ children }: { children: React.ReactNode }) {
   const { t } = useLocaleText();
-  const { data } = useDashboardData();
   const router = useRouter();
   const pathname = usePathname() || DASHBOARD_CLIENTS_PATH;
   const [state, dispatch] = React.useReducer(reducer, { windows: [], nextZIndex: CONSOLE_BASE_Z_INDEX, focusedId: null });
   const [hydrated, setHydrated] = React.useState(false);
-  const autoMinimizeNotifiedRef = React.useRef(false);
+  const autoSuspendNotifiedRef = React.useRef(false);
   const prevPathRef = React.useRef(pathname);
   const windowsRef = React.useRef(state.windows);
   windowsRef.current = state.windows;
@@ -325,20 +336,21 @@ export function ClientConsoleManagerProvider({ children }: { children: React.Rea
     }
   }, [pathname, router]);
 
+  // Soft-nav away from Clients: keep dock entries, suspend iframes as「待恢复」.
   React.useLayoutEffect(() => {
     const previousPath = prevPathRef.current;
     prevPathRef.current = pathname;
-    if (!isMarketsRoute(pathname)) {
-      autoMinimizeNotifiedRef.current = false;
+    if (isClientsRoute(pathname)) {
+      autoSuspendNotifiedRef.current = false;
       return;
     }
-    if (isMarketsRoute(previousPath)) return;
-    const hadVisible = windowsRef.current.some((window) => window.activated && window.state !== "minimized");
-    if (!hadVisible) return;
-    dispatch({ type: "MINIMIZE_ALL_VISIBLE" });
-    if (!autoMinimizeNotifiedRef.current) {
-      autoMinimizeNotifiedRef.current = true;
-      toast.info(t("dashboard.clientConsole.autoMinimized"));
+    if (!isClientsRoute(previousPath)) return;
+    const hadActive = windowsRef.current.some((window) => window.activated);
+    if (!hadActive) return;
+    dispatch({ type: "SUSPEND_ALL" });
+    if (!autoSuspendNotifiedRef.current) {
+      autoSuspendNotifiedRef.current = true;
+      toast.info(t("dashboard.clientConsole.autoSuspended"));
     }
   }, [pathname, t]);
 
@@ -352,16 +364,6 @@ export function ClientConsoleManagerProvider({ children }: { children: React.Rea
     if (!hydrated) return;
     writePersistedWindows(state.windows);
   }, [hydrated, state.windows]);
-
-  React.useEffect(() => {
-    if (!data) return;
-    const marketClientIds = new Set(
-      data.clients
-        .filter((client) => client.installation.provisionSource === "router_market")
-        .map((client) => client.installation.id),
-    );
-    if (marketClientIds.size) dispatch({ type: "CLOSE_CLIENTS", payload: marketClientIds });
-  }, [data]);
 
   React.useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
@@ -406,7 +408,8 @@ export function ClientConsoleManagerProvider({ children }: { children: React.Rea
       windows: state.windows,
       focusedId: state.focusedId,
       dockCount,
-      dockVisible: dockCount > 0 && isClientsRoute(pathname),
+      // Keep dock across dashboard tabs so suspended consoles stay recoverable.
+      dockVisible: dockCount > 0,
       openConsole,
       closeConsole: (id) => dispatch({ type: "CLOSE", payload: id }),
       minimizeConsole: (id) => dispatch({ type: "MINIMIZE", payload: id }),

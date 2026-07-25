@@ -205,7 +205,7 @@ function ClientConsoleButton({ client }: { client: DashboardClient }) {
   const { t } = useLocaleText();
   const { openConsole } = useClientConsole();
   const tunnelUrl = clientTunnelDisplayUrl(client.clientTunnel?.tunnelUrl);
-  if (!tunnelUrl || client.installation.provisionSource === "router_market") return null;
+  if (!tunnelUrl) return null;
   const title = client.clientTunnel?.subdomain || tunnelUrl;
   return (
     <ClientHeaderInlineButton
@@ -441,6 +441,11 @@ function ClientCard({
               ) : (
                 <strong className="truncate text-sm font-semibold text-foreground" title={identity}>{identity}</strong>
               )}
+              {owner && owner !== "-" ? (
+                <span className="min-w-0 truncate text-xs text-muted-foreground" title={owner}>
+                  {owner}
+                </span>
+              ) : null}
               {summary.primaryReason ? (
                 <span
                   className={`min-w-0 truncate text-[11px] font-medium ${state === "offline" ? "text-rose-700" : state === "reconnecting" ? "text-sky-700" : "text-amber-700"}`}
@@ -457,9 +462,6 @@ function ClientCard({
               <ClientUpgradeButton client={client} />
               <ClientDetailsButton onOpen={openClientDrawer} />
               <ClientChatButton client={client} />
-            </div>
-            <div className="flex min-w-0 items-center text-xs text-muted-foreground">
-              <span className="truncate" title={owner}>{owner}</span>
             </div>
           </div>
 

@@ -30,6 +30,7 @@ import {
   testClientMarketHostSsh,
   updateClientMarketHostOffer,
 } from "@/lib/api";
+import { mergeBillingMap, mergeHosts } from "@/lib/client-market-refresh";
 import { DASHBOARD_ACCOUNT_PATH } from "@/lib/dashboard-nav";
 import type {
   ClientMarketBilling,
@@ -42,6 +43,8 @@ import type {
 } from "@/lib/types";
 import type { MessageKey } from "@/lib/i18n";
 import { usePersistentState } from "@/lib/use-persistent-state";
+
+const CLIENT_MARKET_POLL_MS = 20_000;
 
 const ROUTER_OPEN_LOGIN_EVENT = "router-open-login";
 const ADD_HOST_SSH_KEY_OPEN_KEY = "cc-switch.client-market.add-host.ssh-key-open";
@@ -1172,6 +1175,7 @@ function HostRow({
   selectionDisabled,
   onChanged,
   onCreate,
+  onUiBusyChange,
 }: {
   host: ClientMarketHost;
   billing?: ClientMarketBilling;
@@ -1181,6 +1185,7 @@ function HostRow({
   selectionDisabled?: boolean;
   onChanged: () => void;
   onCreate: (host: ClientMarketHost) => void;
+  onUiBusyChange?: (hostId: string, busy: boolean) => void;
 }) {
   const { locale, t } = useLocaleText();
   const { session } = useAuth();
@@ -1191,6 +1196,12 @@ function HostRow({
   const [cleanupJob, setCleanupJob] = React.useState<ProvisioningJob | null>(null);
   const [cleanupOpen, setCleanupOpen] = React.useState(false);
   const [offerOpen, setOfferOpen] = React.useState(false);
+
+  React.useEffect(() => {
+    const locked = offerOpen || cleanupOpen || confirmAction != null || busy;
+    onUiBusyChange?.(host.id, locked);
+    return () => onUiBusyChange?.(host.id, false);
+  }, [busy, cleanupOpen, confirmAction, host.id, offerOpen, onUiBusyChange]);
   const canManageHost = hostCanManage(host, viewerEmail);
   const canDelete = hostCanDelete(host, viewerEmail);
   const isClientOwner = host.isClientOwner === true;
@@ -1853,27 +1864,87 @@ export function ClientMarketPage() {
   const [batchProgressOpen, setBatchProgressOpen] = React.useState(false);
   const [batchProgressAction, setBatchProgressAction] = React.useState<"cleanup" | "delete" | "reverify">("cleanup");
   const [batchProgressItems, setBatchProgressItems] = React.useState<BatchProgressItem[]>([]);
+  const [rowUiBusyCount, setRowUiBusyCount] = React.useState(0);
+  const refreshAbortRef = React.useRef<AbortController | null>(null);
+  const rowBusyIdsRef = React.useRef<Set<string>>(new Set());
 
-  const load = React.useCallback(async () => {
-    setLoading(true);
-    setError("");
-    try {
-      const [nextHosts, billing] = await Promise.all([
-        getClientMarketHosts(),
-        authed ? getMyClientMarketBilling() : Promise.resolve([]),
-      ]);
-      setHosts(nextHosts);
-      setBillingByInstallation(new Map(billing.map((record) => [record.installationId, record])));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLoading(false);
-    }
-  }, [authed]);
+  const setRowUiBusy = React.useCallback((hostId: string, busy: boolean) => {
+    const ids = rowBusyIdsRef.current;
+    const before = ids.size;
+    if (busy) ids.add(hostId);
+    else ids.delete(hostId);
+    if (ids.size !== before) setRowUiBusyCount(ids.size);
+  }, []);
+
+  const refreshPaused =
+    batchBusy ||
+    transferBusy ||
+    addOpen ||
+    importOpen ||
+    exportOpen ||
+    !!fixedHost ||
+    batchConfirm != null ||
+    batchProgressOpen ||
+    rowUiBusyCount > 0;
+
+  const load = React.useCallback(
+    async (options?: { silent?: boolean }) => {
+      const silent = options?.silent === true;
+      // Silent polls never interrupt each other or a visible load.
+      if (silent && refreshAbortRef.current) return;
+      if (!silent) refreshAbortRef.current?.abort();
+      const controller = new AbortController();
+      refreshAbortRef.current = controller;
+      if (!silent) {
+        setLoading(true);
+        setError("");
+      }
+      try {
+        const [nextHosts, billing] = await Promise.all([
+          getClientMarketHosts(),
+          authed ? getMyClientMarketBilling() : Promise.resolve([]),
+        ]);
+        if (controller.signal.aborted) return;
+        setHosts((prev) => mergeHosts(prev, nextHosts));
+        setBillingByInstallation((prev) => mergeBillingMap(prev, billing));
+      } catch (err) {
+        if (controller.signal.aborted) return;
+        if (!silent) {
+          setError(err instanceof Error ? err.message : String(err));
+        }
+      } finally {
+        if (refreshAbortRef.current === controller) refreshAbortRef.current = null;
+        if (!silent) setLoading(false);
+      }
+    },
+    [authed],
+  );
+
+  const silentRefresh = React.useCallback(() => load({ silent: true }), [load]);
 
   React.useEffect(() => {
     void load();
+    return () => {
+      refreshAbortRef.current?.abort();
+    };
   }, [load, viewerUserId]);
+
+  React.useEffect(() => {
+    const tick = () => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
+      if (refreshPaused) return;
+      void silentRefresh();
+    };
+    const timer = window.setInterval(tick, CLIENT_MARKET_POLL_MS);
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") tick();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [refreshPaused, silentRefresh]);
 
   const ownerOptions = React.useMemo(() => {
     const emails = Array.from(new Set(hosts.map((host) => host.hostOwnerEmail))).sort((a, b) =>
@@ -2063,9 +2134,9 @@ export function ClientMarketPage() {
         setSelectionMode(false);
         setSelectedIds(new Set());
       }
-      void load();
+      void silentRefresh();
     },
-    [load, t],
+    [silentRefresh, t],
   );
 
   const beginBatchProgress = (
@@ -2306,7 +2377,7 @@ export function ClientMarketPage() {
       setImportOpen(false);
       setImportText("");
       setImportResult(result);
-      await load();
+      await silentRefresh();
     } catch (reason) {
       toast.danger(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -2638,8 +2709,9 @@ export function ClientMarketPage() {
                     selected={selectedIds.has(host.id)}
                     onSelectedChange={(next) => setHostSelected(host.id, next)}
                     selectionDisabled={batchBusy}
-                    onChanged={() => void load()}
+                    onChanged={() => void silentRefresh()}
                     onCreate={setFixedHost}
+                    onUiBusyChange={setRowUiBusy}
                   />
                 ))}
               </tbody>
@@ -2705,12 +2777,12 @@ export function ClientMarketPage() {
         </div>
       )}
 
-      <AddHostDialog open={addOpen} onOpenChange={setAddOpen} onAdded={() => void load()} />
+      <AddHostDialog open={addOpen} onOpenChange={setAddOpen} onAdded={() => void silentRefresh()} />
       <CreateClientDialog
         open={!!fixedHost}
         onOpenChange={(next) => { if (!next) setFixedHost(null); }}
         fixedHost={fixedHost}
-        onCreated={() => void load()}
+        onCreated={() => void silentRefresh()}
       />
       <Modal.Backdrop
         isOpen={importOpen}
