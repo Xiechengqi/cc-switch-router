@@ -14,6 +14,8 @@ export function CompactRegionMultiSelect({
   ariaLabel,
   className,
   compact = false,
+  variant = "default",
+  columnLabel,
 }: {
   values: string[];
   options: { value: string; label: string }[];
@@ -24,12 +26,16 @@ export function CompactRegionMultiSelect({
   ariaLabel: string;
   className?: string;
   compact?: boolean;
+  /** Header trigger: single-line `Column ▾` / `Column · value` / `Column · N` */
+  variant?: "default" | "header";
+  columnLabel?: string;
 }) {
   const [open, setOpen] = React.useState(false);
   const [hovered, setHovered] = React.useState(false);
   const rootRef = React.useRef<HTMLDivElement>(null);
   const hasSelection = values.length > 0;
   const showClear = hasSelection && hovered;
+  const isHeader = variant === "header";
 
   React.useEffect(() => {
     if (!open) return;
@@ -42,12 +48,18 @@ export function CompactRegionMultiSelect({
   }, [open]);
 
   const summary = React.useMemo(() => {
-    if (values.length === 0) return allLabel;
     const labels = values.map((value) => options.find((option) => option.value === value)?.label || value);
+    if (isHeader) {
+      const title = columnLabel || allLabel;
+      if (values.length === 0) return title;
+      if (values.length === 1) return `${title} · ${labels[0]}`;
+      return `${title} · ${values.length}`;
+    }
+    if (values.length === 0) return allLabel;
     if (labels.length === 1) return labels[0];
     if (labels.length === 2) return labels.join(", ");
     return `${labels[0]}, ${labels[1]} ${moreLabel(labels.length - 2)}`;
-  }, [allLabel, moreLabel, options, values]);
+  }, [allLabel, columnLabel, isHeader, moreLabel, options, values]);
 
   const selectAll = () => {
     onChange([]);
@@ -65,14 +77,21 @@ export function CompactRegionMultiSelect({
       <div
         className={cn(
           "flex w-full items-center transition-colors",
-          compact
+          isHeader
             ? cn(
-                "min-h-6 rounded-md border border-transparent",
+                "min-h-7 rounded-md",
                 open || hasSelection
-                  ? "bg-muted/50 text-foreground"
-                  : "text-muted-foreground hover:bg-muted/40 hover:text-foreground",
+                  ? "bg-muted/45 text-foreground"
+                  : "text-muted-foreground hover:bg-muted/35 hover:text-foreground",
               )
-            : "min-h-9 rounded-lg border bg-white shadow-sm",
+            : compact
+              ? cn(
+                  "min-h-6 rounded-md border border-transparent",
+                  open || hasSelection
+                    ? "bg-muted/50 text-foreground"
+                    : "text-muted-foreground hover:bg-muted/40 hover:text-foreground",
+                )
+              : "min-h-9 rounded-lg border bg-white shadow-sm",
         )}
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}
@@ -84,19 +103,27 @@ export function CompactRegionMultiSelect({
           onClick={() => setOpen((current) => !current)}
           className={cn(
             "flex min-w-0 flex-1 items-center text-left",
-            compact ? "gap-1 px-1.5 py-0.5" : "px-3 py-2 text-xs",
+            isHeader ? "gap-0.5 px-1 py-0.5" : compact ? "gap-1 px-1.5 py-0.5" : "px-3 py-2 text-xs",
           )}
         >
           <span
             className={cn(
               "min-w-0 truncate font-medium",
-              compact
-                ? cn("text-[11px] font-normal", hasSelection ? "text-foreground" : "text-muted-foreground")
-                : "pr-2 text-xs text-foreground",
+              isHeader
+                ? cn("text-xs", hasSelection ? "font-medium text-foreground" : "font-medium text-muted-foreground")
+                : compact
+                  ? cn("text-[11px] font-normal", hasSelection ? "text-foreground" : "text-muted-foreground")
+                  : "pr-2 text-xs text-foreground",
             )}
           >
             {summary}
           </span>
+          {isHeader ? (
+            <ChevronDown
+              className={cn("h-3 w-3 shrink-0 opacity-50 transition-transform", open && "rotate-180")}
+              aria-hidden
+            />
+          ) : null}
         </button>
         {showClear ? (
           <button
@@ -107,38 +134,40 @@ export function CompactRegionMultiSelect({
             }}
             className={cn(
               "inline-flex shrink-0 items-center justify-center rounded-sm text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-600",
-              compact ? "mr-0.5 h-3.5 w-3.5" : "mr-0.5 h-4 w-4",
+              isHeader || compact ? "mr-0.5 h-3.5 w-3.5" : "mr-0.5 h-4 w-4",
             )}
             aria-label={clearLabel}
             title={clearLabel}
           >
-            <X className={cn(compact ? "h-2.5 w-2.5" : "h-3 w-3")} aria-hidden />
+            <X className={cn(isHeader || compact ? "h-2.5 w-2.5" : "h-3 w-3")} aria-hidden />
           </button>
         ) : null}
-        <button
-          type="button"
-          aria-hidden
-          tabIndex={-1}
-          onClick={() => setOpen((current) => !current)}
-          className={cn(
-            "inline-flex shrink-0 items-center justify-center text-muted-foreground",
-            compact ? "px-1 py-0.5" : "px-2 py-2",
-          )}
-        >
-          <ChevronDown
+        {!isHeader ? (
+          <button
+            type="button"
+            aria-hidden
+            tabIndex={-1}
+            onClick={() => setOpen((current) => !current)}
             className={cn(
-              "transition-transform",
-              compact ? "h-3 w-3 opacity-60" : "h-3.5 w-3.5",
-              open && "rotate-180",
+              "inline-flex shrink-0 items-center justify-center text-muted-foreground",
+              compact ? "px-1 py-0.5" : "px-2 py-2",
             )}
-          />
-        </button>
+          >
+            <ChevronDown
+              className={cn(
+                "transition-transform",
+                compact ? "h-3 w-3 opacity-60" : "h-3.5 w-3.5",
+                open && "rotate-180",
+              )}
+            />
+          </button>
+        ) : null}
       </div>
       {open ? (
         <div
           className={cn(
             "absolute z-50 max-h-64 min-w-full overflow-y-auto rounded-lg border border-border bg-white py-1 text-slate-900 shadow-md",
-            compact ? "left-0 top-[calc(100%+2px)] min-w-[10rem]" : "right-0 top-[calc(100%+4px)]",
+            isHeader || compact ? "left-0 top-[calc(100%+2px)] min-w-[10rem]" : "right-0 top-[calc(100%+4px)]",
           )}
         >
           <label className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50">
