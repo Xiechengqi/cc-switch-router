@@ -135,15 +135,45 @@ ensure_client_market_deps() {
 "#;
 
 /// Detect/stop a live cc-switch-server without matching this SSH checker's own cmdline.
-/// `pgrep -f /usr/local/bin/cc-switch-server` false-positives because the remote
-/// `sh -c '...'` argument itself contains that path string.
+/// Match the process COMMAND (e.g. `/usr/local/bin/cc-switch-server`), not a substring of
+/// the remote `sh -c '...'` script which also contains that path.
 const REMOTE_CC_SWITCH_SERVER_HELPERS: &str = r#"
-cc_switch_server_is_running() {
-  if command -v pgrep >/dev/null 2>&1 && pgrep -x cc-switch-server >/dev/null 2>&1; then
+cc_switch_server_pkill() {
+  if command -v pkill >/dev/null 2>&1; then
+    pkill cc-switch-server 2>/dev/null || true
     return 0
   fi
-  if command -v pidof >/dev/null 2>&1 && pidof cc-switch-server >/dev/null 2>&1; then
-    return 0
+  for comm in /proc/[0-9]*/comm; do
+    [ -r "$comm" ] || continue
+    name=$(cat "$comm" 2>/dev/null) || continue
+    [ "$name" = "cc-switch-server" ] || continue
+    pid=${comm#/proc/}
+    pid=${pid%/comm}
+    kill "$pid" 2>/dev/null || true
+  done
+}
+cc_switch_server_is_running() {
+  if command -v ps >/dev/null 2>&1; then
+    # BusyBox: PID USER TIME COMMAND...
+    # GNU:     UID PID PPID C STIME TTY TIME CMD...
+    # Only match argv0 being the binary — never the SSH helper shell cmdline.
+    if ps -ef 2>/dev/null | awk '
+      NR == 1 { next }
+      {
+        cmd = ""
+        if ($1 ~ /^[0-9]+$/ && NF >= 4 && $3 ~ /^[0-9:.-]+$/) {
+          cmd = $4
+        } else if (NF >= 8) {
+          cmd = $8
+        } else {
+          next
+        }
+        if (cmd == "cc-switch-server" || cmd ~ /\/cc-switch-server$/) exit 0
+      }
+      END { exit 1 }
+    '; then
+      return 0
+    fi
   fi
   for comm in /proc/[0-9]*/comm; do
     [ -r "$comm" ] || continue
@@ -153,39 +183,21 @@ cc_switch_server_is_running() {
   return 1
 }
 cc_switch_server_stop() {
-  if command -v pkill >/dev/null 2>&1; then
-    pkill -TERM -x cc-switch-server 2>/dev/null || true
-  else
-    for comm in /proc/[0-9]*/comm; do
-      [ -r "$comm" ] || continue
-      name=$(cat "$comm" 2>/dev/null) || continue
-      [ "$name" = "cc-switch-server" ] || continue
-      pid=${comm#/proc/}
-      pid=${pid%/comm}
-      kill -TERM "$pid" 2>/dev/null || true
-    done
+  if ! cc_switch_server_is_running; then
+    return 0
   fi
-  i=0
-  while cc_switch_server_is_running && [ "$i" -lt 20 ]; do
-    sleep 1
-    i=$((i + 1))
-  done
-  if cc_switch_server_is_running; then
-    if command -v pkill >/dev/null 2>&1; then
-      pkill -KILL -x cc-switch-server 2>/dev/null || true
-    else
-      for comm in /proc/[0-9]*/comm; do
-        [ -r "$comm" ] || continue
-        name=$(cat "$comm" 2>/dev/null) || continue
-        [ "$name" = "cc-switch-server" ] || continue
-        pid=${comm#/proc/}
-        pid=${pid%/comm}
-        kill -KILL "$pid" 2>/dev/null || true
-      done
+  cc_switch_server_pkill
+  attempt=0
+  while [ "$attempt" -lt 3 ]; do
+    sleep 3
+    if ! cc_switch_server_is_running; then
+      return 0
     fi
-    sleep 1
-  fi
-  return 0
+    cc_switch_server_pkill
+    attempt=$((attempt + 1))
+  done
+  # Three spaced ps checks still saw the process.
+  return 1
 }
 cc_switch_server_home() {
   home="${HOME:-}"
@@ -2987,10 +2999,7 @@ async fn ssh_wipe_cc_switch_server(
     let command = format!(
         "{helpers}\
          set -eu; \
-         if cc_switch_server_is_running; then \
-           cc_switch_server_stop; \
-         fi; \
-         if cc_switch_server_is_running; then \
+         if ! cc_switch_server_stop; then \
            echo 'failed to stop cc-switch-server' >&2; exit 43; \
          fi; \
          cc_switch_server_wipe_files; \
@@ -3025,10 +3034,7 @@ async fn ssh_stop_cc_switch_server(
     let command = format!(
         "{helpers}\
          set -eu; \
-         if cc_switch_server_is_running; then \
-           cc_switch_server_stop; \
-         fi; \
-         if cc_switch_server_is_running; then \
+         if ! cc_switch_server_stop; then \
            echo 'failed to stop cc-switch-server' >&2; exit 43; \
          fi",
         helpers = REMOTE_CC_SWITCH_SERVER_HELPERS,
@@ -3056,10 +3062,7 @@ async fn ssh_wipe_cc_switch_files(
     let command = format!(
         "{helpers}\
          set -eu; \
-         if cc_switch_server_is_running; then \
-           cc_switch_server_stop; \
-         fi; \
-         if cc_switch_server_is_running; then \
+         if ! cc_switch_server_stop; then \
            echo 'failed to stop cc-switch-server' >&2; exit 43; \
          fi; \
          cc_switch_server_wipe_files; \

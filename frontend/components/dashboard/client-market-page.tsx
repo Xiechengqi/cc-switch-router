@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Button, Chip, Dropdown, Modal, Tabs, toast, Tooltip } from "@heroui/react";
+import { Button, Checkbox, Chip, Dropdown, Modal, Tabs, toast, Tooltip } from "@heroui/react";
 import { Check, ChevronDown, ChevronLeft, ChevronRight, Circle, Clock3, Download, Loader2, MoreHorizontal, Pencil, Plus, RefreshCw, Trash2, Upload, X } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
@@ -117,6 +117,88 @@ function formatProviderPeriodRange(provider: ClientMarketProvider) {
   return provider.minRentalPeriodDays === provider.maxRentalPeriodDays
     ? String(provider.minRentalPeriodDays)
     : `${provider.minRentalPeriodDays}-${provider.maxRentalPeriodDays}`;
+}
+
+function hostDisplayLabel(host: ClientMarketHost) {
+  return host.hostname || host.ip || host.id.slice(0, 8);
+}
+
+function hostCanManage(host: ClientMarketHost, isAdmin: boolean) {
+  return isAdmin || host.isHostOwner === true;
+}
+
+function hostCanCleanup(host: ClientMarketHost, isAdmin: boolean) {
+  return (
+    !!host.installationId &&
+    (host.status === "allocated" || host.status === "unreachable" || host.status === "draining") &&
+    (hostCanManage(host, isAdmin) || host.isClientOwner === true)
+  );
+}
+
+function hostCanReverify(host: ClientMarketHost, isAdmin: boolean) {
+  return (
+    hostCanManage(host, isAdmin) &&
+    (host.status === "unreachable" || host.status === "disabled" || host.status === "abnormal")
+  );
+}
+
+function hostCanDelete(host: ClientMarketHost, isAdmin: boolean) {
+  return (
+    hostCanManage(host, isAdmin) &&
+    !host.installationId &&
+    (host.status === "idle" || host.status === "disabled" || host.status === "abnormal")
+  );
+}
+
+function hostCanExport(host: ClientMarketHost) {
+  return host.isHostOwner === true && !!host.ip && host.port != null;
+}
+
+function hostExportKey(host: { ip?: string | null; port?: number | null }) {
+  if (!host.ip || host.port == null) return "";
+  return `${host.ip}:${host.port}`;
+}
+
+function cleanupReasonForHost(host: ClientMarketHost, isAdmin: boolean) {
+  const isClientOwner = host.isClientOwner === true;
+  if (host.isHostOwner === true && !isClientOwner) return "provider_release" as const;
+  if (isAdmin && !isClientOwner) return "operator_release" as const;
+  return "client_release" as const;
+}
+
+type BatchItemStatus = "queued" | "running" | "succeeded" | "failed" | "skipped";
+type BatchProgressItem = {
+  hostId: string;
+  label: string;
+  status: BatchItemStatus;
+  detail?: string;
+};
+
+async function mapPool<T, R>(items: T[], concurrency: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(Math.max(concurrency, 1), Math.max(items.length, 1)) }, async () => {
+    while (true) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= items.length) return;
+      results[index] = await fn(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+function countBatchStatuses(items: BatchProgressItem[]) {
+  let succeeded = 0;
+  let skipped = 0;
+  let failed = 0;
+  for (const item of items) {
+    if (item.status === "succeeded") succeeded += 1;
+    else if (item.status === "skipped") skipped += 1;
+    else if (item.status === "failed") failed += 1;
+  }
+  return { succeeded, skipped, failed };
 }
 
 function translateMappedLabel(
@@ -885,12 +967,18 @@ function HostRow({
   host,
   billing,
   isAdmin,
+  selected,
+  onSelectedChange,
+  selectionDisabled,
   onChanged,
   onCreate,
 }: {
   host: ClientMarketHost;
   billing?: ClientMarketBilling;
   isAdmin: boolean;
+  selected: boolean;
+  onSelectedChange: (selected: boolean) => void;
+  selectionDisabled?: boolean;
   onChanged: () => void;
   onCreate: (host: ClientMarketHost) => void;
 }) {
@@ -901,16 +989,10 @@ function HostRow({
   const [cleanupJob, setCleanupJob] = React.useState<ProvisioningJob | null>(null);
   const [cleanupOpen, setCleanupOpen] = React.useState(false);
   const [offerOpen, setOfferOpen] = React.useState(false);
-  const canManageHost = isAdmin || host.isHostOwner === true;
-  const canDelete =
-    canManageHost &&
-    !host.installationId &&
-    (host.status === "idle" || host.status === "disabled" || host.status === "abnormal");
+  const canManageHost = hostCanManage(host, isAdmin);
+  const canDelete = hostCanDelete(host, isAdmin);
   const isClientOwner = host.isClientOwner === true;
-  const canCleanup =
-    !!host.installationId &&
-    (host.status === "allocated" || host.status === "unreachable" || host.status === "draining") &&
-    (canManageHost || isClientOwner);
+  const canCleanup = hostCanCleanup(host, isAdmin);
   const canMarkUnpaid =
     !!host.installationId &&
     host.status === "allocated" &&
@@ -918,11 +1000,9 @@ function HostRow({
     !isClientOwner;
   const isRetryCleanup =
     canCleanup && (host.status === "unreachable" || host.status === "draining");
-  const canReverify =
-    canManageHost &&
-    (host.status === "unreachable" || host.status === "disabled" || host.status === "abnormal");
+  const canReverify = hostCanReverify(host, isAdmin);
   const canOpenTerminal = host.canWebTerminal === true;
-  const hostLabel = host.hostname || host.ip || host.id.slice(0, 8);
+  const hostLabel = hostDisplayLabel(host);
   const terminalTitle = host.ip || hostLabel;
   const countryName = host.countryCode
     ? new Intl.DisplayNames([locale], { type: "region" }).of(host.countryCode) || host.countryCode
@@ -978,26 +1058,15 @@ function HostRow({
     setCleanupJob(null);
     setCleanupOpen(true);
     try {
-      const isHostOwner = host.isHostOwner === true;
       const { jobId } = markUnpaid
         ? await cleanupClientMarketClientWithReason(host.installationId, {
             reason: "payment_not_received",
             blockClientForProvider: true,
           })
-        : isHostOwner && !isClientOwner
-          ? await cleanupClientMarketClientWithReason(host.installationId, {
-              reason: "provider_release",
-              blockClientForProvider: false,
-            })
-        : isAdmin && !isClientOwner
-          ? await cleanupClientMarketClientWithReason(host.installationId, {
-              reason: "operator_release",
-              blockClientForProvider: false,
-            })
-          : await cleanupClientMarketClientWithReason(host.installationId, {
-              reason: "client_release",
-              blockClientForProvider: false,
-            });
+        : await cleanupClientMarketClientWithReason(host.installationId, {
+            reason: cleanupReasonForHost(host, isAdmin),
+            blockClientForProvider: false,
+          });
       toast.info(t("clientMarket.cleanupStarted"));
       const initial = await getClientMarketJob(jobId).catch(() => null);
       if (initial) setCleanupJob(initial);
@@ -1059,6 +1128,17 @@ function HostRow({
     <>
       <div className="grid gap-1.5 rounded-lg border border-border bg-white px-3 py-2.5 text-sm">
         <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+          <Checkbox
+            isSelected={selected}
+            onChange={onSelectedChange}
+            isDisabled={selectionDisabled}
+            aria-label={t("clientMarket.batchSelected", { count: 1 })}
+            className="shrink-0"
+          >
+            <Checkbox.Control>
+              <Checkbox.Indicator />
+            </Checkbox.Control>
+          </Checkbox>
           <Chip
             size="sm"
             variant="soft"
@@ -1352,6 +1432,12 @@ export function ClientMarketPage() {
   const [transferBusy, setTransferBusy] = React.useState(false);
   const [importResult, setImportResult] = React.useState<ClientMarketHostImportResponse | null>(null);
   const importInputRef = React.useRef<HTMLInputElement | null>(null);
+  const [selectedIds, setSelectedIds] = React.useState<Set<string>>(new Set());
+  const [batchBusy, setBatchBusy] = React.useState(false);
+  const [batchConfirm, setBatchConfirm] = React.useState<"cleanup" | "delete" | "reverify" | null>(null);
+  const [batchProgressOpen, setBatchProgressOpen] = React.useState(false);
+  const [batchProgressAction, setBatchProgressAction] = React.useState<"cleanup" | "delete" | "reverify">("cleanup");
+  const [batchProgressItems, setBatchProgressItems] = React.useState<BatchProgressItem[]>([]);
 
   const load = React.useCallback(async () => {
     setLoading(true);
@@ -1464,6 +1550,205 @@ export function ClientMarketPage() {
     setAddOpen(true);
   }, [authed, pendingAddAfterLogin]);
 
+  React.useEffect(() => {
+    const valid = new Set(hosts.map((host) => host.id));
+    setSelectedIds((prev) => {
+      let changed = false;
+      const next = new Set<string>();
+      for (const id of prev) {
+        if (valid.has(id)) next.add(id);
+        else changed = true;
+      }
+      return changed || next.size !== prev.size ? next : prev;
+    });
+  }, [hosts]);
+
+  const selectedHosts = React.useMemo(
+    () => hosts.filter((host) => selectedIds.has(host.id)),
+    [hosts, selectedIds],
+  );
+  const selectedCount = selectedIds.size;
+  const cleanupEligible = React.useMemo(
+    () => selectedHosts.filter((host) => hostCanCleanup(host, isAdmin)),
+    [isAdmin, selectedHosts],
+  );
+  const reverifyEligible = React.useMemo(
+    () => selectedHosts.filter((host) => hostCanReverify(host, isAdmin)),
+    [isAdmin, selectedHosts],
+  );
+  const deleteEligible = React.useMemo(
+    () => selectedHosts.filter((host) => hostCanDelete(host, isAdmin)),
+    [isAdmin, selectedHosts],
+  );
+  const exportEligible = React.useMemo(
+    () => selectedHosts.filter((host) => hostCanExport(host)),
+    [selectedHosts],
+  );
+
+  const setHostSelected = React.useCallback((hostId: string, selected: boolean) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (selected) next.add(hostId);
+      else next.delete(hostId);
+      return next;
+    });
+  }, []);
+
+  const selectPage = () => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      for (const host of pagedHosts) next.add(host.id);
+      return next;
+    });
+  };
+
+  const selectAllFiltered = () => {
+    setSelectedIds(new Set(visibleHosts.map((host) => host.id)));
+  };
+
+  const clearSelection = () => setSelectedIds(new Set());
+
+  const finishBatch = React.useCallback(
+    (items: BatchProgressItem[]) => {
+      const summary = countBatchStatuses(items);
+      toast[summary.failed > 0 ? "danger" : summary.succeeded > 0 ? "success" : "info"](
+        t("clientMarket.batchSummary", summary),
+      );
+      setSelectedIds(new Set());
+      void load();
+    },
+    [load, t],
+  );
+
+  const beginBatchProgress = (
+    action: "cleanup" | "delete" | "reverify",
+    targets: ClientMarketHost[],
+    skippedHosts: ClientMarketHost[],
+  ) => {
+    const items: BatchProgressItem[] = [
+      ...targets.map((host) => ({
+        hostId: host.id,
+        label: hostDisplayLabel(host),
+        status: "queued" as const,
+      })),
+      ...skippedHosts.map((host) => ({
+        hostId: host.id,
+        label: hostDisplayLabel(host),
+        status: "skipped" as const,
+      })),
+    ];
+    const byId = new Map(items.map((item) => [item.hostId, item]));
+    setBatchProgressAction(action);
+    setBatchProgressItems(items);
+    setBatchProgressOpen(true);
+    const patch = (hostId: string, next: Partial<BatchProgressItem>) => {
+      const current = byId.get(hostId);
+      if (!current) return;
+      const updated = { ...current, ...next };
+      byId.set(hostId, updated);
+      setBatchProgressItems(Array.from(byId.values()));
+    };
+    return { byId, patch };
+  };
+
+  const pollCleanupJobQuiet = async (jobId: string) => {
+    for (let i = 0; i < 180; i++) {
+      await new Promise((r) => setTimeout(r, 1200));
+      try {
+        const latest = await getClientMarketJob(jobId);
+        if (latest.status === "succeeded") return { ok: true as const };
+        if (latest.status === "failed") {
+          const detail = latest.failureCode || latest.log.split("\n").filter(Boolean).at(-1) || "";
+          return { ok: false as const, detail };
+        }
+      } catch {
+        continue;
+      }
+    }
+    return { ok: false as const, detail: t("clientMarket.cleanupTimedOut") };
+  };
+
+  const runBatchCleanup = async () => {
+    const targets = cleanupEligible;
+    const skippedHosts = selectedHosts.filter((host) => !hostCanCleanup(host, isAdmin));
+    const { byId, patch } = beginBatchProgress("cleanup", targets, skippedHosts);
+    setBatchBusy(true);
+    try {
+      await mapPool(targets, 2, async (host) => {
+        patch(host.id, { status: "running" });
+        if (!host.installationId) {
+          patch(host.id, { status: "skipped" });
+          return;
+        }
+        try {
+          const { jobId } = await cleanupClientMarketClientWithReason(host.installationId, {
+            reason: cleanupReasonForHost(host, isAdmin),
+            blockClientForProvider: false,
+          });
+          const result = await pollCleanupJobQuiet(jobId);
+          if (result.ok) patch(host.id, { status: "succeeded" });
+          else patch(host.id, { status: "failed", detail: result.detail });
+        } catch (err) {
+          patch(host.id, {
+            status: "failed",
+            detail: err instanceof Error ? err.message : String(err),
+          });
+        }
+      });
+      finishBatch(Array.from(byId.values()));
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
+  const runBatchReverify = async () => {
+    const targets = reverifyEligible;
+    const skippedHosts = selectedHosts.filter((host) => !hostCanReverify(host, isAdmin));
+    const { byId, patch } = beginBatchProgress("reverify", targets, skippedHosts);
+    setBatchBusy(true);
+    try {
+      await mapPool(targets, 5, async (host) => {
+        patch(host.id, { status: "running" });
+        try {
+          await reverifyClientMarketHost(host.id);
+          patch(host.id, { status: "succeeded" });
+        } catch (err) {
+          patch(host.id, {
+            status: "failed",
+            detail: err instanceof Error ? err.message : String(err),
+          });
+        }
+      });
+      finishBatch(Array.from(byId.values()));
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
+  const runBatchDelete = async () => {
+    const targets = deleteEligible;
+    const skippedHosts = selectedHosts.filter((host) => !hostCanDelete(host, isAdmin));
+    const { byId, patch } = beginBatchProgress("delete", targets, skippedHosts);
+    setBatchBusy(true);
+    try {
+      await mapPool(targets, 5, async (host) => {
+        patch(host.id, { status: "running" });
+        try {
+          await deleteClientMarketHost(host.id);
+          patch(host.id, { status: "succeeded" });
+        } catch (err) {
+          patch(host.id, {
+            status: "failed",
+            detail: err instanceof Error ? err.message : String(err),
+          });
+        }
+      });
+      finishBatch(Array.from(byId.values()));
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
   const openAddHost = () => {
     if (!authed) {
       setPendingAddAfterLogin(true);
@@ -1473,24 +1758,81 @@ export function ClientMarketPage() {
     setAddOpen(true);
   };
 
-  const exportHosts = async () => {
+  const downloadHostExport = (document: Awaited<ReturnType<typeof exportMyClientMarketHosts>>) => {
+    const blob = new Blob([`${JSON.stringify(document, null, 2)}\n`], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = window.document.createElement("a");
+    link.href = url;
+    link.download = `cc-switch-client-market-hosts-${new Date().toISOString().slice(0, 10)}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+    toast.success(t("clientMarket.exportedHosts", { count: document.hosts.length }));
+  };
+
+  const exportHosts = async (selectedOnly: boolean) => {
     setTransferBusy(true);
     try {
       const document = await exportMyClientMarketHosts();
-      const blob = new Blob([`${JSON.stringify(document, null, 2)}\n`], { type: "application/json" });
-      const url = URL.createObjectURL(blob);
-      const link = window.document.createElement("a");
-      link.href = url;
-      link.download = `cc-switch-client-market-hosts-${new Date().toISOString().slice(0, 10)}.json`;
-      link.click();
-      URL.revokeObjectURL(url);
-      toast.success(t("clientMarket.exportedHosts", { count: document.hosts.length }));
+      if (selectedOnly) {
+        const keys = new Set(exportEligible.map((host) => hostExportKey(host)).filter(Boolean));
+        if (!keys.size) {
+          toast.danger(t("clientMarket.batchExportEmpty"));
+          return;
+        }
+        document.hosts = document.hosts.filter((entry) => keys.has(hostExportKey(entry)));
+        if (!document.hosts.length) {
+          toast.danger(t("clientMarket.batchExportEmpty"));
+          return;
+        }
+      }
+      downloadHostExport(document);
+      if (selectedOnly) clearSelection();
     } catch (reason) {
       toast.danger(reason instanceof Error ? reason.message : String(reason));
     } finally {
       setTransferBusy(false);
     }
   };
+
+  const batchConfirmCopy =
+    batchConfirm === "cleanup"
+      ? {
+          title: t("clientMarket.batchConfirmCleanupTitle"),
+          description: t("clientMarket.batchConfirmCleanupDesc", {
+            run: cleanupEligible.length,
+            skip: selectedCount - cleanupEligible.length,
+          }),
+          confirmLabel: t("clientMarket.cleanup"),
+          run: () => void runBatchCleanup(),
+        }
+      : batchConfirm === "reverify"
+        ? {
+            title: t("clientMarket.batchConfirmReverifyTitle"),
+            description: t("clientMarket.batchConfirmReverifyDesc", {
+              run: reverifyEligible.length,
+              skip: selectedCount - reverifyEligible.length,
+            }),
+            confirmLabel: t("clientMarket.reverifyHost"),
+            run: () => void runBatchReverify(),
+          }
+        : batchConfirm === "delete"
+          ? {
+              title: t("clientMarket.batchConfirmDeleteTitle"),
+              description: t("clientMarket.batchConfirmDeleteDesc", {
+                run: deleteEligible.length,
+                skip: selectedCount - deleteEligible.length,
+              }),
+              confirmLabel: t("clientMarket.deleteHost"),
+              run: () => void runBatchDelete(),
+            }
+          : null;
+
+  const batchActionLabel =
+    batchProgressAction === "cleanup"
+      ? t("clientMarket.batchProgressCleanup")
+      : batchProgressAction === "reverify"
+        ? t("clientMarket.batchProgressReverify")
+        : t("clientMarket.batchProgressDelete");
 
   const importHosts = async (file?: File) => {
     if (!file) return;
@@ -1588,11 +1930,20 @@ export function ClientMarketPage() {
               </Tooltip>
               <Tooltip>
                 <Tooltip.Trigger>
-                  <Button variant="outline" size="sm" isIconOnly aria-label={t("clientMarket.exportMyHosts")} isDisabled={transferBusy} onClick={() => void exportHosts()}>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    isIconOnly
+                    aria-label={selectedCount ? t("clientMarket.batchExportSelected") : t("clientMarket.exportMyHosts")}
+                    isDisabled={transferBusy || batchBusy}
+                    onClick={() => void exportHosts(selectedCount > 0)}
+                  >
                     {transferBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
                   </Button>
                 </Tooltip.Trigger>
-                <Tooltip.Content>{t("clientMarket.exportMyHosts")}</Tooltip.Content>
+                <Tooltip.Content>
+                  {selectedCount ? t("clientMarket.batchExportSelected") : t("clientMarket.exportMyHosts")}
+                </Tooltip.Content>
               </Tooltip>
             </>
           ) : null}
@@ -1602,6 +1953,101 @@ export function ClientMarketPage() {
           </Button>
         </div>
       </div>
+
+      {selectedCount > 0 ? (
+        <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-white px-3 py-2 text-sm">
+          <span className="font-medium text-foreground">{t("clientMarket.batchSelected", { count: selectedCount })}</span>
+          <Button variant="ghost" size="sm" isDisabled={batchBusy} onClick={selectPage}>
+            {t("clientMarket.batchSelectPage")}
+          </Button>
+          <Button variant="ghost" size="sm" isDisabled={batchBusy} onClick={selectAllFiltered}>
+            {t("clientMarket.batchSelectAll")}
+          </Button>
+          <Button variant="ghost" size="sm" isDisabled={batchBusy} onClick={clearSelection}>
+            {t("clientMarket.batchClear")}
+          </Button>
+          <span className="mx-1 h-4 w-px bg-border" aria-hidden />
+          <Button
+            variant="outline"
+            size="sm"
+            isDisabled={batchBusy || cleanupEligible.length === 0}
+            aria-label={t("clientMarket.batchEligible", { run: cleanupEligible.length, selected: selectedCount })}
+            onClick={() => {
+              if (!cleanupEligible.length) {
+                toast.info(t("clientMarket.batchNothingEligible"));
+                return;
+              }
+              setBatchConfirm("cleanup");
+            }}
+          >
+            {t("clientMarket.cleanup")}
+            <span className="ml-1 text-xs text-muted-foreground">
+              {t("clientMarket.batchEligible", { run: cleanupEligible.length, selected: selectedCount })}
+            </span>
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            isDisabled={batchBusy || reverifyEligible.length === 0}
+            aria-label={t("clientMarket.batchEligible", { run: reverifyEligible.length, selected: selectedCount })}
+            onClick={() => {
+              if (!reverifyEligible.length) {
+                toast.info(t("clientMarket.batchNothingEligible"));
+                return;
+              }
+              setBatchConfirm("reverify");
+            }}
+          >
+            <RefreshCw className="h-4 w-4" />
+            {t("clientMarket.reverifyHost")}
+            <span className="ml-1 text-xs text-muted-foreground">
+              {t("clientMarket.batchEligible", { run: reverifyEligible.length, selected: selectedCount })}
+            </span>
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="text-destructive"
+            isDisabled={batchBusy || deleteEligible.length === 0}
+            aria-label={t("clientMarket.batchEligible", { run: deleteEligible.length, selected: selectedCount })}
+            onClick={() => {
+              if (!deleteEligible.length) {
+                toast.info(t("clientMarket.batchNothingEligible"));
+                return;
+              }
+              setBatchConfirm("delete");
+            }}
+          >
+            <Trash2 className="h-4 w-4" />
+            {t("clientMarket.deleteHost")}
+            <span className="ml-1 text-xs text-muted-foreground">
+              {t("clientMarket.batchEligible", { run: deleteEligible.length, selected: selectedCount })}
+            </span>
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            isDisabled={transferBusy || batchBusy || exportEligible.length === 0}
+            aria-label={t("clientMarket.batchEligible", { run: exportEligible.length, selected: selectedCount })}
+            onClick={() => void exportHosts(true)}
+          >
+            <Download className="h-4 w-4" />
+            {t("clientMarket.batchExportSelected")}
+            <span className="ml-1 text-xs text-muted-foreground">
+              {t("clientMarket.batchEligible", { run: exportEligible.length, selected: selectedCount })}
+            </span>
+          </Button>
+        </div>
+      ) : visibleHosts.length ? (
+        <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+          <Button variant="ghost" size="sm" className="h-7 px-2" isDisabled={batchBusy} onClick={selectPage}>
+            {t("clientMarket.batchSelectPage")}
+          </Button>
+          <Button variant="ghost" size="sm" className="h-7 px-2" isDisabled={batchBusy} onClick={selectAllFiltered}>
+            {t("clientMarket.batchSelectAll")}
+          </Button>
+        </div>
+      ) : null}
 
       {!authed ? (
         <p className="text-sm text-muted-foreground">{t("clientMarket.loginToAddHost")}</p>
@@ -1674,6 +2120,9 @@ export function ClientMarketPage() {
                 host={host}
                 billing={host.installationId ? billingByInstallation.get(host.installationId) : undefined}
                 isAdmin={isAdmin}
+                selected={selectedIds.has(host.id)}
+                onSelectedChange={(next) => setHostSelected(host.id, next)}
+                selectionDisabled={batchBusy}
                 onChanged={() => void load()}
                 onCreate={setFixedHost}
               />
@@ -1736,6 +2185,88 @@ export function ClientMarketPage() {
               <div className="grid gap-1.5">{importResult?.items.map((item) => <div key={`${item.ip}:${item.port}`} className="grid grid-cols-[minmax(0,1fr)_auto] gap-3 rounded-md border px-3 py-2 text-xs"><span className="min-w-0 truncate font-mono">{item.ip}:{item.port}</span><span className={item.status === "failed" ? "text-rose-600" : item.status === "imported" ? "text-emerald-700" : "text-muted-foreground"}>{item.error || item.status}</span></div>)}</div>
             </Modal.Body>
             <Modal.Footer><Button variant="primary" onClick={() => setImportResult(null)}>{t("common.close")}</Button></Modal.Footer>
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
+
+      {batchConfirmCopy ? (
+        <ConfirmAlertDialog
+          open
+          title={batchConfirmCopy.title}
+          description={batchConfirmCopy.description}
+          confirmLabel={batchConfirmCopy.confirmLabel}
+          cancelLabel={t("common.cancel")}
+          tone="danger"
+          busy={batchBusy}
+          onConfirm={() => {
+            setBatchConfirm(null);
+            batchConfirmCopy.run();
+          }}
+          onOpenChange={(nextOpen) => {
+            if (!nextOpen && !batchBusy) setBatchConfirm(null);
+          }}
+        />
+      ) : null}
+
+      <Modal.Backdrop
+        isOpen={batchProgressOpen}
+        onOpenChange={(next) => {
+          if (!next && !batchBusy) setBatchProgressOpen(false);
+        }}
+      >
+        <Modal.Container placement="center">
+          <Modal.Dialog className="light w-[min(560px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
+            <Modal.Header>
+              <Modal.Heading>
+                {t("clientMarket.batchProgressTitle", { action: batchActionLabel })}
+              </Modal.Heading>
+            </Modal.Header>
+            <Modal.Body className="grid max-h-[65vh] gap-2 overflow-y-auto">
+              {batchProgressItems.map((item) => (
+                <div
+                  key={item.hostId}
+                  className="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-3 rounded-md border px-3 py-2 text-xs"
+                >
+                  <div className="min-w-0">
+                    <div className="truncate font-medium text-foreground">{item.label}</div>
+                    {item.detail ? (
+                      <div className="mt-0.5 whitespace-normal break-words text-muted-foreground">{item.detail}</div>
+                    ) : null}
+                  </div>
+                  <span
+                    className={
+                      item.status === "failed"
+                        ? "text-rose-600"
+                        : item.status === "succeeded"
+                          ? "text-emerald-700"
+                          : item.status === "running"
+                            ? "text-primary"
+                            : "text-muted-foreground"
+                    }
+                  >
+                    {item.status === "queued"
+                      ? t("clientMarket.batchStatus.queued")
+                      : item.status === "running"
+                        ? t("clientMarket.batchStatus.running")
+                        : item.status === "succeeded"
+                          ? t("clientMarket.batchStatus.succeeded")
+                          : item.status === "failed"
+                            ? t("clientMarket.batchStatus.failed")
+                            : t("clientMarket.batchStatus.skipped")}
+                  </span>
+                </div>
+              ))}
+            </Modal.Body>
+            <Modal.Footer>
+              <Button
+                variant="primary"
+                isDisabled={batchBusy}
+                onClick={() => setBatchProgressOpen(false)}
+              >
+                {batchBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                {t("common.close")}
+              </Button>
+            </Modal.Footer>
           </Modal.Dialog>
         </Modal.Container>
       </Modal.Backdrop>
