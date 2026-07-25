@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { Button, Checkbox, Chip, Dropdown, Modal, Tabs, toast, Tooltip } from "@heroui/react";
-import { Check, ChevronDown, ChevronLeft, ChevronRight, Circle, Clock3, Download, Loader2, MoreHorizontal, Pencil, Plus, RefreshCw, Trash2, Upload, X } from "lucide-react";
+import { Check, CheckSquare, ChevronDown, ChevronLeft, ChevronRight, Circle, Clock3, Download, Filter, Loader2, MoreHorizontal, Pencil, Plus, RefreshCw, Trash2, Upload, X } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { CopyableCodeField } from "@/components/common/copyable-code-field";
@@ -266,23 +266,38 @@ function statusLabelKey(status: string): MessageKey {
   return (known[status as keyof typeof known] || "clientMarket.status.idle") as MessageKey;
 }
 
-const HOST_STATUS_TABS = [
-  "all",
-  "idle",
-  "reserved",
-  "allocated",
-  "locked",
-  "draining",
-  "disabled",
-  "unreachable",
-  "abnormal",
-] as const;
+const HOST_STATUS_GROUPS = ["all", "idle", "in_use", "needs_attention"] as const;
+type HostStatusFilter = (typeof HOST_STATUS_GROUPS)[number];
 
-type HostStatusFilter = (typeof HOST_STATUS_TABS)[number];
+const STATUS_GROUP_MEMBERS: Record<Exclude<HostStatusFilter, "all">, readonly string[]> = {
+  idle: ["idle"],
+  in_use: ["allocated", "locked", "reserved"],
+  needs_attention: ["draining", "unreachable", "abnormal", "disabled"],
+};
 
-function statusHintKey(status: HostStatusFilter): MessageKey {
+function statusGroupForHost(status: string): Exclude<HostStatusFilter, "all"> | null {
+  const normalized = status.trim().toLowerCase();
+  for (const group of ["idle", "in_use", "needs_attention"] as const) {
+    if (STATUS_GROUP_MEMBERS[group].includes(normalized)) return group;
+  }
+  return null;
+}
+
+function hostMatchesStatusFilter(status: string, filter: HostStatusFilter) {
+  if (filter === "all") return true;
+  return statusGroupForHost(status) === filter;
+}
+
+function statusGroupLabelKey(group: HostStatusFilter): MessageKey {
+  return `clientMarket.statusGroup.${group}` as MessageKey;
+}
+
+function statusGroupHintKey(group: HostStatusFilter): MessageKey {
+  return `clientMarket.statusGroupHint.${group}` as MessageKey;
+}
+
+function fineStatusHintKey(status: string): MessageKey | null {
   const known = {
-    all: "clientMarket.statusHint.all",
     idle: "clientMarket.statusHint.idle",
     reserved: "clientMarket.statusHint.reserved",
     allocated: "clientMarket.statusHint.allocated",
@@ -292,7 +307,7 @@ function statusHintKey(status: HostStatusFilter): MessageKey {
     unreachable: "clientMarket.statusHint.unreachable",
     abnormal: "clientMarket.statusHint.abnormal",
   } as const;
-  return known[status];
+  return known[status as keyof typeof known] ?? null;
 }
 
 function authorizedKeysInstallCommand(line: string): string {
@@ -1147,11 +1162,7 @@ function HostRow({
             size="sm"
             variant="soft"
             className="shrink-0"
-            title={
-              (HOST_STATUS_TABS as readonly string[]).includes(host.status)
-                ? t(statusHintKey(host.status as HostStatusFilter))
-                : undefined
-            }
+            title={fineStatusHintKey(host.status) ? t(fineStatusHintKey(host.status)!) : undefined}
           >
             {t(statusLabelKey(host.status))}
           </Chip>
@@ -1380,32 +1391,27 @@ function HostRow({
 
 const OWNER_FILTER_KEY = "cc_switch_router_client_market_owner_filter_v1";
 const REGION_FILTER_KEY = "cc_switch_router_client_market_region_filter_v1";
-const STATUS_FILTER_KEY = "cc_switch_router_client_market_status_filter_v1";
+const STATUS_FILTER_KEY = "cc_switch_router_client_market_status_filter_v2";
 const HOST_PAGE_SIZE = 10;
 
 function normalizeHostStatusFilter(value: unknown): HostStatusFilter {
-  if (typeof value === "string" && (HOST_STATUS_TABS as readonly string[]).includes(value)) {
+  if (typeof value !== "string") return "all";
+  if ((HOST_STATUS_GROUPS as readonly string[]).includes(value)) {
     return value as HostStatusFilter;
   }
-  return "all";
+  // Migrate legacy fine-grained tabs.
+  const mapped = statusGroupForHost(value);
+  return mapped ?? "all";
 }
 
 function hostStatusTabTone(status: HostStatusFilter, active: boolean) {
   if (active) return "bg-white font-medium text-foreground shadow-sm";
   switch (status) {
-    case "unreachable":
-    case "abnormal":
-      return "text-rose-700";
-    case "locked":
-    case "reserved":
-      return "text-sky-700";
-    case "draining":
+    case "needs_attention":
       return "text-amber-700";
-    case "disabled":
-      return "text-slate-500";
     case "idle":
       return "text-emerald-700";
-    case "allocated":
+    case "in_use":
       return "text-slate-700";
     default:
       return "text-muted-foreground";
@@ -1438,6 +1444,8 @@ export function ClientMarketPage() {
   const importInputRef = React.useRef<HTMLInputElement | null>(null);
   const [selectionMode, setSelectionMode] = React.useState(false);
   const [selectedIds, setSelectedIds] = React.useState<Set<string>>(new Set());
+  const [filterOpen, setFilterOpen] = React.useState(false);
+  const filterRootRef = React.useRef<HTMLDivElement | null>(null);
   const [batchBusy, setBatchBusy] = React.useState(false);
   const [batchConfirm, setBatchConfirm] = React.useState<"cleanup" | "delete" | "reverify" | null>(null);
   const [batchProgressOpen, setBatchProgressOpen] = React.useState(false);
@@ -1507,24 +1515,19 @@ export function ClientMarketPage() {
     const counts: Record<HostStatusFilter, number> = {
       all: scopedHosts.length,
       idle: 0,
-      reserved: 0,
-      allocated: 0,
-      locked: 0,
-      draining: 0,
-      disabled: 0,
-      unreachable: 0,
-      abnormal: 0,
+      in_use: 0,
+      needs_attention: 0,
     };
     for (const host of scopedHosts) {
-      const key = host.status as HostStatusFilter;
-      if (key in counts && key !== "all") counts[key] += 1;
+      const group = statusGroupForHost(host.status);
+      if (group) counts[group] += 1;
     }
     return counts;
   }, [scopedHosts]);
 
   const visibleHosts = React.useMemo(() => {
     return scopedHosts
-      .filter((host) => statusFilter === "all" || host.status === statusFilter)
+      .filter((host) => hostMatchesStatusFilter(host.status, statusFilter))
       .sort((a, b) => {
         const ownerCmp = a.hostOwnerEmail.localeCompare(b.hostOwnerEmail);
         if (ownerCmp !== 0) return ownerCmp;
@@ -1888,14 +1891,34 @@ export function ClientMarketPage() {
 
   const statusTabs = React.useMemo(
     () =>
-      HOST_STATUS_TABS.map((value) => ({
+      HOST_STATUS_GROUPS.map((value) => ({
         value,
-        label: value === "all" ? t("dashboard.all") : t(statusLabelKey(value)),
-        hint: t(statusHintKey(value)),
+        label: t(statusGroupLabelKey(value)),
+        hint: t(statusGroupHintKey(value)),
         count: statusCounts[value],
       })),
     [statusCounts, t],
   );
+
+  const activeFilterCount =
+    (mineOnly ? 1 : 0) + (ownerFilters.length > 0 ? 1 : 0) + (regionFilters.length > 0 ? 1 : 0);
+  const hasActiveFilters = activeFilterCount > 0;
+
+  React.useEffect(() => {
+    if (!filterOpen) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (filterRootRef.current?.contains(event.target as Node)) return;
+      setFilterOpen(false);
+    };
+    window.addEventListener("pointerdown", onPointerDown);
+    return () => window.removeEventListener("pointerdown", onPointerDown);
+  }, [filterOpen]);
+
+  const clearScopedFilters = () => {
+    setOwnerFilters([]);
+    setRegionFilters([]);
+    setMineOnly(false);
+  };
 
   return (
     <div className="mx-auto grid min-w-0 w-[calc(100%-2rem)] max-w-7xl grid-cols-[minmax(0,1fr)] gap-5 pb-10">
@@ -1917,41 +1940,99 @@ export function ClientMarketPage() {
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <CompactRegionMultiSelect
-            values={ownerFilters}
-            onChange={setOwnerFilters}
-            options={ownerOptions}
-            allLabel={t("clientMarket.allOwners")}
-            moreLabel={(count) => t("clientMarket.ownersMore", { count })}
-            clearLabel={t("clientMarket.clearOwnerSelection")}
-            ariaLabel={t("clientMarket.filterOwners")}
-            className="w-full sm:w-56"
-          />
-          <CompactRegionMultiSelect
-            values={regionFilters}
-            onChange={setRegionFilters}
-            options={regionOptions}
-            allLabel={t("clientMarket.allRegions")}
-            moreLabel={(count) => t("clientMarket.regionsMore", { count })}
-            clearLabel={t("clientMarket.clearRegionSelection")}
-            ariaLabel={t("clientMarket.filterRegions")}
-            className="w-full sm:w-44"
-          />
-          {authed ? (
+          <div ref={filterRootRef} className="relative">
             <Button
-              variant={mineOnly ? "primary" : "outline"}
+              variant={hasActiveFilters || filterOpen ? "primary" : "outline"}
               size="sm"
-              onClick={() => setMineOnly((value) => !value)}
+              className="h-8"
+              aria-expanded={filterOpen}
+              aria-label={t("clientMarket.filter")}
+              onClick={() => setFilterOpen((open) => !open)}
             >
-              {mineOnly ? t("clientMarket.allHosts") : t("clientMarket.myHosts")}
+              <Filter className="h-4 w-4" />
+              {hasActiveFilters
+                ? t("clientMarket.filterActive", { count: activeFilterCount })
+                : t("clientMarket.filter")}
+              <ChevronDown className={`h-3.5 w-3.5 transition-transform ${filterOpen ? "rotate-180" : ""}`} />
             </Button>
-          ) : null}
+            {filterOpen ? (
+              <div className="absolute right-0 z-30 mt-1.5 w-[min(20rem,calc(100vw-2rem))] rounded-lg border border-border bg-white p-3 shadow-lg">
+                <div className="grid gap-3">
+                  <CompactRegionMultiSelect
+                    values={ownerFilters}
+                    onChange={setOwnerFilters}
+                    options={ownerOptions}
+                    allLabel={t("clientMarket.allOwners")}
+                    moreLabel={(count) => t("clientMarket.ownersMore", { count })}
+                    clearLabel={t("clientMarket.clearOwnerSelection")}
+                    ariaLabel={t("clientMarket.filterOwners")}
+                    className="w-full"
+                  />
+                  <CompactRegionMultiSelect
+                    values={regionFilters}
+                    onChange={setRegionFilters}
+                    options={regionOptions}
+                    allLabel={t("clientMarket.allRegions")}
+                    moreLabel={(count) => t("clientMarket.regionsMore", { count })}
+                    clearLabel={t("clientMarket.clearRegionSelection")}
+                    ariaLabel={t("clientMarket.filterRegions")}
+                    className="w-full"
+                  />
+                  {authed ? (
+                    <label className="flex cursor-pointer items-center gap-2 rounded-md border border-border px-3 py-2 text-sm">
+                      <input
+                        type="checkbox"
+                        className="h-4 w-4 accent-[var(--accent,#0052FF)]"
+                        checked={mineOnly}
+                        onChange={(event) => setMineOnly(event.target.checked)}
+                      />
+                      <span>{t("clientMarket.filterMineOnly")}</span>
+                    </label>
+                  ) : null}
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="justify-start"
+                    isDisabled={!hasActiveFilters}
+                    onClick={clearScopedFilters}
+                  >
+                    {t("clientMarket.filterClear")}
+                  </Button>
+                </div>
+              </div>
+            ) : null}
+          </div>
           {authed ? (
             <>
               <input ref={importInputRef} type="file" accept="application/json,.json" className="hidden" onChange={(event) => void importHosts(event.target.files?.[0])} />
+              {selectionMode ? (
+                <Button variant="outline" size="sm" className="h-8" isDisabled={batchBusy} onClick={exitSelectionMode}>
+                  <CheckSquare className="h-4 w-4" />
+                  {t("clientMarket.batchDoneSelection")}
+                </Button>
+              ) : (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-8"
+                  isDisabled={batchBusy || !visibleHosts.length}
+                  onClick={enterSelectionMode}
+                >
+                  <CheckSquare className="h-4 w-4" />
+                  {t("clientMarket.batchEnterSelection")}
+                </Button>
+              )}
               <Tooltip>
                 <Tooltip.Trigger>
-                  <Button variant="outline" size="sm" isIconOnly aria-label={t("clientMarket.importMyHosts")} isDisabled={transferBusy} onClick={() => importInputRef.current?.click()}>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    isIconOnly
+                    className="h-8 w-8 min-w-8"
+                    aria-label={t("clientMarket.importMyHosts")}
+                    isDisabled={transferBusy}
+                    onClick={() => importInputRef.current?.click()}
+                  >
                     <Upload className="h-4 w-4" />
                   </Button>
                 </Tooltip.Trigger>
@@ -1963,6 +2044,7 @@ export function ClientMarketPage() {
                     variant="outline"
                     size="sm"
                     isIconOnly
+                    className="h-8 w-8 min-w-8"
                     aria-label={t("clientMarket.exportMyHosts")}
                     isDisabled={transferBusy || batchBusy}
                     onClick={() => void exportHosts(false)}
@@ -1972,18 +2054,9 @@ export function ClientMarketPage() {
                 </Tooltip.Trigger>
                 <Tooltip.Content>{t("clientMarket.exportMyHosts")}</Tooltip.Content>
               </Tooltip>
-              {selectionMode ? (
-                <Button variant="primary" size="sm" isDisabled={batchBusy} onClick={exitSelectionMode}>
-                  {t("clientMarket.batchDoneSelection")}
-                </Button>
-              ) : (
-                <Button variant="outline" size="sm" isDisabled={batchBusy || !visibleHosts.length} onClick={enterSelectionMode}>
-                  {t("clientMarket.batchEnterSelection")}
-                </Button>
-              )}
             </>
           ) : null}
-          <Button variant="outline" size="sm" onClick={openAddHost}>
+          <Button variant="primary" size="sm" className="h-8" onClick={openAddHost}>
             <Plus className="h-4 w-4" />
             {t("clientMarket.addHost")}
           </Button>
