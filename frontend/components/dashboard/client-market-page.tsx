@@ -20,6 +20,7 @@ import {
   createClientMarketHost,
   deleteClientMarketHost,
   exportMyClientMarketHosts,
+  getAccountPaymentProfile,
   getClientMarketProviderSupply,
   getClientMarketHosts,
   getClientMarketJob,
@@ -31,6 +32,7 @@ import {
   testClientMarketHostSsh,
   updateClientMarketHostOffer,
 } from "@/lib/api";
+import { DASHBOARD_ACCOUNT_PATH } from "@/lib/dashboard-nav";
 import type { ClientMarketBilling, ClientMarketHost, ClientMarketHostImportResponse, ClientMarketProvider, HostIpIntel, ProvisionSshKey, ProvisioningJob } from "@/lib/types";
 import type { MessageKey } from "@/lib/i18n";
 import { usePersistentState } from "@/lib/use-persistent-state";
@@ -376,6 +378,10 @@ function parseHostOffer(priceUsd: string, periodDays: string, t: Translate) {
   return { priceCents, rentalPeriodDays };
 }
 
+function isPaymentProfileRequiredError(message: string) {
+  return message.toLowerCase().includes("configure payment details on the account page");
+}
+
 function AddHostDialog({
   open,
   onOpenChange,
@@ -402,6 +408,7 @@ function AddHostDialog({
   const [phase, setPhase] = React.useState<"form" | "progress" | "success">("form");
   const [stepStatus, setStepStatus] = React.useState<StepStatusMap>(IDLE_STEP_STATUS);
   const [ipIntel, setIpIntel] = React.useState<HostIpIntel | null>(null);
+  const [paymentReady, setPaymentReady] = React.useState<boolean | null>(null);
 
   React.useEffect(() => {
     if (!open) return;
@@ -411,7 +418,15 @@ function AddHostDialog({
     setPhase("form");
     setStepStatus(IDLE_STEP_STATUS);
     setIpIntel(null);
+    setPaymentReady(null);
     let cancelled = false;
+    void getAccountPaymentProfile()
+      .then((profile) => {
+        if (!cancelled) setPaymentReady(profile.methods.length > 0);
+      })
+      .catch(() => {
+        if (!cancelled) setPaymentReady(false);
+      });
     setSshKeyLoading(true);
     void getProvisionSshKey()
       .then((key) => {
@@ -491,6 +506,10 @@ function AddHostDialog({
       setError(reason instanceof Error ? reason.message : String(reason));
       return;
     }
+    if (offer.priceCents && paymentReady === false) {
+      setError(t("clientMarket.offerRequiresPayment"));
+      return;
+    }
     if (note.length > 500) {
       setError(t("clientMarket.noteTooLong"));
       return;
@@ -566,7 +585,10 @@ function AddHostDialog({
       setPhase("success");
       onAdded();
     } catch (err) {
-      const message = mapHostError(err instanceof Error ? err.message : String(err));
+      const raw = err instanceof Error ? err.message : String(err);
+      const message = isPaymentProfileRequiredError(raw)
+        ? t("clientMarket.offerRequiresPayment")
+        : mapHostError(raw);
       setError(message);
       setStepStatus(markStepFailed);
     } finally {
@@ -777,6 +799,17 @@ function AddHostDialog({
                   </label>
                 </div>
                 <p className="text-xs text-muted-foreground">{t("clientMarket.offerHint")}</p>
+                {paymentReady === false ? (
+                  <div className="grid gap-1.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-950">
+                    <span>{t("clientMarket.offerRequiresPayment")}</span>
+                    <a
+                      href={DASHBOARD_ACCOUNT_PATH}
+                      className="font-medium text-foreground underline underline-offset-2"
+                    >
+                      {t("clientMarket.goToAccountPayment")}
+                    </a>
+                  </div>
+                ) : null}
                 <label className="grid gap-1 text-sm">
                   <span className="text-muted-foreground">{t("clientMarket.hostNote")}</span>
                   <input
@@ -909,6 +942,42 @@ function cleanupFailureGuidanceKey(failureCode?: string): MessageKey {
   return "clientMarket.cleanupFailedGuidance";
 }
 
+/** Human next-step copy for host list — never surface raw failure codes. */
+function hostStatusGuidanceKey(status: string, lastError?: string): MessageKey | null {
+  const group = statusGroupForHost(status);
+  if (group !== "needs_attention") return null;
+
+  const code = (lastError || "").trim().toLowerCase();
+  if (
+    code.startsWith("provisioning_failed") ||
+    code.startsWith("installer_failed") ||
+    code.includes("provisioning failed")
+  ) {
+    return "clientMarket.hostErrorGuidance.provisioningFailed";
+  }
+  if (code.startsWith("rollback_failed") || code.includes("operator verification")) {
+    return "clientMarket.hostErrorGuidance.rollbackFailed";
+  }
+  if (
+    code.includes("already running") ||
+    code.includes("cc-switch-server process")
+  ) {
+    return "clientMarket.hostErrorGuidance.abnormalProcess";
+  }
+  if (code.startsWith("cleanup_") || code.startsWith("cleanup ")) {
+    return cleanupFailureGuidanceKey(lastError);
+  }
+  if (status === "draining") return "clientMarket.statusHint.draining";
+  if (status === "disabled") return "clientMarket.statusHint.disabled";
+  if (status === "abnormal") return "clientMarket.statusHint.abnormal";
+  if (status === "unreachable") {
+    return lastError
+      ? "clientMarket.hostErrorGuidance.generic"
+      : "clientMarket.statusHint.unreachable";
+  }
+  return lastError ? "clientMarket.hostErrorGuidance.generic" : null;
+}
+
 function HostOfferDialog({
   host,
   open,
@@ -925,12 +994,25 @@ function HostOfferDialog({
   const [period, setPeriod] = React.useState(host.rentalPeriodDays ? String(host.rentalPeriodDays) : "");
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
+  const [paymentReady, setPaymentReady] = React.useState<boolean | null>(null);
 
   React.useEffect(() => {
     if (!open) return;
     setPrice(host.priceCents ? (host.priceCents / 100).toFixed(2) : "");
     setPeriod(host.rentalPeriodDays ? String(host.rentalPeriodDays) : "");
     setError("");
+    setPaymentReady(null);
+    let cancelled = false;
+    void getAccountPaymentProfile()
+      .then((profile) => {
+        if (!cancelled) setPaymentReady(profile.methods.length > 0);
+      })
+      .catch(() => {
+        if (!cancelled) setPaymentReady(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [host.priceCents, host.rentalPeriodDays, open]);
 
   const save = async () => {
@@ -941,6 +1023,10 @@ function HostOfferDialog({
       setError(reason instanceof Error ? reason.message : String(reason));
       return;
     }
+    if (offer.priceCents && paymentReady === false) {
+      setError(t("clientMarket.offerRequiresPayment"));
+      return;
+    }
     setBusy(true);
     setError("");
     try {
@@ -949,7 +1035,8 @@ function HostOfferDialog({
       onSaved();
       onOpenChange(false);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      const message = reason instanceof Error ? reason.message : String(reason);
+      setError(isPaymentProfileRequiredError(message) ? t("clientMarket.offerRequiresPayment") : message);
     } finally {
       setBusy(false);
     }
@@ -962,16 +1049,48 @@ function HostOfferDialog({
           <Modal.Header><Modal.Heading>{t("clientMarket.editOffer")}</Modal.Heading></Modal.Header>
           <Modal.Body className="grid gap-4">
             <p className="text-sm text-muted-foreground">{t("clientMarket.editOfferHint")}</p>
+            {paymentReady === false ? (
+              <div className="grid gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-3 text-sm text-amber-950">
+                <p>{t("clientMarket.offerRequiresPayment")}</p>
+                <a
+                  href={DASHBOARD_ACCOUNT_PATH}
+                  className="inline-flex w-fit items-center font-medium text-foreground underline underline-offset-2"
+                >
+                  {t("clientMarket.goToAccountPayment")}
+                </a>
+              </div>
+            ) : null}
             <div className="grid gap-3 sm:grid-cols-2">
-              <label className="grid gap-1 text-sm"><span className="text-muted-foreground">{t("clientMarket.priceUsd")}</span><input value={price} onChange={(event) => setPrice(event.target.value)} placeholder={t("clientMarket.free")} inputMode="decimal" className="h-10 rounded-md border px-3" /></label>
-              <label className="grid gap-1 text-sm"><span className="text-muted-foreground">{t("clientMarket.periodDays")}</span><input value={period} onChange={(event) => setPeriod(event.target.value)} placeholder={t("clientMarket.forever")} inputMode="numeric" className="h-10 rounded-md border px-3" /></label>
+              <label className="grid gap-1 text-sm">
+                <span className="text-muted-foreground">{t("clientMarket.priceUsd")}</span>
+                <input
+                  value={price}
+                  onChange={(event) => setPrice(event.target.value)}
+                  placeholder={t("clientMarket.free")}
+                  inputMode="decimal"
+                  className="h-10 rounded-md border px-3"
+                />
+              </label>
+              <label className="grid gap-1 text-sm">
+                <span className="text-muted-foreground">{t("clientMarket.periodDays")}</span>
+                <input
+                  value={period}
+                  onChange={(event) => setPeriod(event.target.value)}
+                  placeholder={t("clientMarket.forever")}
+                  inputMode="numeric"
+                  className="h-10 rounded-md border px-3"
+                />
+              </label>
             </div>
             <p className="text-xs text-muted-foreground">{t("clientMarket.makeFreeHint")}</p>
             {error ? <p className="text-sm text-rose-600">{error}</p> : null}
           </Modal.Body>
           <Modal.Footer>
             <Button variant="ghost" isDisabled={busy} onClick={() => onOpenChange(false)}>{t("common.cancel")}</Button>
-            <Button variant="primary" isDisabled={busy} onClick={() => void save()}>{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{t("common.save")}</Button>
+            <Button variant="primary" isDisabled={busy || paymentReady === null} onClick={() => void save()}>
+              {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+              {t("common.save")}
+            </Button>
           </Modal.Footer>
         </Modal.Dialog>
       </Modal.Container>
@@ -1147,15 +1266,14 @@ function HostRow({
     billing.priceCents &&
     (billing.status === "payment_due" ? billing.paymentDeadline : billing.currentPeriodEnd)
   );
-  const hasUnreachableGuidance = host.status === "unreachable" && !!host.installationId;
   const showSubrow =
-    paymentKinds.length > 0 ||
     !!host.clientOwnerEmail ||
     hasBillingCountdown ||
-    !!host.note ||
-    !!host.lastError ||
-    hasUnreachableGuidance;
+    !!host.note;
   const ipIntelSubtitle = secondaryIntelParts.length ? secondaryIntelParts.join(" · ") : "";
+  const statusGuidanceKey = hostStatusGuidanceKey(host.status, host.lastError);
+  const statusGuidanceSubtitle = statusGuidanceKey ? t(statusGuidanceKey) : "";
+  const statusHint = fineStatusHintKey(host.status) ? t(fineStatusHintKey(host.status)!) : "";
   const colSpan = selectionMode ? 8 : 7;
 
   return (
@@ -1176,15 +1294,17 @@ function HostRow({
             </Checkbox>
           </td>
         ) : null}
-        <td className="whitespace-nowrap px-2 py-2 align-middle">
-          <Chip
-            size="sm"
-            variant="soft"
-            className="shrink-0"
-            title={fineStatusHintKey(host.status) ? t(fineStatusHintKey(host.status)!) : undefined}
-          >
-            {t(statusLabelKey(host.status))}
-          </Chip>
+        <td className="max-w-[11rem] px-2 py-2 align-middle">
+          <div className="min-w-0" title={statusGuidanceSubtitle || statusHint || undefined}>
+            <Chip size="sm" variant="soft" className="shrink-0">
+              {t(statusLabelKey(host.status))}
+            </Chip>
+            {statusGuidanceSubtitle ? (
+              <span className="mt-0.5 block truncate text-[11px] leading-4 text-muted-foreground">
+                {statusGuidanceSubtitle}
+              </span>
+            ) : null}
+          </div>
         </td>
         <td className="max-w-[10rem] px-2 py-2 align-middle">
           {locationLabel || host.countryCode ? (
@@ -1205,10 +1325,15 @@ function HostRow({
             {host.hostOwnerEmail}
           </span>
         </td>
-        <td className="whitespace-nowrap px-2 py-2 align-middle">
-          <span className="text-xs font-semibold text-foreground" title={t("clientMarket.currentOffer")}>
-            {formatHostOffer(host.priceCents, host.rentalPeriodDays, locale)}
-          </span>
+        <td className="max-w-[9rem] whitespace-nowrap px-2 py-2 align-middle">
+          <div className="min-w-0">
+            <span className="block text-xs font-semibold text-foreground" title={t("clientMarket.currentOffer")}>
+              {formatHostOffer(host.priceCents, host.rentalPeriodDays, locale)}
+            </span>
+            {paymentKinds.length ? (
+              <PaymentMethodIcons kinds={paymentKinds} className="mt-0.5" />
+            ) : null}
+          </div>
         </td>
         <td className="max-w-[10rem] px-2 py-2 align-middle">
           {subdomain ? (
@@ -1321,7 +1446,6 @@ function HostRow({
         <tr className="border-b border-border/60 bg-muted/20">
           <td colSpan={colSpan} className="px-2 py-1.5 align-middle">
             <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] leading-4 text-muted-foreground">
-              {paymentKinds.length ? <PaymentMethodIcons kinds={paymentKinds} className="shrink-0" /> : null}
               {host.clientOwnerEmail ? (
                 <span className="min-w-0 whitespace-normal break-words" title={host.clientOwnerEmail}>
                   {t("clientMarket.rentedBy", { email: host.clientOwnerEmail })}
@@ -1331,19 +1455,6 @@ function HostRow({
               {host.note ? (
                 <span className="min-w-0 whitespace-normal break-words" title={host.note}>
                   {host.note}
-                </span>
-              ) : null}
-              {host.lastError ? (
-                <span
-                  className="min-w-0 whitespace-normal break-words text-destructive/90"
-                  title={host.lastError}
-                >
-                  {host.lastError}
-                </span>
-              ) : null}
-              {hasUnreachableGuidance ? (
-                <span className="whitespace-normal break-words text-amber-700">
-                  {t(cleanupFailureGuidanceKey(host.lastError))}
                 </span>
               ) : null}
             </div>

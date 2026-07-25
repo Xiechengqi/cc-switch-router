@@ -603,6 +603,9 @@ async fn require_session(
         .ok_or_else(|| AppError::Unauthorized("authenticated owner session required".into()))
 }
 
+pub(crate) const PAYMENT_PROFILE_REQUIRED_FOR_OFFER: &str =
+    "configure payment details on the Account page before setting a Host offer";
+
 pub(crate) fn validate_offer(
     price_cents: Option<i64>,
     rental_period_days: Option<i64>,
@@ -616,6 +619,32 @@ pub(crate) fn validate_offer(
             "paid hosts require priceCents between 1 and 100000000 and rentalPeriodDays between 4 and 3650; omit both for free forever".into(),
         )),
     }
+}
+
+fn payment_profile_has_methods(conn: &Connection, provider_id: &str) -> Result<bool, AppError> {
+    let methods_json: Option<String> = conn
+        .query_row(
+            "SELECT methods_json FROM account_payment_profiles WHERE user_id = ?1",
+            params![provider_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| AppError::Internal(format!("read payment profile for offer failed: {error}")))?;
+    let Some(methods_json) = methods_json else {
+        return Ok(false);
+    };
+    let methods: Vec<PaymentMethod> = serde_json::from_str(&methods_json).unwrap_or_default();
+    Ok(!methods.is_empty())
+}
+
+pub(crate) fn require_payment_profile_for_offer(
+    conn: &Connection,
+    provider_id: &str,
+) -> Result<(), AppError> {
+    if payment_profile_has_methods(conn, provider_id)? {
+        return Ok(());
+    }
+    Err(AppError::BadRequest(PAYMENT_PROFILE_REQUIRED_FOR_OFFER.into()))
 }
 
 fn normalize_payment_method(mut method: PaymentMethod) -> Result<PaymentMethod, AppError> {
@@ -2015,6 +2044,16 @@ impl AppStore {
                 "the Host offer is locked while provisioning is in progress; retry after it completes"
                     .into(),
             ));
+        }
+        // Paid offers require the Host owner's Account payment details so renters
+        // have a way to pay. Free forever does not require a payment profile.
+        if price_cents.is_some() {
+            let Some(host_provider_id) = provider_id.as_deref() else {
+                return Err(AppError::Conflict(
+                    "host is missing a Provider identity".into(),
+                ));
+            };
+            require_payment_profile_for_offer(&tx, host_provider_id)?;
         }
         let revision = old_revision + 1;
         tx.execute(

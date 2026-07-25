@@ -1146,6 +1146,10 @@ async fn create_host(
         .map_err(|e| AppError::Internal(format!("serialize host ip intel failed: {e}")))?;
     let (price_cents, rental_period_days) =
         crate::client_market_trade::validate_offer(input.price_cents, input.rental_period_days)?;
+    if price_cents.is_some() {
+        let conn = state.store.conn.lock().await;
+        crate::client_market_trade::require_payment_profile_for_offer(&conn, &session.user_id)?;
+    }
     state
         .store
         .client_market_ensure_provider(&session.user_id, &owner)
@@ -1327,6 +1331,10 @@ async fn import_one_host(
             entry.price_cents,
             entry.rental_period_days,
         )?;
+        if price.is_some() {
+            let conn = state.store.conn.lock().await;
+            crate::client_market_trade::require_payment_profile_for_offer(&conn, &provider_id)?;
+        }
         if let Some(existing_provider) = state
             .store
             .client_market_endpoint_provider(&ip.to_string(), port)
@@ -5229,6 +5237,13 @@ impl AppStore {
             } else {
                 HOST_STATUS_UNREACHABLE
             };
+            // Successful remote rollback returns the host to the idle pool — do not
+            // leave a stale machine failure code on an otherwise allocatable host.
+            let host_last_error: Option<&str> = if release_to_idle {
+                None
+            } else {
+                Some(failure_code)
+            };
             let changed = tx
                 .execute(
                     "UPDATE router_ssh_hosts
@@ -5246,7 +5261,7 @@ impl AppStore {
                         host_id,
                         status,
                         i64::from(release_to_idle),
-                        failure_code,
+                        host_last_error,
                         now,
                         job_id,
                     ],
@@ -6130,6 +6145,26 @@ mod tests {
             .expect("insert host")
     }
 
+    async fn ensure_payment_profile(store: &AppStore, user_id: &str, email: &str) {
+        use crate::client_market_trade::PaymentMethod;
+        store
+            .client_market_update_payment_profile(
+                &market_session(user_id, email),
+                &[PaymentMethod {
+                    kind: "alipay".into(),
+                    account: Some("13800000000".into()),
+                    qr_image_url: None,
+                    asset_url: None,
+                    token: None,
+                    chain: None,
+                    address: None,
+                    instructions: None,
+                }],
+            )
+            .await
+            .expect("configure test payment profile");
+    }
+
     fn market_session(user_id: &str, email: &str) -> crate::models::AuthSession {
         let now = Utc::now();
         crate::models::AuthSession {
@@ -6798,15 +6833,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            store
-                .client_market_get_host(&reusable.id)
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
-            HOST_STATUS_IDLE
-        );
+        let reusable_after = store
+            .client_market_get_host(&reusable.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reusable_after.status, HOST_STATUS_IDLE);
+        assert_eq!(reusable_after.last_error, None);
 
         let quarantined = add_host(&store, "quarantine-host@example.com", "198.18.4.2", "US").await;
         create_started_job(
@@ -7268,6 +7301,7 @@ mod tests {
             .expect("create two-Host quote");
         assert_eq!(quote.items.len(), 2);
         let provider = market_session("provider-1", "provider@example.com");
+        ensure_payment_profile(&store, "provider-1", "provider@example.com").await;
         let changed_offer = store
             .client_market_update_host_offer(&first.id, &provider, false, Some(900), Some(60))
             .await
@@ -7521,6 +7555,36 @@ mod tests {
         }
 
         let provider = market_session("provider-stable", "provider-new@example.com");
+        assert!(matches!(
+            store
+                .client_market_update_host_offer(&host.id, &provider, false, Some(900), Some(60))
+                .await,
+            Err(AppError::BadRequest(message))
+                if message.contains("configure payment details on the Account page")
+        ));
+
+        let client = market_session("client-stable", "client-new@example.com");
+        let billing_without_profile = store
+            .client_market_billing_for_viewer("paid-client", &client, false)
+            .await
+            .expect("load billing before Provider configures payment details");
+        assert!(billing_without_profile.payment_profile_updated_at.is_none());
+        let payment_profile = store
+            .client_market_update_payment_profile(
+                &provider,
+                &[PaymentMethod {
+                    kind: "crypto".into(),
+                    account: None,
+                    qr_image_url: None,
+                    asset_url: None,
+                    token: Some("USDC".into()),
+                    chain: Some("base".into()),
+                    address: Some("0x0123456789abcdef0123456789abcdef01234567".into()),
+                    instructions: None,
+                }],
+            )
+            .await
+            .expect("configure Provider payment details");
         let updated_offer = store
             .client_market_update_host_offer(&host.id, &provider, false, Some(900), Some(60))
             .await
@@ -7531,6 +7595,10 @@ mod tests {
             .await
             .expect("save unchanged Host offer");
         assert_eq!(unchanged_offer.offer_revision, 2);
+        assert!(matches!(
+            store.client_market_assert_creation_allowed(&client).await,
+            Err(AppError::Conflict(_))
+        ));
         let (status, period_end, invoice_id): (String, String, String) = {
             let conn = store.conn.lock().await;
             assert_eq!(
@@ -7579,33 +7647,6 @@ mod tests {
             parse_market_time(&period_end),
             parse_market_time(&frozen_end.to_rfc3339())
         );
-
-        let client = market_session("client-stable", "client-new@example.com");
-        assert!(matches!(
-            store.client_market_assert_creation_allowed(&client).await,
-            Err(AppError::Conflict(_))
-        ));
-        let billing_without_profile = store
-            .client_market_billing_for_viewer("paid-client", &client, false)
-            .await
-            .expect("load billing before Provider configures payment details");
-        assert!(billing_without_profile.payment_profile_updated_at.is_none());
-        let payment_profile = store
-            .client_market_update_payment_profile(
-                &provider,
-                &[PaymentMethod {
-                    kind: "crypto".into(),
-                    account: None,
-                    qr_image_url: None,
-                    asset_url: None,
-                    token: Some("USDC".into()),
-                    chain: Some("base".into()),
-                    address: Some("0x0123456789abcdef0123456789abcdef01234567".into()),
-                    instructions: None,
-                }],
-            )
-            .await
-            .expect("configure Provider payment details");
         let billing_with_profile = store
             .client_market_billing_for_viewer("paid-client", &client, false)
             .await

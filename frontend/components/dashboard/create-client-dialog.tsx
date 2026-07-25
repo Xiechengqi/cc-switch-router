@@ -437,6 +437,14 @@ export function CreateClientDialog({
   const jobList = Object.values(jobs);
   const successes = jobList.filter((job) => job.status === "succeeded").length;
   const failures = jobList.filter((job) => job.status === "failed").length;
+  const createModeTabClass =
+    "inline-flex h-9 items-center justify-center rounded-md px-3 text-sm font-medium !text-slate-900 transition-colors data-[selected=true]:bg-white data-[selected=true]:font-semibold data-[selected=true]:shadow-sm";
+  const showOfficialCapacityHint =
+    providerSupplyLoaded &&
+    !loading &&
+    !fixedHost &&
+    safeProviders.mode === "official_default" &&
+    capacity === 0;
 
   return (
     <Modal.Backdrop isOpen={open} onOpenChange={close} isDismissable={phase !== "running"}>
@@ -445,8 +453,20 @@ export function CreateClientDialog({
           <Modal.Header><Modal.Heading>{fixedHost ? t("createClient.fixedTitle", { host: fixedHost.hostname || fixedHost.ip || fixedHost.id.slice(0, 8) }) : t("createClient.title")}</Modal.Heading></Modal.Header>
           <Modal.Body className="grid min-w-0 max-h-[min(76vh,680px)] grid-cols-[minmax(0,1fr)] gap-4 overflow-y-auto">
             {phase === "form" && !fixedHost ? (
-              <Tabs selectedKey={mode} onSelectionChange={(key: React.Key) => setMode(String(key) as CreateMode)} variant="secondary">
-                <Tabs.List className="grid w-full grid-cols-2"><Tabs.Tab id="manual">{t("createClient.tabManual")}</Tabs.Tab><Tabs.Tab id="online">{t("createClient.tabOnline")}</Tabs.Tab></Tabs.List>
+              <Tabs
+                selectedKey={mode}
+                aria-label={t("createClient.title")}
+                className="text-slate-900"
+                onSelectionChange={(key: React.Key) => setMode(String(key) as CreateMode)}
+              >
+                <Tabs.List className="grid w-full grid-cols-2 gap-0.5 rounded-lg bg-slate-100 p-1 ring-1 ring-inset ring-slate-200/80">
+                  <Tabs.Tab id="online" className={createModeTabClass}>
+                    {t("createClient.tabOnline")}
+                  </Tabs.Tab>
+                  <Tabs.Tab id="manual" className={createModeTabClass}>
+                    {t("createClient.tabManual")}
+                  </Tabs.Tab>
+                </Tabs.List>
               </Tabs>
             ) : null}
 
@@ -466,7 +486,13 @@ export function CreateClientDialog({
                   <>
                     <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-2">
                       <div className="grid min-w-0 gap-2 sm:flex sm:flex-wrap sm:items-center sm:justify-between"><span className="text-sm font-medium">{t("createClient.hostProvider")}</span><Button size="sm" className="min-w-0 max-w-full justify-start" variant={safeProviders.mode === "official_default" ? "primary" : "outline"} onClick={() => setProviderPersist({ mode: "official_default", providerIds: [] })}><span className="min-w-0 truncate">{t("createClient.official")} · {routerOwnerEmail || t("createClient.routerOwner")}</span></Button></div>
-                      {safeProviders.mode === "official_default" && capacity === 0 ? <p className="text-xs text-amber-700">{t("createClient.officialUnavailable")}</p> : null}
+                      {showOfficialCapacityHint ? (
+                        <p className="text-xs text-amber-800">
+                          {officialProviderId
+                            ? t("createClient.officialUnavailable")
+                            : t("createClient.officialNotConfigured")}
+                        </p>
+                      ) : null}
                       <div className="grid min-w-0 max-h-44 grid-cols-[minmax(0,1fr)] gap-1 overflow-y-auto rounded-md border p-2">
                         {providers.map((provider) => {
                           const checked = selectedProviderIds.includes(provider.providerId);
