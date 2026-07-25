@@ -1,8 +1,9 @@
 "use client";
 
 import * as React from "react";
+import { createPortal } from "react-dom";
 import { Button, Checkbox, Chip, Dropdown, Modal, Tabs, toast, Tooltip } from "@heroui/react";
-import { Check, CheckSquare, ChevronDown, ChevronLeft, ChevronRight, Circle, Clock3, Download, Filter, Loader2, MoreHorizontal, Pencil, Plus, RefreshCw, Trash2, Upload, X } from "lucide-react";
+import { ArrowDown, ArrowUp, Check, CheckSquare, ChevronDown, ChevronLeft, ChevronRight, Circle, Clock3, Download, Filter, Loader2, MoreHorizontal, Pencil, Plus, RefreshCw, Trash2, Upload, X } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { CopyableCodeField } from "@/components/common/copyable-code-field";
@@ -1140,12 +1141,28 @@ function HostRow({
   const cleanupPhase = cleanupJob?.phase || "";
   const cleanupTone =
     cleanupJob?.status === "failed" ? "failed" : cleanupJob?.status === "succeeded" ? "success" : "running";
+  const paymentKinds = host.paymentMethodKinds || [];
+  const hasBillingCountdown = !!(
+    billing &&
+    billing.priceCents &&
+    (billing.status === "payment_due" ? billing.paymentDeadline : billing.currentPeriodEnd)
+  );
+  const hasUnreachableGuidance = host.status === "unreachable" && !!host.installationId;
+  const showSubrow =
+    paymentKinds.length > 0 ||
+    !!host.clientOwnerEmail ||
+    hasBillingCountdown ||
+    secondaryIntelParts.length > 0 ||
+    !!host.note ||
+    !!host.lastError ||
+    hasUnreachableGuidance;
+  const colSpan = selectionMode ? 8 : 7;
 
   return (
     <>
-      <div className="grid gap-1.5 rounded-lg border border-border bg-white px-3 py-2.5 text-sm">
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-          {selectionMode ? (
+      <tr className="border-b border-border/80 transition-colors hover:bg-muted/40">
+        {selectionMode ? (
+          <td className="w-10 px-2 py-2 align-middle">
             <Checkbox
               isSelected={selected}
               onChange={onSelectedChange}
@@ -1157,7 +1174,9 @@ function HostRow({
                 <Checkbox.Indicator />
               </Checkbox.Control>
             </Checkbox>
-          ) : null}
+          </td>
+        ) : null}
+        <td className="whitespace-nowrap px-2 py-2 align-middle">
           <Chip
             size="sm"
             variant="soft"
@@ -1166,25 +1185,10 @@ function HostRow({
           >
             {t(statusLabelKey(host.status))}
           </Chip>
-          {canOpenTerminal ? (
-            <Button
-              variant="ghost"
-              size="sm"
-              isIconOnly
-              className="h-8 w-8 min-w-8 shrink-0 border-0 shadow-none"
-              onClick={() =>
-                openTerminal({
-                  hostId: host.id,
-                  title: terminalTitle,
-                })
-              }
-              aria-label={t("clientMarket.webTerminal")}
-            >
-              <WebTerminalGlyph className="h-4 w-4 text-muted-foreground" />
-            </Button>
-          ) : null}
+        </td>
+        <td className="max-w-[10rem] px-2 py-2 align-middle">
           {locationLabel || host.countryCode ? (
-            <span className="inline-flex min-w-0 max-w-[14rem] items-center gap-1.5 text-xs text-muted-foreground">
+            <span className="inline-flex min-w-0 max-w-full items-center gap-1.5 text-xs text-muted-foreground">
               <CountryFlag code={host.countryCode} className="h-3.5 w-5 shrink-0 rounded-sm object-cover" />
               {locationLabel ? (
                 <span className="truncate" title={locationLabel}>
@@ -1192,199 +1196,236 @@ function HostRow({
                 </span>
               ) : null}
             </span>
-          ) : null}
-          <span
-            className="min-w-0 max-w-[16rem] truncate text-xs font-medium text-foreground"
-            title={host.hostOwnerEmail}
-          >
+          ) : (
+            <span className="text-xs text-muted-foreground/50">—</span>
+          )}
+        </td>
+        <td className="max-w-[12rem] px-2 py-2 align-middle">
+          <span className="block truncate text-xs font-medium text-foreground" title={host.hostOwnerEmail}>
             {host.hostOwnerEmail}
           </span>
-          <span className="shrink-0 text-xs font-semibold text-foreground" title={t("clientMarket.currentOffer")}>
+        </td>
+        <td className="whitespace-nowrap px-2 py-2 align-middle">
+          <span className="text-xs font-semibold text-foreground" title={t("clientMarket.currentOffer")}>
             {formatHostOffer(host.priceCents, host.rentalPeriodDays, locale)}
           </span>
-          <PaymentMethodIcons kinds={host.paymentMethodKinds || []} className="shrink-0" />
-          <HostBillingCountdown billing={billing} />
+        </td>
+        <td className="max-w-[10rem] px-2 py-2 align-middle">
           {subdomain ? (
             <span
-              className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground"
+              className="block truncate font-mono text-xs text-muted-foreground"
               title={host.installationId || host.hostname || undefined}
             >
               {subdomain}
             </span>
           ) : (
-            <span className="min-w-0 flex-1" aria-hidden />
+            <span className="text-xs text-muted-foreground/50">—</span>
           )}
-          {host.clientOwnerEmail ? (
-            <span className="min-w-0 max-w-[16rem] truncate text-xs text-muted-foreground" title={host.clientOwnerEmail}>
-              {t("clientMarket.rentedBy", { email: host.clientOwnerEmail })}
-            </span>
-          ) : null}
+        </td>
+        <td className="whitespace-nowrap px-2 py-2 align-middle">
           {ipPort ? (
-            <span className="shrink-0 font-mono text-xs text-foreground" title={host.hostname || undefined}>
+            <span className="font-mono text-xs text-foreground" title={host.hostname || undefined}>
               {ipPort}
             </span>
-          ) : null}
-          {host.status === "idle" ? (
-            <Button
-              variant="primary"
-              size="sm"
-              className="h-8 shrink-0"
-              onClick={() => onCreate(host)}
-            >
-              <Plus className="h-4 w-4" />
-              {t("createClient.newClient")}
-            </Button>
-          ) : null}
-          {hasActions ? (
-            <Dropdown>
-              <Dropdown.Trigger className="shrink-0 outline-none">
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  isIconOnly
-                  className="h-8 w-8 min-w-8"
-                  isDisabled={busy}
-                  aria-label={t("clientMarket.hostActions")}
-                >
-                  {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <MoreHorizontal className="h-4 w-4" />}
-                </Button>
-              </Dropdown.Trigger>
-              <Dropdown.Popover placement="bottom right">
-                <Dropdown.Menu aria-label={t("clientMarket.hostActions")}>
-                  {canManageHost ? (
-                    <Dropdown.Item id="offer" onAction={() => setOfferOpen(true)}>
-                      <Pencil className="h-4 w-4" />
-                      {t("clientMarket.editOfferAction")}
-                    </Dropdown.Item>
-                  ) : null}
-                  {canReverify ? (
-                    <Dropdown.Item id="reverify" onAction={() => void onReverify()}>
-                      <RefreshCw className="h-4 w-4" />
-                      {t("clientMarket.reverifyHost")}
-                    </Dropdown.Item>
-                  ) : null}
-                  {canCleanup ? (
-                    <Dropdown.Item id="cleanup" onAction={() => setConfirmAction("cleanup")}>
-                      {t(isRetryCleanup ? "clientMarket.retryCleanup" : "clientMarket.cleanup")}
-                    </Dropdown.Item>
-                  ) : null}
-                  {canMarkUnpaid ? (
-                    <Dropdown.Item id="unpaid" className="text-destructive" onAction={() => setConfirmAction("unpaid")}>
-                      <X className="h-4 w-4" />
-                      {t("clientMarket.unpaidCleanup")}
-                    </Dropdown.Item>
-                  ) : null}
-                  {canDelete ? (
-                    <Dropdown.Item
-                      id="delete"
-                      className="text-destructive"
-                      onAction={() => setConfirmAction("delete")}
-                    >
-                      <Trash2 className="h-4 w-4" />
-                      {t("clientMarket.deleteHost")}
-                    </Dropdown.Item>
-                  ) : null}
-                </Dropdown.Menu>
-              </Dropdown.Popover>
-            </Dropdown>
           ) : (
-            <span className="h-8 w-8 shrink-0" aria-hidden />
+            <span className="text-xs text-muted-foreground/50">—</span>
           )}
-        </div>
-        {secondaryIntelParts.length || host.note || host.lastError ? (
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 pl-0.5 text-[11px] leading-4 text-muted-foreground">
-            {secondaryIntelParts.length ? (
-              <span className="whitespace-normal break-words">{secondaryIntelParts.join(" · ")}</span>
+        </td>
+        <td className="whitespace-nowrap px-2 py-2 align-middle">
+          <div className="flex items-center justify-end gap-1">
+            {host.status === "idle" ? (
+              <Button variant="primary" size="sm" className="h-8 shrink-0" onClick={() => onCreate(host)}>
+                <Plus className="h-4 w-4" />
+                {t("createClient.newClient")}
+              </Button>
             ) : null}
-            {host.note ? (
-              <span className="min-w-0 whitespace-normal break-words" title={host.note}>
-                {host.note}
-              </span>
-            ) : null}
-            {host.lastError ? (
-              <span
-                className="min-w-0 whitespace-normal break-words text-destructive/90"
-                title={host.lastError}
-              >
-                {host.lastError}
-              </span>
-            ) : null}
-          </div>
-        ) : null}
-        {host.status === "unreachable" && host.installationId ? (
-          <p className="pl-0.5 text-[11px] leading-4 text-amber-700">
-            {t(cleanupFailureGuidanceKey(host.lastError))}
-          </p>
-        ) : null}
-      </div>
-      {confirmCopy ? (
-        <ConfirmAlertDialog
-          open
-          title={confirmCopy.title}
-          description={confirmCopy.description}
-          confirmLabel={confirmCopy.confirmLabel}
-          cancelLabel={t("common.cancel")}
-          tone="danger"
-          busy={busy}
-          onConfirm={() => {
-            if (confirmAction === "cleanup" || confirmAction === "unpaid") void onCleanup(confirmAction === "unpaid");
-            else void onDelete();
-          }}
-          onOpenChange={(nextOpen) => {
-            if (!nextOpen && !busy) setConfirmAction(null);
-          }}
-        />
-      ) : null}
-      <Modal.Backdrop
-        isOpen={cleanupOpen}
-        onOpenChange={(next) => {
-          if (!next && !busy) setCleanupOpen(false);
-        }}
-      >
-        <Modal.Container placement="center">
-          <Modal.Dialog className="light w-[min(640px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
-            <Modal.Header>
-              <Modal.Heading className="!text-slate-900">
-                {t("clientMarket.cleanupProgressTitle", { host: hostLabel })}
-              </Modal.Heading>
-            </Modal.Header>
-            <Modal.Body className="grid gap-3 !text-slate-900">
-              <div className="flex flex-wrap items-center gap-2 text-sm">
-                <Chip size="sm" variant="soft">
-                  {cleanupJob
-                    ? t(cleanupPhaseLabelKey(cleanupPhase))
-                    : t("clientMarket.cleanupPhase.starting")}
-                </Chip>
-                {cleanupJob?.status ? (
-                  <span className="text-xs text-muted-foreground">{cleanupJob.status}</span>
-                ) : null}
-              </div>
-              <ProvisionJobLog
-                log={cleanupJob?.log || ""}
-                phase={cleanupTone === "failed" ? "failed" : cleanupTone === "success" ? "success" : "running"}
-              />
-              {cleanupJob?.status === "failed" ? (
-                <p className="text-sm text-rose-600">
-                  {t(cleanupFailureGuidanceKey(cleanupJob.failureCode || cleanupJob.log))}
-                </p>
-              ) : null}
-              {cleanupJob?.status === "succeeded" ? (
-                <p className="text-sm text-emerald-700">{t("clientMarket.cleanupSucceeded")}</p>
-              ) : null}
-            </Modal.Body>
-            <Modal.Footer>
+            {canOpenTerminal ? (
               <Button
                 variant="ghost"
-                isDisabled={busy && cleanupJob?.status !== "failed" && cleanupJob?.status !== "succeeded"}
-                onClick={() => setCleanupOpen(false)}
+                size="sm"
+                isIconOnly
+                className="h-8 w-8 min-w-8 shrink-0 border-0 shadow-none"
+                onClick={() =>
+                  openTerminal({
+                    hostId: host.id,
+                    title: terminalTitle,
+                  })
+                }
+                aria-label={t("clientMarket.webTerminal")}
               >
-                {t("common.close")}
+                <WebTerminalGlyph className="h-4 w-4 text-muted-foreground" />
               </Button>
-            </Modal.Footer>
-          </Modal.Dialog>
-        </Modal.Container>
-      </Modal.Backdrop>
-      <HostOfferDialog host={host} open={offerOpen} onOpenChange={setOfferOpen} onSaved={onChanged} />
+            ) : null}
+            {hasActions ? (
+              <Dropdown>
+                <Dropdown.Trigger className="shrink-0 outline-none">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    isIconOnly
+                    className="h-8 w-8 min-w-8"
+                    isDisabled={busy}
+                    aria-label={t("clientMarket.hostActions")}
+                  >
+                    {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <MoreHorizontal className="h-4 w-4" />}
+                  </Button>
+                </Dropdown.Trigger>
+                <Dropdown.Popover placement="bottom right">
+                  <Dropdown.Menu aria-label={t("clientMarket.hostActions")}>
+                    {canManageHost ? (
+                      <Dropdown.Item id="offer" onAction={() => setOfferOpen(true)}>
+                        <Pencil className="h-4 w-4" />
+                        {t("clientMarket.editOfferAction")}
+                      </Dropdown.Item>
+                    ) : null}
+                    {canReverify ? (
+                      <Dropdown.Item id="reverify" onAction={() => void onReverify()}>
+                        <RefreshCw className="h-4 w-4" />
+                        {t("clientMarket.reverifyHost")}
+                      </Dropdown.Item>
+                    ) : null}
+                    {canCleanup ? (
+                      <Dropdown.Item id="cleanup" onAction={() => setConfirmAction("cleanup")}>
+                        {t(isRetryCleanup ? "clientMarket.retryCleanup" : "clientMarket.cleanup")}
+                      </Dropdown.Item>
+                    ) : null}
+                    {canMarkUnpaid ? (
+                      <Dropdown.Item id="unpaid" className="text-destructive" onAction={() => setConfirmAction("unpaid")}>
+                        <X className="h-4 w-4" />
+                        {t("clientMarket.unpaidCleanup")}
+                      </Dropdown.Item>
+                    ) : null}
+                    {canDelete ? (
+                      <Dropdown.Item
+                        id="delete"
+                        className="text-destructive"
+                        onAction={() => setConfirmAction("delete")}
+                      >
+                        <Trash2 className="h-4 w-4" />
+                        {t("clientMarket.deleteHost")}
+                      </Dropdown.Item>
+                    ) : null}
+                  </Dropdown.Menu>
+                </Dropdown.Popover>
+              </Dropdown>
+            ) : null}
+          </div>
+        </td>
+      </tr>
+      {showSubrow ? (
+        <tr className="border-b border-border/60 bg-muted/20">
+          <td colSpan={colSpan} className="px-2 py-1.5 align-middle">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] leading-4 text-muted-foreground">
+              {paymentKinds.length ? <PaymentMethodIcons kinds={paymentKinds} className="shrink-0" /> : null}
+              {host.clientOwnerEmail ? (
+                <span className="min-w-0 whitespace-normal break-words" title={host.clientOwnerEmail}>
+                  {t("clientMarket.rentedBy", { email: host.clientOwnerEmail })}
+                </span>
+              ) : null}
+              <HostBillingCountdown billing={billing} />
+              {secondaryIntelParts.length ? (
+                <span className="whitespace-normal break-words">{secondaryIntelParts.join(" · ")}</span>
+              ) : null}
+              {host.note ? (
+                <span className="min-w-0 whitespace-normal break-words" title={host.note}>
+                  {host.note}
+                </span>
+              ) : null}
+              {host.lastError ? (
+                <span
+                  className="min-w-0 whitespace-normal break-words text-destructive/90"
+                  title={host.lastError}
+                >
+                  {host.lastError}
+                </span>
+              ) : null}
+              {hasUnreachableGuidance ? (
+                <span className="whitespace-normal break-words text-amber-700">
+                  {t(cleanupFailureGuidanceKey(host.lastError))}
+                </span>
+              ) : null}
+            </div>
+          </td>
+        </tr>
+      ) : null}
+      {typeof document !== "undefined"
+        ? createPortal(
+            <>
+              {confirmCopy ? (
+                <ConfirmAlertDialog
+                  open
+                  title={confirmCopy.title}
+                  description={confirmCopy.description}
+                  confirmLabel={confirmCopy.confirmLabel}
+                  cancelLabel={t("common.cancel")}
+                  tone="danger"
+                  busy={busy}
+                  onConfirm={() => {
+                    if (confirmAction === "cleanup" || confirmAction === "unpaid") {
+                      void onCleanup(confirmAction === "unpaid");
+                    } else void onDelete();
+                  }}
+                  onOpenChange={(nextOpen) => {
+                    if (!nextOpen && !busy) setConfirmAction(null);
+                  }}
+                />
+              ) : null}
+              <Modal.Backdrop
+                isOpen={cleanupOpen}
+                onOpenChange={(next) => {
+                  if (!next && !busy) setCleanupOpen(false);
+                }}
+              >
+                <Modal.Container placement="center">
+                  <Modal.Dialog className="light w-[min(640px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
+                    <Modal.Header>
+                      <Modal.Heading className="!text-slate-900">
+                        {t("clientMarket.cleanupProgressTitle", { host: hostLabel })}
+                      </Modal.Heading>
+                    </Modal.Header>
+                    <Modal.Body className="grid gap-3 !text-slate-900">
+                      <div className="flex flex-wrap items-center gap-2 text-sm">
+                        <Chip size="sm" variant="soft">
+                          {cleanupJob
+                            ? t(cleanupPhaseLabelKey(cleanupPhase))
+                            : t("clientMarket.cleanupPhase.starting")}
+                        </Chip>
+                        {cleanupJob?.status ? (
+                          <span className="text-xs text-muted-foreground">{cleanupJob.status}</span>
+                        ) : null}
+                      </div>
+                      <ProvisionJobLog
+                        log={cleanupJob?.log || ""}
+                        phase={
+                          cleanupTone === "failed" ? "failed" : cleanupTone === "success" ? "success" : "running"
+                        }
+                      />
+                      {cleanupJob?.status === "failed" ? (
+                        <p className="text-sm text-rose-600">
+                          {t(cleanupFailureGuidanceKey(cleanupJob.failureCode || cleanupJob.log))}
+                        </p>
+                      ) : null}
+                      {cleanupJob?.status === "succeeded" ? (
+                        <p className="text-sm text-emerald-700">{t("clientMarket.cleanupSucceeded")}</p>
+                      ) : null}
+                    </Modal.Body>
+                    <Modal.Footer>
+                      <Button
+                        variant="ghost"
+                        isDisabled={busy && cleanupJob?.status !== "failed" && cleanupJob?.status !== "succeeded"}
+                        onClick={() => setCleanupOpen(false)}
+                      >
+                        {t("common.close")}
+                      </Button>
+                    </Modal.Footer>
+                  </Modal.Dialog>
+                </Modal.Container>
+              </Modal.Backdrop>
+              <HostOfferDialog host={host} open={offerOpen} onOpenChange={setOfferOpen} onSaved={onChanged} />
+            </>,
+            document.body,
+          )
+        : null}
     </>
   );
 }
@@ -1392,7 +1433,67 @@ function HostRow({
 const OWNER_FILTER_KEY = "cc_switch_router_client_market_owner_filter_v1";
 const REGION_FILTER_KEY = "cc_switch_router_client_market_region_filter_v1";
 const STATUS_FILTER_KEY = "cc_switch_router_client_market_status_filter_v2";
+const SORT_PREFS_KEY = "cc_switch_router_client_market_sort_v1";
 const HOST_PAGE_SIZE = 10;
+
+const HOST_SORT_KEYS = ["status", "region", "owner", "offer", "subdomain", "ip"] as const;
+type HostSortKey = (typeof HOST_SORT_KEYS)[number];
+type HostSortDir = "asc" | "desc";
+type HostSortPrefs = { key: HostSortKey; dir: HostSortDir };
+
+const DEFAULT_HOST_SORT: HostSortPrefs = { key: "owner", dir: "asc" };
+
+function normalizeHostSortPrefs(value: unknown): HostSortPrefs {
+  if (!value || typeof value !== "object") return DEFAULT_HOST_SORT;
+  const record = value as { key?: unknown; dir?: unknown };
+  const key =
+    typeof record.key === "string" && (HOST_SORT_KEYS as readonly string[]).includes(record.key)
+      ? (record.key as HostSortKey)
+      : DEFAULT_HOST_SORT.key;
+  const dir = record.dir === "desc" ? "desc" : "asc";
+  return { key, dir };
+}
+
+function compareHostOffer(left: ClientMarketHost, right: ClientMarketHost) {
+  const leftFree = !left.priceCents || !left.rentalPeriodDays;
+  const rightFree = !right.priceCents || !right.rentalPeriodDays;
+  if (leftFree !== rightFree) return leftFree ? -1 : 1;
+  const priceCmp = (left.priceCents || 0) - (right.priceCents || 0);
+  if (priceCmp !== 0) return priceCmp;
+  return (left.rentalPeriodDays || 0) - (right.rentalPeriodDays || 0);
+}
+
+function compareHostsBySortKey(left: ClientMarketHost, right: ClientMarketHost, key: HostSortKey) {
+  switch (key) {
+    case "status":
+      return left.status.localeCompare(right.status);
+    case "region":
+      return (left.countryCode || "").localeCompare(right.countryCode || "");
+    case "owner":
+      return left.hostOwnerEmail.localeCompare(right.hostOwnerEmail);
+    case "offer":
+      return compareHostOffer(left, right);
+    case "subdomain":
+      return (left.clientSubdomain || "").localeCompare(right.clientSubdomain || "");
+    case "ip":
+      return `${left.ip || ""}:${left.port || 0}`.localeCompare(`${right.ip || ""}:${right.port || 0}`);
+    default:
+      return 0;
+  }
+}
+
+function sortHosts(hosts: ClientMarketHost[], prefs: HostSortPrefs) {
+  const dir = prefs.dir === "desc" ? -1 : 1;
+  return [...hosts].sort((left, right) => {
+    const primary = compareHostsBySortKey(left, right, prefs.key);
+    if (primary !== 0) return primary * dir;
+    const ownerCmp = left.hostOwnerEmail.localeCompare(right.hostOwnerEmail);
+    if (ownerCmp !== 0) return ownerCmp;
+    const ipCmp = `${left.ip || ""}:${left.port || 0}`.localeCompare(`${right.ip || ""}:${right.port || 0}`);
+    if (ipCmp !== 0) return ipCmp;
+    return left.id.localeCompare(right.id);
+  });
+}
 
 function normalizeHostStatusFilter(value: unknown): HostStatusFilter {
   if (typeof value !== "string") return "all";
@@ -1418,6 +1519,63 @@ function hostStatusTabTone(status: HostStatusFilter, active: boolean) {
   }
 }
 
+const HOST_SORT_COLUMN_LABELS: Record<HostSortKey, MessageKey> = {
+  status: "clientMarket.col.status",
+  region: "clientMarket.col.region",
+  owner: "clientMarket.col.owner",
+  offer: "clientMarket.col.offer",
+  subdomain: "clientMarket.col.subdomain",
+  ip: "clientMarket.col.ip",
+};
+
+function HostSortHeader({
+  columnKey,
+  sortPrefs,
+  onSort,
+}: {
+  columnKey: HostSortKey;
+  sortPrefs: HostSortPrefs;
+  onSort: (key: HostSortKey) => void;
+}) {
+  const { t } = useLocaleText();
+  const active = sortPrefs.key === columnKey;
+  const label = t(HOST_SORT_COLUMN_LABELS[columnKey]);
+  const ariaSort = active ? (sortPrefs.dir === "asc" ? "ascending" : "descending") : "none";
+  const sortStateLabel = active
+    ? t(sortPrefs.dir === "asc" ? "clientMarket.sortAsc" : "clientMarket.sortDesc")
+    : undefined;
+
+  return (
+    <th
+      scope="col"
+      aria-sort={ariaSort}
+      className="sticky top-0 z-10 whitespace-nowrap border-b border-border bg-card px-2 py-2 text-left text-xs font-medium text-muted-foreground"
+    >
+      <button
+        type="button"
+        className="inline-flex items-center gap-1 rounded-md px-1 py-0.5 text-left transition-colors hover:bg-muted/60 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2"
+        onClick={() => onSort(columnKey)}
+        aria-label={t("clientMarket.sortBy", { column: label })}
+      >
+        <span>{label}</span>
+        {active ? (
+          sortPrefs.dir === "asc" ? (
+            <ArrowUp className="h-3.5 w-3.5 text-accent" aria-hidden />
+          ) : (
+            <ArrowDown className="h-3.5 w-3.5 text-accent" aria-hidden />
+          )
+        ) : (
+          <span className="inline-flex h-3.5 w-3.5 flex-col justify-center opacity-30" aria-hidden>
+            <ArrowUp className="h-2.5 w-2.5 -mb-0.5" />
+            <ArrowDown className="h-2.5 w-2.5" />
+          </span>
+        )}
+        {sortStateLabel ? <span className="sr-only">{sortStateLabel}</span> : null}
+      </button>
+    </th>
+  );
+}
+
 export function ClientMarketPage() {
   const { locale, t } = useLocaleText();
   const { session } = useAuth();
@@ -1435,6 +1593,8 @@ export function ClientMarketPage() {
   const [ownerFilters, setOwnerFilters] = usePersistentState<string[]>(OWNER_FILTER_KEY, []);
   const [regionFilters, setRegionFilters] = usePersistentState<string[]>(REGION_FILTER_KEY, []);
   const [statusFilterRaw, setStatusFilter] = usePersistentState<HostStatusFilter>(STATUS_FILTER_KEY, "all");
+  const [sortPrefsRaw, setSortPrefs] = usePersistentState<HostSortPrefs>(SORT_PREFS_KEY, DEFAULT_HOST_SORT);
+  const sortPrefs = React.useMemo(() => normalizeHostSortPrefs(sortPrefsRaw), [sortPrefsRaw]);
   const statusFilter = normalizeHostStatusFilter(statusFilterRaw);
   const [page, setPage] = React.useState(1);
   const [error, setError] = React.useState("");
@@ -1526,16 +1686,19 @@ export function ClientMarketPage() {
   }, [scopedHosts]);
 
   const visibleHosts = React.useMemo(() => {
-    return scopedHosts
-      .filter((host) => hostMatchesStatusFilter(host.status, statusFilter))
-      .sort((a, b) => {
-        const ownerCmp = a.hostOwnerEmail.localeCompare(b.hostOwnerEmail);
-        if (ownerCmp !== 0) return ownerCmp;
-        const ipCmp = (a.ip || "").localeCompare(b.ip || "");
-        if (ipCmp !== 0) return ipCmp;
-        return a.id.localeCompare(b.id);
-      });
-  }, [scopedHosts, statusFilter]);
+    const filtered = scopedHosts.filter((host) => hostMatchesStatusFilter(host.status, statusFilter));
+    return sortHosts(filtered, sortPrefs);
+  }, [scopedHosts, sortPrefs, statusFilter]);
+
+  const toggleHostSort = React.useCallback((key: HostSortKey) => {
+    setSortPrefs((prev) => {
+      const current = normalizeHostSortPrefs(prev);
+      if (current.key === key) {
+        return { key, dir: current.dir === "asc" ? "desc" : "asc" };
+      }
+      return { key, dir: "asc" };
+    });
+  }, [setSortPrefs]);
 
   const totalPages = Math.max(1, Math.ceil(visibleHosts.length / HOST_PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
@@ -1546,7 +1709,7 @@ export function ClientMarketPage() {
 
   React.useEffect(() => {
     setPage(1);
-  }, [mineOnly, ownerFilters, regionFilters, statusFilter]);
+  }, [mineOnly, ownerFilters, regionFilters, sortPrefs.key, sortPrefs.dir, statusFilter]);
 
   React.useEffect(() => {
     if (page > totalPages) setPage(totalPages);
@@ -2213,21 +2376,74 @@ export function ClientMarketPage() {
         </div>
       ) : (
         <div className="grid gap-3">
-          <div className="grid gap-2">
-            {pagedHosts.map((host) => (
-              <HostRow
-                key={host.id}
-                host={host}
-                billing={host.installationId ? billingByInstallation.get(host.installationId) : undefined}
-                isAdmin={isAdmin}
-                selectionMode={selectionMode}
-                selected={selectedIds.has(host.id)}
-                onSelectedChange={(next) => setHostSelected(host.id, next)}
-                selectionDisabled={batchBusy}
-                onChanged={() => void load()}
-                onCreate={setFixedHost}
-              />
-            ))}
+          <div className="max-h-[min(70vh,40rem)] overflow-auto rounded-lg border border-border bg-card">
+            <table className="w-full min-w-[56rem] border-collapse text-sm">
+              <thead>
+                <tr>
+                  {selectionMode ? (
+                    <th
+                      scope="col"
+                      className="sticky top-0 z-10 w-10 border-b border-border bg-card px-2 py-2 text-left"
+                    >
+                      <Checkbox
+                        isSelected={
+                          pagedHosts.length > 0 && pagedHosts.every((host) => selectedIds.has(host.id))
+                        }
+                        isIndeterminate={
+                          pagedHosts.some((host) => selectedIds.has(host.id)) &&
+                          !pagedHosts.every((host) => selectedIds.has(host.id))
+                        }
+                        onChange={(checked) => {
+                          if (checked) selectPage();
+                          else {
+                            setSelectedIds((prev) => {
+                              const next = new Set(prev);
+                              for (const host of pagedHosts) next.delete(host.id);
+                              return next;
+                            });
+                          }
+                        }}
+                        isDisabled={batchBusy || !pagedHosts.length}
+                        aria-label={t("clientMarket.batchSelectPage")}
+                        className="shrink-0"
+                      >
+                        <Checkbox.Control>
+                          <Checkbox.Indicator />
+                        </Checkbox.Control>
+                      </Checkbox>
+                    </th>
+                  ) : null}
+                  <HostSortHeader columnKey="status" sortPrefs={sortPrefs} onSort={toggleHostSort} />
+                  <HostSortHeader columnKey="region" sortPrefs={sortPrefs} onSort={toggleHostSort} />
+                  <HostSortHeader columnKey="owner" sortPrefs={sortPrefs} onSort={toggleHostSort} />
+                  <HostSortHeader columnKey="offer" sortPrefs={sortPrefs} onSort={toggleHostSort} />
+                  <HostSortHeader columnKey="subdomain" sortPrefs={sortPrefs} onSort={toggleHostSort} />
+                  <HostSortHeader columnKey="ip" sortPrefs={sortPrefs} onSort={toggleHostSort} />
+                  <th
+                    scope="col"
+                    className="sticky top-0 z-10 whitespace-nowrap border-b border-border bg-card px-2 py-2 text-right text-xs font-medium text-muted-foreground"
+                  >
+                    {t("clientMarket.col.actions")}
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {pagedHosts.map((host) => (
+                  <HostRow
+                    key={host.id}
+                    host={host}
+                    billing={host.installationId ? billingByInstallation.get(host.installationId) : undefined}
+                    isAdmin={isAdmin}
+                    selectionMode={selectionMode}
+                    selected={selectedIds.has(host.id)}
+                    onSelectedChange={(next) => setHostSelected(host.id, next)}
+                    selectionDisabled={batchBusy}
+                    onChanged={() => void load()}
+                    onCreate={setFixedHost}
+                  />
+                ))}
+              </tbody>
+            </table>
           </div>
           {visibleHosts.length > HOST_PAGE_SIZE ? (
             <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-white px-3 py-2 text-sm">
