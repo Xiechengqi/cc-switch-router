@@ -13,6 +13,7 @@ export function CompactRegionMultiSelect({
   clearLabel,
   ariaLabel,
   className,
+  compact = false,
 }: {
   values: string[];
   options: { value: string; label: string }[];
@@ -22,6 +23,7 @@ export function CompactRegionMultiSelect({
   clearLabel: string;
   ariaLabel: string;
   className?: string;
+  compact?: boolean;
 }) {
   const [open, setOpen] = React.useState(false);
   const [hovered, setHovered] = React.useState(false);
@@ -61,7 +63,10 @@ export function CompactRegionMultiSelect({
   return (
     <div ref={rootRef} className={cn("relative", className)}>
       <div
-        className="flex min-h-9 w-full items-center rounded-lg border bg-white shadow-sm"
+        className={cn(
+          "flex w-full items-center rounded-lg border bg-white shadow-sm",
+          compact ? "min-h-7" : "min-h-9",
+        )}
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}
       >
@@ -70,9 +75,19 @@ export function CompactRegionMultiSelect({
           aria-label={ariaLabel}
           aria-expanded={open}
           onClick={() => setOpen((current) => !current)}
-          className="flex min-w-0 flex-1 items-center px-3 py-2 text-left text-xs"
+          className={cn(
+            "flex min-w-0 flex-1 items-center text-left text-xs",
+            compact ? "px-2 py-1" : "px-3 py-2",
+          )}
         >
-          <span className="min-w-0 truncate pr-2 text-xs font-medium text-foreground">{summary}</span>
+          <span
+            className={cn(
+              "min-w-0 truncate pr-2 font-medium text-foreground",
+              compact ? "text-[11px]" : "text-xs",
+            )}
+          >
+            {summary}
+          </span>
         </button>
         {showClear ? (
           <button

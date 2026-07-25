@@ -747,8 +747,7 @@ export async function cleanupClientMarketClientWithReason(
       | "payment_not_received"
       | "host_maintenance"
       | "service_terminated"
-      | "other"
-      | "operator_release";
+      | "other";
     blockClientForProvider?: boolean;
   },
 ) {

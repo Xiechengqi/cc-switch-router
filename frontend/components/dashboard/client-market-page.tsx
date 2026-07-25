@@ -3,7 +3,7 @@
 import * as React from "react";
 import { createPortal } from "react-dom";
 import { Button, Checkbox, Chip, Dropdown, Modal, Tabs, toast, Tooltip } from "@heroui/react";
-import { ArrowDown, ArrowUp, Check, CheckSquare, ChevronDown, ChevronLeft, ChevronRight, Circle, Clock3, Download, Filter, Loader2, MoreHorizontal, Pencil, Plus, RefreshCw, Trash2, Upload, X } from "lucide-react";
+import { ArrowDown, ArrowUp, Check, CheckSquare, ChevronDown, ChevronLeft, ChevronRight, Circle, Clock3, Download, Loader2, MoreHorizontal, Pencil, Plus, RefreshCw, Trash2, Upload, X } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { CopyableCodeField } from "@/components/common/copyable-code-field";
@@ -21,7 +21,6 @@ import {
   deleteClientMarketHost,
   exportMyClientMarketHosts,
   getAccountPaymentProfile,
-  getClientMarketProviderSupply,
   getClientMarketHosts,
   getClientMarketJob,
   getMyClientMarketBilling,
@@ -33,7 +32,15 @@ import {
   updateClientMarketHostOffer,
 } from "@/lib/api";
 import { DASHBOARD_ACCOUNT_PATH } from "@/lib/dashboard-nav";
-import type { ClientMarketBilling, ClientMarketHost, ClientMarketHostImportResponse, ClientMarketProvider, HostIpIntel, ProvisionSshKey, ProvisioningJob } from "@/lib/types";
+import type {
+  ClientMarketBilling,
+  ClientMarketHost,
+  ClientMarketHostImportResponse,
+  ClientMarketHostTransferDocument,
+  HostIpIntel,
+  ProvisionSshKey,
+  ProvisioningJob,
+} from "@/lib/types";
 import type { MessageKey } from "@/lib/i18n";
 import { usePersistentState } from "@/lib/use-persistent-state";
 
@@ -98,56 +105,32 @@ function containsCjk(value: string) {
   return /[\u3400-\u9fff]/.test(value);
 }
 
-function formatObservationRate(value: number | undefined, locale: string) {
-  if (value == null) return "-";
-  return new Intl.NumberFormat(locale, { style: "percent", maximumFractionDigits: 1 }).format(value);
-}
-
-function formatObservationDate(value: string, locale: string) {
-  return new Intl.DateTimeFormat(locale, { dateStyle: "medium" }).format(new Date(value));
-}
-
-function formatProviderPriceRange(provider: ClientMarketProvider, locale: string) {
-  if (provider.minPriceCents == null || provider.maxPriceCents == null) return "-";
-  const format = new Intl.NumberFormat(locale, { style: "currency", currency: "USD" });
-  const min = format.format(provider.minPriceCents / 100);
-  const max = format.format(provider.maxPriceCents / 100);
-  return min === max ? min : `${min}-${max}`;
-}
-
-function formatProviderPeriodRange(provider: ClientMarketProvider) {
-  if (provider.minRentalPeriodDays == null || provider.maxRentalPeriodDays == null) return "-";
-  return provider.minRentalPeriodDays === provider.maxRentalPeriodDays
-    ? String(provider.minRentalPeriodDays)
-    : `${provider.minRentalPeriodDays}-${provider.maxRentalPeriodDays}`;
-}
-
 function hostDisplayLabel(host: ClientMarketHost) {
   return host.hostname || host.ip || host.id.slice(0, 8);
 }
 
-function hostCanManage(host: ClientMarketHost, isAdmin: boolean) {
-  return isAdmin || host.isHostOwner === true;
+function hostCanManage(host: ClientMarketHost) {
+  return host.isHostOwner === true;
 }
 
-function hostCanCleanup(host: ClientMarketHost, isAdmin: boolean) {
+function hostCanCleanup(host: ClientMarketHost) {
   return (
     !!host.installationId &&
     (host.status === "allocated" || host.status === "unreachable" || host.status === "draining") &&
-    (hostCanManage(host, isAdmin) || host.isClientOwner === true)
+    (hostCanManage(host) || host.isClientOwner === true)
   );
 }
 
-function hostCanReverify(host: ClientMarketHost, isAdmin: boolean) {
+function hostCanReverify(host: ClientMarketHost) {
   return (
-    hostCanManage(host, isAdmin) &&
+    hostCanManage(host) &&
     (host.status === "unreachable" || host.status === "disabled" || host.status === "abnormal")
   );
 }
 
-function hostCanDelete(host: ClientMarketHost, isAdmin: boolean) {
+function hostCanDelete(host: ClientMarketHost) {
   return (
-    hostCanManage(host, isAdmin) &&
+    hostCanManage(host) &&
     !host.installationId &&
     (host.status === "idle" || host.status === "disabled" || host.status === "abnormal")
   );
@@ -159,13 +142,92 @@ function hostCanExport(host: ClientMarketHost) {
 
 function hostExportKey(host: { ip?: string | null; port?: number | null }) {
   if (!host.ip || host.port == null) return "";
-  return `${host.ip}:${host.port}`;
+  return formatHostEndpoint(host.ip, host.port);
 }
 
-function cleanupReasonForHost(host: ClientMarketHost, isAdmin: boolean) {
+/** Fixed line format: ip:port|note|priceCents|periodDays|fingerprint */
+type HostTransferLineEntry = ClientMarketHostTransferDocument["hosts"][number];
+
+function formatHostEndpoint(ip: string, port: number) {
+  return ip.includes(":") ? `[${ip}]:${port}` : `${ip}:${port}`;
+}
+
+function splitHostEndpoint(endpoint: string): { ip: string; port: number } | null {
+  const trimmed = endpoint.trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith("[")) {
+    const close = trimmed.indexOf("]");
+    if (close < 1 || trimmed[close + 1] !== ":") return null;
+    const ip = trimmed.slice(1, close).trim();
+    const port = Number(trimmed.slice(close + 2));
+    if (!ip || !Number.isInteger(port) || port <= 0 || port > 65535) return null;
+    return { ip, port };
+  }
+  const idx = trimmed.lastIndexOf(":");
+  if (idx <= 0) return null;
+  const ip = trimmed.slice(0, idx).trim();
+  const port = Number(trimmed.slice(idx + 1));
+  if (!ip || !Number.isInteger(port) || port <= 0 || port > 65535) return null;
+  return { ip, port };
+}
+
+function encodeHostTransferLine(entry: HostTransferLineEntry): string {
+  const endpoint = formatHostEndpoint(entry.ip, entry.port);
+  const note = entry.note?.trim() || "";
+  const price = entry.priceCents != null ? String(entry.priceCents) : "";
+  const period = entry.rentalPeriodDays != null ? String(entry.rentalPeriodDays) : "";
+  const fingerprint = entry.expectedFingerprint?.trim() || "";
+  const status = entry.informationalStatus?.trim();
+  const line = `${endpoint}|${note}|${price}|${period}|${fingerprint}`;
+  return status ? `${line} # ${status}` : line;
+}
+
+function encodeHostTransferDocument(document: ClientMarketHostTransferDocument): string {
+  return document.hosts.map(encodeHostTransferLine).join("\n");
+}
+
+function parseHostTransferLines(text: string): { document?: ClientMarketHostTransferDocument; errorLine?: string } {
+  const hosts: HostTransferLineEntry[] = [];
+  const seen = new Set<string>();
+  for (const raw of text.split(/\r?\n/)) {
+    const trimmed = raw.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const line = trimmed.replace(/\s+#.*$/, "").trim();
+    if (!line) continue;
+    const [endpointPart, note = "", priceRaw = "", periodRaw = "", fingerprint = ""] = line
+      .split("|")
+      .map((part) => part.trim());
+    const endpoint = splitHostEndpoint(endpointPart);
+    if (!endpoint) return { errorLine: trimmed };
+    const key = formatHostEndpoint(endpoint.ip, endpoint.port);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    let priceCents: number | undefined;
+    let rentalPeriodDays: number | undefined;
+    if (priceRaw) {
+      if (!/^\d+$/.test(priceRaw)) return { errorLine: trimmed };
+      priceCents = Number(priceRaw);
+    }
+    if (periodRaw) {
+      if (!/^\d+$/.test(periodRaw)) return { errorLine: trimmed };
+      rentalPeriodDays = Number(periodRaw);
+    }
+    hosts.push({
+      ip: endpoint.ip,
+      port: endpoint.port,
+      note: note || undefined,
+      priceCents,
+      rentalPeriodDays,
+      expectedFingerprint: fingerprint || undefined,
+    });
+  }
+  if (!hosts.length) return {};
+  return { document: { version: 1, hosts } };
+}
+
+function cleanupReasonForHost(host: ClientMarketHost) {
   const isClientOwner = host.isClientOwner === true;
   if (host.isHostOwner === true && !isClientOwner) return "provider_release" as const;
-  if (isAdmin && !isClientOwner) return "operator_release" as const;
   return "client_release" as const;
 }
 
@@ -1101,7 +1163,6 @@ function HostOfferDialog({
 function HostRow({
   host,
   billing,
-  isAdmin,
   selectionMode,
   selected,
   onSelectedChange,
@@ -1111,7 +1172,6 @@ function HostRow({
 }: {
   host: ClientMarketHost;
   billing?: ClientMarketBilling;
-  isAdmin: boolean;
   selectionMode: boolean;
   selected: boolean;
   onSelectedChange: (selected: boolean) => void;
@@ -1126,10 +1186,10 @@ function HostRow({
   const [cleanupJob, setCleanupJob] = React.useState<ProvisioningJob | null>(null);
   const [cleanupOpen, setCleanupOpen] = React.useState(false);
   const [offerOpen, setOfferOpen] = React.useState(false);
-  const canManageHost = hostCanManage(host, isAdmin);
-  const canDelete = hostCanDelete(host, isAdmin);
+  const canManageHost = hostCanManage(host);
+  const canDelete = hostCanDelete(host);
   const isClientOwner = host.isClientOwner === true;
-  const canCleanup = hostCanCleanup(host, isAdmin);
+  const canCleanup = hostCanCleanup(host);
   const canMarkUnpaid =
     !!host.installationId &&
     host.status === "allocated" &&
@@ -1137,7 +1197,7 @@ function HostRow({
     !isClientOwner;
   const isRetryCleanup =
     canCleanup && (host.status === "unreachable" || host.status === "draining");
-  const canReverify = hostCanReverify(host, isAdmin);
+  const canReverify = hostCanReverify(host);
   const canOpenTerminal = host.canWebTerminal === true;
   const hostLabel = hostDisplayLabel(host);
   const terminalTitle = host.ip || hostLabel;
@@ -1201,7 +1261,7 @@ function HostRow({
             blockClientForProvider: true,
           })
         : await cleanupClientMarketClientWithReason(host.installationId, {
-            reason: cleanupReasonForHost(host, isAdmin),
+            reason: cleanupReasonForHost(host),
             blockClientForProvider: false,
           });
       toast.info(t("clientMarket.cleanupStarted"));
@@ -1679,10 +1739,12 @@ function HostSortHeader({
   columnKey,
   sortPrefs,
   onSort,
+  filter,
 }: {
   columnKey: HostSortKey;
   sortPrefs: HostSortPrefs;
   onSort: (key: HostSortKey) => void;
+  filter?: React.ReactNode;
 }) {
   const { t } = useLocaleText();
   const active = sortPrefs.key === columnKey;
@@ -1696,29 +1758,32 @@ function HostSortHeader({
     <th
       scope="col"
       aria-sort={ariaSort}
-      className="sticky top-0 z-10 whitespace-nowrap border-b border-border bg-card px-2 py-2 text-left text-xs font-medium text-muted-foreground"
+      className="sticky top-0 z-10 border-b border-border bg-card px-2 py-2 text-left text-xs font-medium text-muted-foreground"
     >
-      <button
-        type="button"
-        className="inline-flex items-center gap-1 rounded-md px-1 py-0.5 text-left transition-colors hover:bg-muted/60 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2"
-        onClick={() => onSort(columnKey)}
-        aria-label={t("clientMarket.sortBy", { column: label })}
-      >
-        <span>{label}</span>
-        {active ? (
-          sortPrefs.dir === "asc" ? (
-            <ArrowUp className="h-3.5 w-3.5 text-accent" aria-hidden />
+      <div className="grid gap-1.5">
+        <button
+          type="button"
+          className="inline-flex items-center gap-1 rounded-md px-1 py-0.5 text-left transition-colors hover:bg-muted/60 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2"
+          onClick={() => onSort(columnKey)}
+          aria-label={t("clientMarket.sortBy", { column: label })}
+        >
+          <span className="whitespace-nowrap">{label}</span>
+          {active ? (
+            sortPrefs.dir === "asc" ? (
+              <ArrowUp className="h-3.5 w-3.5 text-accent" aria-hidden />
+            ) : (
+              <ArrowDown className="h-3.5 w-3.5 text-accent" aria-hidden />
+            )
           ) : (
-            <ArrowDown className="h-3.5 w-3.5 text-accent" aria-hidden />
-          )
-        ) : (
-          <span className="inline-flex h-3.5 w-3.5 flex-col justify-center opacity-30" aria-hidden>
-            <ArrowUp className="h-2.5 w-2.5 -mb-0.5" />
-            <ArrowDown className="h-2.5 w-2.5" />
-          </span>
-        )}
-        {sortStateLabel ? <span className="sr-only">{sortStateLabel}</span> : null}
-      </button>
+            <span className="inline-flex h-3.5 w-3.5 flex-col justify-center opacity-30" aria-hidden>
+              <ArrowUp className="h-2.5 w-2.5 -mb-0.5" />
+              <ArrowDown className="h-2.5 w-2.5" />
+            </span>
+          )}
+          {sortStateLabel ? <span className="sr-only">{sortStateLabel}</span> : null}
+        </button>
+        {filter}
+      </div>
     </th>
   );
 }
@@ -1728,15 +1793,12 @@ export function ClientMarketPage() {
   const { session } = useAuth();
   const authed = !!session?.authenticated;
   const viewerUserId = session?.user?.id;
-  const isAdmin = !!session?.isAdmin;
 
   const [hosts, setHosts] = React.useState<ClientMarketHost[]>([]);
-  const [providers, setProviders] = React.useState<ClientMarketProvider[]>([]);
   const [billingByInstallation, setBillingByInstallation] = React.useState<Map<string, ClientMarketBilling>>(new Map());
   const [loading, setLoading] = React.useState(true);
   const [addOpen, setAddOpen] = React.useState(false);
   const [pendingAddAfterLogin, setPendingAddAfterLogin] = React.useState(false);
-  const [mineOnly, setMineOnly] = React.useState(false);
   const [ownerFilters, setOwnerFilters] = usePersistentState<string[]>(OWNER_FILTER_KEY, []);
   const [regionFilters, setRegionFilters] = usePersistentState<string[]>(REGION_FILTER_KEY, []);
   const [statusFilterRaw, setStatusFilter] = usePersistentState<HostStatusFilter>(STATUS_FILTER_KEY, "all");
@@ -1747,12 +1809,13 @@ export function ClientMarketPage() {
   const [error, setError] = React.useState("");
   const [fixedHost, setFixedHost] = React.useState<ClientMarketHost | null>(null);
   const [transferBusy, setTransferBusy] = React.useState(false);
+  const [importOpen, setImportOpen] = React.useState(false);
+  const [exportOpen, setExportOpen] = React.useState(false);
+  const [importText, setImportText] = React.useState("");
+  const [exportText, setExportText] = React.useState("");
   const [importResult, setImportResult] = React.useState<ClientMarketHostImportResponse | null>(null);
-  const importInputRef = React.useRef<HTMLInputElement | null>(null);
   const [selectionMode, setSelectionMode] = React.useState(false);
   const [selectedIds, setSelectedIds] = React.useState<Set<string>>(new Set());
-  const [filterOpen, setFilterOpen] = React.useState(false);
-  const filterRootRef = React.useRef<HTMLDivElement | null>(null);
   const [batchBusy, setBatchBusy] = React.useState(false);
   const [batchConfirm, setBatchConfirm] = React.useState<"cleanup" | "delete" | "reverify" | null>(null);
   const [batchProgressOpen, setBatchProgressOpen] = React.useState(false);
@@ -1763,13 +1826,11 @@ export function ClientMarketPage() {
     setLoading(true);
     setError("");
     try {
-      const [nextHosts, supply, billing] = await Promise.all([
+      const [nextHosts, billing] = await Promise.all([
         getClientMarketHosts(),
-        getClientMarketProviderSupply(),
         authed ? getMyClientMarketBilling() : Promise.resolve([]),
       ]);
       setHosts(nextHosts);
-      setProviders(supply.providers);
       setBillingByInstallation(new Map(billing.map((record) => [record.installationId, record])));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -1780,7 +1841,7 @@ export function ClientMarketPage() {
 
   React.useEffect(() => {
     void load();
-  }, [isAdmin, load, viewerUserId]);
+  }, [load, viewerUserId]);
 
   const ownerOptions = React.useMemo(() => {
     const emails = Array.from(new Set(hosts.map((host) => host.hostOwnerEmail))).sort((a, b) =>
@@ -1808,7 +1869,6 @@ export function ClientMarketPage() {
     const ownerSet = new Set(ownerFilters.map((email) => email.toLowerCase()));
     const regionSet = new Set(regionFilters.map((code) => code.toUpperCase()));
     return hosts.filter((host) => {
-      if (mineOnly && host.isHostOwner !== true) return false;
       if (ownerSet.size > 0 && !ownerSet.has(host.hostOwnerEmail.toLowerCase())) return false;
       if (regionSet.size > 0) {
         const code = (host.countryCode || "").trim().toUpperCase();
@@ -1816,7 +1876,7 @@ export function ClientMarketPage() {
       }
       return true;
     });
-  }, [hosts, mineOnly, ownerFilters, regionFilters]);
+  }, [hosts, ownerFilters, regionFilters]);
 
   const statusCounts = React.useMemo(() => {
     const counts: Record<HostStatusFilter, number> = {
@@ -1855,7 +1915,7 @@ export function ClientMarketPage() {
 
   React.useEffect(() => {
     setPage(1);
-  }, [mineOnly, ownerFilters, regionFilters, sortPrefs.key, sortPrefs.dir, statusFilter]);
+  }, [ownerFilters, regionFilters, sortPrefs.key, sortPrefs.dir, statusFilter]);
 
   React.useEffect(() => {
     if (page > totalPages) setPage(totalPages);
@@ -1895,16 +1955,16 @@ export function ClientMarketPage() {
   );
   const selectedCount = selectedIds.size;
   const cleanupEligible = React.useMemo(
-    () => selectedHosts.filter((host) => hostCanCleanup(host, isAdmin)),
-    [isAdmin, selectedHosts],
+    () => selectedHosts.filter((host) => hostCanCleanup(host)),
+    [selectedHosts],
   );
   const reverifyEligible = React.useMemo(
-    () => selectedHosts.filter((host) => hostCanReverify(host, isAdmin)),
-    [isAdmin, selectedHosts],
+    () => selectedHosts.filter((host) => hostCanReverify(host)),
+    [selectedHosts],
   );
   const deleteEligible = React.useMemo(
-    () => selectedHosts.filter((host) => hostCanDelete(host, isAdmin)),
-    [isAdmin, selectedHosts],
+    () => selectedHosts.filter((host) => hostCanDelete(host)),
+    [selectedHosts],
   );
   const exportEligible = React.useMemo(
     () => selectedHosts.filter((host) => hostCanExport(host)),
@@ -2011,7 +2071,7 @@ export function ClientMarketPage() {
 
   const runBatchCleanup = async () => {
     const targets = cleanupEligible;
-    const skippedHosts = selectedHosts.filter((host) => !hostCanCleanup(host, isAdmin));
+    const skippedHosts = selectedHosts.filter((host) => !hostCanCleanup(host));
     const { byId, patch } = beginBatchProgress("cleanup", targets, skippedHosts);
     setBatchBusy(true);
     try {
@@ -2023,7 +2083,7 @@ export function ClientMarketPage() {
         }
         try {
           const { jobId } = await cleanupClientMarketClientWithReason(host.installationId, {
-            reason: cleanupReasonForHost(host, isAdmin),
+            reason: cleanupReasonForHost(host),
             blockClientForProvider: false,
           });
           const result = await pollCleanupJobQuiet(jobId);
@@ -2044,7 +2104,7 @@ export function ClientMarketPage() {
 
   const runBatchReverify = async () => {
     const targets = reverifyEligible;
-    const skippedHosts = selectedHosts.filter((host) => !hostCanReverify(host, isAdmin));
+    const skippedHosts = selectedHosts.filter((host) => !hostCanReverify(host));
     const { byId, patch } = beginBatchProgress("reverify", targets, skippedHosts);
     setBatchBusy(true);
     try {
@@ -2068,7 +2128,7 @@ export function ClientMarketPage() {
 
   const runBatchDelete = async () => {
     const targets = deleteEligible;
-    const skippedHosts = selectedHosts.filter((host) => !hostCanDelete(host, isAdmin));
+    const skippedHosts = selectedHosts.filter((host) => !hostCanDelete(host));
     const { byId, patch } = beginBatchProgress("delete", targets, skippedHosts);
     setBatchBusy(true);
     try {
@@ -2099,18 +2159,7 @@ export function ClientMarketPage() {
     setAddOpen(true);
   };
 
-  const downloadHostExport = (document: Awaited<ReturnType<typeof exportMyClientMarketHosts>>) => {
-    const blob = new Blob([`${JSON.stringify(document, null, 2)}\n`], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const link = window.document.createElement("a");
-    link.href = url;
-    link.download = `cc-switch-client-market-hosts-${new Date().toISOString().slice(0, 10)}.json`;
-    link.click();
-    URL.revokeObjectURL(url);
-    toast.success(t("clientMarket.exportedHosts", { count: document.hosts.length }));
-  };
-
-  const exportHosts = async (selectedOnly: boolean) => {
+  const openExportDialog = async (selectedOnly: boolean) => {
     setTransferBusy(true);
     try {
       const document = await exportMyClientMarketHosts();
@@ -2126,12 +2175,27 @@ export function ClientMarketPage() {
           return;
         }
       }
-      downloadHostExport(document);
+      if (!document.hosts.length) {
+        toast.danger(t("clientMarket.exportEmpty"));
+        return;
+      }
+      setExportText(encodeHostTransferDocument(document));
+      setExportOpen(true);
       if (selectedOnly) clearSelection();
+      toast.success(t("clientMarket.exportedHosts", { count: document.hosts.length }));
     } catch (reason) {
       toast.danger(reason instanceof Error ? reason.message : String(reason));
     } finally {
       setTransferBusy(false);
+    }
+  };
+
+  const copyExportText = async () => {
+    try {
+      await navigator.clipboard.writeText(exportText);
+      toast.success(t("clientMarket.exportCopied"));
+    } catch (reason) {
+      toast.danger(reason instanceof Error ? reason.message : String(reason));
     }
   };
 
@@ -2175,26 +2239,31 @@ export function ClientMarketPage() {
         ? t("clientMarket.batchProgressReverify")
         : t("clientMarket.batchProgressDelete");
 
-  const importHosts = async (file?: File) => {
-    if (!file) return;
-    if (file.size > 1024 * 1024) {
+  const submitImportText = async () => {
+    if (new TextEncoder().encode(importText).length > 1024 * 1024) {
       toast.danger(t("clientMarket.importSizeLimit"));
+      return;
+    }
+    const parsed = parseHostTransferLines(importText);
+    if (parsed.errorLine) {
+      toast.danger(t("clientMarket.importParseError", { line: parsed.errorLine }));
+      return;
+    }
+    if (!parsed.document) {
+      toast.danger(t("clientMarket.importEmpty"));
       return;
     }
     setTransferBusy(true);
     try {
-      const document = JSON.parse(await file.text());
-      if (!document || document.version !== 1 || !Array.isArray(document.hosts)) {
-        throw new Error(t("clientMarket.importVersionRequired"));
-      }
-      const result = await importMyClientMarketHosts(document);
+      const result = await importMyClientMarketHosts(parsed.document);
+      setImportOpen(false);
+      setImportText("");
       setImportResult(result);
       await load();
     } catch (reason) {
       toast.danger(reason instanceof Error ? reason.message : String(reason));
     } finally {
       setTransferBusy(false);
-      if (importInputRef.current) importInputRef.current.value = "";
     }
   };
 
@@ -2208,26 +2277,6 @@ export function ClientMarketPage() {
       })),
     [statusCounts, t],
   );
-
-  const activeFilterCount =
-    (mineOnly ? 1 : 0) + (ownerFilters.length > 0 ? 1 : 0) + (regionFilters.length > 0 ? 1 : 0);
-  const hasActiveFilters = activeFilterCount > 0;
-
-  React.useEffect(() => {
-    if (!filterOpen) return;
-    const onPointerDown = (event: PointerEvent) => {
-      if (filterRootRef.current?.contains(event.target as Node)) return;
-      setFilterOpen(false);
-    };
-    window.addEventListener("pointerdown", onPointerDown);
-    return () => window.removeEventListener("pointerdown", onPointerDown);
-  }, [filterOpen]);
-
-  const clearScopedFilters = () => {
-    setOwnerFilters([]);
-    setRegionFilters([]);
-    setMineOnly(false);
-  };
 
   return (
     <div className="mx-auto grid min-w-0 w-[calc(100%-2rem)] max-w-7xl grid-cols-[minmax(0,1fr)] gap-5 pb-10">
@@ -2249,71 +2298,8 @@ export function ClientMarketPage() {
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <div ref={filterRootRef} className="relative">
-            <Button
-              variant="outline"
-              size="sm"
-              className="h-8"
-              aria-expanded={filterOpen}
-              aria-label={t("clientMarket.filter")}
-              onClick={() => setFilterOpen((open) => !open)}
-            >
-              <Filter className="h-4 w-4" />
-              {hasActiveFilters
-                ? t("clientMarket.filterActive", { count: activeFilterCount })
-                : t("clientMarket.filter")}
-              <ChevronDown className={`h-3.5 w-3.5 transition-transform ${filterOpen ? "rotate-180" : ""}`} />
-            </Button>
-            {filterOpen ? (
-              <div className="absolute right-0 z-30 mt-1.5 w-[min(20rem,calc(100vw-2rem))] rounded-lg border border-border bg-white p-3 shadow-lg">
-                <div className="grid gap-3">
-                  <CompactRegionMultiSelect
-                    values={ownerFilters}
-                    onChange={setOwnerFilters}
-                    options={ownerOptions}
-                    allLabel={t("clientMarket.allOwners")}
-                    moreLabel={(count) => t("clientMarket.ownersMore", { count })}
-                    clearLabel={t("clientMarket.clearOwnerSelection")}
-                    ariaLabel={t("clientMarket.filterOwners")}
-                    className="w-full"
-                  />
-                  <CompactRegionMultiSelect
-                    values={regionFilters}
-                    onChange={setRegionFilters}
-                    options={regionOptions}
-                    allLabel={t("clientMarket.allRegions")}
-                    moreLabel={(count) => t("clientMarket.regionsMore", { count })}
-                    clearLabel={t("clientMarket.clearRegionSelection")}
-                    ariaLabel={t("clientMarket.filterRegions")}
-                    className="w-full"
-                  />
-                  {authed ? (
-                    <label className="flex cursor-pointer items-center gap-2 rounded-md border border-border px-3 py-2 text-sm">
-                      <input
-                        type="checkbox"
-                        className="h-4 w-4 accent-[var(--accent,#0052FF)]"
-                        checked={mineOnly}
-                        onChange={(event) => setMineOnly(event.target.checked)}
-                      />
-                      <span>{t("clientMarket.filterMineOnly")}</span>
-                    </label>
-                  ) : null}
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="justify-start"
-                    isDisabled={!hasActiveFilters}
-                    onClick={clearScopedFilters}
-                  >
-                    {t("clientMarket.filterClear")}
-                  </Button>
-                </div>
-              </div>
-            ) : null}
-          </div>
           {authed ? (
             <>
-              <input ref={importInputRef} type="file" accept="application/json,.json" className="hidden" onChange={(event) => void importHosts(event.target.files?.[0])} />
               {selectionMode ? (
                 <Button variant="outline" size="sm" className="h-8" isDisabled={batchBusy} onClick={exitSelectionMode}>
                   <CheckSquare className="h-4 w-4" />
@@ -2340,7 +2326,7 @@ export function ClientMarketPage() {
                     className="h-8 w-8 min-w-8"
                     aria-label={t("clientMarket.importMyHosts")}
                     isDisabled={transferBusy}
-                    onClick={() => importInputRef.current?.click()}
+                    onClick={() => setImportOpen(true)}
                   >
                     <Upload className="h-4 w-4" />
                   </Button>
@@ -2356,7 +2342,7 @@ export function ClientMarketPage() {
                     className="h-8 w-8 min-w-8"
                     aria-label={t("clientMarket.exportMyHosts")}
                     isDisabled={transferBusy || batchBusy}
-                    onClick={() => void exportHosts(false)}
+                    onClick={() => void openExportDialog(false)}
                   >
                     {transferBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
                   </Button>
@@ -2447,7 +2433,7 @@ export function ClientMarketPage() {
             size="sm"
             isDisabled={transferBusy || batchBusy || exportEligible.length === 0}
             aria-label={t("clientMarket.batchEligible", { run: exportEligible.length, selected: selectedCount })}
-            onClick={() => void exportHosts(true)}
+            onClick={() => void openExportDialog(true)}
           >
             <Download className="h-4 w-4" />
             {t("clientMarket.batchExportSelected")}
@@ -2462,39 +2448,6 @@ export function ClientMarketPage() {
         <p className="text-sm text-muted-foreground">{t("clientMarket.loginToAddHost")}</p>
       ) : null}
 
-      {providers.length ? (
-        <section className="overflow-x-auto border-y border-border bg-white/70 py-2" aria-label={t("clientMarket.providerObservations")}>
-          <div className="mb-1 px-1 text-[11px] text-muted-foreground">{t("clientMarket.providerObservationNotice")}</div>
-          <div className="flex min-w-max items-stretch gap-5 px-1 text-xs">
-            {providers.map((provider) => (
-              <div key={provider.providerId} className="grid content-center gap-1 border-r border-border pr-5 last:border-r-0">
-                <div className="flex items-center gap-2">
-                  <span className="max-w-48 truncate font-medium text-foreground" title={provider.ownerEmail}>{provider.ownerEmail}</span>
-                  {provider.official ? <Chip size="sm" variant="soft">{t("createClient.official")}</Chip> : null}
-                  <PaymentMethodIcons kinds={provider.paymentMethodKinds} />
-                </div>
-                <div className="flex items-center gap-3 text-muted-foreground">
-                  <span>{t("clientMarket.observedHosts", { total: provider.hostTotal, idle: provider.idleTotal, allocated: provider.allocatedTotal })}</span>
-                  <span>{t("clientMarket.observedAllocationRate", { rate: formatObservationRate(provider.allocationRate, locale) })}</span>
-                  <span>{t("clientMarket.observedFreeSupply", { total: provider.freeHostTotal, allocated: provider.freeAllocatedTotal })}</span>
-                  <span>{t("clientMarket.observedPaidSupply", { total: provider.paidHostTotal, allocated: provider.paidAllocatedTotal })}</span>
-                  <span>{t("clientMarket.observedExternalOwners", { count: provider.externalClientOwnerTotal })}</span>
-                  <span>{t("clientMarket.observedLongRentals", { over3: provider.externalClientsOver3Days, over30: provider.externalClientsOver30Days })}</span>
-                </div>
-                <div className="flex items-center gap-3 text-muted-foreground">
-                  <span>{t("clientMarket.observedUptime", { rate: formatObservationRate(provider.onlineRate30d, locale) })}</span>
-                  <span>{t("clientMarket.observedAnomaly", { rate: formatObservationRate(provider.anomalousHostRate, locale) })}</span>
-                  <span>{t("clientMarket.observedJoined", { date: formatObservationDate(provider.joinedAt, locale) })}</span>
-                  <span>{t("clientMarket.observedOfferStable", { date: formatObservationDate(provider.offerStableSince, locale) })}</span>
-                  <span>{t("clientMarket.observedPriceRange", { range: formatProviderPriceRange(provider, locale) })}</span>
-                  <span>{t("clientMarket.observedPeriodRange", { range: formatProviderPeriodRange(provider) })}</span>
-                </div>
-              </div>
-            ))}
-          </div>
-        </section>
-      ) : null}
-
       {loading ? (
         <div className="flex items-center gap-2 text-sm text-muted-foreground">
           <Loader2 className="h-4 w-4 animate-spin" />
@@ -2505,7 +2458,7 @@ export function ClientMarketPage() {
       ) : visibleHosts.length === 0 ? (
         <div className="grid justify-items-center gap-2 rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">
           <span>{scopedHosts.length ? t("dashboard.noFilterResults") : t("clientMarket.noHosts")}</span>
-          {scopedHosts.length || ownerFilters.length || regionFilters.length || statusFilter !== "all" || mineOnly ? (
+          {scopedHosts.length || ownerFilters.length || regionFilters.length || statusFilter !== "all" ? (
             <button
               type="button"
               className="text-xs font-medium text-primary hover:underline"
@@ -2513,7 +2466,6 @@ export function ClientMarketPage() {
                 setStatusFilter("all");
                 setOwnerFilters([]);
                 setRegionFilters([]);
-                setMineOnly(false);
               }}
             >
               {t("dashboard.clearFilters")}
@@ -2560,8 +2512,42 @@ export function ClientMarketPage() {
                     </th>
                   ) : null}
                   <HostSortHeader columnKey="status" sortPrefs={sortPrefs} onSort={toggleHostSort} />
-                  <HostSortHeader columnKey="region" sortPrefs={sortPrefs} onSort={toggleHostSort} />
-                  <HostSortHeader columnKey="owner" sortPrefs={sortPrefs} onSort={toggleHostSort} />
+                  <HostSortHeader
+                    columnKey="region"
+                    sortPrefs={sortPrefs}
+                    onSort={toggleHostSort}
+                    filter={
+                      <CompactRegionMultiSelect
+                        compact
+                        values={regionFilters}
+                        onChange={setRegionFilters}
+                        options={regionOptions}
+                        allLabel={t("clientMarket.allRegions")}
+                        moreLabel={(count) => t("clientMarket.regionsMore", { count })}
+                        clearLabel={t("clientMarket.clearRegionSelection")}
+                        ariaLabel={t("clientMarket.filterRegions")}
+                        className="min-w-[7.5rem] max-w-[11rem]"
+                      />
+                    }
+                  />
+                  <HostSortHeader
+                    columnKey="owner"
+                    sortPrefs={sortPrefs}
+                    onSort={toggleHostSort}
+                    filter={
+                      <CompactRegionMultiSelect
+                        compact
+                        values={ownerFilters}
+                        onChange={setOwnerFilters}
+                        options={ownerOptions}
+                        allLabel={t("clientMarket.allOwners")}
+                        moreLabel={(count) => t("clientMarket.ownersMore", { count })}
+                        clearLabel={t("clientMarket.clearOwnerSelection")}
+                        ariaLabel={t("clientMarket.filterOwners")}
+                        className="min-w-[8rem] max-w-[14rem]"
+                      />
+                    }
+                  />
                   <HostSortHeader columnKey="offer" sortPrefs={sortPrefs} onSort={toggleHostSort} />
                   <HostSortHeader columnKey="subdomain" sortPrefs={sortPrefs} onSort={toggleHostSort} />
                   <HostSortHeader columnKey="ip" sortPrefs={sortPrefs} onSort={toggleHostSort} />
@@ -2579,7 +2565,6 @@ export function ClientMarketPage() {
                     key={host.id}
                     host={host}
                     billing={host.installationId ? billingByInstallation.get(host.installationId) : undefined}
-                    isAdmin={isAdmin}
                     selectionMode={selectionMode}
                     selected={selectedIds.has(host.id)}
                     onSelectedChange={(next) => setHostSelected(host.id, next)}
@@ -2658,6 +2643,74 @@ export function ClientMarketPage() {
         fixedHost={fixedHost}
         onCreated={() => void load()}
       />
+      <Modal.Backdrop
+        isOpen={importOpen}
+        onOpenChange={(next) => {
+          if (!next && !transferBusy) {
+            setImportOpen(false);
+          }
+        }}
+      >
+        <Modal.Container placement="center">
+          <Modal.Dialog className="light w-[min(640px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
+            <Modal.Header>
+              <Modal.Heading>{t("clientMarket.importDialogTitle")}</Modal.Heading>
+            </Modal.Header>
+            <Modal.Body className="grid gap-3">
+              <p className="text-xs leading-relaxed text-muted-foreground">{t("clientMarket.transferFormatHint")}</p>
+              <textarea
+                value={importText}
+                onChange={(event) => setImportText(event.target.value)}
+                placeholder={t("clientMarket.importPlaceholder")}
+                spellCheck={false}
+                className="min-h-56 w-full resize-y rounded-lg border border-border bg-white px-3 py-2 font-mono text-xs leading-5 text-foreground outline-none focus-visible:ring-2 focus-visible:ring-accent"
+              />
+            </Modal.Body>
+            <Modal.Footer>
+              <Button variant="ghost" isDisabled={transferBusy} onClick={() => setImportOpen(false)}>
+                {t("common.cancel")}
+              </Button>
+              <Button variant="primary" isDisabled={transferBusy} onClick={() => void submitImportText()}>
+                {transferBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                {t("clientMarket.importSubmit")}
+              </Button>
+            </Modal.Footer>
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
+
+      <Modal.Backdrop
+        isOpen={exportOpen}
+        onOpenChange={(next) => {
+          if (!next) setExportOpen(false);
+        }}
+      >
+        <Modal.Container placement="center">
+          <Modal.Dialog className="light w-[min(640px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
+            <Modal.Header>
+              <Modal.Heading>{t("clientMarket.exportDialogTitle")}</Modal.Heading>
+            </Modal.Header>
+            <Modal.Body className="grid gap-3">
+              <p className="text-xs leading-relaxed text-muted-foreground">{t("clientMarket.transferFormatHint")}</p>
+              <textarea
+                value={exportText}
+                readOnly
+                spellCheck={false}
+                className="min-h-56 w-full resize-y rounded-lg border border-border bg-muted/30 px-3 py-2 font-mono text-xs leading-5 text-foreground outline-none"
+              />
+            </Modal.Body>
+            <Modal.Footer>
+              <Button variant="ghost" onClick={() => setExportOpen(false)}>
+                {t("common.close")}
+              </Button>
+              <Button variant="primary" onClick={() => void copyExportText()}>
+                {t("clientMarket.exportCopy")}
+              </Button>
+            </Modal.Footer>
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
+
       <Modal.Backdrop isOpen={!!importResult} onOpenChange={(next) => { if (!next) setImportResult(null); }}>
         <Modal.Container placement="center">
           <Modal.Dialog className="light w-[min(620px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">

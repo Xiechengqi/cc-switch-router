@@ -1040,10 +1040,9 @@ async fn get_payment_asset(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Response, AppError> {
     let session = require_session(&state, &headers).await?;
-    let is_admin = state.dynamic.read().await.is_admin(&session.email);
     let bytes = state
         .store
-        .client_market_payment_asset_for_viewer(&id, &session, is_admin)
+        .client_market_payment_asset_for_viewer(&id, &session)
         .await?;
     let mut response = Response::new(Body::from(bytes));
     response
@@ -1106,12 +1105,11 @@ async fn update_host_offer(
     Json(input): Json<UpdateHostOfferRequest>,
 ) -> Result<Json<HostOfferView>, AppError> {
     let session = require_session(&state, &headers).await?;
-    let is_admin = state.dynamic.read().await.is_admin(&session.email);
     let (price, period) = validate_offer(input.price_cents, input.rental_period_days)?;
     Ok(Json(
         state
             .store
-            .client_market_update_host_offer(&id, &session, is_admin, price, period)
+            .client_market_update_host_offer(&id, &session, price, period)
             .await?,
     ))
 }
@@ -1235,11 +1233,10 @@ async fn list_my_billing(
     headers: HeaderMap,
 ) -> Result<Json<Vec<BillingView>>, AppError> {
     let session = require_session(&state, &headers).await?;
-    let is_admin = state.dynamic.read().await.is_admin(&session.email);
     Ok(Json(
         state
             .store
-            .client_market_list_billing_for_viewer(&session, is_admin)
+            .client_market_list_billing_for_viewer(&session)
             .await?,
     ))
 }
@@ -1250,11 +1247,10 @@ async fn get_client_billing(
     AxumPath(installation_id): AxumPath<String>,
 ) -> Result<Json<BillingView>, AppError> {
     let session = require_session(&state, &headers).await?;
-    let is_admin = state.dynamic.read().await.is_admin(&session.email);
     Ok(Json(
         state
             .store
-            .client_market_billing_for_viewer(&installation_id, &session, is_admin)
+            .client_market_billing_for_viewer(&installation_id, &session)
             .await?,
     ))
 }
@@ -1281,10 +1277,9 @@ async fn declare_client_paid(
             &session,
         )
         .await?;
-    let is_admin = state.dynamic.read().await.is_admin(&session.email);
     let billing = state
         .store
-        .client_market_billing_for_viewer(&installation_id, &session, is_admin)
+        .client_market_billing_for_viewer(&installation_id, &session)
         .await?;
     Ok(Json(DeclarePaidResponse { billing }))
 }
@@ -1315,10 +1310,9 @@ async fn declare_invoice_paid(
             &session,
         )
         .await?;
-    let is_admin = state.dynamic.read().await.is_admin(&session.email);
     let billing = state
         .store
-        .client_market_billing_for_viewer(&installation_id, &session, is_admin)
+        .client_market_billing_for_viewer(&installation_id, &session)
         .await?;
     Ok(Json(DeclarePaidResponse { billing }))
 }
@@ -1672,7 +1666,6 @@ impl AppStore {
         &self,
         id: &str,
         viewer: &AuthSession,
-        is_admin: bool,
     ) -> Result<Vec<u8>, AppError> {
         let conn = self.conn.lock().await;
         let asset: Option<(String, Vec<u8>)> = conn
@@ -1685,8 +1678,7 @@ impl AppStore {
             .map_err(|error| AppError::Internal(format!("read payment asset failed: {error}")))?;
         let (owner_user_id, content) =
             asset.ok_or_else(|| AppError::NotFound("payment asset not found".into()))?;
-        let allowed = is_admin
-            || owner_user_id == viewer.user_id
+        let allowed = owner_user_id == viewer.user_id
             || conn
                 .query_row(
                     "SELECT 1 FROM client_market_subscriptions
@@ -1981,7 +1973,6 @@ impl AppStore {
         &self,
         host_id: &str,
         session: &AuthSession,
-        is_admin: bool,
         price_cents: Option<i64>,
         rental_period_days: Option<i64>,
     ) -> Result<HostOfferView, AppError> {
@@ -2008,7 +1999,7 @@ impl AppStore {
             .map_err(|error| AppError::Internal(format!("read host offer failed: {error}")))?;
         let (provider_id, old_price, old_period, old_revision, host_status) =
             host.ok_or_else(|| AppError::NotFound("host not found".into()))?;
-        if !is_admin && provider_id.as_deref() != Some(session.user_id.as_str()) {
+        if provider_id.as_deref() != Some(session.user_id.as_str()) {
             return Err(AppError::Forbidden(
                 "not allowed to edit this Host offer".into(),
             ));
@@ -2665,20 +2656,18 @@ impl AppStore {
     pub async fn client_market_list_billing_for_viewer(
         &self,
         session: &AuthSession,
-        is_admin: bool,
     ) -> Result<Vec<BillingView>, AppError> {
         let conn = self.conn.lock().await;
-        load_billing_views(&conn, None, session, is_admin)
+        load_billing_views(&conn, None, session)
     }
 
     pub async fn client_market_billing_for_viewer(
         &self,
         installation_id: &str,
         session: &AuthSession,
-        is_admin: bool,
     ) -> Result<BillingView, AppError> {
         let conn = self.conn.lock().await;
-        load_billing_views(&conn, Some(installation_id), session, is_admin)?
+        load_billing_views(&conn, Some(installation_id), session)?
             .into_iter()
             .next()
             .ok_or_else(|| AppError::NotFound("Client Market billing record not found".into()))
@@ -3579,7 +3568,6 @@ fn load_billing_views(
     conn: &Connection,
     installation_id: Option<&str>,
     session: &AuthSession,
-    is_admin: bool,
 ) -> Result<Vec<BillingView>, AppError> {
     let mut sql = "SELECT s.installation_id, s.host_id, s.provider_id, s.host_owner_email,
                 s.client_user_id, s.client_owner_email, s.status, s.price_cents,
@@ -3637,7 +3625,7 @@ fn load_billing_views(
     for row in rows {
         let client_role = row.client_user_id == session.user_id;
         let provider_role = row.provider_id == session.user_id;
-        if !is_admin && !client_role && !provider_role {
+        if !client_role && !provider_role {
             continue;
         }
         let mut methods: Vec<PaymentMethod> =
@@ -3673,8 +3661,7 @@ fn load_billing_views(
             can_declare_paid: client_role
                 && row.status == SUBSCRIPTION_PAYMENT_DUE
                 && row.price_cents.is_some(),
-            can_release: (client_role || provider_role || is_admin)
-                && row.status != SUBSCRIPTION_RELEASED,
+            can_release: (client_role || provider_role) && row.status != SUBSCRIPTION_RELEASED,
             updated_at: row.updated_at,
         });
     }

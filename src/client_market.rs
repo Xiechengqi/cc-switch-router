@@ -852,11 +852,6 @@ async fn list_hosts(
     Query(query): Query<ListHostsQuery>,
 ) -> Result<Json<Vec<RouterSshHostView>>, AppError> {
     let viewer = extract_optional_session(&state, &headers).await?;
-    let is_admin = if let Some(ref session) = viewer {
-        state.dynamic.read().await.is_admin(&session.email)
-    } else {
-        false
-    };
     let hosts = state
         .store
         .client_market_list_hosts(
@@ -868,32 +863,28 @@ async fn list_hosts(
     let views = hosts
         .into_iter()
         .map(|host| {
-            let reveal_operations = is_admin
-                || viewer.as_ref().is_some_and(|session| {
-                    host.provider_id.as_deref() == Some(session.user_id.as_str())
-                });
+            // Host operations (port, SSH details, notes, etc.) are host-owner only.
+            // Admins / Router owners do not get elevated market host privileges.
+            let is_host_owner = viewer.as_ref().is_some_and(|session| {
+                host.provider_id.as_deref() == Some(session.user_id.as_str())
+            });
             let is_client_owner = viewer.as_ref().is_some_and(|session| {
                 host.client_owner_user_id.as_deref() == Some(session.user_id.as_str())
             });
+            let reveal_operations = is_host_owner;
             let reveal_installation = reveal_operations || is_client_owner;
             // Web Terminal is host-owner only — not admins or client owners.
-            let can_web_terminal = viewer.as_ref().is_some_and(|session| {
-                host.provider_id.as_deref() == Some(session.user_id.as_str())
-            });
+            let can_web_terminal = is_host_owner;
             let ip_intel = host_ip_intel_for_viewer(
                 host.ip_intel_json.as_deref(),
                 &host.ip,
                 reveal_operations,
             );
-            let display_ip = if reveal_operations {
-                host.ip.clone()
-            } else {
-                mask_public_host_ip(&host.ip)
-            };
+            // Market listings always show the full IP; only port stays owner-private.
             RouterSshHostView {
                 id: host.id,
                 provider_id: host.provider_id,
-                ip: Some(display_ip),
+                ip: Some(host.ip.clone()),
                 port: reveal_operations.then_some(host.port),
                 host_owner_email: host.host_owner_email,
                 price_cents: host.price_cents,
@@ -914,7 +905,7 @@ async fn list_hosts(
                     .then_some(host.installation_id)
                     .flatten(),
                 can_web_terminal,
-                is_host_owner: can_web_terminal,
+                is_host_owner,
                 is_client_owner,
                 last_verified_at: reveal_operations.then_some(host.last_verified_at).flatten(),
                 last_error: reveal_operations.then_some(host.last_error).flatten(),
@@ -1426,10 +1417,9 @@ async fn reverify_host(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<RouterSshHostView>, AppError> {
     let session = require_session(&state, &headers).await?;
-    let is_admin = state.dynamic.read().await.is_admin(&session.email);
     let host = state
         .store
-        .client_market_get_host_for_operator(&id, &session.user_id, is_admin)
+        .client_market_get_host_for_operator(&id, &session.user_id)
         .await?;
     if !matches!(
         host.status.as_str(),
@@ -1446,7 +1436,6 @@ async fn reverify_host(
             host.status.as_str(),
             HOST_STATUS_UNREACHABLE | HOST_STATUS_ABNORMAL
         )
-        && !is_admin
     {
         return Err(AppError::Conflict(
             "host still has an installation; retry client cleanup instead".into(),
@@ -1501,10 +1490,9 @@ async fn delete_host(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let session = require_session(&state, &headers).await?;
-    let is_admin = state.dynamic.read().await.is_admin(&session.email);
     state
         .store
-        .client_market_delete_host(&id, &session.user_id, is_admin)
+        .client_market_delete_host(&id, &session.user_id)
         .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -1548,10 +1536,9 @@ async fn get_job(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<JobView>, AppError> {
     let session = require_session(&state, &headers).await?;
-    let is_admin = state.dynamic.read().await.is_admin(&session.email);
     let mut job = state
         .store
-        .client_market_get_job_for_viewer(&id, &session, is_admin)
+        .client_market_get_job_for_viewer(&id, &session)
         .await?;
     job.client_url = job
         .subdomain
@@ -1609,7 +1596,6 @@ async fn cleanup_client_with_reason(
 ) -> Result<Json<CreateClientResponse>, AppError> {
     let session = require_session(&state, &headers).await?;
     let viewer = session.email.clone();
-    let is_admin = state.dynamic.read().await.is_admin(&viewer);
     let input = input.map(|Json(value)| value).unwrap_or_default();
     let reason = input
         .reason
@@ -1623,7 +1609,6 @@ async fn cleanup_client_with_reason(
             | "host_maintenance"
             | "service_terminated"
             | "other"
-            | "operator_release"
     ) {
         return Err(AppError::BadRequest(
             "unsupported Client cleanup reason".into(),
@@ -1633,13 +1618,14 @@ async fn cleanup_client_with_reason(
         .store
         .client_market_subdomain_for_installation(&installation_id)
         .await?;
+    // Session admins are not elevated: only the Host owner or Client owner may cleanup.
     let job_id = state
         .store
         .client_market_begin_cleanup_job_with_context(
             &installation_id,
             Some(&session.user_id),
             &viewer,
-            is_admin,
+            false,
             reason,
             input.block_client_for_provider,
         )
@@ -3623,45 +3609,19 @@ fn normalize_ip_for_compare(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// Public market listing mask: keep first/last IPv4 octets, hide the middle.
-/// Example: `154.219.101.173` → `154.xx.xx.173`
-fn mask_public_host_ip(ip: &str) -> String {
-    let trimmed = ip.trim();
-    if let Ok(parsed) = trimmed.parse::<IpAddr>() {
-        return match parsed {
-            IpAddr::V4(v4) => {
-                let octets = v4.octets();
-                format!("{}.xx.xx.{}", octets[0], octets[3])
-            }
-            IpAddr::V6(v6) => {
-                let segments = v6.segments();
-                format!(
-                    "{:x}:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:{:x}",
-                    segments[0], segments[7]
-                )
-            }
-        };
-    }
-    let parts: Vec<&str> = trimmed.split('.').collect();
-    if parts.len() == 4 && parts.iter().all(|part| !part.is_empty()) {
-        return format!("{}.xx.xx.{}", parts[0], parts[3]);
-    }
-    "xx.xx.xx.xx".to_string()
-}
-
 fn parse_host_ip_intel(raw: Option<&str>) -> Option<crate::ip_iq::HostIpIntel> {
     raw.and_then(|value| serde_json::from_str(value).ok())
 }
 
-/// Non-owners still see market-useful ISP / risk / classification, without exact IP or geo coords.
+/// Non-owners still see market-useful ISP / risk / classification.
+/// Full IP is public in the market list; geo coords and ownership stay redacted.
 fn public_host_ip_intel(
     intel: crate::ip_iq::HostIpIntel,
     host_ip: &str,
 ) -> crate::ip_iq::HostIpIntel {
-    let masked = mask_public_host_ip(host_ip);
     crate::ip_iq::HostIpIntel {
-        query: masked.clone(),
-        ip: Some(masked),
+        query: host_ip.to_string(),
+        ip: Some(host_ip.to_string()),
         location: intel.location,
         score: None,
         level: intel.level,
@@ -3704,15 +3664,10 @@ fn host_ip_intel_for_viewer(
 
 fn host_to_view(host: RouterSshHostRecord, reveal: bool) -> RouterSshHostView {
     let ip_intel = host_ip_intel_for_viewer(host.ip_intel_json.as_deref(), &host.ip, reveal);
-    let display_ip = if reveal {
-        host.ip.clone()
-    } else {
-        mask_public_host_ip(&host.ip)
-    };
     RouterSshHostView {
         id: host.id,
         provider_id: host.provider_id,
-        ip: Some(display_ip),
+        ip: Some(host.ip.clone()),
         port: reveal.then_some(host.port),
         host_owner_email: host.host_owner_email,
         price_cents: host.price_cents,
@@ -4306,12 +4261,11 @@ impl AppStore {
         &self,
         id: &str,
         viewer_user_id: &str,
-        is_admin: bool,
     ) -> Result<(), AppError> {
         let conn = self.conn.lock().await;
         let host = get_router_ssh_host(&conn, id)?
             .ok_or_else(|| AppError::NotFound("host not found".into()))?;
-        if host.provider_id.as_deref() != Some(viewer_user_id) && !is_admin {
+        if host.provider_id.as_deref() != Some(viewer_user_id) {
             return Err(AppError::Forbidden(
                 "not allowed to delete this host".into(),
             ));
@@ -4471,17 +4425,14 @@ impl AppStore {
         &self,
         job_id: &str,
         session: &crate::models::AuthSession,
-        is_admin: bool,
     ) -> Result<JobView, AppError> {
         let job = self
             .client_market_get_job_record(job_id)
             .await?
             .ok_or_else(|| AppError::NotFound("job not found".into()))?;
-        let allowed = if is_admin {
-            true
-        } else {
-            let conn = self.conn.lock().await;
-            conn.query_row(
+        let conn = self.conn.lock().await;
+        let allowed = conn
+            .query_row(
                 "SELECT CASE WHEN j.client_owner_user_id = ?2 OR h.provider_id = ?2 THEN 1 ELSE 0 END
                  FROM provisioning_jobs j
                  LEFT JOIN router_ssh_hosts h ON h.id = j.host_id
@@ -4491,11 +4442,11 @@ impl AppStore {
             )
             .optional()
             .map_err(|error| AppError::Internal(format!("authorize provisioning job failed: {error}")))?
-            .is_some_and(|allowed| allowed != 0)
-        };
+            .is_some_and(|allowed| allowed != 0);
         if !allowed {
             return Err(AppError::Forbidden("not allowed to view this job".into()));
         }
+        drop(conn);
         let country_code = if let Some(host_id) = job.host_id.as_deref() {
             self.client_market_get_host(host_id)
                 .await?
@@ -4980,12 +4931,11 @@ impl AppStore {
         &self,
         id: &str,
         viewer_user_id: &str,
-        is_admin: bool,
     ) -> Result<RouterSshHostRecord, AppError> {
         let conn = self.conn.lock().await;
         let host = get_router_ssh_host(&conn, id)?
             .ok_or_else(|| AppError::NotFound("host not found".into()))?;
-        if !is_admin && host.provider_id.as_deref() != Some(viewer_user_id) {
+        if host.provider_id.as_deref() != Some(viewer_user_id) {
             return Err(AppError::Forbidden(
                 "not allowed to operate this host".into(),
             ));
@@ -5562,7 +5512,10 @@ impl AppStore {
                 .as_ref()
                 .is_some_and(|owner| owner.0 == user_id)
         });
-        if !is_admin && !is_host_owner && !is_client_owner {
+        // `is_admin` here means Router system automation only (no session actor).
+        // Human admins / Router owners are never elevated for market Host cleanup.
+        let system_operator = is_admin && actor_user_id.is_none();
+        if !system_operator && !is_host_owner && !is_client_owner {
             return Err(AppError::Forbidden(
                 "not allowed to cleanup this client".into(),
             ));
@@ -7176,9 +7129,10 @@ mod tests {
         ] {
             assert!(public.get(key).is_none(), "public view leaked {key}");
         }
+        // Full IP is public; only port and operational fields stay owner-private.
         assert_eq!(
             public.get("ip").and_then(|value| value.as_str()),
-            Some("203.xx.xx.9")
+            Some("203.0.113.9")
         );
         let public_intel = public
             .get("ipIntel")
@@ -7199,7 +7153,7 @@ mod tests {
         );
         assert_eq!(
             public_intel.get("ip").and_then(|value| value.as_str()),
-            Some("203.xx.xx.9")
+            Some("203.0.113.9")
         );
         assert!(public_intel.get("latitude").is_none());
         assert_eq!(
@@ -7218,16 +7172,6 @@ mod tests {
                 .get("clientOwnerEmail")
                 .and_then(|value| value.as_str()),
             Some("client@example.com")
-        );
-    }
-
-    #[test]
-    fn mask_public_host_ip_keeps_first_and_last_octets() {
-        assert_eq!(mask_public_host_ip("154.219.101.173"), "154.xx.xx.173");
-        assert_eq!(mask_public_host_ip("8.8.8.8"), "8.xx.xx.8");
-        assert_eq!(
-            mask_public_host_ip("2001:db8:85a3::8a2e:370:7334"),
-            "2001:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:7334"
         );
     }
 
@@ -7303,7 +7247,7 @@ mod tests {
         let provider = market_session("provider-1", "provider@example.com");
         ensure_payment_profile(&store, "provider-1", "provider@example.com").await;
         let changed_offer = store
-            .client_market_update_host_offer(&first.id, &provider, false, Some(900), Some(60))
+            .client_market_update_host_offer(&first.id, &provider, Some(900), Some(60))
             .await
             .expect("Provider may change an offer while a quote is reserved");
         assert_eq!(changed_offer.offer_revision, 2);
@@ -7557,7 +7501,7 @@ mod tests {
         let provider = market_session("provider-stable", "provider-new@example.com");
         assert!(matches!(
             store
-                .client_market_update_host_offer(&host.id, &provider, false, Some(900), Some(60))
+                .client_market_update_host_offer(&host.id, &provider, Some(900), Some(60))
                 .await,
             Err(AppError::BadRequest(message))
                 if message.contains("configure payment details on the Account page")
@@ -7565,7 +7509,7 @@ mod tests {
 
         let client = market_session("client-stable", "client-new@example.com");
         let billing_without_profile = store
-            .client_market_billing_for_viewer("paid-client", &client, false)
+            .client_market_billing_for_viewer("paid-client", &client)
             .await
             .expect("load billing before Provider configures payment details");
         assert!(billing_without_profile.payment_profile_updated_at.is_none());
@@ -7586,12 +7530,12 @@ mod tests {
             .await
             .expect("configure Provider payment details");
         let updated_offer = store
-            .client_market_update_host_offer(&host.id, &provider, false, Some(900), Some(60))
+            .client_market_update_host_offer(&host.id, &provider, Some(900), Some(60))
             .await
             .expect("update Host offer with stable Provider identity");
         assert_eq!(updated_offer.offer_revision, 2);
         let unchanged_offer = store
-            .client_market_update_host_offer(&host.id, &provider, false, Some(900), Some(60))
+            .client_market_update_host_offer(&host.id, &provider, Some(900), Some(60))
             .await
             .expect("save unchanged Host offer");
         assert_eq!(unchanged_offer.offer_revision, 2);
@@ -7648,7 +7592,7 @@ mod tests {
             parse_market_time(&frozen_end.to_rfc3339())
         );
         let billing_with_profile = store
-            .client_market_billing_for_viewer("paid-client", &client, false)
+            .client_market_billing_for_viewer("paid-client", &client)
             .await
             .expect("reload billing after payment details change");
         {
@@ -7775,7 +7719,7 @@ mod tests {
         assert_eq!(declaration_events, 1);
         assert_eq!(owner_email, "client-new@example.com");
         let billing = store
-            .client_market_billing_for_viewer("paid-client", &client, false)
+            .client_market_billing_for_viewer("paid-client", &client)
             .await
             .expect("load billing after email change");
         assert!(billing.is_client_owner);
