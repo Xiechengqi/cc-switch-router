@@ -10,8 +10,9 @@ import {
   marketLabel,
   type TFn,
 } from "@/components/dashboard/share-dashboard-utils";
+import { getShareUserLimitStatus } from "@/lib/api";
 import { shareAccessApps, resolveShareCoreApp } from "@/lib/share-app";
-import type { DashboardMarket, ShareUserGrant, ShareView } from "@/lib/types";
+import type { DashboardMarket, ShareUserGrant, ShareUserLimitStatusRow, ShareView } from "@/lib/types";
 import { formatDateTime } from "@/lib/utils";
 import {
   forSaleOptionLabel,
@@ -90,6 +91,37 @@ export function ShareEditReadView({
   const tokenUnlimited = isUnlimitedTokenLimit(tokenLimit);
   const parallelUnlimited = isUnlimitedParallelLimit(parallelLimit);
   const limitGrants = React.useMemo(() => activeUserLimitGrants(share), [share]);
+  const [limitRows, setLimitRows] = React.useState<ShareUserLimitStatusRow[] | null>(null);
+  const [limitLoading, setLimitLoading] = React.useState(false);
+  const [limitError, setLimitError] = React.useState("");
+
+  React.useEffect(() => {
+    if (!shareApp) {
+      setLimitRows(null);
+      setLimitError("");
+      setLimitLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setLimitLoading(true);
+    setLimitError("");
+    getShareUserLimitStatus(share.shareId, shareApp)
+      .then((data) => {
+        if (!cancelled) setLimitRows(data.rows || []);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setLimitRows(null);
+          setLimitError(err instanceof Error ? err.message : String(err));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLimitLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [share.shareId, shareApp]);
 
   const marketAccessDisplay = React.useMemo(() => {
     if (forSale === "Free") return t("dashboard.publicFreeShare");
@@ -177,8 +209,12 @@ export function ShareEditReadView({
                 <div className="text-sm font-semibold text-slate-900">{t("dashboard.userLimit.title")}</div>
                 <p className="mt-1 text-xs text-muted-foreground">{t("dashboard.userLimit.hint")}</p>
               </div>
-              {limitGrants.length ? (
-                <ShareUserLimitsTable grants={limitGrants} t={t} />
+              {limitLoading ? (
+                <EmptyBlock>{t("dashboard.userLimit.loading")}</EmptyBlock>
+              ) : limitError ? (
+                <EmptyBlock>{limitError}</EmptyBlock>
+              ) : (limitRows?.length || limitGrants.length) ? (
+                <ShareUserLimitsTable rows={limitRows || undefined} grants={limitGrants} t={t} />
               ) : (
                 <EmptyBlock>{t("dashboard.userLimit.empty")}</EmptyBlock>
               )}

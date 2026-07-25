@@ -18,6 +18,7 @@ import type {
   ShareUsageRefreshResponse,
   ImageGenerationRequestLog,
   ShareUsageByEmailResponse,
+  ShareUserLimitStatusResponse,
   UserApiTokenResponse,
   UserApiTokenResetResponse,
   VersionResponse,
@@ -46,9 +47,17 @@ import type {
   SupplySummaryEntry,
   ProvisionSshKey,
   ProvisioningJob,
-  CreateClientMarketClientRequest,
   CreateClientMarketClientResponse,
   ClientTunnelSubdomainAvailability,
+  AccountPaymentProfile,
+  ClientMarketPaymentMethod,
+  ClientMarketProviderSupply,
+  ClientMarketAllocationQuote,
+  ClientMarketCommitQuoteResponse,
+  ClientMarketBilling,
+  ClientMarketHostTransferDocument,
+  ClientMarketHostImportResponse,
+  ClientMarketProviderBlock,
 } from "@/lib/types";
 
 export type { BoardListResponse, BoardMessage, BoardMeta };
@@ -134,6 +143,18 @@ export async function getShareUsageByEmail(
   const params = new URLSearchParams({ app, period });
   return parseJson<ShareUsageByEmailResponse>(
     await fetch(`/v1/shares/${encodeURIComponent(shareId)}/usage-by-email?${params}`, {
+      cache: "no-store",
+    }),
+  );
+}
+
+export async function getShareUserLimitStatus(
+  shareId: string,
+  app: "claude" | "codex" | "gemini" | string,
+) {
+  const params = new URLSearchParams({ app });
+  return parseJson<ShareUserLimitStatusResponse>(
+    await fetch(`/v1/shares/${encodeURIComponent(shareId)}/user-limit-status?${params}`, {
       cache: "no-store",
     }),
   );
@@ -645,6 +666,8 @@ export async function createClientMarketHost(body: {
   port?: number;
   note?: string;
   rootPassword?: string;
+  priceCents?: number;
+  rentalPeriodDays?: number;
 }) {
   return parseJson<ClientMarketHost>(
     await authFetch("/v1/client-market/hosts", {
@@ -701,16 +724,6 @@ export async function createClientMarketTerminalSession(hostId: string) {
   );
 }
 
-export async function createClientMarketClient(body: CreateClientMarketClientRequest) {
-  return parseJson<CreateClientMarketClientResponse>(
-    await authFetch("/v1/client-market/clients", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }),
-  );
-}
-
 export async function getClientMarketJob(id: string) {
   return parseJson<ProvisioningJob>(
     await authFetch(`/v1/client-market/jobs/${encodeURIComponent(id)}`, { cache: "no-store" }),
@@ -725,10 +738,163 @@ export async function cleanupClientMarketClient(installationId: string) {
   );
 }
 
+export async function cleanupClientMarketClientWithReason(
+  installationId: string,
+  body: {
+    reason:
+      | "client_release"
+      | "provider_release"
+      | "payment_not_received"
+      | "host_maintenance"
+      | "service_terminated"
+      | "other"
+      | "operator_release";
+    blockClientForProvider?: boolean;
+  },
+) {
+  return parseJson<CreateClientMarketClientResponse>(
+    await authFetch(`/v1/client-market/clients/${encodeURIComponent(installationId)}/cleanup`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function getAccountPaymentProfile() {
+  return parseJson<AccountPaymentProfile>(
+    await authFetch("/v1/account/payment-profile", { cache: "no-store" }),
+  );
+}
+
+export async function updateAccountPaymentProfile(methods: ClientMarketPaymentMethod[]) {
+  return parseJson<AccountPaymentProfile>(
+    await authFetch("/v1/account/payment-profile", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ methods }),
+    }),
+  );
+}
+
+export async function getClientMarketProviderBlocks() {
+  return parseJson<ClientMarketProviderBlock[]>(
+    await authFetch("/v1/account/provider-blocks", { cache: "no-store" }),
+  );
+}
+
+export async function liftClientMarketProviderBlock(clientUserId: string) {
+  return parseJson<{ ok: boolean }>(
+    await authFetch(`/v1/account/provider-blocks/${encodeURIComponent(clientUserId)}`, {
+      method: "DELETE",
+    }),
+  );
+}
+
+export async function getClientMarketProviderSupply() {
+  return parseJson<ClientMarketProviderSupply>(
+    await authFetch("/v1/client-market/providers", { cache: "no-store" }),
+  );
+}
+
+export async function updateClientMarketHostOffer(
+  hostId: string,
+  body: { priceCents?: number; rentalPeriodDays?: number },
+) {
+  return parseJson<{ hostId: string; priceCents?: number; rentalPeriodDays?: number; offerRevision: number }>(
+    await authFetch(`/v1/client-market/hosts/${encodeURIComponent(hostId)}/offer`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function createClientMarketQuote(body: {
+  providerIds: string[];
+  countryCodes: string[];
+  count: number;
+  hostId?: string;
+}) {
+  return parseJson<ClientMarketAllocationQuote>(
+    await authFetch("/v1/client-market/quotes", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function commitClientMarketQuote(
+  quoteId: string,
+  items: Array<{ quoteItemId: string; offerRevision: number; subdomain: string; password: string }>,
+) {
+  return parseJson<ClientMarketCommitQuoteResponse>(
+    await authFetch(`/v1/client-market/quotes/${encodeURIComponent(quoteId)}/commit`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ items }),
+    }),
+  );
+}
+
+export async function cancelClientMarketQuote(quoteId: string) {
+  return parseJson<{ ok: boolean }>(
+    await authFetch(`/v1/client-market/quotes/${encodeURIComponent(quoteId)}/cancel`, {
+      method: "POST",
+    }),
+  );
+}
+
+export async function getMyClientMarketBilling() {
+  return parseJson<ClientMarketBilling[]>(
+    await authFetch("/v1/client-market/my-billing", { cache: "no-store" }),
+  );
+}
+
+export async function getClientMarketBilling(installationId: string) {
+  return parseJson<ClientMarketBilling>(
+    await authFetch(`/v1/client-market/clients/${encodeURIComponent(installationId)}/billing`, {
+      cache: "no-store",
+    }),
+  );
+}
+
+export async function declareClientMarketPayment(
+  installationId: string,
+  invoiceId: string,
+  offerRevision: number,
+  paymentProfileUpdatedAt?: string,
+) {
+  return parseJson<{ billing: ClientMarketBilling }>(
+    await authFetch(`/v1/client-market/clients/${encodeURIComponent(installationId)}/declare-paid`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ invoiceId, offerRevision, paymentProfileUpdatedAt, confirmed: true }),
+    }),
+  );
+}
+
+export async function exportMyClientMarketHosts() {
+  return parseJson<ClientMarketHostTransferDocument>(
+    await authFetch("/v1/client-market/hosts/export", { cache: "no-store" }),
+  );
+}
+
+export async function importMyClientMarketHosts(document: ClientMarketHostTransferDocument) {
+  return parseJson<ClientMarketHostImportResponse>(
+    await authFetch("/v1/client-market/hosts/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(document),
+    }),
+  );
+}
+
 export async function checkClientTunnelSubdomainAvailability(subdomain: string, installationId?: string) {
   const params = new URLSearchParams({ subdomain });
   if (installationId) params.set("installationId", installationId);
-  return parseJson<ClientTunnelSubdomainAvailability>(
-    await authFetch(`/v1/client-tunnel/subdomain-availability?${params}`, { cache: "no-store" }),
-  );
+  const response = await authFetch(`/v1/client-tunnel/subdomain-availability?${params}`, { cache: "no-store" });
+  if (response.status === 409) return { available: false, reason: "reserved" } satisfies ClientTunnelSubdomainAvailability;
+  return parseJson<ClientTunnelSubdomainAvailability>(response);
 }

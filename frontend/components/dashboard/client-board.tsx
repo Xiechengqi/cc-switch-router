@@ -4,6 +4,7 @@ import { Button, Card, Chip, Drawer, toast } from "@heroui/react";
 import { Check, ChevronDown, Copy, ExternalLink, MessageCircle, Plus, Search, WalletCards } from "lucide-react";
 import * as React from "react";
 import { CreateClientDialog } from "@/components/dashboard/create-client-dialog";
+import { ClientMarketBillingBanner } from "@/components/dashboard/client-market-billing-banner";
 import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog";
 import { ShareCard } from "@/components/dashboard/share-card";
 import { ClientUpgradeButton } from "@/components/dashboard/client-upgrade-button";
@@ -36,13 +37,14 @@ import {
   shareApiParts,
   sortClients,
 } from "@/components/dashboard/data-tables";
-import type { DashboardClient, DashboardMarket, OperationalState, ShareView } from "@/lib/types";
+import type { ClientMarketBilling, DashboardClient, DashboardMarket, OperationalState, ShareView } from "@/lib/types";
 import { formatDateTime, formatRelativeTime } from "@/lib/utils";
 import { usePersistentState } from "@/lib/use-persistent-state";
-import { recordDashboardUxEvent } from "@/lib/api";
+import { getMyClientMarketBilling, recordDashboardUxEvent } from "@/lib/api";
 import { CompactSelect } from "@/components/common/compact-select";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { useClientChat } from "@/components/chat/client-chat";
+import { useAuth } from "@/components/auth/auth-provider";
 
 const PAYOUT_NETWORK_LABELS: Record<string, string> = {
   "eip155:56": "BSC",
@@ -203,7 +205,7 @@ function ClientConsoleButton({ client }: { client: DashboardClient }) {
   const { t } = useLocaleText();
   const { openConsole } = useClientConsole();
   const tunnelUrl = clientTunnelDisplayUrl(client.clientTunnel?.tunnelUrl);
-  if (!tunnelUrl) return null;
+  if (!tunnelUrl || client.installation.provisionSource === "router_market") return null;
   const title = client.clientTunnel?.subdomain || tunnelUrl;
   return (
     <ClientHeaderInlineButton
@@ -336,6 +338,8 @@ function ClientCard({
   onOpenShare,
   onEditShare,
   onConnectShare,
+  billing,
+  onBillingChanged,
   collapsed,
   onToggleCollapsed,
 }: {
@@ -346,6 +350,8 @@ function ClientCard({
   onOpenShare: (share: ShareView) => void;
   onEditShare: (share: ShareView) => void;
   onConnectShare: (share: ShareView) => void;
+  billing?: ClientMarketBilling;
+  onBillingChanged: () => Promise<void> | void;
   collapsed: boolean;
   onToggleCollapsed: () => void;
 }) {
@@ -406,10 +412,11 @@ function ClientCard({
   );
 
   return (
-    <Card id={`dashboard-client-${client.installation.id}`} className={`overflow-hidden rounded-lg border border-l-[3px] bg-white p-0 shadow-sm transition-[border-color,box-shadow] ${borderTone}`}>
-      <Card.Content className="grid gap-3 p-3.5">
+    <Card id={`dashboard-client-${client.installation.id}`} className={`min-w-0 max-w-full overflow-hidden rounded-lg border border-l-[3px] bg-white p-0 shadow-sm transition-[border-color,box-shadow] ${borderTone}`}>
+      <ClientMarketBillingBanner billing={billing} onChanged={onBillingChanged} />
+      <Card.Content className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-3 p-3.5">
         <div
-          className="group/client-header grid min-h-16 cursor-pointer select-text grid-cols-[minmax(300px,1.3fr)_minmax(760px,1.15fr)_auto] items-center gap-6 rounded-md px-1.5 py-1 outline-none transition-colors hover:bg-primary/[0.03] focus-visible:ring-2 focus-visible:ring-primary/30"
+          className="group/client-header grid min-h-16 cursor-pointer select-text grid-cols-[minmax(0,1fr)_auto] items-start gap-3 rounded-md px-1.5 py-1 outline-none transition-colors hover:bg-primary/[0.03] focus-visible:ring-2 focus-visible:ring-primary/30 xl:grid-cols-[minmax(280px,1.1fr)_minmax(0,2.4fr)_auto] xl:items-center xl:gap-6"
           aria-expanded={!collapsed}
           onMouseDown={handleHeaderPointerDown}
           onClick={handleHeaderClick}
@@ -456,7 +463,7 @@ function ClientCard({
             </div>
           </div>
 
-          <div className={`grid min-w-0 gap-3 ${showRemoval ? "grid-cols-8" : "grid-cols-7"}`}>
+          <div className={`order-3 col-span-2 grid min-w-0 grid-cols-2 gap-3 sm:grid-cols-4 xl:order-none xl:col-span-1 ${showRemoval ? "xl:grid-cols-8" : "xl:grid-cols-7"}`}>
             <Metric
               label={t("dashboard.region")}
               value={clientRegionLabel(client.installation)}
@@ -524,6 +531,8 @@ export function ClientBoard({
   onChanged?: () => Promise<void> | void;
 }) {
   const { locale, t } = useLocaleText();
+  const { session } = useAuth();
+  const authed = !!session?.authenticated;
   const focus = useDashboardFocus();
   const { issuesOnly, setIssuesOnly, regionFilters, setRegionFilters, clearRegionFilters } = useDashboardViewState();
   const { trackOperation } = useOperationVerification();
@@ -539,7 +548,32 @@ export function ClientBoard({
     CLIENT_EXPANDED_STORAGE_KEY,
     null,
   );
+  const [marketBilling, setMarketBilling] = React.useState<Map<string, ClientMarketBilling>>(new Map());
   const lastLocatedFocusRef = React.useRef("");
+
+  const loadMarketBilling = React.useCallback(async () => {
+    if (!authed) {
+      setMarketBilling(new Map());
+      return;
+    }
+    try {
+      const records = await getMyClientMarketBilling();
+      setMarketBilling(new Map(records.map((record) => [record.installationId, record])));
+    } catch {
+      // Billing is supplementary to the dashboard; authorization/API errors must not hide Clients.
+    }
+  }, [authed]);
+
+  React.useEffect(() => {
+    void loadMarketBilling();
+    if (!authed) return;
+    const timer = window.setInterval(() => void loadMarketBilling(), 20_000);
+    return () => window.clearInterval(timer);
+  }, [authed, loadMarketBilling]);
+
+  const refreshBillingAndDashboard = React.useCallback(async () => {
+    await Promise.all([loadMarketBilling(), Promise.resolve(onChanged?.())]);
+  }, [loadMarketBilling, onChanged]);
 
   React.useEffect(() => {
     if (sortOrder === "registered") setSortOrder("running");
@@ -741,9 +775,9 @@ export function ClientBoard({
   }, [connectShareId, shareById]);
 
   return (
-    <section className="grid gap-4">
-      <div className="flex flex-wrap items-center justify-between gap-4">
-        <div className="flex min-w-0 flex-wrap items-center gap-3">
+    <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4">
+      <div className="flex min-w-0 flex-wrap items-center justify-between gap-4">
+        <div className="flex w-full min-w-0 flex-wrap items-center gap-3 sm:w-auto">
           <div className="inline-flex max-w-full overflow-x-auto rounded-lg bg-slate-100 p-1 text-[11px]">
             {([[
               "all", t("dashboard.all"), sortedClients.length,
@@ -780,9 +814,9 @@ export function ClientBoard({
         </div>
       </div>
 
-      <div className="grid gap-4">
+      <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4">
         {clientRows.length ? clientRows.map(({ client, shares: visibleShares, allShares }) => (
-          <ClientCard key={client.installation.id} client={client} shares={visibleShares} summaryShares={allShares} onOpenClient={openClient} onOpenShare={openShare} onEditShare={openEditShare} onConnectShare={openConnectShare} collapsed={!query && !expandedClientIdSet.has(client.installation.id)} onToggleCollapsed={() => toggleClientExpanded(client.installation.id)} />
+          <ClientCard key={client.installation.id} client={client} shares={visibleShares} summaryShares={allShares} onOpenClient={openClient} onOpenShare={openShare} onEditShare={openEditShare} onConnectShare={openConnectShare} billing={marketBilling.get(client.installation.id)} onBillingChanged={refreshBillingAndDashboard} collapsed={!query && !expandedClientIdSet.has(client.installation.id)} onToggleCollapsed={() => toggleClientExpanded(client.installation.id)} />
         )) : (
           <EmptyBlock>
             <div className="grid justify-items-center gap-2">
@@ -889,7 +923,7 @@ export function ClientBoard({
 
       <ShareEditDialog share={editingShare} markets={markets} onClose={closeEditShare} onSaved={handleSaved} />
       <ShareConnectDialog share={currentConnectShare} open={!!currentConnectShare} onOpenChange={closeConnectDialog} />
-      <CreateClientDialog open={createClientOpen} onOpenChange={setCreateClientOpen} />
+      <CreateClientDialog open={createClientOpen} onOpenChange={setCreateClientOpen} onCreated={() => void refreshBillingAndDashboard()} />
     </section>
   );
 }

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use base64::Engine;
-use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Utc};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rand::distributions::{Alphanumeric, DistString};
 use resend_rs::Resend;
@@ -64,12 +64,12 @@ use crate::models::{
     SharePruneRequest, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry,
     ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload, ShareRuntimeRefreshRequest,
     ShareRuntimeSnapshotResponse, ShareSettingsPatch, ShareSettingsUpdateResponse, ShareSignals,
-    ShareSupport, ShareSyncRequest, ShareUpstreamProvider, ShareUpstreamQuota,
+    ShareSupport, ShareSyncRequest, ShareTokenPeriod, ShareUpstreamProvider, ShareUpstreamQuota,
     ShareUsageByEmailResponse, ShareUsageDailyBucket, ShareUsageEmailRow, ShareUserGrant,
-    ShareView, SubdomainAvailabilityResponse, TunnelActivateRequest, TunnelLease,
-    TunnelStateRequest, TunnelStateResponse, UserApiTokenResetResponse, UserApiTokenResponse,
-    UserApiTokenStatus, UserShareView, UserSharesResponse, VerifyEmailCodeRequest,
-    VerifyEmailCodeResponse,
+    ShareUserLimitStatusResponse, ShareUserLimitStatusRow, ShareView,
+    SubdomainAvailabilityResponse, TunnelActivateRequest, TunnelLease, TunnelStateRequest,
+    TunnelStateResponse, UserApiTokenResetResponse, UserApiTokenResponse, UserApiTokenStatus,
+    UserShareView, UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 #[cfg(test)]
 use crate::models::{RenewLeasePayload, ShareAppProvider, ShareUpstreamModel};
@@ -5338,6 +5338,159 @@ impl AppStore {
         })
     }
 
+    pub async fn share_user_limit_status(
+        &self,
+        share_id: &str,
+        app_type: &str,
+    ) -> Result<ShareUserLimitStatusResponse, AppError> {
+        let app = normalize_share_acl_app(app_type)?;
+        let conn = self.conn.lock().await;
+        let Some((
+            owner_email,
+            shared_with_emails_json,
+            access_by_app_json,
+            app_settings_json,
+            user_grants_json,
+        )): Option<(Option<String>, String, String, String, String)> = conn
+            .query_row(
+                "SELECT owner_email, shared_with_emails_json,
+                        COALESCE(access_by_app_json, '{}'),
+                        COALESCE(app_settings_json, '{}'),
+                        COALESCE(user_grants_json, '{}')
+                 FROM shares
+                 WHERE share_id = ?1",
+                params![share_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| {
+                AppError::Internal(format!("query share user limit status failed: {e}"))
+            })?
+        else {
+            return Err(AppError::NotFound("share not found".into()));
+        };
+
+        let shared_with_emails = parse_string_vec(Some(shared_with_emails_json))
+            .map_err(|e| AppError::Internal(format!("parse share acl failed: {e}")))?;
+        let access_by_app = parse_share_access_by_app(Some(access_by_app_json))
+            .map_err(|e| AppError::Internal(format!("parse share access_by_app failed: {e}")))?;
+        let app_settings: BTreeMap<String, crate::models::ShareAppSettings> =
+            serde_json::from_str(&app_settings_json).unwrap_or_default();
+        let user_grants = parse_share_user_grants(Some(user_grants_json))
+            .map_err(|e| AppError::Internal(format!("parse share user grants failed: {e}")))?;
+
+        let owner = owner_email
+            .as_deref()
+            .and_then(normalize_usage_email)
+            .unwrap_or_default();
+        let mut allowed_emails = HashSet::<String>::new();
+        if !owner.is_empty() {
+            allowed_emails.insert(owner.clone());
+        }
+        let app_shareto = if let Some(settings) = app_settings.get(&app) {
+            settings.shared_with_emails.clone()
+        } else if let Some(access) = access_by_app.get(&app) {
+            access.shared_with_emails.clone()
+        } else {
+            shared_with_emails
+        };
+        for email in app_shareto {
+            if let Some(email) = normalize_usage_email(&email) {
+                allowed_emails.insert(email);
+            }
+        }
+
+        let mut grants: Vec<ShareUserGrant> = user_grants
+            .into_values()
+            .filter(|grant| grant.active)
+            .filter(|grant| {
+                let email = normalize_usage_email(&grant.email).unwrap_or_default();
+                grant.role.eq_ignore_ascii_case("owner") || allowed_emails.contains(&email)
+            })
+            .collect();
+        grants.sort_by(|left, right| {
+            let left_owner = left.role.eq_ignore_ascii_case("owner");
+            let right_owner = right.role.eq_ignore_ascii_case("owner");
+            match (left_owner, right_owner) {
+                (true, false) => Ordering::Less,
+                (false, true) => Ordering::Greater,
+                _ => left
+                    .email
+                    .to_ascii_lowercase()
+                    .cmp(&right.email.to_ascii_lowercase()),
+            }
+        });
+
+        let now = Utc::now();
+        let mut usage_by_period: HashMap<ShareTokenPeriod, HashMap<String, u64>> = HashMap::new();
+        let periods: HashSet<ShareTokenPeriod> = grants
+            .iter()
+            .map(|grant| grant.policy.token_period)
+            .collect();
+        for period in periods {
+            let (start, _) = token_period_window(period, now);
+            let start_bound =
+                start.unwrap_or_else(|| Utc.timestamp_opt(0, 0).single().unwrap_or(now));
+            let totals = query_share_email_token_totals(
+                &conn,
+                share_id,
+                &app,
+                start_bound,
+                matches!(period, ShareTokenPeriod::Lifetime),
+            )?;
+            usage_by_period.insert(period, totals);
+        }
+
+        let rows = grants
+            .into_iter()
+            .map(|grant| {
+                let email = normalize_usage_email(&grant.email)
+                    .unwrap_or_else(|| grant.email.trim().to_ascii_lowercase());
+                let period = grant.policy.token_period;
+                let (_, resets_at) = token_period_window(period, now);
+                let tokens_used = usage_by_period
+                    .get(&period)
+                    .and_then(|map| map.get(&email))
+                    .copied()
+                    .unwrap_or(0);
+                let percent = grant
+                    .policy
+                    .token_limit
+                    .filter(|limit| *limit > 0)
+                    .map(|limit| ((tokens_used as f64 / limit as f64) * 100.0).clamp(0.0, 9999.0));
+                ShareUserLimitStatusRow {
+                    email: grant.email,
+                    role: if grant.role.eq_ignore_ascii_case("owner") {
+                        "owner".into()
+                    } else {
+                        "shareto".into()
+                    },
+                    parallel_limit: grant.policy.parallel_limit,
+                    token_limit: grant.policy.token_limit,
+                    token_period: period,
+                    expires_at: grant.policy.expires_at,
+                    tokens_used,
+                    percent,
+                    resets_at: resets_at.map(|ts| ts.to_rfc3339()),
+                }
+            })
+            .collect();
+
+        Ok(ShareUserLimitStatusResponse {
+            share_id: share_id.to_string(),
+            app,
+            rows,
+        })
+    }
+
     pub async fn issue_lease(
         &self,
         config: &Config,
@@ -6754,6 +6907,7 @@ impl AppStore {
             current_sale_market_kind,
             current_app_type,
             current_config_revision,
+            user_grants_json,
         ): (
             String,
             String,
@@ -6762,11 +6916,12 @@ impl AppStore {
             String,
             String,
             i64,
+            String,
         ) = conn
             .query_row(
-                "SELECT installation_id, owner_email, shared_with_emails_json, for_sale, sale_market_kind, app_type, config_revision FROM shares WHERE share_id = ?1",
+                "SELECT installation_id, owner_email, shared_with_emails_json, for_sale, sale_market_kind, app_type, config_revision, COALESCE(user_grants_json, '{}') FROM shares WHERE share_id = ?1",
                 params![share_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
             )
             .optional()
             .map_err(|e| AppError::Internal(format!("query share owner failed: {e}")))?
@@ -6779,6 +6934,8 @@ impl AppStore {
         let owner_email = normalize_email(&owner_email)?;
         let shared_with_emails = parse_string_vec(Some(shared_with_emails_json))
             .map_err(|e| AppError::Internal(format!("parse share acl failed: {e}")))?;
+        let existing_user_grants = parse_share_user_grants(Some(user_grants_json))
+            .map_err(|e| AppError::Internal(format!("parse share user grants failed: {e}")))?;
         let patch = normalize_share_settings_patch(
             patch,
             Some(&owner_email),
@@ -6786,6 +6943,7 @@ impl AppStore {
             Some(&current_for_sale),
             Some(&current_sale_market_kind),
             Some(&current_app_type),
+            Some(&existing_user_grants),
         )?;
         if share_settings_patch_is_empty(&patch) {
             return Err(AppError::BadRequest("share settings patch is empty".into()));
@@ -8012,6 +8170,7 @@ impl AppStore {
                     .prepare(
                         "SELECT i.id FROM installations i
                          WHERE i.last_seen_at < ?1
+                           AND COALESCE(i.provision_source, '') != 'router_market'
                            AND NOT EXISTS (
                                SELECT 1 FROM client_notification_events e
                                WHERE e.installation_id = i.id
@@ -8050,7 +8209,8 @@ impl AppStore {
                         "SELECT s.share_id, s.installation_id
                          FROM shares s
                          INNER JOIN installations i ON i.id = s.installation_id
-                         WHERE i.last_seen_at < ?1",
+                         WHERE i.last_seen_at < ?1
+                           AND COALESCE(i.provision_source, '') != 'router_market'",
                     )
                     .map_err(|e| {
                         AppError::Internal(format!("prepare stale client shares failed: {e}"))
@@ -8080,7 +8240,9 @@ impl AppStore {
                 .execute(
                     "DELETE FROM leases
                      WHERE installation_id IN (
-                         SELECT id FROM installations WHERE last_seen_at < ?1
+                         SELECT id FROM installations
+                         WHERE last_seen_at < ?1
+                           AND COALESCE(provision_source, '') != 'router_market'
                      )",
                     params![stale_cutoff],
                 )
@@ -9454,6 +9616,7 @@ impl AppStore {
                 Some(&for_sale),
                 Some(&sale_market_kind),
                 None,
+                None,
             )?
         } else {
             let mut next_shared = normalize_email_list(&current_shared, &owner_email);
@@ -9486,6 +9649,7 @@ impl AppStore {
                 Some(&current_shared),
                 Some(&for_sale),
                 Some(&sale_market_kind),
+                None,
                 None,
             )?
         };
@@ -16293,6 +16457,191 @@ fn parse_ip_im_geo(body: &str) -> Option<GeoLookupResult> {
     Some(result)
 }
 
+fn token_period_window(
+    period: ShareTokenPeriod,
+    now: DateTime<Utc>,
+) -> (Option<DateTime<Utc>>, Option<DateTime<Utc>>) {
+    match period {
+        ShareTokenPeriod::Lifetime => (None, None),
+        ShareTokenPeriod::Day => {
+            let start = now
+                .date_naive()
+                .and_hms_opt(0, 0, 0)
+                .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+                .unwrap_or(now);
+            (Some(start), Some(start + Duration::days(1)))
+        }
+        ShareTokenPeriod::Week => {
+            let days_from_monday = now.weekday().num_days_from_monday() as i64;
+            let start_date = now.date_naive() - Duration::days(days_from_monday);
+            let start = start_date
+                .and_hms_opt(0, 0, 0)
+                .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+                .unwrap_or(now);
+            (Some(start), Some(start + Duration::days(7)))
+        }
+        ShareTokenPeriod::CalendarMonth => {
+            let start_date =
+                NaiveDate::from_ymd_opt(now.year(), now.month(), 1).unwrap_or(now.date_naive());
+            let start = start_date
+                .and_hms_opt(0, 0, 0)
+                .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+                .unwrap_or(now);
+            let resets = if now.month() == 12 {
+                NaiveDate::from_ymd_opt(now.year() + 1, 1, 1)
+            } else {
+                NaiveDate::from_ymd_opt(now.year(), now.month() + 1, 1)
+            }
+            .and_then(|date| date.and_hms_opt(0, 0, 0))
+            .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+            .unwrap_or(start + Duration::days(31));
+            (Some(start), Some(resets))
+        }
+    }
+}
+
+#[cfg(test)]
+mod token_period_window_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn day_week_month_windows_use_utc_calendar_bounds() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 24, 15, 30, 0).unwrap();
+        let (day_start, day_reset) = token_period_window(ShareTokenPeriod::Day, now);
+        assert_eq!(day_start.unwrap().to_rfc3339(), "2026-07-24T00:00:00+00:00");
+        assert_eq!(day_reset.unwrap().to_rfc3339(), "2026-07-25T00:00:00+00:00");
+
+        let (week_start, week_reset) = token_period_window(ShareTokenPeriod::Week, now);
+        assert_eq!(
+            week_start.unwrap().to_rfc3339(),
+            "2026-07-20T00:00:00+00:00"
+        );
+        assert_eq!(
+            week_reset.unwrap().to_rfc3339(),
+            "2026-07-27T00:00:00+00:00"
+        );
+
+        let (month_start, month_reset) = token_period_window(ShareTokenPeriod::CalendarMonth, now);
+        assert_eq!(
+            month_start.unwrap().to_rfc3339(),
+            "2026-07-01T00:00:00+00:00"
+        );
+        assert_eq!(
+            month_reset.unwrap().to_rfc3339(),
+            "2026-08-01T00:00:00+00:00"
+        );
+
+        let (life_start, life_reset) = token_period_window(ShareTokenPeriod::Lifetime, now);
+        assert!(life_start.is_none());
+        assert!(life_reset.is_none());
+    }
+}
+
+fn query_share_email_token_totals(
+    conn: &Connection,
+    share_id: &str,
+    app: &str,
+    start: DateTime<Utc>,
+    lifetime: bool,
+) -> Result<HashMap<String, u64>, AppError> {
+    let mut totals = HashMap::<String, u64>::new();
+    let start_rfc3339 = start.to_rfc3339();
+    let start_ts = start.timestamp();
+
+    let market_input_expr = market_log_input_tokens_expr("ml");
+    let market_total_expr = market_log_total_tokens_expr("ml");
+    let market_sql = format!(
+        "SELECT lower(trim(ml.user_email)),
+                COALESCE(SUM(CASE WHEN ({market_total_expr}) > 0 OR sl.request_id IS NULL THEN {market_input_expr} ELSE COALESCE(sl.input_tokens, 0) END), 0),
+                COALESCE(SUM(CASE WHEN ({market_total_expr}) > 0 OR sl.request_id IS NULL THEN COALESCE(ml.output_tokens, 0) ELSE COALESCE(sl.output_tokens, 0) END), 0),
+                COALESCE(SUM(CASE WHEN ({market_total_expr}) > 0 OR sl.request_id IS NULL THEN COALESCE(ml.cache_read_tokens, 0) ELSE COALESCE(sl.cache_read_tokens, 0) END), 0),
+                COALESCE(SUM(CASE WHEN ({market_total_expr}) > 0 OR sl.request_id IS NULL THEN COALESCE(ml.cache_creation_tokens, 0) ELSE COALESCE(sl.cache_creation_tokens, 0) END), 0)
+         FROM market_request_logs ml
+         LEFT JOIN share_request_logs sl
+           ON sl.request_id = ml.request_id
+          AND sl.share_id = ml.share_id
+          AND sl.is_health_check = 0
+          AND lower(CASE WHEN COALESCE(sl.request_agent, '') != '' THEN sl.request_agent ELSE sl.app_type END) = lower(ml.request_agent)
+         WHERE ml.share_id = ?1
+           AND lower(ml.request_agent) = lower(?2)
+           AND (?3 = 1 OR ml.created_at >= ?4)
+           AND ml.user_email IS NOT NULL
+           AND trim(ml.user_email) != ''
+         GROUP BY lower(trim(ml.user_email))"
+    );
+    let mut market_stmt = conn
+        .prepare(&market_sql)
+        .map_err(|e| AppError::Internal(format!("prepare user-limit market usage failed: {e}")))?;
+    let market_rows = market_stmt
+        .query_map(
+            params![share_id, app, i64::from(lifetime), start_rfc3339.as_str(),],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                    row.get::<_, i64>(2)?.max(0) as u64,
+                    row.get::<_, i64>(3)?.max(0) as u64,
+                    row.get::<_, i64>(4)?.max(0) as u64,
+                ))
+            },
+        )
+        .map_err(|e| AppError::Internal(format!("query user-limit market usage failed: {e}")))?;
+    for row in market_rows {
+        let (email, input, output, cache_read, cache_creation) = row.map_err(|e| {
+            AppError::Internal(format!("read user-limit market usage row failed: {e}"))
+        })?;
+        *totals.entry(email).or_default() += input + output + cache_read + cache_creation;
+    }
+
+    let share_sql = "
+        SELECT lower(trim(user_email)),
+                COALESCE(SUM(input_tokens), 0),
+                COALESCE(SUM(output_tokens), 0),
+                COALESCE(SUM(cache_read_tokens), 0),
+                COALESCE(SUM(cache_creation_tokens), 0)
+         FROM share_request_logs
+         WHERE share_id = ?1
+           AND lower(app_type) = lower(?2)
+           AND (?3 = 1 OR created_at >= ?4)
+           AND is_health_check = 0
+           AND user_email IS NOT NULL
+           AND trim(user_email) != ''
+           AND NOT EXISTS (
+                SELECT 1
+                FROM market_request_logs ml
+                WHERE ml.request_id = share_request_logs.request_id
+                  AND COALESCE(ml.share_id, '') = share_request_logs.share_id
+                  AND ml.user_email IS NOT NULL
+                  AND trim(ml.user_email) != ''
+           )
+         GROUP BY lower(trim(user_email))";
+    let mut share_stmt = conn
+        .prepare(share_sql)
+        .map_err(|e| AppError::Internal(format!("prepare user-limit share usage failed: {e}")))?;
+    let share_rows = share_stmt
+        .query_map(
+            params![share_id, app, i64::from(lifetime), start_ts],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                    row.get::<_, i64>(2)?.max(0) as u64,
+                    row.get::<_, i64>(3)?.max(0) as u64,
+                    row.get::<_, i64>(4)?.max(0) as u64,
+                ))
+            },
+        )
+        .map_err(|e| AppError::Internal(format!("query user-limit share usage failed: {e}")))?;
+    for row in share_rows {
+        let (email, input, output, cache_read, cache_creation) = row.map_err(|e| {
+            AppError::Internal(format!("read user-limit share usage row failed: {e}"))
+        })?;
+        *totals.entry(email).or_default() += input + output + cache_read + cache_creation;
+    }
+    Ok(totals)
+}
+
 fn authoritative_share_usage_by_app(
     share: &ShareDescriptor,
 ) -> (BTreeMap<String, i64>, BTreeMap<String, i64>) {
@@ -16683,9 +17032,10 @@ fn validate_returned_share_against_patch(
     Ok(())
 }
 
-fn normalize_share_user_grants(
+fn normalize_share_user_grants_preserving(
     grants: BTreeMap<String, ShareUserGrant>,
     owner_email: &str,
+    existing: Option<&BTreeMap<String, ShareUserGrant>>,
 ) -> Result<BTreeMap<String, ShareUserGrant>, AppError> {
     let mut normalized = BTreeMap::new();
     for (key, mut grant) in grants {
@@ -16710,11 +17060,22 @@ fn normalize_share_user_grants(
             "shareto".to_string()
         };
         grant.active = true;
-        grant.usage = Default::default();
-        grant.created_at_ms = 0;
+        // Client patches are untrusted for counters; keep server-owned usage when present.
+        grant.usage = existing
+            .and_then(|map| map.get(&email))
+            .map(|prev| prev.usage.clone())
+            .unwrap_or_default();
+        grant.created_at_ms = existing
+            .and_then(|map| map.get(&email))
+            .map(|prev| prev.created_at_ms)
+            .filter(|value| *value > 0)
+            .unwrap_or(0);
         grant.updated_at_ms = 0;
         grant.revoked_at_ms = None;
-        grant.revision = 0;
+        grant.revision = existing
+            .and_then(|map| map.get(&email))
+            .map(|prev| prev.revision)
+            .unwrap_or(0);
         if normalized.insert(email, grant).is_some() {
             return Err(AppError::BadRequest("duplicate ShareTo email".into()));
         }
@@ -16738,6 +17099,7 @@ fn normalize_share_settings_patch(
     current_for_sale: Option<&str>,
     current_sale_market_kind: Option<&str>,
     current_app_type: Option<&str>,
+    existing_user_grants: Option<&BTreeMap<String, ShareUserGrant>>,
 ) -> Result<ShareSettingsPatch, AppError> {
     if patch.owner_email.is_some() {
         return Err(AppError::Conflict(
@@ -16849,7 +17211,11 @@ fn normalize_share_settings_patch(
         None => None,
     };
     let user_grants = match patch.user_grants {
-        Some(values) => Some(normalize_share_user_grants(values, effective_owner_email)?),
+        Some(values) => Some(normalize_share_user_grants_preserving(
+            values,
+            effective_owner_email,
+            existing_user_grants,
+        )?),
         None => None,
     };
     let mut pricing = match patch.for_sale_official_price_percent_by_app {
@@ -23527,6 +23893,7 @@ mod tests {
             Some("Yes"),
             None,
             Some("codex"),
+            None,
         )
         .expect("normalize");
 
@@ -23567,6 +23934,7 @@ mod tests {
             Some("Yes"),
             Some("share"),
             Some("codex"),
+            None,
         )
         .expect("normalize");
 
@@ -23597,6 +23965,7 @@ mod tests {
             Some("Yes"),
             Some("token"),
             Some("codex"),
+            None,
         )
         .expect("eligible pricing");
         assert_eq!(
@@ -23615,6 +23984,7 @@ mod tests {
             Some("Yes"),
             Some("token"),
             Some("codex"),
+            None,
         );
         assert!(matches!(rejected, Err(AppError::BadRequest(_))));
 
@@ -23631,6 +24001,7 @@ mod tests {
             Some("Yes"),
             Some("token"),
             Some("codex"),
+            None,
         );
         assert!(matches!(wrong_app, Err(AppError::BadRequest(_))));
     }
@@ -23647,6 +24018,7 @@ mod tests {
             Some("Yes"),
             Some("token"),
             Some("codex"),
+            None,
         )
         .expect("transition");
 
@@ -23698,6 +24070,7 @@ mod tests {
             free_share_ip_parallel_limit: 1,
             verification_service_base_url: "https://tokenswitch.org".into(),
             verification_service_api_key: None,
+            router_owner_email: None,
             admin_emails: HashSet::new(),
             telegram_bot_token: None,
             telegram_chat_id: None,
@@ -24696,6 +25069,7 @@ mod tests {
             Some("No"),
             Some("token"),
             Some("codex"),
+            None,
         )
         .expect("normalize user grants");
         let grants = normalized.user_grants.expect("normalized grants");
@@ -24710,6 +25084,46 @@ mod tests {
             assert_eq!(grant.updated_at_ms, 0);
             assert_eq!(grant.revision, 0);
         }
+    }
+
+    #[test]
+    fn share_settings_patch_preserves_existing_user_grant_usage() {
+        let mut existing_owner = test_share_user_grant("owner@example.com", "owner", 1000);
+        existing_owner.created_at_ms = 42;
+        existing_owner.revision = 7;
+        let existing_user = test_share_user_grant("user@example.com", "shareto", 500);
+        let existing = BTreeMap::from([
+            (existing_owner.email.clone(), existing_owner.clone()),
+            (existing_user.email.clone(), existing_user.clone()),
+        ]);
+        let patch_owner = test_share_user_grant("owner@example.com", "owner", 2000);
+        let patch_user = test_share_user_grant("user@example.com", "shareto", 800);
+        let normalized = normalize_share_settings_patch(
+            ShareSettingsPatch {
+                user_grants: Some(BTreeMap::from([
+                    (patch_owner.email.clone(), patch_owner),
+                    (patch_user.email.clone(), patch_user),
+                ])),
+                ..Default::default()
+            },
+            Some("owner@example.com"),
+            Some(&[]),
+            Some("No"),
+            Some("token"),
+            Some("codex"),
+            Some(&existing),
+        )
+        .expect("normalize user grants with existing");
+        let grants = normalized.user_grants.expect("normalized grants");
+        let owner = &grants["owner@example.com"];
+        let user = &grants["user@example.com"];
+        assert_eq!(owner.policy.token_limit, Some(2000));
+        assert_eq!(owner.usage, existing_owner.usage);
+        assert_eq!(owner.created_at_ms, 42);
+        assert_eq!(owner.revision, 7);
+        assert_eq!(user.usage, existing_user.usage);
+        assert_eq!(user.created_at_ms, existing_user.created_at_ms);
+        assert_eq!(user.revision, existing_user.revision);
     }
 
     #[test]

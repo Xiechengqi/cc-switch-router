@@ -842,6 +842,18 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
     },
     // ── Admin & retired message board compatibility ──
     SettingsField {
+        key: "CC_SWITCH_ROUTER_OWNER_EMAIL",
+        label: "Official Client Market Provider",
+        group: "Admin & message board",
+        field_type: FieldType::Email,
+        required: false,
+        restart_required: true,
+        default: None,
+        description: "Email used as the official, default-selected Client Market Host Provider. Defaults to router@<tunnel-host> when unset.",
+        placeholder: Some("router@example.com"),
+        dynamic_group: None,
+    },
+    SettingsField {
         key: "CC_SWITCH_ROUTER_ADMIN_EMAILS",
         label: "Extra admin emails",
         group: "Admin & message board",
@@ -2210,6 +2222,7 @@ mod tests {
             free_share_ip_parallel_limit: 1,
             verification_service_base_url: "https://example.com".into(),
             verification_service_api_key: None,
+            router_owner_email: Some("router@router.example.com".into()),
             admin_emails: HashSet::from([
                 "router@router.example.com".to_string(),
                 "boot-extra@example.com".to_string(),

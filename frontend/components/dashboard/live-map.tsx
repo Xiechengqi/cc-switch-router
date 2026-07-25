@@ -723,7 +723,7 @@ export function LiveMap({ data }: { data: DashboardResponse | null }) {
   return (
     <section
       ref={shellRef}
-      className="relative h-[420px] overflow-hidden rounded-[20px] border bg-white text-primary shadow-[0_4px_6px_rgba(15,23,42,0.04),0_12px_28px_rgba(15,23,42,0.05)]"
+      className="relative h-[420px] min-w-0 max-w-full overflow-hidden rounded-[20px] border bg-white text-primary shadow-[0_4px_6px_rgba(15,23,42,0.04),0_12px_28px_rgba(15,23,42,0.05)]"
       aria-label={t("map.aria")}
     >
       <div className="pointer-events-none absolute inset-0 z-10 bg-[radial-gradient(circle,rgba(15,23,42,0.05)_1px,transparent_1px)] bg-[length:28px_28px] bg-[position:14px_14px]" />

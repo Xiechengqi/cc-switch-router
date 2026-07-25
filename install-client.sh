@@ -58,7 +58,8 @@ done
 }
 
 USAGE() {
-YELLOW "Usage: curl -SsL https://[Router]/install-client.sh | bash -s [Router_Url] [Owner_Email] [Web_Login_Password] [Client_Subdomain] [disableWebTerminal]"
+YELLOW "Usage: printf '%s\\n' \"\${WEB_PASSWORD}\" | bash install-client.sh [Router_Url] [Owner_Email] --password-stdin [Client_Subdomain] [disableWebTerminal]"
+YELLOW "       Legacy mode accepts the password as argument 3 but exposes it through process arguments and shell history."
 YELLOW "       Client_Subdomain and disableWebTerminal are optional; disableWebTerminal disables the Client web terminal."
 }
 
@@ -99,7 +100,15 @@ ROUTER=${1} && [ ".${ROUTER}" = "." ] && USAGE && exit 1
 ROUTER=$(echo ${ROUTER} | sed 's/\/$//')
 echo ${ROUTER} | grep -E '^https://|^http://' &> /dev/null || ERROR "ROUTER must be like https://xxx or http://xxx"
 OWNER=${2} && [ ".${OWNER}" = "." ] && USAGE && exit 1
-PASSWORD=${3} && [ ".${PASSWORD}" = "." ] && USAGE && exit 1
+PASSWORD_ARG=${3} && [ ".${PASSWORD_ARG}" = "." ] && USAGE && exit 1
+PASSWORD_STDIN=0
+if [ "${PASSWORD_ARG}" = "--password-stdin" ]; then
+  PASSWORD_STDIN=1
+  IFS= read -r PASSWORD || ERROR "Unable to read Client Web password from stdin"
+else
+  PASSWORD="${PASSWORD_ARG}"
+fi
+[ ".${PASSWORD}" = "." ] && ERROR "Client Web password must not be empty"
 
 CLIENT_SUBDOMAIN=""
 DISABLE_WEB_TERMINAL=0
@@ -126,16 +135,23 @@ EXEC "${binary} -V" && ${binary} -V
 
 # start
 INFO "Client Owner Email: ${OWNER}"
-INFO "Client Web Password: ${PASSWORD}"
+INFO "Client Web Password: configured"
 INFO "Client Register To Router: ${ROUTER}"
 [ ".${CLIENT_SUBDOMAIN}" != "." ] && INFO "Client Subdomain: ${CLIENT_SUBDOMAIN}"
 [ "${DISABLE_WEB_TERMINAL}" -eq 1 ] && INFO "Web Terminal: disabled"
 YELLOW "Check whether the above parameters are correct and start the installation in 3 seconds ..." && EXEC "sleep 3"
 
 cd $HOME &> /dev/null && ls .cc-switch-server &> /dev/null && INFO "Backup old local data ..." && EXEC "mv -v .cc-switch-server .cc-switch-server.bak.$(date +%s)"
-INIT_CMD="/usr/local/bin/${binary} init --router-url ${ROUTER} --owner-email ${OWNER} --password ${PASSWORD}"
-[ ".${CLIENT_SUBDOMAIN}" != "." ] && INIT_CMD="${INIT_CMD} --client-subdomain ${CLIENT_SUBDOMAIN}"
-EXEC "${INIT_CMD}"
+INIT_ARGS=(init --router-url "${ROUTER}" --owner-email "${OWNER}")
+[ ".${CLIENT_SUBDOMAIN}" != "." ] && INIT_ARGS+=(--client-subdomain "${CLIENT_SUBDOMAIN}")
+if [ "${PASSWORD_STDIN}" -eq 1 ]; then
+  printf '%s\n' "${PASSWORD}" | /usr/local/bin/${binary} "${INIT_ARGS[@]}" --password-stdin \
+    || ERROR "cc-switch-server init failed"
+else
+  /usr/local/bin/${binary} "${INIT_ARGS[@]}" --password "${PASSWORD}" \
+    || ERROR "cc-switch-server init failed"
+fi
+unset PASSWORD PASSWORD_ARG
 [ "${DISABLE_WEB_TERMINAL}" -eq 1 ] && disable_web_terminal
 EXEC "nohup /usr/local/bin/${binary} &> /dev/null &"
 EXEC "sleep 3"
@@ -144,7 +160,7 @@ SUBDOMAIN_URL=$(echo ${ROUTER} | sed "s/:\/\//:\/\/${SUBDOMAIN}\./")
 
 # info
 YELLOW "Please visit ${SUBDOMAIN_URL} with the browser ..."
-YELLOW "Web Password: ${PASSWORD}"
+YELLOW "Web Password: configured during setup (not displayed)"
 
 }
 

@@ -3,6 +3,7 @@
 import { toast } from "@heroui/react";
 import { usePathname, useRouter } from "next/navigation";
 import * as React from "react";
+import { useDashboardData } from "@/components/dashboard/dashboard-data";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { DASHBOARD_CLIENTS_PATH, isClientsRoute, isMarketsRoute } from "@/lib/dashboard-nav";
 
@@ -225,6 +226,18 @@ function reducer(state: ManagerState, action: { type: string; payload?: unknown 
         nextZIndex: CONSOLE_BASE_Z_INDEX,
         focusedId: null,
       };
+    case "CLOSE_CLIENTS": {
+      const clientIds = action.payload as Set<string>;
+      if (!clientIds.size || !state.windows.some((window) => clientIds.has(window.clientId))) return state;
+      const windows = state.windows.filter((window) => !clientIds.has(window.clientId));
+      return {
+        ...state,
+        windows,
+        focusedId: state.focusedId && clientIds.has(state.windows.find((window) => window.id === state.focusedId)?.clientId || "")
+          ? windows.find((window) => !isDocked(window))?.id ?? null
+          : state.focusedId,
+      };
+    }
     case "MINIMIZE": {
       const id = action.payload as string;
       return {
@@ -296,6 +309,7 @@ function reducer(state: ManagerState, action: { type: string; payload?: unknown 
 
 export function ClientConsoleManagerProvider({ children }: { children: React.ReactNode }) {
   const { t } = useLocaleText();
+  const { data } = useDashboardData();
   const router = useRouter();
   const pathname = usePathname() || DASHBOARD_CLIENTS_PATH;
   const [state, dispatch] = React.useReducer(reducer, { windows: [], nextZIndex: CONSOLE_BASE_Z_INDEX, focusedId: null });
@@ -338,6 +352,16 @@ export function ClientConsoleManagerProvider({ children }: { children: React.Rea
     if (!hydrated) return;
     writePersistedWindows(state.windows);
   }, [hydrated, state.windows]);
+
+  React.useEffect(() => {
+    if (!data) return;
+    const marketClientIds = new Set(
+      data.clients
+        .filter((client) => client.installation.provisionSource === "router_market")
+        .map((client) => client.installation.id),
+    );
+    if (marketClientIds.size) dispatch({ type: "CLOSE_CLIENTS", payload: marketClientIds });
+  }, [data]);
 
   React.useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {

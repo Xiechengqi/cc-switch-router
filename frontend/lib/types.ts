@@ -639,6 +639,24 @@ export type ShareUsageByEmailResponse = {
   rows: ShareUsageEmailRow[];
 };
 
+export type ShareUserLimitStatusRow = {
+  email: string;
+  role: string;
+  parallelLimit?: number;
+  tokenLimit?: number;
+  tokenPeriod: ShareTokenPeriod;
+  expiresAt?: number;
+  tokensUsed: number;
+  percent?: number;
+  resetsAt?: string | null;
+};
+
+export type ShareUserLimitStatusResponse = {
+  shareId: string;
+  app: string;
+  rows: ShareUserLimitStatusRow[];
+};
+
 export type ShareModelHealthCheck = {
   requestId: string;
   shareId: string;
@@ -1254,6 +1272,7 @@ export type ShareUsageRefreshResponse = {
 
 export type ClientMarketHostStatus =
   | "idle"
+  | "reserved"
   | "allocated"
   | "locked"
   | "draining"
@@ -1292,9 +1311,14 @@ export type HostIpIntel = {
 
 export type ClientMarketHost = {
   id: string;
+  providerId?: string;
   ip?: string;
   port?: number;
   hostOwnerEmail: string;
+  priceCents?: number;
+  rentalPeriodDays?: number;
+  offerRevision: number;
+  paymentMethodKinds: string[];
   countryCode?: string;
   hostname?: string;
   sshHostKeyFingerprint?: string;
@@ -1303,6 +1327,8 @@ export type ClientMarketHost = {
   clientOwnerEmail?: string;
   installationId?: string;
   canWebTerminal?: boolean;
+  isHostOwner?: boolean;
+  isClientOwner?: boolean;
   lastVerifiedAt?: string;
   lastError?: string;
   note?: string;
@@ -1343,16 +1369,147 @@ export type ProvisioningJob = {
   updatedAt: string;
 };
 
-export type CreateClientMarketClientRequest = {
-  hostOwnerEmails: string[];
-  countryCodes: string[];
-  subdomain: string;
-  password: string;
-  count?: number;
-};
-
 export type CreateClientMarketClientResponse = {
   jobId: string;
+};
+
+export type ClientMarketPaymentMethod = {
+  kind: "alipay" | "wechat" | "binance" | "crypto" | "custom" | string;
+  account?: string;
+  qrImageUrl?: string;
+  assetUrl?: string;
+  token?: "USDT" | "USDC" | string;
+  chain?: "bsc" | "base" | "eth" | "tron" | string;
+  address?: string;
+  instructions?: string;
+};
+
+export type AccountPaymentProfile = {
+  providerId: string;
+  ownerEmail: string;
+  methods: ClientMarketPaymentMethod[];
+  updatedAt: string;
+};
+
+export type ClientMarketProviderBlock = {
+  clientUserId: string;
+  clientOwnerEmail: string;
+  reason: string;
+  createdAt: string;
+};
+
+export type ClientMarketProviderCountry = {
+  code: string;
+  idle: number;
+  total: number;
+};
+
+export type ClientMarketProvider = {
+  providerId: string;
+  ownerEmail: string;
+  official: boolean;
+  joinedAt: string;
+  offerStableSince: string;
+  hostTotal: number;
+  idleTotal: number;
+  allocatedTotal: number;
+  allocationRate: number;
+  freeHostTotal: number;
+  freeAllocatedTotal: number;
+  paidHostTotal: number;
+  paidAllocatedTotal: number;
+  externalClientOwnerTotal: number;
+  externalClientsOver3Days: number;
+  externalClientsOver30Days: number;
+  onlineRate30d?: number;
+  anomalousHostRate: number;
+  minPriceCents?: number;
+  maxPriceCents?: number;
+  minRentalPeriodDays?: number;
+  maxRentalPeriodDays?: number;
+  successfulAllocations: number;
+  paymentMethodKinds: string[];
+  countries: ClientMarketProviderCountry[];
+};
+
+export type ClientMarketProviderSupply = {
+  routerOwnerEmail?: string;
+  officialProviderId?: string;
+  providers: ClientMarketProvider[];
+};
+
+export type ClientMarketQuoteItem = {
+  id: string;
+  hostId: string;
+  providerId: string;
+  hostOwnerEmail: string;
+  countryCode?: string;
+  hostname?: string;
+  priceCents?: number;
+  rentalPeriodDays?: number;
+  offerRevision: number;
+};
+
+export type ClientMarketAllocationQuote = {
+  id: string;
+  status: string;
+  expiresAt: string;
+  items: ClientMarketQuoteItem[];
+};
+
+export type ClientMarketCommitQuoteResponse = {
+  batchId: string;
+  jobIds: string[];
+};
+
+export type ClientMarketBilling = {
+  installationId: string;
+  hostId: string;
+  providerId: string;
+  hostOwnerEmail: string;
+  clientOwnerEmail: string;
+  status: "active" | "payment_due" | "releasing" | "release_failed" | "released" | string;
+  priceCents?: number;
+  rentalPeriodDays?: number;
+  offerRevision: number;
+  currentPeriodEnd?: string;
+  paymentDeadline?: string;
+  openInvoiceId?: string;
+  paymentMethods?: ClientMarketPaymentMethod[];
+  paymentMethodKinds: string[];
+  paymentProfileUpdatedAt?: string;
+  isClientOwner: boolean;
+  canDeclarePaid: boolean;
+  canRelease: boolean;
+  updatedAt: string;
+};
+
+export type ClientMarketHostTransferDocument = {
+  version: number;
+  exportedAt?: string;
+  hosts: Array<{
+    ip: string;
+    port: number;
+    note?: string;
+    priceCents?: number;
+    rentalPeriodDays?: number;
+    expectedFingerprint?: string;
+    informationalStatus?: string;
+  }>;
+};
+
+export type ClientMarketHostImportResponse = {
+  jobId: string;
+  imported: number;
+  skipped: number;
+  failed: number;
+  items: Array<{
+    ip: string;
+    port: number;
+    status: string;
+    hostId?: string;
+    error?: string;
+  }>;
 };
 
 export type ClientTunnelSubdomainAvailability = {
@@ -1361,8 +1518,8 @@ export type ClientTunnelSubdomainAvailability = {
 };
 
 export type CreateClientSelectionPersist = {
-  mode: "all" | "subset";
-  emails: string[];
+  mode: "official_default" | "custom";
+  providerIds: string[];
 };
 
 export type CreateClientRegionsPersist = {

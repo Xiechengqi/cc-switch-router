@@ -5,9 +5,9 @@ import { Button, Card, Chip, Modal, ProgressBar, Tabs } from "@heroui/react";
 import * as React from "react";
 import { ShareClientTag } from "@/components/dashboard/share-client-tag";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { getShareImageGenerationRequestLogs, getShareUsageByEmail } from "@/lib/api";
+import { getShareImageGenerationRequestLogs, getShareUsageByEmail, getShareUserLimitStatus } from "@/lib/api";
 import type { AppLocale } from "@/lib/i18n";
-import type { DashboardClient, ImageGenerationRequestLog, MarketRequestLog, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareMarketListingStatus, ShareModelHealthCheck, ShareRequestLog, ShareTokenPeriod, ShareUpstreamProvider, ShareUsageByEmailResponse, ShareUserGrant, ShareView } from "@/lib/types";
+import type { DashboardClient, ImageGenerationRequestLog, MarketRequestLog, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareMarketListingStatus, ShareModelHealthCheck, ShareRequestLog, ShareTokenPeriod, ShareUpstreamProvider, ShareUsageByEmailResponse, ShareUserGrant, ShareUserLimitStatusRow, ShareView } from "@/lib/types";
 import { compactTokens, formatDateTime, formatNumber, formatRelativeTime } from "@/lib/utils";
 import { resolveShareCoreApp, SHARE_APP_LABELS } from "@/lib/share-app";
 import { averageRecentLatencyMs, boundProviderIdForApp, cacheHitRate, clientPlatformLabel, clientTunnelDisplayUrl, configuredUpstreamPercent, CORE_SHARE_APPS, expiryTitle, formatAgeDaysOrHours, formatImageLogSizeMb, formatImageLogSpendSeconds, formatImageLogTimestamp, formatLatencySeconds, formatMinutesShort, formatPercent, formatShareStatus, HealthDots, isUnlimited, mergeStandaloneOAuthRuntime, modelHealthTitle, modelHealthTone, providerAccountIdentity, providerAccountLevel, providerModelMap, requestBelongsToApp, requestModelRoute, resolveShareAppRuntime, runtimeEndpointSummary, shareApiParts, shareAppExists, shareAppProviderRuntime, shareAppSettings, shareExpiryProgress, tokenCount, usageBucketTotalTokens, type CoreShareApp, type TFn } from "@/components/dashboard/share-dashboard-utils";
@@ -31,13 +31,24 @@ export function ShareExceptionalStatusBadge({ share, t }: { share?: ShareView; t
   return <ShareStatusBadge share={share} t={t} />;
 }
 
-export function UsageBar({ used, limit, t }: { used: number; limit: number; t: TFn }) {
+export function UsageBar({
+  used,
+  limit,
+  t,
+  className,
+}: {
+  used: number;
+  limit: number;
+  t: TFn;
+  className?: string;
+}) {
   if (isUnlimited(limit)) return null;
   const pct = limit > 0 ? Math.min(100, Math.max(0, (used / limit) * 100)) : 0;
+  const fillClass = pct >= 100 ? "rounded bg-danger" : pct >= 80 ? "rounded bg-warning" : "rounded bg-primary";
   return (
-    <ProgressBar aria-label={t("progress.usage")} value={pct} minValue={0} maxValue={100} size="sm" className="mt-1 w-32 gap-0">
+    <ProgressBar aria-label={t("progress.usage")} value={pct} minValue={0} maxValue={100} size="sm" className={`mt-1 gap-0 ${className || "w-32"}`}>
       <ProgressBar.Track className="h-1 rounded bg-muted">
-        <ProgressBar.Fill className="rounded bg-primary" />
+        <ProgressBar.Fill className={fillClass} />
       </ProgressBar.Track>
     </ProgressBar>
   );
@@ -650,9 +661,11 @@ export function ShareEmailUsagePanel({
   const [period, setPeriod] = React.useState<ShareUsagePeriod>("24h");
   const [mode, setMode] = React.useState<ShareUsageViewMode>("table");
   const [usage, setUsage] = React.useState<ShareUsageByEmailResponse | null>(null);
+  const [limitRows, setLimitRows] = React.useState<ShareUserLimitStatusRow[] | null>(null);
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState("");
   const showUsage = mode === "table" || mode === "trend";
+  const showLimits = mode === "limits";
   const limitGrants = React.useMemo(() => activeUserLimitGrants(share, app), [share, app]);
 
   React.useEffect(() => {
@@ -677,6 +690,29 @@ export function ShareEmailUsagePanel({
       cancelled = true;
     };
   }, [share.shareId, app, period, showUsage]);
+
+  React.useEffect(() => {
+    if (!showLimits) return;
+    let cancelled = false;
+    setLoading(true);
+    setError("");
+    getShareUserLimitStatus(share.shareId, app)
+      .then((data) => {
+        if (!cancelled) setLimitRows(data.rows || []);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setLimitRows(null);
+          setError(err instanceof Error ? err.message : String(err));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [share.shareId, app, showLimits]);
 
   const total = usage?.totalTokens ?? 0;
   const modeLabel = (item: ShareUsageViewMode) => {
@@ -725,9 +761,11 @@ export function ShareEmailUsagePanel({
           ))}
         </div>
       </div>
-      {mode === "limits" ? (
-        limitGrants.length ? (
-          <ShareUserLimitsTable grants={limitGrants} t={t} />
+      {showLimits && loading ? <EmptyBlock>{t("dashboard.userLimit.loading")}</EmptyBlock> : null}
+      {showLimits && error ? <EmptyBlock>{error}</EmptyBlock> : null}
+      {showLimits && !loading && !error ? (
+        (limitRows?.length || limitGrants.length) ? (
+          <ShareUserLimitsTable rows={limitRows || undefined} grants={limitGrants} t={t} />
         ) : (
           <EmptyBlock>{t("dashboard.userLimit.empty")}</EmptyBlock>
         )
@@ -753,7 +791,43 @@ function displayUserLimitExpiry(value: number | undefined, permanent: string) {
   return value == null ? permanent : formatDateTime(value);
 }
 
-export function ShareUserLimitsTable({ grants, t }: { grants: ShareUserGrant[]; t: TFn }) {
+function formatResetCountdown(resetsAt: string | null | undefined, nowMs: number) {
+  if (!resetsAt) return null;
+  const target = Date.parse(resetsAt);
+  if (!Number.isFinite(target)) return null;
+  const remainingMs = Math.max(0, target - nowMs);
+  const totalMinutes = Math.floor(remainingMs / 60_000);
+  const days = Math.floor(totalMinutes / (60 * 24));
+  const hours = Math.floor((totalMinutes % (60 * 24)) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return `${days}d ${hours}h`;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  const seconds = Math.floor((remainingMs % 60_000) / 1000);
+  if (totalMinutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
+function grantsToLimitStatusRows(grants: ShareUserGrant[]): ShareUserLimitStatusRow[] {
+  return grants.map((grant) => ({
+    email: grant.email,
+    role: grant.role,
+    parallelLimit: grant.policy?.parallelLimit,
+    tokenLimit: grant.policy?.tokenLimit,
+    tokenPeriod: grant.policy?.tokenPeriod || "lifetime",
+    expiresAt: grant.policy?.expiresAt,
+    tokensUsed: 0,
+  }));
+}
+
+export function ShareUserLimitsTable({
+  rows,
+  grants,
+  t,
+}: {
+  rows?: ShareUserLimitStatusRow[];
+  grants?: ShareUserGrant[];
+  t: TFn;
+}) {
   const unlimited = t("common.unlimited");
   const permanent = t("dashboard.userLimit.permanent");
   const periodLabels: Record<ShareTokenPeriod, string> = {
@@ -762,32 +836,50 @@ export function ShareUserLimitsTable({ grants, t }: { grants: ShareUserGrant[]; 
     week: t("dashboard.userLimit.periodWeek"),
     calendarMonth: t("dashboard.userLimit.periodMonth"),
   };
+  const displayRows = React.useMemo(
+    () => (rows?.length ? rows : grantsToLimitStatusRows(grants || [])),
+    [rows, grants],
+  );
+  const hasCountdown = displayRows.some((row) => Boolean(row.resetsAt));
+  const [nowMs, setNowMs] = React.useState(() => Date.now());
+
+  React.useEffect(() => {
+    if (!hasCountdown) return;
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [hasCountdown]);
+
   return (
     <div className="overflow-hidden rounded-md border">
       <table className="w-full table-fixed border-collapse text-[11px]">
         <colgroup>
-          <col className="w-[36%]" />
-          <col className="w-[14%]" />
-          <col className="w-[28%]" />
-          <col className="w-[22%]" />
+          <col className="w-[34%]" />
+          <col className="w-[12%]" />
+          <col className="w-[34%]" />
+          <col className="w-[20%]" />
         </colgroup>
         <thead className="bg-muted/50 text-left font-mono uppercase tracking-[0.08em] text-muted-foreground">
           <tr>
             <th className="px-1.5 py-2">{t("dashboard.usageEmail.email")}</th>
             <th className="px-1.5 py-2">{t("dashboard.userLimit.parallel")}</th>
             <th className="px-1.5 py-2">{t("dashboard.userLimit.token")}</th>
-            <th className="px-1.5 py-2">{t("dashboard.userLimit.expiry")}</th>
+            <th className="px-1.5 py-2">{t("dashboard.userLimit.reset")}</th>
           </tr>
         </thead>
         <tbody>
-          {grants.map((grant) => {
-            const period = grant.policy?.tokenPeriod || "lifetime";
+          {displayRows.map((row) => {
+            const period = row.tokenPeriod || "lifetime";
+            const limit = row.tokenLimit;
+            const used = row.tokensUsed || 0;
+            const limited = limit != null && !isUnlimited(limit);
+            const pct = limited && limit > 0 ? (used / limit) * 100 : 0;
+            const countdown = formatResetCountdown(row.resetsAt, nowMs);
             return (
-              <tr key={grant.email} className="border-t">
+              <tr key={`${row.role}:${row.email}`} className="border-t">
                 <td className="px-1.5 py-2">
                   <div className="flex min-w-0 items-center gap-1.5">
-                    <span className="min-w-0 whitespace-normal break-all font-medium leading-4">{grant.email}</span>
-                    {grant.role === "owner" ? (
+                    <span className="min-w-0 whitespace-normal break-all font-medium leading-4">{row.email}</span>
+                    {row.role === "owner" ? (
                       <Chip size="sm" variant="tertiary" className="shrink-0">
                         Owner
                       </Chip>
@@ -795,15 +887,36 @@ export function ShareUserLimitsTable({ grants, t }: { grants: ShareUserGrant[]; 
                   </div>
                 </td>
                 <td className="overflow-hidden px-1.5 py-2 font-mono">
-                  {displayUserLimitValue(grant.policy?.parallelLimit, unlimited)}
+                  {displayUserLimitValue(row.parallelLimit, unlimited)}
                 </td>
-                <td className="overflow-hidden px-1.5 py-2 font-mono">
-                  {displayUserLimitValue(grant.policy?.tokenLimit, unlimited)}
-                  {" · "}
-                  {periodLabels[period] || period}
+                <td className="overflow-hidden px-1.5 py-2">
+                  <div className="font-mono leading-4">
+                    <strong>
+                      {compactTokens(used)}
+                      {" / "}
+                      {limited ? compactTokens(limit!) : "∞"}
+                    </strong>
+                    <span className="text-muted-foreground">
+                      {" · "}
+                      {periodLabels[period] || period}
+                    </span>
+                  </div>
+                  {limited ? <UsageBar used={used} limit={limit!} t={t} className="w-full" /> : null}
+                  {pct >= 100 ? (
+                    <div className="mt-0.5 text-[10px] text-danger">{t("dashboard.userLimit.atLimit")}</div>
+                  ) : pct >= 80 ? (
+                    <div className="mt-0.5 text-[10px] text-warning">{t("dashboard.userLimit.nearLimit")}</div>
+                  ) : null}
+                  {row.expiresAt != null ? (
+                    <div className="mt-0.5 text-[10px] text-muted-foreground">
+                      {t("dashboard.userLimit.expiry")}: {displayUserLimitExpiry(row.expiresAt, permanent)}
+                    </div>
+                  ) : null}
                 </td>
-                <td className="overflow-hidden px-1.5 py-2 text-muted-foreground">
-                  {displayUserLimitExpiry(grant.policy?.expiresAt, permanent)}
+                <td className="overflow-hidden px-1.5 py-2 font-mono text-muted-foreground">
+                  {countdown
+                    ? t("dashboard.userLimit.resetIn", { time: countdown })
+                    : t("dashboard.userLimit.noReset")}
                 </td>
               </tr>
             );

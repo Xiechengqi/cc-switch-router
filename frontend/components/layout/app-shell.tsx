@@ -15,7 +15,7 @@ import { getUserApiToken, resetUserApiToken } from "@/lib/api";
 import { DashboardDataProvider } from "@/components/dashboard/dashboard-data";
 import { AnnouncementDialog } from "@/components/announcement/announcement-dialog";
 import type { AppLocale } from "@/lib/i18n";
-import { DASHBOARD_CLIENTS_PATH, DASHBOARD_MARKETS_PATH, DASHBOARD_CLIENT_MARKET_PATH, type DashboardShellActive } from "@/lib/dashboard-nav";
+import { DASHBOARD_ACCOUNT_PATH, DASHBOARD_CLIENTS_PATH, DASHBOARD_MARKETS_PATH, DASHBOARD_CLIENT_MARKET_PATH, type DashboardShellActive } from "@/lib/dashboard-nav";
 import type { UserApiTokenStatus } from "@/lib/types";
 
 type RegionOption = {
@@ -259,12 +259,14 @@ function ApiTokenDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (
   );
 }
 
-function DashboardNav({ active }: { active: "clients" | "markets" | "client-market" }) {
+function DashboardNav({ active }: { active: "clients" | "markets" | "client-market" | "account" }) {
   const { t } = useLocaleText();
   const pathname = usePathname() || DASHBOARD_CLIENTS_PATH;
   const router = useRouter();
   const selectedKey =
-    active === "client-market" || pathname.startsWith("/client-market")
+    active === "account" || pathname.startsWith("/account")
+      ? "account"
+      : active === "client-market" || pathname.startsWith("/client-market")
       ? "client-market"
       : active === "markets" || pathname.startsWith("/markets")
         ? "markets"
@@ -283,20 +285,25 @@ function DashboardNav({ active }: { active: "clients" | "markets" | "client-mark
         if (next === "clients") router.push(DASHBOARD_CLIENTS_PATH);
         else if (next === "markets") router.push(DASHBOARD_MARKETS_PATH);
         else if (next === "client-market") router.push(DASHBOARD_CLIENT_MARKET_PATH);
+        else if (next === "account") router.push(DASHBOARD_ACCOUNT_PATH);
       }}
     >
-      <Tabs.List className="grid w-full grid-cols-3 gap-0.5 rounded-lg bg-slate-100/90 p-1 text-foreground ring-1 ring-inset ring-slate-200/80 sm:inline-grid sm:w-auto">
+      <Tabs.List className="grid w-full grid-cols-4 gap-0.5 rounded-lg bg-slate-100/90 p-1 text-foreground ring-1 ring-inset ring-slate-200/80 sm:inline-grid sm:w-auto">
         <Tabs.Tab id="clients" className={tabClass}>
           <Monitor className="h-3.5 w-3.5 shrink-0" aria-hidden />
-          <span>{t("nav.clientsTab")}</span>
+          <span className="hidden sm:inline">{t("nav.clientsTab")}</span>
         </Tabs.Tab>
         <Tabs.Tab id="markets" className={tabClass}>
           <Store className="h-3.5 w-3.5 shrink-0" aria-hidden />
-          <span>{t("nav.marketsTab")}</span>
+          <span className="hidden sm:inline">{t("nav.marketsTab")}</span>
         </Tabs.Tab>
         <Tabs.Tab id="client-market" className={tabClass}>
           <Network className="h-3.5 w-3.5 shrink-0" aria-hidden />
-          <span>{t("nav.clientMarketTab")}</span>
+          <span className="hidden sm:inline">{t("nav.clientMarketTab")}</span>
+        </Tabs.Tab>
+        <Tabs.Tab id="account" className={tabClass}>
+          <UserRound className="h-3.5 w-3.5 shrink-0" aria-hidden />
+          <span className="hidden sm:inline">{t("nav.accountTab")}</span>
         </Tabs.Tab>
       </Tabs.List>
     </Tabs>
@@ -311,7 +318,7 @@ function Topbar({ active }: { active: DashboardShellActive }) {
   const [clientRedirect, setClientRedirect] = React.useState<string | null>(null);
   const redirectStartedRef = React.useRef(false);
   const authed = !!session?.authenticated;
-  const showDashboardNav = active === "clients" || active === "markets" || active === "client-market";
+  const showDashboardNav = active === "clients" || active === "markets" || active === "client-market" || active === "account";
 
   React.useEffect(() => {
     setClientRedirect(sameRouterDomainClientRedirect(new URLSearchParams(window.location.search).get("clientRedirect")));
@@ -432,9 +439,9 @@ export function AppShell({
     <LocaleProvider>
       <AuthProvider>
         <DashboardDataProvider enabled={dashboardDataEnabled}>
-          <div className="flex min-h-dvh flex-col">
+          <div className="flex min-h-dvh min-w-0 flex-col">
             <Topbar active={active} />
-            <div className="flex flex-1 flex-col">{children}</div>
+            <div className="flex min-w-0 flex-1 flex-col">{children}</div>
           </div>
           <AnnouncementDialog />
           <Toast.Provider placement="top end" />

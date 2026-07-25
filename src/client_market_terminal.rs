@@ -40,7 +40,7 @@ const PTY_READ_CHUNK: usize = 8192;
 #[derive(Debug, Clone)]
 struct TerminalTicket {
     host_id: String,
-    owner_email: String,
+    owner_user_id: String,
     ip: String,
     port: u16,
     expires_at: Instant,
@@ -49,7 +49,7 @@ struct TerminalTicket {
 #[derive(Debug, Default)]
 pub struct TerminalSessionManager {
     tickets: HashMap<String, TerminalTicket>,
-    /// owner_email -> active websocket session count
+    /// Stable owner user id -> active websocket session count.
     active_sessions: HashMap<String, usize>,
 }
 
@@ -80,24 +80,28 @@ impl TerminalSessionManager {
         Ok(ticket)
     }
 
-    fn try_begin_session(&mut self, owner_email: &str) -> Result<(), AppError> {
-        let count = self.active_sessions.get(owner_email).copied().unwrap_or(0);
+    fn try_begin_session(&mut self, owner_user_id: &str) -> Result<(), AppError> {
+        let count = self
+            .active_sessions
+            .get(owner_user_id)
+            .copied()
+            .unwrap_or(0);
         if count >= MAX_SESSIONS_PER_OWNER {
             return Err(AppError::TooManyRequests(
                 "too many active web terminal sessions".into(),
             ));
         }
         self.active_sessions
-            .insert(owner_email.to_string(), count + 1);
+            .insert(owner_user_id.to_string(), count + 1);
         Ok(())
     }
 
-    fn end_session(&mut self, owner_email: &str) {
-        let Some(count) = self.active_sessions.get_mut(owner_email) else {
+    fn end_session(&mut self, owner_user_id: &str) {
+        let Some(count) = self.active_sessions.get_mut(owner_user_id) else {
             return;
         };
         if *count <= 1 {
-            self.active_sessions.remove(owner_email);
+            self.active_sessions.remove(owner_user_id);
         } else {
             *count -= 1;
         }
@@ -130,25 +134,25 @@ async fn create_terminal_session(
     headers: HeaderMap,
     AxumPath(host_id): AxumPath<String>,
 ) -> Result<Json<TerminalSessionResponse>, AppError> {
-    let viewer = require_session_email(&state, &headers).await?;
+    let session = require_session(&state, &headers).await?;
     let host = state
         .store
         .client_market_get_host(&host_id)
         .await?
         .ok_or_else(|| AppError::NotFound("host not found".into()))?;
-    authorize_web_terminal(&host, &viewer)?;
+    authorize_web_terminal(&host, &session.user_id)?;
 
     let mut manager = state.client_market_terminal.lock().await;
     let ticket = manager.issue_ticket(TerminalTicket {
         host_id: host.id.clone(),
-        owner_email: viewer.clone(),
+        owner_user_id: session.user_id.clone(),
         ip: host.ip.clone(),
         port: host.port,
         expires_at: Instant::now() + TICKET_TTL,
     });
     info!(
         host_id = %host.id,
-        owner = %viewer,
+        owner_user_id = %session.user_id,
         "client market terminal session ticket issued"
     );
     Ok(Json(TerminalSessionResponse {
@@ -165,7 +169,7 @@ async fn terminal_ws(
     let ticket = {
         let mut manager = state.client_market_terminal.lock().await;
         let ticket = manager.redeem_ticket(query.ticket.trim())?;
-        manager.try_begin_session(&ticket.owner_email)?;
+        manager.try_begin_session(&ticket.owner_user_id)?;
         ticket
     };
 
@@ -177,7 +181,7 @@ async fn terminal_ws(
 }
 
 async fn run_terminal_session(state: ServerState, socket: WebSocket, ticket: TerminalTicket) {
-    let owner = ticket.owner_email.clone();
+    let owner = ticket.owner_user_id.clone();
     let host_id = ticket.host_id.clone();
     let started = Instant::now();
     info!(host_id = %host_id, owner = %owner, "client market terminal session started");
@@ -451,10 +455,11 @@ async fn send_ws_notice(mut socket: WebSocket, message: &str) -> Result<(), Stri
     Ok(())
 }
 
-fn authorize_web_terminal(host: &RouterSshHostRecord, viewer_email: &str) -> Result<(), AppError> {
-    let viewer = viewer_email.trim().to_ascii_lowercase();
-    let is_host_owner = host.host_owner_email.trim().to_ascii_lowercase() == viewer;
-    if is_host_owner {
+fn authorize_web_terminal(
+    host: &RouterSshHostRecord,
+    viewer_user_id: &str,
+) -> Result<(), AppError> {
+    if host.provider_id.as_deref() == Some(viewer_user_id) {
         return Ok(());
     }
     Err(AppError::Forbidden(
@@ -462,13 +467,12 @@ fn authorize_web_terminal(host: &RouterSshHostRecord, viewer_email: &str) -> Res
     ))
 }
 
-async fn require_session_email(
+async fn require_session(
     state: &ServerState,
     headers: &HeaderMap,
-) -> Result<String, AppError> {
+) -> Result<crate::models::AuthSession, AppError> {
     crate::api::resolve_router_session(state, headers)
         .await?
-        .map(|session| session.email)
         .ok_or_else(|| AppError::Unauthorized("authenticated owner session required".into()))
 }
 
@@ -485,9 +489,14 @@ mod tests {
     fn sample_host(client_owner: Option<&str>, installation: Option<&str>) -> RouterSshHostRecord {
         RouterSshHostRecord {
             id: "host-1".into(),
+            provider_id: Some("provider-1".into()),
             ip: "203.0.113.10".into(),
             port: 22,
             host_owner_email: "host@example.com".into(),
+            price_cents: Some(500),
+            rental_period_days: Some(30),
+            offer_revision: 1,
+            payment_method_kinds: vec!["alipay".into()],
             country_code: Some("US".into()),
             hostname: Some("box".into()),
             ssh_host_key_fingerprint: None,
@@ -495,6 +504,7 @@ mod tests {
             client_subdomain: Some("demo".into()),
             client_owner_email: client_owner.map(str::to_string),
             installation_id: installation.map(str::to_string),
+            client_owner_user_id: client_owner.map(|_| "client-1".to_string()),
             last_verified_at: None,
             last_error: None,
             note: None,
@@ -507,16 +517,15 @@ mod tests {
     #[test]
     fn authorize_allows_host_owner_only() {
         let host = sample_host(Some("client@example.com"), Some("inst-1"));
-        assert!(authorize_web_terminal(&host, "host@example.com").is_ok());
-        assert!(authorize_web_terminal(&host, "HOST@example.com").is_ok());
-        assert!(authorize_web_terminal(&host, "client@example.com").is_err());
-        assert!(authorize_web_terminal(&host, "other@example.com").is_err());
+        assert!(authorize_web_terminal(&host, "provider-1").is_ok());
+        assert!(authorize_web_terminal(&host, "client-1").is_err());
+        assert!(authorize_web_terminal(&host, "other-user").is_err());
         // Admins (including router owner) are intentionally excluded.
-        assert!(authorize_web_terminal(&host, "admin@example.com").is_err());
+        assert!(authorize_web_terminal(&host, "admin-1").is_err());
 
         let idle = sample_host(None, None);
-        assert!(authorize_web_terminal(&idle, "host@example.com").is_ok());
-        assert!(authorize_web_terminal(&idle, "client@example.com").is_err());
+        assert!(authorize_web_terminal(&idle, "provider-1").is_ok());
+        assert!(authorize_web_terminal(&idle, "client-1").is_err());
     }
 
     #[test]
@@ -524,7 +533,7 @@ mod tests {
         let mut manager = TerminalSessionManager::default();
         let id = manager.issue_ticket(TerminalTicket {
             host_id: "h".into(),
-            owner_email: "a@b.co".into(),
+            owner_user_id: "user-a".into(),
             ip: "1.2.3.4".into(),
             port: 22,
             expires_at: Instant::now() + Duration::from_secs(30),
@@ -534,7 +543,7 @@ mod tests {
 
         let expired = manager.issue_ticket(TerminalTicket {
             host_id: "h".into(),
-            owner_email: "a@b.co".into(),
+            owner_user_id: "user-a".into(),
             ip: "1.2.3.4".into(),
             port: 22,
             expires_at: Instant::now() - Duration::from_secs(1),

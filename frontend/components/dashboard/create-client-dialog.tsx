@@ -1,701 +1,524 @@
 "use client";
 
 import * as React from "react";
-import { Button, Modal, Tabs, toast } from "@heroui/react";
-import { Check, Copy, Dices, ExternalLink, Loader2, LogIn, Minus, Plus } from "lucide-react";
+import { Button, Chip, Modal, Tabs } from "@heroui/react";
+import { Check, Copy, Dices, Loader2, LogIn, Minus, Plus, RotateCcw, Server } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CountryFlag } from "@/components/common/country-flag";
-import { useLocaleText } from "@/components/i18n/locale-provider";
+import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
 import { buildClientInstallCommand } from "@/components/dashboard/install-guide-dialog";
 import { ProvisionJobLog } from "@/components/dashboard/provision-job-log";
+import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
+  cancelClientMarketQuote,
   checkClientTunnelSubdomainAvailability,
-  createClientMarketClient,
+  commitClientMarketQuote,
+  createClientMarketQuote,
   getClientMarketJob,
-  getClientMarketSupplySummary,
+  getClientMarketProviderSupply,
 } from "@/lib/api";
-import type { CreateClientRegionsPersist, CreateClientSelectionPersist, SupplySummaryEntry } from "@/lib/types";
+import type {
+  ClientMarketAllocationQuote,
+  ClientMarketHost,
+  ClientMarketProvider,
+  CreateClientRegionsPersist,
+  CreateClientSelectionPersist,
+  ProvisioningJob,
+} from "@/lib/types";
 import { usePersistentState } from "@/lib/use-persistent-state";
 
-const ROUTER_OPEN_LOGIN_EVENT = "router-open-login";
-const HOST_OWNERS_KEY = "cc_switch_router_create_client_host_owners_v1";
-const REGIONS_KEY = "cc_switch_router_create_client_regions_v1";
+const PROVIDERS_KEY = "cc_switch_router_create_client_providers_v2";
+const REGIONS_KEY = "cc_switch_router_create_client_regions_v2";
+
+type Phase = "form" | "quote" | "running" | "complete";
+type CreateMode = "manual" | "online";
+type Draft = { subdomain: string; password: string };
+type SubdomainCheck = {
+  value: string;
+  status: "checking" | "available" | "unavailable" | "error";
+  message?: string;
+};
 
 function randomSubdomain() {
   const letters = "abcdefghijklmnopqrstuvwxyz";
   const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
-  let out = letters[Math.floor(Math.random() * letters.length)];
-  for (let i = 1; i < 10; i++) out += alphabet[Math.floor(Math.random() * alphabet.length)];
-  return out;
+  let output = letters[Math.floor(Math.random() * letters.length)];
+  for (let index = 1; index < 10; index += 1) output += alphabet[Math.floor(Math.random() * alphabet.length)];
+  return output;
 }
 
-function uniqueOwners(entries: SupplySummaryEntry[]) {
-  return Array.from(new Set(entries.map((e) => e.hostOwnerEmail))).sort((a, b) => a.localeCompare(b));
+function normalizeDraftSubdomain(value: string) {
+  return value.trim().toLowerCase();
 }
 
-function aggregateRegions(entries: SupplySummaryEntry[], ownerEmails: string[]) {
-  const ownerSet = new Set(ownerEmails.map((e) => e.toLowerCase()));
-  const map = new Map<string, { idle: number; total: number }>();
-  for (const entry of entries) {
-    if (!ownerSet.has(entry.hostOwnerEmail.toLowerCase())) continue;
-    const code = (entry.countryCode || "").trim().toUpperCase();
-    if (!code) continue;
-    const prev = map.get(code) || { idle: 0, total: 0 };
-    prev.idle += entry.idleCount;
-    prev.total += entry.totalCount;
-    map.set(code, prev);
-  }
-  return Array.from(map.entries())
-    .map(([code, counts]) => ({ code, ...counts }))
-    .sort((a, b) => a.code.localeCompare(b.code));
+function isValidDraftSubdomain(value: string) {
+  return (
+    value.length >= 6 &&
+    value.length <= 30 &&
+    /^[a-z][a-z0-9-]*[a-z0-9]$/.test(value) &&
+    !value.includes("--") &&
+    !["admin", "api", "cdn-cgi", "router", "www"].includes(value)
+  );
 }
 
-function normalizeOwnerPersist(value: unknown): CreateClientSelectionPersist {
-  if (!value || typeof value !== "object") return { mode: "all", emails: [] };
+function normalizeProviderPersist(value: unknown): CreateClientSelectionPersist {
+  if (!value || typeof value !== "object") return { mode: "official_default", providerIds: [] };
   const candidate = value as Partial<CreateClientSelectionPersist>;
-  const emails = Array.isArray(candidate.emails)
-    ? candidate.emails.filter((email): email is string => typeof email === "string")
-    : [];
-  return { mode: candidate.mode === "subset" ? "subset" : "all", emails };
+  return {
+    mode: candidate.mode === "custom" ? "custom" : "official_default",
+    providerIds: Array.isArray(candidate.providerIds)
+      ? candidate.providerIds.filter((item): item is string => typeof item === "string")
+      : [],
+  };
 }
 
 function normalizeRegionPersist(value: unknown): CreateClientRegionsPersist {
   if (!value || typeof value !== "object") return { mode: "all", codes: [] };
   const candidate = value as Partial<CreateClientRegionsPersist>;
-  const codes = Array.isArray(candidate.codes)
-    ? candidate.codes.filter((code): code is string => typeof code === "string")
-    : [];
-  return { mode: candidate.mode === "subset" ? "subset" : "all", codes };
+  return {
+    mode: candidate.mode === "subset" ? "subset" : "all",
+    codes: Array.isArray(candidate.codes)
+      ? candidate.codes.filter((item): item is string => typeof item === "string")
+      : [],
+  };
 }
 
-type Phase = "form" | "running" | "success" | "failed";
-type CreateMode = "manual" | "online";
+function formatOffer(priceCents: number | undefined, days: number | undefined, locale: string) {
+  if (priceCents == null || days == null) return locale.startsWith("zh") ? "免费 · 永久" : "Free · permanent";
+  const amount = new Intl.NumberFormat(locale, { style: "currency", currency: "USD" }).format(priceCents / 100);
+  return locale.startsWith("zh") ? `${amount} / ${days} 天` : `${amount} / ${days} days`;
+}
+
+function secondsRemaining(value?: string) {
+  if (!value) return 0;
+  return Math.max(0, Math.ceil((Date.parse(value) - Date.now()) / 1000));
+}
 
 export function CreateClientDialog({
   open,
   onOpenChange,
+  fixedHost,
+  onCreated,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  fixedHost?: ClientMarketHost | null;
+  onCreated?: () => void;
 }) {
   const { locale, t } = useLocaleText();
   const { session, loading: authLoading } = useAuth();
   const authed = !!session?.authenticated;
-  const ownerEmail =
-    session?.user?.email?.trim() ||
-    session?.installationOwnerEmail?.trim() ||
-    t("dashboard.installClientCommandOwnerPlaceholder");
-
+  const ownerEmail = session?.user?.email?.trim() || t("dashboard.installClientCommandOwnerPlaceholder");
   const [mode, setMode] = React.useState<CreateMode>("online");
-  const [copied, setCopied] = React.useState(false);
-  const [supply, setSupply] = React.useState<SupplySummaryEntry[]>([]);
-  const [supplyLoading, setSupplyLoading] = React.useState(false);
-  const [hostOwnersPersist, setHostOwnersPersist, ownersHydrated] = usePersistentState<CreateClientSelectionPersist>(
-    HOST_OWNERS_KEY,
-    { mode: "all", emails: [] },
+  const [phase, setPhase] = React.useState<Phase>("form");
+  const [providers, setProviders] = React.useState<ClientMarketProvider[]>([]);
+  const [providerSupplyLoaded, setProviderSupplyLoaded] = React.useState(false);
+  const [officialProviderId, setOfficialProviderId] = React.useState<string>();
+  const [routerOwnerEmail, setRouterOwnerEmail] = React.useState<string>();
+  const [providerPersist, setProviderPersist] = usePersistentState<CreateClientSelectionPersist>(
+    PROVIDERS_KEY,
+    { mode: "official_default", providerIds: [] },
   );
-  const [regionsPersist, setRegionsPersist, regionsHydrated] = usePersistentState<CreateClientRegionsPersist>(
+  const [regionPersist, setRegionPersist] = usePersistentState<CreateClientRegionsPersist>(
     REGIONS_KEY,
     { mode: "all", codes: [] },
   );
-
-  const [subdomain, setSubdomain] = React.useState("");
-  const [password, setPassword] = React.useState("");
   const [quantity, setQuantity] = React.useState(1);
-  const [pendingLogin, setPendingLogin] = React.useState(false);
-  const [phase, setPhase] = React.useState<Phase>("form");
-  const [jobLog, setJobLog] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
+  const [quote, setQuote] = React.useState<ClientMarketAllocationQuote | null>(null);
+  const [drafts, setDrafts] = React.useState<Record<string, Draft>>({});
+  const [subdomainChecks, setSubdomainChecks] = React.useState<Record<string, SubdomainCheck>>({});
+  const [jobs, setJobs] = React.useState<Record<string, ProvisioningJob>>({});
+  const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState("");
-  const [successInfo, setSuccessInfo] = React.useState<{
-    subdomain?: string;
-    installationId?: string;
-    hostOwnerEmail?: string;
-    clientOwnerEmail?: string;
-    countryCode?: string;
-    clientUrl?: string;
-  }>({});
-  const supplyReadyRef = React.useRef(false);
-  const ownersReconciledRef = React.useRef(false);
-  const regionsReconciledRef = React.useRef(false);
-  const previousOwnerSignatureRef = React.useRef("");
-  const pollGenerationRef = React.useRef(0);
+  const [copied, setCopied] = React.useState(false);
+  const [clock, setClock] = React.useState(0);
+  const pollGeneration = React.useRef(0);
+  const subdomainCheckGeneration = React.useRef(0);
 
-  const allOwners = React.useMemo(() => uniqueOwners(supply), [supply]);
-  const safeHostOwnersPersist = React.useMemo(
-    () => normalizeOwnerPersist(hostOwnersPersist),
-    [hostOwnersPersist],
-  );
-  const safeRegionsPersist = React.useMemo(
-    () => normalizeRegionPersist(regionsPersist),
-    [regionsPersist],
-  );
-
-  const resolvedOwnerEmails = React.useMemo(() => {
-    if (safeHostOwnersPersist.mode === "all") return allOwners;
-    return safeHostOwnersPersist.emails.filter((e) => allOwners.some((o) => o.toLowerCase() === e.toLowerCase()));
-  }, [allOwners, safeHostOwnersPersist]);
-
-  const regionOptions = React.useMemo(
-    () => aggregateRegions(supply, resolvedOwnerEmails),
-    [resolvedOwnerEmails, supply],
-  );
-
-  const resolvedCountryCodes = React.useMemo(() => {
-    if (safeRegionsPersist.mode === "all") return regionOptions.map((r) => r.code);
-    return safeRegionsPersist.codes.filter((c) => regionOptions.some((r) => r.code === c));
-  }, [regionOptions, safeRegionsPersist]);
-
-  const ownerSignature = React.useMemo(
-    () => resolvedOwnerEmails.map((email) => email.toLowerCase()).sort().join("\n"),
-    [resolvedOwnerEmails],
-  );
-  const selectedIdleCapacity = React.useMemo(() => {
-    const selected = new Set(resolvedCountryCodes);
-    return regionOptions.reduce((total, region) => total + (selected.has(region.code) ? region.idle : 0), 0);
-  }, [regionOptions, resolvedCountryCodes]);
-  const regionNames = React.useMemo(
-    () => new Intl.DisplayNames([locale], { type: "region" }),
-    [locale],
-  );
-
-  React.useEffect(() => {
-    if (!open || !ownersHydrated || !supplyReadyRef.current || ownersReconciledRef.current) return;
-    if (allOwners.length === 0) return;
-    const intersection = safeHostOwnersPersist.emails.filter((email) =>
-      allOwners.some((available) => available.toLowerCase() === email.toLowerCase()),
-    );
-    ownersReconciledRef.current = true;
-    if (safeHostOwnersPersist.mode === "all" || intersection.length === 0) {
-      setHostOwnersPersist({ mode: "all", emails: allOwners });
-    } else if (intersection.length !== safeHostOwnersPersist.emails.length) {
-      setHostOwnersPersist({ mode: "subset", emails: intersection });
+  const safeProviders = React.useMemo(() => normalizeProviderPersist(providerPersist), [providerPersist]);
+  const safeRegions = React.useMemo(() => normalizeRegionPersist(regionPersist), [regionPersist]);
+  const availableProviderIds = React.useMemo(() => new Set(providers.map((provider) => provider.providerId)), [providers]);
+  const selectedProviderIds = React.useMemo(() => {
+    if (fixedHost?.providerId) return [fixedHost.providerId];
+    if (safeProviders.mode === "official_default") {
+      return officialProviderId && availableProviderIds.has(officialProviderId) ? [officialProviderId] : [];
     }
-  }, [allOwners, open, ownersHydrated, safeHostOwnersPersist, setHostOwnersPersist]);
-
-  React.useEffect(() => {
-    if (
-      !open ||
-      !regionsHydrated ||
-      !ownersReconciledRef.current ||
-      !supplyReadyRef.current
-    ) return;
+    return safeProviders.providerIds.filter((id) => availableProviderIds.has(id));
+  }, [availableProviderIds, fixedHost?.providerId, officialProviderId, safeProviders]);
+  const selectedProviders = React.useMemo(
+    () => providers.filter((provider) => selectedProviderIds.includes(provider.providerId)),
+    [providers, selectedProviderIds],
+  );
+  const regionOptions = React.useMemo(() => {
+    const counts = new Map<string, { idle: number; total: number }>();
+    for (const provider of selectedProviders) {
+      for (const country of provider.countries) {
+        const value = counts.get(country.code) || { idle: 0, total: 0 };
+        value.idle += country.idle;
+        value.total += country.total;
+        counts.set(country.code, value);
+      }
+    }
+    return Array.from(counts.entries()).map(([code, count]) => ({ code, ...count })).sort((left, right) => left.code.localeCompare(right.code));
+  }, [selectedProviders]);
+  const selectedCountryCodes = React.useMemo(() => {
+    if (fixedHost?.countryCode) return [fixedHost.countryCode];
     const options = regionOptions.map((region) => region.code);
-    const intersection = safeRegionsPersist.codes.filter((code) => options.includes(code));
-    const ownerChanged = previousOwnerSignatureRef.current !== ownerSignature;
-    previousOwnerSignatureRef.current = ownerSignature;
-    if (!regionsReconciledRef.current) {
-      if (options.length === 0) return;
-      regionsReconciledRef.current = true;
-      if (safeRegionsPersist.mode === "all" || intersection.length === 0) {
-        setRegionsPersist({ mode: "all", codes: options });
-      } else if (intersection.length !== safeRegionsPersist.codes.length) {
-        setRegionsPersist({ mode: "subset", codes: intersection });
-      }
-      return;
-    }
-    if (safeRegionsPersist.mode === "all") {
-      if (options.join("\n") !== safeRegionsPersist.codes.join("\n")) {
-        setRegionsPersist({ mode: "all", codes: options });
-      }
-      return;
-    }
-    if (options.length === 0) return;
-    if (intersection.length === 0 && (ownerChanged || safeRegionsPersist.codes.length > 0)) {
-      setRegionsPersist({ mode: "all", codes: options });
-    } else if (intersection.length !== safeRegionsPersist.codes.length) {
-      setRegionsPersist({ mode: "subset", codes: intersection });
-    }
-  }, [open, ownerSignature, regionOptions, regionsHydrated, safeRegionsPersist, setRegionsPersist]);
+    if (safeRegions.mode === "all") return options;
+    const selected = safeRegions.codes.filter((code) => options.includes(code));
+    return selected.length ? selected : options;
+  }, [fixedHost?.countryCode, regionOptions, safeRegions]);
+  const capacity = React.useMemo(() => {
+    if (fixedHost) return fixedHost.status === "idle" ? 1 : 0;
+    const selected = new Set(selectedCountryCodes);
+    return regionOptions.reduce((sum, region) => sum + (selected.has(region.code) ? region.idle : 0), 0);
+  }, [fixedHost, regionOptions, selectedCountryCodes]);
+  const regionNames = React.useMemo(() => new Intl.DisplayNames([locale], { type: "region" }), [locale]);
 
   React.useEffect(() => {
     if (!open) return;
-    supplyReadyRef.current = false;
-    ownersReconciledRef.current = false;
-    regionsReconciledRef.current = false;
-    previousOwnerSignatureRef.current = "";
-    pollGenerationRef.current += 1;
+    pollGeneration.current += 1;
     setPhase("form");
     setMode("online");
-    setCopied(false);
-    setJobLog("");
-    setError("");
-    setSuccessInfo({});
-    setPassword("");
-    setSubdomain(randomSubdomain());
+    setQuote(null);
+    setDrafts({});
+    setSubdomainChecks({});
+    subdomainCheckGeneration.current += 1;
+    setJobs({});
     setQuantity(1);
-    setPendingLogin(false);
-    setSupplyLoading(true);
-    getClientMarketSupplySummary()
-      .then((entries) => {
-        supplyReadyRef.current = true;
-        setSupply(entries);
+    setError("");
+    setLoading(true);
+    setProviderSupplyLoaded(false);
+    getClientMarketProviderSupply()
+      .then((response) => {
+        setProviders(response.providers);
+        setOfficialProviderId(response.officialProviderId);
+        setRouterOwnerEmail(response.routerOwnerEmail);
+        setProviderSupplyLoaded(true);
       })
-      .catch((err) => setError(err instanceof Error ? err.message : String(err)))
-      .finally(() => setSupplyLoading(false));
+      .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)))
+      .finally(() => setLoading(false));
   }, [open]);
 
   React.useEffect(() => {
-    if (open) return;
-    pollGenerationRef.current += 1;
-    setPassword("");
-  }, [open]);
+    if (!providerSupplyLoaded || safeProviders.mode !== "custom") return;
+    const valid = safeProviders.providerIds.filter((id) => availableProviderIds.has(id));
+    if (!valid.length && safeProviders.providerIds.length) {
+      setProviderPersist({ mode: "official_default", providerIds: [] });
+    } else if (valid.length !== safeProviders.providerIds.length) {
+      setProviderPersist({ mode: "custom", providerIds: valid });
+    }
+  }, [availableProviderIds, providerSupplyLoaded, safeProviders, setProviderPersist]);
 
   React.useEffect(() => {
-    if (!pendingLogin || !authed) return;
-    setPendingLogin(false);
-  }, [authed, pendingLogin]);
+    const options = regionOptions.map((region) => region.code);
+    if (!options.length) return;
+    if (safeRegions.mode === "all") {
+      if (safeRegions.codes.join(",") !== options.join(",")) setRegionPersist({ mode: "all", codes: options });
+      return;
+    }
+    const intersection = safeRegions.codes.filter((code) => options.includes(code));
+    if (!intersection.length) setRegionPersist({ mode: "all", codes: options });
+    else if (intersection.length !== safeRegions.codes.length) setRegionPersist({ mode: "subset", codes: intersection });
+  }, [regionOptions, safeRegions, setRegionPersist]);
 
-  const toggleOwner = (email: string) => {
-    const set = new Set(safeHostOwnersPersist.mode === "all" ? allOwners : safeHostOwnersPersist.emails);
-    if (set.has(email)) set.delete(email);
-    else set.add(email);
-    setHostOwnersPersist({ mode: "subset", emails: Array.from(set).sort((a, b) => a.localeCompare(b)) });
-  };
+  React.useEffect(() => {
+    if (!open || phase !== "quote") return;
+    const timer = window.setInterval(() => setClock((value) => value + 1), 1_000);
+    return () => window.clearInterval(timer);
+  }, [open, phase]);
 
-  const toggleRegion = (code: string) => {
-    const set = new Set(safeRegionsPersist.mode === "all" ? regionOptions.map((region) => region.code) : safeRegionsPersist.codes);
-    if (set.has(code)) set.delete(code);
-    else set.add(code);
-    setRegionsPersist({ mode: "subset", codes: Array.from(set).sort((a, b) => a.localeCompare(b)) });
-  };
+  React.useEffect(() => {
+    if (!quote || phase !== "quote" || secondsRemaining(quote.expiresAt) > 0) return;
+    void cancelClientMarketQuote(quote.id).catch(() => undefined);
+    setQuote(null);
+    setDrafts({});
+    setSubdomainChecks({});
+    subdomainCheckGeneration.current += 1;
+    setError(t("createClient.quoteExpired"));
+    setPhase("form");
+  }, [clock, phase, quote, t]);
 
-  const pollJob = async (jobId: string, generation: number) => {
-    for (let i = 0; i < 1000; i++) {
-      await new Promise((r) => setTimeout(r, 1500));
-      if (pollGenerationRef.current !== generation) return;
-      let job;
-      try {
-        job = await getClientMarketJob(jobId);
-        setError("");
-      } catch {
-        setError(t("createClient.statusRetrying"));
-        continue;
+  React.useEffect(() => {
+    if (!open || phase !== "quote" || !quote) return;
+    const generation = ++subdomainCheckGeneration.current;
+    const values = quote.items.map((item) => ({
+      id: item.id,
+      value: normalizeDraftSubdomain(drafts[item.id]?.subdomain || ""),
+    }));
+    const counts = new Map<string, number>();
+    for (const { value } of values) {
+      if (value) counts.set(value, (counts.get(value) || 0) + 1);
+    }
+    const candidates: Array<{ id: string; value: string }> = [];
+    const immediate: Record<string, SubdomainCheck> = {};
+    for (const item of values) {
+      if (!item.value) {
+        immediate[item.id] = { value: item.value, status: "unavailable", message: t("createClient.subdomainRequired") };
+      } else if (!isValidDraftSubdomain(item.value)) {
+        immediate[item.id] = { value: item.value, status: "unavailable", message: t("createClient.subdomainInvalid") };
+      } else if ((counts.get(item.value) || 0) > 1) {
+        immediate[item.id] = { value: item.value, status: "unavailable", message: t("createClient.subdomainDuplicate") };
+      } else {
+        immediate[item.id] = { value: item.value, status: "checking" };
+        candidates.push(item);
       }
-      setJobLog(job.log || "");
-      if (job.status === "succeeded") {
-        setSuccessInfo({
-          subdomain: job.subdomain,
-          installationId: job.installationId,
-          hostOwnerEmail: job.hostOwnerEmail,
-          clientOwnerEmail: job.clientOwnerEmail,
-          countryCode: job.countryCode,
-          clientUrl: job.clientUrl,
+    }
+    setSubdomainChecks(immediate);
+    if (!candidates.length) return;
+
+    const timer = window.setTimeout(() => {
+      void Promise.all(
+        candidates.map(async (item) => {
+          try {
+            const result = await checkClientTunnelSubdomainAvailability(item.value);
+            return {
+              ...item,
+              check: result.available
+                ? ({ value: item.value, status: "available" } as SubdomainCheck)
+                : ({ value: item.value, status: "unavailable", message: t("createClient.subdomainTaken") } as SubdomainCheck),
+            };
+          } catch {
+            return {
+              ...item,
+              check: { value: item.value, status: "error", message: t("createClient.subdomainCheckFailed") } as SubdomainCheck,
+            };
+          }
+        }),
+      ).then((results) => {
+        if (subdomainCheckGeneration.current !== generation) return;
+        setSubdomainChecks((current) => {
+          const next = { ...current };
+          for (const result of results) next[result.id] = result.check;
+          return next;
         });
-        setPhase("success");
-        return;
-      }
-      if (job.status === "failed") {
-        setPhase("failed");
-        setError(t("createClient.failed"));
-        return;
-      }
+      });
+    }, 350);
+    return () => window.clearTimeout(timer);
+  }, [drafts, open, phase, quote, t]);
+
+  const requestQuote = async () => {
+    if (!authed) {
+      window.dispatchEvent(new Event("router-open-login"));
+      return;
     }
-    setPhase("failed");
-    setError(t("createClient.failed"));
+    if ((!fixedHost && (!selectedProviderIds.length || !selectedCountryCodes.length)) || capacity < quantity) {
+      setError(capacity < quantity ? t("createClient.noCapacity") : t("createClient.selectionRequired"));
+      return;
+    }
+    setLoading(true);
+    setError("");
+    try {
+      const next = await createClientMarketQuote({
+        providerIds: selectedProviderIds,
+        countryCodes: selectedCountryCodes,
+        count: fixedHost ? 1 : quantity,
+        hostId: fixedHost?.id,
+      });
+      setQuote(next);
+      setDrafts(Object.fromEntries(next.items.map((item) => [item.id, { subdomain: randomSubdomain(), password: "" }])));
+      setSubdomainChecks({});
+      setPhase("quote");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setLoading(false);
+    }
   };
 
-  const onPrimary = async () => {
-    if (!authed) {
-      setPendingLogin(true);
-      window.dispatchEvent(new Event(ROUTER_OPEN_LOGIN_EVENT));
-      return;
+  const pollJobs = async (jobIds: string[], generation: number) => {
+    for (let attempt = 0; attempt < 1_000; attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 1_500));
+      if (pollGeneration.current !== generation) return;
+      const settled = await Promise.all(jobIds.map((id) => getClientMarketJob(id).catch(() => null)));
+      const available = settled.filter((job): job is ProvisioningJob => !!job);
+      setJobs(Object.fromEntries(available.map((job) => [job.id, job])));
+      if (available.length === jobIds.length && available.every((job) => job.status === "succeeded" || job.status === "failed")) {
+        setPhase("complete");
+        onCreated?.();
+        return;
+      }
     }
-    if (resolvedOwnerEmails.length === 0 || resolvedCountryCodes.length === 0) {
-      setError(t("createClient.selectionRequired"));
-      return;
-    }
-    if (selectedIdleCapacity < quantity) {
-      setError(t("createClient.noCapacity"));
-      return;
-    }
-    if (quantity > 1) {
-      toast.info(t("createClient.batchSoon"));
-      return;
-    }
-    if (password.length < 8) {
-      setError(t("createClient.passwordHint"));
-      return;
-    }
-    const nextSubdomain = subdomain.trim();
-    if (!nextSubdomain) {
+    setError(t("createClient.failed"));
+    setPhase("complete");
+  };
+
+  const commit = async () => {
+    if (!quote) return;
+    const items = quote.items.map((item) => ({
+      quoteItemId: item.id,
+      offerRevision: item.offerRevision,
+      subdomain: normalizeDraftSubdomain(drafts[item.id]?.subdomain || ""),
+      password: drafts[item.id]?.password || "",
+    }));
+    if (items.some((item) => !item.subdomain.trim())) {
       setError(t("createClient.subdomainRequired"));
       return;
     }
-    setBusy(true);
+    if (items.some((item) => !isValidDraftSubdomain(item.subdomain))) {
+      setError(t("createClient.subdomainInvalid"));
+      return;
+    }
+    if (new Set(items.map((item) => item.subdomain)).size !== items.length) {
+      setError(t("createClient.subdomainDuplicate"));
+      return;
+    }
+    if (items.some((item) => item.password.length < 8)) {
+      setError(t("createClient.passwordHint"));
+      return;
+    }
+    setLoading(true);
     setError("");
     try {
-      const availability = await checkClientTunnelSubdomainAvailability(nextSubdomain);
-      if (!availability.available) {
-        setError(t("createClient.subdomainTaken"));
-        setBusy(false);
+      setSubdomainChecks(Object.fromEntries(items.map((item) => [item.quoteItemId, { value: item.subdomain, status: "checking" }])));
+      const availability = await Promise.all(
+        items.map(async (item) => {
+          try {
+            return { item, result: await checkClientTunnelSubdomainAvailability(item.subdomain) };
+          } catch {
+            return { item, error: true as const };
+          }
+        }),
+      );
+      setSubdomainChecks(Object.fromEntries(availability.map(({ item, ...entry }) => [
+        item.quoteItemId,
+        "error" in entry
+          ? { value: item.subdomain, status: "error", message: t("createClient.subdomainCheckFailed") }
+          : entry.result.available
+            ? { value: item.subdomain, status: "available" }
+            : { value: item.subdomain, status: "unavailable", message: t("createClient.subdomainTaken") },
+      ])) as Record<string, SubdomainCheck>);
+      if (availability.some((entry) => "error" in entry)) {
+        setError(t("createClient.subdomainCheckFailed"));
         return;
       }
-      const { jobId } = await createClientMarketClient({
-        hostOwnerEmails: resolvedOwnerEmails,
-        countryCodes: resolvedCountryCodes,
-        subdomain: nextSubdomain,
-        password,
-        count: 1,
-      });
-      setPassword("");
+      if (availability.some((entry) => entry.result?.available === false)) {
+        setError(t("createClient.subdomainTaken"));
+        return;
+      }
+      const response = await commitClientMarketQuote(quote.id, items);
+      setDrafts({});
+      setSubdomainChecks({});
+      setJobs(Object.fromEntries(response.jobIds.map((id) => [id, { id, status: "pending", jobType: "create", phase: "pending", log: "", createdAt: "", updatedAt: "" } as ProvisioningJob])));
       setPhase("running");
-      setJobLog("");
-      const generation = pollGenerationRef.current;
-      await pollJob(jobId, generation);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-      setPhase("form");
+      const generation = pollGeneration.current;
+      void pollJobs(response.jobIds, generation);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
-      setBusy(false);
+      setLoading(false);
     }
   };
 
-  const primaryLabel = !authed ? t("createClient.login") : phase === "running" ? t("createClient.provisioning") : t("createClient.create");
-  const handleOpenChange = (nextOpen: boolean) => {
+  const cancelQuote = async () => {
+    if (quote) await cancelClientMarketQuote(quote.id).catch(() => undefined);
+    setQuote(null);
+    setDrafts({});
+    setSubdomainChecks({});
+    subdomainCheckGeneration.current += 1;
+    setPhase("form");
+  };
+
+  const close = (nextOpen: boolean) => {
     if (!nextOpen && phase === "running") return;
+    if (!nextOpen && phase === "quote" && quote) void cancelClientMarketQuote(quote.id).catch(() => undefined);
+    if (!nextOpen) subdomainCheckGeneration.current += 1;
+    pollGeneration.current += 1;
     onOpenChange(nextOpen);
   };
-  const installCommand = React.useMemo(
-    () =>
-      buildClientInstallCommand({
-        ownerEmail,
-        passwordPlaceholder: t("createClient.manualPasswordPlaceholder"),
-      }),
-    [ownerEmail, t],
-  );
-  const copyInstallCommand = React.useCallback(async () => {
-    try {
-      await navigator.clipboard.writeText(installCommand);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 2000);
-    } catch {
-      setCopied(false);
-    }
-  }, [installCommand]);
-  const showOnlineProgress = phase === "running" || phase === "failed" || phase === "success";
-  const activeMode: CreateMode = showOnlineProgress ? "online" : mode;
+
+  const installCommand = React.useMemo(() => buildClientInstallCommand({ ownerEmail }), [ownerEmail]);
+  const quoteSeconds = secondsRemaining(quote?.expiresAt);
+  const subdomainsCanCommit = !!quote && quote.items.every((item) => {
+    const value = normalizeDraftSubdomain(drafts[item.id]?.subdomain || "");
+    const check = subdomainChecks[item.id];
+    return isValidDraftSubdomain(value) && check?.value === value && (check.status === "available" || check.status === "error");
+  });
+  const jobList = Object.values(jobs);
+  const successes = jobList.filter((job) => job.status === "succeeded").length;
+  const failures = jobList.filter((job) => job.status === "failed").length;
 
   return (
-    <Modal.Backdrop
-      isOpen={open}
-      onOpenChange={handleOpenChange}
-      isDismissable={phase !== "running"}
-    >
-        <Modal.Container placement="center">
-          <Modal.Dialog className="light w-[min(640px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
-            <Modal.Header>
-              <Modal.Heading className="!text-slate-900">{t("createClient.title")}</Modal.Heading>
-            </Modal.Header>
-            <Modal.Body className="grid max-h-[min(70vh,560px)] gap-4 overflow-y-auto !text-slate-900">
-              {!showOnlineProgress ? (
-                <Tabs
-                  selectedKey={mode}
-                  onSelectionChange={(key: React.Key) => setMode(String(key) as CreateMode)}
-                  variant="secondary"
-                  className="text-foreground"
-                >
-                  <Tabs.List className="grid w-full grid-cols-2 text-foreground">
-                    <Tabs.Tab
-                      id="manual"
-                      className="rounded-md border border-transparent px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors data-[selected=true]:border-primary/30 data-[selected=true]:bg-primary/10 data-[selected=true]:text-primary"
-                    >
-                      {t("createClient.tabManual")}
-                    </Tabs.Tab>
-                    <Tabs.Tab
-                      id="online"
-                      className="rounded-md border border-transparent px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors data-[selected=true]:border-primary/30 data-[selected=true]:bg-primary/10 data-[selected=true]:text-primary"
-                    >
-                      {t("createClient.tabOnline")}
-                    </Tabs.Tab>
-                  </Tabs.List>
-                </Tabs>
-              ) : null}
+    <Modal.Backdrop isOpen={open} onOpenChange={close} isDismissable={phase !== "running"}>
+      <Modal.Container placement="center">
+        <Modal.Dialog className="light min-w-0 w-[min(720px,calc(100vw-2rem))] max-w-none overflow-hidden !bg-white !text-slate-900">
+          <Modal.Header><Modal.Heading>{fixedHost ? t("createClient.fixedTitle", { host: fixedHost.hostname || fixedHost.ip || fixedHost.id.slice(0, 8) }) : t("createClient.title")}</Modal.Heading></Modal.Header>
+          <Modal.Body className="grid min-w-0 max-h-[min(76vh,680px)] grid-cols-[minmax(0,1fr)] gap-4 overflow-y-auto">
+            {phase === "form" && !fixedHost ? (
+              <Tabs selectedKey={mode} onSelectionChange={(key: React.Key) => setMode(String(key) as CreateMode)} variant="secondary">
+                <Tabs.List className="grid w-full grid-cols-2"><Tabs.Tab id="manual">{t("createClient.tabManual")}</Tabs.Tab><Tabs.Tab id="online">{t("createClient.tabOnline")}</Tabs.Tab></Tabs.List>
+              </Tabs>
+            ) : null}
 
-              {phase === "success" ? (
-                <div className="grid gap-2 rounded-lg border border-emerald-200 bg-emerald-50 p-4 text-sm">
-                  <p className="font-semibold text-emerald-900">{t("createClient.successTitle")}</p>
-                  <p>
-                    <span className="text-muted-foreground">{t("createClient.successSubdomain")}: </span>
-                    <span className="font-mono">{successInfo.subdomain}</span>
-                  </p>
-                  <p>
-                    <span className="text-muted-foreground">{t("createClient.successInstallation")}: </span>
-                    <span className="font-mono text-xs">{successInfo.installationId}</span>
-                  </p>
-                  {successInfo.hostOwnerEmail ? (
-                    <p>
-                      <span className="text-muted-foreground">{t("createClient.successHostOwner")}: </span>
-                      {successInfo.hostOwnerEmail}
-                    </p>
-                  ) : null}
-                  {successInfo.clientOwnerEmail ? (
-                    <p>
-                      <span className="text-muted-foreground">{t("createClient.successClientOwner")}: </span>
-                      {successInfo.clientOwnerEmail}
-                    </p>
-                  ) : null}
-                  {successInfo.countryCode ? (
-                    <p className="flex items-center gap-2">
-                      <span className="text-muted-foreground">{t("createClient.successRegion")}: </span>
-                      <CountryFlag code={successInfo.countryCode} className="h-3.5 w-5 rounded-sm object-cover" />
-                      <span>{regionNames.of(successInfo.countryCode) || successInfo.countryCode}</span>
-                    </p>
-                  ) : null}
-                  {successInfo.clientUrl ? (
-                    <a
-                      href={successInfo.clientUrl}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="inline-flex min-w-0 items-center gap-1.5 font-medium text-primary hover:underline"
-                    >
-                      <span className="truncate">{successInfo.clientUrl}</span>
-                      <ExternalLink className="h-3.5 w-3.5 shrink-0" />
-                    </a>
-                  ) : null}
-                </div>
-              ) : phase === "running" || phase === "failed" ? (
-                <div className="grid gap-2">
-                  <ProvisionJobLog log={jobLog} phase={phase === "failed" ? "failed" : "running"} />
-                  {error ? (
-                    <p className={phase === "failed" ? "text-sm text-rose-600" : "text-sm text-amber-600"}>
-                      {error}
-                    </p>
-                  ) : null}
-                </div>
-              ) : activeMode === "manual" ? (
-                <div className="grid gap-3">
-                  <p className="text-sm text-muted-foreground">{t("createClient.manualDescription")}</p>
-                  <div className="rounded-lg border bg-slate-50 p-3">
-                    <div className="mb-2 font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
-                      {t("createClient.manualCommandLabel")}
-                    </div>
-                    <pre className="overflow-x-auto whitespace-pre-wrap break-all font-mono text-[12px] leading-6 text-slate-900">
-                      {installCommand}
-                    </pre>
-                  </div>
-                </div>
-              ) : (
-                <>
-                  {supplyLoading ? (
-                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                      …
-                    </div>
-                  ) : null}
-                  <section className="grid gap-2">
-                    <div className="text-sm font-medium text-slate-900">{t("createClient.hostOwners")}</div>
-                    <div className="flex flex-wrap gap-2">
-                      <Button
-                        size="sm"
-                        variant={safeHostOwnersPersist.mode === "all" ? "primary" : "outline"}
-                        onClick={() => setHostOwnersPersist({ mode: "all", emails: allOwners })}
-                      >
-                        {t("createClient.hostOwnersAll")}
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() => setHostOwnersPersist({ mode: "subset", emails: [] })}
-                      >
-                        {t("createClient.clearOwners")}
-                      </Button>
-                    </div>
-                    <div className="grid max-h-32 gap-1 overflow-y-auto rounded-lg border p-2 text-slate-900">
-                      {allOwners.length === 0 ? (
-                        <p className="px-1 py-2 text-xs text-muted-foreground">—</p>
-                      ) : (
-                        allOwners.map((email) => {
-                          const checked =
-                            safeHostOwnersPersist.mode === "all" ||
-                            safeHostOwnersPersist.emails.some((selected) => selected.toLowerCase() === email.toLowerCase());
-                          return (
-                            <label key={email} className="flex cursor-pointer items-center gap-2 text-sm text-slate-900">
-                              <input
-                                type="checkbox"
-                                checked={checked}
-                                onChange={() => {
-                                  if (safeHostOwnersPersist.mode === "all") {
-                                    setHostOwnersPersist({
-                                      mode: "subset",
-                                      emails: allOwners.filter((item) => item !== email),
-                                    });
-                                    return;
-                                  }
-                                  toggleOwner(email);
-                                }}
-                              />
-                              <span className="truncate">{email}</span>
-                            </label>
-                          );
-                        })
-                      )}
-                    </div>
+            {phase === "form" && mode === "manual" && !fixedHost ? (
+              <div className="grid gap-3"><p className="text-sm text-muted-foreground">{t("createClient.manualDescription")}</p><pre className="overflow-x-auto whitespace-pre-wrap break-all rounded-md border bg-slate-50 p-3 font-mono text-xs leading-6">{installCommand}</pre></div>
+            ) : null}
+
+            {phase === "form" && (mode === "online" || fixedHost) ? (
+              <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-5">
+                {loading ? <div className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />{t("createClient.loadingSupply")}</div> : null}
+                {fixedHost ? (
+                  <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-2 rounded-md border p-3">
+                    <div className="flex flex-wrap items-center gap-2"><Server className="h-4 w-4" /><strong className="text-sm">{fixedHost.hostname || fixedHost.ip}</strong><Chip size="sm" variant="soft">{fixedHost.countryCode || "-"}</Chip></div>
+                    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-2 text-xs text-muted-foreground"><span className="min-w-0 truncate" title={fixedHost.hostOwnerEmail}>{fixedHost.hostOwnerEmail}</span><span className="font-medium text-foreground">{formatOffer(fixedHost.priceCents, fixedHost.rentalPeriodDays, locale)}</span><PaymentMethodIcons kinds={fixedHost.paymentMethodKinds || []} className="col-span-2" /></div>
                   </section>
-
-                  <section className="grid gap-2">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <div className="text-sm font-medium text-slate-900">{t("createClient.regions")}</div>
-                      <div className="flex flex-wrap gap-2">
-                        <Button
-                          size="sm"
-                          variant={safeRegionsPersist.mode === "all" ? "primary" : "outline"}
-                          onClick={() => setRegionsPersist({ mode: "all", codes: regionOptions.map((r) => r.code) })}
-                        >
-                          {t("createClient.regionsAll")}
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={() => setRegionsPersist({ mode: "subset", codes: [] })}
-                        >
-                          {t("createClient.clearRegions")}
-                        </Button>
+                ) : (
+                  <>
+                    <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-2">
+                      <div className="grid min-w-0 gap-2 sm:flex sm:flex-wrap sm:items-center sm:justify-between"><span className="text-sm font-medium">{t("createClient.hostProvider")}</span><Button size="sm" className="min-w-0 max-w-full justify-start" variant={safeProviders.mode === "official_default" ? "primary" : "outline"} onClick={() => setProviderPersist({ mode: "official_default", providerIds: [] })}><span className="min-w-0 truncate">{t("createClient.official")} · {routerOwnerEmail || t("createClient.routerOwner")}</span></Button></div>
+                      {safeProviders.mode === "official_default" && capacity === 0 ? <p className="text-xs text-amber-700">{t("createClient.officialUnavailable")}</p> : null}
+                      <div className="grid min-w-0 max-h-44 grid-cols-[minmax(0,1fr)] gap-1 overflow-y-auto rounded-md border p-2">
+                        {providers.map((provider) => {
+                          const checked = selectedProviderIds.includes(provider.providerId);
+                          return <label key={provider.providerId} className="grid min-w-0 cursor-pointer grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-2 gap-y-1 rounded px-1 py-1.5 text-sm hover:bg-slate-50"><input className="row-span-2" type="checkbox" checked={checked} onChange={() => {
+                            const current = new Set(selectedProviderIds);
+                            if (current.has(provider.providerId)) current.delete(provider.providerId); else current.add(provider.providerId);
+                            setProviderPersist({ mode: "custom", providerIds: Array.from(current) });
+                          }} /><span className="min-w-0 truncate" title={provider.ownerEmail}>{provider.ownerEmail}</span><span className="font-mono text-xs text-muted-foreground">{provider.idleTotal}/{provider.hostTotal}</span><span className="col-span-2 col-start-2 flex min-w-0 flex-wrap items-center gap-1.5">{provider.official ? <Chip size="sm" variant="soft">{t("createClient.official")}</Chip> : null}<PaymentMethodIcons kinds={provider.paymentMethodKinds} /></span></label>;
+                        })}
                       </div>
-                    </div>
-                    <div className="grid max-h-44 gap-1 overflow-y-auto rounded-lg border p-2 text-slate-900">
-                      {regionOptions.length === 0 ? (
-                        <p className="px-1 py-2 text-xs text-muted-foreground">—</p>
-                      ) : (
-                        regionOptions.map((region) => {
-                          const checked =
-                            safeRegionsPersist.mode === "all" || safeRegionsPersist.codes.includes(region.code);
-                          return (
-                            <label key={region.code} className="flex cursor-pointer items-center gap-2 rounded-md px-1 py-1 text-sm text-slate-900 hover:bg-slate-50">
-                              <input
-                                type="checkbox"
-                                checked={checked}
-                                onChange={() => {
-                                  if (safeRegionsPersist.mode === "all") {
-                                    const next = regionOptions.map((r) => r.code).filter((c) => c !== region.code);
-                                    setRegionsPersist({ mode: "subset", codes: next });
-                                    return;
-                                  }
-                                  toggleRegion(region.code);
-                                }}
-                              />
-                              <CountryFlag code={region.code} className="h-3.5 w-5 rounded-sm object-cover" />
-                              <span className="min-w-0 flex-1 truncate font-medium">
-                                {regionNames.of(region.code) || region.code}
-                              </span>
-                              <span className="shrink-0 font-mono text-xs text-muted-foreground">
-                                {region.idle}/{region.total}
-                              </span>
-                            </label>
-                          );
-                        })
-                      )}
-                    </div>
-                  </section>
+                    </section>
+                    <section className="grid gap-2"><span className="text-sm font-medium">{t("createClient.regions")}</span><div className="grid max-h-40 gap-1 overflow-y-auto rounded-md border p-2">
+                      {regionOptions.map((region) => {
+                        const checked = selectedCountryCodes.includes(region.code);
+                        return <label key={region.code} className="flex cursor-pointer items-center gap-2 rounded px-1 py-1.5 text-sm hover:bg-slate-50"><input type="checkbox" checked={checked} onChange={() => {
+                          const current = new Set(selectedCountryCodes);
+                          if (current.has(region.code)) current.delete(region.code); else current.add(region.code);
+                          setRegionPersist({ mode: "subset", codes: Array.from(current) });
+                        }} /><CountryFlag code={region.code} className="h-3.5 w-5 rounded-sm object-cover" /><span className="min-w-0 flex-1 truncate">{regionNames.of(region.code) || region.code}</span><span className="font-mono text-xs text-muted-foreground">{region.idle}/{region.total}</span></label>;
+                      })}
+                    </div></section>
+                    <section className="flex flex-wrap items-center justify-between gap-3"><div><div className="text-sm font-medium">{t("createClient.quantity")}</div><div className="text-xs text-muted-foreground">{t("createClient.capacity", { idle: capacity })}</div></div><div className="inline-flex items-center gap-2"><Button isIconOnly size="sm" variant="outline" aria-label={t("createClient.decreaseQuantity")} isDisabled={quantity <= 1} onClick={() => setQuantity(1)}><Minus className="h-4 w-4" /></Button><span className="w-8 text-center font-mono">{quantity}</span><Button isIconOnly size="sm" variant="outline" aria-label={t("createClient.increaseQuantity")} isDisabled={quantity >= 2 || quantity >= capacity} onClick={() => setQuantity(2)}><Plus className="h-4 w-4" /></Button></div></section>
+                  </>
+                )}
+              </div>
+            ) : null}
 
-                  <section className="grid gap-2">
-                    <div className="text-sm font-medium text-slate-900">{t("createClient.quantity")}</div>
-                    <div className="inline-flex items-center gap-2">
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        isIconOnly
-                        className="h-8 w-8 min-w-8 rounded-md p-0"
-                        isDisabled={quantity <= 1 || busy}
-                        aria-label={t("createClient.decreaseQuantity")}
-                        onClick={() => setQuantity((q) => Math.max(1, q - 1))}
-                      >
-                        <Minus className="h-4 w-4" />
-                      </Button>
-                      <span className="min-w-8 text-center font-mono text-sm text-slate-900">{quantity}</span>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        isIconOnly
-                        className="h-8 w-8 min-w-8 rounded-md p-0"
-                        isDisabled={quantity >= Math.max(1, selectedIdleCapacity) || busy}
-                        aria-label={t("createClient.increaseQuantity")}
-                        onClick={() =>
-                          setQuantity((q) => Math.min(Math.max(1, selectedIdleCapacity), q + 1))
-                        }
-                      >
-                        <Plus className="h-4 w-4" />
-                      </Button>
-                    </div>
-                    <span className="text-xs text-muted-foreground">
-                      {t("createClient.capacity", { idle: selectedIdleCapacity })}
-                    </span>
-                  </section>
+            {phase === "quote" && quote ? (
+              <div className="grid gap-4">
+                <div className="flex flex-wrap items-center justify-between gap-2 border-b pb-3"><div><strong className="text-sm">{t("createClient.reservedHosts")}</strong><p className="text-xs text-muted-foreground">{t("createClient.reviewQuote")}</p></div><Chip size="sm" variant={quoteSeconds <= 30 ? "soft" : "tertiary"}>{quoteSeconds}s</Chip></div>
+                {quote.items.map((item, index) => {
+                  const draft = drafts[item.id] || { subdomain: "", password: "" };
+                  const subdomainValue = normalizeDraftSubdomain(draft.subdomain);
+                  const subdomainCheck = subdomainChecks[item.id]?.value === subdomainValue ? subdomainChecks[item.id] : undefined;
+                  return <section key={item.id} className="grid gap-3 rounded-md border p-3"><div className="flex flex-wrap items-center gap-2"><span className="font-mono text-xs text-muted-foreground">#{index + 1}</span><strong className="text-sm">{item.hostname || item.hostId.slice(0, 8)}</strong>{item.countryCode ? <CountryFlag code={item.countryCode} className="h-3.5 w-5 rounded-sm object-cover" /> : null}<span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{item.hostOwnerEmail}</span><span className="text-sm font-semibold">{formatOffer(item.priceCents, item.rentalPeriodDays, locale)}</span></div><label className="grid gap-1 text-sm"><span className="text-muted-foreground">{t("createClient.subdomain")}</span><div className="flex gap-2"><input value={draft.subdomain} onChange={(event) => setDrafts((current) => ({ ...current, [item.id]: { ...draft, subdomain: event.target.value } }))} className={`h-10 min-w-0 flex-1 rounded-md border px-3 font-mono ${subdomainCheck?.status === "unavailable" ? "border-rose-400" : subdomainCheck?.status === "available" ? "border-emerald-400" : ""}`} /><Button isIconOnly variant="outline" aria-label={t("createClient.randomSubdomain")} onClick={() => setDrafts((current) => ({ ...current, [item.id]: { ...draft, subdomain: randomSubdomain() } }))}><Dices className="h-4 w-4" /></Button></div>{subdomainCheck ? <span className={`flex items-center gap-1 text-xs ${subdomainCheck.status === "available" ? "text-emerald-700" : subdomainCheck.status === "unavailable" ? "text-rose-600" : "text-muted-foreground"}`}>{subdomainCheck.status === "checking" ? <Loader2 className="h-3 w-3 animate-spin" /> : subdomainCheck.status === "available" ? <Check className="h-3 w-3" /> : null}{subdomainCheck.status === "checking" ? t("createClient.subdomainChecking") : subdomainCheck.status === "available" ? t("createClient.subdomainAvailable") : subdomainCheck.message}</span> : null}</label><label className="grid gap-1 text-sm"><span className="text-muted-foreground">{t("createClient.password")}</span><input type="password" value={draft.password} onChange={(event) => setDrafts((current) => ({ ...current, [item.id]: { ...draft, password: event.target.value } }))} autoComplete="new-password" className="h-10 rounded-md border px-3" /></label></section>;
+                })}
+              </div>
+            ) : null}
 
-                  <label className="grid gap-1 text-sm">
-                    <span className="font-medium text-slate-900">{t("createClient.subdomain")}</span>
-                    <div className="flex items-center gap-2">
-                      <input
-                        value={quantity > 1 ? t("createClient.subdomainRandom") : subdomain}
-                        onChange={(e) => {
-                          if (quantity > 1) return;
-                          setSubdomain(e.target.value);
-                        }}
-                        readOnly={quantity > 1}
-                        disabled={quantity > 1}
-                        className="h-11 min-w-0 flex-1 rounded-lg border border-border bg-white px-3 font-mono text-slate-900 outline-none focus:ring-2 focus:ring-primary/30 disabled:cursor-not-allowed disabled:bg-slate-50 disabled:text-slate-500"
-                        autoComplete="off"
-                      />
-                      {quantity === 1 ? (
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="outline"
-                          className="h-11 shrink-0 gap-1.5 px-3"
-                          aria-label={t("createClient.randomSubdomain")}
-                          onClick={() => setSubdomain(randomSubdomain())}
-                        >
-                          <Dices className="h-4 w-4" />
-                          {t("createClient.randomSubdomain")}
-                        </Button>
-                      ) : null}
-                    </div>
-                  </label>
-                  <label className="grid gap-1 text-sm">
-                    <span className="font-medium text-slate-900">{t("createClient.password")}</span>
-                    <input
-                      type="password"
-                      value={password}
-                      onChange={(e) => setPassword(e.target.value)}
-                      className="h-11 rounded-lg border border-border bg-white px-3 text-slate-900 outline-none focus:ring-2 focus:ring-primary/30"
-                      autoComplete="new-password"
-                    />
-                    <span className="text-xs text-muted-foreground">{t("createClient.passwordHint")}</span>
-                  </label>
-                  {error ? <p className="text-sm text-rose-600">{error}</p> : null}
-                </>
-              )}
-            </Modal.Body>
-            <Modal.Footer>
-              <Button variant="ghost" isDisabled={phase === "running"} onClick={() => handleOpenChange(false)}>
-                {phase === "success" ? t("createClient.close") : t("common.close")}
-              </Button>
-              {phase === "form" && activeMode === "manual" ? (
-                <Button variant="primary" onClick={() => void copyInstallCommand()}>
-                  {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
-                  {copied ? t("dashboard.connectDialog.copyOk") : t("dashboard.connectDialog.copy")}
-                </Button>
-              ) : null}
-              {(phase === "form" && activeMode === "online") || phase === "running" ? (
-                <Button
-                  variant="primary"
-                  isDisabled={
-                    busy ||
-                    authLoading ||
-                    phase === "running" ||
-                    (authed && selectedIdleCapacity < quantity)
-                  }
-                  onClick={() => void onPrimary()}
-                >
-                  {!authed ? <LogIn className="h-4 w-4" /> : busy || phase === "running" ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : null}
-                  {primaryLabel}
-                </Button>
-              ) : null}
-            </Modal.Footer>
-          </Modal.Dialog>
-        </Modal.Container>
+            {(phase === "running" || phase === "complete") ? (
+              <div className="grid gap-4">{phase === "complete" ? <div className={`rounded-md border p-3 text-sm ${failures ? "border-amber-200 bg-amber-50" : "border-emerald-200 bg-emerald-50"}`}><strong>{t("createClient.resultSummary", { successes, failures })}</strong>{failures ? <p className="mt-1 text-xs text-muted-foreground">{t("createClient.partialRollback")}</p> : null}</div> : null}{jobList.map((job, index) => <section key={job.id} className="grid gap-2"><div className="flex items-center justify-between text-xs"><span className="font-mono">#{index + 1} · {job.subdomain || job.id.slice(0, 8)}</span><Chip size="sm" variant="soft">{job.status}</Chip></div><ProvisionJobLog log={job.log || ""} phase={job.status === "failed" ? "failed" : job.status === "succeeded" ? "success" : "running"} /></section>)}</div>
+            ) : null}
+            {error ? <p className="text-sm text-rose-600">{error}</p> : null}
+          </Modal.Body>
+          <Modal.Footer>
+            {phase === "quote" ? <Button variant="ghost" isDisabled={loading} onClick={() => void cancelQuote()}><RotateCcw className="h-4 w-4" />{t("clientMarket.back")}</Button> : <Button variant="ghost" isDisabled={phase === "running"} onClick={() => close(false)}>{t("common.close")}</Button>}
+            {phase === "form" && mode === "manual" && !fixedHost ? <Button variant="primary" onClick={() => void navigator.clipboard.writeText(installCommand).then(() => { setCopied(true); window.setTimeout(() => setCopied(false), 1500); })}>{copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}{copied ? t("dashboard.connectDialog.copyOk") : t("dashboard.connectDialog.copy")}</Button> : null}
+            {phase === "form" && (mode === "online" || fixedHost) ? <Button variant="primary" isDisabled={loading || authLoading || (authed && capacity < quantity)} onClick={() => void requestQuote()}>{!authed ? <LogIn className="h-4 w-4" /> : loading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{!authed ? t("createClient.login") : !fixedHost && safeProviders.mode === "official_default" && capacity === 0 ? t("createClient.officialNoCapacityButton") : t("createClient.selectHosts")}</Button> : null}
+            {phase === "quote" ? <Button variant="primary" isDisabled={loading || quoteSeconds <= 0 || !subdomainsCanCommit} onClick={() => void commit()}>{loading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{t("createClient.confirmCreate")}</Button> : null}
+          </Modal.Footer>
+        </Modal.Dialog>
+      </Modal.Container>
     </Modal.Backdrop>
   );
 }

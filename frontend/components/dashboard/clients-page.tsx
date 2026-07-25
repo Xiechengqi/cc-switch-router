@@ -9,7 +9,7 @@ export function ClientsPage() {
   const { data, error, refresh } = useDashboardData();
 
   return (
-    <main className="mx-auto grid w-[calc(100%-2rem)] max-w-7xl gap-5 pb-6">
+    <main className="mx-auto grid min-w-0 w-[calc(100%-2rem)] max-w-7xl grid-cols-[minmax(0,1fr)] gap-5 pb-6">
       {error ? <Alert status="danger" className="!text-slate-900">{error}</Alert> : null}
       <LiveMap data={data} />
       <ClientBoard

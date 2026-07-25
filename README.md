@@ -80,6 +80,7 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_SSH_ADDR` | `0.0.0.0:2222` | SSH 监听地址 |
 | `CC_SWITCH_ROUTER_TUNNEL_DOMAIN` | `0.0.0.0:8787` | 公共 tunnel 域名 |
 | `CC_SWITCH_ROUTER_SSH_PUBLIC_ADDR` | `{TUNNEL_DOMAIN}:{SSH_PORT}` | 下发给客户端的 SSH 地址（Cloudflare 代理时填源站 IP:端口） |
+| `CC_SWITCH_ROUTER_OWNER_EMAIL` | `router@{TUNNEL_DOMAIN}` | Client Market 默认选中的官方 Host Provider 邮箱 |
 | `CC_SWITCH_ROUTER_USE_LOCALHOST` | `false` | 为 `false` 时 tunnel URL 使用 `https://` |
 | `CC_SWITCH_ROUTER_LEASE_TTL_SECS` | `60` | Tunnel lease 有效期（秒）；已连接 client 使用签名续期 API 原连接续期，不按该周期重建 SSH |
 | `CC_SWITCH_ROUTER_DB_PATH` | `$HOME/.cc-switch-router/cc-switch-router.db` | SQLite 路径 |
@@ -140,6 +141,7 @@ cat > "$HOME/.cc-switch-router/.env" <<'EOF'
 CC_SWITCH_ROUTER_API_ADDR=0.0.0.0:80
 CC_SWITCH_ROUTER_SSH_ADDR=0.0.0.0:2222
 CC_SWITCH_ROUTER_TUNNEL_DOMAIN=example.com
+CC_SWITCH_ROUTER_OWNER_EMAIL=router@example.com
 CC_SWITCH_ROUTER_USE_LOCALHOST=false
 CC_SWITCH_ROUTER_RESEND_API_KEY=re_xxx
 CC_SWITCH_ROUTER_RESEND_FROM=noreply@example.com

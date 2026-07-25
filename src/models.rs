@@ -1083,7 +1083,7 @@ mod share_settings_patch_tests {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ShareTokenPeriod {
     #[default]
@@ -1443,6 +1443,33 @@ pub struct ShareUsageByEmailResponse {
     pub days: u32,
     pub total_tokens: u64,
     pub rows: Vec<ShareUsageEmailRow>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareUserLimitStatusRow {
+    pub email: String,
+    pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_limit: Option<u64>,
+    pub token_period: ShareTokenPeriod,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    pub tokens_used: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareUserLimitStatusResponse {
+    pub share_id: String,
+    pub app: String,
+    pub rows: Vec<ShareUserLimitStatusRow>,
 }
 
 #[derive(Debug, Serialize)]

@@ -94,6 +94,9 @@ pub struct Config {
     pub free_share_ip_parallel_limit: i64,
     pub verification_service_base_url: String,
     pub verification_service_api_key: Option<String>,
+    /// The official Client Market Provider. This is intentionally independent
+    /// from the broader administrator set.
+    pub router_owner_email: Option<String>,
     pub admin_emails: HashSet<String>,
     pub telegram_bot_token: Option<String>,
     pub telegram_chat_id: Option<String>,
@@ -119,6 +122,10 @@ impl Config {
         if let Some(default_admin) = derive_default_admin_email(&tunnel_domain) {
             admin_emails.insert(default_admin);
         }
+        let router_owner_email = resolve_router_owner_email(
+            env_var("CC_SWITCH_ROUTER_OWNER_EMAIL").as_deref(),
+            &tunnel_domain,
+        );
         let provision_ssh_private_key_path =
             env_var("CC_SWITCH_ROUTER_PROVISION_SSH_PRIVATE_KEY_PATH")
                 .or_else(|| env_var("CC_SWITCH_ROUTER_PROVISION_SSH_KEY_PATH"))
@@ -253,6 +260,7 @@ impl Config {
             )
             .unwrap_or_else(|| "https://tokenswitch.org".to_string()),
             verification_service_api_key: env_var("CC_SWITCH_ROUTER_VERIFICATION_SERVICE_API_KEY"),
+            router_owner_email,
             admin_emails,
             telegram_bot_token: env_var("CC_SWITCH_ROUTER_TELEGRAM_BOT_TOKEN")
                 .filter(|v| !v.trim().is_empty()),
@@ -313,6 +321,14 @@ impl Config {
     /// in lowercase. Returns `None` if the tunnel domain has no usable host.
     pub fn default_admin_email(&self) -> Option<String> {
         derive_default_admin_email(&self.tunnel_domain)
+    }
+
+    pub fn official_provider_email(&self) -> Option<&str> {
+        self.router_owner_email.as_deref()
+    }
+
+    pub fn validate_official_provider_config(&self) -> std::result::Result<(), String> {
+        validate_official_provider_config(self.use_localhost, self.router_owner_email.as_deref())
     }
 
     pub fn tunnel_url(&self, subdomain: &str) -> String {
@@ -434,6 +450,7 @@ CC_SWITCH_ROUTER_API_ADDR=0.0.0.0:80
 CC_SWITCH_ROUTER_SSH_ADDR=0.0.0.0:2222
 CC_SWITCH_ROUTER_TUNNEL_DOMAIN=
 CC_SWITCH_ROUTER_SSH_PUBLIC_ADDR=
+CC_SWITCH_ROUTER_OWNER_EMAIL=
 CC_SWITCH_ROUTER_USE_LOCALHOST=false
 CC_SWITCH_ROUTER_LEASE_TTL_SECS=60
 CC_SWITCH_ROUTER_DB_PATH={}
@@ -593,6 +610,30 @@ fn derive_default_admin_email(tunnel_domain: &str) -> Option<String> {
     tunnel_domain_host(tunnel_domain).map(|host| format!("router@{host}"))
 }
 
+fn resolve_router_owner_email(configured: Option<&str>, tunnel_domain: &str) -> Option<String> {
+    let configured = configured
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    match configured {
+        Some(value) => crate::notifications::is_basic_email(&value).then_some(value),
+        None => derive_default_admin_email(tunnel_domain)
+            .filter(|value| crate::notifications::is_basic_email(value)),
+    }
+}
+
+fn validate_official_provider_config(
+    use_localhost: bool,
+    router_owner_email: Option<&str>,
+) -> std::result::Result<(), String> {
+    if use_localhost || router_owner_email.is_some() {
+        return Ok(());
+    }
+    Err(
+        "production Client Market requires a valid CC_SWITCH_ROUTER_OWNER_EMAIL or a tunnel domain that resolves router@<tunnel-domain>"
+            .into(),
+    )
+}
+
 fn data_dir_in_home() -> Option<PathBuf> {
     env::var_os("HOME")
         .map(PathBuf::from)
@@ -648,6 +689,7 @@ mod tests {
             free_share_ip_parallel_limit: 1,
             verification_service_base_url: "https://example.com".into(),
             verification_service_api_key: None,
+            router_owner_email: None,
             admin_emails: HashSet::new(),
             telegram_bot_token: None,
             telegram_chat_id: None,
@@ -832,6 +874,22 @@ mod tests {
         );
         assert_eq!(derive_default_admin_email(":8787"), None);
         assert_eq!(derive_default_admin_email("   "), None);
+    }
+
+    #[test]
+    fn router_owner_email_prefers_valid_override_and_rejects_unresolvable_production() {
+        assert_eq!(
+            resolve_router_owner_email(Some(" Owner@Example.COM "), "router.invalid"),
+            Some("owner@example.com".into())
+        );
+        assert_eq!(
+            resolve_router_owner_email(Some("not-an-email"), "router.example.com"),
+            None
+        );
+
+        assert!(validate_official_provider_config(false, None).is_err());
+        assert!(validate_official_provider_config(true, None).is_ok());
+        assert!(validate_official_provider_config(false, Some("owner@example.com")).is_ok());
     }
 
     #[test]

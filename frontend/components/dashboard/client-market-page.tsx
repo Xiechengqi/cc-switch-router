@@ -1,29 +1,36 @@
 "use client";
 
 import * as React from "react";
-import { Button, Chip, Dropdown, Modal, Tabs, toast } from "@heroui/react";
-import { Check, ChevronDown, ChevronLeft, ChevronRight, Circle, Loader2, MoreHorizontal, Plus, RefreshCw, Trash2, X } from "lucide-react";
+import { Button, Chip, Dropdown, Modal, Tabs, toast, Tooltip } from "@heroui/react";
+import { Check, ChevronDown, ChevronLeft, ChevronRight, Circle, Clock3, Download, Loader2, MoreHorizontal, Pencil, Plus, RefreshCw, Trash2, Upload, X } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { CopyableCodeField } from "@/components/common/copyable-code-field";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { CountryFlag } from "@/components/common/country-flag";
+import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
+import { CreateClientDialog } from "@/components/dashboard/create-client-dialog";
 import { ProvisionJobLog } from "@/components/dashboard/provision-job-log";
 import { WebTerminalGlyph } from "@/components/dashboard/web-terminal/web-terminal-glyph";
 import { useWebTerminal } from "@/components/dashboard/web-terminal";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
-  cleanupClientMarketClient,
+  cleanupClientMarketClientWithReason,
   createClientMarketHost,
   deleteClientMarketHost,
+  exportMyClientMarketHosts,
+  getClientMarketProviderSupply,
   getClientMarketHosts,
   getClientMarketJob,
+  getMyClientMarketBilling,
   getProvisionSshKey,
+  importMyClientMarketHosts,
   lookupClientMarketHostIpInfo,
   reverifyClientMarketHost,
   testClientMarketHostSsh,
+  updateClientMarketHostOffer,
 } from "@/lib/api";
-import type { ClientMarketHost, HostIpIntel, ProvisionSshKey, ProvisioningJob } from "@/lib/types";
+import type { ClientMarketBilling, ClientMarketHost, ClientMarketHostImportResponse, ClientMarketProvider, HostIpIntel, ProvisionSshKey, ProvisioningJob } from "@/lib/types";
 import type { MessageKey } from "@/lib/i18n";
 import { usePersistentState } from "@/lib/use-persistent-state";
 
@@ -88,6 +95,30 @@ function containsCjk(value: string) {
   return /[\u3400-\u9fff]/.test(value);
 }
 
+function formatObservationRate(value: number | undefined, locale: string) {
+  if (value == null) return "-";
+  return new Intl.NumberFormat(locale, { style: "percent", maximumFractionDigits: 1 }).format(value);
+}
+
+function formatObservationDate(value: string, locale: string) {
+  return new Intl.DateTimeFormat(locale, { dateStyle: "medium" }).format(new Date(value));
+}
+
+function formatProviderPriceRange(provider: ClientMarketProvider, locale: string) {
+  if (provider.minPriceCents == null || provider.maxPriceCents == null) return "-";
+  const format = new Intl.NumberFormat(locale, { style: "currency", currency: "USD" });
+  const min = format.format(provider.minPriceCents / 100);
+  const max = format.format(provider.maxPriceCents / 100);
+  return min === max ? min : `${min}-${max}`;
+}
+
+function formatProviderPeriodRange(provider: ClientMarketProvider) {
+  if (provider.minRentalPeriodDays == null || provider.maxRentalPeriodDays == null) return "-";
+  return provider.minRentalPeriodDays === provider.maxRentalPeriodDays
+    ? String(provider.minRentalPeriodDays)
+    : `${provider.minRentalPeriodDays}-${provider.maxRentalPeriodDays}`;
+}
+
 function translateMappedLabel(
   raw: string | undefined,
   map: Record<string, MessageKey>,
@@ -142,6 +173,7 @@ function formatHostIpLocation(
 function statusLabelKey(status: string): MessageKey {
   const known = {
     idle: "clientMarket.status.idle",
+    reserved: "clientMarket.status.reserved",
     allocated: "clientMarket.status.allocated",
     locked: "clientMarket.status.locked",
     draining: "clientMarket.status.draining",
@@ -155,6 +187,7 @@ function statusLabelKey(status: string): MessageKey {
 const HOST_STATUS_TABS = [
   "all",
   "idle",
+  "reserved",
   "allocated",
   "locked",
   "draining",
@@ -169,6 +202,7 @@ function statusHintKey(status: HostStatusFilter): MessageKey {
   const known = {
     all: "clientMarket.statusHint.all",
     idle: "clientMarket.statusHint.idle",
+    reserved: "clientMarket.statusHint.reserved",
     allocated: "clientMarket.statusHint.allocated",
     locked: "clientMarket.statusHint.locked",
     draining: "clientMarket.statusHint.draining",
@@ -182,6 +216,66 @@ function statusHintKey(status: HostStatusFilter): MessageKey {
 function authorizedKeysInstallCommand(line: string): string {
   const escaped = line.replace(/'/g, `'\\''`);
   return `echo '${escaped}' >> $HOME/.ssh/authorized_keys`;
+}
+
+type Translate = (key: MessageKey, values?: Record<string, string | number>) => string;
+
+function formatHostOffer(priceCents: number | undefined, rentalPeriodDays: number | undefined, locale: string) {
+  if (!priceCents || !rentalPeriodDays) return locale.startsWith("zh") ? "免费 · 永久" : "Free · forever";
+  const amount = new Intl.NumberFormat(locale, { style: "currency", currency: "USD" }).format(priceCents / 100);
+  return locale.startsWith("zh") ? `${amount} · ${rentalPeriodDays} 天` : `${amount} · ${rentalPeriodDays}d`;
+}
+
+function compactCountdown(value: string, locale: string) {
+  const remainingMinutes = Math.max(0, Math.ceil((Date.parse(value) - Date.now()) / 60_000));
+  const days = Math.floor(remainingMinutes / 1_440);
+  const hours = Math.floor((remainingMinutes % 1_440) / 60);
+  const minutes = remainingMinutes % 60;
+  if (locale.startsWith("zh")) {
+    if (days) return `${days}天 ${hours}小时`;
+    if (hours) return `${hours}小时 ${minutes}分钟`;
+    return `${minutes}分钟`;
+  }
+  if (days) return `${days}d ${hours}h`;
+  if (hours) return `${hours}h ${minutes}m`;
+  return `${minutes}m`;
+}
+
+function HostBillingCountdown({ billing }: { billing?: ClientMarketBilling }) {
+  const { locale, t } = useLocaleText();
+  const [, tick] = React.useState(0);
+  const target = billing?.status === "payment_due" ? billing.paymentDeadline : billing?.currentPeriodEnd;
+
+  React.useEffect(() => {
+    if (!target) return;
+    const timer = window.setInterval(() => tick((value) => value + 1), 30_000);
+    return () => window.clearInterval(timer);
+  }, [target]);
+
+  if (!billing || !target || !billing.priceCents) return null;
+  const key = billing.status === "payment_due" ? "clientMarket.paymentDueCountdown" : "clientMarket.nextBillCountdown";
+  return (
+    <span className={`inline-flex shrink-0 items-center gap-1 text-xs ${billing.status === "payment_due" ? "text-amber-700" : "text-muted-foreground"}`} title={new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(target))}>
+      <Clock3 className="h-3.5 w-3.5" />
+      {t(key, { countdown: compactCountdown(target, locale) })}
+    </span>
+  );
+}
+
+function parseHostOffer(priceUsd: string, periodDays: string, t: Translate) {
+  const price = priceUsd.trim();
+  const period = periodDays.trim();
+  if (!price && !period) return { priceCents: undefined, rentalPeriodDays: undefined };
+  if (!price || !period || !/^\d{1,7}(?:\.\d{1,2})?$/.test(price) || !/^\d+$/.test(period)) {
+    throw new Error(t("clientMarket.offerInvalid"));
+  }
+  const [whole, fraction = ""] = price.split(".");
+  const priceCents = Number(whole) * 100 + Number(fraction.padEnd(2, "0"));
+  const rentalPeriodDays = Number(period);
+  if (priceCents < 1 || priceCents > 100_000_000 || rentalPeriodDays < 4 || rentalPeriodDays > 3_650) {
+    throw new Error(t("clientMarket.offerRange"));
+  }
+  return { priceCents, rentalPeriodDays };
 }
 
 function AddHostDialog({
@@ -202,6 +296,8 @@ function AddHostDialog({
   const [port, setPort] = React.useState("22");
   const [rootPassword, setRootPassword] = React.useState("");
   const [note, setNote] = React.useState("");
+  const [priceUsd, setPriceUsd] = React.useState("");
+  const [rentalPeriodDays, setRentalPeriodDays] = React.useState("");
   const [busy, setBusy] = React.useState(false);
   const [testing, setTesting] = React.useState(false);
   const [error, setError] = React.useState("");
@@ -290,6 +386,13 @@ function AddHostDialog({
   const submit = async () => {
     const parsedPort = parsePort();
     if (parsedPort == null) return;
+    let offer: ReturnType<typeof parseHostOffer>;
+    try {
+      offer = parseHostOffer(priceUsd, rentalPeriodDays, t);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+      return;
+    }
     if (note.length > 500) {
       setError(t("clientMarket.noteTooLong"));
       return;
@@ -316,6 +419,7 @@ function AddHostDialog({
           port: parsedPort,
           note: note.trim() || undefined,
           rootPassword,
+          ...offer,
         });
         setIpIntel(host.ipIntel || null);
         setStepStatus({
@@ -352,6 +456,7 @@ function AddHostDialog({
           ip: hostIp,
           port: parsedPort,
           note: note.trim() || undefined,
+          ...offer,
         });
         setStepStatus({
           installKey: "pending",
@@ -379,6 +484,8 @@ function AddHostDialog({
       setPort("22");
       setRootPassword("");
       setNote("");
+      setPriceUsd("");
+      setRentalPeriodDays("");
       setPhase("form");
       setError("");
       setIpIntel(null);
@@ -549,6 +656,29 @@ function AddHostDialog({
                     <span className="text-xs text-muted-foreground">{t("clientMarket.rootPasswordHint")}</span>
                   </label>
                 ) : null}
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <label className="grid gap-1 text-sm">
+                    <span className="text-muted-foreground">{t("clientMarket.rentalPrice")}</span>
+                    <input
+                      value={priceUsd}
+                      onChange={(event) => setPriceUsd(event.target.value)}
+                      placeholder={t("clientMarket.free")}
+                      inputMode="decimal"
+                      className="h-11 rounded-lg border border-border bg-white px-3 text-slate-900 outline-none focus:ring-2 focus:ring-primary/30"
+                    />
+                  </label>
+                  <label className="grid gap-1 text-sm">
+                    <span className="text-muted-foreground">{t("clientMarket.rentalPeriod")}</span>
+                    <input
+                      value={rentalPeriodDays}
+                      onChange={(event) => setRentalPeriodDays(event.target.value)}
+                      placeholder={t("clientMarket.forever")}
+                      inputMode="numeric"
+                      className="h-11 rounded-lg border border-border bg-white px-3 text-slate-900 outline-none focus:ring-2 focus:ring-primary/30"
+                    />
+                  </label>
+                </div>
+                <p className="text-xs text-muted-foreground">{t("clientMarket.offerHint")}</p>
                 <label className="grid gap-1 text-sm">
                   <span className="text-muted-foreground">{t("clientMarket.hostNote")}</span>
                   <input
@@ -681,37 +811,111 @@ function cleanupFailureGuidanceKey(failureCode?: string): MessageKey {
   return "clientMarket.cleanupFailedGuidance";
 }
 
-function HostRow({
+function HostOfferDialog({
   host,
-  viewerEmail,
-  isAdmin,
-  onChanged,
+  open,
+  onOpenChange,
+  onSaved,
 }: {
   host: ClientMarketHost;
-  viewerEmail?: string;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onSaved: () => void;
+}) {
+  const { t } = useLocaleText();
+  const [price, setPrice] = React.useState(host.priceCents ? (host.priceCents / 100).toFixed(2) : "");
+  const [period, setPeriod] = React.useState(host.rentalPeriodDays ? String(host.rentalPeriodDays) : "");
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState("");
+
+  React.useEffect(() => {
+    if (!open) return;
+    setPrice(host.priceCents ? (host.priceCents / 100).toFixed(2) : "");
+    setPeriod(host.rentalPeriodDays ? String(host.rentalPeriodDays) : "");
+    setError("");
+  }, [host.priceCents, host.rentalPeriodDays, open]);
+
+  const save = async () => {
+    let offer: ReturnType<typeof parseHostOffer>;
+    try {
+      offer = parseHostOffer(price, period, t);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      await updateClientMarketHostOffer(host.id, offer);
+      toast.success(t("clientMarket.offerUpdated"));
+      onSaved();
+      onOpenChange(false);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal.Backdrop isOpen={open} onOpenChange={(next) => !busy && onOpenChange(next)}>
+      <Modal.Container placement="center">
+        <Modal.Dialog className="light w-[min(460px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
+          <Modal.Header><Modal.Heading>{t("clientMarket.editOffer")}</Modal.Heading></Modal.Header>
+          <Modal.Body className="grid gap-4">
+            <p className="text-sm text-muted-foreground">{t("clientMarket.editOfferHint")}</p>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <label className="grid gap-1 text-sm"><span className="text-muted-foreground">{t("clientMarket.priceUsd")}</span><input value={price} onChange={(event) => setPrice(event.target.value)} placeholder={t("clientMarket.free")} inputMode="decimal" className="h-10 rounded-md border px-3" /></label>
+              <label className="grid gap-1 text-sm"><span className="text-muted-foreground">{t("clientMarket.periodDays")}</span><input value={period} onChange={(event) => setPeriod(event.target.value)} placeholder={t("clientMarket.forever")} inputMode="numeric" className="h-10 rounded-md border px-3" /></label>
+            </div>
+            <p className="text-xs text-muted-foreground">{t("clientMarket.makeFreeHint")}</p>
+            {error ? <p className="text-sm text-rose-600">{error}</p> : null}
+          </Modal.Body>
+          <Modal.Footer>
+            <Button variant="ghost" isDisabled={busy} onClick={() => onOpenChange(false)}>{t("common.cancel")}</Button>
+            <Button variant="primary" isDisabled={busy} onClick={() => void save()}>{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{t("common.save")}</Button>
+          </Modal.Footer>
+        </Modal.Dialog>
+      </Modal.Container>
+    </Modal.Backdrop>
+  );
+}
+
+function HostRow({
+  host,
+  billing,
+  isAdmin,
+  onChanged,
+  onCreate,
+}: {
+  host: ClientMarketHost;
+  billing?: ClientMarketBilling;
   isAdmin: boolean;
   onChanged: () => void;
+  onCreate: (host: ClientMarketHost) => void;
 }) {
   const { locale, t } = useLocaleText();
   const { openTerminal } = useWebTerminal();
   const [busy, setBusy] = React.useState(false);
-  const [confirmAction, setConfirmAction] = React.useState<"delete" | "cleanup" | null>(null);
+  const [confirmAction, setConfirmAction] = React.useState<"delete" | "cleanup" | "unpaid" | null>(null);
   const [cleanupJob, setCleanupJob] = React.useState<ProvisioningJob | null>(null);
   const [cleanupOpen, setCleanupOpen] = React.useState(false);
-  const canManageHost =
-    !!viewerEmail &&
-    (isAdmin || viewerEmail.toLowerCase() === host.hostOwnerEmail.toLowerCase());
+  const [offerOpen, setOfferOpen] = React.useState(false);
+  const canManageHost = isAdmin || host.isHostOwner === true;
   const canDelete =
     canManageHost &&
+    !host.installationId &&
     (host.status === "idle" || host.status === "disabled" || host.status === "abnormal");
-  const isClientOwner =
-    !!viewerEmail &&
-    !!host.clientOwnerEmail &&
-    viewerEmail.toLowerCase() === host.clientOwnerEmail.toLowerCase();
+  const isClientOwner = host.isClientOwner === true;
   const canCleanup =
     !!host.installationId &&
     (host.status === "allocated" || host.status === "unreachable" || host.status === "draining") &&
     (canManageHost || isClientOwner);
+  const canMarkUnpaid =
+    !!host.installationId &&
+    host.status === "allocated" &&
+    host.isHostOwner === true &&
+    !isClientOwner;
   const isRetryCleanup =
     canCleanup && (host.status === "unreachable" || host.status === "draining");
   const canReverify =
@@ -767,14 +971,33 @@ function HostRow({
     }
   };
 
-  const onCleanup = async () => {
+  const onCleanup = async (markUnpaid: boolean) => {
     if (!host.installationId) return;
     setConfirmAction(null);
     setBusy(true);
     setCleanupJob(null);
     setCleanupOpen(true);
     try {
-      const { jobId } = await cleanupClientMarketClient(host.installationId);
+      const isHostOwner = host.isHostOwner === true;
+      const { jobId } = markUnpaid
+        ? await cleanupClientMarketClientWithReason(host.installationId, {
+            reason: "payment_not_received",
+            blockClientForProvider: true,
+          })
+        : isHostOwner && !isClientOwner
+          ? await cleanupClientMarketClientWithReason(host.installationId, {
+              reason: "provider_release",
+              blockClientForProvider: false,
+            })
+        : isAdmin && !isClientOwner
+          ? await cleanupClientMarketClientWithReason(host.installationId, {
+              reason: "operator_release",
+              blockClientForProvider: false,
+            })
+          : await cleanupClientMarketClientWithReason(host.installationId, {
+              reason: "client_release",
+              blockClientForProvider: false,
+            });
       toast.info(t("clientMarket.cleanupStarted"));
       const initial = await getClientMarketJob(jobId).catch(() => null);
       if (initial) setCleanupJob(initial);
@@ -800,7 +1023,13 @@ function HostRow({
     }
   };
 
-  const confirmCopy = confirmAction === "cleanup"
+  const confirmCopy = confirmAction === "unpaid"
+    ? {
+        title: t("clientMarket.unpaidCleanupConfirmTitle"),
+        description: t("clientMarket.unpaidCleanupConfirmDesc", { host: hostLabel }),
+        confirmLabel: t("clientMarket.unpaidCleanup"),
+      }
+    : confirmAction === "cleanup"
     ? {
         title: t(isRetryCleanup ? "clientMarket.retryCleanupConfirmTitle" : "clientMarket.cleanupConfirmTitle"),
         description: t(
@@ -816,7 +1045,7 @@ function HostRow({
           confirmLabel: t("clientMarket.deleteHost"),
         }
       : null;
-  const hasActions = canDelete || canCleanup || canReverify;
+  const hasActions = canManageHost || canDelete || canCleanup || canReverify;
   const ipPort = host.ip ? `${host.ip}${host.port ? `:${host.port}` : ""}` : "";
   const intel = host.ipIntel;
   const locationLabel = formatHostIpLocation(intel, countryName, locale);
@@ -875,6 +1104,11 @@ function HostRow({
           >
             {host.hostOwnerEmail}
           </span>
+          <span className="shrink-0 text-xs font-semibold text-foreground" title={t("clientMarket.currentOffer")}>
+            {formatHostOffer(host.priceCents, host.rentalPeriodDays, locale)}
+          </span>
+          <PaymentMethodIcons kinds={host.paymentMethodKinds || []} className="shrink-0" />
+          <HostBillingCountdown billing={billing} />
           {subdomain ? (
             <span
               className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground"
@@ -885,10 +1119,26 @@ function HostRow({
           ) : (
             <span className="min-w-0 flex-1" aria-hidden />
           )}
+          {host.clientOwnerEmail ? (
+            <span className="min-w-0 max-w-[16rem] truncate text-xs text-muted-foreground" title={host.clientOwnerEmail}>
+              {t("clientMarket.rentedBy", { email: host.clientOwnerEmail })}
+            </span>
+          ) : null}
           {ipPort ? (
             <span className="shrink-0 font-mono text-xs text-foreground" title={host.hostname || undefined}>
               {ipPort}
             </span>
+          ) : null}
+          {host.status === "idle" ? (
+            <Button
+              variant="primary"
+              size="sm"
+              className="h-8 shrink-0"
+              onClick={() => onCreate(host)}
+            >
+              <Plus className="h-4 w-4" />
+              {t("createClient.newClient")}
+            </Button>
           ) : null}
           {hasActions ? (
             <Dropdown>
@@ -906,6 +1156,12 @@ function HostRow({
               </Dropdown.Trigger>
               <Dropdown.Popover placement="bottom right">
                 <Dropdown.Menu aria-label={t("clientMarket.hostActions")}>
+                  {canManageHost ? (
+                    <Dropdown.Item id="offer" onAction={() => setOfferOpen(true)}>
+                      <Pencil className="h-4 w-4" />
+                      {t("clientMarket.editOfferAction")}
+                    </Dropdown.Item>
+                  ) : null}
                   {canReverify ? (
                     <Dropdown.Item id="reverify" onAction={() => void onReverify()}>
                       <RefreshCw className="h-4 w-4" />
@@ -915,6 +1171,12 @@ function HostRow({
                   {canCleanup ? (
                     <Dropdown.Item id="cleanup" onAction={() => setConfirmAction("cleanup")}>
                       {t(isRetryCleanup ? "clientMarket.retryCleanup" : "clientMarket.cleanup")}
+                    </Dropdown.Item>
+                  ) : null}
+                  {canMarkUnpaid ? (
+                    <Dropdown.Item id="unpaid" className="text-destructive" onAction={() => setConfirmAction("unpaid")}>
+                      <X className="h-4 w-4" />
+                      {t("clientMarket.unpaidCleanup")}
                     </Dropdown.Item>
                   ) : null}
                   {canDelete ? (
@@ -970,7 +1232,7 @@ function HostRow({
           tone="danger"
           busy={busy}
           onConfirm={() => {
-            if (confirmAction === "cleanup") void onCleanup();
+            if (confirmAction === "cleanup" || confirmAction === "unpaid") void onCleanup(confirmAction === "unpaid");
             else void onDelete();
           }}
           onOpenChange={(nextOpen) => {
@@ -1027,6 +1289,7 @@ function HostRow({
           </Modal.Dialog>
         </Modal.Container>
       </Modal.Backdrop>
+      <HostOfferDialog host={host} open={offerOpen} onOpenChange={setOfferOpen} onSaved={onChanged} />
     </>
   );
 }
@@ -1050,6 +1313,7 @@ function hostStatusTabTone(status: HostStatusFilter, active: boolean) {
     case "abnormal":
       return "text-rose-700";
     case "locked":
+    case "reserved":
       return "text-sky-700";
     case "draining":
       return "text-amber-700";
@@ -1068,10 +1332,12 @@ export function ClientMarketPage() {
   const { locale, t } = useLocaleText();
   const { session } = useAuth();
   const authed = !!session?.authenticated;
-  const viewerEmail = session?.user?.email;
+  const viewerUserId = session?.user?.id;
   const isAdmin = !!session?.isAdmin;
 
   const [hosts, setHosts] = React.useState<ClientMarketHost[]>([]);
+  const [providers, setProviders] = React.useState<ClientMarketProvider[]>([]);
+  const [billingByInstallation, setBillingByInstallation] = React.useState<Map<string, ClientMarketBilling>>(new Map());
   const [loading, setLoading] = React.useState(true);
   const [addOpen, setAddOpen] = React.useState(false);
   const [pendingAddAfterLogin, setPendingAddAfterLogin] = React.useState(false);
@@ -1082,22 +1348,33 @@ export function ClientMarketPage() {
   const statusFilter = normalizeHostStatusFilter(statusFilterRaw);
   const [page, setPage] = React.useState(1);
   const [error, setError] = React.useState("");
+  const [fixedHost, setFixedHost] = React.useState<ClientMarketHost | null>(null);
+  const [transferBusy, setTransferBusy] = React.useState(false);
+  const [importResult, setImportResult] = React.useState<ClientMarketHostImportResponse | null>(null);
+  const importInputRef = React.useRef<HTMLInputElement | null>(null);
 
   const load = React.useCallback(async () => {
     setLoading(true);
     setError("");
     try {
-      setHosts(await getClientMarketHosts());
+      const [nextHosts, supply, billing] = await Promise.all([
+        getClientMarketHosts(),
+        getClientMarketProviderSupply(),
+        authed ? getMyClientMarketBilling() : Promise.resolve([]),
+      ]);
+      setHosts(nextHosts);
+      setProviders(supply.providers);
+      setBillingByInstallation(new Map(billing.map((record) => [record.installationId, record])));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [authed]);
 
   React.useEffect(() => {
     void load();
-  }, [isAdmin, load, viewerEmail]);
+  }, [isAdmin, load, viewerUserId]);
 
   const ownerOptions = React.useMemo(() => {
     const emails = Array.from(new Set(hosts.map((host) => host.hostOwnerEmail))).sort((a, b) =>
@@ -1125,9 +1402,7 @@ export function ClientMarketPage() {
     const ownerSet = new Set(ownerFilters.map((email) => email.toLowerCase()));
     const regionSet = new Set(regionFilters.map((code) => code.toUpperCase()));
     return hosts.filter((host) => {
-      if (mineOnly && viewerEmail) {
-        if (host.hostOwnerEmail.toLowerCase() !== viewerEmail.toLowerCase()) return false;
-      }
+      if (mineOnly && host.isHostOwner !== true) return false;
       if (ownerSet.size > 0 && !ownerSet.has(host.hostOwnerEmail.toLowerCase())) return false;
       if (regionSet.size > 0) {
         const code = (host.countryCode || "").trim().toUpperCase();
@@ -1135,12 +1410,13 @@ export function ClientMarketPage() {
       }
       return true;
     });
-  }, [hosts, mineOnly, ownerFilters, regionFilters, viewerEmail]);
+  }, [hosts, mineOnly, ownerFilters, regionFilters]);
 
   const statusCounts = React.useMemo(() => {
     const counts: Record<HostStatusFilter, number> = {
       all: scopedHosts.length,
       idle: 0,
+      reserved: 0,
       allocated: 0,
       locked: 0,
       draining: 0,
@@ -1197,6 +1473,48 @@ export function ClientMarketPage() {
     setAddOpen(true);
   };
 
+  const exportHosts = async () => {
+    setTransferBusy(true);
+    try {
+      const document = await exportMyClientMarketHosts();
+      const blob = new Blob([`${JSON.stringify(document, null, 2)}\n`], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const link = window.document.createElement("a");
+      link.href = url;
+      link.download = `cc-switch-client-market-hosts-${new Date().toISOString().slice(0, 10)}.json`;
+      link.click();
+      URL.revokeObjectURL(url);
+      toast.success(t("clientMarket.exportedHosts", { count: document.hosts.length }));
+    } catch (reason) {
+      toast.danger(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setTransferBusy(false);
+    }
+  };
+
+  const importHosts = async (file?: File) => {
+    if (!file) return;
+    if (file.size > 1024 * 1024) {
+      toast.danger(t("clientMarket.importSizeLimit"));
+      return;
+    }
+    setTransferBusy(true);
+    try {
+      const document = JSON.parse(await file.text());
+      if (!document || document.version !== 1 || !Array.isArray(document.hosts)) {
+        throw new Error(t("clientMarket.importVersionRequired"));
+      }
+      const result = await importMyClientMarketHosts(document);
+      setImportResult(result);
+      await load();
+    } catch (reason) {
+      toast.danger(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setTransferBusy(false);
+      if (importInputRef.current) importInputRef.current.value = "";
+    }
+  };
+
   const statusTabs = React.useMemo(
     () =>
       HOST_STATUS_TABS.map((value) => ({
@@ -1209,7 +1527,7 @@ export function ClientMarketPage() {
   );
 
   return (
-    <div className="mx-auto grid w-[calc(100%-2rem)] max-w-7xl gap-5 pb-10">
+    <div className="mx-auto grid min-w-0 w-[calc(100%-2rem)] max-w-7xl grid-cols-[minmax(0,1fr)] gap-5 pb-10">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
           <div className="inline-flex max-w-full overflow-x-auto rounded-lg bg-slate-100 p-1 text-[11px]">
@@ -1257,6 +1575,27 @@ export function ClientMarketPage() {
               {mineOnly ? t("clientMarket.allHosts") : t("clientMarket.myHosts")}
             </Button>
           ) : null}
+          {authed ? (
+            <>
+              <input ref={importInputRef} type="file" accept="application/json,.json" className="hidden" onChange={(event) => void importHosts(event.target.files?.[0])} />
+              <Tooltip>
+                <Tooltip.Trigger>
+                  <Button variant="outline" size="sm" isIconOnly aria-label={t("clientMarket.importMyHosts")} isDisabled={transferBusy} onClick={() => importInputRef.current?.click()}>
+                    <Upload className="h-4 w-4" />
+                  </Button>
+                </Tooltip.Trigger>
+                <Tooltip.Content>{t("clientMarket.importMyHosts")}</Tooltip.Content>
+              </Tooltip>
+              <Tooltip>
+                <Tooltip.Trigger>
+                  <Button variant="outline" size="sm" isIconOnly aria-label={t("clientMarket.exportMyHosts")} isDisabled={transferBusy} onClick={() => void exportHosts()}>
+                    {transferBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+                  </Button>
+                </Tooltip.Trigger>
+                <Tooltip.Content>{t("clientMarket.exportMyHosts")}</Tooltip.Content>
+              </Tooltip>
+            </>
+          ) : null}
           <Button variant="outline" size="sm" onClick={openAddHost}>
             <Plus className="h-4 w-4" />
             {t("clientMarket.addHost")}
@@ -1266,6 +1605,39 @@ export function ClientMarketPage() {
 
       {!authed ? (
         <p className="text-sm text-muted-foreground">{t("clientMarket.loginToAddHost")}</p>
+      ) : null}
+
+      {providers.length ? (
+        <section className="overflow-x-auto border-y border-border bg-white/70 py-2" aria-label={t("clientMarket.providerObservations")}>
+          <div className="mb-1 px-1 text-[11px] text-muted-foreground">{t("clientMarket.providerObservationNotice")}</div>
+          <div className="flex min-w-max items-stretch gap-5 px-1 text-xs">
+            {providers.map((provider) => (
+              <div key={provider.providerId} className="grid content-center gap-1 border-r border-border pr-5 last:border-r-0">
+                <div className="flex items-center gap-2">
+                  <span className="max-w-48 truncate font-medium text-foreground" title={provider.ownerEmail}>{provider.ownerEmail}</span>
+                  {provider.official ? <Chip size="sm" variant="soft">{t("createClient.official")}</Chip> : null}
+                  <PaymentMethodIcons kinds={provider.paymentMethodKinds} />
+                </div>
+                <div className="flex items-center gap-3 text-muted-foreground">
+                  <span>{t("clientMarket.observedHosts", { total: provider.hostTotal, idle: provider.idleTotal, allocated: provider.allocatedTotal })}</span>
+                  <span>{t("clientMarket.observedAllocationRate", { rate: formatObservationRate(provider.allocationRate, locale) })}</span>
+                  <span>{t("clientMarket.observedFreeSupply", { total: provider.freeHostTotal, allocated: provider.freeAllocatedTotal })}</span>
+                  <span>{t("clientMarket.observedPaidSupply", { total: provider.paidHostTotal, allocated: provider.paidAllocatedTotal })}</span>
+                  <span>{t("clientMarket.observedExternalOwners", { count: provider.externalClientOwnerTotal })}</span>
+                  <span>{t("clientMarket.observedLongRentals", { over3: provider.externalClientsOver3Days, over30: provider.externalClientsOver30Days })}</span>
+                </div>
+                <div className="flex items-center gap-3 text-muted-foreground">
+                  <span>{t("clientMarket.observedUptime", { rate: formatObservationRate(provider.onlineRate30d, locale) })}</span>
+                  <span>{t("clientMarket.observedAnomaly", { rate: formatObservationRate(provider.anomalousHostRate, locale) })}</span>
+                  <span>{t("clientMarket.observedJoined", { date: formatObservationDate(provider.joinedAt, locale) })}</span>
+                  <span>{t("clientMarket.observedOfferStable", { date: formatObservationDate(provider.offerStableSince, locale) })}</span>
+                  <span>{t("clientMarket.observedPriceRange", { range: formatProviderPriceRange(provider, locale) })}</span>
+                  <span>{t("clientMarket.observedPeriodRange", { range: formatProviderPeriodRange(provider) })}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
       ) : null}
 
       {loading ? (
@@ -1300,9 +1672,10 @@ export function ClientMarketPage() {
               <HostRow
                 key={host.id}
                 host={host}
-                viewerEmail={viewerEmail}
+                billing={host.installationId ? billingByInstallation.get(host.installationId) : undefined}
                 isAdmin={isAdmin}
                 onChanged={() => void load()}
+                onCreate={setFixedHost}
               />
             ))}
           </div>
@@ -1348,6 +1721,24 @@ export function ClientMarketPage() {
       )}
 
       <AddHostDialog open={addOpen} onOpenChange={setAddOpen} onAdded={() => void load()} />
+      <CreateClientDialog
+        open={!!fixedHost}
+        onOpenChange={(next) => { if (!next) setFixedHost(null); }}
+        fixedHost={fixedHost}
+        onCreated={() => void load()}
+      />
+      <Modal.Backdrop isOpen={!!importResult} onOpenChange={(next) => { if (!next) setImportResult(null); }}>
+        <Modal.Container placement="center">
+          <Modal.Dialog className="light w-[min(620px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
+            <Modal.Header><Modal.Heading>{t("clientMarket.importResult")}</Modal.Heading></Modal.Header>
+            <Modal.Body className="grid max-h-[65vh] gap-3 overflow-y-auto">
+              {importResult ? <div className="flex flex-wrap gap-2 text-sm"><Chip size="sm" variant="soft">{t("clientMarket.importedCount", { count: importResult.imported })}</Chip><Chip size="sm" variant="soft">{t("clientMarket.skippedCount", { count: importResult.skipped })}</Chip><Chip size="sm" variant="soft">{t("clientMarket.failedCount", { count: importResult.failed })}</Chip></div> : null}
+              <div className="grid gap-1.5">{importResult?.items.map((item) => <div key={`${item.ip}:${item.port}`} className="grid grid-cols-[minmax(0,1fr)_auto] gap-3 rounded-md border px-3 py-2 text-xs"><span className="min-w-0 truncate font-mono">{item.ip}:{item.port}</span><span className={item.status === "failed" ? "text-rose-600" : item.status === "imported" ? "text-emerald-700" : "text-muted-foreground"}>{item.error || item.status}</span></div>)}</div>
+            </Modal.Body>
+            <Modal.Footer><Button variant="primary" onClick={() => setImportResult(null)}>{t("common.close")}</Button></Modal.Footer>
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
     </div>
   );
 }

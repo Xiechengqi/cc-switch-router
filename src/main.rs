@@ -6,6 +6,7 @@ mod cf;
 mod client_chat;
 mod client_market;
 mod client_market_terminal;
+mod client_market_trade;
 mod client_meta;
 mod config;
 mod ctl_client;
@@ -85,11 +86,15 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     let config = Config::from_env();
+    config
+        .validate_official_provider_config()
+        .map_err(anyhow::Error::msg)?;
     let server_geo = resolve_server_geo().await;
     info!(
         api_addr = %config.api_addr,
         ssh_addr = %config.ssh_addr,
         tunnel_domain = %config.tunnel_domain,
+        router_owner_email = config.official_provider_email().unwrap_or("-"),
         ssh_public_addr = %config.effective_ssh_public_addr(),
         server_label = "server",
         server_lat = server_geo.lat,
@@ -252,6 +257,7 @@ async fn main() -> Result<()> {
     let notification_config = config.clone();
     let chat_notification_store = state.store.clone();
     let chat_notification_config = config.clone();
+    let client_market_trade_state = state.clone();
 
     let http_listener = TcpListener::bind(config.api_addr).await?;
     let ssh_listener = TcpListener::bind(config.ssh_addr).await?;
@@ -421,6 +427,13 @@ async fn main() -> Result<()> {
         }
         result
     });
+    let client_market_trade_task = tokio::spawn(async move {
+        let result = crate::client_market_trade::run_trade_service(client_market_trade_state).await;
+        if let Err(error) = &result {
+            tracing::error!(error = %error, "Client Market trade service stopped");
+        }
+        result
+    });
     let (http_shutdown_tx, http_shutdown_rx) = watch::channel(false);
     let (ssh_shutdown_tx, ssh_shutdown_rx) = watch::channel(false);
     let mut ssh_task = tokio::spawn(async move {
@@ -484,6 +497,7 @@ async fn main() -> Result<()> {
     metrics_task.abort();
     notification_task.abort();
     chat_notification_task.abort();
+    client_market_trade_task.abort();
     service_result
 }
 

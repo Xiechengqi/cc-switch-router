@@ -173,6 +173,12 @@ struct ShareUsageByEmailQuery {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ShareUserLimitStatusQuery {
+    app: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct InstallationUpgradeStatusQuery {
     task_id: String,
 }
@@ -211,6 +217,7 @@ pub fn router(state: ServerState) -> Router {
     Router::new()
         .merge(public_api)
         .merge(crate::client_market::router())
+        .merge(crate::client_market_trade::router())
         .merge(crate::client_market_terminal::router())
         .route("/", any(root_handler))
         .route("/install-client.sh", get(install_client_script))
@@ -365,6 +372,10 @@ pub fn router(state: ServerState) -> Router {
         .route(
             "/v1/shares/:share_id/usage-by-email",
             get(share_usage_by_email),
+        )
+        .route(
+            "/v1/shares/:share_id/user-limit-status",
+            get(share_user_limit_status),
         )
         .route(
             "/v1/shares/:share_id/test-connection",
@@ -3904,6 +3915,19 @@ async fn share_usage_by_email(
                 query.app.as_deref().unwrap_or("claude"),
                 query.period.as_deref().unwrap_or("24h"),
             )
+            .await?,
+    ))
+}
+
+async fn share_user_limit_status(
+    State(state): State<ServerState>,
+    Path(share_id): Path<String>,
+    Query(query): Query<ShareUserLimitStatusQuery>,
+) -> Result<Json<crate::models::ShareUserLimitStatusResponse>, AppError> {
+    Ok(Json(
+        state
+            .store
+            .share_user_limit_status(&share_id, query.app.as_deref().unwrap_or("claude"))
             .await?,
     ))
 }

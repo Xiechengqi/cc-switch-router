@@ -4233,11 +4233,24 @@ async fn resolve_client_web_bearer(
     headers: &HeaderMap,
     owner_email: &str,
     required_api_token_scope: &str,
-    _installation_id: Option<&str>,
+    installation_id: Option<&str>,
 ) -> Result<Option<(String, bool)>, crate::error::AppError> {
     let Some(token) = client_web_bearer_token(headers) else {
         return Ok(None);
     };
+    if let Some(installation_id) = installation_id
+        && state
+            .store
+            .installation_provision_source(installation_id)
+            .await?
+            .as_deref()
+            == Some(crate::client_market::PROVISION_SOURCE_ROUTER_MARKET)
+    {
+        // Market Clients are separate trust domains. Their bearer token must
+        // pass through to cc-switch-server for local password/owner OTP auth;
+        // Router sessions and Router admins are never delegated into them.
+        return Ok(None);
+    }
     if let Some(session) = state.store.resolve_session_by_access_token(token).await? {
         let email = session.email;
         let is_admin = state.dynamic.read().await.is_admin(&email);
@@ -4358,6 +4371,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     use axum::routing::any;
+    use sha2::{Digest, Sha256};
 
     use super::*;
 
@@ -4651,6 +4665,7 @@ mod tests {
             free_share_ip_parallel_limit: 1,
             verification_service_base_url: "https://tokenswitch.org".into(),
             verification_service_api_key: None,
+            router_owner_email: None,
             admin_emails: HashSet::new(),
             telegram_bot_token: None,
             telegram_chat_id: None,
@@ -4675,6 +4690,106 @@ mod tests {
                 sample_interval_secs: 5,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn market_client_web_does_not_delegate_router_session() {
+        let config = proxy_test_config("market-client-web-auth");
+        let proxy = Arc::new(ProxyRegistry::default());
+        let state = proxy_test_state(&config, proxy);
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[11_u8; 32]);
+        let registered = state
+            .store
+            .register_installation(
+                crate::models::RegisterInstallationRequest {
+                    protocol_epoch: crate::namespace::PROTOCOL_EPOCH.into(),
+                    public_key: base64::engine::general_purpose::STANDARD
+                        .encode(signing_key.verifying_key().to_bytes()),
+                    platform: "test".into(),
+                    app_version: "test".into(),
+                    instance_nonce: "nonce-market-client-web-auth".into(),
+                    timestamp_ms: None,
+                    signature: None,
+                    proof_version: None,
+                },
+                crate::models::ClientMetadata {
+                    ip: None,
+                    country_code: None,
+                },
+            )
+            .await
+            .unwrap();
+        let access_token = "router-session-for-market-client";
+        let access_hash = base64::engine::general_purpose::STANDARD
+            .encode(Sha256::digest(access_token.as_bytes()));
+        let now = Utc::now();
+        {
+            let conn = state.store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO users
+                    (id, email_normalized, status, created_at, last_login_at)
+                 VALUES ('router-user', 'owner@example.com', 'active', ?1, ?1)",
+                rusqlite::params![now.to_rfc3339()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO user_sessions
+                    (id, user_id, installation_id, access_token_hash, refresh_token_hash,
+                     access_expires_at, refresh_expires_at, created_at, last_used_at)
+                 VALUES ('router-session', 'router-user', ?1, ?2, 'refresh-hash',
+                         ?3, ?4, ?5, ?5)",
+                rusqlite::params![
+                    registered.installation_id,
+                    access_hash,
+                    (now + chrono::Duration::hours(1)).to_rfc3339(),
+                    (now + chrono::Duration::days(1)).to_rfc3339(),
+                    now.to_rfc3339(),
+                ],
+            )
+            .unwrap();
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {access_token}")).unwrap(),
+        );
+        assert!(
+            resolve_client_web_bearer(
+                &state,
+                &headers,
+                "owner@example.com",
+                "share:read",
+                Some(&registered.installation_id),
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+        {
+            let conn = state.store.conn.lock().await;
+            conn.execute(
+                "UPDATE installations SET provision_source = ?2 WHERE id = ?1",
+                rusqlite::params![
+                    registered.installation_id,
+                    crate::client_market::PROVISION_SOURCE_ROUTER_MARKET,
+                ],
+            )
+            .unwrap();
+        }
+        assert!(
+            resolve_client_web_bearer(
+                &state,
+                &headers,
+                "owner@example.com",
+                "share:read",
+                Some(&registered.installation_id),
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        let _ = std::fs::remove_file(&config.db_path);
     }
 
     #[test]

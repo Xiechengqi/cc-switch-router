@@ -1,14 +1,17 @@
 export const DASHBOARD_CLIENTS_PATH = "/clients/";
 export const DASHBOARD_MARKETS_PATH = "/markets/";
 export const DASHBOARD_CLIENT_MARKET_PATH = "/client-market/";
+export const DASHBOARD_ACCOUNT_PATH = "/account/";
 
 export type DashboardRoute =
   | typeof DASHBOARD_CLIENTS_PATH
   | typeof DASHBOARD_MARKETS_PATH
-  | typeof DASHBOARD_CLIENT_MARKET_PATH;
-export type DashboardShellActive = "clients" | "markets" | "client-market" | "settings" | "metrics";
+  | typeof DASHBOARD_CLIENT_MARKET_PATH
+  | typeof DASHBOARD_ACCOUNT_PATH;
+export type DashboardShellActive = "clients" | "markets" | "client-market" | "account" | "settings" | "metrics";
 
 export function normalizeDashboardPath(pathname: string): DashboardRoute | null {
+  if (pathname.startsWith("/account")) return DASHBOARD_ACCOUNT_PATH;
   if (pathname.startsWith("/client-market")) return DASHBOARD_CLIENT_MARKET_PATH;
   if (pathname.startsWith("/markets")) return DASHBOARD_MARKETS_PATH;
   if (pathname.startsWith("/clients")) return DASHBOARD_CLIENTS_PATH;
@@ -37,6 +40,7 @@ export function buildDashboardHref(route: DashboardRoute, params?: URLSearchPara
 }
 
 export function pathnameForDashboardShell(pathname: string): DashboardShellActive {
+  if (pathname.startsWith("/account")) return "account";
   if (pathname.startsWith("/client-market")) return "client-market";
   if (pathname.startsWith("/markets")) return "markets";
   if (pathname.startsWith("/clients")) return "clients";
