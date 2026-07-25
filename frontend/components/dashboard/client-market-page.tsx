@@ -1288,7 +1288,7 @@ function HostRow({
               aria-label={t("clientMarket.batchSelected", { count: 1 })}
               className="shrink-0"
             >
-              <Checkbox.Control>
+              <Checkbox.Control className="border border-slate-300 bg-white shadow-none">
                 <Checkbox.Indicator />
               </Checkbox.Control>
             </Checkbox>
@@ -2553,7 +2553,7 @@ export function ClientMarketPage() {
                         aria-label={t("clientMarket.batchSelectPage")}
                         className="shrink-0"
                       >
-                        <Checkbox.Control>
+                        <Checkbox.Control className="border border-slate-300 bg-white shadow-none">
                           <Checkbox.Indicator />
                         </Checkbox.Control>
                       </Checkbox>
