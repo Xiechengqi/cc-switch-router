@@ -303,29 +303,121 @@ textarea:-webkit-autofill:focus {
   letter-spacing: -0.025em;
 }
 
+/*
+ * Router control skin — ink primary, quiet outlines, no SaaS glow.
+ * Overrides HeroUI Button / Select defaults without a custom component kit.
+ */
+.button {
+  border-radius: 0.375rem;
+  font-weight: 500;
+  box-shadow: none;
+  transition:
+    background-color 140ms ease,
+    border-color 140ms ease,
+    color 140ms ease,
+    opacity 140ms ease;
+}
+
+.button:active,
+.button[data-pressed="true"] {
+  transform: none;
+}
+
+.button--sm {
+  border-radius: 0.375rem;
+}
+
+.button--sm:active,
+.button--sm[data-pressed="true"],
+.button--lg:active,
+.button--lg[data-pressed="true"] {
+  transform: none;
+}
+
+.button--primary {
+  --button-bg: rgb(var(--router-foreground));
+  --button-bg-hover: rgb(30 41 59);
+  --button-bg-pressed: rgb(15 23 42);
+  --button-fg: #ffffff;
+}
+
+.button--secondary,
+.button--tertiary {
+  --button-bg: rgb(var(--router-muted));
+  --button-bg-hover: rgb(226 232 240);
+  --button-bg-pressed: rgb(226 232 240);
+  --button-fg: rgb(var(--router-foreground));
+}
+
+.button--ghost {
+  --button-bg: transparent;
+  --button-bg-hover: rgb(var(--router-muted));
+  --button-bg-pressed: rgb(226 232 240);
+  --button-fg: rgb(var(--router-foreground));
+  box-shadow: none;
+}
+
+.button--outline {
+  --button-bg: rgb(var(--router-card));
+  --button-bg-hover: rgb(var(--router-muted));
+  --button-bg-pressed: rgb(226 232 240);
+  --button-fg: rgb(var(--router-foreground));
+  border: 1px solid rgb(var(--router-border));
+  box-shadow: none;
+}
+
+.button--outline:hover,
+.button--outline[data-hovered="true"] {
+  border-color: rgb(148 163 184);
+}
+
+.button--danger {
+  --button-bg: rgb(var(--router-destructive));
+  --button-bg-hover: rgb(185 28 28);
+  --button-bg-pressed: rgb(153 27 27);
+  --button-fg: #ffffff;
+  box-shadow: none;
+}
+
+.button--danger-soft {
+  --button-bg: rgb(254 226 226);
+  --button-bg-hover: rgb(254 202 202);
+  --button-bg-pressed: rgb(254 202 202);
+  --button-fg: rgb(153 27 27);
+  box-shadow: none;
+}
+
+.button:focus-visible:not(:focus),
+.button[data-focus-visible="true"] {
+  outline: 2px solid rgb(15 23 42 / 0.28);
+  outline-offset: 2px;
+  box-shadow: none;
+}
+
 /* Every visible dropdown uses HeroUI Select, with one shared control language. */
 .select__trigger {
   min-height: 2.25rem;
   border: 1px solid rgb(var(--router-border));
-  border-radius: 0.5rem;
+  border-radius: 0.375rem;
   background: rgb(var(--router-card));
   color: rgb(var(--router-foreground));
   font-family: var(--font-inter), Inter, system-ui, sans-serif;
   font-size: 0.75rem;
   font-weight: 500;
-  box-shadow: 0 1px 2px rgb(15 23 42 / 0.04);
-  transition: border-color 160ms ease, box-shadow 160ms ease, background-color 160ms ease;
+  box-shadow: none;
+  transition: border-color 140ms ease, background-color 140ms ease;
 }
 
 .select__trigger:hover {
-  border-color: rgb(148 163 184);
+  border-color: rgb(100 116 139);
   background: rgb(248 250 252);
 }
 
 .select__trigger[data-focused="true"],
 .select__trigger:focus-visible {
-  border-color: rgb(var(--router-primary) / 0.5);
-  box-shadow: 0 0 0 3px rgb(var(--router-primary) / 0.1);
+  border-color: rgb(15 23 42 / 0.32);
+  box-shadow: inset 0 1px 0 rgb(15 23 42 / 0.04);
+  outline: none;
 }
 
 .select__value {
@@ -341,10 +433,10 @@ textarea:-webkit-autofill:focus {
 .select__popover {
   overflow: hidden;
   border: 1px solid rgb(var(--router-border));
-  border-radius: 0.625rem;
+  border-radius: 0.5rem;
   background: rgb(var(--router-popover));
   color: rgb(var(--router-popover-foreground));
-  box-shadow: 0 14px 34px rgb(15 23 42 / 0.14), 0 2px 8px rgb(15 23 42 / 0.06);
+  box-shadow: 0 4px 16px rgb(15 23 42 / 0.08);
 }
 
 .select__popover .listbox {
@@ -355,7 +447,7 @@ textarea:-webkit-autofill:focus {
 
 .select__popover .listbox__item {
   min-height: 2rem;
-  border-radius: 0.4rem;
+  border-radius: 0.375rem;
   padding-inline: 0.65rem;
   color: rgb(var(--router-foreground));
   font-weight: 500;
@@ -364,11 +456,13 @@ textarea:-webkit-autofill:focus {
 .select__popover .listbox__item:hover,
 .select__popover .listbox__item[data-focused="true"] {
   background: rgb(var(--router-muted));
+  color: rgb(var(--router-foreground));
 }
 
 .select__popover .listbox__item[data-selected="true"] {
-  background: rgb(var(--router-primary) / 0.09);
-  color: rgb(var(--router-primary));
+  background: rgb(var(--router-muted));
+  color: rgb(var(--router-foreground));
+  font-weight: 600;
 }
 
 a {

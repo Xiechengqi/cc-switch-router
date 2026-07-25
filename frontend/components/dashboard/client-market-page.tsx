@@ -1152,10 +1152,10 @@ function HostRow({
     paymentKinds.length > 0 ||
     !!host.clientOwnerEmail ||
     hasBillingCountdown ||
-    secondaryIntelParts.length > 0 ||
     !!host.note ||
     !!host.lastError ||
     hasUnreachableGuidance;
+  const ipIntelSubtitle = secondaryIntelParts.length ? secondaryIntelParts.join(" · ") : "";
   const colSpan = selectionMode ? 8 : 7;
 
   return (
@@ -1222,11 +1222,16 @@ function HostRow({
             <span className="text-xs text-muted-foreground/50">—</span>
           )}
         </td>
-        <td className="whitespace-nowrap px-2 py-2 align-middle">
+        <td className="max-w-[14rem] px-2 py-2 align-middle">
           {ipPort ? (
-            <span className="font-mono text-xs text-foreground" title={host.hostname || undefined}>
-              {ipPort}
-            </span>
+            <div className="min-w-0" title={[ipPort, host.hostname, ipIntelSubtitle].filter(Boolean).join(" · ")}>
+              <span className="block whitespace-nowrap font-mono text-xs text-foreground">{ipPort}</span>
+              {ipIntelSubtitle ? (
+                <span className="mt-0.5 block truncate text-[11px] leading-4 text-muted-foreground/70">
+                  {ipIntelSubtitle}
+                </span>
+              ) : null}
+            </div>
           ) : (
             <span className="text-xs text-muted-foreground/50">—</span>
           )}
@@ -1234,7 +1239,7 @@ function HostRow({
         <td className="whitespace-nowrap px-2 py-2 align-middle">
           <div className="flex items-center justify-end gap-1">
             {host.status === "idle" ? (
-              <Button variant="primary" size="sm" className="h-8 shrink-0" onClick={() => onCreate(host)}>
+              <Button variant="outline" size="sm" className="h-8 shrink-0" onClick={() => onCreate(host)}>
                 <Plus className="h-4 w-4" />
                 {t("createClient.newClient")}
               </Button>
@@ -1323,9 +1328,6 @@ function HostRow({
                 </span>
               ) : null}
               <HostBillingCountdown billing={billing} />
-              {secondaryIntelParts.length ? (
-                <span className="whitespace-normal break-words">{secondaryIntelParts.join(" · ")}</span>
-              ) : null}
               {host.note ? (
                 <span className="min-w-0 whitespace-normal break-words" title={host.note}>
                   {host.note}
@@ -1436,16 +1438,42 @@ const STATUS_FILTER_KEY = "cc_switch_router_client_market_status_filter_v2";
 const SORT_PREFS_KEY = "cc_switch_router_client_market_sort_v1";
 const HOST_PAGE_SIZE = 10;
 
+/** Compact page list: 1 … 4 5 6 … 12 */
+function buildHostPageItems(current: number, total: number): Array<number | "ellipsis"> {
+  if (total <= 7) return Array.from({ length: total }, (_, i) => i + 1);
+  const pages = new Set<number>([1, total, current, current - 1, current + 1]);
+  if (current <= 3) {
+    pages.add(2);
+    pages.add(3);
+    pages.add(4);
+  }
+  if (current >= total - 2) {
+    pages.add(total - 1);
+    pages.add(total - 2);
+    pages.add(total - 3);
+  }
+  const sorted = [...pages].filter((page) => page >= 1 && page <= total).sort((a, b) => a - b);
+  const items: Array<number | "ellipsis"> = [];
+  for (const page of sorted) {
+    const prev = items[items.length - 1];
+    if (typeof prev === "number" && page - prev > 1) items.push("ellipsis");
+    items.push(page);
+  }
+  return items;
+}
+
 const HOST_SORT_KEYS = ["status", "region", "owner", "offer", "subdomain", "ip"] as const;
 type HostSortKey = (typeof HOST_SORT_KEYS)[number];
 type HostSortDir = "asc" | "desc";
-type HostSortPrefs = { key: HostSortKey; dir: HostSortDir };
+type HostSortPrefs = { key: HostSortKey | null; dir: HostSortDir };
 
 const DEFAULT_HOST_SORT: HostSortPrefs = { key: "owner", dir: "asc" };
+const CLEARED_HOST_SORT: HostSortPrefs = { key: null, dir: "asc" };
 
 function normalizeHostSortPrefs(value: unknown): HostSortPrefs {
   if (!value || typeof value !== "object") return DEFAULT_HOST_SORT;
   const record = value as { key?: unknown; dir?: unknown };
+  if (record.key === null) return CLEARED_HOST_SORT;
   const key =
     typeof record.key === "string" && (HOST_SORT_KEYS as readonly string[]).includes(record.key)
       ? (record.key as HostSortKey)
@@ -1482,16 +1510,24 @@ function compareHostsBySortKey(left: ClientMarketHost, right: ClientMarketHost, 
   }
 }
 
+function compareHostsDefault(left: ClientMarketHost, right: ClientMarketHost) {
+  const ownerCmp = left.hostOwnerEmail.localeCompare(right.hostOwnerEmail);
+  if (ownerCmp !== 0) return ownerCmp;
+  const ipCmp = `${left.ip || ""}:${left.port || 0}`.localeCompare(`${right.ip || ""}:${right.port || 0}`);
+  if (ipCmp !== 0) return ipCmp;
+  return left.id.localeCompare(right.id);
+}
+
 function sortHosts(hosts: ClientMarketHost[], prefs: HostSortPrefs) {
+  if (!prefs.key) {
+    return [...hosts].sort(compareHostsDefault);
+  }
   const dir = prefs.dir === "desc" ? -1 : 1;
+  const key = prefs.key;
   return [...hosts].sort((left, right) => {
-    const primary = compareHostsBySortKey(left, right, prefs.key);
+    const primary = compareHostsBySortKey(left, right, key);
     if (primary !== 0) return primary * dir;
-    const ownerCmp = left.hostOwnerEmail.localeCompare(right.hostOwnerEmail);
-    if (ownerCmp !== 0) return ownerCmp;
-    const ipCmp = `${left.ip || ""}:${left.port || 0}`.localeCompare(`${right.ip || ""}:${right.port || 0}`);
-    if (ipCmp !== 0) return ipCmp;
-    return left.id.localeCompare(right.id);
+    return compareHostsDefault(left, right);
   });
 }
 
@@ -1693,10 +1729,9 @@ export function ClientMarketPage() {
   const toggleHostSort = React.useCallback((key: HostSortKey) => {
     setSortPrefs((prev) => {
       const current = normalizeHostSortPrefs(prev);
-      if (current.key === key) {
-        return { key, dir: current.dir === "asc" ? "desc" : "asc" };
-      }
-      return { key, dir: "asc" };
+      if (current.key !== key) return { key, dir: "asc" };
+      if (current.dir === "asc") return { key, dir: "desc" };
+      return CLEARED_HOST_SORT;
     });
   }, [setSortPrefs]);
 
@@ -2105,7 +2140,7 @@ export function ClientMarketPage() {
         <div className="flex flex-wrap items-center gap-2">
           <div ref={filterRootRef} className="relative">
             <Button
-              variant={hasActiveFilters || filterOpen ? "primary" : "outline"}
+              variant="outline"
               size="sm"
               className="h-8"
               aria-expanded={filterOpen}
@@ -2229,7 +2264,7 @@ export function ClientMarketPage() {
       {selectionMode ? (
         <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-white px-3 py-2 text-sm">
           <span className="font-medium text-foreground">{t("clientMarket.batchSelected", { count: selectedCount })}</span>
-          <Button variant="primary" size="sm" isDisabled={batchBusy || !visibleHosts.length} onClick={selectAllFiltered}>
+          <Button variant="outline" size="sm" isDisabled={batchBusy || !visibleHosts.length} onClick={selectAllFiltered}>
             {t("clientMarket.batchSelectAll")}
           </Button>
           <Button variant="ghost" size="sm" isDisabled={batchBusy || !pagedHosts.length} onClick={selectPage}>
@@ -2375,8 +2410,8 @@ export function ClientMarketPage() {
           ) : null}
         </div>
       ) : (
-        <div className="grid gap-3">
-          <div className="max-h-[min(70vh,40rem)] overflow-auto rounded-lg border border-border bg-card">
+        <div className="overflow-hidden rounded-xl border border-border bg-card shadow-sm">
+          <div className="max-h-[min(70vh,40rem)] overflow-auto">
             <table className="w-full min-w-[56rem] border-collapse text-sm">
               <thead>
                 <tr>
@@ -2446,41 +2481,60 @@ export function ClientMarketPage() {
             </table>
           </div>
           {visibleHosts.length > HOST_PAGE_SIZE ? (
-            <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-white px-3 py-2 text-sm">
-              <span className="text-muted-foreground">
+            <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-t border-border bg-muted/30 px-3 py-2.5">
+              <p className="text-xs text-muted-foreground">
                 {t("clientMarket.paginationSummary", {
                   start: (safePage - 1) * HOST_PAGE_SIZE + 1,
                   end: Math.min(safePage * HOST_PAGE_SIZE, visibleHosts.length),
                   total: visibleHosts.length,
                 })}
-              </span>
-              <div className="flex items-center gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  isIconOnly
-                  className="h-8 w-8 min-w-8"
-                  isDisabled={safePage <= 1}
+              </p>
+              <nav className="flex items-center gap-1" aria-label={t("clientMarket.paginationPage", { page: safePage, pages: totalPages })}>
+                <button
+                  type="button"
+                  className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-35"
+                  disabled={safePage <= 1}
                   aria-label={t("clientMarket.paginationPrev")}
                   onClick={() => setPage((current) => Math.max(1, current - 1))}
                 >
                   <ChevronLeft className="h-4 w-4" />
-                </Button>
-                <span className="min-w-16 text-center font-mono text-xs text-slate-700">
-                  {t("clientMarket.paginationPage", { page: safePage, pages: totalPages })}
-                </span>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  isIconOnly
-                  className="h-8 w-8 min-w-8"
-                  isDisabled={safePage >= totalPages}
+                </button>
+                {buildHostPageItems(safePage, totalPages).map((item, index) =>
+                  item === "ellipsis" ? (
+                    <span
+                      key={`ellipsis-${index}`}
+                      className="inline-flex h-8 w-6 items-center justify-center text-xs text-muted-foreground/60"
+                      aria-hidden
+                    >
+                      …
+                    </span>
+                  ) : (
+                    <button
+                      key={item}
+                      type="button"
+                      aria-label={t("clientMarket.paginationGoTo", { page: item })}
+                      aria-current={item === safePage ? "page" : undefined}
+                      className={
+                        item === safePage
+                          ? "inline-flex h-8 min-w-8 items-center justify-center rounded-lg bg-accent px-2 text-xs font-medium text-accent-foreground shadow-sm shadow-accent/20"
+                          : "inline-flex h-8 min-w-8 items-center justify-center rounded-lg px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                      }
+                      onClick={() => setPage(item)}
+                    >
+                      {item}
+                    </button>
+                  ),
+                )}
+                <button
+                  type="button"
+                  className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-35"
+                  disabled={safePage >= totalPages}
                   aria-label={t("clientMarket.paginationNext")}
                   onClick={() => setPage((current) => Math.min(totalPages, current + 1))}
                 >
                   <ChevronRight className="h-4 w-4" />
-                </Button>
-              </div>
+                </button>
+              </nav>
             </div>
           ) : null}
         </div>
