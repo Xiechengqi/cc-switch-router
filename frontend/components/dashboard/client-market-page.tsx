@@ -967,6 +967,7 @@ function HostRow({
   host,
   billing,
   isAdmin,
+  selectionMode,
   selected,
   onSelectedChange,
   selectionDisabled,
@@ -976,6 +977,7 @@ function HostRow({
   host: ClientMarketHost;
   billing?: ClientMarketBilling;
   isAdmin: boolean;
+  selectionMode: boolean;
   selected: boolean;
   onSelectedChange: (selected: boolean) => void;
   selectionDisabled?: boolean;
@@ -1128,17 +1130,19 @@ function HostRow({
     <>
       <div className="grid gap-1.5 rounded-lg border border-border bg-white px-3 py-2.5 text-sm">
         <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-          <Checkbox
-            isSelected={selected}
-            onChange={onSelectedChange}
-            isDisabled={selectionDisabled}
-            aria-label={t("clientMarket.batchSelected", { count: 1 })}
-            className="shrink-0"
-          >
-            <Checkbox.Control>
-              <Checkbox.Indicator />
-            </Checkbox.Control>
-          </Checkbox>
+          {selectionMode ? (
+            <Checkbox
+              isSelected={selected}
+              onChange={onSelectedChange}
+              isDisabled={selectionDisabled}
+              aria-label={t("clientMarket.batchSelected", { count: 1 })}
+              className="shrink-0"
+            >
+              <Checkbox.Control>
+                <Checkbox.Indicator />
+              </Checkbox.Control>
+            </Checkbox>
+          ) : null}
           <Chip
             size="sm"
             variant="soft"
@@ -1432,6 +1436,7 @@ export function ClientMarketPage() {
   const [transferBusy, setTransferBusy] = React.useState(false);
   const [importResult, setImportResult] = React.useState<ClientMarketHostImportResponse | null>(null);
   const importInputRef = React.useRef<HTMLInputElement | null>(null);
+  const [selectionMode, setSelectionMode] = React.useState(false);
   const [selectedIds, setSelectedIds] = React.useState<Set<string>>(new Set());
   const [batchBusy, setBatchBusy] = React.useState(false);
   const [batchConfirm, setBatchConfirm] = React.useState<"cleanup" | "delete" | "reverify" | null>(null);
@@ -1550,18 +1555,27 @@ export function ClientMarketPage() {
     setAddOpen(true);
   }, [authed, pendingAddAfterLogin]);
 
+  // Drop selections that left the current filter set (or disappeared from hosts).
   React.useEffect(() => {
-    const valid = new Set(hosts.map((host) => host.id));
+    if (!selectionMode) return;
+    const visibleIds = new Set(visibleHosts.map((host) => host.id));
     setSelectedIds((prev) => {
       let changed = false;
       const next = new Set<string>();
       for (const id of prev) {
-        if (valid.has(id)) next.add(id);
+        if (visibleIds.has(id)) next.add(id);
         else changed = true;
       }
       return changed || next.size !== prev.size ? next : prev;
     });
-  }, [hosts]);
+  }, [selectionMode, visibleHosts]);
+
+  React.useEffect(() => {
+    if (!authed && selectionMode) {
+      setSelectionMode(false);
+      setSelectedIds(new Set());
+    }
+  }, [authed, selectionMode]);
 
   const selectedHosts = React.useMemo(
     () => hosts.filter((host) => selectedIds.has(host.id)),
@@ -1594,6 +1608,13 @@ export function ClientMarketPage() {
     });
   }, []);
 
+  const enterSelectionMode = () => setSelectionMode(true);
+
+  const exitSelectionMode = React.useCallback(() => {
+    setSelectionMode(false);
+    setSelectedIds(new Set());
+  }, []);
+
   const selectPage = () => {
     setSelectedIds((prev) => {
       const next = new Set(prev);
@@ -1614,7 +1635,15 @@ export function ClientMarketPage() {
       toast[summary.failed > 0 ? "danger" : summary.succeeded > 0 ? "success" : "info"](
         t("clientMarket.batchSummary", summary),
       );
-      setSelectedIds(new Set());
+      if (summary.failed > 0) {
+        setSelectionMode(true);
+        setSelectedIds(
+          new Set(items.filter((item) => item.status === "failed").map((item) => item.hostId)),
+        );
+      } else {
+        setSelectionMode(false);
+        setSelectedIds(new Set());
+      }
       void load();
     },
     [load, t],
@@ -1934,17 +1963,24 @@ export function ClientMarketPage() {
                     variant="outline"
                     size="sm"
                     isIconOnly
-                    aria-label={selectedCount ? t("clientMarket.batchExportSelected") : t("clientMarket.exportMyHosts")}
+                    aria-label={t("clientMarket.exportMyHosts")}
                     isDisabled={transferBusy || batchBusy}
-                    onClick={() => void exportHosts(selectedCount > 0)}
+                    onClick={() => void exportHosts(false)}
                   >
                     {transferBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
                   </Button>
                 </Tooltip.Trigger>
-                <Tooltip.Content>
-                  {selectedCount ? t("clientMarket.batchExportSelected") : t("clientMarket.exportMyHosts")}
-                </Tooltip.Content>
+                <Tooltip.Content>{t("clientMarket.exportMyHosts")}</Tooltip.Content>
               </Tooltip>
+              {selectionMode ? (
+                <Button variant="primary" size="sm" isDisabled={batchBusy} onClick={exitSelectionMode}>
+                  {t("clientMarket.batchDoneSelection")}
+                </Button>
+              ) : (
+                <Button variant="outline" size="sm" isDisabled={batchBusy || !visibleHosts.length} onClick={enterSelectionMode}>
+                  {t("clientMarket.batchEnterSelection")}
+                </Button>
+              )}
             </>
           ) : null}
           <Button variant="outline" size="sm" onClick={openAddHost}>
@@ -1954,16 +1990,16 @@ export function ClientMarketPage() {
         </div>
       </div>
 
-      {selectedCount > 0 ? (
+      {selectionMode ? (
         <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-white px-3 py-2 text-sm">
           <span className="font-medium text-foreground">{t("clientMarket.batchSelected", { count: selectedCount })}</span>
-          <Button variant="ghost" size="sm" isDisabled={batchBusy} onClick={selectPage}>
-            {t("clientMarket.batchSelectPage")}
-          </Button>
-          <Button variant="ghost" size="sm" isDisabled={batchBusy} onClick={selectAllFiltered}>
+          <Button variant="primary" size="sm" isDisabled={batchBusy || !visibleHosts.length} onClick={selectAllFiltered}>
             {t("clientMarket.batchSelectAll")}
           </Button>
-          <Button variant="ghost" size="sm" isDisabled={batchBusy} onClick={clearSelection}>
+          <Button variant="ghost" size="sm" isDisabled={batchBusy || !pagedHosts.length} onClick={selectPage}>
+            {t("clientMarket.batchSelectPage")}
+          </Button>
+          <Button variant="ghost" size="sm" isDisabled={batchBusy || selectedCount === 0} onClick={clearSelection}>
             {t("clientMarket.batchClear")}
           </Button>
           <span className="mx-1 h-4 w-px bg-border" aria-hidden />
@@ -2036,15 +2072,6 @@ export function ClientMarketPage() {
             <span className="ml-1 text-xs text-muted-foreground">
               {t("clientMarket.batchEligible", { run: exportEligible.length, selected: selectedCount })}
             </span>
-          </Button>
-        </div>
-      ) : visibleHosts.length ? (
-        <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-          <Button variant="ghost" size="sm" className="h-7 px-2" isDisabled={batchBusy} onClick={selectPage}>
-            {t("clientMarket.batchSelectPage")}
-          </Button>
-          <Button variant="ghost" size="sm" className="h-7 px-2" isDisabled={batchBusy} onClick={selectAllFiltered}>
-            {t("clientMarket.batchSelectAll")}
           </Button>
         </div>
       ) : null}
@@ -2120,6 +2147,7 @@ export function ClientMarketPage() {
                 host={host}
                 billing={host.installationId ? billingByInstallation.get(host.installationId) : undefined}
                 isAdmin={isAdmin}
+                selectionMode={selectionMode}
                 selected={selectedIds.has(host.id)}
                 onSelectedChange={(next) => setHostSelected(host.id, next)}
                 selectionDisabled={batchBusy}
