@@ -1,10 +1,18 @@
 import type { Metadata } from "next";
-import { Inter, JetBrains_Mono, Source_Code_Pro } from "next/font/google";
+import { Inter, JetBrains_Mono, Noto_Sans_SC, Source_Code_Pro } from "next/font/google";
 import "./globals.css";
 
 const inter = Inter({
   subsets: ["latin"],
   variable: "--font-inter",
+  display: "swap",
+});
+
+/** CJK companion for Inter — clean geometric sans, readable at UI sizes. */
+const notoSansSc = Noto_Sans_SC({
+  subsets: ["latin"],
+  weight: ["400", "500", "600", "700"],
+  variable: "--font-noto-sans-sc",
   display: "swap",
 });
 
@@ -37,7 +45,9 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body className={`${inter.variable} ${jetbrains.variable} ${sourceCodePro.variable}`}>
+      <body
+        className={`${inter.variable} ${notoSansSc.variable} ${jetbrains.variable} ${sourceCodePro.variable}`}
+      >
         {children}
       </body>
     </html>

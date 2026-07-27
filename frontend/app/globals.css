@@ -27,9 +27,11 @@
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
   --radius-xl: calc(var(--radius) + 4px);
-  --font-sans: var(--font-inter), Inter, system-ui, sans-serif;
+  --font-sans: var(--font-inter), var(--font-noto-sans-sc), "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei", system-ui, sans-serif;
   --font-mono: var(--font-jetbrains), "JetBrains Mono", monospace;
-  --font-display: var(--font-inter), Inter, system-ui, sans-serif;
+  --font-display: var(--font-inter), var(--font-noto-sans-sc), "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei", system-ui, sans-serif;
 }
 
 :root {
@@ -98,7 +100,8 @@ body {
     rgb(var(--router-background));
   color: rgb(var(--router-foreground));
   color-scheme: light;
-  font-family: var(--font-inter), Inter, system-ui, sans-serif;
+  font-family: var(--font-inter), var(--font-noto-sans-sc), "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei", system-ui, sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -301,7 +304,8 @@ textarea:-webkit-autofill:focus {
 
 
 .font-display {
-  font-family: var(--font-inter), Inter, system-ui, sans-serif !important;
+  font-family: var(--font-inter), var(--font-noto-sans-sc), "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei", system-ui, sans-serif !important;
   font-weight: 700;
   letter-spacing: -0.025em;
 }
@@ -389,6 +393,35 @@ textarea:-webkit-autofill:focus {
   --button-bg-pressed: rgb(254 202 202);
   --button-fg: rgb(153 27 27);
   box-shadow: none;
+}
+
+/* Topbar region label: title text + chevron, no chrome. */
+.region-switcher-trigger,
+.region-switcher-trigger.button {
+  --button-bg: transparent;
+  --button-bg-hover: transparent;
+  --button-bg-pressed: transparent;
+  --button-fg: rgb(100 116 139);
+  height: 2.25rem;
+  min-height: 2.25rem;
+  border: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  padding: 0 !important;
+  font-family: var(--font-inter), var(--font-noto-sans-sc), "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei", system-ui, sans-serif !important;
+  font-size: 1.25rem !important;
+  font-weight: 600 !important;
+  letter-spacing: -0.025em;
+  color: rgb(100 116 139) !important;
+}
+
+.region-switcher-trigger:hover,
+.region-switcher-trigger[data-hovered="true"],
+.region-switcher-trigger[data-pressed="true"] {
+  background: transparent !important;
+  color: rgb(71 85 105) !important;
+  opacity: 1;
 }
 
 .button:focus-visible:not(:focus),

@@ -3,8 +3,8 @@
 import Image from "next/image";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { Button, Dropdown, ListBox, Select, Toast } from "@heroui/react";
-import { Activity, KeyRound, LogOut, Monitor, Network, Settings, Store, UserRound } from "lucide-react";
+import { Button, Dropdown, Toast } from "@heroui/react";
+import { Activity, ChevronDown, KeyRound, LogOut, Monitor, Network, Settings, Store, UserRound } from "lucide-react";
 import * as React from "react";
 import { LoginDialog } from "@/components/auth/login-dialog";
 import { AuthProvider, useAuth } from "@/components/auth/auth-provider";
@@ -77,49 +77,41 @@ function RouterSwitcher() {
 
   if (regions.length === 0) return null;
 
+  const openRegion = (name: string) => {
+    if (!name || name === selected) return;
+    setSelected(name);
+    const region = regions.find((item) => item.name === name);
+    const href = region ? normalizeRegionUrl(region.url) : "";
+    if (href) window.location.href = href;
+  };
+
   return (
-    <Select
-      selectedKey={selected || null}
-      aria-label={t("nav.router")}
-      fullWidth={false}
-      className="shrink-0"
-      onSelectionChange={(key: React.Key | null) => {
-        const name = String(key || "");
-        if (!name) return;
-        setSelected(name);
-        const region = regions.find((item) => item.name === name);
-        const href = region ? normalizeRegionUrl(region.url) : "";
-        if (href) window.location.href = href;
-      }}
-    >
-      <Select.Trigger
-        className={cn(
-          "h-7 min-h-7 w-auto max-w-[9rem] items-center gap-1 rounded-md border-0 bg-transparent px-1.5 py-0",
-          "text-[11px] font-medium tracking-wide text-muted-foreground shadow-none",
-          "hover:bg-transparent hover:text-foreground focus:bg-transparent focus-visible:ring-0",
-          "data-[pressed=true]:bg-transparent data-[focus-visible=true]:ring-0",
-        )}
+    <Dropdown>
+      <Dropdown.Trigger
+        aria-label={t("nav.router")}
+        className="region-switcher-trigger inline-flex max-w-[11rem] shrink-0 items-center gap-1 outline-none"
       >
-        <Select.Value className="block min-w-0 truncate text-[11px] font-medium tracking-wide text-inherit">
-          {selected || t("nav.router")}
-        </Select.Value>
-        <Select.Indicator className="size-3.5 shrink-0 text-muted-foreground/60" />
-      </Select.Trigger>
-      <Select.Popover className="min-w-[8.5rem] rounded-lg border border-border/70 bg-background p-1 shadow-md">
-        <ListBox aria-label={t("nav.routers")} className="outline-none">
+        <span className="min-w-0 truncate">{selected || t("nav.router")}</span>
+        <ChevronDown className="h-4 w-4 shrink-0 text-slate-400" aria-hidden />
+      </Dropdown.Trigger>
+      <Dropdown.Popover placement="bottom start" className="min-w-[8.5rem]">
+        <Dropdown.Menu aria-label={t("nav.routers")}>
           {regions.map((region) => (
-            <ListBox.Item
+            <Dropdown.Item
               key={region.name}
               id={region.name}
-              textValue={region.name}
-              className="rounded-md px-2.5 py-1.5 text-xs text-foreground outline-none data-[focused=true]:bg-muted data-[selected=true]:font-semibold"
+              className={cn(
+                "text-sm",
+                region.name === selected ? "font-semibold" : "font-medium",
+              )}
+              onAction={() => openRegion(region.name)}
             >
               {region.name}
-            </ListBox.Item>
+            </Dropdown.Item>
           ))}
-        </ListBox>
-      </Select.Popover>
-    </Select>
+        </Dropdown.Menu>
+      </Dropdown.Popover>
+    </Dropdown>
   );
 }
 
@@ -131,7 +123,7 @@ function LanguageSwitcher() {
     <button
       type="button"
       aria-label={t("common.language")}
-      className="inline-flex h-8 shrink-0 items-center justify-center rounded-md px-1.5 text-xs font-medium tracking-wide text-muted-foreground transition-colors hover:text-foreground"
+      className="inline-flex h-9 shrink-0 items-center justify-center rounded-md px-2 text-sm font-medium tracking-wide text-slate-400 transition-colors hover:text-slate-600"
       onClick={() => setLocale(showEnglish ? "en" : "zh-CN")}
     >
       {showEnglish ? "EN" : "中"}
@@ -182,16 +174,16 @@ function DashboardNav({
             href={item.href}
             aria-current={selected ? "page" : undefined}
             className={cn(
-              "inline-flex h-8 min-w-0 items-center gap-1.5 rounded-md px-2 text-xs transition-colors",
+              "inline-flex h-9 min-w-0 items-center gap-1.5 rounded-md px-2.5 text-sm transition-colors",
               selected
-                ? "font-semibold text-foreground"
-                : "font-medium text-muted-foreground hover:text-foreground",
+                ? "font-semibold text-slate-600"
+                : "font-medium text-slate-400 hover:text-slate-600",
             )}
           >
             <Icon
               className={cn(
-                "h-3.5 w-3.5 shrink-0",
-                selected ? "text-muted-foreground" : "text-muted-foreground/70",
+                "h-4 w-4 shrink-0",
+                selected ? "text-slate-500" : "text-slate-400",
               )}
               aria-hidden
             />
@@ -244,16 +236,16 @@ function Topbar({ active }: { active: DashboardShellActive }) {
   return (
     <>
       {/*
-        Three-column topbar: brand (logo + region) | centered section tabs | lang + user.
-        Language control only offers the alternate locale (EN while zh-CN, 中 while en).
+        Three-column topbar: brand (logo + region title) | centered section tabs | lang + user.
+        Region is a chrome-less title dropdown (font-display + chevron), not a bordered Select.
       */}
-      <header className="mx-auto w-[calc(100%-2rem)] max-w-7xl py-4">
+      <div className="sticky top-0 z-40 border-b border-border/50 bg-background/85 backdrop-blur-md">
+        <header className="mx-auto w-[calc(100%-2rem)] max-w-7xl py-3.5">
         <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-x-3 gap-y-2">
-          <div className="flex min-w-0 items-center gap-1.5 justify-self-start">
+          <div className="flex min-w-0 items-center gap-2.5 justify-self-start">
             <Link href={DASHBOARD_CLIENTS_PATH} className="flex shrink-0 items-center" aria-label="CC-Switch Router">
               <Image src="/router-logo.svg" alt="" width={32} height={32} className="h-8 w-8 shrink-0" priority />
             </Link>
-            <span className="hidden h-3 w-px shrink-0 bg-border/80 sm:block" aria-hidden />
             <RouterSwitcher />
           </div>
 
@@ -273,9 +265,9 @@ function Topbar({ active }: { active: DashboardShellActive }) {
                   <Button
                     variant="ghost"
                     size="sm"
-                    className="h-8 max-w-[12rem] gap-1.5 px-2.5 text-xs font-medium text-muted-foreground hover:text-foreground whitespace-nowrap [&_svg]:my-0"
+                    className="h-9 max-w-[12rem] gap-1.5 px-2.5 text-sm font-medium text-slate-400 hover:text-slate-600 whitespace-nowrap [&_svg]:my-0"
                   >
-                    <UserRound className="h-3.5 w-3.5 shrink-0 text-muted-foreground/70" />
+                    <UserRound className="h-4 w-4 shrink-0 text-slate-400" />
                     <span className="hidden min-w-0 truncate sm:inline">{session?.user?.email}</span>
                   </Button>
                 </Dropdown.Trigger>
@@ -313,7 +305,7 @@ function Topbar({ active }: { active: DashboardShellActive }) {
               <Button
                 variant="ghost"
                 size="sm"
-                className="h-8 shrink-0 px-2.5 text-xs font-medium text-muted-foreground hover:text-foreground"
+                className="h-9 shrink-0 px-2.5 text-sm font-medium text-slate-400 hover:text-slate-600"
                 onClick={() => setLoginOpen(true)}
                 isDisabled={loading}
               >
@@ -322,7 +314,8 @@ function Topbar({ active }: { active: DashboardShellActive }) {
             )}
           </div>
         </div>
-      </header>
+        </header>
+      </div>
 
       <LoginDialog open={loginOpen} onOpenChange={setLoginOpen} />
     </>
