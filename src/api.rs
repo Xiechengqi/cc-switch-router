@@ -35,8 +35,8 @@ use crate::client_meta::extract_client_metadata;
 use crate::dynamic_settings::DynamicSettings;
 use crate::error::AppError;
 use crate::models::{
-    AnnouncementResponse, AnnouncementSettings, AnnouncementSettingsUpdate, AuthSession,
-    BindInstallationOwnerEmailRequest, BindInstallationOwnerEmailResponse,
+    AccountUsageResponse, AnnouncementResponse, AnnouncementSettings, AnnouncementSettingsUpdate,
+    AuthSession, BindInstallationOwnerEmailRequest, BindInstallationOwnerEmailResponse,
     BoardMessageListResponse, BoardMessageView, BoardMetaResponse,
     ChangeInstallationOwnerEmailRequest, ChangeInstallationOwnerEmailResponse,
     ClientChatDeliveriesResponse, ClientChatMessageListResponse, ClientChatReadRequest,
@@ -46,8 +46,8 @@ use crate::models::{
     DashboardMarketRequestLogView, DashboardPresenceRequest, DashboardPresenceResponse,
     DashboardResponse, DashboardTickerShare, DashboardUxEventRequest, DashboardUxEventResponse,
     GatewayRegistryRecord, GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse,
-    HealthResponse, ImageGenerationRequestLogEntry, InstallationHeartbeatRequest,
-    InstallationHeartbeatResponse, InstallationSetupCompletedRequest,
+    HealthResponse, ImageGenerationRequestLogEntry,
+    InstallationHeartbeatRequest, InstallationHeartbeatResponse, InstallationSetupCompletedRequest,
     InstallationSetupCompletedResponse, IssueLeaseRequest, IssueLeaseResponse, MapDisplaySettings,
     MapDisplaySettingsUpdate, MarketDisabledSharesUpdateRequest,
     MarketDisabledSharesUpdateResponse, MarketMaintenanceUpdateRequest,
@@ -56,8 +56,8 @@ use crate::models::{
     MarketRequestLogBatchSyncRequest, MarketShareRuntimeStateReleaseRequest,
     MarketShareRuntimeStateReleaseResponse, MarketShareRuntimeStateSyncRequest,
     MarketShareRuntimeStateSyncResponse, MarketShareView, MarketsResponse,
-    PostClientChatMessageRequest, PublicMapPointsResponse, PublicNetworkStatsResponse,
-    RefreshSessionRequest, RegisterGatewayRequest,
+    PostClientChatMessageRequest, ProviderUsageResponse, PublicMapPointsResponse,
+    PublicNetworkStatsResponse, RefreshSessionRequest, RegisterGatewayRequest,
     RegisterGatewayResponse, RegisterInstallationRequest, RegisterInstallationResponse,
     RegisterMarketRequest, RenewLeaseRequest, RenewLeaseResponse, ReportInstallationStatusRequest,
     ReportInstallationStatusResponse, RequestEmailCodeRequest, RequestEmailCodeResponse,
@@ -70,9 +70,9 @@ use crate::models::{
     ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRuntimeRefreshRequest,
     ShareSettingsPatch, ShareSettingsUpdateRequest, ShareSyncRequest,
     SubdomainAvailabilityResponse, TunnelActivateRequest, TunnelStateRequest, TunnelStateResponse,
-    UpgradeInstallationRequest, UpgradeInstallationResponse, UpgradeInstallationStatusResponse,
-    UserApiTokenResetResponse, UserApiTokenResponse, UserSharesResponse, VerifyEmailCodeRequest,
-    VerifyEmailCodeResponse,
+    UpdateUserProfileRequest, UpgradeInstallationRequest, UpgradeInstallationResponse,
+    UpgradeInstallationStatusResponse, UserApiTokenResetResponse, UserApiTokenResponse,
+    UserProfileResponse, UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
 };
 use crate::notifications::{
     ClientNotificationDeliveriesResponse, ClientNotificationPolicy, NotificationTemplateContext,
@@ -172,6 +172,20 @@ struct ShareUsageByEmailQuery {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct AccountUsageQuery {
+    period: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EmbedUsageQuery {
+    period: Option<String>,
+    theme: Option<String>,
+    models: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ShareUserLimitStatusQuery {
     app: Option<String>,
 }
@@ -188,6 +202,11 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/healthz", get(health))
         .route("/v1/public/map-points", get(public_map_points))
         .route("/v1/public/network-stats", get(public_network_stats))
+        .route("/v1/public/embed/global.svg", get(embed_global_usage_svg))
+        .route(
+            "/v1/public/embed/usage/:username",
+            get(embed_user_usage_svg),
+        )
         .route("/v1/regions", get(regions))
         .route("/v1/announcement", get(announcement_get))
         .route(
@@ -343,6 +362,9 @@ pub fn router(state: ServerState) -> Router {
         )
         .route("/v1/me/api-token", get(get_default_api_token))
         .route("/v1/me/api-token/reset", post(reset_default_api_token))
+        .route("/v1/me/profile", get(get_my_profile).patch(update_my_profile))
+        .route("/v1/me/usage/consumer", get(my_usage_consumer))
+        .route("/v1/me/usage/provider", get(my_usage_provider))
         .route("/v1/me/shares", get(my_shares))
         .route("/v1/tunnels/lease", post(issue_lease))
         .route("/v1/tunnels/lease/renew", post(renew_lease))
@@ -1208,17 +1230,26 @@ async fn upgrade_installation(
         .store
         .prepare_installation_upgrade(&state.config, &installation_id, &session_email)
         .await?;
-    // Speak directly to the live client-web tunnel backend. Going through the
-    // public tunnel URL re-enters the edge proxy, which strips
-    // `x-cc-switch-web-*` and (for Market Clients) refuses to re-inject Router
-    // session identity — the Client then rejects the Router bearer with 401.
-    let backend_base = client_upgrade_backend_base(&state, &tunnel_url, &installation_id).await?;
+    // Speak directly to the live client-web tunnel backend with a signed ingress
+    // context. Unauthenticated `x-cc-switch-web-*` headers are stripped by the
+    // Client's `verify_router_ingress` middleware; going through the public URL
+    // also fails for Market Clients because the edge proxy will not re-inject
+    // Router session identity.
+    let target = client_upgrade_target(&state, &tunnel_url, &installation_id, &session_email).await?;
     let response = state
         .proxy_http
-        .post(format!("{backend_base}/web-api/invoke/start_admin_upgrade"))
-        .header("x-cc-switch-web-user-email", session_email.as_str())
-        .header("x-cc-switch-web-role", "owner")
-        .header("x-cc-switch-installation-id", installation_id.as_str())
+        .post(format!(
+            "{}/web-api/invoke/start_admin_upgrade",
+            target.backend_base
+        ))
+        .header(
+            crate::ingress_context::INGRESS_CONTEXT_HEADER,
+            target.ingress.encoded_context,
+        )
+        .header(
+            crate::ingress_context::INGRESS_SIGNATURE_HEADER,
+            target.ingress.signature,
+        )
         .json(&serde_json::json!({
             "restartAfter": input.restart_after,
             "force": true,
@@ -1261,14 +1292,22 @@ async fn upgrade_installation_status(
         .store
         .prepare_installation_upgrade_status(&state.config, &installation_id, &session_email)
         .await?;
-    let backend_base = client_upgrade_backend_base(&state, &tunnel_url, &installation_id).await?;
+    let target = client_upgrade_target(&state, &tunnel_url, &installation_id, &session_email).await?;
     let response = state
         .proxy_http
-        .get(format!("{backend_base}/web-api/admin/upgrade/status"))
+        .get(format!(
+            "{}/web-api/admin/upgrade/status",
+            target.backend_base
+        ))
         .query(&[("taskId", task_id)])
-        .header("x-cc-switch-web-user-email", session_email.as_str())
-        .header("x-cc-switch-web-role", "owner")
-        .header("x-cc-switch-installation-id", installation_id.as_str())
+        .header(
+            crate::ingress_context::INGRESS_CONTEXT_HEADER,
+            target.ingress.encoded_context,
+        )
+        .header(
+            crate::ingress_context::INGRESS_SIGNATURE_HEADER,
+            target.ingress.signature,
+        )
         .timeout(Duration::from_secs(10))
         .send()
         .await
@@ -1291,16 +1330,28 @@ async fn upgrade_installation_status(
     Ok(Json(validate_installation_upgrade_status(status, task_id)?))
 }
 
-async fn client_upgrade_backend_base(
+struct ClientUpgradeTarget {
+    backend_base: String,
+    ingress: crate::ingress_context::SignedIngressContext,
+}
+
+async fn client_upgrade_target(
     state: &ServerState,
     tunnel_url: &str,
     installation_id: &str,
-) -> Result<String, AppError> {
+    session_email: &str,
+) -> Result<ClientUpgradeTarget, AppError> {
     let host = tunnel_url
         .trim()
         .trim_start_matches("https://")
         .trim_start_matches("http://")
         .trim_end_matches('/');
+    let public_host = host
+        .split(':')
+        .next()
+        .unwrap_or(host)
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
     let route = state
         .proxy
         .backend_for_host(host, &state.config.tunnel_domain)
@@ -1318,7 +1369,41 @@ async fn client_upgrade_backend_base(
             "client tunnel route does not match installation".into(),
         ));
     }
-    Ok(format!("http://{}", route.route_target()))
+    let control_secret = state
+        .store
+        .installation_control_secret(installation_id)
+        .await?
+        .filter(|secret| !secret.trim().is_empty())
+        .ok_or_else(|| {
+            AppError::ServiceUnavailable("installation control secret is missing".into())
+        })?;
+    let owner_email = session_email.trim().to_ascii_lowercase();
+    let ingress = crate::ingress_context::sign(
+        crate::ingress_context::IngressContext {
+            protocol_epoch: crate::namespace::PROTOCOL_EPOCH.to_string(),
+            router_id: state
+                .config
+                .tunnel_domain
+                .trim_end_matches('.')
+                .to_ascii_lowercase(),
+            route_id: format!("client:{installation_id}"),
+            installation_id: installation_id.to_string(),
+            target_lane_id: installation_id.to_string(),
+            public_host,
+            share_id: None,
+            request_id: format!("client-upgrade-{}", chrono::Utc::now().timestamp_millis()),
+            user_email: Some(owner_email),
+            user_role: Some("owner".into()),
+            user_country: None,
+            issued_at_ms: chrono::Utc::now().timestamp_millis(),
+        },
+        &control_secret,
+    )
+    .map_err(|error| AppError::Internal(format!("sign client upgrade ingress failed: {error}")))?;
+    Ok(ClientUpgradeTarget {
+        backend_base: format!("http://{}", route.route_target()),
+        ingress,
+    })
 }
 
 fn validate_installation_upgrade_status(
@@ -2225,6 +2310,122 @@ async fn public_network_stats(
     State(state): State<ServerState>,
 ) -> Result<Json<PublicNetworkStatsResponse>, AppError> {
     Ok(Json(state.store.public_network_stats().await?))
+}
+
+fn svg_usage_response(svg: String) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            "image/svg+xml; charset=utf-8",
+        )
+        .header(
+            header::CACHE_CONTROL,
+            "public, max-age=0, s-maxage=60, stale-while-revalidate=300",
+        )
+        .body(Body::from(svg))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn embed_models_limit(models: Option<usize>) -> usize {
+    models.unwrap_or(8).clamp(1, 16)
+}
+
+async fn embed_global_usage_svg(
+    State(state): State<ServerState>,
+    Query(query): Query<EmbedUsageQuery>,
+) -> Response {
+    let period = query.period.as_deref().unwrap_or("7d");
+    let theme = query.theme.as_deref().unwrap_or("dark");
+    let models_limit = embed_models_limit(query.models);
+    match state.store.usage_global(period).await {
+        Ok(mut data) => {
+            data.models.truncate(models_limit);
+            svg_usage_response(crate::embed_usage::render_global_usage_svg(
+                &data, theme, &data.period,
+            ))
+        }
+        Err(err) => svg_usage_response(crate::embed_usage::render_usage_error_svg(
+            &err.to_string(),
+            theme,
+        )),
+    }
+}
+
+async fn embed_user_usage_svg(
+    State(state): State<ServerState>,
+    Path(username): Path<String>,
+    Query(query): Query<EmbedUsageQuery>,
+) -> Response {
+    let period = query.period.as_deref().unwrap_or("7d");
+    let theme = query.theme.as_deref().unwrap_or("dark");
+    let models_limit = embed_models_limit(query.models);
+    let username = username
+        .strip_suffix(".svg")
+        .unwrap_or(username.as_str())
+        .trim()
+        .trim_start_matches('@')
+        .to_string();
+    match state
+        .store
+        .usage_consumer_by_username(&username, period)
+        .await
+    {
+        Ok(Some((profile, mut data))) => {
+            data.models.truncate(models_limit);
+            svg_usage_response(crate::embed_usage::render_user_usage_svg(
+                &profile.username,
+                &data,
+                theme,
+                &data.period,
+            ))
+        }
+        Ok(None) => svg_usage_response(crate::embed_usage::render_usage_error_svg(
+            "usage not found or not public",
+            theme,
+        )),
+        Err(err) => svg_usage_response(crate::embed_usage::render_usage_error_svg(
+            &err.to_string(),
+            theme,
+        )),
+    }
+}
+
+async fn get_my_profile(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<UserProfileResponse>, AppError> {
+    let email = require_session_email(&state, &headers).await?;
+    Ok(Json(state.store.get_user_profile(&email).await?))
+}
+
+async fn update_my_profile(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(patch): Json<UpdateUserProfileRequest>,
+) -> Result<Json<UserProfileResponse>, AppError> {
+    let email = require_session_email(&state, &headers).await?;
+    Ok(Json(state.store.update_user_profile(&email, patch).await?))
+}
+
+async fn my_usage_consumer(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<AccountUsageQuery>,
+) -> Result<Json<AccountUsageResponse>, AppError> {
+    let email = require_session_email(&state, &headers).await?;
+    let period = query.period.as_deref().unwrap_or("7d");
+    Ok(Json(state.store.usage_consumer(&email, period).await?))
+}
+
+async fn my_usage_provider(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<AccountUsageQuery>,
+) -> Result<Json<ProviderUsageResponse>, AppError> {
+    let email = require_session_email(&state, &headers).await?;
+    let period = query.period.as_deref().unwrap_or("7d");
+    Ok(Json(state.store.usage_provider(&email, period).await?))
 }
 
 async fn regions() -> Result<Json<Vec<RegionOption>>, AppError> {
