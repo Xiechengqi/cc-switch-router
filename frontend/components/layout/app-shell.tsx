@@ -14,7 +14,6 @@ import { refreshAccessToken } from "@/lib/auth";
 import { getUserApiToken, resetUserApiToken } from "@/lib/api";
 import { DashboardDataProvider } from "@/components/dashboard/dashboard-data";
 import { AnnouncementDialog } from "@/components/announcement/announcement-dialog";
-import type { AppLocale } from "@/lib/i18n";
 import { DASHBOARD_ACCOUNT_PATH, DASHBOARD_CLIENTS_PATH, DASHBOARD_MARKETS_PATH, DASHBOARD_CLIENT_MARKET_PATH, type DashboardShellActive } from "@/lib/dashboard-nav";
 import type { UserApiTokenStatus } from "@/lib/types";
 
@@ -79,7 +78,7 @@ function RouterSwitcher() {
       selectedKey={selected || null}
       aria-label={t("nav.router")}
       fullWidth={false}
-      className="hidden shrink-0 sm:flex"
+      className="shrink-0"
       onSelectionChange={(key: React.Key | null) => {
         const name = String(key || "");
         if (!name) return;
@@ -89,8 +88,8 @@ function RouterSwitcher() {
         if (href) window.location.href = href;
       }}
     >
-      <Select.Trigger className="min-h-8 w-36 items-center rounded-lg border border-border bg-card py-1.5 pl-2.5 pr-8 text-xs text-foreground shadow-none">
-        <Select.Value className="block min-w-0 max-w-[7.5rem] truncate pr-1 text-xs font-normal text-foreground">
+      <Select.Trigger className="min-h-8 w-[7.25rem] items-center rounded-lg border border-border/80 bg-card py-1.5 pl-2.5 pr-7 text-xs text-foreground shadow-none sm:w-32">
+        <Select.Value className="block min-w-0 max-w-[5.5rem] truncate pr-1 text-xs font-normal text-foreground sm:max-w-[7rem]">
           {selected || t("nav.router")}
         </Select.Value>
         <Select.Indicator className="text-muted-foreground" />
@@ -110,21 +109,37 @@ function RouterSwitcher() {
 
 function LanguageSwitcher() {
   const { locale, setLocale, t } = useLocaleText();
+  const optionClass = (active: boolean) =>
+    [
+      "inline-flex h-7 min-w-[1.75rem] items-center justify-center rounded-md px-1.5 text-[11px] font-semibold tracking-wide transition-colors",
+      active
+        ? "bg-white text-foreground shadow-sm"
+        : "text-muted-foreground hover:text-foreground",
+    ].join(" ");
+
   return (
-    <Tabs
-      selectedKey={locale}
+    <div
+      role="group"
       aria-label={t("common.language")}
-      variant="secondary"
-      className="shrink-0 text-foreground"
-      onSelectionChange={(key: React.Key) => {
-        if (key === "en" || key === "zh-CN") setLocale(key as AppLocale);
-      }}
+      className="inline-flex h-8 shrink-0 items-center rounded-lg bg-slate-100/90 p-0.5 ring-1 ring-inset ring-slate-200/80"
     >
-      <Tabs.List className="grid w-auto grid-cols-2 text-foreground">
-        <Tabs.Tab id="en" className="px-2 text-xs text-muted-foreground data-[selected=true]:text-foreground">{t("common.english")}</Tabs.Tab>
-        <Tabs.Tab id="zh-CN" className="px-2 text-xs text-muted-foreground data-[selected=true]:text-foreground">{t("common.chinese")}</Tabs.Tab>
-      </Tabs.List>
-    </Tabs>
+      <button
+        type="button"
+        aria-pressed={locale === "en"}
+        className={optionClass(locale === "en")}
+        onClick={() => setLocale("en")}
+      >
+        EN
+      </button>
+      <button
+        type="button"
+        aria-pressed={locale === "zh-CN"}
+        className={optionClass(locale === "zh-CN")}
+        onClick={() => setLocale("zh-CN")}
+      >
+        中
+      </button>
+    </div>
   );
 }
 
@@ -260,12 +275,18 @@ function ApiTokenDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (
   );
 }
 
-function DashboardNav({ active }: { active: "clients" | "markets" | "client-market" | "account" }) {
+function DashboardNav({
+  active,
+  authed,
+}: {
+  active: "clients" | "markets" | "client-market" | "account";
+  authed: boolean;
+}) {
   const { t } = useLocaleText();
   const pathname = usePathname() || DASHBOARD_CLIENTS_PATH;
   const router = useRouter();
   const selectedKey =
-    active === "account" || pathname.startsWith("/account")
+    authed && (active === "account" || pathname.startsWith("/account"))
       ? "account"
       : active === "client-market" || pathname.startsWith("/client-market")
         ? "client-market"
@@ -273,23 +294,28 @@ function DashboardNav({ active }: { active: "clients" | "markets" | "client-mark
           ? "markets"
           : "clients";
   const tabClass =
-    "inline-flex h-8 min-w-0 items-center justify-center gap-1.5 rounded-md px-2 text-xs font-medium text-muted-foreground transition-[background-color,color,box-shadow] hover:text-foreground data-[selected=true]:bg-white data-[selected=true]:font-semibold data-[selected=true]:text-foreground data-[selected=true]:shadow-sm sm:min-w-[5.75rem] sm:px-3";
+    "inline-flex h-8 min-w-0 items-center justify-center gap-1.5 rounded-md px-2 text-xs font-medium text-muted-foreground transition-[background-color,color,box-shadow] hover:text-foreground data-[selected=true]:bg-white data-[selected=true]:font-semibold data-[selected=true]:text-foreground data-[selected=true]:shadow-sm sm:min-w-[5.5rem] sm:px-3";
 
   return (
     <Tabs
       selectedKey={selectedKey}
       variant="secondary"
       aria-label={t("nav.dashboardSections")}
-      className="text-foreground"
+      className="min-w-0 text-foreground"
       onSelectionChange={(key: React.Key) => {
         const next = String(key);
         if (next === "clients") router.push(DASHBOARD_CLIENTS_PATH);
         else if (next === "markets") router.push(DASHBOARD_MARKETS_PATH);
         else if (next === "client-market") router.push(DASHBOARD_CLIENT_MARKET_PATH);
-        else if (next === "account") router.push(DASHBOARD_ACCOUNT_PATH);
+        else if (next === "account" && authed) router.push(DASHBOARD_ACCOUNT_PATH);
       }}
     >
-      <Tabs.List className="grid w-full grid-cols-4 gap-0.5 rounded-lg bg-slate-100/90 p-1 text-foreground ring-1 ring-inset ring-slate-200/80 sm:inline-grid sm:w-auto">
+      <Tabs.List
+        className={[
+          "inline-grid w-max max-w-full gap-0.5 rounded-lg bg-slate-100/90 p-1 text-foreground ring-1 ring-inset ring-slate-200/80",
+          authed ? "grid-cols-4" : "grid-cols-3",
+        ].join(" ")}
+      >
         <Tabs.Tab id="clients" className={tabClass}>
           <Monitor className="h-3.5 w-3.5 shrink-0" aria-hidden />
           <span className="hidden sm:inline">{t("nav.clientsTab")}</span>
@@ -302,10 +328,12 @@ function DashboardNav({ active }: { active: "clients" | "markets" | "client-mark
           <Network className="h-3.5 w-3.5 shrink-0" aria-hidden />
           <span className="hidden sm:inline">{t("nav.clientMarketTab")}</span>
         </Tabs.Tab>
-        <Tabs.Tab id="account" className={tabClass}>
-          <UserRound className="h-3.5 w-3.5 shrink-0" aria-hidden />
-          <span className="hidden sm:inline">{t("nav.accountTab")}</span>
-        </Tabs.Tab>
+        {authed ? (
+          <Tabs.Tab id="account" className={tabClass}>
+            <UserRound className="h-3.5 w-3.5 shrink-0" aria-hidden />
+            <span className="hidden sm:inline">{t("nav.accountTab")}</span>
+          </Tabs.Tab>
+        ) : null}
       </Tabs.List>
     </Tabs>
   );
@@ -352,20 +380,31 @@ function Topbar({ active }: { active: DashboardShellActive }) {
   return (
     <>
       {/*
-        Two structural rows via nested grids — not flex-wrap.
-        Row 1 uses grid-cols-[minmax(0,1fr)_auto] so logo and region/lang/user
-        can never stack; the logo column truncates when space is tight.
-        Row 2 is only the section tabs. Dialogs stay outside <header> so they
-        never become accidental grid items.
+        Single primary row: brand (logo + muted title + region) | section tabs | lang + user.
+        Region sits with the logo because it answers “which Router am I on”; lang/user stay
+        as account chrome on the right. Title is a light subtitle so tabs reclaim the row.
       */}
-      <header className="mx-auto w-[calc(100%-2rem)] max-w-7xl py-5">
-        <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3">
-          <Link href={DASHBOARD_CLIENTS_PATH} className="flex min-w-0 items-center gap-3">
-            <Image src="/router-logo.svg" alt="" width={36} height={36} className="h-9 w-9 shrink-0" priority />
-            <span className="truncate text-base font-extrabold leading-none">CC-Switch Router</span>
-          </Link>
-          <div className="flex flex-nowrap items-center justify-end gap-2 sm:gap-3">
+      <header className="mx-auto w-[calc(100%-2rem)] max-w-7xl py-4">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+          <div className="flex min-w-0 items-center gap-2.5">
+            <Link href={DASHBOARD_CLIENTS_PATH} className="flex min-w-0 items-center gap-2">
+              <Image src="/router-logo.svg" alt="" width={32} height={32} className="h-8 w-8 shrink-0" priority />
+              <span className="hidden max-w-[7.5rem] text-[11px] font-medium leading-tight tracking-wide text-muted-foreground sm:block">
+                CC-Switch Router
+              </span>
+            </Link>
             <RouterSwitcher />
+          </div>
+
+          {showDashboardNav ? (
+            <div className="min-w-0 flex-1 overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+              <DashboardNav active={active} authed={authed} />
+            </div>
+          ) : (
+            <div className="min-w-0 flex-1" />
+          )}
+
+          <div className="ml-auto flex flex-nowrap items-center gap-2">
             <LanguageSwitcher />
             {authed ? (
               <Dropdown>
@@ -422,12 +461,6 @@ function Topbar({ active }: { active: DashboardShellActive }) {
             )}
           </div>
         </div>
-
-        {showDashboardNav ? (
-          <div className="mt-3 min-w-0">
-            <DashboardNav active={active} />
-          </div>
-        ) : null}
       </header>
 
       <LoginDialog open={loginOpen} onOpenChange={setLoginOpen} />
