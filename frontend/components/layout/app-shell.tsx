@@ -217,7 +217,6 @@ function Topbar({ active }: { active: DashboardShellActive }) {
   const router = useRouter();
   const [loginOpen, setLoginOpen] = React.useState(false);
   const [clientRedirect, setClientRedirect] = React.useState<string | null>(null);
-  const [scrolled, setScrolled] = React.useState(false);
   const redirectStartedRef = React.useRef(false);
   const lastAuthedEmailRef = React.useRef<string | null>(null);
   if (session?.authenticated && session.user?.email) {
@@ -229,13 +228,6 @@ function Topbar({ active }: { active: DashboardShellActive }) {
   const showAuthedChrome = authed || (loading && !!lastAuthedEmailRef.current);
   const displayEmail = session?.user?.email || lastAuthedEmailRef.current || "";
   const showDashboardNav = active === "clients" || active === "markets" || active === "client-market" || active === "account";
-
-  React.useEffect(() => {
-    const onScroll = () => setScrolled(window.scrollY > 0);
-    onScroll();
-    window.addEventListener("scroll", onScroll, { passive: true });
-    return () => window.removeEventListener("scroll", onScroll);
-  }, []);
 
   React.useEffect(() => {
     setClientRedirect(sameRouterDomainClientRedirect(new URLSearchParams(window.location.search).get("clientRedirect")));
@@ -271,12 +263,7 @@ function Topbar({ active }: { active: DashboardShellActive }) {
         Three-column topbar: brand (logo + region title) | centered section tabs | lang + user.
         Region is a chrome-less title dropdown (font-display + chevron), not a bordered Select.
       */}
-      <div
-        className={cn(
-          "sticky top-0 z-40 border-b bg-background/85 backdrop-blur-md transition-colors duration-200",
-          scrolled ? "border-border/50" : "border-transparent",
-        )}
-      >
+      <div className="sticky top-0 z-40 bg-background/85 backdrop-blur-md">
         <header className="mx-auto w-[calc(100%-2rem)] max-w-7xl py-3.5">
         <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-x-3 gap-y-2">
           <div className="flex min-w-0 items-center gap-2.5 justify-self-start">
