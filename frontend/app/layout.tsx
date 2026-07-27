@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Inter, JetBrains_Mono, Noto_Sans_SC, Source_Code_Pro } from "next/font/google";
+import { AppProviders } from "@/components/providers/app-providers";
 import "./globals.css";
 
 const inter = Inter({
@@ -48,7 +49,7 @@ export default function RootLayout({
       <body
         className={`${inter.variable} ${notoSansSc.variable} ${jetbrains.variable} ${sourceCodePro.variable}`}
       >
-        {children}
+        <AppProviders>{children}</AppProviders>
       </body>
     </html>
   );

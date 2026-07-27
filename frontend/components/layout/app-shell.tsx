@@ -7,8 +7,8 @@ import { Button, Dropdown, Toast } from "@heroui/react";
 import { Activity, ChevronDown, KeyRound, LogOut, Monitor, Network, Settings, Store, UserRound } from "lucide-react";
 import * as React from "react";
 import { LoginDialog } from "@/components/auth/login-dialog";
-import { AuthProvider, useAuth } from "@/components/auth/auth-provider";
-import { LocaleProvider, useLocaleText } from "@/components/i18n/locale-provider";
+import { useAuth } from "@/components/auth/auth-provider";
+import { useLocaleText } from "@/components/i18n/locale-provider";
 import { refreshAccessToken } from "@/lib/auth";
 import { DashboardDataProvider } from "@/components/dashboard/dashboard-data";
 import { AnnouncementDialog } from "@/components/announcement/announcement-dialog";
@@ -25,6 +25,14 @@ type RegionOption = {
   name: string;
   url: string;
 };
+
+type RegionsCache = {
+  regions: RegionOption[];
+  selected: string;
+};
+
+/** Survives RouterSwitcher remounts during soft/hard navigations. */
+let regionsMemoryCache: RegionsCache | null = null;
 
 function normalizeRegionUrl(url: string) {
   const trimmed = url.trim();
@@ -60,19 +68,26 @@ function sameRouterDomainClientRedirect(raw: string | null) {
 }
 
 function RouterSwitcher() {
-  const [regions, setRegions] = React.useState<RegionOption[]>([]);
-  const [selected, setSelected] = React.useState("");
+  const [regions, setRegions] = React.useState<RegionOption[]>(() => regionsMemoryCache?.regions || []);
+  const [selected, setSelected] = React.useState(() => regionsMemoryCache?.selected || "");
   const { t } = useLocaleText();
 
   React.useEffect(() => {
+    let cancelled = false;
     async function load() {
       const response = await fetch("/v1/regions", { cache: "no-store" });
-      if (!response.ok) return;
+      if (!response.ok || cancelled) return;
       const nextRegions = (await response.json()) as RegionOption[];
+      const nextSelected = currentRegionName(nextRegions) || nextRegions[0]?.name || "";
+      regionsMemoryCache = { regions: nextRegions, selected: nextSelected };
+      if (cancelled) return;
       setRegions(nextRegions);
-      setSelected(currentRegionName(nextRegions) || nextRegions[0]?.name || "");
+      setSelected(nextSelected);
     }
     load().catch(console.error);
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   if (regions.length === 0) return null;
@@ -202,7 +217,15 @@ function Topbar({ active }: { active: DashboardShellActive }) {
   const [loginOpen, setLoginOpen] = React.useState(false);
   const [clientRedirect, setClientRedirect] = React.useState<string | null>(null);
   const redirectStartedRef = React.useRef(false);
+  const lastAuthedEmailRef = React.useRef<string | null>(null);
+  if (session?.authenticated && session.user?.email) {
+    lastAuthedEmailRef.current = session.user.email;
+  } else if (session && !session.authenticated) {
+    lastAuthedEmailRef.current = null;
+  }
   const authed = !!session?.authenticated;
+  const showAuthedChrome = authed || (loading && !!lastAuthedEmailRef.current);
+  const displayEmail = session?.user?.email || lastAuthedEmailRef.current || "";
   const showDashboardNav = active === "clients" || active === "markets" || active === "client-market" || active === "account";
 
   React.useEffect(() => {
@@ -251,7 +274,7 @@ function Topbar({ active }: { active: DashboardShellActive }) {
 
           {showDashboardNav ? (
             <div className="min-w-0 justify-self-center overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-              <DashboardNav active={active} authed={authed} />
+              <DashboardNav active={active} authed={showAuthedChrome} />
             </div>
           ) : (
             <div />
@@ -259,23 +282,24 @@ function Topbar({ active }: { active: DashboardShellActive }) {
 
           <div className="flex flex-nowrap items-center justify-end gap-2 justify-self-end">
             <LanguageSwitcher />
-            {authed ? (
+            {showAuthedChrome ? (
               <Dropdown>
                 <Dropdown.Trigger className="shrink-0 outline-none">
                   <Button
                     variant="ghost"
                     size="sm"
                     className="h-9 max-w-[12rem] gap-1.5 px-2.5 text-sm font-medium text-slate-400 hover:text-slate-600 whitespace-nowrap [&_svg]:my-0"
+                    isDisabled={loading && !authed}
                   >
                     <UserRound className="h-4 w-4 shrink-0 text-slate-400" />
-                    <span className="hidden min-w-0 truncate sm:inline">{session?.user?.email}</span>
+                    <span className="hidden min-w-0 truncate sm:inline">{displayEmail}</span>
                   </Button>
                 </Dropdown.Trigger>
                 <Dropdown.Popover placement="bottom right">
                   <Dropdown.Menu aria-label={t("nav.userMenu")}>
                     <Dropdown.Section>
                       <Dropdown.Item id="email" isDisabled className="text-xs text-muted-foreground">
-                        {session?.user?.email}
+                        {displayEmail}
                       </Dropdown.Item>
                     </Dropdown.Section>
                     <Dropdown.Item id="api-token" onAction={() => router.push(DASHBOARD_ACCOUNT_API_KEYS_PATH)}>
@@ -331,17 +355,13 @@ export function AppShell({
 }) {
   const dashboardDataEnabled = active === "clients" || active === "markets";
   return (
-    <LocaleProvider>
-      <AuthProvider>
-        <DashboardDataProvider enabled={dashboardDataEnabled}>
-          <div className="flex min-h-dvh min-w-0 flex-col">
-            <Topbar active={active} />
-            <div className="flex min-w-0 flex-1 flex-col">{children}</div>
-          </div>
-          <AnnouncementDialog />
-          <Toast.Provider placement="top end" />
-        </DashboardDataProvider>
-      </AuthProvider>
-    </LocaleProvider>
+    <DashboardDataProvider enabled={dashboardDataEnabled}>
+      <div className="flex min-h-dvh min-w-0 flex-col">
+        <Topbar active={active} />
+        <div className="flex min-w-0 flex-1 flex-col pt-4 sm:pt-5">{children}</div>
+      </div>
+      <AnnouncementDialog />
+      <Toast.Provider placement="top end" />
+    </DashboardDataProvider>
   );
 }

@@ -16,20 +16,28 @@ const AuthContext = React.createContext<AuthContextValue | null>(null);
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [session, setSession] = React.useState<SessionStatus | null>(null);
   const [loading, setLoading] = React.useState(true);
+  const bootstrappedRef = React.useRef(false);
 
   const refresh = React.useCallback(async () => {
-    setLoading(true);
+    const initial = !bootstrappedRef.current;
+    if (initial) setLoading(true);
     try {
       await ensureInstallationIdentity();
       setSession(await sessionStatus());
+      bootstrappedRef.current = true;
     } finally {
       setLoading(false);
     }
   }, []);
 
   React.useEffect(() => {
-    refresh().catch(() => setLoading(false));
-    const handler = () => refresh().catch(() => setLoading(false));
+    refresh().catch(() => {
+      bootstrappedRef.current = true;
+      setLoading(false);
+    });
+    const handler = () => {
+      refresh().catch(() => setLoading(false));
+    };
     window.addEventListener("router-auth-changed", handler);
     return () => window.removeEventListener("router-auth-changed", handler);
   }, [refresh]);
