@@ -33,11 +33,6 @@ export function AccountShell({ children }: { children: React.ReactNode }) {
 
   return (
     <main className="mx-auto grid min-w-0 w-[calc(100%-2rem)] max-w-6xl grid-cols-[minmax(0,1fr)] gap-6 pb-12 pt-2 md:grid-cols-[13rem_minmax(0,1fr)] md:gap-8">
-      <header className="border-b border-border pb-4 md:col-span-2">
-        <h1 className="text-xl font-semibold">{t("account.title")}</h1>
-        <p className="mt-1 text-sm text-muted-foreground">{t("account.pageHint")}</p>
-      </header>
-
       <nav
         aria-label={t("account.nav.sections")}
         className="min-w-0 md:sticky md:top-4 md:self-start"

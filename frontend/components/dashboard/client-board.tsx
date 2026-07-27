@@ -1,7 +1,7 @@
 "use client";
 
 import { Button, Card, Chip, Drawer, toast } from "@heroui/react";
-import { Check, ChevronDown, Copy, ExternalLink, MessageCircle, Plus, Search, WalletCards } from "lucide-react";
+import { Check, ChevronDown, Copy, ExternalLink, ListFilter, MessageCircle, Plus, Search, WalletCards } from "lucide-react";
 import * as React from "react";
 import { CreateClientDialog } from "@/components/dashboard/create-client-dialog";
 import { ClientMarketBillingBanner } from "@/components/dashboard/client-market-billing-banner";
@@ -543,6 +543,8 @@ export function ClientBoard({
   const [editingShare, setEditingShare] = React.useState<ShareView | null>(null);
   const [connectShare, setConnectShare] = React.useState<ShareView | null>(null);
   const [createClientOpen, setCreateClientOpen] = React.useState(false);
+  const [filtersOpen, setFiltersOpen] = React.useState(false);
+  const filtersRef = React.useRef<HTMLDivElement>(null);
   const [query, setQuery] = React.useState("");
   const [statusFilter, setStatusFilter] = usePersistentState<"all" | Extract<OperationalState, "online" | "reconnecting" | "degraded" | "offline">>("cc_switch_router_client_status_v1", "all");
   const [sortOrder, setSortOrder] = usePersistentState("cc_switch_router_client_sort_v1", "tokens");
@@ -776,6 +778,22 @@ export function ClientBoard({
     if (connectShareId && !shareById.has(connectShareId)) setConnectShare(null);
   }, [connectShareId, shareById]);
 
+  React.useEffect(() => {
+    if (!filtersOpen) return;
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target as Element | null;
+      if (!target) return;
+      if (filtersRef.current?.contains(target)) return;
+      // HeroUI Select popovers portal outside the filter panel.
+      if (target.closest?.('[role="listbox"], [data-slot="popover"], [data-rac]')) return;
+      setFiltersOpen(false);
+    };
+    window.addEventListener("pointerdown", onPointerDown);
+    return () => window.removeEventListener("pointerdown", onPointerDown);
+  }, [filtersOpen]);
+
+  const activeFilterCount = regionFilters.length;
+
   return (
     <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4">
       <div className="flex min-w-0 flex-wrap items-center justify-between gap-4">
@@ -797,22 +815,80 @@ export function ClientBoard({
             <Search className="h-4 w-4 shrink-0 text-muted-foreground" />
             <input value={query} onChange={(event) => setQuery(event.target.value)} className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground" placeholder={t("dashboard.searchClients")} aria-label={t("dashboard.searchClients")} />
           </label>
-          {regions.length > 1 ? (
-            <CompactRegionMultiSelect
-              values={regionFilters}
-              onChange={(value) => {
-                setRegionFilters(value);
-                void recordDashboardUxEvent({ eventType: "filter_applied", source: "client-board", targetType: "client" });
-              }}
-              options={regions.map((region) => ({ value: region, label: region }))}
-              allLabel={t("dashboard.allRegions")}
-              moreLabel={(count) => t("dashboard.regionsMore", { count })}
-              clearLabel={t("dashboard.clearRegionSelection")}
-              ariaLabel={t("dashboard.filterRegion")}
-              className="w-44"
-            />
-          ) : null}
-          <CompactSelect value={sortOrder === "registered" ? "running" : sortOrder} onChange={(value) => { setSortOrder(value); void recordDashboardUxEvent({ eventType: "filter_applied", source: "client-board", targetType: "client" }); }} options={[{ value: "issues", label: t("dashboard.sortIssues") }, { value: "name", label: t("dashboard.sortName") }, { value: "recent", label: t("dashboard.sortRecent") }, { value: "running", label: t("dashboard.sortRunning") }, { value: "tokens", label: t("dashboard.sortTokens") }, { value: "shares", label: t("dashboard.sortShares") }]} ariaLabel={t("dashboard.sortBy")} className="w-44" />
+          <div ref={filtersRef} className="relative shrink-0">
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-9 gap-1.5 px-3 text-xs"
+              aria-expanded={filtersOpen}
+              aria-haspopup="dialog"
+              onClick={() => setFiltersOpen((open) => !open)}
+            >
+              <ListFilter className="h-3.5 w-3.5" />
+              {activeFilterCount
+                ? t("dashboard.filterActive", { count: activeFilterCount })
+                : t("dashboard.filter")}
+              <ChevronDown className={`h-3.5 w-3.5 text-muted-foreground transition-transform ${filtersOpen ? "rotate-180" : ""}`} />
+            </Button>
+            {filtersOpen ? (
+              <div
+                role="dialog"
+                aria-label={t("dashboard.filter")}
+                className="absolute right-0 z-30 mt-2 w-[min(18rem,calc(100vw-2rem))] rounded-xl border border-border bg-card p-3 shadow-lg"
+              >
+                <div className="grid gap-3">
+                  <label className="grid gap-1.5 text-xs text-muted-foreground">
+                    {t("dashboard.region")}
+                    <CompactRegionMultiSelect
+                      values={regionFilters}
+                      onChange={(value) => {
+                        setRegionFilters(value);
+                        void recordDashboardUxEvent({ eventType: "filter_applied", source: "client-board", targetType: "client" });
+                      }}
+                      options={regions.map((region) => ({ value: region, label: region }))}
+                      allLabel={t("dashboard.allRegions")}
+                      moreLabel={(count) => t("dashboard.regionsMore", { count })}
+                      clearLabel={t("dashboard.clearRegionSelection")}
+                      ariaLabel={t("dashboard.filterRegion")}
+                      className="w-full"
+                    />
+                  </label>
+                  <label className="grid gap-1.5 text-xs text-muted-foreground">
+                    {t("dashboard.filterGeneral")}
+                    <CompactSelect
+                      value={sortOrder === "registered" ? "running" : sortOrder}
+                      onChange={(value) => {
+                        setSortOrder(value);
+                        void recordDashboardUxEvent({ eventType: "filter_applied", source: "client-board", targetType: "client" });
+                      }}
+                      options={[
+                        { value: "issues", label: t("dashboard.sortIssues") },
+                        { value: "name", label: t("dashboard.sortName") },
+                        { value: "recent", label: t("dashboard.sortRecent") },
+                        { value: "running", label: t("dashboard.sortRunning") },
+                        { value: "tokens", label: t("dashboard.sortTokens") },
+                        { value: "shares", label: t("dashboard.sortShares") },
+                      ]}
+                      ariaLabel={t("dashboard.sortBy")}
+                      className="w-full"
+                    />
+                  </label>
+                  {activeFilterCount ? (
+                    <button
+                      type="button"
+                      className="justify-self-start text-xs font-medium text-primary hover:underline"
+                      onClick={() => {
+                        clearRegionFilters();
+                        void recordDashboardUxEvent({ eventType: "filter_applied", source: "client-board", targetType: "client" });
+                      }}
+                    >
+                      {t("dashboard.clearFilters")}
+                    </button>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
+          </div>
         </div>
       </div>
 
