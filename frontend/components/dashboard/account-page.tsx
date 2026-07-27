@@ -73,7 +73,8 @@ function chainLabel(chain: CryptoDraft["chain"]) {
   return CRYPTO_CHAINS.find((item) => item.id === chain)?.label || chain;
 }
 
-export function AccountPage() {
+/** Payment details + collapsed blocked-renter list (Account → 收款信息). */
+export function AccountPaymentsPanel() {
   const { locale, t } = useLocaleText();
   const { session, loading: authLoading } = useAuth();
   const authed = !!session?.authenticated;
@@ -84,6 +85,7 @@ export function AccountPage() {
   const [previews, setPreviews] = React.useState<Record<string, string>>({});
   const [blocks, setBlocks] = React.useState<ClientMarketProviderBlock[]>([]);
   const [liftingBlock, setLiftingBlock] = React.useState("");
+  const [blocksOpen, setBlocksOpen] = React.useState(true);
 
   const dirty = serializePaymentDraft(draft) !== baseline;
 
@@ -189,7 +191,7 @@ export function AccountPage() {
 
   if (authLoading || loading) {
     return (
-      <div className="mx-auto flex w-[calc(100%-2rem)] max-w-5xl items-center gap-2 py-12 text-sm text-muted-foreground">
+      <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
         <Loader2 className="h-4 w-4 animate-spin" />
         {t("account.loading")}
       </div>
@@ -197,8 +199,7 @@ export function AccountPage() {
   }
   if (!authed) {
     return (
-      <div className="mx-auto grid w-[calc(100%-2rem)] max-w-5xl justify-items-start gap-3 py-12">
-        <h1 className="text-xl font-semibold">{t("account.title")}</h1>
+      <div className="grid justify-items-start gap-3 py-6">
         <p className="text-sm text-muted-foreground">{t("account.signInRequired")}</p>
         <Button variant="primary" onClick={() => window.dispatchEvent(new Event("router-open-login"))}>
           {t("nav.login")}
@@ -232,12 +233,7 @@ export function AccountPage() {
   const patchDraft = (patch: Partial<PaymentDraft>) => setDraft((current) => ({ ...current, ...patch }));
 
   return (
-    <main className="mx-auto grid min-w-0 w-[calc(100%-2rem)] max-w-5xl grid-cols-[minmax(0,1fr)] gap-8 pb-12">
-      <header className="border-b pb-5">
-        <h1 className="text-xl font-semibold">{t("account.title")}</h1>
-        <p className="mt-1 text-sm text-muted-foreground">{t("account.pageHint")}</p>
-      </header>
-
+    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-5">
       <section className="grid gap-6 rounded-xl border border-border bg-card p-5 shadow-sm">
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div>
@@ -432,38 +428,50 @@ export function AccountPage() {
         </div>
       </section>
 
-      <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-3 rounded-xl border border-border bg-card p-5 shadow-sm">
-        <div>
-          <h2 className="text-base font-semibold">{t("account.blockedOwners")}</h2>
-          <p className="mt-1 text-xs text-muted-foreground">{t("account.blockedHint")}</p>
-        </div>
-        {blocks.length ? (
-          <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-2">
-            {blocks.map((block) => (
-              <div
-                key={block.clientUserId}
-                className="flex min-w-0 flex-wrap items-center justify-between gap-3 rounded-md border bg-white px-3 py-2 text-sm"
-              >
-                <div className="min-w-0 max-w-full">
-                  <div className="truncate font-medium">{block.clientOwnerEmail}</div>
-                  <div className="break-words text-xs text-muted-foreground">
-                    {blockReasonLabel(block.reason, t)} ·{" "}
-                    {new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(
-                      new Date(block.createdAt),
-                    )}
+      {blocks.length ? (
+        <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-3 rounded-xl border border-border bg-card p-4 shadow-sm">
+          <button
+            type="button"
+            className="flex min-w-0 items-start justify-between gap-3 text-left"
+            aria-expanded={blocksOpen}
+            onClick={() => setBlocksOpen((open) => !open)}
+          >
+            <div className="min-w-0">
+              <h2 className="text-sm font-semibold">
+                {t("account.blockedOwners")} · {blocks.length}
+              </h2>
+              <p className="mt-0.5 text-xs text-muted-foreground">{t("account.blockedHint")}</p>
+            </div>
+            <span className="shrink-0 text-xs text-muted-foreground">
+              {blocksOpen ? t("account.blockedCollapse") : t("account.blockedExpand")}
+            </span>
+          </button>
+          {blocksOpen ? (
+            <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-2">
+              {blocks.map((block) => (
+                <div
+                  key={block.clientUserId}
+                  className="flex min-w-0 flex-wrap items-center justify-between gap-3 rounded-md border bg-white px-3 py-2 text-sm"
+                >
+                  <div className="min-w-0 max-w-full">
+                    <div className="truncate font-medium">{block.clientOwnerEmail}</div>
+                    <div className="break-words text-xs text-muted-foreground">
+                      {blockReasonLabel(block.reason, t)} ·{" "}
+                      {new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(
+                        new Date(block.createdAt),
+                      )}
+                    </div>
                   </div>
+                  <Button size="sm" variant="outline" isDisabled={!!liftingBlock} onClick={() => void unblock(block)}>
+                    {liftingBlock === block.clientUserId ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                    {t("account.unblock")}
+                  </Button>
                 </div>
-                <Button size="sm" variant="outline" isDisabled={!!liftingBlock} onClick={() => void unblock(block)}>
-                  {liftingBlock === block.clientUserId ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                  {t("account.unblock")}
-                </Button>
-              </div>
-            ))}
-          </div>
-        ) : (
-          <p className="text-sm text-muted-foreground">{t("account.noneBlocked")}</p>
-        )}
-      </section>
-    </main>
+              ))}
+            </div>
+          ) : null}
+        </section>
+      ) : null}
+    </div>
   );
 }

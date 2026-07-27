@@ -84,7 +84,7 @@ export function hostCanManage(host: ClientMarketHost, viewerEmail?: string | nul
   return !!viewer && !!owner && viewer === owner;
 }
 
-/** Provider-only. Renters release their own Client from the "My rentals" view,
+/** Provider-only. Renters release their own Client from Account → Client rentals,
  *  which posts `client_release` instead. */
 export function hostCanCleanup(host: ClientMarketHost, viewerEmail?: string | null) {
   return (

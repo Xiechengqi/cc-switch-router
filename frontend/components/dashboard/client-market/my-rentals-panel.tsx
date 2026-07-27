@@ -40,7 +40,7 @@ export function MyRentalsPanel({
 
   if (!rentals.length) {
     return (
-      <div className="grid justify-items-center gap-2 rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">
+      <div className="grid justify-items-center gap-2 rounded-xl border border-dashed border-border bg-card/40 px-4 py-12 text-center text-sm text-muted-foreground">
         <span>{t("clientMarket.rentals.empty")}</span>
       </div>
     );
@@ -54,7 +54,7 @@ export function MyRentalsPanel({
         return (
           <section
             key={billing.installationId}
-            className="grid gap-3 rounded-xl border border-border bg-card p-4 shadow-sm"
+            className="grid gap-3 rounded-xl border border-border bg-card p-4 shadow-sm sm:p-5"
           >
             <div className="flex min-w-0 flex-wrap items-center gap-2">
               {host?.countryCode ? (

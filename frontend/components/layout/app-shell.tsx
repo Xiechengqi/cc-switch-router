@@ -4,7 +4,7 @@ import Image from "next/image";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { Button, Dropdown, ListBox, Modal, Select, Tabs } from "@heroui/react";
-import { Activity, Copy, Eye, EyeOff, KeyRound, Loader2, LogOut, Monitor, Network, Receipt, RotateCcw, Settings, Store, UserRound } from "lucide-react";
+import { Activity, Copy, Eye, EyeOff, KeyRound, Loader2, LogOut, Monitor, Network, RotateCcw, Settings, Store, UserRound } from "lucide-react";
 import * as React from "react";
 import { LoginDialog } from "@/components/auth/login-dialog";
 import { Toast } from "@heroui/react";
@@ -15,7 +15,7 @@ import { getUserApiToken, resetUserApiToken } from "@/lib/api";
 import { DashboardDataProvider } from "@/components/dashboard/dashboard-data";
 import { AnnouncementDialog } from "@/components/announcement/announcement-dialog";
 import type { AppLocale } from "@/lib/i18n";
-import { DASHBOARD_ACCOUNT_PATH, DASHBOARD_CLIENTS_PATH, DASHBOARD_MARKETS_PATH, DASHBOARD_CLIENT_MARKET_PATH, DASHBOARD_RENTALS_PATH, type DashboardShellActive } from "@/lib/dashboard-nav";
+import { DASHBOARD_ACCOUNT_PATH, DASHBOARD_CLIENTS_PATH, DASHBOARD_MARKETS_PATH, DASHBOARD_CLIENT_MARKET_PATH, type DashboardShellActive } from "@/lib/dashboard-nav";
 import type { UserApiTokenStatus } from "@/lib/types";
 
 type RegionOption = {
@@ -260,20 +260,18 @@ function ApiTokenDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (
   );
 }
 
-function DashboardNav({ active }: { active: "clients" | "markets" | "client-market" | "rentals" | "account" }) {
+function DashboardNav({ active }: { active: "clients" | "markets" | "client-market" | "account" }) {
   const { t } = useLocaleText();
   const pathname = usePathname() || DASHBOARD_CLIENTS_PATH;
   const router = useRouter();
   const selectedKey =
     active === "account" || pathname.startsWith("/account")
       ? "account"
-      : active === "rentals" || pathname.startsWith("/rentals")
-      ? "rentals"
       : active === "client-market" || pathname.startsWith("/client-market")
-      ? "client-market"
-      : active === "markets" || pathname.startsWith("/markets")
-        ? "markets"
-        : "clients";
+        ? "client-market"
+        : active === "markets" || pathname.startsWith("/markets")
+          ? "markets"
+          : "clients";
   const tabClass =
     "inline-flex h-8 min-w-0 items-center justify-center gap-1.5 rounded-md px-2 text-xs font-medium text-muted-foreground transition-[background-color,color,box-shadow] hover:text-foreground data-[selected=true]:bg-white data-[selected=true]:font-semibold data-[selected=true]:text-foreground data-[selected=true]:shadow-sm sm:min-w-[5.75rem] sm:px-3";
 
@@ -288,11 +286,10 @@ function DashboardNav({ active }: { active: "clients" | "markets" | "client-mark
         if (next === "clients") router.push(DASHBOARD_CLIENTS_PATH);
         else if (next === "markets") router.push(DASHBOARD_MARKETS_PATH);
         else if (next === "client-market") router.push(DASHBOARD_CLIENT_MARKET_PATH);
-        else if (next === "rentals") router.push(DASHBOARD_RENTALS_PATH);
         else if (next === "account") router.push(DASHBOARD_ACCOUNT_PATH);
       }}
     >
-      <Tabs.List className="grid w-full grid-cols-5 gap-0.5 rounded-lg bg-slate-100/90 p-1 text-foreground ring-1 ring-inset ring-slate-200/80 sm:inline-grid sm:w-auto">
+      <Tabs.List className="grid w-full grid-cols-4 gap-0.5 rounded-lg bg-slate-100/90 p-1 text-foreground ring-1 ring-inset ring-slate-200/80 sm:inline-grid sm:w-auto">
         <Tabs.Tab id="clients" className={tabClass}>
           <Monitor className="h-3.5 w-3.5 shrink-0" aria-hidden />
           <span className="hidden sm:inline">{t("nav.clientsTab")}</span>
@@ -304,10 +301,6 @@ function DashboardNav({ active }: { active: "clients" | "markets" | "client-mark
         <Tabs.Tab id="client-market" className={tabClass}>
           <Network className="h-3.5 w-3.5 shrink-0" aria-hidden />
           <span className="hidden sm:inline">{t("nav.clientMarketTab")}</span>
-        </Tabs.Tab>
-        <Tabs.Tab id="rentals" className={tabClass}>
-          <Receipt className="h-3.5 w-3.5 shrink-0" aria-hidden />
-          <span className="hidden sm:inline">{t("nav.rentalsTab")}</span>
         </Tabs.Tab>
         <Tabs.Tab id="account" className={tabClass}>
           <UserRound className="h-3.5 w-3.5 shrink-0" aria-hidden />
@@ -326,7 +319,7 @@ function Topbar({ active }: { active: DashboardShellActive }) {
   const [clientRedirect, setClientRedirect] = React.useState<string | null>(null);
   const redirectStartedRef = React.useRef(false);
   const authed = !!session?.authenticated;
-  const showDashboardNav = active === "clients" || active === "markets" || active === "client-market" || active === "rentals" || active === "account";
+  const showDashboardNav = active === "clients" || active === "markets" || active === "client-market" || active === "account";
 
   React.useEffect(() => {
     setClientRedirect(sameRouterDomainClientRedirect(new URLSearchParams(window.location.search).get("clientRedirect")));

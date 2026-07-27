@@ -135,7 +135,7 @@ export function ClientMarketPage() {
         setError("");
       }
       try {
-        // Billing moved to /rentals with the renter view, so this page no longer
+        // Billing lives under Account → Client rentals, so this page no longer
         // fetches it. The signal is passed through so aborting actually cancels the
         // in-flight request; previously `abort()` only suppressed the state update.
         const nextHosts = await getClientMarketHosts(undefined, controller.signal);
