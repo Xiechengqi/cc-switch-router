@@ -4,10 +4,10 @@ TokenSwitch 的公共汇聚层。为 `cc-switch-server` 实例提供公网子域
 
 | Region | 24h usage |
 | --- | --- |
-| japan | ![japan 24h](https://jptokenswitch.cc/v1/public/embed/global.svg?period=24h&theme=light) |
-| singapore | ![singapore 24h](https://sgptokenswitch.cc/v1/public/embed/global.svg?period=24h&theme=light) |
-| hongkong | ![hongkong 24h](https://hktokenswitch.cc/v1/public/embed/global.svg?period=24h&theme=light) |
-| usa | ![usa 24h](https://ustokenswitch.cc/v1/public/embed/global.svg?period=24h&theme=light) |
+| [japan](https://jptokenswitch.cc) | ![japan 24h](https://jptokenswitch.cc/v1/public/embed/global.svg?period=24h&theme=light) |
+| [singapore](https://sgptokenswitch.cc) | ![singapore 24h](https://sgptokenswitch.cc/v1/public/embed/global.svg?period=24h&theme=light) |
+| [hongkong](https://hktokenswitch.cc) | ![hongkong 24h](https://hktokenswitch.cc/v1/public/embed/global.svg?period=24h&theme=light) |
+| [usa](https://ustokenswitch.cc) | ![usa 24h](https://ustokenswitch.cc/v1/public/embed/global.svg?period=24h&theme=light) |
 
 - 架构与实现现状 → [ARCHITECTURE.md](ARCHITECTURE.md)
 - 与客户端的接口契约 → [PROTOCOL.md](PROTOCOL.md)

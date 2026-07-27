@@ -92,16 +92,28 @@ function RouterSwitcher() {
         if (href) window.location.href = href;
       }}
     >
-      <Select.Trigger className="h-8 min-h-8 w-[7.25rem] items-center rounded-lg border border-border/60 bg-transparent py-0 pl-2.5 pr-7 text-xs text-foreground shadow-none hover:border-border sm:w-32">
-        <Select.Value className="block min-w-0 max-w-[5.5rem] truncate pr-1 text-xs font-medium text-foreground sm:max-w-[7rem]">
+      <Select.Trigger
+        className={cn(
+          "h-7 min-h-7 w-auto max-w-[9rem] items-center gap-1 rounded-md border-0 bg-transparent px-1.5 py-0",
+          "text-[11px] font-medium tracking-wide text-muted-foreground shadow-none",
+          "hover:bg-transparent hover:text-foreground focus:bg-transparent focus-visible:ring-0",
+          "data-[pressed=true]:bg-transparent data-[focus-visible=true]:ring-0",
+        )}
+      >
+        <Select.Value className="block min-w-0 truncate text-[11px] font-medium tracking-wide text-inherit">
           {selected || t("nav.router")}
         </Select.Value>
-        <Select.Indicator className="text-muted-foreground/70" />
+        <Select.Indicator className="size-3.5 shrink-0 text-muted-foreground/60" />
       </Select.Trigger>
-      <Select.Popover className="min-w-40">
-        <ListBox aria-label={t("nav.routers")}>
+      <Select.Popover className="min-w-[8.5rem] rounded-lg border border-border/70 bg-background p-1 shadow-md">
+        <ListBox aria-label={t("nav.routers")} className="outline-none">
           {regions.map((region) => (
-            <ListBox.Item key={region.name} id={region.name} textValue={region.name}>
+            <ListBox.Item
+              key={region.name}
+              id={region.name}
+              textValue={region.name}
+              className="rounded-md px-2.5 py-1.5 text-xs text-foreground outline-none data-[focused=true]:bg-muted data-[selected=true]:font-semibold"
+            >
               {region.name}
             </ListBox.Item>
           ))}
@@ -113,33 +125,17 @@ function RouterSwitcher() {
 
 function LanguageSwitcher() {
   const { locale, setLocale, t } = useLocaleText();
-  const optionClass = (active: boolean) =>
-    cn(
-      "inline-flex h-8 min-w-[1.75rem] items-center justify-center rounded-md px-1.5 text-xs tracking-wide transition-colors",
-      active
-        ? "font-semibold text-foreground"
-        : "font-medium text-muted-foreground hover:text-foreground",
-    );
+  const showEnglish = locale !== "en";
 
   return (
-    <div role="group" aria-label={t("common.language")} className="inline-flex h-8 shrink-0 items-center gap-0.5">
-      <button
-        type="button"
-        aria-pressed={locale === "en"}
-        className={optionClass(locale === "en")}
-        onClick={() => setLocale("en")}
-      >
-        EN
-      </button>
-      <button
-        type="button"
-        aria-pressed={locale === "zh-CN"}
-        className={optionClass(locale === "zh-CN")}
-        onClick={() => setLocale("zh-CN")}
-      >
-        中
-      </button>
-    </div>
+    <button
+      type="button"
+      aria-label={t("common.language")}
+      className="inline-flex h-8 shrink-0 items-center justify-center rounded-md px-1.5 text-xs font-medium tracking-wide text-muted-foreground transition-colors hover:text-foreground"
+      onClick={() => setLocale(showEnglish ? "en" : "zh-CN")}
+    >
+      {showEnglish ? "EN" : "中"}
+    </button>
   );
 }
 
@@ -248,31 +244,28 @@ function Topbar({ active }: { active: DashboardShellActive }) {
   return (
     <>
       {/*
-        Single primary row: brand (logo + muted title + region) | section tabs | lang + user.
-        Region sits with the logo because it answers “which Router am I on”; lang/user stay
-        as account chrome on the right. Title is a light subtitle so tabs reclaim the row.
+        Three-column topbar: brand (logo + region) | centered section tabs | lang + user.
+        Language control only offers the alternate locale (EN while zh-CN, 中 while en).
       */}
       <header className="mx-auto w-[calc(100%-2rem)] max-w-7xl py-4">
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-          <div className="flex min-w-0 items-center gap-2.5">
-            <Link href={DASHBOARD_CLIENTS_PATH} className="flex min-w-0 items-center gap-2">
+        <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-x-3 gap-y-2">
+          <div className="flex min-w-0 items-center gap-1.5 justify-self-start">
+            <Link href={DASHBOARD_CLIENTS_PATH} className="flex shrink-0 items-center" aria-label="CC-Switch Router">
               <Image src="/router-logo.svg" alt="" width={32} height={32} className="h-8 w-8 shrink-0" priority />
-              <span className="hidden max-w-[7.5rem] text-[11px] font-medium leading-tight tracking-wide text-muted-foreground sm:block">
-                CC-Switch Router
-              </span>
             </Link>
+            <span className="hidden h-3 w-px shrink-0 bg-border/80 sm:block" aria-hidden />
             <RouterSwitcher />
           </div>
 
           {showDashboardNav ? (
-            <div className="min-w-0 flex-1 overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+            <div className="min-w-0 justify-self-center overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
               <DashboardNav active={active} authed={authed} />
             </div>
           ) : (
-            <div className="min-w-0 flex-1" />
+            <div />
           )}
 
-          <div className="ml-auto flex flex-nowrap items-center gap-2">
+          <div className="flex flex-nowrap items-center justify-end gap-2 justify-self-end">
             <LanguageSwitcher />
             {authed ? (
               <Dropdown>
