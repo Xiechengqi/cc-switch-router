@@ -8285,6 +8285,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_supply_bootstraps_profiles_for_orphan_host_owners() {
+        let (store, _config, root) = test_store("provider-supply-orphan-owner");
+        store
+            .client_market_ensure_provider("official-provider", "official@example.com")
+            .await
+            .expect("create official Provider");
+        let _official = add_provider_host(
+            &store,
+            "official-provider",
+            "official@example.com",
+            "198.18.40.1",
+            "DE",
+            None,
+            None,
+        )
+        .await;
+        // Live shape: Host rows exist for a non-official owner with NULL provider_id and
+        // no host_provider_profiles row, so Create Client only ever listed the official owner.
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO users (id, email_normalized, status, created_at, last_login_at)
+                 VALUES ('non-official-user', 'peer@example.com', 'active', ?1, ?1)",
+                params![Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO router_ssh_hosts (
+                    id, provider_id, ip, port, host_owner_email, country_code, hostname,
+                    ssh_host_key_fingerprint, status, installation_id, last_verified_at, last_error,
+                    note, ip_intel_json, price_cents, rental_period_days, offer_revision, created_at, updated_at
+                 ) VALUES (
+                    'orphan-host-1', NULL, '198.18.40.2', 22, 'peer@example.com', 'US', 'peer-host',
+                    'SHA256:peer', 'idle', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 1, ?1, ?1
+                 )",
+                params![Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        }
+
+        let supply = store
+            .client_market_provider_supply(Some("official@example.com"))
+            .await
+            .expect("load Provider supply");
+        assert!(
+            supply
+                .providers
+                .iter()
+                .any(|provider| provider.provider_id == "official-provider" && provider.official),
+            "official Provider must remain listed"
+        );
+        let peer = supply
+            .providers
+            .iter()
+            .find(|provider| provider.owner_email == "peer@example.com")
+            .expect("non-official Host owner must appear in supply");
+        assert_eq!(peer.provider_id, "non-official-user");
+        assert!(!peer.official);
+        assert_eq!(peer.host_total, 1);
+        assert_eq!(peer.idle_total, 1);
+        let us = peer
+            .countries
+            .iter()
+            .find(|country| country.code == "US")
+            .expect("orphan Host country must feed region capacity");
+        assert_eq!(us.idle, 1);
+        assert_eq!(us.total, 1);
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn billing_reconcile_opens_one_renewal_and_reports_overdue_client() {
         let (store, _config, root) = test_store("trade-renewal");
         let host = add_provider_host(

@@ -508,7 +508,14 @@ export function CreateClientDialog({
     onOpenChange(nextOpen);
   };
 
-  const installCommand = React.useMemo(() => buildClientInstallCommand({ ownerEmail }), [ownerEmail]);
+  const installCommand = React.useMemo(
+    () =>
+      buildClientInstallCommand({
+        ownerEmail,
+        passwordPlaceholder: t("createClient.manualPasswordPlaceholder"),
+      }),
+    [ownerEmail, t],
+  );
   const quoteSeconds = secondsRemaining(quote?.expiresAt);
   const subdomainsCanCommit = !!quote && quote.items.every((item) => {
     const value = normalizeDraftSubdomain(drafts[item.id]?.subdomain || "");

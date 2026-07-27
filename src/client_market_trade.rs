@@ -760,6 +760,87 @@ fn heal_all_provider_host_bindings_tx(tx: &Transaction<'_>, now: &str) -> Result
     Ok(())
 }
 
+/// Create Provider profiles for Host owners that have rows in `router_ssh_hosts`
+/// but never got a `host_provider_profiles` entry (common for hosts added before
+/// Provider identity, or with `provider_id` left NULL). Without this, Create Client
+/// supply only lists owners who already have a profile — typically just the official one.
+fn ensure_provider_profiles_for_orphan_hosts_tx(
+    tx: &Transaction<'_>,
+    now: &str,
+) -> Result<(), AppError> {
+    let mut statement = tx
+        .prepare(
+            "SELECT DISTINCT lower(trim(h.host_owner_email))
+             FROM router_ssh_hosts h
+             WHERE trim(h.host_owner_email) != ''
+               AND (
+                    h.provider_id IS NULL
+                    OR NOT EXISTS (
+                        SELECT 1 FROM host_provider_profiles p
+                        WHERE p.provider_id = h.provider_id
+                    )
+               )
+               AND NOT EXISTS (
+                    SELECT 1 FROM host_provider_profiles p
+                    WHERE lower(p.owner_email) = lower(h.host_owner_email)
+               )",
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("prepare orphan Host Provider emails failed: {error}"))
+        })?;
+    let emails = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| {
+            AppError::Internal(format!("query orphan Host Provider emails failed: {error}"))
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            AppError::Internal(format!("read orphan Host Provider emails failed: {error}"))
+        })?;
+    drop(statement);
+
+    for email in emails {
+        let user_id: Option<String> = tx
+            .query_row(
+                "SELECT id FROM users WHERE email_normalized = ?1",
+                params![email],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!("resolve orphan Host owner user failed: {error}"))
+            })?;
+        let mut provider_id = user_id.unwrap_or_else(|| format!("email:{email}"));
+        if let Some(existing_email) = tx
+            .query_row(
+                "SELECT lower(owner_email) FROM host_provider_profiles WHERE provider_id = ?1",
+                params![provider_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!("lookup orphan Provider id collision failed: {error}"))
+            })?
+        {
+            if existing_email != email {
+                provider_id = format!("email:{email}");
+            }
+        }
+        tx.execute(
+            "INSERT INTO host_provider_profiles (provider_id, owner_email, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(provider_id) DO UPDATE SET
+                owner_email = excluded.owner_email,
+                updated_at = excluded.updated_at",
+            params![provider_id, email, now],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("ensure orphan Host Provider profile failed: {error}"))
+        })?;
+    }
+    Ok(())
+}
+
 fn normalize_payment_method(mut method: PaymentMethod) -> Result<PaymentMethod, AppError> {
     method.kind = method.kind.trim().to_ascii_lowercase();
     method.account = clean_optional(method.account, 200)?;
@@ -2081,7 +2162,9 @@ impl AppStore {
             let tx = conn.transaction().map_err(|error| {
                 AppError::Internal(format!("begin Provider supply heal failed: {error}"))
             })?;
-            heal_all_provider_host_bindings_tx(&tx, &Utc::now().to_rfc3339())?;
+            let now = Utc::now().to_rfc3339();
+            ensure_provider_profiles_for_orphan_hosts_tx(&tx, &now)?;
+            heal_all_provider_host_bindings_tx(&tx, &now)?;
             tx.commit().map_err(|error| {
                 AppError::Internal(format!("commit Provider supply heal failed: {error}"))
             })?;
@@ -2544,7 +2627,9 @@ impl AppStore {
             AppError::Internal(format!("begin allocation quote failed: {error}"))
         })?;
         expire_quotes_tx(&tx, now)?;
-        heal_all_provider_host_bindings_tx(&tx, &now.to_rfc3339())?;
+        let now_rfc = now.to_rfc3339();
+        ensure_provider_profiles_for_orphan_hosts_tx(&tx, &now_rfc)?;
+        heal_all_provider_host_bindings_tx(&tx, &now_rfc)?;
         ensure_creation_allowed_tx(&tx, &session.user_id, &session.email)?;
         let active_quote: i64 = tx
             .query_row(
