@@ -26182,8 +26182,11 @@ mod tests {
 
         let svg = crate::embed_usage::render_global_usage_svg(
             &global,
-            "dark",
-            "7d",
+            &crate::embed_usage::EmbedRenderOptions {
+                theme: "dark".into(),
+                period: "7d".into(),
+                ..Default::default()
+            },
             "ustokenswitch.cc",
         );
         assert!(svg.contains("TokenSwitch · ustokenswitch.cc"));

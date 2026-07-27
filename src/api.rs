@@ -182,6 +182,10 @@ struct EmbedUsageQuery {
     period: Option<String>,
     theme: Option<String>,
     models: Option<usize>,
+    show_breakdown: Option<String>,
+    show_models: Option<String>,
+    compact: Option<String>,
+    format: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2331,26 +2335,38 @@ fn embed_models_limit(models: Option<usize>) -> usize {
     models.unwrap_or(8).clamp(1, 16)
 }
 
+fn embed_render_options(query: &EmbedUsageQuery, period_fallback: &str) -> crate::embed_usage::EmbedRenderOptions {
+    crate::embed_usage::EmbedRenderOptions::from_query(
+        query.period.as_deref().or(Some(period_fallback)),
+        query.theme.as_deref(),
+        query.show_breakdown.as_deref(),
+        query.show_models.as_deref(),
+        query.compact.as_deref(),
+        query.format.as_deref(),
+    )
+}
+
 async fn embed_global_usage_svg(
     State(state): State<ServerState>,
     Query(query): Query<EmbedUsageQuery>,
 ) -> Response {
     let period = query.period.as_deref().unwrap_or("7d");
-    let theme = query.theme.as_deref().unwrap_or("dark");
     let models_limit = embed_models_limit(query.models);
+    let opts = embed_render_options(&query, period);
     match state.store.usage_global(period).await {
         Ok(mut data) => {
             data.models.truncate(models_limit);
+            let mut opts = opts;
+            opts.period = data.period.clone();
             svg_usage_response(crate::embed_usage::render_global_usage_svg(
                 &data,
-                theme,
-                &data.period,
+                &opts,
                 &state.config.tunnel_domain,
             ))
         }
         Err(err) => svg_usage_response(crate::embed_usage::render_usage_error_svg(
             &err.to_string(),
-            theme,
+            &opts,
         )),
     }
 }
@@ -2361,8 +2377,8 @@ async fn embed_user_usage_svg(
     Query(query): Query<EmbedUsageQuery>,
 ) -> Response {
     let period = query.period.as_deref().unwrap_or("7d");
-    let theme = query.theme.as_deref().unwrap_or("dark");
     let models_limit = embed_models_limit(query.models);
+    let opts = embed_render_options(&query, period);
     let username = username
         .strip_suffix(".svg")
         .unwrap_or(username.as_str())
@@ -2376,20 +2392,21 @@ async fn embed_user_usage_svg(
     {
         Ok(Some((profile, mut data))) => {
             data.models.truncate(models_limit);
+            let mut opts = opts;
+            opts.period = data.period.clone();
             svg_usage_response(crate::embed_usage::render_user_usage_svg(
                 &profile.username,
                 &data,
-                theme,
-                &data.period,
+                &opts,
             ))
         }
         Ok(None) => svg_usage_response(crate::embed_usage::render_usage_error_svg(
             "usage not found or not public",
-            theme,
+            &opts,
         )),
         Err(err) => svg_usage_response(crate::embed_usage::render_usage_error_svg(
             &err.to_string(),
-            theme,
+            &opts,
         )),
     }
 }

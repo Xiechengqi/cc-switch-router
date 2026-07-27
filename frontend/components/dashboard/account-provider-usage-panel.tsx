@@ -4,120 +4,91 @@ import * as React from "react";
 import { BarChart3, ChevronDown, ChevronRight, Loader2 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import {
+  UsageModelTable,
+  UsagePeriodChips,
+  UsageTokenMixBar,
+  UsageTotalsStrip,
+} from "@/components/dashboard/account-usage-shared";
 import { getMyUsageProvider } from "@/lib/api";
 import type {
   AccountUsagePeriod,
   ProviderInstallationUsage,
   ProviderShareUsage,
   ProviderUsageResponse,
-  UsageModelRow,
-  UsageTokenTotals,
 } from "@/lib/types";
-import { compactTokens, cn } from "@/lib/utils";
-
-const PERIODS: readonly AccountUsagePeriod[] = ["24h", "7d", "30d"];
-
-function TotalsStrip({ totals, t }: { totals: UsageTokenTotals; t: (key: Parameters<ReturnType<typeof useLocaleText>["t"]>[0]) => string }) {
-  const items = [
-    { label: t("account.usage.total"), value: totals.totalTokens },
-    { label: t("account.usage.input"), value: totals.inputTokens },
-    { label: t("account.usage.output"), value: totals.outputTokens },
-    { label: t("account.usage.cacheRead"), value: totals.cacheReadTokens },
-    { label: t("account.usage.cacheWrite"), value: totals.cacheCreationTokens },
-  ];
-  return (
-    <div className="grid gap-2 rounded-xl border border-border bg-card p-3 sm:grid-cols-5">
-      {items.map((item) => (
-        <div key={item.label} className="min-w-0 rounded-lg bg-muted/30 px-3 py-2">
-          <div className="text-[11px] uppercase tracking-[0.06em] text-muted-foreground">{item.label}</div>
-          <div className="mt-0.5 font-mono text-sm font-semibold tabular-nums">{compactTokens(item.value)}</div>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function ModelTable({ models, t }: { models: UsageModelRow[]; t: (key: Parameters<ReturnType<typeof useLocaleText>["t"]>[0]) => string }) {
-  if (!models.length) return null;
-  return (
-    <div className="overflow-hidden rounded-md border">
-      <table className="w-full table-fixed border-collapse text-[11px]">
-        <colgroup>
-          <col className="w-[36%]" />
-          <col className="w-[13%]" />
-          <col className="w-[13%]" />
-          <col className="w-[13%]" />
-          <col className="w-[13%]" />
-          <col className="w-[12%]" />
-        </colgroup>
-        <thead className="bg-muted/50 text-left font-mono uppercase tracking-[0.08em] text-muted-foreground">
-          <tr>
-            <th className="px-1.5 py-2">{t("account.usage.model")}</th>
-            <th className="px-1.5 py-2 text-right">{t("account.usage.input")}</th>
-            <th className="px-1.5 py-2 text-right">{t("account.usage.output")}</th>
-            <th className="px-1.5 py-2 text-right">{t("account.usage.cacheRead")}</th>
-            <th className="px-1.5 py-2 text-right">{t("account.usage.cacheWrite")}</th>
-            <th className="px-1.5 py-2 text-right">{t("account.usage.total")}</th>
-          </tr>
-        </thead>
-        <tbody>
-          {models.map((row) => (
-            <tr key={row.model} className="border-t">
-              <td className="whitespace-normal break-all px-1.5 py-2 font-medium leading-4">{row.model || "-"}</td>
-              <td className="overflow-hidden px-1.5 py-2 text-right font-mono">{compactTokens(row.inputTokens)}</td>
-              <td className="overflow-hidden px-1.5 py-2 text-right font-mono">{compactTokens(row.outputTokens)}</td>
-              <td className="overflow-hidden px-1.5 py-2 text-right font-mono">{compactTokens(row.cacheReadTokens)}</td>
-              <td className="overflow-hidden px-1.5 py-2 text-right font-mono">{compactTokens(row.cacheCreationTokens)}</td>
-              <td className="overflow-hidden px-1.5 py-2 text-right font-mono font-semibold">{compactTokens(row.totalTokens)}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
+import { compactTokens } from "@/lib/utils";
 
 function ShareBlock({ share }: { share: ProviderShareUsage }) {
   const { t } = useLocaleText();
   const [open, setOpen] = React.useState(false);
+  const sortedModels = React.useMemo(() => {
+    const rows = [...(share.models || [])];
+    rows.sort((a, b) => b.totalTokens - a.totalTokens);
+    return rows;
+  }, [share.models]);
+
   return (
     <div className="rounded-lg border border-border bg-background">
       <button
         type="button"
-        className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm"
+        className="flex w-full items-center gap-2 px-3 py-2.5 text-left"
         onClick={() => setOpen((value) => !value)}
       >
-        {open ? <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" /> : <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />}
-        <span className="min-w-0 flex-1 truncate font-medium">{share.shareName || share.shareId}</span>
-        <span className="font-mono text-xs text-muted-foreground">{compactTokens(share.totalTokens)}</span>
+        {open ? (
+          <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+        ) : (
+          <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+        )}
+        <span className="min-w-0 flex-1 truncate text-sm font-medium text-foreground">
+          {share.shareName || share.shareId}
+        </span>
+        {share.shareName ? (
+          <span className="hidden max-w-[140px] truncate font-mono text-[10px] text-muted-foreground sm:inline">
+            {share.shareId}
+          </span>
+        ) : null}
+        <span className="font-mono text-sm font-semibold tabular-nums text-foreground">
+          {compactTokens(share.totalTokens)}
+        </span>
       </button>
       {open ? (
-        <div className="grid gap-3 border-t px-3 py-2">
-          <ModelTable models={share.models || []} t={t} />
+        <div className="grid gap-3 border-t px-3 py-3">
+          <div>
+            <div className="mb-1.5 text-[11px] font-mono uppercase tracking-[0.08em] text-muted-foreground">
+              {t("account.usage.models")}
+            </div>
+            <UsageModelTable models={sortedModels} t={t} emptyMessage={t("account.usage.empty")} />
+          </div>
           {(share.callers || []).length ? (
-            <div className="overflow-hidden rounded-md border">
-              <table className="w-full table-fixed border-collapse text-[11px]">
-                <colgroup>
-                  <col className="w-[55%]" />
-                  <col className="w-[45%]" />
-                </colgroup>
-                <thead className="bg-muted/50 text-left font-mono uppercase tracking-[0.08em] text-muted-foreground">
-                  <tr>
-                    <th className="px-1.5 py-2">{t("account.providerUsage.caller")}</th>
-                    <th className="px-1.5 py-2 text-right">{t("account.usage.total")}</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {(share.callers || []).map((row) => (
-                    <tr key={row.email} className="border-t">
-                      <td className="overflow-hidden px-1.5 py-2">{row.email || "-"}</td>
-                      <td className="overflow-hidden px-1.5 py-2 text-right font-mono font-semibold">
-                        {compactTokens(row.totalTokens)}
-                      </td>
+            <div>
+              <div className="mb-1.5 text-[11px] font-mono uppercase tracking-[0.08em] text-muted-foreground">
+                {t("account.providerUsage.caller")}
+              </div>
+              <div className="overflow-hidden rounded-md border">
+                <table className="w-full table-fixed border-collapse text-[11px]">
+                  <colgroup>
+                    <col className="w-[55%]" />
+                    <col className="w-[45%]" />
+                  </colgroup>
+                  <thead className="bg-muted/50 text-left font-mono uppercase tracking-[0.08em] text-muted-foreground">
+                    <tr>
+                      <th className="px-1.5 py-2">{t("account.providerUsage.caller")}</th>
+                      <th className="px-1.5 py-2 text-right">{t("account.usage.total")}</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {(share.callers || []).map((row) => (
+                      <tr key={row.email} className="border-t">
+                        <td className="overflow-hidden px-1.5 py-2">{row.email || "-"}</td>
+                        <td className="overflow-hidden px-1.5 py-2 text-right font-mono font-semibold tabular-nums">
+                          {compactTokens(row.totalTokens)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </div>
           ) : null}
         </div>
@@ -134,16 +105,24 @@ function InstallationBlock({ installation }: { installation: ProviderInstallatio
     <section className="grid gap-2 rounded-xl border border-border bg-card p-3 sm:p-4">
       <button
         type="button"
-        className="flex w-full items-center gap-2 text-left"
+        className="flex w-full items-center gap-3 text-left"
         onClick={() => setOpen((value) => !value)}
       >
-        {open ? <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" /> : <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />}
+        {open ? (
+          <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />
+        ) : (
+          <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
+        )}
         <div className="min-w-0 flex-1">
-          <div className="truncate text-sm font-semibold">{label}</div>
-          <div className="truncate font-mono text-[11px] text-muted-foreground">{installation.installationId}</div>
+          <div className="truncate text-sm font-semibold text-foreground">{label}</div>
+          <div className="truncate font-mono text-[11px] text-muted-foreground/80">
+            {installation.installationId}
+          </div>
         </div>
         <div className="text-right">
-          <div className="font-mono text-sm font-semibold tabular-nums">{compactTokens(installation.totalTokens)}</div>
+          <div className="font-mono text-base font-semibold tabular-nums tracking-tight text-foreground">
+            {compactTokens(installation.totalTokens)}
+          </div>
           <div className="text-[11px] text-muted-foreground">
             {t("account.providerUsage.shares")}: {installation.shares.length}
           </div>
@@ -216,23 +195,7 @@ export function AccountProviderUsagePanel() {
           </h2>
           <p className="mt-0.5 text-sm text-muted-foreground">{t("account.providerUsage.hint")}</p>
         </div>
-        <div className="flex flex-wrap items-center gap-1">
-          {PERIODS.map((item) => (
-            <button
-              key={item}
-              type="button"
-              className={cn(
-                "rounded-md border px-2 py-1 text-xs transition-colors",
-                period === item
-                  ? "border-primary/40 bg-primary/10 text-primary"
-                  : "border-border bg-muted/20 text-muted-foreground hover:bg-muted/40",
-              )}
-              onClick={() => setPeriod(item)}
-            >
-              {t(`account.usage.period.${item}`)}
-            </button>
-          ))}
-        </div>
+        <UsagePeriodChips period={period} onChange={setPeriod} t={t} />
       </div>
 
       {error ? (
@@ -248,9 +211,12 @@ export function AccountProviderUsagePanel() {
 
       {usage ? (
         <>
-          <TotalsStrip totals={usage} t={t} />
+          <UsageTotalsStrip totals={usage} t={t} />
+          <UsageTokenMixBar totals={usage} t={t} />
           <div>
-            <h3 className="mb-2 text-sm font-semibold text-foreground">{t("account.providerUsage.installations")}</h3>
+            <h3 className="mb-2 text-sm font-semibold text-foreground">
+              {t("account.providerUsage.installations")}
+            </h3>
             {usage.installations.length ? (
               <div className="grid gap-3">
                 {usage.installations.map((installation) => (
