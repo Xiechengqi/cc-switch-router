@@ -2,11 +2,13 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { KeyRound, Receipt, WalletCards } from "lucide-react";
+import { Activity, BarChart3, KeyRound, Receipt, WalletCards } from "lucide-react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   DASHBOARD_ACCOUNT_API_KEYS_PATH,
+  DASHBOARD_ACCOUNT_CONSUMER_USAGE_PATH,
   DASHBOARD_ACCOUNT_PAYMENTS_PATH,
+  DASHBOARD_ACCOUNT_PROVIDER_USAGE_PATH,
   DASHBOARD_ACCOUNT_RENTALS_PATH,
 } from "@/lib/dashboard-nav";
 import { cn } from "@/lib/utils";
@@ -19,6 +21,20 @@ const NAV_ITEMS = [
     icon: KeyRound,
     match: (pathname: string) =>
       pathname.startsWith("/account/api-keys") || pathname === "/account" || pathname === "/account/",
+  },
+  {
+    id: "provider-usage",
+    href: DASHBOARD_ACCOUNT_PROVIDER_USAGE_PATH,
+    labelKey: "account.nav.providerUsage" as const,
+    icon: BarChart3,
+    match: (pathname: string) => pathname.startsWith("/account/provider-usage"),
+  },
+  {
+    id: "consumer-usage",
+    href: DASHBOARD_ACCOUNT_CONSUMER_USAGE_PATH,
+    labelKey: "account.nav.consumerUsage" as const,
+    icon: Activity,
+    match: (pathname: string) => pathname.startsWith("/account/consumer-usage"),
   },
   {
     id: "payments",

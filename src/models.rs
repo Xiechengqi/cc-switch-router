@@ -1247,6 +1247,154 @@ pub struct ShareUsageByEmailResponse {
     pub rows: Vec<ShareUsageEmailRow>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageModelRow {
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub total_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageDailyBucket {
+    pub date: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub total_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageShareRow {
+    pub share_id: String,
+    pub share_name: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub total_tokens: u64,
+    pub models: Vec<UsageModelRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountUsageResponse {
+    pub period: String,
+    pub bucket_granularity: String,
+    pub days: u32,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub total_tokens: u64,
+    pub models: Vec<UsageModelRow>,
+    pub daily: Vec<UsageDailyBucket>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub by_share: Vec<UsageShareRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageCallerRow {
+    pub email: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub total_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderShareUsage {
+    pub share_id: String,
+    pub share_name: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub total_tokens: u64,
+    pub models: Vec<UsageModelRow>,
+    pub callers: Vec<UsageCallerRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderInstallationUsage {
+    pub installation_id: String,
+    pub label: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub total_tokens: u64,
+    pub shares: Vec<ProviderShareUsage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderUsageResponse {
+    pub period: String,
+    pub bucket_granularity: String,
+    pub days: u32,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub total_tokens: u64,
+    pub installations: Vec<ProviderInstallationUsage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlobalUsageResponse {
+    pub period: String,
+    pub bucket_granularity: String,
+    pub days: u32,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub total_tokens: u64,
+    pub models: Vec<UsageModelRow>,
+    pub daily: Vec<UsageDailyBucket>,
+    pub active_shares: usize,
+    pub active_clients: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserProfilePublic {
+    pub username: String,
+    pub public_stats_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserProfileResponse {
+    pub email: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    pub public_stats_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateUserProfileRequest {
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub public_stats_enabled: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareUserLimitStatusRow {

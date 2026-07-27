@@ -12807,6 +12807,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         ",
     )
     .map_err(|e| AppError::Internal(format!("init schema failed: {e}")))?;
+    crate::usage_account::init_schema(conn)?;
     add_column_if_missing(
         conn,
         "leases",
@@ -26115,6 +26116,74 @@ mod tests {
             .expect("share URL view");
         assert_eq!(share_url_view.tokens_used_by_app.get("codex"), Some(&1000));
         assert_eq!(share_url_view.requests_count_by_app.get("codex"), Some(&7));
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn account_usage_consumer_provider_and_global_aggregate_tokens() {
+        let (store, config) = setup_store("account-usage-consumer-provider-global").await;
+        insert_installation(&store, "inst-account-usage").await;
+        insert_share(
+            &store,
+            "inst-account-usage",
+            "share-account-usage",
+            "account-usage-sub",
+            "active",
+        )
+        .await;
+        {
+            let conn = store.conn.lock().await;
+            let now = Utc::now().timestamp();
+            let mut log = test_share_request_log_entry(
+                "req-account-usage",
+                "share-account-usage",
+                now - 3600,
+            );
+            log.user_email = Some("caller@example.com".into());
+            log.model = "gpt-5".into();
+            log.input_tokens = 100;
+            log.output_tokens = 40;
+            log.cache_read_tokens = 10;
+            log.cache_creation_tokens = 0;
+            upsert_share_request_log_tx(&conn, "inst-account-usage", log).expect("insert log");
+        }
+
+        let consumer = store
+            .usage_consumer("caller@example.com", "7d")
+            .await
+            .expect("consumer usage");
+        assert_eq!(consumer.period, "7d");
+        assert_eq!(consumer.total_tokens, 150);
+        assert_eq!(consumer.models.len(), 1);
+        assert_eq!(consumer.models[0].model, "gpt-5");
+        assert!(consumer.daily.len() >= 7);
+
+        let provider = store
+            .usage_provider("owner@example.com", "7d")
+            .await
+            .expect("provider usage");
+        assert_eq!(provider.total_tokens, 150);
+        assert!(!provider.installations.is_empty());
+        assert_eq!(
+            provider.installations[0].shares[0].share_id,
+            "share-account-usage"
+        );
+
+        let global = store.usage_global("7d").await.expect("global usage");
+        assert_eq!(global.total_tokens, 150);
+        assert_eq!(global.models[0].model, "gpt-5");
+        assert!(
+            serde_json::to_value(&global)
+                .expect("serialize")
+                .get("cost")
+                .is_none()
+        );
+
+        let svg = crate::embed_usage::render_global_usage_svg(&global, "dark", "7d");
+        assert!(svg.contains("TokenSwitch · Global"));
+        assert!(svg.contains("?period=24h"));
+        assert!(svg.contains("gpt-5"));
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }

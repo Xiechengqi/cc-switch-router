@@ -2,6 +2,22 @@
 
 TokenSwitch 的公共汇聚层。为 `cc-switch-server` 实例提供公网子域名与反向隧道,并在其上承载额度共享市场、主机供给市场与多区域 Router 联邦。
 
+<!-- Live global token usage (model + token counts only; no cost). -->
+<!-- GitHub README 内嵌图上的按钮不可点；用下方链接打开 SVG 页后可切换 24h/7d/30d。 -->
+<p align="center">
+  <a href="https://jptokenswitch.cc/v1/public/embed/global.svg?period=24h">24h</a>
+  ·
+  <a href="https://jptokenswitch.cc/v1/public/embed/global.svg?period=7d"><strong>7d</strong></a>
+  ·
+  <a href="https://jptokenswitch.cc/v1/public/embed/global.svg?period=30d">30d</a>
+</p>
+<p align="center">
+  <img
+    src="https://jptokenswitch.cc/v1/public/embed/global.svg?period=7d"
+    alt="TokenSwitch global token usage (7d)"
+    width="680" />
+</p>
+
 - 架构与实现现状 → [ARCHITECTURE.md](ARCHITECTURE.md)
 - 与客户端的接口契约 → [PROTOCOL.md](PROTOCOL.md)
 - 手动 UI 回归清单 → [UI_TEST_PLAN.md](UI_TEST_PLAN.md)
@@ -62,9 +78,9 @@ Client Web tunnel:静态资源和明确列出的登录/OAuth 回调公开;其余
 | `/v1/auth/*` | 5 | 公开 / Session | `email/request-code`、`email/verify-code`、`session/refresh`、`session/me`、`session/logout` |
 | `/v1/tunnels/*` | 4 | Ed25519 签名 | `lease`、`lease/renew`、`activate`、`state` |
 | `/v1/account/*` | 4 | Session | `payment-profile`、`payment-assets/:id`、`provider-blocks` |
-| `/v1/public/*` | 2 | 公开 | `map-points`、`network-stats` |
+| `/v1/public/*` | 4 | 公开 | `map-points`、`network-stats`、`embed/global.svg`、`embed/usage/:username` |
 | `/share-api/*` | 4 | 子域名上下文,Session 可选 | `context`、`share`、`auth/me`、`share/settings` |
-| `/v1/dashboard/*`、`/v1/me/*` | 6 | Session | `dashboard`、`presence`、`ux-events`、`me/api-token`、`me/shares` |
+| `/v1/dashboard/*`、`/v1/me/*` | 10 | Session | `dashboard`、`presence`、`ux-events`、`me/api-token`、`me/shares`、`me/profile`、`me/usage/consumer`、`me/usage/provider` |
 | `/v1/board/*` | 5 | — | 遗留接口,写操作返回 `410 Gone` |
 | 其余单例 | 约 15 | 混合 | `healthz`、`regions`、`announcement`、`map-display`、`client-tunnel/subdomain-availability`、`_market/proxy/*`、`_gateway/proxy/*`、`*path`(前端与反代 catch-all) |
 

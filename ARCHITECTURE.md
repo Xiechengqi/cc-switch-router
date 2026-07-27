@@ -202,8 +202,17 @@ routes: Arc<RwLock<HashMap<String, LogicalRoute>>>
 | 联邦 | `router_markets`、`router_gateways`、`share_market_listing_statuses` |
 | 通知 | `client_notification_events`、`email_delivery_batches` 等 9 张 |
 | 聊天 | `client_chat_rooms`、`client_chat_messages` 等 7 张(`store/client_chat.rs`) |
-| 认证 | `users`、`user_sessions`、`user_api_tokens`、`email_login_challenges` |
+| 认证 | `users`、`user_sessions`、`user_api_tokens`、`email_login_challenges`、`user_profiles` |
 | 遗留 | `board_*`(接口已返回 410 Gone,数据保留) |
+
+### 账户用量（Provider / Consumer）
+
+账户页提供双视角用量（只计 model + token，不算 cost）：
+
+- **Provider**：`owner_email` 下多 installation / share 的被消耗量 → `GET /v1/me/usage/provider`
+- **Consumer**：`user_email` 跨 share 的调用量 → `GET /v1/me/usage/consumer`
+- **公开 SVG**：`GET /v1/public/embed/global.svg`（全站）、`GET /v1/public/embed/usage/:username`（opt-in 个人）
+- 数据来自现有 `share_request_logs` / `market_request_logs` 短窗口聚合（24h / 7d / 30d），见 `usage_account.rs` / `embed_usage.rs`
 
 ### 已知限制
 

@@ -18,6 +18,11 @@ import type {
   ShareUserLimitStatusResponse,
   UserApiTokenResponse,
   UserApiTokenResetResponse,
+  AccountUsagePeriod,
+  AccountUsageResponse,
+  ProviderUsageResponse,
+  UserProfileResponse,
+  UpdateUserProfileRequest,
   VersionResponse,
   MetricsSnapshot,
   HostMetricsInfo,
@@ -163,6 +168,34 @@ export async function getUserApiToken() {
 export async function resetUserApiToken() {
   return parseJson<UserApiTokenResetResponse>(
     await authFetch("/v1/me/api-token/reset", { method: "POST" }),
+  );
+}
+
+export async function getMyUsageConsumer(period: AccountUsagePeriod | string) {
+  const params = new URLSearchParams({ period });
+  return parseJson<AccountUsageResponse>(
+    await authFetch(`/v1/me/usage/consumer?${params}`, { cache: "no-store" }),
+  );
+}
+
+export async function getMyUsageProvider(period: AccountUsagePeriod | string) {
+  const params = new URLSearchParams({ period });
+  return parseJson<ProviderUsageResponse>(
+    await authFetch(`/v1/me/usage/provider?${params}`, { cache: "no-store" }),
+  );
+}
+
+export async function getMyProfile() {
+  return parseJson<UserProfileResponse>(await authFetch("/v1/me/profile", { cache: "no-store" }));
+}
+
+export async function updateMyProfile(patch: UpdateUserProfileRequest) {
+  return parseJson<UserProfileResponse>(
+    await authFetch("/v1/me/profile", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    }),
   );
 }
 

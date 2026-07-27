@@ -11,6 +11,7 @@ mod client_meta;
 mod config;
 mod ctl_client;
 mod dynamic_settings;
+mod embed_usage;
 mod error;
 mod geo;
 mod ingress_context;
@@ -30,6 +31,7 @@ mod server_state;
 mod ssh;
 mod startup_config;
 mod store;
+mod usage_account;
 
 use std::collections::HashSet;
 use std::env;

@@ -387,6 +387,76 @@ export type UserApiTokenResetResponse = {
   token: UserApiTokenStatus;
 };
 
+export type AccountUsagePeriod = "24h" | "7d" | "30d";
+
+export type UsageTokenTotals = {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  totalTokens: number;
+};
+
+export type UsageModelRow = UsageTokenTotals & {
+  model: string;
+};
+
+export type UsageDailyBucket = UsageTokenTotals & {
+  date: string;
+};
+
+export type UsageCallerRow = UsageTokenTotals & {
+  email: string;
+};
+
+export type UsageShareRow = UsageTokenTotals & {
+  shareId: string;
+  shareName?: string;
+  models?: UsageModelRow[];
+};
+
+export type AccountUsageResponse = UsageTokenTotals & {
+  period: AccountUsagePeriod | string;
+  bucketGranularity?: "hour" | "day" | string;
+  days: number;
+  models: UsageModelRow[];
+  daily: UsageDailyBucket[];
+  byShare?: UsageShareRow[];
+};
+
+export type ProviderShareUsage = UsageTokenTotals & {
+  shareId: string;
+  shareName?: string;
+  models: UsageModelRow[];
+  callers?: UsageCallerRow[];
+};
+
+export type ProviderInstallationUsage = UsageTokenTotals & {
+  installationId: string;
+  label?: string;
+  shares: ProviderShareUsage[];
+};
+
+export type ProviderUsageResponse = UsageTokenTotals & {
+  period: AccountUsagePeriod | string;
+  bucketGranularity?: "hour" | "day" | string;
+  days: number;
+  installations: ProviderInstallationUsage[];
+};
+
+export type UserProfileResponse = {
+  email?: string;
+  username?: string | null;
+  publicStatsEnabled: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+export type UpdateUserProfileRequest = {
+  username?: string | null;
+  publicStatsEnabled?: boolean;
+};
+
 export type ShareMarketLink = {
   id: string;
   displayName: string;
