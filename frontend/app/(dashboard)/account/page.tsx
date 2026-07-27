@@ -1,6 +1,16 @@
-import { redirect } from "next/navigation";
-import { DASHBOARD_ACCOUNT_API_KEYS_PATH } from "@/lib/dashboard-nav";
+"use client";
 
+import { useRouter } from "next/navigation";
+import * as React from "react";
+import { resolveAccountEntryHref } from "@/lib/dashboard-nav";
+
+/** Restore last account sidebar section from localStorage (static-export safe). */
 export default function Page() {
-  redirect(DASHBOARD_ACCOUNT_API_KEYS_PATH);
+  const router = useRouter();
+
+  React.useEffect(() => {
+    router.replace(resolveAccountEntryHref());
+  }, [router]);
+
+  return null;
 }

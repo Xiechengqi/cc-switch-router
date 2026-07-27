@@ -75,3 +75,47 @@ export function isMarketsRoute(pathname: string) {
 export function isClientMarketRoute(pathname: string) {
   return pathname.startsWith("/client-market");
 }
+
+export const ACCOUNT_NAV_STORAGE_KEY = "cc_switch_router_account_nav_v1";
+
+const ACCOUNT_NAV_HREFS = [
+  DASHBOARD_ACCOUNT_API_KEYS_PATH,
+  DASHBOARD_ACCOUNT_PROVIDER_USAGE_PATH,
+  DASHBOARD_ACCOUNT_CONSUMER_USAGE_PATH,
+  DASHBOARD_ACCOUNT_PAYMENTS_PATH,
+  DASHBOARD_ACCOUNT_RENTALS_PATH,
+] as const;
+
+export type AccountNavHref = (typeof ACCOUNT_NAV_HREFS)[number];
+
+export function isAccountNavHref(value: string | null | undefined): value is AccountNavHref {
+  return !!value && (ACCOUNT_NAV_HREFS as readonly string[]).includes(value);
+}
+
+export function accountNavHrefFromPathname(pathname: string): AccountNavHref | null {
+  const normalized = normalizeDashboardPath(pathname);
+  return isAccountNavHref(normalized) ? normalized : null;
+}
+
+export function readStoredAccountNavHref(): AccountNavHref | null {
+  if (typeof localStorage === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(ACCOUNT_NAV_STORAGE_KEY);
+    return isAccountNavHref(raw) ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+export function writeStoredAccountNavHref(href: AccountNavHref) {
+  if (typeof localStorage === "undefined") return;
+  try {
+    localStorage.setItem(ACCOUNT_NAV_STORAGE_KEY, href);
+  } catch {
+    // ignore quota / private mode
+  }
+}
+
+export function resolveAccountEntryHref(): AccountNavHref {
+  return readStoredAccountNavHref() || DASHBOARD_ACCOUNT_API_KEYS_PATH;
+}

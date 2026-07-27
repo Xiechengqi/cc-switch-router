@@ -71,14 +71,18 @@ export function MyRentalsPanel({
               <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
                 {t("clientMarket.rentals.provider", { owner: billing.hostOwnerEmail })}
               </span>
-              {/* Release lives on the card, not inside the payment modal: a paid rental
-                  with time left renders no billing banner at all, and used to have no
-                  way back to its Provider. `releasing` already has a job in flight. */}
-              {billing.status !== "releasing" ? (
+              {/* Keep mounted through `releasing` so the same instance can finish polling
+                  (and reattach after refresh). Retries for release_failed live in the banner. */}
+              {billing.status !== "release_failed" ? (
                 <ReleaseRentalAction billing={billing} onChanged={onChanged} />
               ) : null}
             </div>
-            <ClientMarketBillingBanner billing={billing} onChanged={onChanged} showPayButton />
+            <ClientMarketBillingBanner
+              billing={billing}
+              onChanged={onChanged}
+              showPayButton
+              resumeRelease={false}
+            />
           </section>
         );
       })}

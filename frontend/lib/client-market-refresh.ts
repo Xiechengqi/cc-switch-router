@@ -94,6 +94,7 @@ const BILLING_SCALAR_KEYS = [
   "isClientOwner",
   "canDeclarePaid",
   "canRelease",
+  "activeCleanupJobId",
   "updatedAt",
 ] as const satisfies readonly (keyof ClientMarketBilling)[];
 

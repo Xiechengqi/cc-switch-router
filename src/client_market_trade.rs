@@ -241,6 +241,9 @@ pub struct BillingView {
     pub is_client_owner: bool,
     pub can_declare_paid: bool,
     pub can_release: bool,
+    /// Latest pending/running cleanup job for this installation (page-refresh resume).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_cleanup_job_id: Option<String>,
     pub updated_at: String,
 }
 
@@ -4087,6 +4090,7 @@ struct BillingRow {
     open_invoice_id: Option<String>,
     methods_json: String,
     payment_profile_updated_at: Option<String>,
+    active_cleanup_job_id: Option<String>,
     updated_at: String,
 }
 
@@ -4105,6 +4109,12 @@ fn load_billing_views(
                           WHERE p.user_id = s.provider_id), '[]'),
                 (SELECT updated_at FROM account_payment_profiles p
                  WHERE p.user_id = s.provider_id),
+                (SELECT j.id FROM provisioning_jobs j
+                 WHERE j.installation_id = s.installation_id
+                   AND j.type = 'cleanup'
+                   AND j.status IN ('pending', 'running')
+                 ORDER BY j.updated_at DESC, j.created_at DESC
+                 LIMIT 1),
                 s.updated_at
          FROM client_market_subscriptions s"
         .to_string();
@@ -4132,7 +4142,8 @@ fn load_billing_views(
             open_invoice_id: row.get(12)?,
             methods_json: row.get(13)?,
             payment_profile_updated_at: row.get(14)?,
-            updated_at: row.get(15)?,
+            active_cleanup_job_id: row.get(15)?,
+            updated_at: row.get(16)?,
         })
     };
     let rows = if let Some(installation_id) = installation_id {
@@ -4187,7 +4198,10 @@ fn load_billing_views(
             can_declare_paid: client_role
                 && row.status == SUBSCRIPTION_PAYMENT_DUE
                 && row.price_cents.is_some(),
-            can_release: (client_role || provider_role) && row.status != SUBSCRIPTION_RELEASED,
+            can_release: (client_role || provider_role)
+                && row.status != SUBSCRIPTION_RELEASED
+                && row.status != SUBSCRIPTION_RELEASING,
+            active_cleanup_job_id: row.active_cleanup_job_id,
             updated_at: row.updated_at,
         });
     }

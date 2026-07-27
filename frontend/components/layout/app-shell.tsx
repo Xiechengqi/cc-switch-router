@@ -14,6 +14,7 @@ import { DashboardDataProvider } from "@/components/dashboard/dashboard-data";
 import { AnnouncementDialog } from "@/components/announcement/announcement-dialog";
 import {
   DASHBOARD_ACCOUNT_API_KEYS_PATH,
+  DASHBOARD_ACCOUNT_PATH,
   DASHBOARD_CLIENTS_PATH,
   DASHBOARD_MARKETS_PATH,
   DASHBOARD_CLIENT_MARKET_PATH,
@@ -174,7 +175,7 @@ function DashboardNav({
       label: t("nav.clientMarketTab"),
     },
     ...(authed
-      ? [{ id: "account" as const, href: DASHBOARD_ACCOUNT_API_KEYS_PATH, icon: UserRound, label: t("nav.accountTab") }]
+      ? [{ id: "account" as const, href: DASHBOARD_ACCOUNT_PATH, icon: UserRound, label: t("nav.accountTab") }]
       : []),
   ];
 
@@ -216,6 +217,7 @@ function Topbar({ active }: { active: DashboardShellActive }) {
   const router = useRouter();
   const [loginOpen, setLoginOpen] = React.useState(false);
   const [clientRedirect, setClientRedirect] = React.useState<string | null>(null);
+  const [scrolled, setScrolled] = React.useState(false);
   const redirectStartedRef = React.useRef(false);
   const lastAuthedEmailRef = React.useRef<string | null>(null);
   if (session?.authenticated && session.user?.email) {
@@ -227,6 +229,13 @@ function Topbar({ active }: { active: DashboardShellActive }) {
   const showAuthedChrome = authed || (loading && !!lastAuthedEmailRef.current);
   const displayEmail = session?.user?.email || lastAuthedEmailRef.current || "";
   const showDashboardNav = active === "clients" || active === "markets" || active === "client-market" || active === "account";
+
+  React.useEffect(() => {
+    const onScroll = () => setScrolled(window.scrollY > 0);
+    onScroll();
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
 
   React.useEffect(() => {
     setClientRedirect(sameRouterDomainClientRedirect(new URLSearchParams(window.location.search).get("clientRedirect")));
@@ -262,7 +271,12 @@ function Topbar({ active }: { active: DashboardShellActive }) {
         Three-column topbar: brand (logo + region title) | centered section tabs | lang + user.
         Region is a chrome-less title dropdown (font-display + chevron), not a bordered Select.
       */}
-      <div className="sticky top-0 z-40 border-b border-border/50 bg-background/85 backdrop-blur-md">
+      <div
+        className={cn(
+          "sticky top-0 z-40 border-b bg-background/85 backdrop-blur-md transition-colors duration-200",
+          scrolled ? "border-border/50" : "border-transparent",
+        )}
+      >
         <header className="mx-auto w-[calc(100%-2rem)] max-w-7xl py-3.5">
         <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-x-3 gap-y-2">
           <div className="flex min-w-0 items-center gap-2.5 justify-self-start">

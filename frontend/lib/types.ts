@@ -1515,6 +1515,8 @@ export type ClientMarketBilling = {
   isClientOwner: boolean;
   canDeclarePaid: boolean;
   canRelease: boolean;
+  /** Pending/running cleanup job — used to resume progress UI after refresh. */
+  activeCleanupJobId?: string;
   updatedAt: string;
 };
 

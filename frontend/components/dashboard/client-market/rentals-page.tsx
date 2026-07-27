@@ -71,8 +71,20 @@ export function RentalsPage() {
   }, [authed, load]);
 
   const myRentals = React.useMemo(
-    () => Array.from(billingByInstallation.values()).filter((billing) => billing.isClientOwner),
+    () =>
+      Array.from(billingByInstallation.values()).filter(
+        (billing) => billing.isClientOwner && billing.status !== "released",
+      ),
     [billingByInstallation],
+  );
+
+  /** Badge counts only in-rent subscriptions; releasing / release_failed stay visible in the list. */
+  const activeRentalCount = React.useMemo(
+    () =>
+      myRentals.filter(
+        (billing) => billing.status === "active" || billing.status === "payment_due",
+      ).length,
+    [myRentals],
   );
 
   const hostsByInstallation = React.useMemo(() => {
@@ -106,9 +118,9 @@ export function RentalsPage() {
           <h2 className="text-base font-semibold text-foreground">{t("account.nav.rentals")}</h2>
           <p className="mt-0.5 text-sm text-muted-foreground">{t("account.rentalsHint")}</p>
         </div>
-        {myRentals.length ? (
+        {activeRentalCount ? (
           <span className="text-xs text-muted-foreground">
-            {t("clientMarket.rentals.count", { count: myRentals.length })}
+            {t("clientMarket.rentals.count", { count: activeRentalCount })}
           </span>
         ) : null}
       </div>

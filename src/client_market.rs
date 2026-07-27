@@ -146,52 +146,55 @@ ensure_client_market_deps() {
 "#;
 
 /// Detect/stop a live cc-switch-server without matching this SSH checker's own cmdline.
-/// Match the process COMMAND (e.g. `/usr/local/bin/cc-switch-server`), not a substring of
-/// the remote `sh -c '...'` script which also contains that path.
+/// Match process argv0 (e.g. `/usr/local/bin/cc-switch-server`) or truncated Linux
+/// `/proc/*/comm` (`cc-switch-serve`, 15-char limit) — never a substring of the remote
+/// `sh -c '...'` helper script which also contains that path as text.
 const REMOTE_CC_SWITCH_SERVER_HELPERS: &str = r#"
+cc_switch_server_list_pids() {
+  for dir in /proc/[0-9]*; do
+    [ -d "$dir" ] || continue
+    pid=${dir#/proc/}
+    case "$pid" in
+      ''|*[!0-9]*) continue ;;
+    esac
+    [ "$pid" -eq "$$" ] 2>/dev/null && continue
+    cmdline="$dir/cmdline"
+    [ -r "$cmdline" ] || continue
+    argv0=$(tr '\0' '\n' < "$cmdline" 2>/dev/null | head -n 1)
+    case "$argv0" in
+      cc-switch-server|*/cc-switch-server)
+        printf '%s\n' "$pid"
+        continue
+        ;;
+    esac
+    if [ -r "$dir/comm" ]; then
+      name=$(cat "$dir/comm" 2>/dev/null) || continue
+      # Linux TASK_COMM_LEN is 15; "cc-switch-server" truncates to "cc-switch-serve".
+      case "$name" in
+        cc-switch-server|cc-switch-serve)
+          printf '%s\n' "$pid"
+          ;;
+      esac
+    fi
+  done
+}
 cc_switch_server_pkill() {
-  if command -v pkill >/dev/null 2>&1; then
-    pkill cc-switch-server 2>/dev/null || true
+  pids=$(cc_switch_server_list_pids | sort -u)
+  if [ -z "$pids" ]; then
     return 0
   fi
-  for comm in /proc/[0-9]*/comm; do
-    [ -r "$comm" ] || continue
-    name=$(cat "$comm" 2>/dev/null) || continue
-    [ "$name" = "cc-switch-server" ] || continue
-    pid=${comm#/proc/}
-    pid=${pid%/comm}
+  for pid in $pids; do
     kill "$pid" 2>/dev/null || true
+  done
+  sleep 1
+  pids=$(cc_switch_server_list_pids | sort -u)
+  for pid in $pids; do
+    kill -9 "$pid" 2>/dev/null || true
   done
 }
 cc_switch_server_is_running() {
-  if command -v ps >/dev/null 2>&1; then
-    # BusyBox: PID USER TIME COMMAND...
-    # GNU:     UID PID PPID C STIME TTY TIME CMD...
-    # Only match argv0 being the binary — never the SSH helper shell cmdline.
-    if ps -ef 2>/dev/null | awk '
-      NR == 1 { next }
-      {
-        cmd = ""
-        if ($1 ~ /^[0-9]+$/ && NF >= 4 && $3 ~ /^[0-9:.-]+$/) {
-          cmd = $4
-        } else if (NF >= 8) {
-          cmd = $8
-        } else {
-          next
-        }
-        if (cmd == "cc-switch-server" || cmd ~ /\/cc-switch-server$/) exit 0
-      }
-      END { exit 1 }
-    '; then
-      return 0
-    fi
-  fi
-  for comm in /proc/[0-9]*/comm; do
-    [ -r "$comm" ] || continue
-    name=$(cat "$comm" 2>/dev/null) || continue
-    [ "$name" = "cc-switch-server" ] && return 0
-  done
-  return 1
+  pids=$(cc_switch_server_list_pids)
+  [ -n "$pids" ]
 }
 cc_switch_server_stop() {
   if ! cc_switch_server_is_running; then
@@ -199,15 +202,15 @@ cc_switch_server_stop() {
   fi
   cc_switch_server_pkill
   attempt=0
-  while [ "$attempt" -lt 3 ]; do
-    sleep 3
+  while [ "$attempt" -lt 5 ]; do
+    sleep 2
     if ! cc_switch_server_is_running; then
       return 0
     fi
     cc_switch_server_pkill
     attempt=$((attempt + 1))
   done
-  # Three spaced ps checks still saw the process.
+  echo "cc-switch-server still running after stop attempts: $(cc_switch_server_list_pids | tr '\n' ' ')" >&2
   return 1
 }
 cc_switch_server_home() {
@@ -2450,6 +2453,8 @@ fn classify_cleanup_failure(error: &AppError) -> &'static str {
         CLEANUP_FAILURE_SSH_TIMEOUT
     } else if lower.contains("failed to stop")
         || lower.contains("respawned")
+        || lower.contains("still running after wipe")
+        || lower.contains("still running after stop")
         || lower.contains("process is already running")
     {
         CLEANUP_FAILURE_STOP
@@ -2555,12 +2560,18 @@ async fn run_cleanup_job_inner(
                 .store
                 .client_market_append_job_log(job_id, "phase: stop cc-switch-server\n")
                 .await?;
-            ssh_stop_cc_switch_server(state, &host).await?;
+            let stop_output = ssh_stop_cc_switch_server(state, &host).await?;
+            if !stop_output.trim().is_empty() {
+                state
+                    .store
+                    .client_market_append_job_log(job_id, &format!("{}\n", stop_output.trim_end()))
+                    .await?;
+            }
             state
                 .store
                 .client_market_append_job_log(
                     job_id,
-                    "remote process stopped (or already stopped)\n",
+                    "remote process stopped (verified not running)\n",
                 )
                 .await?;
             state
@@ -2574,12 +2585,18 @@ async fn run_cleanup_job_inner(
                 .store
                 .client_market_append_job_log(job_id, "phase: wipe install files\n")
                 .await?;
-            ssh_wipe_cc_switch_files(state, &host).await?;
+            let wipe_output = ssh_wipe_cc_switch_files(state, &host).await?;
+            if !wipe_output.trim().is_empty() {
+                state
+                    .store
+                    .client_market_append_job_log(job_id, &format!("{}\n", wipe_output.trim_end()))
+                    .await?;
+            }
             state
                 .store
                 .client_market_append_job_log(
                     job_id,
-                    "remote client files removed (binary, data, backups)\n",
+                    "remote client files removed; process verified stopped\n",
                 )
                 .await?;
             state
@@ -3193,15 +3210,18 @@ async fn ssh_wipe_cc_switch_server(
 async fn ssh_stop_cc_switch_server(
     state: &ServerState,
     host: &RouterSshHostRecord,
-) -> Result<(), AppError> {
+) -> Result<String, AppError> {
     let known_hosts = known_hosts_path(&state.config);
     require_pinned_host_fingerprint(host, &known_hosts).await?;
     let command = format!(
         "{helpers}\
          set -eu; \
+         pids=$(cc_switch_server_list_pids | sort -u | tr '\\n' ' '); \
+         echo \"detected cc-switch-server pids: ${{pids:-none}}\"; \
          if ! cc_switch_server_stop; then \
            echo 'failed to stop cc-switch-server' >&2; exit 43; \
-         fi",
+         fi; \
+         echo 'post-stop running=no'",
         helpers = REMOTE_CC_SWITCH_SERVER_HELPERS,
     );
     ssh_run_remote_with_input(
@@ -3215,13 +3235,12 @@ async fn ssh_stop_cc_switch_server(
         SshHostKeyPolicy::RequireKnown,
     )
     .await
-    .map(|_| ())
 }
 
 async fn ssh_wipe_cc_switch_files(
     state: &ServerState,
     host: &RouterSshHostRecord,
-) -> Result<(), AppError> {
+) -> Result<String, AppError> {
     let known_hosts = known_hosts_path(&state.config);
     require_pinned_host_fingerprint(host, &known_hosts).await?;
     let command = format!(
@@ -3231,9 +3250,13 @@ async fn ssh_wipe_cc_switch_files(
            echo 'failed to stop cc-switch-server' >&2; exit 43; \
          fi; \
          cc_switch_server_wipe_files; \
+         if cc_switch_server_is_running; then \
+           echo 'cc-switch-server still running after wipe' >&2; exit 43; \
+         fi; \
          if cc_switch_server_has_install_files; then \
            echo 'failed to remove cc-switch-server installation files' >&2; exit 44; \
-         fi",
+         fi; \
+         echo 'post-wipe running=no files=removed'",
         helpers = REMOTE_CC_SWITCH_SERVER_HELPERS,
     );
     ssh_run_remote_with_input(
@@ -3247,7 +3270,6 @@ async fn ssh_wipe_cc_switch_files(
         SshHostKeyPolicy::RequireKnown,
     )
     .await
-    .map(|_| ())
 }
 
 /// True when the remote host has no running process and no install/backup files.
@@ -8997,6 +9019,22 @@ mod tests {
     }
 
     #[test]
+    fn remote_helpers_detect_linux_comm_truncation() {
+        assert!(
+            REMOTE_CC_SWITCH_SERVER_HELPERS.contains("cc-switch-serve"),
+            "Linux TASK_COMM_LEN truncates cc-switch-server to cc-switch-serve"
+        );
+        assert!(
+            REMOTE_CC_SWITCH_SERVER_HELPERS.contains("cc_switch_server_list_pids"),
+            "cleanup must list pids via cmdline/comm before kill"
+        );
+        assert!(
+            REMOTE_CC_SWITCH_SERVER_HELPERS.contains("kill -9"),
+            "stop must escalate to SIGKILL when SIGTERM is ignored"
+        );
+    }
+
+    #[test]
     fn classify_cleanup_failure_maps_known_cases() {
         assert_eq!(
             classify_cleanup_failure(&AppError::ServiceUnavailable(
@@ -9021,6 +9059,12 @@ mod tests {
                 "purge installation failed after 3 attempts: db locked".into()
             )),
             CLEANUP_FAILURE_PURGE
+        );
+        assert_eq!(
+            classify_cleanup_failure(&AppError::Conflict(
+                "cc-switch-server still running after wipe".into()
+            )),
+            CLEANUP_FAILURE_STOP
         );
         assert_eq!(
             classify_cleanup_failure(&AppError::Conflict(

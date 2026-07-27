@@ -54,11 +54,14 @@ export function ClientMarketBillingBanner({
   onChanged,
   compact = false,
   showPayButton = true,
+  /** When true (default), mount release resume UI for `releasing` — needed on Client board. */
+  resumeRelease = true,
 }: {
   billing?: ClientMarketBilling;
   onChanged: () => Promise<void> | void;
   compact?: boolean;
   showPayButton?: boolean;
+  resumeRelease?: boolean;
 }) {
   const { locale, t } = useLocaleText();
   const [paymentOpen, setPaymentOpen] = React.useState(false);
@@ -93,9 +96,14 @@ export function ClientMarketBillingBanner({
 
   if (billing.status === "releasing") {
     return (
-      <span className="inline-flex h-6 items-center gap-1 text-[11px] text-muted-foreground" data-no-row-drawer>
+      <span
+        className="inline-flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground"
+        data-no-row-drawer
+        onClick={(event) => event.stopPropagation()}
+      >
         <Loader2 className="h-3 w-3 animate-spin" />
         {t("billing.releasing")}
+        {resumeRelease ? <ReleaseRentalAction billing={billing} onChanged={onChanged} /> : null}
       </span>
     );
   }

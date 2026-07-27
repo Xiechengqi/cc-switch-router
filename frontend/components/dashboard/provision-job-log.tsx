@@ -15,10 +15,10 @@ type AnsiStyle = {
   bg: string;
 };
 
-const ANSI_RE = /\x1b\[([0-9;]*)m/g;
+const ANSI_RE = /(?:\u001b|\x1b)?\[([0-9;]*)m/g;
 
 function stripAnsi(input: string) {
-  return input.replace(/\x1b\[[0-9;]*m/g, "");
+  return input.replace(/(?:\u001b|\x1b)?\[([0-9;]*)m/g, "");
 }
 
 function ansiColorClass(code: number) {
