@@ -127,6 +127,8 @@ pub struct ProviderCountrySummary {
     pub code: String,
     pub idle: i64,
     pub total: i64,
+    pub free_idle: i64,
+    pub free_total: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -2259,7 +2261,10 @@ impl AppStore {
             let mut country_statement = conn
                 .prepare(
                     "SELECT country_code,
-                            SUM(CASE WHEN status = 'idle' THEN 1 ELSE 0 END), COUNT(*)
+                            SUM(CASE WHEN status = 'idle' THEN 1 ELSE 0 END),
+                            COUNT(*),
+                            SUM(CASE WHEN status = 'idle' AND price_cents IS NULL THEN 1 ELSE 0 END),
+                            SUM(CASE WHEN price_cents IS NULL THEN 1 ELSE 0 END)
                      FROM router_ssh_hosts
                      WHERE provider_id = ?1 AND country_code IS NOT NULL
                      GROUP BY country_code ORDER BY country_code",
@@ -2273,6 +2278,8 @@ impl AppStore {
                         code: row.get(0)?,
                         idle: row.get(1)?,
                         total: row.get(2)?,
+                        free_idle: row.get(3)?,
+                        free_total: row.get(4)?,
                     })
                 })
                 .map_err(|error| {
@@ -2684,6 +2691,7 @@ impl AppStore {
                         h.price_cents, h.rental_period_days, h.offer_revision
                  FROM router_ssh_hosts h
                  WHERE h.status = 'idle'
+                   AND h.price_cents IS NULL
                    AND h.provider_id IN ({provider_vars})
                    AND h.country_code IN ({country_vars})
                    AND h.provider_id IS NOT ?
@@ -2715,7 +2723,7 @@ impl AppStore {
         };
         if candidates.len() != input.count {
             return Err(AppError::ServiceUnavailable(
-                "not enough idle Hosts match the selected Providers and regions".into(),
+                "not enough idle free Hosts match the selected Providers and regions".into(),
             ));
         }
         let quote_id = Uuid::new_v4().to_string();

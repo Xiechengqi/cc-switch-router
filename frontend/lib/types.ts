@@ -1371,6 +1371,8 @@ export type ClientMarketProviderCountry = {
   code: string;
   idle: number;
   total: number;
+  freeIdle: number;
+  freeTotal: number;
 };
 
 export type ClientMarketProvider = {

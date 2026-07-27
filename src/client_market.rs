@@ -7433,8 +7433,8 @@ mod tests {
             "provider@example.com",
             "198.18.20.1",
             "US",
-            Some(500),
-            Some(30),
+            None,
+            None,
         )
         .await;
         let second = add_provider_host(
@@ -7443,8 +7443,8 @@ mod tests {
             "provider@example.com",
             "198.18.20.2",
             "US",
-            Some(500),
-            Some(30),
+            None,
+            None,
         )
         .await;
         let client = market_session("client-1", "client@example.com");
@@ -8279,6 +8279,90 @@ mod tests {
             .expect("US capacity from null-provider free host");
         assert_eq!(us.idle, 1);
         assert_eq!(us.total, 1);
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn pool_allocation_quotes_only_select_free_hosts() {
+        use crate::client_market_trade::CreateQuoteRequest;
+
+        let (store, _config, root) = test_store("trade-quotes-free-only");
+        let _paid = add_provider_host(
+            &store,
+            "provider-free-only",
+            "provider@example.com",
+            "198.18.41.1",
+            "US",
+            Some(500),
+            Some(30),
+        )
+        .await;
+        let free = add_provider_host(
+            &store,
+            "provider-free-only",
+            "provider@example.com",
+            "198.18.41.2",
+            "US",
+            None,
+            None,
+        )
+        .await;
+        let client = market_session("client-free-only", "client@example.com");
+
+        assert!(
+            matches!(
+                store
+                    .client_market_create_quote(
+                        &client,
+                        CreateQuoteRequest {
+                            provider_ids: vec!["provider-free-only".into()],
+                            country_codes: vec!["US".into()],
+                            count: 2,
+                            host_id: None,
+                        },
+                    )
+                    .await,
+                Err(AppError::ServiceUnavailable(_))
+            ),
+            "pool quotes must not pad capacity with paid Hosts"
+        );
+
+        let quote = store
+            .client_market_create_quote(
+                &client,
+                CreateQuoteRequest {
+                    provider_ids: vec!["provider-free-only".into()],
+                    country_codes: vec!["US".into()],
+                    count: 1,
+                    host_id: None,
+                },
+            )
+            .await
+            .expect("pool quote selects the free Host");
+        assert_eq!(quote.items.len(), 1);
+        assert_eq!(quote.items[0].host_id, free.id);
+        assert!(quote.items[0].price_cents.is_none());
+
+        store
+            .client_market_cancel_quote(&quote.id, &client)
+            .await
+            .expect("cancel free quote");
+        let paid_quote = store
+            .client_market_create_quote(
+                &client,
+                CreateQuoteRequest {
+                    provider_ids: Vec::new(),
+                    country_codes: Vec::new(),
+                    count: 1,
+                    host_id: Some(_paid.id.clone()),
+                },
+            )
+            .await
+            .expect("fixed Host quotes may still target paid Hosts");
+        assert_eq!(paid_quote.items[0].host_id, _paid.id);
+        assert_eq!(paid_quote.items[0].price_cents, Some(500));
 
         drop(store);
         let _ = std::fs::remove_dir_all(root);

@@ -3,6 +3,7 @@
 import * as React from "react";
 import { Button, Chip, Modal, Tabs } from "@heroui/react";
 import { Check, Copy, Dices, Loader2, LogIn, Minus, Plus, RotateCcw, Server } from "lucide-react";
+import Link from "next/link";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { CountryFlag } from "@/components/common/country-flag";
@@ -18,6 +19,7 @@ import {
   getClientMarketJob,
   getClientMarketProviderSupply,
 } from "@/lib/api";
+import { DASHBOARD_CLIENT_MARKET_PATH } from "@/lib/dashboard-nav";
 import type {
   ClientMarketAllocationQuote,
   ClientMarketHost,
@@ -141,6 +143,8 @@ export function CreateClientDialog({
 
   const safeProviders = React.useMemo(() => normalizeProviderPersist(providerPersist), [providerPersist]);
   const safeRegions = React.useMemo(() => normalizeRegionPersist(regionPersist), [regionPersist]);
+  /** Clients-page pool create only allocates free forever Hosts; Client Market fixed Host may be paid. */
+  const freeOnly = !fixedHost;
   const availableProviderIds = React.useMemo(() => new Set(providers.map((provider) => provider.providerId)), [providers]);
   const selectedProviderIds = React.useMemo(() => {
     if (fixedHost?.providerId) return [fixedHost.providerId];
@@ -153,19 +157,35 @@ export function CreateClientDialog({
     () => providers.filter((provider) => selectedProviderIds.includes(provider.providerId)),
     [providers, selectedProviderIds],
   );
+  const providerFreeIdle = React.useCallback((provider: ClientMarketProvider) => {
+    if (typeof provider.countries?.[0]?.freeIdle === "number") {
+      return provider.countries.reduce((sum, country) => sum + (country.freeIdle || 0), 0);
+    }
+    return Math.max(0, (provider.freeHostTotal || 0) - (provider.freeAllocatedTotal || 0));
+  }, []);
+  const providerFreeTotal = React.useCallback((provider: ClientMarketProvider) => {
+    if (typeof provider.countries?.[0]?.freeTotal === "number") {
+      return provider.countries.reduce((sum, country) => sum + (country.freeTotal || 0), 0);
+    }
+    return provider.freeHostTotal || 0;
+  }, []);
   const providerOptions = React.useMemo(
     () =>
-      providers.map((provider) => ({
-        value: provider.providerId,
-        label: [
-          provider.ownerEmail,
-          provider.official ? t("createClient.official") : null,
-          `${provider.idleTotal}/${provider.hostTotal}`,
-        ]
-          .filter(Boolean)
-          .join(" · "),
-      })),
-    [providers, t],
+      providers.map((provider) => {
+        const idle = freeOnly ? providerFreeIdle(provider) : provider.idleTotal;
+        const total = freeOnly ? providerFreeTotal(provider) : provider.hostTotal;
+        return {
+          value: provider.providerId,
+          label: [
+            provider.ownerEmail,
+            provider.official ? t("createClient.official") : null,
+            `${idle}/${total}`,
+          ]
+            .filter(Boolean)
+            .join(" · "),
+        };
+      }),
+    [freeOnly, providerFreeIdle, providerFreeTotal, providers, t],
   );
   /** CompactRegionMultiSelect treats `[]` as “all”; mirror that when every owner is selected. */
   const providerFilterValues = React.useMemo(() => {
@@ -200,13 +220,21 @@ export function CreateClientDialog({
     for (const provider of selectedProviders) {
       for (const country of provider.countries) {
         const value = counts.get(country.code) || { idle: 0, total: 0 };
-        value.idle += country.idle;
-        value.total += country.total;
+        if (freeOnly) {
+          value.idle += country.freeIdle || 0;
+          value.total += country.freeTotal || 0;
+        } else {
+          value.idle += country.idle;
+          value.total += country.total;
+        }
         counts.set(country.code, value);
       }
     }
-    return Array.from(counts.entries()).map(([code, count]) => ({ code, ...count })).sort((left, right) => left.code.localeCompare(right.code));
-  }, [selectedProviders]);
+    return Array.from(counts.entries())
+      .map(([code, count]) => ({ code, ...count }))
+      .filter((region) => (freeOnly ? region.total > 0 || region.idle > 0 : true))
+      .sort((left, right) => left.code.localeCompare(right.code));
+  }, [freeOnly, selectedProviders]);
   const selectedCountryCodes = React.useMemo(() => {
     if (fixedHost?.countryCode) return [fixedHost.countryCode];
     const options = regionOptions.map((region) => region.code);
@@ -565,6 +593,18 @@ export function CreateClientDialog({
             {phase === "form" && (mode === "online" || fixedHost) ? (
               <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-5">
                 {loading ? <div className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />{t("createClient.loadingSupply")}</div> : null}
+                {freeOnly ? (
+                  <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-900">
+                    {t("createClient.freeOnlyHint")}{" "}
+                    <Link
+                      href={DASHBOARD_CLIENT_MARKET_PATH}
+                      className="font-medium text-primary underline-offset-2 hover:underline"
+                      onClick={() => onOpenChange(false)}
+                    >
+                      {t("createClient.freeOnlyHintLink")}
+                    </Link>
+                  </p>
+                ) : null}
                 {fixedHost ? (
                   <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-2 rounded-md border p-3">
                     <div className="flex flex-wrap items-center gap-2"><Server className="h-4 w-4" /><strong className="text-sm">{fixedHost.hostname || fixedHost.ip}</strong><Chip size="sm" variant="soft">{fixedHost.countryCode || "-"}</Chip></div>
