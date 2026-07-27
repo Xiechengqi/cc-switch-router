@@ -44,8 +44,8 @@ function shareClaudeCursorToolsProbeEnabled(share: ShareView | null) {
  *   - 未登录   → 提示登录 + 触发 LoginDialog
  *   - 已登录 + canViewSecret 为假 → 「没有权限」 + mailto 申请加入
  *   - 已登录 + canViewSecret 为真 → 拉 /v1/me/api-token，展示前缀脱敏 +
- *     "去顶部 API Token 面板重置" 提示。后端只在 reset 时返回明文，所以这里
- *     不重复 reset 入口，集中在 <ApiTokenDialog>。
+ *     "去账户 → API 密钥 重置" 提示。后端只在 reset 时返回明文，所以这里
+ *     不重复 reset 入口，集中在账户页 API 密钥面板。
  */
 export const ShareConnectDialog = React.memo(function ShareConnectDialog({
   share,

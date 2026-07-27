@@ -862,7 +862,7 @@ export function ClientMarketPage() {
               <Button variant="ghost" onClick={() => setExportOpen(false)}>
                 {t("common.close")}
               </Button>
-              <Button variant="primary" onClick={() => void copyExportText()}>
+              <Button variant="outline" onClick={() => void copyExportText()}>
                 {t("clientMarket.exportCopy")}
               </Button>
             </Modal.Footer>
@@ -878,7 +878,7 @@ export function ClientMarketPage() {
               {importResult ? <div className="flex flex-wrap gap-2 text-sm"><Chip size="sm" variant="soft">{t("clientMarket.importedCount", { count: importResult.imported })}</Chip><Chip size="sm" variant="soft">{t("clientMarket.skippedCount", { count: importResult.skipped })}</Chip><Chip size="sm" variant="soft">{t("clientMarket.failedCount", { count: importResult.failed })}</Chip></div> : null}
               <div className="grid gap-1.5">{importResult?.items.map((item) => <div key={`${item.ip}:${item.port}`} className="grid grid-cols-[minmax(0,1fr)_auto] gap-3 rounded-md border px-3 py-2 text-xs"><span className="min-w-0 truncate font-mono">{item.ip}:{item.port}</span><span className={item.status === "failed" ? "text-rose-600" : item.status === "imported" ? "text-emerald-700" : "text-muted-foreground"}>{item.error || item.status}</span></div>)}</div>
             </Modal.Body>
-            <Modal.Footer><Button variant="primary" onClick={() => setImportResult(null)}>{t("common.close")}</Button></Modal.Footer>
+            <Modal.Footer><Button variant="outline" onClick={() => setImportResult(null)}>{t("common.close")}</Button></Modal.Footer>
           </Modal.Dialog>
         </Modal.Container>
       </Modal.Backdrop>
@@ -953,7 +953,7 @@ export function ClientMarketPage() {
             </Modal.Body>
             <Modal.Footer>
               <Button
-                variant="primary"
+                variant="outline"
                 isDisabled={batch.batchBusy}
                 onClick={() => batch.closeProgress()}
               >

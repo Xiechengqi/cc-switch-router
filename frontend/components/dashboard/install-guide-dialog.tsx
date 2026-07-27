@@ -83,7 +83,7 @@ export function InstallGuideDialog({
                   {t("dashboard.installOpenLink")}
                 </Button>
               ) : null}
-              <Button variant="primary" onClick={() => void copy()}>
+              <Button variant="outline" onClick={() => void copy()}>
                 {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
                 {copied ? t("dashboard.connectDialog.copyOk") : t("dashboard.connectDialog.copy")}
               </Button>

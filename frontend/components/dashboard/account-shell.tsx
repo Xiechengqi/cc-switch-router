@@ -2,9 +2,10 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Receipt, WalletCards } from "lucide-react";
+import { KeyRound, Receipt, WalletCards } from "lucide-react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
+  DASHBOARD_ACCOUNT_API_KEYS_PATH,
   DASHBOARD_ACCOUNT_PAYMENTS_PATH,
   DASHBOARD_ACCOUNT_RENTALS_PATH,
 } from "@/lib/dashboard-nav";
@@ -12,11 +13,19 @@ import { cn } from "@/lib/utils";
 
 const NAV_ITEMS = [
   {
+    id: "api-keys",
+    href: DASHBOARD_ACCOUNT_API_KEYS_PATH,
+    labelKey: "account.nav.apiKeys" as const,
+    icon: KeyRound,
+    match: (pathname: string) =>
+      pathname.startsWith("/account/api-keys") || pathname === "/account" || pathname === "/account/",
+  },
+  {
     id: "payments",
     href: DASHBOARD_ACCOUNT_PAYMENTS_PATH,
     labelKey: "account.nav.payments" as const,
     icon: WalletCards,
-    match: (pathname: string) => pathname.startsWith("/account/payments") || pathname === "/account" || pathname === "/account/",
+    match: (pathname: string) => pathname.startsWith("/account/payments"),
   },
   {
     id: "rentals",
@@ -29,7 +38,7 @@ const NAV_ITEMS = [
 
 export function AccountShell({ children }: { children: React.ReactNode }) {
   const { t } = useLocaleText();
-  const pathname = usePathname() || DASHBOARD_ACCOUNT_PAYMENTS_PATH;
+  const pathname = usePathname() || DASHBOARD_ACCOUNT_API_KEYS_PATH;
 
   return (
     <main className="mx-auto grid min-w-0 w-[calc(100%-2rem)] max-w-6xl grid-cols-[minmax(0,1fr)] gap-6 pb-12 pt-2 md:grid-cols-[13rem_minmax(0,1fr)] md:gap-8">

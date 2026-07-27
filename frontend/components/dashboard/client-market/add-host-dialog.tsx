@@ -527,7 +527,7 @@ export function AddHostDialog({
               <Modal.Footer>
                 {phase === "success" || error ? (
                   <Button
-                    variant="primary"
+                    variant="outline"
                     onClick={() => {
                       if (phase === "success") {
                         closeDialog(false);

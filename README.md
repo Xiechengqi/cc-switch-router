@@ -48,21 +48,21 @@ Client Web tunnel:静态资源和明确列出的登录/OAuth 回调公开;其余
 
 ## API 端点
 
-当前共 **175 处路由注册 / 172 条唯一路径**。按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
+当前共 **172 处路由注册 / 169 条唯一路径**。按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 
 | 域 | 路径数 | 认证方式 | 代表端点 |
 |---|---:|---|---|
 | `/v1/client-market/*` | 34 | 用户 Session | `hosts`、`quotes`、`quotes/:id/commit`、`providers`、`billing`、`terminal/ws` |
 | `/v1/admin/*` | 33 | Session + admin 判定 | `settings/values`、`version`、`upgrade`、`metrics/*`、`audit`、`logs/router/tail`、`client-market/subscriptions/:id/force-release` |
 | `/v1/shares/*` | 17 | installation bearer / Ed25519 签名 | `claim-subdomain`、`sync`、`batch-sync`、`descriptor-batch-sync`、`pending-edits`、`edit-ack`、`edit-events`、`runtime-refresh`、`heartbeat`、`prune` |
-| `/v1/installations/*` | 12 | Ed25519 签名 / bearer | `register`、`heartbeat`、`setup-completed`、`report-status`、`client-tunnel`、`client-tunnel/claim`、`payout-profile`、`bind-owner-email` |
+| `/v1/installations/*` | 11 | Ed25519 签名 / bearer | `register`、`heartbeat`、`setup-completed`、`report-status`、`client-tunnel`、`client-tunnel/claim`、`bind-owner-email` |
 | `/v1/chat/*` | 9 | 公开读 / Session 写 | `clients/:installation_id/room`、`rooms/:room_id/messages`、`rooms/:room_id/stream` |
 | `/v1/market/*`、`/v1/markets/*`、`/v1/share-market/*` | 15 | 市场 bearer token | `shares`、`shares/headroom`、`request-logs/batch`、`listing-statuses/sync`、`shares/:id/grants` |
 | `/v1/gateway/*`、`/v1/gateways/*` | 5 | HMAC 签名(`x-cc-gateway-*`) | `register`、`shares`、`shares/feedback`、`request-logs/batch` |
 | `/v1/auth/*` | 5 | 公开 / Session | `email/request-code`、`email/verify-code`、`session/refresh`、`session/me`、`session/logout` |
 | `/v1/tunnels/*` | 4 | Ed25519 签名 | `lease`、`lease/renew`、`activate`、`state` |
 | `/v1/account/*` | 4 | Session | `payment-profile`、`payment-assets/:id`、`provider-blocks` |
-| `/v1/public/*` | 4 | 公开 | `map-points`、`network-stats`、`installations/:id/payout-profile`、`payout-profiles` |
+| `/v1/public/*` | 2 | 公开 | `map-points`、`network-stats` |
 | `/share-api/*` | 4 | 子域名上下文,Session 可选 | `context`、`share`、`auth/me`、`share/settings` |
 | `/v1/dashboard/*`、`/v1/me/*` | 6 | Session | `dashboard`、`presence`、`ux-events`、`me/api-token`、`me/shares` |
 | `/v1/board/*` | 5 | — | 遗留接口,写操作返回 `410 Gone` |
@@ -102,7 +102,7 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_LEASE_RETENTION_SECS` | `86400` | 过期 lease 保留时长(秒) |
 | `CC_SWITCH_ROUTER_REQUEST_LOG_RETENTION_DAYS` | `30` | Share 请求记录和图片请求历史保留天数,范围 1-365;不影响累计 Token 用量 |
 | `CC_SWITCH_ROUTER_CLIENT_STALE_SECS` | `3600` | client 超过该时间未心跳时标记离线,并清理其 share、lease 与内存路由 |
-| `CC_SWITCH_ROUTER_CLIENT_INSTALLATION_RETENTION_SECS` | `21600` | 离线 client 的 installation 记录(含 payout)保留时长,超时后删除;必须 >= `CLIENT_STALE_SECS` |
+| `CC_SWITCH_ROUTER_CLIENT_INSTALLATION_RETENTION_SECS` | `21600` | 离线 client 的 installation 记录保留时长,超时后删除;必须 >= `CLIENT_STALE_SECS` |
 | `CC_SWITCH_ROUTER_REGISTRATION_SOURCE_RATE_PER_MINUTE` | `60` | 单可信来源每分钟持续注册尝试速率 |
 | `CC_SWITCH_ROUTER_REGISTRATION_SOURCE_BURST` | `20` | 单可信来源允许的短时注册尝试突发量 |
 | `CC_SWITCH_ROUTER_REGISTRATION_GLOBAL_RATE_PER_MINUTE` | `600` | Router 全局每分钟持续注册尝试速率 |
@@ -204,8 +204,6 @@ curl http://127.0.0.1/v1/healthz
 
 dashboard 当前行为:
 
-- Client installation 可选携带公开收款资料(一个 EVM 地址、USDC/USDT、BSC/Base/Arbitrum One 多选网络);Client 卡片显示摘要,详情抽屉显示完整地址和自行声明状态。
-- 即使 installation 暂无 share/client tunnel,只要配置了收款资料,也会出现在 Client 列表。
 - 未登录时 share 表格中的 API key 默认脱敏
 - owner 或 `shared_with_emails` 中的邮箱登录后,可看到对应 share 的 API key 明文
 - 页脚 `PAGE ONLINE` 右侧在 free plan 且 Resend 返回 `x-resend-daily-quota` 时,会显示 `RESEND USAGE xx%`
@@ -269,7 +267,6 @@ listener。日志使用 append 模式;生产环境应由 `logrotate` 或 journal
 - share 用量同步为「事件驱动最终一致」,由 `cc-switch-server` 在创建、状态变更、用量变更、删除时异步上报
 - `cc-switch-server` 端 share 同步已做短延迟批量聚合,降低高频请求噪音
 - share owner / `shared_with_emails` ACL 以 `cc-switch-server` 推送为准,`cc-switch-router` 负责持久化、鉴权和 dashboard 脱敏控制
-- 收款资料以 installation 为作用域,通过 Client Ed25519 签名的 `PUT /v1/installations/payout-profile` 同步;清除会保留 revision tombstone,防止旧请求恢复地址。资料公开可读,但 `self_declared` 不代表 Router 已验证钱包所有权
 
 **运行与清理**
 

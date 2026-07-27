@@ -188,9 +188,6 @@ async fn main() -> Result<()> {
         start_instant: Instant::now(),
         scheduling_overrides: OverrideStore::new(),
         metrics: metrics.clone(),
-        payout_profile_read_limiter: Arc::new(
-            crate::server_state::PublicPayoutProfileReadLimiter::default(),
-        ),
         registration_admission: Arc::new(RegistrationAdmissionLimiter::from_env()),
     };
     let startup_reconnect_grace =

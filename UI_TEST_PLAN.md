@@ -160,14 +160,13 @@ location.reload();
 | C-14 | client 有 tunnel | 点外链图标 | 新标签打开 tunnel URL |
 | C-15 | client 有 tunnel | 点 Console | 打开内嵌 iframe 控制台面板 |
 | C-16 | `chatAvailable` | 点 Chat | 打开聊天面板;有未读时显示角标 |
-| C-17 | 有收款资料 | 点地址复制 | 复制到剪贴板 |
-| C-18 | 有 share | 点 share 卡片体 | 打开 share 详情抽屉 |
-| C-19 | share 非 disabled | 点 Connect | 打开连接弹窗(见 §11) |
-| C-20 | 有 share | 点 Edit / View | `canManage` 时可编辑,否则只读视图 |
-| C-21 | 有待应用编辑 | 观察 share 卡片 | 显示「待应用」;被拒绝时显示错误 tooltip |
-| C-22 | 有可升级 client | 点升级按钮 | 弹二次确认后开始升级 |
-| C-23 | 任意 | 保持页面 30 秒 | 数据自动刷新,展开态/筛选态不被重置 |
-| C-24 | 配置了 Telegram | 观察页脚 | 显示 Telegram 链接,新标签打开 |
+| C-17 | 有 share | 点 share 卡片体 | 打开 share 详情抽屉 |
+| C-18 | share 非 disabled | 点 Connect | 打开连接弹窗(见 §11) |
+| C-19 | 有 share | 点 Edit / View | `canManage` 时可编辑,否则只读视图 |
+| C-20 | 有待应用编辑 | 观察 share 卡片 | 显示「待应用」;被拒绝时显示错误 tooltip |
+| C-21 | 有可升级 client | 点升级按钮 | 弹二次确认后开始升级 |
+| C-22 | 任意 | 保持页面 30 秒 | 数据自动刷新,展开态/筛选态不被重置 |
+| C-23 | 配置了 Telegram | 观察页脚 | 显示 Telegram 链接,新标签打开 |
 
 ---
 
@@ -649,8 +648,8 @@ location.reload();
 | `auth/login-dialog.tsx`, `auth-provider.tsx` | A-02~A-06, A-12 |
 | `announcement/*` | A-16~A-19 |
 | `dashboard/live-map.tsx` | C-02~C-06 |
-| `dashboard/client-board.tsx` | C-07~C-17, C-23 |
-| `dashboard/share-card.tsx` | C-18~C-21 |
+| `dashboard/client-board.tsx` | C-07~C-16, C-22 |
+| `dashboard/share-card.tsx` | C-17~C-20 |
 | `dashboard/drawer-panels.tsx` | C-13, C-18, M-05, M-09 |
 | `dashboard/markets-table.tsx` | M-01~M-15 |
 | `dashboard/client-market-page.tsx` | H-01~H-18(归属/筛选/排序/分页), H-60~H-71(选择与批量), H-80~H-84(导入导出) |
@@ -672,7 +671,7 @@ location.reload();
 | `dashboard/account-page.tsx` | AC-01~AC-18 |
 | `dashboard/operation-verification.tsx` | S-24, D-06, D-07 |
 | `dashboard/provision-job-log.tsx` | H-45, D-10, Q-13 |
-| `dashboard/client-upgrade-button.tsx` | C-22, D-08, D-09 |
+| `dashboard/client-upgrade-button.tsx` | C-21, D-08, D-09 |
 | `share/share-page.tsx` | S-40~S-46 |
 | `settings/settings-page.tsx` | X-01~X-08, X-25~X-28 |
 | `settings/version-panel.tsx` | X-09~X-13, X-29, X-30 |
@@ -688,7 +687,7 @@ location.reload();
 | `common/authenticated-image.tsx` | S-34, R-06 |
 | `common/payment-method-icons.tsx` | AC-03~AC-09, R-06 |
 | `common/country-flag.tsx` | C-03, H-14, R-03 |
-| `lib/client-market-refresh.ts` | H-23(数据刷新不丢状态), C-23, R-12 |
+| `lib/client-market-refresh.ts` | H-23(数据刷新不丢状态), C-22, R-12 |
 | `lib/billing-urgency.ts` | R-05, R-11 |
 | `lib/i18n.ts` | G-01, G-10 + 改动键所属界面 |
 | `lib/dashboard-nav.ts` | A-20 |
@@ -709,8 +708,8 @@ location.reload();
 | 指标 | 7 | N-02~N-14 |
 | Shares | 6 | S-05, S-06, S-08~S-25, S-34, S-35 |
 | 账户(收款资料/封禁) | 4 | AC-03~AC-16 |
-| Dashboard | 2 | C-01, C-23 |
-| Installations 升级 | 2 | C-22, D-08, D-09 |
+| Dashboard | 2 | C-01, C-22 |
+| Installations 升级 | 2 | C-21, D-08, D-09 |
 | 用户 API Token | 2 | A-10, A-11 |
 | Markets 优先级 | 1 | M-09 |
 | 其他(regions / 公告读取) | 2 | A-14, A-16 |
@@ -728,12 +727,12 @@ location.reload();
 
 ## 20. 一轮完整回归的建议顺序
 
-共 **322 条用例**。单人跑完约需 4–5 小时。按角色分轮次,减少环境切换:
+共 **321 条用例**。单人跑完约需 4–5 小时。按角色分轮次,减少环境切换:
 
 | 轮次 | 环境 | 用例 | 约计 |
 |---|---|---|---|
 | 1. 匿名 | `DEV_AUTH_BYPASS=0`,不登录 | A-01, C-01~C-06, M-01~M-08, H-06, H-32, S-40, S-41, S-46, CH-02, N-01, X-01 | 25 分钟 |
-| 2. 普通用户 | 登录,名下无主机无租用 | A-02~A-20, AC-01~AC-18, H-01, H-02, R-01, R-02, C-07~C-24 | 60 分钟 |
+| 2. 普通用户 | 登录,名下无主机无租用 | A-02~A-20, AC-01~AC-18, H-01, H-02, R-01, R-02, C-07~C-23 | 60 分钟 |
 | 3. 供给方 | 名下有多状态主机 | H-03~H-05, H-07, H-10~H-18, H-20~H-29, H-40~H-50, H-60~H-84, T-01, T-04~T-19, T-30~T-36, Q-01~Q-14, D-10 | 120 分钟 |
 | 4. 租客 | 有租用中 Client | R-03~R-12, R-20~R-35, T-02, H-30, S-42~S-45, D-01~D-04 | 55 分钟 |
 | 5. 管理员 | 邮箱在 `ADMIN_EMAILS` | X-02~X-38, N-02~N-14, M-09~M-15, CH-07, H-31, T-03, D-05~D-09, S-08~S-35 | 90 分钟 |

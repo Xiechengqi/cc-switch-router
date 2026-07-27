@@ -1,7 +1,7 @@
 "use client";
 
-import { Button, Card, Chip, Drawer, toast } from "@heroui/react";
-import { Check, ChevronDown, Copy, ExternalLink, ListFilter, MessageCircle, Plus, Search, WalletCards } from "lucide-react";
+import { Button, Card, Drawer, toast } from "@heroui/react";
+import { ChevronDown, ExternalLink, ListFilter, MessageCircle, Plus, Search } from "lucide-react";
 import * as React from "react";
 import { CreateClientDialog } from "@/components/dashboard/create-client-dialog";
 import { ClientMarketBillingBanner } from "@/components/dashboard/client-market-billing-banner";
@@ -45,70 +45,6 @@ import { CompactSelect } from "@/components/common/compact-select";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { useClientChat } from "@/components/chat/client-chat";
 import { useAuth } from "@/components/auth/auth-provider";
-
-const PAYOUT_NETWORK_LABELS: Record<string, string> = {
-  "eip155:56": "BSC",
-  "eip155:8453": "Base",
-  "eip155:42161": "Arbitrum One",
-};
-
-function PayoutProfilePanel({ client, detailed = false }: { client: DashboardClient; detailed?: boolean }) {
-  const { locale, t } = useLocaleText();
-  const profile = client.payoutProfile;
-  const [copied, setCopied] = React.useState(false);
-  if (!profile) {
-    return detailed ? <EmptyBlock>{t("dashboard.payoutNotConfigured")}</EmptyBlock> : null;
-  }
-  const copyAddress = async () => {
-    try {
-      await navigator.clipboard.writeText(profile.address);
-      toast.success(t("dashboard.payoutCopied"));
-    } catch {
-      toast.danger(t("dashboard.payoutCopyFailed"));
-      return;
-    }
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1500);
-  };
-  if (!detailed) {
-    const networks = profile.networks.map((network) => PAYOUT_NETWORK_LABELS[network] || network).join(" / ");
-    return (
-      <button
-        type="button"
-        data-no-row-drawer
-        onClick={(event) => { event.stopPropagation(); void copyAddress(); }}
-        className="inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-md px-1.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-slate-100 hover:text-foreground"
-        title={`${profile.token} · ${networks} · ${profile.address}`}
-      >
-        <WalletCards className="h-3.5 w-3.5 shrink-0" />
-        <span className="shrink-0 font-medium text-foreground">{profile.token}</span>
-        <span className="shrink-0">· {networks} ·</span>
-        <code className="min-w-0 truncate font-mono text-[11px]">{profile.address}</code>
-        {copied ? <Check className="h-3.5 w-3.5 shrink-0 text-emerald-600" /> : <Copy className="h-3.5 w-3.5 shrink-0" />}
-      </button>
-    );
-  }
-  return (
-    <div className="grid min-w-0 gap-2 rounded-md border border-amber-200/80 bg-amber-50/50 p-3">
-      <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs">
-        <span className="inline-flex items-center gap-1 font-medium text-amber-800"><WalletCards className="h-3.5 w-3.5" />{t("dashboard.payout")}</span>
-        <Chip size="sm" variant="tertiary">{profile.token}</Chip>
-        {profile.networks.map((network) => <Chip key={network} size="sm" variant="soft">{PAYOUT_NETWORK_LABELS[network] || network}</Chip>)}
-        <Chip size="sm" variant="tertiary">{t("dashboard.payoutSelfDeclared")}</Chip>
-      </div>
-      <div className="flex min-w-0 items-center gap-1.5">
-        <code className={`${detailed ? "break-all" : "min-w-0 truncate"} font-mono text-xs text-foreground`} title={profile.address}>{profile.address}</code>
-        <Button size="sm" variant="ghost" isIconOnly className="h-7 w-7 min-w-0 shrink-0 rounded-md p-0" aria-label={t("dashboard.copyPayoutAddress")} data-no-row-drawer onClick={(event) => { event.stopPropagation(); void copyAddress(); }}>
-          {copied ? <Check className="h-3.5 w-3.5 text-emerald-600" /> : <Copy className="h-3.5 w-3.5" />}
-        </Button>
-      </div>
-      <div className="grid gap-1 text-xs text-muted-foreground">
-        <span>{t("dashboard.payoutUpdated")}: <strong className="text-foreground">{new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(profile.updatedAt))}</strong></span>
-        <span className="text-amber-700">{t("dashboard.payoutUnverifiedHint")}</span>
-      </div>
-    </div>
-  );
-}
 
 function sortShares(shares: ShareView[]) {
   return [...shares].sort((left, right) => {
@@ -637,8 +573,6 @@ export function ClientBoard({
         client.clientTunnel?.subdomain,
         client.clientTunnel?.tunnelUrl,
         client.clientTunnel?.ownerEmail,
-        client.payoutProfile?.address,
-        client.payoutProfile?.token,
       ], normalizedQuery);
       const matchedShares = clientMatch ? allShares : allShares.filter((share) => shareMatchesQuery(share, normalizedQuery));
       return {
@@ -949,9 +883,6 @@ export function ClientBoard({
                           </span>
                         ) : null}
                       </div>
-                    </DrawerSection>
-                    <DrawerSection label={t("dashboard.payout")}>
-                      <PayoutProfilePanel client={selectedClient} detailed />
                     </DrawerSection>
                     <DrawerSection label={t("dashboard.linkedShares")}>
                       <ClientLinkedSharesPanel shares={sharesForClient(selectedClient)} onEdit={openEditShare} t={t} />

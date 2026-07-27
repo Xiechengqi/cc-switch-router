@@ -133,7 +133,7 @@ export function LogsPanel() {
       <Card.Content className="grid gap-4">
         {error ? <Alert status="danger" className="!text-slate-900">{error}</Alert> : null}
         <div className="flex flex-wrap gap-2">
-          <Button variant="primary" onClick={download} isDisabled={busy}>
+          <Button variant="outline" onClick={download} isDisabled={busy}>
             {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
             {t("logs.download")}
           </Button>

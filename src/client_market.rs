@@ -8369,6 +8369,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pool_allocation_quotes_sample_across_free_hosts() {
+        use crate::client_market_trade::CreateQuoteRequest;
+        use std::collections::HashSet;
+
+        let (store, _config, root) = test_store("trade-quotes-random-sample");
+        for index in 0..6 {
+            add_provider_host(
+                &store,
+                "provider-random",
+                "provider@example.com",
+                &format!("198.18.42.{index}"),
+                "US",
+                None,
+                None,
+            )
+            .await;
+        }
+        let client = market_session("client-random", "client@example.com");
+        let mut seen = HashSet::new();
+        for _ in 0..12 {
+            let quote = store
+                .client_market_create_quote(
+                    &client,
+                    CreateQuoteRequest {
+                        provider_ids: vec!["provider-random".into()],
+                        country_codes: vec!["US".into()],
+                        count: 1,
+                        host_id: None,
+                    },
+                )
+                .await
+                .expect("sample free Host");
+            seen.insert(quote.items[0].host_id.clone());
+            store
+                .client_market_cancel_quote(&quote.id, &client)
+                .await
+                .expect("release sampled Host");
+        }
+        assert!(
+            seen.len() > 1,
+            "repeated pool quotes should sample more than one free Host, got {seen:?}"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn provider_supply_bootstraps_profiles_for_orphan_host_owners() {
         let (store, _config, root) = test_store("provider-supply-orphan-owner");
         store

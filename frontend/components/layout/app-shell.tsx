@@ -3,19 +3,23 @@
 import Image from "next/image";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { Button, Dropdown, ListBox, Modal, Select, Tabs } from "@heroui/react";
-import { Activity, Copy, Eye, EyeOff, KeyRound, Loader2, LogOut, Monitor, Network, RotateCcw, Settings, Store, UserRound } from "lucide-react";
+import { Button, Dropdown, ListBox, Select, Toast } from "@heroui/react";
+import { Activity, KeyRound, LogOut, Monitor, Network, Settings, Store, UserRound } from "lucide-react";
 import * as React from "react";
 import { LoginDialog } from "@/components/auth/login-dialog";
-import { Toast } from "@heroui/react";
 import { AuthProvider, useAuth } from "@/components/auth/auth-provider";
 import { LocaleProvider, useLocaleText } from "@/components/i18n/locale-provider";
 import { refreshAccessToken } from "@/lib/auth";
-import { getUserApiToken, resetUserApiToken } from "@/lib/api";
 import { DashboardDataProvider } from "@/components/dashboard/dashboard-data";
 import { AnnouncementDialog } from "@/components/announcement/announcement-dialog";
-import { DASHBOARD_ACCOUNT_PATH, DASHBOARD_CLIENTS_PATH, DASHBOARD_MARKETS_PATH, DASHBOARD_CLIENT_MARKET_PATH, type DashboardShellActive } from "@/lib/dashboard-nav";
-import type { UserApiTokenStatus } from "@/lib/types";
+import {
+  DASHBOARD_ACCOUNT_API_KEYS_PATH,
+  DASHBOARD_CLIENTS_PATH,
+  DASHBOARD_MARKETS_PATH,
+  DASHBOARD_CLIENT_MARKET_PATH,
+  type DashboardShellActive,
+} from "@/lib/dashboard-nav";
+import { cn } from "@/lib/utils";
 
 type RegionOption = {
   name: string;
@@ -88,11 +92,11 @@ function RouterSwitcher() {
         if (href) window.location.href = href;
       }}
     >
-      <Select.Trigger className="min-h-8 w-[7.25rem] items-center rounded-lg border border-border/80 bg-card py-1.5 pl-2.5 pr-7 text-xs text-foreground shadow-none sm:w-32">
-        <Select.Value className="block min-w-0 max-w-[5.5rem] truncate pr-1 text-xs font-normal text-foreground sm:max-w-[7rem]">
+      <Select.Trigger className="h-8 min-h-8 w-[7.25rem] items-center rounded-lg border border-border/60 bg-transparent py-0 pl-2.5 pr-7 text-xs text-foreground shadow-none hover:border-border sm:w-32">
+        <Select.Value className="block min-w-0 max-w-[5.5rem] truncate pr-1 text-xs font-medium text-foreground sm:max-w-[7rem]">
           {selected || t("nav.router")}
         </Select.Value>
-        <Select.Indicator className="text-muted-foreground" />
+        <Select.Indicator className="text-muted-foreground/70" />
       </Select.Trigger>
       <Select.Popover className="min-w-40">
         <ListBox aria-label={t("nav.routers")}>
@@ -110,19 +114,15 @@ function RouterSwitcher() {
 function LanguageSwitcher() {
   const { locale, setLocale, t } = useLocaleText();
   const optionClass = (active: boolean) =>
-    [
-      "inline-flex h-7 min-w-[1.75rem] items-center justify-center rounded-md px-1.5 text-[11px] font-semibold tracking-wide transition-colors",
+    cn(
+      "inline-flex h-8 min-w-[1.75rem] items-center justify-center rounded-md px-1.5 text-xs tracking-wide transition-colors",
       active
-        ? "bg-white text-foreground shadow-sm"
-        : "text-muted-foreground hover:text-foreground",
-    ].join(" ");
+        ? "font-semibold text-foreground"
+        : "font-medium text-muted-foreground hover:text-foreground",
+    );
 
   return (
-    <div
-      role="group"
-      aria-label={t("common.language")}
-      className="inline-flex h-8 shrink-0 items-center rounded-lg bg-slate-100/90 p-0.5 ring-1 ring-inset ring-slate-200/80"
-    >
+    <div role="group" aria-label={t("common.language")} className="inline-flex h-8 shrink-0 items-center gap-0.5">
       <button
         type="button"
         aria-pressed={locale === "en"}
@@ -143,138 +143,6 @@ function LanguageSwitcher() {
   );
 }
 
-function ApiTokenDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
-  const [token, setToken] = React.useState<UserApiTokenStatus | null>(null);
-  const [rawToken, setRawToken] = React.useState("");
-  const [showToken, setShowToken] = React.useState(false);
-  const [busy, setBusy] = React.useState(false);
-  const [error, setError] = React.useState("");
-  const [copied, setCopied] = React.useState(false);
-  const maskedToken = React.useMemo(() => {
-    if (rawToken) {
-      if (rawToken.length <= 12) return "•".repeat(rawToken.length);
-      return `${rawToken.slice(0, 8)}${"•".repeat(16)}${rawToken.slice(-4)}`;
-    }
-    if (token?.prefix) return `${token.prefix}${"•".repeat(16)}`;
-    return "Reset to generate a new API token";
-  }, [rawToken, token?.prefix]);
-
-  const load = React.useCallback(async () => {
-    setBusy(true);
-    setError("");
-    try {
-      const response = await getUserApiToken();
-      setToken(response.token);
-      setRawToken(response.apiToken || "");
-      setShowToken(false);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
-    }
-  }, []);
-
-  React.useEffect(() => {
-    if (!open) return;
-    setRawToken("");
-    setShowToken(false);
-    setCopied(false);
-    load().catch(console.error);
-  }, [load, open]);
-
-  const reset = async () => {
-    setBusy(true);
-    setError("");
-    setCopied(false);
-    try {
-      const response = await resetUserApiToken();
-      setToken(response.token);
-      setRawToken(response.apiToken);
-      setShowToken(false);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const copy = async () => {
-    if (!rawToken) return;
-    await navigator.clipboard.writeText(rawToken);
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1500);
-  };
-
-  return (
-    <Modal.Backdrop isOpen={open} onOpenChange={onOpenChange}>
-        <Modal.Container placement="center">
-          <Modal.Dialog className="light w-[min(560px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900 [--foreground:rgb(15,23,42)] [--muted:rgb(100,116,139)] [--overlay:#fff] [--overlay-foreground:rgb(15,23,42)] [--surface:#fff] [--surface-foreground:rgb(15,23,42)]">
-            <Modal.CloseTrigger className="!bg-slate-100 !text-slate-700 hover:!bg-slate-200 hover:!text-slate-950" />
-            <Modal.Header>
-              <div>
-                <Modal.Heading>API Token</Modal.Heading>
-                <p className="mt-1 text-sm text-slate-600">
-                  用它调用 router API，也可作为 share 调用的 `Authorization: Bearer ...`。
-                </p>
-              </div>
-            </Modal.Header>
-            <Modal.Body className="grid gap-4 !text-slate-900">
-              {error ? <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div> : null}
-              <div className="grid gap-2 rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-900">
-                <div className="flex justify-between gap-3">
-                  <span className="text-slate-500">Prefix</span>
-                  <strong className="font-mono">{token?.prefix || (busy ? "loading..." : "-")}</strong>
-                </div>
-                <div className="flex justify-between gap-3">
-                  <span className="text-slate-500">Created</span>
-                  <span>{token?.createdAt ? new Date(token.createdAt).toLocaleString() : "-"}</span>
-                </div>
-                <div className="flex justify-between gap-3">
-                  <span className="text-slate-500">Last used</span>
-                  <span>{token?.lastUsedAt ? new Date(token.lastUsedAt).toLocaleString() : "-"}</span>
-                </div>
-                <div className="flex justify-between gap-3">
-                  <span className="text-slate-500">Scopes</span>
-                  <span className="text-right">{token?.scopes?.join(", ") || "-"}</span>
-                </div>
-              </div>
-              <div className="grid gap-2">
-                <span className="text-xs text-slate-500">
-                  默认脱敏显示。点击小眼睛可查看完整 API token；旧 token 如未保存明文，请重置后查看。
-                </span>
-                <div className="flex items-start gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-slate-900">
-                  <div className="min-w-0 flex-1 break-all font-mono text-xs">
-                    {showToken && rawToken ? rawToken : maskedToken}
-                  </div>
-                  <button
-                    type="button"
-                    aria-label={showToken ? "Hide API token" : "Show API token"}
-                    title={showToken ? "Hide API token" : "Show API token"}
-                    className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-40"
-                    disabled={!rawToken}
-                    onClick={() => setShowToken((value) => !value)}
-                  >
-                    {showToken ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                  </button>
-                </div>
-              </div>
-            </Modal.Body>
-            <Modal.Footer>
-              <Button variant="outline" onClick={copy} isDisabled={!rawToken || busy}>
-                <Copy className="h-4 w-4" />
-                {copied ? "已复制" : "复制"}
-              </Button>
-              <Button variant="primary" onClick={reset} isDisabled={busy}>
-                {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}
-                重置并显示
-              </Button>
-            </Modal.Footer>
-          </Modal.Dialog>
-        </Modal.Container>
-    </Modal.Backdrop>
-  );
-}
-
 function DashboardNav({
   active,
   authed,
@@ -284,7 +152,6 @@ function DashboardNav({
 }) {
   const { t } = useLocaleText();
   const pathname = usePathname() || DASHBOARD_CLIENTS_PATH;
-  const router = useRouter();
   const selectedKey =
     authed && (active === "account" || pathname.startsWith("/account"))
       ? "account"
@@ -293,57 +160,58 @@ function DashboardNav({
         : active === "markets" || pathname.startsWith("/markets")
           ? "markets"
           : "clients";
-  const tabClass =
-    "inline-flex h-8 min-w-0 items-center justify-center gap-1.5 rounded-md px-2 text-xs font-medium text-muted-foreground transition-[background-color,color,box-shadow] hover:text-foreground data-[selected=true]:bg-white data-[selected=true]:font-semibold data-[selected=true]:text-foreground data-[selected=true]:shadow-sm sm:min-w-[5.5rem] sm:px-3";
+
+  const items = [
+    { id: "clients" as const, href: DASHBOARD_CLIENTS_PATH, icon: Monitor, label: t("nav.clientsTab") },
+    { id: "markets" as const, href: DASHBOARD_MARKETS_PATH, icon: Store, label: t("nav.marketsTab") },
+    {
+      id: "client-market" as const,
+      href: DASHBOARD_CLIENT_MARKET_PATH,
+      icon: Network,
+      label: t("nav.clientMarketTab"),
+    },
+    ...(authed
+      ? [{ id: "account" as const, href: DASHBOARD_ACCOUNT_API_KEYS_PATH, icon: UserRound, label: t("nav.accountTab") }]
+      : []),
+  ];
 
   return (
-    <Tabs
-      selectedKey={selectedKey}
-      variant="secondary"
-      aria-label={t("nav.dashboardSections")}
-      className="min-w-0 text-foreground"
-      onSelectionChange={(key: React.Key) => {
-        const next = String(key);
-        if (next === "clients") router.push(DASHBOARD_CLIENTS_PATH);
-        else if (next === "markets") router.push(DASHBOARD_MARKETS_PATH);
-        else if (next === "client-market") router.push(DASHBOARD_CLIENT_MARKET_PATH);
-        else if (next === "account" && authed) router.push(DASHBOARD_ACCOUNT_PATH);
-      }}
-    >
-      <Tabs.List
-        className={[
-          "inline-grid w-max max-w-full gap-0.5 rounded-lg bg-slate-100/90 p-1 text-foreground ring-1 ring-inset ring-slate-200/80",
-          authed ? "grid-cols-4" : "grid-cols-3",
-        ].join(" ")}
-      >
-        <Tabs.Tab id="clients" className={tabClass}>
-          <Monitor className="h-3.5 w-3.5 shrink-0" aria-hidden />
-          <span className="hidden sm:inline">{t("nav.clientsTab")}</span>
-        </Tabs.Tab>
-        <Tabs.Tab id="markets" className={tabClass}>
-          <Store className="h-3.5 w-3.5 shrink-0" aria-hidden />
-          <span className="hidden sm:inline">{t("nav.marketsTab")}</span>
-        </Tabs.Tab>
-        <Tabs.Tab id="client-market" className={tabClass}>
-          <Network className="h-3.5 w-3.5 shrink-0" aria-hidden />
-          <span className="hidden sm:inline">{t("nav.clientMarketTab")}</span>
-        </Tabs.Tab>
-        {authed ? (
-          <Tabs.Tab id="account" className={tabClass}>
-            <UserRound className="h-3.5 w-3.5 shrink-0" aria-hidden />
-            <span className="hidden sm:inline">{t("nav.accountTab")}</span>
-          </Tabs.Tab>
-        ) : null}
-      </Tabs.List>
-    </Tabs>
+    <nav aria-label={t("nav.dashboardSections")} className="flex w-max max-w-full items-center gap-0.5">
+      {items.map((item) => {
+        const selected = selectedKey === item.id;
+        const Icon = item.icon;
+        return (
+          <Link
+            key={item.id}
+            href={item.href}
+            aria-current={selected ? "page" : undefined}
+            className={cn(
+              "inline-flex h-8 min-w-0 items-center gap-1.5 rounded-md px-2 text-xs transition-colors",
+              selected
+                ? "font-semibold text-foreground"
+                : "font-medium text-muted-foreground hover:text-foreground",
+            )}
+          >
+            <Icon
+              className={cn(
+                "h-3.5 w-3.5 shrink-0",
+                selected ? "text-muted-foreground" : "text-muted-foreground/70",
+              )}
+              aria-hidden
+            />
+            <span className="whitespace-nowrap">{item.label}</span>
+          </Link>
+        );
+      })}
+    </nav>
   );
 }
 
 function Topbar({ active }: { active: DashboardShellActive }) {
   const { session, loading, logout } = useAuth();
   const { t } = useLocaleText();
+  const router = useRouter();
   const [loginOpen, setLoginOpen] = React.useState(false);
-  const [apiTokenOpen, setApiTokenOpen] = React.useState(false);
   const [clientRedirect, setClientRedirect] = React.useState<string | null>(null);
   const redirectStartedRef = React.useRef(false);
   const authed = !!session?.authenticated;
@@ -410,11 +278,11 @@ function Topbar({ active }: { active: DashboardShellActive }) {
               <Dropdown>
                 <Dropdown.Trigger className="shrink-0 outline-none">
                   <Button
-                    variant="outline"
+                    variant="ghost"
                     size="sm"
-                    className="h-8 max-w-[12rem] gap-1.5 px-2.5 whitespace-nowrap [&_svg]:my-0"
+                    className="h-8 max-w-[12rem] gap-1.5 px-2.5 text-xs font-medium text-muted-foreground hover:text-foreground whitespace-nowrap [&_svg]:my-0"
                   >
-                    <UserRound className="h-4 w-4 shrink-0" />
+                    <UserRound className="h-3.5 w-3.5 shrink-0 text-muted-foreground/70" />
                     <span className="hidden min-w-0 truncate sm:inline">{session?.user?.email}</span>
                   </Button>
                 </Dropdown.Trigger>
@@ -425,7 +293,7 @@ function Topbar({ active }: { active: DashboardShellActive }) {
                         {session?.user?.email}
                       </Dropdown.Item>
                     </Dropdown.Section>
-                    <Dropdown.Item id="api-token" onAction={() => setApiTokenOpen(true)}>
+                    <Dropdown.Item id="api-token" onAction={() => router.push(DASHBOARD_ACCOUNT_API_KEYS_PATH)}>
                       <KeyRound className="h-4 w-4" />
                       API Token
                     </Dropdown.Item>
@@ -450,9 +318,9 @@ function Topbar({ active }: { active: DashboardShellActive }) {
               </Dropdown>
             ) : (
               <Button
-                variant="outline"
+                variant="ghost"
                 size="sm"
-                className="h-8 shrink-0 px-3 text-[11px] font-normal text-muted-foreground hover:text-slate-500"
+                className="h-8 shrink-0 px-2.5 text-xs font-medium text-muted-foreground hover:text-foreground"
                 onClick={() => setLoginOpen(true)}
                 isDisabled={loading}
               >
@@ -464,7 +332,6 @@ function Topbar({ active }: { active: DashboardShellActive }) {
       </header>
 
       <LoginDialog open={loginOpen} onOpenChange={setLoginOpen} />
-      <ApiTokenDialog open={apiTokenOpen} onOpenChange={setApiTokenOpen} />
     </>
   );
 }

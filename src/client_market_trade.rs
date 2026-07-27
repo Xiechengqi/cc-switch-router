@@ -11,6 +11,7 @@ use axum::{Json, Router};
 use chrono::{DateTime, Duration, Utc};
 use futures_util::StreamExt;
 use image::{ImageFormat, ImageReader};
+use rand::seq::SliceRandom;
 use reqwest::redirect::Policy;
 use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_iter};
 use serde::{Deserialize, Serialize};
@@ -175,6 +176,7 @@ pub struct QuoteItemView {
     pub host_owner_email: String,
     pub country_code: Option<String>,
     pub hostname: Option<String>,
+    pub ip: Option<String>,
     pub price_cents: Option<i64>,
     pub rental_period_days: Option<i64>,
     pub offer_revision: i64,
@@ -2662,11 +2664,11 @@ impl AppStore {
             let candidate = tx
                 .query_row(
                     "SELECT h.id, h.provider_id, h.host_owner_email, h.country_code, h.hostname,
-                            h.price_cents, h.rental_period_days, h.offer_revision
+                            h.ip, h.price_cents, h.rental_period_days, h.offer_revision
                      FROM router_ssh_hosts h
                      WHERE h.id = ?1 AND h.status = 'idle' AND h.provider_id IS NOT NULL
-                       AND h.provider_id IS NOT ?2
-                       AND LOWER(h.host_owner_email) IS NOT ?3
+                       AND h.provider_id != ?2
+                       AND LOWER(h.host_owner_email) != ?3
                        AND NOT EXISTS (
                            SELECT 1 FROM host_provider_client_blocks b
                            WHERE b.provider_id = h.provider_id AND b.client_user_id = ?2
@@ -2686,23 +2688,24 @@ impl AppStore {
         } else {
             let provider_vars = sql_vars(provider_ids.len());
             let country_vars = sql_vars(countries.len());
+            // Fetch the full idle free pool, then shuffle in Rust. SQLite
+            // `ORDER BY RANDOM() LIMIT n` was observed to keep returning the same
+            // Host on live Routers; application-side sampling is explicit and testable.
             let sql = format!(
                 "SELECT h.id, h.provider_id, h.host_owner_email, h.country_code, h.hostname,
-                        h.price_cents, h.rental_period_days, h.offer_revision
+                        h.ip, h.price_cents, h.rental_period_days, h.offer_revision
                  FROM router_ssh_hosts h
                  WHERE h.status = 'idle'
                    AND h.price_cents IS NULL
                    AND h.provider_id IN ({provider_vars})
                    AND h.country_code IN ({country_vars})
-                   AND h.provider_id IS NOT ?
-                   AND LOWER(h.host_owner_email) IS NOT ?
+                   AND h.provider_id != ?
+                   AND LOWER(h.host_owner_email) != ?
                    AND NOT EXISTS (
                        SELECT 1 FROM host_provider_client_blocks b
                        WHERE b.provider_id = h.provider_id AND b.client_user_id = ?
                          AND b.lifted_at IS NULL
-                   )
-                 ORDER BY RANDOM() LIMIT {}",
-                input.count
+                   )"
             );
             let mut values = provider_ids.clone();
             values.extend(countries.clone());
@@ -2717,9 +2720,17 @@ impl AppStore {
                 .map_err(|error| {
                     AppError::Internal(format!("query random Host quote failed: {error}"))
                 })?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+            let mut pool = rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
                 AppError::Internal(format!("read random Host quote failed: {error}"))
-            })?
+            })?;
+            if pool.len() < input.count {
+                return Err(AppError::ServiceUnavailable(
+                    "not enough idle free Hosts match the selected Providers and regions".into(),
+                ));
+            }
+            pool.shuffle(&mut rand::thread_rng());
+            pool.truncate(input.count);
+            pool
         };
         if candidates.len() != input.count {
             return Err(AppError::ServiceUnavailable(
@@ -2787,6 +2798,7 @@ impl AppStore {
                 host_owner_email: candidate.host_owner_email,
                 country_code: candidate.country_code,
                 hostname: candidate.hostname,
+                ip: candidate.ip,
                 price_cents: candidate.price_cents,
                 rental_period_days: candidate.rental_period_days,
                 offer_revision: candidate.offer_revision,
@@ -3621,6 +3633,7 @@ struct QuoteCandidate {
     host_owner_email: String,
     country_code: Option<String>,
     hostname: Option<String>,
+    ip: Option<String>,
     price_cents: Option<i64>,
     rental_period_days: Option<i64>,
     offer_revision: i64,
@@ -3633,9 +3646,10 @@ fn map_quote_candidate(row: &rusqlite::Row<'_>) -> rusqlite::Result<QuoteCandida
         host_owner_email: row.get(2)?,
         country_code: row.get(3)?,
         hostname: row.get(4)?,
-        price_cents: row.get(5)?,
-        rental_period_days: row.get(6)?,
-        offer_revision: row.get(7)?,
+        ip: row.get(5)?,
+        price_cents: row.get(6)?,
+        rental_period_days: row.get(7)?,
+        offer_revision: row.get(8)?,
     })
 }
 

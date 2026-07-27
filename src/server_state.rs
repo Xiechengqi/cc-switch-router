@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -70,36 +68,8 @@ pub struct ServerState {
     pub scheduling_overrides: Arc<OverrideStore>,
     /// Separate metrics collector/store for host, router, and LLM observability.
     pub metrics: Arc<MetricsRegistry>,
-    /// Per-IP limiter for the public payout-profile lookup endpoints.
-    pub payout_profile_read_limiter: Arc<PublicPayoutProfileReadLimiter>,
     /// Bounded in-memory admission limiter for the public installation registration endpoint.
     pub registration_admission: Arc<RegistrationAdmissionLimiter>,
-}
-
-const PUBLIC_PAYOUT_READS_PER_MINUTE: u32 = 300;
-
-#[derive(Debug, Default)]
-pub struct PublicPayoutProfileReadLimiter {
-    buckets: Mutex<HashMap<IpAddr, (i64, u32)>>,
-}
-
-impl PublicPayoutProfileReadLimiter {
-    pub async fn allow(&self, ip: IpAddr) -> bool {
-        let minute = chrono::Utc::now().timestamp().div_euclid(60);
-        let mut buckets = self.buckets.lock().await;
-        if buckets.len() > 4096 {
-            buckets.retain(|_, (bucket, _)| *bucket >= minute - 1);
-        }
-        let entry = buckets.entry(ip).or_insert((minute, 0));
-        if entry.0 != minute {
-            *entry = (minute, 0);
-        }
-        if entry.1 >= PUBLIC_PAYOUT_READS_PER_MINUTE {
-            return false;
-        }
-        entry.1 += 1;
-        true
-    }
 }
 
 #[derive(Debug, Clone)]

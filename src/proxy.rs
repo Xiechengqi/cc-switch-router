@@ -4607,9 +4607,6 @@ mod tests {
             start_instant: Instant::now(),
             scheduling_overrides: crate::scheduling_signals::OverrideStore::new(),
             metrics,
-            payout_profile_read_limiter: Arc::new(
-                crate::server_state::PublicPayoutProfileReadLimiter::default(),
-            ),
             registration_admission: Arc::new(
                 crate::registration_admission::RegistrationAdmissionLimiter::new(
                     crate::registration_admission::RegistrationAdmissionPolicy::default(),
