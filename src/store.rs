@@ -3687,11 +3687,23 @@ impl AppStore {
     pub async fn count_sent_emails_last_24h(&self) -> Result<usize, AppError> {
         let cutoff = (Utc::now() - Duration::hours(24)).to_rfc3339();
         let conn = self.conn.lock().await;
+        // Footer EMAIL SENT 24H must include every Router outbound mail path.
+        // login_code / client_notification / client_chat already land in email_send_logs;
+        // market_notification and client_market historically only wrote their own tables —
+        // UNION covers those (and dedupes once they also write email_send_logs).
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM email_send_logs
-                 WHERE status = 'sent'
-                   AND created_at >= ?1",
+                "SELECT COUNT(*) FROM (
+                    SELECT id FROM email_send_logs
+                     WHERE status = 'sent' AND created_at >= ?1
+                    UNION
+                    SELECT id FROM market_notification_emails
+                     WHERE status = 'sent' AND created_at >= ?1
+                    UNION
+                    SELECT id FROM client_market_email_deliveries
+                     WHERE status = 'sent'
+                       AND COALESCE(sent_at, updated_at, created_at) >= ?1
+                 )",
                 params![cutoff],
                 |row| row.get(0),
             )
@@ -8956,6 +8968,13 @@ impl AppStore {
             ],
         )
         .map_err(|e| AppError::Internal(format!("insert market notification log failed: {e}")))?;
+        conn.execute(
+            "INSERT OR IGNORE INTO email_send_logs (
+                id, email_type, to_email, provider_message_id, status, error_message, created_at
+             ) VALUES (?1, 'market_notification', ?2, ?3, 'sent', NULL, ?4)",
+            params![id, to, provider_message_id, now],
+        )
+        .map_err(|e| AppError::Internal(format!("insert market notification send log failed: {e}")))?;
         Ok(crate::models::MarketNotificationEmailResponse {
             ok: true,
             message_id: id,

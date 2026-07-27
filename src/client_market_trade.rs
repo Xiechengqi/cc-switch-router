@@ -3625,6 +3625,21 @@ impl AppStore {
         if changed != 1 {
             return Err(AppError::Conflict("market email claim was lost".into()));
         }
+        if status == "sent" {
+            conn.execute(
+                "INSERT OR IGNORE INTO email_send_logs (
+                    id, email_type, to_email, provider_message_id, status,
+                    error_message, created_at
+                 )
+                 SELECT id, 'client_market', recipient, provider_message_id,
+                        'sent', NULL, ?2
+                 FROM client_market_email_deliveries WHERE id = ?1",
+                params![id, now],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("record sent Client Market email failed: {error}"))
+            })?;
+        }
         Ok(())
     }
 }

@@ -8886,6 +8886,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finishing_client_market_email_counts_toward_footer_email_sent() {
+        let (store, _config, root) = test_store("trade-email-footer-count");
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO client_market_email_deliveries
+                    (id, kind, recipient, subject, html_body, text_body, idempotency_key,
+                     status, attempts, next_attempt_at, claim_owner, created_at, updated_at)
+                 VALUES ('sent-email', 'host_rented', 'owner@example.com', 'subject', '<p>body</p>',
+                         'body', 'test:sent-email', 'claimed', 1, ?1, 'worker-a', ?1, ?1)",
+                params![now.to_rfc3339()],
+            )
+            .unwrap();
+            // Historical market notification that never wrote email_send_logs.
+            conn.execute(
+                "INSERT INTO market_notification_emails
+                    (id, market_email, kind, to_email, locale, payload_json,
+                     provider_message_id, status, error_message, created_at)
+                 VALUES ('market-mail-1', 'market@example.com', 'share_offline',
+                         'user@example.com', 'en', '{}', 're_hist', 'sent', NULL, ?1)",
+                params![now.to_rfc3339()],
+            )
+            .unwrap();
+        }
+
+        store
+            .client_market_finish_email(
+                "sent-email",
+                "worker-a",
+                Some("re_provider_1"),
+                None,
+                None,
+            )
+            .await
+            .expect("finish market email");
+
+        {
+            let conn = store.conn.lock().await;
+            let audit: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM email_send_logs
+                     WHERE id = 'sent-email' AND email_type = 'client_market' AND status = 'sent'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(audit, 1);
+        }
+
+        let counted = store
+            .count_sent_emails_last_24h()
+            .await
+            .expect("count footer emails");
+        assert_eq!(
+            counted, 2,
+            "client_market delivery + historical market_notification must both count"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn disabled_email_delivery_does_not_claim_or_consume_attempts() {
         let (store, _config, root) = test_store("trade-email-disabled");
         let now = Utc::now();
