@@ -2,16 +2,14 @@
 
 import * as React from "react";
 import { Button, Chip, Modal, toast } from "@heroui/react";
-import { Loader2, Mail, Trash2, WalletCards } from "lucide-react";
+import { Loader2, Mail, WalletCards } from "lucide-react";
 import { BillingUrgencyChip } from "@/components/dashboard/billing-urgency-chip";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
+import { ReleaseRentalAction } from "@/components/dashboard/client-market/release-rental-action";
 import { AuthenticatedImage } from "@/components/common/authenticated-image";
 import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import {
-  cleanupClientMarketClientWithReason,
-  declareClientMarketPayment,
-} from "@/lib/api";
+import { declareClientMarketPayment } from "@/lib/api";
 import { billingUrgencyTier, formatBillingCountdown } from "@/lib/billing-urgency";
 import type { ClientMarketBilling, ClientMarketPaymentMethod } from "@/lib/types";
 
@@ -65,7 +63,6 @@ export function ClientMarketBillingBanner({
   const { locale, t } = useLocaleText();
   const [paymentOpen, setPaymentOpen] = React.useState(false);
   const [confirmPayment, setConfirmPayment] = React.useState(false);
-  const [confirmRelease, setConfirmRelease] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
 
   if (!billing || !billing.isClientOwner || billing.status === "released") return null;
@@ -94,24 +91,6 @@ export function ClientMarketBillingBanner({
     }
   };
 
-  const release = async () => {
-    setBusy(true);
-    try {
-      await cleanupClientMarketClientWithReason(billing.installationId, {
-        reason: "client_release",
-        blockClientForProvider: false,
-      });
-      toast.info(t("billing.releaseStartedToast"));
-      setConfirmRelease(false);
-      setPaymentOpen(false);
-      await onChanged();
-    } catch (reason) {
-      toast.danger(reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setBusy(false);
-    }
-  };
-
   if (billing.status === "releasing") {
     return (
       <span className="inline-flex h-6 items-center gap-1 text-[11px] text-muted-foreground" data-no-row-drawer>
@@ -131,25 +110,15 @@ export function ClientMarketBillingBanner({
 
   if (billing.status === "release_failed") {
     return (
-      <>
-        <span className="inline-flex flex-wrap items-center gap-1.5" data-no-row-drawer onClick={(event) => event.stopPropagation()}>
-          <span className="text-[11px] text-rose-700">{t("billing.releaseFailed")}</span>
-          <Button size="sm" variant="outline" className="h-6 px-2 text-[11px]" onClick={() => setConfirmRelease(true)}>
-            {t("billing.retryRelease")}
-          </Button>
-        </span>
-        <ConfirmAlertDialog
-          open={confirmRelease}
-          title={t("billing.releaseTitle")}
-          description={t("billing.releaseDescription")}
-          confirmLabel={t("billing.releaseClient")}
-          cancelLabel={t("common.cancel")}
-          busy={busy}
-          tone="danger"
-          onConfirm={() => void release()}
-          onOpenChange={(next) => !busy && setConfirmRelease(next)}
+      <span className="inline-flex flex-wrap items-center gap-1.5" data-no-row-drawer onClick={(event) => event.stopPropagation()}>
+        <span className="text-[11px] text-rose-700">{t("billing.releaseFailed")}</span>
+        <ReleaseRentalAction
+          billing={billing}
+          onChanged={onChanged}
+          label={t("billing.retryRelease")}
+          className="h-6 px-2 text-[11px] text-rose-700"
         />
-      </>
+      </span>
     );
   }
 
@@ -186,10 +155,11 @@ export function ClientMarketBillingBanner({
               <p className="text-xs leading-5 text-muted-foreground">{t("billing.declarationNotice")}</p>
             </Modal.Body>
             <Modal.Footer className="flex flex-wrap gap-2">
-              <Button variant="ghost" className="text-rose-700" isDisabled={busy} onClick={() => setConfirmRelease(true)}>
-                <Trash2 className="h-4 w-4" />
-                {t("billing.releaseClient")}
-              </Button>
+              <ReleaseRentalAction
+                billing={billing}
+                onChanged={onChanged}
+                className="text-rose-700"
+              />
               <div className="ml-auto flex flex-wrap gap-2">
                 <Button variant="ghost" isDisabled={busy} onClick={() => setPaymentOpen(false)}>{t("common.close")}</Button>
                 <Button variant="primary" isDisabled={busy || !billing.canDeclarePaid || !billing.openInvoiceId} onClick={() => setConfirmPayment(true)}>{t("billing.confirmPayment")}</Button>
@@ -209,17 +179,6 @@ export function ClientMarketBillingBanner({
         tone="warning"
         onConfirm={() => void declarePaid()}
         onOpenChange={(next) => !busy && setConfirmPayment(next)}
-      />
-      <ConfirmAlertDialog
-        open={confirmRelease}
-        title={t("billing.releaseTitle")}
-        description={t("billing.releaseDescription")}
-        confirmLabel={t("billing.releaseClient")}
-        cancelLabel={t("common.cancel")}
-        busy={busy}
-        tone="danger"
-        onConfirm={() => void release()}
-        onOpenChange={(next) => !busy && setConfirmRelease(next)}
       />
     </>
   );

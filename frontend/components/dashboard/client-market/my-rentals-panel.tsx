@@ -4,6 +4,7 @@ import * as React from "react";
 import { Chip } from "@heroui/react";
 import { ClientMarketBillingBanner } from "@/components/dashboard/client-market-billing-banner";
 import { CountryFlag } from "@/components/common/country-flag";
+import { ReleaseRentalAction } from "@/components/dashboard/client-market/release-rental-action";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import type { ClientMarketBilling, ClientMarketHost } from "@/lib/types";
 
@@ -70,6 +71,12 @@ export function MyRentalsPanel({
               <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
                 {t("clientMarket.rentals.provider", { owner: billing.hostOwnerEmail })}
               </span>
+              {/* Release lives on the card, not inside the payment modal: a paid rental
+                  with time left renders no billing banner at all, and used to have no
+                  way back to its Provider. `releasing` already has a job in flight. */}
+              {billing.status !== "releasing" ? (
+                <ReleaseRentalAction billing={billing} onChanged={onChanged} />
+              ) : null}
             </div>
             <ClientMarketBillingBanner billing={billing} onChanged={onChanged} showPayButton />
           </section>
