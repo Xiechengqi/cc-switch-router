@@ -212,7 +212,12 @@ fn token_breakdown_line(
     )
 }
 
-pub fn render_global_usage_svg(data: &GlobalUsageResponse, theme: &str, period: &str) -> String {
+pub fn render_global_usage_svg(
+    data: &GlobalUsageResponse,
+    theme: &str,
+    period: &str,
+    router_host: &str,
+) -> String {
     let theme = normalize_theme(theme);
     let period = normalize_period_label(if period.trim().is_empty() {
         data.period.as_str()
@@ -222,8 +227,9 @@ pub fn render_global_usage_svg(data: &GlobalUsageResponse, theme: &str, period: 
     let p = palette(theme);
     let model_limit = data.models.len().max(1);
     let height = 168.0 + (model_limit as f64) * 22.0 + 28.0;
+    let host_label = escape_xml(router_host.trim().trim_end_matches('.'));
     let title = format!(
-        r#"<text x="24" y="34" font-family="ui-sans-serif,system-ui,sans-serif" font-size="16" font-weight="700" fill="{text}">TokenSwitch · Global</text>
+        r#"<text x="24" y="34" font-family="ui-sans-serif,system-ui,sans-serif" font-size="16" font-weight="700" fill="{text}">TokenSwitch · {host_label}</text>
 {period_links}
 <text x="24" y="64" font-family="ui-sans-serif,system-ui,sans-serif" font-size="28" font-weight="700" fill="{accent}">{total} tokens</text>
 <text x="24" y="86" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12" fill="{muted}">{period}</text>

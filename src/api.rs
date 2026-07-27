@@ -2342,7 +2342,10 @@ async fn embed_global_usage_svg(
         Ok(mut data) => {
             data.models.truncate(models_limit);
             svg_usage_response(crate::embed_usage::render_global_usage_svg(
-                &data, theme, &data.period,
+                &data,
+                theme,
+                &data.period,
+                &state.config.tunnel_domain,
             ))
         }
         Err(err) => svg_usage_response(crate::embed_usage::render_usage_error_svg(

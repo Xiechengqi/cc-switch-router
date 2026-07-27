@@ -26180,8 +26180,13 @@ mod tests {
                 .is_none()
         );
 
-        let svg = crate::embed_usage::render_global_usage_svg(&global, "dark", "7d");
-        assert!(svg.contains("TokenSwitch · Global"));
+        let svg = crate::embed_usage::render_global_usage_svg(
+            &global,
+            "dark",
+            "7d",
+            "ustokenswitch.cc",
+        );
+        assert!(svg.contains("TokenSwitch · ustokenswitch.cc"));
         assert!(svg.contains("?period=24h"));
         assert!(svg.contains("gpt-5"));
 
