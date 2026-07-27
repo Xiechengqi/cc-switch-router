@@ -2,21 +2,12 @@
 
 TokenSwitch 的公共汇聚层。为 `cc-switch-server` 实例提供公网子域名与反向隧道,并在其上承载额度共享市场、主机供给市场与多区域 Router 联邦。
 
-<!-- Live global token usage (model + token counts only; no cost). -->
-<!-- GitHub README 内嵌图上的按钮不可点；用下方链接打开 SVG 页后可切换 24h/7d/30d。 -->
-<p align="center">
-  <a href="https://jptokenswitch.cc/v1/public/embed/global.svg?period=24h">24h</a>
-  ·
-  <a href="https://jptokenswitch.cc/v1/public/embed/global.svg?period=7d"><strong>7d</strong></a>
-  ·
-  <a href="https://jptokenswitch.cc/v1/public/embed/global.svg?period=30d">30d</a>
-</p>
-<p align="center">
-  <img
-    src="https://jptokenswitch.cc/v1/public/embed/global.svg?period=7d"
-    alt="TokenSwitch global token usage (7d)"
-    width="680" />
-</p>
+| Region | 24h usage |
+| --- | --- |
+| japan | ![japan 24h](https://jptokenswitch.cc/v1/public/embed/global.svg?period=24h&theme=light) |
+| singapore | ![singapore 24h](https://sgptokenswitch.cc/v1/public/embed/global.svg?period=24h&theme=light) |
+| hongkong | ![hongkong 24h](https://hktokenswitch.cc/v1/public/embed/global.svg?period=24h&theme=light) |
+| usa | ![usa 24h](https://ustokenswitch.cc/v1/public/embed/global.svg?period=24h&theme=light) |
 
 - 架构与实现现状 → [ARCHITECTURE.md](ARCHITECTURE.md)
 - 与客户端的接口契约 → [PROTOCOL.md](PROTOCOL.md)
