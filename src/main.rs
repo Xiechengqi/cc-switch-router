@@ -133,6 +133,7 @@ async fn main() -> Result<()> {
     )?;
     let provision_ssh_public_key =
         provision_ssh::public_key_openssh_from_public_path(&config.provision_ssh_public_key_path)?;
+    ip_iq::warn_insecure_endpoints(&config.ip_intel_endpoints);
     let resend = config
         .resend_api_key
         .as_deref()

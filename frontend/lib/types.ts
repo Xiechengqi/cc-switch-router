@@ -1148,37 +1148,6 @@ export type ClearMetricsResponse = {
   deletedRows: Record<string, number>;
 };
 
-export type BoardMessage = {
-  id: string;
-  body: string;
-  authorKind: string;
-  authorLabel: string;
-  isMine: boolean;
-  pinned: boolean;
-  featured: boolean;
-  createdAt: string;
-  pinnedAt?: string;
-  featuredAt?: string;
-};
-
-export type BoardListResponse = {
-  messages: BoardMessage[];
-  tab: string;
-  totalVisible: number;
-  asOf: string;
-  removedIds?: string[];
-  incremental?: boolean;
-};
-
-export type BoardMeta = {
-  total: number;
-  pinnedCount: number;
-  featuredCount: number;
-  canPostAsAdmin: boolean;
-  maxBodyLength: number;
-  guestSelfDeleteSecs: number;
-};
-
 export type ClientChatMessage = {
   id: string;
   seq: number;

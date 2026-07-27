@@ -126,6 +126,10 @@ export function CreateClientDialog({
   const [quantity, setQuantity] = React.useState(1);
   const [quote, setQuote] = React.useState<ClientMarketAllocationQuote | null>(null);
   const [drafts, setDrafts] = React.useState<Record<string, Draft>>({});
+  /** Drafts rescued from an expired quote, keyed by hostId so they survive the new
+   *  quote's fresh item ids. Losing a filled-in subdomain and password on a 120s
+   *  timer was the single most punishing moment in this flow. */
+  const preservedDrafts = React.useRef<Record<string, Draft>>({});
   const [subdomainChecks, setSubdomainChecks] = React.useState<Record<string, SubdomainCheck>>({});
   const [jobs, setJobs] = React.useState<Record<string, ProvisioningJob>>({});
   const [loading, setLoading] = React.useState(false);
@@ -230,14 +234,24 @@ export function CreateClientDialog({
 
   React.useEffect(() => {
     if (!quote || phase !== "quote" || secondsRemaining(quote.expiresAt) > 0) return;
+    const rescued: Record<string, Draft> = {};
+    for (const item of quote.items) {
+      const draft = drafts[item.id];
+      if (draft && (draft.subdomain || draft.password)) rescued[item.hostId] = draft;
+    }
+    preservedDrafts.current = rescued;
     void cancelClientMarketQuote(quote.id).catch(() => undefined);
     setQuote(null);
     setDrafts({});
     setSubdomainChecks({});
     subdomainCheckGeneration.current += 1;
-    setError(t("createClient.quoteExpired"));
+    setError(
+      Object.keys(rescued).length
+        ? t("createClient.quoteExpiredDraftsKept")
+        : t("createClient.quoteExpired"),
+    );
     setPhase("form");
-  }, [clock, phase, quote, t]);
+  }, [clock, drafts, phase, quote, t]);
 
   React.useEffect(() => {
     if (!open || phase !== "quote" || !quote) return;
@@ -316,7 +330,15 @@ export function CreateClientDialog({
         hostId: fixedHost?.id,
       });
       setQuote(next);
-      setDrafts(Object.fromEntries(next.items.map((item) => [item.id, { subdomain: randomSubdomain(), password: "" }])));
+      setDrafts(
+        Object.fromEntries(
+          next.items.map((item) => [
+            item.id,
+            preservedDrafts.current[item.hostId] ?? { subdomain: randomSubdomain(), password: "" },
+          ]),
+        ),
+      );
+      preservedDrafts.current = {};
       setSubdomainChecks({});
       setPhase("quote");
     } catch (reason) {
@@ -522,7 +544,20 @@ export function CreateClientDialog({
 
             {phase === "quote" && quote ? (
               <div className="grid gap-4">
-                <div className="flex flex-wrap items-center justify-between gap-2 border-b pb-3"><div><strong className="text-sm">{t("createClient.reservedHosts")}</strong><p className="text-xs text-muted-foreground">{t("createClient.reviewQuote")}</p></div><Chip size="sm" variant={quoteSeconds <= 30 ? "soft" : "tertiary"}>{quoteSeconds}s</Chip></div>
+                <div className="flex flex-wrap items-center justify-between gap-2 border-b pb-3"><div><strong className="text-sm">{t("createClient.reservedHosts")}</strong><p className="text-xs text-muted-foreground">{t("createClient.reviewQuote")}</p></div><Chip
+                  size="sm"
+                  variant={quoteSeconds <= 30 ? "soft" : "tertiary"}
+                  className={
+                    quoteSeconds <= 30
+                      ? "bg-rose-100 text-rose-700"
+                      : quoteSeconds <= 60
+                        ? "bg-amber-100 text-amber-800"
+                        : undefined
+                  }
+                  aria-live={quoteSeconds <= 30 ? "assertive" : "polite"}
+                >
+                  {t("createClient.quoteCountdown", { seconds: quoteSeconds })}
+                </Chip></div>
                 {quote.items.map((item, index) => {
                   const draft = drafts[item.id] || { subdomain: "", password: "" };
                   const subdomainValue = normalizeDraftSubdomain(draft.subdomain);

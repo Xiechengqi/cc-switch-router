@@ -270,7 +270,7 @@ function ShareSettingsForm({
     setNotice("");
     try {
       const result = await updateSharePageSettings(buildShareSettingsPatch(effectiveDraft));
-      setNotice(result.appliedSynchronously ? "Settings applied." : "Settings queued; waiting for desktop sync.");
+      setNotice(result.appliedSynchronously ? "Settings applied." : "Settings queued; waiting for cc-switch-server to sync.");
       await onSaved();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));

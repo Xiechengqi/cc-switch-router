@@ -246,6 +246,12 @@ pub struct DeclarePaidRequest {
     pub invoice_id: String,
     pub offer_revision: i64,
     pub payment_profile_updated_at: Option<String>,
+    /// Amount the client actually rendered to the user. `offer_revision` already
+    /// proves the client re-fetched after a price change, but not that a human saw
+    /// the new number — a UI that silently refreshes and resubmits would pass that
+    /// check alone. Echoing the displayed amount closes that gap. Optional for
+    /// backward compatibility; when present it must match the invoice exactly.
+    pub amount_cents_confirmed: Option<i64>,
     #[serde(default)]
     pub confirmed: bool,
 }
@@ -255,6 +261,8 @@ pub struct DeclarePaidRequest {
 pub struct DeclareInvoicePaidRequest {
     pub offer_revision: i64,
     pub payment_profile_updated_at: Option<String>,
+    /// See `DeclarePaidRequest::amount_cents_confirmed`.
+    pub amount_cents_confirmed: Option<i64>,
     #[serde(default)]
     pub confirmed: bool,
 }
@@ -592,6 +600,49 @@ pub fn router() -> Router<ServerState> {
             "/v1/client-market/invoices/:invoice_id/declare-paid",
             post(declare_invoice_paid),
         )
+        .route(
+            "/v1/admin/client-market/subscriptions/:installation_id/force-release",
+            post(admin_force_release_subscription),
+        )
+}
+
+/// Operator escape hatch for a subscription wedged in teardown.
+///
+/// `release_failed` is otherwise terminal: nothing in the codebase transitions a
+/// subscription out of it, while `ensure_creation_allowed_tx` treats it as a hard
+/// block. A single failed remote cleanup — a Host rebooting mid-teardown is enough
+/// — therefore locks the renter out of creating any future Client, permanently.
+///
+/// This deliberately touches only the subscription and its open invoice. Host
+/// disposition is left to the existing reverify / auto-heal path, because forcing
+/// a Host back to `idle` here could hand a renter a box that still has a live
+/// `cc-switch-server` on it.
+async fn admin_force_release_subscription(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    AxumPath(installation_id): AxumPath<String>,
+) -> Result<Json<ForceReleaseResponse>, AppError> {
+    let session = crate::api::require_admin_session(&state, &headers).await?;
+    let outcome = state
+        .store
+        .client_market_force_release_subscription(&installation_id, &session.user_id, &session.email)
+        .await?;
+    Ok(Json(outcome))
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForceReleaseResponse {
+    pub installation_id: String,
+    pub previous_status: String,
+    pub status: String,
+    pub canceled_invoices: usize,
+    /// Present when the Host still carries this installation, so the operator
+    /// knows a reverify is still required before it re-enters the pool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_status: Option<String>,
 }
 
 async fn require_session(
@@ -1327,6 +1378,7 @@ async fn declare_client_paid(
             &input.invoice_id,
             input.offer_revision,
             input.payment_profile_updated_at.as_deref(),
+            input.amount_cents_confirmed,
             &session,
         )
         .await?;
@@ -1360,6 +1412,7 @@ async fn declare_invoice_paid(
             &invoice_id,
             input.offer_revision,
             input.payment_profile_updated_at.as_deref(),
+            input.amount_cents_confirmed,
             &session,
         )
         .await?;
@@ -1371,6 +1424,161 @@ async fn declare_invoice_paid(
 }
 
 impl AppStore {
+    /// Record a Client Market audit event outside of an existing transaction.
+    /// Used by surfaces that are not themselves transactional — notably the web
+    /// terminal, whose root sessions previously left no durable trace at all.
+    pub async fn client_market_record_audit_event(
+        &self,
+        installation_id: Option<&str>,
+        host_id: Option<&str>,
+        actor_user_id: Option<&str>,
+        actor_email: Option<&str>,
+        event_type: &str,
+        detail: serde_json::Value,
+    ) -> Result<(), AppError> {
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction()
+            .map_err(|error| AppError::Internal(format!("begin audit write failed: {error}")))?;
+        insert_audit_tx(
+            &tx,
+            installation_id,
+            host_id,
+            actor_user_id,
+            actor_email,
+            event_type,
+            detail,
+            Utc::now(),
+        )?;
+        tx.commit()
+            .map_err(|error| AppError::Internal(format!("commit audit write failed: {error}")))
+    }
+
+    /// Transition a wedged subscription to `released` so the renter's creation gate
+    /// clears. Accepts `release_failed` (terminal — no other exit exists) and
+    /// `releasing` (can stall if its cleanup job died before reporting).
+    pub async fn client_market_force_release_subscription(
+        &self,
+        installation_id: &str,
+        actor_user_id: &str,
+        actor_email: &str,
+    ) -> Result<ForceReleaseResponse, AppError> {
+        let mut conn = self.conn.lock().await;
+        let now = Utc::now();
+        let tx = conn
+            .transaction()
+            .map_err(|error| AppError::Internal(format!("begin force release failed: {error}")))?;
+
+        let (previous_status, host_id): (String, Option<String>) = tx
+            .query_row(
+                "SELECT status, host_id FROM client_market_subscriptions WHERE installation_id = ?1",
+                params![installation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| AppError::Internal(format!("load subscription failed: {error}")))?
+            .ok_or_else(|| AppError::NotFound("subscription not found".into()))?;
+
+        if previous_status != SUBSCRIPTION_RELEASE_FAILED && previous_status != SUBSCRIPTION_RELEASING
+        {
+            return Err(AppError::Conflict(format!(
+                "subscription is {previous_status}; only releasing or release_failed can be force released"
+            )));
+        }
+
+        // Compare-and-set on the status we actually read, so a concurrent cleanup
+        // finishing normally wins instead of being silently overwritten.
+        let changed = tx
+            .execute(
+                "UPDATE client_market_subscriptions
+                 SET status = ?2, payment_deadline = NULL, released_at = ?3, updated_at = ?3
+                 WHERE installation_id = ?1 AND status = ?4",
+                params![
+                    installation_id,
+                    SUBSCRIPTION_RELEASED,
+                    now.to_rfc3339(),
+                    previous_status
+                ],
+            )
+            .map_err(|error| AppError::Internal(format!("force release failed: {error}")))?;
+        if changed != 1 {
+            return Err(AppError::Conflict(
+                "subscription changed concurrently; retry".into(),
+            ));
+        }
+
+        // An open invoice would keep the renter blocked on the billing surface even
+        // after the subscription is released.
+        let canceled_invoices = tx
+            .execute(
+                "UPDATE client_market_invoices
+                 SET status = 'canceled', canceled_at = ?2
+                 WHERE installation_id = ?1 AND status = 'open'",
+                params![installation_id, now.to_rfc3339()],
+            )
+            .map_err(|error| AppError::Internal(format!("cancel open invoice failed: {error}")))?;
+
+        let host_status: Option<String> = match host_id.as_deref() {
+            Some(host) => tx
+                .query_row(
+                    "SELECT status FROM router_ssh_hosts WHERE id = ?1",
+                    params![host],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| AppError::Internal(format!("load host status failed: {error}")))?,
+            None => None,
+        };
+
+        if let Some((client_email, provider_email, label)) =
+            cleanup_parties_tx(&tx, installation_id)?
+        {
+            for (kind, recipient) in [
+                ("client_force_released", client_email),
+                ("provider_force_released", provider_email),
+            ] {
+                enqueue_email_tx(
+                    &tx,
+                    kind,
+                    &recipient,
+                    &format!("[Client Market] {label} released by an administrator"),
+                    &format!(
+                        "Client {label} was stuck in {previous_status} and has been released by an administrator. Creating new Clients is no longer blocked for this account. The Host may still need reverification by its owner before it returns to the pool."
+                    ),
+                    &format!("force-release:{installation_id}:{}", now.timestamp()),
+                    now,
+                )?;
+            }
+        }
+
+        insert_audit_tx(
+            &tx,
+            Some(installation_id),
+            host_id.as_deref(),
+            Some(actor_user_id),
+            Some(actor_email),
+            "subscription_force_released",
+            serde_json::json!({
+                "previousStatus": previous_status,
+                "canceledInvoices": canceled_invoices,
+                "hostStatus": host_status,
+            }),
+            now,
+        )?;
+
+        tx.commit()
+            .map_err(|error| AppError::Internal(format!("commit force release failed: {error}")))?;
+
+        Ok(ForceReleaseResponse {
+            installation_id: installation_id.to_string(),
+            previous_status,
+            status: SUBSCRIPTION_RELEASED.to_string(),
+            canceled_invoices,
+            host_id,
+            host_status,
+        })
+    }
+
     pub async fn client_market_installation_for_invoice(
         &self,
         invoice_id: &str,
@@ -2343,6 +2551,12 @@ impl AppStore {
                     .into(),
             ));
         }
+        // Self-dealing guard. A Provider renting their own Host would inflate
+        // `successful_allocations` and distort public supply numbers. Ownership is
+        // matched the same way `session_is_host_owner` does it — by provider_id and
+        // by owner email — because provider_id can drift from the account that
+        // originally registered the Host.
+        let self_email = normalize_email(&session.email)?;
         let candidates = if let Some(host_id) = input.host_id.as_deref() {
             let candidate = tx
                 .query_row(
@@ -2350,19 +2564,21 @@ impl AppStore {
                             h.price_cents, h.rental_period_days, h.offer_revision
                      FROM router_ssh_hosts h
                      WHERE h.id = ?1 AND h.status = 'idle' AND h.provider_id IS NOT NULL
+                       AND h.provider_id IS NOT ?2
+                       AND LOWER(h.host_owner_email) IS NOT ?3
                        AND NOT EXISTS (
                            SELECT 1 FROM host_provider_client_blocks b
                            WHERE b.provider_id = h.provider_id AND b.client_user_id = ?2
                              AND b.lifted_at IS NULL
                        )",
-                    params![host_id, session.user_id],
+                    params![host_id, session.user_id, self_email],
                     map_quote_candidate,
                 )
                 .optional()
                 .map_err(|error| AppError::Internal(format!("select fixed Host failed: {error}")))?
                 .ok_or_else(|| {
                     AppError::Conflict(
-                        "the selected Host is no longer idle or this Provider does not accept this account".into(),
+                        "the selected Host is no longer idle, belongs to this account, or this Provider does not accept this account".into(),
                     )
                 })?;
             vec![candidate]
@@ -2376,6 +2592,8 @@ impl AppStore {
                  WHERE h.status = 'idle'
                    AND h.provider_id IN ({provider_vars})
                    AND h.country_code IN ({country_vars})
+                   AND h.provider_id IS NOT ?
+                   AND LOWER(h.host_owner_email) IS NOT ?
                    AND NOT EXISTS (
                        SELECT 1 FROM host_provider_client_blocks b
                        WHERE b.provider_id = h.provider_id AND b.client_user_id = ?
@@ -2386,6 +2604,8 @@ impl AppStore {
             );
             let mut values = provider_ids.clone();
             values.extend(countries.clone());
+            values.push(session.user_id.clone());
+            values.push(self_email.clone());
             values.push(session.user_id.clone());
             let mut statement = tx.prepare(&sql).map_err(|error| {
                 AppError::Internal(format!("prepare random Host quote failed: {error}"))
@@ -2414,7 +2634,7 @@ impl AppStore {
             params![
                 quote_id,
                 session.user_id,
-                normalize_email(&session.email)?,
+                self_email,
                 input.host_id,
                 expires_at.to_rfc3339(),
                 now.to_rfc3339(),
@@ -2860,6 +3080,7 @@ impl AppStore {
         invoice_id: &str,
         expected_offer_revision: i64,
         expected_payment_profile_updated_at: Option<&str>,
+        expected_amount_cents: Option<i64>,
         session: &AuthSession,
     ) -> Result<(), AppError> {
         let now = Utc::now();
@@ -2950,6 +3171,14 @@ impl AppStore {
         if invoice_revision != expected_offer_revision {
             return Err(AppError::Conflict(
                 "the Host offer changed; review the current price before confirming payment".into(),
+            ));
+        }
+        if let Some(expected_amount) = expected_amount_cents
+            && expected_amount != price
+        {
+            return Err(AppError::Conflict(
+                "the invoice amount changed; review the current price before confirming payment"
+                    .into(),
             ));
         }
         if payment_profile_updated_at.as_deref() != expected_payment_profile_updated_at {
@@ -4358,7 +4587,7 @@ pub(crate) fn cleanup_failed_tx(
                 &recipient,
                 &format!("[Client Market] Cleanup failed for {label}"),
                 &format!(
-                    "Remote cleanup failed for Client {label} ({failure_code}). The Client remains in release_failed state, its tunnel stays disabled, and creation remains blocked until automatic recovery or administrator handling succeeds."
+                    "Remote cleanup failed for Client {label} ({failure_code}). The Client stays in release_failed, its tunnel stays disabled, and creating new Clients remains blocked for the Client owner. This state does not clear on its own — contact the Router administrator to force release it."
                 ),
                 &format!("cleanup-failed:{installation_id}:{failure_code}:{kind}"),
                 now,

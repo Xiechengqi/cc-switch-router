@@ -41,6 +41,8 @@ const PTY_READ_CHUNK: usize = 8192;
 struct TerminalTicket {
     host_id: String,
     owner_user_id: String,
+    /// Carried purely so the audit trail names a human, not just an opaque id.
+    owner_email: String,
     ip: String,
     port: u16,
     expires_at: Instant,
@@ -146,6 +148,7 @@ async fn create_terminal_session(
     let ticket = manager.issue_ticket(TerminalTicket {
         host_id: host.id.clone(),
         owner_user_id: session.user_id.clone(),
+        owner_email: session.email.clone(),
         ip: host.ip.clone(),
         port: host.port,
         expires_at: Instant::now() + TICKET_TTL,
@@ -182,29 +185,66 @@ async fn terminal_ws(
 
 async fn run_terminal_session(state: ServerState, socket: WebSocket, ticket: TerminalTicket) {
     let owner = ticket.owner_user_id.clone();
+    let owner_email = ticket.owner_email.clone();
     let host_id = ticket.host_id.clone();
     let started = Instant::now();
     info!(host_id = %host_id, owner = %owner, "client market terminal session started");
 
-    let result = bridge_ssh_session(&state, socket, &ticket).await;
-    if let Err(error) = result {
-        warn!(
-            host_id = %host_id,
-            owner = %owner,
-            error = %error,
-            "client market terminal session ended with error"
-        );
+    // The terminal hands out an unrestricted root shell with no transcript. A durable
+    // start/end record is the minimum needed to answer "who was on this box, when".
+    if let Err(error) = state
+        .store
+        .client_market_record_audit_event(
+            None,
+            Some(&host_id),
+            Some(&owner),
+            Some(&owner_email),
+            "terminal_session_started",
+            serde_json::json!({ "hostIp": ticket.ip, "hostPort": ticket.port }),
+        )
+        .await
+    {
+        warn!(host_id = %host_id, error = %error, "failed to record terminal session start");
     }
+
+    let result = bridge_ssh_session(&state, socket, &ticket).await;
+    let failure = match &result {
+        Err(error) => {
+            warn!(
+                host_id = %host_id,
+                owner = %owner,
+                error = %error,
+                "client market terminal session ended with error"
+            );
+            Some(error.clone())
+        }
+        Ok(()) => None,
+    };
 
     state
         .client_market_terminal
         .lock()
         .await
         .end_session(&owner);
+    let duration_ms = started.elapsed().as_millis() as u64;
+    if let Err(error) = state
+        .store
+        .client_market_record_audit_event(
+            None,
+            Some(&host_id),
+            Some(&owner),
+            Some(&owner_email),
+            "terminal_session_ended",
+            serde_json::json!({ "durationMs": duration_ms, "error": failure }),
+        )
+        .await
+    {
+        warn!(host_id = %host_id, error = %error, "failed to record terminal session end");
+    }
     info!(
         host_id = %host_id,
         owner = %owner,
-        duration_ms = started.elapsed().as_millis() as u64,
+        duration_ms,
         "client market terminal session ended"
     );
 }
@@ -556,6 +596,7 @@ mod tests {
         let id = manager.issue_ticket(TerminalTicket {
             host_id: "h".into(),
             owner_user_id: "user-a".into(),
+            owner_email: "user-a@example.com".into(),
             ip: "1.2.3.4".into(),
             port: 22,
             expires_at: Instant::now() + Duration::from_secs(30),
@@ -566,6 +607,7 @@ mod tests {
         let expired = manager.issue_ticket(TerminalTicket {
             host_id: "h".into(),
             owner_user_id: "user-a".into(),
+            owner_email: "user-a@example.com".into(),
             ip: "1.2.3.4".into(),
             port: 22,
             expires_at: Instant::now() - Duration::from_secs(1),

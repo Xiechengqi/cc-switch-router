@@ -1,8 +1,5 @@
 import { authFetch } from "@/lib/auth";
 import type {
-  BoardListResponse,
-  BoardMessage,
-  BoardMeta,
   DashboardResponse,
   MarketShare,
   ShareSessionLoad,
@@ -60,7 +57,6 @@ import type {
   ClientMarketProviderBlock,
 } from "@/lib/types";
 
-export type { BoardListResponse, BoardMessage, BoardMeta };
 
 export async function parseJson<T>(response: Response): Promise<T> {
   const data = await response.json().catch(() => ({}));
@@ -382,19 +378,10 @@ export async function getMetricsHostInfo() {
   return parseJson<HostMetricsInfo>(await authFetch("/v1/admin/metrics/host/info", { cache: "no-store" }));
 }
 
-export async function getMetricsHostStatus() {
-  return parseJson<HostMetricsStatus>(await authFetch("/v1/admin/metrics/host/status", { cache: "no-store" }));
-}
-
 export async function getMetricsSeries(range: string, step?: string) {
   const params = new URLSearchParams({ range });
   if (step) params.set("step", step);
   return parseJson<MetricsSeriesResponse>(await authFetch(`/v1/admin/metrics/series?${params}`, { cache: "no-store" }));
-}
-
-export async function getLlmMetricsSnapshot(range = "5m") {
-  const params = new URLSearchParams({ range });
-  return parseJson<LlmMetricsSnapshot>(await authFetch(`/v1/admin/metrics/llm/snapshot?${params}`, { cache: "no-store" }));
 }
 
 export async function getLlmMetricsTop(range = "1h", by = "tokens") {
@@ -528,72 +515,6 @@ export async function deleteClientChatMessage(messageId: string) {
   );
 }
 
-const BOARD_GUEST_KEY = "cc_switch_router_board_guest_v1";
-
-export function boardGuestId() {
-  let id = localStorage.getItem(BOARD_GUEST_KEY);
-  if (id && /^[a-z0-9-]{8,80}$/i.test(id)) return id;
-  id = crypto.randomUUID ? crypto.randomUUID() : `guest-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  localStorage.setItem(BOARD_GUEST_KEY, id);
-  return id;
-}
-
-export async function boardFetch(input: RequestInfo | URL, init: RequestInit = {}) {
-  const headers = new Headers(init.headers || {});
-  headers.set("X-Board-Guest-Id", boardGuestId());
-  if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
-  return authFetch(input, { ...init, headers });
-}
-
-export async function getBoardMeta() {
-  return parseJson<BoardMeta>(await boardFetch("/v1/board/meta", { cache: "no-store" }));
-}
-
-export async function getBoardMessages(tab = "all", since?: string, signal?: AbortSignal) {
-  const params = new URLSearchParams({ tab, limit: "50" });
-  if (since) params.set("since", since);
-  return parseJson<BoardListResponse>(await boardFetch(`/v1/board/messages?${params}`, { cache: "no-store", signal }));
-}
-
-export async function getBoardMetaWithSignal(signal?: AbortSignal) {
-  return parseJson<BoardMeta>(await boardFetch("/v1/board/meta", { cache: "no-store", signal }));
-}
-
-export async function postBoardMessage(body: string, guestName?: string) {
-  return parseJson<BoardMessage>(
-    await boardFetch("/v1/board/messages", {
-      method: "POST",
-      body: JSON.stringify({ body, guestName: guestName || undefined }),
-    }),
-  );
-}
-
-export async function setBoardPin(id: string, value: boolean) {
-  return parseJson<unknown>(
-    await boardFetch(`/v1/board/messages/${encodeURIComponent(id)}/pin`, {
-      method: "POST",
-      body: JSON.stringify({ value }),
-    }),
-  );
-}
-
-export async function setBoardFeature(id: string, value: boolean) {
-  return parseJson<unknown>(
-    await boardFetch(`/v1/board/messages/${encodeURIComponent(id)}/feature`, {
-      method: "POST",
-      body: JSON.stringify({ value }),
-    }),
-  );
-}
-
-export async function deleteBoardMessage(id: string) {
-  return parseJson<unknown>(
-    await boardFetch(`/v1/board/messages/${encodeURIComponent(id)}`, {
-      method: "DELETE",
-    }),
-  );
-}
-
 // P18: test-connection
 export async function testShareConnection(
   shareId: string,
@@ -640,24 +561,24 @@ export async function getProvisionSshKey() {
   );
 }
 
-export async function getClientMarketHosts(params?: {
-  ownerEmail?: string;
-  country?: string;
-  status?: string;
-}) {
+export async function getClientMarketHosts(
+  params?: {
+    ownerEmail?: string;
+    country?: string;
+    status?: string;
+  },
+  signal?: AbortSignal,
+) {
   const search = new URLSearchParams();
   if (params?.ownerEmail) search.set("ownerEmail", params.ownerEmail);
   if (params?.country) search.set("country", params.country);
   if (params?.status) search.set("status", params.status);
   const query = search.toString();
   return parseJson<ClientMarketHost[]>(
-    await authFetch(`/v1/client-market/hosts${query ? `?${query}` : ""}`, { cache: "no-store" }),
-  );
-}
-
-export async function getClientMarketSupplySummary() {
-  return parseJson<SupplySummaryEntry[]>(
-    await authFetch("/v1/client-market/supply-summary", { cache: "no-store" }),
+    await authFetch(`/v1/client-market/hosts${query ? `?${query}` : ""}`, {
+      cache: "no-store",
+      signal,
+    }),
   );
 }
 
@@ -727,14 +648,6 @@ export async function createClientMarketTerminalSession(hostId: string) {
 export async function getClientMarketJob(id: string) {
   return parseJson<ProvisioningJob>(
     await authFetch(`/v1/client-market/jobs/${encodeURIComponent(id)}`, { cache: "no-store" }),
-  );
-}
-
-export async function cleanupClientMarketClient(installationId: string) {
-  return parseJson<CreateClientMarketClientResponse>(
-    await authFetch(`/v1/client-market/clients/${encodeURIComponent(installationId)}/cleanup`, {
-      method: "POST",
-    }),
   );
 }
 
@@ -845,17 +758,9 @@ export async function cancelClientMarketQuote(quoteId: string) {
   );
 }
 
-export async function getMyClientMarketBilling() {
+export async function getMyClientMarketBilling(signal?: AbortSignal) {
   return parseJson<ClientMarketBilling[]>(
-    await authFetch("/v1/client-market/my-billing", { cache: "no-store" }),
-  );
-}
-
-export async function getClientMarketBilling(installationId: string) {
-  return parseJson<ClientMarketBilling>(
-    await authFetch(`/v1/client-market/clients/${encodeURIComponent(installationId)}/billing`, {
-      cache: "no-store",
-    }),
+    await authFetch("/v1/client-market/my-billing", { cache: "no-store", signal }),
   );
 }
 
@@ -864,12 +769,22 @@ export async function declareClientMarketPayment(
   invoiceId: string,
   offerRevision: number,
   paymentProfileUpdatedAt?: string,
+  /** The amount actually shown to the user. The Router rejects the declaration if
+   *  this disagrees with the invoice, so a silent price change cannot be paid
+   *  through by a UI that refreshed without the user re-reading the number. */
+  amountCentsConfirmed?: number,
 ) {
   return parseJson<{ billing: ClientMarketBilling }>(
     await authFetch(`/v1/client-market/clients/${encodeURIComponent(installationId)}/declare-paid`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ invoiceId, offerRevision, paymentProfileUpdatedAt, confirmed: true }),
+      body: JSON.stringify({
+        invoiceId,
+        offerRevision,
+        paymentProfileUpdatedAt,
+        amountCentsConfirmed,
+        confirmed: true,
+      }),
     }),
   );
 }

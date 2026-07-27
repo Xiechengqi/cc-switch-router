@@ -1,398 +1,292 @@
-# cc-switch-router 重构分析与接入控制设计
+# cc-switch-router 架构
 
-## 1. 当前实现现状
+本文档描述 `cc-switch-router` 的**当前实现现状**。协议层面的接口契约见 [PROTOCOL.md](PROTOCOL.md),部署与配置见 [README.md](README.md)。
 
-### cc-switch 侧
+> 本文替换了 2026-04 的同名设计提案。那份文档写于项目立项期,描述的是「建议改成…」的目标形态,且以 `cc-switch` Tauri 桌面版为客户端。实现已大幅偏离该提案,客户端也已换为 `cc-switch-server`。
 
-- `cc-switch` 已经有 Rust 实现的 tunnel client，入口在 [src-tauri/src/tunnel/mod.rs](/data/projects/cc-switch/src-tauri/src/tunnel/mod.rs)。
-- 当前启动流程是：
-  1. 通过 HTTP 调 `POST /api/v1/connections/` 预留 connection。
-  2. 服务端返回 `connection_id`。
-  3. 客户端用 SSH 用户名 `"{connection_id}:{secret_key}"` 登录，再申请 `tcpip_forward`。
-- 当前持久化配置在 [src-tauri/src/tunnel/config.rs](/data/projects/cc-switch/src-tauri/src/tunnel/config.rs)：
-  - `server_url`
-  - `ssh_url`
-  - `tunnel_url`
-  - `secret_key`
+---
 
-### share router 服务端侧
+## 0. 术语
 
-- 连接创建 API 在 [internal/server/admin/api/connection/handlers.go](/data/projects/portr/internal/server/admin/api/connection/handlers.go)。
-- SSH 认证在 [internal/server/ssh/sshd.go](/data/projects/portr/internal/server/ssh/sshd.go)。
-- 当前认证核心逻辑：
-  - HTTP 层通过 `secret_key` 查询 `team_users`。
-  - SSH 层再次解析 `connection_id:secret_key`，校验 `reservedConnection.CreatedBy.SecretKey == secretKey`。
-- 这本质上是“长效静态共享密钥 + 连接 ID”的方案。
+`provider` 一词在本仓库有**两个不兼容含义**,文档中一律加限定词区分:
 
-## 2. 现有方案的问题
+| 术语 | 含义 | 代码位置 |
+|---|---|---|
+| **Host Provider**(主机供给方) | Client Market 中出租服务器的用户 | `client_market_trade.rs:72` `provider_id` |
+| **Upstream Provider**(上游供应商) | Share 绑定的 API 后端:claude / codex / gemini / kiro / cursor | `models.rs:1989` `ShareUpstreamProvider` |
 
-如果 `cc-switch` 直接内嵌：
+与 Server 侧对齐的其余词汇:
 
-- `server_url`
-- `ssh_url`
-- `tunnel_url`
-- `secret_key`
+| 术语 | 含义 |
+|---|---|
+| `installation` | 一个运行中的 Server 实例,Router 注册的基本单位 |
+| `client tunnel` | Server 属主自己的管理端点隧道 |
+| `share tunnel` | 对外提供额度共享的隧道,每个启用的 share 一条 |
+| `share descriptor` | Server 同步给 Router 的 share 配置与运行时快照 |
+| `account` | 绑定在 Upstream Provider 上的凭据(OAuth token 或 API key),存于 Server |
+| `control_secret` | 注册时下发的对称 HMAC 密钥,用于 Router → Server 方向认证 |
+| `ingress context` | Router 注入转发请求的签名身份上下文 |
+| `pending share edit` | Router 侧排队的 share 变更,由 Server 拉取并 ack |
 
-那么任何人只要拿到二进制、配置文件或运行时内存，就可以绕过 `cc-switch`，直接写一个脚本调用 API + SSH 接入公共 tunnel 服务。
+---
 
-结论：
+## 1. 系统定位
 
-- “把静态 secret 内嵌到客户端”不能实现“只有 cc-switch 才能穿透”。
-- 它最多只能实现“默认免配置”。
-- 如果目标是“强约束只有受控客户端可接入”，服务端必须改成“短期票据 + 设备身份 + 单次连接授权”，不能再接受长效共享 secret。
+cc-switch-router 是 TokenSwitch 的**公共汇聚层**。它为 `cc-switch-server` 实例提供公网可达性,并在此之上承载三层市场。
 
-## 3. 关于“只有 cc-switch 可以接入”的边界
+单进程同时承载三个职责:
 
-这个目标要先分清强度：
-
-### 可实现的强目标
-
-- 只有拿到服务端签发的短期 tunnel lease 的客户端，才能建立 tunnel。
-- lease 必须绑定某个已注册安装实例、某个 share、某个 subdomain、某个过期时间。
-- SSH 连接必须使用一次性凭证或短期 SSH certificate，而不是静态 secret。
-
-### 无法靠纯客户端绝对实现的目标
-
-- “从密码学上证明请求一定来自官方 cc-switch 二进制，且无法被逆向复制”。
-
-原因：
-
-- 桌面客户端的内嵌密钥最终会落到用户设备上。
-- 没有硬件远程度量/平台可信执行环境时，任何本地秘密都可能被提取。
-
-所以应把目标定义为：
-
-- 不向客户端下发可长期复用的总密钥。
-- 所有接入都必须通过服务端在线签发的短期授权。
-- 即使有人提取到历史请求，也不能长期复用。
-
-## 4. cc-switch-router 的建议目标
-
-`cc-switch-router` 不要照搬 Go 版的 team/user/admin 全量系统，而应该先做一个面向 `cc-switch` 的“受控公共 tunnel service”。
-
-建议第一阶段只保留四类能力：
-
-1. Tunnel control API
-2. SSH reverse forwarding server
-3. HTTP/TCP proxy router
-4. 最小化的状态存储与审计
-
-Go 版里的这些能力不建议首批迁移：
-
-- GitHub OAuth
-- 多团队后台管理 UI
-- 通用用户系统
-- 通用 secret key 分发
-
-因为 `cc-switch` 已经是主产品，`cc-switch-router` 更适合作为它的受控基础设施，而不是通用 SaaS。
-
-## 5. 建议的 Rust 目录结构
-
-建议在 `/data/projects/cc-switch-router` 做成 workspace：
-
-```text
-cc-switch-router/
-  Cargo.toml
-  crates/
-    cc-switch-router-types/
-    cc-switch-router-auth/
-    cc-switch-router-store/
-    cc-switch-router-api/
-    cc-switch-router-ssh/
-    cc-switch-router-proxy/
-    cc-switch-router-server/
+```
+                  ┌────────────────────────────────────┐
+                  │          cc-switch-router          │
+  HTTPS ────────► │  HTTP API + 子域名反代 + 内嵌前端 (:80) │
+  (Cloudflare)    │                                    │
+  SSH   ────────► │  SSH 反向隧道服务端 (:2222)           │
+                  │                                    │
+                  │  SQLite ×2(主库 + 独立 metrics 库)   │
+                  └────────────────────────────────────┘
+                                  ▲
+                                  │ SSH reverse tunnel
+                                  │
+                         cc-switch-server 实例
 ```
 
-职责建议：
+核心依赖:`axum`、`russh`、`rusqlite`、`tokio`、`reqwest`。
 
-- `cc-switch-router-types`
-  - 公共 DTO、枚举、错误码、配置结构
-- `cc-switch-router-auth`
-  - 安装注册、challenge、JWT/lease、SSH cert 签发
-- `cc-switch-router-store`
-  - SQLite/Postgres 抽象
-- `cc-switch-router-api`
-  - `axum`/`hyper` API
-- `cc-switch-router-ssh`
-  - 基于 `russh` 的 reverse forwarding server
-- `cc-switch-router-proxy`
-  - HTTP/WebSocket/TCP 路由
-- `cc-switch-router-server`
-  - 主程序、配置、指标、健康检查、任务调度
+**客户端**:`cc-switch-server` 是唯一客户端。`install-client.sh` 负责在远程主机上部署它。
 
-## 6. 认证与授权的建议方案
+**多区域**:仓库根部 `regions` 文件声明区域到域名的映射,当前为 `japan` / `singapore` / `hongkong` / `usa` 四个区域,经 `GET /v1/regions` 暴露(`src/api.rs:121, 2340`)。
 
-### 6.1 设计原则
+---
 
-- 客户端内嵌的只能是：
-  - 服务地址
-  - TLS pin/public key
-  - 非敏感 app 标识
-- 客户端不能内嵌：
-  - 长期共享 secret
-  - 可直接建立 tunnel 的固定 SSH 密码
-  - 可无限注册连接的 API key
+## 2. 三层市场模型
 
-### 6.2 推荐链路
+三个市场共用同一套隧道内核,分别解决供应链上不同环节的问题。
 
-#### 第一步：安装实例注册
+### ① Share Market —— 额度共享
 
-cc-switch 首次启动 tunnel 功能时：
+卖方拥有 Claude / Codex 等订阅,在自己机器上运行 Server,通过 Router 获得公网子域名。买方使用 Router 签发的 API token 调用 `/v1/messages`、`/v1/responses`、`/v1/chat/completions`,流量经 Router 路由至卖方 Server,由卖方凭据完成真正的上游调用。
 
-1. 本地生成设备密钥对 `device_ed25519`。
-2. 私钥保存到系统安全存储：
-   - macOS Keychain
-   - Windows Credential Manager / DPAPI
-   - Linux Secret Service，降级到本地加密文件
-3. 调用 `POST /v1/installations/register`，上传：
-   - `device_public_key`
-   - `app_version`
-   - `platform`
-   - `instance_nonce`
-4. 服务端返回：
-   - `installation_id`
-   - `installation_token` 或 registration receipt
-
-说明：
-
-- 这里的 `installation_token` 也不能是长期万能凭证。
-- 它更适合作为“已注册实例标识”，真正开 tunnel 时仍要换短期 lease。
-
-#### 第二步：申请短期 tunnel lease
-
-每次启动 share tunnel：
-
-1. cc-switch 本地构造 challenge 请求。
-2. 用 `device_private_key` 对 challenge 签名。
-3. 请求 `POST /v1/tunnels/lease`，带上：
-   - `installation_id`
-   - `share_id`
-   - `requested_subdomain`
-   - `local_target = 127.0.0.1:15721`
-   - `timestamp`
-   - `signature`
-4. 服务端验证设备签名、频率、share 状态后，返回：
-   - `lease_id`
-   - `connection_id`
-   - `ssh_username`
-   - `ssh_password`（一次性，60 秒）
-   - 或更优：`ssh_certificate`
-   - `expires_at`
-
-#### 第三步：SSH 建链
-
-SSH server 不再接受 `connection_id:secret_key`。
-
-改为只接受以下任一方式：
-
-1. 一次性用户名密码
-2. 短期 SSH certificate
-3. SSH public key + 服务端 challenge 验证
-
-推荐优先级：
-
-1. 短期 SSH certificate
-2. 一次性密码
-
-因为这最贴近现有 reverse forwarding 流程，且服务端权限边界清晰。
-
-#### 第四步：Forward 权限校验
-
-在 `tcpip_forward` 时继续校验：
-
-- lease 是否未过期
-- connection 是否属于该 installation
-- subdomain 是否与 lease 一致
-- lease 是否尚未被使用或是否允许重连
-
-即使 SSH 登录成功，也不能跳过 lease 绑定。
-
-### 6.3 为什么这样可以满足“只有 cc-switch 才能接”
-
-它不能做到理论绝对防复制，但可以做到：
-
-- 没有服务端签发的 lease，就无法建 tunnel。
-- 拿到一个历史 lease，也很快失效。
-- 拿到某次 SSH 一次性密码，也只能在极短窗口复用。
-- 客户端不再持有可长期滥用的总密钥。
-
-这是桌面分发模式下最实际的强约束。
-
-## 7. 对 cc-switch 的配套改造建议
-
-### 7.1 TunnelConfig 需要改
-
-当前 [src-tauri/src/tunnel/config.rs](/data/projects/cc-switch/src-tauri/src/tunnel/config.rs) 里的 `secret_key` 应删除，改成：
+定价按**官方价百分比**、分 app 独立设置:
 
 ```rust
-pub struct TunnelConfig {
-    pub api_base: String,
-    pub ssh_addr: String,
-    pub tunnel_domain: String,
-    pub bootstrap_id: String,
-    pub bootstrap_public_key: String,
-    pub pinned_cert_sha256: Option<String>,
-    pub use_localhost: bool,
-}
+for_sale_official_price_percent_by_app: BTreeMap<String, u16>  // models.rs:2211
 ```
 
-说明：
+配套机制:
 
-- `bootstrap_id` 只是客户端识别用途，不授予 tunnel 权限。
-- 真正的 tunnel 权限来自 `/v1/tunnels/lease`。
+- `token_limit` / `parallel_limit` —— 每个 share 的额度与并发上限
+- `share_request_logs`、`llm_request_metrics` —— 逐请求计量(模型、token 数、延迟、估算成本)
+- `share_model_health_state` —— 滚动健康度,支撑 share 间自动 failover
+- `free_share_ip_parallel_limit` —— 免费档按真实用户 IP 限并发
 
-### 7.2 client 流程需要改
+> **关键性质:Router 不持有上游凭证。** `ShareUpstreamProvider` 绑定在卖方 Server 侧,凭据始终留在卖方机器上。Router 只做路由、计量、鉴权和脱敏,不是凭证托管方。
 
-[src-tauri/src/tunnel/connection.rs](/data/projects/cc-switch/src-tauri/src/tunnel/connection.rs) 不能再直接 `POST /api/v1/connections/` 带 `secret_key`。
+### ② Client Market —— 主机供给
 
-建议改成：
+Host Provider 贡献一台 Linux 服务器,Router 用**专用外发 Ed25519 provision key**(与入站 SSH host key 相互独立,`src/provision_ssh.rs:27`)登录,安装依赖并部署 Server,使其成为市场 ① 的一个供给节点。
 
-1. `ensure_installation()`
-2. `request_tunnel_lease()`
-3. `connect_ssh_with_lease()`
+主机状态机(`router_ssh_hosts.status`):
 
-[src-tauri/src/tunnel/ssh.rs](/data/projects/cc-switch/src-tauri/src/tunnel/ssh.rs) 也不能再把用户名拼成 `connection_id:secret_key`。
+```
+idle ──► locked ──► allocated ──► draining ──► idle
 
-### 7.3 设置项需要改
+异常态:unreachable / abnormal / disabled / reserved
+```
 
-[src-tauri/src/commands/share.rs](/data/projects/cc-switch/src-tauri/src/commands/share.rs) 当前会把 tunnel config 持久化到 settings。
+`reserved` 用于报价锁定期(`client_market_trade.rs:29`)。
 
-如果公共服务配置是内嵌的，建议：
+**自愈机制**(`src/client_market.rs`):
 
-- endpoint、pin、public metadata 走内嵌只读配置
-- installation 私钥走系统安全存储
-- lease 不落盘，只保存在内存
+| 场景 | 处理 |
+|---|---|
+| `draining` 停滞超 10 分钟 | 自动派发 cleanup job |
+| `unreachable` 超 5 分钟 | SSH 探测;确认无安装痕迹则清除 DB 记录并复位为 idle |
+| 进程重启导致 job 中断 | 启动时 `reconcile_interrupted_jobs` 以最多 4 并发重跑 |
 
-这样比把 `secret_key` 写进 settings 安全得多。
+**支付为链下荣誉制**:租客调用 `declare-paid` 自报已付,Host Provider 线下核验。Router 存储支付方式二维码资产与声明记录,**不经手资金流**。
 
-## 8. portr-rs 的服务端数据模型建议
+### ③ Router 联邦 —— 横向扩展
 
-建议新建而不是沿用 Go 版表结构。
+其他 Router 与 Gateway 以带 scope 的合作方身份接入,消费 share 挂牌数据:
 
-### 建议核心表
+| 表 | 主体 | 认证 |
+|---|---|---|
+| `router_markets` | 市场合作方 | bearer token |
+| `router_gateways` | 网关合作方 | HMAC 签名(`x-cc-gateway-*` 头 + body SHA-256) |
 
-#### `installations`
+---
 
-- `id`
-- `device_public_key`
-- `platform`
-- `app_version`
-- `status`
-- `created_at`
-- `last_seen_at`
+## 3. 隧道数据路径
 
-#### `shares`
+```
+浏览器 / CLI
+  → Cloudflare
+  → axum (:80) → proxy_handler                     src/proxy.rs:2141
+  → subdomain_for_host()  剥离 tunnel_domain 后缀    src/proxy.rs:5746
+  → ProxyRegistry.routes 查表
+  → reqwest 请求 127.0.0.1:<临时端口>
+  → io::copy_bidirectional ↔ SSH forwarded-tcpip    src/ssh.rs:491
+  → cc-switch-server → 真·上游供应商
+```
 
-- `id`
-- `installation_id`
-- `subdomain`
-- `local_target`
-- `status`
-- `created_at`
+**路由表**是子域名到逻辑路由的映射:
 
-如果 share 仍由 cc-switch 本地定义，也可以不在 server 永久保存完整 share，只保留 tunnel session。
+```rust
+routes: Arc<RwLock<HashMap<String, LogicalRoute>>>
+```
 
-#### `tunnel_leases`
+`LogicalRoute`(`src/proxy.rs:106`)用三段式管理连接世代,支撑无损切换:
 
-- `id`
-- `installation_id`
-- `connection_id`
-- `subdomain`
-- `auth_method`
-- `credential_hash`
-- `issued_at`
-- `expires_at`
-- `used_at`
-- `revoked_at`
+| 字段 | 作用 |
+|---|---|
+| `active: Option<RouteEntry>` | 当前生效的后端 |
+| `candidates: BTreeMap<u64, RouteEntry>` | 已注册但未提升的连接,按世代号排列 |
+| `draining: BTreeMap<u64, RouteEntry>` | 老连接排空中,上限 5 分钟 |
 
-#### `connections`
+路由处于 `Reconnecting` 状态时,新请求经 `watch` channel 最多阻塞等待 3 秒再返回错误(`src/proxy.rs:1136`),而非立即 502。
 
-- `id`
-- `lease_id`
-- `status`
-- `remote_port`
-- `created_at`
-- `started_at`
-- `closed_at`
+响应体经 `bytes_stream()` 流式透传,并用 RAII guard 持有并发许可与流量记录直至流关闭(`src/proxy.rs:2953-2967`)。
 
-#### `backends`
+> **已知行为**:排空窗口内新老两条 SSH 连接可同时为同一子域名转发流量。这是优雅轮换的设计取舍。
 
-- `connection_id`
-- `subdomain`
-- `backend_addr`
-- `status`
-- `last_heartbeat_at`
+---
 
-## 9. 服务间协议建议
+## 4. 认证与准入
 
-### API
+### SSH 面
 
-- `POST /v1/installations/register`
-- `POST /v1/installations/refresh`
-- `POST /v1/tunnels/lease`
-- `POST /v1/tunnels/{lease_id}/heartbeat`
-- `POST /v1/tunnels/{lease_id}/close`
-- `GET /v1/healthz`
+见 [PROTOCOL.md](PROTOCOL.md) 第 5 节。要点:仅一次性密码认证、用户名必须为 UUID、无 shell / exec / sftp、只放行 `tcpip_forward`。
 
-### SSH
+### 分层限流
 
-- 只开放 reverse forward 必需能力
-- 禁止 shell、exec、sftp
-- 禁止任意端口范围外的转发
-- `tcpip_forward` 必须和 lease 绑定
+| 层 | 结构 | 存储 |
+|---|---|---|
+| 注册准入 | 全局 / 来源 / 公钥三级 TokenBucket | 内存(`registration_admission.rs:465`) |
+| 新身份配额 | 10 分钟 / 小时 / 日 滑窗 | SQLite(重启不重置) |
+| 未绑定 Owner 水位 | 默认 50000,达到后暂停新身份准入 | SQLite |
+| 请求并发 | 6 个 `KeyedConcurrencyLimiter` | 内存(`proxy.rs:562-573`) |
+| 认证滥用 | 10 分钟 10 次失败 → 封禁 1 小时 | 内存(`abuse.rs:6-8`) |
 
-### Proxy
+并发限流键位:`share_id`、`share_id:app`、`share_id:app:email`、用户 IP(免费档)、图片任务、市场邮箱。
 
-- HTTP Host 提取 subdomain
-- WebSocket 直接透传
-- 后端失活自动剔除
-- 对未注册 subdomain 返回稳定错误页/错误码
+> **已知限制**:内存 TokenBucket 无持久化,进程重启即清零。SQLite 侧的新身份配额能兜住真正的身份创建,但尝试洪水本身在重启瞬间不受限。
 
-## 10. Rust 技术选型建议
+### 真实客户端 IP
 
-- HTTP API: `axum`
-- SSH server: `russh`
-- HTTP reverse proxy: `hyper` + `hyper-util`，或直接 `axum` + 自定义转发
-- DB: `sqlx`
-- 配置: `serde` + `figment`/`config`
-- JWT/JWS: `jsonwebtoken` 或 `josekit`
-- tracing: `tracing` + `tracing-subscriber`
-- metrics: `metrics` + Prometheus exporter
+`src/cf.rs` **不调用任何 Cloudflare API**,它只硬编码 Cloudflare 的 IPv4/IPv6 网段(`cf.rs:15-42`),用于判断 TCP peer 是否为 CF 边缘节点。
 
-原因：
+- peer 是 CF → 信任 `CF-Connecting-IP` / `CF-IPCountry` / `CF-ASN`
+- peer 非 CF → 回退 socket peer IP
 
-- `cc-switch` 客户端已经在用 Rust，协议和错误模型更容易统一。
-- `russh` 可以同时复用客户端与服务端生态。
-- `sqlx` 的 schema 控制更适合把安全边界显式化。
+这防止伪造头绕过免费档限流(`client_meta.rs:11`、`proxy.rs:4122`)。
 
-## 11. 迁移策略
+---
 
-### Phase 1
+## 5. 数据层
 
-- 在 `/data/projects/portr-rs` 先实现最小版：
-  - installation register
-  - tunnel lease
-  - SSH reverse forwarding
-  - HTTP proxy
-- 不做 admin UI
-- 不做 team/user 系统
+主库与 metrics 库分离,共 78 张表。
 
-### Phase 2
+**连接模型**:单个 `Arc<Mutex<Connection>>`,WAL 模式、外键开启、`busy_timeout = 5000ms`(`store.rs:1241-1246`)。
 
-- 改 `cc-switch` 接入 `portr-rs`
-- 删除 `secret_key` 逻辑
-- 切到 lease-based SSH auth
+**迁移策略**:无版本表。`CREATE TABLE IF NOT EXISTS` 建表,再经 `PRAGMA table_info` 探测后 `ALTER TABLE ADD COLUMN` 补列(`store.rs:13068+`)。每次启动全量重跑,幂等但无回滚路径。
 
-### Phase 3
+### 表分组
 
-- 加审计、限流、封禁
-- 增加 metrics、日志、运营工具
-- 如确有需要，再补一个内部管理面板
+| 域 | 代表表 |
+|---|---|
+| 身份与隧道 | `installations`、`leases`、`tunnel_route_heads`、`shares`、`installation_client_tunnels` |
+| 计量 | `share_request_logs`、`market_request_logs`、`llm_request_metrics`、`image_generation_*` |
+| 健康 | `share_health_checks`、`installation_health_checks`、`share_model_health_state` |
+| 主机市场 | `router_ssh_hosts`、`client_market_subscriptions`、`client_market_invoices`、`account_payment_*` |
+| 联邦 | `router_markets`、`router_gateways`、`share_market_listing_statuses` |
+| 通知 | `client_notification_events`、`email_delivery_batches` 等 9 张 |
+| 聊天 | `client_chat_rooms`、`client_chat_messages` 等 7 张(`store/client_chat.rs`) |
+| 认证 | `users`、`user_sessions`、`user_api_tokens`、`email_login_challenges` |
+| 遗留 | `board_*`(接口已返回 410 Gone,数据保留) |
 
-## 12. 最关键的结论
+### 已知限制
 
-1. `portr` Go server 当前的安全边界依赖静态 `secret_key`，这不适合内嵌到 `cc-switch`。
-2. 如果 `cc-switch` 直接内嵌现有 `secret_key`，任何人都能绕过客户端直连公共 tunnel 服务。
-3. `portr-rs` 必须把认证模型改成“安装实例身份 + 短期 lease + SSH 一次性凭证/证书”。
-4. 对桌面客户端而言，不能承诺理论上的“只有官方二进制能接入”，但可以实现“没有服务端在线签发短期授权就无法接入，且历史凭证无法长期复用”。
-5. 这套方案才适合 `cc-switch` 内嵌公共服务配置、免用户手工配置的产品形态。
+- **单连接全局锁**:所有 store 方法(含只读)都要 `self.conn.lock().await`。WAL 对跨进程并发读有效,但不缓解进程内这把 tokio Mutex 的串行化。这是当前最确定的扩展性瓶颈。
+- **`user_api_tokens.token_plaintext`**:默认 token 以明文存储,以支持在 UI 中重复展示 API key(`store.rs:12756, 23472`)。同表已有 `token_hash`。DB 泄露即等于活跃 token 泄露。
+- 健康检查类表使用 AUTOINCREMENT 追加,依赖 `cleanup_expired_data` 清理而非 schema 层 TTL。
+
+---
+
+## 6. 控制平面
+
+Router 需要把 dashboard 上的 share 配置变更推送到 Server。两条路径:
+
+**同步路径**(首选,`src/ctl_client.rs`):复用已建立的反向隧道,直接调用 Server 的 `/_ctl/apply_share_settings`,HMAC-SHA256 认证。延迟从「一个轮询周期」降到「一个 RTT」。
+
+**异步路径**(降级):写入 pending-edit 队列,Server 经 `POST /v1/shares/pending-edits` 拉取、`POST /v1/shares/edit-ack` 确认,并可通过 `GET /v1/shares/edit-events`(Ed25519 签名的 SSE 流)获得即时唤醒。
+
+降级触发条件见 [PROTOCOL.md](PROTOCOL.md) 第 7 节。
+
+Router 从不改写 Server 返回的 descriptor,只做校验;若客户端只部分应用补丁,Router 拒绝落库而非静默持久化(`store::validate_returned_share_against_patch`)。
+
+---
+
+## 7. 后台任务
+
+`main.rs` 在监听器绑定后拉起以下 `tokio::spawn` 任务:
+
+| 任务 | 周期 | 职责 |
+|---|---|---|
+| `cleanup_task` | 300s | 过期数据清理 + 市场主机对账 |
+| `probe_task` | 30s | 路由健康探测 |
+| `runtime_task` | 10min | share 运行时快照刷新 |
+| `resend_usage_task` | 10min | Resend 配额轮询 |
+| `metrics_task` | — | 指标采集 |
+| `notification_task` | 5s | 离线/恢复邮件 outbox |
+| `chat_notification_task` | — | 聊天邮件投递 |
+| `client_market_trade_task` | — | 交易结算 |
+| `ip_blacklist_log_task` | 600s | 黑名单统计落日志 |
+
+**关停**:收到 SIGTERM 后先停 HTTP 接入并排空最多 30 秒,再关 SSH listener(5 秒)。
+
+> **已知行为**:后台任务在关停时被 `.abort()`(`main.rs:492-500`),持有 DB 锁或处于事务中途的任务会被硬杀。
+
+---
+
+## 8. 通知系统
+
+采用 outbox 模式,三阶段循环(`src/notifications.rs`):
+
+1. **reconcile** —— 扫描在线状态,产出离线/恢复事件;推进持久化 baseline,使停用期间的事件不会补发
+2. **aggregate** —— 同收件人事件在窗口内(默认 60s)合并为一个批次;风暴检测触发时进一步合并为 digest
+3. **deliver** —— worker 以 90 秒租约认领批次,经 Resend 发送
+
+可靠性设计:
+
+- `FrozenEmailEnvelope` 保证重试时载荷不变,配合固定 Resend 幂等键
+- 12 次尝试后进入死信
+- 可重试状态码:408、425、429、5xx,以及带 `concurrent_idempotent_requests` 的 409
+- 单收件人与全局双层小时配额,offline 与 registration 两条 lane 额度互不占用
+
+---
+
+## 9. 前端
+
+Next.js 静态导出(`output: "export"`),`build.rs` 遍历 `frontend/out/` 生成 `include_bytes!` 匹配表编译进二进制,由 `/*path` catch-all 提供服务。单文件部署,无外部资源依赖。
+
+- 无外部状态库,纯 React Context
+- i18n 覆盖 `en` / `zh-CN`
+- 设计 token 以 `--router-*` CSS 自定义属性承载,dark mode 经 `.dark` class 整体切换
+- Web 终端:xterm.js ↔ WebSocket ↔ `portable-pty` 起 `ssh` 子进程(非 russh client),一次性 ticket + 每用户 2 会话上限 + 空闲/硬超时。**仅 Host Provider 本人可开**,租客与 Router 管理员均不可
+
+---
+
+## 10. 自升级
+
+`src/admin/upgrade.rs` 实现进程自替换:
+
+1. 同目录暂存临时文件(避开跨文件系统 rename 的 EXDEV)
+2. 从 GitHub latest release 下载(180s 超时)
+3. `chmod +x` 并以 `--help` 冒烟自检(5s)
+4. SHA-256 比对新旧二进制
+5. 原子 `rename(2)` 交换,旧二进制留 `.bak`
+6. 探测服务管理器(systemd 或 nohup)
+7. `setsid -f` 派生子进程延时重启
+
+进度经 broadcast channel 以 SSE 流式推送至前端。

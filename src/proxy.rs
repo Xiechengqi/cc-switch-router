@@ -2573,7 +2573,7 @@ pub async fn proxy_handler(
         }
         // Strip client-supplied user/share credentials on share routes; router
         // authenticates the caller at the edge (user_api_token + email ACL)
-        // and the cc-switch tunnel only needs the share id we inject below.
+        // and the cc-switch-server tunnel only needs the share id we inject below.
         if is_internal_share_context_header(n) {
             continue;
         }
@@ -2598,7 +2598,7 @@ pub async fn proxy_handler(
         builder = builder.header(name, value);
     }
 
-    // Inject share id so cc-switch can identify the share on its tunnel side
+    // Inject share id so cc-switch-server can identify the share on its tunnel side
     // and attribute usage. There is no longer a separate share_token credential —
     // tunnel transport itself is the only authority that we are speaking on
     // behalf of this share.
@@ -4663,6 +4663,7 @@ mod tests {
             auth_installation_hourly_limit: 15,
             ip_blacklist: String::new(),
             free_share_ip_parallel_limit: 1,
+            ip_intel_endpoints: Vec::new(),
             verification_service_base_url: "https://tokenswitch.org".into(),
             verification_service_api_key: None,
             router_owner_email: None,

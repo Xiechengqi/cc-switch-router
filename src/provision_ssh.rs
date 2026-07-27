@@ -5,9 +5,66 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use tracing::info;
 
+/// Private key material must never be group/world readable. `ssh-keygen` already
+/// creates `0600`, but we do not rely on its defaults: an operator-supplied key,
+/// a permissive inherited umask, or a restored backup can all widen the mode.
+#[cfg(unix)]
+const PRIVATE_KEY_MODE: u32 = 0o600;
+/// The key directory itself is tightened so a widened file mode cannot be reached
+/// by traversal from a shared parent.
+#[cfg(unix)]
+const KEY_DIR_MODE: u32 = 0o700;
+/// Public key material is not secret, but keep it owner-writable only.
+#[cfg(unix)]
+const PUBLIC_KEY_MODE: u32 = 0o644;
+
+/// Apply `mode` to `path`, ignoring a missing file. Applied on every startup —
+/// not only at generation — so pre-existing keys are repaired in place.
+#[cfg(unix)]
+fn enforce_mode(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            let current = metadata.permissions().mode() & 0o777;
+            if current == mode {
+                return Ok(());
+            }
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).with_context(|| {
+                format!(
+                    "tighten permissions to {mode:o} failed: {}",
+                    path.display()
+                )
+            })?;
+            info!(
+                path = %path.display(),
+                from = format!("{current:o}"),
+                to = format!("{mode:o}"),
+                "tightened provisioning ssh key permissions"
+            );
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!("read permissions failed: {}", path.display())
+        }),
+    }
+}
+
+#[cfg(not(unix))]
+fn enforce_mode(_path: &Path, _mode: u32) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+const PRIVATE_KEY_MODE: u32 = 0;
+#[cfg(not(unix))]
+const KEY_DIR_MODE: u32 = 0;
+#[cfg(not(unix))]
+const PUBLIC_KEY_MODE: u32 = 0;
+
 /// Ensure a dedicated outbound provisioning keypair exists and is internally
 /// consistent. A missing pair is generated as Ed25519; an existing private key
-/// is never replaced.
+/// is never replaced. File modes are enforced on every call.
 pub fn require_provision_ssh_keys(private_key_path: &Path, public_key_path: &Path) -> Result<()> {
     if !private_key_path.is_file() {
         if public_key_path.exists() {
@@ -23,6 +80,7 @@ pub fn require_provision_ssh_keys(private_key_path: &Path, public_key_path: &Pat
                     parent.display()
                 )
             })?;
+            enforce_mode(parent, KEY_DIR_MODE)?;
         }
         let output = Command::new("ssh-keygen")
             .arg("-q")
@@ -47,6 +105,8 @@ pub fn require_provision_ssh_keys(private_key_path: &Path, public_key_path: &Pat
             "generated dedicated client market provisioning ssh key"
         );
     }
+    // Enforce before deriving: `ssh-keygen -y` refuses to read a world-readable key.
+    enforce_mode(private_key_path, PRIVATE_KEY_MODE)?;
 
     let derived_public = derive_public_key(private_key_path)?;
     if public_key_path.is_file() {
@@ -76,6 +136,10 @@ pub fn require_provision_ssh_keys(private_key_path: &Path, public_key_path: &Pat
                 public_key_path.display()
             )
         })?;
+    }
+    enforce_mode(public_key_path, PUBLIC_KEY_MODE)?;
+    if let Some(parent) = private_key_path.parent() {
+        enforce_mode(parent, KEY_DIR_MODE)?;
     }
 
     info!(
@@ -208,6 +272,39 @@ mod tests {
         assert_eq!(
             public_key_openssh_from_public_path(&public).unwrap(),
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGjWI8jfRRbxMZjdFDfgRlaHpRZPf7qs4odSbL41WQ1m"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A key restored from a backup or created under a permissive umask must be
+    /// repaired in place, not merely tolerated.
+    #[cfg(unix)]
+    #[test]
+    fn widened_private_key_permissions_are_repaired() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "cc-switch-router-provision-perm-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let private = dir.join("provision");
+        let public = dir.join("provision.pub");
+        require_provision_ssh_keys(&private, &public).unwrap();
+
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        require_provision_ssh_keys(&private, &public).unwrap();
+
+        assert_eq!(
+            fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+            PRIVATE_KEY_MODE,
+            "private key mode must be repaired on startup"
+        );
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            KEY_DIR_MODE,
+            "key directory mode must be repaired on startup"
         );
         let _ = fs::remove_dir_all(&dir);
     }

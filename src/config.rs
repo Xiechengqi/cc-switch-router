@@ -11,6 +11,11 @@ pub const DEFAULT_FOOTER_TELEGRAM_URL: &str = "https://t.me/tokenswitchorg";
 pub const DEFAULT_REQUEST_LOG_RETENTION_DAYS: u32 = 30;
 pub const MIN_REQUEST_LOG_RETENTION_DAYS: u32 = 1;
 pub const MAX_REQUEST_LOG_RETENTION_DAYS: u32 = 365;
+/// Historical hardcoded IP-intelligence origins. Kept as the default so existing
+/// deployments keep working; override with `CC_SWITCH_ROUTER_IP_INTEL_ENDPOINTS`.
+const DEFAULT_IP_INTEL_ENDPOINTS: &[&str] =
+    &["http://3.0.3.0", "http://3.0.2.1", "http://3.0.2.9"];
+
 
 #[derive(Debug, Clone)]
 pub struct MetricsConfig {
@@ -92,6 +97,11 @@ pub struct Config {
     pub auth_installation_hourly_limit: i64,
     pub ip_blacklist: String,
     pub free_share_ip_parallel_limit: i64,
+    /// Base URLs of the IP-intelligence service, tried in order. Every registered
+    /// Client Market Host IP is sent to these endpoints, so they should be operated
+    /// by the Router operator or a party trusted with the full Host inventory.
+    /// Prefer `https://` origins; plaintext entries are logged as a warning at boot.
+    pub ip_intel_endpoints: Vec<String>,
     pub verification_service_base_url: String,
     pub verification_service_api_key: Option<String>,
     /// The official Client Market Provider. This is intentionally independent
@@ -255,6 +265,9 @@ impl Config {
             free_share_ip_parallel_limit: env_var("CC_SWITCH_ROUTER_FREE_SHARE_IP_PARALLEL_LIMIT")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1),
+            ip_intel_endpoints: parse_ip_intel_endpoints(
+                env_var("CC_SWITCH_ROUTER_IP_INTEL_ENDPOINTS").as_deref(),
+            ),
             verification_service_base_url: env_var(
                 "CC_SWITCH_ROUTER_VERIFICATION_SERVICE_BASE_URL",
             )
@@ -587,6 +600,33 @@ fn parse_admin_emails(value: Option<&str>) -> HashSet<String> {
     set
 }
 
+/// Endpoints receive every registered Host IP, so the default is kept identical to
+/// the historical hardcoded list — changing the scheme blindly would break Host
+/// registration if those origins do not terminate TLS. Operators who front the
+/// service with HTTPS should set `CC_SWITCH_ROUTER_IP_INTEL_ENDPOINTS`.
+fn parse_ip_intel_endpoints(value: Option<&str>) -> Vec<String> {
+    let parsed: Vec<String> = value
+        .unwrap_or_default()
+        .split(',')
+        .map(|piece| piece.trim().trim_end_matches('/'))
+        .filter(|piece| !piece.is_empty())
+        .map(|piece| {
+            if piece.starts_with("http://") || piece.starts_with("https://") {
+                piece.to_string()
+            } else {
+                format!("https://{piece}")
+            }
+        })
+        .collect();
+    if parsed.is_empty() {
+        return DEFAULT_IP_INTEL_ENDPOINTS
+            .iter()
+            .map(|value| value.to_string())
+            .collect();
+    }
+    parsed
+}
+
 pub fn tunnel_domain_host(tunnel_domain: &str) -> Option<String> {
     let raw = tunnel_domain.trim();
     if raw.is_empty() {
@@ -687,6 +727,7 @@ mod tests {
             auth_installation_hourly_limit: 5,
             ip_blacklist: String::new(),
             free_share_ip_parallel_limit: 1,
+            ip_intel_endpoints: Vec::new(),
             verification_service_base_url: "https://example.com".into(),
             verification_service_api_key: None,
             router_owner_email: None,
@@ -716,6 +757,7 @@ mod tests {
 
         let disabled = Config {
             free_share_ip_parallel_limit: 0,
+            ip_intel_endpoints: Vec::new(),
             ..config
         };
         assert!(!disabled.free_share_ip_limit_enabled());

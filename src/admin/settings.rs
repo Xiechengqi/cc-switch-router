@@ -2220,6 +2220,7 @@ mod tests {
             auth_installation_hourly_limit: 10,
             ip_blacklist: String::new(),
             free_share_ip_parallel_limit: 1,
+            ip_intel_endpoints: Vec::new(),
             verification_service_base_url: "https://example.com".into(),
             verification_service_api_key: None,
             router_owner_email: Some("router@router.example.com".into()),

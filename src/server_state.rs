@@ -58,7 +58,7 @@ pub struct ServerState {
     pub telegram: Arc<RwLock<Option<Arc<TelegramNotifier>>>>,
     /// Single-flight upgrade orchestrator with SSE log fan-out.
     pub upgrade_registry: SharedUpgradeRegistry,
-    /// Fan-out control channel for online cc-switch clients. Events are wake-ups only;
+    /// Fan-out control channel for online cc-switch-server clients. Events are wake-ups only;
     /// clients still pull signed pending edits before applying anything.
     pub share_edit_events: broadcast::Sender<ShareEditAvailableEvent>,
     /// Path to the live env file (also the apply target).

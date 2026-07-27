@@ -79,6 +79,7 @@ export function ClientMarketBillingBanner({
         billing.openInvoiceId,
         billing.offerRevision,
         billing.paymentProfileUpdatedAt,
+        billing.priceCents,
       );
       toast.success(t("billing.declaredToast"));
       setConfirmPayment(false);

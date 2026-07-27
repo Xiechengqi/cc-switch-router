@@ -1,7 +1,7 @@
 //! Control-plane RPC client: server → installation.
 //!
 //! The dashboard is allowed to *request* share-settings changes, but the
-//! desktop installation remains the single source of truth for its own config.
+//! cc-switch-server installation remains the single source of truth for its own config.
 //! Rather than wait for the client to poll the pending-edit queue and re-sync
 //! (slow, and lossy if the client applies a patch only partially), the server
 //! calls the client's local `/_ctl/apply_share_settings` API synchronously over

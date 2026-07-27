@@ -4570,7 +4570,7 @@ fn extract_guest_id(headers: &HeaderMap) -> Option<String> {
         .map(str::to_string)
 }
 
-async fn require_admin_session(
+pub(crate) async fn require_admin_session(
     state: &ServerState,
     headers: &HeaderMap,
 ) -> Result<AuthSession, AppError> {
@@ -5926,13 +5926,13 @@ fn app_probe_for_kind(app: &str, kind: &str) -> Option<AppProbe> {
         ("claude", "text") => Some(AppProbe {
             method: "POST",
             path: "/v1/messages",
-            // cc-switch client 的 ensure_claude_oauth_billing_header_system 会在
+            // cc-switch-server 的 ensure_claude_oauth_billing_header_system 会在
             // ClaudeOAuth provider 路径下自动注入 x-anthropic-billing-header system
             // 块 + cch 签名，所以这里用最简形式即可——与 api.anthropic.com 官方文档
             // 示例完全一致。
             //
             // `stream: true` 是为了兼容 GitHub Copilot 这类 Anthropic-on-OpenAI 绑定：
-            // cc-switch 在非流式路径上会把上游响应做 openai_to_anthropic 转换；如果
+            // cc-switch-server 在非流式路径上会把上游响应做 openai_to_anthropic 转换；如果
             // 上游碰巧返回 `choices: []`（短回复、Copilot 内部行为等），转换器会抛
             // "Empty choices array"。claude-cli 真实流量恒为 stream:true，走 SSE
             // passthrough 不触发这条转换，所以也对齐这一行为。

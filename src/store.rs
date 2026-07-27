@@ -11303,7 +11303,7 @@ pub async fn fetch_share_runtime_snapshot_from_route(
     share_id: &str,
     installation_id: &str,
 ) -> Result<ShareRuntimeSnapshotResponse, AppError> {
-    // 多 share 模式：同一 cc-switch 可能挂多个 share。
+    // 多 share 模式：同一 cc-switch-server 可能挂多个 share。
     // 用 `?shareId=...` 显式定位，避免老路径"取第一个 share"的歧义。
     let query = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("shareId", share_id)
@@ -16858,7 +16858,7 @@ fn share_settings_patch_is_empty(patch: &ShareSettingsPatch) -> bool {
 /// RPC actually reflects every field the pending edit requested. Returns the
 /// name of the first field that does not match, or `Ok(())` if the client
 /// honored the whole patch. The server uses this to refuse writing a partial
-/// application (the desktop bug where an owner transfer dropped the demoted
+/// application (the historical client bug where an owner transfer dropped the demoted
 /// owner from `shareto`) instead of silently persisting it.
 fn validate_returned_share_against_patch(
     patch: &ShareSettingsPatch,
@@ -24068,6 +24068,7 @@ mod tests {
             auth_installation_hourly_limit: 15,
             ip_blacklist: String::new(),
             free_share_ip_parallel_limit: 1,
+            ip_intel_endpoints: Vec::new(),
             verification_service_base_url: "https://tokenswitch.org".into(),
             verification_service_api_key: None,
             router_owner_email: None,

@@ -1,13 +1,51 @@
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 
 use crate::error::AppError;
 
-const IQ_LOOKUP_HOSTS: &[&str] = &["3.0.3.0", "3.0.2.1", "3.0.2.9"];
 const IQ_TIMEOUT: Duration = Duration::from_secs(5);
 const IQ_RESPONSE_MAX_BYTES: usize = 256 * 1024;
+/// Geolocation and ASN attribution for a given IP change on the order of weeks.
+/// Caching keeps the Host inventory from being re-sent on every reverify, import,
+/// and registration retry.
+const IQ_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const IQ_CACHE_MAX_ENTRIES: usize = 4096;
+
+type IqCache = Mutex<HashMap<String, (Instant, HostIpIntel)>>;
+
+fn cache() -> &'static IqCache {
+    static CACHE: OnceLock<IqCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cache_get(ip: &str) -> Option<HostIpIntel> {
+    let mut guard = cache().lock().ok()?;
+    match guard.get(ip) {
+        Some((stored_at, intel)) if stored_at.elapsed() < IQ_CACHE_TTL => Some(intel.clone()),
+        Some(_) => {
+            guard.remove(ip);
+            None
+        }
+        None => None,
+    }
+}
+
+fn cache_put(ip: &str, intel: &HostIpIntel) {
+    let Ok(mut guard) = cache().lock() else { return };
+    if guard.len() >= IQ_CACHE_MAX_ENTRIES {
+        // Cheap bound: drop everything already past its TTL, and if that frees
+        // nothing, clear outright rather than grow without limit.
+        guard.retain(|_, (stored_at, _)| stored_at.elapsed() < IQ_CACHE_TTL);
+        if guard.len() >= IQ_CACHE_MAX_ENTRIES {
+            guard.clear();
+        }
+    }
+    guard.insert(ip.to_string(), (Instant::now(), intel.clone()));
+}
 
 /// Important IP intelligence fields persisted for Client Market hosts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,10 +147,21 @@ struct IqClassification {
     tor: Option<bool>,
 }
 
-pub async fn lookup_host_ip_intel(ip: &str) -> Result<HostIpIntel, AppError> {
+pub async fn lookup_host_ip_intel(
+    endpoints: &[String],
+    ip: &str,
+) -> Result<HostIpIntel, AppError> {
     let trimmed = ip.trim();
     if trimmed.is_empty() {
         return Err(AppError::BadRequest("ip is required".into()));
+    }
+    if let Some(cached) = cache_get(trimmed) {
+        return Ok(cached);
+    }
+    if endpoints.is_empty() {
+        return Err(AppError::ServiceUnavailable(
+            "no ip intelligence endpoints configured".into(),
+        ));
     }
     let client = reqwest::Client::builder()
         .user_agent("cc-switch-router/client-market")
@@ -121,12 +170,15 @@ pub async fn lookup_host_ip_intel(ip: &str) -> Result<HostIpIntel, AppError> {
         .map_err(|e| AppError::Internal(format!("build iq http client failed: {e}")))?;
 
     let mut last_error = String::from("all iq endpoints failed");
-    for host in IQ_LOOKUP_HOSTS {
-        match lookup_one(&client, host, trimmed).await {
-            Ok(intel) => return Ok(intel),
+    for endpoint in endpoints {
+        match lookup_one(&client, endpoint, trimmed).await {
+            Ok(intel) => {
+                cache_put(trimmed, &intel);
+                return Ok(intel);
+            }
             Err(error) => {
-                last_error = format!("{host}: {error}");
-                tracing::warn!(endpoint = %host, ip = %trimmed, error = %error, "iq ip lookup failed");
+                last_error = format!("{endpoint}: {error}");
+                tracing::warn!(endpoint = %endpoint, ip = %trimmed, error = %error, "iq ip lookup failed");
             }
         }
     }
@@ -135,8 +187,26 @@ pub async fn lookup_host_ip_intel(ip: &str) -> Result<HostIpIntel, AppError> {
     )))
 }
 
-async fn lookup_one(client: &reqwest::Client, host: &str, ip: &str) -> Result<HostIpIntel, String> {
-    let url = format!("http://{host}/iq?ip={ip}");
+/// Emit a single boot-time warning per plaintext endpoint. Host IPs are the full
+/// Client Market inventory; sending them unencrypted exposes that list to anyone on
+/// the path.
+pub fn warn_insecure_endpoints(endpoints: &[String]) {
+    for endpoint in endpoints {
+        if endpoint.starts_with("http://") {
+            tracing::warn!(
+                endpoint = %endpoint,
+                "ip intelligence endpoint uses plaintext http; every registered host ip is sent in the clear. Set CC_SWITCH_ROUTER_IP_INTEL_ENDPOINTS to https origins."
+            );
+        }
+    }
+}
+
+async fn lookup_one(
+    client: &reqwest::Client,
+    endpoint: &str,
+    ip: &str,
+) -> Result<HostIpIntel, String> {
+    let url = format!("{endpoint}/iq?ip={ip}");
     let mut response = timeout(IQ_TIMEOUT, client.get(&url).send())
         .await
         .map_err(|_| "request timed out".to_string())?
@@ -205,7 +275,7 @@ async fn lookup_one(client: &reqwest::Client, host: &str, ip: &str) -> Result<Ho
         vpn: classification.as_ref().and_then(|value| value.vpn),
         hosting: classification.as_ref().and_then(|value| value.hosting),
         tor: classification.as_ref().and_then(|value| value.tor),
-        source: host.to_string(),
+        source: endpoint.to_string(),
     })
 }
 

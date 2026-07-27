@@ -76,6 +76,17 @@ const CLEANUP_PURGE_RETRY_BASE: Duration = Duration::from_secs(1);
 const STALE_DRAINING_AFTER: Duration = Duration::from_secs(10 * 60);
 /// Unreachable hosts that look remotely clean are auto-healed after this age.
 const UNREACHABLE_AUTO_HEAL_AFTER: Duration = Duration::from_secs(5 * 60);
+/// Hosts claimed for provisioning but with no active job for longer than this are
+/// stranded — the worker panicked, or the process died between claim and spawn.
+/// `locked` has no other exit, so without this sweep the Host leaves the pool for
+/// good. The active-job check is the real guard; this floor is set above the worst
+/// case a create job can legitimately hold `locked`
+/// (`SSH_INSTALL_TIMEOUT` + `PROVISION_POLL_TIMEOUT` = 20 min) so the sweep stays
+/// safe even if that check ever regresses.
+const STALE_LOCKED_AFTER: Duration = Duration::from_secs(25 * 60);
+/// Reserved hosts whose quote is gone are returned to the pool after this age.
+/// Quote TTL is 120s; this leaves generous headroom for a commit in flight.
+const STALE_RESERVED_AFTER: Duration = Duration::from_secs(10 * 60);
 
 const SUBDOMAIN_RESERVATION_TTL_MS: i64 = 30 * 60 * 1000;
 const PROVISION_POLL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -1079,7 +1090,7 @@ async fn lookup_host_ip_info(
 ) -> Result<Json<crate::ip_iq::HostIpIntel>, AppError> {
     let _owner = require_session_email(&state, &headers).await?;
     let ip = parse_host_ip(&input.ip)?;
-    let intel = crate::ip_iq::lookup_host_ip_intel(&ip.to_string()).await?;
+    let intel = crate::ip_iq::lookup_host_ip_intel(&state.config.ip_intel_endpoints, &ip.to_string()).await?;
     Ok(Json(intel))
 }
 
@@ -1136,7 +1147,7 @@ async fn create_host(
     }
     let (hostname, fingerprint) =
         ssh_verify_host(&state, &ip.to_string(), port, &known_hosts).await?;
-    let intel = crate::ip_iq::lookup_host_ip_intel(&ip.to_string()).await?;
+    let intel = crate::ip_iq::lookup_host_ip_intel(&state.config.ip_intel_endpoints, &ip.to_string()).await?;
     let intel_json = serde_json::to_string(&intel)
         .map_err(|e| AppError::Internal(format!("serialize host ip intel failed: {e}")))?;
     let (price_cents, rental_period_days) =
@@ -1373,7 +1384,7 @@ async fn import_one_host(
                 ));
             }
         }
-        let intel = crate::ip_iq::lookup_host_ip_intel(&ip.to_string()).await?;
+        let intel = crate::ip_iq::lookup_host_ip_intel(&state.config.ip_intel_endpoints, &ip.to_string()).await?;
         let intel_json = serde_json::to_string(&intel).map_err(|error| {
             AppError::Internal(format!("serialize imported Host IP data failed: {error}"))
         })?;
@@ -1833,14 +1844,27 @@ pub async fn reconcile_stale_market_hosts(state: ServerState) -> Result<(), AppE
                 host_id = %host.id,
                 "stale draining host has no installation; marking unreachable"
             );
-            let _ = state
+            match state
                 .store
                 .client_market_force_host_status(
                     &host.id,
+                    HOST_STATUS_DRAINING,
                     HOST_STATUS_UNREACHABLE,
                     "stale_draining_without_installation",
                 )
-                .await;
+                .await
+            {
+                Ok(false) => info!(
+                    host_id = %host.id,
+                    "stale draining host changed concurrently; leaving it to the winning job"
+                ),
+                Ok(true) => {}
+                Err(err) => warn!(
+                    host_id = %host.id,
+                    error = %err,
+                    "failed to mark stale draining host unreachable"
+                ),
+            }
             continue;
         };
         info!(
@@ -1943,6 +1967,127 @@ pub async fn reconcile_stale_market_hosts(state: ServerState) -> Result<(), AppE
                     "auto-heal remote probe failed"
                 );
             }
+        }
+    }
+
+    reconcile_stranded_locked_hosts(&state, now).await?;
+    reconcile_stranded_reserved_hosts(&state, now).await?;
+    Ok(())
+}
+
+/// `locked` is entered when a Host is claimed for provisioning and is normally left
+/// by the create job. If the process died between the claim and the job starting —
+/// or the worker panicked — nothing else moves the Host, and it silently leaves the
+/// supply pool forever. Reclaim it once no job can possibly still own it.
+async fn reconcile_stranded_locked_hosts(
+    state: &ServerState,
+    now: chrono::DateTime<Utc>,
+) -> Result<(), AppError> {
+    let locked = state
+        .store
+        .client_market_list_hosts_by_status(HOST_STATUS_LOCKED)
+        .await?;
+    for host in locked {
+        let Some(updated) = chrono::DateTime::parse_from_rfc3339(&host.updated_at)
+            .ok()
+            .map(|ts| ts.with_timezone(&Utc))
+        else {
+            continue;
+        };
+        if now.signed_duration_since(updated)
+            < chrono::Duration::from_std(STALE_LOCKED_AFTER)
+                .unwrap_or(chrono::Duration::minutes(25))
+        {
+            continue;
+        }
+        if state
+            .store
+            .client_market_host_has_active_job(&host.id)
+            .await?
+        {
+            continue;
+        }
+        // Route to `unreachable` rather than `idle`: the Host may carry a partial
+        // install from the job that died, so it must pass reverify before it can be
+        // handed to another renter.
+        match state
+            .store
+            .client_market_force_host_status(
+                &host.id,
+                HOST_STATUS_LOCKED,
+                HOST_STATUS_UNREACHABLE,
+                "stale_locked_without_active_job",
+            )
+            .await
+        {
+            Ok(true) => warn!(
+                host_id = %host.id,
+                "reclaimed host stranded in locked state"
+            ),
+            Ok(false) => {}
+            Err(err) => warn!(
+                host_id = %host.id,
+                error = %err,
+                "failed to reclaim stranded locked host"
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// `reserved` is held by a live allocation quote. Quotes are expired opportunistically
+/// (only when some quote endpoint is called), so a restart with quotes outstanding can
+/// strand Hosts indefinitely if no further quote traffic arrives.
+async fn reconcile_stranded_reserved_hosts(
+    state: &ServerState,
+    now: chrono::DateTime<Utc>,
+) -> Result<(), AppError> {
+    let reserved = state
+        .store
+        .client_market_list_hosts_by_status(crate::client_market_trade::HOST_STATUS_RESERVED)
+        .await?;
+    for host in reserved {
+        let Some(updated) = chrono::DateTime::parse_from_rfc3339(&host.updated_at)
+            .ok()
+            .map(|ts| ts.with_timezone(&Utc))
+        else {
+            continue;
+        };
+        if now.signed_duration_since(updated)
+            < chrono::Duration::from_std(STALE_RESERVED_AFTER)
+                .unwrap_or(chrono::Duration::minutes(10))
+        {
+            continue;
+        }
+        if state
+            .store
+            .client_market_host_has_live_quote(&host.id)
+            .await?
+        {
+            continue;
+        }
+        // No live quote can claim it, and a reserved Host was never touched remotely,
+        // so returning it straight to the pool is safe.
+        match state
+            .store
+            .client_market_force_host_status(
+                &host.id,
+                crate::client_market_trade::HOST_STATUS_RESERVED,
+                HOST_STATUS_IDLE,
+                "",
+            )
+            .await
+        {
+            Ok(true) => warn!(
+                host_id = %host.id,
+                "returned host stranded in reserved state to the pool"
+            ),
+            Ok(false) => {}
+            Err(err) => warn!(
+                host_id = %host.id,
+                error = %err,
+                "failed to return stranded reserved host"
+            ),
         }
     }
     Ok(())
@@ -2375,6 +2520,22 @@ async fn run_cleanup_job_inner(
                 "cleanup host subdomain binding mismatch".into(),
             ));
         }
+    }
+
+    // Drop the public route before touching the remote box. Previously this happened
+    // only in the purge phase, so a cleanup that failed during stop or wipe left the
+    // tunnel serving traffic while billing had already moved the subscription to
+    // releasing/release_failed — the renter kept working on a Host they were no longer
+    // being charged for. Removal is idempotent, so the purge phase below can repeat it.
+    if let Some(subdomain) = job.subdomain.as_deref() {
+        state.proxy.remove_route(subdomain).await;
+        state
+            .store
+            .client_market_append_job_log(
+                job_id,
+                &format!("proxy route removed before teardown: {subdomain}\n"),
+            )
+            .await?;
     }
 
     let mut phase = job.phase.clone();
@@ -3094,6 +3255,15 @@ async fn ssh_remote_is_market_clean(
     state: &ServerState,
     host: &RouterSshHostRecord,
 ) -> Result<bool, AppError> {
+    // Auto-heal runs unattended and its success returns a Host to the allocation
+    // pool. Trusting a fresh host key here would let whoever controls the IP during
+    // the heal window present a clean machine and be adopted. A Host with no pinned
+    // fingerprint must go through owner-driven reverify instead.
+    let Some(_) = host.ssh_host_key_fingerprint.as_deref() else {
+        return Err(AppError::Conflict(
+            "host has no pinned SSH fingerprint; auto-heal requires owner reverify".into(),
+        ));
+    };
     let known_hosts = known_hosts_path(&state.config);
     let command = format!(
         "{helpers}\
@@ -3111,11 +3281,7 @@ async fn ssh_remote_is_market_clean(
         &command,
         None,
         SSH_VERIFY_TIMEOUT,
-        if host.ssh_host_key_fingerprint.is_some() {
-            SshHostKeyPolicy::RequireKnown
-        } else {
-            SshHostKeyPolicy::AcceptNew
-        },
+        SshHostKeyPolicy::RequireKnown,
     )
     .await?;
     Ok(output.lines().any(|line| line.trim() == "clean"))
@@ -4940,25 +5106,50 @@ impl AppStore {
         Ok(count > 0)
     }
 
+    /// True when an unexpired `active` allocation quote still holds this host, i.e.
+    /// the `reserved` status is legitimate and must not be reclaimed.
+    pub async fn client_market_host_has_live_quote(&self, host_id: &str) -> Result<bool, AppError> {
+        let conn = self.conn.lock().await;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM client_market_allocation_quote_items i
+                 JOIN client_market_allocation_quotes q ON q.id = i.quote_id
+                 WHERE i.host_id = ?1 AND q.status = 'active' AND q.expires_at > ?2",
+                params![host_id, Utc::now().to_rfc3339()],
+                |row| row.get(0),
+            )
+            .map_err(|e| AppError::Internal(format!("count live host quotes failed: {e}")))?;
+        Ok(count > 0)
+    }
+
+    /// Compare-and-set a host status. Returns `false` when the host is no longer in
+    /// `expected_status`, which means a concurrent job already moved it — the caller
+    /// should skip rather than overwrite. Blind writes here previously let the
+    /// reconcile loop clobber a cleanup job that was mid-commit.
     pub async fn client_market_force_host_status(
         &self,
         host_id: &str,
+        expected_status: &str,
         status: &str,
         last_error: &str,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         let conn = self.conn.lock().await;
         let changed = conn
             .execute(
                 "UPDATE router_ssh_hosts
                  SET status = ?2, last_error = ?3, updated_at = ?4
-                 WHERE id = ?1",
-                params![host_id, status, last_error, Utc::now().to_rfc3339()],
+                 WHERE id = ?1 AND status = ?5",
+                params![
+                    host_id,
+                    status,
+                    last_error,
+                    Utc::now().to_rfc3339(),
+                    expected_status
+                ],
             )
             .map_err(|e| AppError::Internal(format!("force host status failed: {e}")))?;
-        if changed != 1 {
-            return Err(AppError::NotFound("host not found".into()));
-        }
-        Ok(())
+        Ok(changed == 1)
     }
 
     pub async fn client_market_get_host_for_operator(
@@ -6099,6 +6290,7 @@ mod tests {
             auth_installation_hourly_limit: 15,
             ip_blacklist: String::new(),
             free_share_ip_parallel_limit: 1,
+            ip_intel_endpoints: Vec::new(),
             verification_service_base_url: "https://tokenswitch.org".into(),
             verification_service_api_key: None,
             router_owner_email: None,
@@ -7669,7 +7861,7 @@ mod tests {
         );
         assert!(matches!(
             store
-                .client_market_declare_paid("paid-client", &invoice_id, 2, None, &client)
+                .client_market_declare_paid("paid-client", &invoice_id, 2, None, None, &client)
                 .await,
             Err(AppError::Conflict(_))
         ));
@@ -7691,6 +7883,7 @@ mod tests {
                     &invoice_id,
                     1,
                     Some(&payment_profile.updated_at),
+                    None,
                     &client,
                 )
                 .await,
@@ -7703,6 +7896,7 @@ mod tests {
                     &invoice_id,
                     2,
                     Some(&payment_profile.updated_at),
+                    None,
                     &client,
                 )
                 .await,
@@ -7719,12 +7913,31 @@ mod tests {
             )
             .unwrap();
         }
+        // An echoed amount that disagrees with the invoice must be rejected even when
+        // the revision matches — the client displayed a stale number.
+        assert!(
+            matches!(
+                store
+                    .client_market_declare_paid(
+                        "paid-client",
+                        &invoice_id,
+                        2,
+                        Some(&payment_profile.updated_at),
+                        Some(1),
+                        &client,
+                    )
+                    .await,
+                Err(AppError::Conflict(_))
+            ),
+            "mismatched amount_cents_confirmed must be refused"
+        );
         store
             .client_market_declare_paid(
                 "paid-client",
                 &invoice_id,
                 2,
                 Some(&payment_profile.updated_at),
+                None,
                 &client,
             )
             .await
@@ -7735,6 +7948,7 @@ mod tests {
                 &invoice_id,
                 2,
                 Some(&payment_profile.updated_at),
+                None,
                 &client,
             )
             .await
@@ -8553,5 +8767,209 @@ mod tests {
             )),
             CLEANUP_FAILURE_FINGERPRINT
         );
+    }
+
+    /// `release_failed` had no exit: nothing transitioned a subscription out of it
+    /// while `ensure_creation_allowed_tx` treated it as a hard block, so one failed
+    /// remote cleanup locked the renter out of creating Clients permanently.
+    #[tokio::test]
+    async fn force_release_clears_the_release_failed_deadlock() {
+        let (store, _config, root) = test_store("trade-force-release");
+        let host = add_provider_host(
+            &store,
+            "provider-stuck",
+            "provider@example.com",
+            "198.18.30.1",
+            "US",
+            Some(500),
+            Some(30),
+        )
+        .await;
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO client_market_subscriptions
+                    (installation_id, host_id, provider_id, host_owner_email,
+                     client_user_id, client_owner_email, status, price_cents,
+                     rental_period_days, offer_revision, current_period_end,
+                     created_at, updated_at)
+                 VALUES ('stuck-client', ?1, 'provider-stuck', 'provider@example.com',
+                         'client-stuck', 'client@example.com', 'release_failed', 500,
+                         30, 1, ?2, ?3, ?3)",
+                params![
+                    host.id,
+                    (now - chrono::Duration::days(1)).to_rfc3339(),
+                    now.to_rfc3339(),
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO client_market_invoices
+                    (id, installation_id, sequence, amount_cents, rental_period_days,
+                     offer_revision, status, deadline_at, opened_at)
+                 VALUES ('stuck-invoice', 'stuck-client', 1, 500, 30, 1, 'open', ?1, ?2)",
+                params![
+                    (now + chrono::Duration::days(1)).to_rfc3339(),
+                    now.to_rfc3339()
+                ],
+            )
+            .unwrap();
+        }
+
+        let client = market_session("client-stuck", "client@example.com");
+        assert!(
+            store.client_market_assert_creation_allowed(&client).await.is_err(),
+            "release_failed must block creation before the force release"
+        );
+
+        let outcome = store
+            .client_market_force_release_subscription(
+                "stuck-client",
+                "admin-user",
+                "admin@example.com",
+            )
+            .await
+            .expect("force release a wedged subscription");
+        assert_eq!(outcome.previous_status, "release_failed");
+        assert_eq!(outcome.status, "released");
+        assert_eq!(outcome.canceled_invoices, 1);
+
+        store
+            .client_market_assert_creation_allowed(&client)
+            .await
+            .expect("creation gate must clear after the force release");
+
+        // Second call is a conflict, not a silent double-release.
+        assert!(matches!(
+            store
+                .client_market_force_release_subscription(
+                    "stuck-client",
+                    "admin-user",
+                    "admin@example.com"
+                )
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A Provider must not be able to rent their own Host: it would inflate their
+    /// public allocation stats. Ownership is matched by provider_id and by owner
+    /// email, because provider_id can drift from the registering account.
+    #[tokio::test]
+    async fn self_dealing_quotes_are_refused() {
+        use crate::client_market_trade::CreateQuoteRequest;
+
+        let (store, _config, root) = test_store("trade-self-deal");
+        let host = add_provider_host(
+            &store,
+            "provider-self",
+            "self@example.com",
+            "198.18.31.1",
+            "US",
+            Some(500),
+            Some(30),
+        )
+        .await;
+
+        let owner = market_session("provider-self", "self@example.com");
+        assert!(
+            matches!(
+                store
+                    .client_market_create_quote(
+                        &owner,
+                        CreateQuoteRequest {
+                            provider_ids: vec!["provider-self".into()],
+                            country_codes: vec!["US".into()],
+                            count: 1,
+                            host_id: Some(host.id.clone()),
+                        }
+                    )
+                    .await,
+                Err(AppError::Conflict(_))
+            ),
+            "a Provider must not quote their own Host by id"
+        );
+        assert!(
+            store
+                .client_market_create_quote(
+                    &owner,
+                    CreateQuoteRequest {
+                        provider_ids: vec!["provider-self".into()],
+                        country_codes: vec!["US".into()],
+                        count: 1,
+                        host_id: None,
+                    }
+                )
+                .await
+                .is_err(),
+            "random selection must not pick the caller's own Host"
+        );
+
+        // A different account can still rent it, so the guard is not over-broad.
+        let renter = market_session("client-other", "other@example.com");
+        store
+            .client_market_create_quote(
+                &renter,
+                CreateQuoteRequest {
+                    provider_ids: vec!["provider-self".into()],
+                    country_codes: vec!["US".into()],
+                    count: 1,
+                    host_id: Some(host.id.clone()),
+                },
+            )
+            .await
+            .expect("a third-party renter must still be able to quote the Host");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Quotes expire opportunistically, so a restart with quotes outstanding could
+    /// strand Hosts in `reserved` with no live quote to release them.
+    #[tokio::test]
+    async fn stranded_reserved_host_is_detected_as_quoteless() {
+        let (store, _config, root) = test_store("trade-stranded-reserved");
+        let host = add_provider_host(
+            &store,
+            "provider-stranded",
+            "provider@example.com",
+            "198.18.32.1",
+            "US",
+            Some(500),
+            Some(30),
+        )
+        .await;
+        assert!(
+            !store
+                .client_market_host_has_live_quote(&host.id)
+                .await
+                .expect("query live quotes"),
+            "a Host with no quote rows must report no live quote"
+        );
+
+        store
+            .client_market_force_host_status(
+                &host.id,
+                HOST_STATUS_IDLE,
+                crate::client_market_trade::HOST_STATUS_RESERVED,
+                "",
+            )
+            .await
+            .expect("move host to reserved");
+
+        // CAS must refuse when the observed status is stale.
+        assert!(
+            !store
+                .client_market_force_host_status(
+                    &host.id,
+                    HOST_STATUS_IDLE,
+                    HOST_STATUS_UNREACHABLE,
+                    "",
+                )
+                .await
+                .expect("cas call must not error"),
+            "compare-and-set must refuse when the host already moved"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

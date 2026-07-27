@@ -82,7 +82,7 @@ pub fn compute_share_signals(
 /// weekly bucket counts more than a near-empty 5h bucket).
 ///
 /// Returns 0.5 (neutral) if `quota` is `None` or all tiers are short-window;
-/// the missing-signal case should not punish, since cc-switch hasn't observed
+/// the missing-signal case should not punish, since cc-switch-server hasn't observed
 /// the upstream yet.
 pub fn compute_quota_health(quota: Option<&ShareUpstreamQuota>, now: DateTime<Utc>) -> f64 {
     let Some(q) = quota else {
