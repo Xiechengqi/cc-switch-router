@@ -356,78 +356,81 @@ function Topbar({ active }: { active: DashboardShellActive }) {
   }, [authed, clientRedirect, loading]);
 
   return (
-    <header className="mx-auto flex w-[calc(100%-2rem)] max-w-7xl flex-wrap items-center justify-between gap-4 py-5">
-      <div className="flex w-full min-w-0 flex-wrap items-center gap-4 sm:w-auto sm:flex-nowrap">
-        <Link href={DASHBOARD_CLIENTS_PATH} className="flex items-center gap-3">
-          <Image src="/router-logo.svg" alt="" width={36} height={36} className="h-9 w-9" priority />
-          <span className="text-base font-extrabold leading-none">CC-Switch Router</span>
+    // Two rows on purpose. The section tabs and the region/language/user controls
+    // used to share one wrapping flex row, so adding a fifth tab pushed the controls
+    // onto a second line. Giving the tabs their own row keeps those controls pinned
+    // to the top row at every width.
+    <header className="mx-auto grid w-[calc(100%-2rem)] max-w-7xl grid-cols-[minmax(0,1fr)] gap-3 py-5">
+      <div className="flex min-w-0 items-center justify-between gap-4">
+        <Link href={DASHBOARD_CLIENTS_PATH} className="flex min-w-0 items-center gap-3">
+          <Image src="/router-logo.svg" alt="" width={36} height={36} className="h-9 w-9 shrink-0" priority />
+          <span className="truncate text-base font-extrabold leading-none">CC-Switch Router</span>
         </Link>
-        {showDashboardNav ? (
-          <>
-            <span className="hidden h-7 w-px shrink-0 bg-slate-200 sm:block" aria-hidden />
-            <div className="w-full min-w-0 sm:w-auto">
-              <DashboardNav active={active} />
-            </div>
-          </>
-        ) : null}
-      </div>
-      <div className="flex shrink-0 items-center justify-end gap-3 sm:gap-4">
-        <RouterSwitcher />
-        <LanguageSwitcher />
-        {authed ? (
-          <Dropdown>
-            <Dropdown.Trigger className="shrink-0 outline-none">
-              <Button
-                variant="outline"
-                size="sm"
-                className="h-8 gap-1.5 px-2.5 whitespace-nowrap [&_svg]:my-0"
-              >
-                <UserRound className="h-4 w-4 shrink-0" />
-                <span className="hidden sm:inline">{session?.user?.email}</span>
-              </Button>
-            </Dropdown.Trigger>
-            <Dropdown.Popover placement="bottom right">
-              <Dropdown.Menu aria-label={t("nav.userMenu")}>
-                <Dropdown.Section>
-                  <Dropdown.Item id="email" isDisabled className="text-xs text-muted-foreground">
-                    {session?.user?.email}
+        <div className="flex shrink-0 items-center justify-end gap-3 sm:gap-4">
+          <RouterSwitcher />
+          <LanguageSwitcher />
+          {authed ? (
+            <Dropdown>
+              <Dropdown.Trigger className="shrink-0 outline-none">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-8 gap-1.5 px-2.5 whitespace-nowrap [&_svg]:my-0"
+                >
+                  <UserRound className="h-4 w-4 shrink-0" />
+                  <span className="hidden sm:inline">{session?.user?.email}</span>
+                </Button>
+              </Dropdown.Trigger>
+              <Dropdown.Popover placement="bottom right">
+                <Dropdown.Menu aria-label={t("nav.userMenu")}>
+                  <Dropdown.Section>
+                    <Dropdown.Item id="email" isDisabled className="text-xs text-muted-foreground">
+                      {session?.user?.email}
+                    </Dropdown.Item>
+                  </Dropdown.Section>
+                  <Dropdown.Item id="api-token" onAction={() => setApiTokenOpen(true)}>
+                    <KeyRound className="h-4 w-4" />
+                    API Token
                   </Dropdown.Item>
-                </Dropdown.Section>
-                <Dropdown.Item id="api-token" onAction={() => setApiTokenOpen(true)}>
-                  <KeyRound className="h-4 w-4" />
-                  API Token
-                </Dropdown.Item>
-                {session?.isAdmin ? (
-                  <>
-                    <Dropdown.Item id="metrics" onAction={() => window.open("/metrics/", "_blank", "noopener,noreferrer")}>
-                      <Activity className="h-4 w-4" />
-                      {t("nav.metrics")}
-                    </Dropdown.Item>
-                    <Dropdown.Item id="settings" onAction={() => window.open("/settings/", "_blank", "noopener,noreferrer")}>
-                      <Settings className="h-4 w-4" />
-                      {t("nav.settings")}
-                    </Dropdown.Item>
-                  </>
-                ) : null}
-                <Dropdown.Item id="logout" onAction={() => logout().catch(console.error)} className="text-destructive">
-                  <LogOut className="h-4 w-4" />
-                  {t("nav.logout")}
-                </Dropdown.Item>
-              </Dropdown.Menu>
-            </Dropdown.Popover>
-          </Dropdown>
-        ) : (
-          <Button
-            variant="outline"
-            size="sm"
-            className="h-8 px-3 text-[11px] font-normal text-muted-foreground hover:text-slate-500"
-            onClick={() => setLoginOpen(true)}
-            isDisabled={loading}
-          >
-            {t("nav.login")}
-          </Button>
-        )}
+                  {session?.isAdmin ? (
+                    <>
+                      <Dropdown.Item id="metrics" onAction={() => window.open("/metrics/", "_blank", "noopener,noreferrer")}>
+                        <Activity className="h-4 w-4" />
+                        {t("nav.metrics")}
+                      </Dropdown.Item>
+                      <Dropdown.Item id="settings" onAction={() => window.open("/settings/", "_blank", "noopener,noreferrer")}>
+                        <Settings className="h-4 w-4" />
+                        {t("nav.settings")}
+                      </Dropdown.Item>
+                    </>
+                  ) : null}
+                  <Dropdown.Item id="logout" onAction={() => logout().catch(console.error)} className="text-destructive">
+                    <LogOut className="h-4 w-4" />
+                    {t("nav.logout")}
+                  </Dropdown.Item>
+                </Dropdown.Menu>
+              </Dropdown.Popover>
+            </Dropdown>
+          ) : (
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8 px-3 text-[11px] font-normal text-muted-foreground hover:text-slate-500"
+              onClick={() => setLoginOpen(true)}
+              isDisabled={loading}
+            >
+              {t("nav.login")}
+            </Button>
+          )}
+        </div>
       </div>
+
+      {showDashboardNav ? (
+        <div className="min-w-0">
+          <DashboardNav active={active} />
+        </div>
+      ) : null}
+
       <LoginDialog open={loginOpen} onOpenChange={setLoginOpen} />
       <ApiTokenDialog open={apiTokenOpen} onOpenChange={setApiTokenOpen} />
     </header>
