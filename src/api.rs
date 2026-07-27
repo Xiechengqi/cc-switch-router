@@ -1204,21 +1204,21 @@ async fn upgrade_installation(
     Json(input): Json<UpgradeInstallationRequest>,
 ) -> Result<Json<UpgradeInstallationResponse>, AppError> {
     let session_email = require_session_email(&state, &headers).await?;
-    let session_token = extract_session_token(&headers)
-        .ok_or_else(|| AppError::Unauthorized("missing session token".into()))?;
     let (tunnel_url, _) = state
         .store
         .prepare_installation_upgrade(&state.config, &installation_id, &session_email)
         .await?;
+    // Speak directly to the live client-web tunnel backend. Going through the
+    // public tunnel URL re-enters the edge proxy, which strips
+    // `x-cc-switch-web-*` and (for Market Clients) refuses to re-inject Router
+    // session identity — the Client then rejects the Router bearer with 401.
+    let backend_base = client_upgrade_backend_base(&state, &tunnel_url, &installation_id).await?;
     let response = state
         .proxy_http
-        .post(format!(
-            "{}/web-api/invoke/start_admin_upgrade",
-            tunnel_url.trim_end_matches('/')
-        ))
-        .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+        .post(format!("{backend_base}/web-api/invoke/start_admin_upgrade"))
         .header("x-cc-switch-web-user-email", session_email.as_str())
         .header("x-cc-switch-web-role", "owner")
+        .header("x-cc-switch-installation-id", installation_id.as_str())
         .json(&serde_json::json!({
             "restartAfter": input.restart_after,
             "force": true,
@@ -1253,8 +1253,6 @@ async fn upgrade_installation_status(
     Query(query): Query<InstallationUpgradeStatusQuery>,
 ) -> Result<Json<UpgradeInstallationStatusResponse>, AppError> {
     let session_email = require_session_email(&state, &headers).await?;
-    let session_token = extract_session_token(&headers)
-        .ok_or_else(|| AppError::Unauthorized("missing session token".into()))?;
     let task_id = query.task_id.trim();
     if task_id.is_empty() {
         return Err(AppError::BadRequest("taskId is required".into()));
@@ -1263,16 +1261,14 @@ async fn upgrade_installation_status(
         .store
         .prepare_installation_upgrade_status(&state.config, &installation_id, &session_email)
         .await?;
+    let backend_base = client_upgrade_backend_base(&state, &tunnel_url, &installation_id).await?;
     let response = state
         .proxy_http
-        .get(format!(
-            "{}/web-api/admin/upgrade/status",
-            tunnel_url.trim_end_matches('/')
-        ))
+        .get(format!("{backend_base}/web-api/admin/upgrade/status"))
         .query(&[("taskId", task_id)])
-        .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
         .header("x-cc-switch-web-user-email", session_email.as_str())
         .header("x-cc-switch-web-role", "owner")
+        .header("x-cc-switch-installation-id", installation_id.as_str())
         .timeout(Duration::from_secs(10))
         .send()
         .await
@@ -1293,6 +1289,36 @@ async fn upgrade_installation_status(
             AppError::Internal(format!("parse client upgrade status failed: {error}"))
         })?;
     Ok(Json(validate_installation_upgrade_status(status, task_id)?))
+}
+
+async fn client_upgrade_backend_base(
+    state: &ServerState,
+    tunnel_url: &str,
+    installation_id: &str,
+) -> Result<String, AppError> {
+    let host = tunnel_url
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    let route = state
+        .proxy
+        .backend_for_host(host, &state.config.tunnel_domain)
+        .await
+        .ok_or_else(|| AppError::Conflict("client tunnel is offline".into()))?;
+    if !route.is_client_web() {
+        return Err(AppError::Conflict(
+            "client tunnel route is not available for upgrade".into(),
+        ));
+    }
+    if let Some(route_installation_id) = route.installation_id()
+        && route_installation_id != installation_id
+    {
+        return Err(AppError::Conflict(
+            "client tunnel route does not match installation".into(),
+        ));
+    }
+    Ok(format!("http://{}", route.route_target()))
 }
 
 fn validate_installation_upgrade_status(
