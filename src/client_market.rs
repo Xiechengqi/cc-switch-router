@@ -9229,60 +9229,82 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// A Provider must not be able to rent their own Host: it would inflate their
-    /// public allocation stats. Ownership is matched by provider_id and by owner
-    /// email, because provider_id can drift from the registering account.
+    /// Providers may allocate their own Hosts — self-host then self-use is supported.
     #[tokio::test]
-    async fn self_dealing_quotes_are_refused() {
+    async fn providers_may_quote_their_own_hosts() {
         use crate::client_market_trade::CreateQuoteRequest;
 
-        let (store, _config, root) = test_store("trade-self-deal");
+        let (store, _config, root) = test_store("trade-self-use");
         let host = add_provider_host(
             &store,
             "provider-self",
             "self@example.com",
             "198.18.31.1",
             "US",
-            Some(500),
-            Some(30),
+            None,
+            None,
         )
         .await;
 
         let owner = market_session("provider-self", "self@example.com");
-        assert!(
-            matches!(
-                store
-                    .client_market_create_quote(
-                        &owner,
-                        CreateQuoteRequest {
-                            provider_ids: vec!["provider-self".into()],
-                            country_codes: vec!["US".into()],
-                            count: 1,
-                            host_id: Some(host.id.clone()),
-                        }
-                    )
-                    .await,
-                Err(AppError::Conflict(_))
-            ),
-            "a Provider must not quote their own Host by id"
-        );
-        assert!(
-            store
-                .client_market_create_quote(
-                    &owner,
-                    CreateQuoteRequest {
-                        provider_ids: vec!["provider-self".into()],
-                        country_codes: vec!["US".into()],
-                        count: 1,
-                        host_id: None,
-                    }
-                )
-                .await
-                .is_err(),
-            "random selection must not pick the caller's own Host"
-        );
+        store
+            .client_market_create_quote(
+                &owner,
+                CreateQuoteRequest {
+                    provider_ids: vec!["provider-self".into()],
+                    country_codes: vec!["US".into()],
+                    count: 1,
+                    host_id: Some(host.id.clone()),
+                },
+            )
+            .await
+            .expect("a Provider must be able to quote their own Host by id");
 
-        // A different account can still rent it, so the guard is not over-broad.
+        // Release the reserved Host so a follow-up quote can claim it again.
+        {
+            let conn = store.conn.lock().await;
+            let past = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+            conn.execute(
+                "UPDATE client_market_allocation_quotes SET status = 'expired', expires_at = ?1, updated_at = ?1",
+                params![past],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE router_ssh_hosts SET status = 'idle', updated_at = ?1 WHERE id = ?2",
+                params![past, host.id],
+            )
+            .unwrap();
+        }
+
+        let random = store
+            .client_market_create_quote(
+                &owner,
+                CreateQuoteRequest {
+                    provider_ids: vec!["provider-self".into()],
+                    country_codes: vec!["US".into()],
+                    count: 1,
+                    host_id: None,
+                },
+            )
+            .await
+            .expect("random selection must include the caller's own free Host");
+        assert_eq!(random.items[0].host_id, host.id);
+
+        {
+            let conn = store.conn.lock().await;
+            let past = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+            conn.execute(
+                "UPDATE client_market_allocation_quotes SET status = 'expired', expires_at = ?1, updated_at = ?1",
+                params![past],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE router_ssh_hosts SET status = 'idle', updated_at = ?1 WHERE id = ?2",
+                params![past, host.id],
+            )
+            .unwrap();
+        }
+
         let renter = market_session("client-other", "other@example.com");
         store
             .client_market_create_quote(

@@ -2657,12 +2657,8 @@ impl AppStore {
                     .into(),
             ));
         }
-        // Self-dealing guard. A Provider renting their own Host would inflate
-        // `successful_allocations` and distort public supply numbers. Ownership is
-        // matched the same way `session_is_host_owner` does it — by provider_id and
-        // by owner email — because provider_id can drift from the account that
-        // originally registered the Host.
-        let self_email = normalize_email(&session.email)?;
+        // Providers may allocate their own Hosts (self-host then self-use is a
+        // supported workflow). Still honour Provider→client blocks.
         let candidates = if let Some(host_id) = input.host_id.as_deref() {
             let candidate = tx
                 .query_row(
@@ -2670,21 +2666,19 @@ impl AppStore {
                             h.ip, h.price_cents, h.rental_period_days, h.offer_revision
                      FROM router_ssh_hosts h
                      WHERE h.id = ?1 AND h.status = 'idle' AND h.provider_id IS NOT NULL
-                       AND h.provider_id != ?2
-                       AND LOWER(h.host_owner_email) != ?3
                        AND NOT EXISTS (
                            SELECT 1 FROM host_provider_client_blocks b
                            WHERE b.provider_id = h.provider_id AND b.client_user_id = ?2
                              AND b.lifted_at IS NULL
                        )",
-                    params![host_id, session.user_id, self_email],
+                    params![host_id, session.user_id],
                     map_quote_candidate,
                 )
                 .optional()
                 .map_err(|error| AppError::Internal(format!("select fixed Host failed: {error}")))?
                 .ok_or_else(|| {
                     AppError::Conflict(
-                        "the selected Host is no longer idle, belongs to this account, or this Provider does not accept this account".into(),
+                        "the selected Host is no longer idle or this Provider does not accept this account".into(),
                     )
                 })?;
             vec![candidate]
@@ -2702,8 +2696,6 @@ impl AppStore {
                    AND h.price_cents IS NULL
                    AND h.provider_id IN ({provider_vars})
                    AND h.country_code IN ({country_vars})
-                   AND h.provider_id != ?
-                   AND LOWER(h.host_owner_email) != ?
                    AND NOT EXISTS (
                        SELECT 1 FROM host_provider_client_blocks b
                        WHERE b.provider_id = h.provider_id AND b.client_user_id = ?
@@ -2712,8 +2704,6 @@ impl AppStore {
             );
             let mut values = provider_ids.clone();
             values.extend(countries.clone());
-            values.push(session.user_id.clone());
-            values.push(self_email.clone());
             values.push(session.user_id.clone());
             let mut statement = tx.prepare(&sql).map_err(|error| {
                 AppError::Internal(format!("prepare random Host quote failed: {error}"))
@@ -2742,6 +2732,7 @@ impl AppStore {
         }
         let quote_id = Uuid::new_v4().to_string();
         let expires_at = now + Duration::seconds(QUOTE_TTL_SECS);
+        let client_owner_email = normalize_email(&session.email)?;
         tx.execute(
             "INSERT INTO client_market_allocation_quotes
                 (id, client_user_id, client_owner_email, status, fixed_host_id,
@@ -2750,7 +2741,7 @@ impl AppStore {
             params![
                 quote_id,
                 session.user_id,
-                self_email,
+                client_owner_email,
                 input.host_id,
                 expires_at.to_rfc3339(),
                 now.to_rfc3339(),
