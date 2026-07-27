@@ -8223,6 +8223,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_supply_counts_null_provider_id_free_forever_hosts_as_idle() {
+        let (store, _config, root) = test_store("provider-supply-null-provider-free-idle");
+        store
+            .client_market_ensure_provider("provider-stable", "provider@example.com")
+            .await
+            .expect("create Provider profile");
+        let free = add_provider_host(
+            &store,
+            "provider-stable",
+            "provider@example.com",
+            "198.18.25.3",
+            "US",
+            None,
+            None,
+        )
+        .await;
+        {
+            let conn = store.conn.lock().await;
+            // Live us01 shape: provider_id was added nullable and never backfilled.
+            // SQL `NULL != canonical_id` is unknown, so the old heal skipped these rows.
+            conn.execute(
+                "UPDATE router_ssh_hosts
+                 SET provider_id = NULL, price_cents = NULL, rental_period_days = NULL, status = 'idle'
+                 WHERE id = ?1",
+                params![free.id],
+            )
+            .unwrap();
+            let still_null: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM router_ssh_hosts WHERE id = ?1 AND provider_id IS NULL",
+                    params![free.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(still_null, 1);
+        }
+
+        let supply = store
+            .client_market_provider_supply(Some("provider@example.com"))
+            .await
+            .expect("load Provider supply");
+        let provider = supply
+            .providers
+            .iter()
+            .find(|item| item.provider_id == "provider-stable")
+            .expect("stable provider");
+        assert_eq!(provider.host_total, 1);
+        assert_eq!(provider.idle_total, 1);
+        assert_eq!(provider.free_host_total, 1);
+        let us = provider
+            .countries
+            .iter()
+            .find(|country| country.code == "US")
+            .expect("US capacity from null-provider free host");
+        assert_eq!(us.idle, 1);
+        assert_eq!(us.total, 1);
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn billing_reconcile_opens_one_renewal_and_reports_overdue_client() {
         let (store, _config, root) = test_store("trade-renewal");
         let host = add_provider_host(

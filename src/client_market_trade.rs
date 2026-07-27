@@ -722,6 +722,12 @@ fn heal_hosts_onto_provider_tx(
 
 fn heal_all_provider_host_bindings_tx(tx: &Transaction<'_>, now: &str) -> Result<(), AppError> {
     // Prefer stable (non email:) profiles when multiple could match.
+    //
+    // `provider_id IS NULL` must be handled explicitly: SQLite treats
+    // `NULL != '<id>'` as unknown, so a bare inequality skips every legacy Host
+    // whose provider_id column was added nullable and never backfilled. Those
+    // free/forever idle Hosts then disappear from Create Client supply even
+    // though their owner_email already matches a Provider profile.
     tx.execute(
         "UPDATE router_ssh_hosts
          SET provider_id = (
@@ -736,12 +742,15 @@ fn heal_all_provider_host_bindings_tx(tx: &Transaction<'_>, now: &str) -> Result
                 SELECT 1 FROM host_provider_profiles p
                 WHERE lower(p.owner_email) = lower(router_ssh_hosts.host_owner_email)
              )
-           AND provider_id != (
-                SELECT p.provider_id
-                FROM host_provider_profiles p
-                WHERE lower(p.owner_email) = lower(router_ssh_hosts.host_owner_email)
-                ORDER BY CASE WHEN p.provider_id LIKE 'email:%' THEN 1 ELSE 0 END, p.created_at
-                LIMIT 1
+           AND (
+                provider_id IS NULL
+                OR provider_id != (
+                    SELECT p.provider_id
+                    FROM host_provider_profiles p
+                    WHERE lower(p.owner_email) = lower(router_ssh_hosts.host_owner_email)
+                    ORDER BY CASE WHEN p.provider_id LIKE 'email:%' THEN 1 ELSE 0 END, p.created_at
+                    LIMIT 1
+                )
              )",
         params![now],
     )
