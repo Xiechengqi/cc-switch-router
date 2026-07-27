@@ -4,6 +4,7 @@ import * as React from "react";
 import { Button, Chip, Modal, Tabs } from "@heroui/react";
 import { Check, Copy, Dices, Loader2, LogIn, Minus, Plus, RotateCcw, Server } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
+import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { CountryFlag } from "@/components/common/country-flag";
 import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
 import { buildClientInstallCommand } from "@/components/dashboard/install-guide-dialog";
@@ -114,7 +115,6 @@ export function CreateClientDialog({
   const [providers, setProviders] = React.useState<ClientMarketProvider[]>([]);
   const [providerSupplyLoaded, setProviderSupplyLoaded] = React.useState(false);
   const [officialProviderId, setOfficialProviderId] = React.useState<string>();
-  const [routerOwnerEmail, setRouterOwnerEmail] = React.useState<string>();
   const [providerPersist, setProviderPersist] = usePersistentState<CreateClientSelectionPersist>(
     PROVIDERS_KEY,
     { mode: "official_default", providerIds: [] },
@@ -152,6 +152,48 @@ export function CreateClientDialog({
   const selectedProviders = React.useMemo(
     () => providers.filter((provider) => selectedProviderIds.includes(provider.providerId)),
     [providers, selectedProviderIds],
+  );
+  const providerOptions = React.useMemo(
+    () =>
+      providers.map((provider) => ({
+        value: provider.providerId,
+        label: [
+          provider.ownerEmail,
+          provider.official ? t("createClient.official") : null,
+          `${provider.idleTotal}/${provider.hostTotal}`,
+        ]
+          .filter(Boolean)
+          .join(" · "),
+      })),
+    [providers, t],
+  );
+  /** CompactRegionMultiSelect treats `[]` as “all”; mirror that when every owner is selected. */
+  const providerFilterValues = React.useMemo(() => {
+    if (
+      providers.length > 0 &&
+      selectedProviderIds.length === providers.length &&
+      providers.every((provider) => selectedProviderIds.includes(provider.providerId))
+    ) {
+      return [];
+    }
+    return selectedProviderIds;
+  }, [providers, selectedProviderIds]);
+  const setSelectedProviders = React.useCallback(
+    (ids: string[]) => {
+      if (ids.length === 0) {
+        setProviderPersist({
+          mode: "custom",
+          providerIds: providers.map((provider) => provider.providerId),
+        });
+        return;
+      }
+      if (officialProviderId && ids.length === 1 && ids[0] === officialProviderId) {
+        setProviderPersist({ mode: "official_default", providerIds: [] });
+        return;
+      }
+      setProviderPersist({ mode: "custom", providerIds: ids });
+    },
+    [officialProviderId, providers, setProviderPersist],
   );
   const regionOptions = React.useMemo(() => {
     const counts = new Map<string, { idle: number; total: number }>();
@@ -197,7 +239,6 @@ export function CreateClientDialog({
       .then((response) => {
         setProviders(response.providers);
         setOfficialProviderId(response.officialProviderId);
-        setRouterOwnerEmail(response.routerOwnerEmail);
         setProviderSupplyLoaded(true);
       })
       .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)))
@@ -213,6 +254,24 @@ export function CreateClientDialog({
       setProviderPersist({ mode: "custom", providerIds: valid });
     }
   }, [availableProviderIds, providerSupplyLoaded, safeProviders, setProviderPersist]);
+
+  React.useEffect(() => {
+    if (!providerSupplyLoaded || safeProviders.mode !== "official_default") return;
+    if (officialProviderId && availableProviderIds.has(officialProviderId)) return;
+    if (!providers.length) return;
+    // No official Provider configured — fall back to every host owner so non-official supply is reachable.
+    setProviderPersist({
+      mode: "custom",
+      providerIds: providers.map((provider) => provider.providerId),
+    });
+  }, [
+    availableProviderIds,
+    officialProviderId,
+    providerSupplyLoaded,
+    providers,
+    safeProviders.mode,
+    setProviderPersist,
+  ]);
 
   React.useEffect(() => {
     const options = regionOptions.map((region) => region.code);
@@ -507,7 +566,17 @@ export function CreateClientDialog({
                 ) : (
                   <>
                     <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-2">
-                      <div className="grid min-w-0 gap-2 sm:flex sm:flex-wrap sm:items-center sm:justify-between"><span className="text-sm font-medium">{t("createClient.hostProvider")}</span><Button size="sm" className="min-w-0 max-w-full justify-start" variant={safeProviders.mode === "official_default" ? "primary" : "outline"} onClick={() => setProviderPersist({ mode: "official_default", providerIds: [] })}><span className="min-w-0 truncate">{t("createClient.official")} · {routerOwnerEmail || t("createClient.routerOwner")}</span></Button></div>
+                      <span className="text-sm font-medium">{t("createClient.hostProvider")}</span>
+                      <CompactRegionMultiSelect
+                        values={providerFilterValues}
+                        onChange={setSelectedProviders}
+                        options={providerOptions}
+                        allLabel={t("createClient.hostOwnersAll")}
+                        moreLabel={(count) => t("createClient.hostOwnersMore", { count })}
+                        clearLabel={t("createClient.clearOwners")}
+                        ariaLabel={t("createClient.filterHostOwners")}
+                        className="w-full max-w-md"
+                      />
                       {showOfficialCapacityHint ? (
                         <p className="text-xs text-amber-800">
                           {officialProviderId
@@ -515,16 +584,6 @@ export function CreateClientDialog({
                             : t("createClient.officialNotConfigured")}
                         </p>
                       ) : null}
-                      <div className="grid min-w-0 max-h-44 grid-cols-[minmax(0,1fr)] gap-1 overflow-y-auto rounded-md border p-2">
-                        {providers.map((provider) => {
-                          const checked = selectedProviderIds.includes(provider.providerId);
-                          return <label key={provider.providerId} className="grid min-w-0 cursor-pointer grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-2 gap-y-1 rounded px-1 py-1.5 text-sm hover:bg-slate-50"><input className="row-span-2" type="checkbox" checked={checked} onChange={() => {
-                            const current = new Set(selectedProviderIds);
-                            if (current.has(provider.providerId)) current.delete(provider.providerId); else current.add(provider.providerId);
-                            setProviderPersist({ mode: "custom", providerIds: Array.from(current) });
-                          }} /><span className="min-w-0 truncate" title={provider.ownerEmail}>{provider.ownerEmail}</span><span className="font-mono text-xs text-muted-foreground">{provider.idleTotal}/{provider.hostTotal}</span><span className="col-span-2 col-start-2 flex min-w-0 flex-wrap items-center gap-1.5">{provider.official ? <Chip size="sm" variant="soft">{t("createClient.official")}</Chip> : null}<PaymentMethodIcons kinds={provider.paymentMethodKinds} /></span></label>;
-                        })}
-                      </div>
                     </section>
                     <section className="grid gap-2"><span className="text-sm font-medium">{t("createClient.regions")}</span><div className="grid max-h-40 gap-1 overflow-y-auto rounded-md border p-2">
                       {regionOptions.map((region) => {
