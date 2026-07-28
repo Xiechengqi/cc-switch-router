@@ -5837,7 +5837,7 @@ impl AppStore {
             .unwrap_or(owner_email.as_str());
         let should_block_client = is_host_owner
             && reason == "payment_not_received"
-            && block_client_for_provider.unwrap_or(true)
+            && block_client_for_provider.unwrap_or(false)
             && subscription_owner
                 .as_ref()
                 .is_some_and(|owner| host.1.as_deref() != Some(owner.0.as_str()));

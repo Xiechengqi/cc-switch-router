@@ -24,18 +24,18 @@ import { useBatchOperations } from "@/components/dashboard/client-market/use-bat
 import { AddHostDialog } from "@/components/dashboard/client-market/add-host-dialog";
 import { HostRow } from "@/components/dashboard/client-market/host-row";
 import { HostSortHeader } from "@/components/dashboard/client-market/host-sort-header";
+import { ProviderBlocksPanel } from "@/components/dashboard/client-market/provider-blocks-panel";
 import {
   BatchProgressItem,
   CLEARED_HOST_SORT,
   CLIENT_MARKET_POLL_MS,
   DEFAULT_HOST_SORT,
+  HOST_LIST_TABS,
   HOST_PAGE_SIZE,
-  HOST_STATUS_GROUPS,
+  HostListTab,
   HostSortKey,
   HostSortPrefs,
-  HostStatusFilter,
-  OWNER_SCOPE_KEY,
-  OwnerScope,
+  OWNER_FILTER_KEY,
   PAYMENT_FILTER_KEY,
   PAYMENT_FILTER_KINDS,
   REGION_FILTER_KEY,
@@ -46,18 +46,20 @@ import {
   cleanupReasonForHost,
   countBatchStatuses,
   encodeHostTransferDocument,
+  hostBelongsToViewer,
   hostCanCleanup,
   hostCanDelete,
   hostCanExport,
   hostCanReverify,
   hostDisplayLabel,
   hostExportKey,
-  hostMatchesStatusFilter,
+  hostMatchesListTab,
   hostStatusTabTone,
   hostSupportsPaymentKind,
   mapPool,
+  normalizeHostListTab,
   normalizeHostSortPrefs,
-  normalizeHostStatusFilter,
+  normalizeOwnerFilters,
   parseHostTransferLines,
   paymentKindLabelKey,
   sortHosts,
@@ -77,29 +79,19 @@ export function ClientMarketPage() {
   const [loading, setLoading] = React.useState(true);
   const [addOpen, setAddOpen] = React.useState(false);
   const [pendingAddAfterLogin, setPendingAddAfterLogin] = React.useState(false);
-  const [ownerScope, setOwnerScope] = usePersistentState<OwnerScope>(OWNER_SCOPE_KEY, {
-    mode: "mine",
-  });
-  const ownerFilters = React.useMemo(() => {
-    if (ownerScope.mode === "custom") return ownerScope.emails;
-    return viewerEmail ? [viewerEmail] : [];
-  }, [ownerScope, viewerEmail]);
-  const viewingOwnHosts = ownerScope.mode === "mine" && !!viewerEmail;
+  const [ownerFiltersRaw, setOwnerFiltersRaw] = usePersistentState<string[]>(OWNER_FILTER_KEY, []);
+  const ownerFilters = React.useMemo(() => normalizeOwnerFilters(ownerFiltersRaw), [ownerFiltersRaw]);
   const setOwnerFilters = React.useCallback(
-    (emails: string[]) => setOwnerScope({ mode: "custom", emails }),
-    [setOwnerScope],
-  );
-  const showOnlyMyHosts = React.useCallback(() => setOwnerScope({ mode: "mine" }), [setOwnerScope]);
-  const showAllSupply = React.useCallback(
-    () => setOwnerScope({ mode: "custom", emails: [] }),
-    [setOwnerScope],
+    (emails: string[]) => setOwnerFiltersRaw(normalizeOwnerFilters(emails)),
+    [setOwnerFiltersRaw],
   );
   const [regionFilters, setRegionFilters] = usePersistentState<string[]>(REGION_FILTER_KEY, []);
   const [paymentFilters, setPaymentFilters] = usePersistentState<string[]>(PAYMENT_FILTER_KEY, []);
-  const [statusFilterRaw, setStatusFilter] = usePersistentState<HostStatusFilter>(STATUS_FILTER_KEY, "all");
+  const [listTabRaw, setListTab] = usePersistentState<HostListTab>(STATUS_FILTER_KEY, "mine");
   const [sortPrefsRaw, setSortPrefs] = usePersistentState<HostSortPrefs>(SORT_PREFS_KEY, DEFAULT_HOST_SORT);
   const sortPrefs = React.useMemo(() => normalizeHostSortPrefs(sortPrefsRaw), [sortPrefsRaw]);
-  const statusFilter = normalizeHostStatusFilter(statusFilterRaw);
+  const listTab = normalizeHostListTab(listTabRaw, authed);
+  const viewingMine = listTab === "mine";
   const [page, setPage] = React.useState(1);
   const [error, setError] = React.useState("");
   const [fixedHost, setFixedHost] = React.useState<ClientMarketHost | null>(null);
@@ -213,8 +205,14 @@ export function ClientMarketPage() {
     });
   }, [hosts, ownerFilters, paymentFilters, regionFilters]);
 
+  const mineHosts = React.useMemo(
+    () => (authed ? scopedHosts.filter(hostBelongsToViewer) : []),
+    [authed, scopedHosts],
+  );
+
   const statusCounts = React.useMemo(() => {
-    const counts: Record<HostStatusFilter, number> = {
+    const counts: Record<HostListTab, number> = {
+      mine: mineHosts.length,
       all: scopedHosts.length,
       idle: 0,
       in_use: 0,
@@ -225,12 +223,12 @@ export function ClientMarketPage() {
       if (group) counts[group] += 1;
     }
     return counts;
-  }, [scopedHosts]);
+  }, [mineHosts.length, scopedHosts]);
 
   const visibleHosts = React.useMemo(() => {
-    const filtered = scopedHosts.filter((host) => hostMatchesStatusFilter(host.status, statusFilter));
+    const filtered = scopedHosts.filter((host) => hostMatchesListTab(host, listTab));
     return sortHosts(filtered, sortPrefs);
-  }, [scopedHosts, sortPrefs, statusFilter]);
+  }, [listTab, scopedHosts, sortPrefs]);
 
   const toggleHostSort = React.useCallback((key: HostSortKey) => {
     setSortPrefs((prev) => {
@@ -288,7 +286,11 @@ export function ClientMarketPage() {
 
   React.useEffect(() => {
     setPage(1);
-  }, [ownerFilters, paymentFilters, regionFilters, sortPrefs.key, sortPrefs.dir, statusFilter]);
+  }, [ownerFilters, paymentFilters, regionFilters, sortPrefs.key, sortPrefs.dir, listTab]);
+
+  React.useEffect(() => {
+    if (!authed && listTabRaw === "mine") setListTab("all");
+  }, [authed, listTabRaw, setListTab]);
 
   React.useEffect(() => {
     if (page > totalPages) setPage(totalPages);
@@ -380,13 +382,13 @@ export function ClientMarketPage() {
 
   const statusTabs = React.useMemo(
     () =>
-      HOST_STATUS_GROUPS.map((value) => ({
+      HOST_LIST_TABS.filter((value) => value !== "mine" || authed).map((value) => ({
         value,
         label: t(statusGroupLabelKey(value)),
         hint: t(statusGroupHintKey(value)),
         count: statusCounts[value],
       })),
-    [statusCounts, t],
+    [authed, statusCounts, t],
   );
 
   return (
@@ -400,8 +402,8 @@ export function ClientMarketPage() {
                 type="button"
                 title={tab.hint}
                 aria-label={`${tab.label}. ${tab.hint}`}
-                onClick={() => setStatusFilter(tab.value)}
-                className={`rounded-md px-2.5 py-1.5 transition-colors ${hostStatusTabTone(tab.value, statusFilter === tab.value)}`}
+                onClick={() => setListTab(tab.value)}
+                className={`rounded-md px-2.5 py-1.5 transition-colors ${hostStatusTabTone(tab.value, listTab === tab.value)}`}
               >
                 {tab.label} · {tab.count}
               </button>
@@ -461,16 +463,6 @@ export function ClientMarketPage() {
                 <Tooltip.Content>{t("clientMarket.exportMyHosts")}</Tooltip.Content>
               </Tooltip>
             </>
-          ) : null}
-          {authed ? (
-            <Button
-              variant="outline"
-              size="sm"
-              className="h-8"
-              onClick={viewingOwnHosts ? showAllSupply : showOnlyMyHosts}
-            >
-              {viewingOwnHosts ? t("clientMarket.scopeShowAll") : t("clientMarket.scopeShowMine")}
-            </Button>
           ) : null}
           <Button variant="primary" size="sm" className="h-8" onClick={openAddHost}>
             <Plus className="h-4 w-4" />
@@ -579,35 +571,37 @@ export function ClientMarketPage() {
       ) : visibleHosts.length === 0 ? (
         <div className="grid justify-items-center gap-2 rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">
           <span>
-            {scopedHosts.length
-              ? t("dashboard.noFilterResults")
-              : viewingOwnHosts
+            {viewingMine
+              ? !ownerFilters.length && !regionFilters.length && !paymentFilters.length
                 ? t("clientMarket.scopeMineEmpty")
+                : t("dashboard.noFilterResults")
+              : scopedHosts.length || ownerFilters.length || regionFilters.length || paymentFilters.length
+                ? t("dashboard.noFilterResults")
                 : t("clientMarket.noHosts")}
           </span>
-          {/* A Provider with no hosts of their own should be able to reach the public
-              supply listing without discovering the scope toggle first. */}
-          {viewingOwnHosts && !scopedHosts.length ? (
+          {viewingMine &&
+          !mineHosts.length &&
+          !ownerFilters.length &&
+          !regionFilters.length &&
+          !paymentFilters.length ? (
             <button
               type="button"
               className="text-xs font-medium text-primary hover:underline"
-              onClick={showAllSupply}
+              onClick={() => setListTab("all")}
             >
               {t("clientMarket.scopeMineEmptyAction")}
             </button>
           ) : null}
-          {scopedHosts.length ||
-          !viewingOwnHosts ||
-          ownerFilters.length ||
+          {ownerFilters.length ||
           regionFilters.length ||
           paymentFilters.length ||
-          statusFilter !== "all" ? (
+          listTab !== (authed ? "mine" : "all") ? (
             <button
               type="button"
               className="text-xs font-medium text-primary hover:underline"
               onClick={() => {
-                setStatusFilter("all");
-                setOwnerScope({ mode: "mine" });
+                setListTab(authed ? "mine" : "all");
+                setOwnerFilters([]);
                 setRegionFilters([]);
                 setPaymentFilters([]);
               }}
@@ -964,6 +958,8 @@ export function ClientMarketPage() {
           </Modal.Dialog>
         </Modal.Container>
       </Modal.Backdrop>
+
+      <ProviderBlocksPanel enabled={authed} />
     </div>
   );
 }

@@ -22,6 +22,7 @@ export function ConfirmAlertDialog({
   cancelLabel,
   busy = false,
   tone = "primary",
+  extra,
   onConfirm,
   onOpenChange,
 }: {
@@ -32,6 +33,8 @@ export function ConfirmAlertDialog({
   cancelLabel: React.ReactNode;
   busy?: boolean;
   tone?: ConfirmTone;
+  /** Optional controls under the description (e.g. block checkbox). */
+  extra?: React.ReactNode;
   onConfirm: () => void;
   onOpenChange: (open: boolean) => void;
 }) {
@@ -51,7 +54,10 @@ export function ConfirmAlertDialog({
               <AlertDialog.Heading className="!text-slate-900">{title}</AlertDialog.Heading>
             </AlertDialog.Header>
             <AlertDialog.Body>
-              <div className="text-sm leading-6 !text-slate-600">{description}</div>
+              <div className="grid gap-3">
+                <div className="text-sm leading-6 !text-slate-600">{description}</div>
+                {extra ? <div className="text-sm !text-slate-700">{extra}</div> : null}
+              </div>
             </AlertDialog.Body>
             <AlertDialog.Footer>
               <Button

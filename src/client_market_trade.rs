@@ -87,6 +87,14 @@ pub struct ProviderClientBlockView {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CreateProviderBlockRequest {
+    pub email: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdatePaymentProfileRequest {
     #[serde(default)]
     pub methods: Vec<PaymentMethod>,
@@ -557,14 +565,17 @@ pub fn router() -> Router<ServerState> {
             get(get_payment_profile).put(update_payment_profile),
         )
         .route("/v1/account/payment-assets/:id", get(get_payment_asset))
-        .route("/v1/account/provider-blocks", get(list_provider_blocks))
+        .route(
+            "/v1/account/provider-blocks",
+            get(list_provider_blocks).post(create_provider_block),
+        )
         .route(
             "/v1/account/provider-blocks/:client_user_id",
             delete(lift_provider_block),
         )
         .route(
             "/v1/client-market/provider-blocks",
-            get(list_provider_blocks),
+            get(list_provider_blocks).post(create_provider_block),
         )
         .route(
             "/v1/client-market/provider-blocks/:client_user_id",
@@ -1010,6 +1021,20 @@ async fn list_provider_blocks(
         state
             .store
             .client_market_provider_blocks(&session.user_id)
+            .await?,
+    ))
+}
+
+async fn create_provider_block(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<CreateProviderBlockRequest>,
+) -> Result<Json<ProviderClientBlockView>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    Ok(Json(
+        state
+            .store
+            .client_market_create_provider_block(&session, &input.email, input.reason.as_deref())
             .await?,
     ))
 }
@@ -2020,6 +2045,95 @@ impl AppStore {
             .map_err(|error| {
                 AppError::Internal(format!("read Provider block list failed: {error}"))
             })
+    }
+
+    pub async fn client_market_create_provider_block(
+        &self,
+        session: &AuthSession,
+        email: &str,
+        reason: Option<&str>,
+    ) -> Result<ProviderClientBlockView, AppError> {
+        let email = normalize_email(email)?;
+        if email.eq_ignore_ascii_case(session.email.trim()) {
+            return Err(AppError::BadRequest(
+                "cannot block your own account from your Hosts".into(),
+            ));
+        }
+        let reason = reason
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("manual");
+        if reason.len() > 64
+            || !reason
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        {
+            return Err(AppError::BadRequest(
+                "block reason must be a short ascii token".into(),
+            ));
+        }
+        let now = Utc::now();
+        let mut conn = self.conn.lock().await;
+        let client_user_id: String = conn
+            .query_row(
+                "SELECT id FROM users WHERE email_normalized = ?1",
+                params![email],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| AppError::Internal(format!("lookup blocked user failed: {error}")))?
+            .ok_or_else(|| {
+                AppError::NotFound("no Router account found for that email".into())
+            })?;
+        if client_user_id == session.user_id {
+            return Err(AppError::BadRequest(
+                "cannot block your own account from your Hosts".into(),
+            ));
+        }
+        let tx = conn.transaction().map_err(|error| {
+            AppError::Internal(format!("begin Provider block create failed: {error}"))
+        })?;
+        tx.execute(
+            "INSERT INTO host_provider_client_blocks
+                (provider_id, client_user_id, client_owner_email, reason, created_at, lifted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL)
+             ON CONFLICT(provider_id, client_user_id) DO UPDATE SET
+                client_owner_email = excluded.client_owner_email,
+                reason = excluded.reason,
+                created_at = excluded.created_at,
+                lifted_at = NULL",
+            params![
+                session.user_id,
+                client_user_id,
+                email,
+                reason,
+                now.to_rfc3339()
+            ],
+        )
+        .map_err(|error| AppError::Internal(format!("insert Provider block failed: {error}")))?;
+        insert_audit_tx(
+            &tx,
+            None,
+            None,
+            Some(&session.user_id),
+            Some(&session.email),
+            "provider_client_block_created",
+            serde_json::json!({
+                "clientUserId": client_user_id,
+                "clientOwnerEmail": email,
+                "reason": reason,
+            }),
+            now,
+        )?;
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!("commit Provider block create failed: {error}"))
+        })?;
+        Ok(ProviderClientBlockView {
+            client_user_id,
+            client_owner_email: email,
+            reason: reason.to_string(),
+            created_at: now.to_rfc3339(),
+        })
     }
 
     pub async fn client_market_lift_provider_block(

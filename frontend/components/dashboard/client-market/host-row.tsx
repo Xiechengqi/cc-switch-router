@@ -64,6 +64,7 @@ function HostRowImpl({
   const { openTerminal } = useWebTerminal();
   const [busy, setBusy] = React.useState(false);
   const [confirmAction, setConfirmAction] = React.useState<"delete" | "cleanup" | "unpaid" | null>(null);
+  const [blockUnpaidRenter, setBlockUnpaidRenter] = React.useState(false);
   const [cleanupJob, setCleanupJob] = React.useState<ProvisioningJob | null>(null);
   const [cleanupOpen, setCleanupOpen] = React.useState(false);
   const [offerOpen, setOfferOpen] = React.useState(false);
@@ -135,7 +136,7 @@ function HostRowImpl({
     }
   };
 
-  const onCleanup = async (markUnpaid: boolean) => {
+  const onCleanup = async (markUnpaid: boolean, blockClient = false) => {
     if (!host.installationId) return;
     setConfirmAction(null);
     setBusy(true);
@@ -145,7 +146,7 @@ function HostRowImpl({
       const { jobId } = markUnpaid
         ? await cleanupClientMarketClientWithReason(host.installationId, {
             reason: "payment_not_received",
-            blockClientForProvider: true,
+            blockClientForProvider: blockClient,
           })
         : await cleanupClientMarketClientWithReason(host.installationId, {
             reason: cleanupReasonForHost(host),
@@ -359,7 +360,14 @@ function HostRowImpl({
                       </Dropdown.Item>
                     ) : null}
                     {canMarkUnpaid ? (
-                      <Dropdown.Item id="unpaid" className="text-destructive" onAction={() => setConfirmAction("unpaid")}>
+                      <Dropdown.Item
+                        id="unpaid"
+                        className="text-destructive"
+                        onAction={() => {
+                          setBlockUnpaidRenter(false);
+                          setConfirmAction("unpaid");
+                        }}
+                      >
                         <X className="h-4 w-4" />
                         {t("clientMarket.unpaidCleanup")}
                       </Dropdown.Item>
@@ -406,13 +414,40 @@ function HostRowImpl({
                   cancelLabel={t("common.cancel")}
                   tone="danger"
                   busy={busy}
+                  extra={
+                    confirmAction === "unpaid" && host.clientOwnerEmail ? (
+                      <label className="inline-flex items-start gap-2">
+                        <Checkbox
+                          isSelected={blockUnpaidRenter}
+                          onChange={setBlockUnpaidRenter}
+                          isDisabled={busy}
+                          aria-label={t("clientMarket.unpaidBlockCheckbox", {
+                            email: host.clientOwnerEmail,
+                          })}
+                          className="mt-0.5 shrink-0"
+                        >
+                          <Checkbox.Control className="border border-slate-300 bg-white shadow-none">
+                            <Checkbox.Indicator />
+                          </Checkbox.Control>
+                        </Checkbox>
+                        <span className="leading-5">
+                          {t("clientMarket.unpaidBlockCheckbox", { email: host.clientOwnerEmail })}
+                        </span>
+                      </label>
+                    ) : null
+                  }
                   onConfirm={() => {
-                    if (confirmAction === "cleanup" || confirmAction === "unpaid") {
-                      void onCleanup(confirmAction === "unpaid");
+                    if (confirmAction === "cleanup") {
+                      void onCleanup(false);
+                    } else if (confirmAction === "unpaid") {
+                      void onCleanup(true, blockUnpaidRenter);
                     } else void onDelete();
                   }}
                   onOpenChange={(nextOpen) => {
-                    if (!nextOpen && !busy) setConfirmAction(null);
+                    if (!nextOpen && !busy) {
+                      setConfirmAction(null);
+                      setBlockUnpaidRenter(false);
+                    }
                   }}
                 />
               ) : null}

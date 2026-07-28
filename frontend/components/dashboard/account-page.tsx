@@ -7,8 +7,8 @@ import { useAuth } from "@/components/auth/auth-provider";
 import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
 import { AuthenticatedImage } from "@/components/common/authenticated-image";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { getAccountPaymentProfile, getClientMarketProviderBlocks, liftClientMarketProviderBlock, updateAccountPaymentProfile } from "@/lib/api";
-import type { ClientMarketPaymentMethod, ClientMarketProviderBlock } from "@/lib/types";
+import { getAccountPaymentProfile, updateAccountPaymentProfile } from "@/lib/api";
+import type { ClientMarketPaymentMethod } from "@/lib/types";
 
 type CryptoDraft = { token: "USDT" | "USDC"; chain: "bsc" | "base" | "eth" | "tron"; address: string };
 type PaymentDraft = {
@@ -64,18 +64,13 @@ function serializePaymentDraft(draft: PaymentDraft) {
   });
 }
 
-function blockReasonLabel(reason: string, t: ReturnType<typeof useLocaleText>["t"]) {
-  if (reason === "payment_not_received") return t("account.blockReason.paymentNotReceived");
-  return reason.replaceAll("_", " ");
-}
-
 function chainLabel(chain: CryptoDraft["chain"]) {
   return CRYPTO_CHAINS.find((item) => item.id === chain)?.label || chain;
 }
 
-/** Payment details + collapsed blocked-renter list (Account → 收款信息). */
+/** Payment details (Account → 收款信息). Blocked renters live on Client Market. */
 export function AccountPaymentsPanel() {
-  const { locale, t } = useLocaleText();
+  const { t } = useLocaleText();
   const { session, loading: authLoading } = useAuth();
   const authed = !!session?.authenticated;
   const [loading, setLoading] = React.useState(false);
@@ -83,9 +78,6 @@ export function AccountPaymentsPanel() {
   const [draft, setDraft] = React.useState<PaymentDraft>(emptyPaymentDraft);
   const [baseline, setBaseline] = React.useState(() => serializePaymentDraft(emptyPaymentDraft()));
   const [previews, setPreviews] = React.useState<Record<string, string>>({});
-  const [blocks, setBlocks] = React.useState<ClientMarketProviderBlock[]>([]);
-  const [liftingBlock, setLiftingBlock] = React.useState("");
-  const [blocksOpen, setBlocksOpen] = React.useState(true);
 
   const dirty = serializePaymentDraft(draft) !== baseline;
 
@@ -126,11 +118,8 @@ export function AccountPaymentsPanel() {
   React.useEffect(() => {
     if (!authed) return;
     setLoading(true);
-    Promise.all([getAccountPaymentProfile(), getClientMarketProviderBlocks()])
-      .then(([profile, providerBlocks]) => {
-        applyProfile(profile.methods);
-        setBlocks(providerBlocks);
-      })
+    getAccountPaymentProfile()
+      .then((profile) => applyProfile(profile.methods))
       .catch((error) => toast.danger(error instanceof Error ? error.message : String(error)))
       .finally(() => setLoading(false));
   }, [applyProfile, authed]);
@@ -173,19 +162,6 @@ export function AccountPaymentsPanel() {
       toast.danger(error instanceof Error ? error.message : String(error));
     } finally {
       setSaving(false);
-    }
-  };
-
-  const unblock = async (block: ClientMarketProviderBlock) => {
-    setLiftingBlock(block.clientUserId);
-    try {
-      await liftClientMarketProviderBlock(block.clientUserId);
-      setBlocks((current) => current.filter((item) => item.clientUserId !== block.clientUserId));
-      toast.success(t("account.unblockedToast", { email: block.clientOwnerEmail }));
-    } catch (error) {
-      toast.danger(error instanceof Error ? error.message : String(error));
-    } finally {
-      setLiftingBlock("");
     }
   };
 
@@ -427,51 +403,6 @@ export function AccountPaymentsPanel() {
           />
         </div>
       </section>
-
-      {blocks.length ? (
-        <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-3 rounded-xl border border-border bg-card p-4 shadow-sm">
-          <button
-            type="button"
-            className="flex min-w-0 items-start justify-between gap-3 text-left"
-            aria-expanded={blocksOpen}
-            onClick={() => setBlocksOpen((open) => !open)}
-          >
-            <div className="min-w-0">
-              <h2 className="text-sm font-semibold">
-                {t("account.blockedOwners")} · {blocks.length}
-              </h2>
-              <p className="mt-0.5 text-xs text-muted-foreground">{t("account.blockedHint")}</p>
-            </div>
-            <span className="shrink-0 text-xs text-muted-foreground">
-              {blocksOpen ? t("account.blockedCollapse") : t("account.blockedExpand")}
-            </span>
-          </button>
-          {blocksOpen ? (
-            <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-2">
-              {blocks.map((block) => (
-                <div
-                  key={block.clientUserId}
-                  className="flex min-w-0 flex-wrap items-center justify-between gap-3 rounded-md border bg-white px-3 py-2 text-sm"
-                >
-                  <div className="min-w-0 max-w-full">
-                    <div className="truncate font-medium">{block.clientOwnerEmail}</div>
-                    <div className="break-words text-xs text-muted-foreground">
-                      {blockReasonLabel(block.reason, t)} ·{" "}
-                      {new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(
-                        new Date(block.createdAt),
-                      )}
-                    </div>
-                  </div>
-                  <Button size="sm" variant="outline" isDisabled={!!liftingBlock} onClick={() => void unblock(block)}>
-                    {liftingBlock === block.clientUserId ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                    {t("account.unblock")}
-                  </Button>
-                </div>
-              ))}
-            </div>
-          ) : null}
-        </section>
-      ) : null}
     </div>
   );
 }

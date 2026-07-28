@@ -724,13 +724,23 @@ export async function updateAccountPaymentProfile(methods: ClientMarketPaymentMe
 
 export async function getClientMarketProviderBlocks() {
   return parseJson<ClientMarketProviderBlock[]>(
-    await authFetch("/v1/account/provider-blocks", { cache: "no-store" }),
+    await authFetch("/v1/client-market/provider-blocks", { cache: "no-store" }),
+  );
+}
+
+export async function createClientMarketProviderBlock(body: { email: string; reason?: string }) {
+  return parseJson<ClientMarketProviderBlock>(
+    await authFetch("/v1/client-market/provider-blocks", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
   );
 }
 
 export async function liftClientMarketProviderBlock(clientUserId: string) {
   return parseJson<{ ok: boolean }>(
-    await authFetch(`/v1/account/provider-blocks/${encodeURIComponent(clientUserId)}`, {
+    await authFetch(`/v1/client-market/provider-blocks/${encodeURIComponent(clientUserId)}`, {
       method: "DELETE",
     }),
   );

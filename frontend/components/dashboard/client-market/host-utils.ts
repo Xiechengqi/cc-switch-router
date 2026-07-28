@@ -306,6 +306,16 @@ export function statusLabelKey(status: string): MessageKey {
 
 export const HOST_STATUS_GROUPS = ["all", "idle", "in_use", "needs_attention"] as const;
 export type HostStatusFilter = (typeof HOST_STATUS_GROUPS)[number];
+/** Left-rail tabs: optional "mine" (authed only) + status groups. */
+export const HOST_LIST_TABS = ["mine", "all", "idle", "in_use", "needs_attention"] as const;
+export type HostListTab = (typeof HOST_LIST_TABS)[number];
+
+export function hostBelongsToViewer(host: {
+  isHostOwner?: boolean;
+  isClientOwner?: boolean;
+}): boolean {
+  return host.isHostOwner === true || host.isClientOwner === true;
+}
 
 export const STATUS_GROUP_MEMBERS: Record<Exclude<HostStatusFilter, "all">, readonly string[]> = {
   idle: ["idle"],
@@ -326,11 +336,19 @@ export function hostMatchesStatusFilter(status: string, filter: HostStatusFilter
   return statusGroupForHost(status) === filter;
 }
 
-export function statusGroupLabelKey(group: HostStatusFilter): MessageKey {
+export function hostMatchesListTab(
+  host: { status: string; isHostOwner?: boolean; isClientOwner?: boolean },
+  tab: HostListTab,
+) {
+  if (tab === "mine") return hostBelongsToViewer(host);
+  return hostMatchesStatusFilter(host.status, tab);
+}
+
+export function statusGroupLabelKey(group: HostListTab): MessageKey {
   return `clientMarket.statusGroup.${group}` as MessageKey;
 }
 
-export function statusGroupHintKey(group: HostStatusFilter): MessageKey {
+export function statusGroupHintKey(group: HostListTab): MessageKey {
   return `clientMarket.statusGroupHint.${group}` as MessageKey;
 }
 
@@ -452,12 +470,30 @@ export function hostStatusGuidanceKey(status: string, lastError?: string): Messa
   return lastError ? "clientMarket.hostErrorGuidance.generic" : null;
 }
 
+/** Column multi-select for host owner emails (empty = all owners). */
+export const OWNER_FILTER_KEY = "cc_switch_router_client_market_owner_filter_v3";
+/** @deprecated migrated into OWNER_FILTER_KEY / "mine" tab */
 export const OWNER_SCOPE_KEY = "cc_switch_router_client_market_owner_scope_v2";
 
 export type OwnerScope = { mode: "mine" } | { mode: "custom"; emails: string[] };
+
+export function normalizeOwnerFilters(value: unknown): string[] {
+  if (Array.isArray(value) && value.every((item) => typeof item === "string")) {
+    return value.map((item) => item.trim()).filter(Boolean);
+  }
+  // Migrate legacy mine/custom owner scope object.
+  if (value && typeof value === "object" && "mode" in value) {
+    const scope = value as OwnerScope;
+    if (scope.mode === "custom" && Array.isArray(scope.emails)) {
+      return scope.emails.map((item) => String(item).trim()).filter(Boolean);
+    }
+  }
+  return [];
+}
+
 export const REGION_FILTER_KEY = "cc_switch_router_client_market_region_filter_v1";
 export const PAYMENT_FILTER_KEY = "cc_switch_router_client_market_payment_filter_v1";
-export const STATUS_FILTER_KEY = "cc_switch_router_client_market_status_filter_v2";
+export const STATUS_FILTER_KEY = "cc_switch_router_client_market_status_filter_v3";
 export const SORT_PREFS_KEY = "cc_switch_router_client_market_sort_v2";
 export const HOST_PAGE_SIZE = 10;
 
@@ -622,7 +658,13 @@ export function normalizeHostStatusFilter(value: unknown): HostStatusFilter {
   return mapped ?? "all";
 }
 
-export function hostStatusTabTone(status: HostStatusFilter, active: boolean) {
+/** Persistable list tab; "mine" collapses to "all" when logged out. */
+export function normalizeHostListTab(value: unknown, authed: boolean): HostListTab {
+  if (value === "mine") return authed ? "mine" : "all";
+  return normalizeHostStatusFilter(value);
+}
+
+export function hostStatusTabTone(status: HostListTab, active: boolean) {
   if (active) return "bg-white font-medium text-foreground shadow-sm";
   switch (status) {
     case "needs_attention":
@@ -631,6 +673,8 @@ export function hostStatusTabTone(status: HostStatusFilter, active: boolean) {
       return "text-emerald-700";
     case "in_use":
       return "text-slate-700";
+    case "mine":
+      return "text-primary";
     default:
       return "text-muted-foreground";
   }
