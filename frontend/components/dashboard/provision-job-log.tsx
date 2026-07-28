@@ -186,6 +186,20 @@ function classifyLine(raw: string): JobLogTone {
   if (!line) return "muted";
   const lower = line.toLowerCase();
 
+  // Recoverable tunnel/startup retries must win over the generic "failed" → error rule.
+  // Covers both new "deferred; retrying" lines and legacy "WARN ... attempt failed" logs.
+  if (
+    lower.includes("[sensitive output redacted]") ||
+    /\bwarn\b/.test(lower) ||
+    lower.includes("warning") ||
+    lower.includes("retry") ||
+    lower.includes("deferred") ||
+    lower.includes("lease attempt") ||
+    lower.includes("lease still failing") ||
+    lower.includes("lease still timing out")
+  ) {
+    return "warn";
+  }
   if (
     lower.includes("error:") ||
     lower.includes("failed") ||
@@ -194,9 +208,6 @@ function classifyLine(raw: string): JobLogTone {
     lower.includes("开通失败")
   ) {
     return "error";
-  }
-  if (lower.includes("[sensitive output redacted]") || lower.includes("warning") || lower.includes("retry")) {
-    return "warn";
   }
   if (
     lower.includes("install-client.sh") ||
