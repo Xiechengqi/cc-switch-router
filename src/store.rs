@@ -1791,6 +1791,10 @@ impl AppStore {
         let legacy_state =
             prepare_legacy_setup_notification_adoption_tx(&tx, &installation.id, now)?;
         let notifications_enabled = client_notification_runtime_enabled(&tx)?;
+        // Client Market already emails the owner when provisioning completes
+        // (billing + ready card). Skip the duplicate registration mail.
+        let suppress_market_registration = installation.provision_source.as_deref()
+            == Some(crate::client_market::PROVISION_SOURCE_ROUTER_MARKET);
         let (event_id, notification_status, response_status, retain_password_hint) =
             match legacy_state {
                 LegacySetupNotificationState::Sent { event_id }
@@ -1818,11 +1822,32 @@ impl AppStore {
                     false,
                 ),
                 LegacySetupNotificationState::Adopt { event_id } => {
-                    let event_status = if notifications_enabled {
-                        "pending"
-                    } else {
-                        "suppressed_disabled"
-                    };
+                    let (event_status, suppression_reason, notification_status, response_status, retain) =
+                        if !notifications_enabled {
+                            (
+                                "suppressed_disabled",
+                                Some("notifications disabled"),
+                                "suppressed_disabled",
+                                InstallationSetupCompletedStatus::SuppressedDisabled,
+                                false,
+                            )
+                        } else if suppress_market_registration {
+                            (
+                                "suppressed_market_ready",
+                                Some("covered by Client Market ready email"),
+                                "suppressed_disabled",
+                                InstallationSetupCompletedStatus::SuppressedDisabled,
+                                true,
+                            )
+                        } else {
+                            (
+                                "pending",
+                                None,
+                                "queued",
+                                InstallationSetupCompletedStatus::Queued,
+                                true,
+                            )
+                        };
                     tx.execute(
                         "UPDATE client_notification_events
                          SET dedupe_key = ?2, status = ?3, occurred_at = ?4, not_before = ?4,
@@ -1834,7 +1859,7 @@ impl AppStore {
                             event_status,
                             now.to_rfc3339(),
                             snapshot.to_string(),
-                            (!notifications_enabled).then_some("notifications disabled"),
+                            suppression_reason,
                         ],
                     )
                     .map_err(|error| {
@@ -1844,17 +1869,9 @@ impl AppStore {
                     })?;
                     (
                         Some(event_id),
-                        if notifications_enabled {
-                            "queued"
-                        } else {
-                            "suppressed_disabled"
-                        },
-                        if notifications_enabled {
-                            InstallationSetupCompletedStatus::Queued
-                        } else {
-                            InstallationSetupCompletedStatus::SuppressedDisabled
-                        },
-                        notifications_enabled,
+                        notification_status,
+                        response_status,
+                        retain,
                     )
                 }
                 LegacySetupNotificationState::None if existing_setup.is_some() => {
@@ -1874,11 +1891,32 @@ impl AppStore {
                 }
                 LegacySetupNotificationState::None => {
                     let event_id = Uuid::new_v4().to_string();
-                    let event_status = if notifications_enabled {
-                        "pending"
-                    } else {
-                        "suppressed_disabled"
-                    };
+                    let (event_status, suppression_reason, notification_status, response_status, retain) =
+                        if !notifications_enabled {
+                            (
+                                "suppressed_disabled",
+                                Some("notifications disabled"),
+                                "suppressed_disabled",
+                                InstallationSetupCompletedStatus::SuppressedDisabled,
+                                false,
+                            )
+                        } else if suppress_market_registration {
+                            (
+                                "suppressed_market_ready",
+                                Some("covered by Client Market ready email"),
+                                "suppressed_disabled",
+                                InstallationSetupCompletedStatus::SuppressedDisabled,
+                                true,
+                            )
+                        } else {
+                            (
+                                "pending",
+                                None,
+                                "queued",
+                                InstallationSetupCompletedStatus::Queued,
+                                true,
+                            )
+                        };
                     tx.execute(
                         "INSERT INTO client_notification_events (
                             id, dedupe_key, kind, installation_id, episode, status, occurred_at,
@@ -1891,7 +1929,7 @@ impl AppStore {
                             event_status,
                             now.to_rfc3339(),
                             snapshot.to_string(),
-                            (!notifications_enabled).then_some("notifications disabled"),
+                            suppression_reason,
                         ],
                     )
                     .map_err(|error| {
@@ -1901,17 +1939,9 @@ impl AppStore {
                     })?;
                     (
                         Some(event_id),
-                        if notifications_enabled {
-                            "queued"
-                        } else {
-                            "suppressed_disabled"
-                        },
-                        if notifications_enabled {
-                            InstallationSetupCompletedStatus::Queued
-                        } else {
-                            InstallationSetupCompletedStatus::SuppressedDisabled
-                        },
-                        notifications_enabled,
+                        notification_status,
+                        response_status,
+                        retain,
                     )
                 }
             };

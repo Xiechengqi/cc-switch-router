@@ -1414,6 +1414,120 @@ fn html_escape(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// Shared card shell for transactional mail (login / registration / Client Market).
+/// Uses the TokenSwitch chrome so Market emails match verification and top-up styling.
+pub fn render_transactional_card_email(
+    subject: &str,
+    title: &str,
+    preheader: &str,
+    introduction: &str,
+    rows: &[(&str, &str)],
+    action_label: Option<&str>,
+    action_url: Option<&str>,
+    note: Option<&str>,
+    footer: &str,
+) -> RenderedNotificationEmail {
+    let rows_html = rows
+        .iter()
+        .map(|(label, value)| {
+            format!(
+                "<tr>\
+                   <td style=\"padding:10px 12px;color:#64748b;font-size:13px;border-bottom:1px solid #eef2f7;width:38%\">{label}</td>\
+                   <td style=\"padding:10px 12px;color:#0f172a;font-size:13px;font-weight:600;border-bottom:1px solid #eef2f7;word-break:break-word\">{value}</td>\
+                 </tr>",
+                label = html_escape(label),
+                value = html_escape(value),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let details = if rows.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"margin:8px 0 0;border:1px solid #eef2f7;border-radius:12px;border-collapse:separate;overflow:hidden;background:#f8fafc\">{rows_html}</table>",
+            rows_html = rows_html
+        )
+    };
+    let note_html = note
+        .map(|value| {
+            format!(
+                "<div style=\"margin-top:18px;padding:12px 14px;background:#eff6ff;border-left:3px solid #2563eb;color:#1e3a8a;font-size:13px;line-height:20px\">{value}</div>",
+                value = html_escape(value)
+            )
+        })
+        .unwrap_or_default();
+    let action_html = match (action_label, action_url) {
+        (Some(label), Some(url)) if !url.trim().is_empty() && url != "#" => format!(
+            "<p style=\"margin:24px 0 0\"><a href=\"{href}\" style=\"display:inline-block;background:#2563eb;color:#ffffff;text-decoration:none;border-radius:8px;padding:11px 16px;font-size:14px;font-weight:700\">{label}</a></p>",
+            href = html_escape(url),
+            label = html_escape(label),
+        ),
+        _ => String::new(),
+    };
+    let body = format!(
+        "<p style=\"margin:0 0 18px;color:#475569;font-size:15px;line-height:1.6\">{introduction}</p>\
+         {details}{note_html}{action_html}",
+        introduction = html_escape(introduction),
+        details = details,
+        note_html = note_html,
+        action_html = action_html,
+    );
+    let html = format!(
+        "<!doctype html>\
+         <html lang=\"en\">\
+           <head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"x-apple-disable-message-reformatting\"></head>\
+           <body style=\"margin:0;background:#f6f7fb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;color:#0f172a\">\
+             <div style=\"display:none;max-height:0;overflow:hidden;opacity:0;color:transparent\">{preheader}</div>\
+             <table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"width:100%;background:#f6f7fb;border-collapse:collapse\">\
+               <tr><td align=\"center\">\
+                 <table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"width:100%;max-width:560px;margin:28px auto 0;background:#ffffff;border:1px solid #e5e7eb;border-bottom:0;border-radius:18px 18px 0 0;border-collapse:separate;box-shadow:0 16px 40px rgba(15,23,42,0.08)\">\
+                   <tr><td style=\"padding:26px 28px 18px;border-bottom:1px solid #eef2f7;background:#ffffff;border-radius:18px 18px 0 0\">\
+                     <div translate=\"no\" style=\"font-size:13px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#2563eb\">TokenSwitch</div>\
+                     <h1 style=\"margin:10px 0 0;font-size:24px;line-height:1.25;color:#0f172a\">{title}</h1>\
+                   </td></tr>\
+                 </table>\
+                 <table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"width:100%;max-width:560px;margin:0 auto;background:#ffffff;border-left:1px solid #e5e7eb;border-right:1px solid #e5e7eb;border-collapse:collapse\">\
+                   <tr><td style=\"padding:28px\">{body}</td></tr>\
+                 </table>\
+                 <table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"width:100%;max-width:560px;margin:0 auto 28px;background:#ffffff;border:1px solid #e5e7eb;border-top:0;border-radius:0 0 18px 18px;border-collapse:separate\">\
+                   <tr><td style=\"padding:16px 28px;color:#64748b;font-size:12px;line-height:1.5\">{footer}</td></tr>\
+                 </table>\
+               </td></tr>\
+             </table>\
+           </body>\
+         </html>",
+        preheader = html_escape(preheader),
+        title = html_escape(title),
+        body = body,
+        footer = html_escape(footer),
+    );
+    let rows_text = rows
+        .iter()
+        .map(|(label, value)| format!("{label}: {value}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let action_text = match (action_label, action_url) {
+        (Some(label), Some(url)) if !url.trim().is_empty() && url != "#" => {
+            format!("\n\n{label}: {url}")
+        }
+        _ => String::new(),
+    };
+    let note_text = note
+        .map(|value| format!("\n\nNote: {value}"))
+        .unwrap_or_default();
+    let text = format!(
+        "TokenSwitch\n\n{title}\n\n{introduction}\n\n{rows_text}{note_text}{action_text}\n\n{footer}"
+    )
+    .trim()
+    .to_string();
+    RenderedNotificationEmail {
+        subject: sanitize_subject(subject),
+        html,
+        text,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1696,6 +1810,28 @@ mod tests {
             *store.dead_letter_errors.lock().await,
             vec!["contact a***@vendor.test about o***@example.com"]
         );
+    }
+
+    #[test]
+    fn transactional_card_template_matches_tokenswitch_chrome() {
+        let rendered = render_transactional_card_email(
+            "[Client Market] demo is ready",
+            "Your Client is ready",
+            "Your Client is ready",
+            "Your Client Market Client is ready.",
+            &[("Client", "demo"), ("Offer", "Free forever")],
+            Some("Open Client Web"),
+            Some("https://demo.example.com/"),
+            Some("Hint note"),
+            "Footer note",
+        );
+        assert!(rendered.subject.contains("demo is ready"));
+        assert!(rendered.html.contains("TokenSwitch"));
+        assert!(rendered.html.contains("#2563eb"));
+        assert!(rendered.html.contains("Open Client Web"));
+        assert!(rendered.html.contains("Free forever"));
+        assert!(rendered.text.contains("Footer note"));
+        assert!(!rendered.html.contains("white-space:pre-wrap"));
     }
 
     #[test]

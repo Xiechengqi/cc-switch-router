@@ -22,7 +22,8 @@ use crate::ServerState;
 use crate::error::AppError;
 use crate::models::AuthSession;
 use crate::notifications::{
-    FrozenEmailEnvelope, NotificationTemplateContext, retry_delay_secs, sanitize_delivery_error,
+    FrozenEmailEnvelope, NotificationTemplateContext, RenderedNotificationEmail,
+    render_transactional_card_email, retry_delay_secs, sanitize_delivery_error,
     send_resend_frozen_email,
 };
 use crate::store::AppStore;
@@ -40,6 +41,10 @@ const MAX_QR_STORED_BYTES: usize = 4 * 1024 * 1024;
 const EMAIL_CYCLE_SECS: u64 = 5;
 const BILLING_CYCLE_SECS: u64 = 20;
 const MAX_EMAIL_ATTEMPTS: u32 = 12;
+/// Soft per-recipient cap for Client Market mail (aligned with notification lanes).
+const MARKET_EMAIL_RECIPIENT_HOURLY_LIMIT: i64 = 12;
+const MARKET_EMAIL_RATE_DEFER_SECS: i64 = 300;
+const MARKET_EMAIL_FOOTER: &str = "Payment declarations are self-reported. TokenSwitch Router does not process or verify transfers between Client owners and Host Providers.";
 
 const SUBSCRIPTION_ACTIVE: &str = "active";
 const SUBSCRIPTION_PAYMENT_DUE: &str = "payment_due";
@@ -1659,15 +1664,22 @@ impl AppStore {
                 ("client_force_released", client_email),
                 ("provider_force_released", provider_email),
             ] {
-                enqueue_email_tx(
+                let rows = [
+                    ("Client", label.as_str()),
+                    ("Previous status", previous_status.as_str()),
+                ];
+                enqueue_market_card_email_tx(
                     &tx,
                     kind,
                     &recipient,
                     &format!("[Client Market] {label} released by an administrator"),
-                    &format!(
-                        "Client {label} was stuck in {previous_status} and has been released by an administrator. Creating new Clients is no longer blocked for this account. The Host may still need reverification by its owner before it returns to the pool."
-                    ),
-                    &format!("force-release:{installation_id}:{}", now.timestamp()),
+                    "Client force-released",
+                    "This Client was stuck and has been released by an administrator. Creating new Clients is no longer blocked for this account. The Host may still need reverification by its owner before it returns to the pool.",
+                    &rows,
+                    None,
+                    None,
+                    None,
+                    &format!("force-release:{installation_id}:{kind}"),
                     now,
                 )?;
             }
@@ -3476,17 +3488,23 @@ impl AppStore {
         )
         .map_err(|error| AppError::Internal(format!("advance subscription failed: {error}")))?;
         let client_label = client_label_tx(&tx, installation_id)?;
-        let body = format!(
-            "The Client owner {} declared that payment of ${:.2} for {client_label} was completed. The Router has not verified receipt. Please check your own account; if payment is missing, you may release the Client from your Host.",
-            session.email,
-            price as f64 / 100.0,
-        );
-        enqueue_email_tx(
+        let amount = format_offer_dollars(price);
+        let rows = [
+            ("Client", client_label.as_str()),
+            ("Declared by", session.email.as_str()),
+            ("Amount", amount.as_str()),
+        ];
+        enqueue_market_card_email_tx(
             &tx,
             "payment_declared",
             &provider_email,
             &format!("[Client Market] Payment declared for {client_label}"),
-            &body,
+            "Payment declared",
+            "The Client owner declared that payment was completed. Router has not verified receipt. Please check your own account; if payment is missing, you may release the Client from your Host.",
+            &rows,
+            None,
+            None,
+            None,
             &format!("payment-declared:{invoice_id}:{provider_id}"),
             now,
         )?;
@@ -3568,16 +3586,22 @@ impl AppStore {
                 now,
             )?;
             let label = client_label_tx(&tx, &installation_id)?;
-            let body = format!(
-                "The next payment for {label} is due by {}. Please pay the Host Provider and declare payment in the Router before the countdown reaches zero. The Client is released automatically after the deadline.",
-                due.to_rfc3339(),
-            );
-            enqueue_email_tx(
+            let due_text = due.to_rfc3339();
+            let rows = [
+                ("Client", label.as_str()),
+                ("Due by", due_text.as_str()),
+            ];
+            enqueue_market_card_email_tx(
                 &tx,
                 "renewal_due",
                 &client_email,
                 &format!("[Client Market] Payment due for {label}"),
-                &body,
+                "Payment due",
+                "The next payment for this Client is due. Please pay the Host Provider and declare payment in Router before the countdown reaches zero. The Client is released automatically after the deadline.",
+                &rows,
+                None,
+                None,
+                None,
                 &format!("renewal-due:{installation_id}:{}", due.timestamp()),
                 now,
             )?;
@@ -3648,6 +3672,48 @@ impl AppStore {
             })?;
             return Ok(None);
         };
+        let recipient: String = tx
+            .query_row(
+                "SELECT recipient FROM client_market_email_deliveries WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("read market email recipient failed: {error}"))
+            })?;
+        let hour_cutoff = (now - Duration::hours(1)).to_rfc3339();
+        let recent_sent: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM client_market_email_deliveries
+                 WHERE lower(recipient) = lower(?1)
+                   AND status = 'sent'
+                   AND updated_at >= ?2",
+                params![recipient, hour_cutoff],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("count market email recipient rate failed: {error}"))
+            })?;
+        if recent_sent >= MARKET_EMAIL_RECIPIENT_HOURLY_LIMIT {
+            tx.execute(
+                "UPDATE client_market_email_deliveries
+                 SET status = 'retry', next_attempt_at = ?2, claim_owner = NULL,
+                     claim_expires_at = NULL, updated_at = ?3
+                 WHERE id = ?1",
+                params![
+                    id,
+                    (now + Duration::seconds(MARKET_EMAIL_RATE_DEFER_SECS)).to_rfc3339(),
+                    now.to_rfc3339(),
+                ],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("defer rate-limited market email failed: {error}"))
+            })?;
+            tx.commit().map_err(|error| {
+                AppError::Internal(format!("commit rate-limited email defer failed: {error}"))
+            })?;
+            return Ok(None);
+        }
         let changed = tx
             .execute(
                 "UPDATE client_market_email_deliveries
@@ -4067,21 +4133,32 @@ fn enqueue_offer_changed_email_tx(
     now: DateTime<Utc>,
 ) -> Result<(), AppError> {
     let label = client_label_tx(tx, installation_id)?;
-    let body = match (price, period) {
-        (Some(price), Some(period)) => format!(
-            "The Host Provider changed the offer for {label} to ${:.2} every {period} days. The new offer applies immediately to an unpaid invoice and to the next billing period. Any current paid period keeps its existing end date. If this Client did not yet have a paid period, a three-day payment window has started. Open Router Clients to review the deadline or release the Client.",
-            price as f64 / 100.0,
+    let offer_text = match (price, period) {
+        (Some(price), Some(period)) => format!("{} / {period} days", format_offer_dollars(price)),
+        _ => "Free forever".to_string(),
+    };
+    let (intro, note) = match (price, period) {
+        (Some(_), Some(_)) => (
+            "The Host Provider changed the offer for this Client. The new offer applies immediately to an unpaid invoice and to the next billing period. Any current paid period keeps its existing end date. If this Client did not yet have a paid period, a three-day payment window has started.",
+            Some("Open Router Clients to review the deadline or release the Client."),
         ),
-        _ => format!(
-            "The Host Provider changed the offer for {label} to free forever. Any open invoice and payment countdown for this Client have been canceled."
+        _ => (
+            "The Host Provider changed the offer for this Client to free forever. Any open invoice and payment countdown for this Client have been canceled.",
+            None,
         ),
     };
-    enqueue_email_tx(
+    let rows = [("Client", label.as_str()), ("New offer", offer_text.as_str())];
+    enqueue_market_card_email_tx(
         tx,
         "host_offer_changed",
         recipient,
         &format!("[Client Market] Host offer changed for {label}"),
-        &body,
+        "Host offer changed",
+        intro,
+        &rows,
+        None,
+        None,
+        note,
         &format!("host-offer-changed:{installation_id}:{revision}"),
         now,
     )
@@ -4410,29 +4487,42 @@ fn insert_audit_tx(
     Ok(())
 }
 
-fn escape_html(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
+fn market_clients_url(dashboard_url: &str) -> String {
+    format!("{}/clients/", dashboard_url.trim_end_matches('/'))
 }
 
-fn enqueue_email_tx(
+fn market_client_public_url(dashboard_url: &str, subdomain: &str) -> Option<String> {
+    let subdomain = subdomain.trim();
+    if subdomain.is_empty() {
+        return None;
+    }
+    let url = Url::parse(dashboard_url).ok()?;
+    let host = url.host_str()?;
+    if host.contains(':') {
+        return None;
+    }
+    let port = url
+        .port()
+        .map(|value| format!(":{value}"))
+        .unwrap_or_default();
+    Some(format!(
+        "{}://{subdomain}.{host}{port}/",
+        url.scheme()
+    ))
+}
+
+fn format_offer_dollars(price_cents: i64) -> String {
+    format!("${:.2}", price_cents as f64 / 100.0)
+}
+
+fn enqueue_rendered_email_tx(
     tx: &Transaction<'_>,
     kind: &str,
     recipient: &str,
-    subject: &str,
-    body: &str,
+    rendered: &RenderedNotificationEmail,
     idempotency_key: &str,
     now: DateTime<Utc>,
 ) -> Result<(), AppError> {
-    let html = format!(
-        "<!doctype html><html><body style=\"margin:0;background:#f8fafc;color:#172033;font-family:Arial,sans-serif\"><div style=\"max-width:620px;margin:0 auto;padding:28px 16px\"><div style=\"background:#fff;border:1px solid #dbe3ee;border-radius:8px;padding:28px\"><div style=\"font-size:13px;font-weight:700;color:#0f766e\">CC-Switch Router · Client Market</div><h1 style=\"font-size:22px;line-height:30px;margin:14px 0\">{}</h1><p style=\"font-size:15px;line-height:24px;color:#475569;white-space:pre-wrap\">{}</p><p style=\"font-size:12px;line-height:18px;color:#64748b;margin-top:24px\">Payment declarations are self-reported. The Router does not process or verify transfers between Client owners and Host Providers.</p></div></div></body></html>",
-        escape_html(subject),
-        escape_html(body),
-    );
     let event_id = Uuid::new_v4().to_string();
     tx.execute(
         "INSERT INTO client_market_email_events
@@ -4443,9 +4533,9 @@ fn enqueue_email_tx(
             event_id,
             kind,
             recipient,
-            subject,
-            html,
-            body,
+            rendered.subject,
+            rendered.html,
+            rendered.text,
             idempotency_key,
             now.to_rfc3339(),
         ],
@@ -4473,15 +4563,51 @@ fn enqueue_email_tx(
             event_id,
             kind,
             recipient,
-            subject,
-            html,
-            body,
+            rendered.subject,
+            rendered.html,
+            rendered.text,
             idempotency_key,
             now.to_rfc3339(),
         ],
     )
     .map_err(|error| AppError::Internal(format!("enqueue Client Market email failed: {error}")))?;
     Ok(())
+}
+
+fn enqueue_market_card_email_tx(
+    tx: &Transaction<'_>,
+    kind: &str,
+    recipient: &str,
+    subject: &str,
+    title: &str,
+    introduction: &str,
+    rows: &[(&str, &str)],
+    action_label: Option<&str>,
+    action_url: Option<&str>,
+    note: Option<&str>,
+    idempotency_key: &str,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let rendered = render_transactional_card_email(
+        subject,
+        title,
+        subject,
+        introduction,
+        rows,
+        action_label,
+        action_url,
+        note,
+        MARKET_EMAIL_FOOTER,
+    );
+    enqueue_rendered_email_tx(tx, kind, recipient, &rendered, idempotency_key, now)
+}
+
+/// High-risk cleanup reasons still notify both parties when cleanup starts.
+fn cleanup_started_email_worthy(reason: &str) -> bool {
+    matches!(
+        reason,
+        "payment_not_received" | "payment_deadline_expired"
+    )
 }
 
 fn client_label_tx(tx: &Transaction<'_>, installation_id: &str) -> Result<String, AppError> {
@@ -4494,6 +4620,20 @@ fn client_label_tx(tx: &Transaction<'_>, installation_id: &str) -> Result<String
         .optional()
         .map_err(|error| AppError::Internal(format!("read Client label failed: {error}")))?
         .unwrap_or_else(|| installation_id.to_string()))
+}
+
+fn setup_password_hint_tx(
+    tx: &Transaction<'_>,
+    installation_id: &str,
+) -> Result<Option<String>, AppError> {
+    tx.query_row(
+        "SELECT password_hint FROM installation_setup_completions WHERE installation_id = ?1",
+        params![installation_id],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .optional()
+    .map_err(|error| AppError::Internal(format!("read setup password hint failed: {error}")))
+    .map(|value| value.flatten().filter(|hint| !hint.trim().is_empty()))
 }
 
 pub(crate) fn complete_provisioning_tx(
@@ -4592,41 +4732,97 @@ pub(crate) fn complete_provisioning_tx(
         )?;
     }
     let label = client_label_tx(tx, installation_id)?;
-    let client_body = if let Some(deadline) = deadline {
-        format!(
-            "Your Client {label} is ready at {dashboard_url}/clients/. You may evaluate it free for three days. If it suits your needs, pay the Host Provider and declare payment in the Router before {}. If you do not want it, use Release now. After the deadline the Router disables and removes the Client automatically; data loss is your responsibility.",
-            deadline.to_rfc3339(),
-        )
+    let clients_url = market_clients_url(dashboard_url);
+    let client_url = market_client_public_url(dashboard_url, &label);
+    let password_hint = setup_password_hint_tx(tx, installation_id)?;
+    let deadline_text = deadline.map(|value| value.to_rfc3339());
+    let price_text = price.map(format_offer_dollars);
+    let period_text = period.map(|value| format!("{value} days"));
+    let mut owner_rows: Vec<(&str, String)> = vec![
+        ("Client", label.clone()),
+        ("Owner", client_email.clone()),
+    ];
+    if let Some(url) = client_url.as_deref() {
+        owner_rows.push(("Client URL", url.to_string()));
+    }
+    if let Some(hint) = password_hint.as_deref() {
+        owner_rows.push(("Web password hint", hint.to_string()));
+    }
+    match (price_text.as_deref(), period_text.as_deref()) {
+        (Some(price), Some(period)) => {
+            owner_rows.push(("Offer", format!("{price} / {period}")));
+        }
+        _ => owner_rows.push(("Offer", "Free forever".into())),
+    }
+    if let Some(deadline) = deadline_text.as_deref() {
+        owner_rows.push(("Payment deadline", deadline.to_string()));
+    }
+    let owner_intro = if deadline.is_some() {
+        "Your Client Market Client is ready. You may evaluate it free for three days. If it suits your needs, pay the Host Provider and declare payment in Router before the deadline. If you do not want it, use Release now — after the deadline the Router disables and removes the Client automatically."
     } else {
-        format!(
-            "Your Client {label} is ready at {dashboard_url}/clients/. This Host is currently offered free forever, so no payment declaration or billing countdown is required. The Host Provider may change the offer or release the Client later."
-        )
+        "Your Client Market Client is ready under a free-forever Host offer. No payment declaration is required. The Host Provider may change the offer or release the Client later."
     };
-    enqueue_email_tx(
+    let owner_note = password_hint.as_ref().map(|_| {
+        "This is not the complete password. Use the full Web password configured during setup; the Router never receives or emails the complete password."
+    });
+    let owner_row_refs: Vec<(&str, &str)> = owner_rows
+        .iter()
+        .map(|(label, value)| (*label, value.as_str()))
+        .collect();
+    enqueue_market_card_email_tx(
         tx,
         "client_allocated_owner",
         &client_email,
         &format!("[Client Market] {label} is ready"),
-        &client_body,
+        "Your Client is ready",
+        owner_intro,
+        &owner_row_refs,
+        Some(if client_url.is_some() {
+            "Open Client Web"
+        } else {
+            "Open Router Clients"
+        }),
+        Some(client_url.as_deref().unwrap_or(clients_url.as_str())),
+        owner_note,
         &format!("client-ready:{installation_id}:{client_email}"),
         now,
     )?;
     let host_label = hostname.unwrap_or_else(|| host_id.to_string());
-    let provider_body = if paid {
-        format!(
-            "Your hosted machine {host_label} is now rented by {client_email} as Client {label}. Please keep the server stable. The Client owner has a three-day evaluation/payment window. Watch your configured payment accounts; the Router records declarations but does not verify receipt."
-        )
+    let mut provider_rows = vec![
+        ("Host", host_label.clone()),
+        ("Client", label.clone()),
+        ("Client owner", client_email.clone()),
+    ];
+    if paid {
+        if let (Some(price), Some(period)) = (price_text.as_deref(), period_text.as_deref()) {
+            provider_rows.push(("Offer", format!("{price} / {period}")));
+        }
+        if let Some(deadline) = deadline_text.as_deref() {
+            provider_rows.push(("Client payment window", deadline.to_string()));
+        }
     } else {
-        format!(
-            "Your hosted machine {host_label} is now used by {client_email} as Client {label} under your free-forever offer. Please keep the server stable. You may update the offer or release the Client from Client Market."
-        )
+        provider_rows.push(("Offer", "Free forever".into()));
+    }
+    let provider_intro = if paid {
+        "Your Host was allocated on Client Market. Keep the server stable. The Client owner has a three-day evaluation/payment window. Watch your configured payment accounts — Router records declarations but does not verify receipt."
+    } else {
+        "Your Host was allocated under your free-forever offer. Keep the server stable. You may update the offer or release the Client from Client Market."
     };
-    enqueue_email_tx(
+    let provider_row_refs: Vec<(&str, &str)> = provider_rows
+        .iter()
+        .map(|(label, value)| (*label, value.as_str()))
+        .collect();
+    enqueue_market_card_email_tx(
         tx,
         "client_allocated_provider",
         &host_email,
         &format!("[Client Market] Host {host_label} was allocated"),
-        &provider_body,
+        "Host allocated",
+        provider_intro,
+        &provider_row_refs,
+        Some("Open Client Market"),
+        Some(&clients_url),
+        None,
         &format!("host-allocated:{installation_id}:{provider_id}"),
         now,
     )?;
@@ -4710,37 +4906,52 @@ pub(crate) fn cleanup_started_tx(
             })?;
         }
         let label = client_label_tx(tx, installation_id)?;
-        let client_body = match reason {
-            "payment_not_received" => format!(
-                "The Host Provider started removing Client {label} because payment was not received. The Router does not verify payment receipt or arbitrate this decision. The tunnel is disabled immediately and remote data may be permanently deleted."
-            ),
-            "payment_deadline_expired" => format!(
-                "Client {label} passed its three-day payment declaration deadline. The Router disabled the tunnel and started remote cleanup. Data may be permanently deleted."
-            ),
-            _ => format!(
-                "Cleanup started for Client {label} ({reason}). The tunnel is disabled immediately and remote data may be permanently deleted."
-            ),
-        };
-        enqueue_email_tx(
-            tx,
-            "client_cleanup_started",
-            &client_owner_email,
-            &format!("[Client Market] Cleanup started for {label}"),
-            &client_body,
-            &format!("cleanup-started:{installation_id}:{reason}:client"),
-            now,
-        )?;
-        enqueue_email_tx(
-            tx,
-            "provider_cleanup_started",
-            &provider_email,
-            &format!("[Client Market] Cleanup started for {label}"),
-            &format!(
-                "Cleanup started for Client {label} on your Host ({reason}). The Router has disabled the tunnel and will report the final SSH cleanup result. The Router does not verify payment receipt."
-            ),
-            &format!("cleanup-started:{installation_id}:{reason}:provider"),
-            now,
-        )?;
+        if cleanup_started_email_worthy(reason) {
+            let (client_intro, client_title) = match reason {
+                "payment_not_received" => (
+                    "The Host Provider started removing this Client because payment was not received. Router does not verify payment receipt or arbitrate this decision. The tunnel is disabled immediately and remote data may be permanently deleted.",
+                    "Cleanup started — payment not received",
+                ),
+                "payment_deadline_expired" => (
+                    "This Client passed its three-day payment declaration deadline. Router disabled the tunnel and started remote cleanup. Data may be permanently deleted.",
+                    "Cleanup started — payment deadline expired",
+                ),
+                _ => (
+                    "Cleanup started for this Client. The tunnel is disabled immediately and remote data may be permanently deleted.",
+                    "Cleanup started",
+                ),
+            };
+            let reason_row = [("Client", label.as_str()), ("Reason", reason)];
+            enqueue_market_card_email_tx(
+                tx,
+                "client_cleanup_started",
+                &client_owner_email,
+                &format!("[Client Market] Cleanup started for {label}"),
+                client_title,
+                client_intro,
+                &reason_row,
+                None,
+                None,
+                None,
+                &format!("cleanup-started:{installation_id}:{reason}:client"),
+                now,
+            )?;
+            let provider_rows = [("Client", label.as_str()), ("Reason", reason)];
+            enqueue_market_card_email_tx(
+                tx,
+                "provider_cleanup_started",
+                &provider_email,
+                &format!("[Client Market] Cleanup started for {label}"),
+                "Cleanup started on your Host",
+                "Cleanup started for a Client on your Host. Router has disabled the tunnel and will report the final SSH cleanup result. Router does not verify payment receipt.",
+                &provider_rows,
+                None,
+                None,
+                None,
+                &format!("cleanup-started:{installation_id}:{reason}:provider"),
+                now,
+            )?;
+        }
     }
     tx.execute(
         "UPDATE installation_client_tunnels SET enabled = 0, updated_at = ?2
@@ -4782,14 +4993,18 @@ pub(crate) fn cleanup_finished_tx(
             ("client_cleanup_finished", client_email, "Client owner"),
             ("provider_cleanup_finished", provider_email, "Host Provider"),
         ] {
-            enqueue_email_tx(
+            let rows = [("Client", label.as_str()), ("Recorded for", role)];
+            enqueue_market_card_email_tx(
                 tx,
                 kind,
                 &recipient,
                 &format!("[Client Market] Cleanup completed for {label}"),
-                &format!(
-                    "Remote cleanup completed for Client {label}. The Host is idle and available for allocation again. This final result is recorded for the {role}."
-                ),
+                "Cleanup completed",
+                "Remote cleanup completed. The Host is idle and available for allocation again.",
+                &rows,
+                None,
+                None,
+                None,
                 &format!("cleanup-finished:{installation_id}:{kind}"),
                 now,
             )?;
@@ -4831,14 +5046,21 @@ pub(crate) fn cleanup_failed_tx(
             ("client_cleanup_failed", client_email),
             ("provider_cleanup_failed", provider_email),
         ] {
-            enqueue_email_tx(
+            let rows = [
+                ("Client", label.as_str()),
+                ("Failure", failure_code),
+            ];
+            enqueue_market_card_email_tx(
                 tx,
                 kind,
                 &recipient,
                 &format!("[Client Market] Cleanup failed for {label}"),
-                &format!(
-                    "Remote cleanup failed for Client {label} ({failure_code}). The Client stays in release_failed, its tunnel stays disabled, and creating new Clients remains blocked for the Client owner. This state does not clear on its own — contact the Router administrator to force release it."
-                ),
+                "Cleanup failed",
+                "Remote cleanup failed. The Client stays in release_failed, its tunnel stays disabled, and creating new Clients remains blocked for the Client owner. This state does not clear on its own — contact the Router administrator to force release it.",
+                &rows,
+                None,
+                None,
+                None,
                 &format!("cleanup-failed:{installation_id}:{failure_code}:{kind}"),
                 now,
             )?;
