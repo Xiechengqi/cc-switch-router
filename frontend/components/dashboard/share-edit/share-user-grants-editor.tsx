@@ -17,8 +17,11 @@ type GrantDraft = {
   parallelLimit: string;
   tokenLimit: string;
   tokenPeriod: ShareTokenPeriod;
+  tokenPeriodAnchor: string;
   expiresAt: string;
 };
+
+const ANCHORED_PERIODS: ReadonlySet<ShareTokenPeriod> = new Set(["sevenDays", "thirtyDays"]);
 
 function toLocalDateTime(value?: number) {
   if (!value) return "";
@@ -28,12 +31,24 @@ function toLocalDateTime(value?: number) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
+function toUtcDateTime(value?: number) {
+  const date = new Date(value ?? Math.floor(Date.now() / 60_000) * 60_000);
+  if (!Number.isFinite(date.getTime())) return "";
+  const pad = (part: number) => String(part).padStart(2, "0");
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}T${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}`;
+}
+
+function parseUtcDateTime(value: string) {
+  return value ? new Date(`${value}:00Z`).getTime() : undefined;
+}
+
 function makeDraft(email: string, policy: ShareUserPolicy): GrantDraft {
   return {
     email,
     parallelLimit: policy.parallelLimit == null ? "" : String(policy.parallelLimit),
     tokenLimit: policy.tokenLimit == null ? "" : String(policy.tokenLimit),
     tokenPeriod: policy.tokenPeriod || "lifetime",
+    tokenPeriodAnchor: toUtcDateTime(policy.tokenPeriodAnchorAtMs),
     expiresAt: toLocalDateTime(policy.expiresAt),
   };
 }
@@ -47,6 +62,7 @@ export function ShareUserGrantsEditor({
   shareApp,
   ownerEmail,
   defaultPolicy,
+  supportedPeriods,
   t,
   onDraftChange,
 }: {
@@ -54,6 +70,7 @@ export function ShareUserGrantsEditor({
   shareApp: PriceApp;
   ownerEmail: string;
   defaultPolicy: ShareUserPolicy;
+  supportedPeriods?: ShareTokenPeriod[];
   t: TFn;
   onDraftChange: (updater: (current: ShareEditDraft) => ShareEditDraft) => void;
 }) {
@@ -61,12 +78,21 @@ export function ShareUserGrantsEditor({
   const [editingEmail, setEditingEmail] = React.useState<string | null>(null);
   const [grantDraft, setGrantDraft] = React.useState<GrantDraft | null>(null);
   const [error, setError] = React.useState("");
-  const periods: Array<{ key: ShareTokenPeriod; label: string }> = [
+  const supported = new Set<ShareTokenPeriod>(
+    supportedPeriods?.length
+      ? supportedPeriods
+      : ["lifetime", "day", "week", "calendarMonth"],
+  );
+  const periods = ([
     { key: "lifetime", label: t("dashboard.userLimit.periodLifetime") },
     { key: "day", label: t("dashboard.userLimit.periodDay") },
     { key: "week", label: t("dashboard.userLimit.periodWeek") },
+    { key: "sevenDays", label: t("dashboard.userLimit.periodSevenDays") },
     { key: "calendarMonth", label: t("dashboard.userLimit.periodMonth") },
-  ];
+    { key: "thirtyDays", label: t("dashboard.userLimit.periodThirtyDays") },
+  ] satisfies Array<{ key: ShareTokenPeriod; label: string }>).filter((period) =>
+    supported.has(period.key),
+  );
   const periodLabel = Object.fromEntries(periods.map((period) => [period.key, period.label]));
   const marketManagedEmails = new Set(
     [
@@ -134,6 +160,10 @@ export function ShareUserGrantsEditor({
     const expiresAt = grantDraft.expiresAt
       ? new Date(grantDraft.expiresAt).getTime()
       : undefined;
+    const anchored = ANCHORED_PERIODS.has(grantDraft.tokenPeriod);
+    const tokenPeriodAnchorAtMs = anchored
+      ? parseUtcDateTime(grantDraft.tokenPeriodAnchor)
+      : undefined;
     if (!validEmail(email)) {
       setError(t("dashboard.userLimit.invalidEmail"));
       return;
@@ -145,7 +175,12 @@ export function ShareUserGrantsEditor({
     if (
       (parallelLimit != null && (!Number.isInteger(parallelLimit) || parallelLimit < 1)) ||
       (tokenLimit != null && (!Number.isInteger(tokenLimit) || tokenLimit < 1)) ||
-      (expiresAt != null && !Number.isFinite(expiresAt))
+      (expiresAt != null && !Number.isFinite(expiresAt)) ||
+      (anchored && (
+        tokenPeriodAnchorAtMs == null ||
+        !Number.isFinite(tokenPeriodAnchorAtMs) ||
+        tokenPeriodAnchorAtMs > Math.floor(Date.now() / 60_000) * 60_000
+      ))
     ) {
       setError(t("dashboard.userLimit.invalidPolicy"));
       return;
@@ -160,6 +195,7 @@ export function ShareUserGrantsEditor({
         parallelLimit,
         tokenLimit,
         tokenPeriod: grantDraft.tokenPeriod,
+        tokenPeriodAnchorAtMs,
         expiresAt,
       },
     };
@@ -261,13 +297,35 @@ export function ShareUserGrantsEditor({
                 </div>
                 <div className="grid gap-1.5">
                   <span className="mono-label text-muted-foreground">{t("dashboard.userLimit.period")}</span>
-                  <Select selectedKey={grantDraft?.tokenPeriod || "lifetime"} onSelectionChange={(key) => grantDraft && setGrantDraft({ ...grantDraft, tokenPeriod: String(key || "lifetime") as ShareTokenPeriod })}>
+                  <Select selectedKey={grantDraft?.tokenPeriod || "lifetime"} onSelectionChange={(key) => {
+                    if (!grantDraft) return;
+                    const tokenPeriod = String(key || "lifetime") as ShareTokenPeriod;
+                    setGrantDraft({
+                      ...grantDraft,
+                      tokenPeriod,
+                      tokenPeriodAnchor: ANCHORED_PERIODS.has(tokenPeriod)
+                        ? (grantDraft.tokenPeriodAnchor || toUtcDateTime())
+                        : "",
+                    });
+                  }}>
                     <Select.Trigger><Select.Value>{periodLabel[grantDraft?.tokenPeriod || "lifetime"]}</Select.Value><Select.Indicator /></Select.Trigger>
                     <Select.Popover className="share-edit-popover light !bg-white !text-slate-900">
                       <ListBox>{periods.map((period) => <ListBox.Item key={period.key} id={period.key}>{period.label}</ListBox.Item>)}</ListBox>
                     </Select.Popover>
                   </Select>
                 </div>
+                {grantDraft && ANCHORED_PERIODS.has(grantDraft.tokenPeriod) ? (
+                  <div className="grid gap-1.5 sm:col-span-2">
+                    <span className="mono-label text-muted-foreground">{t("dashboard.userLimit.anchor")}</span>
+                    <Input
+                      type="datetime-local"
+                      step={60}
+                      value={grantDraft.tokenPeriodAnchor}
+                      onChange={(event) => setGrantDraft({ ...grantDraft, tokenPeriodAnchor: event.target.value })}
+                    />
+                    <p className="text-xs text-muted-foreground">{t("dashboard.userLimit.anchorHint")}</p>
+                  </div>
+                ) : null}
                 <div className="grid gap-1.5">
                   <span className="mono-label text-muted-foreground">{t("dashboard.field.expiresAt")}</span>
                   <Input type="datetime-local" value={grantDraft?.expiresAt || ""} onChange={(event) => grantDraft && setGrantDraft({ ...grantDraft, expiresAt: event.target.value })} />

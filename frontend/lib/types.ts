@@ -221,12 +221,19 @@ export type DashboardClient = {
 
 export type ShareSaleMarketKind = "token" | "share";
 
-export type ShareTokenPeriod = "lifetime" | "day" | "week" | "calendarMonth";
+export type ShareTokenPeriod =
+  | "lifetime"
+  | "day"
+  | "week"
+  | "sevenDays"
+  | "calendarMonth"
+  | "thirtyDays";
 
 export type ShareUserPolicy = {
   parallelLimit?: number;
   tokenLimit?: number;
   tokenPeriod: ShareTokenPeriod;
+  tokenPeriodAnchorAtMs?: number;
   expiresAt?: number;
 };
 
@@ -297,6 +304,7 @@ export type ShareView = {
   modelHealth?: ShareModelHealthSummary;
   operationalSummary?: OperationalSummary;
   userGrants?: ShareUserGrantMap;
+  supportedUserTokenPeriods?: ShareTokenPeriod[];
   configRevision?: number;
 };
 
@@ -707,9 +715,11 @@ export type ShareUserLimitStatusRow = {
   parallelLimit?: number;
   tokenLimit?: number;
   tokenPeriod: ShareTokenPeriod;
+  tokenPeriodAnchorAtMs?: number;
   expiresAt?: number;
   tokensUsed: number;
   percent?: number;
+  windowStartsAt?: string | null;
   resetsAt?: string | null;
 };
 

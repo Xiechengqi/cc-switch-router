@@ -814,6 +814,7 @@ function grantsToLimitStatusRows(grants: ShareUserGrant[]): ShareUserLimitStatus
     parallelLimit: grant.policy?.parallelLimit,
     tokenLimit: grant.policy?.tokenLimit,
     tokenPeriod: grant.policy?.tokenPeriod || "lifetime",
+    tokenPeriodAnchorAtMs: grant.policy?.tokenPeriodAnchorAtMs,
     expiresAt: grant.policy?.expiresAt,
     tokensUsed: 0,
   }));
@@ -834,7 +835,9 @@ export function ShareUserLimitsTable({
     lifetime: t("dashboard.userLimit.periodLifetime"),
     day: t("dashboard.userLimit.periodDay"),
     week: t("dashboard.userLimit.periodWeek"),
+    sevenDays: t("dashboard.userLimit.periodSevenDays"),
     calendarMonth: t("dashboard.userLimit.periodMonth"),
+    thirtyDays: t("dashboard.userLimit.periodThirtyDays"),
   };
   const displayRows = React.useMemo(
     () => (rows?.length ? rows : grantsToLimitStatusRows(grants || [])),

@@ -64,7 +64,7 @@ use crate::models::{
     ShareRuntimeSnapshotResponse, ShareSettingsPatch, ShareSettingsUpdateResponse, ShareSignals,
     ShareSupport, ShareSyncRequest, ShareTokenPeriod, ShareUpstreamProvider, ShareUpstreamQuota,
     ShareUsageByEmailResponse, ShareUsageDailyBucket, ShareUsageEmailRow, ShareUserGrant,
-    ShareUserLimitStatusResponse, ShareUserLimitStatusRow, ShareView,
+    ShareUserLimitStatusResponse, ShareUserLimitStatusRow, ShareUserPolicy, ShareView,
     SubdomainAvailabilityResponse, TunnelActivateRequest, TunnelLease, TunnelStateRequest,
     TunnelStateResponse, UserApiTokenResetResponse, UserApiTokenResponse, UserApiTokenStatus,
     UserShareView, UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
@@ -4737,6 +4737,7 @@ impl AppStore {
                     .then(|| active_edits.get(&share.share_id).cloned())
                     .flatten(),
                 user_grants,
+                supported_user_token_periods: share.supported_user_token_periods.clone(),
                 config_revision: share.config_revision,
             });
         }
@@ -4852,6 +4853,7 @@ impl AppStore {
             model_health: ShareModelHealthSummary::default(),
             operational_summary: OperationalSummary::healthy("online"),
             user_grants: visible_user_grants,
+            supported_user_token_periods: share.supported_user_token_periods,
             config_revision: share.config_revision,
         };
         view.operational_summary = share_operational_summary(&view, Utc::now());
@@ -5280,34 +5282,36 @@ impl AppStore {
         });
 
         let now = Utc::now();
-        let mut usage_by_period: HashMap<ShareTokenPeriod, HashMap<String, u64>> = HashMap::new();
-        let periods: HashSet<ShareTokenPeriod> = grants
-            .iter()
-            .map(|grant| grant.policy.token_period)
-            .collect();
-        for period in periods {
-            let (start, _) = token_period_window(period, now);
-            let start_bound =
-                start.unwrap_or_else(|| Utc.timestamp_opt(0, 0).single().unwrap_or(now));
-            let totals = query_share_email_token_totals(
-                &conn,
-                share_id,
-                &app,
-                start_bound,
-                matches!(period, ShareTokenPeriod::Lifetime),
-            )?;
-            usage_by_period.insert(period, totals);
+        let mut grant_windows = Vec::with_capacity(grants.len());
+        let mut unique_windows = BTreeMap::<String, UserQuotaWindow>::new();
+        for grant in &grants {
+            let (start, end) = token_period_window(&grant.policy, now)?;
+            let key = quota_window_key(start, end);
+            unique_windows
+                .entry(key.clone())
+                .or_insert(UserQuotaWindow {
+                    key: key.clone(),
+                    start,
+                    end,
+                });
+            grant_windows.push((key, start, end));
         }
+        let usage_by_window = query_share_email_token_totals_for_windows(
+            &conn,
+            share_id,
+            &app,
+            &unique_windows.into_values().collect::<Vec<_>>(),
+        )?;
 
         let rows = grants
             .into_iter()
-            .map(|grant| {
+            .zip(grant_windows)
+            .map(|(grant, (window_key, window_start, resets_at))| {
                 let email = normalize_usage_email(&grant.email)
                     .unwrap_or_else(|| grant.email.trim().to_ascii_lowercase());
                 let period = grant.policy.token_period;
-                let (_, resets_at) = token_period_window(period, now);
-                let tokens_used = usage_by_period
-                    .get(&period)
+                let tokens_used = usage_by_window
+                    .get(&window_key)
                     .and_then(|map| map.get(&email))
                     .copied()
                     .unwrap_or(0);
@@ -5326,8 +5330,10 @@ impl AppStore {
                     parallel_limit: grant.policy.parallel_limit,
                     token_limit: grant.policy.token_limit,
                     token_period: period,
+                    token_period_anchor_at_ms: grant.policy.token_period_anchor_at_ms,
                     expires_at: grant.policy.expires_at,
                     tokens_used,
+                    window_starts_at: window_start.map(|ts| ts.to_rfc3339()),
                     percent,
                     resets_at: resets_at.map(|ts| ts.to_rfc3339()),
                 }
@@ -6758,6 +6764,7 @@ impl AppStore {
             current_app_type,
             current_config_revision,
             user_grants_json,
+            supported_user_token_periods_json,
         ): (
             String,
             String,
@@ -6767,11 +6774,12 @@ impl AppStore {
             String,
             i64,
             String,
+            String,
         ) = conn
             .query_row(
-                "SELECT installation_id, owner_email, shared_with_emails_json, for_sale, sale_market_kind, app_type, config_revision, COALESCE(user_grants_json, '{}') FROM shares WHERE share_id = ?1",
+                "SELECT installation_id, owner_email, shared_with_emails_json, for_sale, sale_market_kind, app_type, config_revision, COALESCE(user_grants_json, '{}'), COALESCE(supported_user_token_periods_json, '[]') FROM shares WHERE share_id = ?1",
                 params![share_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?)),
             )
             .optional()
             .map_err(|e| AppError::Internal(format!("query share owner failed: {e}")))?
@@ -6795,6 +6803,17 @@ impl AppStore {
             Some(&current_app_type),
             Some(&existing_user_grants),
         )?;
+        let supported_user_token_periods =
+            parse_supported_user_token_periods(&supported_user_token_periods_json);
+        if patch.user_grants.as_ref().is_some_and(|grants| {
+            grants
+                .values()
+                .any(|grant| !supported_user_token_periods.contains(&grant.policy.token_period))
+        }) {
+            return Err(AppError::BadRequest(
+                "selected token period is not supported by this client".into(),
+            ));
+        }
         if share_settings_patch_is_empty(&patch) {
             return Err(AppError::BadRequest("share settings patch is empty".into()));
         }
@@ -7579,6 +7598,7 @@ impl AppStore {
                     model_health,
                     operational_summary: OperationalSummary::healthy("online"),
                     user_grants: visible_user_grants,
+                    supported_user_token_periods: share.supported_user_token_periods,
                     config_revision: share.config_revision,
                 };
                 view.operational_summary = share_operational_summary(&view, Utc::now());
@@ -11257,6 +11277,15 @@ fn upsert_share_tx(
             "official price percent requires forSale=Yes and saleMarketKind=token".into(),
         ));
     }
+    let now_ms = Utc::now().timestamp_millis();
+    for grant in share.user_grants.values() {
+        if grant.policy.parallel_limit == Some(0) || grant.policy.token_limit == Some(0) {
+            return Err(AppError::BadRequest(
+                "user limits must be positive or unlimited".into(),
+            ));
+        }
+        validate_share_user_policy(&grant.policy, now_ms)?;
+    }
     let upstream_provider_json = share
         .upstream_provider
         .as_ref()
@@ -11267,6 +11296,12 @@ fn upsert_share_tx(
         .map_err(|e| AppError::Internal(format!("serialize shared_with_emails failed: {e}")))?;
     let user_grants_json = serde_json::to_string(&share.user_grants)
         .map_err(|e| AppError::Internal(format!("serialize user_grants failed: {e}")))?;
+    let supported_user_token_periods_json =
+        serde_json::to_string(&share.supported_user_token_periods).map_err(|e| {
+            AppError::Internal(format!(
+                "serialize supported user token periods failed: {e}"
+            ))
+        })?;
     let access_by_app_json = serde_json::to_string(&share.access_by_app)
         .map_err(|e| AppError::Internal(format!("serialize access_by_app failed: {e}")))?;
     let app_settings = effective_share_app_settings(&share);
@@ -11288,8 +11323,8 @@ fn upsert_share_tx(
         "INSERT INTO shares (
             share_id, installation_id, share_name, owner_email, shared_with_emails_json, market_access_mode, access_by_app_json, app_settings_json, description, for_sale, sale_market_kind, subdomain, app_type, provider_id,
             enabled_claude, enabled_codex, enabled_gemini,
-            token_limit, parallel_limit, tokens_used, requests_count, share_status, created_at, expires_at, upstream_provider_json, app_runtimes_json, app_providers_json, bindings_json, config_revision, user_grants_json, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)
+            token_limit, parallel_limit, tokens_used, requests_count, share_status, created_at, expires_at, upstream_provider_json, app_runtimes_json, app_providers_json, bindings_json, config_revision, user_grants_json, supported_user_token_periods_json, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)
         ON CONFLICT(share_id) DO UPDATE SET
             installation_id = excluded.installation_id,
             share_name = excluded.share_name,
@@ -11320,6 +11355,7 @@ fn upsert_share_tx(
             bindings_json = excluded.bindings_json,
             config_revision = excluded.config_revision,
             user_grants_json = excluded.user_grants_json,
+            supported_user_token_periods_json = excluded.supported_user_token_periods_json,
             runtime_refreshed_at = shares.runtime_refreshed_at,
             updated_at = excluded.updated_at
         WHERE excluded.config_revision >= shares.config_revision",
@@ -11354,6 +11390,7 @@ fn upsert_share_tx(
             bindings_json,
             i64::try_from(share.config_revision).unwrap_or(i64::MAX),
             user_grants_json,
+            supported_user_token_periods_json,
             Utc::now().to_rfc3339(),
         ],
     )
@@ -11730,9 +11767,9 @@ fn upsert_share_request_log_tx(
             request_id, installation_id, share_id, share_name, provider_id, provider_name,
             app_type, model, request_model, request_agent, requested_model, actual_model, actual_model_source,
             status_code, latency_ms, first_token_ms,
-            input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+            input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, quota_tokens,
             is_streaming, session_id, user_country, user_country_iso3, user_email, is_health_check, created_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
         ON CONFLICT(request_id) DO UPDATE SET
             installation_id = excluded.installation_id,
             share_id = excluded.share_id,
@@ -11753,6 +11790,7 @@ fn upsert_share_request_log_tx(
             output_tokens = excluded.output_tokens,
             cache_read_tokens = excluded.cache_read_tokens,
             cache_creation_tokens = excluded.cache_creation_tokens,
+            quota_tokens = COALESCE(excluded.quota_tokens, share_request_logs.quota_tokens),
             is_streaming = excluded.is_streaming,
             session_id = excluded.session_id,
             user_country = COALESCE(excluded.user_country, share_request_logs.user_country),
@@ -11781,6 +11819,7 @@ fn upsert_share_request_log_tx(
             i64::from(log.output_tokens),
             i64::from(log.cache_read_tokens),
             i64::from(log.cache_creation_tokens),
+            log.quota_tokens.map(i64::from),
             i64::from(log.is_streaming as u8),
             log.session_id,
             log.user_country,
@@ -12170,6 +12209,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             -- Share 的单一 app/provider 绑定快照（JSON: {app_type: provider_id}）。
             bindings_json TEXT,
             user_grants_json TEXT NOT NULL DEFAULT '{}',
+            supported_user_token_periods_json TEXT NOT NULL DEFAULT '[]',
             runtime_refreshed_at TEXT,
             config_revision INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT NOT NULL
@@ -12208,6 +12248,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             output_tokens INTEGER NOT NULL,
             cache_read_tokens INTEGER NOT NULL,
             cache_creation_tokens INTEGER NOT NULL,
+            quota_tokens INTEGER,
             is_streaming INTEGER NOT NULL,
             session_id TEXT,
             user_country TEXT,
@@ -12692,6 +12733,8 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         CREATE INDEX IF NOT EXISTS idx_shares_installation_id ON shares(installation_id);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_shares_subdomain_unique ON shares(subdomain) WHERE subdomain IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_share_request_logs_share_id ON share_request_logs(share_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_share_request_logs_share_app_user_created
+            ON share_request_logs(share_id, app_type, user_email, created_at);
         CREATE INDEX IF NOT EXISTS idx_share_request_logs_created_at ON share_request_logs(created_at);
         CREATE INDEX IF NOT EXISTS idx_image_jobs_share_queued ON image_generation_jobs(share_id, queued_at DESC);
         CREATE INDEX IF NOT EXISTS idx_image_jobs_provider_queued ON image_generation_jobs(provider_id, queued_at DESC);
@@ -12754,6 +12797,8 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         CREATE INDEX IF NOT EXISTS idx_market_notification_emails_to_created ON market_notification_emails(to_email, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_market_request_logs_market_created ON market_request_logs(market_email, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_market_request_logs_share_created ON market_request_logs(share_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_market_request_logs_share_agent_user_created
+            ON market_request_logs(share_id, request_agent, user_email, created_at);
         CREATE INDEX IF NOT EXISTS idx_market_request_logs_created ON market_request_logs(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_market_share_model_failure_state_share ON market_share_model_failure_state(market_email, share_id, app_type, last_status);
         CREATE INDEX IF NOT EXISTS idx_market_share_runtime_states_market_share ON market_share_runtime_states(market_email, share_id);
@@ -12853,6 +12898,19 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
     add_column_if_missing(conn, "leases", "ready_at", "TEXT")?;
     add_column_if_missing(conn, "leases", "activated_at", "TEXT")?;
     add_column_if_missing(conn, "leases", "retired_at", "TEXT")?;
+    add_column_if_missing(conn, "share_request_logs", "quota_tokens", "INTEGER")?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_share_request_logs_share_app_user_created
+         ON share_request_logs(share_id, app_type, user_email, created_at)",
+        [],
+    )
+    .map_err(|e| AppError::Internal(format!("index Share user quota logs failed: {e}")))?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_market_request_logs_share_agent_user_created
+         ON market_request_logs(share_id, request_agent, user_email, created_at)",
+        [],
+    )
+    .map_err(|e| AppError::Internal(format!("index Market user quota logs failed: {e}")))?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_leases_route_generation
          ON leases(route_id, generation)",
@@ -13111,6 +13169,20 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             [],
         )
         .map_err(|e| AppError::Internal(format!("add shares user_grants_json failed: {e}")))?;
+    }
+    if !columns
+        .iter()
+        .any(|name| name == "supported_user_token_periods_json")
+    {
+        conn.execute(
+            "ALTER TABLE shares ADD COLUMN supported_user_token_periods_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        )
+        .map_err(|e| {
+            AppError::Internal(format!(
+                "add shares supported_user_token_periods_json failed: {e}"
+            ))
+        })?;
     }
     if !columns.iter().any(|name| name == "market_access_mode") {
         conn.execute(
@@ -16194,10 +16266,10 @@ fn parse_ip_im_geo(body: &str) -> Option<GeoLookupResult> {
 }
 
 fn token_period_window(
-    period: ShareTokenPeriod,
+    policy: &ShareUserPolicy,
     now: DateTime<Utc>,
-) -> (Option<DateTime<Utc>>, Option<DateTime<Utc>>) {
-    match period {
+) -> Result<(Option<DateTime<Utc>>, Option<DateTime<Utc>>), AppError> {
+    let result = match policy.token_period {
         ShareTokenPeriod::Lifetime => (None, None),
         ShareTokenPeriod::Day => {
             let start = now
@@ -16233,6 +16305,70 @@ fn token_period_window(
             .unwrap_or(start + Duration::days(31));
             (Some(start), Some(resets))
         }
+        period @ (ShareTokenPeriod::SevenDays | ShareTokenPeriod::ThirtyDays) => {
+            let anchor_ms = policy.token_period_anchor_at_ms.ok_or_else(|| {
+                AppError::BadRequest(
+                    "tokenPeriodAnchorAtMs is required for fixed token periods".into(),
+                )
+            })?;
+            let duration_ms = match period {
+                ShareTokenPeriod::SevenDays => 7_i64 * 24 * 60 * 60 * 1000,
+                ShareTokenPeriod::ThirtyDays => 30_i64 * 24 * 60 * 60 * 1000,
+                _ => unreachable!(),
+            };
+            let now_ms = now.timestamp_millis();
+            let index =
+                (i128::from(now_ms) - i128::from(anchor_ms)).div_euclid(i128::from(duration_ms));
+            let start_ms = i128::from(anchor_ms)
+                .checked_add(index.checked_mul(i128::from(duration_ms)).ok_or_else(|| {
+                    AppError::BadRequest("fixed token period window overflow".into())
+                })?)
+                .ok_or_else(|| AppError::BadRequest("fixed token period window overflow".into()))?;
+            let end_ms = start_ms
+                .checked_add(i128::from(duration_ms))
+                .ok_or_else(|| AppError::BadRequest("fixed token period window overflow".into()))?;
+            let start = Utc
+                .timestamp_millis_opt(i64::try_from(start_ms).map_err(|_| {
+                    AppError::BadRequest("fixed token period start is out of range".into())
+                })?)
+                .single()
+                .ok_or_else(|| {
+                    AppError::BadRequest("fixed token period start is invalid".into())
+                })?;
+            let end = Utc
+                .timestamp_millis_opt(i64::try_from(end_ms).map_err(|_| {
+                    AppError::BadRequest("fixed token period end is out of range".into())
+                })?)
+                .single()
+                .ok_or_else(|| AppError::BadRequest("fixed token period end is invalid".into()))?;
+            (Some(start), Some(end))
+        }
+    };
+    Ok(result)
+}
+
+fn validate_share_user_policy(policy: &ShareUserPolicy, now_ms: i64) -> Result<(), AppError> {
+    let anchored = matches!(
+        policy.token_period,
+        ShareTokenPeriod::SevenDays | ShareTokenPeriod::ThirtyDays
+    );
+    match (anchored, policy.token_period_anchor_at_ms) {
+        (true, None) => Err(AppError::BadRequest(
+            "tokenPeriodAnchorAtMs is required for fixed token periods".into(),
+        )),
+        (false, Some(_)) => Err(AppError::BadRequest(
+            "tokenPeriodAnchorAtMs is only allowed for sevenDays or thirtyDays".into(),
+        )),
+        (true, Some(anchor)) if anchor < 0 => Err(AppError::BadRequest(
+            "tokenPeriodAnchorAtMs must be a non-negative UTC timestamp".into(),
+        )),
+        (true, Some(anchor)) if anchor % 60_000 != 0 => Err(AppError::BadRequest(
+            "tokenPeriodAnchorAtMs must use minute precision".into(),
+        )),
+        (true, Some(anchor)) if anchor > now_ms => Err(AppError::BadRequest(
+            "tokenPeriodAnchorAtMs cannot be in the future".into(),
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -16244,11 +16380,17 @@ mod token_period_window_tests {
     #[test]
     fn day_week_month_windows_use_utc_calendar_bounds() {
         let now = Utc.with_ymd_and_hms(2026, 7, 24, 15, 30, 0).unwrap();
-        let (day_start, day_reset) = token_period_window(ShareTokenPeriod::Day, now);
+        let policy = |token_period| ShareUserPolicy {
+            token_period,
+            ..ShareUserPolicy::default()
+        };
+        let (day_start, day_reset) =
+            token_period_window(&policy(ShareTokenPeriod::Day), now).unwrap();
         assert_eq!(day_start.unwrap().to_rfc3339(), "2026-07-24T00:00:00+00:00");
         assert_eq!(day_reset.unwrap().to_rfc3339(), "2026-07-25T00:00:00+00:00");
 
-        let (week_start, week_reset) = token_period_window(ShareTokenPeriod::Week, now);
+        let (week_start, week_reset) =
+            token_period_window(&policy(ShareTokenPeriod::Week), now).unwrap();
         assert_eq!(
             week_start.unwrap().to_rfc3339(),
             "2026-07-20T00:00:00+00:00"
@@ -16258,7 +16400,8 @@ mod token_period_window_tests {
             "2026-07-27T00:00:00+00:00"
         );
 
-        let (month_start, month_reset) = token_period_window(ShareTokenPeriod::CalendarMonth, now);
+        let (month_start, month_reset) =
+            token_period_window(&policy(ShareTokenPeriod::CalendarMonth), now).unwrap();
         assert_eq!(
             month_start.unwrap().to_rfc3339(),
             "2026-07-01T00:00:00+00:00"
@@ -16268,112 +16411,277 @@ mod token_period_window_tests {
             "2026-08-01T00:00:00+00:00"
         );
 
-        let (life_start, life_reset) = token_period_window(ShareTokenPeriod::Lifetime, now);
+        let (life_start, life_reset) =
+            token_period_window(&policy(ShareTokenPeriod::Lifetime), now).unwrap();
         assert!(life_start.is_none());
         assert!(life_reset.is_none());
     }
+
+    #[test]
+    fn anchored_windows_roll_at_exact_fixed_boundaries() {
+        let anchor = Utc.with_ymd_and_hms(2026, 7, 1, 12, 15, 0).unwrap();
+        let policy = ShareUserPolicy {
+            token_period: ShareTokenPeriod::SevenDays,
+            token_period_anchor_at_ms: Some(anchor.timestamp_millis()),
+            ..ShareUserPolicy::default()
+        };
+        let before = Utc.with_ymd_and_hms(2026, 7, 15, 12, 14, 0).unwrap();
+        let (start, end) = token_period_window(&policy, before).unwrap();
+        assert_eq!(start.unwrap().to_rfc3339(), "2026-07-08T12:15:00+00:00");
+        assert_eq!(end.unwrap().to_rfc3339(), "2026-07-15T12:15:00+00:00");
+        let boundary = Utc.with_ymd_and_hms(2026, 7, 15, 12, 15, 0).unwrap();
+        let (start, end) = token_period_window(&policy, boundary).unwrap();
+        assert_eq!(start.unwrap().to_rfc3339(), "2026-07-15T12:15:00+00:00");
+        assert_eq!(end.unwrap().to_rfc3339(), "2026-07-22T12:15:00+00:00");
+    }
+
+    #[test]
+    fn quota_schema_migration_is_idempotent_for_existing_databases() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute(
+            "ALTER TABLE share_request_logs DROP COLUMN quota_tokens",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "ALTER TABLE shares DROP COLUMN supported_user_token_periods_json",
+            [],
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+        init_schema(&conn).unwrap();
+
+        let columns = |table: &str| {
+            conn.prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<HashSet<_>, _>>()
+                .unwrap()
+        };
+        assert!(columns("share_request_logs").contains("quota_tokens"));
+        assert!(columns("shares").contains("supported_user_token_periods_json"));
+    }
+
+    #[test]
+    fn missing_or_invalid_capability_uses_legacy_periods() {
+        let legacy = legacy_supported_user_token_periods();
+        assert_eq!(parse_supported_user_token_periods("[]"), legacy);
+        assert_eq!(parse_supported_user_token_periods("not-json"), legacy);
+        assert_eq!(
+            parse_supported_user_token_periods(
+                r#"["lifetime","day","week","sevenDays","calendarMonth","thirtyDays"]"#,
+            ),
+            vec![
+                ShareTokenPeriod::Lifetime,
+                ShareTokenPeriod::Day,
+                ShareTokenPeriod::Week,
+                ShareTokenPeriod::SevenDays,
+                ShareTokenPeriod::CalendarMonth,
+                ShareTokenPeriod::ThirtyDays,
+            ]
+        );
+    }
+
+    #[test]
+    fn batched_usage_keeps_distinct_anchor_windows_and_prefers_quota_tokens() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let log = |request_id: &str, email: &str, created_at: i64, quota_tokens: u32| {
+            ShareRequestLogEntry {
+                request_id: request_id.to_string(),
+                share_id: "share-anchored".into(),
+                share_name: "Anchored".into(),
+                provider_id: "provider".into(),
+                provider_name: "Provider".into(),
+                app_type: "codex".into(),
+                model: "gpt-5".into(),
+                request_model: "gpt-5".into(),
+                request_agent: "codex".into(),
+                requested_model: "gpt-5".into(),
+                actual_model: "gpt-5".into(),
+                actual_model_source: "official".into(),
+                status_code: 200,
+                latency_ms: 1,
+                first_token_ms: None,
+                input_tokens: 900,
+                output_tokens: 100,
+                cache_read_tokens: 50,
+                cache_creation_tokens: 25,
+                quota_tokens: Some(quota_tokens),
+                is_streaming: false,
+                session_id: None,
+                user_country: None,
+                user_country_iso3: None,
+                user_email: Some(email.to_string()),
+                created_at,
+                is_health_check: false,
+            }
+        };
+        let at = |day| {
+            Utc.with_ymd_and_hms(2026, 7, day, 0, 0, 0)
+                .unwrap()
+                .timestamp()
+        };
+        upsert_share_request_log_tx(
+            &conn,
+            "installation",
+            log("alice-old", "alice@example.com", at(20), 7),
+        )
+        .unwrap();
+        upsert_share_request_log_tx(
+            &conn,
+            "installation",
+            log("bob-current", "bob@example.com", at(23), 11),
+        )
+        .unwrap();
+        let windows = vec![
+            UserQuotaWindow {
+                key: "late".into(),
+                start: DateTime::from_timestamp(at(22), 0),
+                end: DateTime::from_timestamp(at(29), 0),
+            },
+            UserQuotaWindow {
+                key: "early".into(),
+                start: DateTime::from_timestamp(at(18), 0),
+                end: DateTime::from_timestamp(at(25), 0),
+            },
+        ];
+        let totals =
+            query_share_email_token_totals_for_windows(&conn, "share-anchored", "codex", &windows)
+                .unwrap();
+        assert_eq!(totals["late"].get("alice@example.com"), None);
+        assert_eq!(totals["late"]["bob@example.com"], 11);
+        assert_eq!(totals["early"]["alice@example.com"], 7);
+        assert_eq!(totals["early"]["bob@example.com"], 11);
+    }
 }
 
-fn query_share_email_token_totals(
+#[derive(Debug, Clone)]
+struct UserQuotaWindow {
+    key: String,
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+}
+
+fn quota_window_key(start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>) -> String {
+    match (start, end) {
+        (Some(start), Some(end)) => format!("{}:{}", start.timestamp(), end.timestamp()),
+        _ => "lifetime".to_string(),
+    }
+}
+
+fn query_share_email_token_totals_for_windows(
     conn: &Connection,
     share_id: &str,
     app: &str,
-    start: DateTime<Utc>,
-    lifetime: bool,
-) -> Result<HashMap<String, u64>, AppError> {
-    let mut totals = HashMap::<String, u64>::new();
-    let start_rfc3339 = start.to_rfc3339();
-    let start_ts = start.timestamp();
+    windows: &[UserQuotaWindow],
+) -> Result<HashMap<String, HashMap<String, u64>>, AppError> {
+    if windows.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut values_sql = Vec::with_capacity(windows.len());
+    let mut values = vec![
+        rusqlite::types::Value::Text(share_id.to_string()),
+        rusqlite::types::Value::Text(app.to_string()),
+    ];
+    for (index, window) in windows.iter().enumerate() {
+        let base = 3 + index * 3;
+        values_sql.push(format!("(?{base}, ?{}, ?{})", base + 1, base + 2));
+        values.push(rusqlite::types::Value::Text(window.key.clone()));
+        values.push(match window.start {
+            Some(start) => rusqlite::types::Value::Integer(start.timestamp()),
+            None => rusqlite::types::Value::Null,
+        });
+        values.push(match window.end {
+            Some(end) => rusqlite::types::Value::Integer(end.timestamp()),
+            None => rusqlite::types::Value::Null,
+        });
+    }
 
     let market_input_expr = market_log_input_tokens_expr("ml");
     let market_total_expr = market_log_total_tokens_expr("ml");
-    let market_sql = format!(
-        "SELECT lower(trim(ml.user_email)),
-                COALESCE(SUM(CASE WHEN ({market_total_expr}) > 0 OR sl.request_id IS NULL THEN {market_input_expr} ELSE COALESCE(sl.input_tokens, 0) END), 0),
-                COALESCE(SUM(CASE WHEN ({market_total_expr}) > 0 OR sl.request_id IS NULL THEN COALESCE(ml.output_tokens, 0) ELSE COALESCE(sl.output_tokens, 0) END), 0),
-                COALESCE(SUM(CASE WHEN ({market_total_expr}) > 0 OR sl.request_id IS NULL THEN COALESCE(ml.cache_read_tokens, 0) ELSE COALESCE(sl.cache_read_tokens, 0) END), 0),
-                COALESCE(SUM(CASE WHEN ({market_total_expr}) > 0 OR sl.request_id IS NULL THEN COALESCE(ml.cache_creation_tokens, 0) ELSE COALESCE(sl.cache_creation_tokens, 0) END), 0)
-         FROM market_request_logs ml
+    let share_fallback = "COALESCE(sl.input_tokens, 0) + COALESCE(sl.output_tokens, 0) + COALESCE(sl.cache_read_tokens, 0) + COALESCE(sl.cache_creation_tokens, 0)";
+    let direct_fallback = "COALESCE(sr.input_tokens, 0) + COALESCE(sr.output_tokens, 0) + COALESCE(sr.cache_read_tokens, 0) + COALESCE(sr.cache_creation_tokens, 0)";
+    let sql = format!(
+        "WITH windows(window_key, start_ts, end_ts) AS (VALUES {}),
+         market_usage AS (
+           SELECT w.window_key, lower(trim(ml.user_email)) AS email,
+                  COALESCE(SUM(
+                    CASE
+                      WHEN sl.quota_tokens IS NOT NULL THEN sl.quota_tokens
+                      WHEN ({market_total_expr}) > 0 OR sl.request_id IS NULL
+                        THEN {market_input_expr} + COALESCE(ml.output_tokens, 0)
+                             + COALESCE(ml.cache_read_tokens, 0) + COALESCE(ml.cache_creation_tokens, 0)
+                      ELSE {share_fallback}
+                    END
+                  ), 0) AS tokens
+           FROM windows w
+           JOIN market_request_logs ml
+             ON (w.start_ts IS NULL OR unixepoch(ml.created_at) >= w.start_ts)
+            AND (w.end_ts IS NULL OR unixepoch(ml.created_at) < w.end_ts)
          LEFT JOIN share_request_logs sl
            ON sl.request_id = ml.request_id
           AND sl.share_id = ml.share_id
           AND sl.is_health_check = 0
           AND lower(CASE WHEN COALESCE(sl.request_agent, '') != '' THEN sl.request_agent ELSE sl.app_type END) = lower(ml.request_agent)
-         WHERE ml.share_id = ?1
-           AND lower(ml.request_agent) = lower(?2)
-           AND (?3 = 1 OR ml.created_at >= ?4)
+          WHERE ml.share_id = ?1
+            AND lower(ml.request_agent) = lower(?2)
            AND ml.user_email IS NOT NULL
            AND trim(ml.user_email) != ''
-         GROUP BY lower(trim(ml.user_email))"
-    );
-    let mut market_stmt = conn
-        .prepare(&market_sql)
-        .map_err(|e| AppError::Internal(format!("prepare user-limit market usage failed: {e}")))?;
-    let market_rows = market_stmt
-        .query_map(
-            params![share_id, app, i64::from(lifetime), start_rfc3339.as_str(),],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?.max(0) as u64,
-                    row.get::<_, i64>(2)?.max(0) as u64,
-                    row.get::<_, i64>(3)?.max(0) as u64,
-                    row.get::<_, i64>(4)?.max(0) as u64,
-                ))
-            },
-        )
-        .map_err(|e| AppError::Internal(format!("query user-limit market usage failed: {e}")))?;
-    for row in market_rows {
-        let (email, input, output, cache_read, cache_creation) = row.map_err(|e| {
-            AppError::Internal(format!("read user-limit market usage row failed: {e}"))
-        })?;
-        *totals.entry(email).or_default() += input + output + cache_read + cache_creation;
-    }
-
-    let share_sql = "
-        SELECT lower(trim(user_email)),
-                COALESCE(SUM(input_tokens), 0),
-                COALESCE(SUM(output_tokens), 0),
-                COALESCE(SUM(cache_read_tokens), 0),
-                COALESCE(SUM(cache_creation_tokens), 0)
-         FROM share_request_logs
-         WHERE share_id = ?1
-           AND lower(app_type) = lower(?2)
-           AND (?3 = 1 OR created_at >= ?4)
-           AND is_health_check = 0
-           AND user_email IS NOT NULL
-           AND trim(user_email) != ''
-           AND NOT EXISTS (
+          GROUP BY w.window_key, lower(trim(ml.user_email))
+         ),
+         direct_usage AS (
+           SELECT w.window_key, lower(trim(sr.user_email)) AS email,
+                  COALESCE(SUM(COALESCE(sr.quota_tokens, {direct_fallback})), 0) AS tokens
+           FROM windows w
+           JOIN share_request_logs sr
+             ON (w.start_ts IS NULL OR sr.created_at >= w.start_ts)
+            AND (w.end_ts IS NULL OR sr.created_at < w.end_ts)
+          WHERE sr.share_id = ?1
+            AND lower(sr.app_type) = lower(?2)
+            AND sr.is_health_check = 0
+            AND sr.user_email IS NOT NULL
+            AND trim(sr.user_email) != ''
+            AND NOT EXISTS (
                 SELECT 1
                 FROM market_request_logs ml
-                WHERE ml.request_id = share_request_logs.request_id
-                  AND COALESCE(ml.share_id, '') = share_request_logs.share_id
+                WHERE ml.request_id = sr.request_id
+                  AND COALESCE(ml.share_id, '') = sr.share_id
                   AND ml.user_email IS NOT NULL
                   AND trim(ml.user_email) != ''
            )
-         GROUP BY lower(trim(user_email))";
-    let mut share_stmt = conn
-        .prepare(share_sql)
-        .map_err(|e| AppError::Internal(format!("prepare user-limit share usage failed: {e}")))?;
-    let share_rows = share_stmt
-        .query_map(
-            params![share_id, app, i64::from(lifetime), start_ts],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?.max(0) as u64,
-                    row.get::<_, i64>(2)?.max(0) as u64,
-                    row.get::<_, i64>(3)?.max(0) as u64,
-                    row.get::<_, i64>(4)?.max(0) as u64,
-                ))
-            },
-        )
-        .map_err(|e| AppError::Internal(format!("query user-limit share usage failed: {e}")))?;
-    for row in share_rows {
-        let (email, input, output, cache_read, cache_creation) = row.map_err(|e| {
-            AppError::Internal(format!("read user-limit share usage row failed: {e}"))
+          GROUP BY w.window_key, lower(trim(sr.user_email))
+         )
+         SELECT window_key, email, SUM(tokens)
+           FROM (
+             SELECT window_key, email, tokens FROM market_usage
+             UNION ALL
+             SELECT window_key, email, tokens FROM direct_usage
+           )
+          GROUP BY window_key, email",
+        values_sql.join(", ")
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| AppError::Internal(format!("prepare batched user-limit usage failed: {e}")))?;
+    let rows = stmt
+        .query_map(params_from_iter(values), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?.max(0) as u64,
+            ))
+        })
+        .map_err(|e| AppError::Internal(format!("query batched user-limit usage failed: {e}")))?;
+    let mut totals = HashMap::<String, HashMap<String, u64>>::new();
+    for row in rows {
+        let (window_key, email, tokens) = row.map_err(|e| {
+            AppError::Internal(format!("read batched user-limit usage row failed: {e}"))
         })?;
-        *totals.entry(email).or_default() += input + output + cache_read + cache_creation;
+        totals.entry(window_key).or_default().insert(email, tokens);
     }
     Ok(totals)
 }
@@ -16398,7 +16706,8 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                     s.owner_email, s.shared_with_emails_json,
                     s.enabled_claude, s.enabled_codex, s.enabled_gemini,
                     s.token_limit, s.parallel_limit, s.tokens_used, s.requests_count, s.share_status, s.created_at, s.expires_at, s.upstream_provider_json, s.app_runtimes_json, s.app_providers_json,
-                    s.bindings_json, s.config_revision, COALESCE(s.user_grants_json, '{}')
+                    s.bindings_json, s.config_revision, COALESCE(s.user_grants_json, '{}'),
+                    COALESCE(s.supported_user_token_periods_json, '[]')
              FROM shares s
              ORDER BY s.share_name ASC",
         )
@@ -16444,11 +16753,30 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                     auto_start: false,
                     config_revision: row.get::<_, i64>(28)?.max(0) as u64,
                     user_grants: parse_share_user_grants(row.get(29)?)?,
+                    supported_user_token_periods: parse_supported_user_token_periods(
+                        &row.get::<_, String>(30)?,
+                    ),
                 },
             ))
         })
         .map_err(|e| AppError::Internal(format!("query shares failed: {e}")))?;
     collect_rows(rows)
+}
+
+fn legacy_supported_user_token_periods() -> Vec<ShareTokenPeriod> {
+    vec![
+        ShareTokenPeriod::Lifetime,
+        ShareTokenPeriod::Day,
+        ShareTokenPeriod::Week,
+        ShareTokenPeriod::CalendarMonth,
+    ]
+}
+
+fn parse_supported_user_token_periods(value: &str) -> Vec<ShareTokenPeriod> {
+    serde_json::from_str::<Vec<ShareTokenPeriod>>(value)
+        .ok()
+        .filter(|periods| !periods.is_empty())
+        .unwrap_or_else(legacy_supported_user_token_periods)
 }
 
 fn list_active_share_edits(conn: &Connection) -> Result<HashMap<String, ShareEditView>, AppError> {
@@ -16789,6 +17117,7 @@ fn normalize_share_user_grants_preserving(
                 "user limits must be positive or unlimited".into(),
             ));
         }
+        validate_share_user_policy(&grant.policy, Utc::now().timestamp_millis())?;
         grant.email = email.clone();
         grant.role = if email == owner_email {
             "owner".to_string()
@@ -18973,7 +19302,7 @@ fn list_global_recent_share_request_logs(
             "SELECT request_id, share_id, share_name, provider_id, provider_name, app_type, model,
                     request_model, request_agent, requested_model, actual_model, actual_model_source,
                     status_code, latency_ms, first_token_ms, input_tokens,
-                    output_tokens, cache_read_tokens, cache_creation_tokens, is_streaming,
+                    output_tokens, cache_read_tokens, cache_creation_tokens, quota_tokens, is_streaming,
                     session_id, user_country, user_country_iso3, user_email, is_health_check, created_at
              FROM share_request_logs
              WHERE COALESCE(is_health_check, 0) = 0
@@ -18996,13 +19325,13 @@ fn list_recent_share_request_logs(
             "SELECT request_id, share_id, share_name, provider_id, provider_name, app_type, model,
                     request_model, request_agent, requested_model, actual_model, actual_model_source,
                     status_code, latency_ms, first_token_ms, input_tokens,
-                    output_tokens, cache_read_tokens, cache_creation_tokens, is_streaming,
+                    output_tokens, cache_read_tokens, cache_creation_tokens, quota_tokens, is_streaming,
                     session_id, user_country, user_country_iso3, user_email, is_health_check, created_at
              FROM (
                  SELECT request_id, share_id, share_name, provider_id, provider_name, app_type, model,
                         request_model, request_agent, requested_model, actual_model, actual_model_source,
                         status_code, latency_ms, first_token_ms, input_tokens,
-                        output_tokens, cache_read_tokens, cache_creation_tokens, is_streaming,
+                        output_tokens, cache_read_tokens, cache_creation_tokens, quota_tokens, is_streaming,
                         session_id, user_country, user_country_iso3, user_email, is_health_check, created_at,
                         ROW_NUMBER() OVER (PARTITION BY share_id ORDER BY created_at DESC) AS row_num
                  FROM share_request_logs
@@ -19039,13 +19368,16 @@ fn map_share_request_log_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShareR
         output_tokens: row.get::<_, i64>(16)? as u32,
         cache_read_tokens: row.get::<_, i64>(17)? as u32,
         cache_creation_tokens: row.get::<_, i64>(18)? as u32,
-        is_streaming: row.get::<_, i64>(19)? != 0,
-        session_id: row.get(20)?,
-        user_country: row.get(21)?,
-        user_country_iso3: row.get(22)?,
-        user_email: row.get(23)?,
-        is_health_check: row.get::<_, i64>(24)? != 0,
-        created_at: row.get(25)?,
+        quota_tokens: row
+            .get::<_, Option<i64>>(19)?
+            .map(|value| value.max(0) as u32),
+        is_streaming: row.get::<_, i64>(20)? != 0,
+        session_id: row.get(21)?,
+        user_country: row.get(22)?,
+        user_country_iso3: row.get(23)?,
+        user_email: row.get(24)?,
+        is_health_check: row.get::<_, i64>(25)? != 0,
+        created_at: row.get(26)?,
     })
 }
 
@@ -19316,6 +19648,7 @@ fn market_log_to_share_request_log(
         output_tokens: log.output_tokens,
         cache_read_tokens: log.cache_read_tokens,
         cache_creation_tokens: log.cache_creation_tokens,
+        quota_tokens: None,
         is_streaming: log.status == "streaming",
         session_id: None,
         user_country: log.user_country.clone(),
@@ -24760,6 +25093,7 @@ mod tests {
             auto_start: false,
             config_revision: 0,
             user_grants: BTreeMap::new(),
+            supported_user_token_periods: legacy_supported_user_token_periods(),
         }
     }
 
@@ -24772,6 +25106,7 @@ mod tests {
                 parallel_limit: Some(2),
                 token_limit: Some(token_limit),
                 token_period: crate::models::ShareTokenPeriod::Day,
+                token_period_anchor_at_ms: None,
                 expires_at: Some(1_900_000_000_000),
             },
             usage: crate::models::ShareUserUsage {
@@ -25747,6 +26082,7 @@ mod tests {
             output_tokens: 2,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            quota_tokens: None,
             is_streaming: false,
             session_id: None,
             user_country: None,
@@ -25755,6 +26091,38 @@ mod tests {
             created_at,
             is_health_check: false,
         }
+    }
+
+    #[test]
+    fn user_quota_keeps_explicit_zero_and_deduplicates_market_logs() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let now = Utc::now().timestamp();
+        for (request_id, quota_tokens) in [("req_quota_zero", 0), ("req_quota_nine", 9)] {
+            let mut direct = test_share_request_log_entry(request_id, "share-quota", now);
+            direct.input_tokens = 900;
+            direct.output_tokens = 100;
+            direct.quota_tokens = Some(quota_tokens);
+            direct.user_email = Some("user@example.com".to_string());
+            upsert_share_request_log_tx(&conn, "installation", direct).unwrap();
+
+            let mut market = test_market_request_log(request_id, "share-quota");
+            market.created_at = DateTime::from_timestamp(now, 0).unwrap().to_rfc3339();
+            upsert_market_request_log_tx(&conn, &test_market(), market).unwrap();
+        }
+        let totals = query_share_email_token_totals_for_windows(
+            &conn,
+            "share-quota",
+            "codex",
+            &[UserQuotaWindow {
+                key: "lifetime".to_string(),
+                start: None,
+                end: None,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(totals["lifetime"]["user@example.com"], 9);
     }
 
     #[test]
@@ -33191,6 +33559,7 @@ mod tests {
             auto_start: false,
             config_revision: 0,
             user_grants: BTreeMap::new(),
+            supported_user_token_periods: legacy_supported_user_token_periods(),
         };
         let timestamp_ms = Utc::now().timestamp_millis();
         let nonce = Uuid::new_v4().to_string();
@@ -33272,6 +33641,7 @@ mod tests {
             auto_start: false,
             config_revision: 0,
             user_grants: BTreeMap::new(),
+            supported_user_token_periods: legacy_supported_user_token_periods(),
         };
 
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -34056,6 +34426,7 @@ mod tests {
             auto_start: false,
             config_revision: 0,
             user_grants: BTreeMap::new(),
+            supported_user_token_periods: legacy_supported_user_token_periods(),
         };
         let claim = share_claim_payload(&share);
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -34143,6 +34514,7 @@ mod tests {
             auto_start: false,
             config_revision: 0,
             user_grants: BTreeMap::new(),
+            supported_user_token_periods: legacy_supported_user_token_periods(),
         };
         let claim = ShareClaimPayload {
             subdomain: "other-sub".into(),
@@ -34230,6 +34602,7 @@ mod tests {
             auto_start: false,
             config_revision: 0,
             user_grants: BTreeMap::new(),
+            supported_user_token_periods: legacy_supported_user_token_periods(),
         };
 
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -34354,6 +34727,7 @@ mod tests {
             auto_start: false,
             config_revision: 0,
             user_grants: BTreeMap::new(),
+            supported_user_token_periods: legacy_supported_user_token_periods(),
         };
 
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -34443,6 +34817,7 @@ mod tests {
             auto_start: false,
             config_revision: 0,
             user_grants: BTreeMap::new(),
+            supported_user_token_periods: legacy_supported_user_token_periods(),
         };
 
         let timestamp_ms = Utc::now().timestamp_millis();
@@ -34556,6 +34931,7 @@ mod tests {
             auto_start: false,
             config_revision: 0,
             user_grants: BTreeMap::new(),
+            supported_user_token_periods: legacy_supported_user_token_periods(),
         };
         let ops = vec![ShareSyncOperation {
             kind: "upsert".into(),
@@ -35885,6 +36261,7 @@ mod tests {
                     output_tokens: 2,
                     cache_read_tokens: 0,
                     cache_creation_tokens: 0,
+                    quota_tokens: None,
                     is_streaming: false,
                     session_id: None,
                     user_country: None,
@@ -36068,6 +36445,7 @@ mod tests {
             output_tokens: 20,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            quota_tokens: Some(30),
             is_streaming: true,
             session_id: Some("session-1".into()),
             user_country: None,
@@ -36725,6 +37103,53 @@ mod tests {
             .expect_err("shared email should not create edit");
 
         assert!(err.to_string().contains("only share owner"));
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn share_edit_requires_client_token_period_capability() {
+        let (store, config) = setup_store("share-edit-token-period-capability").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-edit", "edit-sub", "active").await;
+        let mut owner = test_share_user_grant("owner@example.com", "owner", 1_000);
+        owner.policy.token_period = ShareTokenPeriod::SevenDays;
+        owner.policy.token_period_anchor_at_ms =
+            Some(Utc::now().timestamp_millis().div_euclid(60_000) * 60_000);
+        let patch = ShareSettingsPatch {
+            user_grants: Some(BTreeMap::from([(owner.email.clone(), owner)])),
+            ..ShareSettingsPatch::default()
+        };
+
+        let error = store
+            .create_share_settings_edit("share-edit", "owner@example.com", patch.clone())
+            .await
+            .expect_err("legacy Client capability must reject fixed periods");
+        assert!(error.to_string().contains("not supported by this client"));
+
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET supported_user_token_periods_json = ?2 WHERE share_id = ?1",
+                params![
+                    "share-edit",
+                    serde_json::to_string(&vec![
+                        ShareTokenPeriod::Lifetime,
+                        ShareTokenPeriod::Day,
+                        ShareTokenPeriod::Week,
+                        ShareTokenPeriod::SevenDays,
+                        ShareTokenPeriod::CalendarMonth,
+                        ShareTokenPeriod::ThirtyDays,
+                    ])
+                    .unwrap()
+                ],
+            )
+            .unwrap();
+        }
+        store
+            .create_share_settings_edit("share-edit", "owner@example.com", patch)
+            .await
+            .expect("current Client capability must allow fixed periods");
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }

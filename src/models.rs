@@ -332,6 +332,8 @@ pub struct UserShareView {
     pub active_edit: Option<ShareEditView>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub user_grants: BTreeMap<String, ShareUserGrant>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_user_token_periods: Vec<ShareTokenPeriod>,
     #[serde(default)]
     pub config_revision: u64,
 }
@@ -892,7 +894,9 @@ pub enum ShareTokenPeriod {
     Lifetime,
     Day,
     Week,
+    SevenDays,
     CalendarMonth,
+    ThirtyDays,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -904,6 +908,8 @@ pub struct ShareUserPolicy {
     pub token_limit: Option<u64>,
     #[serde(default)]
     pub token_period: ShareTokenPeriod,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_period_anchor_at_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
 }
@@ -930,6 +936,20 @@ pub struct ShareUserUsage {
     pub week: ShareUserUsageBucket,
     #[serde(default)]
     pub calendar_month: ShareUserUsageBucket,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchored: Option<ShareAnchoredUsageBucket>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareAnchoredUsageBucket {
+    pub period: ShareTokenPeriod,
+    pub anchor_at_ms: i64,
+    pub started_at_ms: i64,
+    #[serde(default)]
+    pub tokens_used: u64,
+    #[serde(default)]
+    pub requests_count: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -1083,6 +1103,8 @@ pub struct ShareRequestLogEntry {
     pub output_tokens: u32,
     pub cache_read_tokens: u32,
     pub cache_creation_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_tokens: Option<u32>,
     pub is_streaming: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
@@ -1406,8 +1428,12 @@ pub struct ShareUserLimitStatusRow {
     pub token_limit: Option<u64>,
     pub token_period: ShareTokenPeriod,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_period_anchor_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
     pub tokens_used: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_starts_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub percent: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2201,6 +2227,8 @@ pub struct ShareDescriptor {
     pub config_revision: u64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub user_grants: BTreeMap<String, ShareUserGrant>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_user_token_periods: Vec<ShareTokenPeriod>,
 }
 
 fn is_zero_revision(value: &u64) -> bool {
@@ -3069,6 +3097,8 @@ pub struct ShareView {
     pub operational_summary: OperationalSummary,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub user_grants: BTreeMap<String, ShareUserGrant>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_user_token_periods: Vec<ShareTokenPeriod>,
     #[serde(default)]
     pub config_revision: u64,
 }

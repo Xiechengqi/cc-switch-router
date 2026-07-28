@@ -3558,6 +3558,7 @@ mod tests {
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            quota_tokens: None,
             is_streaming: false,
             session_id: None,
             user_country: None,

@@ -605,6 +605,7 @@ export function ShareEditFormBody({
             shareApp={shareApp}
             ownerEmail={share.ownerEmail || ""}
             defaultPolicy={defaultUserPolicy}
+            supportedPeriods={share.supportedUserTokenPeriods}
             t={t}
             onDraftChange={form.onDraftChange}
           />
