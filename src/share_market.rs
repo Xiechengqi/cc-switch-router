@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::ServerState;
+use crate::client_market_trade::PaymentContact;
 use crate::client_market_trade::PaymentMethod;
 use crate::error::AppError;
 use crate::models::{
@@ -62,6 +63,16 @@ pub struct ListingView {
     pub subdomain: String,
     pub share_online: bool,
     pub is_owner: bool,
+    #[serde(default)]
+    pub contacts: Vec<PaymentContact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_provider: Option<crate::models::ShareUpstreamProvider>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_limit: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_limit: Option<i64>,
+    #[serde(default)]
+    pub tokens_used: i64,
     pub supported_user_token_periods: Vec<ShareTokenPeriod>,
     pub seats: Vec<SeatView>,
     pub created_at: String,
@@ -112,6 +123,8 @@ pub struct SubscriptionView {
     pub payment_deadline: Option<String>,
     pub open_invoice: Option<InvoiceView>,
     pub payment_methods: Option<Vec<PaymentMethod>>,
+    #[serde(default)]
+    pub contacts: Vec<PaymentContact>,
     pub payment_profile_updated_at: Option<String>,
     pub can_declare_paid: bool,
     pub can_release: bool,
@@ -665,18 +678,20 @@ fn open_invoice(conn: &Connection, subscription_id: &str) -> Result<Option<Invoi
 fn payment_profile(
     conn: &Connection,
     owner_user_id: &str,
-) -> Result<Option<(Vec<PaymentMethod>, String)>, AppError> {
-    let row: Option<(String, String)> = conn
+) -> Result<Option<(Vec<PaymentMethod>, Vec<PaymentContact>, String)>, AppError> {
+    let row: Option<(String, String, String)> = conn
         .query_row(
-            "SELECT methods_json, updated_at FROM account_payment_profiles WHERE user_id = ?1",
+            "SELECT methods_json, COALESCE(contacts_json, '[]'), updated_at
+             FROM account_payment_profiles WHERE user_id = ?1",
             params![owner_user_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()
         .map_err(map_db("read Share Market payment profile"))?;
-    Ok(row.map(|(methods, updated_at)| {
+    Ok(row.map(|(methods, contacts, updated_at)| {
         (
             serde_json::from_str::<Vec<PaymentMethod>>(&methods).unwrap_or_default(),
+            serde_json::from_str::<Vec<PaymentContact>>(&contacts).unwrap_or_default(),
             updated_at,
         )
     }))
@@ -695,13 +710,19 @@ fn subscription_view(
     } else {
         None
     };
-    let (payment_methods, payment_profile_updated_at) =
+    let (payment_methods, contacts, payment_profile_updated_at) =
         if is_renter && open_invoice.is_some() && record.price_minor.is_some() {
             payment_profile(conn, &record.owner_user_id)?
-                .map(|(methods, updated_at)| (Some(methods), Some(updated_at)))
-                .unwrap_or((Some(Vec::new()), None))
+                .map(|(methods, contacts, updated_at)| {
+                    (Some(methods), contacts, Some(updated_at))
+                })
+                .unwrap_or((Some(Vec::new()), Vec::new(), None))
+        } else if is_renter || is_owner {
+            payment_profile(conn, &record.owner_user_id)?
+                .map(|(_, contacts, _)| (None, contacts, None))
+                .unwrap_or((None, Vec::new(), None))
         } else {
-            (None, None)
+            (None, Vec::new(), None)
         };
     let can_declare_paid = is_renter
         && open_invoice.is_some()
@@ -740,6 +761,7 @@ fn subscription_view(
         payment_deadline: record.payment_deadline,
         open_invoice,
         payment_methods,
+        contacts,
         payment_profile_updated_at,
         can_declare_paid,
         can_release,
@@ -805,7 +827,9 @@ impl AppStore {
                         listing.status, COALESCE(s.share_status, 'missing'),
                         COALESCE(s.subdomain, ''), listing.created_at, listing.updated_at,
                         COALESCE(s.supported_user_token_periods_json, '[]'),
-                        COALESCE(s.owner_email, ''), COALESCE(s.user_grants_json, '{}')
+                        COALESCE(s.owner_email, ''), COALESCE(s.user_grants_json, '{}'),
+                        s.upstream_provider_json, s.token_limit, s.parallel_limit,
+                        COALESCE(s.tokens_used, 0)
                  FROM share_market_listings listing
                  LEFT JOIN shares s ON s.share_id = listing.share_id
                  WHERE (listing.status = 'active'
@@ -837,6 +861,10 @@ impl AppStore {
                     row.get::<_, String>(11)?,
                     row.get::<_, String>(12)?,
                     row.get::<_, String>(13)?,
+                    row.get::<_, Option<String>>(14)?,
+                    row.get::<_, Option<i64>>(15)?,
+                    row.get::<_, Option<i64>>(16)?,
+                    row.get::<_, i64>(17)?,
                 ))
             })
             .map_err(map_db("query Share Market catalog"))?
@@ -860,6 +888,10 @@ impl AppStore {
             supported_periods_json,
             current_owner_email,
             grants_json,
+            upstream_provider_json,
+            token_limit,
+            parallel_limit,
+            tokens_used,
         ) in listing_rows
         {
             let is_owner = viewer.is_some_and(|value| value.user_id == owner_user_id);
@@ -986,6 +1018,9 @@ impl AppStore {
                     subscription,
                 });
             }
+            let contacts = payment_profile(&conn, &owner_user_id)?
+                .map(|(_, contacts, _)| contacts)
+                .unwrap_or_default();
             listings.push(ListingView {
                 id,
                 share_id,
@@ -997,6 +1032,13 @@ impl AppStore {
                 subdomain: subdomain.clone(),
                 share_online: !subdomain.is_empty() && active_subdomains.contains(&subdomain),
                 is_owner,
+                contacts,
+                upstream_provider: upstream_provider_json
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str(value).ok()),
+                token_limit,
+                parallel_limit,
+                tokens_used,
                 supported_user_token_periods: serde_json::from_str(&supported_periods_json)
                     .unwrap_or_else(|_| vec![ShareTokenPeriod::Lifetime]),
                 seats,
@@ -3169,9 +3211,20 @@ pub(crate) fn handle_control_edit_ack(
     error_message: Option<&str>,
     now: &str,
 ) -> Result<(), AppError> {
-    let operation: Option<(String, String, String, i64, String, String)> = conn
+    let operation: Option<(
+        String,
+        String,
+        String,
+        i64,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+    )> = conn
         .query_row(
-            "SELECT id, status, action, attempts, subscription_id, share_id
+            "SELECT id, status, action, attempts, subscription_id, share_id,
+                    entitlement_id, email, policy_json
              FROM share_control_operations WHERE edit_id = ?1",
             params![edit_id],
             |row| {
@@ -3182,13 +3235,25 @@ pub(crate) fn handle_control_edit_ack(
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
                 ))
             },
         )
         .optional()
         .map_err(map_db("read acknowledged Share control operation"))?;
-    let Some((operation_id, operation_status, action, attempts, subscription_id, _share_id)) =
-        operation
+    let Some((
+        operation_id,
+        operation_status,
+        action,
+        attempts,
+        subscription_id,
+        share_id,
+        entitlement_id,
+        email,
+        policy_json,
+    )) = operation
     else {
         return Ok(());
     };
@@ -3196,6 +3261,20 @@ pub(crate) fn handle_control_edit_ack(
         return Ok(());
     }
     if status == "applied" {
+        let policy = policy_json
+            .as_deref()
+            .map(serde_json::from_str::<ShareUserPolicy>)
+            .transpose()
+            .map_err(|_| AppError::Internal("stored Share grant policy is invalid".into()))?;
+        apply_control_grant_effect(
+            conn,
+            &share_id,
+            &action,
+            &email,
+            &entitlement_id,
+            policy.as_ref(),
+            now,
+        )?;
         conn.execute(
             "UPDATE share_control_operations
              SET status = 'applied', updated_at = ?2, applied_at = ?2, last_error = NULL
@@ -3268,13 +3347,206 @@ pub(crate) fn handle_control_edit_ack(
     Ok(())
 }
 
+fn apply_control_grant_effect(
+    conn: &Connection,
+    share_id: &str,
+    action: &str,
+    email: &str,
+    entitlement_id: &str,
+    policy: Option<&ShareUserPolicy>,
+    now: &str,
+) -> Result<(), AppError> {
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT COALESCE(user_grants_json, '{}'), COALESCE(shared_with_emails_json, '[]')
+             FROM shares WHERE share_id = ?1",
+            params![share_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(map_db("read Share grants for control effect"))?;
+    let Some((grants_json, shared_json)) = row else {
+        return Ok(());
+    };
+    let mut grants: BTreeMap<String, ShareUserGrant> =
+        serde_json::from_str(&grants_json).unwrap_or_default();
+    let mut shared: Vec<String> = serde_json::from_str(&shared_json).unwrap_or_default();
+    let email = email.trim().to_ascii_lowercase();
+    if email.is_empty() {
+        return Ok(());
+    }
+    let now_ms = Utc::now().timestamp_millis().max(0) as u128;
+    match action {
+        "upsert" => {
+            let Some(policy) = policy.cloned() else {
+                return Err(AppError::Internal(
+                    "Share Market grant upsert is missing policy".into(),
+                ));
+            };
+            let previous = grants.get(&email).cloned();
+            grants.insert(
+                email.clone(),
+                ShareUserGrant {
+                    email: email.clone(),
+                    role: "shareto".to_string(),
+                    active: true,
+                    policy,
+                    usage: previous
+                        .as_ref()
+                        .map(|grant| grant.usage.clone())
+                        .unwrap_or_default(),
+                    created_at_ms: previous
+                        .as_ref()
+                        .map(|grant| grant.created_at_ms)
+                        .filter(|created_at| *created_at > 0)
+                        .unwrap_or(now_ms),
+                    updated_at_ms: now_ms,
+                    revoked_at_ms: None,
+                    revision: previous
+                        .as_ref()
+                        .map(|grant| grant.revision.saturating_add(1))
+                        .unwrap_or(1)
+                        .max(1),
+                    manager: ShareGrantManager::RouterShareMarket,
+                    entitlement_id: Some(entitlement_id.to_string()),
+                },
+            );
+            if !shared
+                .iter()
+                .any(|value| value.eq_ignore_ascii_case(&email))
+            {
+                shared.push(email);
+            }
+        }
+        "revoke" => {
+            let target_email = grants
+                .iter()
+                .find(|(_, grant)| {
+                    grant.manager == ShareGrantManager::RouterShareMarket
+                        && grant.entitlement_id.as_deref() == Some(entitlement_id)
+                })
+                .map(|(key, _)| key.clone())
+                .unwrap_or_else(|| email.clone());
+            if let Some(grant) = grants.get_mut(&target_email) {
+                grant.active = false;
+                grant.updated_at_ms = now_ms;
+                grant.revoked_at_ms = Some(now_ms);
+                grant.revision = grant.revision.saturating_add(1).max(1);
+            }
+            shared.retain(|value| !value.eq_ignore_ascii_case(&target_email));
+        }
+        _ => return Ok(()),
+    }
+    let grants_json = serde_json::to_string(&grants).map_err(|error| {
+        AppError::Internal(format!("encode Share grants after control effect failed: {error}"))
+    })?;
+    let shared_json = serde_json::to_string(&shared).map_err(|error| {
+        AppError::Internal(format!(
+            "encode Share ACL after control effect failed: {error}"
+        ))
+    })?;
+    conn.execute(
+        "UPDATE shares
+         SET user_grants_json = ?2, shared_with_emails_json = ?3, updated_at = ?4
+         WHERE share_id = ?1",
+        params![share_id, grants_json, shared_json, now],
+    )
+    .map_err(map_db("persist Share control grant effect"))?;
+    Ok(())
+}
+
+async fn try_apply_dispatched_edit_via_ctl(
+    state: &ServerState,
+    event: &ShareEditAvailableEvent,
+) -> Result<bool, AppError> {
+    let Some(edit) = state
+        .store
+        .pending_share_edit_for_share(&event.share_id, event.revision)
+        .await?
+    else {
+        return Ok(false);
+    };
+    let route = state.proxy.route_by_share_id(&event.share_id).await;
+    let secret = state
+        .store
+        .installation_control_secret(&event.installation_id)
+        .await
+        .unwrap_or(None);
+    let (Some(route), Some(secret)) = (route, secret) else {
+        return Ok(false);
+    };
+    match crate::ctl_client::apply_share_settings(
+        route.route_target(),
+        &event.installation_id,
+        &secret,
+        &event.share_id,
+        &edit.patch,
+    )
+    .await
+    {
+        Ok(returned_share) => {
+            state
+                .store
+                .apply_share_edit_directly(&edit.id, returned_share)
+                .await?;
+            Ok(true)
+        }
+        Err(error) if error.is_transport() => {
+            tracing::info!(
+                share_id = %event.share_id,
+                edit_id = %edit.id,
+                error = %error,
+                "Share Market control RPC unavailable; keeping async pending edit"
+            );
+            Ok(false)
+        }
+        Err(error) => {
+            let message = error.to_string();
+            tracing::warn!(
+                share_id = %event.share_id,
+                edit_id = %edit.id,
+                error = %message,
+                "Share Market control RPC rejected managed grant"
+            );
+            let _ = state
+                .store
+                .mark_share_edit_rejected(&edit.id, &message)
+                .await;
+            Ok(false)
+        }
+    }
+}
+
 async fn run_once(state: &ServerState) -> Result<(), AppError> {
     let events = state
         .store
         .share_market_reconcile_and_dispatch(Utc::now())
         .await?;
-    for event in events {
-        let _ = state.share_edit_events.send(event);
+    let mut applied = false;
+    for event in &events {
+        let _ = state.share_edit_events.send(event.clone());
+        match try_apply_dispatched_edit_via_ctl(state, event).await {
+            Ok(true) => applied = true,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(
+                    share_id = %event.share_id,
+                    error = %error,
+                    "Share Market synchronous grant apply failed"
+                );
+            }
+        }
+    }
+    if applied || !events.is_empty() {
+        // Advance grant_pending / finish revoke_pending after ctl apply or
+        // descriptor-side entitlement observation from a prior cycle.
+        let follow_up = state
+            .store
+            .share_market_reconcile_and_dispatch(Utc::now())
+            .await?;
+        for event in follow_up {
+            let _ = state.share_edit_events.send(event);
+        }
     }
     Ok(())
 }
@@ -4674,6 +4946,127 @@ mod tests {
         assert_eq!(
             subscription_status(&store, &subscription_id).await,
             "active_free"
+        );
+    }
+
+    #[tokio::test]
+    async fn applied_ack_writes_entitlement_so_reconcile_can_activate_without_descriptor_sync() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-ack-grant", "owner-ack-grant@example.com");
+        let renter = session("renter-ack-grant", "renter-ack-grant@example.com");
+        insert_share(
+            &store,
+            "share-ack-grant",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (_listing_id, seat_id) =
+            create_listing(&store, &owner, "share-ack-grant", free_seat()).await;
+        let subscription_id = store
+            .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
+            .await
+            .expect("rent ack-grant seat");
+        let now = Utc::now();
+        assert_eq!(
+            store
+                .share_market_reconcile_and_dispatch(now)
+                .await
+                .expect("dispatch grant")
+                .len(),
+            1
+        );
+        let edit_id: String = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT edit_id FROM share_control_operations
+                 WHERE subscription_id = ?1 AND action = 'upsert'",
+                params![subscription_id],
+                |row| row.get(0),
+            )
+            .expect("read grant edit");
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE share_edit_requests SET status = 'applied' WHERE id = ?1",
+                params![edit_id],
+            )
+            .expect("mark edit applied");
+            handle_control_edit_ack(&conn, &edit_id, "applied", None, &now.to_rfc3339())
+                .expect("ack writes managed grant into Share descriptor");
+        }
+        let entitlement_id = subscription_entitlement(&store, &subscription_id).await;
+        let grants_json: Option<String> = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT user_grants_json FROM shares WHERE share_id = 'share-ack-grant'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read grants");
+        assert!(
+            active_entitlement(grants_json.as_deref(), &entitlement_id),
+            "applied ack should materialize routerShareMarket grant"
+        );
+        store
+            .share_market_reconcile_and_dispatch(now + Duration::seconds(1))
+            .await
+            .expect("activate from ack-written entitlement");
+        assert_eq!(
+            subscription_status(&store, &subscription_id).await,
+            "active_free"
+        );
+
+        store
+            .share_market_request_release(&owner, &subscription_id, true, false, None)
+            .await
+            .expect("force revoke");
+        assert_eq!(
+            store
+                .share_market_reconcile_and_dispatch(now + Duration::seconds(2))
+                .await
+                .expect("dispatch revoke")
+                .len(),
+            1
+        );
+        let revoke_edit: String = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT edit_id FROM share_control_operations
+                 WHERE subscription_id = ?1 AND action = 'revoke'",
+                params![subscription_id],
+                |row| row.get(0),
+            )
+            .expect("read revoke edit");
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE share_edit_requests SET status = 'applied' WHERE id = ?1",
+                params![revoke_edit],
+            )
+            .expect("mark revoke applied");
+            handle_control_edit_ack(
+                &conn,
+                &revoke_edit,
+                "applied",
+                None,
+                &(now + Duration::seconds(3)).to_rfc3339(),
+            )
+            .expect("ack clears managed grant");
+        }
+        store
+            .share_market_reconcile_and_dispatch(now + Duration::seconds(4))
+            .await
+            .expect("release after ack-cleared entitlement");
+        assert_eq!(
+            subscription_status(&store, &subscription_id).await,
+            SUB_RELEASED
         );
     }
 

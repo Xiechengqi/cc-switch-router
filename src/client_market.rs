@@ -828,6 +828,8 @@ struct RouterSshHostView {
     offer_revision: i64,
     #[serde(default)]
     payment_method_kinds: Vec<String>,
+    #[serde(default)]
+    contacts: Vec<crate::client_market_trade::PaymentContact>,
     country_code: Option<String>,
     hostname: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -909,6 +911,7 @@ async fn list_hosts(
                 rental_period_days: host.rental_period_days,
                 offer_revision: host.offer_revision,
                 payment_method_kinds: host.payment_method_kinds,
+                contacts: host.contacts,
                 country_code: host.country_code,
                 hostname: host.hostname,
                 ssh_host_key_fingerprint: reveal_operations
@@ -3872,6 +3875,7 @@ fn host_to_view(host: RouterSshHostRecord, reveal: bool) -> RouterSshHostView {
         rental_period_days: host.rental_period_days,
         offer_revision: host.offer_revision,
         payment_method_kinds: host.payment_method_kinds,
+        contacts: host.contacts,
         country_code: host.country_code,
         hostname: host.hostname,
         ssh_host_key_fingerprint: reveal.then_some(host.ssh_host_key_fingerprint).flatten(),
@@ -3929,6 +3933,7 @@ pub struct RouterSshHostRecord {
     pub rental_period_days: Option<i64>,
     pub offer_revision: i64,
     pub payment_method_kinds: Vec<String>,
+    pub contacts: Vec<crate::client_market_trade::PaymentContact>,
     pub country_code: Option<String>,
     pub hostname: Option<String>,
     pub ssh_host_key_fingerprint: Option<String>,
@@ -4310,6 +4315,8 @@ impl AppStore {
                     COALESCE(NULLIF(TRIM(t.owner_email), ''), NULLIF(TRIM(i.owner_email), '')),
                     s.client_user_id, h.provider_id, h.price_cents, h.rental_period_days, h.offer_revision,
                     COALESCE((SELECT methods_json FROM account_payment_profiles p
+                              WHERE p.user_id = h.provider_id), '[]'),
+                    COALESCE((SELECT contacts_json FROM account_payment_profiles p
                               WHERE p.user_id = h.provider_id), '[]')
              FROM router_ssh_hosts h
              LEFT JOIN installation_client_tunnels t ON t.installation_id = h.installation_id
@@ -5099,6 +5106,8 @@ impl AppStore {
                         COALESCE(NULLIF(TRIM(t.owner_email), ''), NULLIF(TRIM(i.owner_email), '')),
                         s.client_user_id, h.provider_id, h.price_cents, h.rental_period_days, h.offer_revision,
                         COALESCE((SELECT methods_json FROM account_payment_profiles p
+                                  WHERE p.user_id = h.provider_id), '[]'),
+                        COALESCE((SELECT contacts_json FROM account_payment_profiles p
                                   WHERE p.user_id = h.provider_id), '[]')
                  FROM router_ssh_hosts h
                  LEFT JOIN installation_client_tunnels t ON t.installation_id = h.installation_id
@@ -6157,6 +6166,8 @@ fn get_router_ssh_host(
                 COALESCE(NULLIF(TRIM(t.owner_email), ''), NULLIF(TRIM(i.owner_email), '')),
                 s.client_user_id, h.provider_id, h.price_cents, h.rental_period_days, h.offer_revision,
                 COALESCE((SELECT methods_json FROM account_payment_profiles p
+                          WHERE p.user_id = h.provider_id), '[]'),
+                COALESCE((SELECT contacts_json FROM account_payment_profiles p
                           WHERE p.user_id = h.provider_id), '[]')
          FROM router_ssh_hosts h
          LEFT JOIN installation_client_tunnels t ON t.installation_id = h.installation_id
@@ -6188,6 +6199,7 @@ fn get_provisioning_job(
 
 fn map_router_ssh_host_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouterSshHostRecord> {
     let methods_json: String = row.get(22)?;
+    let contacts_json: String = row.get(23)?;
     let mut payment_method_kinds =
         serde_json::from_str::<Vec<crate::client_market_trade::PaymentMethod>>(&methods_json)
             .unwrap_or_default()
@@ -6196,6 +6208,8 @@ fn map_router_ssh_host_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouterSs
             .collect::<Vec<_>>();
     payment_method_kinds.sort();
     payment_method_kinds.dedup();
+    let contacts: Vec<crate::client_market_trade::PaymentContact> =
+        serde_json::from_str(&contacts_json).unwrap_or_default();
     Ok(RouterSshHostRecord {
         id: row.get(0)?,
         ip: row.get(1)?,
@@ -6220,6 +6234,7 @@ fn map_router_ssh_host_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouterSs
         rental_period_days: row.get(20)?,
         offer_revision: row.get(21)?,
         payment_method_kinds,
+        contacts,
     })
 }
 
@@ -6382,6 +6397,7 @@ mod tests {
                     address: None,
                     instructions: None,
                 }],
+                None,
             )
             .await
             .expect("configure test payment profile");
@@ -7366,6 +7382,7 @@ mod tests {
             rental_period_days: Some(30),
             offer_revision: 1,
             payment_method_kinds: vec!["alipay".into()],
+            contacts: vec![],
             country_code: Some("US".into()),
             hostname: Some("host.example".into()),
             ssh_host_key_fingerprint: Some("SHA256:secret".into()),
@@ -7795,6 +7812,7 @@ mod tests {
                     address: Some("0x0123456789abcdef0123456789abcdef01234567".into()),
                     instructions: None,
                 }],
+                None,
             )
             .await
             .expect("configure Provider payment details");

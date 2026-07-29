@@ -2,9 +2,10 @@
 
 import * as React from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Button, Checkbox, Modal, Tabs, toast } from "@heroui/react";
+import { Button, Checkbox, Modal, toast } from "@heroui/react";
 import {
   Ban,
+  ChevronDown,
   CircleDollarSign,
   ExternalLink,
   Loader2,
@@ -20,8 +21,9 @@ import { useAuth } from "@/components/auth/auth-provider";
 import { AuthenticatedImage } from "@/components/common/authenticated-image";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
+import { ProviderContactButton, ProviderContactsList } from "@/components/common/provider-contacts";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
-import { subdomainTunnelUrl } from "@/components/dashboard/share-dashboard-utils";
+import { subdomainTunnelUrl, providerQuotaStatusLine, providerStatusIdentity, providerActualModelNames } from "@/components/dashboard/share-dashboard-utils";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   addShareMarketSeat,
@@ -46,7 +48,10 @@ import type {
   ShareMarketSeatInput,
   ShareMarketSubscription,
   ShareTokenPeriod,
+  ShareUpstreamProvider,
 } from "@/lib/types";
+import type { AppLocale } from "@/lib/i18n";
+import { compactTokens } from "@/lib/utils";
 
 type MarketTab = ShareMarketTabParam;
 type TFn = ReturnType<typeof useLocaleText>["t"];
@@ -430,6 +435,27 @@ function shareOpenUrl(subdomain?: string | null) {
   return subdomainTunnelUrl(subdomain);
 }
 
+function listingProviderLines(provider: ShareUpstreamProvider | undefined, locale: AppLocale, unavailable: string) {
+  if (!provider) {
+    return { identity: unavailable, quota: "-", models: "-" };
+  }
+  return {
+    identity: providerStatusIdentity(provider),
+    quota: providerQuotaStatusLine(provider, locale),
+    models: providerActualModelNames(provider),
+  };
+}
+
+function shareMarketTabTone(active: boolean) {
+  return active ? "bg-white font-medium text-foreground shadow-sm" : "text-slate-700";
+}
+
+function formatShareLimit(value?: number | null) {
+  if (value == null) return "—";
+  if (Number(value) < 0) return "∞";
+  return compactTokens(value);
+}
+
 function formatPrice(seat: Pick<ShareMarketSeat, "isFree" | "priceMinor" | "currency" | "periodUnit" | "periodCount">, free: string) {
   if (seat.isFree || seat.priceMinor == null) return free;
   const amount = new Intl.NumberFormat(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(seat.priceMinor / 100);
@@ -458,6 +484,211 @@ function subscriptionStatusLabel(status: string, t: TFn) {
   } as const;
   const key = keys[status as keyof typeof keys];
   return key ? t(key) : status.replaceAll("_", " ");
+}
+
+type MarketLayout = "seats" | "shares";
+const LAYOUT_STORAGE_KEY = "cc-switch.shareMarket.layout";
+
+function readStoredLayout(): MarketLayout {
+  if (typeof window === "undefined") return "seats";
+  try {
+    const value = window.localStorage.getItem(LAYOUT_STORAGE_KEY);
+    return value === "shares" ? "shares" : "seats";
+  } catch {
+    return "seats";
+  }
+}
+
+function writeStoredLayout(layout: MarketLayout) {
+  try {
+    window.localStorage.setItem(LAYOUT_STORAGE_KEY, layout);
+  } catch {
+    // ignore quota / private mode
+  }
+}
+
+type SeatTableRow = {
+  key: string;
+  listing: ShareMarketListing;
+  seat: ShareMarketSeat;
+  subscription?: ShareMarketSubscription;
+};
+
+function isMineRelatedSubscription(status: string) {
+  return !["released", "grant_failed"].includes(status);
+}
+
+function guestCanSeeAvailable(listing: ShareMarketListing, seat: ShareMarketSeat) {
+  return listing.status === "active" && listing.shareStatus === "active" && seat.status === "available";
+}
+
+function buildSeatRows(
+  catalog: ShareMarketCatalog | null,
+  tab: MarketTab,
+  authed: boolean,
+): SeatTableRow[] {
+  if (!catalog) return [];
+  if (tab === "rentals") {
+    const bySeat = new Map<string, { listing?: ShareMarketListing; seat?: ShareMarketSeat }>();
+    for (const listing of catalog.listings) {
+      for (const seat of listing.seats) {
+        bySeat.set(seat.id, { listing, seat });
+      }
+    }
+    return catalog.mySubscriptions
+      .filter((subscription) => isMineRelatedSubscription(subscription.status))
+      .map((subscription) => {
+        const matched = bySeat.get(subscription.seatId);
+        const listing =
+          matched?.listing ||
+          ({
+            id: subscription.listingId,
+            shareId: subscription.shareId,
+            shareName: subscription.shareName,
+            appType: subscription.appType,
+            ownerEmail: subscription.ownerEmail,
+            status: "active",
+            shareStatus: "active",
+            subdomain: subscription.subdomain,
+            shareOnline: !!subscription.shareOnline,
+            isOwner: false,
+            contacts: subscription.contacts,
+            supportedUserTokenPeriods: [],
+            seats: [],
+            createdAt: subscription.createdAt,
+            updatedAt: subscription.updatedAt,
+          } satisfies ShareMarketListing);
+        const seat =
+          matched?.seat ||
+          ({
+            id: subscription.seatId,
+            position: 0,
+            status: "occupied",
+            offerRevision: subscription.offerRevision,
+            isFree: subscription.priceMinor == null,
+            canRent: false,
+            parallelLimit: undefined,
+            tokenLimit: undefined,
+            tokenPeriod: "lifetime" as const,
+            priceMinor: subscription.priceMinor,
+            currency: subscription.currency,
+            periodUnit:
+              subscription.periodUnit === "day" ||
+              subscription.periodUnit === "week" ||
+              subscription.periodUnit === "month"
+                ? subscription.periodUnit
+                : undefined,
+            periodCount: subscription.periodCount,
+            subscription,
+          } satisfies ShareMarketSeat);
+        return {
+          key: `rental-${subscription.id}`,
+          listing,
+          seat,
+          subscription,
+        };
+      });
+  }
+
+  const listings = tab === "mine" ? catalog.listings.filter((listing) => listing.isOwner) : catalog.listings;
+  const rows: SeatTableRow[] = [];
+  for (const listing of listings) {
+    for (const seat of listing.seats) {
+      if (tab === "mine") {
+        rows.push({ key: seat.id, listing, seat, subscription: seat.subscription });
+        continue;
+      }
+      const mineRelated = !!seat.subscription && isMineRelatedSubscription(seat.subscription.status);
+      const rentable = seat.canRent || (!authed && guestCanSeeAvailable(listing, seat));
+      if (rentable || mineRelated) {
+        rows.push({ key: seat.id, listing, seat, subscription: seat.subscription });
+      }
+    }
+  }
+
+  if (tab === "all" && authed) {
+    const seen = new Set(rows.map((row) => row.seat.id));
+    for (const subscription of catalog.mySubscriptions) {
+      if (!isMineRelatedSubscription(subscription.status) || seen.has(subscription.seatId)) continue;
+      const listing = catalog.listings.find((item) => item.id === subscription.listingId);
+      const seat = listing?.seats.find((item) => item.id === subscription.seatId);
+      if (!listing || !seat) continue;
+      rows.push({ key: seat.id, listing, seat, subscription });
+      seen.add(seat.id);
+    }
+  }
+
+  return rows;
+}
+
+function ProviderExpandPanel({
+  listing,
+  locale,
+  t,
+}: {
+  listing: ShareMarketListing;
+  locale: AppLocale;
+  t: TFn;
+}) {
+  const shareUrl = shareOpenUrl(listing.subdomain);
+  const provider = listingProviderLines(listing.upstreamProvider, locale, t("dashboard.providerUnavailable"));
+  const tokensUsed = listing.tokensUsed || 0;
+  const tokenLimit = listing.tokenLimit;
+  const usagePercent =
+    tokenLimit != null && Number(tokenLimit) > 0
+      ? Math.min(100, Math.max(0, (tokensUsed / Number(tokenLimit)) * 100))
+      : null;
+  return (
+    <div className="grid gap-3 border-t border-slate-100 bg-slate-50/80 px-4 py-3 text-[11px] text-slate-700 sm:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)]">
+      <div className="grid min-w-0 gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-2">
+        <div className="min-w-0 truncate font-semibold" title={provider.quota}>
+          {provider.quota && provider.quota !== "-" ? provider.quota : provider.identity}
+        </div>
+        <div className="min-w-0 truncate text-slate-500" title={provider.identity}>{provider.identity}</div>
+        {provider.models && provider.models !== "-" ? (
+          <div className="min-w-0 truncate text-slate-500" title={provider.models}>{provider.models}</div>
+        ) : null}
+        {shareUrl ? (
+          <a
+            href={shareUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="mt-1 inline-flex min-w-0 items-center gap-1 truncate font-medium text-slate-900 underline-offset-2 hover:underline"
+            title={shareUrl}
+          >
+            <span className="truncate">{shareUrl}</span>
+            <ExternalLink className="h-3 w-3 shrink-0 text-slate-400" aria-hidden />
+          </a>
+        ) : (
+          <span className="mt-1 text-slate-500">{t("shareMarket.shareUrl")}: —</span>
+        )}
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <div className="min-w-0">
+          <span className="block text-slate-500">{t("dashboard.usage")}</span>
+          <strong className="tabular-nums text-slate-900">
+            {compactTokens(tokensUsed)} / {formatShareLimit(tokenLimit)}
+          </strong>
+          {usagePercent != null ? (
+            <div className="mt-1 h-1 overflow-hidden rounded-full bg-slate-100">
+              <div className={`h-full rounded-full ${usagePercent >= 90 ? "bg-rose-500" : "bg-primary/70"}`} style={{ width: `${usagePercent}%` }} />
+            </div>
+          ) : null}
+        </div>
+        <div className="min-w-0">
+          <span className="block text-slate-500">{t("dashboard.parallel")}</span>
+          <strong className="tabular-nums text-slate-900">{formatShareLimit(listing.parallelLimit)}</strong>
+        </div>
+        <div className="min-w-0 col-span-2">
+          <span className="block text-slate-500">{t("shareMarket.owner")}</span>
+          <div className="flex min-w-0 items-center gap-1">
+            <span className="min-w-0 flex-1 truncate text-slate-600" title={listing.ownerEmail}>{listing.ownerEmail}</span>
+            <ProviderContactButton contacts={listing.contacts} />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function PaymentDialog({
@@ -509,6 +740,7 @@ function PaymentDialog({
               </div>
             ) : null}
             <div className="grid gap-3">
+              <ProviderContactsList contacts={subscription?.contacts} />
               {paymentMethods.map((method, index) => (
                 <div key={`${method.kind}-${index}`} className="grid gap-2 border-b border-slate-100 pb-3 last:border-0">
                   <div className="flex items-center gap-2 text-sm font-medium"><PaymentMethodIcons kinds={[method.kind]} />{method.kind}</div>
@@ -551,12 +783,23 @@ export function ShareMarketPage() {
   const tab: MarketTab =
     tabParam === "mine" || tabParam === "rentals" || tabParam === "all" ? tabParam : "all";
   const focusShareId = searchParams.get("focus") || "";
+  const [layout, setLayoutState] = React.useState<MarketLayout>("seats");
+  const [expandedSeatIds, setExpandedSeatIds] = React.useState<Set<string>>(() => new Set());
   const [addOpen, setAddOpen] = React.useState(false);
   const [seatDialog, setSeatDialog] = React.useState<{ listingId: string; seat?: ShareMarketSeat; supportedPeriods?: ShareTokenPeriod[] } | null>(null);
   const [payment, setPayment] = React.useState<ShareMarketSubscription | null>(null);
   const [confirmAction, setConfirmAction] = React.useState<ConfirmAction | null>(null);
   const [busyId, setBusyId] = React.useState("");
   const focusedRef = React.useRef<string>("");
+
+  React.useEffect(() => {
+    setLayoutState(readStoredLayout());
+  }, []);
+
+  const setLayout = React.useCallback((next: MarketLayout) => {
+    setLayoutState(next);
+    writeStoredLayout(next);
+  }, []);
 
   const setTab = React.useCallback(
     (next: MarketTab) => {
@@ -565,6 +808,18 @@ export function ShareMarketPage() {
       router.replace(`${DASHBOARD_SHARE_MARKET_PATH}?${params.toString()}`, { scroll: false });
     },
     [router, searchParams],
+  );
+
+  const openShareManage = React.useCallback(
+    (shareId: string) => {
+      setLayout("shares");
+      focusedRef.current = "";
+      const params = new URLSearchParams(searchParams.toString());
+      params.set("tab", "mine");
+      params.set("focus", shareId);
+      router.replace(`${DASHBOARD_SHARE_MARKET_PATH}?${params.toString()}`, { scroll: false });
+    },
+    [router, searchParams, setLayout],
   );
 
   const load = React.useCallback(async (silent = false) => {
@@ -610,11 +865,17 @@ export function ShareMarketPage() {
     if (!catalog) return [];
     return tab === "mine" ? catalog.listings.filter((listing) => listing.isOwner) : catalog.listings;
   }, [catalog, tab]);
+
+  const seatRows = React.useMemo(
+    () => buildSeatRows(catalog, tab, authed),
+    [authed, catalog, tab],
+  );
+
   const date = (value?: string) => value ? new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value)) : "";
   const tokenPeriod = (period: ShareTokenPeriod) => t(`shareMarket.period.${period}`);
 
   React.useEffect(() => {
-    if (!focusShareId || !catalog || focusedRef.current === focusShareId) return;
+    if (!focusShareId || !catalog || layout !== "shares" || focusedRef.current === focusShareId) return;
     const target =
       document.querySelector(`[data-share-id="${CSS.escape(focusShareId)}"]`) ||
       document.querySelector(`[data-subscription-share-id="${CSS.escape(focusShareId)}"]`);
@@ -622,7 +883,16 @@ export function ShareMarketPage() {
       target.scrollIntoView({ behavior: "smooth", block: "center" });
       focusedRef.current = focusShareId;
     }
-  }, [catalog, focusShareId, tab]);
+  }, [catalog, focusShareId, layout, tab]);
+
+  const toggleExpanded = (seatId: string) => {
+    setExpandedSeatIds((current) => {
+      const next = new Set(current);
+      if (next.has(seatId)) next.delete(seatId);
+      else next.add(seatId);
+      return next;
+    });
+  };
 
   const renderSubscription = (subscription: ShareMarketSubscription, ownerView = false) => {
     const openUrl = shareOpenUrl(subscription.subdomain);
@@ -643,7 +913,10 @@ export function ShareMarketPage() {
             </span>
           ) : null}
         </div>
-        <p className="mt-1 truncate text-xs text-slate-500">{ownerView ? subscription.renterEmail : subscription.ownerEmail}</p>
+        <div className="mt-1 flex min-w-0 items-center gap-1">
+          <p className="min-w-0 flex-1 truncate text-xs text-slate-500">{ownerView ? subscription.renterEmail : subscription.ownerEmail}</p>
+          {!ownerView ? <ProviderContactButton contacts={subscription.contacts} /> : null}
+        </div>
         <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-600">
           {subscription.trialEndsAt && subscription.status === "trial_payment_due" ? <span>{t("shareMarket.trialEnds", { time: date(subscription.trialEndsAt) })}</span> : null}
           {subscription.paymentDeadline ? <span>{t("shareMarket.paymentDeadline", { time: date(subscription.paymentDeadline) })}</span> : null}
@@ -669,23 +942,91 @@ export function ShareMarketPage() {
     );
   };
 
-  const renderListing = (listing: ShareMarketListing) => (
+  const renderListing = (listing: ShareMarketListing) => {
+    const shareUrl = shareOpenUrl(listing.subdomain);
+    const provider = listingProviderLines(
+      listing.upstreamProvider,
+      locale,
+      t("dashboard.providerUnavailable"),
+    );
+    const title = shareUrl || listing.shareName;
+    const tokensUsed = listing.tokensUsed || 0;
+    const tokenLimit = listing.tokenLimit;
+    const usagePercent =
+      tokenLimit != null && Number(tokenLimit) > 0
+        ? Math.min(100, Math.max(0, (tokensUsed / Number(tokenLimit)) * 100))
+        : null;
+    const focused = focusShareId === listing.shareId;
+    return (
     <article
       key={listing.id}
       data-share-id={listing.shareId}
-      className="overflow-hidden rounded-md border border-slate-200 bg-white"
+      className={`overflow-hidden rounded-md border bg-white ${focused ? "border-primary ring-2 ring-primary/20" : "border-slate-200"}`}
     >
       <header className="flex flex-wrap items-start justify-between gap-3 border-b border-slate-200 px-4 py-3">
-        <div className="min-w-0">
+        <div className="grid min-w-0 flex-1 gap-2">
           <div className="flex min-w-0 items-center gap-2">
-            <ShareAppLogo app={(listing.appType === "claude" || listing.appType === "gemini" ? listing.appType : "codex")} size={20} />
-            <h2 className="truncate text-base font-semibold text-slate-900">{listing.shareName}</h2>
-            <span className={`rounded-sm px-1.5 py-0.5 text-xs ${listing.shareOnline ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-500"}`}>{listing.shareOnline ? t("shareMarket.online") : t("shareMarket.offline")}</span>
-            {listing.status === "closed" ? <span className="rounded-sm bg-amber-50 px-1.5 py-0.5 text-xs text-amber-700">{t("shareMarket.closed")}</span> : null}
+            <span className={`h-2 w-2 shrink-0 rounded-full ${listing.shareOnline ? "bg-emerald-500" : "bg-slate-400"}`} title={listing.shareOnline ? t("shareMarket.online") : t("shareMarket.offline")} />
+            <ShareAppLogo app={(listing.appType === "claude" || listing.appType === "gemini" ? listing.appType : "codex")} size={18} />
+            {shareUrl ? (
+              <a
+                href={shareUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex min-w-0 max-w-full items-center gap-1 truncate text-sm font-semibold text-slate-900 underline-offset-2 hover:underline"
+                title={shareUrl}
+              >
+                <span className="truncate">{listing.shareName || shareUrl}</span>
+                <ExternalLink className="h-3 w-3 shrink-0 text-slate-400" aria-hidden />
+              </a>
+            ) : (
+              <h2 className="truncate text-sm font-semibold text-slate-900" title={title}>{listing.shareName}</h2>
+            )}
+            <span className={`rounded-sm px-1.5 py-0.5 text-[10px] font-medium ${listing.shareOnline ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-500"}`}>
+              {listing.shareOnline ? t("shareMarket.online") : t("shareMarket.offline")}
+            </span>
+            {listing.status === "closed" ? <span className="rounded-sm bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700">{t("shareMarket.closed")}</span> : null}
           </div>
-          <p className="mt-1 truncate text-xs text-slate-500">{t("shareMarket.owner")}: {listing.ownerEmail}</p>
+
+          <div className="grid min-w-0 gap-1 rounded-md border border-slate-200 bg-slate-50/80 px-2.5 py-2 text-[11px] text-slate-700">
+            <div className="min-w-0 truncate font-semibold" title={provider.quota}>
+              {provider.quota && provider.quota !== "-" ? provider.quota : provider.identity}
+            </div>
+            <div className="min-w-0 truncate text-slate-500" title={provider.identity}>
+              {provider.identity}
+            </div>
+            {provider.models && provider.models !== "-" ? (
+              <div className="min-w-0 truncate text-slate-500" title={provider.models}>{provider.models}</div>
+            ) : null}
+          </div>
+
+          <div className="grid grid-cols-2 gap-3 text-[11px] sm:grid-cols-3">
+            <div className="min-w-0">
+              <span className="block text-slate-500">{t("dashboard.usage")}</span>
+              <strong className="tabular-nums text-slate-900">
+                {compactTokens(tokensUsed)} / {formatShareLimit(tokenLimit)}
+              </strong>
+              {usagePercent != null ? (
+                <div className="mt-1 h-1 overflow-hidden rounded-full bg-slate-100">
+                  <div className={`h-full rounded-full ${usagePercent >= 90 ? "bg-rose-500" : "bg-primary/70"}`} style={{ width: `${usagePercent}%` }} />
+                </div>
+              ) : null}
+            </div>
+            <div className="min-w-0">
+              <span className="block text-slate-500">{t("dashboard.parallel")}</span>
+              <strong className="tabular-nums text-slate-900">{formatShareLimit(listing.parallelLimit)}</strong>
+            </div>
+            <div className="min-w-0 col-span-2 sm:col-span-1">
+              <span className="block text-slate-500">{t("shareMarket.owner")}</span>
+              <div className="flex min-w-0 items-center gap-1">
+                <span className="min-w-0 flex-1 truncate text-slate-600" title={listing.ownerEmail}>{listing.ownerEmail}</span>
+                <ProviderContactButton contacts={listing.contacts} />
+              </div>
+            </div>
+          </div>
+
           {listing.isOwner && listing.status === "closed" ? (
-            <p className="mt-2 max-w-2xl text-xs leading-relaxed text-slate-500">{t("shareMarket.closedHint")}</p>
+            <p className="max-w-2xl text-xs leading-relaxed text-slate-500">{t("shareMarket.closedHint")}</p>
           ) : null}
         </div>
         {listing.isOwner ? (
@@ -724,7 +1065,7 @@ export function ShareMarketPage() {
                         {t("shareMarket.rent")}
                       </Button>
                     ) : null}
-                    {!authed && listing.status === "active" && listing.shareStatus === "active" && seat.status === "available" ? <Button size="sm" variant="outline" onClick={() => window.dispatchEvent(new Event("router-open-login"))}>{t("nav.login")}</Button> : null}
+                    {!authed && guestCanSeeAvailable(listing, seat) ? <Button size="sm" variant="outline" onClick={() => window.dispatchEvent(new Event("router-open-login"))}>{t("nav.login")}</Button> : null}
                     {listing.isOwner && seat.status === "available" ? <Button isIconOnly size="sm" variant="ghost" aria-label={t("common.edit")} onClick={() => setSeatDialog({ listingId: listing.id, seat, supportedPeriods: listing.supportedUserTokenPeriods })}><Pencil className="h-4 w-4" /></Button> : null}
                     {listing.isOwner && (seat.status === "available" || seat.status === "disabled") ? <Button isIconOnly size="sm" variant="ghost" aria-label={t("shareMarket.deleteSeat")} isDisabled={!!busyId} onClick={() => setConfirmAction({ id: seat.id, title: t("shareMarket.confirm.deleteTitle"), description: t("shareMarket.confirm.deleteDescription", { position: seat.position }), confirmLabel: t("shareMarket.deleteSeat"), tone: "danger", run: () => deleteShareMarketSeat(seat.id) })}><Trash2 className="h-4 w-4 text-red-600" /></Button> : null}
                   </div></td>
@@ -736,18 +1077,179 @@ export function ShareMarketPage() {
         </table>
       </div>
     </article>
+    );
+  };
+
+  const renderSeatFirstTable = () => (
+    <section className="overflow-hidden rounded-md border border-slate-200 bg-white">
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[920px] text-left text-sm">
+          <thead className="bg-slate-50 text-xs font-medium text-slate-500">
+            <tr>
+              <th className="w-10 px-3 py-2.5" />
+              <th className="px-3 py-2.5">{t("shareMarket.online")}</th>
+              <th className="px-3 py-2.5">Share</th>
+              <th className="px-3 py-2.5">{t("shareMarket.dialog.seats")}</th>
+              <th className="px-3 py-2.5">{t("shareMarket.parallel")}</th>
+              <th className="px-3 py-2.5">{t("shareMarket.tokens")}</th>
+              <th className="px-3 py-2.5">{t("shareMarket.dialog.amount")}</th>
+              <th className="px-3 py-2.5">{t("shareMarket.status")}</th>
+              <th className="px-4 py-2.5 text-right">{t("common.actions")}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {seatRows.map((row) => {
+              const { listing, seat, subscription } = row;
+              const expanded = expandedSeatIds.has(seat.id);
+              const statusText = subscription
+                ? subscriptionStatusLabel(subscription.status, t)
+                : statusLabel(seat.status, t);
+              return (
+                <React.Fragment key={row.key}>
+                  <tr className="border-t border-slate-100">
+                    <td className="px-3 py-3">
+                      <button
+                        type="button"
+                        className="inline-flex h-7 w-7 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 hover:text-slate-800"
+                        aria-expanded={expanded}
+                        aria-label={expanded ? t("shareMarket.collapseDetails") : t("shareMarket.expandDetails")}
+                        onClick={() => toggleExpanded(seat.id)}
+                      >
+                        <ChevronDown className={`h-4 w-4 transition-transform ${expanded ? "rotate-180" : ""}`} />
+                      </button>
+                    </td>
+                    <td className="px-3 py-3">
+                      <span className={`inline-flex items-center gap-1.5 text-xs ${listing.shareOnline ? "text-emerald-700" : "text-slate-500"}`}>
+                        <span className={`h-2 w-2 rounded-full ${listing.shareOnline ? "bg-emerald-500" : "bg-slate-400"}`} />
+                        {listing.shareOnline ? t("shareMarket.online") : t("shareMarket.offline")}
+                      </span>
+                    </td>
+                    <td className="px-3 py-3">
+                      <div className="flex min-w-0 items-center gap-2">
+                        <ShareAppLogo app={(listing.appType === "claude" || listing.appType === "gemini" ? listing.appType : "codex")} size={16} />
+                        <span className="truncate font-medium text-slate-900">{listing.shareName}</span>
+                      </div>
+                    </td>
+                    <td className="px-3 py-3 font-medium">
+                      {seat.position > 0 ? t("shareMarket.seat", { position: seat.position }) : "—"}
+                    </td>
+                    <td className="px-3 py-3 text-slate-600">{seat.parallelLimit ?? t("common.unlimited")}</td>
+                    <td className="px-3 py-3 text-slate-600">
+                      {seat.tokenLimit?.toLocaleString() ?? t("common.unlimited")}
+                      {seat.tokenPeriod ? ` · ${tokenPeriod(seat.tokenPeriod)}` : ""}
+                    </td>
+                    <td className="px-3 py-3 font-medium">{formatPrice(seat, t("shareMarket.free"))}</td>
+                    <td className="px-3 py-3">
+                      <span className="rounded-sm bg-slate-100 px-1.5 py-0.5 text-xs text-slate-600">{statusText}</span>
+                    </td>
+                    <td className="px-4 py-3">
+                      <div className="flex flex-wrap justify-end gap-1">
+                        {seat.canRent ? (
+                          <Button
+                            size="sm"
+                            variant="primary"
+                            isDisabled={!!busyId}
+                            onClick={() => {
+                              if (!listing.shareOnline) toast.info(t("shareMarket.rentOfflineHint"));
+                              void act(seat.id, () => rentShareMarketSeat(seat.id, seat.offerRevision));
+                            }}
+                          >
+                            {busyId === seat.id ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                            {t("shareMarket.rent")}
+                          </Button>
+                        ) : null}
+                        {!authed && guestCanSeeAvailable(listing, seat) ? (
+                          <Button size="sm" variant="outline" onClick={() => window.dispatchEvent(new Event("router-open-login"))}>{t("nav.login")}</Button>
+                        ) : null}
+                        {subscription && !listing.isOwner && subscription.canDeclarePaid ? (
+                          <Button size="sm" variant="primary" onClick={() => setPayment(subscription)}>{t("shareMarket.declarePaid")}</Button>
+                        ) : null}
+                        {subscription && !listing.isOwner && subscription.canRelease ? (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            isDisabled={!!busyId}
+                            onClick={() => setConfirmAction({
+                              id: subscription.id,
+                              title: t("shareMarket.confirm.releaseTitle"),
+                              description: t("shareMarket.confirm.releaseDescription", { share: listing.shareName }),
+                              confirmLabel: t("shareMarket.release"),
+                              tone: "warning",
+                              run: () => releaseShareMarketSubscription(subscription.id),
+                            })}
+                          >
+                            <RotateCcw className="h-4 w-4" />{t("shareMarket.release")}
+                          </Button>
+                        ) : null}
+                        {listing.isOwner ? (
+                          <Button size="sm" variant="outline" onClick={() => openShareManage(listing.shareId)}>
+                            {t("shareMarket.manage")}
+                          </Button>
+                        ) : null}
+                      </div>
+                    </td>
+                  </tr>
+                  {expanded ? (
+                    <tr className="border-t border-slate-100">
+                      <td colSpan={9} className="p-0">
+                        <ProviderExpandPanel listing={listing} locale={locale} t={t} />
+                      </td>
+                    </tr>
+                  ) : null}
+                </React.Fragment>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      {catalog && seatRows.length === 0 ? (
+        <p className="py-10 text-center text-sm text-slate-500">
+          {tab === "rentals" && !authed ? t("shareMarket.loginRequired") : t("shareMarket.empty")}
+        </p>
+      ) : null}
+    </section>
   );
+
+  const marketTabs: { id: MarketTab; label: string }[] = [
+    { id: "all", label: t("shareMarket.tab.all") },
+    { id: "mine", label: t("shareMarket.tab.mine") },
+    { id: "rentals", label: t("shareMarket.tab.rentals") },
+  ];
+
+  const layoutTabs: { id: MarketLayout; label: string }[] = [
+    { id: "seats", label: t("shareMarket.layout.seats") },
+    { id: "shares", label: t("shareMarket.layout.shares") },
+  ];
 
   return (
     <div className="mx-auto grid w-full max-w-7xl gap-5 px-1 pb-10">
-      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 pb-4">
-        <Tabs selectedKey={tab} onSelectionChange={(key) => setTab(String(key) as MarketTab)} variant="secondary" className="text-foreground">
-          <Tabs.List className="grid grid-cols-3 text-foreground">
-            <Tabs.Tab id="all" className="px-3 py-2 text-sm">{t("shareMarket.tab.all")}</Tabs.Tab>
-            <Tabs.Tab id="mine" className="px-3 py-2 text-sm">{t("shareMarket.tab.mine")}</Tabs.Tab>
-            <Tabs.Tab id="rentals" className="px-3 py-2 text-sm">{t("shareMarket.tab.rentals")}</Tabs.Tab>
-          </Tabs.List>
-        </Tabs>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+          <div className="inline-flex max-w-full overflow-x-auto rounded-lg bg-slate-100 p-1 text-[11px]">
+            {marketTabs.map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => setTab(item.id)}
+                className={`rounded-md px-2.5 py-1.5 transition-colors ${shareMarketTabTone(tab === item.id)}`}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+          <div className="inline-flex max-w-full overflow-x-auto rounded-lg bg-slate-100 p-1 text-[11px]">
+            {layoutTabs.map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => setLayout(item.id)}
+                className={`rounded-md px-2.5 py-1.5 transition-colors ${shareMarketTabTone(layout === item.id)}`}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+        </div>
         <div className="flex gap-2">
           <Button isIconOnly variant="ghost" aria-label={t("common.reload")} isDisabled={loading} onClick={() => void load()}><RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} /></Button>
           <Button variant="primary" isDisabled={authLoading} onClick={() => authed ? setAddOpen(true) : window.dispatchEvent(new Event("router-open-login"))}><Plus className="h-4 w-4" />{t("shareMarket.addShare")}</Button>
@@ -755,13 +1257,23 @@ export function ShareMarketPage() {
       </div>
       {loading && !catalog ? <div className="flex items-center gap-2 py-12 text-sm text-slate-500"><Loader2 className="h-4 w-4 animate-spin" />{t("shareMarket.loading")}</div> : null}
       {error ? <div className="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div> : null}
-      {tab !== "rentals" ? <div className="grid gap-4">{listings.map(renderListing)}{catalog && listings.length === 0 ? <p className="py-10 text-center text-sm text-slate-500">{t("shareMarket.empty")}</p> : null}</div> : null}
-      {tab === "rentals" ? (
+
+      {layout === "seats" ? renderSeatFirstTable() : null}
+
+      {layout === "shares" && tab !== "rentals" ? (
+        <div className="grid gap-4">
+          {listings.map(renderListing)}
+          {catalog && listings.length === 0 ? <p className="py-10 text-center text-sm text-slate-500">{t("shareMarket.empty")}</p> : null}
+        </div>
+      ) : null}
+
+      {layout === "shares" && tab === "rentals" ? (
         <section className="rounded-md border border-slate-200 bg-white px-4">
           {(catalog?.mySubscriptions || []).map((subscription) => renderSubscription(subscription))}
           {catalog && catalog.mySubscriptions.length === 0 ? <p className="py-10 text-center text-sm text-slate-500">{authed ? t("shareMarket.empty") : t("shareMarket.loginRequired")}</p> : null}
         </section>
       ) : null}
+
       {tab === "mine" && authed ? (
         <section className="border-t border-slate-200 pt-5">
           <div className="mb-3 flex items-center gap-2"><UserRoundX className="h-4 w-4 text-slate-500" /><h2 className="text-sm font-semibold">{t("shareMarket.blocks")}</h2></div>
@@ -796,3 +1308,4 @@ export function ShareMarketPage() {
     </div>
   );
 }
+

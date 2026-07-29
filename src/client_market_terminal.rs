@@ -541,6 +541,7 @@ mod tests {
             rental_period_days: Some(30),
             offer_revision: 1,
             payment_method_kinds: vec!["alipay".into()],
+            contacts: vec![],
             country_code: Some("US".into()),
             hostname: Some("box".into()),
             ssh_host_key_fingerprint: None,

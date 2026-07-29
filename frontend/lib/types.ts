@@ -1343,6 +1343,7 @@ export type ClientMarketHost = {
   rentalPeriodDays?: number;
   offerRevision: number;
   paymentMethodKinds: string[];
+  contacts?: PaymentContact[];
   countryCode?: string;
   hostname?: string;
   sshHostKeyFingerprint?: string;
@@ -1408,10 +1409,18 @@ export type ClientMarketPaymentMethod = {
   instructions?: string;
 };
 
+export type PaymentContactChannel = "wechat" | "telegram" | "custom";
+
+export type PaymentContact = {
+  channel: PaymentContactChannel | string;
+  handle: string;
+};
+
 export type AccountPaymentProfile = {
   providerId: string;
   ownerEmail: string;
   methods: ClientMarketPaymentMethod[];
+  contacts?: PaymentContact[];
   updatedAt: string;
 };
 
@@ -1504,6 +1513,7 @@ export type ClientMarketBilling = {
   openInvoiceId?: string;
   paymentMethods?: ClientMarketPaymentMethod[];
   paymentMethodKinds: string[];
+  contacts?: PaymentContact[];
   paymentProfileUpdatedAt?: string;
   isClientOwner: boolean;
   canDeclarePaid: boolean;
@@ -1601,6 +1611,7 @@ export type ShareMarketSubscription = {
   paymentDeadline?: string;
   openInvoice?: ShareMarketInvoice;
   paymentMethods?: ClientMarketPaymentMethod[];
+  contacts?: PaymentContact[];
   paymentProfileUpdatedAt?: string;
   canDeclarePaid: boolean;
   canRelease: boolean;
@@ -1630,6 +1641,11 @@ export type ShareMarketListing = {
   subdomain?: string;
   shareOnline: boolean;
   isOwner: boolean;
+  contacts?: PaymentContact[];
+  upstreamProvider?: ShareUpstreamProvider;
+  tokenLimit?: number;
+  parallelLimit?: number;
+  tokensUsed?: number;
   supportedUserTokenPeriods: ShareTokenPeriod[];
   seats: ShareMarketSeat[];
   createdAt: string;

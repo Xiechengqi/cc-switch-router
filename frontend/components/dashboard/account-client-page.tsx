@@ -23,18 +23,32 @@ import type { ClientMarketBilling, ClientMarketHost } from "@/lib/types";
 
 type ClientMonitorTab = "user" | "provider";
 
+type MonitorEntry = {
+  key: string;
+  billing?: ClientMarketBilling;
+  host?: ClientMarketHost;
+};
+
 const RECENT_RELEASED_MS = 30 * 24 * 60 * 60 * 1000;
 
-function offerLabel(billing: ClientMarketBilling, locale: string) {
-  if (!billing.priceCents || !billing.rentalPeriodDays) {
+function isFreeForeverOffer(priceCents?: number | null, rentalPeriodDays?: number | null) {
+  return !priceCents || !rentalPeriodDays;
+}
+
+function offerLabel(
+  priceCents: number | undefined,
+  rentalPeriodDays: number | undefined,
+  locale: string,
+) {
+  if (isFreeForeverOffer(priceCents, rentalPeriodDays)) {
     return locale.startsWith("zh") ? "免费 / 永久" : "Free / forever";
   }
   const amount = new Intl.NumberFormat(locale, { style: "currency", currency: "USD" }).format(
-    billing.priceCents / 100,
+    (priceCents as number) / 100,
   );
   return locale.startsWith("zh")
-    ? `${amount} / ${billing.rentalPeriodDays} 天`
-    : `${amount} / ${billing.rentalPeriodDays} days`;
+    ? `${amount} / ${rentalPeriodDays} 天`
+    : `${amount} / ${rentalPeriodDays} days`;
 }
 
 function statusLabelKey(status: string): MessageKey {
@@ -49,6 +63,8 @@ function statusLabelKey(status: string): MessageKey {
       return "account.client.status.releaseFailed";
     case "released":
       return "account.client.status.released";
+    case "idle":
+      return "account.client.status.idle";
     default:
       return "account.client.status.unknown";
   }
@@ -65,23 +81,74 @@ function isRecentReleased(billing: ClientMarketBilling, now = Date.now()) {
   return now - updated <= RECENT_RELEASED_MS;
 }
 
+/** Host-only / billing-missing rows (common for free-forever allocations). */
+function synthesizeBillingFromHost(
+  host: ClientMarketHost,
+  isClientOwner: boolean,
+): ClientMarketBilling {
+  const installationId = host.installationId || `host:${host.id}`;
+  return {
+    installationId,
+    hostId: host.id,
+    providerId: host.providerId || "",
+    hostOwnerEmail: host.hostOwnerEmail,
+    clientOwnerEmail: host.clientOwnerEmail || "",
+    status: host.installationId ? "active" : "idle",
+    priceCents: host.priceCents,
+    rentalPeriodDays: host.rentalPeriodDays,
+    offerRevision: host.offerRevision ?? 0,
+    paymentMethodKinds: host.paymentMethodKinds || [],
+    isClientOwner,
+    canDeclarePaid: false,
+    canRelease: !!host.installationId,
+    updatedAt: host.updatedAt || host.createdAt || new Date(0).toISOString(),
+  };
+}
+
+function entryRank(status: string) {
+  if (status === "release_failed") return 0;
+  if (status === "payment_due") return 1;
+  if (status === "releasing") return 2;
+  if (status === "active") return 3;
+  if (status === "idle") return 4;
+  return 5;
+}
+
 function MonitorCard({
-  billing,
-  host,
+  entry,
   perspective,
 }: {
-  billing: ClientMarketBilling;
-  host?: ClientMarketHost;
+  entry: MonitorEntry;
   perspective: ClientMonitorTab;
 }) {
   const { locale, t } = useLocaleText();
+  const billing = entry.billing;
+  const host = entry.host;
+  const status = billing?.status || host?.status || "unknown";
+  const priceCents = billing?.priceCents ?? host?.priceCents;
+  const rentalPeriodDays = billing?.rentalPeriodDays ?? host?.rentalPeriodDays;
   const subdomain = host?.clientSubdomain;
   const title =
-    subdomain || host?.hostname || host?.ip || billing.installationId.slice(0, 12);
-  const deadline = billingDeadlineTarget(billing);
+    subdomain ||
+    host?.hostname ||
+    host?.ip ||
+    (billing?.installationId.startsWith("host:")
+      ? billing.installationId.slice(5, 17)
+      : billing?.installationId.slice(0, 12)) ||
+    host?.id.slice(0, 12) ||
+    "—";
+  const deadline = billing ? billingDeadlineTarget(billing) : undefined;
   const countdown = formatBillingCountdown(deadline, locale);
   const absolute = formatBillingAbsoluteDate(deadline, locale);
-  const anomalous = isAnomalous(billing.status);
+  const anomalous = isAnomalous(status);
+  const providerEmail = billing?.hostOwnerEmail || host?.hostOwnerEmail || "—";
+  const renterEmail = billing?.clientOwnerEmail || host?.clientOwnerEmail || "";
+  const marketHref = host?.installationId
+    ? clientMarketMineHref(host.installationId)
+    : billing && !billing.installationId.startsWith("host:")
+      ? clientMarketMineHref(billing.installationId)
+      : clientMarketMineHref();
+  const updatedAt = billing?.updatedAt || host?.updatedAt || host?.createdAt;
 
   return (
     <section
@@ -95,24 +162,26 @@ function MonitorCard({
         ) : null}
         <strong className="truncate text-sm">{title}</strong>
         <Chip size="sm" variant={anomalous ? "primary" : "tertiary"}>
-          {t(statusLabelKey(billing.status))}
+          {t(statusLabelKey(status))}
         </Chip>
-        {host?.status ? (
+        {host?.status && host.status !== status ? (
           <Chip size="sm" variant="tertiary">
             {host.status}
           </Chip>
         ) : null}
         <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
           {perspective === "user"
-            ? t("account.client.provider", { owner: billing.hostOwnerEmail })
-            : t("account.client.renter", { email: billing.clientOwnerEmail })}
+            ? t("account.client.provider", { owner: providerEmail })
+            : renterEmail
+              ? t("account.client.renter", { email: renterEmail })
+              : t("account.client.noRenter")}
         </span>
       </div>
 
       <dl className="grid gap-2 text-sm sm:grid-cols-2">
         <div className="grid gap-0.5">
           <dt className="text-xs text-muted-foreground">{t("account.client.offer")}</dt>
-          <dd className="font-medium">{offerLabel(billing, locale)}</dd>
+          <dd className="font-medium">{offerLabel(priceCents, rentalPeriodDays, locale)}</dd>
         </div>
         <div className="grid gap-0.5">
           <dt className="text-xs text-muted-foreground">{t("account.client.deadline")}</dt>
@@ -126,12 +195,12 @@ function MonitorCard({
         <div className="grid gap-0.5 sm:col-span-2">
           <dt className="text-xs text-muted-foreground">{t("account.client.updated")}</dt>
           <dd className="text-muted-foreground">
-            {formatBillingAbsoluteDate(billing.updatedAt, locale) || billing.updatedAt}
+            {formatBillingAbsoluteDate(updatedAt, locale) || updatedAt || "—"}
           </dd>
         </div>
       </dl>
 
-      {billing.isClientOwner && billing.status !== "released" ? (
+      {billing?.isClientOwner && billing.status !== "released" && billing.status !== "idle" ? (
         <div className="flex flex-wrap items-center gap-2">
           <BillingUrgencyChip billing={billing} showPayButton={false} />
         </div>
@@ -140,7 +209,7 @@ function MonitorCard({
       <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/70 pt-3">
         <p className="text-xs text-muted-foreground">{t("account.client.readOnlyHint")}</p>
         <Link
-          href={clientMarketMineHref(billing.installationId)}
+          href={marketHref}
           className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-border bg-background px-3 text-sm font-medium text-foreground transition-colors hover:border-accent/30 hover:bg-muted"
         >
           {t("account.client.manageInMarket")}
@@ -152,18 +221,16 @@ function MonitorCard({
 }
 
 function MonitorList({
-  billings,
-  hostsByInstallation,
+  entries,
   perspective,
   emptyKey,
 }: {
-  billings: ClientMarketBilling[];
-  hostsByInstallation: Map<string, ClientMarketHost>;
+  entries: MonitorEntry[];
   perspective: ClientMonitorTab;
   emptyKey: "account.client.userEmpty" | "account.client.providerEmpty";
 }) {
   const { t } = useLocaleText();
-  if (!billings.length) {
+  if (!entries.length) {
     return (
       <div className="grid justify-items-center gap-2 rounded-xl border border-dashed border-border bg-card/40 px-4 py-12 text-center text-sm text-muted-foreground">
         <span>{t(emptyKey)}</span>
@@ -180,21 +247,16 @@ function MonitorList({
 
   return (
     <div className="grid gap-3">
-      {billings.map((billing) => (
-        <MonitorCard
-          key={`${perspective}:${billing.installationId}`}
-          billing={billing}
-          host={hostsByInstallation.get(billing.installationId)}
-          perspective={perspective}
-        />
+      {entries.map((entry) => (
+        <MonitorCard key={`${perspective}:${entry.key}`} entry={entry} perspective={perspective} />
       ))}
     </div>
   );
 }
 
 /**
- * Account → Client: read-only Provider / User monitor for Market rentals.
- * Actions live exclusively on Client Market.
+ * Account → Client Market: read-only Provider / User monitor.
+ * Includes free-forever Hosts (billing + host fallback). Actions stay on Client Market.
  */
 export function AccountClientPage() {
   const { t } = useLocaleText();
@@ -273,60 +335,112 @@ export function AccountClientPage() {
     return map;
   }, [hosts]);
 
+  const hostsById = React.useMemo(() => {
+    const map = new Map<string, ClientMarketHost>();
+    for (const host of hosts) map.set(host.id, host);
+    return map;
+  }, [hosts]);
+
   const allBillings = React.useMemo(
     () => Array.from(billingByInstallation.values()),
     [billingByInstallation],
   );
 
-  const userBillings = React.useMemo(
-    () =>
-      allBillings
-        .filter(
-          (billing) =>
-            billing.isClientOwner &&
-            (billing.status !== "released" || isRecentReleased(billing)),
-        )
-        .sort((left, right) => {
-          const rank = (status: string) => {
-            if (status === "release_failed") return 0;
-            if (status === "payment_due") return 1;
-            if (status === "releasing") return 2;
-            if (status === "active") return 3;
-            return 4;
-          };
-          return (
-            rank(left.status) - rank(right.status) ||
-            left.installationId.localeCompare(right.installationId)
-          );
-        }),
-    [allBillings],
-  );
+  const userEntries = React.useMemo(() => {
+    const entries: MonitorEntry[] = [];
+    const seen = new Set<string>();
 
-  const providerBillings = React.useMemo(
-    () =>
-      allBillings
-        .filter(
-          (billing) =>
-            !!viewerUserId &&
-            billing.providerId === viewerUserId &&
-            (billing.status !== "released" || isRecentReleased(billing)),
-        )
-        .sort((left, right) => {
-          const rank = (status: string) => {
-            if (status === "payment_due") return 0;
-            if (status === "release_failed") return 1;
-            if (status === "releasing") return 2;
-            if (status === "active") return 3;
-            return 4;
-          };
-          return (
-            rank(left.status) - rank(right.status) ||
-            left.clientOwnerEmail.localeCompare(right.clientOwnerEmail) ||
-            left.installationId.localeCompare(right.installationId)
-          );
-        }),
-    [allBillings, viewerUserId],
-  );
+    for (const billing of allBillings) {
+      if (!billing.isClientOwner) continue;
+      if (billing.status === "released" && !isRecentReleased(billing)) continue;
+      seen.add(billing.installationId);
+      entries.push({
+        key: billing.installationId,
+        billing,
+        host: hostsByInstallation.get(billing.installationId),
+      });
+    }
+
+    // Free-forever (and any) rentals that appear on hosts but lack / missed billing rows.
+    for (const host of hosts) {
+      if (host.isClientOwner !== true || !host.installationId) continue;
+      if (seen.has(host.installationId)) continue;
+      seen.add(host.installationId);
+      entries.push({
+        key: host.installationId,
+        billing: synthesizeBillingFromHost(host, true),
+        host,
+      });
+    }
+
+    return entries.sort((left, right) => {
+      const leftStatus = left.billing?.status || left.host?.status || "";
+      const rightStatus = right.billing?.status || right.host?.status || "";
+      return (
+        entryRank(leftStatus) - entryRank(rightStatus) || left.key.localeCompare(right.key)
+      );
+    });
+  }, [allBillings, hosts, hostsByInstallation]);
+
+  const providerEntries = React.useMemo(() => {
+    const entries: MonitorEntry[] = [];
+    const seenInstallations = new Set<string>();
+    const seenHosts = new Set<string>();
+
+    for (const billing of allBillings) {
+      const host =
+        hostsByInstallation.get(billing.installationId) || hostsById.get(billing.hostId);
+      const isProvider =
+        (!!viewerUserId && billing.providerId === viewerUserId) || host?.isHostOwner === true;
+      if (!isProvider) continue;
+      if (billing.status === "released" && !isRecentReleased(billing)) continue;
+      seenInstallations.add(billing.installationId);
+      if (host) seenHosts.add(host.id);
+      entries.push({ key: billing.installationId, billing, host });
+    }
+
+    for (const host of hosts) {
+      if (host.isHostOwner !== true) continue;
+
+      // Allocated Client on this Host (incl. free forever) missing from billing.
+      if (host.installationId && !seenInstallations.has(host.installationId)) {
+        seenInstallations.add(host.installationId);
+        seenHosts.add(host.id);
+        entries.push({
+          key: host.installationId,
+          billing: synthesizeBillingFromHost(host, host.isClientOwner === true),
+          host,
+        });
+        continue;
+      }
+
+      // Idle free-forever Hosts: still show under Provider monitor.
+      if (
+        !host.installationId &&
+        isFreeForeverOffer(host.priceCents, host.rentalPeriodDays) &&
+        !seenHosts.has(host.id)
+      ) {
+        seenHosts.add(host.id);
+        entries.push({
+          key: `host:${host.id}`,
+          billing: synthesizeBillingFromHost(host, false),
+          host,
+        });
+      }
+    }
+
+    return entries.sort((left, right) => {
+      const leftStatus = left.billing?.status || left.host?.status || "";
+      const rightStatus = right.billing?.status || right.host?.status || "";
+      const leftRenter = left.billing?.clientOwnerEmail || left.host?.clientOwnerEmail || "";
+      const rightRenter = right.billing?.clientOwnerEmail || right.host?.clientOwnerEmail || "";
+      return (
+        entryRank(leftStatus) - entryRank(rightStatus) ||
+        leftRenter.localeCompare(rightRenter) ||
+        left.key.localeCompare(right.key)
+      );
+    });
+  }, [allBillings, hosts, hostsById, hostsByInstallation, viewerUserId]);
 
   if (!authed) {
     return <p className="py-6 text-sm text-muted-foreground">{t("clientMarket.rentals.loginRequired")}</p>;
@@ -360,10 +474,10 @@ export function AccountClientPage() {
         className="min-w-0 text-foreground"
       >
         <Tabs.List className="grid w-full max-w-sm grid-cols-2 text-foreground">
-          <Tabs.Tab id="user" className="px-3 py-2 text-sm">
+          <Tabs.Tab id="user" className="px-3 py-2 text-sm font-medium !text-slate-900 data-[selected=true]:!text-slate-900">
             {t("account.client.tab.user")}
           </Tabs.Tab>
-          <Tabs.Tab id="provider" className="px-3 py-2 text-sm">
+          <Tabs.Tab id="provider" className="px-3 py-2 text-sm font-medium !text-slate-900 data-[selected=true]:!text-slate-900">
             {t("account.client.tab.provider")}
           </Tabs.Tab>
         </Tabs.List>
@@ -371,15 +485,13 @@ export function AccountClientPage() {
 
       {tab === "user" ? (
         <MonitorList
-          billings={userBillings}
-          hostsByInstallation={hostsByInstallation}
+          entries={userEntries}
           perspective="user"
           emptyKey="account.client.userEmpty"
         />
       ) : (
         <MonitorList
-          billings={providerBillings}
-          hostsByInstallation={hostsByInstallation}
+          entries={providerEntries}
           perspective="provider"
           emptyKey="account.client.providerEmpty"
         />

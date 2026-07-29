@@ -8,6 +8,7 @@ import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { ReleaseRentalAction } from "@/components/dashboard/client-market/release-rental-action";
 import { AuthenticatedImage } from "@/components/common/authenticated-image";
 import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
+import { ProviderContactsList } from "@/components/common/provider-contacts";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { declareClientMarketPayment } from "@/lib/api";
 import { billingUrgencyTier, formatBillingCountdown } from "@/lib/billing-urgency";
@@ -186,6 +187,7 @@ export function ClientMarketBillingBanner({
                   <div className="grid min-w-0 gap-1 sm:grid-cols-[auto_minmax(0,1fr)] sm:items-start sm:gap-3"><span className="text-muted-foreground">{t("billing.timeRemaining")}</span><strong className="min-w-0 break-words sm:text-right">{dueCountdown}</strong></div>
                 ) : null}
               </div>
+              <ProviderContactsList contacts={billing.contacts} />
               <p className="text-xs leading-5 text-muted-foreground">{t("billing.creationBlocked")}</p>
               {methods.length ? (
                 <div className="grid min-w-0 grid-cols-[minmax(0,1fr)]"><div className="flex min-w-0 items-center gap-2"><WalletCards className="h-4 w-4 shrink-0" /><strong className="min-w-0 text-sm">{t("billing.providerPaymentDetails")}</strong></div>{methods.map((method, index) => <PaymentMethod key={`${method.kind}:${method.account || method.address || index}`} method={method} />)}</div>

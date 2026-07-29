@@ -53,6 +53,7 @@ import type {
   ClientTunnelSubdomainAvailability,
   AccountPaymentProfile,
   ClientMarketPaymentMethod,
+  PaymentContact,
   ClientMarketProviderSupply,
   ClientMarketAllocationQuote,
   ClientMarketCommitQuoteResponse,
@@ -715,12 +716,15 @@ export async function getAccountPaymentProfile() {
   );
 }
 
-export async function updateAccountPaymentProfile(methods: ClientMarketPaymentMethod[]) {
+export async function updateAccountPaymentProfile(
+  methods: ClientMarketPaymentMethod[],
+  contacts?: PaymentContact[],
+) {
   return parseJson<AccountPaymentProfile>(
     await authFetch("/v1/account/payment-profile", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ methods }),
+      body: JSON.stringify({ methods, contacts }),
     }),
   );
 }

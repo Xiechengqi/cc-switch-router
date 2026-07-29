@@ -8,9 +8,10 @@ import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
 import { AuthenticatedImage } from "@/components/common/authenticated-image";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getAccountPaymentProfile, updateAccountPaymentProfile } from "@/lib/api";
-import type { ClientMarketPaymentMethod } from "@/lib/types";
+import type { ClientMarketPaymentMethod, PaymentContact, PaymentContactChannel } from "@/lib/types";
 
 type CryptoDraft = { token: "USDT" | "USDC"; chain: "bsc" | "base" | "eth" | "tron"; address: string };
+type ContactDraft = { channel: PaymentContactChannel; handle: string };
 type PaymentDraft = {
   alipayAccount: string;
   alipayQr: string;
@@ -19,9 +20,15 @@ type PaymentDraft = {
   binanceQr: string;
   crypto: CryptoDraft[];
   custom: string;
+  contacts: ContactDraft[];
 };
 
 const CRYPTO_TOKENS = ["USDT", "USDC"] as const;
+const CONTACT_CHANNELS: { id: PaymentContactChannel; labelKey: "account.contact.channel.wechat" | "account.contact.channel.telegram" | "account.contact.channel.custom" }[] = [
+  { id: "wechat", labelKey: "account.contact.channel.wechat" },
+  { id: "telegram", labelKey: "account.contact.channel.telegram" },
+  { id: "custom", labelKey: "account.contact.channel.custom" },
+];
 const CRYPTO_CHAINS = [
   { id: "bsc", label: "BSC" },
   { id: "base", label: "Base" },
@@ -30,6 +37,7 @@ const CRYPTO_CHAINS = [
 ] as const;
 
 const emptyCrypto = (): CryptoDraft => ({ token: "USDT", chain: "bsc", address: "" });
+const emptyContact = (): ContactDraft => ({ channel: "wechat", handle: "" });
 
 const emptyPaymentDraft = (): PaymentDraft => ({
   alipayAccount: "",
@@ -39,6 +47,7 @@ const emptyPaymentDraft = (): PaymentDraft => ({
   binanceQr: "",
   crypto: [emptyCrypto()],
   custom: "",
+  contacts: [],
 });
 
 function normalizeCrypto(items: CryptoDraft[]): CryptoDraft[] {
@@ -52,6 +61,15 @@ function normalizeCrypto(items: CryptoDraft[]): CryptoDraft[] {
   return cleaned.length ? cleaned : [emptyCrypto()];
 }
 
+function normalizeContacts(items: ContactDraft[]): ContactDraft[] {
+  return items
+    .map((item): ContactDraft => ({
+      channel: (["wechat", "telegram", "custom"].includes(item.channel) ? item.channel : "custom") as PaymentContactChannel,
+      handle: item.handle.trim(),
+    }))
+    .filter((item) => item.handle);
+}
+
 function serializePaymentDraft(draft: PaymentDraft) {
   return JSON.stringify({
     alipayAccount: draft.alipayAccount.trim(),
@@ -61,6 +79,7 @@ function serializePaymentDraft(draft: PaymentDraft) {
     binanceQr: draft.binanceQr.trim(),
     crypto: normalizeCrypto(draft.crypto),
     custom: draft.custom.trim(),
+    contacts: normalizeContacts(draft.contacts),
   });
 }
 
@@ -81,7 +100,7 @@ export function AccountPaymentsPanel() {
 
   const dirty = serializePaymentDraft(draft) !== baseline;
 
-  const applyProfile = React.useCallback((methods: ClientMarketPaymentMethod[]) => {
+  const applyProfile = React.useCallback((methods: ClientMarketPaymentMethod[], contacts: PaymentContact[] = []) => {
     const alipay = methods.find((method) => method.kind === "alipay");
     const wechat = methods.find((method) => method.kind === "wechat");
     const binance = methods.find((method) => method.kind === "binance");
@@ -103,6 +122,14 @@ export function AccountPaymentsPanel() {
       binanceQr: binance?.qrImageUrl || "",
       crypto: cryptoMethods.length ? cryptoMethods : [emptyCrypto()],
       custom: customMethod?.instructions || "",
+      contacts: contacts
+        .filter((contact) => contact.handle?.trim())
+        .map((contact) => ({
+          channel: (["wechat", "telegram", "custom"].includes(contact.channel)
+            ? contact.channel
+            : "custom") as PaymentContactChannel,
+          handle: contact.handle,
+        })),
     };
     setDraft(next);
     setBaseline(serializePaymentDraft(next));
@@ -119,7 +146,7 @@ export function AccountPaymentsPanel() {
     if (!authed) return;
     setLoading(true);
     getAccountPaymentProfile()
-      .then((profile) => applyProfile(profile.methods))
+      .then((profile) => applyProfile(profile.methods, profile.contacts || []))
       .catch((error) => toast.danger(error instanceof Error ? error.message : String(error)))
       .finally(() => setLoading(false));
   }, [applyProfile, authed]);
@@ -153,10 +180,11 @@ export function AccountPaymentsPanel() {
       }
     }
     if (draft.custom.trim()) methods.push({ kind: "custom", instructions: draft.custom.trim() });
+    const contacts = normalizeContacts(draft.contacts);
     setSaving(true);
     try {
-      const profile = await updateAccountPaymentProfile(methods);
-      applyProfile(profile.methods);
+      const profile = await updateAccountPaymentProfile(methods, contacts);
+      applyProfile(profile.methods, profile.contacts || []);
       toast.success(t("account.saved"));
     } catch (error) {
       toast.danger(error instanceof Error ? error.message : String(error));
@@ -223,6 +251,110 @@ export function AccountPaymentsPanel() {
             {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
             {t("common.save")}
           </Button>
+        </div>
+
+        <div className="grid gap-3 border-b border-border pb-6">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h3 className="text-sm font-semibold">{t("account.contact.title")}</h3>
+              <p className="mt-0.5 text-xs text-muted-foreground">{t("account.contact.hint")}</p>
+            </div>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() =>
+                setDraft((current) => ({
+                  ...current,
+                  contacts: [...current.contacts, emptyContact()],
+                }))
+              }
+            >
+              <Plus className="h-4 w-4" />
+              {t("account.contact.add")}
+            </Button>
+          </div>
+          {draft.contacts.length ? (
+            <div className="grid gap-2">
+              {draft.contacts.map((contact, index) => (
+                <div
+                  key={index}
+                  className="grid grid-cols-[minmax(0,9rem)_minmax(0,1fr)_2.25rem] items-end gap-2"
+                >
+                  <label className="grid gap-1 text-xs text-muted-foreground">
+                    {t("account.contact.channel")}
+                    <Select
+                      selectedKey={contact.channel}
+                      aria-label={t("account.contact.channel")}
+                      onSelectionChange={(key) => {
+                        const channel = String(key || "wechat");
+                        const next = (
+                          ["wechat", "telegram", "custom"].includes(channel) ? channel : "custom"
+                        ) as PaymentContactChannel;
+                        setDraft((current) => ({
+                          ...current,
+                          contacts: current.contacts.map((item, i) =>
+                            i === index ? { ...item, channel: next } : item,
+                          ),
+                        }));
+                      }}
+                    >
+                      <Select.Trigger className="h-10 w-full min-h-10">
+                        <Select.Value>
+                          {t(
+                            CONTACT_CHANNELS.find((item) => item.id === contact.channel)?.labelKey ||
+                              "account.contact.channel.custom",
+                          )}
+                        </Select.Value>
+                        <Select.Indicator />
+                      </Select.Trigger>
+                      <Select.Popover className="min-w-[9rem]">
+                        <ListBox aria-label={t("account.contact.channel")}>
+                          {CONTACT_CHANNELS.map((channel) => (
+                            <ListBox.Item key={channel.id} id={channel.id} textValue={t(channel.labelKey)}>
+                              {t(channel.labelKey)}
+                            </ListBox.Item>
+                          ))}
+                        </ListBox>
+                      </Select.Popover>
+                    </Select>
+                  </label>
+                  <label className="grid min-w-0 gap-1 text-xs text-muted-foreground">
+                    {t("account.contact.handle")}
+                    <input
+                      value={contact.handle}
+                      onChange={(event) =>
+                        setDraft((current) => ({
+                          ...current,
+                          contacts: current.contacts.map((item, i) =>
+                            i === index ? { ...item, handle: event.target.value } : item,
+                          ),
+                        }))
+                      }
+                      placeholder={t("account.contact.handlePlaceholder")}
+                      className="h-10 min-w-0 rounded-md border bg-white px-3 text-sm outline-none focus:ring-2 focus:ring-primary/20"
+                    />
+                  </label>
+                  <Button
+                    isIconOnly
+                    size="sm"
+                    variant="ghost"
+                    aria-label={t("account.contact.remove")}
+                    className="h-10 w-9 min-w-9"
+                    onClick={() =>
+                      setDraft((current) => ({
+                        ...current,
+                        contacts: current.contacts.filter((_, i) => i !== index),
+                      }))
+                    }
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-sm text-muted-foreground">{t("account.contact.emptyEditor")}</p>
+          )}
         </div>
 
         <div className="grid gap-4 border-b border-border pb-6">

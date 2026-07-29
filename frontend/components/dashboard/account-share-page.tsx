@@ -398,10 +398,10 @@ export function AccountSharePage() {
         className="min-w-0 text-foreground"
       >
         <Tabs.List className="grid w-full max-w-sm grid-cols-2 text-foreground">
-          <Tabs.Tab id="user" className="px-3 py-2 text-sm">
+          <Tabs.Tab id="user" className="px-3 py-2 text-sm font-medium !text-slate-900 data-[selected=true]:!text-slate-900">
             {t("account.share.tab.user")}
           </Tabs.Tab>
-          <Tabs.Tab id="provider" className="px-3 py-2 text-sm">
+          <Tabs.Tab id="provider" className="px-3 py-2 text-sm font-medium !text-slate-900 data-[selected=true]:!text-slate-900">
             {t("account.share.tab.provider")}
           </Tabs.Tab>
         </Tabs.List>

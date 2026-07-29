@@ -6971,7 +6971,24 @@ impl AppStore {
             ));
         }
         tx.commit().map_err(map_share_constraint_error)?;
+        crate::share_market::handle_control_edit_ack(
+            &conn,
+            edit_id,
+            "applied",
+            None,
+            &now.to_rfc3339(),
+        )?;
         Ok(())
+    }
+
+    pub async fn pending_share_edit_for_share(
+        &self,
+        share_id: &str,
+        revision: i64,
+    ) -> Result<Option<ShareEditView>, AppError> {
+        let conn = self.conn.lock().await;
+        let edit = get_active_share_edit(&conn, share_id)?;
+        Ok(edit.filter(|value| value.revision == revision))
     }
 
     /// Marks a pending edit rejected with an operator-facing reason. Used when
@@ -6984,13 +7001,21 @@ impl AppStore {
         error_message: &str,
     ) -> Result<(), AppError> {
         let conn = self.conn.lock().await;
+        let now = Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE share_edit_requests
              SET status = 'rejected', updated_at = ?2, error_message = ?3
              WHERE id = ?1 AND status = 'pending'",
-            params![edit_id, Utc::now().to_rfc3339(), error_message],
+            params![edit_id, now, error_message],
         )
         .map_err(|e| AppError::Internal(format!("reject share edit failed: {e}")))?;
+        crate::share_market::handle_control_edit_ack(
+            &conn,
+            edit_id,
+            "rejected",
+            Some(error_message),
+            &now,
+        )?;
         Ok(())
     }
 

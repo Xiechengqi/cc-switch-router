@@ -56,6 +56,7 @@ function sameHost(left: ClientMarketHost, right: ClientMarketHost): boolean {
     if (left[key] !== right[key]) return false;
   }
   if (!sameStringList(left.paymentMethodKinds, right.paymentMethodKinds)) return false;
+  if (JSON.stringify(left.contacts ?? []) !== JSON.stringify(right.contacts ?? [])) return false;
   // ipIntel is a nested object refreshed rarely; only pay for it once the cheap
   // scalar pass has found no difference.
   return JSON.stringify(left.ipIntel ?? null) === JSON.stringify(right.ipIntel ?? null);
@@ -104,6 +105,7 @@ function sameBilling(left: ClientMarketBilling, right: ClientMarketBilling): boo
     if (left[key] !== right[key]) return false;
   }
   if (!sameStringList(left.paymentMethodKinds, right.paymentMethodKinds)) return false;
+  if (JSON.stringify(left.contacts ?? []) !== JSON.stringify(right.contacts ?? [])) return false;
   return (
     JSON.stringify(left.paymentMethods ?? null) === JSON.stringify(right.paymentMethods ?? null)
   );

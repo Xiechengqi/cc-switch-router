@@ -51,6 +51,15 @@ const SUBSCRIPTION_PAYMENT_DUE: &str = "payment_due";
 const SUBSCRIPTION_RELEASING: &str = "releasing";
 const SUBSCRIPTION_RELEASE_FAILED: &str = "release_failed";
 const SUBSCRIPTION_RELEASED: &str = "released";
+const MAX_PAYMENT_CONTACTS: usize = 10;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PaymentContact {
+    /// `wechat` | `telegram` | `custom`
+    pub channel: String,
+    pub handle: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -78,6 +87,8 @@ pub struct PaymentProfileView {
     pub provider_id: String,
     pub owner_email: String,
     pub methods: Vec<PaymentMethod>,
+    #[serde(default)]
+    pub contacts: Vec<PaymentContact>,
     pub updated_at: String,
 }
 
@@ -103,6 +114,9 @@ pub struct CreateProviderBlockRequest {
 pub struct UpdatePaymentProfileRequest {
     #[serde(default)]
     pub methods: Vec<PaymentMethod>,
+    /// When omitted, existing contacts are preserved (backward compatible).
+    #[serde(default)]
+    pub contacts: Option<Vec<PaymentContact>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -250,6 +264,8 @@ pub struct BillingView {
     pub open_invoice_id: Option<String>,
     pub payment_methods: Option<Vec<PaymentMethod>>,
     pub payment_method_kinds: Vec<String>,
+    #[serde(default)]
+    pub contacts: Vec<PaymentContact>,
     pub payment_profile_updated_at: Option<String>,
     pub is_client_owner: bool,
     pub can_declare_paid: bool,
@@ -538,6 +554,12 @@ pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     add_column(conn, "provisioning_jobs", "client_owner_user_id", "TEXT")?;
     add_column(conn, "provisioning_jobs", "cleanup_reason", "TEXT")?;
     add_column(conn, "client_market_email_deliveries", "event_id", "TEXT")?;
+    add_column(
+        conn,
+        "account_payment_profiles",
+        "contacts_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_router_ssh_hosts_provider_supply
             ON router_ssh_hosts(provider_id, status, country_code);",
@@ -946,6 +968,44 @@ fn normalize_payment_method(mut method: PaymentMethod) -> Result<PaymentMethod, 
     Ok(method)
 }
 
+fn normalize_payment_contact(mut contact: PaymentContact) -> Result<PaymentContact, AppError> {
+    contact.channel = contact.channel.trim().to_ascii_lowercase();
+    contact.handle = contact.handle.trim().to_string();
+    if !matches!(
+        contact.channel.as_str(),
+        "wechat" | "telegram" | "custom"
+    ) {
+        return Err(AppError::BadRequest(
+            "contact channel must be wechat, telegram, or custom".into(),
+        ));
+    }
+    if contact.handle.is_empty() || contact.handle.chars().count() > 200 {
+        return Err(AppError::BadRequest(
+            "contact handle is required and must be at most 200 characters".into(),
+        ));
+    }
+    Ok(contact)
+}
+
+fn normalize_payment_contacts(contacts: Vec<PaymentContact>) -> Result<Vec<PaymentContact>, AppError> {
+    if contacts.len() > MAX_PAYMENT_CONTACTS {
+        return Err(AppError::BadRequest(
+            "at most 10 contact entries are allowed".into(),
+        ));
+    }
+    let mut output = Vec::with_capacity(contacts.len());
+    for contact in contacts {
+        let contact = normalize_payment_contact(contact)?;
+        if output.iter().any(|existing: &PaymentContact| {
+            existing.channel == contact.channel && existing.handle == contact.handle
+        }) {
+            return Err(AppError::BadRequest("duplicate contact entry".into()));
+        }
+        output.push(contact);
+    }
+    Ok(output)
+}
+
 fn validate_crypto_address(chain: &str, address: &str) -> Result<(), AppError> {
     let valid = if matches!(chain, "bsc" | "base" | "eth") {
         address.len() == 42
@@ -1100,10 +1160,14 @@ async fn update_payment_profile(
         }
         methods.push(method);
     }
+    let contacts = match input.contacts {
+        Some(contacts) => Some(normalize_payment_contacts(contacts)?),
+        None => None,
+    };
     Ok(Json(
         state
             .store
-            .client_market_update_payment_profile(&session, &methods)
+            .client_market_update_payment_profile(&session, &methods, contacts.as_deref())
             .await?,
     ))
 }
@@ -1911,20 +1975,21 @@ impl AppStore {
     ) -> Result<PaymentProfileView, AppError> {
         let email = normalize_email(owner_email)?;
         let conn = self.conn.lock().await;
-        let row: Option<(String, String, String)> = conn
+        let row: Option<(String, String, String, String)> = conn
             .query_row(
-                "SELECT owner_email, methods_json, updated_at
+                "SELECT owner_email, methods_json, COALESCE(contacts_json, '[]'), updated_at
                  FROM account_payment_profiles WHERE user_id = ?1",
                 params![user_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(|error| AppError::Internal(format!("read payment profile failed: {error}")))?;
-        if let Some((owner_email, methods_json, updated_at)) = row {
+        if let Some((owner_email, methods_json, contacts_json, updated_at)) = row {
             return Ok(PaymentProfileView {
                 provider_id: user_id.to_string(),
                 owner_email,
                 methods: serde_json::from_str(&methods_json).unwrap_or_default(),
+                contacts: serde_json::from_str(&contacts_json).unwrap_or_default(),
                 updated_at,
             });
         }
@@ -1932,6 +1997,7 @@ impl AppStore {
             provider_id: user_id.to_string(),
             owner_email: email,
             methods: Vec::new(),
+            contacts: Vec::new(),
             updated_at: Utc::now().to_rfc3339(),
         })
     }
@@ -1940,6 +2006,7 @@ impl AppStore {
         &self,
         session: &AuthSession,
         methods: &[PaymentMethod],
+        contacts: Option<&[PaymentContact]>,
     ) -> Result<PaymentProfileView, AppError> {
         let email = normalize_email(&session.email)?;
         let methods_json = serde_json::to_string(methods).map_err(|error| {
@@ -1950,14 +2017,30 @@ impl AppStore {
         let tx = conn.transaction().map_err(|error| {
             AppError::Internal(format!("begin payment profile update failed: {error}"))
         })?;
+        let existing_contacts_json: String = tx
+            .query_row(
+                "SELECT COALESCE(contacts_json, '[]') FROM account_payment_profiles WHERE user_id = ?1",
+                params![session.user_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| AppError::Internal(format!("read existing contacts failed: {error}")))?
+            .unwrap_or_else(|| "[]".to_string());
+        let contacts_json = match contacts {
+            Some(contacts) => serde_json::to_string(contacts).map_err(|error| {
+                AppError::Internal(format!("encode payment contacts failed: {error}"))
+            })?,
+            None => existing_contacts_json,
+        };
         tx.execute(
-            "INSERT INTO account_payment_profiles (user_id, owner_email, methods_json, updated_at)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO account_payment_profiles (user_id, owner_email, methods_json, contacts_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(user_id) DO UPDATE SET
                 owner_email = excluded.owner_email,
                 methods_json = excluded.methods_json,
+                contacts_json = excluded.contacts_json,
                 updated_at = excluded.updated_at",
-            params![session.user_id, email, methods_json, now],
+            params![session.user_id, email, methods_json, contacts_json, now],
         )
         .map_err(|error| AppError::Internal(format!("save payment profile failed: {error}")))?;
         tx.execute(
@@ -2022,6 +2105,7 @@ impl AppStore {
             provider_id: session.user_id.clone(),
             owner_email: email,
             methods: methods.to_vec(),
+            contacts: serde_json::from_str(&contacts_json).unwrap_or_default(),
             updated_at: now,
         })
     }
@@ -4286,6 +4370,7 @@ struct BillingRow {
     payment_deadline: Option<String>,
     open_invoice_id: Option<String>,
     methods_json: String,
+    contacts_json: String,
     payment_profile_updated_at: Option<String>,
     active_cleanup_job_id: Option<String>,
     updated_at: String,
@@ -4303,6 +4388,8 @@ fn load_billing_views(
                 (SELECT id FROM client_market_invoices i
                  WHERE i.installation_id = s.installation_id AND i.status = 'open' LIMIT 1),
                 COALESCE((SELECT methods_json FROM account_payment_profiles p
+                          WHERE p.user_id = s.provider_id), '[]'),
+                COALESCE((SELECT contacts_json FROM account_payment_profiles p
                           WHERE p.user_id = s.provider_id), '[]'),
                 (SELECT updated_at FROM account_payment_profiles p
                  WHERE p.user_id = s.provider_id),
@@ -4338,9 +4425,10 @@ fn load_billing_views(
             payment_deadline: row.get(11)?,
             open_invoice_id: row.get(12)?,
             methods_json: row.get(13)?,
-            payment_profile_updated_at: row.get(14)?,
-            active_cleanup_job_id: row.get(15)?,
-            updated_at: row.get(16)?,
+            contacts_json: row.get(14)?,
+            payment_profile_updated_at: row.get(15)?,
+            active_cleanup_job_id: row.get(16)?,
+            updated_at: row.get(17)?,
         })
     };
     let rows = if let Some(installation_id) = installation_id {
@@ -4390,6 +4478,7 @@ fn load_billing_views(
             open_invoice_id: row.open_invoice_id,
             payment_methods: Some(methods),
             payment_method_kinds: kinds,
+            contacts: serde_json::from_str(&row.contacts_json).unwrap_or_default(),
             payment_profile_updated_at: row.payment_profile_updated_at,
             is_client_owner: client_role,
             can_declare_paid: client_role

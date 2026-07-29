@@ -13,6 +13,7 @@ import { useWebTerminal } from "@/components/dashboard/web-terminal";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { HostOfferDialog } from "@/components/dashboard/client-market/host-offer-dialog";
 import { ClientMarketBillingBanner } from "@/components/dashboard/client-market-billing-banner";
+import { ProviderContactButton } from "@/components/common/provider-contacts";
 import { ReleaseRentalAction } from "@/components/dashboard/client-market/release-rental-action";
 import {
   cleanupClientMarketClientWithReason,
@@ -275,9 +276,12 @@ function HostRowImpl({
           )}
         </td>
         <td className="max-w-[12rem] px-2 py-2 align-middle">
-          <span className="block truncate text-xs font-medium text-foreground" title={host.hostOwnerEmail}>
-            {host.hostOwnerEmail}
-          </span>
+          <div className="flex min-w-0 items-center gap-1">
+            <span className="min-w-0 flex-1 truncate text-xs font-medium text-foreground" title={host.hostOwnerEmail}>
+              {host.hostOwnerEmail}
+            </span>
+            <ProviderContactButton contacts={host.contacts} />
+          </div>
         </td>
         <td className="max-w-[9rem] whitespace-nowrap px-2 py-2 align-middle">
           <span className="block text-xs font-semibold text-foreground" title={t("clientMarket.currentOffer")}>
