@@ -16311,11 +16311,15 @@ fn list_active_share_edits(conn: &Connection) -> Result<HashMap<String, ShareEdi
             "SELECT id, share_id, installation_id, revision, status, patch_json, created_by_email, created_at, updated_at, applied_at, error_message
              FROM share_edit_requests
              WHERE status IN ('pending', 'rejected') AND retired_at IS NULL
+               AND NOT (status = 'rejected' AND created_by_email = ?1)
              ORDER BY revision DESC",
         )
         .map_err(|e| AppError::Internal(format!("prepare active share edits failed: {e}")))?;
     let rows = stmt
-        .query_map([], share_edit_from_row)
+        .query_map(
+            params![crate::share_market::SHARE_MARKET_CONTROL_ACTOR_EMAIL],
+            share_edit_from_row,
+        )
         .map_err(|e| AppError::Internal(format!("query active share edits failed: {e}")))?;
     let mut result = HashMap::new();
     for edit in collect_rows(rows)? {
@@ -36016,6 +36020,61 @@ mod tests {
             err.to_string()
                 .contains("share owner is managed by the installation owner")
         );
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn dashboard_active_edit_ignores_rejected_share_market_control_edits() {
+        let (store, config) = setup_store("dashboard-ignore-share-market-control-edit").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-edit", "edit-sub", "active").await;
+
+        let owner_edit = store
+            .create_share_settings_edit(
+                "share-edit",
+                "owner@example.com",
+                ShareSettingsPatch {
+                    description: Some(Some("owner edit".into())),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .await
+            .expect("create owner edit")
+            .edit;
+        store
+            .mark_share_edit_rejected(&owner_edit.id, "owner edit failed")
+            .await
+            .expect("reject owner edit");
+
+        {
+            let conn = store.conn.lock().await;
+            let now = Utc::now().to_rfc3339();
+            let patch_json = serde_json::to_string(&ShareSettingsPatch::default())
+                .expect("encode internal edit patch");
+            conn.execute(
+                "INSERT INTO share_edit_requests (
+                    id, share_id, installation_id, owner_email, revision, status,
+                    patch_json, created_by_email, created_at, updated_at,
+                    applied_at, error_message, retired_at
+                 ) VALUES (?1, 'share-edit', 'inst-1', ?2, ?3, 'rejected',
+                           ?4, ?2, ?5, ?5, NULL, 'managed grant rejected', NULL)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    crate::share_market::SHARE_MARKET_CONTROL_ACTOR_EMAIL,
+                    owner_edit.revision + 1,
+                    patch_json,
+                    now,
+                ],
+            )
+            .expect("insert rejected Share Market control edit");
+
+            let active = list_active_share_edits(&conn).expect("list dashboard active edits");
+            assert_eq!(
+                active.get("share-edit").map(|edit| edit.id.as_str()),
+                Some(owner_edit.id.as_str())
+            );
+        }
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }

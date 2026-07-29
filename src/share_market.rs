@@ -26,10 +26,12 @@ const RENEWAL_GRACE_HOURS: i64 = 72;
 const SERVICE_CYCLE_SECS: u64 = 5;
 const MAX_SEATS_PER_LISTING: usize = 20;
 const MAX_CONTROL_ATTEMPTS: i64 = 8;
+pub(crate) const SHARE_MARKET_CONTROL_ACTOR_EMAIL: &str = "share-market@router.internal";
 
 const SEAT_AVAILABLE: &str = "available";
 const SEAT_DISABLED: &str = "disabled";
 const SEAT_DELETED: &str = "deleted";
+const SEAT_RETIRED_VIEW: &str = "retired";
 
 const SUB_GRANT_PENDING: &str = "grant_pending";
 const SUB_TRIAL_PAYMENT_DUE: &str = "trial_payment_due";
@@ -95,6 +97,9 @@ pub struct SeatView {
     pub offer_revision: i64,
     pub is_free: bool,
     pub can_rent: bool,
+    pub read_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription: Option<SubscriptionView>,
 }
@@ -129,6 +134,10 @@ pub struct SubscriptionView {
     pub can_declare_paid: bool,
     pub can_release: bool,
     pub can_force_revoke: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -274,6 +283,8 @@ pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             period_count INTEGER,
             offer_revision INTEGER NOT NULL DEFAULT 1,
             current_subscription_id TEXT,
+            retired_subscription_id TEXT,
+            retired_at TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             UNIQUE(listing_id, position),
@@ -391,10 +402,62 @@ pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         CREATE INDEX IF NOT EXISTS idx_share_market_subscriptions_renter
             ON share_market_subscriptions(renter_user_id, status);",
     )?;
-    let _ = conn.execute(
-        "ALTER TABLE share_market_listings ADD COLUMN deleted_at TEXT",
-        [],
-    );
+    add_column_if_missing(conn, "share_market_listings", "deleted_at", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "share_market_seats",
+        "retired_subscription_id",
+        "TEXT",
+    )?;
+    add_column_if_missing(conn, "share_market_seats", "retired_at", "TEXT")?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_share_market_seats_listing_lifecycle
+             ON share_market_seats(listing_id, retired_at, position);
+         UPDATE share_market_seats AS seat
+         SET status = 'disabled',
+             retired_subscription_id = (
+                 SELECT sub.id FROM share_market_subscriptions sub
+                 WHERE sub.seat_id = seat.id
+                   AND sub.status IN ('released', 'grant_failed')
+                 ORDER BY COALESCE(sub.released_at, sub.updated_at) DESC, sub.created_at DESC
+                 LIMIT 1
+             ),
+             retired_at = (
+                 SELECT COALESCE(sub.released_at, sub.updated_at)
+                 FROM share_market_subscriptions sub
+                 WHERE sub.seat_id = seat.id
+                   AND sub.status IN ('released', 'grant_failed')
+                 ORDER BY COALESCE(sub.released_at, sub.updated_at) DESC, sub.created_at DESC
+                 LIMIT 1
+             )
+         WHERE seat.current_subscription_id IS NULL
+           AND seat.retired_at IS NULL
+           AND seat.status IN ('available', 'disabled')
+           AND EXISTS (
+               SELECT 1 FROM share_market_subscriptions sub
+               WHERE sub.seat_id = seat.id
+                 AND sub.status IN ('released', 'grant_failed')
+           );",
+    )?;
+    Ok(())
+}
+
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), rusqlite::Error> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|value| value == column) {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -610,6 +673,8 @@ struct SubscriptionRecord {
     trial_ends_at: Option<String>,
     current_period_end: Option<String>,
     payment_deadline: Option<String>,
+    release_reason: Option<String>,
+    released_at: Option<String>,
     created_at: String,
     updated_at: String,
 }
@@ -626,7 +691,8 @@ fn subscription_record(
                 sub.renter_user_id, sub.renter_email, sub.status,
                 sub.price_minor, sub.currency, sub.period_unit, sub.period_count,
                 sub.offer_revision, sub.trial_ends_at, sub.current_period_end,
-                sub.payment_deadline, sub.created_at, sub.updated_at
+                sub.payment_deadline, sub.release_reason, sub.released_at,
+                sub.created_at, sub.updated_at
          FROM share_market_subscriptions sub
          LEFT JOIN shares s ON s.share_id = sub.share_id
          WHERE sub.id = ?1",
@@ -656,8 +722,10 @@ fn subscription_record(
                 trial_ends_at: row.get(18)?,
                 current_period_end: row.get(19)?,
                 payment_deadline: row.get(20)?,
-                created_at: row.get(21)?,
-                updated_at: row.get(22)?,
+                release_reason: row.get(21)?,
+                released_at: row.get(22)?,
+                created_at: row.get(23)?,
+                updated_at: row.get(24)?,
             })
         },
     )
@@ -784,6 +852,8 @@ fn subscription_view(
         can_declare_paid,
         can_release,
         can_force_revoke,
+        release_reason: record.release_reason,
+        released_at: record.released_at,
         created_at: record.created_at,
         updated_at: record.updated_at,
     })
@@ -858,7 +928,6 @@ impl AppStore {
                     OR EXISTS (
                         SELECT 1 FROM share_market_subscriptions sub
                         WHERE sub.listing_id = listing.id AND sub.renter_user_id = ?1
-                          AND sub.status NOT IN ('released', 'grant_failed')
                     ))
                  ORDER BY listing.created_at DESC",
             )
@@ -954,10 +1023,11 @@ impl AppStore {
                 .prepare(
                     "SELECT id, position, status, parallel_limit, token_limit,
                             token_period_json, price_minor, currency, period_unit,
-                            period_count, offer_revision, current_subscription_id
+                            period_count, offer_revision, current_subscription_id,
+                            retired_subscription_id, retired_at
                      FROM share_market_seats
                      WHERE listing_id = ?1 AND status != 'deleted'
-                     ORDER BY position",
+                     ORDER BY CASE WHEN retired_at IS NULL THEN 0 ELSE 1 END, position",
                 )
                 .map_err(map_db("prepare Share Market seats"))?;
             let seat_rows = seat_statement
@@ -975,6 +1045,8 @@ impl AppStore {
                         row.get::<_, Option<i64>>(9)?,
                         row.get::<_, i64>(10)?,
                         row.get::<_, Option<String>>(11)?,
+                        row.get::<_, Option<String>>(12)?,
+                        row.get::<_, Option<String>>(13)?,
                     ))
                 })
                 .map_err(map_db("query Share Market seats"))?
@@ -994,19 +1066,19 @@ impl AppStore {
                 period_unit,
                 period_count,
                 offer_revision,
-                subscription_id,
+                current_subscription_id,
+                retired_subscription_id,
+                retired_at,
             ) in seat_rows
             {
-                let subscription = match subscription_id {
+                let subscription = match current_subscription_id.or(retired_subscription_id) {
                     Some(subscription_id) => subscription_record(&conn, &subscription_id)?
                         .filter(|record| {
                             is_owner
                                 || viewer
                                     .is_some_and(|session| session.user_id == record.renter_user_id)
                         })
-                        .map(|record| {
-                            subscription_view(&conn, record, viewer, active_subdomains)
-                        })
+                        .map(|record| subscription_view(&conn, record, viewer, active_subdomains))
                         .transpose()?,
                     None => None,
                 };
@@ -1015,15 +1087,21 @@ impl AppStore {
                         && share_status == "active"
                         && current_owner_email.eq_ignore_ascii_case(&owner_email)
                         && seat_status == SEAT_AVAILABLE
+                        && retired_at.is_none()
                         && session.user_id != owner_user_id
                         && !viewer_blocked
                         && !viewer_already_renting
                         && !viewer_has_direct_grant
                 });
+                let read_only = retired_at.is_some();
                 seats.push(SeatView {
                     id: seat_id,
                     position,
-                    status: seat_status,
+                    status: if read_only {
+                        SEAT_RETIRED_VIEW.to_string()
+                    } else {
+                        seat_status
+                    },
                     parallel_limit: parallel_limit.and_then(|value| u32::try_from(value).ok()),
                     token_limit: token_limit.and_then(|value| u64::try_from(value).ok()),
                     token_period: serde_json::from_str(&token_period_json)
@@ -1035,6 +1113,8 @@ impl AppStore {
                     offer_revision,
                     is_free: price_minor.is_none(),
                     can_rent,
+                    read_only,
+                    retired_at,
                     subscription,
                 });
             }
@@ -1073,7 +1153,7 @@ impl AppStore {
             let mut statement = conn
                 .prepare(
                     "SELECT id FROM share_market_subscriptions
-                     WHERE renter_user_id = ?1 AND status NOT IN ('released', 'grant_failed')
+                     WHERE renter_user_id = ?1
                      ORDER BY created_at DESC",
                 )
                 .map_err(map_db("prepare renter subscriptions"))?;
@@ -1432,7 +1512,9 @@ impl AppStore {
         let count: i64 = tx
             .query_row(
                 "SELECT COUNT(*) FROM share_market_seats
-                 WHERE listing_id = ?1 AND status != 'deleted'",
+                 WHERE listing_id = ?1
+                   AND retired_at IS NULL
+                   AND status IN ('available', 'reserved', 'occupied', 'revoking')",
                 params![listing_id],
                 |row| row.get(0),
             )
@@ -1490,11 +1572,11 @@ impl AppStore {
         let tx = conn
             .transaction()
             .map_err(map_db("begin update Share seat"))?;
-        let row: Option<(String, String, i64, String, String, String)> = tx
+        let row: Option<(String, String, i64, String, String, String, Option<String>)> = tx
             .query_row(
                 "SELECT listing.owner_user_id, seat.status, seat.offer_revision,
                         listing.owner_email, s.owner_email,
-                        COALESCE(s.supported_user_token_periods_json, '[]')
+                        COALESCE(s.supported_user_token_periods_json, '[]'), seat.retired_at
                  FROM share_market_seats seat
                  JOIN share_market_listings listing ON listing.id = seat.listing_id
                  JOIN shares s ON s.share_id = listing.share_id
@@ -1508,6 +1590,7 @@ impl AppStore {
                         row.get(3)?,
                         row.get(4)?,
                         row.get(5)?,
+                        row.get(6)?,
                     ))
                 },
             )
@@ -1520,6 +1603,7 @@ impl AppStore {
             listing_owner_email,
             share_owner_email,
             periods_json,
+            retired_at,
         )) = row
         else {
             return Err(AppError::NotFound("seat not found".into()));
@@ -1534,7 +1618,7 @@ impl AppStore {
                 "listing Share is no longer owned by this account".into(),
             ));
         }
-        if status != SEAT_AVAILABLE {
+        if status != SEAT_AVAILABLE || retired_at.is_some() {
             return Err(AppError::Conflict(
                 "an occupied or pending seat must be reclaimed before editing".into(),
             ));
@@ -1600,23 +1684,29 @@ impl AppStore {
         let tx = conn
             .transaction()
             .map_err(map_db("begin delete Share seat"))?;
-        let row: Option<(String, String, String)> = tx
+        let row: Option<(String, String, String, Option<String>, i64)> = tx
             .query_row(
-                "SELECT listing.owner_user_id, seat.status, seat.listing_id
+                "SELECT listing.owner_user_id, seat.status, seat.listing_id, seat.retired_at,
+                        (SELECT COUNT(*) FROM share_market_subscriptions sub WHERE sub.seat_id = seat.id)
                  FROM share_market_seats seat
                  JOIN share_market_listings listing ON listing.id = seat.listing_id
                  WHERE seat.id = ?1",
                 params![seat_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .optional()
             .map_err(map_db("read Share seat for delete"))?;
-        let Some((owner_user_id, status, listing_id)) = row else {
+        let Some((owner_user_id, status, listing_id, retired_at, subscription_count)) = row else {
             return Err(AppError::NotFound("seat not found".into()));
         };
         if owner_user_id != session.user_id {
             return Err(AppError::Forbidden(
                 "only listing owner can delete seat".into(),
+            ));
+        }
+        if retired_at.is_some() || subscription_count > 0 {
+            return Err(AppError::Conflict(
+                "a seat with rental history is read-only".into(),
             ));
         }
         if status != SEAT_AVAILABLE && status != SEAT_DISABLED {
@@ -1729,17 +1819,17 @@ impl AppStore {
                 "only closed listings can be deleted".into(),
             ));
         }
-        let active_rentals: i64 = tx
+        let rental_history: i64 = tx
             .query_row(
                 "SELECT COUNT(*) FROM share_market_subscriptions
-                 WHERE listing_id = ?1 AND status NOT IN ('released', 'grant_failed')",
+                 WHERE listing_id = ?1",
                 params![listing_id],
                 |row| row.get(0),
             )
             .map_err(map_db("count active Share rentals before delete"))?;
-        if active_rentals > 0 {
+        if rental_history > 0 {
             return Err(AppError::Conflict(
-                "cannot delete listing while rentals are in progress".into(),
+                "cannot delete a listing after a seat has been rented".into(),
             ));
         }
         tx.execute(
@@ -1987,6 +2077,7 @@ impl AppStore {
                  JOIN share_market_listings listing ON listing.id = seat.listing_id
                  JOIN shares s ON s.share_id = listing.share_id
                  WHERE seat.id = ?1 AND s.share_status = 'active'
+                   AND seat.retired_at IS NULL
                    AND lower(s.owner_email) = lower(listing.owner_email)",
                 params![seat_id],
                 |row| {
@@ -2144,7 +2235,8 @@ impl AppStore {
             .execute(
                 "UPDATE share_market_seats
                  SET status = 'reserved', current_subscription_id = ?2, updated_at = ?3
-                 WHERE id = ?1 AND status = 'available' AND offer_revision = ?4",
+                 WHERE id = ?1 AND status = 'available' AND retired_at IS NULL
+                   AND offer_revision = ?4",
                 params![seat_id, subscription_id, now, offer_revision],
             )
             .map_err(map_db("reserve Share seat"))?;
@@ -2813,13 +2905,13 @@ fn retire_unconfirmed_grant_tx(
         .map_err(map_db("retire unconfirmed Share grant edit"))?;
     }
     tx.execute(
-            "UPDATE share_control_operations
+        "UPDATE share_control_operations
              SET status = 'rejected', updated_at = ?3, last_error = ?2
              WHERE subscription_id = ?1 AND action = 'upsert'
                AND status IN ('pending', 'dispatched')",
-            params![subscription_id, message, now],
-        )
-        .map_err(map_db("reject unconfirmed Share grant"))?;
+        params![subscription_id, message, now],
+    )
+    .map_err(map_db("reject unconfirmed Share grant"))?;
     Ok(RetireUnconfirmedGrant { had_dispatched })
 }
 
@@ -2919,14 +3011,15 @@ fn finish_release_tx(
     reason: &str,
     now: &str,
 ) -> Result<(), AppError> {
-    tx.execute(
-        "UPDATE share_market_subscriptions
+    let released = tx
+        .execute(
+            "UPDATE share_market_subscriptions
          SET status = 'released', release_reason = COALESCE(release_reason, ?2),
              updated_at = ?3, released_at = ?3
          WHERE id = ?1 AND status != 'released'",
-        params![subscription_id, reason, now],
-    )
-    .map_err(map_db("release Share subscription"))?;
+            params![subscription_id, reason, now],
+        )
+        .map_err(map_db("release Share subscription"))?;
     tx.execute(
         "UPDATE share_market_invoices
          SET status = 'canceled', canceled_at = ?2
@@ -2934,29 +3027,51 @@ fn finish_release_tx(
         params![subscription_id, now],
     )
     .map_err(map_db("cancel released Share invoices"))?;
-    tx.execute(
-        "UPDATE share_market_seats
-         SET status = CASE
-                WHEN (SELECT status FROM share_market_listings WHERE id = ?2) = 'active'
-                    THEN 'available'
-                ELSE 'disabled'
-             END,
-             current_subscription_id = NULL, updated_at = ?3
-         WHERE id = ?1 AND current_subscription_id = ?4",
-        params![seat_id, listing_id, now, subscription_id],
-    )
-    .map_err(map_db("release Share seat"))?;
-    event_tx(
-        tx,
-        Some(listing_id),
-        Some(seat_id),
-        Some(subscription_id),
-        None,
-        "subscription_released",
-        serde_json::json!({ "reason": reason }),
-        now,
-    )?;
+    let retired = retire_seat(tx, seat_id, subscription_id, now)?;
+    if released > 0 {
+        event_tx(
+            tx,
+            Some(listing_id),
+            Some(seat_id),
+            Some(subscription_id),
+            None,
+            "subscription_released",
+            serde_json::json!({ "reason": reason }),
+            now,
+        )?;
+    }
+    if retired {
+        event_tx(
+            tx,
+            Some(listing_id),
+            Some(seat_id),
+            Some(subscription_id),
+            None,
+            "seat_retired",
+            serde_json::json!({ "reason": reason }),
+            now,
+        )?;
+    }
     Ok(())
+}
+
+fn retire_seat(
+    conn: &Connection,
+    seat_id: &str,
+    subscription_id: &str,
+    now: &str,
+) -> Result<bool, AppError> {
+    let changed = conn
+        .execute(
+            "UPDATE share_market_seats
+             SET status = 'disabled', current_subscription_id = NULL,
+                 retired_subscription_id = COALESCE(retired_subscription_id, ?2),
+                 retired_at = COALESCE(retired_at, ?3), updated_at = ?3
+             WHERE id = ?1 AND current_subscription_id = ?2",
+            params![seat_id, subscription_id, now],
+        )
+        .map_err(map_db("retire Share seat"))?;
+    Ok(changed > 0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3457,12 +3572,13 @@ impl AppStore {
                     id, share_id, installation_id, owner_email, revision, status,
                     patch_json, created_by_email, created_at, updated_at,
                     applied_at, error_message, retired_at
-                 ) VALUES (?1, ?2, ?3, 'share-market@router.internal', ?4, 'pending',
-                           ?5, 'share-market@router.internal', ?6, ?6, NULL, NULL, NULL)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending',
+                           ?6, ?4, ?7, ?7, NULL, NULL, NULL)",
                 params![
                     edit_id,
                     share_id,
                     installation_id,
+                    SHARE_MARKET_CONTROL_ACTOR_EMAIL,
                     edit_revision,
                     patch_json,
                     now
@@ -3542,6 +3658,15 @@ pub(crate) fn handle_control_edit_ack(
     else {
         return Ok(());
     };
+    if status == "rejected" {
+        conn.execute(
+            "UPDATE share_edit_requests
+             SET retired_at = COALESCE(retired_at, ?2)
+             WHERE id = ?1 AND status = 'rejected'",
+            params![edit_id, now],
+        )
+        .map_err(map_db("retire rejected Share control edit"))?;
+    }
     if operation_status != "dispatched" {
         return Ok(());
     }
@@ -3609,16 +3734,7 @@ pub(crate) fn handle_control_edit_ack(
         if grant_failed == 1
             && let Some(seat_id) = seat_id
         {
-            conn.execute(
-                "UPDATE share_market_seats
-                 SET status = CASE
-                        WHEN (SELECT status FROM share_market_listings WHERE id = listing_id) = 'active'
-                            THEN 'available' ELSE 'disabled' END,
-                     current_subscription_id = NULL, updated_at = ?2
-                 WHERE id = ?1 AND current_subscription_id = ?3",
-                params![seat_id, now, subscription_id],
-            )
-            .map_err(map_db("release failed Share grant seat"))?;
+            retire_seat(conn, &seat_id, &subscription_id, now)?;
         }
     } else {
         conn.execute(
@@ -4171,6 +4287,89 @@ mod tests {
         assert!(tables >= 6);
     }
 
+    #[test]
+    fn schema_migration_backfills_legacy_released_seats_idempotently() {
+        let conn = Connection::open_in_memory().expect("memory database");
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        init_schema(&conn).expect("current schema");
+        conn.execute_batch(
+            "DROP INDEX idx_share_market_seats_listing_lifecycle;
+             ALTER TABLE share_market_seats DROP COLUMN retired_subscription_id;
+             ALTER TABLE share_market_seats DROP COLUMN retired_at;",
+        )
+        .expect("simulate legacy seat schema");
+        conn.execute(
+            "INSERT INTO share_market_listings (
+                id, share_id, owner_user_id, owner_email, status, created_at, updated_at
+             ) VALUES ('legacy-listing', 'legacy-share', 'legacy-owner',
+                       'owner@example.com', 'active', ?1, ?1)",
+            params!["2026-07-01T00:00:00Z"],
+        )
+        .expect("insert legacy listing");
+        conn.execute(
+            "INSERT INTO share_market_seats (
+                id, listing_id, position, status, parallel_limit, token_limit,
+                token_period_json, price_minor, currency, period_unit, period_count,
+                offer_revision, current_subscription_id, created_at, updated_at
+             ) VALUES ('legacy-seat', 'legacy-listing', 1, 'available', 2, 10000,
+                       '\"day\"', NULL, NULL, NULL, NULL, 1, NULL, ?1, ?1)",
+            params!["2026-07-01T00:00:00Z"],
+        )
+        .expect("insert legacy seat");
+        conn.execute(
+            "INSERT INTO share_market_subscriptions (
+                id, seat_id, listing_id, share_id, entitlement_id,
+                owner_user_id, owner_email, renter_user_id, renter_email, status,
+                parallel_limit, token_limit, token_period_json, price_minor, currency,
+                period_unit, period_count, offer_revision, trial_ends_at,
+                current_period_end, payment_deadline, release_reason,
+                created_at, updated_at, released_at
+             ) VALUES ('legacy-subscription', 'legacy-seat', 'legacy-listing',
+                       'legacy-share', 'legacy-entitlement', 'legacy-owner',
+                       'owner@example.com', 'legacy-renter', 'renter@example.com',
+                       'released', 2, 10000, '\"day\"', NULL, NULL, NULL, NULL, 1,
+                       NULL, NULL, NULL, 'returned', ?1, ?2, ?2)",
+            params!["2026-07-01T00:00:00Z", "2026-07-02T00:00:00Z"],
+        )
+        .expect("insert legacy released subscription");
+
+        init_schema(&conn).expect("migrate legacy schema");
+        init_schema(&conn).expect("repeat legacy migration");
+
+        let columns = conn
+            .prepare("PRAGMA table_info(share_market_seats)")
+            .expect("prepare seat columns")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query seat columns")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read seat columns");
+        assert_eq!(
+            columns
+                .iter()
+                .filter(|column| column.as_str() == "retired_subscription_id")
+                .count(),
+            1
+        );
+        assert_eq!(
+            columns
+                .iter()
+                .filter(|column| column.as_str() == "retired_at")
+                .count(),
+            1
+        );
+        let retirement: (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT status, retired_subscription_id, retired_at
+                 FROM share_market_seats WHERE id = 'legacy-seat'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read migrated retirement");
+        assert_eq!(retirement.0, SEAT_DISABLED);
+        assert_eq!(retirement.1.as_deref(), Some("legacy-subscription"));
+        assert_eq!(retirement.2.as_deref(), Some("2026-07-02T00:00:00Z"));
+    }
+
     #[tokio::test]
     async fn undispatched_grants_are_canceled_without_issuing_revokes() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
@@ -4184,7 +4383,7 @@ mod tests {
             &[ShareTokenPeriod::Day],
         )
         .await;
-        let (_listing_id, seat_id) =
+        let (listing_id, seat_id) =
             create_listing(&store, &owner, "share-cancel", free_seat()).await;
 
         let first_subscription = store
@@ -4207,17 +4406,20 @@ mod tests {
                 .expect("cancel unavailable undispatched grant")
                 .is_empty()
         );
-        let (subscription_status, seat_status, upsert_status, revoke_count): (
-            String,
-            String,
-            String,
-            i64,
-        ) = store
+        let (
+            subscription_status,
+            seat_status,
+            retired_subscription_id,
+            retired_at,
+            upsert_status,
+            revoke_count,
+        ): (String, String, Option<String>, Option<String>, String, i64) = store
             .conn
             .lock()
             .await
             .query_row(
-                "SELECT sub.status, seat.status, operation.status,
+                "SELECT sub.status, seat.status, seat.retired_subscription_id,
+                        seat.retired_at, operation.status,
                         (SELECT COUNT(*) FROM share_control_operations revoke
                          WHERE revoke.subscription_id = sub.id AND revoke.action = 'revoke')
                  FROM share_market_subscriptions sub
@@ -4226,11 +4428,25 @@ mod tests {
                    ON operation.subscription_id = sub.id AND operation.action = 'upsert'
                  WHERE sub.id = ?1",
                 params![first_subscription],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )
             .expect("read canceled unavailable grant");
         assert_eq!(subscription_status, SUB_RELEASED);
-        assert_eq!(seat_status, SEAT_AVAILABLE);
+        assert_eq!(seat_status, SEAT_DISABLED);
+        assert_eq!(
+            retired_subscription_id.as_deref(),
+            Some(first_subscription.as_str())
+        );
+        assert!(retired_at.is_some());
         assert_eq!(upsert_status, "rejected");
         assert_eq!(revoke_count, 0);
 
@@ -4243,8 +4459,22 @@ mod tests {
                 [],
             )
             .expect("reactivate Share");
+        assert!(matches!(
+            store
+                .share_market_rent_seat(&renter_b, &seat_id, RentSeatRequest { offer_revision: 1 })
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        let replacement_seat = store
+            .share_market_add_seat(&owner, &listing_id, free_seat())
+            .await
+            .expect("create replacement seat after retirement");
         let second_subscription = store
-            .share_market_rent_seat(&renter_b, &seat_id, RentSeatRequest { offer_revision: 1 })
+            .share_market_rent_seat(
+                &renter_b,
+                &replacement_seat,
+                RentSeatRequest { offer_revision: 1 },
+            )
             .await
             .expect("rent seat before immediate release");
         store
@@ -4266,6 +4496,78 @@ mod tests {
             .expect("read immediately released grant");
         assert_eq!(status, SUB_RELEASED);
         assert_eq!(revoke_count, 0);
+    }
+
+    #[tokio::test]
+    async fn retired_seats_do_not_consume_listing_capacity() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-capacity", "owner-capacity@example.com");
+        let renter = session("renter-capacity", "renter-capacity@example.com");
+        insert_share(
+            &store,
+            "share-capacity",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let listing_id = store
+            .share_market_create_listing(
+                &owner,
+                CreateListingRequest {
+                    share_id: "share-capacity".into(),
+                    seats: vec![free_seat(); MAX_SEATS_PER_LISTING],
+                },
+            )
+            .await
+            .expect("create full listing");
+        assert!(matches!(
+            store
+                .share_market_add_seat(&owner, &listing_id, free_seat())
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        let first_seat: String = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT id FROM share_market_seats
+                 WHERE listing_id = ?1 AND position = 1",
+                params![listing_id],
+                |row| row.get(0),
+            )
+            .expect("read first full-listing seat");
+        let subscription_id = store
+            .share_market_rent_seat(&renter, &first_seat, RentSeatRequest { offer_revision: 1 })
+            .await
+            .expect("rent capacity seat");
+        store
+            .share_market_request_release(&renter, &subscription_id, false, false, None)
+            .await
+            .expect("release undispatched capacity seat");
+
+        let replacement = store
+            .share_market_add_seat(&owner, &listing_id, free_seat())
+            .await
+            .expect("retired seat frees effective capacity");
+        let (active_count, retired_count, replacement_position): (i64, i64, i64) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT
+                    SUM(CASE WHEN retired_at IS NULL AND status IN
+                        ('available', 'reserved', 'occupied', 'revoking') THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN retired_at IS NOT NULL THEN 1 ELSE 0 END),
+                    MAX(CASE WHEN id = ?2 THEN position ELSE 0 END)
+                 FROM share_market_seats WHERE listing_id = ?1",
+                params![listing_id, replacement],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read effective listing capacity");
+        assert_eq!(active_count, MAX_SEATS_PER_LISTING as i64);
+        assert_eq!(retired_count, 1);
+        assert_eq!(replacement_position, MAX_SEATS_PER_LISTING as i64 + 1);
     }
 
     #[tokio::test]
@@ -4571,17 +4873,27 @@ mod tests {
             subscription_status(&store, &subscription_id).await,
             SUB_RELEASED
         );
-        let seat_status: String = store
+        let (seat_status, retired_subscription_id, retired_at): (
+            String,
+            Option<String>,
+            Option<String>,
+        ) = store
             .conn
             .lock()
             .await
             .query_row(
-                "SELECT status FROM share_market_seats WHERE id = ?1 AND listing_id = ?2",
+                "SELECT status, retired_subscription_id, retired_at
+                 FROM share_market_seats WHERE id = ?1 AND listing_id = ?2",
                 params![seat_id, listing_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("read released missing Share seat");
-        assert_eq!(seat_status, SEAT_AVAILABLE);
+        assert_eq!(seat_status, SEAT_DISABLED);
+        assert_eq!(
+            retired_subscription_id.as_deref(),
+            Some(subscription_id.as_str())
+        );
+        assert!(retired_at.is_some());
     }
 
     #[tokio::test]
@@ -4686,8 +4998,7 @@ mod tests {
         let owner = session("owner", "owner@example.com");
         let renter = session("renter", "renter@example.com");
         insert_share(&store, "share-free", &owner.email, &[ShareTokenPeriod::Day]).await;
-        let (_listing_id, seat_id) =
-            create_listing(&store, &owner, "share-free", free_seat()).await;
+        let (listing_id, seat_id) = create_listing(&store, &owner, "share-free", free_seat()).await;
         let subscription_id = store
             .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
             .await
@@ -4746,55 +5057,142 @@ mod tests {
                 .expect("confirm revoke without ack")
                 .is_empty()
         );
-        let (subscription_status, seat_status, revoke_status, revoke_attempts): (
-            String,
-            String,
-            String,
-            i64,
-        ) = store
+        let (
+            subscription_status,
+            seat_status,
+            retired_subscription_id,
+            retired_at,
+            revoke_status,
+            revoke_attempts,
+        ): (String, String, Option<String>, Option<String>, String, i64) = store
             .conn
             .lock()
             .await
             .query_row(
-                "SELECT sub.status, seat.status, operation.status, operation.attempts
+                "SELECT sub.status, seat.status, seat.retired_subscription_id,
+                        seat.retired_at, operation.status, operation.attempts
                  FROM share_market_subscriptions sub
                  JOIN share_market_seats seat ON seat.id = sub.seat_id
                  JOIN share_control_operations operation
                    ON operation.subscription_id = sub.id AND operation.action = 'revoke'
                  WHERE sub.id = ?1",
                 params![subscription_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )
             .expect("read released free rental");
         assert_eq!(subscription_status, "released");
-        assert_eq!(seat_status, "available");
+        assert_eq!(seat_status, SEAT_DISABLED);
+        assert_eq!(
+            retired_subscription_id.as_deref(),
+            Some(subscription_id.as_str())
+        );
+        assert!(retired_at.is_some());
         assert_eq!(revoke_status, "applied");
         assert_eq!(revoke_attempts, 0);
 
-        store
-            .share_market_delete_seat(&owner, &seat_id)
-            .await
-            .expect("delete released seat without deleting subscription history");
-        let (stored_status, subscription_count): (String, i64) = store
-            .conn
-            .lock()
-            .await
-            .query_row(
-                "SELECT seat.status,
-                        (SELECT COUNT(*) FROM share_market_subscriptions sub
-                         WHERE sub.seat_id = seat.id)
-                 FROM share_market_seats seat WHERE seat.id = ?1",
-                params![seat_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .expect("read soft-deleted Share seat");
-        assert_eq!(stored_status, SEAT_DELETED);
-        assert_eq!(subscription_count, 1);
-        let catalog = store
+        assert!(matches!(
+            store.share_market_delete_seat(&owner, &seat_id).await,
+            Err(AppError::Conflict(_))
+        ));
+        assert!(matches!(
+            store
+                .share_market_rent_seat(
+                    &session("other", "other@example.com"),
+                    &seat_id,
+                    RentSeatRequest { offer_revision: 1 },
+                )
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+
+        let owner_catalog = store
             .share_market_catalog(Some(&owner), &[])
             .await
-            .expect("read catalog after deleting released seat");
-        assert!(catalog.listings[0].seats.is_empty());
+            .expect("read owner catalog after release");
+        let retired = owner_catalog.listings[0]
+            .seats
+            .iter()
+            .find(|seat| seat.id == seat_id)
+            .expect("retired owner seat");
+        assert_eq!(retired.status, SEAT_RETIRED_VIEW);
+        assert!(retired.read_only);
+        assert_eq!(
+            retired
+                .subscription
+                .as_ref()
+                .map(|subscription| subscription.renter_email.as_str()),
+            Some(renter.email.as_str())
+        );
+
+        let unrelated = session("unrelated", "unrelated@example.com");
+        let unrelated_catalog = store
+            .share_market_catalog(Some(&unrelated), &[])
+            .await
+            .expect("read unrelated catalog after release");
+        let private_retired = unrelated_catalog.listings[0]
+            .seats
+            .iter()
+            .find(|seat| seat.id == seat_id)
+            .expect("retired public seat");
+        assert!(private_retired.subscription.is_none());
+        let anonymous_catalog = store
+            .share_market_catalog(None, &[])
+            .await
+            .expect("read anonymous catalog after release");
+        assert!(
+            anonymous_catalog.listings[0].seats[0]
+                .subscription
+                .is_none()
+        );
+
+        let renter_catalog = store
+            .share_market_catalog(Some(&renter), &[])
+            .await
+            .expect("read renter history after release");
+        assert!(
+            renter_catalog
+                .my_subscriptions
+                .iter()
+                .any(|subscription| subscription.id == subscription_id)
+        );
+        assert_eq!(
+            renter_catalog.listings[0].seats[0]
+                .subscription
+                .as_ref()
+                .map(|subscription| subscription.renter_email.as_str()),
+            Some(renter.email.as_str())
+        );
+
+        let replacement_seat = store
+            .share_market_add_seat(&owner, &listing_id, free_seat())
+            .await
+            .expect("add replacement seat");
+        let catalog_after_add = store
+            .share_market_catalog(Some(&owner), &[])
+            .await
+            .expect("read lifecycle ordering");
+        assert_eq!(catalog_after_add.listings[0].seats.len(), 2);
+        assert_eq!(catalog_after_add.listings[0].seats[0].id, replacement_seat);
+        assert_eq!(catalog_after_add.listings[0].seats[0].position, 2);
+        assert_eq!(catalog_after_add.listings[0].seats[1].id, seat_id);
+        assert!(catalog_after_add.listings[0].seats[1].read_only);
+        store
+            .share_market_close_listing(&owner, &listing_id)
+            .await
+            .expect("close listing with rental history");
+        assert!(matches!(
+            store.share_market_delete_listing(&owner, &listing_id).await,
+            Err(AppError::Conflict(_))
+        ));
     }
 
     #[tokio::test]
@@ -5229,6 +5627,14 @@ mod tests {
                 &now.to_rfc3339(),
             )
             .expect("retry config conflict");
+            let retired_at: Option<String> = conn
+                .query_row(
+                    "SELECT retired_at FROM share_edit_requests WHERE id = ?1",
+                    params![first_edit],
+                    |row| row.get(0),
+                )
+                .expect("read retired retry edit");
+            assert!(retired_at.is_some());
             conn.execute(
                 "UPDATE shares SET config_revision = 9 WHERE share_id = 'share-retry'",
                 [],
@@ -5464,7 +5870,7 @@ mod tests {
             &[ShareTokenPeriod::Day],
         )
         .await;
-        let (_listing_id, seat_id) =
+        let (listing_id, seat_id) =
             create_listing(&store, &owner, "share-failure", free_seat()).await;
         let first_subscription = store
             .share_market_rent_seat(
@@ -5510,14 +5916,49 @@ mod tests {
             subscription_status(&store, &first_subscription).await,
             SUB_GRANT_FAILED
         );
+        let (failed_seat_status, retired_subscription_id, retired_at): (
+            String,
+            Option<String>,
+            Option<String>,
+        ) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT status, retired_subscription_id, retired_at
+                 FROM share_market_seats WHERE id = ?1",
+                params![seat_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read failed grant retirement");
+        assert_eq!(failed_seat_status, SEAT_DISABLED);
+        assert_eq!(
+            retired_subscription_id.as_deref(),
+            Some(first_subscription.as_str())
+        );
+        assert!(retired_at.is_some());
+        assert!(matches!(
+            store
+                .share_market_rent_seat(
+                    &second_renter,
+                    &seat_id,
+                    RentSeatRequest { offer_revision: 1 },
+                )
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        let replacement_seat = store
+            .share_market_add_seat(&owner, &listing_id, free_seat())
+            .await
+            .expect("create seat after failed grant");
         let second_subscription = store
             .share_market_rent_seat(
                 &second_renter,
-                &seat_id,
+                &replacement_seat,
                 RentSeatRequest { offer_revision: 1 },
             )
             .await
-            .expect("reuse seat after failed grant");
+            .expect("rent replacement seat after failed grant");
         activate_subscription(&store, &second_subscription, now + Duration::seconds(2)).await;
 
         store
@@ -5592,6 +6033,21 @@ mod tests {
         assert_eq!(
             subscription_status(&store, &second_subscription).await,
             SUB_RELEASED
+        );
+        let replacement_retirement: (String, Option<String>) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT status, retired_subscription_id FROM share_market_seats WHERE id = ?1",
+                params![replacement_seat],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read retried revoke retirement");
+        assert_eq!(replacement_retirement.0, SEAT_DISABLED);
+        assert_eq!(
+            replacement_retirement.1.as_deref(),
+            Some(second_subscription.as_str())
         );
     }
 

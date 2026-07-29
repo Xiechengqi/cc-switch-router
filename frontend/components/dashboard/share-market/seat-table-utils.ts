@@ -34,7 +34,7 @@ export type SeatRowLike = {
   };
   seat: Pick<
     ShareMarketSeat,
-    "position" | "parallelLimit" | "tokenLimit" | "priceMinor" | "isFree" | "status" | "currency"
+    "position" | "parallelLimit" | "tokenLimit" | "priceMinor" | "isFree" | "status" | "currency" | "readOnly"
   >;
   subscription?: Pick<ShareMarketSubscription, "status">;
   statusKey: string;
@@ -53,10 +53,12 @@ function cmp(a: string | number, b: string | number) {
 }
 
 export function sortSeatRows<T extends SeatRowLike>(rows: T[], prefs: SeatSortPrefs): T[] {
-  if (!prefs.key) return rows;
   const dir = prefs.dir === "asc" ? 1 : -1;
   const key = prefs.key;
   return [...rows].sort((left, right) => {
+    const lifecycle = Number(isRetiredSeatRow(left)) - Number(isRetiredSeatRow(right));
+    if (lifecycle !== 0) return lifecycle;
+    if (!key) return 0;
     let result = 0;
     switch (key) {
       case "online":
@@ -94,5 +96,20 @@ export function sortSeatRows<T extends SeatRowLike>(rows: T[], prefs: SeatSortPr
         break;
     }
     return result * dir;
+  });
+}
+
+export function isRetiredSeatRow(row: SeatRowLike) {
+  return row.seat.readOnly
+    || row.seat.status === "retired"
+    || row.subscription?.status === "released"
+    || row.subscription?.status === "grant_failed";
+}
+
+export function sortSeatsByLifecycle<T extends ShareMarketSeat>(seats: T[]): T[] {
+  return [...seats].sort((left, right) => {
+    const lifecycle = Number(left.readOnly || left.status === "retired")
+      - Number(right.readOnly || right.status === "retired");
+    return lifecycle || left.position - right.position;
   });
 }

@@ -846,6 +846,7 @@ export type ShareUpstreamProvider = {
   app?: string;
   providerType?: string;
   accountEmail?: string;
+  subscriptionLevel?: string;
   forSaleOfficialPricePercent?: number;
   apiUrl?: string;
   quota?: {
@@ -1617,6 +1618,8 @@ export type ShareMarketSubscription = {
   canDeclarePaid: boolean;
   canRelease: boolean;
   canForceRevoke: boolean;
+  releaseReason?: string;
+  releasedAt?: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -1628,6 +1631,8 @@ export type ShareMarketSeat = ShareMarketSeatInput & {
   offerRevision: number;
   isFree: boolean;
   canRent: boolean;
+  readOnly: boolean;
+  retiredAt?: string;
   subscription?: ShareMarketSubscription;
 };
 
