@@ -831,6 +831,8 @@ struct RouterSshHostView {
     #[serde(default)]
     payment_method_kinds: Vec<String>,
     #[serde(default)]
+    payment_methods: Vec<crate::client_market_trade::PaymentMethod>,
+    #[serde(default)]
     contacts: Vec<crate::client_market_trade::PaymentContact>,
     country_code: Option<String>,
     hostname: Option<String>,
@@ -878,6 +880,7 @@ async fn list_hosts(
             query.status.as_deref(),
         )
         .await?;
+    let reveal_payment_methods = viewer.is_some();
     let views = hosts
         .into_iter()
         .map(|host| {
@@ -914,6 +917,11 @@ async fn list_hosts(
                 currency: host.currency.clone().or_else(|| host.price_cents.map(|_| "USD".into())),
                 offer_revision: host.offer_revision,
                 payment_method_kinds: host.payment_method_kinds,
+                payment_methods: if reveal_payment_methods {
+                    host.payment_methods
+                } else {
+                    Vec::new()
+                },
                 contacts: host.contacts,
                 country_code: host.country_code,
                 hostname: host.hostname,
@@ -3885,6 +3893,11 @@ fn host_to_view(host: RouterSshHostRecord, reveal: bool) -> RouterSshHostView {
         currency: host.currency,
         offer_revision: host.offer_revision,
         payment_method_kinds: host.payment_method_kinds,
+        payment_methods: if reveal {
+            host.payment_methods
+        } else {
+            Vec::new()
+        },
         contacts: host.contacts,
         country_code: host.country_code,
         hostname: host.hostname,
@@ -3944,6 +3957,7 @@ pub struct RouterSshHostRecord {
     pub currency: Option<String>,
     pub offer_revision: i64,
     pub payment_method_kinds: Vec<String>,
+    pub payment_methods: Vec<crate::client_market_trade::PaymentMethod>,
     pub contacts: Vec<crate::client_market_trade::PaymentContact>,
     pub country_code: Option<String>,
     pub hostname: Option<String>,
@@ -6218,12 +6232,13 @@ fn map_router_ssh_host_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouterSs
     let methods_json: String = row.get(22)?;
     let contacts_json: String = row.get(23)?;
     let currency: Option<String> = row.get(24)?;
-    let mut payment_method_kinds =
+    let payment_methods =
         serde_json::from_str::<Vec<crate::client_market_trade::PaymentMethod>>(&methods_json)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|method| method.kind)
-            .collect::<Vec<_>>();
+            .unwrap_or_default();
+    let mut payment_method_kinds = payment_methods
+        .iter()
+        .map(|method| method.kind.clone())
+        .collect::<Vec<_>>();
     payment_method_kinds.sort();
     payment_method_kinds.dedup();
     let contacts: Vec<crate::client_market_trade::PaymentContact> =
@@ -6252,6 +6267,7 @@ fn map_router_ssh_host_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouterSs
         rental_period_days: row.get(20)?,
         offer_revision: row.get(21)?,
         payment_method_kinds,
+        payment_methods,
         contacts,
         currency,
     })
@@ -7403,6 +7419,16 @@ mod tests {
             currency: Some("USD".into()),
             offer_revision: 1,
             payment_method_kinds: vec!["alipay".into()],
+            payment_methods: vec![crate::client_market_trade::PaymentMethod {
+                kind: "alipay".into(),
+                account: Some("account-id".into()),
+                qr_image_url: None,
+                asset_url: None,
+                token: None,
+                chain: None,
+                address: None,
+                instructions: None,
+            }],
             contacts: vec![],
             country_code: Some("US".into()),
             hostname: Some("host.example".into()),
@@ -7469,6 +7495,13 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("public-client")
         );
+        assert_eq!(
+            public
+                .get("paymentMethods")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(0)
+        );
         let private = serde_json::to_value(host_to_view(host, true)).unwrap();
         assert_eq!(
             private.get("ip").and_then(|value| value.as_str()),
@@ -7479,6 +7512,13 @@ mod tests {
                 .get("clientOwnerEmail")
                 .and_then(|value| value.as_str()),
             Some("client@example.com")
+        );
+        assert_eq!(
+            private
+                .get("paymentMethods")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(1)
         );
     }
 

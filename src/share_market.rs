@@ -67,6 +67,8 @@ pub struct ListingView {
     pub is_owner: bool,
     #[serde(default)]
     pub contacts: Vec<PaymentContact>,
+    #[serde(default)]
+    pub payment_methods: Vec<PaymentMethod>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_provider: Option<crate::models::ShareUpstreamProvider>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -798,14 +800,12 @@ fn subscription_view(
     let (payment_methods, contacts, payment_profile_updated_at) =
         if is_renter && open_invoice.is_some() && record.price_minor.is_some() {
             payment_profile(conn, &record.owner_user_id)?
-                .map(|(methods, contacts, updated_at)| {
-                    (Some(methods), contacts, Some(updated_at))
-                })
+                .map(|(methods, contacts, updated_at)| (Some(methods), contacts, Some(updated_at)))
                 .unwrap_or((Some(Vec::new()), Vec::new(), None))
         } else if is_renter || is_owner {
             payment_profile(conn, &record.owner_user_id)?
-                .map(|(_, contacts, _)| (None, contacts, None))
-                .unwrap_or((None, Vec::new(), None))
+                .map(|(methods, contacts, _)| (Some(methods), contacts, None))
+                .unwrap_or((Some(Vec::new()), Vec::new(), None))
         } else {
             (None, Vec::new(), None)
         };
@@ -1118,8 +1118,17 @@ impl AppStore {
                     subscription,
                 });
             }
-            let contacts = payment_profile(&conn, &owner_user_id)?
-                .map(|(_, contacts, _)| contacts)
+            let (payment_methods, contacts) = payment_profile(&conn, &owner_user_id)?
+                .map(|(methods, contacts, _)| {
+                    (
+                        if viewer.is_some() {
+                            methods
+                        } else {
+                            Vec::new()
+                        },
+                        contacts,
+                    )
+                })
                 .unwrap_or_default();
             listings.push(ListingView {
                 id,
@@ -1133,6 +1142,7 @@ impl AppStore {
                 share_online: !subdomain.is_empty() && active_subdomains.contains(&subdomain),
                 is_owner,
                 contacts,
+                payment_methods,
                 upstream_provider: upstream_provider_json
                     .as_deref()
                     .and_then(|value| serde_json::from_str(value).ok()),
@@ -5196,6 +5206,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn market_contact_payment_details_require_login_and_authorize_listed_assets() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-contact", "owner-contact@example.com");
+        let viewer = session("viewer-contact", "viewer-contact@example.com");
+        configure_payment_profile(&store, &owner, "account-contact", "profile-contact").await;
+        let asset_id = store
+            .client_market_store_payment_asset(&owner.user_id, "contact-qr", b"png")
+            .await
+            .expect("store payment asset");
+
+        assert!(matches!(
+            store
+                .client_market_payment_asset_for_viewer(&asset_id, &viewer)
+                .await,
+            Err(AppError::Forbidden(_))
+        ));
+
+        insert_share(
+            &store,
+            "share-contact",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (listing_id, _) = create_listing(&store, &owner, "share-contact", paid_seat()).await;
+
+        let anonymous = store
+            .share_market_catalog(None, &[])
+            .await
+            .expect("load anonymous catalog");
+        assert!(anonymous.listings[0].payment_methods.is_empty());
+
+        let authenticated = store
+            .share_market_catalog(Some(&viewer), &[])
+            .await
+            .expect("load authenticated catalog");
+        assert_eq!(
+            authenticated.listings[0]
+                .payment_methods
+                .first()
+                .and_then(|method| method.account.as_deref()),
+            Some("account-contact")
+        );
+        assert_eq!(
+            store
+                .client_market_payment_asset_for_viewer(&asset_id, &viewer)
+                .await
+                .expect("read marketed payment asset"),
+            b"png"
+        );
+
+        store
+            .share_market_close_listing(&owner, &listing_id)
+            .await
+            .expect("close listing");
+        assert!(matches!(
+            store
+                .client_market_payment_asset_for_viewer(&asset_id, &viewer)
+                .await,
+            Err(AppError::Forbidden(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn paid_rental_trials_declares_idempotently_renews_and_times_out() {
         let store = AppStore::new_in_memory_for_tests().expect("test store");
         let owner = session("owner-paid", "owner-paid@example.com");
@@ -5348,6 +5422,24 @@ mod tests {
             subscription_status(&store, &subscription_id).await,
             SUB_ACTIVE_PAID
         );
+        let active_catalog = store
+            .share_market_catalog(Some(&renter), &[])
+            .await
+            .expect("load active paid rental contact details");
+        let active_subscription = active_catalog
+            .my_subscriptions
+            .iter()
+            .find(|item| item.id == subscription_id)
+            .expect("active paid subscription");
+        assert_eq!(
+            active_subscription
+                .payment_methods
+                .as_ref()
+                .and_then(|methods| methods.first())
+                .and_then(|method| method.account.as_deref()),
+            Some("account-v2")
+        );
+        assert!(active_subscription.payment_profile_updated_at.is_none());
 
         let first_period_end: String = store
             .conn

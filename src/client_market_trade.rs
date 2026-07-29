@@ -2383,6 +2383,33 @@ impl AppStore {
                 .map_err(|error| {
                     AppError::Internal(format!("authorize payment asset failed: {error}"))
                 })?
+                .is_some()
+            || conn
+                .query_row(
+                    "SELECT 1
+                     WHERE EXISTS (
+                         SELECT 1 FROM share_market_listings listing
+                         JOIN shares share ON share.share_id = listing.share_id
+                         WHERE listing.owner_user_id = ?1
+                           AND listing.status = 'active'
+                           AND listing.deleted_at IS NULL
+                           AND lower(share.owner_email) = lower(listing.owner_email)
+                     ) OR EXISTS (
+                         SELECT 1 FROM share_market_subscriptions subscription
+                         WHERE subscription.owner_user_id = ?1
+                           AND subscription.renter_user_id = ?2
+                     ) OR EXISTS (
+                         SELECT 1 FROM router_ssh_hosts host
+                         WHERE host.provider_id = ?1
+                     )
+                     LIMIT 1",
+                    params![owner_user_id, viewer.user_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|error| {
+                    AppError::Internal(format!("authorize marketed payment asset failed: {error}"))
+                })?
                 .is_some();
         if !allowed {
             return Err(AppError::Forbidden(

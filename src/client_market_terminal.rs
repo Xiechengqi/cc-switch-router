@@ -542,6 +542,7 @@ mod tests {
             currency: Some("USD".into()),
             offer_revision: 1,
             payment_method_kinds: vec!["alipay".into()],
+            payment_methods: vec![],
             contacts: vec![],
             country_code: Some("US".into()),
             hostname: Some("box".into()),

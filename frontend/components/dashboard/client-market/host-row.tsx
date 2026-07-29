@@ -280,7 +280,7 @@ function HostRowImpl({
             <span className="min-w-0 truncate text-xs font-medium text-foreground" title={host.hostOwnerEmail}>
               {host.hostOwnerEmail}
             </span>
-            <ProviderContactButton contacts={host.contacts} />
+            <ProviderContactButton contacts={host.contacts} paymentMethods={host.paymentMethods} />
           </div>
         </td>
         <td className="max-w-[9rem] whitespace-nowrap px-2 py-2 align-middle">

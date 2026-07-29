@@ -15,7 +15,7 @@ import type { ClientMarketBilling, ClientMarketHost } from "@/lib/types";
  * table will silently render stale values.
  */
 
-/** Scalar fields of `ClientMarketHost`; `paymentMethodKinds` and `ipIntel` are
+/** Scalar fields of `ClientMarketHost`; payment collections and `ipIntel` are
  *  compared separately because they are not primitives. */
 const HOST_SCALAR_KEYS = [
   "id",
@@ -56,6 +56,7 @@ function sameHost(left: ClientMarketHost, right: ClientMarketHost): boolean {
     if (left[key] !== right[key]) return false;
   }
   if (!sameStringList(left.paymentMethodKinds, right.paymentMethodKinds)) return false;
+  if (JSON.stringify(left.paymentMethods ?? []) !== JSON.stringify(right.paymentMethods ?? [])) return false;
   if (JSON.stringify(left.contacts ?? []) !== JSON.stringify(right.contacts ?? [])) return false;
   // ipIntel is a nested object refreshed rarely; only pay for it once the cheap
   // scalar pass has found no difference.

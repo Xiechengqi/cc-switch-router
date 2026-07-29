@@ -1345,6 +1345,7 @@ export type ClientMarketHost = {
   currency?: string;
   offerRevision: number;
   paymentMethodKinds: string[];
+  paymentMethods?: ClientMarketPaymentMethod[];
   contacts?: PaymentContact[];
   countryCode?: string;
   hostname?: string;
@@ -1648,6 +1649,7 @@ export type ShareMarketListing = {
   shareOnline: boolean;
   isOwner: boolean;
   contacts?: PaymentContact[];
+  paymentMethods?: ClientMarketPaymentMethod[];
   upstreamProvider?: ShareUpstreamProvider;
   tokenLimit?: number;
   parallelLimit?: number;

@@ -22,12 +22,14 @@ import {
   X,
 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
-import { AuthenticatedImage } from "@/components/common/authenticated-image";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { CompactSelect } from "@/components/common/compact-select";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
-import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
-import { ProviderContactButton, ProviderContactsList } from "@/components/common/provider-contacts";
+import {
+  ProviderContactButton,
+  ProviderContactsList,
+  ProviderPaymentMethodsList,
+} from "@/components/common/provider-contacts";
 import { UserBlacklistPanel } from "@/components/common/user-blacklist-panel";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import { SeatSortHeader } from "@/components/dashboard/share-market/seat-sort-header";
@@ -58,6 +60,7 @@ import {
   updateShareMarketSeat,
 } from "@/lib/api";
 import { DASHBOARD_SHARE_MARKET_PATH, type ShareMarketTabParam } from "@/lib/dashboard-nav";
+import { formatBillingCountdown } from "@/lib/billing-urgency";
 import { usePersistentState } from "@/lib/use-persistent-state";
 import type {
   ShareMarketCatalog,
@@ -708,6 +711,7 @@ function buildSeatRows(
           shareOnline: !!subscription.shareOnline,
           isOwner: false,
           contacts: subscription.contacts,
+          paymentMethods: subscription.paymentMethods,
           supportedUserTokenPeriods: [],
           seats: [],
           createdAt: subscription.createdAt,
@@ -832,7 +836,7 @@ function ProviderExpandPanel({
         <div className="min-w-0 col-span-2">
           <div className="flex items-center gap-0.5 text-slate-500">
             <span>{t("shareMarket.owner")}</span>
-            <ProviderContactButton contacts={listing.contacts} />
+            <ProviderContactButton contacts={listing.contacts} paymentMethods={listing.paymentMethods} />
           </div>
           <span className="block truncate text-slate-600" title={listing.ownerEmail}>{listing.ownerEmail}</span>
         </div>
@@ -891,15 +895,7 @@ function PaymentDialog({
             ) : null}
             <div className="grid gap-3">
               <ProviderContactsList contacts={subscription?.contacts} />
-              {paymentMethods.map((method, index) => (
-                <div key={`${method.kind}-${index}`} className="grid gap-2 border-b border-slate-100 pb-3 last:border-0">
-                  <div className="flex items-center gap-2 text-sm font-medium"><PaymentMethodIcons kinds={[method.kind]} />{method.kind}</div>
-                  {method.account ? <code className="break-all text-sm">{method.account}</code> : null}
-                  {method.address ? <code className="break-all text-sm">{method.token} {method.chain} · {method.address}</code> : null}
-                  {method.instructions ? <p className="whitespace-pre-wrap text-sm text-slate-600">{method.instructions}</p> : null}
-                  {method.assetUrl ? <AuthenticatedImage src={method.assetUrl} alt={method.kind} className="h-44 w-44 rounded-md border bg-white object-contain p-1" /> : null}
-                </div>
-              ))}
+              <ProviderPaymentMethodsList paymentMethods={paymentMethods} />
               {!hasPaymentMethods ? <p className="text-sm text-slate-500">{t("shareMarket.noPaymentMethods")}</p> : null}
             </div>
             <Checkbox isSelected={confirmed} onChange={setConfirmed}>
@@ -917,6 +913,45 @@ function PaymentDialog({
         </Modal.Dialog>
       </Modal.Container>
     </Modal.Backdrop>
+  );
+}
+
+function SharePaymentAction({
+  subscription,
+  onPay,
+}: {
+  subscription: ShareMarketSubscription;
+  onPay: () => void;
+}) {
+  const { locale, t } = useLocaleText();
+  const [, refreshCountdown] = React.useState(0);
+  const countdownId = React.useId();
+  const deadline = subscription.paymentDeadline || subscription.openInvoice?.deadlineAt;
+
+  React.useEffect(() => {
+    if (!deadline) return;
+    const timer = window.setInterval(() => refreshCountdown((value) => value + 1), 30_000);
+    return () => window.clearInterval(timer);
+  }, [deadline]);
+
+  const countdown = formatBillingCountdown(deadline, locale);
+  return (
+    <div className="grid justify-items-center gap-0.5">
+      <Button
+        size="sm"
+        variant="primary"
+        aria-describedby={countdown ? countdownId : undefined}
+        onClick={onPay}
+      >
+        <CircleDollarSign className="h-4 w-4" />
+        {t("shareMarket.goPay")}
+      </Button>
+      {countdown ? (
+        <span id={countdownId} className="max-w-28 text-center text-[10px] leading-4 text-amber-700">
+          {t("shareMarket.paymentCountdown", { countdown })}
+        </span>
+      ) : null}
+    </div>
   );
 }
 
@@ -1188,7 +1223,7 @@ export function ShareMarketPage() {
         </div>
         <div className="mt-1 flex min-w-0 items-center gap-0.5">
           <p className="min-w-0 truncate text-xs text-slate-500">{ownerView ? subscription.renterEmail : subscription.ownerEmail}</p>
-          {!ownerView ? <ProviderContactButton contacts={subscription.contacts} /> : null}
+          {!ownerView ? <ProviderContactButton contacts={subscription.contacts} paymentMethods={subscription.paymentMethods} /> : null}
         </div>
         <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-600">
           {subscription.trialEndsAt && subscription.status === "trial_payment_due" ? <span>{t("shareMarket.trialEnds", { time: date(subscription.trialEndsAt) })}</span> : null}
@@ -1196,13 +1231,13 @@ export function ShareMarketPage() {
           {subscription.currentPeriodEnd ? <span>{t("shareMarket.periodEnds", { time: date(subscription.currentPeriodEnd) })}</span> : null}
         </div>
       </div>
-      <div className="flex flex-wrap justify-start gap-2 sm:justify-end">
+      <div className="flex flex-wrap items-start justify-start gap-2 sm:justify-end">
         {openUrl ? (
           <Button size="sm" variant="outline" onClick={() => window.open(openUrl, "_blank", "noopener,noreferrer")}>
             <ExternalLink className="h-4 w-4" />{t("shareMarket.openShare")}
           </Button>
         ) : null}
-        {!ownerView && subscription.canDeclarePaid ? <Button size="sm" variant="primary" onClick={() => setPayment(subscription)}>{t("shareMarket.declarePaid")}</Button> : null}
+        {!ownerView && subscription.canDeclarePaid ? <SharePaymentAction subscription={subscription} onPay={() => setPayment(subscription)} /> : null}
         {!ownerView && subscription.canRelease ? <Button size="sm" variant="outline" isDisabled={!!busyId} onClick={() => setConfirmAction({ id: subscription.id, title: t("shareMarket.confirm.releaseTitle"), description: t("shareMarket.confirm.releaseDescription", { share: subscription.shareName }), confirmLabel: t("shareMarket.release"), tone: "warning", run: () => releaseShareMarketSubscription(subscription.id) })}><RotateCcw className="h-4 w-4" />{t("shareMarket.release")}</Button> : null}
         {ownerView && subscription.canForceRevoke ? (
           <>
@@ -1226,7 +1261,7 @@ export function ShareMarketPage() {
       && !seat.readOnly
       && (seat.status === "available" || seat.status === "disabled");
     return (
-      <div className="flex justify-end gap-1">
+      <div className="flex items-start justify-end gap-1">
         {rentAction === "rent" ? (
           <Button
             size="sm"
@@ -1247,9 +1282,7 @@ export function ShareMarketPage() {
           </Button>
         ) : null}
         {subscription?.canDeclarePaid ? (
-          <Button size="sm" variant="primary" onClick={() => setPayment(subscription)}>
-            {t("shareMarket.declarePaid")}
-          </Button>
+          <SharePaymentAction subscription={subscription} onPay={() => setPayment(subscription)} />
         ) : null}
         {subscription?.canRelease ? (
           <Button
@@ -1424,7 +1457,7 @@ export function ShareMarketPage() {
             <div className="flex min-w-0 items-center gap-1 text-xs text-slate-500">
               <span className="shrink-0">{t("shareMarket.owner")}:</span>
               <span className="max-w-[16rem] truncate text-slate-700" title={listing.ownerEmail}>{listing.ownerEmail}</span>
-              <ProviderContactButton contacts={listing.contacts} />
+              <ProviderContactButton contacts={listing.contacts} paymentMethods={listing.paymentMethods} />
             </div>
             <span className={`rounded-sm px-1.5 py-0.5 text-[10px] font-medium ${statusTone}`}>{listingStatus}</span>
           </div>
@@ -1651,7 +1684,7 @@ export function ShareMarketPage() {
                         <span className="min-w-0 truncate text-xs text-slate-600" title={listing.ownerEmail}>
                           {listing.ownerEmail}
                         </span>
-                        <ProviderContactButton contacts={listing.contacts} />
+                        <ProviderContactButton contacts={listing.contacts} paymentMethods={listing.paymentMethods} />
                       </div>
                     </td>
                     <td className="px-4 py-3">{renderSeatActions(listing, seat, subscription)}</td>
