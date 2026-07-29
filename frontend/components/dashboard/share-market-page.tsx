@@ -630,6 +630,22 @@ function guestCanSeeAvailable(listing: ShareMarketListing, seat: ShareMarketSeat
   return listing.status === "active" && listing.shareStatus === "active" && seat.status === "available";
 }
 
+/** Share-view rent CTA: trust canRent, and always offer free available seats to non-owners. */
+function shareSeatRentAction(
+  listing: ShareMarketListing,
+  seat: ShareMarketSeat,
+  authed: boolean,
+): "rent" | "login" | null {
+  if (listing.isOwner) return null;
+  if (listing.status !== "active" || seat.status !== "available") return null;
+  if (seat.canRent) return "rent";
+  if (!authed && guestCanSeeAvailable(listing, seat)) return "login";
+  // Free seats are hidden from the seats browse layout; Share view must still expose rent.
+  const freeSeat = seat.isFree || seat.priceMinor == null;
+  if (freeSeat) return authed ? "rent" : "login";
+  return null;
+}
+
 function buildSeatRows(
   catalog: ShareMarketCatalog | null,
   tab: MarketTab,
@@ -1281,7 +1297,9 @@ export function ShareMarketPage() {
         <table className="w-full min-w-[760px] text-left text-sm">
           <thead className="bg-slate-50 text-xs font-medium text-slate-500"><tr><th className="px-4 py-2.5">{t("shareMarket.dialog.seats")}</th><th className="px-3 py-2.5">{t("shareMarket.parallel")}</th><th className="px-3 py-2.5">{t("shareMarket.tokens")}</th><th className="px-3 py-2.5">{t("shareMarket.dialog.amount")}</th><th className="px-3 py-2.5">{t("shareMarket.status")}</th><th className="px-4 py-2.5 text-right">{t("common.actions")}</th></tr></thead>
           <tbody>
-            {listing.seats.map((seat) => (
+            {listing.seats.map((seat) => {
+              const rentAction = shareSeatRentAction(listing, seat, authed);
+              return (
               <React.Fragment key={seat.id}>
                 <tr className="border-t border-slate-100 first:border-0">
                   <td className="px-4 py-3 font-medium">{t("shareMarket.seat", { position: seat.position })}</td>
@@ -1290,7 +1308,7 @@ export function ShareMarketPage() {
                   <td className="px-3 py-3 font-medium">{formatPrice(seat, t("shareMarket.free"))}</td>
                   <td className="px-3 py-3"><span className="rounded-sm bg-slate-100 px-1.5 py-0.5 text-xs text-slate-600">{statusLabel(seat.status, t)}</span></td>
                   <td className="px-4 py-3"><div className="flex justify-end gap-1">
-                    {seat.canRent ? (
+                    {rentAction === "rent" ? (
                       <Button
                         size="sm"
                         variant="primary"
@@ -1306,7 +1324,11 @@ export function ShareMarketPage() {
                         {t("shareMarket.rent")}
                       </Button>
                     ) : null}
-                    {!authed && guestCanSeeAvailable(listing, seat) ? <Button size="sm" variant="outline" onClick={() => window.dispatchEvent(new Event("router-open-login"))}>{t("nav.login")}</Button> : null}
+                    {rentAction === "login" ? (
+                      <Button size="sm" variant="outline" onClick={() => window.dispatchEvent(new Event("router-open-login"))}>
+                        {t("nav.login")}
+                      </Button>
+                    ) : null}
                     {listing.isOwner && seat.status === "available" ? <Button isIconOnly size="sm" variant="ghost" aria-label={t("common.edit")} onClick={() => setSeatDialog({ listingId: listing.id, seat, supportedPeriods: listing.supportedUserTokenPeriods })}><Pencil className="h-4 w-4" /></Button> : null}
                     {listing.isOwner ? (
                       <Button
@@ -1327,7 +1349,8 @@ export function ShareMarketPage() {
                 </tr>
                 {seat.subscription && listing.isOwner ? <tr><td colSpan={6} className="bg-slate-50 px-4">{renderSubscription(seat.subscription, true)}</td></tr> : null}
               </React.Fragment>
-            ))}
+              );
+            })}
           </tbody>
         </table>
       </div>
@@ -1616,7 +1639,10 @@ export function ShareMarketPage() {
         </div>
         <div className="flex gap-2">
           <Button isIconOnly variant="ghost" aria-label={t("common.reload")} isDisabled={loading} onClick={() => void load()}><RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} /></Button>
-          <Button variant="primary" isDisabled={authLoading} onClick={() => authed ? setAddOpen(true) : window.dispatchEvent(new Event("router-open-login"))}><Plus className="h-4 w-4" />{t("shareMarket.addShare")}</Button>
+          <Button variant="primary" size="sm" className="h-8" isDisabled={authLoading} onClick={() => authed ? setAddOpen(true) : window.dispatchEvent(new Event("router-open-login"))}>
+            <Plus className="h-4 w-4" />
+            {t("shareMarket.addShare")}
+          </Button>
         </div>
       </div>
       {loading && !catalog ? <div className="flex items-center gap-2 py-12 text-sm text-slate-500"><Loader2 className="h-4 w-4 animate-spin" />{t("shareMarket.loading")}</div> : null}
