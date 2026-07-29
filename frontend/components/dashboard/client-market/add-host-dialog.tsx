@@ -49,6 +49,7 @@ export function AddHostDialog({
   const [rootPassword, setRootPassword] = React.useState("");
   const [note, setNote] = React.useState("");
   const [priceUsd, setPriceUsd] = React.useState("");
+  const [currency, setCurrency] = React.useState<"CNY" | "USD">("USD");
   const [rentalPeriodDays, setRentalPeriodDays] = React.useState("");
   const [busy, setBusy] = React.useState(false);
   const [testing, setTesting] = React.useState(false);
@@ -149,7 +150,7 @@ export function AddHostDialog({
     if (parsedPort == null) return;
     let offer: ReturnType<typeof parseHostOffer>;
     try {
-      offer = parseHostOffer(priceUsd, rentalPeriodDays, t);
+      offer = parseHostOffer(priceUsd, rentalPeriodDays, t, currency);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
       return;
@@ -424,7 +425,7 @@ export function AddHostDialog({
                     <span className="text-xs text-muted-foreground">{t("clientMarket.rootPasswordHint")}</span>
                   </label>
                 ) : null}
-                <div className="grid gap-3 sm:grid-cols-2">
+                <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_7rem_minmax(0,1fr)]">
                   <label className="grid gap-1 text-sm">
                     <span className="text-muted-foreground">{t("clientMarket.rentalPrice")}</span>
                     <input
@@ -434,6 +435,17 @@ export function AddHostDialog({
                       inputMode="decimal"
                       className="h-11 rounded-lg border border-border bg-white px-3 text-slate-900 outline-none focus:ring-2 focus:ring-primary/30"
                     />
+                  </label>
+                  <label className="grid gap-1 text-sm">
+                    <span className="text-muted-foreground">{t("clientMarket.rentalCurrency")}</span>
+                    <select
+                      value={currency}
+                      onChange={(event) => setCurrency(event.target.value === "CNY" ? "CNY" : "USD")}
+                      className="h-11 rounded-lg border border-border bg-white px-2 text-slate-900 outline-none focus:ring-2 focus:ring-primary/30"
+                    >
+                      <option value="CNY">CNY</option>
+                      <option value="USD">USD</option>
+                    </select>
                   </label>
                   <label className="grid gap-1 text-sm">
                     <span className="text-muted-foreground">{t("clientMarket.rentalPeriod")}</span>

@@ -825,6 +825,8 @@ struct RouterSshHostView {
     price_cents: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rental_period_days: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    currency: Option<String>,
     offer_revision: i64,
     #[serde(default)]
     payment_method_kinds: Vec<String>,
@@ -909,6 +911,7 @@ async fn list_hosts(
                 host_owner_email: host.host_owner_email,
                 price_cents: host.price_cents,
                 rental_period_days: host.rental_period_days,
+                currency: host.currency.clone().or_else(|| host.price_cents.map(|_| "USD".into())),
                 offer_revision: host.offer_revision,
                 payment_method_kinds: host.payment_method_kinds,
                 contacts: host.contacts,
@@ -966,6 +969,8 @@ struct CreateHostRequest {
     root_password: Option<String>,
     price_cents: Option<i64>,
     rental_period_days: Option<i64>,
+    #[serde(default)]
+    currency: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1158,6 +1163,8 @@ async fn create_host(
         .map_err(|e| AppError::Internal(format!("serialize host ip intel failed: {e}")))?;
     let (price_cents, rental_period_days) =
         crate::client_market_trade::validate_offer(input.price_cents, input.rental_period_days)?;
+    let currency =
+        crate::client_market_trade::normalize_offer_currency(price_cents, input.currency)?;
     if price_cents.is_some() {
         let conn = state.store.conn.lock().await;
         crate::client_market_trade::require_payment_profile_for_offer(&conn, &session.user_id)?;
@@ -1180,6 +1187,7 @@ async fn create_host(
             Some(&intel_json),
             price_cents,
             rental_period_days,
+            currency.as_deref(),
         )
         .await?;
     Ok(Json(host_to_view(host, true)))
@@ -1408,6 +1416,7 @@ async fn import_one_host(
                 Some(&intel_json),
                 price,
                 period,
+                None,
             )
             .await?;
         Ok(Some(host.id))
@@ -3873,6 +3882,7 @@ fn host_to_view(host: RouterSshHostRecord, reveal: bool) -> RouterSshHostView {
         host_owner_email: host.host_owner_email,
         price_cents: host.price_cents,
         rental_period_days: host.rental_period_days,
+        currency: host.currency,
         offer_revision: host.offer_revision,
         payment_method_kinds: host.payment_method_kinds,
         contacts: host.contacts,
@@ -3931,6 +3941,7 @@ pub struct RouterSshHostRecord {
     pub host_owner_email: String,
     pub price_cents: Option<i64>,
     pub rental_period_days: Option<i64>,
+    pub currency: Option<String>,
     pub offer_revision: i64,
     pub payment_method_kinds: Vec<String>,
     pub contacts: Vec<crate::client_market_trade::PaymentContact>,
@@ -4317,7 +4328,8 @@ impl AppStore {
                     COALESCE((SELECT methods_json FROM account_payment_profiles p
                               WHERE p.user_id = h.provider_id), '[]'),
                     COALESCE((SELECT contacts_json FROM account_payment_profiles p
-                              WHERE p.user_id = h.provider_id), '[]')
+                              WHERE p.user_id = h.provider_id), '[]'),
+                    NULLIF(TRIM(h.currency), '')
              FROM router_ssh_hosts h
              LEFT JOIN installation_client_tunnels t ON t.installation_id = h.installation_id
              LEFT JOIN installations i ON i.id = h.installation_id
@@ -4416,6 +4428,7 @@ impl AppStore {
             ip_intel_json,
             None,
             None,
+            None,
         )
         .await
     }
@@ -4434,6 +4447,7 @@ impl AppStore {
         ip_intel_json: Option<&str>,
         price_cents: Option<i64>,
         rental_period_days: Option<i64>,
+        currency: Option<&str>,
     ) -> Result<RouterSshHostRecord, AppError> {
         let owner = normalize_market_email(owner_email)?;
         let now = Utc::now().to_rfc3339();
@@ -4450,9 +4464,9 @@ impl AppStore {
             "INSERT INTO router_ssh_hosts (
                 id, provider_id, ip, port, host_owner_email, country_code, hostname, ssh_host_key_fingerprint,
                 status, installation_id, last_verified_at, last_error, note, ip_intel_json,
-                price_cents, rental_period_days, offer_revision, created_at, updated_at
+                price_cents, rental_period_days, currency, offer_revision, created_at, updated_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, NULL, ?11, ?12,
-                       ?13, ?14, 1, ?10, ?10)",
+                       ?13, ?14, ?15, 1, ?10, ?10)",
             params![
                 id,
                 provider_id,
@@ -4468,6 +4482,7 @@ impl AppStore {
                 ip_intel_json,
                 price_cents,
                 rental_period_days,
+                currency,
             ],
         )
         .map_err(|e| {
@@ -5108,7 +5123,8 @@ impl AppStore {
                         COALESCE((SELECT methods_json FROM account_payment_profiles p
                                   WHERE p.user_id = h.provider_id), '[]'),
                         COALESCE((SELECT contacts_json FROM account_payment_profiles p
-                                  WHERE p.user_id = h.provider_id), '[]')
+                                  WHERE p.user_id = h.provider_id), '[]'),
+                        NULLIF(TRIM(h.currency), '')
                  FROM router_ssh_hosts h
                  LEFT JOIN installation_client_tunnels t ON t.installation_id = h.installation_id
                  LEFT JOIN installations i ON i.id = h.installation_id
@@ -6168,7 +6184,8 @@ fn get_router_ssh_host(
                 COALESCE((SELECT methods_json FROM account_payment_profiles p
                           WHERE p.user_id = h.provider_id), '[]'),
                 COALESCE((SELECT contacts_json FROM account_payment_profiles p
-                          WHERE p.user_id = h.provider_id), '[]')
+                          WHERE p.user_id = h.provider_id), '[]'),
+                NULLIF(TRIM(h.currency), '')
          FROM router_ssh_hosts h
          LEFT JOIN installation_client_tunnels t ON t.installation_id = h.installation_id
          LEFT JOIN installations i ON i.id = h.installation_id
@@ -6200,6 +6217,7 @@ fn get_provisioning_job(
 fn map_router_ssh_host_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouterSshHostRecord> {
     let methods_json: String = row.get(22)?;
     let contacts_json: String = row.get(23)?;
+    let currency: Option<String> = row.get(24)?;
     let mut payment_method_kinds =
         serde_json::from_str::<Vec<crate::client_market_trade::PaymentMethod>>(&methods_json)
             .unwrap_or_default()
@@ -6235,6 +6253,7 @@ fn map_router_ssh_host_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouterSs
         offer_revision: row.get(21)?,
         payment_method_kinds,
         contacts,
+        currency,
     })
 }
 
@@ -6441,6 +6460,7 @@ mod tests {
                 None,
                 price_cents,
                 rental_period_days,
+                price_cents.map(|_| "USD"),
             )
             .await
             .expect("insert Provider Host")
@@ -7380,6 +7400,7 @@ mod tests {
             host_owner_email: "host@example.com".into(),
             price_cents: Some(500),
             rental_period_days: Some(30),
+            currency: Some("USD".into()),
             offer_revision: 1,
             payment_method_kinds: vec!["alipay".into()],
             contacts: vec![],
@@ -7533,7 +7554,7 @@ mod tests {
         let provider = market_session("provider-1", "provider@example.com");
         ensure_payment_profile(&store, "provider-1", "provider@example.com").await;
         let changed_offer = store
-            .client_market_update_host_offer(&first.id, &provider, Some(900), Some(60))
+            .client_market_update_host_offer(&first.id, &provider, Some(900), Some(60), Some("USD".into()))
             .await
             .expect("Provider may change an offer while a quote is reserved");
         assert_eq!(changed_offer.offer_revision, 2);
@@ -7787,7 +7808,7 @@ mod tests {
         let provider = market_session("provider-stable", "provider-new@example.com");
         assert!(matches!(
             store
-                .client_market_update_host_offer(&host.id, &provider, Some(900), Some(60))
+                .client_market_update_host_offer(&host.id, &provider, Some(900), Some(60), Some("USD".into()))
                 .await,
             Err(AppError::BadRequest(message))
                 if message.contains("configure payment details on the Account page")
@@ -7817,12 +7838,12 @@ mod tests {
             .await
             .expect("configure Provider payment details");
         let updated_offer = store
-            .client_market_update_host_offer(&host.id, &provider, Some(900), Some(60))
+            .client_market_update_host_offer(&host.id, &provider, Some(900), Some(60), Some("USD".into()))
             .await
             .expect("update Host offer with stable Provider identity");
         assert_eq!(updated_offer.offer_revision, 2);
         let unchanged_offer = store
-            .client_market_update_host_offer(&host.id, &provider, Some(900), Some(60))
+            .client_market_update_host_offer(&host.id, &provider, Some(900), Some(60), Some("USD".into()))
             .await
             .expect("save unchanged Host offer");
         assert_eq!(unchanged_offer.offer_revision, 2);

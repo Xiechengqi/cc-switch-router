@@ -1,8 +1,11 @@
 "use client";
 
 import * as React from "react";
+import { createPortal } from "react-dom";
 import { ChevronDown, X } from "lucide-react";
 import { cn } from "@/lib/utils";
+
+type MenuPosition = { top: number; left: number; minWidth: number };
 
 export function CompactRegionMultiSelect({
   values,
@@ -32,15 +35,49 @@ export function CompactRegionMultiSelect({
 }) {
   const [open, setOpen] = React.useState(false);
   const [hovered, setHovered] = React.useState(false);
+  const [menuPosition, setMenuPosition] = React.useState<MenuPosition | null>(null);
   const rootRef = React.useRef<HTMLDivElement>(null);
+  const menuRef = React.useRef<HTMLDivElement>(null);
   const hasSelection = values.length > 0;
   const showClear = hasSelection && hovered;
   const isHeader = variant === "header";
+  // Header filters live inside overflow table shells; portal so menus are not clipped.
+  const usePortal = isHeader;
+
+  const updateMenuPosition = React.useCallback(() => {
+    const root = rootRef.current;
+    if (!root) return;
+    const rect = root.getBoundingClientRect();
+    const minWidth = Math.max(rect.width, isHeader || compact ? 160 : rect.width);
+    const estimatedHeight = Math.min(256, 40 + options.length * 28);
+    const spaceBelow = window.innerHeight - rect.bottom - 8;
+    const openUp = spaceBelow < estimatedHeight && rect.top > spaceBelow;
+    const top = openUp ? Math.max(8, rect.top - estimatedHeight - 2) : rect.bottom + 2;
+    const left = Math.min(rect.left, Math.max(8, window.innerWidth - minWidth - 8));
+    setMenuPosition({ top, left, minWidth });
+  }, [compact, isHeader, options.length]);
+
+  React.useEffect(() => {
+    if (!open) {
+      setMenuPosition(null);
+      return;
+    }
+    updateMenuPosition();
+    if (!usePortal) return;
+    const onReposition = () => updateMenuPosition();
+    window.addEventListener("resize", onReposition);
+    window.addEventListener("scroll", onReposition, true);
+    return () => {
+      window.removeEventListener("resize", onReposition);
+      window.removeEventListener("scroll", onReposition, true);
+    };
+  }, [open, updateMenuPosition, usePortal]);
 
   React.useEffect(() => {
     if (!open) return;
     const onPointerDown = (event: PointerEvent) => {
-      if (rootRef.current?.contains(event.target as Node)) return;
+      const target = event.target as Node;
+      if (rootRef.current?.contains(target) || menuRef.current?.contains(target)) return;
       setOpen(false);
     };
     window.addEventListener("pointerdown", onPointerDown);
@@ -71,6 +108,52 @@ export function CompactRegionMultiSelect({
     else selected.add(value);
     onChange(Array.from(selected).sort((left, right) => left.localeCompare(right)));
   };
+
+  const menu = open ? (
+    <div
+      ref={menuRef}
+      className={cn(
+        "z-[80] max-h-64 overflow-y-auto rounded-lg border border-border bg-white py-1 text-slate-900 shadow-md",
+        usePortal ? "fixed" : "absolute",
+        !usePortal && (isHeader || compact ? "left-0 top-[calc(100%+2px)] min-w-[10rem]" : "right-0 top-[calc(100%+4px)] min-w-full"),
+      )}
+      style={
+        usePortal && menuPosition
+          ? { top: menuPosition.top, left: menuPosition.left, minWidth: menuPosition.minWidth }
+          : undefined
+      }
+    >
+      <label className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50">
+        <input
+          type="checkbox"
+          checked={values.length === 0}
+          onChange={() => selectAll()}
+          className="h-3.5 w-3.5 accent-[var(--accent,#0052FF)]"
+        />
+        <span>{allLabel}</span>
+      </label>
+      {options.map((option) => (
+        <label
+          key={option.value}
+          className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50"
+        >
+          <input
+            type="checkbox"
+            checked={values.includes(option.value)}
+            onChange={() => {
+              if (values.length === 0) {
+                onChange([option.value]);
+                return;
+              }
+              toggleCountry(option.value);
+            }}
+            className="h-3.5 w-3.5 accent-[var(--accent,#0052FF)]"
+          />
+          <span className="min-w-0 truncate">{option.label}</span>
+        </label>
+      ))}
+    </div>
+  ) : null;
 
   return (
     <div ref={rootRef} className={cn("relative", className)}>
@@ -163,44 +246,9 @@ export function CompactRegionMultiSelect({
           </button>
         ) : null}
       </div>
-      {open ? (
-        <div
-          className={cn(
-            "absolute z-50 max-h-64 min-w-full overflow-y-auto rounded-lg border border-border bg-white py-1 text-slate-900 shadow-md",
-            isHeader || compact ? "left-0 top-[calc(100%+2px)] min-w-[10rem]" : "right-0 top-[calc(100%+4px)]",
-          )}
-        >
-          <label className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50">
-            <input
-              type="checkbox"
-              checked={values.length === 0}
-              onChange={() => selectAll()}
-              className="h-3.5 w-3.5 accent-[var(--accent,#0052FF)]"
-            />
-            <span>{allLabel}</span>
-          </label>
-          {options.map((option) => (
-            <label
-              key={option.value}
-              className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50"
-            >
-              <input
-                type="checkbox"
-                checked={values.includes(option.value)}
-                onChange={() => {
-                  if (values.length === 0) {
-                    onChange([option.value]);
-                    return;
-                  }
-                  toggleCountry(option.value);
-                }}
-                className="h-3.5 w-3.5 accent-[var(--accent,#0052FF)]"
-              />
-              <span className="min-w-0 truncate">{option.label}</span>
-            </label>
-          ))}
-        </div>
-      ) : null}
+      {usePortal && typeof document !== "undefined" && menu
+        ? createPortal(menu, document.body)
+        : menu}
     </div>
   );
 }

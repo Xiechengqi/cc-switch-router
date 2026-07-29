@@ -22,6 +22,7 @@ export function HostOfferDialog({
 }) {
   const { t } = useLocaleText();
   const [price, setPrice] = React.useState(host.priceCents ? (host.priceCents / 100).toFixed(2) : "");
+  const [currency, setCurrency] = React.useState<"CNY" | "USD">(host.currency === "CNY" ? "CNY" : "USD");
   const [period, setPeriod] = React.useState(host.rentalPeriodDays ? String(host.rentalPeriodDays) : "");
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
@@ -30,6 +31,7 @@ export function HostOfferDialog({
   React.useEffect(() => {
     if (!open) return;
     setPrice(host.priceCents ? (host.priceCents / 100).toFixed(2) : "");
+    setCurrency(host.currency === "CNY" ? "CNY" : "USD");
     setPeriod(host.rentalPeriodDays ? String(host.rentalPeriodDays) : "");
     setError("");
     setPaymentReady(null);
@@ -44,12 +46,12 @@ export function HostOfferDialog({
     return () => {
       cancelled = true;
     };
-  }, [host.priceCents, host.rentalPeriodDays, open]);
+  }, [host.currency, host.priceCents, host.rentalPeriodDays, open]);
 
   const save = async () => {
     let offer: ReturnType<typeof parseHostOffer>;
     try {
-      offer = parseHostOffer(price, period, t);
+      offer = parseHostOffer(price, period, t, currency);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
       return;
@@ -91,7 +93,7 @@ export function HostOfferDialog({
                 </a>
               </div>
             ) : null}
-            <div className="grid gap-3 sm:grid-cols-2">
+            <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_7rem_minmax(0,1fr)]">
               <label className="grid gap-1 text-sm">
                 <span className="text-muted-foreground">{t("clientMarket.priceUsd")}</span>
                 <input
@@ -101,6 +103,17 @@ export function HostOfferDialog({
                   inputMode="decimal"
                   className="h-10 rounded-md border px-3"
                 />
+              </label>
+              <label className="grid gap-1 text-sm">
+                <span className="text-muted-foreground">{t("clientMarket.currency")}</span>
+                <select
+                  value={currency}
+                  onChange={(event) => setCurrency(event.target.value === "CNY" ? "CNY" : "USD")}
+                  className="h-10 rounded-md border px-2"
+                >
+                  <option value="CNY">CNY</option>
+                  <option value="USD">USD</option>
+                </select>
               </label>
               <label className="grid gap-1 text-sm">
                 <span className="text-muted-foreground">{t("clientMarket.periodDays")}</span>

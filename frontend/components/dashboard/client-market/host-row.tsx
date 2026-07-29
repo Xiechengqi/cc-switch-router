@@ -276,8 +276,8 @@ function HostRowImpl({
           )}
         </td>
         <td className="max-w-[12rem] px-2 py-2 align-middle">
-          <div className="flex min-w-0 items-center gap-1">
-            <span className="min-w-0 flex-1 truncate text-xs font-medium text-foreground" title={host.hostOwnerEmail}>
+          <div className="flex min-w-0 items-center gap-0.5">
+            <span className="min-w-0 truncate text-xs font-medium text-foreground" title={host.hostOwnerEmail}>
               {host.hostOwnerEmail}
             </span>
             <ProviderContactButton contacts={host.contacts} />
@@ -285,7 +285,7 @@ function HostRowImpl({
         </td>
         <td className="max-w-[9rem] whitespace-nowrap px-2 py-2 align-middle">
           <span className="block text-xs font-semibold text-foreground" title={t("clientMarket.currentOffer")}>
-            {formatHostOffer(host.priceCents, host.rentalPeriodDays, locale)}
+            {formatHostOffer(host.priceCents, host.rentalPeriodDays, locale, host.currency)}
           </span>
         </td>
         <td className="max-w-[12rem] px-2 py-2 align-middle">

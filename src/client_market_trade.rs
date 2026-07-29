@@ -172,6 +172,8 @@ pub struct ProviderSupplyResponse {
 pub struct UpdateHostOfferRequest {
     pub price_cents: Option<i64>,
     pub rental_period_days: Option<i64>,
+    #[serde(default)]
+    pub currency: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -180,6 +182,8 @@ pub struct HostOfferView {
     pub host_id: String,
     pub price_cents: Option<i64>,
     pub rental_period_days: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
     pub offer_revision: i64,
 }
 
@@ -543,6 +547,7 @@ pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     add_column(conn, "router_ssh_hosts", "provider_id", "TEXT")?;
     add_column(conn, "router_ssh_hosts", "price_cents", "INTEGER")?;
     add_column(conn, "router_ssh_hosts", "rental_period_days", "INTEGER")?;
+    add_column(conn, "router_ssh_hosts", "currency", "TEXT")?;
     add_column(
         conn,
         "router_ssh_hosts",
@@ -713,6 +718,23 @@ pub(crate) fn validate_offer(
         }
         _ => Err(AppError::BadRequest(
             "paid hosts require priceCents between 1 and 100000000 and rentalPeriodDays between 4 and 3650; omit both for free forever".into(),
+        )),
+    }
+}
+
+pub(crate) fn normalize_offer_currency(
+    price_cents: Option<i64>,
+    currency: Option<String>,
+) -> Result<Option<String>, AppError> {
+    let normalized = currency
+        .map(|value| value.trim().to_ascii_uppercase())
+        .filter(|value| !value.is_empty());
+    match (price_cents, normalized.as_deref()) {
+        (None, _) => Ok(None),
+        (Some(_), None) => Ok(Some("USD".into())),
+        (Some(_), Some("CNY" | "USD")) => Ok(normalized),
+        (Some(_), Some(_)) => Err(AppError::BadRequest(
+            "currency must be CNY or USD".into(),
         )),
     }
 }
@@ -1401,10 +1423,11 @@ async fn update_host_offer(
 ) -> Result<Json<HostOfferView>, AppError> {
     let session = require_session(&state, &headers).await?;
     let (price, period) = validate_offer(input.price_cents, input.rental_period_days)?;
+    let currency = normalize_offer_currency(price, input.currency)?;
     Ok(Json(
         state
             .store
-            .client_market_update_host_offer(&id, &session, price, period)
+            .client_market_update_host_offer(&id, &session, price, period, currency)
             .await?,
     ))
 }
@@ -2660,14 +2683,24 @@ impl AppStore {
         session: &AuthSession,
         price_cents: Option<i64>,
         rental_period_days: Option<i64>,
+        currency: Option<String>,
     ) -> Result<HostOfferView, AppError> {
         let mut conn = self.conn.lock().await;
         let tx = conn
             .transaction()
             .map_err(|error| AppError::Internal(format!("begin offer update failed: {error}")))?;
-        let host: Option<(Option<String>, String, Option<i64>, Option<i64>, i64, String)> = tx
+        let host: Option<(
+            Option<String>,
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            i64,
+            String,
+        )> = tx
             .query_row(
-                "SELECT provider_id, host_owner_email, price_cents, rental_period_days, offer_revision, status
+                "SELECT provider_id, host_owner_email, price_cents, rental_period_days,
+                        currency, offer_revision, status
                  FROM router_ssh_hosts WHERE id = ?1",
                 params![host_id],
                 |row| {
@@ -2678,13 +2711,21 @@ impl AppStore {
                         row.get(3)?,
                         row.get(4)?,
                         row.get(5)?,
+                        row.get(6)?,
                     ))
                 },
             )
             .optional()
             .map_err(|error| AppError::Internal(format!("read host offer failed: {error}")))?;
-        let (provider_id, host_owner_email, old_price, old_period, old_revision, host_status) =
-            host.ok_or_else(|| AppError::NotFound("host not found".into()))?;
+        let (
+            provider_id,
+            host_owner_email,
+            old_price,
+            old_period,
+            old_currency,
+            old_revision,
+            host_status,
+        ) = host.ok_or_else(|| AppError::NotFound("host not found".into()))?;
         if !crate::client_market::session_is_host_owner(
             session,
             provider_id.as_deref(),
@@ -2726,7 +2767,15 @@ impl AppStore {
                 })?;
             }
         }
-        if old_price == price_cents && old_period == rental_period_days {
+        let old_currency_norm = old_currency
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_ascii_uppercase());
+        if old_price == price_cents
+            && old_period == rental_period_days
+            && old_currency_norm == currency
+        {
             tx.commit().map_err(|error| {
                 AppError::Internal(format!("commit unchanged Host offer failed: {error}"))
             })?;
@@ -2734,6 +2783,7 @@ impl AppStore {
                 host_id: host_id.to_string(),
                 price_cents,
                 rental_period_days,
+                currency,
                 offer_revision: old_revision,
             });
         }
@@ -2751,12 +2801,14 @@ impl AppStore {
         let revision = old_revision + 1;
         tx.execute(
             "UPDATE router_ssh_hosts
-             SET price_cents = ?2, rental_period_days = ?3, offer_revision = ?4, updated_at = ?5
+             SET price_cents = ?2, rental_period_days = ?3, currency = ?4,
+                 offer_revision = ?5, updated_at = ?6
              WHERE id = ?1",
             params![
                 host_id,
                 price_cents,
                 rental_period_days,
+                currency,
                 revision,
                 Utc::now().to_rfc3339()
             ],
@@ -2780,8 +2832,10 @@ impl AppStore {
             serde_json::json!({
                 "oldPriceCents": old_price,
                 "oldRentalPeriodDays": old_period,
+                "oldCurrency": old_currency,
                 "priceCents": price_cents,
                 "rentalPeriodDays": rental_period_days,
+                "currency": currency,
                 "offerRevision": revision,
             }),
             Utc::now(),
@@ -2792,6 +2846,7 @@ impl AppStore {
             host_id: host_id.to_string(),
             price_cents,
             rental_period_days,
+            currency,
             offer_revision: revision,
         })
     }

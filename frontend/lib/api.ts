@@ -626,6 +626,7 @@ export async function createClientMarketHost(body: {
   rootPassword?: string;
   priceCents?: number;
   rentalPeriodDays?: number;
+  currency?: string;
 }) {
   return parseJson<ClientMarketHost>(
     await authFetch("/v1/client-market/hosts", {
@@ -761,9 +762,15 @@ export async function getClientMarketProviderSupply() {
 
 export async function updateClientMarketHostOffer(
   hostId: string,
-  body: { priceCents?: number; rentalPeriodDays?: number },
+  body: { priceCents?: number; rentalPeriodDays?: number; currency?: string },
 ) {
-  return parseJson<{ hostId: string; priceCents?: number; rentalPeriodDays?: number; offerRevision: number }>(
+  return parseJson<{
+    hostId: string;
+    priceCents?: number;
+    rentalPeriodDays?: number;
+    currency?: string;
+    offerRevision: number;
+  }>(
     await authFetch(`/v1/client-market/hosts/${encodeURIComponent(hostId)}/offer`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },

@@ -1341,6 +1341,7 @@ export type ClientMarketHost = {
   hostOwnerEmail: string;
   priceCents?: number;
   rentalPeriodDays?: number;
+  currency?: string;
   offerRevision: number;
   paymentMethodKinds: string[];
   contacts?: PaymentContact[];

@@ -468,9 +468,9 @@ fn normalize_seat(input: SeatInput) -> Result<NormalizedSeat, AppError> {
     }
     let currency =
         currency.ok_or_else(|| AppError::BadRequest("paid seat currency is required".into()))?;
-    if currency.len() != 3 || !currency.bytes().all(|byte| byte.is_ascii_uppercase()) {
+    if currency != "CNY" && currency != "USD" {
         return Err(AppError::BadRequest(
-            "currency must be a three-letter ISO code".into(),
+            "currency must be CNY or USD".into(),
         ));
     }
     let period_unit = period_unit.ok_or_else(|| {

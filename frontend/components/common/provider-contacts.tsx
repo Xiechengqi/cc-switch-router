@@ -43,10 +43,7 @@ export function ProviderContactsList({ contacts }: { contacts?: PaymentContact[]
   );
 }
 
-/**
- * Market contact glyph: opens a dialog of Provider contacts.
- * Disabled (grey, non-interactive) when the Provider has not configured any.
- */
+/** Market contact glyph: opens a dialog of Provider contacts. Hidden when none are configured. */
 export function ProviderContactButton({
   contacts,
   className,
@@ -57,7 +54,7 @@ export function ProviderContactButton({
   const { t } = useLocaleText();
   const [open, setOpen] = React.useState(false);
   const items = (contacts || []).filter((contact) => contact.handle?.trim());
-  const hasContacts = items.length > 0;
+  if (!items.length) return null;
 
   return (
     <>
@@ -65,15 +62,12 @@ export function ProviderContactButton({
         isIconOnly
         size="sm"
         variant="ghost"
-        className={`h-7 w-7 min-w-7 shrink-0 border-0 shadow-none ${
-          hasContacts ? "text-foreground" : "pointer-events-none text-muted-foreground/35"
-        } ${className || ""}`}
-        isDisabled={!hasContacts}
-        aria-label={hasContacts ? t("account.contact.view") : t("account.contact.empty")}
+        className={`h-7 w-7 min-w-7 shrink-0 border-0 shadow-none text-foreground ${className || ""}`}
+        aria-label={t("account.contact.view")}
         data-no-row-drawer
         onClick={(event) => {
           event.stopPropagation();
-          if (hasContacts) setOpen(true);
+          setOpen(true);
         }}
       >
         <ContactRound className="h-3.5 w-3.5" />

@@ -400,16 +400,25 @@ export function authorizedKeysInstallCommand(line: string): string {
 
 export type Translate = (key: MessageKey, values?: Record<string, string | number>) => string;
 
-export function formatHostOffer(priceCents: number | undefined, rentalPeriodDays: number | undefined, locale: string) {
+export function formatHostOffer(
+  priceCents: number | undefined,
+  rentalPeriodDays: number | undefined,
+  locale: string,
+  currency = "USD",
+) {
   if (!priceCents || !rentalPeriodDays) return locale.startsWith("zh") ? "免费 · 永久" : "Free · forever";
-  const amount = new Intl.NumberFormat(locale, { style: "currency", currency: "USD" }).format(priceCents / 100);
+  const amount = new Intl.NumberFormat(locale, {
+    style: "currency",
+    currency: currency === "CNY" ? "CNY" : "USD",
+  }).format(priceCents / 100);
   return locale.startsWith("zh") ? `${amount} · ${rentalPeriodDays} 天` : `${amount} · ${rentalPeriodDays}d`;
 }
 
-export function parseHostOffer(priceUsd: string, periodDays: string, t: Translate) {
+export function parseHostOffer(priceUsd: string, periodDays: string, t: Translate, currency = "USD") {
   const price = priceUsd.trim();
   const period = periodDays.trim();
-  if (!price && !period) return { priceCents: undefined, rentalPeriodDays: undefined };
+  const normalizedCurrency = currency.trim().toUpperCase() === "CNY" ? "CNY" : "USD";
+  if (!price && !period) return { priceCents: undefined, rentalPeriodDays: undefined, currency: undefined as string | undefined };
   if (!price || !period || !/^\d{1,7}(?:\.\d{1,2})?$/.test(price) || !/^\d+$/.test(period)) {
     throw new Error(t("clientMarket.offerInvalid"));
   }
@@ -419,7 +428,7 @@ export function parseHostOffer(priceUsd: string, periodDays: string, t: Translat
   if (priceCents < 1 || priceCents > 100_000_000 || rentalPeriodDays < 4 || rentalPeriodDays > 3_650) {
     throw new Error(t("clientMarket.offerRange"));
   }
-  return { priceCents, rentalPeriodDays };
+  return { priceCents, rentalPeriodDays, currency: normalizedCurrency };
 }
 
 export function isPaymentProfileRequiredError(message: string) {

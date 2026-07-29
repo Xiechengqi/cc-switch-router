@@ -539,6 +539,7 @@ mod tests {
             host_owner_email: "host@example.com".into(),
             price_cents: Some(500),
             rental_period_days: Some(30),
+            currency: Some("USD".into()),
             offer_revision: 1,
             payment_method_kinds: vec!["alipay".into()],
             contacts: vec![],

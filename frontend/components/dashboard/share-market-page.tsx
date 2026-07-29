@@ -7,6 +7,7 @@ import {
   Ban,
   ChevronDown,
   CircleDollarSign,
+  Copy,
   ExternalLink,
   Loader2,
   Pencil,
@@ -21,6 +22,7 @@ import {
 import { useAuth } from "@/components/auth/auth-provider";
 import { AuthenticatedImage } from "@/components/common/authenticated-image";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
+import { CompactSelect } from "@/components/common/compact-select";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
 import { ProviderContactButton, ProviderContactsList } from "@/components/common/provider-contacts";
@@ -145,7 +147,7 @@ function seatInput(draft: SeatDraft, t: TFn): ShareMarketSeatInput {
     throw new Error(t("shareMarket.error.billingPeriod"));
   }
   const currency = draft.currency.trim().toUpperCase();
-  if (!/^[A-Z]{3}$/.test(currency)) {
+  if (currency !== "CNY" && currency !== "USD") {
     throw new Error(t("shareMarket.error.currency"));
   }
   return {
@@ -175,41 +177,43 @@ function SeatFields({
   const { t } = useLocaleText();
   const patch = (value: Partial<SeatDraft>) => onChange({ ...draft, ...value });
   const periods = supportedPeriods?.length ? supportedPeriods : TOKEN_PERIODS;
+  const selectTrigger = "min-h-10 w-full text-sm";
   return (
-    <div className="grid min-w-0 gap-3 sm:grid-cols-2">
-      <label className="grid gap-1 text-xs text-slate-500">
-        {t("shareMarket.parallel")}
-        <input
-          className={fieldClass()}
-          inputMode="numeric"
-          value={draft.parallelLimit}
-          placeholder={t("shareMarket.dialog.unlimited")}
-          onChange={(event) => patch({ parallelLimit: event.target.value })}
-        />
-      </label>
-      <label className="grid gap-1 text-xs text-slate-500">
-        {t("shareMarket.tokens")}
-        <input
-          className={fieldClass()}
-          inputMode="numeric"
-          value={draft.tokenLimit}
-          placeholder={t("shareMarket.dialog.unlimited")}
-          onChange={(event) => patch({ tokenLimit: event.target.value })}
-        />
-      </label>
-      <label className="grid gap-1 text-xs text-slate-500 sm:col-span-2">
-        {t("shareMarket.period")}
-        <select
-          className={fieldClass()}
-          value={draft.tokenPeriod}
-          onChange={(event) => patch({ tokenPeriod: event.target.value as ShareTokenPeriod })}
-        >
-          {periods.map((period) => (
-            <option key={period} value={period}>{t(`shareMarket.period.${period}`)}</option>
-          ))}
-        </select>
-      </label>
-      <div className="grid grid-cols-2 gap-1 rounded-md bg-slate-100 p-1 sm:col-span-2">
+    <div className="grid min-w-0 gap-3">
+      <div className="grid min-w-0 gap-3 sm:grid-cols-3">
+        <label className="grid gap-1 text-xs text-slate-500">
+          {t("shareMarket.parallel")}
+          <input
+            className={fieldClass()}
+            inputMode="numeric"
+            value={draft.parallelLimit}
+            placeholder={t("shareMarket.dialog.unlimited")}
+            onChange={(event) => patch({ parallelLimit: event.target.value })}
+          />
+        </label>
+        <label className="grid gap-1 text-xs text-slate-500">
+          {t("shareMarket.tokens")}
+          <input
+            className={fieldClass()}
+            inputMode="numeric"
+            value={draft.tokenLimit}
+            placeholder={t("shareMarket.dialog.unlimited")}
+            onChange={(event) => patch({ tokenLimit: event.target.value })}
+          />
+        </label>
+        <label className="grid gap-1 text-xs text-slate-500">
+          {t("shareMarket.period")}
+          <CompactSelect
+            value={draft.tokenPeriod}
+            options={periods.map((period) => ({ value: period, label: t(`shareMarket.period.${period}`) }))}
+            onChange={(value) => patch({ tokenPeriod: value as ShareTokenPeriod })}
+            ariaLabel={t("shareMarket.period")}
+            className="w-full"
+            triggerClassName={selectTrigger}
+          />
+        </label>
+      </div>
+      <div className="grid grid-cols-2 gap-1 rounded-md bg-slate-100 p-1">
         <button
           type="button"
           className={`h-9 rounded-md text-sm font-medium ${!draft.paid ? "bg-white text-slate-900 shadow-sm" : "text-slate-500"}`}
@@ -226,7 +230,7 @@ function SeatFields({
         </button>
       </div>
       {draft.paid ? (
-        <>
+        <div className="grid min-w-0 gap-3 sm:grid-cols-2">
           <label className="grid gap-1 text-xs text-slate-500">
             {t("shareMarket.dialog.amount")}
             <input
@@ -238,11 +242,16 @@ function SeatFields({
           </label>
           <label className="grid gap-1 text-xs text-slate-500">
             {t("shareMarket.dialog.currency")}
-            <input
-              className={fieldClass()}
-              maxLength={3}
-              value={draft.currency}
-              onChange={(event) => patch({ currency: event.target.value.toUpperCase() })}
+            <CompactSelect
+              value={draft.currency === "USD" ? "USD" : "CNY"}
+              options={[
+                { value: "CNY", label: "CNY" },
+                { value: "USD", label: "USD" },
+              ]}
+              onChange={(value) => patch({ currency: value })}
+              ariaLabel={t("shareMarket.dialog.currency")}
+              className="w-full"
+              triggerClassName={selectTrigger}
             />
           </label>
           <label className="grid gap-1 text-xs text-slate-500">
@@ -255,18 +264,21 @@ function SeatFields({
             />
           </label>
           <label className="grid gap-1 text-xs text-slate-500">
-            &nbsp;
-            <select
-              className={fieldClass()}
+            {t("shareMarket.dialog.billingUnit")}
+            <CompactSelect
               value={draft.periodUnit}
-              onChange={(event) => patch({ periodUnit: event.target.value as SeatDraft["periodUnit"] })}
-            >
-              <option value="day">{t("shareMarket.dialog.day")}</option>
-              <option value="week">{t("shareMarket.dialog.week")}</option>
-              <option value="month">{t("shareMarket.dialog.month")}</option>
-            </select>
+              options={[
+                { value: "day", label: t("shareMarket.dialog.day") },
+                { value: "week", label: t("shareMarket.dialog.week") },
+                { value: "month", label: t("shareMarket.dialog.month") },
+              ]}
+              onChange={(value) => patch({ periodUnit: value as SeatDraft["periodUnit"] })}
+              ariaLabel={t("shareMarket.dialog.billingUnit")}
+              className="w-full"
+              triggerClassName={selectTrigger}
+            />
           </label>
-        </>
+        </div>
       ) : null}
     </div>
   );
@@ -332,29 +344,51 @@ function AddListingDialog({
             {loading ? <div className="flex items-center gap-2 py-8 text-sm text-slate-500"><Loader2 className="h-4 w-4 animate-spin" />{t("common.loading")}</div> : null}
             {!loading ? (
               <>
+                {shares.length === 0 ? <p className="text-sm text-slate-500">{t("shareMarket.dialog.noShares")}</p> : (
+                  <>
                 <label className="grid gap-1 text-xs text-slate-500">
                   {t("shareMarket.dialog.selectShare")}
-                  <select
-                    className={fieldClass()}
+                  <CompactSelect
                     value={shareId}
-                    onChange={(event) => {
-                      const nextId = event.target.value;
+                    options={shares.map((share) => ({
+                      value: share.shareId,
+                      label: `${share.shareName} · ${share.appType}`,
+                    }))}
+                    onChange={(nextId) => {
                       const nextShare = shares.find((share) => share.shareId === nextId);
                       setShareId(nextId);
                       setSeats([emptySeat(nextShare?.supportedUserTokenPeriods)]);
                     }}
-                  >
-                    {shares.map((share) => <option key={share.shareId} value={share.shareId}>{share.shareName} · {share.appType}</option>)}
-                  </select>
+                    ariaLabel={t("shareMarket.dialog.selectShare")}
+                    className="w-full"
+                    triggerClassName="min-h-10 w-full text-sm"
+                  />
                 </label>
-                {shares.length === 0 ? <p className="text-sm text-slate-500">{t("shareMarket.dialog.noShares")}</p> : null}
-                {shares.length > 0 ? (
                   <div className="grid gap-3">
                     <div className="text-sm font-semibold text-slate-900">{t("shareMarket.dialog.seats")}</div>
                     {seats.map((seat, index) => (
                       <section key={index} className="grid gap-3 border-t border-slate-200 pt-4 first:border-0 first:pt-0">
                         <div className="flex items-center justify-between gap-3">
-                          <span className="text-sm font-medium">{t("shareMarket.seat", { position: index + 1 })}</span>
+                          <div className="flex min-w-0 items-center gap-0.5">
+                            <span className="text-sm font-medium">{t("shareMarket.seat", { position: index + 1 })}</span>
+                            <Button
+                              isIconOnly
+                              size="sm"
+                              variant="ghost"
+                              className="h-7 w-7 min-w-7"
+                              aria-label={t("shareMarket.copySeat")}
+                              isDisabled={seats.length >= 20}
+                              onClick={() =>
+                                setSeats((items) => {
+                                  if (items.length >= 20) return items;
+                                  const clone: SeatDraft = { ...items[index] };
+                                  return [...items.slice(0, index + 1), clone, ...items.slice(index + 1)];
+                                })
+                              }
+                            >
+                              <Copy className="h-3.5 w-3.5" />
+                            </Button>
+                          </div>
                           {seats.length > 1 ? (
                             <Button isIconOnly size="sm" variant="ghost" aria-label={t("common.delete")} onClick={() => setSeats((items) => items.filter((_, itemIndex) => itemIndex !== index))}>
                               <X className="h-4 w-4" />
@@ -370,7 +404,8 @@ function AddListingDialog({
                       </Button>
                     ) : null}
                   </div>
-                ) : null}
+                  </>
+                )}
               </>
             ) : null}
             {error ? <p className="text-sm text-red-600">{error}</p> : null}
@@ -753,11 +788,11 @@ function ProviderExpandPanel({
           <strong className="tabular-nums text-slate-900">{formatShareLimit(listing.parallelLimit)}</strong>
         </div>
         <div className="min-w-0 col-span-2">
-          <span className="block text-slate-500">{t("shareMarket.owner")}</span>
-          <div className="flex min-w-0 items-center gap-1">
-            <span className="min-w-0 flex-1 truncate text-slate-600" title={listing.ownerEmail}>{listing.ownerEmail}</span>
+          <div className="flex items-center gap-0.5 text-slate-500">
+            <span>{t("shareMarket.owner")}</span>
             <ProviderContactButton contacts={listing.contacts} />
           </div>
+          <span className="block truncate text-slate-600" title={listing.ownerEmail}>{listing.ownerEmail}</span>
         </div>
       </div>
     </div>
@@ -1107,8 +1142,8 @@ export function ShareMarketPage() {
             </span>
           ) : null}
         </div>
-        <div className="mt-1 flex min-w-0 items-center gap-1">
-          <p className="min-w-0 flex-1 truncate text-xs text-slate-500">{ownerView ? subscription.renterEmail : subscription.ownerEmail}</p>
+        <div className="mt-1 flex min-w-0 items-center gap-0.5">
+          <p className="min-w-0 truncate text-xs text-slate-500">{ownerView ? subscription.renterEmail : subscription.ownerEmail}</p>
           {!ownerView ? <ProviderContactButton contacts={subscription.contacts} /> : null}
         </div>
         <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-600">
@@ -1198,11 +1233,11 @@ export function ShareMarketPage() {
               <strong className="tabular-nums text-slate-900">{formatShareLimit(listing.parallelLimit)}</strong>
             </div>
             <div className="min-w-0 col-span-2 sm:col-span-1">
-              <span className="block text-slate-500">{t("shareMarket.owner")}</span>
-              <div className="flex min-w-0 items-center gap-1">
-                <span className="min-w-0 flex-1 truncate text-slate-600" title={listing.ownerEmail}>{listing.ownerEmail}</span>
+              <div className="flex items-center gap-0.5 text-slate-500">
+                <span>{t("shareMarket.owner")}</span>
                 <ProviderContactButton contacts={listing.contacts} />
               </div>
+              <span className="block truncate text-slate-600" title={listing.ownerEmail}>{listing.ownerEmail}</span>
             </div>
           </div>
 
@@ -1268,6 +1303,20 @@ export function ShareMarketPage() {
                     ) : null}
                     {!authed && guestCanSeeAvailable(listing, seat) ? <Button size="sm" variant="outline" onClick={() => window.dispatchEvent(new Event("router-open-login"))}>{t("nav.login")}</Button> : null}
                     {listing.isOwner && seat.status === "available" ? <Button isIconOnly size="sm" variant="ghost" aria-label={t("common.edit")} onClick={() => setSeatDialog({ listingId: listing.id, seat, supportedPeriods: listing.supportedUserTokenPeriods })}><Pencil className="h-4 w-4" /></Button> : null}
+                    {listing.isOwner ? (
+                      <Button
+                        isIconOnly
+                        size="sm"
+                        variant="ghost"
+                        aria-label={t("shareMarket.copySeat")}
+                        isDisabled={!!busyId}
+                        onClick={() =>
+                          void act(`copy-${seat.id}`, () => addShareMarketSeat(listing.id, seatInput(draftFromSeat(seat), t)))
+                        }
+                      >
+                        {busyId === `copy-${seat.id}` ? <Loader2 className="h-4 w-4 animate-spin" /> : <Copy className="h-4 w-4" />}
+                      </Button>
+                    ) : null}
                     {listing.isOwner && (seat.status === "available" || seat.status === "disabled") ? <Button isIconOnly size="sm" variant="ghost" aria-label={t("shareMarket.deleteSeat")} isDisabled={!!busyId} onClick={() => setConfirmAction({ id: seat.id, title: t("shareMarket.confirm.deleteTitle"), description: t("shareMarket.confirm.deleteDescription", { position: seat.position }), confirmLabel: t("shareMarket.deleteSeat"), tone: "danger", run: () => deleteShareMarketSeat(seat.id) })}><Trash2 className="h-4 w-4 text-red-600" /></Button> : null}
                   </div></td>
                 </tr>
@@ -1282,20 +1331,12 @@ export function ShareMarketPage() {
   };
 
   const renderSeatFirstTable = () => (
-    <section className="overflow-hidden rounded-md border border-slate-200 bg-white">
+    <section className="rounded-md border border-slate-200 bg-white">
       <div className="overflow-x-auto">
         <table className="w-full min-w-[980px] text-left text-sm">
           <thead className="bg-slate-50 text-xs font-medium text-slate-500">
             <tr>
-              <th className="sticky top-0 z-10 w-28 border-b border-slate-200 bg-slate-50 px-2 py-2">
-                <LayoutModeToggle
-                  layout={layout}
-                  onChange={setLayout}
-                  seatsLabel={t("shareMarket.layout.seats")}
-                  sharesLabel={t("shareMarket.layout.shares")}
-                  ariaLabel={t("shareMarket.layoutToggle")}
-                />
-              </th>
+              <th className="sticky top-0 z-10 w-10 border-b border-slate-200 bg-slate-50 px-2 py-2" />
               <SeatSortHeader
                 columnKey="online"
                 sortPrefs={sortPrefs}
@@ -1443,9 +1484,12 @@ export function ShareMarketPage() {
                       <span className="rounded-sm bg-slate-100 px-1.5 py-0.5 text-xs text-slate-600">{statusText}</span>
                     </td>
                     <td className="px-3 py-3">
-                      <span className="block max-w-[10rem] truncate text-xs text-slate-600" title={listing.ownerEmail}>
-                        {listing.ownerEmail}
-                      </span>
+                      <div className="flex min-w-0 max-w-[12rem] items-center gap-0.5">
+                        <span className="min-w-0 truncate text-xs text-slate-600" title={listing.ownerEmail}>
+                          {listing.ownerEmail}
+                        </span>
+                        <ProviderContactButton contacts={listing.contacts} />
+                      </div>
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex justify-end gap-1">
@@ -1530,15 +1574,13 @@ export function ShareMarketPage() {
     <div className="mx-auto grid w-full max-w-7xl gap-5 px-1 pb-10">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
-          {layout === "shares" ? (
-            <LayoutModeToggle
-              layout={layout}
-              onChange={setLayout}
-              seatsLabel={t("shareMarket.layout.seats")}
-              sharesLabel={t("shareMarket.layout.shares")}
-              ariaLabel={t("shareMarket.layoutToggle")}
-            />
-          ) : null}
+          <LayoutModeToggle
+            layout={layout}
+            onChange={setLayout}
+            seatsLabel={t("shareMarket.layout.seats")}
+            sharesLabel={t("shareMarket.layout.shares")}
+            ariaLabel={t("shareMarket.layoutToggle")}
+          />
           <div className="inline-flex max-w-full overflow-x-auto rounded-lg bg-slate-100 p-1 text-[11px]">
             {marketTabs.map((item) => (
               <button
