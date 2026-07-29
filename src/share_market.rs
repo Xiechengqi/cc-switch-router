@@ -735,8 +735,9 @@ fn subscription_view(
             record.status.as_str(),
             SUB_RELEASED | SUB_GRANT_FAILED | SUB_REVOKE_PENDING
         );
-    let can_force_revoke =
-        is_owner && !matches!(record.status.as_str(), SUB_RELEASED | SUB_GRANT_FAILED);
+    // Allow retry while revoke is stuck (e.g. earlier grant edit blocked dispatch).
+    let can_force_revoke = is_owner
+        && !matches!(record.status.as_str(), SUB_RELEASED | SUB_GRANT_FAILED);
     let share_online =
         !record.subdomain.is_empty() && active_subdomains.contains(&record.subdomain);
     Ok(SubscriptionView {
@@ -2127,7 +2128,7 @@ impl AppStore {
             owner_user_id,
             renter_user_id,
             renter_email,
-            subscription_status,
+            _subscription_status,
         )) = row
         else {
             return Err(AppError::NotFound("active subscription not found".into()));
@@ -2147,9 +2148,23 @@ impl AppStore {
         } else {
             "renter_release"
         });
-        let canceled_before_dispatch = subscription_status == SUB_GRANT_PENDING
-            && cancel_pending_grant_tx(&tx, subscription_id, reason, &now)?;
-        if canceled_before_dispatch {
+        // Retire stuck pending/dispatched grant edits so revoke can dispatch, or so
+        // never-dispatched grants can finish without waiting on an offline Client.
+        let retired = retire_unconfirmed_grant_tx(&tx, subscription_id, reason, &now)?;
+        let grants_json: Option<String> = tx
+            .query_row(
+                "SELECT user_grants_json FROM shares WHERE share_id = ?1",
+                params![share_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(map_db("read Share grants during release"))?
+            .flatten();
+        let has_entitlement = active_entitlement(grants_json.as_deref(), &entitlement_id);
+        let grant_never_reached_client = !entitlement_was_activated_tx(&tx, subscription_id)?
+            && !has_entitlement
+            && !retired.had_dispatched;
+        if grant_never_reached_client {
             finish_release_tx(&tx, subscription_id, &seat_id, &listing_id, reason, &now)?;
         } else {
             request_revoke_tx(
@@ -2553,6 +2568,85 @@ fn cancel_pending_grant_tx(
         )
         .map_err(map_db("cancel pending Share grant"))?;
     Ok(changed > 0)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RetireUnconfirmedGrant {
+    had_dispatched: bool,
+}
+
+/// Retires unconfirmed upsert control work (pending or dispatched) so a later
+/// revoke can dispatch. Callers that know the grant never reached the Client can
+/// finish without a revoke when `had_dispatched` is false.
+fn retire_unconfirmed_grant_tx(
+    tx: &Transaction<'_>,
+    subscription_id: &str,
+    reason: &str,
+    now: &str,
+) -> Result<RetireUnconfirmedGrant, AppError> {
+    let message = format!("grant canceled before confirmation: {reason}");
+    let had_dispatched = tx
+        .query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM share_control_operations
+                WHERE subscription_id = ?1 AND action = 'upsert' AND status = 'dispatched'
+             )",
+            params![subscription_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(map_db("check dispatched Share grant"))?
+        != 0;
+    let edit_ids: Vec<String> = {
+        let mut statement = tx
+            .prepare(
+                "SELECT edit_id FROM share_control_operations
+                 WHERE subscription_id = ?1 AND action = 'upsert'
+                   AND status IN ('pending', 'dispatched')
+                   AND edit_id IS NOT NULL",
+            )
+            .map_err(map_db("prepare unconfirmed Share grant edits"))?;
+        statement
+            .query_map(params![subscription_id], |row| row.get(0))
+            .map_err(map_db("query unconfirmed Share grant edits"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_db("read unconfirmed Share grant edits"))?
+    };
+    for edit_id in edit_ids {
+        tx.execute(
+            "UPDATE share_edit_requests
+             SET status = 'cancelled', retired_at = ?2, updated_at = ?2,
+                 error_message = COALESCE(error_message, ?3)
+             WHERE id = ?1 AND status = 'pending'",
+            params![edit_id, now, message],
+        )
+        .map_err(map_db("retire unconfirmed Share grant edit"))?;
+    }
+    tx.execute(
+            "UPDATE share_control_operations
+             SET status = 'rejected', updated_at = ?3, last_error = ?2
+             WHERE subscription_id = ?1 AND action = 'upsert'
+               AND status IN ('pending', 'dispatched')",
+            params![subscription_id, message, now],
+        )
+        .map_err(map_db("reject unconfirmed Share grant"))?;
+    Ok(RetireUnconfirmedGrant { had_dispatched })
+}
+
+fn entitlement_was_activated_tx(
+    tx: &Transaction<'_>,
+    subscription_id: &str,
+) -> Result<bool, AppError> {
+    let exists: i64 = tx
+        .query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM share_market_events
+                WHERE subscription_id = ?1 AND event_type = 'entitlement_activated'
+             )",
+            params![subscription_id],
+            |row| row.get(0),
+        )
+        .map_err(map_db("read Share entitlement activation"))?;
+    Ok(exists != 0)
 }
 
 fn can_confirm_absent_entitlement_tx(
@@ -4116,6 +4210,102 @@ mod tests {
             .share_market_reconcile_and_dispatch(now + Duration::seconds(6))
             .await
             .expect("release after confirmed revoke");
+        assert_eq!(
+            subscription_status(&store, &subscription_id).await,
+            SUB_RELEASED
+        );
+    }
+
+    #[tokio::test]
+    async fn force_revoke_unblocks_when_stuck_behind_dispatched_unconfirmed_grant() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-stuck-revoke", "owner-stuck-revoke@example.com");
+        let renter = session("renter-stuck-revoke", "renter-stuck-revoke@example.com");
+        insert_share(
+            &store,
+            "share-stuck-revoke",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (_listing_id, seat_id) =
+            create_listing(&store, &owner, "share-stuck-revoke", free_seat()).await;
+        let subscription_id = store
+            .share_market_rent_seat(&renter, &seat_id, RentSeatRequest { offer_revision: 1 })
+            .await
+            .expect("rent stuck-revoke seat");
+        let now = Utc::now();
+        assert_eq!(
+            store
+                .share_market_reconcile_and_dispatch(now)
+                .await
+                .expect("dispatch grant")
+                .len(),
+            1
+        );
+        store
+            .share_market_request_release(&owner, &subscription_id, true, false, None)
+            .await
+            .expect("force revoke while grant still unconfirmed");
+        assert_eq!(
+            subscription_status(&store, &subscription_id).await,
+            SUB_REVOKE_PENDING
+        );
+        let (upsert_status, revoke_status): (String, String) = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT
+                    (SELECT status FROM share_control_operations
+                     WHERE subscription_id = ?1 AND action = 'upsert'),
+                    (SELECT status FROM share_control_operations
+                     WHERE subscription_id = ?1 AND action = 'revoke')",
+                params![subscription_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read control ops after force revoke");
+        assert_eq!(upsert_status, "rejected");
+        assert_eq!(revoke_status, "pending");
+        assert_eq!(
+            store
+                .share_market_reconcile_and_dispatch(now + Duration::seconds(1))
+                .await
+                .expect("dispatch revoke after retiring stuck grant")
+                .len(),
+            1
+        );
+        let revoke_edit: String = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT edit_id FROM share_control_operations
+                 WHERE subscription_id = ?1 AND action = 'revoke'",
+                params![subscription_id],
+                |row| row.get(0),
+            )
+            .expect("read dispatched revoke edit");
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE share_edit_requests SET status = 'applied' WHERE id = ?1",
+                params![revoke_edit],
+            )
+            .expect("mark revoke applied");
+            handle_control_edit_ack(
+                &conn,
+                &revoke_edit,
+                "applied",
+                None,
+                &(now + Duration::seconds(2)).to_rfc3339(),
+            )
+            .expect("ack revoke");
+        }
+        store
+            .share_market_reconcile_and_dispatch(now + Duration::seconds(3))
+            .await
+            .expect("finish after revoke ack");
         assert_eq!(
             subscription_status(&store, &subscription_id).await,
             SUB_RELEASED
