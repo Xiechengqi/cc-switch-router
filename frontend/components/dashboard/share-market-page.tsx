@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useSearchParams } from "next/navigation";
 import { Button, Checkbox, Dropdown, Modal, toast } from "@heroui/react";
 import {
   Ban,
@@ -59,7 +59,7 @@ import {
   rentShareMarketSeat,
   updateShareMarketSeat,
 } from "@/lib/api";
-import { DASHBOARD_SHARE_MARKET_PATH, type ShareMarketTabParam } from "@/lib/dashboard-nav";
+import type { ShareMarketTabParam } from "@/lib/dashboard-nav";
 import { formatBillingCountdown } from "@/lib/billing-urgency";
 import { usePersistentState } from "@/lib/use-persistent-state";
 import type {
@@ -104,6 +104,38 @@ const TOKEN_PERIODS: ShareTokenPeriod[] = [
   "calendarMonth",
   "thirtyDays",
 ];
+
+function marketTabFromParam(value: string | null): MarketTab {
+  return value === "mine" || value === "rentals" || value === "all" ? value : "all";
+}
+
+function replaceMarketQuery(tab: MarketTab, focusShareId: string) {
+  const url = new URL(window.location.href);
+  url.searchParams.set("tab", tab);
+  if (focusShareId) url.searchParams.set("focus", focusShareId);
+  else url.searchParams.delete("focus");
+  window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
+}
+
+function canOpenSharePayment(subscription: ShareMarketSubscription) {
+  return subscription.canDeclarePaid
+    || (
+      subscription.canRelease
+      && subscription.status === "grant_pending"
+      && subscription.priceMinor != null
+    );
+}
+
+function sharePaymentDeadline(subscription: ShareMarketSubscription, trialHours: number) {
+  const authoritative = subscription.paymentDeadline || subscription.openInvoice?.deadlineAt;
+  if (authoritative || subscription.status !== "grant_pending" || subscription.priceMinor == null) {
+    return authoritative;
+  }
+  if (!Number.isFinite(trialHours) || trialHours <= 0) return undefined;
+  const createdAt = Date.parse(subscription.createdAt);
+  if (!Number.isFinite(createdAt)) return undefined;
+  return new Date(createdAt + trialHours * 60 * 60 * 1_000).toISOString();
+}
 
 function emptySeat(supportedPeriods: ShareTokenPeriod[] = TOKEN_PERIODS): SeatDraft {
   return {
@@ -858,10 +890,20 @@ function PaymentDialog({
   const [confirmed, setConfirmed] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
-  React.useEffect(() => { setConfirmed(false); setError(""); }, [subscription?.id]);
   const invoice = subscription?.openInvoice;
   const paymentMethods = subscription?.paymentMethods || [];
   const hasPaymentMethods = paymentMethods.length > 0;
+  const confirmationRevision = [
+    subscription?.id,
+    invoice?.id,
+    invoice?.amountMinor,
+    subscription?.offerRevision,
+    subscription?.paymentProfileUpdatedAt,
+  ].join(":");
+  React.useEffect(() => {
+    setConfirmed(false);
+    setError("");
+  }, [confirmationRevision]);
   const submit = async () => {
     if (!subscription || !invoice || !subscription.paymentProfileUpdatedAt) return;
     setBusy(true);
@@ -893,12 +935,18 @@ function PaymentDialog({
                 <strong className="text-lg">{(invoice.amountMinor / 100).toFixed(2)} {invoice.currency}</strong>
               </div>
             ) : null}
+            {subscription && !invoice ? (
+              <div className="flex items-center gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
+                <span>{t("shareMarket.paymentPreparing")}</span>
+              </div>
+            ) : null}
             <div className="grid gap-3">
               <ProviderContactsList contacts={subscription?.contacts} />
               <ProviderPaymentMethodsList paymentMethods={paymentMethods} />
               {!hasPaymentMethods ? <p className="text-sm text-slate-500">{t("shareMarket.noPaymentMethods")}</p> : null}
             </div>
-            <Checkbox isSelected={confirmed} onChange={setConfirmed}>
+            <Checkbox isDisabled={!invoice} isSelected={confirmed} onChange={setConfirmed}>
               <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
               <Checkbox.Content><span className="text-sm text-slate-700">{t("shareMarket.confirmPaid")}</span></Checkbox.Content>
             </Checkbox>
@@ -918,15 +966,17 @@ function PaymentDialog({
 
 function SharePaymentAction({
   subscription,
+  trialHours,
   onPay,
 }: {
   subscription: ShareMarketSubscription;
+  trialHours: number;
   onPay: () => void;
 }) {
   const { locale, t } = useLocaleText();
   const [, refreshCountdown] = React.useState(0);
   const countdownId = React.useId();
-  const deadline = subscription.paymentDeadline || subscription.openInvoice?.deadlineAt;
+  const deadline = sharePaymentDeadline(subscription, trialHours);
 
   React.useEffect(() => {
     if (!deadline) return;
@@ -958,16 +1008,13 @@ function SharePaymentAction({
 export function ShareMarketPage() {
   const { t, locale } = useLocaleText();
   const { session, loading: authLoading } = useAuth();
-  const router = useRouter();
   const searchParams = useSearchParams();
   const authed = !!session?.authenticated;
   const [catalog, setCatalog] = React.useState<ShareMarketCatalog | null>(null);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState("");
-  const tabParam = searchParams.get("tab");
-  const tab: MarketTab =
-    tabParam === "mine" || tabParam === "rentals" || tabParam === "all" ? tabParam : "all";
-  const focusShareId = searchParams.get("focus") || "";
+  const [tab, setTabState] = React.useState<MarketTab>(() => marketTabFromParam(searchParams.get("tab")));
+  const [focusShareId, setFocusShareId] = React.useState(() => searchParams.get("focus") || "");
   const [layout, setLayoutState] = React.useState<MarketLayout>("seats");
   const [expandedSeatIds, setExpandedSeatIds] = React.useState<Set<string>>(() => new Set());
   const [query, setQuery] = React.useState("");
@@ -978,13 +1025,23 @@ export function ShareMarketPage() {
   const [sortPrefs, setSortPrefs] = usePersistentState<SeatSortPrefs>(SORT_PREFS_KEY, CLEARED_SEAT_SORT);
   const [addOpen, setAddOpen] = React.useState(false);
   const [seatDialog, setSeatDialog] = React.useState<{ listingId: string; seat?: ShareMarketSeat; supportedPeriods?: ShareTokenPeriod[] } | null>(null);
-  const [payment, setPayment] = React.useState<ShareMarketSubscription | null>(null);
+  const [paymentSubscriptionId, setPaymentSubscriptionId] = React.useState("");
   const [confirmAction, setConfirmAction] = React.useState<ConfirmAction | null>(null);
   const [busyId, setBusyId] = React.useState("");
   const focusedRef = React.useRef<string>("");
 
   React.useEffect(() => {
     setLayoutState(readStoredLayout());
+  }, []);
+
+  React.useEffect(() => {
+    const syncFromHistory = () => {
+      const params = new URLSearchParams(window.location.search);
+      setTabState(marketTabFromParam(params.get("tab")));
+      setFocusShareId(params.get("focus") || "");
+    };
+    window.addEventListener("popstate", syncFromHistory);
+    return () => window.removeEventListener("popstate", syncFromHistory);
   }, []);
 
   const setLayout = React.useCallback((next: MarketLayout) => {
@@ -994,23 +1051,21 @@ export function ShareMarketPage() {
 
   const setTab = React.useCallback(
     (next: MarketTab) => {
-      const params = new URLSearchParams(searchParams.toString());
-      params.set("tab", next);
-      router.replace(`${DASHBOARD_SHARE_MARKET_PATH}?${params.toString()}`, { scroll: false });
+      setTabState(next);
+      replaceMarketQuery(next, focusShareId);
     },
-    [router, searchParams],
+    [focusShareId],
   );
 
   const openShareManage = React.useCallback(
     (shareId: string) => {
       setLayout("shares");
       focusedRef.current = "";
-      const params = new URLSearchParams(searchParams.toString());
-      params.set("tab", "mine");
-      params.set("focus", shareId);
-      router.replace(`${DASHBOARD_SHARE_MARKET_PATH}?${params.toString()}`, { scroll: false });
+      setTabState("mine");
+      setFocusShareId(shareId);
+      replaceMarketQuery("mine", shareId);
     },
-    [router, searchParams, setLayout],
+    [setLayout],
   );
 
   const load = React.useCallback(async (silent = false) => {
@@ -1026,12 +1081,27 @@ export function ShareMarketPage() {
   }, []);
 
   React.useEffect(() => { void load(); }, [load, session?.user?.id]);
+  const paymentSubscription = React.useMemo(
+    () => catalog?.mySubscriptions.find((subscription) => subscription.id === paymentSubscriptionId) || null,
+    [catalog, paymentSubscriptionId],
+  );
   React.useEffect(() => {
+    if (!paymentSubscriptionId || !catalog) return;
+    if (!paymentSubscription || !canOpenSharePayment(paymentSubscription)) {
+      setPaymentSubscriptionId("");
+    }
+  }, [catalog, paymentSubscription, paymentSubscriptionId]);
+  React.useEffect(() => {
+    const waitingForPayment = !!paymentSubscription
+      && paymentSubscription.status === "grant_pending"
+      && !paymentSubscription.openInvoice;
     const timer = window.setInterval(() => {
-      if (!addOpen && !seatDialog && !payment && !confirmAction && !busyId) void load(true);
-    }, 5_000);
+      if (waitingForPayment || (!addOpen && !seatDialog && !paymentSubscriptionId && !confirmAction && !busyId)) {
+        void load(true);
+      }
+    }, waitingForPayment ? 1_000 : 5_000);
     return () => window.clearInterval(timer);
-  }, [addOpen, busyId, confirmAction, load, payment, seatDialog]);
+  }, [addOpen, busyId, confirmAction, load, paymentSubscription, paymentSubscriptionId, seatDialog]);
 
   const act = async (id: string, action: () => Promise<unknown>) => {
     if (busyId) return;
@@ -1237,7 +1307,13 @@ export function ShareMarketPage() {
             <ExternalLink className="h-4 w-4" />{t("shareMarket.openShare")}
           </Button>
         ) : null}
-        {!ownerView && subscription.canDeclarePaid ? <SharePaymentAction subscription={subscription} onPay={() => setPayment(subscription)} /> : null}
+        {!ownerView && canOpenSharePayment(subscription) ? (
+          <SharePaymentAction
+            subscription={subscription}
+            trialHours={catalog?.trialHours || 0}
+            onPay={() => setPaymentSubscriptionId(subscription.id)}
+          />
+        ) : null}
         {!ownerView && subscription.canRelease ? <Button size="sm" variant="outline" isDisabled={!!busyId} onClick={() => setConfirmAction({ id: subscription.id, title: t("shareMarket.confirm.releaseTitle"), description: t("shareMarket.confirm.releaseDescription", { share: subscription.shareName }), confirmLabel: t("shareMarket.release"), tone: "warning", run: () => releaseShareMarketSubscription(subscription.id) })}><RotateCcw className="h-4 w-4" />{t("shareMarket.release")}</Button> : null}
         {ownerView && subscription.canForceRevoke ? (
           <>
@@ -1281,8 +1357,12 @@ export function ShareMarketPage() {
             {t("nav.login")}
           </Button>
         ) : null}
-        {subscription?.canDeclarePaid ? (
-          <SharePaymentAction subscription={subscription} onPay={() => setPayment(subscription)} />
+        {subscription && canOpenSharePayment(subscription) ? (
+          <SharePaymentAction
+            subscription={subscription}
+            trialHours={catalog?.trialHours || 0}
+            onPay={() => setPaymentSubscriptionId(subscription.id)}
+          />
         ) : null}
         {subscription?.canRelease ? (
           <Button
@@ -1818,7 +1898,11 @@ export function ShareMarketPage() {
       />
       <AddListingDialog open={addOpen} onOpenChange={setAddOpen} onSaved={() => void load(true)} />
       <SeatDialog open={!!seatDialog} listingId={seatDialog?.listingId || ""} seat={seatDialog?.seat} supportedPeriods={seatDialog?.supportedPeriods} onOpenChange={(next) => !next && setSeatDialog(null)} onSaved={() => void load(true)} />
-      <PaymentDialog subscription={payment} onClose={() => setPayment(null)} onPaid={() => void load(true)} />
+      <PaymentDialog
+        subscription={paymentSubscription}
+        onClose={() => setPaymentSubscriptionId("")}
+        onPaid={() => void load(true)}
+      />
       <ConfirmAlertDialog
         open={!!confirmAction}
         title={confirmAction?.title || ""}
