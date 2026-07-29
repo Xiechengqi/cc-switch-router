@@ -630,8 +630,8 @@ function guestCanSeeAvailable(listing: ShareMarketListing, seat: ShareMarketSeat
   return listing.status === "active" && listing.shareStatus === "active" && seat.status === "available";
 }
 
-/** Share-view rent CTA: trust canRent, and always offer free available seats to non-owners. */
-function shareSeatRentAction(
+/** Rent/login CTA for non-owners on available seats (same rules in seats + Share layouts). */
+function seatRentAction(
   listing: ShareMarketListing,
   seat: ShareMarketSeat,
   authed: boolean,
@@ -640,9 +640,9 @@ function shareSeatRentAction(
   if (listing.status !== "active" || seat.status !== "available") return null;
   if (seat.canRent) return "rent";
   if (!authed && guestCanSeeAvailable(listing, seat)) return "login";
-  // Free seats are hidden from the seats browse layout; Share view must still expose rent.
-  const freeSeat = seat.isFree || seat.priceMinor == null;
-  if (freeSeat) return authed ? "rent" : "login";
+  // canRent can lag false while the seat is clearly open; still offer rent/login
+  // and let the API enforce block / already-renting / direct-grant rules.
+  if (listing.shareStatus === "active") return authed ? "rent" : "login";
   return null;
 }
 
@@ -718,15 +718,8 @@ function buildSeatRows(
   const rows: SeatTableRow[] = [];
   for (const listing of listings) {
     for (const seat of listing.seats) {
-      if (tab === "mine") {
-        rows.push({ key: seat.id, listing, seat, subscription: seat.subscription });
-        continue;
-      }
-      const mineRelated = !!seat.subscription && isMineRelatedSubscription(seat.subscription.status);
-      const rentable = seat.canRent || (!authed && guestCanSeeAvailable(listing, seat));
-      if (rentable || mineRelated) {
-        rows.push({ key: seat.id, listing, seat, subscription: seat.subscription });
-      }
+      // Seats and Share layouts share the same catalog content; only the presentation differs.
+      rows.push({ key: seat.id, listing, seat, subscription: seat.subscription });
     }
   }
 
@@ -1038,8 +1031,6 @@ export function ShareMarketPage() {
     });
     const normalized = query.trim().toLocaleLowerCase();
     const filtered = rows.filter((row) => {
-      // Seats layout is a paid marketplace browse; free seats stay in Share view only.
-      if (row.seat.isFree) return false;
       if (normalized && !row.searchText.includes(normalized)) return false;
       if (onlineFilters.length) {
         const onlineKey = row.listing.shareOnline ? "online" : "offline";
@@ -1077,7 +1068,6 @@ export function ShareMarketPage() {
   const shareOptions = React.useMemo(() => {
     const names = new Set<string>();
     for (const row of buildSeatRows(catalog, tab, authed)) {
-      if (row.seat.isFree) continue;
       names.add(row.listing.shareName || row.listing.shareId);
     }
     return Array.from(names)
@@ -1087,7 +1077,6 @@ export function ShareMarketPage() {
   const statusOptions = React.useMemo(() => {
     const keys = new Set<string>();
     for (const row of buildSeatRows(catalog, tab, authed)) {
-      if (row.seat.isFree) continue;
       keys.add(row.subscription?.status || row.seat.status);
     }
     return Array.from(keys)
@@ -1100,7 +1089,6 @@ export function ShareMarketPage() {
   const ownerOptions = React.useMemo(() => {
     const emails = new Set<string>();
     for (const row of buildSeatRows(catalog, tab, authed)) {
-      if (row.seat.isFree) continue;
       if (row.listing.ownerEmail) emails.add(row.listing.ownerEmail);
     }
     return Array.from(emails)
@@ -1298,7 +1286,7 @@ export function ShareMarketPage() {
           <thead className="bg-slate-50 text-xs font-medium text-slate-500"><tr><th className="px-4 py-2.5">{t("shareMarket.dialog.seats")}</th><th className="px-3 py-2.5">{t("shareMarket.parallel")}</th><th className="px-3 py-2.5">{t("shareMarket.tokens")}</th><th className="px-3 py-2.5">{t("shareMarket.dialog.amount")}</th><th className="px-3 py-2.5">{t("shareMarket.status")}</th><th className="px-4 py-2.5 text-right">{t("common.actions")}</th></tr></thead>
           <tbody>
             {listing.seats.map((seat) => {
-              const rentAction = shareSeatRentAction(listing, seat, authed);
+              const rentAction = seatRentAction(listing, seat, authed);
               return (
               <React.Fragment key={seat.id}>
                 <tr className="border-t border-slate-100 first:border-0">
@@ -1521,25 +1509,32 @@ export function ShareMarketPage() {
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex justify-end gap-1">
-                        {seat.canRent ? (
-                          <Button
-                            size="sm"
-                            variant="primary"
-                            isDisabled={!!busyId}
-                            onClick={() => {
-                              if (!listing.shareOnline) toast.info(t("shareMarket.rentOfflineHint"));
-                              void act(seat.id, () => rentShareMarketSeat(seat.id, seat.offerRevision));
-                            }}
-                          >
-                            {busyId === seat.id ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                            {t("shareMarket.rent")}
-                          </Button>
-                        ) : null}
-                        {!authed && guestCanSeeAvailable(listing, seat) ? (
-                          <Button size="sm" variant="outline" onClick={() => window.dispatchEvent(new Event("router-open-login"))}>
-                            {t("nav.login")}
-                          </Button>
-                        ) : null}
+                        {(() => {
+                          const rentAction = seatRentAction(listing, seat, authed);
+                          return (
+                            <>
+                              {rentAction === "rent" ? (
+                                <Button
+                                  size="sm"
+                                  variant="primary"
+                                  isDisabled={!!busyId}
+                                  onClick={() => {
+                                    if (!listing.shareOnline) toast.info(t("shareMarket.rentOfflineHint"));
+                                    void act(seat.id, () => rentShareMarketSeat(seat.id, seat.offerRevision));
+                                  }}
+                                >
+                                  {busyId === seat.id ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                                  {t("shareMarket.rent")}
+                                </Button>
+                              ) : null}
+                              {rentAction === "login" ? (
+                                <Button size="sm" variant="outline" onClick={() => window.dispatchEvent(new Event("router-open-login"))}>
+                                  {t("nav.login")}
+                                </Button>
+                              ) : null}
+                            </>
+                          );
+                        })()}
                         {subscription?.canDeclarePaid ? (
                           <Button size="sm" variant="primary" onClick={() => setPayment(subscription)}>
                             {t("shareMarket.declarePaid")}
@@ -1563,6 +1558,66 @@ export function ShareMarketPage() {
                           >
                             <RotateCcw className="h-4 w-4" />
                             {t("shareMarket.release")}
+                          </Button>
+                        ) : null}
+                        {listing.isOwner && seat.status === "available" ? (
+                          <Button
+                            isIconOnly
+                            size="sm"
+                            variant="ghost"
+                            aria-label={t("common.edit")}
+                            onClick={() =>
+                              setSeatDialog({
+                                listingId: listing.id,
+                                seat,
+                                supportedPeriods: listing.supportedUserTokenPeriods,
+                              })
+                            }
+                          >
+                            <Pencil className="h-4 w-4" />
+                          </Button>
+                        ) : null}
+                        {listing.isOwner ? (
+                          <Button
+                            isIconOnly
+                            size="sm"
+                            variant="ghost"
+                            aria-label={t("shareMarket.copySeat")}
+                            isDisabled={!!busyId}
+                            onClick={() =>
+                              void act(`copy-${seat.id}`, () =>
+                                addShareMarketSeat(listing.id, seatInput(draftFromSeat(seat), t)),
+                              )
+                            }
+                          >
+                            {busyId === `copy-${seat.id}` ? (
+                              <Loader2 className="h-4 w-4 animate-spin" />
+                            ) : (
+                              <Copy className="h-4 w-4" />
+                            )}
+                          </Button>
+                        ) : null}
+                        {listing.isOwner && (seat.status === "available" || seat.status === "disabled") ? (
+                          <Button
+                            isIconOnly
+                            size="sm"
+                            variant="ghost"
+                            aria-label={t("shareMarket.deleteSeat")}
+                            isDisabled={!!busyId}
+                            onClick={() =>
+                              setConfirmAction({
+                                id: seat.id,
+                                title: t("shareMarket.confirm.deleteTitle"),
+                                description: t("shareMarket.confirm.deleteDescription", {
+                                  position: seat.position,
+                                }),
+                                confirmLabel: t("shareMarket.deleteSeat"),
+                                tone: "danger",
+                                run: () => deleteShareMarketSeat(seat.id),
+                              })
+                            }
+                          >
+                            <Trash2 className="h-4 w-4 text-red-600" />
                           </Button>
                         ) : null}
                         {listing.isOwner ? (
@@ -1664,21 +1719,60 @@ export function ShareMarketPage() {
         </section>
       ) : null}
 
-      {tab === "mine" && authed ? (
-        <section className="border-t border-slate-200 pt-5">
-          <div className="mb-3 flex items-center gap-2"><UserRoundX className="h-4 w-4 text-slate-500" /><h2 className="text-sm font-semibold">{t("shareMarket.blocks")}</h2></div>
-          <div className="rounded-md border border-slate-200 bg-white px-4">
-            {(catalog?.ownerBlocks || []).map((block) => (
-              <div key={block.blockedUserId} className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 py-3 last:border-0">
-                <div>
-                  <div className="text-sm font-medium">{block.blockedEmail}</div>
-                  {block.reason ? <div className="text-xs text-slate-500">{block.reason === "owner_force_revoke" ? t("shareMarket.ownerRevokeReason") : block.reason}</div> : null}
-                </div>
-                <Button size="sm" variant="outline" isDisabled={!!busyId} onClick={() => void act(block.blockedUserId, () => liftShareMarketBlock(block.blockedUserId))}>{t("shareMarket.unblock")}</Button>
-              </div>
-            ))}
-            {catalog && catalog.ownerBlocks.length === 0 ? <p className="py-5 text-sm text-slate-500">{t("shareMarket.noBlocks")}</p> : null}
+      {authed && ((catalog?.listings || []).some((listing) => listing.isOwner) || (catalog?.ownerBlocks || []).length > 0) ? (
+        <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-3 rounded-xl border border-border bg-card p-4 shadow-sm">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <UserRoundX className="h-4 w-4 text-muted-foreground" />
+              <h2 className="text-sm font-semibold">
+                {t("shareMarket.blocks")}
+                {(catalog?.ownerBlocks || []).length ? ` · ${catalog!.ownerBlocks.length}` : ""}
+              </h2>
+            </div>
+            <p className="mt-0.5 text-xs text-muted-foreground">{t("shareMarket.blocksHint")}</p>
           </div>
+          {(catalog?.ownerBlocks || []).length === 0 ? (
+            <p className="py-1 text-xs text-muted-foreground">{t("shareMarket.noBlocks")}</p>
+          ) : (
+            <div className="overflow-x-auto rounded-md border border-border">
+              <table className="min-w-full text-left text-sm">
+                <thead className="bg-muted/40 text-xs text-muted-foreground">
+                  <tr>
+                    <th className="px-3 py-2 font-medium">{t("shareMarket.blocksCol.email")}</th>
+                    <th className="px-3 py-2 font-medium">{t("shareMarket.blocksCol.reason")}</th>
+                    <th className="px-3 py-2 font-medium">{t("shareMarket.blocksCol.since")}</th>
+                    <th className="px-3 py-2 font-medium">{t("common.actions")}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(catalog?.ownerBlocks || []).map((block) => (
+                    <tr key={block.blockedUserId} className="border-t border-border/80">
+                      <td className="max-w-[18rem] truncate px-3 py-2 font-medium" title={block.blockedEmail}>
+                        {block.blockedEmail}
+                      </td>
+                      <td className="whitespace-nowrap px-3 py-2 text-muted-foreground">
+                        {block.reason === "owner_force_revoke" ? t("shareMarket.ownerRevokeReason") : block.reason.replaceAll("_", " ")}
+                      </td>
+                      <td className="whitespace-nowrap px-3 py-2 text-muted-foreground">
+                        {date(block.createdAt)}
+                      </td>
+                      <td className="px-3 py-2">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          isDisabled={!!busyId}
+                          onClick={() => void act(block.blockedUserId, () => liftShareMarketBlock(block.blockedUserId))}
+                        >
+                          {busyId === block.blockedUserId ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                          {t("shareMarket.unblock")}
+                        </Button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </section>
       ) : null}
       <AddListingDialog open={addOpen} onOpenChange={setAddOpen} onSaved={() => void load(true)} />

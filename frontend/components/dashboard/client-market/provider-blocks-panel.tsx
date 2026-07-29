@@ -17,8 +17,15 @@ function blockReasonLabel(reason: string, t: ReturnType<typeof useLocaleText>["t
   return reason.replaceAll("_", " ");
 }
 
-/** Provider-owned blocklist of Client owners — lives on Client Market, not Account payments. */
-export function ProviderBlocksPanel({ enabled }: { enabled: boolean }) {
+/** Provider-owned user blacklist — lives on Client Market, not Account payments. */
+export function ProviderBlocksPanel({
+  enabled,
+  hosting = false,
+}: {
+  enabled: boolean;
+  /** True when the viewer currently hosts at least one Client Market host. */
+  hosting?: boolean;
+}) {
   const { locale, t } = useLocaleText();
   const [blocks, setBlocks] = React.useState<ClientMarketProviderBlock[]>([]);
   const [loading, setLoading] = React.useState(false);
@@ -78,6 +85,8 @@ export function ProviderBlocksPanel({ enabled }: { enabled: boolean }) {
   };
 
   if (!enabled) return null;
+  // Only providers who host (or still have leftover blocks) see this panel.
+  if (!hosting && !loading && !blocks.length) return null;
 
   return (
     <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-3 rounded-xl border border-border bg-card p-4 shadow-sm">

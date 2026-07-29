@@ -1017,7 +1017,10 @@ export function ClientMarketPage() {
         </Modal.Container>
       </Modal.Backdrop>
 
-      <ProviderBlocksPanel enabled={authed} />
+      <ProviderBlocksPanel
+        enabled={authed}
+        hosting={hosts.some((host) => hostBelongsToViewer(host) || host.isHostOwner === true)}
+      />
     </div>
   );
 }
