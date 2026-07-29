@@ -63,6 +63,7 @@ import type {
   ClientMarketProviderBlock,
   ShareMarketCatalog,
   ShareMarketOwnedShare,
+  ShareMarketOwnerBlock,
   ShareMarketSeatInput,
 } from "@/lib/types";
 
@@ -981,6 +982,16 @@ export async function forceRevokeShareMarketSubscription(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(input),
+    }),
+  );
+}
+
+export async function createShareMarketBlock(body: { email: string; reason?: string }) {
+  return parseJson<ShareMarketOwnerBlock>(
+    await authFetch("/v1/share-market/blocks", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
     }),
   );
 }

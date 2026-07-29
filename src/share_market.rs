@@ -221,6 +221,14 @@ pub struct ForceRevokeRequest {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateOwnerBlockRequest {
+    pub email: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct NormalizedSeat {
     parallel_limit: Option<u32>,
@@ -417,7 +425,10 @@ pub fn router() -> Router<ServerState> {
             "/v1/share-market/subscriptions/:id/force-revoke",
             post(force_revoke_subscription),
         )
-        .route("/v1/share-market/blocks", get(list_owner_blocks))
+        .route(
+            "/v1/share-market/blocks",
+            get(list_owner_blocks).post(create_owner_block),
+        )
         .route("/v1/share-market/blocks/:user_id", delete(lift_owner_block))
 }
 
@@ -2493,6 +2504,78 @@ impl AppStore {
         Ok(())
     }
 
+    pub async fn share_market_create_block(
+        &self,
+        session: &AuthSession,
+        email: &str,
+        reason: Option<&str>,
+    ) -> Result<OwnerBlockView, AppError> {
+        let email = {
+            let value = email.trim().to_ascii_lowercase();
+            if value.is_empty()
+                || value.len() > 320
+                || value.chars().any(char::is_control)
+                || !value.contains('@')
+            {
+                return Err(AppError::BadRequest("invalid account email".into()));
+            }
+            value
+        };
+        if email.eq_ignore_ascii_case(session.email.trim()) {
+            return Err(AppError::BadRequest(
+                "cannot block your own account".into(),
+            ));
+        }
+        let reason = reason
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("manual");
+        if reason.len() > 64
+            || !reason
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        {
+            return Err(AppError::BadRequest(
+                "block reason must be a short ascii token".into(),
+            ));
+        }
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock().await;
+        let blocked_user_id: String = conn
+            .query_row(
+                "SELECT id FROM users WHERE email_normalized = ?1",
+                params![email],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(map_db("lookup blocked Share Market user"))?
+            .ok_or_else(|| AppError::NotFound("no Router account found for that email".into()))?;
+        if blocked_user_id == session.user_id {
+            return Err(AppError::BadRequest(
+                "cannot block your own account".into(),
+            ));
+        }
+        let tx = conn
+            .transaction()
+            .map_err(map_db("begin create Share Market block"))?;
+        block_owner_user_tx(
+            &tx,
+            &session.user_id,
+            &blocked_user_id,
+            &email,
+            reason,
+            &now,
+        )?;
+        tx.commit()
+            .map_err(map_db("commit create Share Market block"))?;
+        Ok(OwnerBlockView {
+            blocked_user_id,
+            blocked_email: email,
+            reason: reason.to_string(),
+            created_at: now,
+        })
+    }
+
     pub async fn share_market_lift_block(
         &self,
         session: &AuthSession,
@@ -2589,6 +2672,20 @@ async fn list_owner_blocks(
     let session = require_session(&state, &headers).await?;
     let conn = state.store.conn.lock().await;
     Ok(Json(owner_blocks_for(&conn, &session.user_id)?))
+}
+
+async fn create_owner_block(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<CreateOwnerBlockRequest>,
+) -> Result<Json<OwnerBlockView>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    Ok(Json(
+        state
+            .store
+            .share_market_create_block(&session, &input.email, input.reason.as_deref())
+            .await?,
+    ))
 }
 
 async fn lift_owner_block(

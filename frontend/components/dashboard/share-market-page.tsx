@@ -26,6 +26,7 @@ import { CompactSelect } from "@/components/common/compact-select";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
 import { ProviderContactButton, ProviderContactsList } from "@/components/common/provider-contacts";
+import { UserBlacklistPanel } from "@/components/common/user-blacklist-panel";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import { SeatSortHeader } from "@/components/dashboard/share-market/seat-sort-header";
 import {
@@ -47,6 +48,7 @@ import {
   forceRevokeShareMarketSubscription,
   getShareMarketCatalog,
   getShareMarketOwnedShares,
+  createShareMarketBlock,
   liftShareMarketBlock,
   releaseShareMarketSubscription,
   rentShareMarketSeat,
@@ -1719,62 +1721,42 @@ export function ShareMarketPage() {
         </section>
       ) : null}
 
-      {authed && ((catalog?.listings || []).some((listing) => listing.isOwner) || (catalog?.ownerBlocks || []).length > 0) ? (
-        <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-3 rounded-xl border border-border bg-card p-4 shadow-sm">
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <UserRoundX className="h-4 w-4 text-muted-foreground" />
-              <h2 className="text-sm font-semibold">
-                {t("shareMarket.blocks")}
-                {(catalog?.ownerBlocks || []).length ? ` · ${catalog!.ownerBlocks.length}` : ""}
-              </h2>
-            </div>
-            <p className="mt-0.5 text-xs text-muted-foreground">{t("shareMarket.blocksHint")}</p>
-          </div>
-          {(catalog?.ownerBlocks || []).length === 0 ? (
-            <p className="py-1 text-xs text-muted-foreground">{t("shareMarket.noBlocks")}</p>
-          ) : (
-            <div className="overflow-x-auto rounded-md border border-border">
-              <table className="min-w-full text-left text-sm">
-                <thead className="bg-muted/40 text-xs text-muted-foreground">
-                  <tr>
-                    <th className="px-3 py-2 font-medium">{t("shareMarket.blocksCol.email")}</th>
-                    <th className="px-3 py-2 font-medium">{t("shareMarket.blocksCol.reason")}</th>
-                    <th className="px-3 py-2 font-medium">{t("shareMarket.blocksCol.since")}</th>
-                    <th className="px-3 py-2 font-medium">{t("common.actions")}</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {(catalog?.ownerBlocks || []).map((block) => (
-                    <tr key={block.blockedUserId} className="border-t border-border/80">
-                      <td className="max-w-[18rem] truncate px-3 py-2 font-medium" title={block.blockedEmail}>
-                        {block.blockedEmail}
-                      </td>
-                      <td className="whitespace-nowrap px-3 py-2 text-muted-foreground">
-                        {block.reason === "owner_force_revoke" ? t("shareMarket.ownerRevokeReason") : block.reason.replaceAll("_", " ")}
-                      </td>
-                      <td className="whitespace-nowrap px-3 py-2 text-muted-foreground">
-                        {date(block.createdAt)}
-                      </td>
-                      <td className="px-3 py-2">
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          isDisabled={!!busyId}
-                          onClick={() => void act(block.blockedUserId, () => liftShareMarketBlock(block.blockedUserId))}
-                        >
-                          {busyId === block.blockedUserId ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                          {t("shareMarket.unblock")}
-                        </Button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </section>
-      ) : null}
+      <UserBlacklistPanel
+        enabled={authed}
+        hosting={(catalog?.listings || []).some((listing) => listing.isOwner)}
+        entries={(catalog?.ownerBlocks || []).map((block) => ({
+          id: block.blockedUserId,
+          email: block.blockedEmail,
+          reason: block.reason,
+          createdAt: block.createdAt,
+        }))}
+        hint={t("shareMarket.blocksHint")}
+        empty={t("shareMarket.noBlocks")}
+        reasonLabel={(reason) =>
+          reason === "owner_force_revoke" || reason === "manual"
+            ? reason === "manual"
+              ? t("clientMarket.blockReason.manual")
+              : t("shareMarket.ownerRevokeReason")
+            : reason.replaceAll("_", " ")
+        }
+        onAdd={async (emails) => {
+          for (const email of emails) {
+            await createShareMarketBlock({ email, reason: "manual" });
+          }
+          if (emails.length === 1) {
+            toast.success(t("shareMarket.blockedAddedToast", { email: emails[0] }));
+          } else {
+            toast.success(t("shareMarket.blockedAddedCountToast", { count: emails.length }));
+          }
+          await load(true);
+        }}
+        onLift={async (id) => {
+          const target = (catalog?.ownerBlocks || []).find((block) => block.blockedUserId === id);
+          await liftShareMarketBlock(id);
+          if (target) toast.success(t("shareMarket.unblockedToast", { email: target.blockedEmail }));
+          await load(true);
+        }}
+      />
       <AddListingDialog open={addOpen} onOpenChange={setAddOpen} onSaved={() => void load(true)} />
       <SeatDialog open={!!seatDialog} listingId={seatDialog?.listingId || ""} seat={seatDialog?.seat} supportedPeriods={seatDialog?.supportedPeriods} onOpenChange={(next) => !next && setSeatDialog(null)} onSaved={() => void load(true)} />
       <PaymentDialog subscription={payment} onClose={() => setPayment(null)} onPaid={() => void load(true)} />
