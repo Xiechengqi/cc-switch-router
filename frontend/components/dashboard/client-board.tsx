@@ -45,6 +45,7 @@ import { CompactSelect } from "@/components/common/compact-select";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { useClientChat } from "@/components/chat/client-chat";
 import { useAuth } from "@/components/auth/auth-provider";
+import { clientMarketMineHref } from "@/lib/dashboard-nav";
 
 function sortShares(shares: ShareView[]) {
   return [...shares].sort((left, right) => {
@@ -393,7 +394,14 @@ function ClientCard({
             </div>
             <div className="flex min-w-0 flex-wrap items-center gap-2 pl-4">
               <OperationalStatusPill summary={summary} />
-              <ClientMarketBillingBanner billing={billing} onChanged={onBillingChanged} />
+              <ClientMarketBillingBanner
+                billing={billing}
+                onChanged={onBillingChanged}
+                readOnly
+                resumeRelease={false}
+                showPayButton={false}
+                manageHref={billing ? clientMarketMineHref(billing.installationId) : undefined}
+              />
               {tunnelUrl ? <ClientConsoleButton client={client} /> : null}
               <ClientUpgradeButton client={client} />
               <ClientDetailsButton onOpen={openClientDrawer} />

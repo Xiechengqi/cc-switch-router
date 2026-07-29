@@ -64,9 +64,7 @@ use crate::models::{
     SessionStatusResponse, ShareApiAuthResponse, ShareApiAuthUser, ShareApiContextResponse,
     ShareApiShareResponse, ShareBatchSyncRequest, ShareClaimSubdomainRequest, ShareDeleteRequest,
     ShareEditAckRequest, ShareEditAvailableEvent, ShareEditEventSignaturePayload,
-    ShareHeartbeatRequest, ShareMarketGrantRequest, ShareMarketGrantResponse,
-    ShareMarketGrantStatusResponse, ShareMarketListingStatusSyncRequest,
-    ShareMarketListingStatusSyncResponse, SharePendingEditsRequest, SharePruneRequest,
+    ShareHeartbeatRequest, SharePendingEditsRequest, SharePruneRequest,
     ShareRequestLogBatchSyncRequest, ShareRequestLogEntry, ShareRuntimeRefreshRequest,
     ShareSettingsPatch, ShareSettingsUpdateRequest, ShareSyncRequest,
     SubdomainAvailabilityResponse, TunnelActivateRequest, TunnelStateRequest, TunnelStateResponse,
@@ -233,6 +231,7 @@ pub fn router(state: ServerState) -> Router {
         .merge(crate::client_market::router())
         .merge(crate::client_market_trade::router())
         .merge(crate::client_market_terminal::router())
+        .merge(crate::share_market::router())
         .route("/", any(root_handler))
         .route("/install-client.sh", get(install_client_script))
         .route("/favicon.ico", get(favicon))
@@ -241,19 +240,6 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/markets", get(markets))
         .route("/v1/markets/register", post(register_market))
         .route("/v1/market/shares", get(market_shares))
-        .route("/v1/share-market/shares", get(share_market_shares))
-        .route(
-            "/v1/share-market/listing-statuses/sync",
-            post(share_market_listing_statuses_sync),
-        )
-        .route(
-            "/v1/share-market/shares/:share_id/grants",
-            post(share_market_create_grant),
-        )
-        .route(
-            "/v1/share-market/shares/:share_id/grants/:router_edit_id",
-            get(share_market_grant_status),
-        )
         .route("/v1/market/shares/headroom", post(market_shares_headroom))
         .route("/v1/market/shares/feedback", post(market_shares_feedback))
         .route("/v1/market/share-states", post(market_share_states))
@@ -578,7 +564,6 @@ async fn market_shares(
             "main",
             &active_subdomains,
             &inflight_by_share,
-            true,
         )
         .await?;
     // Overlay per-owner penalty from the in-memory override store. Done at the
@@ -593,91 +578,6 @@ async fn market_shares(
     }
     apply_market_share_route_availability(&state, &mut shares).await;
     Ok(Json(shares))
-}
-
-async fn share_market_shares(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-) -> Result<Json<Vec<MarketShareView>>, AppError> {
-    let market = authenticate_market(&state, &headers, "market:shares:read").await?;
-    if market.market_kind != "share" {
-        return Err(AppError::Forbidden(
-            "share-market shares API is only available to share markets".into(),
-        ));
-    }
-    let active_subdomains = state.proxy.active_subdomains().await.into_iter().collect();
-    let inflight_by_share = state.proxy.inflight_by_share().await;
-    let mut shares = state
-        .store
-        .list_share_market_delegated_shares(
-            &market.email,
-            "main",
-            &active_subdomains,
-            &inflight_by_share,
-        )
-        .await?;
-    apply_market_share_route_availability(&state, &mut shares).await;
-    Ok(Json(shares))
-}
-
-async fn share_market_create_grant(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Path(share_id): Path<String>,
-    Json(input): Json<ShareMarketGrantRequest>,
-) -> Result<Json<ShareMarketGrantResponse>, AppError> {
-    let market = authenticate_market(&state, &headers, "market:share_grants:write").await?;
-    if market.market_kind != "share" {
-        return Err(AppError::Forbidden(
-            "share-market grants API is only available to share markets".into(),
-        ));
-    }
-    Ok(Json(
-        state
-            .store
-            .create_share_market_grant(&market.email, &share_id, input)
-            .await?,
-    ))
-}
-
-async fn share_market_grant_status(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Path((share_id, router_edit_id)): Path<(String, String)>,
-) -> Result<Json<ShareMarketGrantStatusResponse>, AppError> {
-    let market = authenticate_market(&state, &headers, "market:share_grants:write").await?;
-    if market.market_kind != "share" {
-        return Err(AppError::Forbidden(
-            "share-market grants API is only available to share markets".into(),
-        ));
-    }
-    Ok(Json(
-        state
-            .store
-            .share_market_grant_status(&market.email, &share_id, &router_edit_id)
-            .await?,
-    ))
-}
-
-async fn share_market_listing_statuses_sync(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Json(input): Json<ShareMarketListingStatusSyncRequest>,
-) -> Result<Json<ShareMarketListingStatusSyncResponse>, AppError> {
-    let market = authenticate_market(&state, &headers, "market:share_states:write").await?;
-    if market.market_kind != "share" {
-        return Err(AppError::Forbidden(
-            "listing status sync is only available to share markets".into(),
-        ));
-    }
-    let synced = state
-        .store
-        .sync_share_market_listing_statuses(&market.email, input.replace, input.statuses)
-        .await?;
-    Ok(Json(ShareMarketListingStatusSyncResponse {
-        ok: true,
-        synced,
-    }))
 }
 
 /// Per-request real-time headroom probe. The market normally consumes the
@@ -1683,10 +1583,6 @@ async fn dashboard(
             &state.proxy,
             viewer_email.as_deref(),
         )
-        .await?;
-    state
-        .store
-        .attach_share_market_listing_statuses(&mut response)
         .await?;
     let snapshot = state.recent_traffic.snapshot().await;
     enrich_share_ticker_logs_with_live_country(&mut response.ticker_shares, &snapshot);

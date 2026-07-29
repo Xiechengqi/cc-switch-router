@@ -48,20 +48,27 @@ function PaymentMethod({ method }: { method: ClientMarketPaymentMethod }) {
   );
 }
 
-/** Inline billing urgency + payment/release modals for Client rows and Client Market. */
+/** Inline billing urgency + payment/release modals for Client Market rows.
+ *  Clients board uses `readOnly` — pay/release live only on Client Market. */
 export function ClientMarketBillingBanner({
   billing,
   onChanged,
   compact = false,
   showPayButton = true,
-  /** When true (default), mount release resume UI for `releasing` — needed on Client board. */
+  /** When true (default), mount release resume UI for `releasing`. */
   resumeRelease = true,
+  /** Urgency cue only — no pay modal, no release / retry actions. */
+  readOnly = false,
+  manageHref,
 }: {
   billing?: ClientMarketBilling;
   onChanged: () => Promise<void> | void;
   compact?: boolean;
   showPayButton?: boolean;
   resumeRelease?: boolean;
+  readOnly?: boolean;
+  /** Optional deep-link shown next to read-only urgency (e.g. Client Market「我的」). */
+  manageHref?: string;
 }) {
   const { locale, t } = useLocaleText();
   const [paymentOpen, setPaymentOpen] = React.useState(false);
@@ -69,6 +76,17 @@ export function ClientMarketBillingBanner({
   const [busy, setBusy] = React.useState(false);
 
   if (!billing || !billing.isClientOwner || billing.status === "released") return null;
+
+  const manageLink = manageHref ? (
+    <a
+      href={manageHref}
+      className="inline-flex h-6 items-center rounded-md px-1.5 text-[11px] font-medium text-accent hover:underline"
+      data-no-row-drawer
+      onClick={(event) => event.stopPropagation()}
+    >
+      {t("billing.manageInMarket")}
+    </a>
+  ) : null;
 
   const declarePaid = async () => {
     if (!billing.openInvoiceId) return;
@@ -103,7 +121,8 @@ export function ClientMarketBillingBanner({
       >
         <Loader2 className="h-3 w-3 animate-spin" />
         {t("billing.releasing")}
-        {resumeRelease ? <ReleaseRentalAction billing={billing} onChanged={onChanged} /> : null}
+        {!readOnly && resumeRelease ? <ReleaseRentalAction billing={billing} onChanged={onChanged} /> : null}
+        {readOnly ? manageLink : null}
       </span>
     );
   }
@@ -120,17 +139,30 @@ export function ClientMarketBillingBanner({
     return (
       <span className="inline-flex flex-wrap items-center gap-1.5" data-no-row-drawer onClick={(event) => event.stopPropagation()}>
         <span className="text-[11px] text-rose-700">{t("billing.releaseFailed")}</span>
-        <ReleaseRentalAction
-          billing={billing}
-          onChanged={onChanged}
-          label={t("billing.retryRelease")}
-          className="h-6 px-2 text-[11px] text-rose-700"
-        />
+        {readOnly ? (
+          manageLink
+        ) : (
+          <ReleaseRentalAction
+            billing={billing}
+            onChanged={onChanged}
+            label={t("billing.retryRelease")}
+            className="h-6 px-2 text-[11px] text-rose-700"
+          />
+        )}
       </span>
     );
   }
 
   if (!tier || tier === "silent") return null;
+
+  if (readOnly) {
+    return (
+      <span className="inline-flex flex-wrap items-center gap-1.5" data-no-row-drawer onClick={(event) => event.stopPropagation()}>
+        <BillingUrgencyChip billing={billing} compact={compact} showPayButton={false} />
+        {manageLink}
+      </span>
+    );
+  }
 
   return (
     <>

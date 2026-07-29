@@ -15,7 +15,7 @@ export function buildClientInstallCommand(options?: {
     /\/$/,
     "",
   );
-  const ownerEmail = options?.ownerEmail?.trim() || "owner@example.com";
+  const ownerEmail = options?.ownerEmail?.trim() || "user-email";
   const password = options?.passwordPlaceholder?.trim() || "web登陆密码";
   return `curl -SsL ${base}/install-client.sh | bash -s ${base} ${ownerEmail} ${password}`;
 }

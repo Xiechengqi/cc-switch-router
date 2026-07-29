@@ -8,7 +8,6 @@ import type { CoreShareApp } from "@/lib/share-app";
 import {
   applyRecommendedMarketDefaults,
   PRICE_APPS,
-  recommendedShareMarketEmail,
   type ShareEditDraft,
 } from "./share-edit-draft";
 import { FieldGroup, MarketEmailChip } from "./share-edit-shared";
@@ -26,12 +25,10 @@ export type ShareEditMarketFieldsProps = {
   shareApp: CoreShareApp;
   draft: ShareEditDraft;
   tokenMarkets: DashboardMarket[];
-  shareMarkets: DashboardMarket[];
   marketSelectKey: number;
   descriptionLength: number;
   descriptionInvalid: boolean;
   pricingInvalid: boolean;
-  shareMarketInvalid: boolean;
   onDescriptionChange: (value: string) => void;
   onForSaleChange: (next: "Yes" | "No" | "Free") => void;
   onDraftChange: (updater: (current: ShareEditDraft) => ShareEditDraft) => void;
@@ -44,46 +41,23 @@ export function ShareEditMarketFields({
   shareApp,
   draft,
   tokenMarkets,
-  shareMarkets,
   marketSelectKey,
   descriptionLength,
   descriptionInvalid,
   pricingInvalid,
-  shareMarketInvalid,
   onDescriptionChange,
   onForSaleChange,
   onDraftChange,
   onMarketPicked,
 }: ShareEditMarketFieldsProps) {
-  const { forSale, saleMarketKind, marketAccessMode, selectedMarketEmails, selectedShareMarketEmail, priceInputs } =
-    draft;
+  const { forSale, marketAccessMode, selectedMarketEmails, priceInputs } = draft;
 
   const availableMarkets = React.useMemo(() => {
-    if (saleMarketKind === "share") {
-      return [...shareMarkets].sort((a, b) => marketLabel(a).localeCompare(marketLabel(b)));
-    }
     const blocked = new Set(selectedMarketEmails);
     return tokenMarkets
       .filter((market) => market.email && !blocked.has(market.email.toLowerCase()))
       .sort((a, b) => marketLabel(a).localeCompare(marketLabel(b)));
-  }, [saleMarketKind, selectedMarketEmails, shareMarkets, tokenMarkets]);
-
-  const handleSaleMarketKindChange = (next: "token" | "share") => {
-    onDraftChange((current) => {
-      let nextDraft: ShareEditDraft = {
-        ...current,
-        saleMarketKind: next,
-        marketAccessMode: next === "share" ? "selected" : current.marketAccessMode,
-        selectedMarketEmails: next === "share" ? [] : current.selectedMarketEmails,
-        selectedShareMarketEmail: next === "token" ? "" : current.selectedShareMarketEmail,
-        priceInputs: next === "share" ? { claude: "", codex: "", gemini: "" } : current.priceInputs,
-      };
-      if (next === "share" && !nextDraft.selectedShareMarketEmail) {
-        nextDraft.selectedShareMarketEmail = recommendedShareMarketEmail(shareMarkets);
-      }
-      return applyRecommendedMarketDefaults(nextDraft, tokenMarkets, shareMarkets);
-    });
-  };
+  }, [selectedMarketEmails, tokenMarkets]);
 
   const removeMarketEmail = (email: string) => {
     onDraftChange((current) => ({
@@ -114,7 +88,7 @@ export function ShareEditMarketFields({
       </ShareEditSection>
 
       <ShareEditSection title={t("dashboard.shareEdit.section.market")}>
-        <div className="grid gap-3 sm:grid-cols-3">
+        <div className="grid gap-3 sm:grid-cols-2">
           <FieldGroup label={t("dashboard.field.forSale")}>
             <Select
               selectedKey={forSale}
@@ -136,68 +110,25 @@ export function ShareEditMarketFields({
             </Select>
           </FieldGroup>
 
-          {forSale === "Yes" ? (
-            <FieldGroup label={t("dashboard.field.marketType")}>
-              <Select
-                selectedKey={saleMarketKind}
-                onSelectionChange={(key) => handleSaleMarketKindChange(String(key || "token") as "token" | "share")}
-              >
-                <Select.Trigger>
-                  <Select.Value>
-                    {saleMarketKind === "share" ? t("dashboard.shareMarket") : t("dashboard.tokenMarket")}
-                  </Select.Value>
-                  <Select.Indicator />
-                </Select.Trigger>
-                <Select.Popover className="share-edit-popover light !bg-white !text-slate-900">
-                  <ListBox>
-                    <ListBox.Item id="token">{t("dashboard.tokenMarket")}</ListBox.Item>
-                    <ListBox.Item id="share">{t("dashboard.shareMarket")}</ListBox.Item>
-                  </ListBox>
-                </Select.Popover>
-              </Select>
-            </FieldGroup>
-          ) : null}
-
           <FieldGroup
             label={t("dashboard.field.marketAccess")}
-            hint={
-              forSale !== "Yes"
-                ? t("dashboard.hint.forSaleOnly")
-                : saleMarketKind === "share"
-                  ? t("dashboard.hint.shareMarketSingle")
-                  : undefined
-            }
-            invalid={shareMarketInvalid}
+            hint={forSale !== "Yes" ? t("dashboard.hint.forSaleOnly") : undefined}
           >
             <Select
               key={marketSelectKey}
               selectedKey={null}
               onSelectionChange={(key) => onMarketPicked(String(key || ""))}
-              isDisabled={forSale !== "Yes" || (saleMarketKind === "share" && shareMarkets.length === 0)}
+              isDisabled={forSale !== "Yes"}
             >
               <Select.Trigger>
                 <Select.Value>
-                  {saleMarketKind === "share"
-                    ? selectedShareMarketEmail
-                      ? marketLabel(
-                          shareMarkets.find((market) => market.email.toLowerCase() === selectedShareMarketEmail) || {
-                            email: selectedShareMarketEmail,
-                            publicBaseUrl: "",
-                            subdomain: "",
-                          },
-                        )
-                      : t("dashboard.selectShareMarket")
-                    : marketAccessMode === "all"
-                      ? t("dashboard.allMarkets")
-                      : t("dashboard.addMarket")}
+                  {marketAccessMode === "all" ? t("dashboard.allMarkets") : t("dashboard.addMarket")}
                 </Select.Value>
                 <Select.Indicator />
               </Select.Trigger>
               <Select.Popover className="share-edit-popover light !bg-white !text-slate-900">
                 <ListBox>
-                  {saleMarketKind === "token" ? (
-                    <ListBox.Item id="__all__">{t("dashboard.allMarkets")}</ListBox.Item>
-                  ) : null}
+                  <ListBox.Item id="__all__">{t("dashboard.allMarkets")}</ListBox.Item>
                   {availableMarkets.map((market) => (
                     <ListBox.Item key={market.email} id={market.email.toLowerCase()}>
                       {marketLabel(market)}
@@ -207,11 +138,10 @@ export function ShareEditMarketFields({
                 </ListBox>
               </Select.Popover>
             </Select>
-            {shareMarketInvalid ? <span className="text-xs text-red-600">{t("dashboard.fieldInvalid")}</span> : null}
           </FieldGroup>
         </div>
 
-        {forSale === "Yes" && saleMarketKind === "token" ? (
+        {forSale === "Yes" ? (
           <div className="grid gap-1.5 text-sm">
             <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
               <span className="mono-label text-muted-foreground">{t("dashboard.field.modelPricing")}</span>
@@ -248,7 +178,7 @@ export function ShareEditMarketFields({
           </div>
         ) : null}
 
-        {forSale === "Yes" && saleMarketKind === "token" && marketAccessMode === "selected" ? (
+        {forSale === "Yes" && marketAccessMode === "selected" ? (
           <FieldGroup label={t("dashboard.field.selectedMarkets")} hint={t("dashboard.hint.selectedMarkets")}>
             {selectedMarketEmails.length ? (
               <div className="flex flex-wrap gap-1.5">
@@ -266,7 +196,7 @@ export function ShareEditMarketFields({
           </FieldGroup>
         ) : null}
 
-        {forSale === "Yes" && saleMarketKind === "token" && marketAccessMode === "all" ? (
+        {forSale === "Yes" && marketAccessMode === "all" ? (
           <div className="rounded-lg border border-primary/20 bg-primary/5 px-3 py-2 text-xs text-primary">
             {t("dashboard.allMarketsSelected")}
             <button
@@ -277,7 +207,6 @@ export function ShareEditMarketFields({
                   applyRecommendedMarketDefaults(
                     { ...current, marketAccessMode: "selected", selectedMarketEmails: [] },
                     tokenMarkets,
-                    shareMarkets,
                   ),
                 )
               }

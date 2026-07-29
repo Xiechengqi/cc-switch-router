@@ -14,11 +14,12 @@ import {
   exportMyClientMarketHosts,
   getClientMarketHosts,
   getClientMarketJob,
+  getMyClientMarketBilling,
   importMyClientMarketHosts,
   reverifyClientMarketHost,
 } from "@/lib/api";
 import { mergeHosts } from "@/lib/client-market-refresh";
-import type { ClientMarketHost, ClientMarketHostImportResponse } from "@/lib/types";
+import type { ClientMarketBilling, ClientMarketHost, ClientMarketHostImportResponse } from "@/lib/types";
 import { usePersistentState } from "@/lib/use-persistent-state";
 import { useBatchOperations } from "@/components/dashboard/client-market/use-batch-operations";
 import { AddHostDialog } from "@/components/dashboard/client-market/add-host-dialog";
@@ -62,6 +63,7 @@ import {
   normalizeOwnerFilters,
   parseHostTransferLines,
   paymentKindLabelKey,
+  prioritizeMineClientOwned,
   sortHosts,
   statusGroupForHost,
   statusGroupHintKey,
@@ -76,6 +78,7 @@ export function ClientMarketPage() {
   const viewerEmail = session?.user?.email;
 
   const [hosts, setHosts] = React.useState<ClientMarketHost[]>([]);
+  const [billings, setBillings] = React.useState<ClientMarketBilling[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [addOpen, setAddOpen] = React.useState(false);
   const [pendingAddAfterLogin, setPendingAddAfterLogin] = React.useState(false);
@@ -102,8 +105,10 @@ export function ClientMarketPage() {
   const [exportText, setExportText] = React.useState("");
   const [importResult, setImportResult] = React.useState<ClientMarketHostImportResponse | null>(null);
   const [rowUiBusyCount, setRowUiBusyCount] = React.useState(0);
+  const [focusInstallationId, setFocusInstallationId] = React.useState<string | null>(null);
   const refreshAbortRef = React.useRef<AbortController | null>(null);
   const rowBusyIdsRef = React.useRef<Set<string>>(new Set());
+  const focusAppliedRef = React.useRef(false);
 
   const setRowUiBusy = React.useCallback((hostId: string, busy: boolean) => {
     const ids = rowBusyIdsRef.current;
@@ -127,12 +132,21 @@ export function ClientMarketPage() {
         setError("");
       }
       try {
-        // Billing lives under Account → Client rentals, so this page no longer
-        // fetches it. The signal is passed through so aborting actually cancels the
-        // in-flight request; previously `abort()` only suppressed the state update.
         const nextHosts = await getClientMarketHosts(undefined, controller.signal);
         if (controller.signal.aborted) return;
         setHosts((prev) => mergeHosts(prev, nextHosts));
+        if (authed) {
+          try {
+            const nextBilling = await getMyClientMarketBilling(controller.signal);
+            if (!controller.signal.aborted) setBillings(nextBilling);
+          } catch {
+            if (!controller.signal.aborted && !silent) {
+              /* hosts still usable; renter actions degrade until next poll */
+            }
+          }
+        } else {
+          setBillings([]);
+        }
       } catch (err) {
         if (controller.signal.aborted) return;
         if (!silent) {
@@ -143,7 +157,7 @@ export function ClientMarketPage() {
         if (!silent) setLoading(false);
       }
     },
-    [],
+    [authed],
   );
 
   const silentRefresh = React.useCallback(() => load({ silent: true }), [load]);
@@ -225,9 +239,19 @@ export function ClientMarketPage() {
     return counts;
   }, [mineHosts.length, scopedHosts]);
 
+  const billingByInstallation = React.useMemo(() => {
+    const map = new Map<string, ClientMarketBilling>();
+    for (const billing of billings) {
+      if (!billing.isClientOwner) continue;
+      map.set(billing.installationId, billing);
+    }
+    return map;
+  }, [billings]);
+
   const visibleHosts = React.useMemo(() => {
     const filtered = scopedHosts.filter((host) => hostMatchesListTab(host, listTab));
-    return sortHosts(filtered, sortPrefs);
+    const sorted = sortHosts(filtered, sortPrefs);
+    return listTab === "mine" ? prioritizeMineClientOwned(sorted) : sorted;
   }, [listTab, scopedHosts, sortPrefs]);
 
   const toggleHostSort = React.useCallback((key: HostSortKey) => {
@@ -291,6 +315,32 @@ export function ClientMarketPage() {
   React.useEffect(() => {
     if (!authed && listTabRaw === "mine") setListTab("all");
   }, [authed, listTabRaw, setListTab]);
+
+  React.useEffect(() => {
+    if (typeof window === "undefined" || focusAppliedRef.current) return;
+    const params = new URLSearchParams(window.location.search);
+    const tab = params.get("tab");
+    const focus = params.get("focus");
+    if (tab === "mine" && authed) setListTab("mine");
+    if (focus) {
+      setFocusInstallationId(focus);
+      focusAppliedRef.current = true;
+    }
+  }, [authed, setListTab]);
+
+  React.useEffect(() => {
+    if (!focusInstallationId || loading) return;
+    const index = visibleHosts.findIndex((host) => host.installationId === focusInstallationId);
+    if (index < 0) return;
+    const targetPage = Math.floor(index / HOST_PAGE_SIZE) + 1;
+    if (targetPage !== page) setPage(targetPage);
+    const timer = window.setTimeout(() => {
+      document
+        .getElementById(`client-market-host-${focusInstallationId}`)
+        ?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }, 80);
+    return () => window.clearTimeout(timer);
+  }, [focusInstallationId, loading, page, visibleHosts]);
 
   React.useEffect(() => {
     if (page > totalPages) setPage(totalPages);
@@ -717,6 +767,14 @@ export function ClientMarketPage() {
                   <HostRow
                     key={host.id}
                     host={host}
+                    billing={
+                      host.installationId
+                        ? billingByInstallation.get(host.installationId) ?? null
+                        : null
+                    }
+                    highlighted={
+                      !!focusInstallationId && host.installationId === focusInstallationId
+                    }
                     selectionMode={batch.selectionMode}
                     selected={batch.selectedIds.has(host.id)}
                     onSelectedChange={batch.setHostSelected}

@@ -131,6 +131,32 @@ export function averageRecentLatencyMs(logs?: ShareRequestLog[], limit = 10) {
   return samples.reduce((sum, latency) => sum + latency, 0) / samples.length;
 }
 
+/** Recent-window total throughput (tok/s): Σ(input+output) / Σ(latency), truncated. */
+export function recentThroughputTokensPerSec(logs?: ShareRequestLog[], limit = 10) {
+  const samples = [...(logs || [])]
+    .sort((left, right) => Number(right.createdAt || 0) - Number(left.createdAt || 0))
+    .slice(0, limit)
+    .filter((log) => {
+      const latency = Number(log.latencyMs || 0);
+      return Number.isFinite(latency) && latency > 0;
+    });
+  if (!samples.length) return null;
+  let tokenSum = 0;
+  let latencySumMs = 0;
+  for (const log of samples) {
+    tokenSum += tokenCount(log.inputTokens) + tokenCount(log.outputTokens);
+    latencySumMs += Number(log.latencyMs || 0);
+  }
+  const timeSec = latencySumMs / 1000;
+  if (!(timeSec > 0) || !(tokenSum > 0)) return null;
+  return Math.trunc(tokenSum / timeSec);
+}
+
+export function formatThroughputTokensPerSec(tokensPerSec: number | null) {
+  if (tokensPerSec == null || !Number.isFinite(tokensPerSec) || tokensPerSec <= 0) return "-";
+  return `${tokensPerSec} tok/s`;
+}
+
 export function formatLatencySeconds(latencyMs: number | null) {
   if (latencyMs == null || !Number.isFinite(latencyMs) || latencyMs <= 0) return "-";
   const seconds = latencyMs / 1000;
@@ -364,28 +390,6 @@ export function sortMarkets(markets: DashboardMarket[]) {
       (Date.parse(a.createdAt) || 0) - (Date.parse(b.createdAt) || 0) ||
       (a.publicBaseUrl || a.email || a.id).localeCompare(b.publicBaseUrl || b.email || b.id),
   );
-}
-
-export function isShareMarket(market: DashboardMarket) {
-  return market.marketKind === "share";
-}
-
-export function isUsageMarket(market: DashboardMarket) {
-  return !isShareMarket(market);
-}
-
-export function marketKindLabel(market: DashboardMarket, t: TFn) {
-  return isShareMarket(market) ? t("dashboard.shareMarket") : t("dashboard.tokenMarket");
-}
-
-export function marketKindDescription(market: DashboardMarket, t: TFn) {
-  return isShareMarket(market)
-    ? t("dashboard.shareMarketTooltip")
-    : t("dashboard.tokenMarketTooltip");
-}
-
-export function canShowMarketSharePriority(market: DashboardMarket) {
-  return isUsageMarket(market);
 }
 
 export function marketLabel(market: Pick<DashboardMarket, "publicBaseUrl" | "email" | "subdomain">) {
@@ -1000,7 +1004,6 @@ export function shareAppSettings(share: ShareView, app: CoreShareApp) {
   const access = share.accessByApp?.[app];
   return {
     forSale: share.appSettings?.[app]?.forSale ?? share.forSale,
-    saleMarketKind: share.appSettings?.[app]?.saleMarketKind ?? share.saleMarketKind ?? "token",
     marketAccessMode: share.appSettings?.[app]?.marketAccessMode ?? access?.marketAccessMode ?? share.marketAccessMode,
     sharedWithEmails: share.appSettings?.[app]?.sharedWithEmails ?? access?.sharedWithEmails ?? share.sharedWithEmails ?? [],
     tokenLimit: share.appSettings?.[app]?.tokenLimit ?? share.tokenLimit,

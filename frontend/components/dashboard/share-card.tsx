@@ -9,6 +9,7 @@ import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
 import {
   averageRecentLatencyMs,
   formatLatencySeconds,
+  formatThroughputTokensPerSec,
   latencyResponseToneClass,
   parallelOccupancyTitle,
   modelHealthTitle,
@@ -18,6 +19,7 @@ import {
   providerQuotaStatusLine,
   providerStatusIdentity,
   isApiProviderRuntime,
+  recentThroughputTokensPerSec,
   resolveShareAppRuntime,
   shareDisplayTitle,
   subdomainTunnelUrl,
@@ -90,6 +92,7 @@ export const ShareCard = React.memo(function ShareCard({
   const parallelLimit = settings?.parallelLimit ?? share.parallelLimit;
   const activeRequests = app ? share.activeRequestsByApp?.[app] ?? 0 : share.activeRequests || 0;
   const averageLatency = averageRecentLatencyMs(appRequests);
+  const throughputTokensPerSec = recentThroughputTokensPerSec(appRequests);
   const runtime = app ? resolveShareAppRuntime(share, app) : undefined;
   const providerEnabled = app ? !!share.support?.[app] : !!runtime;
   const quotaStatusLine = providerEnabled && runtime ? providerQuotaStatusLine(runtime, locale) : "-";
@@ -100,7 +103,6 @@ export const ShareCard = React.memo(function ShareCard({
   const isApiProvider = providerEnabled && runtime ? isApiProviderRuntime(runtime) : false;
   const apiEndpoint = providerEnabled && runtime ? providerApiEndpoint(runtime) : "-";
   const healthTone = app ? modelHealthTone(share, app) : { className: "bg-slate-50 text-muted-foreground", label: "" };
-  const marketCount = share.marketAccessMode === "all" ? null : (share.marketLinks || []).length;
   const summary = shareOperationalSummary(share);
   const issue = summary.primaryReason ? operationalReasonLabel(summary.primaryReason, t) : null;
   const title = shareDisplayTitle(share);
@@ -114,7 +116,6 @@ export const ShareCard = React.memo(function ShareCard({
   const expiryLabel = shareExpiryProgress(share, locale);
   const expiryHint = `${formatDateTime(share.createdAt)} / ${expiryTitle(share.expiresAt)}`;
   const parallelTitle = parallelOccupancyTitle(share, app, t);
-  const saleLabel = share.forSale === "No" ? t("dashboard.notListed") : marketCount == null ? t("dashboard.allMarkets") : t("dashboard.marketsCount", { count: marketCount });
   const editPending = share.canManage && share.activeEdit?.status === "pending";
   const editRejected = share.canManage && share.activeEdit?.status === "rejected";
   const focused = focus.isFocused("share", share.shareId);
@@ -255,8 +256,10 @@ export const ShareCard = React.memo(function ShareCard({
               </strong>
             </div>
             <div className="min-w-0">
-              <span className="block text-muted-foreground">{t("dashboard.forSale")}</span>
-              <span className="block truncate text-foreground" title={saleLabel}>{saleLabel}</span>
+              <span className="block text-muted-foreground">{t("dashboard.totalThroughput")}</span>
+              <strong className="block truncate tabular-nums font-medium text-foreground">
+                {formatThroughputTokensPerSec(throughputTokensPerSec)}
+              </strong>
             </div>
           </div>
         </div>

@@ -60,6 +60,9 @@ import type {
   ClientMarketHostTransferDocument,
   ClientMarketHostImportResponse,
   ClientMarketProviderBlock,
+  ShareMarketCatalog,
+  ShareMarketOwnedShare,
+  ShareMarketSeatInput,
 } from "@/lib/types";
 
 
@@ -854,4 +857,117 @@ export async function checkClientTunnelSubdomainAvailability(subdomain: string, 
   const response = await authFetch(`/v1/client-tunnel/subdomain-availability?${params}`, { cache: "no-store" });
   if (response.status === 409) return { available: false, reason: "reserved" } satisfies ClientTunnelSubdomainAvailability;
   return parseJson<ClientTunnelSubdomainAvailability>(response);
+}
+
+export async function getShareMarketCatalog(signal?: AbortSignal) {
+  return parseJson<ShareMarketCatalog>(
+    await authFetch("/v1/share-market/listings", { cache: "no-store", signal }),
+  );
+}
+
+export async function getShareMarketOwnedShares() {
+  return parseJson<ShareMarketOwnedShare[]>(
+    await authFetch("/v1/share-market/owned-shares", { cache: "no-store" }),
+  );
+}
+
+export async function createShareMarketListing(shareId: string, seats: ShareMarketSeatInput[]) {
+  return parseJson<{ ok: true; listingId: string }>(
+    await authFetch("/v1/share-market/listings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ shareId, seats }),
+    }),
+  );
+}
+
+export async function addShareMarketSeat(listingId: string, seat: ShareMarketSeatInput) {
+  return parseJson<{ ok: true; seatId: string }>(
+    await authFetch(`/v1/share-market/listings/${encodeURIComponent(listingId)}/seats`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(seat),
+    }),
+  );
+}
+
+export async function updateShareMarketSeat(
+  seatId: string,
+  seat: ShareMarketSeatInput,
+  offerRevision: number,
+) {
+  return parseJson<{ ok: true }>(
+    await authFetch(`/v1/share-market/seats/${encodeURIComponent(seatId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ seat, offerRevision }),
+    }),
+  );
+}
+
+export async function deleteShareMarketSeat(seatId: string) {
+  return parseJson<{ ok: true }>(
+    await authFetch(`/v1/share-market/seats/${encodeURIComponent(seatId)}`, { method: "DELETE" }),
+  );
+}
+
+export async function closeShareMarketListing(listingId: string) {
+  return parseJson<{ ok: true }>(
+    await authFetch(`/v1/share-market/listings/${encodeURIComponent(listingId)}`, { method: "DELETE" }),
+  );
+}
+
+export async function rentShareMarketSeat(seatId: string, offerRevision: number) {
+  return parseJson<{ ok: true; subscriptionId: string }>(
+    await authFetch(`/v1/share-market/seats/${encodeURIComponent(seatId)}/rent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ offerRevision }),
+    }),
+  );
+}
+
+export async function declareShareMarketPaid(
+  subscriptionId: string,
+  input: {
+    invoiceId: string;
+    offerRevision: number;
+    amountMinorConfirmed: number;
+    paymentProfileUpdatedAt: string;
+  },
+) {
+  return parseJson<{ ok: true }>(
+    await authFetch(`/v1/share-market/subscriptions/${encodeURIComponent(subscriptionId)}/declare-paid`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...input, confirmed: true }),
+    }),
+  );
+}
+
+export async function releaseShareMarketSubscription(subscriptionId: string) {
+  return parseJson<{ ok: true }>(
+    await authFetch(`/v1/share-market/subscriptions/${encodeURIComponent(subscriptionId)}/release`, {
+      method: "POST",
+    }),
+  );
+}
+
+export async function forceRevokeShareMarketSubscription(
+  subscriptionId: string,
+  input: { blockUser: boolean; reason?: string },
+) {
+  return parseJson<{ ok: true }>(
+    await authFetch(`/v1/share-market/subscriptions/${encodeURIComponent(subscriptionId)}/force-revoke`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    }),
+  );
+}
+
+export async function liftShareMarketBlock(userId: string) {
+  return parseJson<{ ok: true }>(
+    await authFetch(`/v1/share-market/blocks/${encodeURIComponent(userId)}`, { method: "DELETE" }),
+  );
 }

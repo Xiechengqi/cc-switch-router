@@ -28,6 +28,7 @@ mod recent_traffic;
 mod registration_admission;
 mod scheduling_signals;
 mod server_state;
+mod share_market;
 mod ssh;
 mod startup_config;
 mod store;
@@ -258,6 +259,7 @@ async fn main() -> Result<()> {
     let chat_notification_store = state.store.clone();
     let chat_notification_config = config.clone();
     let client_market_trade_state = state.clone();
+    let share_market_state = state.clone();
 
     let http_listener = TcpListener::bind(config.api_addr).await?;
     let ssh_listener = TcpListener::bind(config.ssh_addr).await?;
@@ -434,6 +436,13 @@ async fn main() -> Result<()> {
         }
         result
     });
+    let share_market_task = tokio::spawn(async move {
+        let result = crate::share_market::run_service(share_market_state).await;
+        if let Err(error) = &result {
+            tracing::error!(error = %error, "Share Market service stopped");
+        }
+        result
+    });
     let (http_shutdown_tx, http_shutdown_rx) = watch::channel(false);
     let (ssh_shutdown_tx, ssh_shutdown_rx) = watch::channel(false);
     let mut ssh_task = tokio::spawn(async move {
@@ -498,6 +507,7 @@ async fn main() -> Result<()> {
     notification_task.abort();
     chat_notification_task.abort();
     client_market_trade_task.abort();
+    share_market_task.abort();
     service_result
 }
 

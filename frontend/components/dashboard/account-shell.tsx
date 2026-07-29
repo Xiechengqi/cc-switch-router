@@ -2,17 +2,18 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { Activity, BarChart3, KeyRound, Receipt, WalletCards } from "lucide-react";
+import { Activity, BarChart3, KeyRound, Receipt, Share2, WalletCards } from "lucide-react";
 import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   accountNavHrefFromPathname,
   DASHBOARD_ACCOUNT_API_KEYS_PATH,
+  DASHBOARD_ACCOUNT_CLIENT_PATH,
   DASHBOARD_ACCOUNT_CONSUMER_USAGE_PATH,
   DASHBOARD_ACCOUNT_PATH,
   DASHBOARD_ACCOUNT_PAYMENTS_PATH,
   DASHBOARD_ACCOUNT_PROVIDER_USAGE_PATH,
-  DASHBOARD_ACCOUNT_RENTALS_PATH,
+  DASHBOARD_ACCOUNT_SHARE_PATH,
   resolveAccountEntryHref,
   writeStoredAccountNavHref,
   type AccountNavHref,
@@ -27,7 +28,8 @@ const NAV_ITEMS: {
     | "account.nav.providerUsage"
     | "account.nav.consumerUsage"
     | "account.nav.payments"
-    | "account.nav.rentals";
+    | "account.nav.share"
+    | "account.nav.client";
   icon: typeof KeyRound;
   match: (pathname: string) => boolean;
 }[] = [
@@ -61,11 +63,19 @@ const NAV_ITEMS: {
     match: (pathname: string) => pathname.startsWith("/account/payments"),
   },
   {
-    id: "rentals",
-    href: DASHBOARD_ACCOUNT_RENTALS_PATH,
-    labelKey: "account.nav.rentals",
+    id: "share",
+    href: DASHBOARD_ACCOUNT_SHARE_PATH,
+    labelKey: "account.nav.share",
+    icon: Share2,
+    match: (pathname: string) => pathname.startsWith("/account/share"),
+  },
+  {
+    id: "client",
+    href: DASHBOARD_ACCOUNT_CLIENT_PATH,
+    labelKey: "account.nav.client",
     icon: Receipt,
-    match: (pathname: string) => pathname.startsWith("/account/rentals"),
+    match: (pathname: string) =>
+      pathname.startsWith("/account/client") || pathname.startsWith("/account/rentals"),
   },
 ];
 

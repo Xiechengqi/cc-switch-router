@@ -59,32 +59,44 @@ cc-switch-router 是 TokenSwitch 的**公共汇聚层**。它为 `cc-switch-serv
 
 ---
 
-## 2. 三层市场模型
+## 2. 三个交易面
 
-三个市场共用同一套隧道内核,分别解决供应链上不同环节的问题。
+三个交易面共用同一套隧道与 Share descriptor 内核,但商品、结算和权限模型彼此独立。
 
-### ① Share Market —— 额度共享
+### ① Token Market —— 按量 Token 交易
 
-卖方拥有 Claude / Codex 等订阅,在自己机器上运行 Server,通过 Router 获得公网子域名。买方使用 Router 签发的 API token 调用 `/v1/messages`、`/v1/responses`、`/v1/chat/completions`,流量经 Router 路由至卖方 Server,由卖方凭据完成真正的上游调用。
+卖方拥有 Claude / Codex 等订阅,在自己机器上运行 Server,通过 Router 获得公网子域名。外部 Token Market 以 `marketKind=usage` 注册,买方按请求消耗 Token；流量经 Router 路由至卖方 Server,由卖方凭据完成真正的上游调用。
 
 定价按**官方价百分比**、分 app 独立设置:
 
 ```rust
-for_sale_official_price_percent_by_app: BTreeMap<String, u16>  // models.rs:2211
+for_sale_official_price_percent_by_app: BTreeMap<String, u16>
 ```
 
 配套机制:
 
-- `token_limit` / `parallel_limit` —— 每个 share 的额度与并发上限
-- `share_request_logs`、`llm_request_metrics` —— 逐请求计量(模型、token 数、延迟、估算成本)
-- `share_model_health_state` —— 滚动健康度,支撑 share 间自动 failover
+- `token_limit` / `parallel_limit` —— 每个 Share 的额度与并发上限
+- `share_request_logs`、`llm_request_metrics` —— 逐请求计量(模型、Token 数、延迟、估算成本)
+- `share_model_health_state` —— 滚动健康度,支撑 Share 间自动 failover
 - `free_share_ip_parallel_limit` —— 免费档按真实用户 IP 限并发
 
 > **关键性质:Router 不持有上游凭证。** `ShareUpstreamProvider` 绑定在卖方 Server 侧,凭据始终留在卖方机器上。Router 只做路由、计量、鉴权和脱敏,不是凭证托管方。
 
-### ② Client Market —— 主机供给
+### ② Share Market —— 固定拼车位租用
 
-Host Provider 贡献一台 Linux 服务器,Router 用**专用外发 Ed25519 provision key**(与入站 SSH host key 相互独立,`src/provision_ssh.rs:27`)登录,安装依赖并部署 Server,使其成为市场 ① 的一个供给节点。
+Share Market 内建于 Router,不注册为外部 `router_markets`。Share owner 只能从 Router 的 Share Market 页面通过「添加 Share」选择自己当前 active、尚未挂售的 Share,并创建最多 20 个拼车位。每个拼车位独立配置用户 Token/并发限制以及可选价格和账单周期。
+
+- 价格、币种和账单周期全部为空时为免费拼车位；任意登录用户可租用,不生成账单且长期有效。
+- 付费拼车位先授予 72 小时体验权限并生成首张账单。租客根据 owner 的收款资料私下付款后声明已付款；续费到期同样保留 72 小时声明窗口,超时自动回收。
+- 租用后,Router 才通过 pending Share edit 在 Server 上创建 `routerShareMarket` 管理的 `shareto` entitlement。普通 Share 编辑不能修改或删除这类 entitlement。
+- Owner 可强制回收、回收并拉黑租客、解除拉黑或停止挂售。停止挂售只关闭空闲拼车位,不打断现有租约。
+- **重新挂售**:停止挂售且该 Share 上已无活跃租约后,可再次通过「添加 Share」新建 listing。若仍有进行中的租约,「添加 Share」不可选中该 Share；也可在 Mine 的 closed listing 上「添加拼车位」以重新打开同一 listing。
+
+状态与审计由 `share_market_listings`、`share_market_seats`、`share_market_subscriptions`、`share_market_invoices`、`share_control_operations` 和 `share_market_events` 持久化。
+
+### ③ Client Market —— 主机供给
+
+Host Provider 贡献一台 Linux 服务器,Router 用**专用外发 Ed25519 provision key**(与入站 SSH host key 相互独立,`src/provision_ssh.rs:27`)登录,安装依赖并部署 Server,使其成为 Token/Share 交易面的供给节点。
 
 主机状态机(`router_ssh_hosts.status`):
 
@@ -106,9 +118,9 @@ idle ──► locked ──► allocated ──► draining ──► idle
 
 **支付为链下荣誉制**:租客调用 `declare-paid` 自报已付,Host Provider 线下核验。Router 存储支付方式二维码资产与声明记录,**不经手资金流**。
 
-### ③ Router 联邦 —— 横向扩展
+### Router 联邦 —— 横向扩展
 
-其他 Router 与 Gateway 以带 scope 的合作方身份接入,消费 share 挂牌数据:
+其他 Router 与 Gateway 以带 scope 的合作方身份接入,消费 Token Market 的 Share 挂牌数据。内建 Share Market 不通过该联邦注册或分发:
 
 | 表 | 主体 | 认证 |
 |---|---|---|
@@ -199,7 +211,7 @@ routes: Arc<RwLock<HashMap<String, LogicalRoute>>>
 | 计量 | `share_request_logs`、`market_request_logs`、`llm_request_metrics`、`image_generation_*` |
 | 健康 | `share_health_checks`、`installation_health_checks`、`share_model_health_state` |
 | 主机市场 | `router_ssh_hosts`、`client_market_subscriptions`、`client_market_invoices`、`account_payment_*` |
-| 联邦 | `router_markets`、`router_gateways`、`share_market_listing_statuses` |
+| 联邦与市场 | `router_markets`、`router_gateways`、`share_market_listings`、`share_market_seats`、`share_market_subscriptions` |
 | 通知 | `client_notification_events`、`email_delivery_batches` 等 9 张 |
 | 聊天 | `client_chat_rooms`、`client_chat_messages` 等 7 张(`store/client_chat.rs`) |
 | 认证 | `users`、`user_sessions`、`user_api_tokens`、`email_login_challenges`、`user_profiles` |

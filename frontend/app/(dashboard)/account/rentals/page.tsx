@@ -1,5 +1,7 @@
-import { RentalsPage } from "@/components/dashboard/client-market/rentals-page";
+import { redirect } from "next/navigation";
+import { DASHBOARD_ACCOUNT_CLIENT_PATH } from "@/lib/dashboard-nav";
 
+/** Legacy Account → Client rentals → Client monitor (User tab). */
 export default function Page() {
-  return <RentalsPage />;
+  redirect(`${DASHBOARD_ACCOUNT_CLIENT_PATH}?tab=user`);
 }

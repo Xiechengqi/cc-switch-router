@@ -155,6 +155,42 @@ Router 复用已建立的反向隧道**同步调用** Server 本地 API,避免�
 
 Router **从不改写** Server 返回的 descriptor,只做校验(`store::apply_share_edit_directly`);若客户端只部分应用了补丁,Router 拒绝落库而非静默持久化。
 
+### 7.1 Share Market managed grants
+
+内建 Share Market(`src/share_market.rs`,`/v1/share-market/*`)在租用/回收时不直接改 Server 本地文件,而是经 pending Share edit 下发 **managed grant** 操作:
+
+| 字段 | 含义 |
+|---|---|
+| `patch.managedGrant.action` | `upsert` 授予拼车位 / `revoke` 回收 |
+| `patch.managedGrant.entitlementId` | 稳定 entitlement ID,与订阅绑定 |
+| `patch.managedGrant.policy` | 拼车位并行/Token 限制与周期(upsert 必填) |
+| Server 落库 `userGrants[].manager` | 固定为 `routerShareMarket` |
+
+Server 要求:
+
+1. 普通 `share/settings` 入口拒绝带 `managedGrant` 的补丁。
+2. pending-edit 应用路径接受 managed grant,写入/移除 `routerShareMarket` grant。
+3. 普通用户编辑不得修改或删除 `manager=routerShareMarket` 的 grant。
+4. edit-ack(`POST /v1/shares/edit-ack`)成功后,Router 将订阅从 `grant_pending` 推进到 `active_free` 或 `trial_payment_due`,或完成 revoke 后释放座位。
+
+浏览器侧 HTTP 契约(用户 Session):
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| `GET` | `/v1/share-market/listings` | 公开 catalog(含 `canRent`、owner blocks) |
+| `POST` | `/v1/share-market/listings` | 添加 Share 挂牌(1–20 座位) |
+| `DELETE` | `/v1/share-market/listings/:id` | 停止挂售 |
+| `GET` | `/v1/share-market/owned-shares` | 「添加 Share」候选(`alreadyListed`) |
+| `POST` | `/v1/share-market/listings/:id/seats` | 添加拼车位(可 reopen closed listing) |
+| `PATCH`/`DELETE` | `/v1/share-market/seats/:id` | 编辑/删除空闲座位 |
+| `POST` | `/v1/share-market/seats/:id/rent` | 租用 |
+| `POST` | `/v1/share-market/subscriptions/:id/declare-paid` | 声明已付款 |
+| `POST` | `/v1/share-market/subscriptions/:id/release` | 租客归还 |
+| `POST` | `/v1/share-market/subscriptions/:id/force-revoke` | Owner 强制回收(可选拉黑) |
+| `GET`/`DELETE` | `/v1/share-market/blocks`… | Owner 拉黑列表 / 解除 |
+
+`alreadyListed` 为 true 当且仅当:当前 owner 对该 Share 有 `active` listing,或该 Share 上仍有非终态订阅。停止挂售且租约全部结束后可再次 `POST /listings`。
+
 ---
 
 ## 8. 探针:`/_share-router/*`

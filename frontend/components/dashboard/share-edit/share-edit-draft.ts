@@ -7,11 +7,11 @@ import type {
   ShareUserPolicy,
   ShareView,
 } from "@/lib/types";
+import { isRouterShareMarketManagedGrant } from "@/lib/share-settings";
 import {
   DEFAULT_PARALLEL_LIMIT,
   DEFAULT_TOKEN_LIMIT,
   isPermanentExpiryDate,
-  isShareMarket,
   isUnlimitedExpiry,
   isUnlimitedParallelLimit,
   isUnlimitedTokenLimit,
@@ -32,10 +32,8 @@ export const PRICE_APPS: Array<{ key: PriceApp; label: string }> = [
 export type ShareEditDraft = {
   description: string;
   forSale: "Yes" | "No" | "Free";
-  saleMarketKind: "token" | "share";
   marketAccessMode: "selected" | "all";
   selectedMarketEmails: string[];
-  selectedShareMarketEmail: string;
   shareToEmailsByApp: Record<PriceApp, string[]>;
   tokenLimitInput: string;
   tokenLimitUnlimited: boolean;
@@ -89,17 +87,8 @@ export function normalizedUniqueEmails(values: string[]) {
 
 export function sortedTokenMarkets(markets: DashboardMarket[]) {
   return markets
-    .filter((market) => !isShareMarket(market) && market.email)
+    .filter((market) => market.email)
     .sort((a, b) => marketLabel(a).localeCompare(marketLabel(b)));
-}
-
-export function sortedShareMarkets(markets: DashboardMarket[]) {
-  return markets.filter(isShareMarket).sort((a, b) => marketLabel(a).localeCompare(marketLabel(b)));
-}
-
-/** 推荐：Share Market 取排序后第一个；Token Market 取排序后第一个（selected 模式）。 */
-export function recommendedShareMarketEmail(shareMarkets: DashboardMarket[]) {
-  return sortedShareMarkets(shareMarkets)[0]?.email?.toLowerCase() || "";
 }
 
 export function recommendedTokenMarketEmail(tokenMarkets: DashboardMarket[]) {
@@ -109,21 +98,8 @@ export function recommendedTokenMarketEmail(tokenMarkets: DashboardMarket[]) {
 export function applyRecommendedMarketDefaults(
   draft: ShareEditDraft,
   tokenMarkets: DashboardMarket[],
-  shareMarkets: DashboardMarket[],
 ): ShareEditDraft {
   if (draft.forSale !== "Yes") return draft;
-
-  if (draft.saleMarketKind === "share") {
-    if (draft.selectedShareMarketEmail || !shareMarkets.length) return draft;
-    const email = recommendedShareMarketEmail(shareMarkets);
-    if (!email) return draft;
-    return {
-      ...draft,
-      marketAccessMode: "selected",
-      selectedShareMarketEmail: email,
-    };
-  }
-
   if (draft.marketAccessMode !== "selected" || draft.selectedMarketEmails.length) return draft;
   const email = recommendedTokenMarketEmail(tokenMarkets);
   if (!email) return draft;
@@ -136,8 +112,6 @@ export function applyRecommendedMarketDefaults(
 export function buildShareEditDraft(
   share: ShareView,
   publicMarketEmails: ReadonlySet<string>,
-  tokenMarketEmails: ReadonlySet<string>,
-  shareMarketEmails: ReadonlySet<string>,
 ): ShareEditDraft {
   const pendingPricing =
     share.activeEdit?.status === "rejected"
@@ -152,7 +126,6 @@ export function buildShareEditDraft(
     priceInputs[app.key] = typeof value === "number" && value > 0 ? String(value) : "";
   }
 
-  const saleMarketKind = share.saleMarketKind === "share" ? "share" : "token";
   const initialMode = (share.marketAccessMode as "selected" | "all") || "selected";
   const marketLinks = share.marketLinks || [];
   const accessByApp = effectiveShareAccessByApp(share);
@@ -196,22 +169,15 @@ export function buildShareEditDraft(
   const draft: ShareEditDraft = {
     description: share.description || "",
     forSale: (share.forSale as "Yes" | "No" | "Free") || "No",
-    saleMarketKind,
-    marketAccessMode: saleMarketKind === "share" ? "selected" : initialMode,
+    marketAccessMode: initialMode,
     selectedMarketEmails:
-      saleMarketKind === "token" && initialMode === "selected"
+      initialMode === "selected"
         ? normalizedUniqueEmails(
             marketLinks
               .map((link) => (link.email || "").toLowerCase())
-              .filter((email) => email && !shareMarketEmails.has(email)),
+              .filter(Boolean),
           )
         : [],
-    selectedShareMarketEmail:
-      saleMarketKind === "share"
-        ? marketLinks
-            .map((link) => (link.email || "").toLowerCase())
-            .find((email) => email && !tokenMarketEmails.has(email)) || ""
-        : "",
     shareToEmailsByApp: {
       claude: splitEmails((accessByApp.claude?.sharedWithEmails || []).join("\n")).filter(
         (email) => !publicMarketEmails.has(email),
@@ -241,7 +207,7 @@ export function buildShareEditDraft(
 }
 
 function buildShareEditPricingPayload(draft: ShareEditDraft, share?: ShareView | null) {
-  if (draft.forSale !== "Yes" || draft.saleMarketKind !== "token") return {};
+  if (draft.forSale !== "Yes") return {};
   const result: Record<string, number> = {};
   for (const app of shareAccessApps(share ?? null)) {
     if (!share?.support?.[app]) continue;
@@ -259,8 +225,7 @@ export function buildShareEditPatch(
   activeShareApps: PriceApp[],
   publicMarketEmails: ReadonlySet<string>,
 ): ShareSettingsPatch {
-  const effectiveSaleMarketKind = draft.forSale === "Yes" ? draft.saleMarketKind : "token";
-  const effectiveMarketAccessMode = effectiveSaleMarketKind === "share" ? "selected" : draft.marketAccessMode;
+  const effectiveMarketAccessMode = draft.marketAccessMode;
   const tokenLimit = draft.tokenLimitUnlimited ? UNLIMITED_TOKEN_LIMIT : Number.parseInt(draft.tokenLimitInput, 10);
   const parallelLimit = draft.parallelLimitUnlimited
     ? UNLIMITED_PARALLEL_LIMIT
@@ -277,11 +242,9 @@ export function buildShareEditPatch(
   for (const app of activeShareApps) {
     const shareToEmails = directShareToEmails.filter((email) => !publicMarketEmails.has(email));
     const saleEmails =
-      draft.forSale === "Yes" && effectiveSaleMarketKind === "token" && effectiveMarketAccessMode === "selected"
+      draft.forSale === "Yes" && effectiveMarketAccessMode === "selected"
         ? draft.selectedMarketEmails
-        : draft.forSale === "Yes" && effectiveSaleMarketKind === "share" && draft.selectedShareMarketEmail
-          ? [draft.selectedShareMarketEmail]
-          : [];
+        : [];
     for (const email of [...shareToEmails, ...saleEmails]) {
       activeGrantEmails.add(email);
     }
@@ -291,7 +254,6 @@ export function buildShareEditPatch(
     };
     appSettings[app] = {
       forSale: draft.forSale,
-      saleMarketKind: effectiveSaleMarketKind,
       marketAccessMode: effectiveMarketAccessMode,
       sharedWithEmails: accessByApp[app]?.sharedWithEmails ?? [],
       tokenLimit,
@@ -309,8 +271,14 @@ export function buildShareEditPatch(
         : undefined,
   };
   const userGrants: ShareUserGrantMap = {};
+  for (const [key, grant] of Object.entries(draft.userGrants)) {
+    if (!isRouterShareMarketManagedGrant(grant)) continue;
+    const email = (grant.email || key).trim().toLowerCase();
+    if (email) userGrants[email] = grant;
+  }
   for (const email of activeGrantEmails) {
     const previous = draft.userGrants[email];
+    if (isRouterShareMarketManagedGrant(previous)) continue;
     userGrants[email] = {
       ...previous,
       email,
@@ -322,7 +290,6 @@ export function buildShareEditPatch(
   const patch: ShareSettingsPatch = {
     description: draft.description.trim() || null,
     forSale: draft.forSale,
-    saleMarketKind: effectiveSaleMarketKind,
     marketAccessMode: effectiveMarketAccessMode,
     sharedWithEmails: normalizedUniqueEmails(
       Object.values(accessByApp).flatMap((access) => access?.sharedWithEmails ?? []),

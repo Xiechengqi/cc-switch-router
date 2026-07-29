@@ -6,7 +6,6 @@ import { EmptyBlock } from "@/components/dashboard/drawer-panels";
 import {
   DEFAULT_PARALLEL_LIMIT,
   DEFAULT_TOKEN_LIMIT,
-  isShareMarket,
   UNLIMITED_PARALLEL_LIMIT,
   UNLIMITED_TOKEN_LIMIT,
   type TFn,
@@ -42,13 +41,10 @@ export type ShareEditFormApi = {
   parallelInvalid: boolean;
   expiryInvalid: boolean;
   pricingInvalid: boolean;
-  shareMarketInvalid: boolean;
   formInvalid: boolean;
   isDirty: boolean;
   marketSelectKey: number;
   tokenMarkets: DashboardMarket[];
-  shareMarkets: DashboardMarket[];
-  shareMarketEmails: ReadonlySet<string>;
   transferableShareEmails: string[];
   setError: (value: string) => void;
   setNotice: (value: string) => void;
@@ -92,25 +88,15 @@ export function useShareEditForm({
   const editShare = baseShare || share;
   const activeShareApps = React.useMemo(() => shareAccessApps(editShare), [editShare]);
   const shareApp = activeShareApps[0] ?? resolveShareCoreApp(editShare);
-  const tokenMarkets = React.useMemo(() => markets.filter((market) => !isShareMarket(market)), [markets]);
-  const shareMarkets = React.useMemo(() => markets.filter(isShareMarket), [markets]);
+  const tokenMarkets = markets;
   const publicMarketEmails = React.useMemo(
     () => new Set(markets.map((market) => (market.email || "").toLowerCase()).filter(Boolean)),
     [markets],
   );
-  const tokenMarketEmails = React.useMemo(
-    () => new Set(tokenMarkets.map((market) => (market.email || "").toLowerCase()).filter(Boolean)),
-    [tokenMarkets],
-  );
-  const shareMarketEmails = React.useMemo(
-    () => new Set(shareMarkets.map((market) => (market.email || "").toLowerCase()).filter(Boolean)),
-    [shareMarkets],
-  );
-
   const applyDraft = React.useCallback((next: ShareEditDraft, recommend = false) => {
-    setDraft(recommend ? applyRecommendedMarketDefaults(next, tokenMarkets, shareMarkets) : next);
+    setDraft(recommend ? applyRecommendedMarketDefaults(next, tokenMarkets) : next);
     setMarketSelectKey((current) => current + 1);
-  }, [shareMarkets, tokenMarkets]);
+  }, [tokenMarkets]);
 
   React.useEffect(() => {
     if (!share) {
@@ -120,12 +106,7 @@ export function useShareEditForm({
       return;
     }
     if (baseShare?.shareId === share.shareId) return;
-    const initial = buildShareEditDraft(
-      share,
-      publicMarketEmails,
-      tokenMarketEmails,
-      shareMarketEmails,
-    );
+    const initial = buildShareEditDraft(share, publicMarketEmails);
     setBaseShare(share);
     setBaseDraft(initial);
     applyDraft(initial);
@@ -133,25 +114,25 @@ export function useShareEditForm({
     setNotice("");
     setConfirmFreeOpen(false);
     setTransferTargetEmail("");
-  }, [applyDraft, baseShare?.shareId, publicMarketEmails, share, shareMarketEmails, tokenMarketEmails, tokenMarkets, shareMarkets]);
+  }, [applyDraft, baseShare?.shareId, publicMarketEmails, share]);
 
   React.useEffect(() => {
     if (!share || !draft || !baseDraft || baseShare?.shareId !== share.shareId) return;
     if (JSON.stringify(draft) !== JSON.stringify(baseDraft)) return;
-    if (!tokenMarkets.length && !shareMarkets.length) return;
-    const recommended = applyRecommendedMarketDefaults(draft, tokenMarkets, shareMarkets);
+    if (!tokenMarkets.length) return;
+    const recommended = applyRecommendedMarketDefaults(draft, tokenMarkets);
     if (JSON.stringify(recommended) === JSON.stringify(draft)) return;
     setDraft(recommended);
-  }, [baseDraft, baseShare?.shareId, draft, share, shareMarkets, tokenMarkets]);
+  }, [baseDraft, baseShare?.shareId, draft, share, tokenMarkets]);
 
   const onDraftChange = React.useCallback(
     (updater: (current: ShareEditDraft) => ShareEditDraft) => {
       setDraft((current) => {
         if (!current) return current;
-        return applyRecommendedMarketDefaults(updater(current), tokenMarkets, shareMarkets);
+        return applyRecommendedMarketDefaults(updater(current), tokenMarkets);
       });
     },
-    [shareMarkets, tokenMarkets],
+    [tokenMarkets],
   );
 
   const onDescriptionChange = React.useCallback((value: string) => {
@@ -175,12 +156,12 @@ export function useShareEditForm({
               : { claude: "", codex: "", gemini: "" },
         };
         if (next === "Yes") {
-          return applyRecommendedMarketDefaults(updated, tokenMarkets, shareMarkets);
+          return applyRecommendedMarketDefaults(updated, tokenMarkets);
         }
         return updated;
       });
     },
-    [draft, onDraftChange, shareMarkets, tokenMarkets],
+    [draft, onDraftChange, tokenMarkets],
   );
 
   const confirmFree = React.useCallback(() => {
@@ -237,17 +218,6 @@ export function useShareEditForm({
   const onMarketPicked = React.useCallback(
     (raw: string) => {
       if (!raw || !draft) return;
-      if (draft.saleMarketKind === "share") {
-        const normalized = raw.toLowerCase();
-        if (!shareMarketEmails.has(normalized)) return;
-        onDraftChange((current) => ({
-          ...current,
-          marketAccessMode: "selected",
-          selectedShareMarketEmail: normalized,
-        }));
-        setMarketSelectKey((current) => current + 1);
-        return;
-      }
       if (raw === "__all__") {
         onDraftChange((current) => ({
           ...current,
@@ -265,7 +235,7 @@ export function useShareEditForm({
       }));
       setMarketSelectKey((current) => current + 1);
     },
-    [draft, onDraftChange, shareMarketEmails],
+    [draft, onDraftChange],
   );
 
   const transferableShareEmails = React.useMemo(() => {
@@ -289,16 +259,13 @@ export function useShareEditForm({
   const expiryInvalid = !draft.expiresPermanent && !draft.expiresAtInput.trim();
   const pricingInvalid =
     draft.forSale === "Yes" &&
-    draft.saleMarketKind === "token" &&
     activeShareApps.some((app) => {
       const raw = draft.priceInputs[app];
       if (!raw) return false;
       return !/^(?:[1-9]|[1-9][0-9]|100)$/.test(raw);
     });
-  const shareMarketInvalid =
-    draft.forSale === "Yes" && draft.saleMarketKind === "share" && !draft.selectedShareMarketEmail;
   const formInvalid =
-    descriptionInvalid || tokenInvalid || parallelInvalid || expiryInvalid || pricingInvalid || shareMarketInvalid;
+    descriptionInvalid || tokenInvalid || parallelInvalid || expiryInvalid || pricingInvalid;
 
   const currentPatch = buildShareEditPatch(draft, editShare!, activeShareApps, publicMarketEmails);
   const basePatch = buildShareEditPatch(baseDraft, editShare!, activeShareApps, publicMarketEmails);
@@ -346,20 +313,16 @@ export function useShareEditForm({
     setNotice("");
     try {
       const targetEmail = transferTargetEmail.toLowerCase();
-      const effectiveSaleMarketKind = draft.forSale === "Yes" ? draft.saleMarketKind : "token";
-      const effectiveMarketAccessMode =
-        effectiveSaleMarketKind === "share" ? "selected" : draft.marketAccessMode;
+      const effectiveMarketAccessMode = draft.marketAccessMode;
       const accessByApp: ShareAccessByApp = {};
       for (const app of activeShareApps) {
         const shareToEmails = (draft.shareToEmailsByApp[app] ?? []).filter(
           (email) => !publicMarketEmails.has(email),
         );
         const saleEmails =
-          draft.forSale === "Yes" && effectiveSaleMarketKind === "token" && effectiveMarketAccessMode === "selected"
+          draft.forSale === "Yes" && effectiveMarketAccessMode === "selected"
             ? draft.selectedMarketEmails
-            : draft.forSale === "Yes" && effectiveSaleMarketKind === "share" && draft.selectedShareMarketEmail
-              ? [draft.selectedShareMarketEmail]
-              : [];
+            : [];
         accessByApp[app] = {
           sharedWithEmails: normalizedUniqueEmails([
             ...shareToEmails.filter((email) => email !== targetEmail),
@@ -376,7 +339,6 @@ export function useShareEditForm({
         ownerEmail: targetEmail,
         sharedWithEmails: nextShared,
         accessByApp,
-        saleMarketKind: effectiveSaleMarketKind,
         marketAccessMode: effectiveMarketAccessMode,
       }, share.configRevision);
       await onSaved({ appliedSynchronously: res.appliedSynchronously });
@@ -407,13 +369,10 @@ export function useShareEditForm({
     parallelInvalid,
     expiryInvalid,
     pricingInvalid,
-    shareMarketInvalid,
     formInvalid,
     isDirty,
     marketSelectKey,
     tokenMarkets,
-    shareMarkets,
-    shareMarketEmails,
     transferableShareEmails,
     setError,
     setNotice,
@@ -467,12 +426,10 @@ export function ShareEditFormBody({
         shareApp={shareApp}
         draft={draft}
         tokenMarkets={form.tokenMarkets}
-        shareMarkets={form.shareMarkets}
         marketSelectKey={form.marketSelectKey}
         descriptionLength={form.descriptionLength}
         descriptionInvalid={form.descriptionInvalid}
         pricingInvalid={form.pricingInvalid}
-        shareMarketInvalid={form.shareMarketInvalid}
         onDescriptionChange={form.onDescriptionChange}
         onForSaleChange={form.handleForSaleChange}
         onDraftChange={form.onDraftChange}

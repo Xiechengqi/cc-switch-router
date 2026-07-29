@@ -219,8 +219,6 @@ export type DashboardClient = {
   removalAt?: string;
 };
 
-export type ShareSaleMarketKind = "token" | "share";
-
 export type ShareTokenPeriod =
   | "lifetime"
   | "day"
@@ -247,6 +245,8 @@ export type ShareUserGrant = {
   updatedAtMs?: number;
   revokedAtMs?: number;
   revision?: number;
+  manager?: "owner" | "manual" | "routerShareMarket";
+  entitlementId?: string;
 };
 
 export type ShareUserGrantMap = Record<string, ShareUserGrant>;
@@ -263,7 +263,6 @@ export type ShareView = {
   unknownMarketEmails?: string[];
   description?: string;
   forSale: string;
-  saleMarketKind?: ShareSaleMarketKind;
   marketAccessMode: string;
   forSaleOfficialPricePercentByApp?: Record<string, number>;
   subdomain: string;
@@ -317,7 +316,6 @@ export type ShareAccessByApp = Partial<Record<"claude" | "codex" | "gemini", Sha
 
 export type ShareAppSettings = {
   forSale?: "Yes" | "No" | "Free";
-  saleMarketKind?: ShareSaleMarketKind;
   marketAccessMode?: "selected" | "all";
   sharedWithEmails?: string[];
   tokenLimit?: number;
@@ -331,7 +329,6 @@ export type ShareSettingsPatch = {
   ownerEmail?: string;
   description?: string | null;
   forSale?: "Yes" | "No" | "Free";
-  saleMarketKind?: ShareSaleMarketKind;
   marketAccessMode?: "selected" | "all";
   sharedWithEmails?: string[];
   accessByApp?: ShareAccessByApp;
@@ -476,19 +473,6 @@ export type ShareMarketLink = {
   online: boolean;
   routeState: RouteState;
   routeStateSince?: string;
-  listingStatusByApp?: Record<string, ShareMarketListingStatus>;
-};
-
-export type ShareMarketListingStatus = {
-  listingUrl?: string;
-  status?: "idle" | "carpooling" | "full" | "unavailable" | "unknown" | string;
-  saleMode?: "single" | "carpool" | string | null;
-  filledSeats?: number | null;
-  requiredSeats?: number | null;
-  listingStatus?: string | null;
-  updatedAt?: string | null;
-  expiresAt?: string | null;
-  isStale?: boolean;
 };
 
 export type DashboardMarket = {
@@ -557,7 +541,6 @@ export type MarketShare = {
   installationOwnerEmail?: string;
   appType: string;
   forSale: string;
-  saleMarketKind?: ShareSaleMarketKind;
   marketAccessMode: string;
   shareStatus: string;
   online: boolean;
@@ -1571,4 +1554,108 @@ export type CreateClientSelectionPersist = {
 export type CreateClientRegionsPersist = {
   mode: "all" | "subset";
   codes: string[];
+};
+
+export type ShareMarketSeatInput = {
+  parallelLimit?: number;
+  tokenLimit?: number;
+  tokenPeriod: ShareTokenPeriod;
+  priceMinor?: number;
+  currency?: string;
+  periodUnit?: "day" | "week" | "month";
+  periodCount?: number;
+};
+
+export type ShareMarketInvoice = {
+  id: string;
+  sequence: number;
+  amountMinor: number;
+  currency: string;
+  periodUnit: string;
+  periodCount: number;
+  status: string;
+  dueAt: string;
+  deadlineAt: string;
+  openedAt: string;
+};
+
+export type ShareMarketSubscription = {
+  id: string;
+  seatId: string;
+  listingId: string;
+  shareId: string;
+  shareName: string;
+  appType: string;
+  subdomain?: string;
+  shareOnline?: boolean;
+  ownerEmail: string;
+  renterEmail: string;
+  status: string;
+  priceMinor?: number;
+  currency?: string;
+  periodUnit?: string;
+  periodCount?: number;
+  offerRevision: number;
+  trialEndsAt?: string;
+  currentPeriodEnd?: string;
+  paymentDeadline?: string;
+  openInvoice?: ShareMarketInvoice;
+  paymentMethods?: ClientMarketPaymentMethod[];
+  paymentProfileUpdatedAt?: string;
+  canDeclarePaid: boolean;
+  canRelease: boolean;
+  canForceRevoke: boolean;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ShareMarketSeat = ShareMarketSeatInput & {
+  id: string;
+  position: number;
+  status: string;
+  offerRevision: number;
+  isFree: boolean;
+  canRent: boolean;
+  subscription?: ShareMarketSubscription;
+};
+
+export type ShareMarketListing = {
+  id: string;
+  shareId: string;
+  shareName: string;
+  appType: string;
+  ownerEmail: string;
+  status: string;
+  shareStatus: string;
+  subdomain?: string;
+  shareOnline: boolean;
+  isOwner: boolean;
+  supportedUserTokenPeriods: ShareTokenPeriod[];
+  seats: ShareMarketSeat[];
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ShareMarketOwnerBlock = {
+  blockedUserId: string;
+  blockedEmail: string;
+  reason: string;
+  createdAt: string;
+};
+
+export type ShareMarketCatalog = {
+  listings: ShareMarketListing[];
+  mySubscriptions: ShareMarketSubscription[];
+  ownerBlocks: ShareMarketOwnerBlock[];
+  trialHours: number;
+  renewalGraceHours: number;
+};
+
+export type ShareMarketOwnedShare = {
+  shareId: string;
+  shareName: string;
+  appType: string;
+  shareStatus: string;
+  alreadyListed: boolean;
+  supportedUserTokenPeriods: ShareTokenPeriod[];
 };

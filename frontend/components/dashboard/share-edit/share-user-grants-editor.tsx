@@ -10,6 +10,7 @@ import type {
   ShareUserGrant,
   ShareUserPolicy,
 } from "@/lib/types";
+import { routerShareMarketManagedEmails } from "@/lib/share-settings";
 import type { PriceApp, ShareEditDraft } from "./share-edit-draft";
 
 type GrantDraft = {
@@ -94,16 +95,16 @@ export function ShareUserGrantsEditor({
     supported.has(period.key),
   );
   const periodLabel = Object.fromEntries(periods.map((period) => [period.key, period.label]));
-  const marketManagedEmails = new Set(
-    [
-      ...draft.selectedMarketEmails,
-      draft.selectedShareMarketEmail,
-    ].filter(Boolean),
-  );
+  const tokenMarketEmails = new Set(draft.selectedMarketEmails);
+  const shareMarketManagedEmails = routerShareMarketManagedEmails(draft.userGrants);
+  const protectedEmails = new Set([
+    ...tokenMarketEmails,
+    ...shareMarketManagedEmails,
+  ]);
   const visibleEmails = new Set([
     normalizedOwner,
     ...Object.values(draft.shareToEmailsByApp).flat(),
-    ...marketManagedEmails,
+    ...protectedEmails,
   ]);
   const grants = Array.from(visibleEmails)
     .filter(Boolean)
@@ -127,6 +128,7 @@ export function ShareUserGrantsEditor({
   };
 
   const openEdit = (grant: ShareUserGrant) => {
+    if (shareMarketManagedEmails.has(grant.email)) return;
     setEditingEmail(grant.email);
     setError("");
     setGrantDraft(makeDraft(grant.email, grant.policy));
@@ -135,7 +137,7 @@ export function ShareUserGrantsEditor({
   const applyGrants = (userGrants: ShareEditDraft["userGrants"]) => {
     const emails = Object.values(userGrants)
       .filter((grant) => grant.active !== false && grant.role === "shareto")
-      .filter((grant) => !marketManagedEmails.has(grant.email))
+      .filter((grant) => !tokenMarketEmails.has(grant.email))
       .map((grant) => grant.email)
       .sort();
     onDraftChange((current) => ({
@@ -166,6 +168,13 @@ export function ShareUserGrantsEditor({
       : undefined;
     if (!validEmail(email)) {
       setError(t("dashboard.userLimit.invalidEmail"));
+      return;
+    }
+    if (
+      (editingEmail && shareMarketManagedEmails.has(editingEmail)) ||
+      (!editingEmail && shareMarketManagedEmails.has(email))
+    ) {
+      setError(t("dashboard.userLimit.duplicateEmail"));
       return;
     }
     if (!editingEmail && draft.userGrants[email]?.active !== false && draft.userGrants[email]) {
@@ -244,6 +253,9 @@ export function ShareUserGrantsEditor({
                     {grant.role === "owner" ? (
                       <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold text-slate-600">Owner</span>
                     ) : null}
+                    {shareMarketManagedEmails.has(grant.email) ? (
+                      <span className="rounded bg-sky-50 px-1.5 py-0.5 text-[10px] font-semibold text-sky-700">Share Market</span>
+                    ) : null}
                   </div>
                 </td>
                 <td className="px-3 py-2">{limit(grant.policy.parallelLimit)}</td>
@@ -251,10 +263,12 @@ export function ShareUserGrantsEditor({
                 <td className="px-3 py-2">{expiry(grant.policy.expiresAt)}</td>
                 <td className="px-3 py-2">
                   <div className="flex justify-end gap-1">
-                    <Button isIconOnly size="sm" variant="ghost" aria-label={t("common.edit")} onClick={() => openEdit(grant)}>
-                      <Pencil className="h-4 w-4" />
-                    </Button>
-                    {grant.role !== "owner" && !marketManagedEmails.has(grant.email) ? (
+                    {!shareMarketManagedEmails.has(grant.email) ? (
+                      <Button isIconOnly size="sm" variant="ghost" aria-label={t("common.edit")} onClick={() => openEdit(grant)}>
+                        <Pencil className="h-4 w-4" />
+                      </Button>
+                    ) : null}
+                    {grant.role !== "owner" && !protectedEmails.has(grant.email) ? (
                       <Button isIconOnly size="sm" variant="ghost" aria-label={t("common.delete")} onClick={() => {
                         const userGrants = { ...draft.userGrants };
                         delete userGrants[grant.email];

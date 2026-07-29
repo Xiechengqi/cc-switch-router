@@ -12,6 +12,8 @@ import { WebTerminalGlyph } from "@/components/dashboard/web-terminal/web-termin
 import { useWebTerminal } from "@/components/dashboard/web-terminal";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { HostOfferDialog } from "@/components/dashboard/client-market/host-offer-dialog";
+import { ClientMarketBillingBanner } from "@/components/dashboard/client-market-billing-banner";
+import { ReleaseRentalAction } from "@/components/dashboard/client-market/release-rental-action";
 import {
   cleanupClientMarketClientWithReason,
   deleteClientMarketHost,
@@ -19,7 +21,7 @@ import {
   reverifyClientMarketHost,
 } from "@/lib/api";
 import { mergeHosts } from "@/lib/client-market-refresh";
-import type { ClientMarketHost, ProvisioningJob } from "@/lib/types";
+import type { ClientMarketBilling, ClientMarketHost, ProvisioningJob } from "@/lib/types";
 import {
   cleanupFailureGuidanceKey,
   cleanupPhaseLabelKey,
@@ -29,6 +31,7 @@ import {
   formatHostIpLocation,
   formatHostOffer,
   hostCanCleanup,
+  hostCanClientRelease,
   hostCanDelete,
   hostCanManage,
   hostCanReverify,
@@ -39,6 +42,8 @@ import {
 
 function HostRowImpl({
   host,
+  billing,
+  highlighted = false,
   selectionMode,
   selected,
   onSelectedChange,
@@ -48,6 +53,8 @@ function HostRowImpl({
   onUiBusyChange,
 }: {
   host: ClientMarketHost;
+  billing?: ClientMarketBilling | null;
+  highlighted?: boolean;
   selectionMode: boolean;
   selected: boolean;
   /** Takes the host id so the parent can pass one stable callback to every row
@@ -78,6 +85,8 @@ function HostRowImpl({
   const canDelete = hostCanDelete(host, viewerEmail);
   const isClientOwner = host.isClientOwner === true;
   const canCleanup = hostCanCleanup(host, viewerEmail);
+  const canClientRelease = hostCanClientRelease(host, billing);
+  const showRenterBilling = isClientOwner && !!billing && billing.status !== "released";
   const canMarkUnpaid =
     !!host.installationId &&
     host.status === "allocated" &&
@@ -209,7 +218,7 @@ function HostRowImpl({
   const cleanupTone =
     cleanupJob?.status === "failed" ? "failed" : cleanupJob?.status === "succeeded" ? "success" : "running";
   const noteText = host.note?.trim() || "";
-  const showSubrow = !!noteText;
+  const showSubrow = !!noteText || showRenterBilling;
   const ipIntelSubtitle = secondaryIntelParts.length ? secondaryIntelParts.join(" · ") : "";
   const statusGuidanceKey = hostStatusGuidanceKey(host.status, host.lastError);
   const statusGuidanceSubtitle = statusGuidanceKey ? t(statusGuidanceKey) : "";
@@ -218,7 +227,12 @@ function HostRowImpl({
 
   return (
     <>
-      <tr className="border-b border-border/80 transition-colors hover:bg-muted/40">
+      <tr
+        id={host.installationId ? `client-market-host-${host.installationId}` : undefined}
+        className={`border-b border-border/80 transition-colors hover:bg-muted/40 ${
+          highlighted ? "bg-accent/[0.06] ring-2 ring-inset ring-accent/40" : ""
+        }`}
+      >
         {selectionMode ? (
           <td className="w-10 px-2 py-2 align-middle">
             <Checkbox
@@ -309,6 +323,13 @@ function HostRowImpl({
                 {t("createClient.newClient")}
               </Button>
             ) : null}
+            {canClientRelease && billing ? (
+              <ReleaseRentalAction
+                billing={billing}
+                onChanged={onChanged}
+                className="h-8 px-2.5 text-xs text-rose-700"
+              />
+            ) : null}
             {canOpenTerminal ? (
               <Button
                 variant="ghost"
@@ -397,6 +418,15 @@ function HostRowImpl({
                 <span className="min-w-0 whitespace-normal break-words" title={noteText}>
                   {noteText}
                 </span>
+              ) : null}
+              {showRenterBilling && billing ? (
+                <ClientMarketBillingBanner
+                  billing={billing}
+                  onChanged={onChanged}
+                  compact
+                  showPayButton
+                  resumeRelease
+                />
               ) : null}
             </div>
           </td>

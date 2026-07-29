@@ -11,11 +11,11 @@ import { useDashboardFocus } from "@/components/dashboard/dashboard-focus";
 import { useDashboardViewState } from "@/components/dashboard/dashboard-view-state";
 import { useOperationVerification } from "@/components/dashboard/operation-verification";
 import { getMarketLinkedShares, getMarketSharePriority, getMarketShareSessionLoads, releaseMarketShareState, updateMarketDisabledShares, updateMarketMaintenance } from "@/lib/api";
-import type { DashboardMarket, MarketAppAvailabilityEntry, MarketRequestLog, MarketShare, MarketShareRuntimeState, OperationalState, ShareAppRuntimes, ShareUpstreamProvider } from "@/lib/types";
+import type { DashboardMarket, MarketRequestLog, MarketShare, MarketShareRuntimeState, OperationalState, ShareAppRuntimes, ShareUpstreamProvider } from "@/lib/types";
 import { cn, compactTokens, formatDateTime, formatRelativeTime } from "@/lib/utils";
 import { usePersistentState } from "@/lib/use-persistent-state";
 import { recordDashboardUxEvent } from "@/lib/api";
-import { canShowMarketSharePriority, drawerDialogClassName, formatOfficialPriceMultiplier, formatUsdExactTrimmed, formatUsdOneDecimal, isShareMarket, isUnlimited, isUsageMarket, marketKindDescription, marketKindLabel, requestModelRoute, shouldOpenRowDrawer, sortMarkets, usageBucketTotalTokens, type TFn } from "@/components/dashboard/share-dashboard-utils";
+import { drawerDialogClassName, formatOfficialPriceMultiplier, formatUsdExactTrimmed, formatUsdOneDecimal, isUnlimited, requestModelRoute, shouldOpenRowDrawer, sortMarkets, usageBucketTotalTokens, type TFn } from "@/components/dashboard/share-dashboard-utils";
 import { InstallGuideDialog } from "@/components/dashboard/install-guide-dialog";
 import { SectionInstallButton } from "@/components/dashboard/section-install-button";
 import { CompactSelect } from "@/components/common/compact-select";
@@ -26,7 +26,7 @@ function marketCapacityPercent(market: DashboardMarket) {
 }
 
 function MarketEditAction({ market, onEdit, t }: { market: DashboardMarket; onEdit: (market: DashboardMarket) => void; t: TFn }) {
-  if (!market.canManage || isShareMarket(market)) return null;
+  if (!market.canManage) return null;
   return (
     <button
       type="button"
@@ -67,9 +67,9 @@ function MarketTypeChip({ market, t }: { market: DashboardMarket; t: TFn }) {
     <Chip
       size="sm"
       variant="soft"
-      title={marketKindDescription(market, t)}
+      title={t("dashboard.tokenMarketTooltip")}
     >
-      {marketKindLabel(market, t)}
+      {t("dashboard.tokenMarket")}
     </Chip>
   );
 }
@@ -236,7 +236,7 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
               {rows.length ? rows.map(({ market, state, summary: operational }) => {
                 const capacityPercent = marketCapacityPercent(market);
                 const capacityLimit = isUnlimited(market.parallelCapacity) ? "∞" : market.parallelCapacity > 0 ? String(market.parallelCapacity) : "-";
-                const usageValue = isShareMarket(market) ? compactTokens(market.usageTokens) : `${compactTokens(market.usageTokens)} · ${formatUsdOneDecimal(market.usageAmountUsd)}`;
+                const usageValue = `${compactTokens(market.usageTokens)} · ${formatUsdOneDecimal(market.usageAmountUsd)}`;
                 const rowTone = state === "offline" ? "border-l-rose-500" : state === "reconnecting" ? "border-l-sky-500" : state === "degraded" ? "border-l-amber-400" : state === "maintenance" ? "border-l-blue-400" : state === "disabled" ? "border-l-slate-300 opacity-70" : "border-l-transparent";
                 const uptimeTitle = t("dashboard.uptimeObservation", { healthy: (market.onlineRate24h || 0).toFixed(1), observed: market.observedMinutes24h || 0, coverage: (market.observationCoverage24h || 0).toFixed(1) });
                 const focused = focus.isFocused("market", market.id);
@@ -302,17 +302,13 @@ export function MarketsTable({ markets, onChanged }: { markets: DashboardMarket[
                   <div className="grid gap-4">
                     <div className="flex justify-end"><MarketEditAction market={selected} onEdit={setEditingMarket} t={t} /></div>
                     <OperationalDiagnosis summary={marketOperationalSummary(selected)} kind="market" />
-                    {isUsageMarket(selected) ? (
-                      <DrawerSection label={t("dashboard.officialPrice")}>
-                        <MarketPricingCell market={selected} t={t} />
-                      </DrawerSection>
-                    ) : null}
-                    <DrawerSection label={canShowMarketSharePriority(selected) ? t("dashboard.sharePriority") : t("dashboard.linkedShares")}>
-                      {canShowMarketSharePriority(selected) ? <MarketSharePriorityPanel market={selected} t={t} /> : <MarketLinkedShares market={selected} t={t} />}
+                    <DrawerSection label={t("dashboard.officialPrice")}>
+                      <MarketPricingCell market={selected} t={t} />
                     </DrawerSection>
-                    {isUsageMarket(selected) ? (
-                      <DrawerSection label={t("dashboard.recentRequests")}><MarketRequestLogs logs={selected.recentRequests || []} /></DrawerSection>
-                    ) : null}
+                    <DrawerSection label={t("dashboard.sharePriority")}>
+                      <MarketSharePriorityPanel market={selected} t={t} />
+                    </DrawerSection>
+                    <DrawerSection label={t("dashboard.recentRequests")}><MarketRequestLogs logs={selected.recentRequests || []} /></DrawerSection>
                   </div>
                 ) : null}
               </Drawer.Body>
@@ -716,79 +712,6 @@ function MarketEditDialog({ market, onClose, onSaved }: { market: DashboardMarke
           </Modal.Dialog>
         </Modal.Container>
     </Modal.Backdrop>
-  );
-}
-
-function MarketLinkedShares({ market, t }: { market: DashboardMarket; t: TFn }) {
-  const shares = market.linkedShares || [];
-  if (!shares.length) return <EmptyBlock>{t("dashboard.noLinkedShares")}</EmptyBlock>;
-  const availabilityTitle = (app: string, availability?: MarketAppAvailabilityEntry) => {
-    if (!availability) return app;
-    const parts = [
-      `${app}: ${String(availability.status || "unknown")}`,
-      "market request history, not client health",
-      availability.reason,
-      availability.requestedModel,
-    ].filter(Boolean);
-    return parts.join(" · ");
-  };
-  const appTitle = (label: string, availability: MarketAppAvailabilityEntry | undefined, blockedStates: MarketShareRuntimeState[]) => {
-    const lines = [availabilityTitle(label, availability)];
-    blockedStates.forEach((state) => lines.push(marketRuntimeStateTitle(state)));
-    return lines.join("\n");
-  };
-  return (
-    <div className="grid gap-2">
-      {shares.map((share) => {
-        const blockedByApp = marketBlockedStatesByApp(share.marketStates);
-        const visibleApps = MARKET_SHARE_APPS.filter(([key]) => share.support?.[key as keyof typeof share.support] || blockedByApp.has(key));
-        return (
-          <Card key={share.shareId} className={`rounded-lg border p-0 shadow-none ${share.disabledByMarket ? "border-amber-200 bg-amber-50/40" : ""}`}>
-            <Card.Content className="flex-row items-center justify-between gap-3 p-3">
-              <div className="min-w-0">
-                <div className="truncate font-medium">{share.subdomain || share.shareName || "-"}</div>
-                <div className="truncate text-xs text-muted-foreground">{share.ownerEmail || "-"}</div>
-              </div>
-              <div className="grid justify-items-end gap-1">
-                <Chip color={share.online ? "success" : share.routeState === "reconnecting" ? "accent" : "default"} size="sm" variant={share.online || share.routeState === "reconnecting" ? "soft" : "tertiary"}>{share.online ? t("common.online") : share.routeState === "reconnecting" ? t("dashboard.reconnecting") : t("common.offline")}</Chip>
-                {share.disabledByMarket ? <Chip color="warning" size="sm" variant="soft">{t("dashboard.disabled")}</Chip> : null}
-                {visibleApps.length ? (
-                  <div className="flex gap-1">
-                    {visibleApps.map(([key, label]) => {
-                      const availability = share.appAvailability?.[key as keyof typeof share.appAvailability];
-                      const blockedStates = blockedByApp.get(key) || [];
-                      const blocked = blockedStates.length > 0;
-                      const unavailable = availability?.status === "unavailable";
-                      // P15：把 "degraded" 也单独着色（黄）。后端在 share 命中 429 /
-                      // upstream error 等场景会把 appAvailability.status 设成 degraded
-                      // 但又没到 unavailable 的程度；以前前端只看 "unavailable" 一档，
-                      // 整段 chip 还是灰色，运维看不出 share 是限流降级中。
-                      const degraded =
-                        !blocked && !unavailable && availability?.status === "degraded";
-                      const chipColor: "danger" | "warning" | "default" =
-                        blocked || unavailable ? "danger" : degraded ? "warning" : "default";
-                      const chipVariant: "soft" | "tertiary" =
-                        blocked || unavailable || degraded ? "soft" : "tertiary";
-                      return (
-                        <Chip
-                          key={label}
-                          color={chipColor}
-                          size="sm"
-                          title={appTitle(label, availability, blockedStates)}
-                          variant={chipVariant}
-                        >
-                          {label}
-                        </Chip>
-                      );
-                    })}
-                  </div>
-                ) : null}
-              </div>
-            </Card.Content>
-          </Card>
-        );
-      })}
-    </div>
   );
 }
 

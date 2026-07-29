@@ -7,7 +7,7 @@ import { ShareClientTag } from "@/components/dashboard/share-client-tag";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getShareImageGenerationRequestLogs, getShareUsageByEmail, getShareUserLimitStatus } from "@/lib/api";
 import type { AppLocale } from "@/lib/i18n";
-import type { DashboardClient, ImageGenerationRequestLog, MarketRequestLog, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareMarketListingStatus, ShareModelHealthCheck, ShareRequestLog, ShareTokenPeriod, ShareUpstreamProvider, ShareUsageByEmailResponse, ShareUserGrant, ShareUserLimitStatusRow, ShareView } from "@/lib/types";
+import type { DashboardClient, ImageGenerationRequestLog, MarketRequestLog, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareModelHealthCheck, ShareRequestLog, ShareTokenPeriod, ShareUpstreamProvider, ShareUsageByEmailResponse, ShareUserGrant, ShareUserLimitStatusRow, ShareView } from "@/lib/types";
 import { compactTokens, formatDateTime, formatNumber, formatRelativeTime } from "@/lib/utils";
 import { resolveShareCoreApp, SHARE_APP_LABELS } from "@/lib/share-app";
 import { averageRecentLatencyMs, boundProviderIdForApp, cacheHitRate, clientPlatformLabel, clientTunnelDisplayUrl, configuredUpstreamPercent, CORE_SHARE_APPS, expiryTitle, formatAgeDaysOrHours, formatImageLogSizeMb, formatImageLogSpendSeconds, formatImageLogTimestamp, formatLatencySeconds, formatMinutesShort, formatPercent, formatShareStatus, HealthDots, isUnlimited, mergeStandaloneOAuthRuntime, modelHealthTitle, modelHealthTone, providerAccountIdentity, providerAccountLevel, providerModelMap, requestBelongsToApp, requestModelRoute, resolveShareAppRuntime, runtimeEndpointSummary, shareApiParts, shareAppExists, shareAppProviderRuntime, shareAppSettings, shareExpiryProgress, tokenCount, usageBucketTotalTokens, type CoreShareApp, type TFn } from "@/components/dashboard/share-dashboard-utils";
@@ -57,8 +57,7 @@ export function UsageBar({
 export function ForSaleCell({ share, t }: { share?: ShareView; t: TFn }) {
   if (!share) return <span className="text-muted-foreground">-</span>;
   const value = share.forSale === "Free" ? t("dashboard.free") : share.forSale === "Yes" ? t("dashboard.yes") : t("dashboard.no");
-  const saleMarketKind = share.saleMarketKind === "share" ? "share" : "token";
-  const pricingLines = share.forSale === "Yes" && saleMarketKind === "token"
+  const pricingLines = share.forSale === "Yes"
     ? [
         ["Claude", configuredUpstreamPercent(share.appRuntimes, "claude")],
         ["Codex", configuredUpstreamPercent(share.appRuntimes, "codex")],
@@ -66,9 +65,7 @@ export function ForSaleCell({ share, t }: { share?: ShareView; t: TFn }) {
       ].filter(([, percent]) => !!percent)
     : [];
   const marketLines = share.forSale === "Yes"
-    ? saleMarketKind === "share"
-      ? [t("dashboard.shareMarket"), ...(share.marketLinks || []).map((market) => market.subdomain || market.email).filter(Boolean)]
-      : [t("dashboard.tokenMarket"), ...(share.marketAccessMode === "all" ? [t("dashboard.allMarkets")] : (share.marketLinks || []).map((market) => market.subdomain || market.email).filter(Boolean))]
+    ? [t("dashboard.tokenMarket"), ...(share.marketAccessMode === "all" ? [t("dashboard.allMarkets")] : (share.marketLinks || []).map((market) => market.subdomain || market.email).filter(Boolean))]
     : [];
   return (
     <div className="grid min-w-32 gap-1.5">
@@ -198,38 +195,18 @@ export function ShareStatusCell({ share, t, locale }: { share?: ShareView; t: TF
   const limit = isUnlimited(share.parallelLimit) ? "∞" : String(share.parallelLimit || 0);
   const averageLatency = averageRecentLatencyMs(share.recentRequests);
   const rowClass = "grid grid-cols-[76px_minmax(0,1fr)] gap-2";
-  const shareMarketListingUrl = shareStatusShareMarketUrl(share, share.appType as CoreShareApp);
   const saleValue =
     share.forSale === "Free"
       ? t("dashboard.free")
       : share.forSale === "Yes"
-        ? share.saleMarketKind === "share"
-          ? t("dashboard.shareMarket")
-          : t("dashboard.tokenMarket")
+        ? t("dashboard.tokenMarket")
         : t("dashboard.no");
   const saleVariant: "soft" | "tertiary" = share.forSale === "No" ? "tertiary" : "soft";
   const saleRow = (
     <div className={rowClass}>
       <span className="mono-label text-muted-foreground">{t("dashboard.forSale")}</span>
       <div className="flex min-w-0 flex-wrap items-center gap-1">
-        {shareMarketListingUrl ? (
-          <a
-            href={shareMarketListingUrl}
-            target="_blank"
-            rel="noreferrer"
-            data-no-row-drawer
-            className="inline-flex items-center gap-1"
-            title={shareMarketListingUrl}
-          >
-            <Chip size="sm" variant={saleVariant}>
-              {saleValue}
-              <ExternalLink className="ml-1 inline h-3 w-3" />
-            </Chip>
-          </a>
-        ) : (
-          <Chip size="sm" variant={saleVariant}>{saleValue}</Chip>
-        )}
-        <ShareMarketListingStatusChip share={share} app={share.appType as CoreShareApp} t={t} />
+        <Chip size="sm" variant={saleVariant}>{saleValue}</Chip>
       </div>
     </div>
   );
@@ -255,76 +232,6 @@ export function ShareStatusCell({ share, t, locale }: { share?: ShareView; t: TF
       <div className={rowClass}><span className="mono-label text-muted-foreground">{t("dashboard.health")}</span><HealthDots entries={share.healthChecks} /></div>
     </div>
   );
-}
-
-export function ShareMarketListingStatusChip({ share, app, t }: { share: ShareView; app?: CoreShareApp; t: TFn }) {
-  const listing = shareMarketListingForApp(share, app);
-  if (!listing) return null;
-  const status = listing.status || "unknown";
-  const label = shareMarketListingStatusLabel(listing, t);
-  const color =
-    status === "full"
-      ? "success"
-      : status === "carpooling"
-        ? "warning"
-        : status === "unavailable"
-          ? "default"
-          : status === "unknown"
-            ? "default"
-            : "accent";
-  return (
-    <Chip size="sm" variant="soft" color={color as "success" | "warning" | "default" | "accent"}>
-      {label}
-    </Chip>
-  );
-}
-
-export function shareMarketListingStatusLabel(listing: ShareMarketListingStatus, t: TFn) {
-  const status = listing.status || "unknown";
-  const base =
-    status === "idle"
-      ? t("dashboard.shareMarketListingIdle")
-      : status === "carpooling"
-        ? t("dashboard.shareMarketListingCarpooling")
-        : status === "full"
-          ? t("dashboard.shareMarketListingFull")
-          : status === "unavailable"
-            ? t("dashboard.shareMarketListingUnavailable")
-            : t("dashboard.shareMarketListingUnknown");
-  if (
-    status === "carpooling" &&
-    typeof listing.filledSeats === "number" &&
-    typeof listing.requiredSeats === "number" &&
-    listing.requiredSeats > 0
-  ) {
-    return `${base} ${listing.filledSeats}/${listing.requiredSeats}`;
-  }
-  return base;
-}
-
-export function shareMarketListingForApp(share: ShareView, app?: CoreShareApp) {
-  if (!app) return undefined;
-  const market = (share.marketLinks || []).find(
-    (item) => item.marketKind === "share" && item.publicBaseUrl,
-  );
-  return market?.listingStatusByApp?.[app];
-}
-
-export function shareStatusShareMarketUrl(share: ShareView, app?: CoreShareApp) {
-  const settings = app ? shareAppSettings(share, app) : undefined;
-  const forSale = settings?.forSale ?? share.forSale;
-  const saleMarketKind = settings?.saleMarketKind ?? share.saleMarketKind;
-  if (forSale !== "Yes" || saleMarketKind !== "share") return null;
-  const market = (share.marketLinks || []).find(
-    (item) => item.marketKind === "share" && item.publicBaseUrl,
-  );
-  if (!market?.publicBaseUrl) return null;
-  const listing = app ? market.listingStatusByApp?.[app] : undefined;
-  if (listing?.listingUrl) return listing.listingUrl;
-  const base = market.publicBaseUrl.replace(/\/+$/, "");
-  const routerId = share.routerId || "main";
-  const appParam = app ? `&app_type=${encodeURIComponent(app)}` : "";
-  return `${base}/listing/share?router_id=${encodeURIComponent(routerId)}&share_id=${encodeURIComponent(share.shareId)}${appParam}`;
 }
 
 export function clientOwnerEmail(client?: DashboardClient | null) {
@@ -498,13 +405,12 @@ export function ShareMarkets({ share, t }: { share?: ShareView; t: TFn }) {
   if (!share) return <EmptyBlock>{t("dashboard.noShare")}</EmptyBlock>;
   if (share.forSale === "Free") return <EmptyBlock>{t("dashboard.publicFreeShare")}</EmptyBlock>;
   if (share.forSale !== "Yes") return <EmptyBlock>{t("dashboard.notForSale")}</EmptyBlock>;
-  const saleMarketKind = share.saleMarketKind === "share" ? "share" : "token";
-  if (saleMarketKind === "token" && share.marketAccessMode === "all") return <EmptyBlock>{t("dashboard.authorizedAllMarkets")}</EmptyBlock>;
+  if (share.marketAccessMode === "all") return <EmptyBlock>{t("dashboard.authorizedAllMarkets")}</EmptyBlock>;
   const links = share.marketLinks || [];
   const unknown = share.unknownMarketEmails || [];
   return (
     <div className="grid gap-2">
-      <Chip size="sm" variant="tertiary">{saleMarketKind === "share" ? t("dashboard.shareMarket") : t("dashboard.tokenMarket")}</Chip>
+      <Chip size="sm" variant="tertiary">{t("dashboard.tokenMarket")}</Chip>
       {links.map((market) => {
         const reconnecting = market.routeState === "reconnecting";
         return (

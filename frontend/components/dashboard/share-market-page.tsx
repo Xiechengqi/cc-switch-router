@@ -1,0 +1,798 @@
+"use client";
+
+import * as React from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { Button, Checkbox, Modal, Tabs, toast } from "@heroui/react";
+import {
+  Ban,
+  CircleDollarSign,
+  ExternalLink,
+  Loader2,
+  Pencil,
+  Plus,
+  RefreshCw,
+  RotateCcw,
+  Trash2,
+  UserRoundX,
+  X,
+} from "lucide-react";
+import { useAuth } from "@/components/auth/auth-provider";
+import { AuthenticatedImage } from "@/components/common/authenticated-image";
+import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
+import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
+import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
+import { subdomainTunnelUrl } from "@/components/dashboard/share-dashboard-utils";
+import { useLocaleText } from "@/components/i18n/locale-provider";
+import {
+  addShareMarketSeat,
+  closeShareMarketListing,
+  createShareMarketListing,
+  declareShareMarketPaid,
+  deleteShareMarketSeat,
+  forceRevokeShareMarketSubscription,
+  getShareMarketCatalog,
+  getShareMarketOwnedShares,
+  liftShareMarketBlock,
+  releaseShareMarketSubscription,
+  rentShareMarketSeat,
+  updateShareMarketSeat,
+} from "@/lib/api";
+import { DASHBOARD_SHARE_MARKET_PATH, type ShareMarketTabParam } from "@/lib/dashboard-nav";
+import type {
+  ShareMarketCatalog,
+  ShareMarketListing,
+  ShareMarketOwnedShare,
+  ShareMarketSeat,
+  ShareMarketSeatInput,
+  ShareMarketSubscription,
+  ShareTokenPeriod,
+} from "@/lib/types";
+
+type MarketTab = ShareMarketTabParam;
+type TFn = ReturnType<typeof useLocaleText>["t"];
+type ConfirmAction = {
+  id: string;
+  title: string;
+  description: string;
+  confirmLabel: string;
+  tone: "danger" | "warning";
+  run: () => Promise<unknown>;
+};
+type SeatDraft = {
+  parallelLimit: string;
+  tokenLimit: string;
+  tokenPeriod: ShareTokenPeriod;
+  paid: boolean;
+  price: string;
+  currency: string;
+  periodUnit: "day" | "week" | "month";
+  periodCount: string;
+};
+
+const TOKEN_PERIODS: ShareTokenPeriod[] = [
+  "lifetime",
+  "day",
+  "week",
+  "sevenDays",
+  "calendarMonth",
+  "thirtyDays",
+];
+
+function emptySeat(supportedPeriods: ShareTokenPeriod[] = TOKEN_PERIODS): SeatDraft {
+  return {
+    parallelLimit: "",
+    tokenLimit: "",
+    tokenPeriod: supportedPeriods.includes("lifetime") ? "lifetime" : supportedPeriods[0] || "lifetime",
+    paid: false,
+    price: "",
+    currency: "CNY",
+    periodUnit: "month",
+    periodCount: "1",
+  };
+}
+
+function draftFromSeat(seat: ShareMarketSeat): SeatDraft {
+  return {
+    parallelLimit: seat.parallelLimit == null ? "" : String(seat.parallelLimit),
+    tokenLimit: seat.tokenLimit == null ? "" : String(seat.tokenLimit),
+    tokenPeriod: seat.tokenPeriod,
+    paid: !seat.isFree,
+    price: seat.priceMinor == null ? "" : (seat.priceMinor / 100).toFixed(2),
+    currency: seat.currency || "CNY",
+    periodUnit: (seat.periodUnit as SeatDraft["periodUnit"]) || "month",
+    periodCount: String(seat.periodCount || 1),
+  };
+}
+
+function parsePositiveOptional(value: string, label: string, t: TFn) {
+  if (!value.trim()) return undefined;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    throw new Error(t("shareMarket.error.positiveInteger", { field: label }));
+  }
+  return parsed;
+}
+
+function seatInput(draft: SeatDraft, t: TFn): ShareMarketSeatInput {
+  const parallelLimit = parsePositiveOptional(draft.parallelLimit, t("shareMarket.parallel"), t);
+  const tokenLimit = parsePositiveOptional(draft.tokenLimit, t("shareMarket.tokens"), t);
+  if (!draft.paid) return { parallelLimit, tokenLimit, tokenPeriod: draft.tokenPeriod };
+  const price = draft.price.trim();
+  const amount = Number(price);
+  const periodCount = Number(draft.periodCount);
+  const priceMinor = Math.round(amount * 100);
+  if (!/^\d+(?:\.\d{1,2})?$/.test(price) || amount <= 0 || !Number.isSafeInteger(priceMinor)) {
+    throw new Error(t("shareMarket.error.price"));
+  }
+  if (!Number.isSafeInteger(periodCount) || periodCount < 1 || periodCount > 365) {
+    throw new Error(t("shareMarket.error.billingPeriod"));
+  }
+  const currency = draft.currency.trim().toUpperCase();
+  if (!/^[A-Z]{3}$/.test(currency)) {
+    throw new Error(t("shareMarket.error.currency"));
+  }
+  return {
+    parallelLimit,
+    tokenLimit,
+    tokenPeriod: draft.tokenPeriod,
+    priceMinor,
+    currency,
+    periodUnit: draft.periodUnit,
+    periodCount,
+  };
+}
+
+function fieldClass() {
+  return "h-10 min-w-0 rounded-md border border-slate-200 bg-white px-3 text-sm text-slate-900 outline-none focus:border-slate-400";
+}
+
+function SeatFields({
+  draft,
+  supportedPeriods,
+  onChange,
+}: {
+  draft: SeatDraft;
+  supportedPeriods?: ShareTokenPeriod[];
+  onChange: (draft: SeatDraft) => void;
+}) {
+  const { t } = useLocaleText();
+  const patch = (value: Partial<SeatDraft>) => onChange({ ...draft, ...value });
+  const periods = supportedPeriods?.length ? supportedPeriods : TOKEN_PERIODS;
+  return (
+    <div className="grid min-w-0 gap-3 sm:grid-cols-2">
+      <label className="grid gap-1 text-xs text-slate-500">
+        {t("shareMarket.parallel")}
+        <input
+          className={fieldClass()}
+          inputMode="numeric"
+          value={draft.parallelLimit}
+          placeholder={t("shareMarket.dialog.unlimited")}
+          onChange={(event) => patch({ parallelLimit: event.target.value })}
+        />
+      </label>
+      <label className="grid gap-1 text-xs text-slate-500">
+        {t("shareMarket.tokens")}
+        <input
+          className={fieldClass()}
+          inputMode="numeric"
+          value={draft.tokenLimit}
+          placeholder={t("shareMarket.dialog.unlimited")}
+          onChange={(event) => patch({ tokenLimit: event.target.value })}
+        />
+      </label>
+      <label className="grid gap-1 text-xs text-slate-500 sm:col-span-2">
+        {t("shareMarket.period")}
+        <select
+          className={fieldClass()}
+          value={draft.tokenPeriod}
+          onChange={(event) => patch({ tokenPeriod: event.target.value as ShareTokenPeriod })}
+        >
+          {periods.map((period) => (
+            <option key={period} value={period}>{t(`shareMarket.period.${period}`)}</option>
+          ))}
+        </select>
+      </label>
+      <div className="grid grid-cols-2 gap-1 rounded-md bg-slate-100 p-1 sm:col-span-2">
+        <button
+          type="button"
+          className={`h-9 rounded-md text-sm font-medium ${!draft.paid ? "bg-white text-slate-900 shadow-sm" : "text-slate-500"}`}
+          onClick={() => patch({ paid: false })}
+        >
+          {t("shareMarket.dialog.freeMode")}
+        </button>
+        <button
+          type="button"
+          className={`h-9 rounded-md text-sm font-medium ${draft.paid ? "bg-white text-slate-900 shadow-sm" : "text-slate-500"}`}
+          onClick={() => patch({ paid: true })}
+        >
+          {t("shareMarket.dialog.paidMode")}
+        </button>
+      </div>
+      {draft.paid ? (
+        <>
+          <label className="grid gap-1 text-xs text-slate-500">
+            {t("shareMarket.dialog.amount")}
+            <input
+              className={fieldClass()}
+              inputMode="decimal"
+              value={draft.price}
+              onChange={(event) => patch({ price: event.target.value })}
+            />
+          </label>
+          <label className="grid gap-1 text-xs text-slate-500">
+            {t("shareMarket.dialog.currency")}
+            <input
+              className={fieldClass()}
+              maxLength={3}
+              value={draft.currency}
+              onChange={(event) => patch({ currency: event.target.value.toUpperCase() })}
+            />
+          </label>
+          <label className="grid gap-1 text-xs text-slate-500">
+            {t("shareMarket.dialog.billingCount")}
+            <input
+              className={fieldClass()}
+              inputMode="numeric"
+              value={draft.periodCount}
+              onChange={(event) => patch({ periodCount: event.target.value })}
+            />
+          </label>
+          <label className="grid gap-1 text-xs text-slate-500">
+            &nbsp;
+            <select
+              className={fieldClass()}
+              value={draft.periodUnit}
+              onChange={(event) => patch({ periodUnit: event.target.value as SeatDraft["periodUnit"] })}
+            >
+              <option value="day">{t("shareMarket.dialog.day")}</option>
+              <option value="week">{t("shareMarket.dialog.week")}</option>
+              <option value="month">{t("shareMarket.dialog.month")}</option>
+            </select>
+          </label>
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+function AddListingDialog({
+  open,
+  onOpenChange,
+  onSaved,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onSaved: () => void;
+}) {
+  const { t } = useLocaleText();
+  const [shares, setShares] = React.useState<ShareMarketOwnedShare[]>([]);
+  const [shareId, setShareId] = React.useState("");
+  const [seats, setSeats] = React.useState<SeatDraft[]>([emptySeat()]);
+  const [loading, setLoading] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState("");
+
+  React.useEffect(() => {
+    if (!open) return;
+    setLoading(true);
+    setError("");
+    setSeats([emptySeat()]);
+    getShareMarketOwnedShares()
+      .then((items) => {
+        const eligible = items.filter((item) => !item.alreadyListed && item.shareStatus === "active");
+        setShares(eligible);
+        setShareId(eligible[0]?.shareId || "");
+        setSeats([emptySeat(eligible[0]?.supportedUserTokenPeriods)]);
+      })
+      .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)))
+      .finally(() => setLoading(false));
+  }, [open]);
+
+  const selectedShare = shares.find((share) => share.shareId === shareId);
+  const supportedPeriods = selectedShare?.supportedUserTokenPeriods;
+
+  const submit = async () => {
+    if (!shareId || busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      await createShareMarketListing(shareId, seats.map((seat) => seatInput(seat, t)));
+      onOpenChange(false);
+      onSaved();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal.Backdrop isOpen={open} onOpenChange={(next) => !busy && onOpenChange(next)}>
+      <Modal.Container placement="center">
+        <Modal.Dialog className="light w-[min(720px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
+          <Modal.Header><Modal.Heading>{t("shareMarket.dialog.title")}</Modal.Heading></Modal.Header>
+          <Modal.Body className="grid max-h-[75vh] gap-4 overflow-y-auto">
+            {loading ? <div className="flex items-center gap-2 py-8 text-sm text-slate-500"><Loader2 className="h-4 w-4 animate-spin" />{t("common.loading")}</div> : null}
+            {!loading ? (
+              <>
+                <label className="grid gap-1 text-xs text-slate-500">
+                  {t("shareMarket.dialog.selectShare")}
+                  <select
+                    className={fieldClass()}
+                    value={shareId}
+                    onChange={(event) => {
+                      const nextId = event.target.value;
+                      const nextShare = shares.find((share) => share.shareId === nextId);
+                      setShareId(nextId);
+                      setSeats([emptySeat(nextShare?.supportedUserTokenPeriods)]);
+                    }}
+                  >
+                    {shares.map((share) => <option key={share.shareId} value={share.shareId}>{share.shareName} · {share.appType}</option>)}
+                  </select>
+                </label>
+                {shares.length === 0 ? <p className="text-sm text-slate-500">{t("shareMarket.dialog.noShares")}</p> : null}
+                {shares.length > 0 ? (
+                  <div className="grid gap-3">
+                    <div className="text-sm font-semibold text-slate-900">{t("shareMarket.dialog.seats")}</div>
+                    {seats.map((seat, index) => (
+                      <section key={index} className="grid gap-3 border-t border-slate-200 pt-4 first:border-0 first:pt-0">
+                        <div className="flex items-center justify-between gap-3">
+                          <span className="text-sm font-medium">{t("shareMarket.seat", { position: index + 1 })}</span>
+                          {seats.length > 1 ? (
+                            <Button isIconOnly size="sm" variant="ghost" aria-label={t("common.delete")} onClick={() => setSeats((items) => items.filter((_, itemIndex) => itemIndex !== index))}>
+                              <X className="h-4 w-4" />
+                            </Button>
+                          ) : null}
+                        </div>
+                        <SeatFields draft={seat} supportedPeriods={supportedPeriods} onChange={(next) => setSeats((items) => items.map((item, itemIndex) => itemIndex === index ? next : item))} />
+                      </section>
+                    ))}
+                    {seats.length < 20 ? (
+                      <Button variant="outline" onClick={() => setSeats((items) => [...items, emptySeat(supportedPeriods)])}>
+                        <Plus className="h-4 w-4" />{t("shareMarket.dialog.addSeat")}
+                      </Button>
+                    ) : null}
+                  </div>
+                ) : null}
+              </>
+            ) : null}
+            {error ? <p className="text-sm text-red-600">{error}</p> : null}
+          </Modal.Body>
+          <Modal.Footer>
+            <Button variant="outline" isDisabled={busy} onClick={() => onOpenChange(false)}>{t("common.cancel")}</Button>
+            <Button variant="primary" isDisabled={!shareId || busy || loading} onClick={() => void submit()}>
+              {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+              {t("shareMarket.dialog.create")}
+            </Button>
+          </Modal.Footer>
+        </Modal.Dialog>
+      </Modal.Container>
+    </Modal.Backdrop>
+  );
+}
+
+function SeatDialog({
+  open,
+  listingId,
+  seat,
+  supportedPeriods,
+  onOpenChange,
+  onSaved,
+}: {
+  open: boolean;
+  listingId: string;
+  seat?: ShareMarketSeat;
+  supportedPeriods?: ShareTokenPeriod[];
+  onOpenChange: (open: boolean) => void;
+  onSaved: () => void;
+}) {
+  const { t } = useLocaleText();
+  const [draft, setDraft] = React.useState<SeatDraft>(emptySeat());
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState("");
+  React.useEffect(() => {
+    if (!open) return;
+    setDraft(seat ? draftFromSeat(seat) : emptySeat(supportedPeriods));
+    setError("");
+  }, [open, seat, supportedPeriods]);
+  const save = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const input = seatInput(draft, t);
+      if (seat) await updateShareMarketSeat(seat.id, input, seat.offerRevision);
+      else await addShareMarketSeat(listingId, input);
+      onOpenChange(false);
+      onSaved();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Modal.Backdrop isOpen={open} onOpenChange={(next) => !busy && onOpenChange(next)}>
+      <Modal.Container placement="center">
+        <Modal.Dialog className="light w-[min(560px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
+          <Modal.Header><Modal.Heading>{seat ? t("common.edit") : t("shareMarket.addSeat")}</Modal.Heading></Modal.Header>
+          <Modal.Body className="grid gap-4"><SeatFields draft={draft} supportedPeriods={supportedPeriods} onChange={setDraft} />{error ? <p className="text-sm text-red-600">{error}</p> : null}</Modal.Body>
+          <Modal.Footer>
+            <Button variant="outline" isDisabled={busy} onClick={() => onOpenChange(false)}>{t("common.cancel")}</Button>
+            <Button variant="primary" isDisabled={busy} onClick={() => void save()}>{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{t("common.save")}</Button>
+          </Modal.Footer>
+        </Modal.Dialog>
+      </Modal.Container>
+    </Modal.Backdrop>
+  );
+}
+
+function shareOpenUrl(subdomain?: string | null) {
+  return subdomainTunnelUrl(subdomain);
+}
+
+function formatPrice(seat: Pick<ShareMarketSeat, "isFree" | "priceMinor" | "currency" | "periodUnit" | "periodCount">, free: string) {
+  if (seat.isFree || seat.priceMinor == null) return free;
+  const amount = new Intl.NumberFormat(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(seat.priceMinor / 100);
+  return `${amount} ${seat.currency || ""} / ${seat.periodCount || 1} ${seat.periodUnit || ""}`;
+}
+
+function statusLabel(status: string, t: ReturnType<typeof useLocaleText>["t"]) {
+  if (status === "available") return t("shareMarket.available");
+  if (status === "occupied") return t("shareMarket.occupied");
+  if (status === "revoking") return t("shareMarket.revoking");
+  if (status === "disabled") return t("shareMarket.disabled");
+  return t("shareMarket.pending");
+}
+
+function subscriptionStatusLabel(status: string, t: TFn) {
+  const keys = {
+    grant_pending: "shareMarket.subscription.grantPending",
+    active_free: "shareMarket.subscription.activeFree",
+    trial_payment_due: "shareMarket.subscription.trialPaymentDue",
+    active_paid: "shareMarket.subscription.activePaid",
+    renewal_due: "shareMarket.subscription.renewalDue",
+    revoke_pending: "shareMarket.subscription.revokePending",
+    revoke_failed: "shareMarket.subscription.revokeFailed",
+    grant_failed: "shareMarket.subscription.grantFailed",
+    released: "shareMarket.subscription.released",
+  } as const;
+  const key = keys[status as keyof typeof keys];
+  return key ? t(key) : status.replaceAll("_", " ");
+}
+
+function PaymentDialog({
+  subscription,
+  onClose,
+  onPaid,
+}: {
+  subscription: ShareMarketSubscription | null;
+  onClose: () => void;
+  onPaid: () => void;
+}) {
+  const { t } = useLocaleText();
+  const [confirmed, setConfirmed] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState("");
+  React.useEffect(() => { setConfirmed(false); setError(""); }, [subscription?.id]);
+  const invoice = subscription?.openInvoice;
+  const paymentMethods = subscription?.paymentMethods || [];
+  const hasPaymentMethods = paymentMethods.length > 0;
+  const submit = async () => {
+    if (!subscription || !invoice || !subscription.paymentProfileUpdatedAt) return;
+    setBusy(true);
+    setError("");
+    try {
+      await declareShareMarketPaid(subscription.id, {
+        invoiceId: invoice.id,
+        offerRevision: subscription.offerRevision,
+        amountMinorConfirmed: invoice.amountMinor,
+        paymentProfileUpdatedAt: subscription.paymentProfileUpdatedAt,
+      });
+      onClose();
+      onPaid();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Modal.Backdrop isOpen={!!subscription} onOpenChange={(next) => !next && !busy && onClose()}>
+      <Modal.Container placement="center">
+        <Modal.Dialog className="light w-[min(620px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
+          <Modal.Header><Modal.Heading>{t("shareMarket.paymentDetails")}</Modal.Heading></Modal.Header>
+          <Modal.Body className="grid max-h-[70vh] gap-4 overflow-y-auto">
+            {invoice ? (
+              <div className="flex items-baseline justify-between gap-3 border-b border-slate-200 pb-3">
+                <span className="text-sm text-slate-500">{subscription?.shareName}</span>
+                <strong className="text-lg">{(invoice.amountMinor / 100).toFixed(2)} {invoice.currency}</strong>
+              </div>
+            ) : null}
+            <div className="grid gap-3">
+              {paymentMethods.map((method, index) => (
+                <div key={`${method.kind}-${index}`} className="grid gap-2 border-b border-slate-100 pb-3 last:border-0">
+                  <div className="flex items-center gap-2 text-sm font-medium"><PaymentMethodIcons kinds={[method.kind]} />{method.kind}</div>
+                  {method.account ? <code className="break-all text-sm">{method.account}</code> : null}
+                  {method.address ? <code className="break-all text-sm">{method.token} {method.chain} · {method.address}</code> : null}
+                  {method.instructions ? <p className="whitespace-pre-wrap text-sm text-slate-600">{method.instructions}</p> : null}
+                  {method.assetUrl ? <AuthenticatedImage src={method.assetUrl} alt={method.kind} className="h-44 w-44 rounded-md border bg-white object-contain p-1" /> : null}
+                </div>
+              ))}
+              {!hasPaymentMethods ? <p className="text-sm text-slate-500">{t("shareMarket.noPaymentMethods")}</p> : null}
+            </div>
+            <Checkbox isSelected={confirmed} onChange={setConfirmed}>
+              <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
+              <Checkbox.Content><span className="text-sm text-slate-700">{t("shareMarket.confirmPaid")}</span></Checkbox.Content>
+            </Checkbox>
+            {error ? <p className="text-sm text-red-600">{error}</p> : null}
+          </Modal.Body>
+          <Modal.Footer>
+            <Button variant="outline" isDisabled={busy} onClick={onClose}>{t("common.cancel")}</Button>
+            <Button variant="primary" isDisabled={!confirmed || !invoice || !hasPaymentMethods || busy || !subscription?.paymentProfileUpdatedAt} onClick={() => void submit()}>
+              {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <CircleDollarSign className="h-4 w-4" />}{t("shareMarket.declarePaid")}
+            </Button>
+          </Modal.Footer>
+        </Modal.Dialog>
+      </Modal.Container>
+    </Modal.Backdrop>
+  );
+}
+
+export function ShareMarketPage() {
+  const { t, locale } = useLocaleText();
+  const { session, loading: authLoading } = useAuth();
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const authed = !!session?.authenticated;
+  const [catalog, setCatalog] = React.useState<ShareMarketCatalog | null>(null);
+  const [loading, setLoading] = React.useState(true);
+  const [error, setError] = React.useState("");
+  const tabParam = searchParams.get("tab");
+  const tab: MarketTab =
+    tabParam === "mine" || tabParam === "rentals" || tabParam === "all" ? tabParam : "all";
+  const focusShareId = searchParams.get("focus") || "";
+  const [addOpen, setAddOpen] = React.useState(false);
+  const [seatDialog, setSeatDialog] = React.useState<{ listingId: string; seat?: ShareMarketSeat; supportedPeriods?: ShareTokenPeriod[] } | null>(null);
+  const [payment, setPayment] = React.useState<ShareMarketSubscription | null>(null);
+  const [confirmAction, setConfirmAction] = React.useState<ConfirmAction | null>(null);
+  const [busyId, setBusyId] = React.useState("");
+  const focusedRef = React.useRef<string>("");
+
+  const setTab = React.useCallback(
+    (next: MarketTab) => {
+      const params = new URLSearchParams(searchParams.toString());
+      params.set("tab", next);
+      router.replace(`${DASHBOARD_SHARE_MARKET_PATH}?${params.toString()}`, { scroll: false });
+    },
+    [router, searchParams],
+  );
+
+  const load = React.useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
+    try {
+      setCatalog(await getShareMarketCatalog());
+      setError("");
+    } catch (reason) {
+      if (!silent) setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      if (!silent) setLoading(false);
+    }
+  }, []);
+
+  React.useEffect(() => { void load(); }, [load, session?.user?.id]);
+  React.useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (!addOpen && !seatDialog && !payment && !confirmAction && !busyId) void load(true);
+    }, 5_000);
+    return () => window.clearInterval(timer);
+  }, [addOpen, busyId, confirmAction, load, payment, seatDialog]);
+
+  const act = async (id: string, action: () => Promise<unknown>) => {
+    if (busyId) return;
+    setBusyId(id);
+    try {
+      await action();
+      await load(true);
+    } catch (reason) {
+      toast.danger(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusyId("");
+    }
+  };
+
+  const runConfirmedAction = async () => {
+    if (!confirmAction) return;
+    await act(confirmAction.id, confirmAction.run);
+    setConfirmAction(null);
+  };
+
+  const listings = React.useMemo(() => {
+    if (!catalog) return [];
+    return tab === "mine" ? catalog.listings.filter((listing) => listing.isOwner) : catalog.listings;
+  }, [catalog, tab]);
+  const date = (value?: string) => value ? new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value)) : "";
+  const tokenPeriod = (period: ShareTokenPeriod) => t(`shareMarket.period.${period}`);
+
+  React.useEffect(() => {
+    if (!focusShareId || !catalog || focusedRef.current === focusShareId) return;
+    const target =
+      document.querySelector(`[data-share-id="${CSS.escape(focusShareId)}"]`) ||
+      document.querySelector(`[data-subscription-share-id="${CSS.escape(focusShareId)}"]`);
+    if (target instanceof HTMLElement) {
+      target.scrollIntoView({ behavior: "smooth", block: "center" });
+      focusedRef.current = focusShareId;
+    }
+  }, [catalog, focusShareId, tab]);
+
+  const renderSubscription = (subscription: ShareMarketSubscription, ownerView = false) => {
+    const openUrl = shareOpenUrl(subscription.subdomain);
+    return (
+    <div
+      key={subscription.id}
+      data-subscription-share-id={subscription.shareId}
+      className="grid gap-3 border-b border-slate-200 py-4 last:border-0 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center"
+    >
+      <div className="min-w-0">
+        <div className="flex min-w-0 items-center gap-2">
+          <ShareAppLogo app={(subscription.appType === "claude" || subscription.appType === "gemini" ? subscription.appType : "codex")} size={18} />
+          <strong className="truncate text-sm">{subscription.shareName}</strong>
+          <span className="rounded-sm bg-slate-100 px-1.5 py-0.5 text-xs text-slate-600">{subscriptionStatusLabel(subscription.status, t)}</span>
+          {subscription.shareOnline != null ? (
+            <span className={`rounded-sm px-1.5 py-0.5 text-xs ${subscription.shareOnline ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-500"}`}>
+              {subscription.shareOnline ? t("shareMarket.online") : t("shareMarket.offline")}
+            </span>
+          ) : null}
+        </div>
+        <p className="mt-1 truncate text-xs text-slate-500">{ownerView ? subscription.renterEmail : subscription.ownerEmail}</p>
+        <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-600">
+          {subscription.trialEndsAt && subscription.status === "trial_payment_due" ? <span>{t("shareMarket.trialEnds", { time: date(subscription.trialEndsAt) })}</span> : null}
+          {subscription.paymentDeadline ? <span>{t("shareMarket.paymentDeadline", { time: date(subscription.paymentDeadline) })}</span> : null}
+          {subscription.currentPeriodEnd ? <span>{t("shareMarket.periodEnds", { time: date(subscription.currentPeriodEnd) })}</span> : null}
+        </div>
+      </div>
+      <div className="flex flex-wrap justify-start gap-2 sm:justify-end">
+        {openUrl ? (
+          <Button size="sm" variant="outline" onClick={() => window.open(openUrl, "_blank", "noopener,noreferrer")}>
+            <ExternalLink className="h-4 w-4" />{t("shareMarket.openShare")}
+          </Button>
+        ) : null}
+        {!ownerView && subscription.canDeclarePaid ? <Button size="sm" variant="primary" onClick={() => setPayment(subscription)}>{t("shareMarket.declarePaid")}</Button> : null}
+        {!ownerView && subscription.canRelease ? <Button size="sm" variant="outline" isDisabled={!!busyId} onClick={() => setConfirmAction({ id: subscription.id, title: t("shareMarket.confirm.releaseTitle"), description: t("shareMarket.confirm.releaseDescription", { share: subscription.shareName }), confirmLabel: t("shareMarket.release"), tone: "warning", run: () => releaseShareMarketSubscription(subscription.id) })}><RotateCcw className="h-4 w-4" />{t("shareMarket.release")}</Button> : null}
+        {ownerView && subscription.canForceRevoke ? (
+          <>
+            <Button size="sm" variant="outline" isDisabled={!!busyId} onClick={() => setConfirmAction({ id: subscription.id, title: t("shareMarket.confirm.revokeTitle"), description: t("shareMarket.confirm.revokeDescription", { email: subscription.renterEmail }), confirmLabel: t("shareMarket.forceRevoke"), tone: "warning", run: () => forceRevokeShareMarketSubscription(subscription.id, { blockUser: false }) })}>{t("shareMarket.forceRevoke")}</Button>
+            <Button size="sm" variant="danger" isDisabled={!!busyId} onClick={() => setConfirmAction({ id: subscription.id, title: t("shareMarket.confirm.blockTitle"), description: t("shareMarket.confirm.blockDescription", { email: subscription.renterEmail }), confirmLabel: t("shareMarket.blockAndRevoke"), tone: "danger", run: () => forceRevokeShareMarketSubscription(subscription.id, { blockUser: true }) })}><UserRoundX className="h-4 w-4" />{t("shareMarket.blockAndRevoke")}</Button>
+          </>
+        ) : null}
+      </div>
+    </div>
+    );
+  };
+
+  const renderListing = (listing: ShareMarketListing) => (
+    <article
+      key={listing.id}
+      data-share-id={listing.shareId}
+      className="overflow-hidden rounded-md border border-slate-200 bg-white"
+    >
+      <header className="flex flex-wrap items-start justify-between gap-3 border-b border-slate-200 px-4 py-3">
+        <div className="min-w-0">
+          <div className="flex min-w-0 items-center gap-2">
+            <ShareAppLogo app={(listing.appType === "claude" || listing.appType === "gemini" ? listing.appType : "codex")} size={20} />
+            <h2 className="truncate text-base font-semibold text-slate-900">{listing.shareName}</h2>
+            <span className={`rounded-sm px-1.5 py-0.5 text-xs ${listing.shareOnline ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-500"}`}>{listing.shareOnline ? t("shareMarket.online") : t("shareMarket.offline")}</span>
+            {listing.status === "closed" ? <span className="rounded-sm bg-amber-50 px-1.5 py-0.5 text-xs text-amber-700">{t("shareMarket.closed")}</span> : null}
+          </div>
+          <p className="mt-1 truncate text-xs text-slate-500">{t("shareMarket.owner")}: {listing.ownerEmail}</p>
+          {listing.isOwner && listing.status === "closed" ? (
+            <p className="mt-2 max-w-2xl text-xs leading-relaxed text-slate-500">{t("shareMarket.closedHint")}</p>
+          ) : null}
+        </div>
+        {listing.isOwner ? (
+          <div className="flex flex-wrap gap-2">
+            <Button size="sm" variant="outline" onClick={() => setSeatDialog({ listingId: listing.id, supportedPeriods: listing.supportedUserTokenPeriods })}><Plus className="h-4 w-4" />{t("shareMarket.addSeat")}</Button>
+            {listing.status === "active" ? <Button size="sm" variant="outline" isDisabled={!!busyId} onClick={() => setConfirmAction({ id: listing.id, title: t("shareMarket.confirm.closeTitle"), description: t("shareMarket.confirm.closeDescription", { share: listing.shareName }), confirmLabel: t("shareMarket.closeListing"), tone: "warning", run: () => closeShareMarketListing(listing.id) })}><Ban className="h-4 w-4" />{t("shareMarket.closeListing")}</Button> : null}
+          </div>
+        ) : null}
+      </header>
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[760px] text-left text-sm">
+          <thead className="bg-slate-50 text-xs font-medium text-slate-500"><tr><th className="px-4 py-2.5">{t("shareMarket.dialog.seats")}</th><th className="px-3 py-2.5">{t("shareMarket.parallel")}</th><th className="px-3 py-2.5">{t("shareMarket.tokens")}</th><th className="px-3 py-2.5">{t("shareMarket.dialog.amount")}</th><th className="px-3 py-2.5">{t("shareMarket.status")}</th><th className="px-4 py-2.5 text-right">{t("common.actions")}</th></tr></thead>
+          <tbody>
+            {listing.seats.map((seat) => (
+              <React.Fragment key={seat.id}>
+                <tr className="border-t border-slate-100 first:border-0">
+                  <td className="px-4 py-3 font-medium">{t("shareMarket.seat", { position: seat.position })}</td>
+                  <td className="px-3 py-3 text-slate-600">{seat.parallelLimit ?? t("common.unlimited")}</td>
+                  <td className="px-3 py-3 text-slate-600">{seat.tokenLimit?.toLocaleString() ?? t("common.unlimited")} · {tokenPeriod(seat.tokenPeriod)}</td>
+                  <td className="px-3 py-3 font-medium">{formatPrice(seat, t("shareMarket.free"))}</td>
+                  <td className="px-3 py-3"><span className="rounded-sm bg-slate-100 px-1.5 py-0.5 text-xs text-slate-600">{statusLabel(seat.status, t)}</span></td>
+                  <td className="px-4 py-3"><div className="flex justify-end gap-1">
+                    {seat.canRent ? (
+                      <Button
+                        size="sm"
+                        variant="primary"
+                        isDisabled={!!busyId}
+                        onClick={() => {
+                          if (!listing.shareOnline) {
+                            toast.info(t("shareMarket.rentOfflineHint"));
+                          }
+                          void act(seat.id, () => rentShareMarketSeat(seat.id, seat.offerRevision));
+                        }}
+                      >
+                        {busyId === seat.id ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                        {t("shareMarket.rent")}
+                      </Button>
+                    ) : null}
+                    {!authed && listing.status === "active" && listing.shareStatus === "active" && seat.status === "available" ? <Button size="sm" variant="outline" onClick={() => window.dispatchEvent(new Event("router-open-login"))}>{t("nav.login")}</Button> : null}
+                    {listing.isOwner && seat.status === "available" ? <Button isIconOnly size="sm" variant="ghost" aria-label={t("common.edit")} onClick={() => setSeatDialog({ listingId: listing.id, seat, supportedPeriods: listing.supportedUserTokenPeriods })}><Pencil className="h-4 w-4" /></Button> : null}
+                    {listing.isOwner && (seat.status === "available" || seat.status === "disabled") ? <Button isIconOnly size="sm" variant="ghost" aria-label={t("shareMarket.deleteSeat")} isDisabled={!!busyId} onClick={() => setConfirmAction({ id: seat.id, title: t("shareMarket.confirm.deleteTitle"), description: t("shareMarket.confirm.deleteDescription", { position: seat.position }), confirmLabel: t("shareMarket.deleteSeat"), tone: "danger", run: () => deleteShareMarketSeat(seat.id) })}><Trash2 className="h-4 w-4 text-red-600" /></Button> : null}
+                  </div></td>
+                </tr>
+                {seat.subscription && listing.isOwner ? <tr><td colSpan={6} className="bg-slate-50 px-4">{renderSubscription(seat.subscription, true)}</td></tr> : null}
+              </React.Fragment>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </article>
+  );
+
+  return (
+    <div className="mx-auto grid w-full max-w-7xl gap-5 px-1 pb-10">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 pb-4">
+        <Tabs selectedKey={tab} onSelectionChange={(key) => setTab(String(key) as MarketTab)} variant="secondary" className="text-foreground">
+          <Tabs.List className="grid grid-cols-3 text-foreground">
+            <Tabs.Tab id="all" className="px-3 py-2 text-sm">{t("shareMarket.tab.all")}</Tabs.Tab>
+            <Tabs.Tab id="mine" className="px-3 py-2 text-sm">{t("shareMarket.tab.mine")}</Tabs.Tab>
+            <Tabs.Tab id="rentals" className="px-3 py-2 text-sm">{t("shareMarket.tab.rentals")}</Tabs.Tab>
+          </Tabs.List>
+        </Tabs>
+        <div className="flex gap-2">
+          <Button isIconOnly variant="ghost" aria-label={t("common.reload")} isDisabled={loading} onClick={() => void load()}><RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} /></Button>
+          <Button variant="primary" isDisabled={authLoading} onClick={() => authed ? setAddOpen(true) : window.dispatchEvent(new Event("router-open-login"))}><Plus className="h-4 w-4" />{t("shareMarket.addShare")}</Button>
+        </div>
+      </div>
+      {loading && !catalog ? <div className="flex items-center gap-2 py-12 text-sm text-slate-500"><Loader2 className="h-4 w-4 animate-spin" />{t("shareMarket.loading")}</div> : null}
+      {error ? <div className="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div> : null}
+      {tab !== "rentals" ? <div className="grid gap-4">{listings.map(renderListing)}{catalog && listings.length === 0 ? <p className="py-10 text-center text-sm text-slate-500">{t("shareMarket.empty")}</p> : null}</div> : null}
+      {tab === "rentals" ? (
+        <section className="rounded-md border border-slate-200 bg-white px-4">
+          {(catalog?.mySubscriptions || []).map((subscription) => renderSubscription(subscription))}
+          {catalog && catalog.mySubscriptions.length === 0 ? <p className="py-10 text-center text-sm text-slate-500">{authed ? t("shareMarket.empty") : t("shareMarket.loginRequired")}</p> : null}
+        </section>
+      ) : null}
+      {tab === "mine" && authed ? (
+        <section className="border-t border-slate-200 pt-5">
+          <div className="mb-3 flex items-center gap-2"><UserRoundX className="h-4 w-4 text-slate-500" /><h2 className="text-sm font-semibold">{t("shareMarket.blocks")}</h2></div>
+          <div className="rounded-md border border-slate-200 bg-white px-4">
+            {(catalog?.ownerBlocks || []).map((block) => (
+              <div key={block.blockedUserId} className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 py-3 last:border-0">
+                <div>
+                  <div className="text-sm font-medium">{block.blockedEmail}</div>
+                  {block.reason ? <div className="text-xs text-slate-500">{block.reason === "owner_force_revoke" ? t("shareMarket.ownerRevokeReason") : block.reason}</div> : null}
+                </div>
+                <Button size="sm" variant="outline" isDisabled={!!busyId} onClick={() => void act(block.blockedUserId, () => liftShareMarketBlock(block.blockedUserId))}>{t("shareMarket.unblock")}</Button>
+              </div>
+            ))}
+            {catalog && catalog.ownerBlocks.length === 0 ? <p className="py-5 text-sm text-slate-500">{t("shareMarket.noBlocks")}</p> : null}
+          </div>
+        </section>
+      ) : null}
+      <AddListingDialog open={addOpen} onOpenChange={setAddOpen} onSaved={() => void load(true)} />
+      <SeatDialog open={!!seatDialog} listingId={seatDialog?.listingId || ""} seat={seatDialog?.seat} supportedPeriods={seatDialog?.supportedPeriods} onOpenChange={(next) => !next && setSeatDialog(null)} onSaved={() => void load(true)} />
+      <PaymentDialog subscription={payment} onClose={() => setPayment(null)} onPaid={() => void load(true)} />
+      <ConfirmAlertDialog
+        open={!!confirmAction}
+        title={confirmAction?.title || ""}
+        description={confirmAction?.description || ""}
+        confirmLabel={confirmAction?.confirmLabel || ""}
+        cancelLabel={t("common.cancel")}
+        tone={confirmAction?.tone || "warning"}
+        busy={!!busyId}
+        onConfirm={() => void runConfirmedAction()}
+        onOpenChange={(next) => !next && !busyId && setConfirmAction(null)}
+      />
+    </div>
+  );
+}

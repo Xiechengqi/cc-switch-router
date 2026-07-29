@@ -4,7 +4,7 @@ import Image from "next/image";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { Button, Dropdown, Toast } from "@heroui/react";
-import { Activity, ChevronDown, KeyRound, LogOut, Monitor, Network, Settings, Store, UserRound } from "lucide-react";
+import { Activity, ChevronDown, KeyRound, LogOut, Monitor, Network, Settings, Share2, Store, UserRound } from "lucide-react";
 import * as React from "react";
 import { LoginDialog } from "@/components/auth/login-dialog";
 import { useAuth } from "@/components/auth/auth-provider";
@@ -17,6 +17,7 @@ import {
   DASHBOARD_ACCOUNT_PATH,
   DASHBOARD_CLIENTS_PATH,
   DASHBOARD_MARKETS_PATH,
+  DASHBOARD_SHARE_MARKET_PATH,
   DASHBOARD_CLIENT_MARKET_PATH,
   type DashboardShellActive,
 } from "@/lib/dashboard-nav";
@@ -151,7 +152,7 @@ function DashboardNav({
   active,
   authed,
 }: {
-  active: "clients" | "markets" | "client-market" | "account";
+  active: "clients" | "markets" | "share-market" | "client-market" | "account";
   authed: boolean;
 }) {
   const { t } = useLocaleText();
@@ -161,13 +162,21 @@ function DashboardNav({
       ? "account"
       : active === "client-market" || pathname.startsWith("/client-market")
         ? "client-market"
-        : active === "markets" || pathname.startsWith("/markets")
-          ? "markets"
-          : "clients";
+        : active === "share-market" || pathname.startsWith("/share-market")
+          ? "share-market"
+          : active === "markets" || pathname.startsWith("/markets")
+            ? "markets"
+            : "clients";
 
   const items = [
     { id: "clients" as const, href: DASHBOARD_CLIENTS_PATH, icon: Monitor, label: t("nav.clientsTab") },
     { id: "markets" as const, href: DASHBOARD_MARKETS_PATH, icon: Store, label: t("nav.marketsTab") },
+    {
+      id: "share-market" as const,
+      href: DASHBOARD_SHARE_MARKET_PATH,
+      icon: Share2,
+      label: t("nav.shareMarketTab"),
+    },
     {
       id: "client-market" as const,
       href: DASHBOARD_CLIENT_MARKET_PATH,
@@ -227,7 +236,7 @@ function Topbar({ active }: { active: DashboardShellActive }) {
   const authed = !!session?.authenticated;
   const showAuthedChrome = authed || (loading && !!lastAuthedEmailRef.current);
   const displayEmail = session?.user?.email || lastAuthedEmailRef.current || "";
-  const showDashboardNav = active === "clients" || active === "markets" || active === "client-market" || active === "account";
+  const showDashboardNav = active === "clients" || active === "markets" || active === "share-market" || active === "client-market" || active === "account";
 
   React.useEffect(() => {
     setClientRedirect(sameRouterDomainClientRedirect(new URLSearchParams(window.location.search).get("clientRedirect")));
@@ -265,7 +274,7 @@ function Topbar({ active }: { active: DashboardShellActive }) {
       */}
       <div className="sticky top-0 z-40 bg-background/85 backdrop-blur-md">
         <header className="mx-auto w-[calc(100%-2rem)] max-w-7xl py-3.5">
-        <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-x-3 gap-y-2">
+        <div className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-3 gap-y-2 md:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]">
           <div className="flex min-w-0 items-center gap-2.5 justify-self-start">
             <Link href={DASHBOARD_CLIENTS_PATH} className="flex shrink-0 items-center" aria-label="CC-Switch Router">
               <Image src="/router-logo.svg" alt="" width={32} height={32} className="h-8 w-8 shrink-0" priority />
@@ -274,7 +283,7 @@ function Topbar({ active }: { active: DashboardShellActive }) {
           </div>
 
           {showDashboardNav ? (
-            <div className="min-w-0 justify-self-center overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+            <div className="min-w-0 max-w-full justify-self-stretch overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] md:justify-self-center [&::-webkit-scrollbar]:hidden">
               <DashboardNav active={active} authed={showAuthedChrome} />
             </div>
           ) : (

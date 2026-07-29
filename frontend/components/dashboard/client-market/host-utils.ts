@@ -84,14 +84,41 @@ export function hostCanManage(host: ClientMarketHost, viewerEmail?: string | nul
   return !!viewer && !!owner && viewer === owner;
 }
 
-/** Provider-only. Renters release their own Client from Account → Client rentals,
- *  which posts `client_release` instead. */
+/** Provider-only. Renters release via `client_release` (see hostCanClientRelease). */
 export function hostCanCleanup(host: ClientMarketHost, viewerEmail?: string | null) {
   return (
     !!host.installationId &&
     (host.status === "allocated" || host.status === "unreachable" || host.status === "draining") &&
     hostCanManage(host, viewerEmail)
   );
+}
+
+/** Renter (or self-renter) may release their Client with reason `client_release`. */
+export function hostCanClientRelease(
+  host: ClientMarketHost,
+  billing?: { isClientOwner?: boolean; canRelease?: boolean; status?: string } | null,
+) {
+  if (host.isClientOwner !== true || !host.installationId) return false;
+  if (
+    host.status !== "allocated" &&
+    host.status !== "unreachable" &&
+    host.status !== "draining"
+  ) {
+    return false;
+  }
+  if (!billing) return true;
+  if (billing.isClientOwner === false) return false;
+  if (billing.status === "released" || billing.status === "releasing") return false;
+  return billing.canRelease !== false;
+}
+
+/** Within「我的」, rented rows (isClientOwner) sort ahead of hosted-only rows. */
+export function prioritizeMineClientOwned<T extends { isClientOwner?: boolean }>(hosts: T[]) {
+  return [...hosts].sort((left, right) => {
+    const leftRank = left.isClientOwner === true ? 0 : 1;
+    const rightRank = right.isClientOwner === true ? 0 : 1;
+    return leftRank - rightRank;
+  });
 }
 
 export function hostCanReverify(host: ClientMarketHost, viewerEmail?: string | null) {

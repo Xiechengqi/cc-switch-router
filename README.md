@@ -55,7 +55,7 @@ Client Web tunnel:静态资源和明确列出的登录/OAuth 回调公开;其余
 
 ## API 端点
 
-当前共 **172 处路由注册 / 169 条唯一路径**。按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
+API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 
 | 域 | 路径数 | 认证方式 | 代表端点 |
 |---|---:|---|---|
@@ -64,7 +64,8 @@ Client Web tunnel:静态资源和明确列出的登录/OAuth 回调公开;其余
 | `/v1/shares/*` | 17 | installation bearer / Ed25519 签名 | `claim-subdomain`、`sync`、`batch-sync`、`descriptor-batch-sync`、`pending-edits`、`edit-ack`、`edit-events`、`runtime-refresh`、`heartbeat`、`prune` |
 | `/v1/installations/*` | 11 | Ed25519 签名 / bearer | `register`、`heartbeat`、`setup-completed`、`report-status`、`client-tunnel`、`client-tunnel/claim`、`bind-owner-email` |
 | `/v1/chat/*` | 9 | 公开读 / Session 写 | `clients/:installation_id/room`、`rooms/:room_id/messages`、`rooms/:room_id/stream` |
-| `/v1/market/*`、`/v1/markets/*`、`/v1/share-market/*` | 15 | 市场 bearer token | `shares`、`shares/headroom`、`request-logs/batch`、`listing-statuses/sync`、`shares/:id/grants` |
+| `/v1/market/*`、`/v1/markets/*` | 11 | 公开读 / 用户 Session / 市场 bearer token | `shares`、`shares/headroom`、`request-logs/batch`、`share-states`、`tunnel/lease` |
+| `/v1/share-market/*` | 11 | 公开 catalog / 用户 Session | `listings`、`owned-shares`、`seats/:id/rent`、`subscriptions/:id/declare-paid`、`force-revoke`、`blocks`；停止挂售后无活跃租约可再次 `POST listings` |
 | `/v1/gateway/*`、`/v1/gateways/*` | 5 | HMAC 签名(`x-cc-gateway-*`) | `register`、`shares`、`shares/feedback`、`request-logs/batch` |
 | `/v1/auth/*` | 5 | 公开 / Session | `email/request-code`、`email/verify-code`、`session/refresh`、`session/me`、`session/logout` |
 | `/v1/tunnels/*` | 4 | Ed25519 签名 | `lease`、`lease/renew`、`activate`、`state` |

@@ -1,5 +1,11 @@
 import { shareAccessApps } from "@/lib/share-app";
-import type { ShareAccessByApp, ShareSettingsPatch, ShareView } from "@/lib/types";
+import type {
+  ShareAccessByApp,
+  ShareSettingsPatch,
+  ShareUserGrant,
+  ShareUserGrantMap,
+  ShareView,
+} from "@/lib/types";
 
 export const UNLIMITED_TOKEN_LIMIT = -1;
 export const UNLIMITED_PARALLEL_LIMIT = -1;
@@ -8,7 +14,6 @@ export const PERMANENT_EXPIRES_AT_ISO = "2099-12-31T23:59:59Z";
 export type ShareSettingsDraft = {
   description: string;
   forSale: "Yes" | "No" | "Free";
-  saleMarketKind: "token" | "share";
   marketAccessMode: "selected" | "all";
   sharedWithEmails: string[];
   accessByApp: ShareAccessByApp;
@@ -17,6 +22,23 @@ export type ShareSettingsDraft = {
   expiresAt: string;
   pricing: Record<string, number>;
 };
+
+export function isRouterShareMarketManagedGrant(
+  grant: ShareUserGrant | undefined,
+): boolean {
+  return grant?.manager === "routerShareMarket";
+}
+
+export function routerShareMarketManagedEmails(
+  grants: ShareUserGrantMap | undefined,
+): Set<string> {
+  return new Set(
+    Object.entries(grants ?? {})
+      .filter(([, grant]) => isRouterShareMarketManagedGrant(grant))
+      .map(([key, grant]) => (grant.email || key).trim().toLowerCase())
+      .filter(Boolean),
+  );
+}
 
 export function normalizeEmailList(value: string | string[]) {
   const items = Array.isArray(value) ? value : value.split(/[,\s]+/);
@@ -55,7 +77,6 @@ export function draftFromShare(share: ShareView): ShareSettingsDraft {
   return {
     description: share.description || "",
     forSale: (["Yes", "No", "Free"].includes(share.forSale) ? share.forSale : "No") as "Yes" | "No" | "Free",
-    saleMarketKind: share.saleMarketKind === "share" ? "share" : "token",
     marketAccessMode: share.marketAccessMode === "all" ? "all" : "selected",
     sharedWithEmails: normalizeEmailList(share.sharedWithEmails || []),
     accessByApp,
@@ -70,15 +91,13 @@ export function buildShareSettingsPatch(draft: ShareSettingsDraft): ShareSetting
   return {
     description: draft.description.trim() || null,
     forSale: draft.forSale,
-    saleMarketKind: draft.saleMarketKind,
     marketAccessMode: draft.marketAccessMode,
     sharedWithEmails: normalizeEmailList(draft.sharedWithEmails),
     accessByApp: draft.accessByApp,
     tokenLimit: draft.tokenLimit,
     parallelLimit: draft.parallelLimit,
     expiresAt: draft.expiresAt,
-    forSaleOfficialPricePercentByApp:
-      draft.forSale === "Yes" && draft.saleMarketKind === "token" ? draft.pricing : {},
+    forSaleOfficialPricePercentByApp: draft.forSale === "Yes" ? draft.pricing : {},
   };
 }
 
@@ -108,7 +127,7 @@ export function validateShareSettingsDraft(draft: ShareSettingsDraft) {
   }
   const expires = new Date(draft.expiresAt).getTime();
   if (!draft.expiresAt || !Number.isFinite(expires)) errors.push("Expiration time is invalid.");
-  if (draft.forSale === "Yes" && draft.saleMarketKind === "token") {
+  if (draft.forSale === "Yes") {
     for (const value of Object.values(draft.pricing)) {
       if (!Number.isInteger(value) || value < 1 || value > 100) {
         errors.push("Model pricing must be between 1 and 100.");

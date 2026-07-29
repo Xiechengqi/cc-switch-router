@@ -65,6 +65,8 @@ cd frontend && npm run dev     # /v1/* 代理到 CC_SWITCH_ROUTER_DEV_API_TARGET
 |---|:--:|:--:|:--:|:--:|:--:|
 | `/clients` 总览 + 地图 | ✅ 只读 | ✅ | ✅ | ✅ | ✅ |
 | `/markets` | ✅ 只读 | ✅ | ✅ | ✅ | ✅ 可编辑 |
+| `/share-market` | ✅ 只读 catalog | ✅ 租用/挂售 | ✅ | ✅ | ✅ 无特权 |
+| `/account/share` | ❌ | ✅ 只读监控 | ✅ | ✅ | ✅ 无特权 |
 | `/client-market` 主机表 | ✅ 只读 | ✅ 空表 | ✅ 全功能 | ✅ 空表 | ✅ 无特权 |
 | `/rentals` | ❌ 提示登录 | ✅ 空 | ✅ 空 | ✅ 有数据 | ✅ |
 | `/account` | ❌ | ✅ | ✅ | ✅ | ✅ |
@@ -72,7 +74,7 @@ cd frontend && npm run dev     # /v1/* 代理到 CC_SWITCH_ROUTER_DEV_API_TARGET
 | `/metrics` | ❌ | ❌ 提示 | ❌ 提示 | ❌ 提示 | ✅ |
 | Share 页(子域名) | ✅ 只读 | ✅ | ✅ | ✅ | ✅ |
 
-> **管理员在 Client Market 无特权**。主机操作只认 host owner,管理员不被提升(`src/client_market.rs:889` 注释明确)。用例 H-31 覆盖。
+> **管理员在 Client Market / Share Market 无特权**。主机操作只认 host owner；拼车位操作只认 Share owner / 租客本人。用例 H-31、SM-08 覆盖。
 
 ---
 
@@ -185,12 +187,48 @@ location.reload();
 | M-07 | 筛选无结果 | 观察 | 「清除筛选」链接可用 |
 | M-08 | 任意 | 点「安装 Market」 | 打开安装指引弹窗,含 GitHub releases 链接 |
 | M-09 | 抽屉内 | 切换 Claude/Codex/Gemini 优先级 tab | 拉取并展示对应 app 的 share 优先级 |
-| M-10 | `canManage` 且非 share market | 点 Edit | 打开编辑弹窗 |
+| M-10 | `canManage` | 点 Edit | 打开编辑弹窗 |
 | M-11 | 承 M-10 | 勾选维护模式 + 填消息 → 保存 | 保存成功;消息框在未开启维护时 disabled |
 | M-12 | 承 M-10 | 勾选若干 share → 停用所选 | 对应 share 进入停用集合 |
 | M-13 | 承 M-10 | 点 全部启用 / 全部停用 | 批量生效 |
 | M-14 | 有阻塞状态 | 点单条 Release / 全部 Release | 逐条释放 |
 | M-15 | 非 `canManage` | 打开抽屉 | 无 Edit 按钮 |
+
+---
+
+## 6.1 Share Market 拼车位(SM)
+
+覆盖 `share-market-page.tsx`。轮询 5 秒；弹窗、确认框或操作进行中时暂停刷新。
+
+| ID | 前置 | 步骤 | 预期 |
+|---|---|---|---|
+| SM-01 | 任意 | 打开 `/share-market` | 顶部顺序为 Token Market / Share Market / Client Market；空 catalog 正常显示 |
+| SM-02 | 未登录 | 点租用或添加 Share | 打开登录弹窗,不提交写请求 |
+| SM-03 | 已登录且拥有 active Share | 点添加 Share | 只列出未挂售 Share；可一次添加 1-20 个拼车位 |
+| SM-04 | 添加拼车位 | 保持价格模式为免费 | 请求中价格、币种和账单周期均为空 |
+| SM-05 | 添加付费拼车位 | 输入三位以上小数、非三字母币种或非法周期 | 内联报错,不提交 |
+| SM-06 | 有可用拼车位 | 租用 | 座位进入 pending/occupied；同一用户不能重复租同一 Share；租用按钮对已拉黑/已有 direct grant 的用户不显示 |
+| SM-07 | 付费租约 | 查看付款详情并确认已付款 | 显示 owner 当前收款资料；无收款方式时声明按钮 disabled |
+| SM-08 | owner 查看已租座位 | 强制回收 / 回收并拉黑 | 二次确认后进入回收状态；拉黑用户不能再次租用该 owner 的座位(按钮不出现) |
+| SM-09 | owner 的 Mine tab | 解除拉黑 | 即使无 listing 也能看到拉黑列表；解除后用户可再次租用 |
+| SM-10 | listing 有活跃租约 | 停止挂售 | 空闲座位关闭,活跃租约继续显示且可正常使用；「添加 Share」仍不可选该 Share |
+| SM-11 | 已释放的座位 | 删除座位 | 座位从 catalog 消失,历史订阅和账单仍保留 |
+| SM-12 | 窄屏 | 检查导航、弹窗和座位表 | 导航和表格可横向滚动；弹窗纵向滚动；文字和操作不重叠 |
+| SM-13 | 停止挂售且无活跃租约 | 点添加 Share | 该 Share 重新出现在候选列表；可新建 listing |
+| SM-14 | 离线 Share 的可用座位 | 点租用 | toast 提示离线后仍提交租用；权限待 Server 上线后生效 |
+| SM-15 | 租约非终态 | My rentals / owner 嵌套订阅 | 有 subdomain 时显示「打开 Share」并可跳转 |
+
+### 6.1.1 Share Market ↔ Server 联调(SM-E2E)
+
+需 Router + 至少一台在线 Server。关闭 `DEV_AUTH_BYPASS` 或使用两套邮箱分别作为 owner / renter。
+
+| ID | 步骤 | 预期 |
+|---|---|---|
+| SM-E2E-01 | owner 添加 Share 并挂出免费拼车位 | listing 出现在 All；Server 侧尚无新 grant |
+| SM-E2E-02 | renter 租用 | Router 订阅 `grant_pending` → pending edit → Server ack 后出现 `routerShareMarket` shareto |
+| SM-E2E-03 | renter 打开 Share 并鉴权调用 | 请求成功；用量计入该 grant 限额 |
+| SM-E2E-04 | owner 强制回收 | revoke pending edit → grant 移除 → renter 再请求被拒；座位回到可租 |
+| SM-E2E-05 | 付费座位:体验期内声明付款 / 超时 | 声明后 `active_paid`；超时未声明则自动回收 |
 
 ---
 
@@ -375,6 +413,21 @@ location.reload();
 | AC-17 | 无封禁 | 观察 | 空态文案 |
 | AC-18 | 修改收款资料后 | 让租客侧刷新账单 | 租客支付时因 `paymentProfileUpdatedAt` 变化被要求重新确认(与 R-11 呼应) |
 
+### 9.1 账户 Share 只读监控(AS)
+
+覆盖 `account-share-page.tsx`。20s 轮询；**无任何写操作按钮**(租用/付款/回收等只在 Share Market)。
+
+| ID | 前置 | 步骤 | 预期 |
+|---|---|---|---|
+| AS-01 | 已登录 | 打开 `/account/share` | 侧边栏有 Share Market / Share 市场(在 Client 之前)；默认 User tab；只读提示可见 |
+| AS-02 | 有租约 | User tab | 显示订阅卡:状态、截止、报价、owner；异常态边框强调；无付款/归还按钮 |
+| AS-03 | 有挂售 | Provider tab | 显示 listing 摘要(空闲/占用/需关注)与租客租约卡；无强制回收按钮 |
+| AS-04 | User 卡 | 点「在 Share Market 中管理」 | 跳到 `/share-market/?tab=rentals&focus=…` |
+| AS-05 | Provider 卡 | 点管理 | 跳到 `/share-market/?tab=mine&focus=…` |
+| AS-06 | 有 subdomain | 点「打开 Share」 | 新标签打开 Share 子域 |
+| AS-07 | 空态 | User / Provider 无数据 | 空态 + 「打开 Share Market」链接 |
+| AS-08 | 未登录 | 打开 `/account/share` | 提示登录(账户区本身通常需登录) |
+
 ---
 
 ## 10. 控制台与 Web 终端(T)
@@ -449,7 +502,7 @@ location.reload();
 | S-14 | 编辑中 | Token / 并发限额填 0 或负数 | 内联报错 |
 | S-15 | 编辑中 | 勾选「不限」 | 对应数字输入框 disabled |
 | S-16 | 编辑中 | 定价填 0 或 101 | 报错(合法范围 1–100) |
-| S-17 | 编辑中 | 售卖类型选 Share Market 但未选市场 | 报错,保存 disabled |
+| S-17 | 编辑中 | 观察售卖配置 | 只显示 Token Market 定价和访问范围,不出现旧 Share Market 类型或市场选择器 |
 | S-18 | 编辑中 | 市场访问模式选「全部市场」 | 已选市场 chip 区隐藏;可点「切换为指定」恢复 |
 | S-19 | 编辑中 | 添加/删除 shared-with 邮箱 tag | tag 增删;非法邮箱被拒 |
 | S-20 | 支持 user grants | 编辑单用户额度 | 按用户设置 token/并发/过期 |
@@ -652,6 +705,9 @@ location.reload();
 | `dashboard/share-card.tsx` | C-17~C-20 |
 | `dashboard/drawer-panels.tsx` | C-13, C-18, M-05, M-09 |
 | `dashboard/markets-table.tsx` | M-01~M-15 |
+| `dashboard/share-market-page.tsx` | SM-01~SM-15, SM-E2E-01~SM-E2E-05 |
+| `dashboard/account-share-page.tsx` | AS-01~AS-08 |
+| `dashboard/account-client-page.tsx` | 账户 Client 只读监控(镜像 AS) |
 | `dashboard/client-market-page.tsx` | H-01~H-18(归属/筛选/排序/分页), H-60~H-71(选择与批量), H-80~H-84(导入导出) |
 | `client-market/host-utils.ts` | H-10~H-13, H-42(矩阵), H-64 |
 | `client-market/host-row.tsx` | H-40~H-50, T-01~T-03 |
@@ -712,6 +768,7 @@ location.reload();
 | Installations 升级 | 2 | C-21, D-08, D-09 |
 | 用户 API Token | 2 | A-10, A-11 |
 | Markets 优先级 | 1 | M-09 |
+| Share Market | 见 `getShareMarket*` / `*ShareMarket*` | SM-01~SM-15, SM-E2E-01~SM-E2E-05 |
 | 其他(regions / 公告读取) | 2 | A-14, A-16 |
 | 账单(`getMyClientMarketBilling` / `declareClientMarketPayment`) | 2 | R-05~R-11 |
 

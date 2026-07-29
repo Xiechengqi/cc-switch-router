@@ -34,40 +34,38 @@ use crate::models::{
     ClientTunnelUpdateRequest, ClientTunnelView, CountryBoard, CountryClientBoard, CountryMapPoint,
     CountryShareBoard, DashboardClientTunnelView, DashboardClientView, DashboardMap,
     DashboardMapPoint, DashboardMarketRequestLogView, DashboardMarketView,
-    DashboardPresenceRequest, DashboardResponse, DashboardStats,
-    DashboardTickerShare, DashboardUxEventRequest, GatewayRegistryRecord,
-    GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse, HealthCheckEntry,
-    HealthTimelineBucket, ImageGenerationRequestLogEntry, Installation,
-    InstallationHeartbeatRequest, InstallationHeartbeatResponse,
-    InstallationSetupCompletedPayload, InstallationSetupCompletedRequest,
-    InstallationSetupCompletedResponse, InstallationSetupCompletedStatus, InstallationUpgradeView,
-    InstallationView, IssueLeaseRequest, IssueLeaseResponse, LatLonPoint, MapDisplaySettings,
-    MapDisplaySettingsUpdate, MapViewportSettings, MarketAppAvailability,
-    MarketAppAvailabilityEntry, MarketDisabledSharesUpdateRequest,
-    MarketDisabledSharesUpdateResponse, MarketLinkedShareView, MarketMaintenanceUpdateRequest,
-    MarketMaintenanceUpdateResponse, MarketRegistryRecord, MarketRequestLogBatchSyncRequest,
-    MarketRequestLogEntry, MarketShareAppView, MarketShareRuntimeStateInput,
-    MarketShareRuntimeStateView, MarketShareView, ModelHealthSummary, OperationalReason,
-    OperationalSummary, PublicMapClientPoint, PublicMapPointsResponse,
-    PublicMarketConfig, PublicNetworkStatsResponse, RefreshSessionRequest, RegisterGatewayRequest,
-    RegisterGatewayResponse, RegisterInstallationRequest, RegisterInstallationResponse,
-    RegisterMarketRequest, RenewLeaseRequest, RenewLeaseResponse, RequestEmailCodeRequest,
-    RequestEmailCodeResponse, SessionStatusResponse, ShareAppAccess, ShareAppAvailability,
-    ShareAppProviders, ShareAppRuntimes, ShareAppSettings, ShareBatchSyncRequest,
-    ShareClaimPayload, ShareClaimSubdomainRequest, ShareDeleteRequest, ShareDescriptor,
-    ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest, ShareMarketGrantRequest,
-    ShareMarketGrantResponse, ShareMarketGrantStatusResponse, ShareMarketLinkView,
-    ShareMarketListingStatusInput, ShareMarketListingStatusView, ShareModelHealthCheckEntry,
-    ShareModelHealthSummary, SharePendingEditsRequest, SharePendingEditsResponse,
-    SharePruneRequest, ShareRequestLogBatchSyncRequest, ShareRequestLogEntry,
-    ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload, ShareRuntimeRefreshRequest,
-    ShareRuntimeSnapshotResponse, ShareSettingsPatch, ShareSettingsUpdateResponse, ShareSignals,
-    ShareSupport, ShareSyncRequest, ShareTokenPeriod, ShareUpstreamProvider, ShareUpstreamQuota,
-    ShareUsageByEmailResponse, ShareUsageDailyBucket, ShareUsageEmailRow, ShareUserGrant,
-    ShareUserLimitStatusResponse, ShareUserLimitStatusRow, ShareUserPolicy, ShareView,
-    SubdomainAvailabilityResponse, TunnelActivateRequest, TunnelLease, TunnelStateRequest,
-    TunnelStateResponse, UserApiTokenResetResponse, UserApiTokenResponse, UserApiTokenStatus,
-    UserShareView, UserSharesResponse, VerifyEmailCodeRequest, VerifyEmailCodeResponse,
+    DashboardPresenceRequest, DashboardResponse, DashboardStats, DashboardTickerShare,
+    DashboardUxEventRequest, GatewayRegistryRecord, GetInstallationOwnerEmailQuery,
+    GetInstallationOwnerEmailResponse, HealthCheckEntry, HealthTimelineBucket,
+    ImageGenerationRequestLogEntry, Installation, InstallationHeartbeatRequest,
+    InstallationHeartbeatResponse, InstallationSetupCompletedPayload,
+    InstallationSetupCompletedRequest, InstallationSetupCompletedResponse,
+    InstallationSetupCompletedStatus, InstallationUpgradeView, InstallationView, IssueLeaseRequest,
+    IssueLeaseResponse, LatLonPoint, MapDisplaySettings, MapDisplaySettingsUpdate,
+    MapViewportSettings, MarketAppAvailability, MarketAppAvailabilityEntry,
+    MarketDisabledSharesUpdateRequest, MarketDisabledSharesUpdateResponse, MarketLinkView,
+    MarketLinkedShareView, MarketMaintenanceUpdateRequest, MarketMaintenanceUpdateResponse,
+    MarketRegistryRecord, MarketRequestLogBatchSyncRequest, MarketRequestLogEntry,
+    MarketShareAppView, MarketShareRuntimeStateInput, MarketShareRuntimeStateView, MarketShareView,
+    ModelHealthSummary, OperationalReason, OperationalSummary, PublicMapClientPoint,
+    PublicMapPointsResponse, PublicMarketConfig, PublicNetworkStatsResponse, RefreshSessionRequest,
+    RegisterGatewayRequest, RegisterGatewayResponse, RegisterInstallationRequest,
+    RegisterInstallationResponse, RegisterMarketRequest, RenewLeaseRequest, RenewLeaseResponse,
+    RequestEmailCodeRequest, RequestEmailCodeResponse, SessionStatusResponse, ShareAppAccess,
+    ShareAppAvailability, ShareAppProviders, ShareAppRuntimes, ShareAppSettings,
+    ShareBatchSyncRequest, ShareClaimPayload, ShareClaimSubdomainRequest, ShareDeleteRequest,
+    ShareDescriptor, ShareEditAckRequest, ShareEditView, ShareHeartbeatRequest,
+    ShareModelHealthCheckEntry, ShareModelHealthSummary, SharePendingEditsRequest,
+    SharePendingEditsResponse, SharePruneRequest, ShareRequestLogBatchSyncRequest,
+    ShareRequestLogEntry, ShareRequestLogFetchResponse, ShareRuntimeRefreshPayload,
+    ShareRuntimeRefreshRequest, ShareRuntimeSnapshotResponse, ShareSettingsPatch,
+    ShareSettingsUpdateResponse, ShareSignals, ShareSupport, ShareSyncRequest, ShareTokenPeriod,
+    ShareUpstreamProvider, ShareUpstreamQuota, ShareUsageByEmailResponse, ShareUsageDailyBucket,
+    ShareUsageEmailRow, ShareUserGrant, ShareUserLimitStatusResponse, ShareUserLimitStatusRow,
+    ShareUserPolicy, ShareView, SubdomainAvailabilityResponse, TunnelActivateRequest, TunnelLease,
+    TunnelStateRequest, TunnelStateResponse, UserApiTokenResetResponse, UserApiTokenResponse,
+    UserApiTokenStatus, UserShareView, UserSharesResponse, VerifyEmailCodeRequest,
+    VerifyEmailCodeResponse,
 };
 #[cfg(test)]
 use crate::models::{RenewLeasePayload, ShareAppProvider, ShareUpstreamModel};
@@ -135,7 +133,6 @@ const MARKET_DEFAULT_SCOPES: &[&str] = &[
     "market:request_logs:write",
     "market:share_states:write",
     "market:share_states:release",
-    "market:share_grants:write",
 ];
 const GATEWAY_DEFAULT_SCOPES: &[&str] = &[
     "gateway:shares:read",
@@ -1261,6 +1258,25 @@ impl AppStore {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_in_memory_for_tests() -> Result<Self, AppError> {
+        let conn = Connection::open_in_memory().map_err(|error| {
+            AppError::Internal(format!("open in-memory database failed: {error}"))
+        })?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(|error| {
+                AppError::Internal(format!("enable test foreign keys failed: {error}"))
+            })?;
+        init_schema(&conn)?;
+        let salt = Alphanumeric.sample_string(&mut rand::thread_rng(), 32);
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            share_log_recovery_attempts: Arc::new(Mutex::new(HashMap::new())),
+            ip_hash_salt: Arc::new(salt),
+            geo_lookup_base_url: Arc::new("https://ip.im".to_string()),
+        })
+    }
+
     pub async fn lookup_geo_country_code_for_ip(&self, ip: &str) -> Option<String> {
         let base = self.geo_lookup_base_url.clone();
         lookup_ip_im_geo_at(&base, ip)
@@ -1822,32 +1838,37 @@ impl AppStore {
                     false,
                 ),
                 LegacySetupNotificationState::Adopt { event_id } => {
-                    let (event_status, suppression_reason, notification_status, response_status, retain) =
-                        if !notifications_enabled {
-                            (
-                                "suppressed_disabled",
-                                Some("notifications disabled"),
-                                "suppressed_disabled",
-                                InstallationSetupCompletedStatus::SuppressedDisabled,
-                                false,
-                            )
-                        } else if suppress_market_registration {
-                            (
-                                "suppressed_market_ready",
-                                Some("covered by Client Market ready email"),
-                                "suppressed_disabled",
-                                InstallationSetupCompletedStatus::SuppressedDisabled,
-                                true,
-                            )
-                        } else {
-                            (
-                                "pending",
-                                None,
-                                "queued",
-                                InstallationSetupCompletedStatus::Queued,
-                                true,
-                            )
-                        };
+                    let (
+                        event_status,
+                        suppression_reason,
+                        notification_status,
+                        response_status,
+                        retain,
+                    ) = if !notifications_enabled {
+                        (
+                            "suppressed_disabled",
+                            Some("notifications disabled"),
+                            "suppressed_disabled",
+                            InstallationSetupCompletedStatus::SuppressedDisabled,
+                            false,
+                        )
+                    } else if suppress_market_registration {
+                        (
+                            "suppressed_market_ready",
+                            Some("covered by Client Market ready email"),
+                            "suppressed_disabled",
+                            InstallationSetupCompletedStatus::SuppressedDisabled,
+                            true,
+                        )
+                    } else {
+                        (
+                            "pending",
+                            None,
+                            "queued",
+                            InstallationSetupCompletedStatus::Queued,
+                            true,
+                        )
+                    };
                     tx.execute(
                         "UPDATE client_notification_events
                          SET dedupe_key = ?2, status = ?3, occurred_at = ?4, not_before = ?4,
@@ -1867,12 +1888,7 @@ impl AppStore {
                             "adopt legacy setup notification event failed: {error}"
                         ))
                     })?;
-                    (
-                        Some(event_id),
-                        notification_status,
-                        response_status,
-                        retain,
-                    )
+                    (Some(event_id), notification_status, response_status, retain)
                 }
                 LegacySetupNotificationState::None if existing_setup.is_some() => {
                     let (_, notification_status, _, event_id) = existing_setup
@@ -1891,32 +1907,37 @@ impl AppStore {
                 }
                 LegacySetupNotificationState::None => {
                     let event_id = Uuid::new_v4().to_string();
-                    let (event_status, suppression_reason, notification_status, response_status, retain) =
-                        if !notifications_enabled {
-                            (
-                                "suppressed_disabled",
-                                Some("notifications disabled"),
-                                "suppressed_disabled",
-                                InstallationSetupCompletedStatus::SuppressedDisabled,
-                                false,
-                            )
-                        } else if suppress_market_registration {
-                            (
-                                "suppressed_market_ready",
-                                Some("covered by Client Market ready email"),
-                                "suppressed_disabled",
-                                InstallationSetupCompletedStatus::SuppressedDisabled,
-                                true,
-                            )
-                        } else {
-                            (
-                                "pending",
-                                None,
-                                "queued",
-                                InstallationSetupCompletedStatus::Queued,
-                                true,
-                            )
-                        };
+                    let (
+                        event_status,
+                        suppression_reason,
+                        notification_status,
+                        response_status,
+                        retain,
+                    ) = if !notifications_enabled {
+                        (
+                            "suppressed_disabled",
+                            Some("notifications disabled"),
+                            "suppressed_disabled",
+                            InstallationSetupCompletedStatus::SuppressedDisabled,
+                            false,
+                        )
+                    } else if suppress_market_registration {
+                        (
+                            "suppressed_market_ready",
+                            Some("covered by Client Market ready email"),
+                            "suppressed_disabled",
+                            InstallationSetupCompletedStatus::SuppressedDisabled,
+                            true,
+                        )
+                    } else {
+                        (
+                            "pending",
+                            None,
+                            "queued",
+                            InstallationSetupCompletedStatus::Queued,
+                            true,
+                        )
+                    };
                     tx.execute(
                         "INSERT INTO client_notification_events (
                             id, dedupe_key, kind, installation_id, episode, status, occurred_at,
@@ -1937,12 +1958,7 @@ impl AppStore {
                             "insert setup-completed client notification failed: {error}"
                         ))
                     })?;
-                    (
-                        Some(event_id),
-                        notification_status,
-                        response_status,
-                        retain,
-                    )
+                    (Some(event_id), notification_status, response_status, retain)
                 }
             };
         if existing_setup.is_some() {
@@ -4748,7 +4764,6 @@ impl AppStore {
                 can_manage: owner,
                 description: share.description.clone(),
                 for_sale: share.for_sale.clone(),
-                sale_market_kind: share.sale_market_kind.clone(),
                 market_access_mode: share.market_access_mode.clone(),
                 subdomain: share.subdomain.clone(),
                 tunnel_url: config.tunnel_url(&share.subdomain),
@@ -4840,7 +4855,6 @@ impl AppStore {
             unknown_market_emails: Vec::new(),
             description: share.description,
             for_sale: share.for_sale,
-            sale_market_kind: share.sale_market_kind,
             market_access_mode: share.market_access_mode,
             for_sale_official_price_percent_by_app: share.for_sale_official_price_percent_by_app,
             subdomain: share.subdomain,
@@ -6790,7 +6804,6 @@ impl AppStore {
             owner_email,
             shared_with_emails_json,
             current_for_sale,
-            current_sale_market_kind,
             current_app_type,
             current_config_revision,
             user_grants_json,
@@ -6801,15 +6814,14 @@ impl AppStore {
             String,
             String,
             String,
-            String,
             i64,
             String,
             String,
         ) = conn
             .query_row(
-                "SELECT installation_id, owner_email, shared_with_emails_json, for_sale, sale_market_kind, app_type, config_revision, COALESCE(user_grants_json, '{}'), COALESCE(supported_user_token_periods_json, '[]') FROM shares WHERE share_id = ?1",
+                "SELECT installation_id, owner_email, shared_with_emails_json, for_sale, app_type, config_revision, COALESCE(user_grants_json, '{}'), COALESCE(supported_user_token_periods_json, '[]') FROM shares WHERE share_id = ?1",
                 params![share_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
             )
             .optional()
             .map_err(|e| AppError::Internal(format!("query share owner failed: {e}")))?
@@ -6829,7 +6841,6 @@ impl AppStore {
             Some(&owner_email),
             Some(&shared_with_emails),
             Some(&current_for_sale),
-            Some(&current_sale_market_kind),
             Some(&current_app_type),
             Some(&existing_user_grants),
         )?;
@@ -7043,6 +7054,8 @@ impl AppStore {
             }
         };
         let now = Utc::now().to_rfc3339();
+        let ack_edit_id = input.ack.edit_id.clone();
+        let ack_error = input.ack.error_message.clone();
         let changed = conn
             .execute(
                 "UPDATE share_edit_requests
@@ -7055,20 +7068,40 @@ impl AppStore {
                    AND revision = ?3
                    AND status = 'pending'",
                 params![
-                    input.ack.edit_id,
+                    ack_edit_id,
                     input.installation_id,
                     input.ack.revision,
                     status,
                     now,
-                    input.ack.error_message,
+                    ack_error,
                 ],
             )
             .map_err(|e| AppError::Internal(format!("ack share edit failed: {e}")))?;
         if changed == 0 {
-            return Err(AppError::Conflict(
-                "share edit ack did not match an active pending edit".into(),
-            ));
+            let existing_status: Option<String> = conn
+                .query_row(
+                    "SELECT status FROM share_edit_requests
+                     WHERE id = ?1 AND installation_id = ?2 AND revision = ?3",
+                    params![ack_edit_id, input.installation_id, input.ack.revision],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| {
+                    AppError::Internal(format!("read acknowledged share edit failed: {e}"))
+                })?;
+            if existing_status.as_deref() != Some(status) {
+                return Err(AppError::Conflict(
+                    "share edit ack did not match an active or identically resolved edit".into(),
+                ));
+            }
         }
+        crate::share_market::handle_control_edit_ack(
+            &conn,
+            &ack_edit_id,
+            status,
+            ack_error.as_deref(),
+            &now,
+        )?;
         Ok(())
     }
 
@@ -7498,15 +7531,7 @@ impl AppStore {
                         .as_ref()
                         .map(|edit| edit.status != "pending")
                         .unwrap_or(true);
-                let market_links = if share.sale_market_kind == "share" {
-                    let market_emails = share_acl_emails(&share);
-                    market_emails
-                        .iter()
-                        .filter_map(|email| market_by_email.get(&email.to_ascii_lowercase()))
-                        .filter(|market| market.market_kind == "share")
-                        .map(dashboard_market_to_share_link)
-                        .collect::<Vec<_>>()
-                } else if share.market_access_mode == "all"
+                let market_links = if share.market_access_mode == "all"
                     || share
                         .access_by_app
                         .values()
@@ -7514,7 +7539,6 @@ impl AppStore {
                 {
                     markets
                         .iter()
-                        .filter(|market| market.market_kind != "share")
                         .map(dashboard_market_to_share_link)
                         .collect::<Vec<_>>()
                 } else {
@@ -7522,7 +7546,6 @@ impl AppStore {
                     market_emails
                         .iter()
                         .filter_map(|email| market_by_email.get(&email.to_ascii_lowercase()))
-                        .filter(|market| market.market_kind != "share")
                         .map(dashboard_market_to_share_link)
                         .collect::<Vec<_>>()
                 };
@@ -7582,7 +7605,6 @@ impl AppStore {
                     unknown_market_emails,
                     description: share.description,
                     for_sale: share.for_sale,
-                    sale_market_kind: share.sale_market_kind,
                     market_access_mode: share.market_access_mode,
                     for_sale_official_price_percent_by_app: share
                         .for_sale_official_price_percent_by_app,
@@ -7735,9 +7757,7 @@ impl AppStore {
             })
             // 只展示有 share 或已配置 client tunnel 的机器；otherwise dashboard 会被纯
             // lease/heartbeat 但无可用入口的 installation 撑满。
-            .filter(|client| {
-                !client.share_ids.is_empty() || client.client_tunnel.is_some()
-            })
+            .filter(|client| !client.share_ids.is_empty() || client.client_tunnel.is_some())
             .collect::<Vec<_>>();
         client_views.sort_by(|left, right| {
             // P7 Step 2：installation 维度排序。原"can_manage 优先"是 share 字段，已移除；
@@ -8909,7 +8929,6 @@ impl AppStore {
             router_id,
             active_subdomains,
             inflight_by_share,
-            true,
         )
         .await
     }
@@ -9024,7 +9043,9 @@ impl AppStore {
              ) VALUES (?1, 'market_notification', ?2, ?3, 'sent', NULL, ?4)",
             params![id, to, provider_message_id, now],
         )
-        .map_err(|e| AppError::Internal(format!("insert market notification send log failed: {e}")))?;
+        .map_err(|e| {
+            AppError::Internal(format!("insert market notification send log failed: {e}"))
+        })?;
         Ok(crate::models::MarketNotificationEmailResponse {
             ok: true,
             message_id: id,
@@ -9094,14 +9115,12 @@ impl AppStore {
         router_id: &str,
         active_subdomains: &HashSet<String>,
         inflight_by_share: &HashMap<String, usize>,
-        allow_all_market_access: bool,
     ) -> Result<Vec<MarketShareView>, AppError> {
         self.list_market_shares_with_signal_app(
             market_email,
             router_id,
             active_subdomains,
             inflight_by_share,
-            allow_all_market_access,
             None,
         )
         .await
@@ -9113,7 +9132,6 @@ impl AppStore {
         router_id: &str,
         active_subdomains: &HashSet<String>,
         inflight_by_share: &HashMap<String, usize>,
-        allow_all_market_access: bool,
         signal_app: Option<&str>,
     ) -> Result<Vec<MarketShareView>, AppError> {
         let conn = self.conn.lock().await;
@@ -9128,7 +9146,7 @@ impl AppStore {
             .prepare(
                 "SELECT s.share_id, s.installation_id, s.share_name, s.owner_email,
                         i.owner_email, s.shared_with_emails_json, COALESCE(s.access_by_app_json, '{}'),
-                        COALESCE(s.app_settings_json, '{}'), s.market_access_mode, s.app_type, s.for_sale, s.sale_market_kind,
+                        COALESCE(s.app_settings_json, '{}'), s.market_access_mode, s.app_type, s.for_sale,
                         s.share_status, COALESCE(s.subdomain, ''), s.parallel_limit,
                         i.last_seen_at, s.enabled_claude, s.enabled_codex, s.enabled_gemini,
                         s.upstream_provider_json, s.app_runtimes_json,
@@ -9152,8 +9170,8 @@ impl AppStore {
                 let shared_with_emails = parse_string_vec(row.get(5)?)?;
                 let access_by_app = parse_share_access_by_app(row.get(6)?)?;
                 let app_settings = parse_share_app_settings(row.get(7)?)?;
-                let subdomain: String = row.get(13)?;
-                let parallel_limit: i64 = row.get(14)?;
+                let subdomain: String = row.get(12)?;
+                let parallel_limit: i64 = row.get(13)?;
                 let active_requests = *inflight_by_share.get(&share_id).unwrap_or(&0);
                 let mut healthy_minutes_24h = online_minutes.get(&share_id).copied().unwrap_or(0);
                 let mut observed_minutes_24h =
@@ -9166,12 +9184,12 @@ impl AppStore {
                     observed_online_rate(healthy_minutes_24h, observed_minutes_24h) / 100.0;
                 let samples = samples_10m.get(&share_id).copied().unwrap_or(0);
                 let upstream_provider: Option<ShareUpstreamProvider> =
-                    parse_upstream_provider(row.get(19)?)?;
+                    parse_upstream_provider(row.get(18)?)?;
                 let model_health = model_health_by_share
                     .get(&share_id)
                     .cloned()
                     .unwrap_or_default();
-                let raw_app_runtimes = parse_app_runtimes(row.get(20)?)?;
+                let raw_app_runtimes = parse_app_runtimes(row.get(19)?)?;
                 let available_app_runtimes = filter_app_runtimes_by_quota(
                     filter_app_runtimes_by_model_health(
                         raw_app_runtimes.clone(),
@@ -9180,11 +9198,7 @@ impl AppStore {
                     ),
                     now,
                 );
-                let app_runtimes = if allow_all_market_access {
-                    available_app_runtimes
-                } else {
-                    raw_app_runtimes.clone()
-                };
+                let app_runtimes = available_app_runtimes;
                 let quota_health = compute_market_share_quota_health(
                     signal_app,
                     &raw_app_runtimes,
@@ -9221,28 +9235,27 @@ impl AppStore {
                         market_access_mode: row.get(8)?,
                         app_type: row.get(9)?,
                         for_sale: row.get(10)?,
-                        sale_market_kind: row.get(11)?,
-                        share_status: row.get(12)?,
+                        share_status: row.get(11)?,
                         online: false,
                         route_state: "offline".into(),
                         route_state_since: None,
                         active_requests,
-                        token_limit: row.get(23)?,
-                        tokens_used: row.get(24)?,
-                        requests_count: row.get(25)?,
+                        token_limit: row.get(22)?,
+                        tokens_used: row.get(23)?,
+                        requests_count: row.get(24)?,
                         parallel_limit,
-                        expires_at: row.get(26)?,
+                        expires_at: row.get(25)?,
                         online_rate_24h,
                         observed_minutes_24h,
                         observation_coverage_24h: observation_coverage(observed_minutes_24h),
-                        last_seen_at: row.get(15)?,
-                        share_created_at: row.get(22)?,
-                        disabled_by_market: row.get::<_, Option<String>>(21)?.is_some(),
-                        market_disabled_at: row.get(21)?,
+                        last_seen_at: row.get(14)?,
+                        share_created_at: row.get(21)?,
+                        disabled_by_market: row.get::<_, Option<String>>(20)?.is_some(),
+                        market_disabled_at: row.get(20)?,
                         support: ShareSupport {
-                            claude: row.get::<_, i64>(16)? != 0,
-                            codex: row.get::<_, i64>(17)? != 0,
-                            gemini: row.get::<_, i64>(18)? != 0,
+                            claude: row.get::<_, i64>(15)? != 0,
+                            codex: row.get::<_, i64>(16)? != 0,
+                            gemini: row.get::<_, i64>(17)? != 0,
                         },
                         upstream_provider,
                         app_runtimes,
@@ -9267,11 +9280,6 @@ impl AppStore {
         for row in rows {
             let (shared_with_emails, access_by_app, subdomain, mut share, app_settings) =
                 row.map_err(|e| AppError::Internal(format!("read market share row failed: {e}")))?;
-            let expected_sale_market_kind = if allow_all_market_access {
-                "token"
-            } else {
-                "share"
-            };
             share.market_apps = build_market_share_apps(
                 &share.support,
                 &app_settings,
@@ -9279,9 +9287,6 @@ impl AppStore {
                 &shared_with_emails,
                 &share.market_access_mode,
                 &share.for_sale,
-                &share.sale_market_kind,
-                expected_sale_market_kind,
-                allow_all_market_access,
                 market_email,
             );
             let candidate_apps = match signal_app {
@@ -9302,323 +9307,6 @@ impl AppStore {
             shares.push(share);
         }
         Ok(shares)
-    }
-
-    pub async fn list_share_market_delegated_shares(
-        &self,
-        market_email: &str,
-        router_id: &str,
-        active_subdomains: &HashSet<String>,
-        inflight_by_share: &HashMap<String, usize>,
-    ) -> Result<Vec<MarketShareView>, AppError> {
-        self.list_market_shares(
-            market_email,
-            router_id,
-            active_subdomains,
-            inflight_by_share,
-            false,
-        )
-        .await
-    }
-
-    pub async fn create_share_market_grant(
-        &self,
-        market_email: &str,
-        share_id: &str,
-        input: ShareMarketGrantRequest,
-    ) -> Result<ShareMarketGrantResponse, AppError> {
-        let market_email = normalize_email(market_email)?;
-        let action = input.action.trim().to_ascii_lowercase();
-        if !matches!(action.as_str(), "add" | "revoke") {
-            return Err(AppError::BadRequest(
-                "grant action must be add or revoke".into(),
-            ));
-        }
-        if input.grant_id.trim().is_empty() {
-            return Err(AppError::BadRequest("grantId is required".into()));
-        }
-
-        let conn = self.conn.lock().await;
-        let (
-            installation_id,
-            owner_email,
-            shared_with_emails_json,
-            access_by_app_json,
-            app_settings_json,
-            market_access_mode,
-            for_sale,
-            sale_market_kind,
-            token_limit,
-            parallel_limit,
-            expires_at,
-        ): (
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            i64,
-            i64,
-            String,
-        ) = conn
-            .query_row(
-                "SELECT installation_id, owner_email, shared_with_emails_json, COALESCE(access_by_app_json, '{}'), COALESCE(app_settings_json, '{}'), market_access_mode, for_sale, sale_market_kind, token_limit, parallel_limit, expires_at
-                 FROM shares WHERE share_id = ?1 AND share_status = 'active'",
-                params![share_id],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                        row.get(8)?,
-                        row.get(9)?,
-                        row.get(10)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(|e| AppError::Internal(format!("query delegated share failed: {e}")))?
-            .ok_or_else(|| AppError::NotFound("share not found".into()))?;
-        let owner_email = normalize_email(&owner_email)?;
-        let current_shared = parse_string_vec(Some(shared_with_emails_json))
-            .map_err(|e| AppError::Internal(format!("parse share acl failed: {e}")))?;
-        let access_by_app = parse_share_access_by_app(Some(access_by_app_json))
-            .map_err(|e| AppError::Internal(format!("parse share app acl failed: {e}")))?;
-        let app_settings = parse_share_app_settings(Some(app_settings_json))
-            .map_err(|e| AppError::Internal(format!("parse share app settings failed: {e}")))?;
-        let grant_app = match input.app_type.as_deref() {
-            Some(app) if !app.trim().is_empty() => Some(normalize_share_acl_app(app)?),
-            _ => None,
-        };
-        let candidate_apps: Vec<&str> = match grant_app.as_deref() {
-            Some(app) => vec![app],
-            None => vec!["claude", "codex", "gemini"],
-        };
-        let listed_for_share_market = candidate_apps.iter().any(|app| {
-            let setting = app_settings.get(*app);
-            let app_for_sale = setting
-                .map(|value| value.for_sale.as_str())
-                .unwrap_or(&for_sale);
-            let app_sale_market_kind = setting
-                .map(|value| value.sale_market_kind.as_str())
-                .unwrap_or(&sale_market_kind);
-            app_for_sale == "Yes" && app_sale_market_kind == "share"
-        });
-        if !listed_for_share_market {
-            return Err(AppError::Forbidden(
-                "share is not listed for share-market sale".into(),
-            ));
-        }
-        let delegated = candidate_apps.iter().any(|app| {
-            share_app_settings_visible_to_market(
-                app,
-                &app_settings,
-                &access_by_app,
-                &current_shared,
-                &market_access_mode,
-                &for_sale,
-                &sale_market_kind,
-                "share",
-                false,
-                &market_email,
-            )
-        });
-        if !delegated {
-            return Err(AppError::Forbidden(
-                "share is not delegated to this share-market".into(),
-            ));
-        }
-        if let Some(active) = get_active_share_edit(&conn, share_id)? {
-            return Err(AppError::Conflict(format!(
-                "share settings edit {} is {} and must be applied before another edit",
-                active.revision, active.status
-            )));
-        }
-
-        let buyer_emails = normalize_email_list(&input.buyer_emails, &owner_email);
-        if buyer_emails.is_empty() {
-            return Err(AppError::BadRequest("buyerEmails is required".into()));
-        }
-        let patch = if let Some(app) = grant_app.as_deref() {
-            let mut next_app_settings = effective_app_settings_from_parts(
-                &app_settings,
-                &access_by_app,
-                &current_shared,
-                &market_access_mode,
-                &for_sale,
-                &sale_market_kind,
-                token_limit,
-                parallel_limit,
-                &expires_at,
-            );
-            let current_setting = next_app_settings.get(app).cloned().unwrap_or_else(|| {
-                effective_app_setting_from_parts(
-                    app,
-                    &app_settings,
-                    &access_by_app,
-                    &current_shared,
-                    &market_access_mode,
-                    &for_sale,
-                    &sale_market_kind,
-                    token_limit,
-                    parallel_limit,
-                    &expires_at,
-                )
-            });
-            let mut next_emails = normalize_email_list_with_options(
-                &current_setting.shared_with_emails,
-                &owner_email,
-                true,
-            );
-            match action.as_str() {
-                "add" => {
-                    next_emails.extend(buyer_emails);
-                    next_emails =
-                        normalize_email_list_with_options(&next_emails, &owner_email, true);
-                }
-                "revoke" => {
-                    let revoke = buyer_emails.into_iter().collect::<HashSet<_>>();
-                    next_emails.retain(|email| !revoke.contains(email));
-                }
-                _ => unreachable!(),
-            }
-            if next_emails
-                == normalize_email_list_with_options(
-                    &current_setting.shared_with_emails,
-                    &owner_email,
-                    true,
-                )
-            {
-                return Ok(ShareMarketGrantResponse {
-                    ok: true,
-                    grant_id: input.grant_id,
-                    router_edit_id: format!("noop:{share_id}:{app}"),
-                    status: "noop".into(),
-                });
-            }
-            let mut next_setting = current_setting;
-            next_setting.shared_with_emails = next_emails;
-            next_app_settings.insert(app.to_string(), next_setting);
-            normalize_share_settings_patch(
-                ShareSettingsPatch {
-                    app_settings: Some(next_app_settings),
-                    ..Default::default()
-                },
-                Some(&owner_email),
-                Some(&current_shared),
-                Some(&for_sale),
-                Some(&sale_market_kind),
-                None,
-                None,
-            )?
-        } else {
-            let mut next_shared = normalize_email_list(&current_shared, &owner_email);
-            match action.as_str() {
-                "add" => {
-                    next_shared.extend(buyer_emails);
-                    next_shared = normalize_email_list(&next_shared, &owner_email);
-                }
-                "revoke" => {
-                    let revoke = buyer_emails.into_iter().collect::<HashSet<_>>();
-                    next_shared.retain(|email| !revoke.contains(email));
-                }
-                _ => unreachable!(),
-            }
-            if next_shared == normalize_email_list(&current_shared, &owner_email) {
-                return Ok(ShareMarketGrantResponse {
-                    ok: true,
-                    grant_id: input.grant_id,
-                    router_edit_id: format!("noop:{share_id}"),
-                    status: "noop".into(),
-                });
-            }
-
-            normalize_share_settings_patch(
-                ShareSettingsPatch {
-                    shared_with_emails: Some(next_shared),
-                    ..Default::default()
-                },
-                Some(&owner_email),
-                Some(&current_shared),
-                Some(&for_sale),
-                Some(&sale_market_kind),
-                None,
-                None,
-            )?
-        };
-        let revision = next_share_edit_revision(&conn, share_id)?;
-        let edit_id = Uuid::new_v4().to_string();
-        let now = Utc::now().to_rfc3339();
-        let patch_json = serde_json::to_string(&patch).map_err(|e| {
-            AppError::Internal(format!("serialize share-market grant patch failed: {e}"))
-        })?;
-        conn.execute(
-            "INSERT INTO share_edit_requests (
-                id, share_id, installation_id, owner_email, revision, status, patch_json,
-                created_by_email, created_at, updated_at, applied_at, error_message
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7, ?8, ?8, NULL, NULL)",
-            params![
-                edit_id,
-                share_id,
-                installation_id,
-                owner_email,
-                revision,
-                patch_json,
-                market_email,
-                now,
-            ],
-        )
-        .map_err(|e| AppError::Internal(format!("insert share-market grant edit failed: {e}")))?;
-        Ok(ShareMarketGrantResponse {
-            ok: true,
-            grant_id: input.grant_id,
-            router_edit_id: edit_id,
-            status: "pending".into(),
-        })
-    }
-
-    pub async fn share_market_grant_status(
-        &self,
-        market_email: &str,
-        share_id: &str,
-        router_edit_id: &str,
-    ) -> Result<ShareMarketGrantStatusResponse, AppError> {
-        let market_email = normalize_email(market_email)?;
-        if router_edit_id.starts_with("noop:") {
-            let noop_share_id = router_edit_id.trim_start_matches("noop:");
-            if noop_share_id != share_id {
-                return Err(AppError::NotFound("share grant edit not found".into()));
-            }
-            return Ok(ShareMarketGrantStatusResponse {
-                ok: true,
-                router_edit_id: router_edit_id.to_string(),
-                status: "applied".into(),
-                error_message: None,
-                applied_at: Some(Utc::now()),
-            });
-        }
-
-        let conn = self.conn.lock().await;
-        let edit = get_share_edit_by_id(&conn, router_edit_id)?
-            .ok_or_else(|| AppError::NotFound("share grant edit not found".into()))?;
-        if edit.share_id != share_id || normalize_email(&edit.created_by_email)? != market_email {
-            return Err(AppError::NotFound("share grant edit not found".into()));
-        }
-        Ok(ShareMarketGrantStatusResponse {
-            ok: true,
-            router_edit_id: router_edit_id.to_string(),
-            status: edit.status,
-            error_message: edit.error_message,
-            applied_at: edit.applied_at,
-        })
     }
 
     /// Batched lookup of `parallel_limit` for a set of share_ids. Backs the
@@ -9690,13 +9378,7 @@ impl AppStore {
         self.require_market_manager(market_email, current_user_email, is_admin)
             .await?;
         let mut shares = self
-            .list_market_shares(
-                market_email,
-                "main",
-                active_subdomains,
-                inflight_by_share,
-                true,
-            )
+            .list_market_shares(market_email, "main", active_subdomains, inflight_by_share)
             .await?;
         let conn = self.conn.lock().await;
         let states_by_market = list_market_share_runtime_state_map(&conn)?;
@@ -9726,9 +9408,9 @@ impl AppStore {
             let conn = self.conn.lock().await;
             let market = get_market_by_email(&conn, &normalized_market_email)?
                 .ok_or_else(|| AppError::NotFound("market not found".into()))?;
-            if market.market_kind == "share" {
+            if market.market_kind != "usage" {
                 return Err(AppError::BadRequest(
-                    "share priority is only available for token markets".into(),
+                    "share priority is only available for usage markets".into(),
                 ));
             }
         }
@@ -9739,7 +9421,6 @@ impl AppStore {
                 "main",
                 active_subdomains,
                 inflight_by_share,
-                true,
                 signal_app.as_deref(),
             )
             .await?;
@@ -9940,139 +9621,6 @@ impl AppStore {
             AppError::Internal(format!("commit market share states sync failed: {e}"))
         })?;
         Ok(synced)
-    }
-
-    pub async fn sync_share_market_listing_statuses(
-        &self,
-        market_email: &str,
-        replace: bool,
-        statuses: Vec<ShareMarketListingStatusInput>,
-    ) -> Result<usize, AppError> {
-        let normalized_market_email = normalize_email(market_email)?;
-        let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().await;
-        let tx = conn.unchecked_transaction().map_err(|e| {
-            AppError::Internal(format!(
-                "begin share market listing status sync failed: {e}"
-            ))
-        })?;
-        if replace {
-            tx.execute(
-                "DELETE FROM share_market_listing_statuses WHERE lower(market_email) = lower(?1)",
-                params![normalized_market_email],
-            )
-            .map_err(|e| {
-                AppError::Internal(format!("replace share market listing statuses failed: {e}"))
-            })?;
-        }
-
-        let mut synced = 0usize;
-        for status in statuses {
-            let router_id =
-                normalize_optional_string(status.router_id).unwrap_or_else(|| "main".to_string());
-            let share_id = status.share_id.trim().to_string();
-            if share_id.is_empty() {
-                continue;
-            }
-            let app_type = normalize_app_type_token(&status.app_type)?;
-            if !share_market_listing_status_visible_to_market(
-                &tx,
-                &normalized_market_email,
-                &router_id,
-                &share_id,
-                &app_type,
-            )? {
-                continue;
-            }
-            let listing_url = status.listing_url.trim().to_string();
-            if !listing_url.starts_with("http://") && !listing_url.starts_with("https://") {
-                continue;
-            }
-            let status_value = normalize_listing_status_token(&status.status)?;
-            let sale_mode = normalize_optional_listing_sale_mode(status.sale_mode)?;
-            let listing_status = normalize_optional_string(status.listing_status);
-            let expires_at = normalize_optional_string(status.expires_at);
-            let filled_seats = status.filled_seats.map(|value| value.max(0));
-            let required_seats = status.required_seats.map(|value| value.max(0));
-            tx.execute(
-                r#"
-                INSERT INTO share_market_listing_statuses
-                    (market_email, router_id, share_id, app_type, listing_url, status, sale_mode,
-                     filled_seats, required_seats, listing_status, expires_at, created_at, updated_at)
-                VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12)
-                ON CONFLICT(market_email, router_id, share_id, app_type) DO UPDATE SET
-                    listing_url = excluded.listing_url,
-                    status = excluded.status,
-                    sale_mode = excluded.sale_mode,
-                    filled_seats = excluded.filled_seats,
-                    required_seats = excluded.required_seats,
-                    listing_status = excluded.listing_status,
-                    expires_at = excluded.expires_at,
-                    updated_at = excluded.updated_at
-                "#,
-                params![
-                    normalized_market_email,
-                    router_id,
-                    share_id,
-                    app_type,
-                    listing_url,
-                    status_value,
-                    sale_mode,
-                    filled_seats,
-                    required_seats,
-                    listing_status,
-                    expires_at,
-                    now
-                ],
-            )
-            .map_err(|e| {
-                AppError::Internal(format!("upsert share market listing status failed: {e}"))
-            })?;
-            synced += 1;
-        }
-        tx.commit().map_err(|e| {
-            AppError::Internal(format!(
-                "commit share market listing status sync failed: {e}"
-            ))
-        })?;
-        Ok(synced)
-    }
-
-    pub async fn attach_share_market_listing_statuses(
-        &self,
-        response: &mut DashboardResponse,
-    ) -> Result<(), AppError> {
-        let conn = self.conn.lock().await;
-        let statuses = list_share_market_listing_status_map(&conn)?;
-        drop(conn);
-        for share in &mut response.shares {
-            for market in share
-                .market_links
-                .iter_mut()
-                .filter(|market| market.market_kind == "share")
-            {
-                let market_email = market.email.to_ascii_lowercase();
-                for app in ["claude", "codex", "gemini"] {
-                    let router_id = if share.router_id.trim().is_empty() {
-                        "main"
-                    } else {
-                        share.router_id.as_str()
-                    };
-                    let key = (
-                        market_email.clone(),
-                        router_id.to_string(),
-                        share.share_id.clone(),
-                        app.to_string(),
-                    );
-                    if let Some(status) = statuses.get(&key) {
-                        market
-                            .listing_status_by_app
-                            .insert(app.to_string(), status.clone());
-                    }
-                }
-            }
-        }
-        Ok(())
     }
 
     pub async fn update_market_maintenance(
@@ -11290,7 +10838,6 @@ fn upsert_share_tx(
     let description = normalize_share_description(share.description.clone())?;
     let for_sale = normalize_share_for_sale(&share.for_sale)?;
     let market_access_mode = normalize_market_access_mode(&share.market_access_mode)?;
-    let sale_market_kind = normalize_sale_market_kind(&share.sale_market_kind)?;
     if share
         .for_sale_official_price_percent_by_app
         .iter()
@@ -11300,11 +10847,9 @@ fn upsert_share_tx(
             "official price percent must target the share app and be between 1 and 100".into(),
         ));
     }
-    if !share.for_sale_official_price_percent_by_app.is_empty()
-        && (for_sale != "Yes" || sale_market_kind != "token")
-    {
+    if !share.for_sale_official_price_percent_by_app.is_empty() && for_sale != "Yes" {
         return Err(AppError::BadRequest(
-            "official price percent requires forSale=Yes and saleMarketKind=token".into(),
+            "official price percent requires forSale=Yes".into(),
         ));
     }
     let now_ms = Utc::now().timestamp_millis();
@@ -11351,10 +10896,10 @@ fn upsert_share_tx(
         .map_err(|e| AppError::Internal(format!("serialize app providers failed: {e}")))?;
     conn.execute(
         "INSERT INTO shares (
-            share_id, installation_id, share_name, owner_email, shared_with_emails_json, market_access_mode, access_by_app_json, app_settings_json, description, for_sale, sale_market_kind, subdomain, app_type, provider_id,
+            share_id, installation_id, share_name, owner_email, shared_with_emails_json, market_access_mode, access_by_app_json, app_settings_json, description, for_sale, subdomain, app_type, provider_id,
             enabled_claude, enabled_codex, enabled_gemini,
             token_limit, parallel_limit, tokens_used, requests_count, share_status, created_at, expires_at, upstream_provider_json, app_runtimes_json, app_providers_json, bindings_json, config_revision, user_grants_json, supported_user_token_periods_json, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)
         ON CONFLICT(share_id) DO UPDATE SET
             installation_id = excluded.installation_id,
             share_name = excluded.share_name,
@@ -11365,7 +10910,6 @@ fn upsert_share_tx(
             app_settings_json = excluded.app_settings_json,
             description = excluded.description,
             for_sale = excluded.for_sale,
-            sale_market_kind = excluded.sale_market_kind,
             subdomain = excluded.subdomain,
             app_type = excluded.app_type,
             provider_id = excluded.provider_id,
@@ -11400,7 +10944,6 @@ fn upsert_share_tx(
             app_settings_json,
             description,
             for_sale,
-            sale_market_kind,
             share.subdomain,
             share.app_type,
             share.provider_id,
@@ -11599,11 +11142,6 @@ fn delete_share_auxiliary_rows_tx(conn: &Connection, share_id: &str) -> Result<(
         params![share_id],
     )
     .map_err(|e| AppError::Internal(format!("delete market share runtime states failed: {e}")))?;
-    conn.execute(
-        "DELETE FROM share_market_listing_statuses WHERE share_id = ?1",
-        params![share_id],
-    )
-    .map_err(|e| AppError::Internal(format!("delete share market listing statuses failed: {e}")))?;
     Ok(())
 }
 
@@ -11773,10 +11311,6 @@ fn retire_share_tx(
             "market share model failure state",
         ),
         ("market_share_runtime_states", "market share runtime state"),
-        (
-            "share_market_listing_statuses",
-            "share market listing status",
-        ),
     ] {
         conn.execute(
             &format!("DELETE FROM {table} WHERE share_id = ?1"),
@@ -12122,6 +11656,9 @@ fn write_map_display_settings(
 fn init_schema(conn: &Connection) -> Result<(), AppError> {
     crate::public_hosts::init_schema(conn).map_err(map_public_host_error)?;
     crate::client_market::init_schema(conn).map_err(map_client_market_schema_error)?;
+    crate::share_market::init_schema(conn).map_err(|error| {
+        AppError::Internal(format!("initialize Share Market schema failed: {error}"))
+    })?;
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS installations (
@@ -12219,7 +11756,6 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             app_settings_json TEXT NOT NULL DEFAULT '{}',
             description TEXT,
             for_sale TEXT NOT NULL DEFAULT 'No',
-            sale_market_kind TEXT NOT NULL DEFAULT 'token',
             subdomain TEXT,
             app_type TEXT NOT NULL,
             provider_id TEXT,
@@ -12450,23 +11986,6 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             expires_at TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS share_market_listing_statuses (
-            market_email TEXT NOT NULL,
-            router_id TEXT NOT NULL,
-            share_id TEXT NOT NULL,
-            app_type TEXT NOT NULL,
-            listing_url TEXT NOT NULL,
-            status TEXT NOT NULL,
-            sale_mode TEXT,
-            filled_seats INTEGER,
-            required_seats INTEGER,
-            listing_status TEXT,
-            expires_at TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (market_email, router_id, share_id, app_type)
         );
 
         CREATE TABLE IF NOT EXISTS dashboard_presence (
@@ -12833,8 +12352,6 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         CREATE INDEX IF NOT EXISTS idx_market_share_model_failure_state_share ON market_share_model_failure_state(market_email, share_id, app_type, last_status);
         CREATE INDEX IF NOT EXISTS idx_market_share_runtime_states_market_share ON market_share_runtime_states(market_email, share_id);
         CREATE INDEX IF NOT EXISTS idx_market_share_runtime_states_expires ON market_share_runtime_states(expires_at);
-        CREATE INDEX IF NOT EXISTS idx_share_market_listing_statuses_market_share ON share_market_listing_statuses(market_email, router_id, share_id);
-        CREATE INDEX IF NOT EXISTS idx_share_market_listing_statuses_expires ON share_market_listing_statuses(expires_at);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_market_share_runtime_states_unique
             ON market_share_runtime_states (
                 market_email,
@@ -12985,13 +12502,6 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             "backfill market share state release scope failed: {e}"
         ))
     })?;
-    conn.execute(
-        "UPDATE router_markets
-            SET scopes_json = replace(scopes_json, ']', ',\"market:share_grants:write\"]')
-          WHERE instr(scopes_json, 'market:share_grants:write') = 0",
-        [],
-    )
-    .map_err(|e| AppError::Internal(format!("backfill market share grant scope failed: {e}")))?;
     let columns = conn
         .prepare("PRAGMA table_info(installations)")
         .and_then(|mut stmt| {
@@ -13242,13 +12752,6 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         )
         .map_err(|e| AppError::Internal(format!("add shares for_sale failed: {e}")))?;
     }
-    if !columns.iter().any(|name| name == "sale_market_kind") {
-        conn.execute(
-            "ALTER TABLE shares ADD COLUMN sale_market_kind TEXT NOT NULL DEFAULT 'token'",
-            [],
-        )
-        .map_err(|e| AppError::Internal(format!("add shares sale_market_kind failed: {e}")))?;
-    }
     conn.execute(
         "CREATE TABLE IF NOT EXISTS email_send_logs (
             id TEXT PRIMARY KEY,
@@ -13388,36 +12891,6 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         [],
     )
     .map_err(|e| AppError::Internal(format!("create market failure state index failed: {e}")))?;
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS share_market_listing_statuses (
-            market_email TEXT NOT NULL,
-            router_id TEXT NOT NULL,
-            share_id TEXT NOT NULL,
-            app_type TEXT NOT NULL,
-            listing_url TEXT NOT NULL,
-            status TEXT NOT NULL,
-            sale_mode TEXT,
-            filled_seats INTEGER,
-            required_seats INTEGER,
-            listing_status TEXT,
-            expires_at TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (market_email, router_id, share_id, app_type)
-        )",
-        [],
-    )
-    .map_err(|e| AppError::Internal(format!("create listing status table failed: {e}")))?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_share_market_listing_statuses_market_share ON share_market_listing_statuses(market_email, router_id, share_id)",
-        [],
-    )
-    .map_err(|e| AppError::Internal(format!("create listing status share index failed: {e}")))?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_share_market_listing_statuses_expires ON share_market_listing_statuses(expires_at)",
-        [],
-    )
-    .map_err(|e| AppError::Internal(format!("create listing status expires index failed: {e}")))?;
     add_column_if_missing(
         conn,
         "share_request_logs",
@@ -16732,7 +16205,7 @@ fn authoritative_share_usage_by_app(
 fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppError> {
     let mut stmt = conn
         .prepare(
-        "SELECT s.installation_id, s.share_id, s.share_name, s.description, s.for_sale, s.sale_market_kind, s.market_access_mode, COALESCE(s.access_by_app_json, '{}'), COALESCE(s.app_settings_json, '{}'), COALESCE(s.subdomain, '-'), s.app_type, s.provider_id,
+        "SELECT s.installation_id, s.share_id, s.share_name, s.description, s.for_sale, s.market_access_mode, COALESCE(s.access_by_app_json, '{}'), COALESCE(s.app_settings_json, '{}'), COALESCE(s.subdomain, '-'), s.app_type, s.provider_id,
                     s.owner_email, s.shared_with_emails_json,
                     s.enabled_claude, s.enabled_codex, s.enabled_gemini,
                     s.token_limit, s.parallel_limit, s.tokens_used, s.requests_count, s.share_status, s.created_at, s.expires_at, s.upstream_provider_json, s.app_runtimes_json, s.app_providers_json,
@@ -16751,40 +16224,38 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                     share_name: row.get(2)?,
                     description: row.get(3)?,
                     for_sale: row.get(4)?,
-                    sale_market_kind: row.get(5)?,
-                    market_access_mode: row.get(6)?,
-                    access_by_app: parse_share_access_by_app(row.get(7)?)?,
-                    app_settings: parse_share_app_settings(row.get(8)?)?,
+                    market_access_mode: row.get(5)?,
+                    access_by_app: parse_share_access_by_app(row.get(6)?)?,
+                    app_settings: parse_share_app_settings(row.get(7)?)?,
                     for_sale_official_price_percent_by_app: Default::default(),
-                    subdomain: row.get(9)?,
-                    app_type: row.get(10)?,
-                    provider_id: row.get(11)?,
-                    bindings: parse_share_bindings(row.get(27)?)?,
-                    owner_email: row.get(12)?,
-                    shared_with_emails: parse_string_vec(row.get(13)?)?,
+                    subdomain: row.get(8)?,
+                    app_type: row.get(9)?,
+                    provider_id: row.get(10)?,
+                    bindings: parse_share_bindings(row.get(26)?)?,
+                    owner_email: row.get(11)?,
+                    shared_with_emails: parse_string_vec(row.get(12)?)?,
                     support: ShareSupport {
-                        claude: row.get::<_, i64>(14)? != 0,
-                        codex: row.get::<_, i64>(15)? != 0,
-                        gemini: row.get::<_, i64>(16)? != 0,
+                        claude: row.get::<_, i64>(13)? != 0,
+                        codex: row.get::<_, i64>(14)? != 0,
+                        gemini: row.get::<_, i64>(15)? != 0,
                     },
-                    token_limit: row.get(17)?,
-                    parallel_limit: row.get(18)?,
-                    tokens_used: row.get(19)?,
-                    requests_count: row.get(20)?,
-                    share_status: row.get(21)?,
-                    created_at: row.get(22)?,
-                    expires_at: row.get(23)?,
-                    upstream_provider: parse_upstream_provider(row.get(24)?)?,
-                    app_runtimes: parse_app_runtimes(row.get(25)?)?,
-                    app_providers: parse_app_providers(row.get(26)?)?,
-                    market_grant: None,
+                    token_limit: row.get(16)?,
+                    parallel_limit: row.get(17)?,
+                    tokens_used: row.get(18)?,
+                    requests_count: row.get(19)?,
+                    share_status: row.get(20)?,
+                    created_at: row.get(21)?,
+                    expires_at: row.get(22)?,
+                    upstream_provider: parse_upstream_provider(row.get(23)?)?,
+                    app_runtimes: parse_app_runtimes(row.get(24)?)?,
+                    app_providers: parse_app_providers(row.get(25)?)?,
                     app_availability: ShareAppAvailability::default(),
                     model_health: ShareModelHealthSummary::default(),
                     auto_start: false,
-                    config_revision: row.get::<_, i64>(28)?.max(0) as u64,
-                    user_grants: parse_share_user_grants(row.get(29)?)?,
+                    config_revision: row.get::<_, i64>(27)?.max(0) as u64,
+                    user_grants: parse_share_user_grants(row.get(28)?)?,
                     supported_user_token_periods: parse_supported_user_token_periods(
-                        &row.get::<_, String>(30)?,
+                        &row.get::<_, String>(29)?,
                     ),
                 },
             ))
@@ -16935,7 +16406,6 @@ fn share_settings_patch_is_empty(patch: &ShareSettingsPatch) -> bool {
     patch.owner_email.is_none()
         && patch.description.is_none()
         && patch.for_sale.is_none()
-        && patch.sale_market_kind.is_none()
         && patch.market_access_mode.is_none()
         && patch.shared_with_emails.is_none()
         && patch.access_by_app.is_none()
@@ -16946,6 +16416,7 @@ fn share_settings_patch_is_empty(patch: &ShareSettingsPatch) -> bool {
         && patch.expires_at.is_none()
         && patch.auto_start.is_none()
         && patch.user_grants.is_none()
+        && patch.managed_grant.is_none()
 }
 
 /// Verifies that the descriptor the client reported back through the control
@@ -17008,7 +16479,6 @@ fn validate_returned_share_against_patch(
         for (app, setting) in app_settings {
             let got = share.app_settings.get(app).ok_or("appSettings")?;
             if got.for_sale != setting.for_sale
-                || got.sale_market_kind != setting.sale_market_kind
                 || got.market_access_mode != setting.market_access_mode
                 || got.token_limit != setting.token_limit
                 || got.parallel_limit != setting.parallel_limit
@@ -17045,11 +16515,6 @@ fn validate_returned_share_against_patch(
     if let Some(for_sale) = patch.for_sale.as_deref() {
         if for_sale != share.for_sale {
             return Err("forSale");
-        }
-    }
-    if let Some(sale_market_kind) = patch.sale_market_kind.as_deref() {
-        if sale_market_kind != share.sale_market_kind {
-            return Err("saleMarketKind");
         }
     }
     if let Some(mode) = patch.market_access_mode.as_deref() {
@@ -17123,6 +16588,33 @@ fn validate_returned_share_against_patch(
             }
         }
     }
+    if let Some(operation) = patch.managed_grant.as_ref() {
+        let expected = operation.email.trim().to_ascii_lowercase();
+        match operation.action {
+            crate::models::ShareManagedGrantAction::Upsert => {
+                let Some(returned) = share.user_grants.get(&expected).filter(|grant| {
+                    grant.active
+                        && grant.manager == crate::models::ShareGrantManager::RouterShareMarket
+                        && grant.entitlement_id.as_deref()
+                            == Some(operation.entitlement_id.as_str())
+                }) else {
+                    return Err("managedGrant");
+                };
+                if operation.policy.as_ref() != Some(&returned.policy) {
+                    return Err("managedGrant");
+                }
+            }
+            crate::models::ShareManagedGrantAction::Revoke => {
+                if share.user_grants.values().any(|grant| {
+                    grant.active
+                        && grant.entitlement_id.as_deref()
+                            == Some(operation.entitlement_id.as_str())
+                }) {
+                    return Err("managedGrant");
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -17148,6 +16640,24 @@ fn normalize_share_user_grants_preserving(
             ));
         }
         validate_share_user_policy(&grant.policy, Utc::now().timestamp_millis())?;
+        if let Some(previous) = existing
+            .and_then(|map| map.get(&email))
+            .filter(|grant| {
+                grant.manager == crate::models::ShareGrantManager::RouterShareMarket
+            })
+        {
+            if grant.active != previous.active
+                || grant.policy != previous.policy
+                || grant.manager != crate::models::ShareGrantManager::RouterShareMarket
+                || grant.entitlement_id != previous.entitlement_id
+            {
+                return Err(AppError::Conflict(
+                    "Share Market managed users are read-only".into(),
+                ));
+            }
+            normalized.insert(email, previous.clone());
+            continue;
+        }
         grant.email = email.clone();
         grant.role = if email == owner_email {
             "owner".to_string()
@@ -17171,8 +16681,23 @@ fn normalize_share_user_grants_preserving(
             .and_then(|map| map.get(&email))
             .map(|prev| prev.revision)
             .unwrap_or(0);
+        grant.manager = if grant.role == "owner" {
+            crate::models::ShareGrantManager::Owner
+        } else {
+            crate::models::ShareGrantManager::Manual
+        };
+        grant.entitlement_id = None;
         if normalized.insert(email, grant).is_some() {
             return Err(AppError::BadRequest("duplicate ShareTo email".into()));
+        }
+    }
+    if let Some(existing) = existing {
+        for (email, grant) in existing.iter().filter(|(_, grant)| {
+            grant.active && grant.manager == crate::models::ShareGrantManager::RouterShareMarket
+        }) {
+            normalized
+                .entry(email.clone())
+                .or_insert_with(|| grant.clone());
         }
     }
     if !owner_email.is_empty()
@@ -17192,10 +16717,14 @@ fn normalize_share_settings_patch(
     owner_email: Option<&str>,
     current_shared_with_emails: Option<&[String]>,
     current_for_sale: Option<&str>,
-    current_sale_market_kind: Option<&str>,
     current_app_type: Option<&str>,
     existing_user_grants: Option<&BTreeMap<String, ShareUserGrant>>,
 ) -> Result<ShareSettingsPatch, AppError> {
+    if patch.managed_grant.is_some() {
+        return Err(AppError::Forbidden(
+            "managed grants can only be changed by Share Market".into(),
+        ));
+    }
     if patch.owner_email.is_some() {
         return Err(AppError::Conflict(
             "share owner is managed by the installation owner".into(),
@@ -17208,17 +16737,6 @@ fn normalize_share_settings_patch(
         None => None,
     };
     let current_for_sale = current_for_sale.map(normalize_share_for_sale).transpose()?;
-    let sale_market_kind = match patch.sale_market_kind {
-        Some(value) => Some(normalize_sale_market_kind(&value)?),
-        None => None,
-    };
-    let current_sale_market_kind = current_sale_market_kind
-        .map(normalize_sale_market_kind)
-        .transpose()?;
-    let allow_owner_in_acl = sale_market_kind
-        .as_deref()
-        .or(current_sale_market_kind.as_deref())
-        == Some("share");
     let effective_owner_email = next_owner_email.as_deref().unwrap_or(current_owner_email);
     if let Some(next_owner_email) = next_owner_email.as_deref() {
         if next_owner_email == current_owner_email {
@@ -17241,11 +16759,7 @@ fn normalize_share_settings_patch(
     }
     let shared_with_emails = match patch.shared_with_emails {
         Some(values) => {
-            let mut normalized = normalize_email_list_with_options(
-                &values,
-                effective_owner_email,
-                allow_owner_in_acl,
-            );
+            let mut normalized = normalize_email_list(&values, effective_owner_email);
             if next_owner_email.is_some()
                 && !current_owner_email.is_empty()
                 && !normalized.iter().any(|email| email == current_owner_email)
@@ -17275,11 +16789,8 @@ fn normalize_share_settings_patch(
             let mut normalized = BTreeMap::new();
             for (app, access) in values {
                 let app = normalize_share_acl_app(&app)?;
-                let mut emails = normalize_email_list_with_options(
-                    &access.shared_with_emails,
-                    effective_owner_email,
-                    allow_owner_in_acl,
-                );
+                let mut emails =
+                    normalize_email_list(&access.shared_with_emails, effective_owner_email);
                 if next_owner_email.is_some()
                     && !current_owner_email.is_empty()
                     && !emails.iter().any(|email| email == current_owner_email)
@@ -17339,18 +16850,14 @@ fn normalize_share_settings_patch(
         }
         None => None,
     };
-    let pricing_eligible = for_sale.as_deref().or(current_for_sale.as_deref()) == Some("Yes")
-        && sale_market_kind
-            .as_deref()
-            .or(current_sale_market_kind.as_deref())
-            == Some("token");
+    let pricing_eligible = for_sale.as_deref().or(current_for_sale.as_deref()) == Some("Yes");
     if !pricing_eligible {
         if pricing.as_ref().is_some_and(|values| !values.is_empty()) {
             return Err(AppError::BadRequest(
-                "official price percent requires forSale=Yes and saleMarketKind=token".into(),
+                "official price percent requires forSale=Yes".into(),
             ));
         }
-        if pricing.is_none() && (for_sale.is_some() || sale_market_kind.is_some()) {
+        if pricing.is_none() && for_sale.is_some() {
             pricing = Some(BTreeMap::new());
         }
     }
@@ -17385,7 +16892,6 @@ fn normalize_share_settings_patch(
             None => None,
         },
         for_sale,
-        sale_market_kind,
         market_access_mode: match patch.market_access_mode {
             Some(value) => Some(normalize_market_access_mode(&value)?),
             None => None,
@@ -17399,6 +16905,7 @@ fn normalize_share_settings_patch(
         expires_at: patch.expires_at,
         auto_start: patch.auto_start,
         user_grants,
+        managed_grant: None,
     })
 }
 
@@ -17425,16 +16932,6 @@ fn normalize_share_for_sale(value: &str) -> Result<String, AppError> {
         "Free" => Ok("Free".to_string()),
         _ => Err(AppError::BadRequest(
             "share for_sale must be Yes, No, or Free".into(),
-        )),
-    }
-}
-
-fn normalize_sale_market_kind(value: &str) -> Result<String, AppError> {
-    match value.trim() {
-        "token" => Ok("token".to_string()),
-        "share" => Ok("share".to_string()),
-        _ => Err(AppError::BadRequest(
-            "share sale_market_kind must be token or share".into(),
         )),
     }
 }
@@ -17467,19 +16964,8 @@ fn normalize_share_app_settings(
     for (app, setting) in values {
         let app = normalize_share_acl_app(&app)?;
         let for_sale = normalize_share_for_sale(&setting.for_sale)?;
-        let sale_market_kind = normalize_sale_market_kind(&setting.sale_market_kind)?;
         let market_access_mode = normalize_market_access_mode(&setting.market_access_mode)?;
-        let allow_owner = sale_market_kind == "share";
-        let shared_with_emails = normalize_email_list_with_options(
-            &setting.shared_with_emails,
-            owner_email,
-            allow_owner,
-        );
-        if for_sale == "Yes" && sale_market_kind == "share" && shared_with_emails.is_empty() {
-            return Err(AppError::BadRequest(format!(
-                "{app} ShareMarket sale must explicitly delegate to one ShareMarket"
-            )));
-        }
+        let shared_with_emails = normalize_email_list(&setting.shared_with_emails, owner_email);
         if setting.token_limit <= 0 && setting.token_limit != -1 {
             return Err(AppError::BadRequest(format!(
                 "{app} tokenLimit must be positive or -1"
@@ -17498,7 +16984,6 @@ fn normalize_share_app_settings(
             app,
             ShareAppSettings {
                 for_sale,
-                sale_market_kind,
                 market_access_mode,
                 shared_with_emails,
                 token_limit: setting.token_limit,
@@ -17708,7 +17193,6 @@ fn effective_share_app_settings(share: &ShareDescriptor) -> BTreeMap<String, Sha
                 .cloned()
                 .unwrap_or_else(|| ShareAppSettings {
                     for_sale: share.for_sale.clone(),
-                    sale_market_kind: share.sale_market_kind.clone(),
                     market_access_mode: access
                         .map(|entry| entry.market_access_mode.clone())
                         .unwrap_or_else(|| share.market_access_mode.clone()),
@@ -17726,75 +17210,6 @@ fn effective_share_app_settings(share: &ShareDescriptor) -> BTreeMap<String, Sha
         out.insert(app.to_string(), setting);
     }
     out
-}
-
-fn effective_app_settings_from_parts(
-    app_settings: &BTreeMap<String, ShareAppSettings>,
-    access_by_app: &BTreeMap<String, ShareAppAccess>,
-    shared_with_emails: &[String],
-    market_access_mode: &str,
-    for_sale: &str,
-    sale_market_kind: &str,
-    token_limit: i64,
-    parallel_limit: i64,
-    expires_at: &str,
-) -> BTreeMap<String, ShareAppSettings> {
-    ["claude", "codex", "gemini"]
-        .into_iter()
-        .map(|app| {
-            (
-                app.to_string(),
-                effective_app_setting_from_parts(
-                    app,
-                    app_settings,
-                    access_by_app,
-                    shared_with_emails,
-                    market_access_mode,
-                    for_sale,
-                    sale_market_kind,
-                    token_limit,
-                    parallel_limit,
-                    expires_at,
-                ),
-            )
-        })
-        .collect()
-}
-
-fn effective_app_setting_from_parts(
-    app: &str,
-    app_settings: &BTreeMap<String, ShareAppSettings>,
-    access_by_app: &BTreeMap<String, ShareAppAccess>,
-    shared_with_emails: &[String],
-    market_access_mode: &str,
-    for_sale: &str,
-    sale_market_kind: &str,
-    token_limit: i64,
-    parallel_limit: i64,
-    expires_at: &str,
-) -> ShareAppSettings {
-    let access = access_by_app.get(app);
-    let mut setting = app_settings
-        .get(app)
-        .cloned()
-        .unwrap_or_else(|| ShareAppSettings {
-            for_sale: for_sale.to_string(),
-            sale_market_kind: sale_market_kind.to_string(),
-            market_access_mode: access
-                .map(|entry| entry.market_access_mode.clone())
-                .unwrap_or_else(|| market_access_mode.to_string()),
-            shared_with_emails: access
-                .map(|entry| entry.shared_with_emails.clone())
-                .unwrap_or_else(|| shared_with_emails.to_vec()),
-            token_limit,
-            parallel_limit,
-            expires_at: expires_at.to_string(),
-        });
-    if let Some(access) = access {
-        setting.market_access_mode = access.market_access_mode.clone();
-        setting.shared_with_emails = access.shared_with_emails.clone();
-    }
-    setting
 }
 
 fn parse_app_providers(value: Option<String>) -> Result<ShareAppProviders, rusqlite::Error> {
@@ -20544,9 +19959,12 @@ fn normalize_market_kind(value: Option<&str>) -> Result<String, AppError> {
         .filter(|value| !value.is_empty())
         .unwrap_or("usage")
         .to_ascii_lowercase();
-    match kind.as_str() {
-        "usage" | "share" => Ok(kind),
-        _ => Err(AppError::BadRequest("invalid market kind".into())),
+    if kind == "usage" {
+        Ok(kind)
+    } else {
+        Err(AppError::BadRequest(
+            "only usage markets can be registered".into(),
+        ))
     }
 }
 
@@ -20819,11 +20237,9 @@ fn enrich_dashboard_market(
     runtime_states_by_market: &HashMap<String, HashMap<String, Vec<MarketShareRuntimeStateView>>>,
 ) {
     let market_email = market.email.to_ascii_lowercase();
-    let is_share_market = market.market_kind == "share";
     let disabled_for_market = disabled_by_market.get(&market_email);
     let app_availability_for_market = app_availability_by_market.get(&market_email);
     let runtime_states_for_market = runtime_states_by_market.get(&market_email);
-    let mut share_market_usage_tokens = 0_u64;
     let mut linked_shares = shares
         .iter()
         .filter_map(|(_, share)| {
@@ -20831,18 +20247,9 @@ fn enrich_dashboard_market(
                 .shared_with_emails
                 .iter()
                 .any(|email| email.eq_ignore_ascii_case(&market_email));
-            let visible_to_market = if is_share_market {
-                share.sale_market_kind == "share" && explicit_market_match
-            } else {
-                share.sale_market_kind != "share"
-                    && (share.market_access_mode == "all" || explicit_market_match)
-            };
+            let visible_to_market = share.market_access_mode == "all" || explicit_market_match;
             if share.for_sale != "Yes" || !visible_to_market {
                 return None;
-            }
-            if is_share_market {
-                share_market_usage_tokens =
-                    share_market_usage_tokens.saturating_add(share.tokens_used.max(0) as u64);
             }
             let active_requests = inflight_by_share.get(&share.share_id).copied().unwrap_or(0);
             let (route_state, route_state_since) =
@@ -20909,21 +20316,13 @@ fn enrich_dashboard_market(
         .iter()
         .filter(|share| !share.disabled_by_market)
         .collect::<Vec<_>>();
-    let enabled_linked_share_count = enabled_linked_shares.len();
-    market.active_requests = if is_share_market {
-        enabled_linked_shares
-            .iter()
-            .map(|share| share.active_requests)
-            .sum()
-    } else {
-        // Count only requests that actually traversed the market proxy. Direct
-        // share-subdomain traffic stays out of this number even though it shows up
-        // in the share-keyed limiter.
-        inflight_by_market_email
-            .get(&market_email)
-            .copied()
-            .unwrap_or(0)
-    };
+    // Count only requests that actually traversed the market proxy. Direct
+    // share-subdomain traffic stays out of this number even though it shows up
+    // in the share-keyed limiter.
+    market.active_requests = inflight_by_market_email
+        .get(&market_email)
+        .copied()
+        .unwrap_or(0);
     market.parallel_capacity = if enabled_linked_shares
         .iter()
         .any(|share| share.parallel_limit < 0)
@@ -20935,10 +20334,6 @@ fn enrich_dashboard_market(
             .map(|share| share.parallel_limit.max(0))
             .sum()
     };
-    if is_share_market {
-        market.usage_tokens = share_market_usage_tokens;
-        market.usage_amount_usd = "0.00000000".to_string();
-    }
     // Online minutes: take the max across linked shares — i.e. the best path
     // the market could route through. Approximates the union of healthy
     // minutes without an additional per-minute SQL pass; stays exact when the
@@ -20962,26 +20357,10 @@ fn enrich_dashboard_market(
         .as_ref()
         .map(|share| share.observed_minutes_24h)
         .unwrap_or(0);
-    if is_share_market && market.observed_minutes_24h == 0 {
-        if enabled_linked_share_count > 0 {
-            market.observed_minutes_24h = 1;
-            market.online_minutes_24h = usize::from(market.online_share_count > 0);
-        } else if market.online {
-            market.observed_minutes_24h = 1;
-            market.online_minutes_24h = 1;
-        }
-    }
     market.online_rate_24h =
         observed_online_rate(market.online_minutes_24h, market.observed_minutes_24h);
     market.observation_coverage_24h = observation_coverage(market.observed_minutes_24h);
     market.health_checks = aggregate_market_health_checks(&linked_shares, health_by_share);
-    if is_share_market && (market.online || market.online_share_count > 0) {
-        if market.health_checks.is_empty() {
-            append_recent_online_health_checks(&mut market.health_checks, 10);
-        } else {
-            append_current_online_health_check(&mut market.health_checks);
-        }
-    }
     market.health_timeline = merge_market_health_timeline(
         &linked_shares,
         health_timeline_by_share,
@@ -21095,8 +20474,8 @@ fn current_online_health_timeline(start: i64) -> Vec<HealthTimelineBucket> {
         .collect()
 }
 
-fn dashboard_market_to_share_link(market: &DashboardMarketView) -> ShareMarketLinkView {
-    ShareMarketLinkView {
+fn dashboard_market_to_share_link(market: &DashboardMarketView) -> MarketLinkView {
+    MarketLinkView {
         id: market.id.clone(),
         display_name: market.display_name.clone(),
         email: market.email.clone(),
@@ -21107,7 +20486,6 @@ fn dashboard_market_to_share_link(market: &DashboardMarketView) -> ShareMarketLi
         online: market.online,
         route_state: market.route_state.clone(),
         route_state_since: market.route_state_since.clone(),
-        listing_status_by_app: BTreeMap::new(),
     }
 }
 
@@ -21205,113 +20583,6 @@ fn list_market_share_runtime_state_map(
     Ok(result)
 }
 
-fn list_share_market_listing_status_map(
-    conn: &Connection,
-) -> Result<HashMap<(String, String, String, String), ShareMarketListingStatusView>, AppError> {
-    let now = Utc::now().to_rfc3339();
-    let mut stmt = conn
-        .prepare(
-            r#"
-            SELECT lower(market_email), router_id, share_id, app_type, listing_url, status,
-                   sale_mode, filled_seats, required_seats, listing_status, updated_at, expires_at,
-                   CASE WHEN expires_at IS NOT NULL AND expires_at <= ?1 THEN 1 ELSE 0 END AS is_stale
-              FROM share_market_listing_statuses
-             ORDER BY updated_at DESC
-            "#,
-        )
-        .map_err(|e| {
-            AppError::Internal(format!("prepare share market listing statuses failed: {e}"))
-        })?;
-    let rows = stmt
-        .query_map(params![now], |row| {
-            let market_email: String = row.get(0)?;
-            let router_id: String = row.get(1)?;
-            let share_id: String = row.get(2)?;
-            let app_type: String = row.get(3)?;
-            Ok((
-                (market_email, router_id, share_id, app_type),
-                ShareMarketListingStatusView {
-                    listing_url: row.get(4)?,
-                    status: row.get(5)?,
-                    sale_mode: row.get(6)?,
-                    filled_seats: row.get(7)?,
-                    required_seats: row.get(8)?,
-                    listing_status: row.get(9)?,
-                    updated_at: row.get(10)?,
-                    expires_at: row.get(11)?,
-                    is_stale: row.get::<_, i64>(12)? != 0,
-                },
-            ))
-        })
-        .map_err(|e| {
-            AppError::Internal(format!("query share market listing statuses failed: {e}"))
-        })?;
-    let mut result = HashMap::new();
-    for row in rows {
-        let (key, value) = row.map_err(|e| {
-            AppError::Internal(format!("read share market listing status failed: {e}"))
-        })?;
-        result.entry(key).or_insert(value);
-    }
-    Ok(result)
-}
-
-fn share_market_listing_status_visible_to_market(
-    tx: &rusqlite::Transaction<'_>,
-    market_email: &str,
-    _router_id: &str,
-    share_id: &str,
-    app_type: &str,
-) -> Result<bool, AppError> {
-    let row = tx
-        .query_row(
-            r#"
-            SELECT shared_with_emails_json, market_access_mode,
-                   COALESCE(access_by_app_json, '{}'), COALESCE(app_settings_json, '{}'),
-                   for_sale, sale_market_kind
-              FROM shares
-             WHERE share_id = ?1
-               AND share_status = 'active'
-            "#,
-            params![share_id],
-            |row| {
-                Ok((
-                    parse_string_vec(row.get(0)?)?,
-                    row.get::<_, String>(1)?,
-                    parse_share_access_by_app(row.get(2)?)?,
-                    parse_share_app_settings(row.get(3)?)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(|e| AppError::Internal(format!("query listing status share failed: {e}")))?;
-    let Some((
-        shared_with_emails,
-        market_access_mode,
-        access_by_app,
-        app_settings,
-        for_sale,
-        sale_market_kind,
-    )) = row
-    else {
-        return Ok(false);
-    };
-    Ok(share_app_settings_visible_to_market(
-        app_type,
-        &app_settings,
-        &access_by_app,
-        &shared_with_emails,
-        &market_access_mode,
-        &for_sale,
-        &sale_market_kind,
-        "share",
-        false,
-        market_email,
-    ))
-}
-
 fn list_market_visible_share_ids(
     conn: &Connection,
     market_email: &str,
@@ -21320,7 +20591,7 @@ fn list_market_visible_share_ids(
         .prepare(
             "SELECT share_id, shared_with_emails_json, market_access_mode,
                     COALESCE(access_by_app_json, '{}'), COALESCE(app_settings_json, '{}'),
-                    for_sale, sale_market_kind
+                    for_sale
              FROM shares
              WHERE share_status = 'active'
                AND subdomain IS NOT NULL
@@ -21337,7 +20608,6 @@ fn list_market_visible_share_ids(
                 parse_share_access_by_app(row.get(3)?)?,
                 parse_share_app_settings(row.get(4)?)?,
                 row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
             ))
         })
         .map_err(|e| AppError::Internal(format!("query visible market shares failed: {e}")))?;
@@ -21350,7 +20620,6 @@ fn list_market_visible_share_ids(
             access_by_app,
             app_settings,
             for_sale,
-            sale_market_kind,
         ) =
             row.map_err(|e| AppError::Internal(format!("read visible market share failed: {e}")))?;
         let visible = ["claude", "codex", "gemini"].iter().any(|app| {
@@ -21361,9 +20630,6 @@ fn list_market_visible_share_ids(
                 &shared_with_emails,
                 &market_access_mode,
                 &for_sale,
-                &sale_market_kind,
-                "token",
-                true,
                 market_email,
             )
         });
@@ -21460,23 +20726,14 @@ fn normalize_self_reported_share_owner(
     }
     share.owner_email = Some(owner_email.clone());
     share.share_name = owner_email.clone();
-    let allow_owner_in_acl = share.sale_market_kind == "share";
-    share.shared_with_emails = normalize_email_list_with_options(
-        &share.shared_with_emails,
-        &owner_email,
-        allow_owner_in_acl,
-    );
+    share.shared_with_emails = normalize_email_list(&share.shared_with_emails, &owner_email);
     let mut access_by_app = BTreeMap::new();
     for (app, access) in std::mem::take(&mut share.access_by_app) {
         let app = normalize_share_acl_app(&app)?;
         access_by_app.insert(
             app,
             ShareAppAccess {
-                shared_with_emails: normalize_email_list_with_options(
-                    &access.shared_with_emails,
-                    &owner_email,
-                    allow_owner_in_acl,
-                ),
+                shared_with_emails: normalize_email_list(&access.shared_with_emails, &owner_email),
                 market_access_mode: normalize_market_access_mode(&access.market_access_mode)?,
             },
         );
@@ -22825,46 +22082,11 @@ fn normalize_runtime_state_token(value: &str, field: &str) -> Result<String, App
     Ok(value)
 }
 
-fn normalize_app_type_token(value: &str) -> Result<String, AppError> {
-    let value = value.trim().to_ascii_lowercase();
-    match value.as_str() {
-        "claude" | "codex" | "gemini" => Ok(value),
-        _ => Err(AppError::BadRequest("invalid app type".into())),
-    }
-}
-
-fn normalize_listing_status_token(value: &str) -> Result<String, AppError> {
-    let value = value.trim().to_ascii_lowercase();
-    match value.as_str() {
-        "idle" | "carpooling" | "full" | "unavailable" | "unknown" => Ok(value),
-        _ => Err(AppError::BadRequest("invalid listing status".into())),
-    }
-}
-
-fn normalize_optional_listing_sale_mode(value: Option<String>) -> Result<Option<String>, AppError> {
-    let Some(value) = normalize_optional_string(value) else {
-        return Ok(None);
-    };
-    let value = value.to_ascii_lowercase();
-    match value.as_str() {
-        "single" | "carpool" => Ok(Some(value)),
-        _ => Err(AppError::BadRequest("invalid listing sale mode".into())),
-    }
-}
-
 fn normalize_email_list(values: &[String], owner_email: &str) -> Vec<String> {
-    normalize_email_list_with_options(values, owner_email, false)
-}
-
-fn normalize_email_list_with_options(
-    values: &[String],
-    owner_email: &str,
-    allow_owner: bool,
-) -> Vec<String> {
     let mut result = Vec::new();
     for value in values {
         if let Ok(email) = normalize_email(value) {
-            if (!allow_owner && email == owner_email) || result.contains(&email) {
+            if email == owner_email || result.contains(&email) {
                 continue;
             }
             result.push(email);
@@ -23772,7 +22994,6 @@ fn share_supports_app(support: &ShareSupport, app: &str) -> bool {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_market_share_apps(
     support: &ShareSupport,
     app_settings: &BTreeMap<String, ShareAppSettings>,
@@ -23780,9 +23001,6 @@ fn build_market_share_apps(
     shared_with_emails: &[String],
     market_access_mode: &str,
     legacy_for_sale: &str,
-    legacy_sale_market_kind: &str,
-    expected_sale_market_kind: &str,
-    allow_all_market_access: bool,
     market_email: &str,
 ) -> BTreeMap<String, MarketShareAppView> {
     ["claude", "codex", "gemini"]
@@ -23793,9 +23011,6 @@ fn build_market_share_apps(
             let for_sale = setting
                 .map(|value| value.for_sale.clone())
                 .unwrap_or_else(|| legacy_for_sale.to_string());
-            let sale_market_kind = setting
-                .map(|value| value.sale_market_kind.clone())
-                .unwrap_or_else(|| legacy_sale_market_kind.to_string());
             let app_market_access_mode = setting
                 .map(|value| value.market_access_mode.clone())
                 .or_else(|| access.map(|value| value.market_access_mode.clone()))
@@ -23807,9 +23022,6 @@ fn build_market_share_apps(
                 shared_with_emails,
                 market_access_mode,
                 legacy_for_sale,
-                legacy_sale_market_kind,
-                expected_sale_market_kind,
-                allow_all_market_access,
                 market_email,
             );
             (
@@ -23819,7 +23031,6 @@ fn build_market_share_apps(
                     supported: share_supports_app(support, app),
                     visible,
                     for_sale,
-                    sale_market_kind,
                     market_access_mode: app_market_access_mode,
                 },
             )
@@ -23827,7 +23038,6 @@ fn build_market_share_apps(
         .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
 fn share_app_settings_visible_to_market(
     app: &str,
     app_settings: &BTreeMap<String, ShareAppSettings>,
@@ -23835,9 +23045,6 @@ fn share_app_settings_visible_to_market(
     shared_with_emails: &[String],
     market_access_mode: &str,
     legacy_for_sale: &str,
-    legacy_sale_market_kind: &str,
-    expected_sale_market_kind: &str,
-    allow_all_market_access: bool,
     market_email: &str,
 ) -> bool {
     let access = access_by_app.get(app);
@@ -23845,10 +23052,7 @@ fn share_app_settings_visible_to_market(
     let for_sale = setting
         .map(|value| value.for_sale.as_str())
         .unwrap_or(legacy_for_sale);
-    let sale_market_kind = setting
-        .map(|value| value.sale_market_kind.as_str())
-        .unwrap_or(legacy_sale_market_kind);
-    if for_sale != "Yes" || sale_market_kind != expected_sale_market_kind {
+    if for_sale != "Yes" {
         return false;
     }
     let app_mode = setting
@@ -23859,7 +23063,7 @@ fn share_app_settings_visible_to_market(
         .map(|value| value.shared_with_emails.as_slice())
         .or_else(|| access.map(|value| value.shared_with_emails.as_slice()))
         .unwrap_or(shared_with_emails);
-    if allow_all_market_access && app_mode == "all" {
+    if app_mode == "all" {
         return true;
     }
     app_emails
@@ -23969,89 +23173,6 @@ mod tests {
     }
 
     #[test]
-    fn share_market_settings_patch_keeps_owner_email_as_market_delegate() {
-        let owner = "router@jptokenswitch.cc";
-        let patch = ShareSettingsPatch {
-            sale_market_kind: Some("share".into()),
-            market_access_mode: Some("selected".into()),
-            shared_with_emails: Some(vec![owner.into()]),
-            access_by_app: Some(BTreeMap::from([(
-                "codex".into(),
-                ShareAppAccess {
-                    shared_with_emails: vec![owner.into()],
-                    market_access_mode: "selected".into(),
-                },
-            )])),
-            ..Default::default()
-        };
-
-        let normalized = normalize_share_settings_patch(
-            patch,
-            Some(owner),
-            Some(&[]),
-            Some("Yes"),
-            None,
-            Some("codex"),
-            None,
-        )
-        .expect("normalize");
-
-        assert_eq!(normalized.sale_market_kind.as_deref(), Some("share"));
-        assert_eq!(
-            normalized.shared_with_emails.as_deref(),
-            Some(&[owner.to_string()][..])
-        );
-        assert_eq!(
-            normalized
-                .access_by_app
-                .as_ref()
-                .and_then(|access| access.get("codex"))
-                .map(|access| access.shared_with_emails.as_slice()),
-            Some(&[owner.to_string()][..])
-        );
-    }
-
-    #[test]
-    fn existing_share_market_settings_patch_keeps_owner_email_as_market_delegate() {
-        let owner = "router@jptokenswitch.cc";
-        let patch = ShareSettingsPatch {
-            shared_with_emails: Some(vec![owner.into()]),
-            access_by_app: Some(BTreeMap::from([(
-                "codex".into(),
-                ShareAppAccess {
-                    shared_with_emails: vec![owner.into()],
-                    market_access_mode: "selected".into(),
-                },
-            )])),
-            ..Default::default()
-        };
-
-        let normalized = normalize_share_settings_patch(
-            patch,
-            Some(owner),
-            Some(&[]),
-            Some("Yes"),
-            Some("share"),
-            Some("codex"),
-            None,
-        )
-        .expect("normalize");
-
-        assert_eq!(
-            normalized.shared_with_emails.as_deref(),
-            Some(&[owner.to_string()][..])
-        );
-        assert_eq!(
-            normalized
-                .access_by_app
-                .as_ref()
-                .and_then(|access| access.get("codex"))
-                .map(|access| access.shared_with_emails.as_slice()),
-            Some(&[owner.to_string()][..])
-        );
-    }
-
-    #[test]
     fn token_market_pricing_requires_eligible_final_sale_state() {
         let pricing = BTreeMap::from([("codex".to_string(), 80)]);
         let normalized = normalize_share_settings_patch(
@@ -24062,7 +23183,6 @@ mod tests {
             Some("owner@example.com"),
             Some(&[]),
             Some("Yes"),
-            Some("token"),
             Some("codex"),
             None,
         )
@@ -24081,7 +23201,6 @@ mod tests {
             Some("owner@example.com"),
             Some(&[]),
             Some("Yes"),
-            Some("token"),
             Some("codex"),
             None,
         );
@@ -24098,33 +23217,10 @@ mod tests {
             Some("owner@example.com"),
             Some(&[]),
             Some("Yes"),
-            Some("token"),
             Some("codex"),
             None,
         );
         assert!(matches!(wrong_app, Err(AppError::BadRequest(_))));
-    }
-
-    #[test]
-    fn sale_state_transition_clears_token_market_pricing() {
-        let normalized = normalize_share_settings_patch(
-            ShareSettingsPatch {
-                sale_market_kind: Some("share".to_string()),
-                ..Default::default()
-            },
-            Some("owner@example.com"),
-            Some(&[]),
-            Some("Yes"),
-            Some("token"),
-            Some("codex"),
-            None,
-        )
-        .expect("transition");
-
-        assert_eq!(
-            normalized.for_sale_official_price_percent_by_app,
-            Some(BTreeMap::new())
-        );
     }
 
     fn test_config(name: &str) -> Config {
@@ -24968,15 +24064,6 @@ mod tests {
             params![share_id, now_text],
         )
         .expect("insert market share runtime state");
-        conn.execute(
-            "INSERT INTO share_market_listing_statuses (
-                market_email, router_id, share_id, app_type, listing_url, status,
-                created_at, updated_at
-             ) VALUES ('market@example.com', 'main', ?1, 'codex',
-                       'https://market.example.com/listing', 'active', ?2, ?2)",
-            params![share_id, now_text],
-        )
-        .expect("insert share market listing status");
     }
 
     async fn insert_installation_health_check(
@@ -25097,7 +24184,6 @@ mod tests {
             for_sale_official_price_percent_by_app: Default::default(),
             description: None,
             for_sale: "No".into(),
-            sale_market_kind: "token".into(),
             subdomain,
             app_type: "codex".into(),
             provider_id: Some("provider-test".into()),
@@ -25117,7 +24203,6 @@ mod tests {
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
             app_providers: ShareAppProviders::default(),
-            market_grant: None,
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
@@ -25151,6 +24236,12 @@ mod tests {
             updated_at_ms: 20,
             revoked_at_ms: None,
             revision: 3,
+            manager: if role == "owner" {
+                crate::models::ShareGrantManager::Owner
+            } else {
+                crate::models::ShareGrantManager::Manual
+            },
+            entitlement_id: None,
         }
     }
 
@@ -25169,7 +24260,6 @@ mod tests {
             Some("owner@example.com"),
             Some(&[]),
             Some("No"),
-            Some("token"),
             Some("codex"),
             None,
         )
@@ -25211,7 +24301,6 @@ mod tests {
             Some("owner@example.com"),
             Some(&[]),
             Some("No"),
-            Some("token"),
             Some("codex"),
             Some(&existing),
         )
@@ -25226,6 +24315,39 @@ mod tests {
         assert_eq!(user.usage, existing_user.usage);
         assert_eq!(user.created_at_ms, existing_user.created_at_ms);
         assert_eq!(user.revision, existing_user.revision);
+    }
+
+    #[test]
+    fn share_settings_patch_cannot_reactivate_revoked_market_grant() {
+        let owner = test_share_user_grant("owner@example.com", "owner", 1000);
+        let mut revoked = test_share_user_grant("renter@example.com", "shareto", 500);
+        revoked.active = false;
+        revoked.manager = crate::models::ShareGrantManager::RouterShareMarket;
+        revoked.entitlement_id = Some("entitlement-revoked".to_string());
+        let existing = BTreeMap::from([
+            (owner.email.clone(), owner.clone()),
+            (revoked.email.clone(), revoked.clone()),
+        ]);
+        let mut reactivated = revoked;
+        reactivated.active = true;
+
+        let error = normalize_share_settings_patch(
+            ShareSettingsPatch {
+                user_grants: Some(BTreeMap::from([
+                    (owner.email.clone(), owner),
+                    (reactivated.email.clone(), reactivated),
+                ])),
+                ..Default::default()
+            },
+            Some("owner@example.com"),
+            Some(&[]),
+            Some("No"),
+            Some("codex"),
+            Some(&existing),
+        )
+        .expect_err("ordinary edit must not reactivate revoked market grant");
+
+        assert!(error.to_string().contains("managed users are read-only"));
     }
 
     #[test]
@@ -25375,11 +24497,20 @@ mod tests {
     }
 
     #[test]
-    fn share_market_dashboard_status_aggregates_hosted_share_runtime() {
-        let market_email = "share-market@example.com";
+    fn market_registration_accepts_usage_kind_only() {
+        assert_eq!(normalize_market_kind(None).unwrap(), "usage");
+        assert_eq!(normalize_market_kind(Some(" Usage ")).unwrap(), "usage");
+        assert!(matches!(
+            normalize_market_kind(Some("share")),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn usage_market_dashboard_aggregates_linked_share_runtime() {
+        let market_email = "market@example.com";
         let mut share = test_share_descriptor("share-1", "share-sub");
         share.for_sale = "Yes".into();
-        share.sale_market_kind = "share".into();
         share.shared_with_emails = vec![market_email.into()];
         share.parallel_limit = 9;
         share.tokens_used = 987_654;
@@ -25393,14 +24524,14 @@ mod tests {
         )]);
         let shares = vec![("inst-1".into(), share)];
         let inflight_by_share = HashMap::from([("share-1".to_string(), 4_usize)]);
-        let inflight_by_market_email = HashMap::from([(market_email.to_string(), 99_usize)]);
+        let inflight_by_market_email = HashMap::from([(market_email.to_string(), 4_usize)]);
         let mut market = DashboardMarketView {
             id: "market-1".into(),
-            display_name: "Share Market".into(),
+            display_name: "Token Market".into(),
             email: market_email.into(),
-            subdomain: "share-market".into(),
-            public_base_url: "https://share-market.example.com".into(),
-            market_kind: "share".into(),
+            subdomain: "token-market".into(),
+            public_base_url: "https://token-market.example.com".into(),
+            market_kind: "usage".into(),
             status: "active".into(),
             online: true,
             route_state: "active".into(),
@@ -25452,18 +24583,12 @@ mod tests {
         assert_eq!(market.online_share_count, 1);
         assert_eq!(market.active_requests, 4);
         assert_eq!(market.parallel_capacity, 9);
-        assert_eq!(market.usage_tokens, 987_654);
-        assert_eq!(market.usage_amount_usd, "0.00000000");
+        assert_eq!(market.usage_tokens, 0);
+        assert_eq!(market.usage_amount_usd, "12.34000000");
         assert_eq!(market.online_minutes_24h, 1);
         assert_eq!(market.observed_minutes_24h, 1);
         assert_eq!(market.online_rate_24h, 100.0);
-        assert!(
-            market
-                .health_checks
-                .last()
-                .map(|entry| entry.is_healthy)
-                .unwrap_or(false)
-        );
+        assert!(market.health_checks.is_empty());
         assert_eq!(market_operational_summary(&market).state, "available");
         market.active_requests = market.parallel_capacity as usize;
         let full = market_operational_summary(&market);
@@ -25477,15 +24602,15 @@ mod tests {
     }
 
     #[test]
-    fn share_market_dashboard_health_uses_market_online_fallback() {
-        let market_email = "share-market@example.com";
+    fn usage_market_dashboard_does_not_synthesize_share_health() {
+        let market_email = "market@example.com";
         let mut market = DashboardMarketView {
             id: "market-1".into(),
-            display_name: "Share Market".into(),
+            display_name: "Token Market".into(),
             email: market_email.into(),
-            subdomain: "share-market".into(),
-            public_base_url: "https://share-market.example.com".into(),
-            market_kind: "share".into(),
+            subdomain: "token-market".into(),
+            public_base_url: "https://token-market.example.com".into(),
+            market_kind: "usage".into(),
             status: "active".into(),
             online: true,
             route_state: "active".into(),
@@ -25535,14 +24660,10 @@ mod tests {
 
         assert_eq!(market.share_count, 0);
         assert_eq!(market.online_share_count, 0);
-        assert_eq!(market.online_minutes_24h, 1);
-        assert_eq!(market.observed_minutes_24h, 1);
-        assert_eq!(market.online_rate_24h, 100.0);
-        assert_eq!(market.health_checks.len(), 10);
-        assert!(
-            market.health_checks.iter().all(|entry| entry.is_healthy),
-            "online share market should show recent healthy dashboard dots even before shares are linked"
-        );
+        assert_eq!(market.online_minutes_24h, 0);
+        assert_eq!(market.observed_minutes_24h, 0);
+        assert_eq!(market.online_rate_24h, 0.0);
+        assert!(market.health_checks.is_empty());
     }
 
     fn test_market_request_log(request_id: &str, share_id: &str) -> MarketRequestLogEntry {
@@ -25656,14 +24777,14 @@ mod tests {
 
         let active = HashSet::from(["share-sub".to_string()]);
         let shares = store
-            .list_market_shares(&market.email, "main", &active, &HashMap::new(), true)
+            .list_market_shares(&market.email, "main", &active, &HashMap::new())
             .await
             .expect("list market shares");
         assert_eq!(shares.len(), 1);
         assert!((shares[0].signals.owner_penalty - 0.7).abs() < 1e-9);
 
         let other_shares = store
-            .list_market_shares("other@example.com", "main", &active, &HashMap::new(), true)
+            .list_market_shares("other@example.com", "main", &active, &HashMap::new())
             .await
             .expect("list other market shares");
         assert_eq!(other_shares.len(), 1);
@@ -25894,7 +25015,7 @@ mod tests {
 
         let active = HashSet::from(["share-sub".to_string()]);
         let shares = store
-            .list_market_shares(&market.email, "main", &active, &HashMap::new(), true)
+            .list_market_shares(&market.email, "main", &active, &HashMap::new())
             .await
             .expect("list market shares");
         assert_eq!(shares.len(), 1);
@@ -25970,7 +25091,7 @@ mod tests {
 
         let active = HashSet::from(["share-sub".to_string()]);
         let shares = store
-            .list_market_shares(&market.email, "main", &active, &HashMap::new(), true)
+            .list_market_shares(&market.email, "main", &active, &HashMap::new())
             .await
             .expect("list market shares");
         assert_ne!(
@@ -26013,7 +25134,7 @@ mod tests {
 
         let active = HashSet::from(["share-sub".to_string()]);
         let shares = store
-            .list_market_shares(&market.email, "main", &active, &HashMap::new(), true)
+            .list_market_shares(&market.email, "main", &active, &HashMap::new())
             .await
             .expect("list market shares");
 
@@ -26069,7 +25190,7 @@ mod tests {
 
         let active = HashSet::from(["share-sub".to_string()]);
         let shares = store
-            .list_market_shares(&market.email, "main", &active, &HashMap::new(), true)
+            .list_market_shares(&market.email, "main", &active, &HashMap::new())
             .await
             .expect("list market shares");
 
@@ -26708,7 +25829,6 @@ mod tests {
                 "router-test",
                 &HashSet::new(),
                 &HashMap::new(),
-                true,
             )
             .await
             .expect("list market shares");
@@ -26718,343 +25838,6 @@ mod tests {
         assert_eq!(shares[0].market_access_mode, "all");
         assert_eq!(shares[0].subdomain, "all-share-sub");
         assert_eq!(shares[0].share_status, "active");
-
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
-    }
-
-    #[tokio::test]
-    async fn list_market_shares_excludes_share_market_sales() {
-        let (store, config) = setup_store("market-share-kind-filter").await;
-        insert_installation(&store, "inst-kind").await;
-        insert_share(
-            &store,
-            "inst-kind",
-            "share-kind",
-            "kind-share-sub",
-            "active",
-        )
-        .await;
-        {
-            let conn = store.conn.lock().await;
-            conn.execute(
-                "UPDATE shares SET for_sale = 'Yes', sale_market_kind = 'share', market_access_mode = 'all' WHERE share_id = ?1",
-                params!["share-kind"],
-            )
-            .expect("enable share market sale");
-        }
-
-        let shares = store
-            .list_market_shares(
-                "usage-market@example.com",
-                "router-test",
-                &HashSet::new(),
-                &HashMap::new(),
-                true,
-            )
-            .await
-            .expect("list usage market shares");
-        assert!(shares.is_empty());
-
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
-    }
-
-    #[tokio::test]
-    async fn dashboard_share_market_sale_links_only_explicit_share_market() {
-        let (store, config) = setup_store("dashboard-share-market-link").await;
-        let usage_market = test_market();
-        insert_market(&store, &usage_market).await;
-        let mut share_market = test_market();
-        share_market.id = "share-market".into();
-        share_market.display_name = "Share Market".into();
-        share_market.email = "share-market@example.com".into();
-        share_market.subdomain = "share-market".into();
-        share_market.public_base_url = "https://share-market.example.com".into();
-        share_market.market_kind = "share".into();
-        insert_market(&store, &share_market).await;
-        insert_installation(&store, "inst-share-market-link").await;
-        insert_share(
-            &store,
-            "inst-share-market-link",
-            "share-market-link",
-            "share-market-link-sub",
-            "active",
-        )
-        .await;
-        set_share_shared_with_emails(&store, "share-market-link", &["share-market@example.com"])
-            .await;
-        {
-            let conn = store.conn.lock().await;
-            conn.execute(
-                "UPDATE shares
-                    SET for_sale = 'Yes',
-                        sale_market_kind = 'share',
-                        market_access_mode = 'all',
-                        parallel_limit = 7,
-                        tokens_used = 123456
-                  WHERE share_id = ?1",
-                params!["share-market-link"],
-            )
-            .expect("enable share market sale");
-        }
-
-        let server_geo = ServerGeo {
-            lat: None,
-            lon: None,
-        };
-        let proxy = ProxyRegistry::default();
-        let dashboard = store
-            .dashboard_snapshot(&config, &server_geo, &proxy, None)
-            .await
-            .expect("dashboard");
-        let share = dashboard
-            .shares
-            .iter()
-            .find(|share| share.share_id == "share-market-link")
-            .expect("share view");
-
-        assert_eq!(share.router_id, "main");
-        assert_eq!(share.sale_market_kind, "share");
-        assert_eq!(share.market_links.len(), 1);
-        assert_eq!(share.market_links[0].email, "share-market@example.com");
-        assert_eq!(share.market_links[0].market_kind, "share");
-        assert_eq!(
-            share.market_links[0].public_base_url,
-            "https://share-market.example.com"
-        );
-        let dashboard_share_market = dashboard
-            .markets
-            .iter()
-            .find(|market| market.email == "share-market@example.com")
-            .expect("share market dashboard view");
-        assert_eq!(dashboard_share_market.share_count, 1);
-        assert_eq!(dashboard_share_market.parallel_capacity, 7);
-        assert_eq!(dashboard_share_market.usage_tokens, 123456);
-        assert_eq!(dashboard_share_market.usage_amount_usd, "0.00000000");
-
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
-    }
-
-    #[tokio::test]
-    async fn dashboard_uses_cached_share_market_listing_status() {
-        let (store, config) = setup_store("dashboard-share-market-listing-status").await;
-        let mut share_market = test_market();
-        share_market.id = "share-market-status".into();
-        share_market.email = "share-market@example.com".into();
-        share_market.subdomain = "share-market".into();
-        share_market.public_base_url = "https://share-market.example.com".into();
-        share_market.market_kind = "share".into();
-        insert_market(&store, &share_market).await;
-        insert_installation(&store, "inst-share-market-status").await;
-        insert_share(
-            &store,
-            "inst-share-market-status",
-            "share-market-status",
-            "share-market-status-sub",
-            "active",
-        )
-        .await;
-        set_share_shared_with_emails(&store, "share-market-status", &["share-market@example.com"])
-            .await;
-        {
-            let conn = store.conn.lock().await;
-            conn.execute(
-                "UPDATE shares
-                    SET for_sale = 'Yes',
-                        sale_market_kind = 'share'
-                  WHERE share_id = ?1",
-                params!["share-market-status"],
-            )
-            .expect("enable share market sale");
-        }
-
-        let synced = store
-            .sync_share_market_listing_statuses(
-                "share-market@example.com",
-                true,
-                vec![ShareMarketListingStatusInput {
-                    router_id: Some("main".into()),
-                    share_id: "share-market-status".into(),
-                    app_type: "codex".into(),
-                    listing_url: "https://share-market.example.com/listing/share?router_id=main&share_id=share-market-status&app_type=codex".into(),
-                    status: "idle".into(),
-                    sale_mode: Some("single".into()),
-                    filled_seats: Some(0),
-                    required_seats: Some(3),
-                    listing_status: Some("active".into()),
-                    expires_at: Some((Utc::now() + Duration::minutes(5)).to_rfc3339()),
-                }],
-            )
-            .await
-            .expect("sync listing status");
-        assert_eq!(synced, 1);
-
-        let server_geo = ServerGeo {
-            lat: None,
-            lon: None,
-        };
-        let proxy = ProxyRegistry::default();
-        let mut dashboard = store
-            .dashboard_snapshot(&config, &server_geo, &proxy, None)
-            .await
-            .expect("dashboard");
-        store
-            .attach_share_market_listing_statuses(&mut dashboard)
-            .await
-            .expect("attach listing statuses");
-        let share = dashboard
-            .shares
-            .iter()
-            .find(|share| share.share_id == "share-market-status")
-            .expect("share view");
-        let listing_status = share.market_links[0]
-            .listing_status_by_app
-            .get("codex")
-            .expect("codex listing status");
-        assert_eq!(listing_status.status, "idle");
-        assert_eq!(listing_status.sale_mode.as_deref(), Some("single"));
-        assert!(!listing_status.is_stale);
-
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
-    }
-
-    #[tokio::test]
-    async fn share_market_grant_requires_explicit_delegation_not_all_access() {
-        let (store, config) = setup_store("share-market-grant-explicit-acl").await;
-        insert_installation(&store, "inst-share-market").await;
-        insert_share(
-            &store,
-            "inst-share-market",
-            "share-market-all-only",
-            "share-market-all-sub",
-            "active",
-        )
-        .await;
-        {
-            let conn = store.conn.lock().await;
-            conn.execute(
-                "UPDATE shares SET for_sale = 'Yes', sale_market_kind = 'share', market_access_mode = 'all' WHERE share_id = ?1",
-                params!["share-market-all-only"],
-            )
-            .expect("enable usage market all access");
-        }
-
-        let err = store
-            .create_share_market_grant(
-                "share-market@example.com",
-                "share-market-all-only",
-                ShareMarketGrantRequest {
-                    grant_id: "grant-all-only".into(),
-                    action: "add".into(),
-                    app_type: None,
-                    buyer_emails: vec!["buyer@example.com".into()],
-                    order_ids: vec!["order-1".into()],
-                    listing_id: None,
-                    carpool_group_id: None,
-                    seat_count: None,
-                },
-            )
-            .await
-            .expect_err("share market must not inherit usage all access");
-        assert!(err.to_string().contains("not delegated"));
-
-        set_share_shared_with_emails(
-            &store,
-            "share-market-all-only",
-            &["share-market@example.com"],
-        )
-        .await;
-        let granted = store
-            .create_share_market_grant(
-                "share-market@example.com",
-                "share-market-all-only",
-                ShareMarketGrantRequest {
-                    grant_id: "grant-explicit".into(),
-                    action: "add".into(),
-                    app_type: None,
-                    buyer_emails: vec!["buyer@example.com".into()],
-                    order_ids: vec!["order-1".into()],
-                    listing_id: None,
-                    carpool_group_id: None,
-                    seat_count: None,
-                },
-            )
-            .await
-            .expect("explicitly delegated share market can create grant");
-        assert_eq!(granted.status, "pending");
-        let grant_status = store
-            .share_market_grant_status(
-                "share-market@example.com",
-                "share-market-all-only",
-                &granted.router_edit_id,
-            )
-            .await
-            .expect("share market can query its own grant edit");
-        assert_eq!(grant_status.status, "pending");
-
-        {
-            let conn = store.conn.lock().await;
-            conn.execute(
-                "UPDATE share_edit_requests SET status = 'applied', applied_at = updated_at WHERE id = ?1",
-                params![granted.router_edit_id],
-            )
-            .expect("mark grant edit applied");
-        }
-        let applied_status = store
-            .share_market_grant_status(
-                "share-market@example.com",
-                "share-market-all-only",
-                &granted.router_edit_id,
-            )
-            .await
-            .expect("share market sees applied grant edit");
-        assert_eq!(applied_status.status, "applied");
-        assert!(applied_status.applied_at.is_some());
-
-        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
-    }
-
-    #[tokio::test]
-    async fn share_market_grant_rejects_token_market_sale() {
-        let (store, config) = setup_store("share-market-grant-token-kind").await;
-        insert_installation(&store, "inst-token-kind").await;
-        insert_share(
-            &store,
-            "inst-token-kind",
-            "share-token-kind",
-            "token-kind-sub",
-            "active",
-        )
-        .await;
-        {
-            let conn = store.conn.lock().await;
-            conn.execute(
-                "UPDATE shares SET for_sale = 'Yes', sale_market_kind = 'token', shared_with_emails_json = ?2 WHERE share_id = ?1",
-                params![
-                    "share-token-kind",
-                    serde_json::to_string(&vec!["share-market@example.com"]).expect("serialize emails")
-                ],
-            )
-            .expect("enable token market sale with explicit share market email");
-        }
-
-        let err = store
-            .create_share_market_grant(
-                "share-market@example.com",
-                "share-token-kind",
-                ShareMarketGrantRequest {
-                    grant_id: "grant-token-kind".into(),
-                    action: "add".into(),
-                    app_type: None,
-                    buyer_emails: vec!["buyer@example.com".into()],
-                    order_ids: vec!["order-1".into()],
-                    listing_id: None,
-                    carpool_group_id: None,
-                    seat_count: None,
-                },
-            )
-            .await
-            .expect_err("share market must reject token market sale");
-        assert!(err.to_string().contains("share-market sale"));
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
@@ -27087,7 +25870,6 @@ mod tests {
                 "router-test",
                 &active_subdomains,
                 &HashMap::new(),
-                true,
             )
             .await
             .expect("list market shares");
@@ -28650,7 +27432,7 @@ mod tests {
 
     #[test]
     fn issue_lease_signature_payload_preserves_server_share_json() {
-        let signed = include_str!("../tests/fixtures/us04_share_lease_signed_payload.json");
+        let signed = include_str!("../tests/fixtures/us04_share_lease_signed_payload.json").trim();
         let http = include_str!("../tests/fixtures/us04_share_lease_request.json");
         let request: IssueLeaseRequest =
             serde_json::from_str(http).expect("deserialize lease request");
@@ -33567,7 +32349,6 @@ mod tests {
             for_sale_official_price_percent_by_app: Default::default(),
             description: None,
             for_sale: "No".into(),
-            sale_market_kind: "token".into(),
             subdomain: "market-a".into(),
             app_type: "codex".into(),
             provider_id: Some("provider-market".into()),
@@ -33583,7 +32364,6 @@ mod tests {
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
             app_providers: ShareAppProviders::default(),
-            market_grant: None,
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
@@ -33649,7 +32429,6 @@ mod tests {
             for_sale_official_price_percent_by_app: Default::default(),
             description: None,
             for_sale: "No".into(),
-            sale_market_kind: "token".into(),
             subdomain: test_share_host("signed"),
             app_type: "codex".into(),
             provider_id: Some("provider-signed".into()),
@@ -33665,7 +32444,6 @@ mod tests {
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
             app_providers: ShareAppProviders::default(),
-            market_grant: None,
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
@@ -34434,7 +33212,6 @@ mod tests {
             )]),
             description: Some("metadata outside claim signature".into()),
             for_sale: "Yes".into(),
-            sale_market_kind: "token".into(),
             subdomain: test_share_host("minimal"),
             app_type: "codex".into(),
             provider_id: Some("provider-minimal".into()),
@@ -34450,7 +33227,6 @@ mod tests {
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
             app_providers: ShareAppProviders::default(),
-            market_grant: None,
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
@@ -34522,7 +33298,6 @@ mod tests {
             for_sale_official_price_percent_by_app: Default::default(),
             description: None,
             for_sale: "No".into(),
-            sale_market_kind: "token".into(),
             subdomain: "mismatch-sub".into(),
             app_type: "codex".into(),
             provider_id: Some("provider-mismatch".into()),
@@ -34538,7 +33313,6 @@ mod tests {
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
             app_providers: ShareAppProviders::default(),
-            market_grant: None,
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
@@ -34610,7 +33384,6 @@ mod tests {
             for_sale_official_price_percent_by_app: Default::default(),
             description: None,
             for_sale: "No".into(),
-            sale_market_kind: "token".into(),
             subdomain: owner_host.clone(),
             app_type: "codex".into(),
             provider_id: Some("provider-owner".into()),
@@ -34626,7 +33399,6 @@ mod tests {
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
             app_providers: ShareAppProviders::default(),
-            market_grant: None,
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
@@ -34735,7 +33507,6 @@ mod tests {
             for_sale_official_price_percent_by_app: Default::default(),
             description: None,
             for_sale: "No".into(),
-            sale_market_kind: "token".into(),
             subdomain: test_share_host("heal"),
             app_type: "codex".into(),
             provider_id: Some("provider-heal".into()),
@@ -34751,7 +33522,6 @@ mod tests {
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
             app_providers: ShareAppProviders::default(),
-            market_grant: None,
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
@@ -34825,7 +33595,6 @@ mod tests {
             for_sale_official_price_percent_by_app: Default::default(),
             description: None,
             for_sale: "No".into(),
-            sale_market_kind: "token".into(),
             subdomain: reused_host.clone(),
             app_type: "codex".into(),
             provider_id: Some("provider-reused".into()),
@@ -34841,7 +33610,6 @@ mod tests {
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
             app_providers: ShareAppProviders::default(),
-            market_grant: None,
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
@@ -34935,7 +33703,6 @@ mod tests {
             )]),
             description: Some("signed batch sync".into()),
             for_sale: "Yes".into(),
-            sale_market_kind: "token".into(),
             subdomain: test_share_host("batch-sub"),
             app_type: "codex".into(),
             provider_id: Some("provider-batch".into()),
@@ -34955,7 +33722,6 @@ mod tests {
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
             app_providers: ShareAppProviders::default(),
-            market_grant: None,
             app_availability: ShareAppAvailability::default(),
             model_health: ShareModelHealthSummary::default(),
             auto_start: false,
@@ -35234,15 +34000,6 @@ mod tests {
                 params!["share-legacy-history", now_text],
             )
             .expect("insert retained market runtime state");
-            conn.execute(
-                "INSERT INTO share_market_listing_statuses (
-                    market_email, router_id, share_id, app_type, listing_url, status,
-                    created_at, updated_at
-                 ) VALUES ('market@example.com', 'main', ?1, 'codex',
-                           'https://market.example.com/listing', 'active', ?2, ?2)",
-                params!["share-legacy-history", now_text],
-            )
-            .expect("insert retained listing status");
         }
 
         let ops = vec![
@@ -35328,7 +34085,6 @@ mod tests {
             "market_disabled_shares",
             "market_share_model_failure_state",
             "market_share_runtime_states",
-            "share_market_listing_statuses",
         ] {
             let count: i64 = conn
                 .query_row(
@@ -35463,7 +34219,6 @@ mod tests {
             "market_disabled_shares",
             "market_share_model_failure_state",
             "market_share_runtime_states",
-            "share_market_listing_statuses",
         ] {
             let count: i64 = conn
                 .query_row(
@@ -35666,7 +34421,6 @@ mod tests {
             "market_disabled_shares",
             "market_share_model_failure_state",
             "market_share_runtime_states",
-            "share_market_listing_statuses",
         ] {
             let count: i64 = conn
                 .query_row(
@@ -35964,7 +34718,6 @@ mod tests {
             "market_disabled_shares",
             "market_share_model_failure_state",
             "market_share_runtime_states",
-            "share_market_listing_statuses",
         ] {
             let count: i64 = conn
                 .query_row(
@@ -36223,7 +34976,6 @@ mod tests {
         newest.config_revision = 2;
         newest.description = Some("new description".into());
         newest.for_sale = "Yes".into();
-        newest.sale_market_kind = "token".into();
         newest.market_access_mode = "selected".into();
         newest.shared_with_emails = vec!["buyer@example.com".into()];
         newest.token_limit = 50_000;
@@ -37646,7 +36398,6 @@ mod tests {
             "market_disabled_shares",
             "market_share_model_failure_state",
             "market_share_runtime_states",
-            "share_market_listing_statuses",
         ] {
             let count: i64 = conn
                 .query_row(
