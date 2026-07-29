@@ -1022,6 +1022,8 @@ export function ShareMarketPage() {
     });
     const normalized = query.trim().toLocaleLowerCase();
     const filtered = rows.filter((row) => {
+      // Seats layout is a paid marketplace browse; free seats stay in Share view only.
+      if (row.seat.isFree) return false;
       if (normalized && !row.searchText.includes(normalized)) return false;
       if (onlineFilters.length) {
         const onlineKey = row.listing.shareOnline ? "online" : "offline";
@@ -1059,6 +1061,7 @@ export function ShareMarketPage() {
   const shareOptions = React.useMemo(() => {
     const names = new Set<string>();
     for (const row of buildSeatRows(catalog, tab, authed)) {
+      if (row.seat.isFree) continue;
       names.add(row.listing.shareName || row.listing.shareId);
     }
     return Array.from(names)
@@ -1068,6 +1071,7 @@ export function ShareMarketPage() {
   const statusOptions = React.useMemo(() => {
     const keys = new Set<string>();
     for (const row of buildSeatRows(catalog, tab, authed)) {
+      if (row.seat.isFree) continue;
       keys.add(row.subscription?.status || row.seat.status);
     }
     return Array.from(keys)
@@ -1080,6 +1084,7 @@ export function ShareMarketPage() {
   const ownerOptions = React.useMemo(() => {
     const emails = new Set<string>();
     for (const row of buildSeatRows(catalog, tab, authed)) {
+      if (row.seat.isFree) continue;
       if (row.listing.ownerEmail) emails.add(row.listing.ownerEmail);
     }
     return Array.from(emails)
