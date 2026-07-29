@@ -240,12 +240,13 @@ impl NormalizedSeat {
 
 pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS share_market_listings (
+        "        CREATE TABLE IF NOT EXISTS share_market_listings (
             id TEXT PRIMARY KEY,
             share_id TEXT NOT NULL,
             owner_user_id TEXT NOT NULL,
             owner_email TEXT NOT NULL,
             status TEXT NOT NULL CHECK (status IN ('active', 'closed')),
+            deleted_at TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -382,6 +383,10 @@ pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         CREATE INDEX IF NOT EXISTS idx_share_market_subscriptions_renter
             ON share_market_subscriptions(renter_user_id, status);",
     )?;
+    let _ = conn.execute(
+        "ALTER TABLE share_market_listings ADD COLUMN deleted_at TEXT",
+        [],
+    );
     Ok(())
 }
 
@@ -393,6 +398,7 @@ pub fn router() -> Router<ServerState> {
         )
         .route("/v1/share-market/owned-shares", get(list_owned_shares))
         .route("/v1/share-market/listings/:id", delete(close_listing))
+        .route("/v1/share-market/listings/:id/delete", post(delete_listing))
         .route("/v1/share-market/listings/:id/seats", post(add_seat))
         .route(
             "/v1/share-market/seats/:id",
@@ -785,6 +791,7 @@ impl AppStore {
                             SELECT 1 FROM share_market_listings listing
                             WHERE listing.share_id = s.share_id
                               AND listing.status = 'active'
+                              AND listing.deleted_at IS NULL
                               AND lower(listing.owner_email) = lower(s.owner_email)
                         ) OR EXISTS (
                             SELECT 1 FROM share_market_subscriptions sub
@@ -833,14 +840,15 @@ impl AppStore {
                         COALESCE(s.tokens_used, 0)
                  FROM share_market_listings listing
                  LEFT JOIN shares s ON s.share_id = listing.share_id
-                 WHERE (listing.status = 'active'
+                 WHERE listing.deleted_at IS NULL
+                   AND ((listing.status = 'active'
                         AND lower(COALESCE(s.owner_email, '')) = lower(listing.owner_email))
                     OR listing.owner_user_id = ?1
                     OR EXISTS (
                         SELECT 1 FROM share_market_subscriptions sub
                         WHERE sub.listing_id = listing.id AND sub.renter_user_id = ?1
                           AND sub.status NOT IN ('released', 'grant_failed')
-                    )
+                    ))
                  ORDER BY listing.created_at DESC",
             )
             .map_err(map_db("prepare Share Market catalog"))?;
@@ -1295,7 +1303,7 @@ impl AppStore {
         let active_listing_exists = tx
             .query_row(
                 "SELECT 1 FROM share_market_listings
-                 WHERE share_id = ?1 AND status = 'active' LIMIT 1",
+                 WHERE share_id = ?1 AND status = 'active' AND deleted_at IS NULL LIMIT 1",
                 params![share_id],
                 |_| Ok(()),
             )
@@ -1638,7 +1646,8 @@ impl AppStore {
             .map_err(map_db("begin close Share listing"))?;
         let owner_user_id: Option<String> = tx
             .query_row(
-                "SELECT owner_user_id FROM share_market_listings WHERE id = ?1",
+                "SELECT owner_user_id FROM share_market_listings
+                 WHERE id = ?1 AND deleted_at IS NULL",
                 params![listing_id],
                 |row| row.get(0),
             )
@@ -1674,6 +1683,78 @@ impl AppStore {
             &now,
         )?;
         tx.commit().map_err(map_db("commit close Share listing"))?;
+        Ok(())
+    }
+
+    pub async fn share_market_delete_listing(
+        &self,
+        session: &AuthSession,
+        listing_id: &str,
+    ) -> Result<(), AppError> {
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction()
+            .map_err(map_db("begin delete Share listing"))?;
+        let row: Option<(String, String)> = tx
+            .query_row(
+                "SELECT owner_user_id, status FROM share_market_listings
+                 WHERE id = ?1 AND deleted_at IS NULL",
+                params![listing_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(map_db("read Share listing for delete"))?;
+        let Some((owner_user_id, status)) = row else {
+            return Err(AppError::NotFound("listing not found".into()));
+        };
+        if owner_user_id != session.user_id {
+            return Err(AppError::Forbidden(
+                "only listing owner can delete listing".into(),
+            ));
+        }
+        if status != "closed" {
+            return Err(AppError::BadRequest(
+                "only closed listings can be deleted".into(),
+            ));
+        }
+        let active_rentals: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM share_market_subscriptions
+                 WHERE listing_id = ?1 AND status NOT IN ('released', 'grant_failed')",
+                params![listing_id],
+                |row| row.get(0),
+            )
+            .map_err(map_db("count active Share rentals before delete"))?;
+        if active_rentals > 0 {
+            return Err(AppError::Conflict(
+                "cannot delete listing while rentals are in progress".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE share_market_seats SET status = 'deleted', updated_at = ?2
+             WHERE listing_id = ?1 AND status != 'deleted'",
+            params![listing_id, now],
+        )
+        .map_err(map_db("delete seats for Share listing"))?;
+        tx.execute(
+            "UPDATE share_market_listings
+             SET deleted_at = ?2, updated_at = ?2
+             WHERE id = ?1 AND deleted_at IS NULL",
+            params![listing_id, now],
+        )
+        .map_err(map_db("soft-delete Share listing"))?;
+        event_tx(
+            &tx,
+            Some(listing_id),
+            None,
+            None,
+            Some(session),
+            "listing_deleted",
+            serde_json::json!({}),
+            &now,
+        )?;
+        tx.commit().map_err(map_db("commit delete Share listing"))?;
         Ok(())
     }
 }
@@ -1741,6 +1822,19 @@ async fn close_listing(
     state
         .store
         .share_market_close_listing(&session, &listing_id)
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn delete_listing(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(listing_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    state
+        .store
+        .share_market_delete_listing(&session, &listing_id)
         .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -5548,6 +5642,39 @@ mod tests {
                 .await,
             Err(AppError::Conflict(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn owner_can_delete_closed_listing_without_active_rentals() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let owner = session("owner-delete-listing", "owner-delete-listing@example.com");
+        insert_share(
+            &store,
+            "share-delete-listing",
+            &owner.email,
+            &[ShareTokenPeriod::Day],
+        )
+        .await;
+        let (listing_id, _seat_id) =
+            create_listing(&store, &owner, "share-delete-listing", free_seat()).await;
+        store
+            .share_market_close_listing(&owner, &listing_id)
+            .await
+            .expect("close listing before delete");
+        store
+            .share_market_delete_listing(&owner, &listing_id)
+            .await
+            .expect("delete closed listing");
+        let catalog = store
+            .share_market_catalog(Some(&owner), &[])
+            .await
+            .expect("catalog after delete");
+        assert!(catalog.listings.iter().all(|listing| listing.id != listing_id));
+        let owned = store
+            .share_market_owned_shares(&owner)
+            .await
+            .expect("owned shares after delete");
+        assert!(!owned[0].already_listed);
     }
 
     #[tokio::test]

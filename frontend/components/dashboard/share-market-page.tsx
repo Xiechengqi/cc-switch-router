@@ -13,16 +13,26 @@ import {
   Plus,
   RefreshCw,
   RotateCcw,
+  Search,
   Trash2,
   UserRoundX,
   X,
 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { AuthenticatedImage } from "@/components/common/authenticated-image";
+import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
 import { ProviderContactButton, ProviderContactsList } from "@/components/common/provider-contacts";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
+import { SeatSortHeader } from "@/components/dashboard/share-market/seat-sort-header";
+import {
+  CLEARED_SEAT_SORT,
+  sortSeatRows,
+  toggleSeatSort,
+  type SeatSortKey,
+  type SeatSortPrefs,
+} from "@/components/dashboard/share-market/seat-table-utils";
 import { subdomainTunnelUrl, providerQuotaStatusLine, providerStatusIdentity, providerActualModelNames } from "@/components/dashboard/share-dashboard-utils";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
@@ -30,6 +40,7 @@ import {
   closeShareMarketListing,
   createShareMarketListing,
   declareShareMarketPaid,
+  deleteShareMarketListing,
   deleteShareMarketSeat,
   forceRevokeShareMarketSubscription,
   getShareMarketCatalog,
@@ -40,6 +51,7 @@ import {
   updateShareMarketSeat,
 } from "@/lib/api";
 import { DASHBOARD_SHARE_MARKET_PATH, type ShareMarketTabParam } from "@/lib/dashboard-nav";
+import { usePersistentState } from "@/lib/use-persistent-state";
 import type {
   ShareMarketCatalog,
   ShareMarketListing,
@@ -51,7 +63,7 @@ import type {
   ShareUpstreamProvider,
 } from "@/lib/types";
 import type { AppLocale } from "@/lib/i18n";
-import { compactTokens } from "@/lib/utils";
+import { cn, compactTokens } from "@/lib/utils";
 
 type MarketTab = ShareMarketTabParam;
 type TFn = ReturnType<typeof useLocaleText>["t"];
@@ -435,6 +447,14 @@ function shareOpenUrl(subdomain?: string | null) {
   return subdomainTunnelUrl(subdomain);
 }
 
+type MarketLayout = "seats" | "shares";
+const LAYOUT_STORAGE_KEY = "cc-switch.shareMarket.layout";
+const ONLINE_FILTER_KEY = "cc-switch.shareMarket.onlineFilter";
+const SHARE_FILTER_KEY = "cc-switch.shareMarket.shareFilter";
+const STATUS_FILTER_KEY = "cc-switch.shareMarket.statusFilter";
+const OWNER_FILTER_KEY = "cc-switch.shareMarket.ownerFilter";
+const SORT_PREFS_KEY = "cc-switch.shareMarket.seatSort";
+
 function listingProviderLines(provider: ShareUpstreamProvider | undefined, locale: AppLocale, unavailable: string) {
   if (!provider) {
     return { identity: unavailable, quota: "-", models: "-" };
@@ -446,8 +466,64 @@ function listingProviderLines(provider: ShareUpstreamProvider | undefined, local
   };
 }
 
+function listingProviderTitle(provider: ShareUpstreamProvider | undefined, locale: AppLocale, unavailable: string) {
+  const lines = listingProviderLines(provider, locale, unavailable);
+  const parts: string[] = [];
+  for (const part of [lines.quota, lines.identity, lines.models]) {
+    const value = String(part || "").trim();
+    if (!value || value === "-" || parts.includes(value)) continue;
+    parts.push(value);
+  }
+  return parts.join(" · ") || unavailable;
+}
+
 function shareMarketTabTone(active: boolean) {
   return active ? "bg-white font-medium text-foreground shadow-sm" : "text-slate-700";
+}
+
+function LayoutModeToggle({
+  layout,
+  onChange,
+  seatsLabel,
+  sharesLabel,
+  ariaLabel,
+}: {
+  layout: MarketLayout;
+  onChange: (next: MarketLayout) => void;
+  seatsLabel: string;
+  sharesLabel: string;
+  ariaLabel: string;
+}) {
+  return (
+    <div
+      role="group"
+      aria-label={ariaLabel}
+      className="inline-flex shrink-0 overflow-hidden rounded-lg border border-slate-200 bg-slate-100 p-0.5 text-[11px]"
+    >
+      <button
+        type="button"
+        onClick={() => onChange("seats")}
+        className={cn(
+          "rounded-md px-2.5 py-1.5 transition-colors",
+          layout === "seats" ? "bg-white font-semibold text-foreground shadow-sm" : "font-medium text-slate-500 hover:text-slate-700",
+        )}
+        aria-pressed={layout === "seats"}
+      >
+        {seatsLabel}
+      </button>
+      <button
+        type="button"
+        onClick={() => onChange("shares")}
+        className={cn(
+          "rounded-md px-2.5 py-1.5 transition-colors",
+          layout === "shares" ? "bg-white font-semibold text-foreground shadow-sm" : "font-medium text-slate-500 hover:text-slate-700",
+        )}
+        aria-pressed={layout === "shares"}
+      >
+        {sharesLabel}
+      </button>
+    </div>
+  );
 }
 
 function formatShareLimit(value?: number | null) {
@@ -485,9 +561,6 @@ function subscriptionStatusLabel(status: string, t: TFn) {
   const key = keys[status as keyof typeof keys];
   return key ? t(key) : status.replaceAll("_", " ");
 }
-
-type MarketLayout = "seats" | "shares";
-const LAYOUT_STORAGE_KEY = "cc-switch.shareMarket.layout";
 
 function readStoredLayout(): MarketLayout {
   if (typeof window === "undefined") return "seats";
@@ -785,6 +858,12 @@ export function ShareMarketPage() {
   const focusShareId = searchParams.get("focus") || "";
   const [layout, setLayoutState] = React.useState<MarketLayout>("seats");
   const [expandedSeatIds, setExpandedSeatIds] = React.useState<Set<string>>(() => new Set());
+  const [query, setQuery] = React.useState("");
+  const [onlineFilters, setOnlineFilters] = usePersistentState<string[]>(ONLINE_FILTER_KEY, []);
+  const [shareFilters, setShareFilters] = usePersistentState<string[]>(SHARE_FILTER_KEY, []);
+  const [statusFilters, setStatusFilters] = usePersistentState<string[]>(STATUS_FILTER_KEY, []);
+  const [ownerFilters, setOwnerFilters] = usePersistentState<string[]>(OWNER_FILTER_KEY, []);
+  const [sortPrefs, setSortPrefs] = usePersistentState<SeatSortPrefs>(SORT_PREFS_KEY, CLEARED_SEAT_SORT);
   const [addOpen, setAddOpen] = React.useState(false);
   const [seatDialog, setSeatDialog] = React.useState<{ listingId: string; seat?: ShareMarketSeat; supportedPeriods?: ShareTokenPeriod[] } | null>(null);
   const [payment, setPayment] = React.useState<ShareMarketSubscription | null>(null);
@@ -863,13 +942,128 @@ export function ShareMarketPage() {
 
   const listings = React.useMemo(() => {
     if (!catalog) return [];
-    return tab === "mine" ? catalog.listings.filter((listing) => listing.isOwner) : catalog.listings;
-  }, [catalog, tab]);
+    const base = tab === "mine" ? catalog.listings.filter((listing) => listing.isOwner) : catalog.listings;
+    const normalized = query.trim().toLocaleLowerCase();
+    if (!normalized) return base;
+    return base.filter((listing) => {
+      const providerTitle = listingProviderTitle(
+        listing.upstreamProvider,
+        locale,
+        t("dashboard.providerUnavailable"),
+      ).toLocaleLowerCase();
+      const haystack = [
+        listing.shareName,
+        listing.ownerEmail,
+        listing.subdomain,
+        providerTitle,
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLocaleLowerCase();
+      return haystack.includes(normalized);
+    });
+  }, [catalog, locale, query, t, tab]);
 
-  const seatRows = React.useMemo(
-    () => buildSeatRows(catalog, tab, authed),
-    [authed, catalog, tab],
+  const seatRows = React.useMemo(() => {
+    const rows = buildSeatRows(catalog, tab, authed).map((row) => {
+      const statusKey = row.subscription?.status || row.seat.status;
+      const providerTitle = listingProviderTitle(
+        row.listing.upstreamProvider,
+        locale,
+        t("dashboard.providerUnavailable"),
+      );
+      const searchText = [
+        row.listing.shareName,
+        row.listing.ownerEmail,
+        row.listing.subdomain,
+        providerTitle,
+        statusKey,
+        String(row.seat.position),
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLocaleLowerCase();
+      return { ...row, statusKey, searchText };
+    });
+    const normalized = query.trim().toLocaleLowerCase();
+    const filtered = rows.filter((row) => {
+      if (normalized && !row.searchText.includes(normalized)) return false;
+      if (onlineFilters.length) {
+        const onlineKey = row.listing.shareOnline ? "online" : "offline";
+        if (!onlineFilters.includes(onlineKey)) return false;
+      }
+      if (shareFilters.length && !shareFilters.includes(row.listing.shareName || row.listing.shareId)) {
+        return false;
+      }
+      if (statusFilters.length && !statusFilters.includes(row.statusKey)) return false;
+      if (ownerFilters.length && !ownerFilters.includes(row.listing.ownerEmail)) return false;
+      return true;
+    });
+    return sortSeatRows(filtered, sortPrefs);
+  }, [
+    authed,
+    catalog,
+    locale,
+    onlineFilters,
+    ownerFilters,
+    query,
+    shareFilters,
+    sortPrefs,
+    statusFilters,
+    t,
+    tab,
+  ]);
+
+  const onlineOptions = React.useMemo(
+    () => [
+      { value: "online", label: t("shareMarket.online") },
+      { value: "offline", label: t("shareMarket.offline") },
+    ],
+    [t],
   );
+  const shareOptions = React.useMemo(() => {
+    const names = new Set<string>();
+    for (const row of buildSeatRows(catalog, tab, authed)) {
+      names.add(row.listing.shareName || row.listing.shareId);
+    }
+    return Array.from(names)
+      .sort((a, b) => a.localeCompare(b))
+      .map((value) => ({ value, label: value }));
+  }, [authed, catalog, tab]);
+  const statusOptions = React.useMemo(() => {
+    const keys = new Set<string>();
+    for (const row of buildSeatRows(catalog, tab, authed)) {
+      keys.add(row.subscription?.status || row.seat.status);
+    }
+    return Array.from(keys)
+      .sort((a, b) => a.localeCompare(b))
+      .map((value) => ({
+        value,
+        label: value.includes("_") ? subscriptionStatusLabel(value, t) : statusLabel(value, t),
+      }));
+  }, [authed, catalog, t, tab]);
+  const ownerOptions = React.useMemo(() => {
+    const emails = new Set<string>();
+    for (const row of buildSeatRows(catalog, tab, authed)) {
+      if (row.listing.ownerEmail) emails.add(row.listing.ownerEmail);
+    }
+    return Array.from(emails)
+      .sort((a, b) => a.localeCompare(b))
+      .map((value) => ({ value, label: value }));
+  }, [authed, catalog, tab]);
+  const hasSeatFilters =
+    onlineFilters.length > 0 || shareFilters.length > 0 || statusFilters.length > 0 || ownerFilters.length > 0;
+
+  const onSeatSort = React.useCallback((key: SeatSortKey) => {
+    setSortPrefs((current) => toggleSeatSort(current, key));
+  }, [setSortPrefs]);
+
+  const clearSeatFilters = React.useCallback(() => {
+    setOnlineFilters([]);
+    setShareFilters([]);
+    setStatusFilters([]);
+    setOwnerFilters([]);
+  }, [setOnlineFilters, setOwnerFilters, setShareFilters, setStatusFilters]);
 
   const date = (value?: string) => value ? new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value)) : "";
   const tokenPeriod = (period: ShareTokenPeriod) => t(`shareMarket.period.${period}`);
@@ -944,12 +1138,11 @@ export function ShareMarketPage() {
 
   const renderListing = (listing: ShareMarketListing) => {
     const shareUrl = shareOpenUrl(listing.subdomain);
-    const provider = listingProviderLines(
+    const providerTitle = listingProviderTitle(
       listing.upstreamProvider,
       locale,
       t("dashboard.providerUnavailable"),
     );
-    const title = shareUrl || listing.shareName;
     const tokensUsed = listing.tokensUsed || 0;
     const tokenLimit = listing.tokenLimit;
     const usagePercent =
@@ -974,30 +1167,18 @@ export function ShareMarketPage() {
                 target="_blank"
                 rel="noreferrer"
                 className="inline-flex min-w-0 max-w-full items-center gap-1 truncate text-sm font-semibold text-slate-900 underline-offset-2 hover:underline"
-                title={shareUrl}
+                title={providerTitle}
               >
-                <span className="truncate">{listing.shareName || shareUrl}</span>
+                <span className="truncate">{providerTitle}</span>
                 <ExternalLink className="h-3 w-3 shrink-0 text-slate-400" aria-hidden />
               </a>
             ) : (
-              <h2 className="truncate text-sm font-semibold text-slate-900" title={title}>{listing.shareName}</h2>
+              <h2 className="min-w-0 truncate text-sm font-semibold text-slate-900" title={providerTitle}>{providerTitle}</h2>
             )}
             <span className={`rounded-sm px-1.5 py-0.5 text-[10px] font-medium ${listing.shareOnline ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-500"}`}>
               {listing.shareOnline ? t("shareMarket.online") : t("shareMarket.offline")}
             </span>
             {listing.status === "closed" ? <span className="rounded-sm bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700">{t("shareMarket.closed")}</span> : null}
-          </div>
-
-          <div className="grid min-w-0 gap-1 rounded-md border border-slate-200 bg-slate-50/80 px-2.5 py-2 text-[11px] text-slate-700">
-            <div className="min-w-0 truncate font-semibold" title={provider.quota}>
-              {provider.quota && provider.quota !== "-" ? provider.quota : provider.identity}
-            </div>
-            <div className="min-w-0 truncate text-slate-500" title={provider.identity}>
-              {provider.identity}
-            </div>
-            {provider.models && provider.models !== "-" ? (
-              <div className="min-w-0 truncate text-slate-500" title={provider.models}>{provider.models}</div>
-            ) : null}
           </div>
 
           <div className="grid grid-cols-2 gap-3 text-[11px] sm:grid-cols-3">
@@ -1033,6 +1214,26 @@ export function ShareMarketPage() {
           <div className="flex flex-wrap gap-2">
             <Button size="sm" variant="outline" onClick={() => setSeatDialog({ listingId: listing.id, supportedPeriods: listing.supportedUserTokenPeriods })}><Plus className="h-4 w-4" />{t("shareMarket.addSeat")}</Button>
             {listing.status === "active" ? <Button size="sm" variant="outline" isDisabled={!!busyId} onClick={() => setConfirmAction({ id: listing.id, title: t("shareMarket.confirm.closeTitle"), description: t("shareMarket.confirm.closeDescription", { share: listing.shareName }), confirmLabel: t("shareMarket.closeListing"), tone: "warning", run: () => closeShareMarketListing(listing.id) })}><Ban className="h-4 w-4" />{t("shareMarket.closeListing")}</Button> : null}
+            {listing.status === "closed" ? (
+              <Button
+                size="sm"
+                variant="danger"
+                isDisabled={!!busyId}
+                onClick={() =>
+                  setConfirmAction({
+                    id: listing.id,
+                    title: t("shareMarket.confirm.deleteListingTitle"),
+                    description: t("shareMarket.confirm.deleteListingDescription", { share: listing.shareName }),
+                    confirmLabel: t("shareMarket.deleteListing"),
+                    tone: "danger",
+                    run: () => deleteShareMarketListing(listing.id),
+                  })
+                }
+              >
+                <Trash2 className="h-4 w-4" />
+                {t("shareMarket.deleteListing")}
+              </Button>
+            ) : null}
           </div>
         ) : null}
       </header>
@@ -1083,18 +1284,115 @@ export function ShareMarketPage() {
   const renderSeatFirstTable = () => (
     <section className="overflow-hidden rounded-md border border-slate-200 bg-white">
       <div className="overflow-x-auto">
-        <table className="w-full min-w-[920px] text-left text-sm">
+        <table className="w-full min-w-[980px] text-left text-sm">
           <thead className="bg-slate-50 text-xs font-medium text-slate-500">
             <tr>
-              <th className="w-10 px-3 py-2.5" />
-              <th className="px-3 py-2.5">{t("shareMarket.online")}</th>
-              <th className="px-3 py-2.5">Share</th>
-              <th className="px-3 py-2.5">{t("shareMarket.dialog.seats")}</th>
-              <th className="px-3 py-2.5">{t("shareMarket.parallel")}</th>
-              <th className="px-3 py-2.5">{t("shareMarket.tokens")}</th>
-              <th className="px-3 py-2.5">{t("shareMarket.dialog.amount")}</th>
-              <th className="px-3 py-2.5">{t("shareMarket.status")}</th>
-              <th className="px-4 py-2.5 text-right">{t("common.actions")}</th>
+              <th className="sticky top-0 z-10 w-28 border-b border-slate-200 bg-slate-50 px-2 py-2">
+                <LayoutModeToggle
+                  layout={layout}
+                  onChange={setLayout}
+                  seatsLabel={t("shareMarket.layout.seats")}
+                  sharesLabel={t("shareMarket.layout.shares")}
+                  ariaLabel={t("shareMarket.layoutToggle")}
+                />
+              </th>
+              <SeatSortHeader
+                columnKey="online"
+                sortPrefs={sortPrefs}
+                onSort={onSeatSort}
+                filter={
+                  <CompactRegionMultiSelect
+                    variant="header"
+                    columnLabel={t("shareMarket.col.online")}
+                    values={onlineFilters}
+                    onChange={setOnlineFilters}
+                    options={onlineOptions}
+                    allLabel={t("shareMarket.allOnline")}
+                    moreLabel={(count) => `+${count}`}
+                    clearLabel={t("shareMarket.filterClear")}
+                    ariaLabel={t("shareMarket.filterOnline")}
+                    className="w-full max-w-[8.5rem]"
+                  />
+                }
+              />
+              <SeatSortHeader
+                columnKey="share"
+                sortPrefs={sortPrefs}
+                onSort={onSeatSort}
+                filter={
+                  <CompactRegionMultiSelect
+                    variant="header"
+                    columnLabel={t("shareMarket.col.share")}
+                    values={shareFilters}
+                    onChange={setShareFilters}
+                    options={shareOptions}
+                    allLabel={t("shareMarket.allShares")}
+                    moreLabel={(count) => `+${count}`}
+                    clearLabel={t("shareMarket.filterClear")}
+                    ariaLabel={t("shareMarket.filterShare")}
+                    className="w-full max-w-[10rem]"
+                  />
+                }
+              />
+              <SeatSortHeader columnKey="seat" sortPrefs={sortPrefs} onSort={onSeatSort} />
+              <SeatSortHeader columnKey="parallel" sortPrefs={sortPrefs} onSort={onSeatSort} />
+              <SeatSortHeader columnKey="tokens" sortPrefs={sortPrefs} onSort={onSeatSort} />
+              <SeatSortHeader columnKey="amount" sortPrefs={sortPrefs} onSort={onSeatSort} />
+              <SeatSortHeader
+                columnKey="status"
+                sortPrefs={sortPrefs}
+                onSort={onSeatSort}
+                filter={
+                  <CompactRegionMultiSelect
+                    variant="header"
+                    columnLabel={t("shareMarket.col.status")}
+                    values={statusFilters}
+                    onChange={setStatusFilters}
+                    options={statusOptions}
+                    allLabel={t("shareMarket.allStatuses")}
+                    moreLabel={(count) => `+${count}`}
+                    clearLabel={t("shareMarket.filterClear")}
+                    ariaLabel={t("shareMarket.filterStatus")}
+                    className="w-full max-w-[9rem]"
+                  />
+                }
+              />
+              <SeatSortHeader
+                columnKey="owner"
+                sortPrefs={sortPrefs}
+                onSort={onSeatSort}
+                filter={
+                  <CompactRegionMultiSelect
+                    variant="header"
+                    columnLabel={t("shareMarket.owner")}
+                    values={ownerFilters}
+                    onChange={setOwnerFilters}
+                    options={ownerOptions}
+                    allLabel={t("shareMarket.allOwners")}
+                    moreLabel={(count) => `+${count}`}
+                    clearLabel={t("shareMarket.filterClear")}
+                    ariaLabel={t("shareMarket.filterOwner")}
+                    className="w-full max-w-[11rem]"
+                  />
+                }
+              />
+              <th
+                scope="col"
+                className="sticky top-0 z-10 border-b border-slate-200 bg-slate-50 px-4 py-2 text-right text-xs font-medium text-slate-500"
+              >
+                <div className="flex items-center justify-end gap-2">
+                  {hasSeatFilters ? (
+                    <button
+                      type="button"
+                      className="text-[11px] font-medium text-accent hover:underline"
+                      onClick={clearSeatFilters}
+                    >
+                      {t("shareMarket.filterClear")}
+                    </button>
+                  ) : null}
+                  <span>{t("common.actions")}</span>
+                </div>
+              </th>
             </tr>
           </thead>
           <tbody>
@@ -1127,7 +1425,9 @@ export function ShareMarketPage() {
                     <td className="px-3 py-3">
                       <div className="flex min-w-0 items-center gap-2">
                         <ShareAppLogo app={(listing.appType === "claude" || listing.appType === "gemini" ? listing.appType : "codex")} size={16} />
-                        <span className="truncate font-medium text-slate-900">{listing.shareName}</span>
+                        <span className="truncate font-medium text-slate-900" title={listingProviderTitle(listing.upstreamProvider, locale, listing.shareName)}>
+                          {listingProviderTitle(listing.upstreamProvider, locale, listing.shareName)}
+                        </span>
                       </div>
                     </td>
                     <td className="px-3 py-3 font-medium">
@@ -1142,8 +1442,13 @@ export function ShareMarketPage() {
                     <td className="px-3 py-3">
                       <span className="rounded-sm bg-slate-100 px-1.5 py-0.5 text-xs text-slate-600">{statusText}</span>
                     </td>
+                    <td className="px-3 py-3">
+                      <span className="block max-w-[10rem] truncate text-xs text-slate-600" title={listing.ownerEmail}>
+                        {listing.ownerEmail}
+                      </span>
+                    </td>
                     <td className="px-4 py-3">
-                      <div className="flex flex-wrap justify-end gap-1">
+                      <div className="flex justify-end gap-1">
                         {seat.canRent ? (
                           <Button
                             size="sm"
@@ -1159,26 +1464,33 @@ export function ShareMarketPage() {
                           </Button>
                         ) : null}
                         {!authed && guestCanSeeAvailable(listing, seat) ? (
-                          <Button size="sm" variant="outline" onClick={() => window.dispatchEvent(new Event("router-open-login"))}>{t("nav.login")}</Button>
+                          <Button size="sm" variant="outline" onClick={() => window.dispatchEvent(new Event("router-open-login"))}>
+                            {t("nav.login")}
+                          </Button>
                         ) : null}
-                        {subscription && !listing.isOwner && subscription.canDeclarePaid ? (
-                          <Button size="sm" variant="primary" onClick={() => setPayment(subscription)}>{t("shareMarket.declarePaid")}</Button>
+                        {subscription?.canDeclarePaid ? (
+                          <Button size="sm" variant="primary" onClick={() => setPayment(subscription)}>
+                            {t("shareMarket.declarePaid")}
+                          </Button>
                         ) : null}
-                        {subscription && !listing.isOwner && subscription.canRelease ? (
+                        {subscription?.canRelease ? (
                           <Button
                             size="sm"
                             variant="outline"
                             isDisabled={!!busyId}
-                            onClick={() => setConfirmAction({
-                              id: subscription.id,
-                              title: t("shareMarket.confirm.releaseTitle"),
-                              description: t("shareMarket.confirm.releaseDescription", { share: listing.shareName }),
-                              confirmLabel: t("shareMarket.release"),
-                              tone: "warning",
-                              run: () => releaseShareMarketSubscription(subscription.id),
-                            })}
+                            onClick={() =>
+                              setConfirmAction({
+                                id: subscription.id,
+                                title: t("shareMarket.confirm.releaseTitle"),
+                                description: t("shareMarket.confirm.releaseDescription", { share: subscription.shareName }),
+                                confirmLabel: t("shareMarket.release"),
+                                tone: "warning",
+                                run: () => releaseShareMarketSubscription(subscription.id),
+                              })
+                            }
                           >
-                            <RotateCcw className="h-4 w-4" />{t("shareMarket.release")}
+                            <RotateCcw className="h-4 w-4" />
+                            {t("shareMarket.release")}
                           </Button>
                         ) : null}
                         {listing.isOwner ? (
@@ -1190,8 +1502,8 @@ export function ShareMarketPage() {
                     </td>
                   </tr>
                   {expanded ? (
-                    <tr className="border-t border-slate-100">
-                      <td colSpan={9} className="p-0">
+                    <tr className="border-t border-slate-100 bg-slate-50/70">
+                      <td colSpan={10} className="px-4 py-3">
                         <ProviderExpandPanel listing={listing} locale={locale} t={t} />
                       </td>
                     </tr>
@@ -1203,9 +1515,7 @@ export function ShareMarketPage() {
         </table>
       </div>
       {catalog && seatRows.length === 0 ? (
-        <p className="py-10 text-center text-sm text-slate-500">
-          {tab === "rentals" && !authed ? t("shareMarket.loginRequired") : t("shareMarket.empty")}
-        </p>
+        <p className="border-t border-slate-100 py-10 text-center text-sm text-slate-500">{t("shareMarket.empty")}</p>
       ) : null}
     </section>
   );
@@ -1216,15 +1526,19 @@ export function ShareMarketPage() {
     { id: "rentals", label: t("shareMarket.tab.rentals") },
   ];
 
-  const layoutTabs: { id: MarketLayout; label: string }[] = [
-    { id: "seats", label: t("shareMarket.layout.seats") },
-    { id: "shares", label: t("shareMarket.layout.shares") },
-  ];
-
   return (
     <div className="mx-auto grid w-full max-w-7xl gap-5 px-1 pb-10">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+          {layout === "shares" ? (
+            <LayoutModeToggle
+              layout={layout}
+              onChange={setLayout}
+              seatsLabel={t("shareMarket.layout.seats")}
+              sharesLabel={t("shareMarket.layout.shares")}
+              ariaLabel={t("shareMarket.layoutToggle")}
+            />
+          ) : null}
           <div className="inline-flex max-w-full overflow-x-auto rounded-lg bg-slate-100 p-1 text-[11px]">
             {marketTabs.map((item) => (
               <button
@@ -1237,18 +1551,21 @@ export function ShareMarketPage() {
               </button>
             ))}
           </div>
-          <div className="inline-flex max-w-full overflow-x-auto rounded-lg bg-slate-100 p-1 text-[11px]">
-            {layoutTabs.map((item) => (
-              <button
-                key={item.id}
-                type="button"
-                onClick={() => setLayout(item.id)}
-                className={`rounded-md px-2.5 py-1.5 transition-colors ${shareMarketTabTone(layout === item.id)}`}
-              >
-                {item.label}
+          <label className="flex min-w-[12rem] max-w-sm flex-1 items-center gap-2 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-sm shadow-sm">
+            <Search className="h-4 w-4 shrink-0 text-slate-400" aria-hidden />
+            <input
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-slate-400"
+              placeholder={t("shareMarket.search")}
+              aria-label={t("shareMarket.searchAria")}
+            />
+            {query ? (
+              <button type="button" className="rounded p-0.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700" aria-label={t("common.close")} onClick={() => setQuery("")}>
+                <X className="h-3.5 w-3.5" />
               </button>
-            ))}
-          </div>
+            ) : null}
+          </label>
         </div>
         <div className="flex gap-2">
           <Button isIconOnly variant="ghost" aria-label={t("common.reload")} isDisabled={loading} onClick={() => void load()}><RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} /></Button>

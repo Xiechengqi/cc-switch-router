@@ -921,6 +921,14 @@ export async function closeShareMarketListing(listingId: string) {
   );
 }
 
+export async function deleteShareMarketListing(listingId: string) {
+  return parseJson<{ ok: true }>(
+    await authFetch(`/v1/share-market/listings/${encodeURIComponent(listingId)}/delete`, {
+      method: "POST",
+    }),
+  );
+}
+
 export async function rentShareMarketSeat(seatId: string, offerRevision: number) {
   return parseJson<{ ok: true; subscriptionId: string }>(
     await authFetch(`/v1/share-market/seats/${encodeURIComponent(seatId)}/rent`, {

@@ -199,10 +199,10 @@ function DashboardNav({
             href={item.href}
             aria-current={selected ? "page" : undefined}
             className={cn(
-              "inline-flex h-9 min-w-0 items-center gap-1.5 border-b-2 px-2.5 text-sm transition-colors",
+              "inline-flex h-9 min-w-0 items-center gap-1.5 rounded-md px-2.5 text-sm transition-colors",
               selected
-                ? "border-accent font-semibold text-foreground"
-                : "border-transparent font-medium text-slate-400 hover:text-slate-600",
+                ? "font-semibold text-foreground"
+                : "font-medium text-slate-400 hover:text-slate-600",
             )}
           >
             <Icon
