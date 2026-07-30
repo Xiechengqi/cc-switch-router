@@ -75,7 +75,7 @@ export function ProviderPaymentMethodsList({
     <div className="grid min-w-0 gap-2 rounded-md border border-border bg-slate-50 p-3">
       <div className="flex min-w-0 items-center gap-2">
         <WalletCards className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
-        <strong className="text-sm">{t("billing.providerPaymentDetails")}</strong>
+        <strong className="text-sm">{t("marketBilling.providerPaymentDetails")}</strong>
       </div>
       <div className="grid min-w-0 gap-3">
         {methods.map((method, index) => {
@@ -122,21 +122,18 @@ export function ProviderPaymentMethodsList({
   );
 }
 
-/** Market contact glyph: opens the Provider contact and payment details. */
+/** Market contact glyph: opens the Provider's public contact channels. */
 export function ProviderContactButton({
   contacts,
-  paymentMethods,
   className,
 }: {
   contacts?: PaymentContact[] | null;
-  paymentMethods?: ClientMarketPaymentMethod[] | null;
   className?: string;
 }) {
   const { t } = useLocaleText();
   const [open, setOpen] = React.useState(false);
   const items = (contacts || []).filter((contact) => contact.handle?.trim());
-  const methods = (paymentMethods || []).filter((method) => method.kind?.trim());
-  if (!items.length && !methods.length) return null;
+  if (!items.length) return null;
 
   return (
     <>
@@ -147,7 +144,7 @@ export function ProviderContactButton({
             size="sm"
             variant="ghost"
             className={`h-7 w-7 min-w-7 shrink-0 border-0 shadow-none text-foreground ${className || ""}`}
-            aria-label={t("account.contactPayment.view")}
+            aria-label={t("account.contact.view")}
             data-no-row-drawer
             onClick={(event) => {
               event.stopPropagation();
@@ -157,17 +154,16 @@ export function ProviderContactButton({
             <ContactRound className="h-3.5 w-3.5" />
           </Button>
         </Tooltip.Trigger>
-        <Tooltip.Content>{t("account.contactPayment.view")}</Tooltip.Content>
+        <Tooltip.Content>{t("account.contact.view")}</Tooltip.Content>
       </Tooltip>
       <Modal.Backdrop isOpen={open} onOpenChange={setOpen}>
         <Modal.Container placement="center">
           <Modal.Dialog className="light w-[min(420px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
             <Modal.Header>
-              <Modal.Heading>{t("account.contactPayment.title")}</Modal.Heading>
+              <Modal.Heading>{t("account.contact.title")}</Modal.Heading>
             </Modal.Header>
             <Modal.Body className="grid max-h-[70vh] gap-3 overflow-y-auto">
               <ProviderContactsList contacts={items} />
-              <ProviderPaymentMethodsList paymentMethods={methods} />
             </Modal.Body>
             <Modal.Footer>
               <Button variant="ghost" onClick={() => setOpen(false)}>

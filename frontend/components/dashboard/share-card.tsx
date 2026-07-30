@@ -1,7 +1,7 @@
 "use client";
 
 import { Card } from "@heroui/react";
-import { Eye, ExternalLink, Link2, Pencil } from "lucide-react";
+import { Eye, Link2, Pencil } from "lucide-react";
 import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { operationalReasonLabel, shareOperationalSummary } from "@/components/dashboard/operational-status";
@@ -22,7 +22,6 @@ import {
   recentThroughputTokensPerSec,
   resolveShareAppRuntime,
   shareDisplayTitle,
-  subdomainTunnelUrl,
   shareAppSettings,
   shareExpiryProgress,
   expiryTitle,
@@ -31,8 +30,10 @@ import {
 import type { ShareRequestLog, ShareView } from "@/lib/types";
 import { compactTokens, formatDateTime } from "@/lib/utils";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
-import { resolveShareCoreApp } from "@/lib/share-app";
+import { resolveShareCoreApp, shareAccessApps } from "@/lib/share-app";
 import { recordDashboardUxEvent } from "@/lib/api";
+import { shareEditPendingLabel } from "@/components/dashboard/share-edit/share-edit-section";
+import { SubdomainCopyButton } from "@/components/dashboard/subdomain-copy-button";
 
 function requestBelongsToApp(request: ShareRequestLog, app: CoreShareApp) {
   const appType = (request.appType || "").trim().toLowerCase();
@@ -69,13 +70,11 @@ function shouldOpenShareCard(
 
 export const ShareCard = React.memo(function ShareCard({
   share,
-  referenceTunnelUrl,
   onOpen,
   onEdit,
   onConnect,
 }: {
   share: ShareView;
-  referenceTunnelUrl?: string;
   onOpen: (share: ShareView) => void;
   onEdit: (share: ShareView) => void;
   onConnect: (share: ShareView) => void;
@@ -84,13 +83,18 @@ export const ShareCard = React.memo(function ShareCard({
   const focus = useDashboardFocus();
   const cardRef = React.useRef<HTMLDivElement | null>(null);
   const pointerDownRef = React.useRef<{ x: number; y: number } | null>(null);
+  const apps = shareAccessApps(share);
   const app = resolveShareCoreApp(share);
   const settings = app ? shareAppSettings(share, app) : null;
-  const appRequests = app ? (share.recentRequests || []).filter((request) => requestBelongsToApp(request, app)) : share.recentRequests || [];
+  const appRequests = apps.length === 1 && app
+    ? (share.recentRequests || []).filter((request) => requestBelongsToApp(request, app))
+    : share.recentRequests || [];
   const tokensUsed = share.tokensUsed || 0;
   const tokenLimit = settings?.tokenLimit ?? share.tokenLimit;
   const parallelLimit = settings?.parallelLimit ?? share.parallelLimit;
-  const activeRequests = app ? share.activeRequestsByApp?.[app] ?? 0 : share.activeRequests || 0;
+  const activeRequests = apps.length === 1 && app
+    ? share.activeRequestsByApp?.[app] ?? 0
+    : share.activeRequests || 0;
   const averageLatency = averageRecentLatencyMs(appRequests);
   const throughputTokensPerSec = recentThroughputTokensPerSec(appRequests);
   const runtime = app ? resolveShareAppRuntime(share, app) : undefined;
@@ -106,7 +110,8 @@ export const ShareCard = React.memo(function ShareCard({
   const summary = shareOperationalSummary(share);
   const issue = summary.primaryReason ? operationalReasonLabel(summary.primaryReason, t) : null;
   const title = shareDisplayTitle(share);
-  const titleUrl = subdomainTunnelUrl(share.subdomain, referenceTunnelUrl);
+  const subdomain = share.subdomain || "";
+  const hasSubdomain = Boolean(subdomain.trim());
   const description = share.description?.trim() || "";
   const usagePercent = !isUnlimited(tokenLimit) && Number(tokenLimit) > 0 ? Math.min(100, Math.max(0, (tokensUsed / Number(tokenLimit)) * 100)) : null;
   const onlineRate = share.onlineRate24h || 0;
@@ -115,7 +120,7 @@ export const ShareCard = React.memo(function ShareCard({
   const onlineTitle = t("dashboard.uptimeObservation", { healthy: onlineRate.toFixed(1), observed: observedMinutes, coverage: observationCoverage.toFixed(1) });
   const expiryLabel = shareExpiryProgress(share, locale);
   const expiryHint = `${formatDateTime(share.createdAt)} / ${expiryTitle(share.expiresAt)}`;
-  const parallelTitle = parallelOccupancyTitle(share, app, t);
+  const parallelTitle = parallelOccupancyTitle(share, apps.length === 1 ? app : null, t);
   const editPending = share.canManage && share.activeEdit?.status === "pending";
   const editRejected = share.canManage && share.activeEdit?.status === "rejected";
   const focused = focus.isFocused("share", share.shareId);
@@ -125,14 +130,14 @@ export const ShareCard = React.memo(function ShareCard({
   const statusDot = summary.state === "offline" ? "bg-rose-500" : summary.state === "reconnecting" ? "bg-sky-500" : summary.state === "degraded" ? "bg-amber-400" : summary.state === "disabled" ? "bg-slate-400" : "bg-emerald-500";
   const connectDisabled = summary.state === "disabled";
   const editLabel = editPending
-    ? t("dashboard.pendingApply")
+    ? shareEditPendingLabel(share.activeEdit!, t)
     : editRejected
       ? t("dashboard.applyFailed")
       : share.canManage
         ? t("common.edit")
         : t("common.view");
   const secondaryActionClass =
-    "inline-flex h-6 items-center gap-1 rounded-md border border-slate-200 bg-white px-2 text-[10px] font-semibold text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50";
+    "inline-flex h-6 max-w-[160px] items-center gap-1 rounded-md border border-slate-200 bg-white px-2 text-[10px] font-semibold text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50";
 
   const openShareDrawer = React.useCallback(() => {
     focus.setFocus({ kind: "share", id: share.shareId, source: "client-board" });
@@ -164,23 +169,15 @@ export const ShareCard = React.memo(function ShareCard({
           <div className="flex min-w-0 items-center justify-between gap-2">
             <div className="flex min-w-0 items-center gap-1.5">
               <span className={`h-2 w-2 shrink-0 rounded-full ${statusDot}`} title={issue || summary.state} />
-              {titleUrl ? (
-                <a
-                  href={titleUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  data-no-row-drawer
-                  className="inline-flex min-w-0 max-w-full items-center gap-1 truncate text-sm font-semibold text-foreground underline-offset-4 hover:underline"
-                  title={titleUrl}
-                  onClick={(event) => event.stopPropagation()}
-                >
-                  <span className="truncate">{title}</span>
-                  <ExternalLink className="h-3 w-3 shrink-0 text-muted-foreground" aria-hidden />
-                </a>
-              ) : (
-                <strong className="truncate text-sm font-semibold text-foreground" title={title}>{title}</strong>
-              )}
-              {app ? <ShareAppLogo app={app} size={14} /> : null}
+              <strong className="min-w-0 truncate text-sm font-semibold text-foreground" title={title}>{title}</strong>
+              {hasSubdomain ? <SubdomainCopyButton subdomain={subdomain} /> : null}
+              {apps.length > 0 ? (
+                <span className="inline-flex shrink-0 items-center gap-1">
+                  {apps.map((supportedApp) => (
+                    <ShareAppLogo key={supportedApp} app={supportedApp} size={14} />
+                  ))}
+                </span>
+              ) : null}
             </div>
             <div className="flex shrink-0 items-center gap-1">
               <button type="button" data-no-row-drawer disabled={connectDisabled} title={connectDisabled ? issue || t("common.disabled") : undefined} className="inline-flex h-6 items-center gap-1 rounded-md border border-primary/20 bg-primary/5 px-2 text-[10px] font-semibold text-primary hover:bg-primary/10 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-50 disabled:text-slate-400" onClick={(event) => { event.stopPropagation(); if (!connectDisabled) onConnect(share); }}>
@@ -198,7 +195,7 @@ export const ShareCard = React.memo(function ShareCard({
                 }}
               >
                 {share.canManage ? <Pencil className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
-                {editLabel}
+                <span className="truncate">{editLabel}</span>
               </button>
             </div>
           </div>

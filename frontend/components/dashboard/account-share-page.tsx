@@ -11,8 +11,8 @@ import { subdomainTunnelUrl } from "@/components/dashboard/share-dashboard-utils
 import { CLIENT_MARKET_POLL_MS } from "@/components/dashboard/client-market/host-utils";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getShareMarketCatalog } from "@/lib/api";
-import { formatBillingAbsoluteDate, formatBillingCountdown } from "@/lib/billing-urgency";
 import {
+  DASHBOARD_ACCOUNT_BILLING_PATH,
   DASHBOARD_ACCOUNT_SHARE_PATH,
   shareMarketHref,
 } from "@/lib/dashboard-nav";
@@ -31,12 +31,16 @@ function subscriptionStatusKey(status: string): MessageKey {
       return "shareMarket.subscription.grantPending";
     case "active_free":
       return "shareMarket.subscription.activeFree";
-    case "trial_payment_due":
-      return "shareMarket.subscription.trialPaymentDue";
-    case "active_paid":
-      return "shareMarket.subscription.activePaid";
-    case "renewal_due":
-      return "shareMarket.subscription.renewalDue";
+    case "active_postpaid":
+      return "shareMarket.subscription.activePostpaid";
+    case "billing_suspend_pending":
+      return "shareMarket.subscription.billingSuspendPending";
+    case "billing_suspended":
+      return "shareMarket.subscription.billingSuspended";
+    case "billing_resume_pending":
+      return "shareMarket.subscription.billingResumePending";
+    case "billing_control_failed":
+      return "shareMarket.subscription.billingControlRetry";
     case "revoke_pending":
       return "shareMarket.subscription.revokePending";
     case "revoke_failed":
@@ -52,9 +56,11 @@ function subscriptionStatusKey(status: string): MessageKey {
 
 function isAnomalous(status: string) {
   return (
-    status === "trial_payment_due" ||
-    status === "renewal_due" ||
     status === "grant_pending" ||
+    status === "billing_suspend_pending" ||
+    status === "billing_suspended" ||
+    status === "billing_resume_pending" ||
+    status === "billing_control_failed" ||
     status === "revoke_pending" ||
     status === "revoke_failed" ||
     status === "grant_failed"
@@ -63,18 +69,22 @@ function isAnomalous(status: string) {
 
 function anomalyRank(status: string) {
   switch (status) {
-    case "revoke_failed":
+    case "billing_control_failed":
       return 0;
-    case "grant_failed":
+    case "revoke_failed":
       return 1;
-    case "trial_payment_due":
+    case "grant_failed":
       return 2;
-    case "renewal_due":
+    case "billing_suspended":
       return 3;
-    case "revoke_pending":
+    case "billing_suspend_pending":
       return 4;
-    case "grant_pending":
+    case "billing_resume_pending":
       return 5;
+    case "revoke_pending":
+      return 6;
+    case "grant_pending":
+      return 7;
     default:
       return 10;
   }
@@ -88,23 +98,19 @@ function sortSubscriptions(left: ShareMarketSubscription, right: ShareMarketSubs
   );
 }
 
-function subscriptionDeadline(subscription: ShareMarketSubscription): string | undefined {
-  if (subscription.status === "trial_payment_due" || subscription.status === "renewal_due") {
-    return subscription.paymentDeadline || subscription.trialEndsAt || subscription.currentPeriodEnd;
-  }
-  return subscription.currentPeriodEnd || subscription.paymentDeadline || subscription.trialEndsAt;
+function offerLabel(subscription: ShareMarketSubscription, locale: string, freeLabel: string) {
+  if (subscription.dailyRateMinor == null) return freeLabel;
+  const amount = (subscription.dailyRateMinor / 100).toFixed(2);
+  const currency = subscription.currency || "CNY";
+  return locale.startsWith("zh") ? `${currency} ${amount} / 天` : `${currency} ${amount} / day`;
 }
 
-function offerLabel(subscription: ShareMarketSubscription, locale: string, freeLabel: string) {
-  if (subscription.priceMinor == null) return freeLabel;
-  const amount = (subscription.priceMinor / 100).toFixed(2);
-  const unit = subscription.periodUnit || "month";
-  const count = subscription.periodCount || 1;
-  const currency = subscription.currency || "CNY";
-  if (locale.startsWith("zh")) {
-    return `${currency} ${amount} / ${count}${unit === "day" ? "天" : unit === "week" ? "周" : "月"}`;
-  }
-  return `${currency} ${amount} / ${count} ${unit}${count === 1 ? "" : "s"}`;
+function formatDate(value: string | undefined, locale: string) {
+  if (!value) return "-";
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp)
+    ? new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(timestamp))
+    : value;
 }
 
 function shareOpenUrl(subdomain?: string | null) {
@@ -119,9 +125,6 @@ function SubscriptionMonitorCard({
   perspective: ShareMonitorTab;
 }) {
   const { locale, t } = useLocaleText();
-  const deadline = subscriptionDeadline(subscription);
-  const countdown = formatBillingCountdown(deadline, locale);
-  const absolute = formatBillingAbsoluteDate(deadline, locale);
   const anomalous = isAnomalous(subscription.status);
   const openUrl = shareOpenUrl(subscription.subdomain);
   const manageHref =
@@ -166,18 +169,9 @@ function SubscriptionMonitorCard({
           <dd className="font-medium">{offerLabel(subscription, locale, t("shareMarket.free"))}</dd>
         </div>
         <div className="grid gap-0.5">
-          <dt className="text-xs text-muted-foreground">{t("account.share.deadline")}</dt>
-          <dd className="font-medium">
-            {absolute || t("account.share.noDeadline")}
-            {countdown ? (
-              <span className="ml-2 text-xs font-normal text-muted-foreground">({countdown})</span>
-            ) : null}
-          </dd>
-        </div>
-        <div className="grid gap-0.5 sm:col-span-2">
           <dt className="text-xs text-muted-foreground">{t("account.share.updated")}</dt>
           <dd className="text-muted-foreground">
-            {formatBillingAbsoluteDate(subscription.updatedAt, locale) || subscription.updatedAt}
+            {formatDate(subscription.updatedAt, locale)}
           </dd>
         </div>
       </dl>
@@ -185,6 +179,15 @@ function SubscriptionMonitorCard({
       <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/70 pt-3">
         <p className="text-xs text-muted-foreground">{t("account.share.readOnlyHint")}</p>
         <div className="flex flex-wrap gap-2">
+          {subscription.dailyRateMinor != null ? (
+            <Link
+              href={DASHBOARD_ACCOUNT_BILLING_PATH}
+              className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-border bg-background px-3 text-sm font-medium text-foreground transition-colors hover:border-accent/30 hover:bg-muted"
+            >
+              {t("marketBilling.open")}
+              <ArrowUpRight className="h-3.5 w-3.5" aria-hidden />
+            </Link>
+          ) : null}
           {openUrl ? (
             <a
               href={openUrl}

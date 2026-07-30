@@ -537,12 +537,10 @@ mod tests {
             ip: "203.0.113.10".into(),
             port: 22,
             host_owner_email: "host@example.com".into(),
-            price_cents: Some(500),
-            rental_period_days: Some(30),
+            daily_rate_minor: Some(500),
             currency: Some("USD".into()),
             offer_revision: 1,
             payment_method_kinds: vec!["alipay".into()],
-            payment_methods: vec![],
             contacts: vec![],
             country_code: Some("US".into()),
             hostname: Some("box".into()),
@@ -582,7 +580,9 @@ mod tests {
         let host = sample_host(Some("client@example.com"), Some("inst-1"));
         assert!(authorize_web_terminal(&host, &session("provider-1", "host@example.com")).is_ok());
         assert!(authorize_web_terminal(&host, &session("client-1", "client@example.com")).is_err());
-        assert!(authorize_web_terminal(&host, &session("other-user", "other@example.com")).is_err());
+        assert!(
+            authorize_web_terminal(&host, &session("other-user", "other@example.com")).is_err()
+        );
         // Admins (including router owner) are intentionally excluded unless they own the host.
         assert!(authorize_web_terminal(&host, &session("admin-1", "admin@example.com")).is_err());
         // Legacy ownership: email matches even when provider_id differs.

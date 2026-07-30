@@ -398,22 +398,19 @@ fn apply_usage_event(
         .or_default()
         .add(input, output, cache_read, cache_creation);
     if !share_id.is_empty() {
-        let entry = by_share.entry(share_id.to_string()).or_insert_with(|| {
-            (
-                share_name.to_string(),
-                TokenAgg::default(),
-                BTreeMap::new(),
-            )
-        });
+        let entry = by_share
+            .entry(share_id.to_string())
+            .or_insert_with(|| (share_name.to_string(), TokenAgg::default(), BTreeMap::new()));
         if entry.0.is_empty() && !share_name.is_empty() {
             entry.0 = share_name.to_string();
         }
         entry.1.add(input, output, cache_read, cache_creation);
-        entry
-            .2
-            .entry(model.to_string())
-            .or_default()
-            .add(input, output, cache_read, cache_creation);
+        entry.2.entry(model.to_string()).or_default().add(
+            input,
+            output,
+            cache_read,
+            cache_creation,
+        );
     }
 }
 
@@ -567,9 +564,9 @@ fn query_consumer_events(
     let mut events = Vec::new();
 
     {
-        let mut stmt = conn
-            .prepare(&market_sql)
-            .map_err(|e| AppError::Internal(format!("prepare consumer market usage failed: {e}")))?;
+        let mut stmt = conn.prepare(&market_sql).map_err(|e| {
+            AppError::Internal(format!("prepare consumer market usage failed: {e}"))
+        })?;
         let mapped = if let Some(email) = email {
             stmt.query_map(params![email, start_rfc3339], map_usage_event_row)
         } else {
@@ -617,8 +614,7 @@ fn map_usage_event_row(row: &rusqlite::Row<'_>) -> Result<UsageEvent, rusqlite::
 }
 
 fn count_active_network(conn: &Connection) -> Result<(usize, usize), AppError> {
-    let active_cutoff =
-        (Utc::now() - Duration::minutes(ACTIVE_CLIENT_WINDOW_MINUTES)).to_rfc3339();
+    let active_cutoff = (Utc::now() - Duration::minutes(ACTIVE_CLIENT_WINDOW_MINUTES)).to_rfc3339();
     let active_shares: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM shares WHERE share_status = 'active'",
@@ -663,9 +659,12 @@ impl AppStore {
         let conn = self.conn.lock().await;
         let user_id = ensure_user_id(&conn, &email)?;
         match load_profile_row(&conn, &user_id)? {
-            Some((username, public_stats_enabled, updated_at)) => {
-                Ok(profile_response(&email, username, public_stats_enabled, Some(updated_at)))
-            }
+            Some((username, public_stats_enabled, updated_at)) => Ok(profile_response(
+                &email,
+                username,
+                public_stats_enabled,
+                Some(updated_at),
+            )),
             None => Ok(profile_response(&email, None, false, None)),
         }
     }
@@ -683,17 +682,14 @@ impl AppStore {
         let user_id = ensure_user_id(&conn, &email)?;
         let now = Utc::now().to_rfc3339();
         let existing = load_profile_row(&conn, &user_id)?;
-        let (mut username, mut username_normalized, mut public_stats_enabled) =
-            match &existing {
-                Some((username, enabled, _)) => (
-                    username.clone(),
-                    username
-                        .as_ref()
-                        .map(|value| value.to_ascii_lowercase()),
-                    *enabled,
-                ),
-                None => (None, None, false),
-            };
+        let (mut username, mut username_normalized, mut public_stats_enabled) = match &existing {
+            Some((username, enabled, _)) => (
+                username.clone(),
+                username.as_ref().map(|value| value.to_ascii_lowercase()),
+                *enabled,
+            ),
+            None => (None, None, false),
+        };
 
         if let Some(raw) = patch.username {
             let trimmed = raw.trim();
@@ -723,7 +719,12 @@ impl AppStore {
         }
 
         if let Some(enabled) = patch.public_stats_enabled {
-            if enabled && username.as_ref().map(|v| v.trim().is_empty()).unwrap_or(true) {
+            if enabled
+                && username
+                    .as_ref()
+                    .map(|v| v.trim().is_empty())
+                    .unwrap_or(true)
+            {
                 return Err(AppError::BadRequest(
                     "username is required to enable public stats".into(),
                 ));
@@ -952,9 +953,9 @@ impl AppStore {
             if installation_id.is_empty() {
                 continue;
             }
-            labels.entry(installation_id.clone()).or_insert_with(|| {
-                installation_label(platform, app_version, subdomain.as_deref())
-            });
+            labels
+                .entry(installation_id.clone())
+                .or_insert_with(|| installation_label(platform, app_version, subdomain.as_deref()));
         }
 
         // installation -> share -> (name, totals, models, callers)
@@ -986,8 +987,17 @@ impl AppStore {
         }
 
         let mut totals = TokenAgg::default();
-        for (installation_id, share_id, share_name, model, caller, input, output, cache_read, cache_creation)
-            in rows
+        for (
+            installation_id,
+            share_id,
+            share_name,
+            model,
+            caller,
+            input,
+            output,
+            cache_read,
+            cache_creation,
+        ) in rows
         {
             totals.add(input, output, cache_read, cache_creation);
             let inst_key = if installation_id.is_empty() {
@@ -996,26 +1006,24 @@ impl AppStore {
                 installation_id
             };
             let inst = installations.entry(inst_key).or_default();
-            inst.totals
-                .add(input, output, cache_read, cache_creation);
+            inst.totals.add(input, output, cache_read, cache_creation);
             let share = inst.shares.entry(share_id).or_default();
             if share.name.is_empty() && !share_name.is_empty() {
                 share.name = share_name;
             }
-            share
-                .totals
-                .add(input, output, cache_read, cache_creation);
+            share.totals.add(input, output, cache_read, cache_creation);
             share
                 .models
                 .entry(model)
                 .or_default()
                 .add(input, output, cache_read, cache_creation);
             if !caller.is_empty() {
-                share
-                    .callers
-                    .entry(caller)
-                    .or_default()
-                    .add(input, output, cache_read, cache_creation);
+                share.callers.entry(caller).or_default().add(
+                    input,
+                    output,
+                    cache_read,
+                    cache_creation,
+                );
             }
         }
 

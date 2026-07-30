@@ -3,8 +3,9 @@
 import * as React from "react";
 import { createPortal } from "react-dom";
 import { Button, Checkbox, Chip, Dropdown, Modal, toast } from "@heroui/react";
-import { Loader2, MoreHorizontal, Pencil, Plus, RefreshCw, Trash2, X } from "lucide-react";
+import { Loader2, MessageCircle, MoreHorizontal, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
+import { useClientChat } from "@/components/chat/client-chat";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { CountryFlag } from "@/components/common/country-flag";
 import { ProvisionJobLog } from "@/components/dashboard/provision-job-log";
@@ -12,17 +13,17 @@ import { WebTerminalGlyph } from "@/components/dashboard/web-terminal/web-termin
 import { useWebTerminal } from "@/components/dashboard/web-terminal";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { HostOfferDialog } from "@/components/dashboard/client-market/host-offer-dialog";
-import { ClientMarketBillingBanner } from "@/components/dashboard/client-market-billing-banner";
+import { ClientMarketRentalBanner } from "@/components/dashboard/client-market-rental-banner";
 import { ProviderContactButton } from "@/components/common/provider-contacts";
 import { ReleaseRentalAction } from "@/components/dashboard/client-market/release-rental-action";
 import {
-  cleanupClientMarketClientWithReason,
+  cleanupClientMarketProviderRental,
   deleteClientMarketHost,
   getClientMarketJob,
   reverifyClientMarketHost,
 } from "@/lib/api";
 import { mergeHosts } from "@/lib/client-market-refresh";
-import type { ClientMarketBilling, ClientMarketHost, ProvisioningJob } from "@/lib/types";
+import type { ClientMarketHost, ClientMarketRental, ProvisioningJob } from "@/lib/types";
 import {
   cleanupFailureGuidanceKey,
   cleanupPhaseLabelKey,
@@ -43,7 +44,7 @@ import {
 
 function HostRowImpl({
   host,
-  billing,
+  rental,
   highlighted = false,
   selectionMode,
   selected,
@@ -54,7 +55,7 @@ function HostRowImpl({
   onUiBusyChange,
 }: {
   host: ClientMarketHost;
-  billing?: ClientMarketBilling | null;
+  rental?: ClientMarketRental | null;
   highlighted?: boolean;
   selectionMode: boolean;
   selected: boolean;
@@ -68,11 +69,12 @@ function HostRowImpl({
 }) {
   const { locale, t } = useLocaleText();
   const { session } = useAuth();
+  const { openChat, unreadByInstallation } = useClientChat();
   const viewerEmail = session?.user?.email;
   const { openTerminal } = useWebTerminal();
   const [busy, setBusy] = React.useState(false);
-  const [confirmAction, setConfirmAction] = React.useState<"delete" | "cleanup" | "unpaid" | null>(null);
-  const [blockUnpaidRenter, setBlockUnpaidRenter] = React.useState(false);
+  const [confirmAction, setConfirmAction] = React.useState<"delete" | "cleanup" | null>(null);
+  const [denyRenterAccess, setDenyRenterAccess] = React.useState(false);
   const [cleanupJob, setCleanupJob] = React.useState<ProvisioningJob | null>(null);
   const [cleanupOpen, setCleanupOpen] = React.useState(false);
   const [offerOpen, setOfferOpen] = React.useState(false);
@@ -86,13 +88,8 @@ function HostRowImpl({
   const canDelete = hostCanDelete(host, viewerEmail);
   const isClientOwner = host.isClientOwner === true;
   const canCleanup = hostCanCleanup(host, viewerEmail);
-  const canClientRelease = hostCanClientRelease(host, billing);
-  const showRenterBilling = isClientOwner && !!billing && billing.status !== "released";
-  const canMarkUnpaid =
-    !!host.installationId &&
-    host.status === "allocated" &&
-    canManageHost &&
-    !isClientOwner;
+  const canClientRelease = hostCanClientRelease(host, rental);
+  const showRenterRental = isClientOwner && !!rental && rental.status !== "released";
   const isRetryCleanup =
     canCleanup && (host.status === "unreachable" || host.status === "draining");
   const canReverify = hostCanReverify(host, viewerEmail);
@@ -146,22 +143,17 @@ function HostRowImpl({
     }
   };
 
-  const onCleanup = async (markUnpaid: boolean, blockClient = false) => {
+  const onCleanup = async (denyClientAccess = false) => {
     if (!host.installationId) return;
     setConfirmAction(null);
     setBusy(true);
     setCleanupJob(null);
     setCleanupOpen(true);
     try {
-      const { jobId } = markUnpaid
-        ? await cleanupClientMarketClientWithReason(host.installationId, {
-            reason: "payment_not_received",
-            blockClientForProvider: blockClient,
-          })
-        : await cleanupClientMarketClientWithReason(host.installationId, {
-            reason: cleanupReasonForHost(host),
-            blockClientForProvider: false,
-          });
+      const { jobId } = await cleanupClientMarketProviderRental(host.installationId, {
+        reason: cleanupReasonForHost(host),
+        denyClientAccess,
+      });
       toast.info(t("clientMarket.cleanupStarted"));
       const initial = await getClientMarketJob(jobId).catch(() => null);
       if (initial) setCleanupJob(initial);
@@ -187,13 +179,7 @@ function HostRowImpl({
     }
   };
 
-  const confirmCopy = confirmAction === "unpaid"
-    ? {
-        title: t("clientMarket.unpaidCleanupConfirmTitle"),
-        description: t("clientMarket.unpaidCleanupConfirmDesc", { host: hostLabel }),
-        confirmLabel: t("clientMarket.unpaidCleanup"),
-      }
-    : confirmAction === "cleanup"
+  const confirmCopy = confirmAction === "cleanup"
     ? {
         title: t(isRetryCleanup ? "clientMarket.retryCleanupConfirmTitle" : "clientMarket.cleanupConfirmTitle"),
         description: t(
@@ -219,7 +205,10 @@ function HostRowImpl({
   const cleanupTone =
     cleanupJob?.status === "failed" ? "failed" : cleanupJob?.status === "succeeded" ? "success" : "running";
   const noteText = host.note?.trim() || "";
-  const showSubrow = !!noteText || showRenterBilling;
+  const chatUnread = host.installationId
+    ? unreadByInstallation.get(host.installationId) || 0
+    : 0;
+  const showSubrow = !!noteText || showRenterRental;
   const ipIntelSubtitle = secondaryIntelParts.length ? secondaryIntelParts.join(" · ") : "";
   const statusGuidanceKey = hostStatusGuidanceKey(host.status, host.lastError);
   const statusGuidanceSubtitle = statusGuidanceKey ? t(statusGuidanceKey) : "";
@@ -280,12 +269,12 @@ function HostRowImpl({
             <span className="min-w-0 truncate text-xs font-medium text-foreground" title={host.hostOwnerEmail}>
               {host.hostOwnerEmail}
             </span>
-            <ProviderContactButton contacts={host.contacts} paymentMethods={host.paymentMethods} />
+            <ProviderContactButton contacts={host.contacts} />
           </div>
         </td>
         <td className="max-w-[9rem] whitespace-nowrap px-2 py-2 align-middle">
           <span className="block text-xs font-semibold text-foreground" title={t("clientMarket.currentOffer")}>
-            {formatHostOffer(host.priceCents, host.rentalPeriodDays, locale, host.currency)}
+            {formatHostOffer(host.dailyRateMinor, locale, host.currency)}
           </span>
         </td>
         <td className="max-w-[12rem] px-2 py-2 align-middle">
@@ -321,15 +310,34 @@ function HostRowImpl({
         </td>
         <td className="whitespace-nowrap px-2 py-2 align-middle">
           <div className="flex items-center justify-end gap-1">
+            {host.installationId ? (
+              <span className="relative inline-flex" title={t("clientMarket.openGroupChat")}>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  isIconOnly
+                  className="h-8 w-8 min-w-8 shrink-0"
+                  onClick={() => void openChat(host.installationId!)}
+                  aria-label={t("clientMarket.openGroupChat")}
+                >
+                  <MessageCircle className="h-4 w-4" />
+                </Button>
+                {chatUnread > 0 ? (
+                  <span className="pointer-events-none absolute -right-1 -top-1 min-w-4 rounded-full bg-red-600 px-1 text-center text-[9px] font-semibold leading-4 text-white">
+                    {chatUnread > 99 ? "99+" : chatUnread}
+                  </span>
+                ) : null}
+              </span>
+            ) : null}
             {host.status === "idle" ? (
               <Button variant="outline" size="sm" className="h-8 shrink-0" onClick={() => onCreate(host)}>
                 <Plus className="h-4 w-4" />
                 {t("createClient.newClient")}
               </Button>
             ) : null}
-            {canClientRelease && billing ? (
+            {canClientRelease && rental ? (
               <ReleaseRentalAction
-                billing={billing}
+                rental={rental}
                 onChanged={onChanged}
                 className="h-8 px-2.5 text-xs text-rose-700"
               />
@@ -384,19 +392,6 @@ function HostRowImpl({
                         {t(isRetryCleanup ? "clientMarket.retryCleanup" : "clientMarket.cleanup")}
                       </Dropdown.Item>
                     ) : null}
-                    {canMarkUnpaid ? (
-                      <Dropdown.Item
-                        id="unpaid"
-                        className="text-destructive"
-                        onAction={() => {
-                          setBlockUnpaidRenter(false);
-                          setConfirmAction("unpaid");
-                        }}
-                      >
-                        <X className="h-4 w-4" />
-                        {t("clientMarket.unpaidCleanup")}
-                      </Dropdown.Item>
-                    ) : null}
                     {canDelete ? (
                       <Dropdown.Item
                         id="delete"
@@ -423,12 +418,11 @@ function HostRowImpl({
                   {noteText}
                 </span>
               ) : null}
-              {showRenterBilling && billing ? (
-                <ClientMarketBillingBanner
-                  billing={billing}
+              {showRenterRental && rental ? (
+                <ClientMarketRentalBanner
+                  rental={rental}
                   onChanged={onChanged}
                   compact
-                  showPayButton
                   resumeRelease
                 />
               ) : null}
@@ -449,38 +443,43 @@ function HostRowImpl({
                   tone="danger"
                   busy={busy}
                   extra={
-                    confirmAction === "unpaid" && host.clientOwnerEmail ? (
-                      <label className="inline-flex items-start gap-2">
-                        <Checkbox
-                          isSelected={blockUnpaidRenter}
-                          onChange={setBlockUnpaidRenter}
-                          isDisabled={busy}
-                          aria-label={t("clientMarket.unpaidBlockCheckbox", {
-                            email: host.clientOwnerEmail,
-                          })}
-                          className="mt-0.5 shrink-0"
-                        >
-                          <Checkbox.Control className="border border-slate-300 bg-white shadow-none">
-                            <Checkbox.Indicator />
-                          </Checkbox.Control>
-                        </Checkbox>
-                        <span className="leading-5">
-                          {t("clientMarket.unpaidBlockCheckbox", { email: host.clientOwnerEmail })}
-                        </span>
-                      </label>
+                    confirmAction === "cleanup" ? (
+                      <div className="grid gap-3">
+                        <p className="rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-xs leading-5 text-sky-900">
+                          {t("chat.marketPublicNotice")}
+                        </p>
+                        {host.clientOwnerEmail && !isClientOwner ? (
+                          <label className="inline-flex items-start gap-2">
+                            <Checkbox
+                              isSelected={denyRenterAccess}
+                              onChange={setDenyRenterAccess}
+                              isDisabled={busy}
+                              aria-label={t("clientMarket.denyOnCleanupCheckbox", {
+                                email: host.clientOwnerEmail,
+                              })}
+                              className="mt-0.5 shrink-0"
+                            >
+                              <Checkbox.Control className="border border-slate-300 bg-white shadow-none">
+                                <Checkbox.Indicator />
+                              </Checkbox.Control>
+                            </Checkbox>
+                            <span className="leading-5">
+                              {t("clientMarket.denyOnCleanupCheckbox", { email: host.clientOwnerEmail })}
+                            </span>
+                          </label>
+                        ) : null}
+                      </div>
                     ) : null
                   }
                   onConfirm={() => {
                     if (confirmAction === "cleanup") {
-                      void onCleanup(false);
-                    } else if (confirmAction === "unpaid") {
-                      void onCleanup(true, blockUnpaidRenter);
+                      void onCleanup(denyRenterAccess);
                     } else void onDelete();
                   }}
                   onOpenChange={(nextOpen) => {
                     if (!nextOpen && !busy) {
                       setConfirmAction(null);
-                      setBlockUnpaidRenter(false);
+                      setDenyRenterAccess(false);
                     }
                   }}
                 />

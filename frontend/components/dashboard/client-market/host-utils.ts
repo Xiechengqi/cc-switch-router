@@ -96,7 +96,7 @@ export function hostCanCleanup(host: ClientMarketHost, viewerEmail?: string | nu
 /** Renter (or self-renter) may release their Client with reason `client_release`. */
 export function hostCanClientRelease(
   host: ClientMarketHost,
-  billing?: { isClientOwner?: boolean; canRelease?: boolean; status?: string } | null,
+  rental?: { isClientOwner?: boolean; canRelease?: boolean; status?: string } | null,
 ) {
   if (host.isClientOwner !== true || !host.installationId) return false;
   if (
@@ -106,10 +106,10 @@ export function hostCanClientRelease(
   ) {
     return false;
   }
-  if (!billing) return true;
-  if (billing.isClientOwner === false) return false;
-  if (billing.status === "released" || billing.status === "releasing") return false;
-  return billing.canRelease !== false;
+  if (!rental) return true;
+  if (rental.isClientOwner === false) return false;
+  if (rental.status === "released" || rental.status === "releasing") return false;
+  return rental.canRelease !== false;
 }
 
 /** Within「我的」, rented rows (isClientOwner) sort ahead of hosted-only rows. */
@@ -145,7 +145,7 @@ export function hostExportKey(host: { ip?: string | null; port?: number | null }
   return formatHostEndpoint(host.ip, host.port);
 }
 
-/** Fixed line format: ip:port|note|priceCents|periodDays|fingerprint */
+/** Fixed line format: ip:port|note|dailyPriceMinor|currency|fingerprint */
 export type HostTransferLineEntry = ClientMarketHostTransferDocument["hosts"][number];
 
 export function formatHostEndpoint(ip: string, port: number) {
@@ -174,11 +174,11 @@ export function splitHostEndpoint(endpoint: string): { ip: string; port: number 
 export function encodeHostTransferLine(entry: HostTransferLineEntry): string {
   const endpoint = formatHostEndpoint(entry.ip, entry.port);
   const note = entry.note?.trim() || "";
-  const price = entry.priceCents != null ? String(entry.priceCents) : "";
-  const period = entry.rentalPeriodDays != null ? String(entry.rentalPeriodDays) : "";
+  const price = entry.dailyRateMinor != null ? String(entry.dailyRateMinor) : "";
+  const currency = entry.currency?.trim().toUpperCase() || "";
   const fingerprint = entry.expectedFingerprint?.trim() || "";
   const status = entry.informationalStatus?.trim();
-  const line = `${endpoint}|${note}|${price}|${period}|${fingerprint}`;
+  const line = `${endpoint}|${note}|${price}|${currency}|${fingerprint}`;
   return status ? `${line} # ${status}` : line;
 }
 
@@ -194,7 +194,7 @@ export function parseHostTransferLines(text: string): { document?: ClientMarketH
     if (!trimmed || trimmed.startsWith("#")) continue;
     const line = trimmed.replace(/\s+#.*$/, "").trim();
     if (!line) continue;
-    const [endpointPart, note = "", priceRaw = "", periodRaw = "", fingerprint = ""] = line
+    const [endpointPart, note = "", priceRaw = "", currencyRaw = "", fingerprint = ""] = line
       .split("|")
       .map((part) => part.trim());
     const endpoint = splitHostEndpoint(endpointPart);
@@ -202,22 +202,19 @@ export function parseHostTransferLines(text: string): { document?: ClientMarketH
     const key = formatHostEndpoint(endpoint.ip, endpoint.port);
     if (seen.has(key)) continue;
     seen.add(key);
-    let priceCents: number | undefined;
-    let rentalPeriodDays: number | undefined;
+    let dailyRateMinor: number | undefined;
     if (priceRaw) {
       if (!/^\d+$/.test(priceRaw)) return { errorLine: trimmed };
-      priceCents = Number(priceRaw);
+      dailyRateMinor = Number(priceRaw);
     }
-    if (periodRaw) {
-      if (!/^\d+$/.test(periodRaw)) return { errorLine: trimmed };
-      rentalPeriodDays = Number(periodRaw);
-    }
+    const currency = currencyRaw ? currencyRaw.toUpperCase() : undefined;
+    if (currency && currency !== "CNY" && currency !== "USD") return { errorLine: trimmed };
     hosts.push({
       ip: endpoint.ip,
       port: endpoint.port,
       note: note || undefined,
-      priceCents,
-      rentalPeriodDays,
+      dailyRateMinor,
+      currency,
       expectedFingerprint: fingerprint || undefined,
     });
   }
@@ -401,34 +398,31 @@ export function authorizedKeysInstallCommand(line: string): string {
 export type Translate = (key: MessageKey, values?: Record<string, string | number>) => string;
 
 export function formatHostOffer(
-  priceCents: number | undefined,
-  rentalPeriodDays: number | undefined,
+  dailyRateMinor: number | undefined,
   locale: string,
   currency = "USD",
 ) {
-  if (!priceCents || !rentalPeriodDays) return locale.startsWith("zh") ? "免费 · 永久" : "Free · forever";
+  if (!dailyRateMinor) return locale.startsWith("zh") ? "免费 · 永久" : "Free · forever";
   const amount = new Intl.NumberFormat(locale, {
     style: "currency",
     currency: currency === "CNY" ? "CNY" : "USD",
-  }).format(priceCents / 100);
-  return locale.startsWith("zh") ? `${amount} · ${rentalPeriodDays} 天` : `${amount} · ${rentalPeriodDays}d`;
+  }).format(dailyRateMinor / 100);
+  return locale.startsWith("zh") ? `${amount} / 天` : `${amount} / day`;
 }
 
-export function parseHostOffer(priceUsd: string, periodDays: string, t: Translate, currency = "USD") {
-  const price = priceUsd.trim();
-  const period = periodDays.trim();
+export function parseHostOffer(priceValue: string, t: Translate, currency = "USD") {
+  const price = priceValue.trim();
   const normalizedCurrency = currency.trim().toUpperCase() === "CNY" ? "CNY" : "USD";
-  if (!price && !period) return { priceCents: undefined, rentalPeriodDays: undefined, currency: undefined as string | undefined };
-  if (!price || !period || !/^\d{1,7}(?:\.\d{1,2})?$/.test(price) || !/^\d+$/.test(period)) {
+  if (!price) return { dailyRateMinor: undefined, currency: undefined as string | undefined };
+  if (!/^\d{1,7}(?:\.\d{1,2})?$/.test(price)) {
     throw new Error(t("clientMarket.offerInvalid"));
   }
   const [whole, fraction = ""] = price.split(".");
-  const priceCents = Number(whole) * 100 + Number(fraction.padEnd(2, "0"));
-  const rentalPeriodDays = Number(period);
-  if (priceCents < 1 || priceCents > 100_000_000 || rentalPeriodDays < 4 || rentalPeriodDays > 3_650) {
+  const dailyRateMinor = Number(whole) * 100 + Number(fraction.padEnd(2, "0"));
+  if (dailyRateMinor < 1 || dailyRateMinor > 100_000_000) {
     throw new Error(t("clientMarket.offerRange"));
   }
-  return { priceCents, rentalPeriodDays, currency: normalizedCurrency };
+  return { dailyRateMinor, currency: normalizedCurrency };
 }
 
 export function isPaymentProfileRequiredError(message: string) {
@@ -608,12 +602,12 @@ export function normalizeHostSortPrefs(value: unknown): HostSortPrefs {
 }
 
 export function compareHostOffer(left: ClientMarketHost, right: ClientMarketHost) {
-  const leftFree = !left.priceCents || !left.rentalPeriodDays;
-  const rightFree = !right.priceCents || !right.rentalPeriodDays;
+  const leftFree = !left.dailyRateMinor;
+  const rightFree = !right.dailyRateMinor;
   if (leftFree !== rightFree) return leftFree ? -1 : 1;
-  const priceCmp = (left.priceCents || 0) - (right.priceCents || 0);
+  const priceCmp = (left.dailyRateMinor || 0) - (right.dailyRateMinor || 0);
   if (priceCmp !== 0) return priceCmp;
-  return (left.rentalPeriodDays || 0) - (right.rentalPeriodDays || 0);
+  return (left.currency || "USD").localeCompare(right.currency || "USD");
 }
 
 /**

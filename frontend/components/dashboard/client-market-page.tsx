@@ -9,23 +9,21 @@ import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { CreateClientDialog } from "@/components/dashboard/create-client-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
-  cleanupClientMarketClientWithReason,
   deleteClientMarketHost,
   exportMyClientMarketHosts,
   getClientMarketHosts,
   getClientMarketJob,
-  getMyClientMarketBilling,
+  getMyClientMarketRentals,
   importMyClientMarketHosts,
   reverifyClientMarketHost,
 } from "@/lib/api";
 import { mergeHosts } from "@/lib/client-market-refresh";
-import type { ClientMarketBilling, ClientMarketHost, ClientMarketHostImportResponse } from "@/lib/types";
+import type { ClientMarketHost, ClientMarketHostImportResponse, ClientMarketRental } from "@/lib/types";
 import { usePersistentState } from "@/lib/use-persistent-state";
 import { useBatchOperations } from "@/components/dashboard/client-market/use-batch-operations";
 import { AddHostDialog } from "@/components/dashboard/client-market/add-host-dialog";
 import { HostRow } from "@/components/dashboard/client-market/host-row";
 import { HostSortHeader } from "@/components/dashboard/client-market/host-sort-header";
-import { ProviderBlocksPanel } from "@/components/dashboard/client-market/provider-blocks-panel";
 import {
   BatchProgressItem,
   CLEARED_HOST_SORT,
@@ -78,7 +76,7 @@ export function ClientMarketPage() {
   const viewerEmail = session?.user?.email;
 
   const [hosts, setHosts] = React.useState<ClientMarketHost[]>([]);
-  const [billings, setBillings] = React.useState<ClientMarketBilling[]>([]);
+  const [rentals, setRentals] = React.useState<ClientMarketRental[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [addOpen, setAddOpen] = React.useState(false);
   const [pendingAddAfterLogin, setPendingAddAfterLogin] = React.useState(false);
@@ -137,15 +135,15 @@ export function ClientMarketPage() {
         setHosts((prev) => mergeHosts(prev, nextHosts));
         if (authed) {
           try {
-            const nextBilling = await getMyClientMarketBilling(controller.signal);
-            if (!controller.signal.aborted) setBillings(nextBilling);
+            const nextRentals = await getMyClientMarketRentals(controller.signal);
+            if (!controller.signal.aborted) setRentals(nextRentals);
           } catch {
             if (!controller.signal.aborted && !silent) {
               /* hosts still usable; renter actions degrade until next poll */
             }
           }
         } else {
-          setBillings([]);
+          setRentals([]);
         }
       } catch (err) {
         if (controller.signal.aborted) return;
@@ -239,14 +237,14 @@ export function ClientMarketPage() {
     return counts;
   }, [mineHosts.length, scopedHosts]);
 
-  const billingByInstallation = React.useMemo(() => {
-    const map = new Map<string, ClientMarketBilling>();
-    for (const billing of billings) {
-      if (!billing.isClientOwner) continue;
-      map.set(billing.installationId, billing);
+  const rentalByInstallation = React.useMemo(() => {
+    const map = new Map<string, ClientMarketRental>();
+    for (const rental of rentals) {
+      if (!rental.isClientOwner) continue;
+      map.set(rental.installationId, rental);
     }
     return map;
-  }, [billings]);
+  }, [rentals]);
 
   const visibleHosts = React.useMemo(() => {
     const filtered = scopedHosts.filter((host) => hostMatchesListTab(host, listTab));
@@ -767,9 +765,9 @@ export function ClientMarketPage() {
                   <HostRow
                     key={host.id}
                     host={host}
-                    billing={
+                    rental={
                       host.installationId
-                        ? billingByInstallation.get(host.installationId) ?? null
+                        ? rentalByInstallation.get(host.installationId) ?? null
                         : null
                     }
                     highlighted={
@@ -1017,10 +1015,6 @@ export function ClientMarketPage() {
         </Modal.Container>
       </Modal.Backdrop>
 
-      <ProviderBlocksPanel
-        enabled={authed}
-        hosting={hosts.some((host) => hostBelongsToViewer(host) || host.isHostOwner === true)}
-      />
     </div>
   );
 }

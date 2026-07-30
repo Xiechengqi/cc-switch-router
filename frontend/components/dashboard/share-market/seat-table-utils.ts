@@ -34,7 +34,7 @@ export type SeatRowLike = {
   };
   seat: Pick<
     ShareMarketSeat,
-    "position" | "parallelLimit" | "tokenLimit" | "priceMinor" | "isFree" | "status" | "currency" | "readOnly"
+    "position" | "parallelLimit" | "tokenLimit" | "dailyRateMinor" | "isFree" | "status" | "currency" | "readOnly"
   >;
   subscription?: Pick<ShareMarketSubscription, "status">;
   statusKey: string;
@@ -84,8 +84,8 @@ export function sortSeatRows<T extends SeatRowLike>(rows: T[], prefs: SeatSortPr
         break;
       case "amount":
         result = cmp(
-          left.seat.isFree ? 0 : left.seat.priceMinor ?? 0,
-          right.seat.isFree ? 0 : right.seat.priceMinor ?? 0,
+          left.seat.isFree ? 0 : left.seat.dailyRateMinor ?? 0,
+          right.seat.isFree ? 0 : right.seat.dailyRateMinor ?? 0,
         );
         break;
       case "status":

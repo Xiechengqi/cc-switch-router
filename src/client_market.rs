@@ -769,10 +769,6 @@ pub fn router() -> Router<ServerState> {
         .route("/v1/client-market/hosts/:id/reverify", post(reverify_host))
         .route("/v1/client-market/jobs/:id", get(get_job))
         .route(
-            "/v1/client-market/clients/:installation_id/cleanup",
-            post(cleanup_client),
-        )
-        .route(
             "/v1/client-market/clients/:installation_id/release",
             post(release_client),
         )
@@ -822,16 +818,12 @@ struct RouterSshHostView {
     port: Option<u16>,
     host_owner_email: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    price_cents: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    rental_period_days: Option<i64>,
+    daily_rate_minor: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     currency: Option<String>,
     offer_revision: i64,
     #[serde(default)]
     payment_method_kinds: Vec<String>,
-    #[serde(default)]
-    payment_methods: Vec<crate::client_market_trade::PaymentMethod>,
     #[serde(default)]
     contacts: Vec<crate::client_market_trade::PaymentContact>,
     country_code: Option<String>,
@@ -880,18 +872,13 @@ async fn list_hosts(
             query.status.as_deref(),
         )
         .await?;
-    let reveal_payment_methods = viewer.is_some();
     let views = hosts
         .into_iter()
         .map(|host| {
             // Host operations (port, SSH details, notes, etc.) are host-owner only.
             // Admins / Router owners do not get elevated market host privileges.
             let is_host_owner = viewer.as_ref().is_some_and(|session| {
-                session_is_host_owner(
-                    session,
-                    host.provider_id.as_deref(),
-                    &host.host_owner_email,
-                )
+                session_is_host_owner(session, host.provider_id.as_deref(), &host.host_owner_email)
             });
             let is_client_owner = viewer.as_ref().is_some_and(|session| {
                 host.client_owner_user_id.as_deref() == Some(session.user_id.as_str())
@@ -912,16 +899,13 @@ async fn list_hosts(
                 ip: Some(host.ip.clone()),
                 port: reveal_operations.then_some(host.port),
                 host_owner_email: host.host_owner_email,
-                price_cents: host.price_cents,
-                rental_period_days: host.rental_period_days,
-                currency: host.currency.clone().or_else(|| host.price_cents.map(|_| "USD".into())),
+                daily_rate_minor: host.daily_rate_minor,
+                currency: host
+                    .currency
+                    .clone()
+                    .or_else(|| host.daily_rate_minor.map(|_| "USD".into())),
                 offer_revision: host.offer_revision,
                 payment_method_kinds: host.payment_method_kinds,
-                payment_methods: if reveal_payment_methods {
-                    host.payment_methods
-                } else {
-                    Vec::new()
-                },
                 contacts: host.contacts,
                 country_code: host.country_code,
                 hostname: host.hostname,
@@ -975,8 +959,7 @@ struct CreateHostRequest {
     /// Optional root password used only to install the provision public key.
     /// Never persisted; dropped when the request handler returns.
     root_password: Option<String>,
-    price_cents: Option<i64>,
-    rental_period_days: Option<i64>,
+    daily_rate_minor: Option<i64>,
     #[serde(default)]
     currency: Option<String>,
 }
@@ -989,9 +972,9 @@ struct HostTransferEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    price_cents: Option<i64>,
+    daily_rate_minor: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    rental_period_days: Option<i64>,
+    currency: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expected_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1109,7 +1092,9 @@ async fn lookup_host_ip_info(
 ) -> Result<Json<crate::ip_iq::HostIpIntel>, AppError> {
     let _owner = require_session_email(&state, &headers).await?;
     let ip = parse_host_ip(&input.ip)?;
-    let intel = crate::ip_iq::lookup_host_ip_intel(&state.config.ip_intel_endpoints, &ip.to_string()).await?;
+    let intel =
+        crate::ip_iq::lookup_host_ip_intel(&state.config.ip_intel_endpoints, &ip.to_string())
+            .await?;
     Ok(Json(intel))
 }
 
@@ -1166,14 +1151,15 @@ async fn create_host(
     }
     let (hostname, fingerprint) =
         ssh_verify_host(&state, &ip.to_string(), port, &known_hosts).await?;
-    let intel = crate::ip_iq::lookup_host_ip_intel(&state.config.ip_intel_endpoints, &ip.to_string()).await?;
+    let intel =
+        crate::ip_iq::lookup_host_ip_intel(&state.config.ip_intel_endpoints, &ip.to_string())
+            .await?;
     let intel_json = serde_json::to_string(&intel)
         .map_err(|e| AppError::Internal(format!("serialize host ip intel failed: {e}")))?;
-    let (price_cents, rental_period_days) =
-        crate::client_market_trade::validate_offer(input.price_cents, input.rental_period_days)?;
+    let daily_rate_minor = crate::client_market_trade::validate_offer(input.daily_rate_minor)?;
     let currency =
-        crate::client_market_trade::normalize_offer_currency(price_cents, input.currency)?;
-    if price_cents.is_some() {
+        crate::client_market_trade::normalize_offer_currency(daily_rate_minor, input.currency)?;
+    if daily_rate_minor.is_some() {
         let conn = state.store.conn.lock().await;
         crate::client_market_trade::require_payment_profile_for_offer(&conn, &session.user_id)?;
     }
@@ -1193,8 +1179,7 @@ async fn create_host(
             fingerprint.as_deref(),
             input.note.as_deref(),
             Some(&intel_json),
-            price_cents,
-            rental_period_days,
+            daily_rate_minor,
             currency.as_deref(),
         )
         .await?;
@@ -1223,8 +1208,8 @@ async fn export_hosts(
             ip: host.ip,
             port: host.port,
             note: host.note,
-            price_cents: host.price_cents,
-            rental_period_days: host.rental_period_days,
+            daily_rate_minor: host.daily_rate_minor,
+            currency: host.currency,
             expected_fingerprint: host.ssh_host_key_fingerprint,
             informational_status: Some(host.status),
         })
@@ -1361,11 +1346,10 @@ async fn import_one_host(
                 "Host note cannot exceed 500 bytes".into(),
             ));
         }
-        let (price, period) = crate::client_market_trade::validate_offer(
-            entry.price_cents,
-            entry.rental_period_days,
-        )?;
-        if price.is_some() {
+        let daily_rate_minor = crate::client_market_trade::validate_offer(entry.daily_rate_minor)?;
+        let currency =
+            crate::client_market_trade::normalize_offer_currency(daily_rate_minor, entry.currency)?;
+        if daily_rate_minor.is_some() {
             let conn = state.store.conn.lock().await;
             crate::client_market_trade::require_payment_profile_for_offer(&conn, &provider_id)?;
         }
@@ -1406,7 +1390,9 @@ async fn import_one_host(
                 ));
             }
         }
-        let intel = crate::ip_iq::lookup_host_ip_intel(&state.config.ip_intel_endpoints, &ip.to_string()).await?;
+        let intel =
+            crate::ip_iq::lookup_host_ip_intel(&state.config.ip_intel_endpoints, &ip.to_string())
+                .await?;
         let intel_json = serde_json::to_string(&intel).map_err(|error| {
             AppError::Internal(format!("serialize imported Host IP data failed: {error}"))
         })?;
@@ -1422,9 +1408,8 @@ async fn import_one_host(
                 fingerprint.as_deref(),
                 entry.note.as_deref(),
                 Some(&intel_json),
-                price,
-                period,
-                None,
+                daily_rate_minor,
+                currency.as_deref(),
             )
             .await?;
         Ok(Some(host.id))
@@ -1534,10 +1519,7 @@ async fn delete_host(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let session = require_session(&state, &headers).await?;
-    state
-        .store
-        .client_market_delete_host(&id, &session)
-        .await?;
+    state.store.client_market_delete_host(&id, &session).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -1551,7 +1533,7 @@ struct CreateClientResponse {
 #[serde(rename_all = "camelCase")]
 struct CleanupClientRequest {
     reason: Option<String>,
-    block_client_for_provider: Option<bool>,
+    deny_client_access: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1591,26 +1573,18 @@ async fn get_job(
     Ok(Json(job))
 }
 
-async fn cleanup_client(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    AxumPath(installation_id): AxumPath<String>,
-    input: Option<Json<CleanupClientRequest>>,
-) -> Result<Json<CreateClientResponse>, AppError> {
-    cleanup_client_with_reason(state, headers, installation_id, input, None).await
-}
-
 async fn release_client(
     State(state): State<ServerState>,
     headers: HeaderMap,
     AxumPath(installation_id): AxumPath<String>,
 ) -> Result<Json<CreateClientResponse>, AppError> {
-    cleanup_client_with_reason(
+    start_client_cleanup(
         state,
         headers,
         installation_id,
-        None,
-        Some("client_release"),
+        "client_release",
+        false,
+        "client",
     )
     .await
 }
@@ -1621,43 +1595,37 @@ async fn provider_cleanup_client(
     AxumPath(installation_id): AxumPath<String>,
     input: Option<Json<CleanupClientRequest>>,
 ) -> Result<Json<CreateClientResponse>, AppError> {
-    cleanup_client_with_reason(
+    let input = input.map(|Json(value)| value).unwrap_or_default();
+    let reason = input.reason.as_deref().unwrap_or("provider_release");
+    if !matches!(
+        reason,
+        "provider_release" | "host_maintenance" | "service_terminated" | "other"
+    ) {
+        return Err(AppError::BadRequest(
+            "unsupported Provider cleanup reason".into(),
+        ));
+    }
+    start_client_cleanup(
         state,
         headers,
         installation_id,
-        input,
-        Some("provider_release"),
+        reason,
+        input.deny_client_access.unwrap_or(false),
+        "provider",
     )
     .await
 }
 
-async fn cleanup_client_with_reason(
+async fn start_client_cleanup(
     state: ServerState,
     headers: HeaderMap,
     installation_id: String,
-    input: Option<Json<CleanupClientRequest>>,
-    default_reason: Option<&str>,
+    reason: &str,
+    deny_client_access: bool,
+    required_role: &str,
 ) -> Result<Json<CreateClientResponse>, AppError> {
     let session = require_session(&state, &headers).await?;
     let viewer = session.email.clone();
-    let input = input.map(|Json(value)| value).unwrap_or_default();
-    let reason = input
-        .reason
-        .as_deref()
-        .unwrap_or(default_reason.unwrap_or("client_release"));
-    if !matches!(
-        reason,
-        "client_release"
-            | "provider_release"
-            | "payment_not_received"
-            | "host_maintenance"
-            | "service_terminated"
-            | "other"
-    ) {
-        return Err(AppError::BadRequest(
-            "unsupported Client cleanup reason".into(),
-        ));
-    }
     let subdomain = state
         .store
         .client_market_subdomain_for_installation(&installation_id)
@@ -1670,8 +1638,9 @@ async fn cleanup_client_with_reason(
             Some(&session.user_id),
             &viewer,
             false,
+            Some(required_role),
             reason,
-            input.block_client_for_provider,
+            Some(deny_client_access),
         )
         .await?;
     if let Some(subdomain) = subdomain.as_deref() {
@@ -1686,6 +1655,79 @@ async fn cleanup_client_with_reason(
         }
     });
     Ok(Json(CreateClientResponse { job_id }))
+}
+
+pub(crate) async fn terminate_for_billing(
+    state: &ServerState,
+    installation_id: &str,
+    reason: &str,
+) -> Result<(), AppError> {
+    let status = {
+        let conn = state.store.conn.lock().await;
+        conn.query_row(
+            "SELECT status FROM client_market_subscriptions WHERE installation_id = ?1",
+            params![installation_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "read Client subscription for billing termination failed: {error}"
+            ))
+        })?
+    };
+    if status
+        .as_deref()
+        .is_none_or(|status| matches!(status, "released" | "releasing" | "release_failed"))
+    {
+        return Ok(());
+    }
+    let subdomain = state
+        .store
+        .client_market_subdomain_for_installation(installation_id)
+        .await?;
+    let job_id = match state
+        .store
+        .client_market_begin_system_cleanup_job(installation_id, reason)
+        .await
+    {
+        Ok(job_id) => job_id,
+        Err(AppError::Conflict(_)) => {
+            let conn = state.store.conn.lock().await;
+            let releasing = conn
+                .query_row(
+                    "SELECT 1 FROM client_market_subscriptions
+                     WHERE installation_id = ?1
+                       AND status IN ('released', 'releasing', 'release_failed')",
+                    params![installation_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "recheck Client billing termination failed: {error}"
+                    ))
+                })?
+                .is_some();
+            if releasing {
+                return Ok(());
+            }
+            return Err(AppError::Conflict(
+                "Client billing termination raced with another operation".into(),
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    if let Some(subdomain) = subdomain.as_deref() {
+        state.proxy.remove_route(subdomain).await;
+    }
+    let runner_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(error) = run_cleanup_job(runner_state, job_id.clone()).await {
+            error!(job_id = %job_id, error = %error, "Client billing termination cleanup failed");
+        }
+    });
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -2698,8 +2740,8 @@ async fn run_cleanup_job_inner(
 }
 
 async fn handle_cleanup_job_failure(state: &ServerState, job_id: &str, error: &AppError) {
-    warn!(job_id = %job_id, error = %error, "client market cleanup failed");
-    let detail = error.to_string();
+    let detail = crate::store::client_chat::sanitize_system_event_text(&error.to_string());
+    warn!(job_id = %job_id, error = %detail, "client market cleanup failed");
     let failure_code = classify_cleanup_failure(error);
     let _ = state
         .store
@@ -3888,16 +3930,10 @@ fn host_to_view(host: RouterSshHostRecord, reveal: bool) -> RouterSshHostView {
         ip: Some(host.ip.clone()),
         port: reveal.then_some(host.port),
         host_owner_email: host.host_owner_email,
-        price_cents: host.price_cents,
-        rental_period_days: host.rental_period_days,
+        daily_rate_minor: host.daily_rate_minor,
         currency: host.currency,
         offer_revision: host.offer_revision,
         payment_method_kinds: host.payment_method_kinds,
-        payment_methods: if reveal {
-            host.payment_methods
-        } else {
-            Vec::new()
-        },
         contacts: host.contacts,
         country_code: host.country_code,
         hostname: host.hostname,
@@ -3952,12 +3988,10 @@ pub struct RouterSshHostRecord {
     pub ip: String,
     pub port: u16,
     pub host_owner_email: String,
-    pub price_cents: Option<i64>,
-    pub rental_period_days: Option<i64>,
+    pub daily_rate_minor: Option<i64>,
     pub currency: Option<String>,
     pub offer_revision: i64,
     pub payment_method_kinds: Vec<String>,
-    pub payment_methods: Vec<crate::client_market_trade::PaymentMethod>,
     pub contacts: Vec<crate::client_market_trade::PaymentContact>,
     pub country_code: Option<String>,
     pub hostname: Option<String>,
@@ -4338,7 +4372,7 @@ impl AppStore {
                     h.last_verified_at, h.last_error, h.note, h.created_at, h.updated_at,
                     h.ip_intel_json, t.subdomain,
                     COALESCE(NULLIF(TRIM(t.owner_email), ''), NULLIF(TRIM(i.owner_email), '')),
-                    s.client_user_id, h.provider_id, h.price_cents, h.rental_period_days, h.offer_revision,
+                    s.client_user_id, h.provider_id, h.daily_rate_minor, h.offer_revision,
                     COALESCE((SELECT methods_json FROM account_payment_profiles p
                               WHERE p.user_id = h.provider_id), '[]'),
                     COALESCE((SELECT contacts_json FROM account_payment_profiles p
@@ -4442,7 +4476,6 @@ impl AppStore {
             ip_intel_json,
             None,
             None,
-            None,
         )
         .await
     }
@@ -4459,14 +4492,21 @@ impl AppStore {
         fingerprint: Option<&str>,
         note: Option<&str>,
         ip_intel_json: Option<&str>,
-        price_cents: Option<i64>,
-        rental_period_days: Option<i64>,
+        daily_rate_minor: Option<i64>,
         currency: Option<&str>,
     ) -> Result<RouterSshHostRecord, AppError> {
         let owner = normalize_market_email(owner_email)?;
         let now = Utc::now().to_rfc3339();
         let id = Uuid::new_v4().to_string();
         let conn = self.conn.lock().await;
+        if daily_rate_minor.is_some() {
+            crate::market_billing::require_supplier_profile_tx(
+                &conn,
+                provider_id,
+                currency
+                    .ok_or_else(|| AppError::Internal("paid Host currency is missing".into()))?,
+            )?;
+        }
         conn.execute(
             "INSERT INTO host_provider_profiles (provider_id, owner_email, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?3)
@@ -4478,9 +4518,9 @@ impl AppStore {
             "INSERT INTO router_ssh_hosts (
                 id, provider_id, ip, port, host_owner_email, country_code, hostname, ssh_host_key_fingerprint,
                 status, installation_id, last_verified_at, last_error, note, ip_intel_json,
-                price_cents, rental_period_days, currency, offer_revision, created_at, updated_at
+                daily_rate_minor, currency, offer_revision, created_at, updated_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, NULL, ?11, ?12,
-                       ?13, ?14, ?15, 1, ?10, ?10)",
+                       ?13, ?14, 1, ?10, ?10)",
             params![
                 id,
                 provider_id,
@@ -4494,8 +4534,7 @@ impl AppStore {
                 now,
                 note,
                 ip_intel_json,
-                price_cents,
-                rental_period_days,
+                daily_rate_minor,
                 currency,
             ],
         )
@@ -4519,11 +4558,7 @@ impl AppStore {
         let conn = self.conn.lock().await;
         let host = get_router_ssh_host(&conn, id)?
             .ok_or_else(|| AppError::NotFound("host not found".into()))?;
-        if !session_is_host_owner(
-            session,
-            host.provider_id.as_deref(),
-            &host.host_owner_email,
-        ) {
+        if !session_is_host_owner(session, host.provider_id.as_deref(), &host.host_owner_email) {
             return Err(AppError::Forbidden(
                 "not allowed to delete this host".into(),
             ));
@@ -5032,21 +5067,23 @@ impl AppStore {
         }
         let owner_placeholders = placeholders(owners.len());
         let region_placeholders = placeholders(regions.len());
+        let client_identity: (Option<String>, String) = tx
+            .query_row(
+                "SELECT client_owner_user_id, client_owner_email
+                 FROM provisioning_jobs WHERE id = ?1",
+                params![job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| AppError::Internal(format!("read claim client identity failed: {e}")))?;
+        let client_user_id = client_identity.0.ok_or_else(|| {
+            AppError::Conflict("provisioning job has no authenticated client owner".into())
+        })?;
         let sql = format!(
-            "SELECT id FROM router_ssh_hosts
+            "SELECT id, provider_id FROM router_ssh_hosts
              WHERE status = '{HOST_STATUS_IDLE}'
                AND host_owner_email IN ({owner_placeholders})
                AND country_code IN ({region_placeholders})
-               AND NOT EXISTS (
-                   SELECT 1 FROM host_provider_client_blocks b
-                   WHERE b.provider_id = router_ssh_hosts.provider_id
-                     AND b.client_user_id = (
-                         SELECT client_owner_user_id FROM provisioning_jobs WHERE id = ?
-                     )
-                     AND b.lifted_at IS NULL
-               )
-             ORDER BY RANDOM()
-             LIMIT 1"
+             ORDER BY RANDOM()"
         );
         let mut query = tx
             .prepare(&sql)
@@ -5058,11 +5095,30 @@ impl AppStore {
         for region in regions {
             values.push(region);
         }
-        values.push(&job_id);
-        let host_id: Option<String> = query
-            .query_row(values.as_slice(), |row| row.get(0))
-            .optional()
-            .map_err(|e| AppError::Internal(format!("select idle host failed: {e}")))?;
+        let candidates = query
+            .query_map(values.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .map_err(|e| AppError::Internal(format!("select idle hosts failed: {e}")))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| AppError::Internal(format!("read idle hosts failed: {e}")))?;
+        drop(query);
+        let mut host_id = None;
+        for (candidate_id, provider_id) in candidates {
+            let Some(provider_id) = provider_id else {
+                continue;
+            };
+            if crate::market_access::product_access_allowed_tx(
+                &tx,
+                &provider_id,
+                &client_user_id,
+                &client_identity.1,
+                crate::market_access::PRODUCT_CLIENT_HOST,
+            )? {
+                host_id = Some(candidate_id);
+                break;
+            }
+        }
         let host_id = host_id
             .ok_or_else(|| AppError::ServiceUnavailable("no idle host matches selection".into()))?;
         let now = Utc::now().to_rfc3339();
@@ -5074,7 +5130,6 @@ impl AppStore {
                 params![host_id, HOST_STATUS_LOCKED, now, HOST_STATUS_IDLE],
             )
             .map_err(|e| AppError::Internal(format!("mark host provisioning failed: {e}")))?;
-        drop(query);
         if updated != 1 {
             return Err(AppError::Conflict("host claim raced, retry".into()));
         }
@@ -5133,7 +5188,7 @@ impl AppStore {
                         h.last_verified_at, h.last_error, h.note, h.created_at, h.updated_at,
                         h.ip_intel_json, t.subdomain,
                         COALESCE(NULLIF(TRIM(t.owner_email), ''), NULLIF(TRIM(i.owner_email), '')),
-                        s.client_user_id, h.provider_id, h.price_cents, h.rental_period_days, h.offer_revision,
+                        s.client_user_id, h.provider_id, h.daily_rate_minor, h.offer_revision,
                         COALESCE((SELECT methods_json FROM account_payment_profiles p
                                   WHERE p.user_id = h.provider_id), '[]'),
                         COALESCE((SELECT contacts_json FROM account_payment_profiles p
@@ -5221,11 +5276,7 @@ impl AppStore {
         let conn = self.conn.lock().await;
         let host = get_router_ssh_host(&conn, id)?
             .ok_or_else(|| AppError::NotFound("host not found".into()))?;
-        if !session_is_host_owner(
-            session,
-            host.provider_id.as_deref(),
-            &host.host_owner_email,
-        ) {
+        if !session_is_host_owner(session, host.provider_id.as_deref(), &host.host_owner_email) {
             return Err(AppError::Forbidden(
                 "not allowed to operate this host".into(),
             ));
@@ -5686,6 +5737,7 @@ impl AppStore {
             actor_user_id.as_deref(),
             &viewer,
             is_admin,
+            None,
             "operator_release",
             None,
         )
@@ -5702,6 +5754,7 @@ impl AppStore {
             None,
             "router-system@internal.invalid",
             true,
+            None,
             reason,
             Some(false),
         )
@@ -5714,8 +5767,9 @@ impl AppStore {
         actor_user_id: Option<&str>,
         viewer_email: &str,
         is_admin: bool,
+        required_role: Option<&str>,
         reason: &str,
-        block_client_for_provider: Option<bool>,
+        deny_client_access: Option<bool>,
     ) -> Result<String, AppError> {
         let viewer = normalize_market_email(viewer_email)?;
         let mut conn = self.conn.lock().await;
@@ -5774,28 +5828,6 @@ impl AppStore {
             .map_err(|error| {
                 AppError::Internal(format!("read cleanup billing owner failed: {error}"))
             })?;
-        if reason == "payment_deadline_expired" {
-            let still_expired: i64 = tx
-                .query_row(
-                    "SELECT EXISTS(
-                        SELECT 1 FROM client_market_subscriptions
-                        WHERE installation_id = ?1 AND status = 'payment_due'
-                          AND payment_deadline IS NOT NULL AND payment_deadline <= ?2
-                    )",
-                    params![installation_id, Utc::now().to_rfc3339()],
-                    |row| row.get(0),
-                )
-                .map_err(|error| {
-                    AppError::Internal(format!(
-                        "recheck expired billing before cleanup failed: {error}"
-                    ))
-                })?;
-            if still_expired == 0 {
-                return Err(AppError::Conflict(
-                    "the Client payment state changed before automatic release".into(),
-                ));
-            }
-        }
         let is_host_owner = actor_user_id.is_some_and(|user_id| host.1.as_deref() == Some(user_id))
             || normalize_market_email(&viewer)
                 .ok()
@@ -5822,6 +5854,24 @@ impl AppStore {
         // `is_admin` here means Router system automation only (no session actor).
         // Human admins / Router owners are never elevated for market Host cleanup.
         let system_operator = is_admin && actor_user_id.is_none();
+        match required_role {
+            Some("client") if !is_client_owner => {
+                return Err(AppError::Forbidden(
+                    "only the Client owner may release this rental".into(),
+                ));
+            }
+            Some("provider") if !is_host_owner => {
+                return Err(AppError::Forbidden(
+                    "only the Host Provider may clean this rental".into(),
+                ));
+            }
+            Some("client" | "provider") | None => {}
+            Some(_) => {
+                return Err(AppError::Internal(
+                    "invalid Client cleanup role constraint".into(),
+                ));
+            }
+        }
         if !system_operator && !is_host_owner && !is_client_owner {
             return Err(AppError::Forbidden(
                 "not allowed to cleanup this client".into(),
@@ -5874,9 +5924,9 @@ impl AppStore {
             .as_ref()
             .map(|owner| owner.1.as_str())
             .unwrap_or(owner_email.as_str());
-        let should_block_client = is_host_owner
-            && reason == "payment_not_received"
-            && block_client_for_provider.unwrap_or(false)
+        let should_deny_client = required_role == Some("provider")
+            && is_host_owner
+            && deny_client_access.unwrap_or(false)
             && subscription_owner
                 .as_ref()
                 .is_some_and(|owner| host.1.as_deref() != Some(owner.0.as_str()));
@@ -5922,7 +5972,7 @@ impl AppStore {
             actor_user_id,
             Some(&viewer),
             reason,
-            should_block_client,
+            should_deny_client,
             Utc::now(),
         )?;
         tx.commit()
@@ -5997,6 +6047,8 @@ impl AppStore {
         failure_code: &str,
         log: &str,
     ) -> Result<(), AppError> {
+        let failure_code = crate::store::client_chat::sanitize_system_event_text(failure_code);
+        let failure_code = failure_code.as_str();
         let chunk = sanitize_job_log_chunk(log);
         let mut conn = self.conn.lock().await;
         let tx = conn.transaction().map_err(|e| {
@@ -6194,7 +6246,7 @@ fn get_router_ssh_host(
                 h.last_verified_at, h.last_error, h.note, h.created_at, h.updated_at,
                 h.ip_intel_json, t.subdomain,
                 COALESCE(NULLIF(TRIM(t.owner_email), ''), NULLIF(TRIM(i.owner_email), '')),
-                s.client_user_id, h.provider_id, h.price_cents, h.rental_period_days, h.offer_revision,
+                s.client_user_id, h.provider_id, h.daily_rate_minor, h.offer_revision,
                 COALESCE((SELECT methods_json FROM account_payment_profiles p
                           WHERE p.user_id = h.provider_id), '[]'),
                 COALESCE((SELECT contacts_json FROM account_payment_profiles p
@@ -6229,9 +6281,9 @@ fn get_provisioning_job(
 }
 
 fn map_router_ssh_host_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouterSshHostRecord> {
-    let methods_json: String = row.get(22)?;
-    let contacts_json: String = row.get(23)?;
-    let currency: Option<String> = row.get(24)?;
+    let methods_json: String = row.get(21)?;
+    let contacts_json: String = row.get(22)?;
+    let currency: Option<String> = row.get(23)?;
     let payment_methods =
         serde_json::from_str::<Vec<crate::client_market_trade::PaymentMethod>>(&methods_json)
             .unwrap_or_default();
@@ -6263,11 +6315,9 @@ fn map_router_ssh_host_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouterSs
         client_owner_email: row.get(16)?,
         client_owner_user_id: row.get(17)?,
         provider_id: row.get(18)?,
-        price_cents: row.get(19)?,
-        rental_period_days: row.get(20)?,
-        offer_revision: row.get(21)?,
+        daily_rate_minor: row.get(19)?,
+        offer_revision: row.get(20)?,
         payment_method_kinds,
-        payment_methods,
         contacts,
         currency,
     })
@@ -6396,6 +6446,62 @@ mod tests {
         (store, config, root)
     }
 
+    #[test]
+    fn schema_excludes_legacy_prepaid_billing_contract() {
+        let conn = Connection::open_in_memory().expect("open in-memory database");
+        init_schema(&conn).expect("initialize Client Market schema");
+
+        for table in [
+            "client_market_invoices",
+            "client_market_payment_declarations",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .expect("inspect legacy Client Market table");
+            assert_eq!(count, 0, "legacy table {table} must not be created");
+        }
+
+        for (table, legacy_columns) in [
+            (
+                "router_ssh_hosts",
+                &["price_cents", "rental_period_days"][..],
+            ),
+            (
+                "client_market_allocation_quote_items",
+                &["price_cents", "rental_period_days"][..],
+            ),
+            (
+                "client_market_subscriptions",
+                &[
+                    "price_cents",
+                    "rental_period_days",
+                    "last_declared_at",
+                    "current_period_end",
+                    "payment_deadline",
+                ][..],
+            ),
+        ] {
+            let mut statement = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .expect("inspect Client Market schema");
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .expect("query Client Market columns")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect Client Market columns");
+            for column in legacy_columns {
+                assert!(
+                    !columns.iter().any(|existing| existing == column),
+                    "legacy column {table}.{column} must not be created"
+                );
+            }
+        }
+    }
+
     async fn add_host(
         store: &AppStore,
         owner: &str,
@@ -6460,9 +6566,21 @@ mod tests {
         email: &str,
         ip: &str,
         country: &str,
-        price_cents: Option<i64>,
-        rental_period_days: Option<i64>,
+        daily_rate_minor: Option<i64>,
     ) -> RouterSshHostRecord {
+        let session = market_session(provider_id, email);
+        let now = Utc::now().to_rfc3339();
+        {
+            let conn = store.conn.lock().await;
+            crate::market_access::configure_open_test_policy(&conn, &session, "USD", 50_000, &now);
+        }
+        if daily_rate_minor.is_some() {
+            ensure_payment_profile(store, provider_id, email).await;
+            store
+                .market_billing_update_supplier_profile(&session, "USD", 24)
+                .await
+                .expect("configure test USD payment grace");
+        }
         store
             .client_market_insert_host_for_provider(
                 provider_id,
@@ -6474,9 +6592,8 @@ mod tests {
                 Some("SHA256:market-test"),
                 None,
                 None,
-                price_cents,
-                rental_period_days,
-                price_cents.map(|_| "USD"),
+                daily_rate_minor,
+                daily_rate_minor.map(|_| "USD"),
             )
             .await
             .expect("insert Provider Host")
@@ -6508,6 +6625,33 @@ mod tests {
             )
             .await
             .expect("create job");
+        store
+            .client_market_bind_job_user(
+                job_id,
+                &format!("test-client:{}", client_owner.to_ascii_lowercase()),
+            )
+            .await
+            .expect("bind test Client owner");
+        {
+            let conn = store.conn.lock().await;
+            let now = Utc::now().to_rfc3339();
+            for owner in owners {
+                let provider_id: String = conn
+                    .query_row(
+                        "SELECT provider_id FROM host_provider_profiles WHERE owner_email = ?1",
+                        params![owner.to_ascii_lowercase()],
+                        |row| row.get(0),
+                    )
+                    .expect("resolve test Host Provider");
+                crate::market_access::configure_open_test_policy(
+                    &conn,
+                    &market_session(&provider_id, owner),
+                    "USD",
+                    50_000,
+                    &now,
+                );
+            }
+        }
         store
             .client_market_start_job(job_id, JOB_TYPE_CREATE)
             .await
@@ -6580,8 +6724,8 @@ mod tests {
                 ip: "203.0.113.10".into(),
                 port: 22,
                 note: Some("first".into()),
-                price_cents: None,
-                rental_period_days: None,
+                daily_rate_minor: None,
+                currency: None,
                 expected_fingerprint: Some("SHA256:first".into()),
                 informational_status: Some("idle".into()),
             },
@@ -6589,8 +6733,8 @@ mod tests {
                 ip: "203.0.113.11".into(),
                 port: 2222,
                 note: Some("second".into()),
-                price_cents: Some(500),
-                rental_period_days: Some(4),
+                daily_rate_minor: Some(500),
+                currency: Some("USD".into()),
                 expected_fingerprint: Some("SHA256:second".into()),
                 informational_status: Some("allocated".into()),
             },
@@ -7210,6 +7354,25 @@ mod tests {
             .client_market_begin_cleanup_job("cleanup-installation", "host@example.com", false)
             .await
             .unwrap();
+        {
+            let conn = store.conn.lock().await;
+            let (event_type, payload_json): (String, String) = conn
+                .query_row(
+                    "SELECT event_type, payload_json
+                     FROM client_chat_system_outbox
+                     WHERE installation_id = 'cleanup-installation'
+                     ORDER BY created_at DESC LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&payload_json).unwrap();
+            assert_eq!(event_type, "cleanup_started");
+            assert_eq!(payload["clientLabel"], "cleanup-client");
+            assert_eq!(payload["clientOwnerEmail"], "client@example.com");
+            assert_eq!(payload["providerEmail"], "host@example.com");
+            assert_eq!(payload["status"], "releasing");
+        }
         assert_eq!(
             store
                 .client_market_get_host(&host.id)
@@ -7324,7 +7487,6 @@ mod tests {
             "198.18.5.3",
             "US",
             Some(500),
-            Some(30),
         )
         .await;
         let now = Utc::now().to_rfc3339();
@@ -7352,11 +7514,11 @@ mod tests {
             conn.execute(
                 "INSERT INTO client_market_subscriptions
                     (installation_id, host_id, provider_id, host_owner_email,
-                     client_user_id, client_owner_email, status, price_cents,
-                     rental_period_days, offer_revision, created_at, updated_at)
+                     client_user_id, client_owner_email, status, daily_rate_minor,
+                     offer_revision, created_at, updated_at)
                  VALUES ('failed-release-client', ?1, 'provider-reuse', 'provider@example.com',
                          'renter-reuse', 'renter@example.com', 'release_failed', 500,
-                         30, 1, ?2, ?2)",
+                         1, ?2, ?2)",
                 params![host.id, now],
             )
             .unwrap();
@@ -7414,21 +7576,10 @@ mod tests {
             ip: "203.0.113.9".into(),
             port: 2222,
             host_owner_email: "host@example.com".into(),
-            price_cents: Some(500),
-            rental_period_days: Some(30),
+            daily_rate_minor: Some(500),
             currency: Some("USD".into()),
             offer_revision: 1,
             payment_method_kinds: vec!["alipay".into()],
-            payment_methods: vec![crate::client_market_trade::PaymentMethod {
-                kind: "alipay".into(),
-                account: Some("account-id".into()),
-                qr_image_url: None,
-                asset_url: None,
-                token: None,
-                chain: None,
-                address: None,
-                instructions: None,
-            }],
             contacts: vec![],
             country_code: Some("US".into()),
             hostname: Some("host.example".into()),
@@ -7495,13 +7646,7 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("public-client")
         );
-        assert_eq!(
-            public
-                .get("paymentMethods")
-                .and_then(|value| value.as_array())
-                .map(Vec::len),
-            Some(0)
-        );
+        assert!(public.get("paymentMethods").is_none());
         let private = serde_json::to_value(host_to_view(host, true)).unwrap();
         assert_eq!(
             private.get("ip").and_then(|value| value.as_str()),
@@ -7513,13 +7658,7 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("client@example.com")
         );
-        assert_eq!(
-            private
-                .get("paymentMethods")
-                .and_then(|value| value.as_array())
-                .map(Vec::len),
-            Some(1)
-        );
+        assert!(private.get("paymentMethods").is_none());
     }
 
     #[tokio::test]
@@ -7534,7 +7673,6 @@ mod tests {
             "198.18.20.1",
             "US",
             None,
-            None,
         )
         .await;
         let second = add_provider_host(
@@ -7543,7 +7681,6 @@ mod tests {
             "provider@example.com",
             "198.18.20.2",
             "US",
-            None,
             None,
         )
         .await;
@@ -7593,8 +7730,12 @@ mod tests {
         assert_eq!(quote.items.len(), 2);
         let provider = market_session("provider-1", "provider@example.com");
         ensure_payment_profile(&store, "provider-1", "provider@example.com").await;
+        store
+            .market_billing_update_supplier_profile(&provider, "USD", 24)
+            .await
+            .expect("configure Provider payment grace");
         let changed_offer = store
-            .client_market_update_host_offer(&first.id, &provider, Some(900), Some(60), Some("USD".into()))
+            .client_market_update_host_offer(&first.id, &provider, Some(900), Some("USD".into()))
             .await
             .expect("Provider may change an offer while a quote is reserved");
         assert_eq!(changed_offer.offer_revision, 2);
@@ -7726,7 +7867,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quote_commit_rechecks_provider_block_and_cancel_releases_host() {
+    async fn quote_commit_rechecks_provider_access_and_cancel_releases_host() {
         use crate::client_market_trade::CreateQuoteRequest;
 
         let (store, _config, root) = test_store("trade-quote-provider-block");
@@ -7737,7 +7878,6 @@ mod tests {
             "198.18.20.3",
             "US",
             Some(500),
-            Some(30),
         )
         .await;
         let client = market_session("client-blocked-quote", "client@example.com");
@@ -7752,21 +7892,21 @@ mod tests {
                 },
             )
             .await
-            .expect("create quote before Provider block");
+            .expect("create quote before Provider access changes");
         {
             let conn = store.conn.lock().await;
-            conn.execute(
-                "INSERT INTO host_provider_client_blocks
-                    (provider_id, client_user_id, client_owner_email, reason, created_at)
-                 VALUES (?1, ?2, ?3, 'payment_not_received', ?4)",
-                params![
-                    "provider-blocked-quote",
-                    client.user_id,
-                    client.email,
-                    Utc::now().to_rfc3339(),
-                ],
+            crate::market_access::set_product_access_decision_tx(
+                &conn,
+                "provider-blocked-quote",
+                "provider@example.com",
+                &client.user_id,
+                &client.email,
+                crate::market_access::PRODUCT_CLIENT_HOST,
+                crate::market_access::DECISION_DENY,
+                "provider-blocked-quote",
+                &Utc::now().to_rfc3339(),
             )
-            .unwrap();
+            .expect("deny quoted Client access");
         }
         let prepared = vec![(
             quote.items[0].id.clone(),
@@ -7778,7 +7918,7 @@ mod tests {
             store
                 .client_market_commit_quote(&quote.id, &client, &prepared)
                 .await,
-            Err(AppError::Conflict(_))
+            Err(AppError::Forbidden(_))
         ));
         assert_eq!(
             store
@@ -7808,10 +7948,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn offer_updates_freeze_paid_period_and_payment_declaration_is_idempotent() {
-        use crate::client_market_trade::PaymentMethod;
-
-        let (store, _config, root) = test_store("trade-offer-payment");
+    async fn host_offer_updates_only_affect_future_postpaid_contracts() {
+        let (store, _config, root) = test_store("trade-offer-postpaid");
         let host = add_provider_host(
             &store,
             "provider-stable",
@@ -7819,280 +7957,48 @@ mod tests {
             "198.18.21.1",
             "US",
             Some(500),
-            Some(30),
         )
         .await;
-        let now = Utc::now();
-        let frozen_end = now + chrono::Duration::days(2);
+        let now = Utc::now().to_rfc3339();
         {
             let conn = store.conn.lock().await;
             conn.execute(
                 "INSERT INTO client_market_subscriptions
                     (installation_id, host_id, provider_id, host_owner_email,
-                     client_user_id, client_owner_email, status, price_cents,
-                     rental_period_days, offer_revision, last_declared_at,
-                     current_period_end, created_at, updated_at)
+                     client_user_id, client_owner_email, status, daily_rate_minor,
+                     currency, offer_revision, created_at, updated_at)
                  VALUES ('paid-client', ?1, 'provider-stable', 'provider-old@example.com',
                          'client-stable', 'client-old@example.com', 'active', 500,
-                         30, 1, ?2, ?3, ?4, ?4)",
-                params![
-                    host.id,
-                    (now - chrono::Duration::days(28)).to_rfc3339(),
-                    frozen_end.to_rfc3339(),
-                    now.to_rfc3339(),
-                ],
+                         'USD', 1, ?2, ?2)",
+                params![host.id, now],
             )
-            .unwrap();
+            .expect("insert active postpaid subscription");
         }
 
-        let provider = market_session("provider-stable", "provider-new@example.com");
-        assert!(matches!(
-            store
-                .client_market_update_host_offer(&host.id, &provider, Some(900), Some(60), Some("USD".into()))
-                .await,
-            Err(AppError::BadRequest(message))
-                if message.contains("configure payment details on the Account page")
-        ));
+        let provider = market_session("provider-stable", "provider-old@example.com");
+        let updated = store
+            .client_market_update_host_offer(&host.id, &provider, Some(900), Some("USD".into()))
+            .await
+            .expect("update daily Host rate");
+        assert_eq!(updated.offer_revision, 2);
+        assert_eq!(updated.daily_rate_minor, Some(900));
+        let unchanged = store
+            .client_market_update_host_offer(&host.id, &provider, Some(900), Some("USD".into()))
+            .await
+            .expect("save unchanged daily Host rate");
+        assert_eq!(unchanged.offer_revision, 2);
 
-        let client = market_session("client-stable", "client-new@example.com");
-        let billing_without_profile = store
-            .client_market_billing_for_viewer("paid-client", &client)
-            .await
-            .expect("load billing before Provider configures payment details");
-        assert!(billing_without_profile.payment_profile_updated_at.is_none());
-        let payment_profile = store
-            .client_market_update_payment_profile(
-                &provider,
-                &[PaymentMethod {
-                    kind: "crypto".into(),
-                    account: None,
-                    qr_image_url: None,
-                    asset_url: None,
-                    token: Some("USDC".into()),
-                    chain: Some("base".into()),
-                    address: Some("0x0123456789abcdef0123456789abcdef01234567".into()),
-                    instructions: None,
-                }],
-                None,
-            )
-            .await
-            .expect("configure Provider payment details");
-        let updated_offer = store
-            .client_market_update_host_offer(&host.id, &provider, Some(900), Some(60), Some("USD".into()))
-            .await
-            .expect("update Host offer with stable Provider identity");
-        assert_eq!(updated_offer.offer_revision, 2);
-        let unchanged_offer = store
-            .client_market_update_host_offer(&host.id, &provider, Some(900), Some(60), Some("USD".into()))
-            .await
-            .expect("save unchanged Host offer");
-        assert_eq!(unchanged_offer.offer_revision, 2);
-        assert!(matches!(
-            store.client_market_assert_creation_allowed(&client).await,
-            Err(AppError::Conflict(_))
-        ));
-        let (status, period_end, invoice_id): (String, String, String) = {
-            let conn = store.conn.lock().await;
-            assert_eq!(
-                conn.query_row(
-                    "SELECT COUNT(*) FROM client_market_email_deliveries
-                     WHERE kind = 'host_offer_changed'",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-                1
-            );
-            assert_eq!(
-                conn.query_row(
-                    "SELECT COUNT(*) FROM client_market_offer_events
-                     WHERE host_id = ?1 AND offer_revision = 2",
-                    params![host.id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-                1
-            );
-            assert_eq!(
-                conn.query_row(
-                    "SELECT COUNT(*) FROM client_market_email_deliveries d
-                     JOIN client_market_email_events e ON e.id = d.event_id
-                     WHERE d.kind = 'host_offer_changed'",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-                1
-            );
-            conn.query_row(
-                "SELECT s.status, s.current_period_end, i.id
-                 FROM client_market_subscriptions s
-                 JOIN client_market_invoices i ON i.installation_id = s.installation_id
-                 WHERE s.installation_id = 'paid-client' AND i.status = 'open'",
+        let conn = store.conn.lock().await;
+        let frozen: (Option<i64>, Option<String>, i64) = conn
+            .query_row(
+                "SELECT daily_rate_minor, currency, offer_revision
+                 FROM client_market_subscriptions WHERE installation_id = 'paid-client'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .unwrap()
-        };
-        assert_eq!(status, "payment_due");
-        assert_eq!(
-            parse_market_time(&period_end),
-            parse_market_time(&frozen_end.to_rfc3339())
-        );
-        let billing_with_profile = store
-            .client_market_billing_for_viewer("paid-client", &client)
-            .await
-            .expect("reload billing after payment details change");
-        {
-            let conn = store.conn.lock().await;
-            assert_eq!(
-                conn.query_row(
-                    "SELECT COUNT(*) FROM account_payment_methods
-                     WHERE profile_user_id = 'provider-stable' AND enabled = 1",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-                1
-            );
-        }
-        assert_eq!(
-            billing_with_profile.payment_profile_updated_at.as_deref(),
-            Some(payment_profile.updated_at.as_str())
-        );
-        assert!(matches!(
-            store
-                .client_market_declare_paid("paid-client", &invoice_id, 2, None, None, &client)
-                .await,
-            Err(AppError::Conflict(_))
-        ));
-        {
-            let conn = store.conn.lock().await;
-            conn.execute(
-                "UPDATE client_market_invoices SET deadline_at = ?2 WHERE id = ?1",
-                params![
-                    invoice_id,
-                    (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()
-                ],
-            )
-            .unwrap();
-        }
-        assert!(matches!(
-            store
-                .client_market_declare_paid(
-                    "paid-client",
-                    &invoice_id,
-                    1,
-                    Some(&payment_profile.updated_at),
-                    None,
-                    &client,
-                )
-                .await,
-            Err(AppError::Conflict(_))
-        ));
-        assert!(matches!(
-            store
-                .client_market_declare_paid(
-                    "paid-client",
-                    &invoice_id,
-                    2,
-                    Some(&payment_profile.updated_at),
-                    None,
-                    &client,
-                )
-                .await,
-            Err(AppError::Gone(_))
-        ));
-        {
-            let conn = store.conn.lock().await;
-            conn.execute(
-                "UPDATE client_market_invoices SET deadline_at = ?2 WHERE id = ?1",
-                params![
-                    invoice_id,
-                    (Utc::now() + chrono::Duration::days(1)).to_rfc3339()
-                ],
-            )
-            .unwrap();
-        }
-        // An echoed amount that disagrees with the invoice must be rejected even when
-        // the revision matches — the client displayed a stale number.
-        assert!(
-            matches!(
-                store
-                    .client_market_declare_paid(
-                        "paid-client",
-                        &invoice_id,
-                        2,
-                        Some(&payment_profile.updated_at),
-                        Some(1),
-                        &client,
-                    )
-                    .await,
-                Err(AppError::Conflict(_))
-            ),
-            "mismatched amount_cents_confirmed must be refused"
-        );
-        store
-            .client_market_declare_paid(
-                "paid-client",
-                &invoice_id,
-                2,
-                Some(&payment_profile.updated_at),
-                None,
-                &client,
-            )
-            .await
-            .expect("declare payment");
-        store
-            .client_market_declare_paid(
-                "paid-client",
-                &invoice_id,
-                2,
-                Some(&payment_profile.updated_at),
-                None,
-                &client,
-            )
-            .await
-            .expect("repeat payment declaration");
-        let (next_end, declarations, owner_email, declaration_events): (String, i64, String, i64) = {
-            let conn = store.conn.lock().await;
-            let subscription = conn
-                .query_row(
-                    "SELECT current_period_end, client_owner_email
-                     FROM client_market_subscriptions WHERE installation_id = 'paid-client'",
-                    [],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                )
-                .unwrap();
-            let count = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM client_market_payment_declarations WHERE invoice_id = ?1",
-                    params![invoice_id],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            let event_count = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM client_market_subscription_events
-                     WHERE installation_id = 'paid-client' AND event_type = 'payment_declared'",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            (subscription.0, count, subscription.1, event_count)
-        };
-        assert_eq!(
-            parse_market_time(&next_end),
-            parse_market_time(&frozen_end.to_rfc3339()) + chrono::Duration::days(60)
-        );
-        assert_eq!(declarations, 1);
-        assert_eq!(declaration_events, 1);
-        assert_eq!(owner_email, "client-new@example.com");
-        let billing = store
-            .client_market_billing_for_viewer("paid-client", &client)
-            .await
-            .expect("load billing after email change");
-        assert!(billing.is_client_owner);
+            .expect("read frozen Client contract offer");
+        assert_eq!(frozen, (Some(500), Some("USD".into()), 1));
+        drop(conn);
         drop(store);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -8107,7 +8013,6 @@ mod tests {
             "198.18.24.1",
             "US",
             None,
-            None,
         )
         .await;
         let second = add_provider_host(
@@ -8116,7 +8021,6 @@ mod tests {
             "provider-old@example.com",
             "198.18.24.2",
             "CA",
-            None,
             None,
         )
         .await;
@@ -8135,7 +8039,7 @@ mod tests {
             .unwrap();
             conn.execute(
                 "UPDATE router_ssh_hosts
-                 SET price_cents = 500, rental_period_days = 30, status = 'allocated'
+                 SET daily_rate_minor = 500, status = 'allocated'
                  WHERE id = ?1",
                 params![second.id],
             )
@@ -8164,16 +8068,15 @@ mod tests {
                 conn.execute(
                     "INSERT INTO client_market_subscriptions
                         (installation_id, host_id, provider_id, host_owner_email,
-                         client_user_id, client_owner_email, status, price_cents,
-                         rental_period_days, offer_revision, last_declared_at,
+                         client_user_id, client_owner_email, status, daily_rate_minor,
+                         offer_revision,
                          created_at, updated_at)
                      VALUES (?1, ?2, 'provider-stable', 'provider-new@example.com',
-                             ?3, 'client@example.com', 'active', 500, 30, 1, ?4, ?5, ?5)",
+                             ?3, 'client@example.com', 'active', 500, 1, ?4, ?4)",
                     params![
                         installation_id,
                         host_id,
                         client_user_id,
-                        now.to_rfc3339(),
                         created_at.to_rfc3339(),
                     ],
                 )
@@ -8232,7 +8135,6 @@ mod tests {
             "198.18.24.3",
             "US",
             None,
-            None,
         )
         .await;
 
@@ -8268,7 +8170,6 @@ mod tests {
             "198.18.25.1",
             "US",
             Some(500),
-            Some(30),
         )
         .await;
         let free = add_provider_host(
@@ -8278,7 +8179,6 @@ mod tests {
             "198.18.25.2",
             "JP",
             None,
-            None,
         )
         .await;
         {
@@ -8286,7 +8186,7 @@ mod tests {
             // Simulate legacy/drifted provider_id that never got healed by a paid offer edit.
             conn.execute(
                 "UPDATE router_ssh_hosts
-                 SET provider_id = 'email:provider@example.com', price_cents = NULL, rental_period_days = NULL
+                 SET provider_id = 'email:provider@example.com', daily_rate_minor = NULL
                  WHERE id = ?1",
                 params![free.id],
             )
@@ -8337,7 +8237,6 @@ mod tests {
             "198.18.25.3",
             "US",
             None,
-            None,
         )
         .await;
         {
@@ -8346,7 +8245,7 @@ mod tests {
             // SQL `NULL != canonical_id` is unknown, so the old heal skipped these rows.
             conn.execute(
                 "UPDATE router_ssh_hosts
-                 SET provider_id = NULL, price_cents = NULL, rental_period_days = NULL, status = 'idle'
+                 SET provider_id = NULL, daily_rate_minor = NULL, status = 'idle'
                  WHERE id = ?1",
                 params![free.id],
             )
@@ -8397,7 +8296,6 @@ mod tests {
             "198.18.41.1",
             "US",
             Some(500),
-            Some(30),
         )
         .await;
         let free = add_provider_host(
@@ -8406,7 +8304,6 @@ mod tests {
             "provider@example.com",
             "198.18.41.2",
             "US",
-            None,
             None,
         )
         .await;
@@ -8444,7 +8341,7 @@ mod tests {
             .expect("pool quote selects the free Host");
         assert_eq!(quote.items.len(), 1);
         assert_eq!(quote.items[0].host_id, free.id);
-        assert!(quote.items[0].price_cents.is_none());
+        assert!(quote.items[0].daily_rate_minor.is_none());
 
         store
             .client_market_cancel_quote(&quote.id, &client)
@@ -8463,7 +8360,7 @@ mod tests {
             .await
             .expect("fixed Host quotes may still target paid Hosts");
         assert_eq!(paid_quote.items[0].host_id, _paid.id);
-        assert_eq!(paid_quote.items[0].price_cents, Some(500));
+        assert_eq!(paid_quote.items[0].daily_rate_minor, Some(500));
 
         drop(store);
         let _ = std::fs::remove_dir_all(root);
@@ -8482,7 +8379,6 @@ mod tests {
                 "provider@example.com",
                 &format!("198.18.42.{index}"),
                 "US",
-                None,
                 None,
             )
             .await;
@@ -8531,7 +8427,6 @@ mod tests {
             "198.18.40.1",
             "DE",
             None,
-            None,
         )
         .await;
         // Live shape: Host rows exist for a non-official owner with NULL provider_id and
@@ -8548,10 +8443,10 @@ mod tests {
                 "INSERT INTO router_ssh_hosts (
                     id, provider_id, ip, port, host_owner_email, country_code, hostname,
                     ssh_host_key_fingerprint, status, installation_id, last_verified_at, last_error,
-                    note, ip_intel_json, price_cents, rental_period_days, offer_revision, created_at, updated_at
+                    note, ip_intel_json, daily_rate_minor, offer_revision, created_at, updated_at
                  ) VALUES (
                     'orphan-host-1', NULL, '198.18.40.2', 22, 'peer@example.com', 'US', 'peer-host',
-                    'SHA256:peer', 'idle', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 1, ?1, ?1
+                    'SHA256:peer', 'idle', NULL, NULL, NULL, NULL, NULL, NULL, 1, ?1, ?1
                  )",
                 params![Utc::now().to_rfc3339()],
             )
@@ -8591,156 +8486,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn billing_reconcile_opens_one_renewal_and_reports_overdue_client() {
-        let (store, _config, root) = test_store("trade-renewal");
+    async fn trade_reconcile_leaves_postpaid_subscriptions_to_market_billing() {
+        let (store, _config, root) = test_store("trade-postpaid");
         let host = add_provider_host(
             &store,
-            "provider-renewal",
+            "provider-postpaid",
             "provider@example.com",
             "198.18.22.1",
             "US",
             Some(700),
-            Some(30),
         )
         .await;
         let now = Utc::now();
-        let period_end = now + chrono::Duration::days(2);
         {
             let conn = store.conn.lock().await;
             conn.execute(
                 "INSERT INTO client_market_subscriptions
                     (installation_id, host_id, provider_id, host_owner_email,
-                     client_user_id, client_owner_email, status, price_cents,
-                     rental_period_days, offer_revision, current_period_end,
+                     client_user_id, client_owner_email, status, daily_rate_minor,
+                     currency, offer_revision,
                      created_at, updated_at)
-                 VALUES ('renewal-client', ?1, 'provider-renewal', 'provider@example.com',
-                         'renewal-user', 'renewal@example.com', 'active', 700,
-                         30, 1, ?2, ?3, ?3)",
-                params![host.id, period_end.to_rfc3339(), now.to_rfc3339()],
-            )
-            .unwrap();
-        }
-        assert!(
-            store
-                .client_market_reconcile_trade_state(now)
-                .await
-                .expect("open renewal")
-                .is_empty()
-        );
-        assert!(
-            store
-                .client_market_reconcile_trade_state(now + chrono::Duration::minutes(1))
-                .await
-                .expect("repeat renewal reconciliation")
-                .is_empty()
-        );
-        {
-            let conn = store.conn.lock().await;
-            let count: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM client_market_invoices
-                     WHERE installation_id = 'renewal-client' AND status = 'open'",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(count, 1);
-        }
-        let expired = store
-            .client_market_reconcile_trade_state(period_end + chrono::Duration::seconds(1))
-            .await
-            .expect("report overdue Client");
-        assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0].installation_id, "renewal-client");
-        drop(store);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn automatic_release_rechecks_payment_state_inside_cleanup_transaction() {
-        let (store, _config, root) = test_store("trade-release-payment-race");
-        let host = add_provider_host(
-            &store,
-            "provider-race",
-            "provider@example.com",
-            "198.18.22.2",
-            "US",
-            Some(700),
-            Some(30),
-        )
-        .await;
-        let now = Utc::now();
-        {
-            let conn = store.conn.lock().await;
-            insert_installation(&conn, "race-client", "renter@example.com");
-            conn.execute(
-                "UPDATE installations SET provision_source = ?2, provision_host_id = ?3 WHERE id = ?1",
-                params!["race-client", PROVISION_SOURCE_ROUTER_MARKET, host.id],
-            )
-            .unwrap();
-            insert_tunnel_and_public_host(
-                &conn,
-                "race-client",
-                "renter@example.com",
-                "race-client",
-            );
-            conn.execute(
-                "UPDATE router_ssh_hosts SET status = 'allocated', installation_id = 'race-client'
-                 WHERE id = ?1",
-                params![host.id],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO client_market_subscriptions
-                    (installation_id, host_id, provider_id, host_owner_email,
-                     client_user_id, client_owner_email, status, price_cents,
-                     rental_period_days, offer_revision, current_period_end,
-                     payment_deadline, created_at, updated_at)
-                 VALUES ('race-client', ?1, 'provider-race', 'provider@example.com',
-                         'renter-race', 'renter@example.com', 'active', 700,
-                         30, 1, ?2, NULL, ?3, ?3)",
-                params![
-                    host.id,
-                    (now + chrono::Duration::days(30)).to_rfc3339(),
-                    now.to_rfc3339(),
-                ],
-            )
-            .unwrap();
-        }
-
-        assert!(matches!(
-            store
-                .client_market_begin_system_cleanup_job("race-client", "payment_deadline_expired")
-                .await,
-            Err(AppError::Conflict(_))
-        ));
-        assert_eq!(
-            store
-                .client_market_get_host(&host.id)
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
-            HOST_STATUS_ALLOCATED
-        );
-
-        {
-            let conn = store.conn.lock().await;
-            conn.execute(
-                "UPDATE client_market_subscriptions
-                 SET status = 'payment_due', payment_deadline = ?2 WHERE installation_id = ?1",
-                params![
-                    "race-client",
-                    (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()
-                ],
+                 VALUES ('postpaid-client', ?1, 'provider-postpaid', 'provider@example.com',
+                         'postpaid-user', 'postpaid@example.com', 'active', 700,
+                         'USD', 1, ?2, ?2)",
+                params![host.id, now.to_rfc3339()],
             )
             .unwrap();
         }
         store
-            .client_market_begin_system_cleanup_job("race-client", "payment_deadline_expired")
+            .client_market_reconcile_trade_state(now)
             .await
-            .expect("start automatic cleanup while payment is still overdue");
-
+            .expect("reconcile market quotes");
+        store
+            .client_market_reconcile_trade_state(now + chrono::Duration::days(60))
+            .await
+            .expect("repeat market quote reconciliation");
+        {
+            let conn = store.conn.lock().await;
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM client_market_subscriptions
+                     WHERE installation_id = 'postpaid-client'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "active");
+        }
         drop(store);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -8755,7 +8547,6 @@ mod tests {
             "198.18.23.1",
             "US",
             Some(500),
-            Some(30),
         )
         .await;
         let now = Utc::now().to_rfc3339();
@@ -8782,17 +8573,13 @@ mod tests {
             conn.execute(
                 "INSERT INTO client_market_subscriptions
                     (installation_id, host_id, provider_id, host_owner_email,
-                     client_user_id, client_owner_email, status, price_cents,
-                     rental_period_days, offer_revision, payment_deadline,
+                     client_user_id, client_owner_email, status, daily_rate_minor,
+                     offer_revision,
                      created_at, updated_at)
                  VALUES ('blocked-client', ?1, 'provider-block', 'provider-old@example.com',
-                         'client-block', 'client-old@example.com', 'payment_due', 500,
-                         30, 1, ?2, ?3, ?3)",
-                params![
-                    host.id,
-                    (Utc::now() + chrono::Duration::days(3)).to_rfc3339(),
-                    now
-                ],
+                         'client-block', 'client-old@example.com', 'active', 500,
+                         1, ?2, ?2)",
+                params![host.id, now],
             )
             .unwrap();
         }
@@ -8802,57 +8589,51 @@ mod tests {
                 Some("provider-block"),
                 "provider-new@example.com",
                 false,
-                "payment_not_received",
+                Some("provider"),
+                "provider_release",
                 Some(true),
             )
             .await
             .expect("Provider cleanup after email change");
-        let blocks = store
-            .client_market_provider_blocks("provider-block")
-            .await
-            .unwrap();
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].client_user_id, "client-block");
         {
             let conn = store.conn.lock().await;
-            let mut statement = conn
-                .prepare(
-                    "SELECT recipient FROM client_market_email_deliveries
-                     WHERE idempotency_key LIKE 'cleanup-started:blocked-client:%'
-                     ORDER BY recipient",
+            let provider_email: String = conn
+                .query_row(
+                    "SELECT owner_email FROM host_provider_profiles WHERE provider_id = ?1",
+                    params!["provider-block"],
+                    |row| row.get(0),
                 )
                 .unwrap();
-            let recipients = statement
-                .query_map([], |row| row.get::<_, String>(0))
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap();
-            assert_eq!(
-                recipients,
-                vec![
-                    "client-old@example.com".to_string(),
-                    "provider-new@example.com".to_string(),
-                ]
+            assert_eq!(provider_email, "provider-new@example.com");
+            assert!(
+                !crate::market_access::product_access_allowed_tx(
+                    &conn,
+                    "provider-block",
+                    "client-block",
+                    "client-old@example.com",
+                    crate::market_access::PRODUCT_CLIENT_HOST,
+                )
+                .expect("read denied Client access")
             );
+            crate::market_access::set_product_access_decision_tx(
+                &conn,
+                "provider-block",
+                "provider-new@example.com",
+                "client-block",
+                "client-old@example.com",
+                crate::market_access::PRODUCT_CLIENT_HOST,
+                crate::market_access::DECISION_ALLOW,
+                "provider-block",
+                &Utc::now().to_rfc3339(),
+            )
+            .expect("allow Client access again");
         }
-        let provider = market_session("provider-block", "provider-new@example.com");
-        store
-            .client_market_lift_provider_block(&provider, "client-block")
-            .await
-            .expect("lift Provider block");
-        assert!(
-            store
-                .client_market_provider_blocks("provider-block")
-                .await
-                .unwrap()
-                .is_empty()
-        );
         drop(store);
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
-    async fn provider_release_and_self_rental_never_create_payment_blocks() {
+    async fn provider_release_without_deny_and_self_rental_never_denies_access() {
         let (store, _config, root) = test_store("trade-provider-release-no-block");
         let provider_id = "provider-release";
         let provider_email = "provider@example.com";
@@ -8863,7 +8644,6 @@ mod tests {
             "198.18.25.1",
             "US",
             Some(500),
-            Some(30),
         )
         .await;
         let second = add_provider_host(
@@ -8873,7 +8653,6 @@ mod tests {
             "198.18.25.2",
             "US",
             Some(500),
-            Some(30),
         )
         .await;
         let now = Utc::now().to_rfc3339();
@@ -8913,9 +8692,9 @@ mod tests {
                 conn.execute(
                     "INSERT INTO client_market_subscriptions
                         (installation_id, host_id, provider_id, host_owner_email,
-                         client_user_id, client_owner_email, status, price_cents,
-                         rental_period_days, offer_revision, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 500, 30, 1, ?7, ?7)",
+                         client_user_id, client_owner_email, status, daily_rate_minor,
+                         offer_revision, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 500, 1, ?7, ?7)",
                     params![
                         installation_id,
                         host_id,
@@ -8936,150 +8715,53 @@ mod tests {
                 Some(provider_id),
                 provider_email,
                 false,
+                Some("provider"),
                 "provider_release",
-                Some(true),
+                Some(false),
             )
             .await
             .expect("ordinary Provider release");
+        {
+            let conn = store.conn.lock().await;
+            assert!(
+                crate::market_access::product_access_allowed_tx(
+                    &conn,
+                    provider_id,
+                    "renter",
+                    "renter@example.com",
+                    crate::market_access::PRODUCT_CLIENT_HOST,
+                )
+                .expect("ordinary release preserves Client access")
+            );
+        }
         store
             .client_market_begin_cleanup_job_with_context(
                 "provider-self-client",
                 Some(provider_id),
                 provider_email,
                 false,
-                "payment_not_received",
+                Some("provider"),
+                "provider_release",
                 Some(true),
             )
             .await
             .expect("self-rental release");
-        assert!(
-            store
-                .client_market_provider_blocks(provider_id)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-
-        drop(store);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn finishing_client_market_email_counts_toward_footer_email_sent() {
-        let (store, _config, root) = test_store("trade-email-footer-count");
-        let now = Utc::now();
         {
             let conn = store.conn.lock().await;
-            conn.execute(
-                "INSERT INTO client_market_email_deliveries
-                    (id, kind, recipient, subject, html_body, text_body, idempotency_key,
-                     status, attempts, next_attempt_at, claim_owner, created_at, updated_at)
-                 VALUES ('sent-email', 'host_rented', 'owner@example.com', 'subject', '<p>body</p>',
-                         'body', 'test:sent-email', 'claimed', 1, ?1, 'worker-a', ?1, ?1)",
-                params![now.to_rfc3339()],
-            )
-            .unwrap();
-            // Historical market notification that never wrote email_send_logs.
-            conn.execute(
-                "INSERT INTO market_notification_emails
-                    (id, market_email, kind, to_email, locale, payload_json,
-                     provider_message_id, status, error_message, created_at)
-                 VALUES ('market-mail-1', 'market@example.com', 'share_offline',
-                         'user@example.com', 'en', '{}', 're_hist', 'sent', NULL, ?1)",
-                params![now.to_rfc3339()],
-            )
-            .unwrap();
-        }
-
-        store
-            .client_market_finish_email(
-                "sent-email",
-                "worker-a",
-                Some("re_provider_1"),
-                None,
-                None,
-            )
-            .await
-            .expect("finish market email");
-
-        {
-            let conn = store.conn.lock().await;
-            let audit: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM email_send_logs
-                     WHERE id = 'sent-email' AND email_type = 'client_market' AND status = 'sent'",
-                    [],
-                    |row| row.get(0),
+            assert!(
+                crate::market_access::product_access_allowed_tx(
+                    &conn,
+                    provider_id,
+                    provider_id,
+                    provider_email,
+                    crate::market_access::PRODUCT_CLIENT_HOST,
                 )
-                .unwrap();
-            assert_eq!(audit, 1);
+                .expect("self-rental access remains allowed")
+            );
         }
-
-        let counted = store
-            .count_sent_emails_last_24h()
-            .await
-            .expect("count footer emails");
-        assert_eq!(
-            counted, 2,
-            "client_market delivery + historical market_notification must both count"
-        );
 
         drop(store);
         let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn disabled_email_delivery_does_not_claim_or_consume_attempts() {
-        let (store, _config, root) = test_store("trade-email-disabled");
-        let now = Utc::now();
-        {
-            let conn = store.conn.lock().await;
-            conn.execute(
-                "INSERT INTO client_market_email_deliveries
-                    (id, kind, recipient, subject, html_body, text_body, idempotency_key,
-                     status, attempts, next_attempt_at, created_at, updated_at)
-                 VALUES ('pending-email', 'test', 'owner@example.com', 'subject', '<p>body</p>',
-                         'body', 'test:pending-email', 'pending', 0, ?1, ?1, ?1)",
-                params![now.to_rfc3339()],
-            )
-            .unwrap();
-        }
-
-        assert!(
-            store
-                .client_market_claim_email("test-worker", now, false)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        {
-            let conn = store.conn.lock().await;
-            let state: (String, i64) = conn
-                .query_row(
-                    "SELECT status, attempts FROM client_market_email_deliveries
-                     WHERE id = 'pending-email'",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .unwrap();
-            assert_eq!(state, ("pending".into(), 0));
-        }
-        assert!(
-            store
-                .client_market_claim_email("test-worker", now, true)
-                .await
-                .unwrap()
-                .is_some()
-        );
-
-        drop(store);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    fn parse_market_time(value: &str) -> chrono::DateTime<Utc> {
-        chrono::DateTime::parse_from_rfc3339(value)
-            .unwrap()
-            .with_timezone(&Utc)
     }
 
     #[test]
@@ -9236,7 +8918,6 @@ mod tests {
             "198.18.30.1",
             "US",
             Some(500),
-            Some(30),
         )
         .await;
         let now = Utc::now();
@@ -9245,35 +8926,23 @@ mod tests {
             conn.execute(
                 "INSERT INTO client_market_subscriptions
                     (installation_id, host_id, provider_id, host_owner_email,
-                     client_user_id, client_owner_email, status, price_cents,
-                     rental_period_days, offer_revision, current_period_end,
+                     client_user_id, client_owner_email, status, daily_rate_minor,
+                     offer_revision,
                      created_at, updated_at)
                  VALUES ('stuck-client', ?1, 'provider-stuck', 'provider@example.com',
                          'client-stuck', 'client@example.com', 'release_failed', 500,
-                         30, 1, ?2, ?3, ?3)",
-                params![
-                    host.id,
-                    (now - chrono::Duration::days(1)).to_rfc3339(),
-                    now.to_rfc3339(),
-                ],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO client_market_invoices
-                    (id, installation_id, sequence, amount_cents, rental_period_days,
-                     offer_revision, status, deadline_at, opened_at)
-                 VALUES ('stuck-invoice', 'stuck-client', 1, 500, 30, 1, 'open', ?1, ?2)",
-                params![
-                    (now + chrono::Duration::days(1)).to_rfc3339(),
-                    now.to_rfc3339()
-                ],
+                         1, ?2, ?2)",
+                params![host.id, now.to_rfc3339()],
             )
             .unwrap();
         }
 
         let client = market_session("client-stuck", "client@example.com");
         assert!(
-            store.client_market_assert_creation_allowed(&client).await.is_err(),
+            store
+                .client_market_assert_creation_allowed(&client)
+                .await
+                .is_err(),
             "release_failed must block creation before the force release"
         );
 
@@ -9287,7 +8956,6 @@ mod tests {
             .expect("force release a wedged subscription");
         assert_eq!(outcome.previous_status, "release_failed");
         assert_eq!(outcome.status, "released");
-        assert_eq!(outcome.canceled_invoices, 1);
 
         store
             .client_market_assert_creation_allowed(&client)
@@ -9321,23 +8989,34 @@ mod tests {
             "198.18.31.1",
             "US",
             None,
-            None,
+        )
+        .await;
+        let paid_host = add_provider_host(
+            &store,
+            "provider-self",
+            "self@example.com",
+            "198.18.31.2",
+            "US",
+            Some(500),
         )
         .await;
 
         let owner = market_session("provider-self", "self@example.com");
-        store
+        let self_paid_quote = store
             .client_market_create_quote(
                 &owner,
                 CreateQuoteRequest {
                     provider_ids: vec!["provider-self".into()],
                     country_codes: vec!["US".into()],
                     count: 1,
-                    host_id: Some(host.id.clone()),
+                    host_id: Some(paid_host.id.clone()),
                 },
             )
             .await
             .expect("a Provider must be able to quote their own Host by id");
+        assert_eq!(self_paid_quote.items[0].host_id, paid_host.id);
+        assert!(self_paid_quote.items[0].daily_rate_minor.is_none());
+        assert!(self_paid_quote.items[0].currency.is_none());
 
         // Release the reserved Host so a follow-up quote can claim it again.
         {
@@ -9350,7 +9029,7 @@ mod tests {
             .unwrap();
             conn.execute(
                 "UPDATE router_ssh_hosts SET status = 'idle', updated_at = ?1 WHERE id = ?2",
-                params![past, host.id],
+                params![past, paid_host.id],
             )
             .unwrap();
         }
@@ -9412,7 +9091,6 @@ mod tests {
             "198.18.32.1",
             "US",
             Some(500),
-            Some(30),
         )
         .await;
         assert!(

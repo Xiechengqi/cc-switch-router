@@ -1,4 +1,4 @@
-import type { ClientMarketBilling, ClientMarketHost } from "@/lib/types";
+import type { ClientMarketHost, ClientMarketRental } from "@/lib/types";
 
 /**
  * Identity-preserving merges for the 20s Client Market poll.
@@ -11,7 +11,7 @@ import type { ClientMarketBilling, ClientMarketHost } from "@/lib/types";
  * and stop at the first difference.
  *
  * Both comparators enumerate every field of their type. If a field is added to
- * `ClientMarketHost` / `ClientMarketBilling` it MUST be added here too, otherwise the
+ * `ClientMarketHost` / `ClientMarketRental` it MUST be added here too, otherwise the
  * table will silently render stale values.
  */
 
@@ -23,8 +23,8 @@ const HOST_SCALAR_KEYS = [
   "ip",
   "port",
   "hostOwnerEmail",
-  "priceCents",
-  "rentalPeriodDays",
+  "dailyRateMinor",
+  "currency",
   "offerRevision",
   "countryCode",
   "hostname",
@@ -56,7 +56,6 @@ function sameHost(left: ClientMarketHost, right: ClientMarketHost): boolean {
     if (left[key] !== right[key]) return false;
   }
   if (!sameStringList(left.paymentMethodKinds, right.paymentMethodKinds)) return false;
-  if (JSON.stringify(left.paymentMethods ?? []) !== JSON.stringify(right.paymentMethods ?? [])) return false;
   if (JSON.stringify(left.contacts ?? []) !== JSON.stringify(right.contacts ?? [])) return false;
   // ipIntel is a nested object refreshed rarely; only pay for it once the cheap
   // scalar pass has found no difference.
@@ -79,48 +78,41 @@ export function mergeHosts(prev: ClientMarketHost[], next: ClientMarketHost[]): 
   return changed ? merged : prev;
 }
 
-const BILLING_SCALAR_KEYS = [
+const RENTAL_SCALAR_KEYS = [
   "installationId",
   "hostId",
   "providerId",
   "hostOwnerEmail",
   "clientOwnerEmail",
   "status",
-  "priceCents",
-  "rentalPeriodDays",
+  "dailyRateMinor",
+  "currency",
   "offerRevision",
-  "currentPeriodEnd",
-  "paymentDeadline",
-  "openInvoiceId",
-  "paymentProfileUpdatedAt",
   "isClientOwner",
-  "canDeclarePaid",
   "canRelease",
   "activeCleanupJobId",
   "updatedAt",
-] as const satisfies readonly (keyof ClientMarketBilling)[];
+] as const satisfies readonly (keyof ClientMarketRental)[];
 
-function sameBilling(left: ClientMarketBilling, right: ClientMarketBilling): boolean {
+function sameRental(left: ClientMarketRental, right: ClientMarketRental): boolean {
   if (left === right) return true;
-  for (const key of BILLING_SCALAR_KEYS) {
+  for (const key of RENTAL_SCALAR_KEYS) {
     if (left[key] !== right[key]) return false;
   }
   if (!sameStringList(left.paymentMethodKinds, right.paymentMethodKinds)) return false;
   if (JSON.stringify(left.contacts ?? []) !== JSON.stringify(right.contacts ?? [])) return false;
-  return (
-    JSON.stringify(left.paymentMethods ?? null) === JSON.stringify(right.paymentMethods ?? null)
-  );
+  return true;
 }
 
-export function mergeBillingMap(
-  prev: Map<string, ClientMarketBilling>,
-  next: ClientMarketBilling[],
-): Map<string, ClientMarketBilling> {
+export function mergeRentalMap(
+  prev: Map<string, ClientMarketRental>,
+  next: ClientMarketRental[],
+): Map<string, ClientMarketRental> {
   let changed = prev.size !== next.length;
-  const merged = new Map<string, ClientMarketBilling>();
+  const merged = new Map<string, ClientMarketRental>();
   for (const record of next) {
     const existing = prev.get(record.installationId);
-    if (existing && sameBilling(existing, record)) {
+    if (existing && sameRental(existing, record)) {
       merged.set(record.installationId, existing);
       continue;
     }

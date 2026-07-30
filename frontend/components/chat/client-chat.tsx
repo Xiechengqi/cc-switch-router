@@ -24,7 +24,6 @@ import {
 } from "@/components/dashboard/client-console/client-console-manager";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
-  getClientChatMeta,
   getClientChatRoom,
   getVisitedClientChatRooms,
   importClientChatVisits,
@@ -39,6 +38,7 @@ const CHAT_DOCK_CONSOLE_GAP = 12;
 
 type ClientChatContextValue = {
   openChat: (installationId: string) => Promise<void>;
+  openClientChat: (installationId: string) => Promise<void>;
   unreadByInstallation: Map<string, number>;
 };
 
@@ -92,17 +92,12 @@ export function ClientChatProvider({ children }: { children: React.ReactNode }) 
 
   const loadUnread = React.useCallback(
     async (signal?: AbortSignal) => {
-      if (session?.authenticated) {
-        const meta = await getClientChatMeta(signal);
-        setTotalUnread(meta.totalUnread);
-      } else {
-        await loadRooms(signal);
-      }
+      await loadRooms(signal);
     },
-    [loadRooms, session?.authenticated],
+    [loadRooms],
   );
 
-  const openChat = React.useCallback(
+  const openClientChat = React.useCallback(
     async (installationId: string) => {
       openedDeepLinkRef.current = installationId;
       const requestId = ++openRequestRef.current;
@@ -209,11 +204,12 @@ export function ClientChatProvider({ children }: { children: React.ReactNode }) 
   }, [loadRooms, openList, selectedRoom]);
 
   React.useEffect(() => {
-    const installationId = new URL(window.location.href).searchParams.get("chat");
+    const url = new URL(window.location.href);
+    const installationId = url.searchParams.get("chat");
     if (installationId && openedDeepLinkRef.current !== installationId) {
-      void openChat(installationId);
+      void openClientChat(installationId);
     }
-  }, [openChat]);
+  }, [openClientChat]);
 
   React.useEffect(() => {
     if (!session?.authenticated || !session.user?.id) {
@@ -253,8 +249,12 @@ export function ClientChatProvider({ children }: { children: React.ReactNode }) 
   }, [loadRooms, loadUnread, open, selectedRoom]);
 
   const context = React.useMemo(
-    () => ({ openChat, unreadByInstallation }),
-    [openChat, unreadByInstallation],
+    () => ({
+      openChat: openClientChat,
+      openClientChat,
+      unreadByInstallation,
+    }),
+    [openClientChat, unreadByInstallation],
   );
 
   return (
@@ -269,8 +269,8 @@ export function ClientChatProvider({ children }: { children: React.ReactNode }) 
         listLoading={listLoading}
         error={error}
         onFabClick={handleFabClick}
-        onSelectRoom={(room) => void openChat(room.installationId)}
-        onOpenInstallation={(installationId) => void openChat(installationId)}
+        onSelectRoom={(room) => void openClientChat(room.installationId)}
+        onOpenInstallation={(installationId) => void openClientChat(installationId)}
         onRoomChange={setSelectedRoom}
         onRoomsRefresh={refreshRooms}
         onBackToList={backToList}

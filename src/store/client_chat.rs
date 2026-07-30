@@ -5,7 +5,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::AppStore;
+use super::{AppStore, RouteHealthStatus};
 use crate::client_chat::{
     CHAT_ARCHIVE_RETENTION_SECS, CHAT_EMAIL_BATCH_WINDOW_SECS, CHAT_MAX_BODY_CHARS,
     CHAT_MESSAGE_PAGE_MAX, CHAT_PUBLIC_LOOKUP_MAX_ROOMS, CHAT_ROOM_MESSAGES_PER_MINUTE,
@@ -31,13 +31,17 @@ enum ChatDeliveryOutcome<'a> {
     DeadLetter(&'a str),
 }
 
+const SHARE_OFFLINE_CONFIRM_SECS: i64 = 180;
+const SHARE_RECOVERY_CONFIRM_SECS: i64 = 120;
+
 pub(super) fn init_schema(conn: &Connection) -> Result<(), AppError> {
     conn.execute_batch(
         "
-        CREATE TABLE IF NOT EXISTS client_chat_rooms (
+        CREATE TABLE IF NOT EXISTS chat_rooms (
             id TEXT PRIMARY KEY,
-            installation_id TEXT NOT NULL UNIQUE,
+            installation_id TEXT NOT NULL,
             client_label_snapshot TEXT NOT NULL,
+            owner_user_id_snapshot TEXT,
             owner_email_snapshot TEXT NOT NULL,
             owner_generation INTEGER NOT NULL DEFAULT 1,
             status TEXT NOT NULL DEFAULT 'active'
@@ -46,10 +50,11 @@ pub(super) fn init_schema(conn: &Connection) -> Result<(), AppError> {
             updated_at TEXT NOT NULL,
             last_message_at TEXT,
             archived_at TEXT,
-            delete_after TEXT
+            delete_after TEXT,
+            UNIQUE (installation_id, owner_generation)
         );
 
-        CREATE TABLE IF NOT EXISTS client_chat_messages (
+        CREATE TABLE IF NOT EXISTS chat_messages (
             seq INTEGER PRIMARY KEY AUTOINCREMENT,
             id TEXT NOT NULL UNIQUE,
             room_id TEXT NOT NULL,
@@ -57,6 +62,14 @@ pub(super) fn init_schema(conn: &Connection) -> Result<(), AppError> {
             author_email TEXT NOT NULL,
             author_label TEXT NOT NULL,
             client_message_id TEXT NOT NULL,
+            author_kind TEXT NOT NULL DEFAULT 'user'
+                CHECK (author_kind IN ('user', 'system')),
+            message_kind TEXT NOT NULL DEFAULT 'text'
+                CHECK (message_kind IN ('text', 'market_event')),
+            event_type TEXT,
+            event_payload_json TEXT,
+            payload_version INTEGER NOT NULL DEFAULT 1,
+            source_event_id TEXT UNIQUE,
             body TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'visible'
                 CHECK (status IN ('visible', 'deleted')),
@@ -65,10 +78,10 @@ pub(super) fn init_schema(conn: &Connection) -> Result<(), AppError> {
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             UNIQUE (room_id, author_user_id, client_message_id),
-            FOREIGN KEY (room_id) REFERENCES client_chat_rooms(id) ON DELETE CASCADE
+            FOREIGN KEY (room_id) REFERENCES chat_rooms(id) ON DELETE CASCADE
         );
 
-        CREATE TABLE IF NOT EXISTS client_chat_visits (
+        CREATE TABLE IF NOT EXISTS chat_visits (
             user_id TEXT NOT NULL,
             room_id TEXT NOT NULL,
             first_opened_at TEXT NOT NULL,
@@ -76,17 +89,61 @@ pub(super) fn init_schema(conn: &Connection) -> Result<(), AppError> {
             last_read_seq INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT NOT NULL,
             PRIMARY KEY (user_id, room_id),
-            FOREIGN KEY (room_id) REFERENCES client_chat_rooms(id) ON DELETE CASCADE
+            FOREIGN KEY (room_id) REFERENCES chat_rooms(id) ON DELETE CASCADE
         );
 
-        CREATE TABLE IF NOT EXISTS client_chat_rate_limit (
+        CREATE TABLE IF NOT EXISTS share_presence_state (
+            share_id TEXT PRIMARY KEY,
+            state TEXT NOT NULL DEFAULT 'unknown'
+                CHECK (state IN ('unknown', 'online', 'offline')),
+            router_epoch TEXT NOT NULL,
+            has_online_baseline INTEGER NOT NULL DEFAULT 0,
+            unhealthy_since TEXT,
+            healthy_since TEXT,
+            offline_episode INTEGER NOT NULL DEFAULT 0,
+            last_offline_event_id TEXT,
+            last_recovered_event_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS client_chat_system_outbox (
+            id TEXT PRIMARY KEY,
+            installation_id TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            source_event_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            follower_user_ids_json TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'processing', 'completed', 'dead_letter')),
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT,
+            last_error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            UNIQUE (source_kind, source_event_id, installation_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS chat_public_payment_assets (
+            asset_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            room_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (asset_id, message_id),
+            FOREIGN KEY (message_id) REFERENCES chat_messages(id) ON DELETE CASCADE,
+            FOREIGN KEY (room_id) REFERENCES chat_rooms(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS chat_rate_limit (
             scope TEXT NOT NULL,
             bucket_start INTEGER NOT NULL,
             count INTEGER NOT NULL,
             PRIMARY KEY (scope, bucket_start)
         );
 
-        CREATE TABLE IF NOT EXISTS client_chat_email_events (
+        CREATE TABLE IF NOT EXISTS chat_email_events (
             id TEXT PRIMARY KEY,
             message_id TEXT NOT NULL UNIQUE,
             room_id TEXT NOT NULL,
@@ -98,11 +155,11 @@ pub(super) fn init_schema(conn: &Connection) -> Result<(), AppError> {
             window_ends_at TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
-            FOREIGN KEY (message_id) REFERENCES client_chat_messages(id) ON DELETE CASCADE,
-            FOREIGN KEY (room_id) REFERENCES client_chat_rooms(id) ON DELETE CASCADE
+            FOREIGN KEY (message_id) REFERENCES chat_messages(id) ON DELETE CASCADE,
+            FOREIGN KEY (room_id) REFERENCES chat_rooms(id) ON DELETE CASCADE
         );
 
-        CREATE TABLE IF NOT EXISTS client_chat_email_deliveries (
+        CREATE TABLE IF NOT EXISTS chat_email_deliveries (
             id TEXT PRIMARY KEY,
             room_id TEXT NOT NULL,
             installation_id TEXT NOT NULL,
@@ -126,31 +183,37 @@ pub(super) fn init_schema(conn: &Connection) -> Result<(), AppError> {
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             sent_at TEXT,
-            FOREIGN KEY (room_id) REFERENCES client_chat_rooms(id) ON DELETE CASCADE
+            FOREIGN KEY (room_id) REFERENCES chat_rooms(id) ON DELETE CASCADE
         );
 
-        CREATE TABLE IF NOT EXISTS client_chat_email_delivery_items (
+        CREATE TABLE IF NOT EXISTS chat_email_delivery_items (
             delivery_id TEXT NOT NULL,
             event_id TEXT NOT NULL,
             PRIMARY KEY (delivery_id, event_id),
-            FOREIGN KEY (delivery_id) REFERENCES client_chat_email_deliveries(id) ON DELETE CASCADE,
-            FOREIGN KEY (event_id) REFERENCES client_chat_email_events(id) ON DELETE CASCADE
+            FOREIGN KEY (delivery_id) REFERENCES chat_email_deliveries(id) ON DELETE CASCADE,
+            FOREIGN KEY (event_id) REFERENCES chat_email_events(id) ON DELETE CASCADE
         );
 
-        CREATE INDEX IF NOT EXISTS idx_client_chat_rooms_status
-            ON client_chat_rooms(status, delete_after);
-        CREATE INDEX IF NOT EXISTS idx_client_chat_messages_room_seq
-            ON client_chat_messages(room_id, seq DESC);
-        CREATE INDEX IF NOT EXISTS idx_client_chat_messages_author
-            ON client_chat_messages(author_user_id, created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_client_chat_visits_user_recent
-            ON client_chat_visits(user_id, last_opened_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_client_chat_events_pending
-            ON client_chat_email_events(status, window_ends_at, room_id, owner_generation);
-        CREATE INDEX IF NOT EXISTS idx_client_chat_delivery_claim
-            ON client_chat_email_deliveries(status, next_attempt_at, not_before, claim_expires_at);
-        CREATE INDEX IF NOT EXISTS idx_client_chat_delivery_recent
-            ON client_chat_email_deliveries(created_at DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_chat_rooms_status
+            ON chat_rooms(status, delete_after);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_rooms_active_installation
+            ON chat_rooms(installation_id) WHERE status = 'active';
+        CREATE INDEX IF NOT EXISTS idx_chat_messages_room_seq
+            ON chat_messages(room_id, seq DESC);
+        CREATE INDEX IF NOT EXISTS idx_chat_messages_author
+            ON chat_messages(author_user_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_chat_visits_user_recent
+            ON chat_visits(user_id, last_opened_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_client_chat_system_outbox_pending
+            ON client_chat_system_outbox(status, next_attempt_at, created_at);
+        CREATE INDEX IF NOT EXISTS idx_chat_public_payment_assets_asset
+            ON chat_public_payment_assets(asset_id);
+        CREATE INDEX IF NOT EXISTS idx_chat_events_pending
+            ON chat_email_events(status, window_ends_at, room_id, owner_generation);
+        CREATE INDEX IF NOT EXISTS idx_chat_delivery_claim
+            ON chat_email_deliveries(status, next_attempt_at, not_before, claim_expires_at);
+        CREATE INDEX IF NOT EXISTS idx_chat_delivery_recent
+            ON chat_email_deliveries(created_at DESC, id DESC);
         ",
     )
     .map_err(|error| {
@@ -159,8 +222,9 @@ pub(super) fn init_schema(conn: &Connection) -> Result<(), AppError> {
 
     let now = Utc::now();
     conn.execute(
-        "INSERT OR IGNORE INTO client_chat_rooms (
-            id, installation_id, client_label_snapshot, owner_email_snapshot,
+        "INSERT OR IGNORE INTO chat_rooms (
+            id, installation_id, client_label_snapshot, owner_user_id_snapshot,
+            owner_email_snapshot,
             owner_generation, status, created_at, updated_at
          )
          SELECT lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' ||
@@ -169,6 +233,7 @@ pub(super) fn init_schema(conn: &Connection) -> Result<(), AppError> {
                 substr(lower(hex(randomblob(2))), 2) || '-' || lower(hex(randomblob(6))),
                 i.id,
                 COALESCE(NULLIF(t.subdomain, ''), i.platform || ' · ' || substr(i.id, 1, 8)),
+                (SELECT u.id FROM users u WHERE u.email_normalized = lower(trim(i.owner_email))),
                 lower(trim(i.owner_email)), 1, 'active', ?1, ?1
          FROM installations i
          LEFT JOIN installation_client_tunnels t ON t.installation_id = i.id
@@ -211,7 +276,7 @@ pub(super) fn init_schema(conn: &Connection) -> Result<(), AppError> {
         let mut statement = conn
             .prepare(
                 "SELECT r.installation_id
-                 FROM client_chat_rooms r
+                 FROM chat_rooms r
                  LEFT JOIN installations i ON i.id = r.installation_id
                  WHERE r.status = 'active'
                    AND (i.id IS NULL OR i.owner_verified_at IS NULL
@@ -260,7 +325,9 @@ pub(super) fn ensure_room_for_verified_owner_tx(
 
     let existing = conn
         .query_row(
-            "SELECT id, owner_email_snapshot FROM client_chat_rooms WHERE installation_id = ?1",
+            "SELECT id, owner_email_snapshot FROM chat_rooms
+             WHERE installation_id = ?1
+             ORDER BY owner_generation DESC LIMIT 1",
             params![installation_id],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
@@ -269,9 +336,12 @@ pub(super) fn ensure_room_for_verified_owner_tx(
     if let Some((room_id, existing_owner)) = existing {
         let owner_changed = !existing_owner.eq_ignore_ascii_case(&owner_email);
         conn.execute(
-            "UPDATE client_chat_rooms
+            "UPDATE chat_rooms
              SET client_label_snapshot = ?2,
                  owner_email_snapshot = ?3,
+                 owner_user_id_snapshot = (
+                    SELECT id FROM users WHERE email_normalized = ?3
+                 ),
                  owner_generation = owner_generation + CASE WHEN lower(owner_email_snapshot) != ?3 THEN 1 ELSE 0 END,
                  status = 'active', archived_at = NULL, delete_after = NULL, updated_at = ?4
              WHERE id = ?1",
@@ -286,10 +356,13 @@ pub(super) fn ensure_room_for_verified_owner_tx(
 
     let room_id = Uuid::new_v4().to_string();
     conn.execute(
-        "INSERT INTO client_chat_rooms (
-            id, installation_id, client_label_snapshot, owner_email_snapshot,
+        "INSERT INTO chat_rooms (
+            id, installation_id, client_label_snapshot,
+            owner_user_id_snapshot, owner_email_snapshot,
             owner_generation, status, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, 1, 'active', ?5, ?5)",
+         ) VALUES (?1, ?2, ?3,
+                   (SELECT id FROM users WHERE email_normalized = ?4),
+                   ?4, 1, 'active', ?5, ?5)",
         params![
             room_id,
             installation_id,
@@ -309,7 +382,8 @@ pub(super) fn archive_room_for_installation_tx(
 ) -> Result<(), AppError> {
     let room_id = conn
         .query_row(
-            "SELECT id FROM client_chat_rooms WHERE installation_id = ?1",
+            "SELECT id FROM chat_rooms
+             WHERE installation_id = ?1 AND status = 'active'",
             params![installation_id],
             |row| row.get::<_, String>(0),
         )
@@ -321,7 +395,7 @@ pub(super) fn archive_room_for_installation_tx(
         return Ok(());
     };
     conn.execute(
-        "UPDATE client_chat_rooms
+        "UPDATE chat_rooms
          SET status = 'archived', archived_at = ?2, delete_after = ?3, updated_at = ?2
          WHERE id = ?1 AND status = 'active'",
         params![
@@ -335,13 +409,544 @@ pub(super) fn archive_room_for_installation_tx(
     Ok(())
 }
 
+pub(crate) fn record_share_presence_observation_tx(
+    conn: &Connection,
+    share_id: &str,
+    status: RouteHealthStatus,
+    reason: &str,
+    router_epoch: &str,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let share_lifecycle = conn
+        .query_row(
+            "SELECT share_status, expires_at FROM shares WHERE share_id = ?1",
+            params![share_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(|error| AppError::Internal(format!("read Share lifecycle failed: {error}")))?;
+    let Some((share_status, expires_at)) = share_lifecycle else {
+        return Ok(());
+    };
+    let expires_at_text = expires_at;
+    let expires_at = DateTime::parse_from_rfc3339(&expires_at_text)
+        .map(|value| value.with_timezone(&Utc))
+        .unwrap_or(now);
+    let lifecycle_active = share_status == "active" && expires_at > now;
+    if share_status == "active" && expires_at <= now {
+        crate::share_market::enqueue_share_lifecycle_event_tx(
+            conn,
+            share_id,
+            "share_expired",
+            serde_json::json!({ "expiresAt": expires_at_text }),
+            &format!("share-lifecycle:{share_id}:expired:{expires_at_text}"),
+            now,
+        )?;
+    }
+    let stored = conn
+        .query_row(
+            "SELECT state, router_epoch, has_online_baseline, unhealthy_since,
+                    healthy_since, offline_episode
+             FROM share_presence_state WHERE share_id = ?1",
+            params![share_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? != 0,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| {
+            AppError::Internal(format!("read Share presence state failed: {error}"))
+        })?;
+    let now_text = now.to_rfc3339();
+    if !lifecycle_active {
+        conn.execute(
+            "INSERT INTO share_presence_state (
+                share_id, state, router_epoch, has_online_baseline, unhealthy_since,
+                healthy_since, offline_episode, created_at, updated_at
+             ) VALUES (?1, 'unknown', ?2, 0, NULL, NULL, 0, ?3, ?3)
+             ON CONFLICT(share_id) DO UPDATE SET
+                state = 'unknown', router_epoch = excluded.router_epoch,
+                has_online_baseline = 0, unhealthy_since = NULL, healthy_since = NULL,
+                updated_at = excluded.updated_at",
+            params![share_id, router_epoch, now_text],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("reset Share presence state failed: {error}"))
+        })?;
+        return Ok(());
+    }
+    let Some((state, previous_epoch, has_online_baseline, unhealthy_since, healthy_since, episode)) =
+        stored
+    else {
+        let (initial_state, baseline) = if status == RouteHealthStatus::Healthy {
+            ("online", 1)
+        } else {
+            ("unknown", 0)
+        };
+        conn.execute(
+            "INSERT INTO share_presence_state (
+                share_id, state, router_epoch, has_online_baseline, unhealthy_since,
+                healthy_since, offline_episode, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, 0, ?5, ?5)",
+            params![share_id, initial_state, router_epoch, baseline, now_text],
+        )
+        .map_err(|error| AppError::Internal(format!("baseline Share presence failed: {error}")))?;
+        return Ok(());
+    };
+
+    if previous_epoch != router_epoch {
+        let (next_state, next_baseline, next_healthy_since) = if state == "offline" {
+            (
+                "offline",
+                i64::from(has_online_baseline),
+                (status == RouteHealthStatus::Healthy).then_some(now_text.as_str()),
+            )
+        } else if status == RouteHealthStatus::Healthy {
+            ("online", 1, None)
+        } else {
+            ("unknown", i64::from(has_online_baseline), None)
+        };
+        conn.execute(
+            "UPDATE share_presence_state
+             SET state = ?2, router_epoch = ?3, has_online_baseline = ?4,
+                 unhealthy_since = NULL, healthy_since = ?5, updated_at = ?6
+             WHERE share_id = ?1",
+            params![
+                share_id,
+                next_state,
+                router_epoch,
+                next_baseline,
+                next_healthy_since,
+                now_text,
+            ],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("rebaseline Share presence epoch failed: {error}"))
+        })?;
+        return Ok(());
+    }
+
+    match status {
+        RouteHealthStatus::Unknown => {
+            conn.execute(
+                "UPDATE share_presence_state
+                 SET unhealthy_since = NULL, healthy_since = NULL, updated_at = ?2
+                 WHERE share_id = ?1",
+                params![share_id, now_text],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("pause Share presence transition failed: {error}"))
+            })?;
+        }
+        RouteHealthStatus::Healthy if state == "offline" => {
+            let started_at = healthy_since
+                .as_deref()
+                .map(|value| parse_timestamp(value.to_string(), "Share recovery candidate"))
+                .transpose()?
+                .unwrap_or(now);
+            if now.signed_duration_since(started_at).num_seconds() >= SHARE_RECOVERY_CONFIRM_SECS {
+                let event_id = crate::share_market::enqueue_share_lifecycle_event_tx(
+                    conn,
+                    share_id,
+                    "service_recovered",
+                    serde_json::json!({
+                        "episode": episode,
+                        "recoveredAt": now_text,
+                    }),
+                    &format!("share-presence:{share_id}:{episode}:recovered"),
+                    now,
+                )?;
+                conn.execute(
+                    "UPDATE share_presence_state
+                     SET state = 'online', has_online_baseline = 1,
+                         unhealthy_since = NULL, healthy_since = NULL,
+                         last_recovered_event_id = ?2, updated_at = ?3
+                     WHERE share_id = ?1",
+                    params![share_id, event_id, now_text],
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!("confirm Share recovery failed: {error}"))
+                })?;
+            } else if healthy_since.is_none() {
+                conn.execute(
+                    "UPDATE share_presence_state SET healthy_since = ?2, updated_at = ?2
+                     WHERE share_id = ?1",
+                    params![share_id, now_text],
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!("start Share recovery candidate failed: {error}"))
+                })?;
+            }
+        }
+        RouteHealthStatus::Healthy => {
+            conn.execute(
+                "UPDATE share_presence_state
+                 SET state = 'online', has_online_baseline = 1,
+                     unhealthy_since = NULL, healthy_since = NULL, updated_at = ?2
+                 WHERE share_id = ?1",
+                params![share_id, now_text],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("confirm Share online baseline failed: {error}"))
+            })?;
+        }
+        RouteHealthStatus::Unhealthy if state != "offline" && has_online_baseline => {
+            let started_at = unhealthy_since
+                .as_deref()
+                .map(|value| parse_timestamp(value.to_string(), "Share offline candidate"))
+                .transpose()?
+                .unwrap_or(now);
+            if now.signed_duration_since(started_at).num_seconds() >= SHARE_OFFLINE_CONFIRM_SECS {
+                let next_episode = episode.saturating_add(1);
+                let event_id = crate::share_market::enqueue_share_lifecycle_event_tx(
+                    conn,
+                    share_id,
+                    "service_offline",
+                    serde_json::json!({
+                        "episode": next_episode,
+                        "offlineSince": started_at.to_rfc3339(),
+                        "reason": reason,
+                    }),
+                    &format!("share-presence:{share_id}:{next_episode}:offline"),
+                    now,
+                )?;
+                conn.execute(
+                    "UPDATE share_presence_state
+                     SET state = 'offline', unhealthy_since = NULL, healthy_since = NULL,
+                         offline_episode = ?2, last_offline_event_id = ?3, updated_at = ?4
+                     WHERE share_id = ?1",
+                    params![share_id, next_episode, event_id, now_text],
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!("confirm Share offline transition failed: {error}"))
+                })?;
+            } else if unhealthy_since.is_none() {
+                conn.execute(
+                    "UPDATE share_presence_state SET unhealthy_since = ?2, updated_at = ?2
+                     WHERE share_id = ?1",
+                    params![share_id, now_text],
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!("start Share offline candidate failed: {error}"))
+                })?;
+            }
+        }
+        RouteHealthStatus::Unhealthy => {
+            conn.execute(
+                "UPDATE share_presence_state SET healthy_since = NULL, updated_at = ?2
+                 WHERE share_id = ?1",
+                params![share_id, now_text],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("retain Share offline state failed: {error}"))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn enqueue_client_system_event_tx(
+    conn: &Connection,
+    installation_id: &str,
+    source_kind: &str,
+    source_event_id: &str,
+    event_type: &str,
+    payload: serde_json::Value,
+    follower_user_ids: &[String],
+    now: &str,
+) -> Result<(), AppError> {
+    validate_system_event_identity(installation_id, "installation id", 128)?;
+    validate_system_event_identity(source_kind, "source kind", 64)?;
+    validate_system_event_identity(source_event_id, "source event id", 256)?;
+    validate_system_event_identity(event_type, "event type", 128)?;
+    let payload = sanitize_system_event_payload(payload)?;
+    let payload_json = serde_json::to_string(&payload)
+        .map_err(|error| AppError::Internal(format!("encode client chat event failed: {error}")))?;
+    if payload_json.len() > 64 * 1024 {
+        return Err(AppError::BadRequest(
+            "client chat event payload is too large".into(),
+        ));
+    }
+    let mut followers = follower_user_ids
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    followers.sort();
+    followers.dedup();
+    let followers_json = serde_json::to_string(&followers)
+        .map_err(|error| AppError::Internal(format!("encode chat followers failed: {error}")))?;
+    conn.execute(
+        "INSERT OR IGNORE INTO client_chat_system_outbox (
+            id, installation_id, source_kind, source_event_id, event_type,
+            payload_json, follower_user_ids_json, status, attempts,
+            next_attempt_at, last_error, created_at, updated_at, completed_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', 0,
+                   NULL, NULL, ?8, ?8, NULL)",
+        params![
+            Uuid::new_v4().to_string(),
+            installation_id,
+            source_kind,
+            source_event_id,
+            event_type,
+            payload_json,
+            followers_json,
+            now,
+        ],
+    )
+    .map_err(|error| AppError::Internal(format!("enqueue client chat event failed: {error}")))?;
+    Ok(())
+}
+
+fn validate_system_event_identity(
+    value: &str,
+    field: &str,
+    max_len: usize,
+) -> Result<(), AppError> {
+    if value.is_empty()
+        || value.len() > max_len
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+    {
+        return Err(AppError::BadRequest(format!("invalid {field}")));
+    }
+    Ok(())
+}
+
+pub(crate) fn sanitize_system_event_payload(
+    mut payload: serde_json::Value,
+) -> Result<serde_json::Value, AppError> {
+    if !payload.is_object() {
+        return Err(AppError::BadRequest(
+            "client chat event payload must be an object".into(),
+        ));
+    }
+    sanitize_system_event_value(&mut payload, None)?;
+    Ok(payload)
+}
+
+pub(crate) fn sanitize_system_event_text(value: &str) -> String {
+    if contains_credential_fragment(value) {
+        "[credential omitted]".into()
+    } else {
+        value.to_string()
+    }
+}
+
+fn sanitize_system_event_value(
+    value: &mut serde_json::Value,
+    field_name: Option<&str>,
+) -> Result<(), AppError> {
+    match value {
+        serde_json::Value::Object(object) => {
+            let allows_payment_asset_token = object
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| kind == "crypto")
+                && object
+                    .get("token")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|token| matches!(token, "USDT" | "USDC"));
+            for (key, value) in object {
+                let normalized = key
+                    .chars()
+                    .filter(|character| character.is_ascii_alphanumeric())
+                    .flat_map(char::to_lowercase)
+                    .collect::<String>();
+                if is_forbidden_event_field(&normalized)
+                    && !(normalized == "token" && allows_payment_asset_token)
+                {
+                    return Err(AppError::BadRequest(format!(
+                        "client chat event payload contains forbidden credential field {key}"
+                    )));
+                }
+                sanitize_system_event_value(value, Some(key))?;
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                sanitize_system_event_value(value, field_name)?;
+            }
+        }
+        serde_json::Value::String(text) => {
+            let field = field_name.unwrap_or("url");
+            if looks_like_event_url(text, field) {
+                validate_event_url(text, field)?;
+            }
+            if contains_credential_fragment(text) {
+                *text = sanitize_system_event_text(text);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn is_forbidden_event_field(normalized: &str) -> bool {
+    [
+        "apikey",
+        "accesstoken",
+        "refreshtoken",
+        "idtoken",
+        "sessiontoken",
+        "oauthtoken",
+        "authtoken",
+        "apitoken",
+        "bearertoken",
+        "verificationtoken",
+        "provisiontoken",
+        "resettoken",
+        "csrftoken",
+        "token",
+        "jwt",
+        "authorization",
+        "cookie",
+        "setcookie",
+        "password",
+        "clientwebpassword",
+        "secret",
+        "controlsecret",
+        "sshpassword",
+        "privatekey",
+        "credential",
+        "credentials",
+        "leasecredential",
+        "passphrase",
+    ]
+    .iter()
+    .any(|forbidden| normalized == *forbidden || normalized.ends_with(forbidden))
+}
+
+fn looks_like_event_url(value: &str, field: &str) -> bool {
+    value.starts_with("https://")
+        || value.starts_with("http://")
+        || (value.starts_with('/')
+            && field
+                .chars()
+                .filter(|character| character.is_ascii_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect::<String>()
+                .ends_with("url"))
+}
+
+fn validate_event_url(value: &str, field: &str) -> Result<(), AppError> {
+    if value.starts_with('/') {
+        if value.starts_with("//") || value.chars().any(char::is_control) {
+            return Err(AppError::BadRequest(format!(
+                "{field} must be a same-origin absolute path"
+            )));
+        }
+        let parsed = url::Url::parse(&format!("https://router.invalid{value}"))
+            .map_err(|_| AppError::BadRequest(format!("{field} must be a valid public URL")))?;
+        return validate_event_url_query(&parsed, field);
+    }
+    validate_public_event_url(value, field)
+}
+
+pub(crate) fn validate_public_event_url(value: &str, field: &str) -> Result<(), AppError> {
+    let parsed = url::Url::parse(value)
+        .map_err(|_| AppError::BadRequest(format!("{field} must be a valid public URL")))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(AppError::BadRequest(format!(
+            "{field} must be an HTTP or HTTPS URL"
+        )));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(AppError::BadRequest(format!(
+            "{field} must not contain URL credentials"
+        )));
+    }
+    validate_event_url_query(&parsed, field)
+}
+
+fn validate_event_url_query(parsed: &url::Url, field: &str) -> Result<(), AppError> {
+    for (key, _) in parsed.query_pairs() {
+        if is_forbidden_event_url_parameter(&key) {
+            return Err(AppError::BadRequest(format!(
+                "{field} must not contain credential query parameters"
+            )));
+        }
+    }
+    if let Some(fragment) = parsed.fragment() {
+        for (key, _) in url::form_urlencoded::parse(fragment.as_bytes()) {
+            if is_forbidden_event_url_parameter(&key) {
+                return Err(AppError::BadRequest(format!(
+                    "{field} must not contain credential fragment parameters"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_forbidden_event_url_parameter(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    [
+        "token",
+        "signature",
+        "secret",
+        "key",
+        "credential",
+        "authorization",
+        "password",
+    ]
+    .iter()
+    .any(|forbidden| normalized.contains(forbidden))
+}
+
+fn contains_credential_fragment(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    [
+        "authorization:",
+        "authorization=",
+        "proxy-authorization:",
+        "proxy-authorization=",
+        "bearer ",
+        "x-api-key:",
+        "x-api-key=",
+        "x-goog-api-key:",
+        "x-goog-api-key=",
+        "api_key=",
+        "apikey=",
+        "access_token=",
+        "refresh_token=",
+        "id_token=",
+        "session_token=",
+        "oauth_token=",
+        "client_secret=",
+        "cookie:",
+        "set-cookie:",
+        "control_secret=",
+        "ssh_password=",
+        "private_key=",
+        "password=",
+        "secret=",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+        || lower.starts_with("sk-")
+        || lower.contains(" sk-")
+}
+
 pub(super) fn cleanup_expired_rooms_tx(
     conn: &Connection,
     now: DateTime<Utc>,
 ) -> Result<usize, AppError> {
     let deleted = conn
         .execute(
-            "DELETE FROM client_chat_rooms
+            "DELETE FROM chat_rooms
          WHERE status = 'archived' AND delete_after IS NOT NULL AND delete_after <= ?1",
             params![now.to_rfc3339()],
         )
@@ -349,7 +954,7 @@ pub(super) fn cleanup_expired_rooms_tx(
             AppError::Internal(format!("delete expired chat rooms failed: {error}"))
         })?;
     conn.execute(
-        "DELETE FROM client_chat_rate_limit WHERE bucket_start < ?1",
+        "DELETE FROM chat_rate_limit WHERE bucket_start < ?1",
         params![now.timestamp() - 2 * 60 * 60],
     )
     .map_err(|error| {
@@ -413,7 +1018,7 @@ impl AppStore {
             .ok_or_else(|| AppError::NotFound("client chat room not found".into()))
     }
 
-    pub async fn lookup_client_chat_rooms(
+    pub async fn lookup_chat_rooms(
         &self,
         installation_ids: Vec<String>,
         last_read_seq_by_installation: BTreeMap<String, i64>,
@@ -471,7 +1076,7 @@ impl AppStore {
         })
     }
 
-    pub async fn list_visited_client_chat_rooms(
+    pub async fn list_visited_chat_rooms(
         &self,
         user_id: &str,
     ) -> Result<ClientChatRoomListResponse, AppError> {
@@ -479,11 +1084,11 @@ impl AppStore {
         let room_ids = {
             let mut statement = conn
                 .prepare(
-                    "SELECT v.room_id
-                     FROM client_chat_visits v
-                     INNER JOIN client_chat_rooms r ON r.id = v.room_id
-                     WHERE v.user_id = ?1
-                     ORDER BY COALESCE(r.last_message_at, v.last_opened_at) DESC, r.id DESC
+                    "SELECT r.id
+                     FROM chat_rooms r
+                     INNER JOIN chat_visits v ON v.room_id = r.id AND v.user_id = ?1
+                     ORDER BY COALESCE(r.last_message_at, v.last_opened_at, r.created_at) DESC,
+                              r.id DESC
                      LIMIT ?2",
                 )
                 .map_err(|error| {
@@ -523,21 +1128,10 @@ impl AppStore {
         validate_public_id(room_id, "room id")?;
         let now = Utc::now();
         let conn = self.conn.lock().await;
-        let exists = conn
-            .query_row(
-                "SELECT 1 FROM client_chat_rooms WHERE id = ?1",
-                params![room_id],
-                |_| Ok(()),
-            )
-            .optional()
-            .map_err(|error| AppError::Internal(format!("check chat room failed: {error}")))?
-            .is_some();
-        if !exists {
-            return Err(AppError::NotFound("client chat room not found".into()));
-        }
+        let room = load_room_by_id(&conn, room_id, Some(user_id))?
+            .ok_or_else(|| AppError::NotFound("chat room not found".into()))?;
         upsert_visit_tx(&conn, user_id, room_id, None, now)?;
-        load_room_by_id(&conn, room_id, Some(user_id))?
-            .ok_or_else(|| AppError::NotFound("client chat room not found".into()))
+        Ok(room)
     }
 
     pub async fn remove_client_chat_visit(
@@ -548,14 +1142,14 @@ impl AppStore {
         validate_public_id(room_id, "room id")?;
         let conn = self.conn.lock().await;
         conn.execute(
-            "DELETE FROM client_chat_visits WHERE user_id = ?1 AND room_id = ?2",
+            "DELETE FROM chat_visits WHERE user_id = ?1 AND room_id = ?2",
             params![user_id, room_id],
         )
         .map_err(|error| AppError::Internal(format!("remove chat visit failed: {error}")))?;
         Ok(())
     }
 
-    pub async fn import_client_chat_visits(
+    pub async fn import_chat_visits(
         &self,
         user_id: &str,
         visits: Vec<ClientChatVisitImportItem>,
@@ -581,8 +1175,9 @@ impl AppStore {
             }
             let room = tx
                 .query_row(
-                    "SELECT id, COALESCE((SELECT MAX(seq) FROM client_chat_messages WHERE room_id = r.id), 0)
-                     FROM client_chat_rooms r WHERE installation_id = ?1",
+                    "SELECT id, COALESCE((SELECT MAX(seq) FROM chat_messages WHERE room_id = r.id), 0)
+                     FROM chat_rooms r
+                     WHERE installation_id = ?1 AND status = 'active'",
                     params![visit.installation_id],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
                 )
@@ -614,20 +1209,9 @@ impl AppStore {
         validate_public_id(room_id, "room id")?;
         let now = Utc::now();
         let conn = self.conn.lock().await;
-        let latest_seq = conn
-            .query_row(
-                "SELECT COALESCE((
-                    SELECT MAX(m.seq) FROM client_chat_messages m WHERE m.room_id = r.id
-                 ), 0)
-                 FROM client_chat_rooms r WHERE r.id = ?1",
-                params![room_id],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(|error| {
-                AppError::Internal(format!("read latest chat sequence failed: {error}"))
-            })?
-            .ok_or_else(|| AppError::NotFound("client chat room not found".into()))?;
+        let room = load_room_by_id(&conn, room_id, Some(user_id))?
+            .ok_or_else(|| AppError::NotFound("chat room not found".into()))?;
+        let latest_seq = room.latest_seq;
         let next = last_read_seq.clamp(0, latest_seq);
         upsert_visit_tx(&conn, user_id, room_id, Some(next), now)?;
         Ok(ClientChatReadResponse {
@@ -636,7 +1220,7 @@ impl AppStore {
         })
     }
 
-    pub async fn list_client_chat_messages(
+    pub async fn list_chat_messages(
         &self,
         room_id: &str,
         viewer_user_id: Option<&str>,
@@ -651,37 +1235,33 @@ impl AppStore {
             ));
         }
         let conn = self.conn.lock().await;
-        let exists = conn
+        let room_exists = conn
             .query_row(
-                "SELECT 1 FROM client_chat_rooms WHERE id = ?1",
+                "SELECT 1 FROM chat_rooms WHERE id = ?1",
                 params![room_id],
-                |_| Ok(()),
+                |row| row.get::<_, i64>(0),
             )
             .optional()
-            .map_err(|error| AppError::Internal(format!("check chat room failed: {error}")))?
-            .is_some();
-        if !exists {
-            return Err(AppError::NotFound("client chat room not found".into()));
+            .map_err(|error| AppError::Internal(format!("check chat room failed: {error}")))?;
+        if room_exists.is_none() {
+            return Err(AppError::NotFound("chat room not found".into()));
         }
         let limit = limit.clamp(1, CHAT_MESSAGE_PAGE_MAX);
         let fetch_limit = (limit + 1) as i64;
+        let select = "SELECT id, seq, body, author_user_id, author_label, author_kind,
+                             message_kind, event_type, event_payload_json, status, created_at
+                      FROM chat_messages m";
         let mut messages = if let Some(after_seq) = after_seq {
             query_messages(
                 &conn,
-                "SELECT id, seq, body, author_user_id, author_label, status, created_at
-                 FROM client_chat_messages
-                 WHERE room_id = ?1 AND seq > ?2
-                 ORDER BY seq ASC LIMIT ?3",
+                &format!("{select} WHERE room_id = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3"),
                 params![room_id, after_seq.max(0), fetch_limit],
                 viewer_user_id,
             )?
         } else if let Some(before_seq) = before_seq {
             let mut rows = query_messages(
                 &conn,
-                "SELECT id, seq, body, author_user_id, author_label, status, created_at
-                 FROM client_chat_messages
-                 WHERE room_id = ?1 AND seq < ?2
-                 ORDER BY seq DESC LIMIT ?3",
+                &format!("{select} WHERE room_id = ?1 AND seq < ?2 ORDER BY seq DESC LIMIT ?3"),
                 params![room_id, before_seq.max(0), fetch_limit],
                 viewer_user_id,
             )?;
@@ -690,10 +1270,7 @@ impl AppStore {
         } else {
             let mut rows = query_messages(
                 &conn,
-                "SELECT id, seq, body, author_user_id, author_label, status, created_at
-                 FROM client_chat_messages
-                 WHERE room_id = ?1
-                 ORDER BY seq DESC LIMIT ?2",
+                &format!("{select} WHERE room_id = ?1 ORDER BY seq DESC LIMIT ?2"),
                 params![room_id, fetch_limit],
                 viewer_user_id,
             )?;
@@ -708,15 +1285,7 @@ impl AppStore {
                 messages.truncate(limit);
             }
         }
-        let latest_seq = conn
-            .query_row(
-                "SELECT COALESCE(MAX(seq), 0) FROM client_chat_messages WHERE room_id = ?1",
-                params![room_id],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(|error| {
-                AppError::Internal(format!("read latest chat sequence failed: {error}"))
-            })?;
+        let latest_seq = latest_visible_seq(&conn, room_id)?;
         Ok(ClientChatMessageListResponse {
             messages,
             latest_seq,
@@ -724,27 +1293,25 @@ impl AppStore {
         })
     }
 
-    pub async fn get_client_chat_room_latest_seq(&self, room_id: &str) -> Result<i64, AppError> {
+    pub async fn get_chat_room_latest_seq(
+        &self,
+        room_id: &str,
+        _viewer_user_id: Option<&str>,
+    ) -> Result<i64, AppError> {
         validate_public_id(room_id, "room id")?;
         let conn = self.conn.lock().await;
-        let exists = conn
+        let room_exists = conn
             .query_row(
-                "SELECT 1 FROM client_chat_rooms WHERE id = ?1",
+                "SELECT 1 FROM chat_rooms WHERE id = ?1",
                 params![room_id],
-                |_| Ok(()),
+                |row| row.get::<_, i64>(0),
             )
             .optional()
-            .map_err(|error| AppError::Internal(format!("check chat room failed: {error}")))?
-            .is_some();
-        if !exists {
-            return Err(AppError::NotFound("client chat room not found".into()));
+            .map_err(|error| AppError::Internal(format!("check chat room failed: {error}")))?;
+        if room_exists.is_none() {
+            return Err(AppError::NotFound("chat room not found".into()));
         }
-        conn.query_row(
-            "SELECT COALESCE(MAX(seq), 0) FROM client_chat_messages WHERE room_id = ?1",
-            params![room_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(|error| AppError::Internal(format!("read latest chat sequence failed: {error}")))
+        latest_visible_seq(&conn, room_id)
     }
 
     pub async fn create_client_chat_message(
@@ -779,7 +1346,7 @@ impl AppStore {
             .query_row(
                 "SELECT r.installation_id, r.owner_email_snapshot, r.owner_generation,
                         lower(trim(i.owner_email)), i.owner_verified_at
-                 FROM client_chat_rooms r
+                 FROM chat_rooms r
                  LEFT JOIN installations i ON i.id = r.installation_id
                  WHERE r.id = ?1 AND r.status = 'active'",
                 params![room_id],
@@ -795,9 +1362,7 @@ impl AppStore {
             )
             .optional()
             .map_err(|error| AppError::Internal(format!("read active chat room failed: {error}")))?
-            .ok_or_else(|| {
-                AppError::Conflict("client chat room is archived or unavailable".into())
-            })?;
+            .ok_or_else(|| AppError::Conflict("chat room is archived or unavailable".into()))?;
         let (installation_id, owner_snapshot, owner_generation, owner_email, owner_verified_at) =
             room;
         let owner_email = owner_email
@@ -835,7 +1400,7 @@ impl AppStore {
         let author_email = session.email.trim().to_ascii_lowercase();
         let author_label = email_local_part(&author_email)?;
         tx.execute(
-            "INSERT INTO client_chat_messages (
+            "INSERT INTO chat_messages (
                 id, room_id, author_user_id, author_email, author_label,
                 client_message_id, body, status, created_at, updated_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'visible', ?8, ?8)",
@@ -853,7 +1418,7 @@ impl AppStore {
         .map_err(|error| AppError::Internal(format!("insert chat message failed: {error}")))?;
         let seq = tx.last_insert_rowid();
         tx.execute(
-            "UPDATE client_chat_rooms SET last_message_at = ?2, updated_at = ?2 WHERE id = ?1",
+            "UPDATE chat_rooms SET last_message_at = ?2, updated_at = ?2 WHERE id = ?1",
             params![room_id, now.to_rfc3339()],
         )
         .map_err(|error| {
@@ -878,10 +1443,99 @@ impl AppStore {
             seq,
             body,
             author_label,
+            author_kind: "user".into(),
+            message_kind: "text".into(),
+            event_type: None,
+            event_payload: None,
             is_mine: true,
             status: "visible".into(),
             created_at: now,
         })
+    }
+
+    pub async fn process_client_chat_system_outbox(&self, limit: usize) -> Result<usize, AppError> {
+        let mut conn = self.conn.lock().await;
+        let mut completed = 0;
+        for _ in 0..limit.clamp(1, 200) {
+            let now = Utc::now();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|error| {
+                    AppError::Internal(format!("begin chat outbox transaction failed: {error}"))
+                })?;
+            let item = tx
+                .query_row(
+                    "SELECT id, attempts FROM client_chat_system_outbox
+                     WHERE status = 'pending'
+                       AND (next_attempt_at IS NULL OR next_attempt_at <= ?1)
+                     ORDER BY created_at, id
+                     LIMIT 1",
+                    params![now.to_rfc3339()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()
+                .map_err(|error| AppError::Internal(format!("read chat outbox failed: {error}")))?;
+            let Some((outbox_id, attempts)) = item else {
+                tx.commit().map_err(|error| {
+                    AppError::Internal(format!("commit empty chat outbox failed: {error}"))
+                })?;
+                break;
+            };
+            tx.execute(
+                "UPDATE client_chat_system_outbox
+                 SET status = 'processing', attempts = attempts + 1, updated_at = ?2
+                 WHERE id = ?1 AND status = 'pending'",
+                params![outbox_id, now.to_rfc3339()],
+            )
+            .map_err(|error| AppError::Internal(format!("claim chat outbox failed: {error}")))?;
+            match materialize_client_system_event_tx(&tx, &outbox_id, now) {
+                Ok(()) => {
+                    tx.commit().map_err(|error| {
+                        AppError::Internal(format!("commit chat outbox event failed: {error}"))
+                    })?;
+                    completed += 1;
+                }
+                Err(error) => {
+                    let retry_delay = 5_i64
+                        .saturating_mul(1_i64 << attempts.clamp(0, 6) as u32)
+                        .min(3_600);
+                    let next_status = if attempts + 1 >= 12 {
+                        "dead_letter"
+                    } else {
+                        "pending"
+                    };
+                    tx.execute(
+                        "UPDATE client_chat_system_outbox
+                         SET status = ?2, next_attempt_at = ?3, last_error = ?4, updated_at = ?5
+                         WHERE id = ?1",
+                        params![
+                            outbox_id,
+                            next_status,
+                            (now + Duration::seconds(retry_delay)).to_rfc3339(),
+                            error.to_string(),
+                            now.to_rfc3339(),
+                        ],
+                    )
+                    .map_err(|update_error| {
+                        AppError::Internal(format!(
+                            "record chat outbox failure failed: {update_error}"
+                        ))
+                    })?;
+                    tx.commit().map_err(|commit_error| {
+                        AppError::Internal(format!(
+                            "commit chat outbox failure failed: {commit_error}"
+                        ))
+                    })?;
+                    tracing::warn!(
+                        outbox_id,
+                        attempts = attempts + 1,
+                        error = %error,
+                        "client chat system event materialization failed"
+                    );
+                }
+            }
+        }
+        Ok(completed)
     }
 
     pub async fn delete_client_chat_message(
@@ -897,8 +1551,9 @@ impl AppStore {
             .map_err(|error| AppError::Internal(format!("begin chat delete failed: {error}")))?;
         let message = tx
             .query_row(
-                "SELECT id, seq, body, author_label, status, created_at
-                 FROM client_chat_messages WHERE id = ?1",
+                "SELECT id, seq, body, author_label, author_kind, message_kind,
+                        event_type, event_payload_json, status, created_at
+                 FROM chat_messages WHERE id = ?1",
                 params![message_id],
                 |row| {
                     Ok((
@@ -908,6 +1563,10 @@ impl AppStore {
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
                         row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
                     ))
                 },
             )
@@ -916,9 +1575,14 @@ impl AppStore {
                 AppError::Internal(format!("read chat message for delete failed: {error}"))
             })?
             .ok_or_else(|| AppError::NotFound("chat message not found".into()))?;
-        if message.4 != "deleted" {
+        if message.4 == "system" {
+            return Err(AppError::Conflict(
+                "system chat events cannot be deleted".into(),
+            ));
+        }
+        if message.8 != "deleted" {
             tx.execute(
-                "UPDATE client_chat_messages
+                "UPDATE chat_messages
                  SET status = 'deleted', body = '', deleted_by = ?2,
                      deleted_at = ?3, updated_at = ?3
                  WHERE id = ?1",
@@ -934,9 +1598,13 @@ impl AppStore {
             seq: message.1,
             body: String::new(),
             author_label: message.3,
+            author_kind: message.4,
+            message_kind: message.5,
+            event_type: message.6,
+            event_payload: parse_event_payload(message.7)?,
             is_mine: false,
             status: "deleted".into(),
-            created_at: parse_timestamp(message.5, "chat message")?,
+            created_at: parse_timestamp(message.9, "chat message")?,
         })
     }
 
@@ -959,7 +1627,7 @@ impl AppStore {
                 .prepare(
                     "SELECT room_id, installation_id, owner_generation, recipient,
                             window_started_at, window_ends_at
-                     FROM client_chat_email_events
+                     FROM chat_email_events
                      WHERE status = 'pending' AND window_ends_at <= ?1
                      GROUP BY room_id, installation_id, owner_generation, recipient,
                               window_started_at, window_ends_at
@@ -1004,7 +1672,7 @@ impl AppStore {
                             r.status, r.owner_generation,
                             r.owner_email_snapshot,
                             lower(trim(i.owner_email)), i.owner_verified_at
-                     FROM client_chat_rooms r
+                     FROM chat_rooms r
                      LEFT JOIN installations i ON i.id = r.installation_id
                      LEFT JOIN installation_client_tunnels t ON t.installation_id = r.installation_id
                      WHERE r.id = ?1",
@@ -1058,8 +1726,8 @@ impl AppStore {
                 let mut statement = tx
                     .prepare(
                         "SELECT e.id, m.created_at, m.author_label, m.body
-                         FROM client_chat_email_events e
-                         INNER JOIN client_chat_messages m ON m.id = e.message_id
+                         FROM chat_email_events e
+                         INNER JOIN chat_messages m ON m.id = e.message_id
                          WHERE e.room_id = ?1 AND e.installation_id = ?2
                            AND e.owner_generation = ?3 AND lower(e.recipient) = lower(?4)
                            AND e.window_started_at = ?5 AND e.window_ends_at = ?6
@@ -1098,7 +1766,7 @@ impl AppStore {
             };
             if events.is_empty() {
                 tx.execute(
-                    "UPDATE client_chat_email_events
+                    "UPDATE chat_email_events
                      SET status = 'cancelled_message_deleted', updated_at = ?7
                      WHERE room_id = ?1 AND installation_id = ?2
                        AND owner_generation = ?3 AND lower(recipient) = lower(?4)
@@ -1140,7 +1808,7 @@ impl AppStore {
             );
             let delivery_id = tx
                 .query_row(
-                    "SELECT id FROM client_chat_email_deliveries WHERE idempotency_key = ?1",
+                    "SELECT id FROM chat_email_deliveries WHERE idempotency_key = ?1",
                     params![idempotency_key],
                     |row| row.get::<_, String>(0),
                 )
@@ -1150,7 +1818,7 @@ impl AppStore {
                 })?
                 .unwrap_or_else(|| Uuid::new_v4().to_string());
             tx.execute(
-                "INSERT OR IGNORE INTO client_chat_email_deliveries (
+                "INSERT OR IGNORE INTO chat_email_deliveries (
                     id, room_id, installation_id, client_label, owner_generation,
                     recipient, from_address, reply_to, subject, html_body, text_body,
                     idempotency_key, status, attempts, not_before, created_at, updated_at
@@ -1178,7 +1846,7 @@ impl AppStore {
             })?;
             for (event_id, _, _, _) in &events {
                 tx.execute(
-                    "INSERT OR IGNORE INTO client_chat_email_delivery_items (delivery_id, event_id)
+                    "INSERT OR IGNORE INTO chat_email_delivery_items (delivery_id, event_id)
                      VALUES (?1, ?2)",
                     params![delivery_id, event_id],
                 )
@@ -1192,7 +1860,7 @@ impl AppStore {
                 .collect::<Vec<_>>();
             for event_id in &event_ids {
                 tx.execute(
-                    "UPDATE client_chat_email_events SET status = 'batched', updated_at = ?2
+                    "UPDATE chat_email_events SET status = 'batched', updated_at = ?2
                      WHERE id = ?1 AND status = 'pending'",
                     params![event_id, now.to_rfc3339()],
                 )
@@ -1223,7 +1891,7 @@ impl AppStore {
             })?;
         let id = tx
             .query_row(
-                "SELECT id FROM client_chat_email_deliveries
+                "SELECT id FROM chat_email_deliveries
                  WHERE (
                      status IN ('pending', 'retry')
                      AND not_before <= ?1
@@ -1248,7 +1916,7 @@ impl AppStore {
         };
         let changed = tx
             .execute(
-                "UPDATE client_chat_email_deliveries
+                "UPDATE chat_email_deliveries
                  SET status = 'claimed', claim_owner = ?2, claim_expires_at = ?3,
                      attempts = attempts + 1, updated_at = ?4
                  WHERE id = ?1 AND (
@@ -1273,7 +1941,7 @@ impl AppStore {
             .query_row(
                 "SELECT id, recipient, from_address, reply_to, subject, html_body,
                         text_body, idempotency_key, attempts
-                 FROM client_chat_email_deliveries WHERE id = ?1",
+                 FROM chat_email_deliveries WHERE id = ?1",
                 params![id],
                 |row| {
                     Ok(ChatDeliveryClaim {
@@ -1315,8 +1983,8 @@ impl AppStore {
                 "SELECT d.room_id, d.owner_generation, d.recipient,
                         r.status, r.owner_generation, r.owner_email_snapshot,
                         lower(trim(i.owner_email)), i.owner_verified_at
-                 FROM client_chat_email_deliveries d
-                 INNER JOIN client_chat_rooms r ON r.id = d.room_id
+                 FROM chat_email_deliveries d
+                 INNER JOIN chat_rooms r ON r.id = d.room_id
                  LEFT JOIN installations i ON i.id = r.installation_id
                  WHERE d.id = ?1 AND d.status = 'claimed' AND d.claim_owner = ?2",
                 params![delivery_id, worker_id],
@@ -1456,7 +2124,7 @@ impl AppStore {
             })?;
         let changed = tx
             .execute(
-                "UPDATE client_chat_email_deliveries
+                "UPDATE chat_email_deliveries
                  SET status = ?3, provider_message_id = COALESCE(?4, provider_message_id),
                      error_message = ?5, next_attempt_at = ?6,
                      claim_owner = NULL, claim_expires_at = NULL,
@@ -1481,10 +2149,10 @@ impl AppStore {
         }
         if status == "sent" {
             tx.execute(
-                "UPDATE client_chat_email_events
+                "UPDATE chat_email_events
                  SET status = 'sent', updated_at = ?2
                  WHERE status = 'batched' AND id IN (
-                     SELECT event_id FROM client_chat_email_delivery_items WHERE delivery_id = ?1
+                     SELECT event_id FROM chat_email_delivery_items WHERE delivery_id = ?1
                  )",
                 params![delivery_id, now.to_rfc3339()],
             )
@@ -1495,7 +2163,7 @@ impl AppStore {
                 "INSERT OR IGNORE INTO email_send_logs (
                     id, email_type, to_email, provider_message_id, status, error_message, created_at
                  ) SELECT id, 'client_chat', recipient, provider_message_id, 'sent', NULL, ?2
-                   FROM client_chat_email_deliveries WHERE id = ?1",
+                   FROM chat_email_deliveries WHERE id = ?1",
                 params![delivery_id, now.to_rfc3339()],
             )
             .map_err(|error| {
@@ -1503,10 +2171,10 @@ impl AppStore {
             })?;
         } else if status == "dead_letter" {
             tx.execute(
-                "UPDATE client_chat_email_events
+                "UPDATE chat_email_events
                  SET status = 'dead_letter', updated_at = ?2
                  WHERE status = 'batched' AND id IN (
-                     SELECT event_id FROM client_chat_email_delivery_items WHERE delivery_id = ?1
+                     SELECT event_id FROM chat_email_delivery_items WHERE delivery_id = ?1
                  )",
                 params![delivery_id, now.to_rfc3339()],
             )
@@ -1530,8 +2198,8 @@ impl AppStore {
                 "SELECT d.id, d.room_id, d.installation_id, d.client_label, d.recipient,
                         COUNT(di.event_id), d.status, d.attempts, d.created_at,
                         d.next_attempt_at, d.sent_at, d.error_message
-                 FROM client_chat_email_deliveries d
-                 LEFT JOIN client_chat_email_delivery_items di ON di.delivery_id = d.id
+                 FROM chat_email_deliveries d
+                 LEFT JOIN chat_email_delivery_items di ON di.delivery_id = d.id
                  GROUP BY d.id
                  ORDER BY d.created_at DESC, d.id DESC LIMIT ?1",
             )
@@ -1608,32 +2276,32 @@ impl AppStore {
             })?;
         let changed = tx
             .execute(
-                "UPDATE client_chat_email_deliveries
+                "UPDATE chat_email_deliveries
                  SET status = 'retry', attempts = 0, next_attempt_at = ?2,
                      claim_owner = NULL, claim_expires_at = NULL, error_message = NULL,
                      updated_at = ?2
                  WHERE id = ?1 AND status = 'dead_letter'
                    AND EXISTS (
                        SELECT 1
-                       FROM client_chat_rooms r
+                       FROM chat_rooms r
                        INNER JOIN installations i ON i.id = r.installation_id
-                       WHERE r.id = client_chat_email_deliveries.room_id
+                       WHERE r.id = chat_email_deliveries.room_id
                          AND r.status = 'active'
-                         AND r.owner_generation = client_chat_email_deliveries.owner_generation
-                         AND lower(r.owner_email_snapshot) = lower(client_chat_email_deliveries.recipient)
+                         AND r.owner_generation = chat_email_deliveries.owner_generation
+                         AND lower(r.owner_email_snapshot) = lower(chat_email_deliveries.recipient)
                          AND i.owner_verified_at IS NOT NULL
-                         AND lower(trim(i.owner_email)) = lower(client_chat_email_deliveries.recipient)
+                         AND lower(trim(i.owner_email)) = lower(chat_email_deliveries.recipient)
                    )
                    AND EXISTS (
-                       SELECT 1 FROM client_chat_email_delivery_items di
-                       WHERE di.delivery_id = client_chat_email_deliveries.id
+                       SELECT 1 FROM chat_email_delivery_items di
+                       WHERE di.delivery_id = chat_email_deliveries.id
                    )
                    AND NOT EXISTS (
                        SELECT 1
-                       FROM client_chat_email_delivery_items di
-                       INNER JOIN client_chat_email_events e ON e.id = di.event_id
-                       INNER JOIN client_chat_messages m ON m.id = e.message_id
-                       WHERE di.delivery_id = client_chat_email_deliveries.id
+                       FROM chat_email_delivery_items di
+                       INNER JOIN chat_email_events e ON e.id = di.event_id
+                       INNER JOIN chat_messages m ON m.id = e.message_id
+                       WHERE di.delivery_id = chat_email_deliveries.id
                          AND (e.status != 'dead_letter' OR m.status != 'visible')
                    )",
                 params![delivery_id, now.to_rfc3339()],
@@ -1647,10 +2315,10 @@ impl AppStore {
             ));
         }
         tx.execute(
-            "UPDATE client_chat_email_events
+            "UPDATE chat_email_events
              SET status = 'batched', updated_at = ?2
              WHERE id IN (
-                 SELECT event_id FROM client_chat_email_delivery_items WHERE delivery_id = ?1
+                 SELECT event_id FROM chat_email_delivery_items WHERE delivery_id = ?1
              ) AND status = 'dead_letter'",
             params![delivery_id, now.to_rfc3339()],
         )
@@ -1669,7 +2337,7 @@ fn cancel_deleted_message_delivery_tx(
 ) -> Result<(), AppError> {
     let event_id = conn
         .query_row(
-            "SELECT id FROM client_chat_email_events WHERE message_id = ?1",
+            "SELECT id FROM chat_email_events WHERE message_id = ?1",
             params![message_id],
             |row| row.get::<_, String>(0),
         )
@@ -1682,8 +2350,8 @@ fn cancel_deleted_message_delivery_tx(
         let mut statement = conn
             .prepare(
                 "SELECT d.id
-                 FROM client_chat_email_deliveries d
-                 INNER JOIN client_chat_email_delivery_items di ON di.delivery_id = d.id
+                 FROM chat_email_deliveries d
+                 INNER JOIN chat_email_delivery_items di ON di.delivery_id = d.id
                  WHERE di.event_id = ?1
                    AND d.status IN ('pending', 'retry', 'claimed', 'dead_letter')",
             )
@@ -1702,7 +2370,7 @@ fn cancel_deleted_message_delivery_tx(
     };
     for delivery_id in delivery_ids {
         conn.execute(
-            "UPDATE client_chat_email_deliveries
+            "UPDATE chat_email_deliveries
              SET status = 'cancelled_message_deleted', claim_owner = NULL,
                  claim_expires_at = NULL, updated_at = ?2
              WHERE id = ?1
@@ -1713,12 +2381,12 @@ fn cancel_deleted_message_delivery_tx(
             AppError::Internal(format!("cancel deleted chat delivery failed: {error}"))
         })?;
         conn.execute(
-            "UPDATE client_chat_email_events
+            "UPDATE chat_email_events
              SET status = 'pending', window_started_at = ?2, window_ends_at = ?2, updated_at = ?2
              WHERE status IN ('batched', 'dead_letter') AND id != ?3 AND id IN (
-                 SELECT event_id FROM client_chat_email_delivery_items WHERE delivery_id = ?1
+                 SELECT event_id FROM chat_email_delivery_items WHERE delivery_id = ?1
              ) AND EXISTS (
-                 SELECT 1 FROM client_chat_messages m
+                 SELECT 1 FROM chat_messages m
                  WHERE m.id = message_id AND m.status = 'visible'
              )",
             params![delivery_id, now.to_rfc3339(), event_id],
@@ -1728,7 +2396,7 @@ fn cancel_deleted_message_delivery_tx(
         })?;
     }
     conn.execute(
-        "UPDATE client_chat_email_events
+        "UPDATE chat_email_events
          SET status = 'cancelled_message_deleted', updated_at = ?2
          WHERE id = ?1 AND status != 'sent'",
         params![event_id, now.to_rfc3339()],
@@ -1737,9 +2405,274 @@ fn cancel_deleted_message_delivery_tx(
     Ok(())
 }
 
+fn resolve_client_system_event_room_tx(
+    conn: &Connection,
+    installation_id: &str,
+    now: DateTime<Utc>,
+) -> Result<(String, Option<String>), AppError> {
+    let owner = conn
+        .query_row(
+            "SELECT lower(trim(owner_email)),
+                    (SELECT id FROM users WHERE email_normalized = lower(trim(i.owner_email)))
+             FROM installations i
+             WHERE i.id = ?1 AND i.owner_verified_at IS NOT NULL
+               AND i.owner_email IS NOT NULL AND trim(i.owner_email) != ''",
+            params![installation_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()
+        .map_err(|error| AppError::Internal(format!("read chat event Client failed: {error}")))?;
+    if let Some((owner_email, owner_user_id)) = owner {
+        let room_id = ensure_room_for_verified_owner_tx(conn, installation_id, &owner_email, now)?;
+        return Ok((room_id, owner_user_id));
+    }
+
+    let installation_exists = conn
+        .query_row(
+            "SELECT 1 FROM installations WHERE id = ?1",
+            params![installation_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| AppError::Internal(format!("check chat event Client failed: {error}")))?
+        .is_some();
+    if installation_exists {
+        return Err(AppError::Conflict("client owner is not verified".into()));
+    }
+
+    conn.query_row(
+        "SELECT id,
+                COALESCE(owner_user_id_snapshot,
+                         (SELECT u.id FROM users u
+                          WHERE u.email_normalized = lower(trim(r.owner_email_snapshot))))
+         FROM chat_rooms r
+         WHERE installation_id = ?1
+         ORDER BY owner_generation DESC LIMIT 1",
+        params![installation_id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+    )
+    .optional()
+    .map_err(|error| {
+        AppError::Internal(format!("read archived chat event Client failed: {error}"))
+    })?
+    .ok_or_else(|| AppError::Conflict("client chat room is unavailable".into()))
+}
+
+fn materialize_client_system_event_tx(
+    conn: &Connection,
+    outbox_id: &str,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let event = conn
+        .query_row(
+            "SELECT installation_id, source_kind, source_event_id, event_type,
+                    payload_json, follower_user_ids_json, created_at
+             FROM client_chat_system_outbox WHERE id = ?1 AND status = 'processing'",
+            params![outbox_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| AppError::Internal(format!("read client chat event failed: {error}")))?
+        .ok_or_else(|| AppError::NotFound("client chat event not found".into()))?;
+    let (
+        installation_id,
+        source_kind,
+        source_event_id,
+        event_type,
+        payload_json,
+        follower_user_ids_json,
+        created_at,
+    ) = event;
+    let payload = serde_json::from_str::<serde_json::Value>(&payload_json)
+        .map_err(|error| AppError::Internal(format!("parse client chat event failed: {error}")))?;
+    let payload = sanitize_system_event_payload(payload)?;
+    let payload_json = serde_json::to_string(&payload)
+        .map_err(|error| AppError::Internal(format!("encode client chat event failed: {error}")))?;
+    let mut follower_user_ids = serde_json::from_str::<Vec<String>>(&follower_user_ids_json)
+        .map_err(|error| AppError::Internal(format!("parse chat followers failed: {error}")))?;
+    let (room_id, owner_user_id) =
+        resolve_client_system_event_room_tx(conn, &installation_id, now)?;
+    if let Some(owner_user_id) = owner_user_id {
+        follower_user_ids.push(owner_user_id);
+    }
+    follower_user_ids.sort();
+    follower_user_ids.dedup();
+    let previous_latest_seq = latest_visible_seq(conn, &room_id)?;
+    for user_id in follower_user_ids
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        conn.execute(
+            "INSERT INTO chat_visits (
+                user_id, room_id, first_opened_at, last_opened_at, last_read_seq, updated_at
+             ) VALUES (?1, ?2, ?3, ?3, ?4, ?3)
+             ON CONFLICT(user_id, room_id) DO UPDATE SET
+                last_opened_at = excluded.last_opened_at,
+                updated_at = excluded.updated_at",
+            params![user_id, room_id, now.to_rfc3339(), previous_latest_seq],
+        )
+        .map_err(|error| AppError::Internal(format!("follow client chat room failed: {error}")))?;
+    }
+    let message_source_id = format!("{source_kind}:{source_event_id}:{installation_id}");
+    let body = payload
+        .get("summary")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&event_type);
+    let message_id = Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT OR IGNORE INTO chat_messages (
+            id, room_id, author_user_id, author_email, author_label, client_message_id,
+            author_kind, message_kind, event_type, event_payload_json, payload_version,
+            source_event_id, body, status, created_at, updated_at
+         ) VALUES (?1, ?2, 'system', '', 'System message', ?3,
+                   'system', 'market_event', ?4, ?5, 1, ?3, ?6,
+                   'visible', ?7, ?7)",
+        params![
+            message_id,
+            room_id,
+            message_source_id,
+            event_type,
+            payload_json,
+            body,
+            created_at,
+        ],
+    )
+    .map_err(|error| {
+        AppError::Internal(format!("materialize client chat event failed: {error}"))
+    })?;
+    let stored_message_id = conn
+        .query_row(
+            "SELECT id FROM chat_messages WHERE source_event_id = ?1",
+            params![message_source_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "read materialized client chat event failed: {error}"
+            ))
+        })?;
+    publish_system_event_payment_assets_tx(
+        conn,
+        &room_id,
+        &stored_message_id,
+        &payload,
+        &created_at,
+    )?;
+    conn.execute(
+        "UPDATE chat_rooms
+         SET last_message_at = CASE
+                 WHEN last_message_at IS NULL OR last_message_at < ?2 THEN ?2
+                 ELSE last_message_at END,
+             updated_at = CASE WHEN updated_at < ?2 THEN ?2 ELSE updated_at END
+         WHERE id = ?1",
+        params![room_id, created_at],
+    )
+    .map_err(|error| AppError::Internal(format!("update client chat activity failed: {error}")))?;
+    conn.execute(
+        "UPDATE client_chat_system_outbox
+         SET status = 'completed', next_attempt_at = NULL,
+             last_error = NULL, updated_at = ?2, completed_at = ?2
+         WHERE id = ?1",
+        params![outbox_id, now.to_rfc3339()],
+    )
+    .map_err(|error| AppError::Internal(format!("complete client chat outbox failed: {error}")))?;
+    Ok(())
+}
+
+fn publish_system_event_payment_assets_tx(
+    conn: &Connection,
+    room_id: &str,
+    message_id: &str,
+    payload: &serde_json::Value,
+    created_at: &str,
+) -> Result<(), AppError> {
+    let allowed_owners = ["ownerUserId", "providerUserId", "supplierUserId"]
+        .iter()
+        .filter_map(|field| payload.get(*field).and_then(serde_json::Value::as_str))
+        .filter(|value| !value.trim().is_empty())
+        .collect::<HashSet<_>>();
+    if allowed_owners.is_empty() {
+        return Ok(());
+    }
+    let mut asset_ids = HashSet::new();
+    collect_system_event_payment_asset_ids(payload, &mut asset_ids);
+    for asset_id in asset_ids {
+        let asset_owner = conn
+            .query_row(
+                "SELECT user_id FROM account_payment_assets WHERE id = ?1",
+                params![asset_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!("read system event payment asset failed: {error}"))
+            })?;
+        if !asset_owner
+            .as_deref()
+            .is_some_and(|owner| allowed_owners.contains(owner))
+        {
+            continue;
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO chat_public_payment_assets (
+                asset_id, message_id, room_id, created_at
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![asset_id, message_id, room_id, created_at],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "publish system event payment asset failed: {error}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn collect_system_event_payment_asset_ids<'a>(
+    value: &'a serde_json::Value,
+    output: &mut HashSet<&'a str>,
+) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for value in object.values() {
+                collect_system_event_payment_asset_ids(value, output);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_system_event_payment_asset_ids(value, output);
+            }
+        }
+        serde_json::Value::String(value) => {
+            if let Some(asset_id) = value.strip_prefix("/v1/account/payment-assets/")
+                && !asset_id.is_empty()
+                && asset_id.len() <= 128
+                && asset_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            {
+                output.insert(asset_id);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn room_id_installation(conn: &Connection, room_id: &str) -> Result<String, AppError> {
     conn.query_row(
-        "SELECT installation_id FROM client_chat_rooms WHERE id = ?1",
+        "SELECT installation_id FROM chat_rooms WHERE id = ?1",
         params![room_id],
         |row| row.get::<_, String>(0),
     )
@@ -1807,7 +2740,10 @@ fn load_room_by_installation(
 ) -> Result<Option<ClientChatRoomView>, AppError> {
     let room_id = conn
         .query_row(
-            "SELECT id FROM client_chat_rooms WHERE installation_id = ?1",
+            "SELECT id FROM chat_rooms
+             WHERE installation_id = ?1
+             ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, owner_generation DESC
+             LIMIT 1",
             params![installation_id],
             |row| row.get::<_, String>(0),
         )
@@ -1828,9 +2764,8 @@ fn load_room_by_id(
         .query_row(
             "SELECT r.id, r.installation_id,
                     COALESCE(NULLIF(t.subdomain, ''), r.client_label_snapshot),
-                    r.status, r.last_message_at, r.archived_at,
-                    COALESCE((SELECT MAX(m.seq) FROM client_chat_messages m WHERE m.room_id = r.id), 0)
-             FROM client_chat_rooms r
+                    r.status, r.last_message_at, r.archived_at
+             FROM chat_rooms r
              LEFT JOIN installation_client_tunnels t ON t.installation_id = r.installation_id
              WHERE r.id = ?1",
             params![room_id],
@@ -1842,63 +2777,20 @@ fn load_room_by_id(
                     row.get::<_, String>(3)?,
                     row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<String>>(5)?,
-                    row.get::<_, i64>(6)?,
                 ))
             },
         )
         .optional()
         .map_err(|error| AppError::Internal(format!("read chat room summary failed: {error}")))?;
-    let Some((id, installation_id, client_label, status, last_message_at, archived_at, latest_seq)) =
-        row
+    let Some((id, installation_id, client_label, status, last_message_at, archived_at)) = row
     else {
         return Ok(None);
     };
-    let last_message = conn
-        .query_row(
-            "SELECT seq, body, author_label, status, created_at
-             FROM client_chat_messages WHERE room_id = ?1 ORDER BY seq DESC LIMIT 1",
-            params![id],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(|error| AppError::Internal(format!("read chat message preview failed: {error}")))?
-        .map(|(seq, body, author_label, message_status, created_at)| {
-            Ok(ClientChatMessagePreview {
-                seq,
-                body: if message_status == "visible" {
-                    body
-                } else {
-                    String::new()
-                },
-                author_label,
-                created_at: parse_timestamp(created_at, "chat message")?,
-            })
-        })
-        .transpose()?;
+    let can_post = status == "active" && viewer_user_id.is_some();
+    let latest_seq = latest_visible_seq(conn, &id)?;
+    let last_message = latest_visible_message_preview(conn, &id)?;
     let unread_count = if let Some(user_id) = viewer_user_id {
-        conn.query_row(
-            "SELECT COUNT(*)
-             FROM client_chat_messages m
-             WHERE m.room_id = ?1
-               AND m.status = 'visible'
-               AND m.author_user_id != ?2
-               AND m.seq > COALESCE((
-                   SELECT v.last_read_seq FROM client_chat_visits v
-                   WHERE v.user_id = ?2 AND v.room_id = ?1
-               ), 0)",
-            params![id, user_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(|error| AppError::Internal(format!("count unread chat messages failed: {error}")))?
-        .max(0) as usize
+        count_unread_messages(conn, &id, user_id)?
     } else {
         0
     };
@@ -1907,12 +2799,105 @@ fn load_room_by_id(
         installation_id,
         client_label,
         status,
+        can_post,
+        read_only: !can_post,
         latest_seq,
         unread_count,
         last_message_at: parse_optional_timestamp(last_message_at, "chat room activity")?,
         last_message,
         archived_at: parse_optional_timestamp(archived_at, "chat room archive")?,
     }))
+}
+
+fn latest_visible_seq(conn: &Connection, room_id: &str) -> Result<i64, AppError> {
+    conn.query_row(
+        "SELECT COALESCE(MAX(seq), 0) FROM chat_messages WHERE room_id = ?1",
+        params![room_id],
+        |row| row.get(0),
+    )
+    .map_err(|error| AppError::Internal(format!("read latest chat sequence failed: {error}")))
+}
+
+fn latest_visible_message_preview(
+    conn: &Connection,
+    room_id: &str,
+) -> Result<Option<ClientChatMessagePreview>, AppError> {
+    let sql = "SELECT seq, body, author_label, author_kind, message_kind, event_type,
+                      event_payload_json, status, created_at
+               FROM chat_messages WHERE room_id = ?1 ORDER BY seq DESC LIMIT 1";
+    let read = |row: &rusqlite::Row<'_>| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?,
+        ))
+    };
+    let stored = conn
+        .query_row(sql, params![room_id], read)
+        .optional()
+        .map_err(|error| {
+            AppError::Internal(format!("read chat message preview failed: {error}"))
+        })?;
+    stored
+        .map(
+            |(
+                seq,
+                body,
+                author_label,
+                author_kind,
+                message_kind,
+                event_type,
+                event_payload,
+                status,
+                created_at,
+            )| {
+                Ok(ClientChatMessagePreview {
+                    seq,
+                    body: if status == "visible" {
+                        body
+                    } else {
+                        String::new()
+                    },
+                    author_label,
+                    author_kind,
+                    message_kind,
+                    event_type,
+                    event_payload: parse_event_payload(event_payload)?,
+                    created_at: parse_timestamp(created_at, "chat message")?,
+                })
+            },
+        )
+        .transpose()
+}
+
+fn count_unread_messages(
+    conn: &Connection,
+    room_id: &str,
+    user_id: &str,
+) -> Result<usize, AppError> {
+    let sql = "SELECT COUNT(*) FROM chat_messages m
+         WHERE m.room_id = ?1 AND m.status = 'visible' AND m.author_user_id != ?2
+           AND m.seq > COALESCE((SELECT last_read_seq FROM chat_visits
+                                 WHERE user_id = ?2 AND room_id = ?1), 0)";
+    conn.query_row(sql, params![room_id, user_id], |row| row.get::<_, i64>(0))
+        .map(|count| count.max(0) as usize)
+        .map_err(|error| AppError::Internal(format!("count unread chat messages failed: {error}")))
+}
+
+fn parse_event_payload(value: Option<String>) -> Result<Option<serde_json::Value>, AppError> {
+    value
+        .map(|value| {
+            serde_json::from_str(&value).map_err(|error| {
+                AppError::Internal(format!("parse chat event payload failed: {error}"))
+            })
+        })
+        .transpose()
 }
 
 fn count_visible_messages_after(
@@ -1922,7 +2907,7 @@ fn count_visible_messages_after(
 ) -> Result<usize, AppError> {
     conn.query_row(
         "SELECT COUNT(*)
-         FROM client_chat_messages
+         FROM chat_messages
          WHERE room_id = ?1 AND status = 'visible' AND seq > ?2",
         params![room_id, last_read_seq.max(0)],
         |row| row.get::<_, i64>(0),
@@ -1952,11 +2937,27 @@ fn query_messages<P: rusqlite::Params>(
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
             ))
         })
         .map_err(|error| AppError::Internal(format!("query chat messages failed: {error}")))?;
     rows.map(|row| {
-        let (id, seq, body, author_user_id, author_label, status, created_at) =
+        let (
+            id,
+            seq,
+            body,
+            author_user_id,
+            author_label,
+            author_kind,
+            message_kind,
+            event_type,
+            event_payload,
+            status,
+            created_at,
+        ) =
             row.map_err(|error| AppError::Internal(format!("read chat message failed: {error}")))?;
         Ok(ClientChatMessageView {
             id,
@@ -1967,6 +2968,10 @@ fn query_messages<P: rusqlite::Params>(
                 String::new()
             },
             author_label,
+            author_kind,
+            message_kind,
+            event_type,
+            event_payload: parse_event_payload(event_payload)?,
             is_mine: viewer_user_id == Some(author_user_id.as_str()),
             status,
             created_at: parse_timestamp(created_at, "chat message")?,
@@ -1983,12 +2988,12 @@ fn upsert_visit_tx(
     now: DateTime<Utc>,
 ) -> Result<(), AppError> {
     conn.execute(
-        "INSERT INTO client_chat_visits (
+        "INSERT INTO chat_visits (
             user_id, room_id, first_opened_at, last_opened_at, last_read_seq, updated_at
          ) VALUES (?1, ?2, ?3, ?3, ?4, ?3)
          ON CONFLICT(user_id, room_id) DO UPDATE SET
             last_opened_at = excluded.last_opened_at,
-            last_read_seq = MAX(client_chat_visits.last_read_seq, excluded.last_read_seq),
+            last_read_seq = MAX(chat_visits.last_read_seq, excluded.last_read_seq),
             updated_at = excluded.updated_at",
         params![
             user_id,
@@ -2010,7 +3015,7 @@ fn consume_chat_rate_limit_tx(
 ) -> Result<(), AppError> {
     let bucket_start = now.timestamp().div_euclid(bucket_secs) * bucket_secs;
     conn.execute(
-        "INSERT INTO client_chat_rate_limit (scope, bucket_start, count)
+        "INSERT INTO chat_rate_limit (scope, bucket_start, count)
          VALUES (?1, ?2, 1)
          ON CONFLICT(scope, bucket_start) DO UPDATE SET count = count + 1",
         params![scope, bucket_start],
@@ -2018,7 +3023,7 @@ fn consume_chat_rate_limit_tx(
     .map_err(|error| AppError::Internal(format!("update chat rate limit failed: {error}")))?;
     let count = conn
         .query_row(
-            "SELECT count FROM client_chat_rate_limit WHERE scope = ?1 AND bucket_start = ?2",
+            "SELECT count FROM chat_rate_limit WHERE scope = ?1 AND bucket_start = ?2",
             params![scope, bucket_start],
             |row| row.get::<_, i64>(0),
         )
@@ -2039,8 +3044,9 @@ fn load_idempotent_message(
     client_message_id: &str,
 ) -> Result<Option<ClientChatMessageView>, AppError> {
     conn.query_row(
-        "SELECT id, seq, body, author_label, status, created_at
-         FROM client_chat_messages
+        "SELECT id, seq, body, author_label, author_kind, message_kind,
+                event_type, event_payload_json, status, created_at
+         FROM chat_messages
          WHERE room_id = ?1 AND author_user_id = ?2 AND client_message_id = ?3",
         params![room_id, user_id, client_message_id],
         |row| {
@@ -2051,26 +3057,47 @@ fn load_idempotent_message(
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
             ))
         },
     )
     .optional()
     .map_err(|error| AppError::Internal(format!("read idempotent chat message failed: {error}")))?
-    .map(|(id, seq, body, author_label, status, created_at)| {
-        Ok(ClientChatMessageView {
+    .map(
+        |(
             id,
             seq,
-            body: if status == "visible" {
-                body
-            } else {
-                String::new()
-            },
+            body,
             author_label,
-            is_mine: true,
+            author_kind,
+            message_kind,
+            event_type,
+            event_payload,
             status,
-            created_at: parse_timestamp(created_at, "chat message")?,
-        })
-    })
+            created_at,
+        )| {
+            Ok(ClientChatMessageView {
+                id,
+                seq,
+                body: if status == "visible" {
+                    body
+                } else {
+                    String::new()
+                },
+                author_label,
+                author_kind,
+                message_kind,
+                event_type,
+                event_payload: parse_event_payload(event_payload)?,
+                is_mine: true,
+                status,
+                created_at: parse_timestamp(created_at, "chat message")?,
+            })
+        },
+    )
     .transpose()
 }
 
@@ -2086,7 +3113,7 @@ fn insert_chat_email_event_tx(
     let window = conn
         .query_row(
             "SELECT window_started_at, window_ends_at
-             FROM client_chat_email_events
+             FROM chat_email_events
              WHERE room_id = ?1 AND owner_generation = ?2 AND lower(recipient) = lower(?3)
                AND status = 'pending' AND window_ends_at > ?4
              ORDER BY window_started_at DESC LIMIT 1",
@@ -2104,7 +3131,7 @@ fn insert_chat_email_event_tx(
         )
     });
     conn.execute(
-        "INSERT INTO client_chat_email_events (
+        "INSERT INTO chat_email_events (
             id, message_id, room_id, installation_id, owner_generation,
             recipient, status, window_started_at, window_ends_at, created_at, updated_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, ?9, ?9)",
@@ -2131,7 +3158,7 @@ fn cancel_room_deliveries_tx(
     now: DateTime<Utc>,
 ) -> Result<(), AppError> {
     conn.execute(
-        "UPDATE client_chat_email_deliveries
+        "UPDATE chat_email_deliveries
          SET status = ?2, claim_owner = NULL, claim_expires_at = NULL, updated_at = ?3
          WHERE room_id = ?1
            AND status IN ('pending', 'retry', 'claimed', 'dead_letter')",
@@ -2139,7 +3166,7 @@ fn cancel_room_deliveries_tx(
     )
     .map_err(|error| AppError::Internal(format!("cancel chat email deliveries failed: {error}")))?;
     conn.execute(
-        "UPDATE client_chat_email_events
+        "UPDATE chat_email_events
          SET status = ?2, updated_at = ?3
          WHERE room_id = ?1 AND status IN ('pending', 'batched', 'dead_letter')",
         params![room_id, status, now.to_rfc3339()],
@@ -2156,7 +3183,7 @@ fn requeue_room_deliveries_for_current_owner_tx(
     let current = conn
         .query_row(
             "SELECT r.owner_email_snapshot, r.owner_generation, r.status
-             FROM client_chat_rooms r WHERE r.id = ?1",
+             FROM chat_rooms r WHERE r.id = ?1",
             params![room_id],
             |row| {
                 Ok((
@@ -2176,7 +3203,7 @@ fn requeue_room_deliveries_for_current_owner_tx(
     }
 
     conn.execute(
-        "UPDATE client_chat_email_deliveries
+        "UPDATE chat_email_deliveries
          SET status = 'cancelled_owner_changed', claim_owner = NULL,
              claim_expires_at = NULL, updated_at = ?2
          WHERE room_id = ?1
@@ -2185,12 +3212,12 @@ fn requeue_room_deliveries_for_current_owner_tx(
     )
     .map_err(|error| AppError::Internal(format!("cancel stale chat deliveries failed: {error}")))?;
     conn.execute(
-        "UPDATE client_chat_email_events
+        "UPDATE chat_email_events
          SET recipient = ?2, owner_generation = ?3,
              status = CASE
-                 WHEN (SELECT m.status FROM client_chat_messages m WHERE m.id = message_id) != 'visible'
+                 WHEN (SELECT m.status FROM chat_messages m WHERE m.id = message_id) != 'visible'
                  THEN 'cancelled_message_deleted'
-                 WHEN lower((SELECT m.author_email FROM client_chat_messages m WHERE m.id = message_id)) = lower(?2)
+                 WHEN lower((SELECT m.author_email FROM chat_messages m WHERE m.id = message_id)) = lower(?2)
                  THEN 'cancelled_owner_now'
                  ELSE 'pending'
              END,

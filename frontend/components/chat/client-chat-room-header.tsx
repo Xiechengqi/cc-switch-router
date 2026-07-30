@@ -27,7 +27,7 @@ export function ClientChatRoomHeader({
 
   async function copyLink() {
     try {
-      await navigator.clipboard.writeText(chatRoomUrl(room.installationId));
+      await navigator.clipboard.writeText(chatRoomUrl(room));
       toast.success(t("chat.linkCopied"));
     } catch {
       toast.danger(t("common.copyFailed"));

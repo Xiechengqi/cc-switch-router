@@ -59,17 +59,19 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 
 | 域 | 路径数 | 认证方式 | 代表端点 |
 |---|---:|---|---|
-| `/v1/client-market/*` | 34 | 用户 Session | `hosts`、`quotes`、`quotes/:id/commit`、`providers`、`billing`、`terminal/ws` |
-| `/v1/admin/*` | 33 | Session + admin 判定 | `settings/values`、`version`、`upgrade`、`metrics/*`、`audit`、`logs/router/tail`、`client-market/subscriptions/:id/force-release` |
+| `/v1/client-market/*` | 28 | 用户 Session | `hosts`、`quotes`、`quotes/:id/commit`、`providers`、`my-rentals`、`terminal/ws` |
+| `/v1/admin/*` | 约 36 | Session + admin 判定 | `settings/values`、`version`、`upgrade`、`metrics/*`、`audit`、`logs/router/tail`、`market-billing/disputes` |
 | `/v1/shares/*` | 17 | installation bearer / Ed25519 签名 | `claim-subdomain`、`sync`、`batch-sync`、`descriptor-batch-sync`、`pending-edits`、`edit-ack`、`edit-events`、`runtime-refresh`、`heartbeat`、`prune` |
 | `/v1/installations/*` | 11 | Ed25519 签名 / bearer | `register`、`heartbeat`、`setup-completed`、`report-status`、`client-tunnel`、`client-tunnel/claim`、`bind-owner-email` |
-| `/v1/chat/*` | 9 | 公开读 / Session 写 | `clients/:installation_id/room`、`rooms/:room_id/messages`、`rooms/:room_id/stream` |
+| `/v1/chat/*` | 9 | 公开读 / Session 写 | `clients/:installation_id/room`、`rooms/:room_id/messages`、`rooms/:room_id/stream`；不存在 Share 独立房间 |
 | `/v1/market/*`、`/v1/markets/*` | 11 | 公开读 / 用户 Session / 市场 bearer token | `shares`、`shares/headroom`、`request-logs/batch`、`share-states`、`tunnel/lease` |
-| `/v1/share-market/*` | 11 | 公开 catalog / 用户 Session | `listings`、`owned-shares`、`seats/:id/rent`、`subscriptions/:id/declare-paid`、`force-revoke`、`blocks`；停止挂售后无活跃租约可再次 `POST listings` |
+| `/v1/share-market/*` | 9 | 公开 catalog / 用户 Session | `listings`、`owned-shares`、`seats/:id/rent`、`subscriptions/:id/release`、`force-revoke`；停止挂售后无活跃租约可再次 `POST listings` |
+| `/v1/market-access/*` | 6 | 用户 Session / scoped API Token | `dashboard`、`policies/:product_kind`、`counterparties`、买家授信、黑名单模式公共额度 |
+| `/v1/market-billing/*` | 10 | 用户 Session | `dashboard`、`supplier-profiles`、`accounts/:id/settle`、`request-settlement`、`accounts/:id/invoices`、付款声明/确认/拒绝与争议 |
 | `/v1/gateway/*`、`/v1/gateways/*` | 5 | HMAC 签名(`x-cc-gateway-*`) | `register`、`shares`、`shares/feedback`、`request-logs/batch` |
 | `/v1/auth/*` | 5 | 公开 / Session | `email/request-code`、`email/verify-code`、`session/refresh`、`session/me`、`session/logout` |
 | `/v1/tunnels/*` | 4 | Ed25519 签名 | `lease`、`lease/renew`、`activate`、`state` |
-| `/v1/account/*` | 4 | Session | `payment-profile`、`payment-assets/:id`、`provider-blocks` |
+| `/v1/account/*` | 2 | Session | `payment-profile`、`payment-assets/:id` |
 | `/v1/public/*` | 4 | 公开 | `map-points`、`network-stats`、`embed/global.svg`、`embed/usage/:username` |
 | `/share-api/*` | 4 | 子域名上下文,Session 可选 | `context`、`share`、`auth/me`、`share/settings` |
 | `/v1/dashboard/*`、`/v1/me/*` | 10 | Session | `dashboard`、`presence`、`ux-events`、`me/api-token`、`me/shares`、`me/profile`、`me/usage/consumer`、`me/usage/provider` |
@@ -173,7 +175,13 @@ EOF
 
 Client 生命周期通知使用持久化 outbox、固定 Resend 幂等键和离线 episode 去重,注册与离线邮件都只发送至对应 Client 当前已验证的 Owner 邮箱。关闭总开关时,Router 会推进在线状态 baseline 并抑制待发记录;以后重新启用不会补发停用期间的历史通知。多 Client 在窗口内集中注册或离线时会按 Owner 合并为 digest。Offline lane 使用独立的单收件人/全局 `10/50` 小时额度,registration lane 使用独立的 `3/10` 小时额度,两者互不占用。未完成的 outbox 会持续保留,已发送、dead-letter、取消和抑制记录保留 30 天供审计。
 
-Client 聊天室与 `installation.id` 一一对应,只为已验证 Owner 的 Client 建立。历史消息公开可读,发送消息必须使用 Router 登录 Session;普通用户 API Token 不能发送。匿名访客的最近聊天室和已读游标只保存在当前浏览器,登录后会一次性合并到服务端用户记录。非 Owner 消息在同一聊天室内从第一条消息开始使用固定 60 秒窗口聚合,窗口内每条消息都完整写入同一封 Owner 邮件;Owner 自己的消息不会触发邮件。消息与邮件事件在同一 SQLite 事务落库,后台使用固定 Resend 幂等键、claim lease、重试和 dead-letter。Client 被清理后聊天室转为公开只读归档并保留 60 天,同一 Client 在期限内恢复时沿用原房间。
+Share Market 与 Client Market 对免费和付费商品统一采用供应商准入策略,默认均为白名单。供应商先按买家邮箱建立信任关系,再按产品允许访问；付费商品还必须按买家、供应商和币种授予有限或无限信用额度。切换到黑名单模式必须显式确认风险,未知买家只能使用免费商品,或在供应商另行开启有限公共额度后租用付费商品；公共额度不能设为无限。
+
+付费商品共用账户级后付费赊账：每项服务先享受 12 小时健康时长试用,之后只按 Router 观测到的健康服务秒数累计固定每日费用。同一买家、供应商和币种共用一个余额；有限额度使用达到 80% 时向相关 Client 公开聊天室写入系统预警,用满后生成聚合账单并暂停相关服务。无限额度不自动出账,供应商可主动要求清账；买家也可主动清账,最后一项服务结束时剩余余额会自动出账。Router 不经手资金,付款声明仍需供应商确认到账；逾期声明或争议不会自行解除市场赊账限制。
+
+Client 公开聊天室与 `installation.id` 一一对应,只为已验证 Owner 的 Client 建立；同一 Client 下的所有 Share 共用这一房间,不存在 Share 独立聊天室。历史消息公开可读,发送真人消息必须使用 Router 登录 Session;普通用户 API Token 不能发送。匿名访客的最近聊天室和已读游标只保存在当前浏览器,登录后会一次性合并到服务端用户记录。非 Owner 真人消息在同一聊天室内从第一条消息开始使用固定 60 秒窗口聚合,窗口内每条消息都完整写入同一封 Owner 邮件;Owner 自己的消息和系统消息不会触发聊天邮件。消息与邮件事件在同一 SQLite 事务落库,后台使用固定 Resend 幂等键、claim lease、重试和 dead-letter。Client 被清理后聊天室转为公开只读归档并保留 60 天,同一 Client 在期限内恢复时沿用原房间。
+
+Share Market、Client Market 与统一账务的关键事件通过持久化 outbox 写入对应 Client 公开聊天室。租用双方的完整邮箱、账单金额、收款方式与联系方式、付款 reference/note、凭证 URL、争议或回收原因以及安全的原始错误均公开展示；系统消息引用的同源收款图片随消息公开并在消息保留期内防止清理,未发布图片仍需 Owner 或账单买方身份。API Key、OAuth/Session token、Cookie、Authorization、密码、secret、私钥和 SSH/lease 凭据禁止进入 Market 源事件和聊天室 payload；后端在持久化前拒绝敏感字段与 query/fragment/userinfo 带凭据的 URL,并替换外部错误或备注中的凭据片段,前端渲染时再执行一次同类过滤。`PaymentMethod.token` 只允许表达 `USDT`/`USDC` 资产符号。验证码、安全通知、Client 注册/离线生命周期邮件和真人聊天提醒邮件仍保留,Market/Billing 业务事件本身不再发送交易邮件。
 
 旧 `/v1/board/*` 数据不迁移也不删除;GET 在一个兼容版本内保持只读,POST/置顶/精选/删除均返回 HTTP `410 Gone`。旧 `CC_SWITCH_ROUTER_BOARD_*` 和 Board Telegram 开关仅作为兼容配置保留,不影响 Client 聊天室。
 

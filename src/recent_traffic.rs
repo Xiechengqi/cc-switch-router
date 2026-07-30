@@ -59,6 +59,12 @@ pub struct RecentRequestEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_model: Option<String>,
@@ -100,6 +106,9 @@ impl Default for RecentRequestEvent {
             cache_read_tokens: None,
             cache_creation_tokens: None,
             total_tokens: None,
+            usage_state: None,
+            stream_status: None,
+            usage_revision: None,
             request_agent: None,
             requested_model: None,
             actual_model: None,
@@ -193,6 +202,9 @@ impl RecentTraffic {
             cache_read_tokens: None,
             cache_creation_tokens: None,
             total_tokens: None,
+            usage_state: None,
+            stream_status: None,
+            usage_revision: None,
             request_agent: None,
             requested_model: None,
             actual_model: None,
@@ -244,6 +256,9 @@ impl RecentTraffic {
             cache_read_tokens: None,
             cache_creation_tokens: None,
             total_tokens: None,
+            usage_state: None,
+            stream_status: None,
+            usage_revision: None,
             request_agent: None,
             requested_model: None,
             actual_model: None,

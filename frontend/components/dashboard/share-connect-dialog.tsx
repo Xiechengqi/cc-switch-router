@@ -7,13 +7,16 @@ import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getUserApiToken } from "@/lib/api";
 import { ShareConnectionTestRow } from "@/components/dashboard/share-connection-test";
-import { boundProviderIdForShareApp, resolveShareCoreApp, SHARE_APP_LABELS } from "@/lib/share-app";
+import {
+  boundProviderIdForShareApp,
+  shareAccessApps,
+  SHARE_APP_LABELS,
+} from "@/lib/share-app";
 import type { ShareView, UserApiTokenStatus } from "@/lib/types";
 
 const ROUTER_OPEN_LOGIN_EVENT = "router-open-login";
 
 function shareCodexImageGenerationEnabled(share: ShareView | null) {
-  if (resolveShareCoreApp(share) !== "codex") return false;
   const providerId = boundProviderIdForShareApp(share, "codex");
   if (!providerId) return false;
   return !!share?.appProviders?.codex?.some(
@@ -25,7 +28,6 @@ function shareCodexImageGenerationEnabled(share: ShareView | null) {
 }
 
 function shareClaudeCursorToolsProbeEnabled(share: ShareView | null) {
-  if (resolveShareCoreApp(share) !== "claude") return false;
   const providerId = boundProviderIdForShareApp(share, "claude");
   if (!providerId) return false;
   return !!share?.appProviders?.claude?.some(
@@ -136,8 +138,8 @@ export const ShareConnectDialog = React.memo(function ShareConnectDialog({
     return `mailto:${ownerEmail}?subject=${subject}`;
   }, [ownerEmail, share?.subdomain, share?.shareId]);
 
-  const shareApp = resolveShareCoreApp(share);
-  const shareAppLabel = shareApp ? SHARE_APP_LABELS[shareApp] : "";
+  const shareApps = shareAccessApps(share);
+  const shareAppLabel = shareApps.map((app) => SHARE_APP_LABELS[app]).join(" / ");
 
   if (!share) return null;
 
@@ -186,49 +188,47 @@ export const ShareConnectDialog = React.memo(function ShareConnectDialog({
                 <span className="text-xs font-medium uppercase tracking-wide text-slate-500">
                   {t("dashboard.connectDialog.test.section")}
                 </span>
-                {shareApp ? (
-                  <ShareConnectionTestRow
-                    key={shareApp}
-                    share={share}
-                    app={shareApp}
-                    apiToken={apiTokenPlain}
-                    baseUrl={baseUrl}
-                    canExecute={authenticated && canViewSecret}
-                  />
-                ) : null}
-                {shareApp === "codex" ? (
-                  <ShareConnectionTestRow
-                    key="codex-chat"
-                    share={share}
-                    app="codex"
-                    kind="chat"
-                    apiToken={apiTokenPlain}
-                    baseUrl={baseUrl}
-                    canExecute={authenticated && canViewSecret}
-                  />
-                ) : null}
-                {shareApp === "codex" && codexImageGenerationEnabled ? (
-                  <ShareConnectionTestRow
-                    key="codex-image"
-                    share={share}
-                    app="codex"
-                    kind="image"
-                    apiToken={apiTokenPlain}
-                    baseUrl={baseUrl}
-                    canExecute={authenticated && canViewSecret}
-                  />
-                ) : null}
-                {shareApp === "claude" && claudeCursorToolsProbeEnabled ? (
-                  <ShareConnectionTestRow
-                    key="claude-tools"
-                    share={share}
-                    app="claude"
-                    kind="tools"
-                    apiToken={apiTokenPlain}
-                    baseUrl={baseUrl}
-                    canExecute={authenticated && canViewSecret}
-                  />
-                ) : null}
+                {shareApps.map((app) => (
+                  <React.Fragment key={app}>
+                    <ShareConnectionTestRow
+                      share={share}
+                      app={app}
+                      apiToken={apiTokenPlain}
+                      baseUrl={baseUrl}
+                      canExecute={authenticated && canViewSecret}
+                    />
+                    {app === "codex" ? (
+                      <ShareConnectionTestRow
+                        share={share}
+                        app="codex"
+                        kind="chat"
+                        apiToken={apiTokenPlain}
+                        baseUrl={baseUrl}
+                        canExecute={authenticated && canViewSecret}
+                      />
+                    ) : null}
+                    {app === "codex" && codexImageGenerationEnabled ? (
+                      <ShareConnectionTestRow
+                        share={share}
+                        app="codex"
+                        kind="image"
+                        apiToken={apiTokenPlain}
+                        baseUrl={baseUrl}
+                        canExecute={authenticated && canViewSecret}
+                      />
+                    ) : null}
+                    {app === "claude" && claudeCursorToolsProbeEnabled ? (
+                      <ShareConnectionTestRow
+                        share={share}
+                        app="claude"
+                        kind="tools"
+                        apiToken={apiTokenPlain}
+                        baseUrl={baseUrl}
+                        canExecute={authenticated && canViewSecret}
+                      />
+                    ) : null}
+                  </React.Fragment>
+                ))}
               </div>
             </Modal.Body>
             <Modal.Footer>

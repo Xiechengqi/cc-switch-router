@@ -170,6 +170,9 @@ pub async fn run_client_chat_email_service(store: AppStore, config: Config) -> a
 
     loop {
         interval.tick().await;
+        if let Err(error) = store.process_client_chat_system_outbox(100).await {
+            warn!(error = %error, "client chat system outbox cycle failed");
+        }
         if let Err(error) =
             run_chat_email_cycle(&store, &config, &template, &http, &worker_id, Utc::now()).await
         {

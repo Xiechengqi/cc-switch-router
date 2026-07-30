@@ -45,6 +45,8 @@ pub struct ServerState {
     pub client_market_job_secrets: Arc<Mutex<ClientMarketJobSecrets>>,
     /// Short-lived web terminal tickets and per-owner session counters.
     pub client_market_terminal: Arc<Mutex<TerminalSessionManager>>,
+    /// Serializes external billing suspend/resume/terminate effects across API and worker tasks.
+    pub market_billing_controls: Arc<Mutex<()>>,
     /// In-memory rolling tracker of proxy traffic by user origin. Drives the dashboard
     /// "demand" overlay and burst-arc animation; not persisted across restarts.
     pub recent_traffic: RecentTraffic,

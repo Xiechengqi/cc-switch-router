@@ -30,10 +30,7 @@ fn enforce_mode(path: &Path, mode: u32) -> Result<()> {
                 return Ok(());
             }
             fs::set_permissions(path, fs::Permissions::from_mode(mode)).with_context(|| {
-                format!(
-                    "tighten permissions to {mode:o} failed: {}",
-                    path.display()
-                )
+                format!("tighten permissions to {mode:o} failed: {}", path.display())
             })?;
             info!(
                 path = %path.display(),
@@ -44,9 +41,9 @@ fn enforce_mode(path: &Path, mode: u32) -> Result<()> {
             Ok(())
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| {
-            format!("read permissions failed: {}", path.display())
-        }),
+        Err(error) => {
+            Err(error).with_context(|| format!("read permissions failed: {}", path.display()))
+        }
     }
 }
 

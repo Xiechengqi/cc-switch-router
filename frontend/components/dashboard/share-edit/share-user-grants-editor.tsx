@@ -60,7 +60,7 @@ function validEmail(value: string) {
 
 export function ShareUserGrantsEditor({
   draft,
-  shareApp,
+  activeShareApps,
   ownerEmail,
   defaultPolicy,
   supportedPeriods,
@@ -68,7 +68,7 @@ export function ShareUserGrantsEditor({
   onDraftChange,
 }: {
   draft: ShareEditDraft;
-  shareApp: PriceApp;
+  activeShareApps: PriceApp[];
   ownerEmail: string;
   defaultPolicy: ShareUserPolicy;
   supportedPeriods?: ShareTokenPeriod[];
@@ -143,10 +143,12 @@ export function ShareUserGrantsEditor({
     onDraftChange((current) => ({
       ...current,
       userGrants,
-      shareToEmailsByApp: {
-        ...current.shareToEmailsByApp,
-        [shareApp]: emails,
-      },
+      shareToEmailsByApp: Object.fromEntries(
+        (["claude", "codex", "gemini"] as const).map((app) => [
+          app,
+          activeShareApps.includes(app) ? emails : current.shareToEmailsByApp[app],
+        ]),
+      ) as ShareEditDraft["shareToEmailsByApp"],
     }));
   };
 

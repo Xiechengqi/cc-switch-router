@@ -23,6 +23,10 @@ type TickerMeta = Partial<Omit<ShareRequestLog, "createdAt"> & Omit<MarketReques
   totalTokens?: number;
   isInflight?: boolean;
 };
+type TickerUsageMeta = {
+  usageState?: string;
+  status?: string;
+};
 
 const REQUEST_TICKER_LIMIT = 100;
 const REQUEST_TICKER_VISIBLE_ROWS = 5;
@@ -96,7 +100,18 @@ function usageBucketTotalTokens(log?: Pick<TickerMeta, "inputTokens" | "outputTo
   return tokenCount(log?.inputTokens) + tokenCount(log?.outputTokens) + tokenCount(log?.cacheReadTokens) + tokenCount(log?.cacheCreationTokens);
 }
 
+function hasObservedTickerUsage(log?: TickerUsageMeta | null) {
+  const usageState = String(log?.usageState || "").trim().toLowerCase();
+  if (usageState) return usageState === "observed";
+  return String(log?.status || "").trim().toLowerCase() !== "streaming";
+}
+
+function observedUsageBucketTotalTokens(log?: TickerMeta | null) {
+  return hasObservedTickerUsage(log) ? usageBucketTotalTokens(log) : undefined;
+}
+
 function marketRequestTotalTokens(log: MarketRequestLog) {
+  if (!hasObservedTickerUsage(log)) return undefined;
   const input = tokenCount(log.inputTokens);
   const cacheRead = tokenCount(log.cacheReadTokens);
   const canonicalInput = log.requestAgent.trim().toLowerCase() === "codex"
@@ -106,6 +121,7 @@ function marketRequestTotalTokens(log: MarketRequestLog) {
 }
 
 function eventTotalTokens(event: RecentRequestEvent) {
+  if (!hasObservedTickerUsage(event)) return undefined;
   if (event.totalTokens != null) return tokenCount(event.totalTokens);
   const hasUsageBuckets = event.inputTokens != null
     || event.outputTokens != null
@@ -148,12 +164,19 @@ function tickerDetail(meta?: TickerMeta) {
   const actual = meta?.actualModel || meta?.model || "";
   const modelName = [agent, requested && actual && requested !== actual ? `${requested} -> ${actual}` : actual || requested || "-"].filter(Boolean).join(" · ");
   const latency = formatTickerLatency(meta?.latencyMs);
-  const tokenTotal = meta?.totalTokens ?? usageBucketTotalTokens(meta);
-  const tokens = meta?.isInflight
-    ? tokenTotal > 0
-      ? `${compactTickerTokens(tokenTotal)}+ tokens`
-      : "tokens …"
-    : `${compactTickerTokens(tokenTotal)} token${tokenTotal === 1 ? "" : "s"}`;
+  const usageObserved = hasObservedTickerUsage(meta);
+  const tokenTotal = usageObserved
+    ? meta?.totalTokens ?? usageBucketTotalTokens(meta)
+    : undefined;
+  const tokens = tokenTotal == null
+    ? String(meta?.usageState || "").toLowerCase() === "pending" || meta?.isInflight
+      ? "tokens …"
+      : "tokens -"
+    : meta?.isInflight
+      ? tokenTotal > 0
+        ? `${compactTickerTokens(tokenTotal)}+ tokens`
+        : "tokens …"
+      : `${compactTickerTokens(tokenTotal)} token${tokenTotal === 1 ? "" : "s"}`;
   const fee = formatMarketFee(meta?.usageAmountUsd);
   return [meta?.userEmail || "", modelName, latency, tokens, fee].filter(Boolean).join(" · ");
 }
@@ -355,21 +378,21 @@ function buildRequestMeta(data: DashboardResponse | null) {
   for (const share of data?.tickerShares || []) {
     for (const log of share.recentRequests || []) {
       const market = marketMeta.get(log.requestId);
-      const marketTotal = market ? marketRequestTotalTokens(market) : 0;
-      meta.set(log.requestId, { ...log, shareName: share.shareName, shareId: share.shareId, userEmail: log.userEmail || market?.userEmail, apiKeyPrefix: market?.apiKeyPrefix, usageAmountUsd: market?.usageAmountUsd, totalTokens: marketTotal > 0 ? marketTotal : usageBucketTotalTokens(log) });
+      const marketTotal = market ? marketRequestTotalTokens(market) : undefined;
+      meta.set(log.requestId, { ...log, shareName: share.shareName, shareId: share.shareId, userEmail: log.userEmail || market?.userEmail, apiKeyPrefix: market?.apiKeyPrefix, usageAmountUsd: market?.usageAmountUsd, totalTokens: marketTotal ?? observedUsageBucketTotalTokens(log) });
     }
   }
   for (const share of data?.shares || []) {
     for (const log of share.recentRequests || []) {
       const market = marketMeta.get(log.requestId);
-      const marketTotal = market ? marketRequestTotalTokens(market) : 0;
-      meta.set(log.requestId, { ...log, shareName: share.shareName || log.shareName, shareId: share.shareId || log.shareId, userEmail: log.userEmail || market?.userEmail, apiKeyPrefix: market?.apiKeyPrefix, usageAmountUsd: market?.usageAmountUsd, totalTokens: marketTotal > 0 ? marketTotal : usageBucketTotalTokens(log) });
+      const marketTotal = market ? marketRequestTotalTokens(market) : undefined;
+      meta.set(log.requestId, { ...log, shareName: share.shareName || log.shareName, shareId: share.shareId || log.shareId, userEmail: log.userEmail || market?.userEmail, apiKeyPrefix: market?.apiKeyPrefix, usageAmountUsd: market?.usageAmountUsd, totalTokens: marketTotal ?? observedUsageBucketTotalTokens(log) });
     }
   }
   for (const [requestId, log] of marketMeta) {
     const existing = meta.get(requestId);
     const marketTotal = marketRequestTotalTokens(log);
-    meta.set(requestId, { ...(existing || {}), ...log, userEmail: log.userEmail || existing?.userEmail, totalTokens: marketTotal > 0 ? marketTotal : existing?.totalTokens ?? 0 });
+    meta.set(requestId, { ...(existing || {}), ...log, userEmail: log.userEmail || existing?.userEmail, totalTokens: marketTotal ?? existing?.totalTokens });
   }
   return meta;
 }
@@ -437,6 +460,7 @@ function RequestTickerPanel({ data }: { data: DashboardResponse | null }) {
           <div className="flex flex-col gap-1">
             {visibleEvents.map((event, index) => {
               const item = meta.get(event.requestId);
+              const eventTokenTotal = eventTotalTokens(event);
               const mergedItem: TickerMeta = {
                 ...(item || {}),
                 userEmail: event.userEmail || item?.userEmail,
@@ -452,7 +476,10 @@ function RequestTickerPanel({ data }: { data: DashboardResponse | null }) {
                 outputTokens: event.outputTokens ?? item?.outputTokens,
                 cacheReadTokens: event.cacheReadTokens ?? item?.cacheReadTokens,
                 cacheCreationTokens: event.cacheCreationTokens ?? item?.cacheCreationTokens,
-                totalTokens: eventTotalTokens(event) ?? item?.totalTokens,
+                totalTokens: event.usageState != null ? eventTokenTotal : eventTokenTotal ?? item?.totalTokens,
+                usageState: event.usageState ?? item?.usageState,
+                streamStatus: event.streamStatus ?? item?.streamStatus,
+                usageRevision: event.usageRevision ?? item?.usageRevision,
                 isInflight: event.isInflight,
               };
               const countryCode = resolveTickerCountry(event, mergedItem, data);

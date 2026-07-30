@@ -21,6 +21,11 @@ export function resolveShareCoreApp(share: ShareView | null | undefined): CoreSh
 }
 
 export function shareAccessApps(share: ShareView | null | undefined): CoreShareApp[] {
+  if (!share) return [];
+  const bound = (["claude", "codex", "gemini"] as const).filter(
+    (app) => typeof share.bindings?.[app] === "string" && !!share.bindings[app]?.trim(),
+  );
+  if (bound.length > 0) return bound;
   const app = resolveShareCoreApp(share);
   return app ? [app] : [];
 }

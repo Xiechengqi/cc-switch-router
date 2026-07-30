@@ -4,10 +4,9 @@ import { Checkbox, Input, ListBox, Select, TextArea } from "@heroui/react";
 import * as React from "react";
 import { isOfficialRuntime, marketLabel, type TFn } from "@/components/dashboard/share-dashboard-utils";
 import type { DashboardMarket, ShareAppRuntimes, ShareUpstreamProvider, ShareView } from "@/lib/types";
-import type { CoreShareApp } from "@/lib/share-app";
+import { SHARE_APP_LABELS, type CoreShareApp } from "@/lib/share-app";
 import {
   applyRecommendedMarketDefaults,
-  PRICE_APPS,
   type ShareEditDraft,
 } from "./share-edit-draft";
 import { FieldGroup, MarketEmailChip } from "./share-edit-shared";
@@ -22,7 +21,7 @@ function providerHint(runtime?: ShareUpstreamProvider) {
 export type ShareEditMarketFieldsProps = {
   t: TFn;
   share: ShareView;
-  shareApp: CoreShareApp;
+  activeShareApps: CoreShareApp[];
   draft: ShareEditDraft;
   tokenMarkets: DashboardMarket[];
   marketSelectKey: number;
@@ -38,7 +37,7 @@ export type ShareEditMarketFieldsProps = {
 export function ShareEditMarketFields({
   t,
   share,
-  shareApp,
+  activeShareApps,
   draft,
   tokenMarkets,
   marketSelectKey,
@@ -51,6 +50,7 @@ export function ShareEditMarketFields({
   onMarketPicked,
 }: ShareEditMarketFieldsProps) {
   const { forSale, marketAccessMode, selectedMarketEmails, priceInputs } = draft;
+  const sharedPriceApp = activeShareApps[0];
 
   const availableMarkets = React.useMemo(() => {
     const blocked = new Set(selectedMarketEmails);
@@ -147,32 +147,35 @@ export function ShareEditMarketFields({
               <span className="mono-label text-muted-foreground">{t("dashboard.field.modelPricing")}</span>
               <span className="text-xs text-muted-foreground">{t("dashboard.hint.modelPricing")}</span>
             </div>
-            <div className="grid gap-3 sm:grid-cols-3">
-              {PRICE_APPS.filter((app) => app.key === shareApp).map((app) => {
-                const supported = !!share?.support?.[app.key];
-                const hint = providerHint(share?.appRuntimes?.[app.key as keyof ShareAppRuntimes]);
-                return (
-                  <div key={app.key} className="grid gap-1">
-                    <span className="mono-label text-muted-foreground">{app.label}</span>
-                    <Input
-                      type="number"
-                      min={1}
-                      max={100}
-                      step={1}
-                      value={priceInputs[app.key]}
-                      disabled={!supported}
-                      placeholder={supported ? t("common.unset") : t("dashboard.noCurrentNode")}
-                      onChange={(event) =>
-                        onDraftChange((current) => ({
-                          ...current,
-                          priceInputs: { ...current.priceInputs, [app.key]: event.target.value },
-                        }))
-                      }
-                    />
-                    <span className="truncate text-[11px] text-muted-foreground">{hint || "-"}</span>
-                  </div>
-                );
-              })}
+            <div className="grid max-w-sm gap-1">
+              <span className="mono-label text-muted-foreground">
+                {activeShareApps.map((app) => SHARE_APP_LABELS[app]).join(" / ")}
+              </span>
+              <Input
+                type="number"
+                min={1}
+                max={100}
+                step={1}
+                value={sharedPriceApp ? priceInputs[sharedPriceApp] : ""}
+                disabled={!sharedPriceApp}
+                placeholder={sharedPriceApp ? t("common.unset") : t("dashboard.noCurrentNode")}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  onDraftChange((current) => ({
+                    ...current,
+                    priceInputs: {
+                      ...current.priceInputs,
+                      ...Object.fromEntries(activeShareApps.map((app) => [app, value])),
+                    },
+                  }));
+                }}
+              />
+              <span className="truncate text-[11px] text-muted-foreground">
+                {activeShareApps
+                  .map((app) => providerHint(share?.appRuntimes?.[app as keyof ShareAppRuntimes]))
+                  .filter(Boolean)
+                  .join(" / ") || "-"}
+              </span>
             </div>
             {pricingInvalid ? <span className="text-xs text-red-600">{t("dashboard.fieldInvalid")}</span> : null}
           </div>

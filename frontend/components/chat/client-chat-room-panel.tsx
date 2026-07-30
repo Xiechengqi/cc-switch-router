@@ -1,8 +1,9 @@
 "use client";
 
 import { Button, ScrollShadow, TextArea } from "@heroui/react";
-import { Loader2, Send, Trash2 } from "lucide-react";
+import { Info, Loader2, Send, Trash2 } from "lucide-react";
 import * as React from "react";
+import { chatSystemEventDetails, chatSystemEventText } from "@/components/chat/chat-system-event";
 import {
   DRAFT_PREFIX,
   LocalChatMessage,
@@ -25,7 +26,6 @@ import { cn, formatDateTime, formatRelativeTime } from "@/lib/utils";
 import type { MessageKey } from "@/lib/i18n";
 
 const ROOM_POLL_MS = 30_000;
-
 function renderBodyNodes(body: string, mine: boolean) {
   const URL_RE = /(https?:\/\/[^\s<>"']+)/gi;
   const nodes: React.ReactNode[] = [];
@@ -67,6 +67,43 @@ function MessageBubble({
   onRetry: () => void;
 }) {
   const mine = message.isMine;
+  if (message.authorKind === "system" || message.messageKind === "market_event") {
+    const details = chatSystemEventDetails(message, t, locale);
+    return (
+      <article className="flex justify-center py-0.5">
+        <div className="flex w-[94%] max-w-[94%] items-start gap-2 rounded-md bg-slate-100 px-3 py-2 text-xs leading-5 text-slate-600">
+          <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-slate-400" />
+          <div className="min-w-0">
+            <p className="break-words font-medium text-slate-700">{chatSystemEventText(message, t, locale)}</p>
+            {details.length ? (
+              <dl className="mt-2 grid grid-cols-[minmax(6rem,auto)_minmax(0,1fr)] gap-x-3 gap-y-1 border-t border-slate-200 pt-2">
+                {details.map((detail) => (
+                  <React.Fragment key={detail.key}>
+                    <dt className="break-words text-slate-400">{detail.label}</dt>
+                    <dd className="min-w-0 whitespace-pre-wrap break-all text-slate-600">
+                      {detail.href ? (
+                        <a
+                          href={detail.href}
+                          target="_blank"
+                          rel="noopener noreferrer nofollow"
+                          className="text-primary underline underline-offset-2"
+                        >
+                          {detail.value}
+                        </a>
+                      ) : detail.value}
+                    </dd>
+                  </React.Fragment>
+                ))}
+              </dl>
+            ) : null}
+            <p className="mt-0.5 text-[10px] text-slate-400" title={formatDateTime(message.createdAt)}>
+              {t("chat.systemMessage")} · {formatRelativeTime(message.createdAt, locale)}
+            </p>
+          </div>
+        </div>
+      </article>
+    );
+  }
   return (
     <article className={cn("group flex min-w-0", mine ? "justify-end" : "justify-start")}>
       <div className={cn("max-w-[88%]", mine ? "items-end" : "items-start")}>
@@ -303,7 +340,7 @@ export function ClientChatRoomPanel({
 
   async function send(retryMessage?: LocalChatMessage) {
     const normalized = (retryMessage?.body || body).trim();
-    if (!normalized || sending || room.status !== "active" || !session?.authenticated) return;
+    if (!normalized || sending || !room.canPost || !session?.authenticated) return;
     if (Array.from(normalized).length > MAX_BODY_LENGTH) {
       setError(t("chat.overLimit", { count: MAX_BODY_LENGTH }));
       return;
@@ -318,6 +355,8 @@ export function ClientChatRoomPanel({
       seq: retryMessage?.seq || latestSeqRef.current + 1,
       body: normalized,
       authorLabel: session.user?.email?.split("@")[0] || t("chat.you"),
+      authorKind: "user",
+      messageKind: "text",
       isMine: true,
       status: "visible",
       createdAt: new Date().toISOString(),
@@ -411,7 +450,12 @@ export function ClientChatRoomPanel({
               message={message}
               locale={locale}
               t={t}
-              canDelete={!!session?.isAdmin && message.status === "visible" && !message.__pending}
+              canDelete={
+                !!session?.isAdmin
+                && message.authorKind !== "system"
+                && message.status === "visible"
+                && !message.__pending
+              }
               onDelete={() => setDeleteTarget(message)}
               onRetry={() => void send(message)}
             />
@@ -423,7 +467,7 @@ export function ClientChatRoomPanel({
       </ScrollShadow>
       <div className="shrink-0 border-t border-slate-200 bg-slate-50/70 p-3">
         {error ? <p className="mb-2 break-words text-xs text-red-600">{error}</p> : null}
-        {room.status === "archived" ? (
+        {room.status === "archived" || room.readOnly ? (
           <p className="py-2 text-center text-xs text-slate-500">{t("chat.archivedReadOnly")}</p>
         ) : !session?.authenticated ? (
           <div className="grid gap-2">

@@ -1,10 +1,10 @@
 "use client";
 
 import { Button, Card, Drawer, toast } from "@heroui/react";
-import { ChevronDown, ExternalLink, ListFilter, MessageCircle, Plus, Search } from "lucide-react";
+import { ChevronDown, ListFilter, MessageCircle, Plus, Search, X } from "lucide-react";
 import * as React from "react";
 import { CreateClientDialog } from "@/components/dashboard/create-client-dialog";
-import { ClientMarketBillingBanner } from "@/components/dashboard/client-market-billing-banner";
+import { ClientMarketRentalBanner } from "@/components/dashboard/client-market-rental-banner";
 import { ShareConnectDialog } from "@/components/dashboard/share-connect-dialog";
 import { ShareCard } from "@/components/dashboard/share-card";
 import { ClientUpgradeButton } from "@/components/dashboard/client-upgrade-button";
@@ -19,7 +19,6 @@ import {
   clientOwnerEmail,
   clientPlatformLabel,
   clientTunnelDisplayUrl,
-  subdomainTunnelUrl,
   ClientProvidersPanel,
   DrawerSection,
   drawerDialogClassName,
@@ -37,15 +36,16 @@ import {
   shareApiParts,
   sortClients,
 } from "@/components/dashboard/data-tables";
-import type { ClientMarketBilling, DashboardClient, DashboardMarket, OperationalState, ShareView } from "@/lib/types";
+import type { ClientMarketRental, DashboardClient, DashboardMarket, OperationalState, ShareView } from "@/lib/types";
 import { formatDateTime, formatRelativeTime } from "@/lib/utils";
 import { usePersistentState } from "@/lib/use-persistent-state";
-import { getMyClientMarketBilling, recordDashboardUxEvent } from "@/lib/api";
+import { getMyClientMarketRentals, recordDashboardUxEvent } from "@/lib/api";
 import { CompactSelect } from "@/components/common/compact-select";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { useClientChat } from "@/components/chat/client-chat";
 import { useAuth } from "@/components/auth/auth-provider";
 import { clientMarketMineHref } from "@/lib/dashboard-nav";
+import { SubdomainCopyButton } from "@/components/dashboard/subdomain-copy-button";
 
 function sortShares(shares: ShareView[]) {
   return [...shares].sort((left, right) => {
@@ -226,14 +226,12 @@ function shareMatchesQuery(share: ShareView, query: string) {
 const ShareScroller = React.memo(function ShareScroller({
   shares,
   totalCount = shares.length,
-  referenceTunnelUrl,
   onOpenShare,
   onEditShare,
   onConnectShare,
 }: {
   shares: ShareView[];
   totalCount?: number;
-  referenceTunnelUrl?: string;
   onOpenShare: (share: ShareView) => void;
   onEditShare: (share: ShareView) => void;
   onConnectShare: (share: ShareView) => void;
@@ -260,7 +258,7 @@ const ShareScroller = React.memo(function ShareScroller({
       </div>
         <div className="grid min-w-0 grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-4" aria-label={t("dashboard.shares")}>
           {shares.map((share) => (
-            <ShareCard key={share.shareId} share={share} referenceTunnelUrl={referenceTunnelUrl} onOpen={onOpenShare} onEdit={onEditShare} onConnect={onConnectShare} />
+            <ShareCard key={share.shareId} share={share} onOpen={onOpenShare} onEdit={onEditShare} onConnect={onConnectShare} />
           ))}
         </div>
     </div>
@@ -275,8 +273,8 @@ function ClientCard({
   onOpenShare,
   onEditShare,
   onConnectShare,
-  billing,
-  onBillingChanged,
+  rental,
+  onRentalChanged,
   collapsed,
   onToggleCollapsed,
 }: {
@@ -287,8 +285,8 @@ function ClientCard({
   onOpenShare: (share: ShareView) => void;
   onEditShare: (share: ShareView) => void;
   onConnectShare: (share: ShareView) => void;
-  billing?: ClientMarketBilling;
-  onBillingChanged: () => Promise<void> | void;
+  rental?: ClientMarketRental;
+  onRentalChanged: () => Promise<void> | void;
   collapsed: boolean;
   onToggleCollapsed: () => void;
 }) {
@@ -310,8 +308,9 @@ function ClientCard({
         routeOnline: routeOnlineCount,
       })
     : undefined;
-  const identity = client.clientTunnel?.subdomain || client.installation.id;
-  const identityUrl = client.clientTunnel?.subdomain ? tunnelUrl : "";
+  const subdomain = client.clientTunnel?.subdomain || "";
+  const hasSubdomain = Boolean(subdomain.trim());
+  const identity = hasSubdomain ? subdomain : client.installation.id;
   const versionLabel = clientPlatformLabel(client);
   const showRemoval = state === "offline" && !!client.removalAt;
   const borderTone = state === "offline" ? "border-l-rose-500" : state === "reconnecting" ? "border-l-sky-500" : state === "degraded" ? "border-l-amber-400" : "border-l-slate-200";
@@ -361,22 +360,8 @@ function ClientCard({
           <div className="grid min-w-0 gap-1.5">
             <div className="flex min-w-0 items-center gap-2">
               <span className={`h-2 w-2 shrink-0 rounded-full ${state === "offline" ? "bg-rose-500" : state === "reconnecting" ? "bg-sky-500" : state === "degraded" ? "bg-amber-400" : "bg-emerald-500"}`} />
-              {identityUrl ? (
-                <a
-                  href={identityUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  data-no-row-drawer
-                  className="inline-flex min-w-0 max-w-full items-center gap-1 truncate text-sm font-semibold text-foreground underline-offset-4 hover:underline"
-                  title={identityUrl}
-                  onClick={(event) => event.stopPropagation()}
-                >
-                  <span className="truncate">{identity}</span>
-                  <ExternalLink className="h-3 w-3 shrink-0 text-muted-foreground" aria-hidden />
-                </a>
-              ) : (
-                <strong className="truncate text-sm font-semibold text-foreground" title={identity}>{identity}</strong>
-              )}
+              <strong className="min-w-0 truncate text-sm font-semibold text-foreground" title={identity}>{identity}</strong>
+              {hasSubdomain ? <SubdomainCopyButton subdomain={subdomain} /> : null}
               {owner && owner !== "-" ? (
                 <span className="min-w-0 truncate text-xs text-muted-foreground" title={owner}>
                   {owner}
@@ -394,13 +379,12 @@ function ClientCard({
             </div>
             <div className="flex min-w-0 flex-wrap items-center gap-2 pl-4">
               <OperationalStatusPill summary={summary} />
-              <ClientMarketBillingBanner
-                billing={billing}
-                onChanged={onBillingChanged}
+              <ClientMarketRentalBanner
+                rental={rental}
+                onChanged={onRentalChanged}
                 readOnly
                 resumeRelease={false}
-                showPayButton={false}
-                manageHref={billing ? clientMarketMineHref(billing.installationId) : undefined}
+                manageHref={rental ? clientMarketMineHref(rental.installationId) : undefined}
               />
               {tunnelUrl ? <ClientConsoleButton client={client} /> : null}
               <ClientUpgradeButton client={client} />
@@ -449,7 +433,7 @@ function ClientCard({
           </div>
         </div>
 
-        {!collapsed ? <ShareScroller shares={shares} totalCount={allShares.length} referenceTunnelUrl={client.clientTunnel?.tunnelUrl} onOpenShare={onOpenShare} onEditShare={onEditShare} onConnectShare={onConnectShare} /> : null}
+        {!collapsed ? <ShareScroller shares={shares} totalCount={allShares.length} onOpenShare={onOpenShare} onEditShare={onEditShare} onConnectShare={onConnectShare} /> : null}
       </Card.Content>
     </Card>
   );
@@ -496,32 +480,32 @@ export function ClientBoard({
     CLIENT_EXPANDED_STORAGE_KEY,
     null,
   );
-  const [marketBilling, setMarketBilling] = React.useState<Map<string, ClientMarketBilling>>(new Map());
+  const [marketRentals, setMarketRentals] = React.useState<Map<string, ClientMarketRental>>(new Map());
   const lastLocatedFocusRef = React.useRef("");
 
-  const loadMarketBilling = React.useCallback(async () => {
+  const loadMarketRentals = React.useCallback(async () => {
     if (!authed) {
-      setMarketBilling(new Map());
+      setMarketRentals(new Map());
       return;
     }
     try {
-      const records = await getMyClientMarketBilling();
-      setMarketBilling(new Map(records.map((record) => [record.installationId, record])));
+      const records = await getMyClientMarketRentals();
+      setMarketRentals(new Map(records.map((record) => [record.installationId, record])));
     } catch {
-      // Billing is supplementary to the dashboard; authorization/API errors must not hide Clients.
+      // Rental metadata is supplementary; authorization/API errors must not hide Clients.
     }
   }, [authed]);
 
   React.useEffect(() => {
-    void loadMarketBilling();
+    void loadMarketRentals();
     if (!authed) return;
-    const timer = window.setInterval(() => void loadMarketBilling(), 20_000);
+    const timer = window.setInterval(() => void loadMarketRentals(), 20_000);
     return () => window.clearInterval(timer);
-  }, [authed, loadMarketBilling]);
+  }, [authed, loadMarketRentals]);
 
-  const refreshBillingAndDashboard = React.useCallback(async () => {
-    await Promise.all([loadMarketBilling(), Promise.resolve(onChanged?.())]);
-  }, [loadMarketBilling, onChanged]);
+  const refreshRentalsAndDashboard = React.useCallback(async () => {
+    await Promise.all([loadMarketRentals(), Promise.resolve(onChanged?.())]);
+  }, [loadMarketRentals, onChanged]);
 
   React.useEffect(() => {
     if (sortOrder === "registered") setSortOrder("running");
@@ -756,6 +740,16 @@ export function ClientBoard({
           <label className="flex h-9 min-w-0 flex-1 items-center gap-2 rounded-md border bg-white px-3 text-sm focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-primary/10 sm:min-w-64">
             <Search className="h-4 w-4 shrink-0 text-muted-foreground" />
             <input value={query} onChange={(event) => setQuery(event.target.value)} className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground" placeholder={t("dashboard.searchClients")} aria-label={t("dashboard.searchClients")} />
+            {query ? (
+              <button
+                type="button"
+                className="rounded p-0.5 text-muted-foreground hover:bg-slate-100 hover:text-foreground"
+                aria-label={t("common.close")}
+                onClick={() => setQuery("")}
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            ) : null}
           </label>
           <div ref={filtersRef} className="relative shrink-0">
             <Button
@@ -836,7 +830,7 @@ export function ClientBoard({
 
       <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4">
         {clientRows.length ? clientRows.map(({ client, shares: visibleShares, allShares }) => (
-          <ClientCard key={client.installation.id} client={client} shares={visibleShares} summaryShares={allShares} onOpenClient={openClient} onOpenShare={openShare} onEditShare={openEditShare} onConnectShare={openConnectShare} billing={marketBilling.get(client.installation.id)} onBillingChanged={refreshBillingAndDashboard} collapsed={!query && !expandedClientIdSet.has(client.installation.id)} onToggleCollapsed={() => toggleClientExpanded(client.installation.id)} />
+          <ClientCard key={client.installation.id} client={client} shares={visibleShares} summaryShares={allShares} onOpenClient={openClient} onOpenShare={openShare} onEditShare={openEditShare} onConnectShare={openConnectShare} rental={marketRentals.get(client.installation.id)} onRentalChanged={refreshRentalsAndDashboard} collapsed={!query && !expandedClientIdSet.has(client.installation.id)} onToggleCollapsed={() => toggleClientExpanded(client.installation.id)} />
         )) : (
           <EmptyBlock>
             <div className="grid justify-items-center gap-2">
@@ -940,7 +934,7 @@ export function ClientBoard({
 
       <ShareEditDialog share={editingShare} markets={markets} onClose={closeEditShare} onSaved={handleSaved} />
       <ShareConnectDialog share={currentConnectShare} open={!!currentConnectShare} onOpenChange={closeConnectDialog} />
-      <CreateClientDialog open={createClientOpen} onOpenChange={setCreateClientOpen} onCreated={() => void refreshBillingAndDashboard()} />
+      <CreateClientDialog open={createClientOpen} onOpenChange={setCreateClientOpen} onCreated={() => void refreshRentalsAndDashboard()} />
     </section>
   );
 }

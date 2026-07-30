@@ -4,13 +4,14 @@ import { Eye, ExternalLink, Link2, Maximize2, Pencil } from "lucide-react";
 import { Button, Card, Chip, Modal, ProgressBar, Tabs } from "@heroui/react";
 import * as React from "react";
 import { ShareClientTag } from "@/components/dashboard/share-client-tag";
+import { shareEditPendingLabel } from "@/components/dashboard/share-edit/share-edit-section";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getShareImageGenerationRequestLogs, getShareUsageByEmail, getShareUserLimitStatus } from "@/lib/api";
 import type { AppLocale } from "@/lib/i18n";
 import type { DashboardClient, ImageGenerationRequestLog, MarketRequestLog, ShareAppProvider, ShareAppProviders, ShareAppRuntimes, ShareModelHealthCheck, ShareRequestLog, ShareTokenPeriod, ShareUpstreamProvider, ShareUsageByEmailResponse, ShareUserGrant, ShareUserLimitStatusRow, ShareView } from "@/lib/types";
 import { compactTokens, formatDateTime, formatNumber, formatRelativeTime } from "@/lib/utils";
 import { resolveShareCoreApp, SHARE_APP_LABELS } from "@/lib/share-app";
-import { averageRecentLatencyMs, boundProviderIdForApp, cacheHitRate, clientPlatformLabel, clientTunnelDisplayUrl, configuredUpstreamPercent, CORE_SHARE_APPS, expiryTitle, formatAgeDaysOrHours, formatImageLogSizeMb, formatImageLogSpendSeconds, formatImageLogTimestamp, formatLatencySeconds, formatMinutesShort, formatPercent, formatShareStatus, HealthDots, isUnlimited, mergeStandaloneOAuthRuntime, modelHealthTitle, modelHealthTone, providerAccountIdentity, providerAccountLevel, providerModelMap, requestBelongsToApp, requestModelRoute, resolveShareAppRuntime, runtimeEndpointSummary, shareApiParts, shareAppExists, shareAppProviderRuntime, shareAppSettings, shareExpiryProgress, tokenCount, usageBucketTotalTokens, type CoreShareApp, type TFn } from "@/components/dashboard/share-dashboard-utils";
+import { averageRecentLatencyMs, boundProviderIdForApp, cacheHitRate, clientPlatformLabel, clientTunnelDisplayUrl, configuredUpstreamPercent, CORE_SHARE_APPS, expiryTitle, formatAgeDaysOrHours, formatImageLogSizeMb, formatImageLogSpendSeconds, formatImageLogTimestamp, formatLatencySeconds, formatMinutesShort, formatPercent, formatShareStatus, hasObservedShareUsage, HealthDots, isUnlimited, mergeStandaloneOAuthRuntime, modelHealthTitle, modelHealthTone, providerAccountIdentity, providerAccountLevel, providerModelMap, requestBelongsToApp, requestModelRoute, resolveShareAppRuntime, runtimeEndpointSummary, shareApiParts, shareAppExists, shareAppProviderRuntime, shareAppSettings, shareExpiryProgress, tokenCount, usageBucketTotalTokens, type CoreShareApp, type TFn } from "@/components/dashboard/share-dashboard-utils";
 
 export function StatusBadge({ active, label }: { active: boolean; label: string }) {
   return <Chip color={active ? "success" : "default"} size="sm" variant={active ? "soft" : "tertiary"}>{label}</Chip>;
@@ -128,7 +129,7 @@ export function ShareAppSupportCard({
 export function ShareEditAction({ share, onEdit, t }: { share?: ShareView; onEdit: (share: ShareView) => void; t: TFn }) {
   if (!share) return null;
   if (share.canManage && share.activeEdit?.status === "pending") {
-    return <Chip size="sm" color="warning" variant="soft">{t("dashboard.pendingApply")}</Chip>;
+    return <Chip size="sm" color="warning" variant="soft">{shareEditPendingLabel(share.activeEdit, t)}</Chip>;
   }
   const handle = (event: React.MouseEvent) => {
     event.stopPropagation();
@@ -841,6 +842,7 @@ export function ShareUsageTable({ usage, t }: { usage: ShareUsageByEmailResponse
     if (role === "owner") return t("dashboard.usageEmail.role.owner");
     if (role === "shareto") return t("dashboard.usageEmail.role.shareto");
     if (role === "market") return t("dashboard.usageEmail.role.market");
+    if (role === "deprecated") return t("dashboard.usageEmail.role.deprecated");
     return role || "-";
   };
   return (
@@ -1277,8 +1279,22 @@ export function ShareRequestLogs({ logs }: { logs: ShareRequestLog[] }) {
                   {log.userEmail ? <span>{log.userEmail}</span> : null}
                   <span>{log.providerName || log.providerId || "-"}</span>
                   <span>{log.requestedModel || log.requestModel || "-"}</span>
+                  {log.requestedReasoningEffort || log.effectiveReasoningEffort ? (
+                    <span>
+                      {t("dashboard.reasoningEffort")}: {log.requestedReasoningEffort && log.effectiveReasoningEffort && log.requestedReasoningEffort !== log.effectiveReasoningEffort
+                        ? `${log.requestedReasoningEffort} → ${log.effectiveReasoningEffort}`
+                        : log.requestedReasoningEffort || log.effectiveReasoningEffort}
+                    </span>
+                  ) : null}
+                  {log.clientServiceTier || log.effectiveServiceTier ? (
+                    <span>
+                      {t("dashboard.serviceTier")}: {log.clientServiceTier && log.effectiveServiceTier && log.clientServiceTier !== log.effectiveServiceTier
+                        ? `${log.clientServiceTier} → ${log.effectiveServiceTier}`
+                        : log.effectiveServiceTier || log.clientServiceTier}
+                    </span>
+                  ) : null}
                   <span title={formatDateTime(log.createdAt * 1000)}>{formatRelativeTime(log.createdAt * 1000, locale)}</span>
-                  {log.isStreaming ? <span>stream</span> : null}
+                  {log.isStreaming ? <span>{log.streamStatus || "stream"}</span> : null}
                 </div>
               </div>
               <div className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground">
@@ -1330,21 +1346,40 @@ export function ShareModelHealthChecks({ checks }: { checks: ShareModelHealthChe
 }
 
 export function TokenGrid({ log }: { log: ShareRequestLog | MarketRequestLog }) {
+  const { t } = useLocaleText();
+  const usageObserved = hasObservedShareUsage(log);
+  const usageState = log.usageState || "observed";
+  const usageStateLabel = (() => {
+    switch (usageState) {
+      case "pending": return t("dashboard.usageState.pending");
+      case "missing": return t("dashboard.usageState.missing");
+      case "parse_error": return t("dashboard.usageState.parseError");
+      case "interrupted": return t("dashboard.usageState.interrupted");
+      default: return usageState;
+    }
+  })();
   const items = [
-    ["Input", tokenCount(log.inputTokens), "Fresh input tokens used for input pricing."],
-    ["Output", tokenCount(log.outputTokens), "Output tokens used for output pricing."],
-    ["Cache R", tokenCount(log.cacheReadTokens), "Cache read tokens used for cache-read pricing."],
-    ["Cache W", tokenCount(log.cacheCreationTokens), "Cache creation tokens used for cache-write pricing."],
-    ["Total", usageBucketTotalTokens(log), "Input + Output + Cache R + Cache W."],
-    ["Hit", formatPercent(cacheHitRate(log)), "Cache R / (Input + Cache R)."],
+    ["Input", usageObserved ? tokenCount(log.inputTokens) : "-", "Fresh input tokens used for input pricing."],
+    ["Output", usageObserved ? tokenCount(log.outputTokens) : "-", "Output tokens used for output pricing."],
+    ["Cache R", usageObserved ? tokenCount(log.cacheReadTokens) : "-", "Cache read tokens used for cache-read pricing."],
+    ["Cache W", usageObserved ? tokenCount(log.cacheCreationTokens) : "-", "Cache creation tokens used for cache-write pricing."],
+    ["Total", usageObserved ? usageBucketTotalTokens(log) : "-", "Input + Output + Cache R + Cache W."],
+    ["Hit", usageObserved ? formatPercent(cacheHitRate(log)) : "-", "Cache R / (Input + Cache R)."],
   ];
   return (
-    <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-6">
-      {items.map(([label, value, title]) => (
-        <div key={label} className="rounded-md bg-muted/40 px-2 py-1.5 text-xs text-muted-foreground" title={String(title)}>
-          {label}<span className="ml-2 font-mono font-semibold text-foreground">{typeof value === "number" ? formatNumber(value) : value}</span>
+    <div className="space-y-2">
+      {!usageObserved ? (
+        <div className="text-xs text-muted-foreground" title={log.streamStatus || undefined}>
+          {usageStateLabel}{log.streamStatus ? ` · ${log.streamStatus}` : ""}
         </div>
-      ))}
+      ) : null}
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-6">
+        {items.map(([label, value, title]) => (
+          <div key={label} className="rounded-md bg-muted/40 px-2 py-1.5 text-xs text-muted-foreground" title={String(title)}>
+            {label}<span className="ml-2 font-mono font-semibold text-foreground">{typeof value === "number" ? formatNumber(value) : value}</span>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

@@ -88,7 +88,7 @@ use crate::registration_admission::{
     RegistrationAdmissionPolicy, RegistrationQuotaWindow, registration_source_scope,
 };
 
-mod client_chat;
+pub(crate) mod client_chat;
 
 const SHARE_REQUEST_LOG_RECOVERY_LIMIT: usize = 10;
 pub const IMAGE_GENERATION_REQUEST_LOG_RETAIN_PER_SHARE: usize = 10;
@@ -140,7 +140,14 @@ const GATEWAY_DEFAULT_SCOPES: &[&str] = &[
     "gateway:feedback:write",
     "gateway:request_logs:write",
 ];
-const USER_DEFAULT_API_TOKEN_SCOPES: &[&str] = &["share:read", "share:write", "share:invoke"];
+const USER_DEFAULT_API_TOKEN_SCOPES: &[&str] = &[
+    "share:read",
+    "share:write",
+    "share:invoke",
+    "market:access:read",
+    "market:access:write",
+    "market:billing:settlement",
+];
 const USER_DEFAULT_API_TOKEN_NAME: &str = "default";
 const DASHBOARD_EXPIRY_WARNING_DAYS: i64 = 7;
 const DASHBOARD_CAPACITY_WARNING_RATIO: f64 = 0.9;
@@ -1807,8 +1814,8 @@ impl AppStore {
         let legacy_state =
             prepare_legacy_setup_notification_adoption_tx(&tx, &installation.id, now)?;
         let notifications_enabled = client_notification_runtime_enabled(&tx)?;
-        // Client Market already emails the owner when provisioning completes
-        // (billing + ready card). Skip the duplicate registration mail.
+        // Client Market already publishes provisioning completion to the Client's
+        // public room. Skip the duplicate registration email.
         let suppress_market_registration = installation.provision_source.as_deref()
             == Some(crate::client_market::PROVISION_SOURCE_ROUTER_MARKET);
         let (event_id, notification_status, response_status, retain_password_hint) =
@@ -1854,8 +1861,8 @@ impl AppStore {
                         )
                     } else if suppress_market_registration {
                         (
-                            "suppressed_market_ready",
-                            Some("covered by Client Market ready email"),
+                            "suppressed_market_chat",
+                            Some("covered by Client Market provisioning system event"),
                             "suppressed_disabled",
                             InstallationSetupCompletedStatus::SuppressedDisabled,
                             true,
@@ -1923,8 +1930,8 @@ impl AppStore {
                         )
                     } else if suppress_market_registration {
                         (
-                            "suppressed_market_ready",
-                            Some("covered by Client Market ready email"),
+                            "suppressed_market_chat",
+                            Some("covered by Client Market provisioning system event"),
                             "suppressed_disabled",
                             InstallationSetupCompletedStatus::SuppressedDisabled,
                             true,
@@ -3733,10 +3740,8 @@ impl AppStore {
     pub async fn count_sent_emails_last_24h(&self) -> Result<usize, AppError> {
         let cutoff = (Utc::now() - Duration::hours(24)).to_rfc3339();
         let conn = self.conn.lock().await;
-        // Footer EMAIL SENT 24H must include every Router outbound mail path.
-        // login_code / client_notification / client_chat already land in email_send_logs;
-        // market_notification and client_market historically only wrote their own tables —
-        // UNION covers those (and dedupes once they also write email_send_logs).
+        // Footer EMAIL SENT 24H includes the remaining outbound email paths.
+        // Client/Share Market business events are delivered to Client chat instead.
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM (
@@ -3745,10 +3750,6 @@ impl AppStore {
                     UNION
                     SELECT id FROM market_notification_emails
                      WHERE status = 'sent' AND created_at >= ?1
-                    UNION
-                    SELECT id FROM client_market_email_deliveries
-                     WHERE status = 'sent'
-                       AND COALESCE(sent_at, updated_at, created_at) >= ?1
                  )",
                 params![cutoff],
                 |row| row.get(0),
@@ -4271,6 +4272,28 @@ impl AppStore {
             let tx = conn.unchecked_transaction().map_err(|e| {
                 AppError::Internal(format!("begin client tunnel claim tx failed: {e}"))
             })?;
+            if signed_payload.enabled {
+                let billing_suspended = tx
+                    .query_row(
+                        "SELECT 1 FROM client_market_subscriptions
+                         WHERE installation_id = ?1 AND status = 'billing_suspended'",
+                        params![installation_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()
+                    .map_err(|error| {
+                        AppError::Internal(format!(
+                            "check Client billing suspension failed: {error}"
+                        ))
+                    })?
+                    .is_some();
+                if billing_suspended {
+                    return Err(AppError::Conflict(
+                        "client tunnel remains disabled until the supplier account is settled"
+                            .into(),
+                    ));
+                }
+            }
             crate::client_market::authorize_client_market_subdomain_claim(
                 &tx,
                 &subdomain,
@@ -4829,6 +4852,7 @@ impl AppStore {
         let mut view = ShareView {
             router_id: "main".to_string(),
             share_id: share.share_id,
+            capacity_pool_id: share.capacity_pool_id,
             share_name: share.share_name,
             owner_email: share.owner_email,
             shared_with_emails: if can_manage {
@@ -4911,6 +4935,10 @@ impl AppStore {
         app_type: Option<&str>,
     ) -> Result<bool, AppError> {
         let email = normalize_email(user_email)?;
+        let Some(app_type) = app_type else {
+            return Ok(false);
+        };
+        let app_type = normalize_share_acl_app(app_type)?;
         let conn = self.conn.lock().await;
         let Some((
             owner_email,
@@ -4920,8 +4948,14 @@ impl AppStore {
             for_sale,
         )): Option<(Option<String>, String, String, String, String)> = conn
             .query_row(
-                "SELECT owner_email, shared_with_emails_json, COALESCE(access_by_app_json, '{}'), COALESCE(app_settings_json, '{}'), for_sale FROM shares WHERE share_id = ?1",
-                params![share_id],
+                "SELECT owner_email, shared_with_emails_json, COALESCE(access_by_app_json, '{}'), COALESCE(app_settings_json, '{}'), for_sale
+                 FROM shares
+                 WHERE share_id = ?1
+                   AND EXISTS (
+                       SELECT 1 FROM share_bindings
+                       WHERE share_id = ?1 AND app_type = ?2
+                   )",
+                params![share_id, app_type],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .optional()
@@ -4942,21 +4976,19 @@ impl AppStore {
             serde_json::from_str(&access_by_app_json).unwrap_or_default();
         let app_settings: BTreeMap<String, ShareAppSettings> =
             serde_json::from_str(&app_settings_json).unwrap_or_default();
-        if let Some(app_type) = app_type.map(|value| value.trim().to_ascii_lowercase()) {
-            if let Some(settings) = app_settings.get(&app_type) {
-                return Ok(settings
+        if let Some(settings) = app_settings.get(&app_type) {
+            return Ok(settings
+                .shared_with_emails
+                .iter()
+                .any(|shared| shared.eq_ignore_ascii_case(&email)));
+        }
+        if !access_by_app.is_empty() {
+            return Ok(access_by_app.get(&app_type).is_some_and(|access| {
+                access
                     .shared_with_emails
                     .iter()
-                    .any(|shared| shared.eq_ignore_ascii_case(&email)));
-            }
-            if !access_by_app.is_empty() {
-                return Ok(access_by_app.get(&app_type).is_some_and(|access| {
-                    access
-                        .shared_with_emails
-                        .iter()
-                        .any(|shared| shared.eq_ignore_ascii_case(&email))
-                }));
-            }
+                    .any(|shared| shared.eq_ignore_ascii_case(&email))
+            }));
         }
         let shared_with_emails = parse_string_vec(Some(shared_with_emails_json))
             .map_err(|e| AppError::Internal(format!("parse share invoke acl failed: {e}")))?;
@@ -4982,13 +5014,23 @@ impl AppStore {
             shared_with_emails_json,
             access_by_app_json,
             market_access_mode,
-        )): Option<(Option<String>, String, String, String)> = conn
+            user_grants_json,
+        )): Option<(Option<String>, String, String, String, String)> = conn
             .query_row(
-                "SELECT owner_email, shared_with_emails_json, COALESCE(access_by_app_json, '{}'), market_access_mode
+                "SELECT owner_email, shared_with_emails_json, COALESCE(access_by_app_json, '{}'),
+                        market_access_mode, COALESCE(user_grants_json, '{}')
                  FROM shares
                  WHERE share_id = ?1",
                 params![share_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()
             .map_err(|e| AppError::Internal(format!("query share usage acl failed: {e}")))?
@@ -5001,6 +5043,22 @@ impl AppStore {
         let access_by_app = parse_share_access_by_app(Some(access_by_app_json)).map_err(|e| {
             AppError::Internal(format!("parse share usage access_by_app failed: {e}"))
         })?;
+        let user_grants = parse_share_user_grants(Some(user_grants_json))
+            .map_err(|e| AppError::Internal(format!("parse share usage grants failed: {e}")))?;
+        let deprecated_shareto_emails = user_grants
+            .into_iter()
+            .filter_map(|(key, grant)| {
+                if grant.active || !grant.role.eq_ignore_ascii_case("shareto") {
+                    return None;
+                }
+                let email = if grant.email.trim().is_empty() {
+                    key.as_str()
+                } else {
+                    grant.email.as_str()
+                };
+                normalize_usage_email(email)
+            })
+            .collect::<HashSet<_>>();
 
         let mut roles = BTreeMap::<String, String>::new();
         if let Some(owner) = owner_email.as_deref().and_then(normalize_usage_email) {
@@ -5050,6 +5108,13 @@ impl AppStore {
                     total_tokens: 0,
                 })
                 .collect(),
+        };
+        let unlisted_usage_role = |email: &str| {
+            if deprecated_shareto_emails.contains(email) {
+                "deprecated"
+            } else {
+                "market"
+            }
         };
         let mut rows_by_email = roles
             .iter()
@@ -5108,9 +5173,10 @@ impl AppStore {
                 AppError::Internal(format!("read market share usage row failed: {e}"))
             })?;
             if include_actual_usage_emails {
+                let role = unlisted_usage_role(&email);
                 rows_by_email
                     .entry(email.clone())
-                    .or_insert_with(|| make_usage_row(&email, "market"));
+                    .or_insert_with(|| make_usage_row(&email, role));
             }
             let Some(row) = rows_by_email.get_mut(&email) else {
                 continue;
@@ -5180,9 +5246,10 @@ impl AppStore {
             let (email, bucket, input, output, cache_read, cache_creation) =
                 row.map_err(|e| AppError::Internal(format!("read share usage row failed: {e}")))?;
             if include_actual_usage_emails {
+                let role = unlisted_usage_role(&email);
                 rows_by_email
                     .entry(email.clone())
-                    .or_insert_with(|| make_usage_row(&email, "market"));
+                    .or_insert_with(|| make_usage_row(&email, role));
             }
             let Some(row) = rows_by_email.get_mut(&email) else {
                 continue;
@@ -6804,7 +6871,7 @@ impl AppStore {
             owner_email,
             shared_with_emails_json,
             current_for_sale,
-            current_app_type,
+            current_bindings,
             current_config_revision,
             user_grants_json,
             supported_user_token_periods_json,
@@ -6813,15 +6880,15 @@ impl AppStore {
             String,
             String,
             String,
-            String,
+            BTreeMap<String, String>,
             i64,
             String,
             String,
         ) = conn
             .query_row(
-                "SELECT installation_id, owner_email, shared_with_emails_json, for_sale, app_type, config_revision, COALESCE(user_grants_json, '{}'), COALESCE(supported_user_token_periods_json, '[]') FROM shares WHERE share_id = ?1",
+                "SELECT installation_id, owner_email, shared_with_emails_json, for_sale, COALESCE(bindings_json, '{}'), config_revision, COALESCE(user_grants_json, '{}'), COALESCE(supported_user_token_periods_json, '[]') FROM shares WHERE share_id = ?1",
                 params![share_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, parse_share_bindings(row.get(4)?)?, row.get(5)?, row.get(6)?, row.get(7)?)),
             )
             .optional()
             .map_err(|e| AppError::Internal(format!("query share owner failed: {e}")))?
@@ -6841,7 +6908,7 @@ impl AppStore {
             Some(&owner_email),
             Some(&shared_with_emails),
             Some(&current_for_sale),
-            Some(&current_app_type),
+            Some(&current_bindings),
             Some(&existing_user_grants),
         )?;
         let supported_user_token_periods =
@@ -7000,6 +7067,7 @@ impl AppStore {
         edit_id: &str,
         error_message: &str,
     ) -> Result<(), AppError> {
+        let error_message = client_chat::sanitize_system_event_text(error_message);
         let conn = self.conn.lock().await;
         let now = Utc::now().to_rfc3339();
         conn.execute(
@@ -7013,7 +7081,7 @@ impl AppStore {
             &conn,
             edit_id,
             "rejected",
-            Some(error_message),
+            Some(&error_message),
             &now,
         )?;
         Ok(())
@@ -7080,7 +7148,11 @@ impl AppStore {
         };
         let now = Utc::now().to_rfc3339();
         let ack_edit_id = input.ack.edit_id.clone();
-        let ack_error = input.ack.error_message.clone();
+        let ack_error = input
+            .ack
+            .error_message
+            .as_deref()
+            .map(client_chat::sanitize_system_event_text);
         let changed = conn
             .execute(
                 "UPDATE share_edit_requests
@@ -7604,6 +7676,7 @@ impl AppStore {
                 let mut view = ShareView {
                     router_id: "main".to_string(),
                     share_id: share.share_id,
+                    capacity_pool_id: share.capacity_pool_id,
                     share_name: share.share_name,
                     owner_email: share.owner_email,
                     shared_with_emails: if can_manage {
@@ -8958,6 +9031,24 @@ impl AppStore {
         .await
     }
 
+    pub async fn list_gateway_shares_for_app(
+        &self,
+        gateway: &GatewayRegistryRecord,
+        router_id: &str,
+        active_subdomains: &HashSet<String>,
+        inflight_by_share: &HashMap<String, usize>,
+        app: &str,
+    ) -> Result<Vec<MarketShareView>, AppError> {
+        self.list_market_shares_for_app(
+            &gateway.owner_email,
+            router_id,
+            active_subdomains,
+            inflight_by_share,
+            app,
+        )
+        .await
+    }
+
     pub async fn batch_sync_gateway_request_logs(
         &self,
         gateway: &GatewayRegistryRecord,
@@ -9151,6 +9242,25 @@ impl AppStore {
         .await
     }
 
+    pub async fn list_market_shares_for_app(
+        &self,
+        market_email: &str,
+        router_id: &str,
+        active_subdomains: &HashSet<String>,
+        inflight_by_share: &HashMap<String, usize>,
+        app: &str,
+    ) -> Result<Vec<MarketShareView>, AppError> {
+        let app = normalize_share_acl_app(app)?;
+        self.list_market_shares_with_signal_app(
+            market_email,
+            router_id,
+            active_subdomains,
+            inflight_by_share,
+            Some(&app),
+        )
+        .await
+    }
+
     async fn list_market_shares_with_signal_app(
         &self,
         market_email: &str,
@@ -9176,7 +9286,9 @@ impl AppStore {
                         i.last_seen_at, s.enabled_claude, s.enabled_codex, s.enabled_gemini,
                         s.upstream_provider_json, s.app_runtimes_json,
                         mds.created_at, s.created_at,
-                        s.token_limit, s.tokens_used, s.requests_count, s.expires_at
+                        s.token_limit, s.tokens_used, s.requests_count, s.expires_at,
+                        s.bindings_json, s.capacity_pool_id,
+                        COALESCE(s.for_sale_official_price_percent_by_app_json, '{}')
                  FROM shares s
                  LEFT JOIN installations i ON i.id = s.installation_id
                  LEFT JOIN market_disabled_shares mds
@@ -9195,6 +9307,7 @@ impl AppStore {
                 let shared_with_emails = parse_string_vec(row.get(5)?)?;
                 let access_by_app = parse_share_access_by_app(row.get(6)?)?;
                 let app_settings = parse_share_app_settings(row.get(7)?)?;
+                let bindings = parse_share_bindings(row.get(26)?)?;
                 let subdomain: String = row.get(12)?;
                 let parallel_limit: i64 = row.get(13)?;
                 let active_requests = *inflight_by_share.get(&share_id).unwrap_or(&0);
@@ -9252,6 +9365,7 @@ impl AppStore {
                     MarketShareView {
                         router_id: router_id.to_string(),
                         share_id: share_id.clone(),
+                        capacity_pool_id: row.get(27)?,
                         subdomain: subdomain.clone(),
                         installation_id: row.get(1)?,
                         share_name: row.get(2)?,
@@ -9260,6 +9374,8 @@ impl AppStore {
                         market_access_mode: row.get(8)?,
                         app_type: row.get(9)?,
                         for_sale: row.get(10)?,
+                        for_sale_official_price_percent_by_app:
+                            parse_share_official_price_percent_by_app(row.get(28)?)?,
                         share_status: row.get(11)?,
                         online: false,
                         route_state: "offline".into(),
@@ -9297,16 +9413,18 @@ impl AppStore {
                         },
                     },
                     app_settings,
+                    bindings,
                 ))
             })
             .map_err(|e| AppError::Internal(format!("query market shares failed: {e}")))?;
 
         let mut shares = Vec::new();
         for row in rows {
-            let (shared_with_emails, access_by_app, subdomain, mut share, app_settings) =
+            let (shared_with_emails, access_by_app, subdomain, mut share, app_settings, bindings) =
                 row.map_err(|e| AppError::Internal(format!("read market share row failed: {e}")))?;
             share.market_apps = build_market_share_apps(
                 &share.support,
+                &bindings,
                 &app_settings,
                 &access_by_app,
                 &shared_with_emails,
@@ -9812,7 +9930,8 @@ impl AppStore {
         reason: &str,
         router_epoch: &str,
     ) -> Result<(), AppError> {
-        let now = Utc::now().timestamp();
+        let observed_at = Utc::now();
+        let now = observed_at.timestamp();
         let conn = self.conn.lock().await;
         conn.execute(
             "INSERT INTO share_health_checks (
@@ -9828,6 +9947,14 @@ impl AppStore {
             ],
         )
         .map_err(|e| AppError::Internal(format!("insert route health failed: {e}")))?;
+        client_chat::record_share_presence_observation_tx(
+            &conn,
+            share_id,
+            status,
+            reason,
+            router_epoch,
+            observed_at,
+        )?;
         conn.execute(
             "DELETE FROM share_health_checks WHERE checked_at < ?1",
             params![now - 86_400],
@@ -9938,11 +10065,14 @@ impl AppStore {
         mut share: ShareDescriptor,
     ) -> Result<(), AppError> {
         let conn = self.conn.lock().await;
-        let existing_subdomain =
-            get_share_owned_subdomain(&conn, installation_id, &share.share_id)?
-                .ok_or_else(|| AppError::Conflict("share subdomain is not claimed".into()))?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| AppError::Internal(format!("begin share upsert tx failed: {e}")))?;
+        let existing_subdomain = get_share_owned_subdomain(&tx, installation_id, &share.share_id)?
+            .ok_or_else(|| AppError::Conflict("share subdomain is not claimed".into()))?;
         share.subdomain = existing_subdomain;
-        upsert_share_tx(&conn, installation_id, share)?;
+        upsert_share_tx(&tx, installation_id, share)?;
+        tx.commit().map_err(map_share_constraint_error)?;
         Ok(())
     }
 
@@ -10841,21 +10971,132 @@ fn normalize_share_descriptor_fields(share: &mut ShareDescriptor) {
     }
 }
 
+fn validate_share_descriptor_bindings(share: &ShareDescriptor) -> Result<(), AppError> {
+    if share.capacity_pool_id.trim().is_empty() || share.capacity_pool_id.len() > 128 {
+        return Err(AppError::BadRequest(
+            "share capacityPoolId must be a non-empty identifier of at most 128 bytes".into(),
+        ));
+    }
+    if !(1..=3).contains(&share.bindings.len()) {
+        return Err(AppError::BadRequest(
+            "share must contain between one and three app bindings".into(),
+        ));
+    }
+    for (app, provider_id) in &share.bindings {
+        if !matches!(app.as_str(), "claude" | "codex" | "gemini") {
+            return Err(AppError::BadRequest(
+                "share binding app must be claude, codex, or gemini".into(),
+            ));
+        }
+        if provider_id.trim().is_empty() || provider_id.trim() != provider_id {
+            return Err(AppError::BadRequest(
+                "share binding providerId must be non-empty and trimmed".into(),
+            ));
+        }
+        if !share_supports_app(&share.support, app) {
+            return Err(AppError::BadRequest(format!(
+                "share support must include bound app {app}"
+            )));
+        }
+    }
+    if !matches!(share.app_type.as_str(), "claude" | "codex" | "gemini")
+        || share.provider_id.as_deref().is_none_or(|provider_id| {
+            share.bindings.get(&share.app_type).map(String::as_str) != Some(provider_id)
+        })
+    {
+        return Err(AppError::BadRequest(
+            "share appType/providerId must match one of its bindings".into(),
+        ));
+    }
+    for app in share
+        .access_by_app
+        .keys()
+        .chain(share.app_settings.keys())
+        .chain(share.for_sale_official_price_percent_by_app.keys())
+    {
+        if !share.bindings.contains_key(app) {
+            return Err(AppError::BadRequest(format!(
+                "share app configuration targets unbound app {app}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_shared_app_configuration(
+    share: &ShareDescriptor,
+    for_sale: &str,
+    market_access_mode: &str,
+) -> Result<(), AppError> {
+    let expected = ShareAppSettings {
+        for_sale: for_sale.to_string(),
+        market_access_mode: market_access_mode.to_string(),
+        shared_with_emails: share.shared_with_emails.clone(),
+        token_limit: share.token_limit,
+        parallel_limit: share.parallel_limit,
+        expires_at: share.expires_at.clone(),
+    };
+    let settings = effective_share_app_settings(share);
+    for app in share.bindings.keys() {
+        if settings.get(app) != Some(&expected) {
+            return Err(AppError::BadRequest(
+                "all bindings in a share must use the same remote share configuration".into(),
+            ));
+        }
+    }
+
+    let prices = &share.for_sale_official_price_percent_by_app;
+    if prices.values().any(|percent| !(1..=100).contains(percent)) {
+        return Err(AppError::BadRequest(
+            "official price percent must be between 1 and 100".into(),
+        ));
+    }
+    if !prices.is_empty()
+        && (prices.len() != share.bindings.len()
+            || prices.values().copied().collect::<HashSet<_>>().len() != 1)
+    {
+        return Err(AppError::BadRequest(
+            "all bindings in a share must use the same official price percent".into(),
+        ));
+    }
+    if !prices.is_empty() && for_sale != "Yes" {
+        return Err(AppError::BadRequest(
+            "official price percent requires forSale=Yes".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn upsert_share_tx(
     conn: &Connection,
     installation_id: &str,
     mut share: ShareDescriptor,
 ) -> Result<(), AppError> {
     normalize_share_descriptor_fields(&mut share);
-    if share.bindings.len() != 1
-        || share.provider_id.as_deref().is_none_or(|provider_id| {
-            share.bindings.get(&share.app_type).map(String::as_str) != Some(provider_id)
-        })
-    {
-        return Err(AppError::BadRequest(
-            "share must contain exactly one binding matching appType/providerId".into(),
-        ));
-    }
+    validate_share_descriptor_bindings(&share)?;
+    let chat_share_id = share.share_id.clone();
+    let previous_event_snapshot = conn
+        .query_row(
+            "SELECT share_status, expires_at, upstream_provider_json, bindings_json,
+                    config_revision
+             FROM shares WHERE share_id = ?1",
+            params![chat_share_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "read previous Share event snapshot failed: {error}"
+            ))
+        })?;
     let installation = get_installation(conn, installation_id)?
         .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
     let installation_owner = verified_installation_owner_email(&installation)?;
@@ -10863,20 +11104,7 @@ fn upsert_share_tx(
     let description = normalize_share_description(share.description.clone())?;
     let for_sale = normalize_share_for_sale(&share.for_sale)?;
     let market_access_mode = normalize_market_access_mode(&share.market_access_mode)?;
-    if share
-        .for_sale_official_price_percent_by_app
-        .iter()
-        .any(|(app, percent)| app != &share.app_type || !(1..=100).contains(percent))
-    {
-        return Err(AppError::BadRequest(
-            "official price percent must target the share app and be between 1 and 100".into(),
-        ));
-    }
-    if !share.for_sale_official_price_percent_by_app.is_empty() && for_sale != "Yes" {
-        return Err(AppError::BadRequest(
-            "official price percent requires forSale=Yes".into(),
-        ));
-    }
+    validate_shared_app_configuration(&share, &for_sale, &market_access_mode)?;
     let now_ms = Utc::now().timestamp_millis();
     for grant in share.user_grants.values() {
         if grant.policy.parallel_limit == Some(0) || grant.policy.token_limit == Some(0) {
@@ -10919,12 +11147,25 @@ fn upsert_share_tx(
         .map_err(|e| AppError::Internal(format!("serialize app runtimes failed: {e}")))?;
     let app_providers_json = serde_json::to_string(&share.app_providers)
         .map_err(|e| AppError::Internal(format!("serialize app providers failed: {e}")))?;
-    conn.execute(
+    let official_price_percent_by_app_json =
+        serde_json::to_string(&share.for_sale_official_price_percent_by_app).map_err(|e| {
+            AppError::Internal(format!(
+                "serialize official price percent by app failed: {e}"
+            ))
+        })?;
+    let next_chat_snapshot = (
+        share.share_status.clone(),
+        share.expires_at.clone(),
+        upstream_provider_json.clone(),
+        bindings_json.clone(),
+        i64::try_from(share.config_revision).unwrap_or(i64::MAX),
+    );
+    let share_changed = conn.execute(
         "INSERT INTO shares (
             share_id, installation_id, share_name, owner_email, shared_with_emails_json, market_access_mode, access_by_app_json, app_settings_json, description, for_sale, subdomain, app_type, provider_id,
             enabled_claude, enabled_codex, enabled_gemini,
-            token_limit, parallel_limit, tokens_used, requests_count, share_status, created_at, expires_at, upstream_provider_json, app_runtimes_json, app_providers_json, bindings_json, config_revision, user_grants_json, supported_user_token_periods_json, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)
+            token_limit, parallel_limit, tokens_used, requests_count, share_status, created_at, expires_at, upstream_provider_json, app_runtimes_json, app_providers_json, bindings_json, config_revision, user_grants_json, supported_user_token_periods_json, updated_at, capacity_pool_id, for_sale_official_price_percent_by_app_json
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
         ON CONFLICT(share_id) DO UPDATE SET
             installation_id = excluded.installation_id,
             share_name = excluded.share_name,
@@ -10955,6 +11196,8 @@ fn upsert_share_tx(
             config_revision = excluded.config_revision,
             user_grants_json = excluded.user_grants_json,
             supported_user_token_periods_json = excluded.supported_user_token_periods_json,
+            capacity_pool_id = excluded.capacity_pool_id,
+            for_sale_official_price_percent_by_app_json = excluded.for_sale_official_price_percent_by_app_json,
             runtime_refreshed_at = shares.runtime_refreshed_at,
             updated_at = excluded.updated_at
         WHERE excluded.config_revision >= shares.config_revision",
@@ -10990,9 +11233,79 @@ fn upsert_share_tx(
             user_grants_json,
             supported_user_token_periods_json,
             Utc::now().to_rfc3339(),
+            share.capacity_pool_id,
+            official_price_percent_by_app_json,
         ],
     )
     .map_err(map_share_constraint_error)?;
+    if share_changed > 0 {
+        conn.execute(
+            "DELETE FROM share_bindings WHERE share_id = ?1",
+            params![chat_share_id],
+        )
+        .map_err(|e| AppError::Internal(format!("replace share bindings failed: {e}")))?;
+        for (app, provider_id) in &share.bindings {
+            conn.execute(
+                "INSERT INTO share_bindings (share_id, app_type, provider_id) VALUES (?1, ?2, ?3)",
+                params![chat_share_id, app, provider_id],
+            )
+            .map_err(|e| AppError::Internal(format!("store share binding failed: {e}")))?;
+        }
+    }
+    if let Some((
+        previous_status,
+        previous_expires,
+        previous_upstream,
+        previous_bindings,
+        previous_revision,
+    )) = previous_event_snapshot
+    {
+        let (next_status, next_expires, next_upstream, next_bindings, next_revision) =
+            next_chat_snapshot;
+        if next_revision >= previous_revision && previous_status != next_status {
+            let event_type = if next_status == "active" {
+                "share_enabled"
+            } else {
+                "share_disabled"
+            };
+            crate::share_market::enqueue_share_lifecycle_event_tx(
+                conn,
+                &chat_share_id,
+                event_type,
+                serde_json::json!({
+                    "previousStatus": previous_status,
+                    "status": next_status,
+                }),
+                &format!("share-sync:{chat_share_id}:{next_revision}:status"),
+                Utc::now(),
+            )?;
+        }
+        if next_revision >= previous_revision && previous_expires != next_expires {
+            crate::share_market::enqueue_share_lifecycle_event_tx(
+                conn,
+                &chat_share_id,
+                "share_expiration_changed",
+                serde_json::json!({
+                    "previousExpiresAt": previous_expires,
+                    "expiresAt": next_expires,
+                }),
+                &format!("share-sync:{chat_share_id}:{next_revision}:expiration"),
+                Utc::now(),
+            )?;
+        }
+        if next_revision >= previous_revision
+            && (previous_upstream != next_upstream || previous_bindings != next_bindings)
+        {
+            crate::share_market::enqueue_share_lifecycle_event_tx(
+                conn,
+                &chat_share_id,
+                "share_provider_changed",
+                serde_json::json!({ "configRevision": next_revision }),
+                &format!("share-sync:{chat_share_id}:{next_revision}:provider"),
+                Utc::now(),
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -11355,10 +11668,12 @@ fn upsert_share_request_log_tx(
         "INSERT INTO share_request_logs (
             request_id, installation_id, share_id, share_name, provider_id, provider_name,
             app_type, model, request_model, request_agent, requested_model, actual_model, actual_model_source,
+            requested_reasoning_effort, effective_reasoning_effort, client_service_tier,
+            effective_service_tier, service_tier_decision, usage_state, stream_status, usage_revision,
             status_code, latency_ms, first_token_ms,
             input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, quota_tokens,
             is_streaming, session_id, user_country, user_country_iso3, user_email, is_health_check, created_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36)
         ON CONFLICT(request_id) DO UPDATE SET
             installation_id = excluded.installation_id,
             share_id = excluded.share_id,
@@ -11372,6 +11687,14 @@ fn upsert_share_request_log_tx(
             requested_model = excluded.requested_model,
             actual_model = excluded.actual_model,
             actual_model_source = excluded.actual_model_source,
+            requested_reasoning_effort = excluded.requested_reasoning_effort,
+            effective_reasoning_effort = excluded.effective_reasoning_effort,
+            client_service_tier = excluded.client_service_tier,
+            effective_service_tier = excluded.effective_service_tier,
+            service_tier_decision = excluded.service_tier_decision,
+            usage_state = excluded.usage_state,
+            stream_status = excluded.stream_status,
+            usage_revision = excluded.usage_revision,
             status_code = excluded.status_code,
             latency_ms = excluded.latency_ms,
             first_token_ms = excluded.first_token_ms,
@@ -11386,7 +11709,8 @@ fn upsert_share_request_log_tx(
             user_country_iso3 = COALESCE(excluded.user_country_iso3, share_request_logs.user_country_iso3),
             user_email = COALESCE(excluded.user_email, share_request_logs.user_email),
             is_health_check = excluded.is_health_check,
-            created_at = excluded.created_at",
+            created_at = excluded.created_at
+        WHERE excluded.usage_revision >= share_request_logs.usage_revision",
         params![
             log.request_id,
             installation_id,
@@ -11401,6 +11725,14 @@ fn upsert_share_request_log_tx(
             log.requested_model,
             log.actual_model,
             log.actual_model_source,
+            log.requested_reasoning_effort,
+            log.effective_reasoning_effort,
+            log.client_service_tier,
+            log.effective_service_tier,
+            log.service_tier_decision,
+            log.usage_state,
+            log.stream_status,
+            log.usage_revision as i64,
             i64::from(log.status_code),
             log.latency_ms as i64,
             log.first_token_ms.map(|v| v as i64),
@@ -11680,6 +12012,9 @@ fn write_map_display_settings(
 
 fn init_schema(conn: &Connection) -> Result<(), AppError> {
     crate::public_hosts::init_schema(conn).map_err(map_public_host_error)?;
+    crate::market_access::init_schema(conn).map_err(|error| {
+        AppError::Internal(format!("initialize market access schema failed: {error}"))
+    })?;
     crate::client_market::init_schema(conn).map_err(map_client_market_schema_error)?;
     crate::share_market::init_schema(conn).map_err(|error| {
         AppError::Internal(format!("initialize Share Market schema failed: {error}"))
@@ -11772,6 +12107,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
 
         CREATE TABLE IF NOT EXISTS shares (
             share_id TEXT PRIMARY KEY,
+            capacity_pool_id TEXT NOT NULL,
             installation_id TEXT NOT NULL,
             share_name TEXT NOT NULL,
             owner_email TEXT,
@@ -11779,6 +12115,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             market_access_mode TEXT NOT NULL DEFAULT 'selected',
             access_by_app_json TEXT NOT NULL DEFAULT '{}',
             app_settings_json TEXT NOT NULL DEFAULT '{}',
+            for_sale_official_price_percent_by_app_json TEXT NOT NULL DEFAULT '{}',
             description TEXT,
             for_sale TEXT NOT NULL DEFAULT 'No',
             subdomain TEXT,
@@ -11797,7 +12134,7 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             upstream_provider_json TEXT,
             app_runtimes_json TEXT,
             app_providers_json TEXT,
-            -- Share 的单一 app/provider 绑定快照（JSON: {app_type: provider_id}）。
+            -- Share 的全部 app/provider 绑定快照（JSON: {app_type: provider_id}）。
             bindings_json TEXT,
             user_grants_json TEXT NOT NULL DEFAULT '{}',
             supported_user_token_periods_json TEXT NOT NULL DEFAULT '[]',
@@ -11805,6 +12142,16 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             config_revision INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS share_bindings (
+            share_id TEXT NOT NULL REFERENCES shares(share_id) ON DELETE CASCADE,
+            app_type TEXT NOT NULL CHECK (app_type IN ('claude', 'codex', 'gemini')),
+            provider_id TEXT NOT NULL CHECK (provider_id != ''),
+            PRIMARY KEY (share_id, app_type)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_share_bindings_app_share
+            ON share_bindings(app_type, share_id);
 
         CREATE TABLE IF NOT EXISTS installation_client_tunnels (
             installation_id TEXT PRIMARY KEY,
@@ -11832,6 +12179,14 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             requested_model TEXT NOT NULL DEFAULT '',
             actual_model TEXT NOT NULL DEFAULT '',
             actual_model_source TEXT NOT NULL DEFAULT '',
+            requested_reasoning_effort TEXT,
+            effective_reasoning_effort TEXT,
+            client_service_tier TEXT,
+            effective_service_tier TEXT,
+            service_tier_decision TEXT,
+            usage_state TEXT NOT NULL DEFAULT 'observed',
+            stream_status TEXT,
+            usage_revision INTEGER NOT NULL DEFAULT 0,
             status_code INTEGER NOT NULL,
             latency_ms INTEGER NOT NULL,
             first_token_ms INTEGER,
@@ -12836,10 +13191,24 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
             })?;
     }
     if !columns.iter().any(|name| name == "bindings_json") {
-        // Share 的 app/provider 绑定快照。新写入严格要求一个 binding；该列保留
+        // Share 的 app/provider 绑定快照。新写入严格要求 1..=3 个 binding；该列保留
         // nullable 仅用于 SQLite schema 的增量建表过程。
         conn.execute("ALTER TABLE shares ADD COLUMN bindings_json TEXT", [])
             .map_err(|e| AppError::Internal(format!("add shares bindings_json failed: {e}")))?;
+    }
+    if !columns
+        .iter()
+        .any(|name| name == "for_sale_official_price_percent_by_app_json")
+    {
+        conn.execute(
+            "ALTER TABLE shares ADD COLUMN for_sale_official_price_percent_by_app_json TEXT NOT NULL DEFAULT '{}'",
+            [],
+        )
+        .map_err(|e| {
+            AppError::Internal(format!(
+                "add shares for_sale_official_price_percent_by_app_json failed: {e}"
+            ))
+        })?;
     }
     if !columns.iter().any(|name| name == "parallel_limit") {
         conn.execute(
@@ -12939,6 +13308,34 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
         "share_request_logs",
         "actual_model_source",
         "TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column_if_missing(
+        conn,
+        "share_request_logs",
+        "requested_reasoning_effort",
+        "TEXT",
+    )?;
+    add_column_if_missing(
+        conn,
+        "share_request_logs",
+        "effective_reasoning_effort",
+        "TEXT",
+    )?;
+    add_column_if_missing(conn, "share_request_logs", "client_service_tier", "TEXT")?;
+    add_column_if_missing(conn, "share_request_logs", "effective_service_tier", "TEXT")?;
+    add_column_if_missing(conn, "share_request_logs", "service_tier_decision", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "share_request_logs",
+        "usage_state",
+        "TEXT NOT NULL DEFAULT 'observed'",
+    )?;
+    add_column_if_missing(conn, "share_request_logs", "stream_status", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "share_request_logs",
+        "usage_revision",
+        "INTEGER NOT NULL DEFAULT 0",
     )?;
     add_column_if_missing(conn, "share_request_logs", "user_country", "TEXT")?;
     add_column_if_missing(conn, "share_request_logs", "user_country_iso3", "TEXT")?;
@@ -13184,6 +13581,9 @@ fn init_schema(conn: &Connection) -> Result<(), AppError> {
     )
     .map_err(|e| AppError::Internal(format!("backfill installation owner email failed: {e}")))?;
     client_chat::init_schema(conn)?;
+    crate::market_billing::init_schema(conn).map_err(|error| {
+        AppError::Internal(format!("initialize Market billing schema failed: {error}"))
+    })?;
     conn.execute(
         "INSERT OR IGNORE INTO installation_notification_state (
             installation_id, registration_state, monitoring_enabled, presence_state,
@@ -15990,6 +16390,11 @@ mod token_period_window_tests {
                 .unwrap()
         };
         assert!(columns("share_request_logs").contains("quota_tokens"));
+        assert!(columns("share_request_logs").contains("usage_state"));
+        assert!(columns("share_request_logs").contains("stream_status"));
+        assert!(columns("share_request_logs").contains("usage_revision"));
+        assert!(columns("share_request_logs").contains("requested_reasoning_effort"));
+        assert!(columns("share_request_logs").contains("effective_service_tier"));
         assert!(columns("shares").contains("supported_user_token_periods_json"));
     }
 
@@ -16031,6 +16436,14 @@ mod token_period_window_tests {
                 requested_model: "gpt-5".into(),
                 actual_model: "gpt-5".into(),
                 actual_model_source: "official".into(),
+                requested_reasoning_effort: None,
+                effective_reasoning_effort: None,
+                client_service_tier: None,
+                effective_service_tier: None,
+                service_tier_decision: None,
+                usage_state: "observed".into(),
+                stream_status: None,
+                usage_revision: 0,
                 status_code: 200,
                 latency_ms: 1,
                 first_token_ms: None,
@@ -16235,7 +16648,8 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                     s.enabled_claude, s.enabled_codex, s.enabled_gemini,
                     s.token_limit, s.parallel_limit, s.tokens_used, s.requests_count, s.share_status, s.created_at, s.expires_at, s.upstream_provider_json, s.app_runtimes_json, s.app_providers_json,
                     s.bindings_json, s.config_revision, COALESCE(s.user_grants_json, '{}'),
-                    COALESCE(s.supported_user_token_periods_json, '[]')
+                    COALESCE(s.supported_user_token_periods_json, '[]'), s.capacity_pool_id,
+                    COALESCE(s.for_sale_official_price_percent_by_app_json, '{}')
              FROM shares s
              ORDER BY s.share_name ASC",
         )
@@ -16246,13 +16660,15 @@ fn list_shares(conn: &Connection) -> Result<Vec<(String, ShareDescriptor)>, AppE
                 row.get(0)?,
                 ShareDescriptor {
                     share_id: row.get(1)?,
+                    capacity_pool_id: row.get(30)?,
                     share_name: row.get(2)?,
                     description: row.get(3)?,
                     for_sale: row.get(4)?,
                     market_access_mode: row.get(5)?,
                     access_by_app: parse_share_access_by_app(row.get(6)?)?,
                     app_settings: parse_share_app_settings(row.get(7)?)?,
-                    for_sale_official_price_percent_by_app: Default::default(),
+                    for_sale_official_price_percent_by_app:
+                        parse_share_official_price_percent_by_app(row.get(31)?)?,
                     subdomain: row.get(8)?,
                     app_type: row.get(9)?,
                     provider_id: row.get(10)?,
@@ -16671,9 +17087,7 @@ fn normalize_share_user_grants_preserving(
         validate_share_user_policy(&grant.policy, Utc::now().timestamp_millis())?;
         if let Some(previous) = existing
             .and_then(|map| map.get(&email))
-            .filter(|grant| {
-                grant.manager == crate::models::ShareGrantManager::RouterShareMarket
-            })
+            .filter(|grant| grant.manager == crate::models::ShareGrantManager::RouterShareMarket)
         {
             if grant.active != previous.active
                 || grant.policy != previous.policy
@@ -16746,7 +17160,7 @@ fn normalize_share_settings_patch(
     owner_email: Option<&str>,
     current_shared_with_emails: Option<&[String]>,
     current_for_sale: Option<&str>,
-    current_app_type: Option<&str>,
+    current_bindings: Option<&BTreeMap<String, String>>,
     existing_user_grants: Option<&BTreeMap<String, ShareUserGrant>>,
 ) -> Result<ShareSettingsPatch, AppError> {
     if patch.managed_grant.is_some() {
@@ -16863,9 +17277,9 @@ fn normalize_share_settings_patch(
                         "official price percent app must be claude, codex, or gemini".into(),
                     ));
                 }
-                if current_app_type.is_some_and(|current| app != current) {
+                if current_bindings.is_none_or(|bindings| !bindings.contains_key(&app)) {
                     return Err(AppError::BadRequest(
-                        "official price percent must only contain the share app".into(),
+                        "official price percent must only contain bound share apps".into(),
                     ));
                 }
                 if !(1..=100).contains(&percent) {
@@ -16874,6 +17288,21 @@ fn normalize_share_settings_patch(
                     ));
                 }
                 normalized.insert(app, percent);
+            }
+            if !normalized.is_empty() {
+                let bindings = current_bindings.expect("non-empty pricing requires bindings");
+                if normalized.len() != bindings.len()
+                    || bindings.keys().any(|app| !normalized.contains_key(app))
+                {
+                    return Err(AppError::BadRequest(
+                        "official price percent must cover every bound share app".into(),
+                    ));
+                }
+                if normalized.values().copied().collect::<HashSet<_>>().len() != 1 {
+                    return Err(AppError::BadRequest(
+                        "all bound share apps must use the same official price percent".into(),
+                    ));
+                }
             }
             Some(normalized)
         }
@@ -17139,7 +17568,7 @@ fn parse_app_runtimes(value: Option<String>) -> Result<ShareAppRuntimes, rusqlit
     })
 }
 
-/// 反序列化 share 的单一 app/provider binding JSON 列。
+/// 反序列化 share 的 app/provider bindings JSON 列。
 /// 空字符串 / NULL 只作为数据库读取的防御性兜底；新写入不会产生空 binding。
 fn parse_share_bindings(
     value: Option<String>,
@@ -17172,6 +17601,20 @@ fn parse_share_access_by_app(
 fn parse_share_app_settings(
     value: Option<String>,
 ) -> Result<BTreeMap<String, ShareAppSettings>, rusqlite::Error> {
+    let Some(value) = value else {
+        return Ok(BTreeMap::new());
+    };
+    if value.trim().is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    serde_json::from_str(&value).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+    })
+}
+
+fn parse_share_official_price_percent_by_app(
+    value: Option<String>,
+) -> Result<BTreeMap<String, u16>, rusqlite::Error> {
     let Some(value) = value else {
         return Ok(BTreeMap::new());
     };
@@ -17407,22 +17850,13 @@ fn load_share_bound_app_types(
     conn: &Connection,
     share_id: &str,
 ) -> Result<HashSet<String>, AppError> {
-    let bindings_json: Option<String> = conn
-        .query_row(
-            "SELECT bindings_json FROM shares WHERE share_id = ?1",
-            params![share_id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()
-        .map_err(|e| AppError::Internal(format!("read share bindings_json failed: {e}")))?
-        .flatten();
-    let map = parse_share_bindings(bindings_json)
-        .map_err(|e| AppError::Internal(format!("decode share bindings failed: {e}")))?;
-    Ok(map
-        .into_iter()
-        .filter(|(_, provider_id)| !provider_id.trim().is_empty())
-        .map(|(app, _)| app)
-        .collect())
+    let mut stmt = conn
+        .prepare("SELECT app_type FROM share_bindings WHERE share_id = ?1")
+        .map_err(|e| AppError::Internal(format!("prepare share bindings failed: {e}")))?;
+    let rows = stmt
+        .query_map(params![share_id], |row| row.get::<_, String>(0))
+        .map_err(|e| AppError::Internal(format!("read share bindings failed: {e}")))?;
+    collect_rows(rows).map(|apps| apps.into_iter().collect())
 }
 
 /// Delete model_health rows for apps this share no longer binds. Called on
@@ -18775,6 +19209,8 @@ fn list_global_recent_share_request_logs(
         .prepare(
             "SELECT request_id, share_id, share_name, provider_id, provider_name, app_type, model,
                     request_model, request_agent, requested_model, actual_model, actual_model_source,
+                    requested_reasoning_effort, effective_reasoning_effort, client_service_tier,
+                    effective_service_tier, service_tier_decision, usage_state, stream_status, usage_revision,
                     status_code, latency_ms, first_token_ms, input_tokens,
                     output_tokens, cache_read_tokens, cache_creation_tokens, quota_tokens, is_streaming,
                     session_id, user_country, user_country_iso3, user_email, is_health_check, created_at
@@ -18798,12 +19234,16 @@ fn list_recent_share_request_logs(
         .prepare(
             "SELECT request_id, share_id, share_name, provider_id, provider_name, app_type, model,
                     request_model, request_agent, requested_model, actual_model, actual_model_source,
+                    requested_reasoning_effort, effective_reasoning_effort, client_service_tier,
+                    effective_service_tier, service_tier_decision, usage_state, stream_status, usage_revision,
                     status_code, latency_ms, first_token_ms, input_tokens,
                     output_tokens, cache_read_tokens, cache_creation_tokens, quota_tokens, is_streaming,
                     session_id, user_country, user_country_iso3, user_email, is_health_check, created_at
              FROM (
                  SELECT request_id, share_id, share_name, provider_id, provider_name, app_type, model,
                         request_model, request_agent, requested_model, actual_model, actual_model_source,
+                        requested_reasoning_effort, effective_reasoning_effort, client_service_tier,
+                        effective_service_tier, service_tier_decision, usage_state, stream_status, usage_revision,
                         status_code, latency_ms, first_token_ms, input_tokens,
                         output_tokens, cache_read_tokens, cache_creation_tokens, quota_tokens, is_streaming,
                         session_id, user_country, user_country_iso3, user_email, is_health_check, created_at,
@@ -18835,23 +19275,31 @@ fn map_share_request_log_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShareR
         requested_model: row.get(9)?,
         actual_model: row.get(10)?,
         actual_model_source: row.get(11)?,
-        status_code: row.get::<_, i64>(12)? as u16,
-        latency_ms: row.get::<_, i64>(13)? as u64,
-        first_token_ms: row.get::<_, Option<i64>>(14)?.map(|v| v as u64),
-        input_tokens: row.get::<_, i64>(15)? as u32,
-        output_tokens: row.get::<_, i64>(16)? as u32,
-        cache_read_tokens: row.get::<_, i64>(17)? as u32,
-        cache_creation_tokens: row.get::<_, i64>(18)? as u32,
+        requested_reasoning_effort: row.get(12)?,
+        effective_reasoning_effort: row.get(13)?,
+        client_service_tier: row.get(14)?,
+        effective_service_tier: row.get(15)?,
+        service_tier_decision: row.get(16)?,
+        usage_state: row.get(17)?,
+        stream_status: row.get(18)?,
+        usage_revision: row.get::<_, i64>(19)?.max(0) as u64,
+        status_code: row.get::<_, i64>(20)? as u16,
+        latency_ms: row.get::<_, i64>(21)? as u64,
+        first_token_ms: row.get::<_, Option<i64>>(22)?.map(|v| v as u64),
+        input_tokens: row.get::<_, i64>(23)? as u32,
+        output_tokens: row.get::<_, i64>(24)? as u32,
+        cache_read_tokens: row.get::<_, i64>(25)? as u32,
+        cache_creation_tokens: row.get::<_, i64>(26)? as u32,
         quota_tokens: row
-            .get::<_, Option<i64>>(19)?
+            .get::<_, Option<i64>>(27)?
             .map(|value| value.max(0) as u32),
-        is_streaming: row.get::<_, i64>(20)? != 0,
-        session_id: row.get(21)?,
-        user_country: row.get(22)?,
-        user_country_iso3: row.get(23)?,
-        user_email: row.get(24)?,
-        is_health_check: row.get::<_, i64>(25)? != 0,
-        created_at: row.get(26)?,
+        is_streaming: row.get::<_, i64>(28)? != 0,
+        session_id: row.get(29)?,
+        user_country: row.get(30)?,
+        user_country_iso3: row.get(31)?,
+        user_email: row.get(32)?,
+        is_health_check: row.get::<_, i64>(33)? != 0,
+        created_at: row.get(34)?,
     })
 }
 
@@ -19113,6 +19561,18 @@ fn market_log_to_share_request_log(
         requested_model: log.requested_model.clone(),
         actual_model: log.actual_model.clone(),
         actual_model_source: log.actual_model_source.clone(),
+        requested_reasoning_effort: None,
+        effective_reasoning_effort: None,
+        client_service_tier: None,
+        effective_service_tier: None,
+        service_tier_decision: None,
+        usage_state: if log.status == "streaming" {
+            "pending".to_string()
+        } else {
+            "observed".to_string()
+        },
+        stream_status: Some(log.status.clone()),
+        usage_revision: 0,
         status_code: log
             .status_code
             .unwrap_or_else(|| status_code_from_market_status(&log.status)),
@@ -23025,6 +23485,7 @@ fn share_supports_app(support: &ShareSupport, app: &str) -> bool {
 
 fn build_market_share_apps(
     support: &ShareSupport,
+    bindings: &BTreeMap<String, String>,
     app_settings: &BTreeMap<String, ShareAppSettings>,
     access_by_app: &BTreeMap<String, ShareAppAccess>,
     shared_with_emails: &[String],
@@ -23057,7 +23518,7 @@ fn build_market_share_apps(
                 app.to_string(),
                 MarketShareAppView {
                     app: app.to_string(),
-                    supported: share_supports_app(support, app),
+                    supported: bindings.contains_key(app) && share_supports_app(support, app),
                     visible,
                     for_sale,
                     market_access_mode: app_market_access_mode,
@@ -23202,8 +23663,9 @@ mod tests {
     }
 
     #[test]
-    fn token_market_pricing_requires_eligible_final_sale_state() {
+    fn token_market_pricing_accepts_single_bound_app() {
         let pricing = BTreeMap::from([("codex".to_string(), 80)]);
+        let bindings = BTreeMap::from([("codex".to_string(), "provider-codex".to_string())]);
         let normalized = normalize_share_settings_patch(
             ShareSettingsPatch {
                 for_sale_official_price_percent_by_app: Some(pricing.clone()),
@@ -23212,14 +23674,97 @@ mod tests {
             Some("owner@example.com"),
             Some(&[]),
             Some("Yes"),
-            Some("codex"),
+            Some(&bindings),
             None,
         )
         .expect("eligible pricing");
         assert_eq!(
             normalized.for_sale_official_price_percent_by_app,
-            Some(pricing.clone())
+            Some(pricing)
         );
+    }
+
+    #[test]
+    fn token_market_pricing_accepts_equal_prices_for_all_bound_apps() {
+        let pricing = BTreeMap::from([("claude".to_string(), 80), ("codex".to_string(), 80)]);
+        let bindings = BTreeMap::from([
+            ("claude".to_string(), "provider-claude".to_string()),
+            ("codex".to_string(), "provider-codex".to_string()),
+        ]);
+
+        let normalized = normalize_share_settings_patch(
+            ShareSettingsPatch {
+                for_sale_official_price_percent_by_app: Some(pricing.clone()),
+                ..Default::default()
+            },
+            Some("owner@example.com"),
+            Some(&[]),
+            Some("Yes"),
+            Some(&bindings),
+            None,
+        )
+        .expect("equal multi-app pricing");
+
+        assert_eq!(
+            normalized.for_sale_official_price_percent_by_app,
+            Some(pricing)
+        );
+    }
+
+    #[test]
+    fn token_market_pricing_rejects_missing_bound_app() {
+        let bindings = BTreeMap::from([
+            ("claude".to_string(), "provider-claude".to_string()),
+            ("codex".to_string(), "provider-codex".to_string()),
+        ]);
+
+        let rejected = normalize_share_settings_patch(
+            ShareSettingsPatch {
+                for_sale_official_price_percent_by_app: Some(BTreeMap::from([(
+                    "codex".to_string(),
+                    80,
+                )])),
+                ..Default::default()
+            },
+            Some("owner@example.com"),
+            Some(&[]),
+            Some("Yes"),
+            Some(&bindings),
+            None,
+        );
+
+        assert!(matches!(rejected, Err(AppError::BadRequest(_))));
+    }
+
+    #[test]
+    fn token_market_pricing_rejects_different_bound_app_prices() {
+        let bindings = BTreeMap::from([
+            ("claude".to_string(), "provider-claude".to_string()),
+            ("codex".to_string(), "provider-codex".to_string()),
+        ]);
+
+        let rejected = normalize_share_settings_patch(
+            ShareSettingsPatch {
+                for_sale_official_price_percent_by_app: Some(BTreeMap::from([
+                    ("claude".to_string(), 80),
+                    ("codex".to_string(), 70),
+                ])),
+                ..Default::default()
+            },
+            Some("owner@example.com"),
+            Some(&[]),
+            Some("Yes"),
+            Some(&bindings),
+            None,
+        );
+
+        assert!(matches!(rejected, Err(AppError::BadRequest(_))));
+    }
+
+    #[test]
+    fn token_market_pricing_requires_eligible_final_sale_state() {
+        let pricing = BTreeMap::from([("codex".to_string(), 80)]);
+        let bindings = BTreeMap::from([("codex".to_string(), "provider-codex".to_string())]);
 
         let rejected = normalize_share_settings_patch(
             ShareSettingsPatch {
@@ -23230,12 +23775,12 @@ mod tests {
             Some("owner@example.com"),
             Some(&[]),
             Some("Yes"),
-            Some("codex"),
+            Some(&bindings),
             None,
         );
         assert!(matches!(rejected, Err(AppError::BadRequest(_))));
 
-        let wrong_app = normalize_share_settings_patch(
+        let unbound_app = normalize_share_settings_patch(
             ShareSettingsPatch {
                 for_sale_official_price_percent_by_app: Some(BTreeMap::from([(
                     "claude".to_string(),
@@ -23246,10 +23791,10 @@ mod tests {
             Some("owner@example.com"),
             Some(&[]),
             Some("Yes"),
-            Some("codex"),
+            Some(&bindings),
             None,
         );
-        assert!(matches!(wrong_app, Err(AppError::BadRequest(_))));
+        assert!(matches!(unbound_app, Err(AppError::BadRequest(_))));
     }
 
     fn test_config(name: &str) -> Config {
@@ -23621,11 +24166,11 @@ mod tests {
         let conn = store.conn.lock().await;
         conn.execute(
             "INSERT INTO shares (
-                share_id, installation_id, share_name, owner_email, shared_with_emails_json,
+                share_id, capacity_pool_id, installation_id, share_name, owner_email, shared_with_emails_json,
                 description, for_sale, subdomain, app_type, provider_id,
                 enabled_claude, enabled_codex, enabled_gemini, token_limit, parallel_limit,
                 tokens_used, requests_count, share_status, created_at, expires_at, bindings_json, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, '[]', NULL, 'No', ?5, 'proxy', NULL, 1, 1, 1, 1000, 3, 0, 0, ?6, ?7, ?8, ?9, ?7)",
+             ) VALUES (?1, ?1, ?2, ?3, ?4, '[]', NULL, 'No', ?5, 'proxy', NULL, 1, 1, 1, 1000, 3, 0, 0, ?6, ?7, ?8, ?9, ?7)",
             params![
                 share_id,
                 installation_id,
@@ -23639,6 +24184,13 @@ mod tests {
             ],
         )
         .expect("insert share");
+        for app in ["claude", "codex", "gemini"] {
+            conn.execute(
+                "INSERT INTO share_bindings (share_id, app_type, provider_id) VALUES (?1, ?2, 'provider-test')",
+                params![share_id, app],
+            )
+            .expect("insert share binding");
+        }
         conn.execute(
             "INSERT OR IGNORE INTO public_hosts (
                 label, route_id, kind, subject_id, installation_id, target_lane_id,
@@ -23675,6 +24227,18 @@ mod tests {
             params![share_id, bindings],
         )
         .expect("update share bindings_json");
+        conn.execute(
+            "DELETE FROM share_bindings WHERE share_id = ?1",
+            params![share_id],
+        )
+        .expect("delete previous share bindings");
+        for app in apps {
+            conn.execute(
+                "INSERT INTO share_bindings (share_id, app_type, provider_id) VALUES (?1, ?2, 'provider-test')",
+                params![share_id, app],
+            )
+            .expect("insert replacement share binding");
+        }
     }
 
     async fn set_share_shared_with_emails(store: &AppStore, share_id: &str, emails: &[&str]) {
@@ -23805,7 +24369,10 @@ mod tests {
                 vec![
                     "share:read".to_string(),
                     "share:write".to_string(),
-                    "share:invoke".to_string()
+                    "share:invoke".to_string(),
+                    "market:access:read".to_string(),
+                    "market:access:write".to_string(),
+                    "market:billing:settlement".to_string()
                 ]
             );
 
@@ -23878,27 +24445,33 @@ mod tests {
 
         assert!(
             store
-                .user_can_invoke_share("OWNER@example.com", "share-acl", None)
+                .user_can_invoke_share("OWNER@example.com", "share-acl", Some("codex"))
                 .await
                 .expect("owner acl")
         );
         assert!(
             store
-                .user_can_invoke_share("shared@example.com", "share-acl", None)
+                .user_can_invoke_share("shared@example.com", "share-acl", Some("codex"))
                 .await
                 .expect("shared acl")
         );
         assert!(
             !store
-                .user_can_invoke_share("other@example.com", "share-acl", None)
+                .user_can_invoke_share("other@example.com", "share-acl", Some("codex"))
                 .await
                 .expect("other acl")
         );
         assert!(
             !store
-                .user_can_invoke_share("owner@example.com", "missing-share", None)
+                .user_can_invoke_share("owner@example.com", "missing-share", Some("codex"))
                 .await
                 .expect("missing share acl")
+        );
+        assert!(
+            !store
+                .user_can_invoke_share("owner@example.com", "share-acl", None)
+                .await
+                .expect("missing app is denied")
         );
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
@@ -23951,10 +24524,10 @@ mod tests {
                 .expect("claude denied on codex")
         );
         assert!(
-            store
+            !store
                 .user_can_invoke_share("legacy@example.com", "share-app-acl", None)
                 .await
-                .expect("legacy fallback acl")
+                .expect("missing app is denied")
         );
         assert!(
             !store
@@ -24002,6 +24575,7 @@ mod tests {
         let (store, config) = setup_store("user-api-token-free-share-acl").await;
         insert_installation(&store, "inst-1").await;
         insert_share(&store, "inst-1", "share-free", "free-sub", "active").await;
+        set_share_bindings(&store, "share-free", &["codex"]).await;
 
         {
             let conn = store.conn.lock().await;
@@ -24014,9 +24588,15 @@ mod tests {
 
         assert!(
             store
-                .user_can_invoke_share("other@example.com", "share-free", None)
+                .user_can_invoke_share("other@example.com", "share-free", Some("codex"))
                 .await
                 .expect("free share acl")
+        );
+        assert!(
+            !store
+                .user_can_invoke_share("other@example.com", "share-free", Some("claude"))
+                .await
+                .expect("free share cannot invoke an unbound app")
         );
 
         {
@@ -24030,7 +24610,7 @@ mod tests {
 
         assert!(
             !store
-                .user_can_invoke_share("other@example.com", "share-free", None)
+                .user_can_invoke_share("other@example.com", "share-free", Some("codex"))
                 .await
                 .expect("private share acl")
         );
@@ -24204,6 +24784,7 @@ mod tests {
         };
         ShareDescriptor {
             share_id: share_id.into(),
+            capacity_pool_id: format!("pool-{share_id}"),
             share_name: format!("share-{share_id}"),
             owner_email: Some("owner@example.com".into()),
             shared_with_emails: vec![],
@@ -24289,7 +24870,10 @@ mod tests {
             Some("owner@example.com"),
             Some(&[]),
             Some("No"),
-            Some("codex"),
+            Some(&BTreeMap::from([(
+                "codex".to_string(),
+                "provider-codex".to_string(),
+            )])),
             None,
         )
         .expect("normalize user grants");
@@ -24330,7 +24914,10 @@ mod tests {
             Some("owner@example.com"),
             Some(&[]),
             Some("No"),
-            Some("codex"),
+            Some(&BTreeMap::from([(
+                "codex".to_string(),
+                "provider-codex".to_string(),
+            )])),
             Some(&existing),
         )
         .expect("normalize user grants with existing");
@@ -24371,7 +24958,10 @@ mod tests {
             Some("owner@example.com"),
             Some(&[]),
             Some("No"),
-            Some("codex"),
+            Some(&BTreeMap::from([(
+                "codex".to_string(),
+                "provider-codex".to_string(),
+            )])),
             Some(&existing),
         )
         .expect_err("ordinary edit must not reactivate revoked market grant");
@@ -25255,6 +25845,14 @@ mod tests {
             requested_model: "gpt-5".into(),
             actual_model: "gpt-5".into(),
             actual_model_source: "official".into(),
+            requested_reasoning_effort: None,
+            effective_reasoning_effort: None,
+            client_service_tier: None,
+            effective_service_tier: None,
+            service_tier_decision: None,
+            usage_state: "observed".into(),
+            stream_status: None,
+            usage_revision: 0,
             status_code: 200,
             latency_ms: 100,
             first_token_ms: None,
@@ -25271,6 +25869,73 @@ mod tests {
             created_at,
             is_health_check: false,
         }
+    }
+
+    #[test]
+    fn share_request_log_revision_prevents_stale_usage_overwrite() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let now = Utc::now().timestamp();
+
+        let mut pending = test_share_request_log_entry("req_usage_revision", "share-1", now);
+        pending.usage_state = "pending".into();
+        pending.stream_status = Some("pending".into());
+        pending.usage_revision = 1;
+        pending.input_tokens = 0;
+        pending.output_tokens = 0;
+        upsert_share_request_log_tx(&conn, "installation", pending.clone()).unwrap();
+
+        let mut observed = pending.clone();
+        observed.usage_state = "observed".into();
+        observed.stream_status = Some("completed".into());
+        observed.usage_revision = 2;
+        observed.input_tokens = 120;
+        observed.output_tokens = 30;
+        observed.cache_read_tokens = 80;
+        observed.requested_reasoning_effort = Some("high".into());
+        observed.effective_reasoning_effort = Some("high".into());
+        observed.effective_service_tier = Some("priority".into());
+        upsert_share_request_log_tx(&conn, "installation", observed).unwrap();
+
+        upsert_share_request_log_tx(&conn, "installation", pending).unwrap();
+
+        let stored = list_global_recent_share_request_logs(&conn, 10).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].usage_state, "observed");
+        assert_eq!(stored[0].stream_status.as_deref(), Some("completed"));
+        assert_eq!(stored[0].usage_revision, 2);
+        assert_eq!(stored[0].input_tokens, 120);
+        assert_eq!(stored[0].output_tokens, 30);
+        assert_eq!(stored[0].cache_read_tokens, 80);
+        assert_eq!(
+            stored[0].requested_reasoning_effort.as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            stored[0].effective_service_tier.as_deref(),
+            Some("priority")
+        );
+    }
+
+    #[test]
+    fn share_request_log_preserves_explicit_zero_observation() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let mut observed = test_share_request_log_entry(
+            "req_usage_explicit_zero",
+            "share-1",
+            Utc::now().timestamp(),
+        );
+        observed.usage_state = "observed".into();
+        observed.usage_revision = 1;
+        observed.input_tokens = 0;
+        observed.output_tokens = 0;
+        upsert_share_request_log_tx(&conn, "installation", observed).unwrap();
+
+        let stored = list_global_recent_share_request_logs(&conn, 10).unwrap();
+        assert_eq!(stored[0].usage_state, "observed");
+        assert_eq!(stored[0].input_tokens, 0);
+        assert_eq!(stored[0].output_tokens, 0);
     }
 
     #[test]
@@ -25416,11 +26081,19 @@ mod tests {
                     market_access_mode: "selected".to_string(),
                 },
             )]);
+            let mut removed_shareto = test_share_user_grant("removed@example.com", "shareto", 500);
+            removed_shareto.active = false;
+            removed_shareto.revoked_at_ms = Some(Utc::now().timestamp_millis() as u128);
+            let user_grants =
+                BTreeMap::from([("removed@example.com".to_string(), removed_shareto)]);
             conn.execute(
-                "UPDATE shares SET access_by_app_json = ?2 WHERE share_id = ?1",
+                "UPDATE shares
+                 SET access_by_app_json = ?2, user_grants_json = ?3
+                 WHERE share_id = ?1",
                 params![
                     "share-usage",
-                    serde_json::to_string(&access_by_app).expect("serialize access_by_app")
+                    serde_json::to_string(&access_by_app).expect("serialize access_by_app"),
+                    serde_json::to_string(&user_grants).expect("serialize user grants"),
                 ],
             )
             .expect("set access_by_app");
@@ -25448,6 +26121,15 @@ mod tests {
             unknown_log.input_tokens = 900;
             unknown_log.output_tokens = 99;
             upsert_share_request_log_tx(&conn, "inst-1", unknown_log).expect("insert unknown log");
+
+            let mut removed_log =
+                test_share_request_log_entry("req-usage-removed", "share-usage", now);
+            removed_log.app_type = "claude".into();
+            removed_log.user_email = Some("removed@example.com".into());
+            removed_log.input_tokens = 800;
+            removed_log.output_tokens = 88;
+            upsert_share_request_log_tx(&conn, "inst-1", removed_log)
+                .expect("insert removed shareto log");
 
             let mut codex_log = test_share_request_log_entry("req-usage-codex", "share-usage", now);
             codex_log.app_type = "codex".into();
@@ -25479,6 +26161,13 @@ mod tests {
         assert_eq!(shareto.role, "shareto");
         assert_eq!(shareto.total_tokens, 50);
         assert_eq!(shareto.daily.len(), 7);
+        assert!(
+            usage
+                .rows
+                .iter()
+                .all(|row| row.email != "removed@example.com"),
+            "selected access must not expose removed ShareTo emails"
+        );
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
@@ -25621,6 +26310,181 @@ mod tests {
             .find(|row| row.email == "owner@example.com")
             .expect("owner row");
         assert_eq!(owner.total_tokens, 50);
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn share_usage_by_email_labels_inactive_shareto_as_deprecated() {
+        let (store, config) = setup_store("share-usage-by-email-deprecated").await;
+        insert_installation(&store, "inst-1").await;
+        insert_share(&store, "inst-1", "share-usage", "usage-sub", "active").await;
+        let market = test_market();
+        insert_market(&store, &market).await;
+        {
+            let conn = store.conn.lock().await;
+            let access_by_app = BTreeMap::from([(
+                "codex".to_string(),
+                ShareAppAccess {
+                    shared_with_emails: vec!["current@example.com".to_string()],
+                    market_access_mode: "all".to_string(),
+                },
+            )]);
+            let revoked_at = Utc::now().timestamp_millis() as u128;
+            let current = test_share_user_grant("current@example.com", "shareto", 500);
+            let mut removed_direct =
+                test_share_user_grant("removed-direct@example.com", "shareto", 500);
+            removed_direct.active = false;
+            removed_direct.revoked_at_ms = Some(revoked_at);
+            let mut removed_managed =
+                test_share_user_grant("removed-managed@example.com", "shareto", 500);
+            removed_managed.active = false;
+            removed_managed.revoked_at_ms = Some(revoked_at);
+            removed_managed.manager = crate::models::ShareGrantManager::RouterShareMarket;
+            removed_managed.entitlement_id = Some("entitlement-deprecated".into());
+            let mut unused_removed =
+                test_share_user_grant("unused-removed@example.com", "shareto", 500);
+            unused_removed.active = false;
+            unused_removed.revoked_at_ms = Some(revoked_at);
+            let user_grants = BTreeMap::from([
+                ("current@example.com".to_string(), current),
+                ("removed-direct@example.com".to_string(), removed_direct),
+                ("removed-managed@example.com".to_string(), removed_managed),
+                ("unused-removed@example.com".to_string(), unused_removed),
+            ]);
+            conn.execute(
+                "UPDATE shares
+                 SET access_by_app_json = ?2, user_grants_json = ?3
+                 WHERE share_id = ?1",
+                params![
+                    "share-usage",
+                    serde_json::to_string(&access_by_app).expect("serialize access_by_app"),
+                    serde_json::to_string(&user_grants).expect("serialize user grants"),
+                ],
+            )
+            .expect("set Share access and grant history");
+
+            let now = Utc::now().timestamp();
+            let mut owner_log = test_share_request_log_entry("req-usage-owner", "share-usage", now);
+            owner_log.app_type = "codex".into();
+            owner_log.user_email = Some("owner@example.com".into());
+            owner_log.input_tokens = 5;
+            owner_log.output_tokens = 0;
+            owner_log.cache_read_tokens = 0;
+            owner_log.cache_creation_tokens = 0;
+            upsert_share_request_log_tx(&conn, "inst-1", owner_log).expect("insert owner usage");
+
+            let mut current_log =
+                test_share_request_log_entry("req-usage-current", "share-usage", now);
+            current_log.app_type = "codex".into();
+            current_log.user_email = Some("current@example.com".into());
+            current_log.input_tokens = 10;
+            current_log.output_tokens = 0;
+            current_log.cache_read_tokens = 0;
+            current_log.cache_creation_tokens = 0;
+            upsert_share_request_log_tx(&conn, "inst-1", current_log)
+                .expect("insert current ShareTo usage");
+
+            let mut removed_direct_log =
+                test_share_request_log_entry("req-usage-removed-direct", "share-usage", now);
+            removed_direct_log.app_type = "codex".into();
+            removed_direct_log.user_email = Some("removed-direct@example.com".into());
+            removed_direct_log.input_tokens = 20;
+            removed_direct_log.output_tokens = 0;
+            removed_direct_log.cache_read_tokens = 0;
+            removed_direct_log.cache_creation_tokens = 0;
+            upsert_share_request_log_tx(&conn, "inst-1", removed_direct_log)
+                .expect("insert removed direct ShareTo usage");
+
+            let mut removed_managed_log =
+                test_market_request_log("req_usage_removed_managed", "share-usage");
+            removed_managed_log.user_email = Some("removed-managed@example.com".into());
+            removed_managed_log.input_tokens = 30;
+            removed_managed_log.output_tokens = 0;
+            removed_managed_log.cache_read_tokens = 0;
+            removed_managed_log.cache_creation_tokens = 0;
+            upsert_market_request_log_tx(&conn, &market, removed_managed_log)
+                .expect("insert removed managed ShareTo usage");
+
+            let mut market_log = test_market_request_log("req_usage_market", "share-usage");
+            market_log.user_email = Some("market@example.com".into());
+            market_log.input_tokens = 40;
+            market_log.output_tokens = 0;
+            market_log.cache_read_tokens = 0;
+            market_log.cache_creation_tokens = 0;
+            upsert_market_request_log_tx(&conn, &market, market_log)
+                .expect("insert actual Market usage");
+        }
+
+        let usage = store
+            .share_usage_by_email("share-usage", "codex", "1w")
+            .await
+            .expect("usage with revoked ShareTo history");
+        assert_eq!(usage.total_tokens, 105);
+        let role = |email: &str| {
+            usage
+                .rows
+                .iter()
+                .find(|row| row.email == email)
+                .map(|row| row.role.as_str())
+        };
+        assert_eq!(role("owner@example.com"), Some("owner"));
+        assert_eq!(role("current@example.com"), Some("shareto"));
+        assert_eq!(role("removed-direct@example.com"), Some("deprecated"));
+        assert_eq!(role("removed-managed@example.com"), Some("deprecated"));
+        assert_eq!(role("market@example.com"), Some("market"));
+        assert_eq!(role("unused-removed@example.com"), None);
+
+        {
+            let conn = store.conn.lock().await;
+            let user_grants_json: String = conn
+                .query_row(
+                    "SELECT user_grants_json FROM shares WHERE share_id = 'share-usage'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read grant history before reactivation");
+            let mut user_grants: BTreeMap<String, ShareUserGrant> =
+                serde_json::from_str(&user_grants_json).expect("parse grant history");
+            let reactivated = user_grants
+                .get_mut("removed-direct@example.com")
+                .expect("removed ShareTo grant");
+            reactivated.active = true;
+            reactivated.revoked_at_ms = None;
+            let access_by_app = BTreeMap::from([(
+                "codex".to_string(),
+                ShareAppAccess {
+                    shared_with_emails: vec![
+                        "current@example.com".to_string(),
+                        "removed-direct@example.com".to_string(),
+                    ],
+                    market_access_mode: "all".to_string(),
+                },
+            )]);
+            conn.execute(
+                "UPDATE shares
+                 SET access_by_app_json = ?2, user_grants_json = ?3
+                 WHERE share_id = ?1",
+                params![
+                    "share-usage",
+                    serde_json::to_string(&access_by_app).expect("serialize reactivated access"),
+                    serde_json::to_string(&user_grants).expect("serialize reactivated grants"),
+                ],
+            )
+            .expect("reactivate removed ShareTo");
+        }
+        let reactivated_usage = store
+            .share_usage_by_email("share-usage", "codex", "1w")
+            .await
+            .expect("usage after ShareTo reactivation");
+        assert_eq!(
+            reactivated_usage
+                .rows
+                .iter()
+                .find(|row| row.email == "removed-direct@example.com")
+                .map(|row| row.role.as_str()),
+            Some("shareto")
+        );
 
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
@@ -32369,6 +33233,7 @@ mod tests {
 
         let share = ShareDescriptor {
             share_id: "share-market-reserved".into(),
+            capacity_pool_id: "pool-market-reserved".into(),
             share_name: "Reserved".into(),
             owner_email: Some("owner@example.com".into()),
             shared_with_emails: vec![],
@@ -32389,7 +33254,11 @@ mod tests {
             share_status: "active".into(),
             created_at: Utc::now().to_rfc3339(),
             expires_at: (Utc::now() + Duration::days(1)).to_rfc3339(),
-            support: ShareSupport::default(),
+            support: ShareSupport {
+                claude: false,
+                codex: true,
+                gemini: false,
+            },
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
             app_providers: ShareAppProviders::default(),
@@ -32449,6 +33318,7 @@ mod tests {
 
         let share = ShareDescriptor {
             share_id: "share-1".into(),
+            capacity_pool_id: "pool-share-1".into(),
             share_name: "Signed Share".into(),
             owner_email: Some("owner@example.com".into()),
             shared_with_emails: vec![],
@@ -32469,7 +33339,11 @@ mod tests {
             share_status: "paused".into(),
             created_at: Utc::now().to_rfc3339(),
             expires_at: (Utc::now() + Duration::hours(1)).to_rfc3339(),
-            support: ShareSupport::default(),
+            support: ShareSupport {
+                claude: false,
+                codex: true,
+                gemini: false,
+            },
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
             app_providers: ShareAppProviders::default(),
@@ -33229,6 +34103,7 @@ mod tests {
 
         let share = ShareDescriptor {
             share_id: "share-minimal".into(),
+            capacity_pool_id: "pool-share-minimal".into(),
             share_name: "Signed Share".into(),
             owner_email: Some("owner@example.com".into()),
             shared_with_emails: vec![],
@@ -33252,7 +34127,11 @@ mod tests {
             share_status: "active".into(),
             created_at: Utc::now().to_rfc3339(),
             expires_at: (Utc::now() + Duration::hours(1)).to_rfc3339(),
-            support: ShareSupport::default(),
+            support: ShareSupport {
+                claude: false,
+                codex: true,
+                gemini: false,
+            },
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
             app_providers: ShareAppProviders::default(),
@@ -33318,6 +34197,7 @@ mod tests {
 
         let share = ShareDescriptor {
             share_id: "share-mismatch".into(),
+            capacity_pool_id: "pool-share-mismatch".into(),
             share_name: "Signed Share".into(),
             owner_email: Some("owner@example.com".into()),
             shared_with_emails: vec![],
@@ -33338,7 +34218,11 @@ mod tests {
             share_status: "active".into(),
             created_at: Utc::now().to_rfc3339(),
             expires_at: (Utc::now() + Duration::hours(1)).to_rfc3339(),
-            support: ShareSupport::default(),
+            support: ShareSupport {
+                claude: false,
+                codex: true,
+                gemini: false,
+            },
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
             app_providers: ShareAppProviders::default(),
@@ -33404,6 +34288,7 @@ mod tests {
 
         let share = ShareDescriptor {
             share_id: "share-new".into(),
+            capacity_pool_id: "pool-share-new".into(),
             share_name: "owner@example.com".into(),
             owner_email: Some("owner@example.com".into()),
             shared_with_emails: vec![],
@@ -33424,7 +34309,11 @@ mod tests {
             share_status: "paused".into(),
             created_at: Utc::now().to_rfc3339(),
             expires_at: (Utc::now() + Duration::hours(1)).to_rfc3339(),
-            support: ShareSupport::default(),
+            support: ShareSupport {
+                claude: false,
+                codex: true,
+                gemini: false,
+            },
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
             app_providers: ShareAppProviders::default(),
@@ -33527,6 +34416,7 @@ mod tests {
 
         let share = ShareDescriptor {
             share_id: "share-heal".into(),
+            capacity_pool_id: "pool-share-heal".into(),
             share_name: "router@example.com".into(),
             owner_email: Some("router@example.com".into()),
             shared_with_emails: vec![],
@@ -33547,7 +34437,11 @@ mod tests {
             share_status: "active".into(),
             created_at: Utc::now().to_rfc3339(),
             expires_at: (Utc::now() + Duration::hours(1)).to_rfc3339(),
-            support: ShareSupport::default(),
+            support: ShareSupport {
+                claude: false,
+                codex: true,
+                gemini: false,
+            },
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
             app_providers: ShareAppProviders::default(),
@@ -33615,6 +34509,7 @@ mod tests {
 
         let share = ShareDescriptor {
             share_id: "share-new".into(),
+            capacity_pool_id: "pool-share-new".into(),
             share_name: "owner@example.com".into(),
             owner_email: Some("owner@example.com".into()),
             shared_with_emails: vec![],
@@ -33635,7 +34530,11 @@ mod tests {
             share_status: "paused".into(),
             created_at: Utc::now().to_rfc3339(),
             expires_at: (Utc::now() + Duration::hours(1)).to_rfc3339(),
-            support: ShareSupport::default(),
+            support: ShareSupport {
+                claude: false,
+                codex: true,
+                gemini: false,
+            },
             upstream_provider: None,
             app_runtimes: ShareAppRuntimes::default(),
             app_providers: ShareAppProviders::default(),
@@ -33720,6 +34619,7 @@ mod tests {
 
         let share = ShareDescriptor {
             share_id: "share-batch-1".into(),
+            capacity_pool_id: "pool-share-batch-1".into(),
             share_name: "Batch Share".into(),
             owner_email: Some("owner@example.com".into()),
             shared_with_emails: vec![],
@@ -34882,6 +35782,7 @@ mod tests {
             "kind": "upsert",
             "share": {
                 "shareId": "share-batch-health-1",
+                "capacityPoolId": "pool-share-batch-health-1",
                 "shareName": "Batch Health Share",
                 "ownerEmail": "owner@example.com",
                 "subdomain": test_share_host("batch-health-sub"),
@@ -34960,8 +35861,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_share_requires_one_matching_provider_binding() {
-        let (store, config) = setup_store("share-single-binding-validation").await;
+    async fn upsert_share_validates_and_persists_multiple_provider_bindings() {
+        let (store, config) = setup_store("share-multi-binding-validation").await;
+        insert_installation(&store, "inst-binding").await;
         let conn = store.conn.lock().await;
 
         let mut missing = test_share_descriptor("share-missing", "missing-sub");
@@ -34970,18 +35872,44 @@ mod tests {
         assert!(
             missing_error
                 .to_string()
-                .contains("exactly one binding matching appType/providerId")
+                .contains("between one and three app bindings")
         );
 
         let mut multiple = test_share_descriptor("share-multiple", "multiple-sub");
         multiple
             .bindings
             .insert("claude".into(), "provider-claude".into());
-        let multiple_error = upsert_share_tx(&conn, "inst-binding", multiple).unwrap_err();
-        assert!(
-            multiple_error
-                .to_string()
-                .contains("exactly one binding matching appType/providerId")
+        multiple.support.claude = true;
+        multiple.for_sale = "Yes".into();
+        multiple.for_sale_official_price_percent_by_app =
+            BTreeMap::from([("claude".to_string(), 80), ("codex".to_string(), 80)]);
+        upsert_share_tx(&conn, "inst-binding", multiple).expect("store multi-app share");
+        let stored_bindings = conn
+            .prepare(
+                "SELECT app_type, provider_id FROM share_bindings WHERE share_id = ?1 ORDER BY app_type",
+            )
+            .expect("prepare stored bindings")
+            .query_map(params!["share-multiple"], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query stored bindings")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read stored bindings");
+        assert_eq!(
+            stored_bindings,
+            vec![
+                ("claude".to_string(), "provider-claude".to_string()),
+                ("codex".to_string(), "provider-test".to_string()),
+            ]
+        );
+        let (_, persisted) = list_shares(&conn)
+            .expect("list persisted shares")
+            .into_iter()
+            .find(|(_, share)| share.share_id == "share-multiple")
+            .expect("persisted multi-app share");
+        assert_eq!(
+            persisted.for_sale_official_price_percent_by_app,
+            BTreeMap::from([("claude".to_string(), 80), ("codex".to_string(), 80)])
         );
 
         let mut mismatched = test_share_descriptor("share-mismatch", "mismatch-sub");
@@ -34990,7 +35918,27 @@ mod tests {
         assert!(
             mismatch_error
                 .to_string()
-                .contains("exactly one binding matching appType/providerId")
+                .contains("must match one of its bindings")
+        );
+
+        let mut split_configuration =
+            test_share_descriptor("share-split-config", "split-config-sub");
+        split_configuration
+            .bindings
+            .insert("claude".into(), "provider-claude".into());
+        split_configuration.support.claude = true;
+        split_configuration.app_settings.insert(
+            "claude".into(),
+            ShareAppSettings {
+                parallel_limit: 1,
+                ..ShareAppSettings::default()
+            },
+        );
+        let split_error = upsert_share_tx(&conn, "inst-binding", split_configuration).unwrap_err();
+        assert!(
+            split_error
+                .to_string()
+                .contains("same remote share configuration")
         );
 
         drop(conn);
@@ -35065,6 +36013,14 @@ mod tests {
                     requested_model: "gpt-5".into(),
                     actual_model: "gpt-5".into(),
                     actual_model_source: "official".into(),
+                    requested_reasoning_effort: None,
+                    effective_reasoning_effort: None,
+                    client_service_tier: None,
+                    effective_service_tier: None,
+                    service_tier_decision: None,
+                    usage_state: "observed".into(),
+                    stream_status: None,
+                    usage_revision: 0,
                     status_code: 200,
                     latency_ms: 100,
                     first_token_ms: None,
@@ -35249,6 +36205,14 @@ mod tests {
             requested_model: "gpt-5".into(),
             actual_model: "gpt-5".into(),
             actual_model_source: "official".into(),
+            requested_reasoning_effort: Some("high".into()),
+            effective_reasoning_effort: Some("high".into()),
+            client_service_tier: Some("default".into()),
+            effective_service_tier: Some("priority".into()),
+            service_tier_decision: Some("server_forced_priority".into()),
+            usage_state: "observed".into(),
+            stream_status: Some("completed".into()),
+            usage_revision: 2,
             status_code: 200,
             latency_ms: 1234,
             first_token_ms: Some(222),
@@ -37842,71 +38806,739 @@ mod tests {
         .expect("create chat room")
     }
 
+    async fn insert_chat_user(store: &AppStore, user_id: &str, email: &str) {
+        let now = Utc::now().to_rfc3339();
+        let conn = store.conn.lock().await;
+        conn.execute(
+            "INSERT OR IGNORE INTO users (id, email_normalized, status, created_at, last_login_at)
+             VALUES (?1, lower(?2), 'active', ?3, ?3)",
+            params![user_id, email, now],
+        )
+        .expect("insert chat user");
+    }
+
+    async fn ensure_test_share_installation_room(
+        store: &AppStore,
+        suffix: &str,
+    ) -> (String, String) {
+        let installation_id = format!("share-chat-installation-{suffix}");
+        let share_id = format!("share-chat-{suffix}");
+        insert_installation(store, &installation_id).await;
+        insert_chat_user(store, "share-owner-user", "owner@example.com").await;
+        insert_share(
+            store,
+            &installation_id,
+            &share_id,
+            &test_share_host(&format!("chat-{suffix}")),
+            "active",
+        )
+        .await;
+        let room_id = ensure_test_chat_room(store, &installation_id).await;
+        (share_id, room_id)
+    }
+
     #[tokio::test]
-    async fn client_chat_room_is_one_to_one_with_verified_client() {
-        let (store, config) = setup_store("client-chat-one-to-one").await;
-        let installation_id = "chat-client-one";
+    async fn multiple_shares_use_the_single_client_chat_room() {
+        let (store, config) = setup_store("client-chat-multiple-shares").await;
+        let installation_id = "share-chat-installation-shared";
         insert_installation(&store, installation_id).await;
-
-        let first = ensure_test_chat_room(&store, installation_id).await;
-        let second = ensure_test_chat_room(&store, installation_id).await;
-        assert_eq!(first, second);
-
-        let room = store
-            .get_client_chat_room_by_installation(installation_id, None)
-            .await
-            .expect("public room");
-        assert_eq!(room.id, first);
-        assert_eq!(room.status, "active");
-
-        let count = {
-            let conn = store.conn.lock().await;
-            conn.query_row(
-                "SELECT COUNT(*) FROM client_chat_rooms WHERE installation_id = ?1",
-                params![installation_id],
-                |row| row.get::<_, i64>(0),
+        insert_chat_user(&store, "share-owner-user", "owner@example.com").await;
+        for suffix in ["one", "two"] {
+            insert_share(
+                &store,
+                installation_id,
+                &format!("share-chat-{suffix}"),
+                &test_share_host(&format!("chat-{suffix}")),
+                "active",
             )
-            .expect("count chat rooms")
-        };
-        assert_eq!(count, 1);
+            .await;
+        }
+        let room_id = ensure_test_chat_room(&store, installation_id).await;
+        {
+            let conn = store.conn.lock().await;
+            for suffix in ["one", "two"] {
+                crate::share_market::enqueue_share_lifecycle_event_tx(
+                    &conn,
+                    &format!("share-chat-{suffix}"),
+                    "service_offline",
+                    serde_json::json!({ "reason": format!("share {suffix} unavailable") }),
+                    &format!("test:share-offline:{suffix}"),
+                    Utc::now(),
+                )
+                .expect("enqueue Share lifecycle event");
+            }
+        }
+        assert_eq!(
+            store
+                .process_client_chat_system_outbox(100)
+                .await
+                .expect("materialize Share events"),
+            2
+        );
+
+        let conn = store.conn.lock().await;
+        let room_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chat_rooms WHERE installation_id = ?1",
+                params![installation_id],
+                |row| row.get(0),
+            )
+            .expect("count installation rooms");
+        assert_eq!(room_count, 1);
+        let message_room_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT room_id) FROM chat_messages
+                 WHERE source_event_id LIKE 'share_market:%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count Share event rooms");
+        assert_eq!(message_room_count, 1);
+        let materialized_room: String = conn
+            .query_row(
+                "SELECT room_id FROM chat_messages
+                 WHERE source_event_id LIKE 'share_market:%' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read Share event room");
+        assert_eq!(materialized_room, room_id);
+        drop(conn);
+        let _ = std::fs::remove_file(config.db_path);
+    }
+
+    #[tokio::test]
+    async fn market_system_event_follows_participants_and_preserves_public_details() {
+        let (store, config) = setup_store("client-chat-market-system-event").await;
+        let installation_id = "share-chat-installation-public-event";
+        insert_installation(&store, installation_id).await;
+        let room_id = ensure_test_chat_room(&store, installation_id).await;
+        insert_chat_user(&store, "provider-user", "provider@example.com").await;
+        insert_chat_user(&store, "renter-user", "renter@example.com").await;
+        let followers = vec!["provider-user".to_string(), "renter-user".to_string()];
+        let source_event_id = Uuid::new_v4().to_string();
+        {
+            let conn = store.conn.lock().await;
+            client_chat::enqueue_client_system_event_tx(
+                &conn,
+                installation_id,
+                "market_billing",
+                &source_event_id,
+                "billing_payment_declared",
+                serde_json::json!({
+                    "summary": "Payment declared",
+                    "buyerEmail": "renter@example.com",
+                    "supplierEmail": "provider@example.com",
+                    "amountMinor": 12345,
+                    "currency": "USD",
+                    "paymentReference": "wire-reference-001",
+                    "evidenceUrl": "https://evidence.example.com/receipt/001",
+                    "paymentMethods": [{
+                        "kind": "crypto",
+                        "token": "USDT",
+                        "chain": "tron",
+                        "address": "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj",
+                        "assetUrl": "/v1/account/payment-assets/public-receipt"
+                    }],
+                    "paymentContacts": [{
+                        "channel": "telegram",
+                        "handle": "provider-account"
+                    }],
+                    "reason": "manual settlement",
+                    "rawError": "upstream returned HTTP 503",
+                }),
+                &followers,
+                &Utc::now().to_rfc3339(),
+            )
+            .expect("enqueue public market event");
+        }
+        assert_eq!(
+            store
+                .process_client_chat_system_outbox(100)
+                .await
+                .expect("materialize public market event"),
+            1
+        );
+
+        for user_id in ["provider-user", "renter-user"] {
+            let rooms = store
+                .list_visited_chat_rooms(user_id)
+                .await
+                .expect("list participant rooms");
+            assert_eq!(rooms.rooms.len(), 1);
+            assert_eq!(rooms.rooms[0].id, room_id);
+            assert_eq!(rooms.rooms[0].unread_count, 1);
+        }
+        let messages = store
+            .list_chat_messages(&room_id, Some("renter-user"), None, None, 50)
+            .await
+            .expect("read market chat event");
+        assert_eq!(messages.messages.len(), 1);
+        let message = &messages.messages[0];
+        assert_eq!(message.author_kind, "system");
+        assert_eq!(message.message_kind, "market_event");
+        let payload = message.event_payload.as_ref().expect("event payload");
+        assert_eq!(payload["buyerEmail"], "renter@example.com");
+        assert_eq!(payload["supplierEmail"], "provider@example.com");
+        assert_eq!(payload["amountMinor"], 12345);
+        assert_eq!(payload["paymentReference"], "wire-reference-001");
+        assert_eq!(payload["paymentMethods"][0]["token"], "USDT");
+        assert_eq!(
+            payload["paymentMethods"][0]["assetUrl"],
+            "/v1/account/payment-assets/public-receipt"
+        );
+        assert_eq!(payload["paymentContacts"][0]["handle"], "provider-account");
+        assert_eq!(
+            payload["evidenceUrl"],
+            "https://evidence.example.com/receipt/001"
+        );
+        assert_eq!(payload["reason"], "manual settlement");
+        assert_eq!(payload["rawError"], "upstream returned HTTP 503");
+        assert!(matches!(
+            store
+                .delete_client_chat_message(&message.id, "admin@example.com")
+                .await,
+            Err(AppError::Conflict(_))
+        ));
 
         {
             let conn = store.conn.lock().await;
+            client_chat::enqueue_client_system_event_tx(
+                &conn,
+                installation_id,
+                "market_billing",
+                &source_event_id,
+                "billing_payment_declared",
+                serde_json::json!({ "summary": "duplicate" }),
+                &followers,
+                &Utc::now().to_rfc3339(),
+            )
+            .expect("dedupe duplicate event");
+            let chat_email_events: i64 = conn
+                .query_row("SELECT COUNT(*) FROM chat_email_events", [], |row| {
+                    row.get(0)
+                })
+                .expect("count human chat email events");
+            assert_eq!(chat_email_events, 0);
+        }
+        assert_eq!(
+            store
+                .process_client_chat_system_outbox(100)
+                .await
+                .expect("process duplicate event"),
+            0
+        );
+        let conn = store.conn.lock().await;
+        let source_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chat_messages WHERE source_event_id = ?1",
+                params![format!(
+                    "market_billing:{source_event_id}:{installation_id}"
+                )],
+                |row| row.get(0),
+            )
+            .expect("count idempotent event messages");
+        assert_eq!(source_count, 1);
+        drop(conn);
+        let _ = std::fs::remove_file(config.db_path);
+    }
+
+    #[tokio::test]
+    async fn published_chat_payment_asset_is_public_and_retained() {
+        let (store, config) = setup_store("client-chat-public-payment-asset").await;
+        let installation_id = "share-chat-installation-public-payment-asset";
+        insert_installation(&store, installation_id).await;
+        ensure_test_chat_room(&store, installation_id).await;
+        let provider = chat_test_session("public-asset-provider", "provider@example.com");
+        insert_chat_user(&store, &provider.user_id, &provider.email).await;
+        let asset_id = store
+            .client_market_store_payment_asset(
+                &provider.user_id,
+                "https://payment.example.com/public.png",
+                &[1, 2, 3, 4],
+            )
+            .await
+            .expect("store public payment asset");
+        let unpublished_asset_id = store
+            .client_market_store_payment_asset(
+                &provider.user_id,
+                "https://payment.example.com/private.png",
+                &[5, 6, 7, 8],
+            )
+            .await
+            .expect("store unpublished payment asset");
+        {
+            let conn = store.conn.lock().await;
+            client_chat::enqueue_client_system_event_tx(
+                &conn,
+                installation_id,
+                "market_billing",
+                "public-payment-asset-event",
+                "payment_due",
+                serde_json::json!({
+                    "summary": "Payment due",
+                    "supplierUserId": provider.user_id.clone(),
+                    "paymentMethods": [{
+                        "kind": "crypto",
+                        "token": "USDT",
+                        "chain": "tron",
+                        "address": "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj",
+                        "assetUrl": format!("/v1/account/payment-assets/{asset_id}"),
+                    }],
+                }),
+                &[provider.user_id.clone()],
+                &Utc::now().to_rfc3339(),
+            )
+            .expect("enqueue public payment asset event");
+        }
+        assert_eq!(
+            store
+                .process_client_chat_system_outbox(100)
+                .await
+                .expect("materialize public payment asset event"),
+            1
+        );
+        assert_eq!(
+            store
+                .client_market_payment_asset_for_viewer(&asset_id, None)
+                .await
+                .expect("anonymous viewer reads published payment asset"),
+            vec![1, 2, 3, 4]
+        );
+        assert!(matches!(
+            store
+                .client_market_payment_asset_for_viewer(&unpublished_asset_id, None)
+                .await,
+            Err(AppError::Forbidden(_))
+        ));
+
+        store
+            .client_market_update_payment_profile(&provider, &[], None)
+            .await
+            .expect("clear live profile without deleting published asset");
+        assert_eq!(
+            store
+                .client_market_payment_asset_for_viewer(&asset_id, None)
+                .await
+                .expect("published payment asset survives profile replacement"),
+            vec![1, 2, 3, 4]
+        );
+        let unpublished_exists: i64 = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT COUNT(*) FROM account_payment_assets WHERE id = ?1",
+                params![unpublished_asset_id],
+                |row| row.get(0),
+            )
+            .expect("check unpublished payment asset cleanup");
+        assert_eq!(unpublished_exists, 0);
+        let _ = std::fs::remove_file(config.db_path);
+    }
+
+    #[tokio::test]
+    async fn market_system_event_rejects_credentials_and_sanitizes_unsafe_errors() {
+        let (store, config) = setup_store("client-chat-market-credential-guard").await;
+        let installation_id = "share-chat-installation-credential-guard";
+        insert_installation(&store, installation_id).await;
+        let conn = store.conn.lock().await;
+        assert!(matches!(
+            client_chat::enqueue_client_system_event_tx(
+                &conn,
+                installation_id,
+                "client_market",
+                "forbidden-field",
+                "cleanup_failed",
+                serde_json::json!({ "apiKey": "sk-do-not-store" }),
+                &[],
+                &Utc::now().to_rfc3339(),
+            ),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(matches!(
+            client_chat::enqueue_client_system_event_tx(
+                &conn,
+                installation_id,
+                "client_market",
+                "forbidden-generic-token",
+                "cleanup_failed",
+                serde_json::json!({ "token": "opaque-do-not-store" }),
+                &[],
+                &Utc::now().to_rfc3339(),
+            ),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(matches!(
+            client_chat::enqueue_client_system_event_tx(
+                &conn,
+                installation_id,
+                "market_billing",
+                "fragment-signed-evidence",
+                "billing_payment_declared",
+                serde_json::json!({
+                    "evidenceUrl": "https://evidence.example.com/a#access_token=secret"
+                }),
+                &[],
+                &Utc::now().to_rfc3339(),
+            ),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(matches!(
+            client_chat::enqueue_client_system_event_tx(
+                &conn,
+                installation_id,
+                "client_market",
+                "forbidden-oauth-token",
+                "cleanup_failed",
+                serde_json::json!({ "oauthToken": "do-not-store" }),
+                &[],
+                &Utc::now().to_rfc3339(),
+            ),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(matches!(
+            client_chat::enqueue_client_system_event_tx(
+                &conn,
+                installation_id,
+                "market_billing",
+                "signed-evidence",
+                "billing_payment_declared",
+                serde_json::json!({
+                    "evidenceUrl": "https://evidence.example.com/a?signature=secret"
+                }),
+                &[],
+                &Utc::now().to_rfc3339(),
+            ),
+            Err(AppError::BadRequest(_))
+        ));
+        client_chat::enqueue_client_system_event_tx(
+            &conn,
+            installation_id,
+            "client_market",
+            "unsafe-error",
+            "cleanup_failed",
+            serde_json::json!({
+                "summary": "Cleanup failed",
+                "rawError": "x-goog-api-key: AIza-do-not-store",
+            }),
+            &[],
+            &Utc::now().to_rfc3339(),
+        )
+        .expect("sanitize unsafe error");
+        let stored_payload: String = conn
+            .query_row(
+                "SELECT payload_json FROM client_chat_system_outbox
+                 WHERE source_event_id = 'unsafe-error'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read sanitized payload");
+        assert!(!stored_payload.contains("AIza-do-not-store"));
+        assert!(stored_payload.contains("[credential omitted]"));
+        drop(conn);
+        let _ = std::fs::remove_file(config.db_path);
+    }
+
+    #[tokio::test]
+    async fn client_system_event_materializes_into_archived_room_after_purge() {
+        let (store, config) = setup_store("client-chat-archived-system-event").await;
+        let installation_id = "client-chat-archived-installation";
+        insert_installation(&store, installation_id).await;
+        insert_chat_user(&store, "archived-provider", "provider@example.com").await;
+        let room_id = ensure_test_chat_room(&store, installation_id).await;
+        {
+            let conn = store.conn.lock().await;
+            client_chat::enqueue_client_system_event_tx(
+                &conn,
+                installation_id,
+                "client_market",
+                "cleanup-finished-after-purge",
+                "cleanup_finished",
+                serde_json::json!({
+                    "summary": "Client cleanup finished",
+                    "clientOwnerEmail": "owner@example.com",
+                    "providerEmail": "provider@example.com",
+                }),
+                &["archived-provider".into()],
+                &Utc::now().to_rfc3339(),
+            )
+            .expect("enqueue cleanup completion");
+            client_chat::archive_room_for_installation_tx(&conn, installation_id, Utc::now())
+                .expect("archive cleaned Client room");
             conn.execute(
-                "UPDATE installations SET owner_verified_at = NULL WHERE id = ?1",
+                "DELETE FROM installations WHERE id = ?1",
                 params![installation_id],
             )
-            .expect("remove owner verification");
-            client_chat::init_schema(&conn).expect("reconcile ownerless chat room");
-            let status = conn
-                .query_row(
-                    "SELECT status FROM client_chat_rooms WHERE id = ?1",
-                    params![first],
-                    |row| row.get::<_, String>(0),
-                )
-                .expect("read archived chat room");
-            assert_eq!(status, "archived");
+            .expect("purge cleaned Client installation");
+        }
 
-            conn.execute(
-                "UPDATE installations SET owner_verified_at = ?2 WHERE id = ?1",
-                params![installation_id, Utc::now().to_rfc3339()],
+        assert_eq!(
+            store
+                .process_client_chat_system_outbox(100)
+                .await
+                .expect("materialize cleanup completion into archive"),
+            1
+        );
+        let conn = store.conn.lock().await;
+        let (status, messages): (String, i64) = conn
+            .query_row(
+                "SELECT r.status, COUNT(m.id)
+                 FROM chat_rooms r
+                 LEFT JOIN chat_messages m ON m.room_id = r.id
+                 WHERE r.id = ?1 GROUP BY r.id",
+                params![room_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .expect("restore owner verification");
-            client_chat::init_schema(&conn).expect("reactivate verified chat room");
-            let reactivated = conn
-                .query_row(
-                    "SELECT id, status FROM client_chat_rooms WHERE installation_id = ?1",
-                    params![installation_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            .expect("read archived cleanup event");
+        assert_eq!(status, "archived");
+        assert_eq!(messages, 1);
+        let provider_visits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chat_visits
+                 WHERE room_id = ?1 AND user_id = 'archived-provider'",
+                params![room_id],
+                |row| row.get(0),
+            )
+            .expect("read archived Provider visit");
+        assert_eq!(provider_visits, 1);
+        drop(conn);
+        let _ = std::fs::remove_file(config.db_path);
+    }
+
+    #[tokio::test]
+    async fn client_chat_outbox_poison_event_retries_without_blocking_and_dead_letters() {
+        let (store, config) = setup_store("client-chat-outbox-retry").await;
+        let installation_id = "chat-outbox-healthy";
+        insert_installation(&store, installation_id).await;
+        {
+            let conn = store.conn.lock().await;
+            client_chat::enqueue_client_system_event_tx(
+                &conn,
+                "missing-installation",
+                "client_market",
+                "poison-event",
+                "cleanup_failed",
+                serde_json::json!({ "summary": "Missing Client" }),
+                &[],
+                &Utc::now().to_rfc3339(),
+            )
+            .expect("enqueue poison event");
+            client_chat::enqueue_client_system_event_tx(
+                &conn,
+                installation_id,
+                "client_market",
+                "healthy-event",
+                "client_provisioned",
+                serde_json::json!({ "summary": "Client ready" }),
+                &[],
+                &Utc::now().to_rfc3339(),
+            )
+            .expect("enqueue healthy event");
+        }
+        assert_eq!(
+            store
+                .process_client_chat_system_outbox(100)
+                .await
+                .expect("process around poison event"),
+            1
+        );
+        for _ in 1..12 {
+            {
+                let conn = store.conn.lock().await;
+                conn.execute(
+                    "UPDATE client_chat_system_outbox
+                     SET next_attempt_at = ?2
+                     WHERE source_event_id = ?1 AND status = 'pending'",
+                    params![
+                        "poison-event",
+                        (Utc::now() - Duration::seconds(1)).to_rfc3339()
+                    ],
                 )
-                .expect("read reactivated chat room");
-            assert_eq!(reactivated, (first, "active".into()));
+                .expect("make poison event retryable");
+            }
+            store
+                .process_client_chat_system_outbox(1)
+                .await
+                .expect("retry poison event");
+        }
+        let conn = store.conn.lock().await;
+        let (status, attempts): (String, i64) = conn
+            .query_row(
+                "SELECT status, attempts FROM client_chat_system_outbox
+                 WHERE source_event_id = 'poison-event'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read poison event state");
+        assert_eq!(status, "dead_letter");
+        assert_eq!(attempts, 12);
+        let healthy_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chat_messages
+                 WHERE source_event_id LIKE 'client_market:healthy-event:%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count healthy event");
+        assert_eq!(healthy_count, 1);
+        drop(conn);
+        let _ = std::fs::remove_file(config.db_path);
+    }
+
+    #[tokio::test]
+    async fn share_presence_transitions_survive_router_epoch_changes_without_false_alerts() {
+        let (store, config) = setup_store("share-chat-presence-state").await;
+        let (share_id, _) = ensure_test_share_installation_room(&store, "presence-state").await;
+        let baseline = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            client_chat::record_share_presence_observation_tx(
+                &conn,
+                &share_id,
+                RouteHealthStatus::Healthy,
+                "healthy",
+                "router-epoch-a",
+                baseline,
+            )
+            .expect("record online baseline");
+            client_chat::record_share_presence_observation_tx(
+                &conn,
+                &share_id,
+                RouteHealthStatus::Unhealthy,
+                "tunnel unavailable",
+                "router-epoch-a",
+                baseline + Duration::seconds(10),
+            )
+            .expect("start offline candidate");
+            client_chat::record_share_presence_observation_tx(
+                &conn,
+                &share_id,
+                RouteHealthStatus::Unhealthy,
+                "tunnel unavailable",
+                "router-epoch-a",
+                baseline + Duration::seconds(191),
+            )
+            .expect("confirm offline episode");
+            client_chat::record_share_presence_observation_tx(
+                &conn,
+                &share_id,
+                RouteHealthStatus::Unhealthy,
+                "router restarted",
+                "router-epoch-b",
+                baseline + Duration::seconds(200),
+            )
+            .expect("rebaseline confirmed offline state");
+            client_chat::record_share_presence_observation_tx(
+                &conn,
+                &share_id,
+                RouteHealthStatus::Healthy,
+                "healthy",
+                "router-epoch-b",
+                baseline + Duration::seconds(210),
+            )
+            .expect("start recovery candidate");
+            client_chat::record_share_presence_observation_tx(
+                &conn,
+                &share_id,
+                RouteHealthStatus::Healthy,
+                "healthy",
+                "router-epoch-b",
+                baseline + Duration::seconds(331),
+            )
+            .expect("confirm recovery");
+        }
+
+        let (offline_events, recovery_events) = {
+            let conn = store.conn.lock().await;
+            (
+                conn.query_row(
+                    "SELECT COUNT(*) FROM share_market_events
+                     WHERE share_id = ?1 AND event_type = 'service_offline'",
+                    params![share_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count offline events"),
+                conn.query_row(
+                    "SELECT COUNT(*) FROM share_market_events
+                     WHERE share_id = ?1 AND event_type = 'service_recovered'",
+                    params![share_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count recovery events"),
+            )
+        };
+        assert_eq!(offline_events, 1);
+        assert_eq!(recovery_events, 1);
+
+        let (cold_share_id, _) =
+            ensure_test_share_installation_room(&store, "cold-unhealthy").await;
+        {
+            let conn = store.conn.lock().await;
+            client_chat::record_share_presence_observation_tx(
+                &conn,
+                &cold_share_id,
+                RouteHealthStatus::Unhealthy,
+                "cold startup",
+                "router-epoch-c",
+                baseline,
+            )
+            .expect("record cold unhealthy baseline");
+            client_chat::record_share_presence_observation_tx(
+                &conn,
+                &cold_share_id,
+                RouteHealthStatus::Unhealthy,
+                "still unhealthy",
+                "router-epoch-c",
+                baseline + Duration::seconds(600),
+            )
+            .expect("retain silent cold baseline");
+            let cold_events: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM share_market_events
+                     WHERE share_id = ?1 AND event_type = 'service_offline'",
+                    params![cold_share_id],
+                    |row| row.get(0),
+                )
+                .expect("count cold-start offline events");
+            assert_eq!(cold_events, 0);
+        }
+
+        let (expired_share_id, _) = ensure_test_share_installation_room(&store, "expired").await;
+        let expired_at = baseline - Duration::minutes(1);
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE shares SET expires_at = ?2 WHERE share_id = ?1",
+                params![expired_share_id, expired_at.to_rfc3339()],
+            )
+            .expect("expire test Share");
+            for offset in [0, 60] {
+                client_chat::record_share_presence_observation_tx(
+                    &conn,
+                    &expired_share_id,
+                    RouteHealthStatus::Unhealthy,
+                    "expired",
+                    "router-epoch-d",
+                    baseline + Duration::seconds(offset),
+                )
+                .expect("record expired Share state");
+            }
+            let expired_events: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM share_market_events
+                     WHERE share_id = ?1 AND event_type = 'share_expired'",
+                    params![expired_share_id],
+                    |row| row.get(0),
+                )
+                .expect("count expired events");
+            assert_eq!(expired_events, 1);
         }
         let _ = std::fs::remove_file(config.db_path);
     }
 
     #[tokio::test]
-    async fn client_chat_messages_are_public_idempotent_and_recent_is_per_user() {
+    async fn chat_messages_are_public_idempotent_and_recent_is_per_user() {
         let (store, config) = setup_store("client-chat-public-idempotent").await;
         let installation_id = "chat-client-public";
         insert_installation(&store, installation_id).await;
@@ -37935,7 +39567,7 @@ mod tests {
         assert_eq!(first.id, duplicate.id);
 
         let public = store
-            .list_client_chat_messages(&room_id, None, None, None, 50)
+            .list_chat_messages(&room_id, None, None, None, 50)
             .await
             .expect("public chat history");
         assert_eq!(public.messages.len(), 1);
@@ -37948,7 +39580,7 @@ mod tests {
             .expect("record visit");
         assert_eq!(
             store
-                .list_visited_client_chat_rooms("viewer-one")
+                .list_visited_chat_rooms("viewer-one")
                 .await
                 .expect("viewer one rooms")
                 .rooms
@@ -37961,7 +39593,7 @@ mod tests {
             .expect("remove visit");
         assert!(
             store
-                .list_visited_client_chat_rooms("viewer-one")
+                .list_visited_chat_rooms("viewer-one")
                 .await
                 .expect("viewer one rooms after remove")
                 .rooms
@@ -37969,7 +39601,7 @@ mod tests {
         );
         assert!(
             store
-                .list_visited_client_chat_rooms("viewer-two")
+                .list_visited_chat_rooms("viewer-two")
                 .await
                 .expect("viewer two rooms")
                 .rooms
@@ -37977,7 +39609,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .import_client_chat_visits(
+                .import_chat_visits(
                     "viewer-two",
                     vec![crate::models::ClientChatVisitImportItem {
                         installation_id: installation_id.into(),
@@ -37989,14 +39621,14 @@ mod tests {
             1
         );
         let imported = store
-            .list_visited_client_chat_rooms("viewer-two")
+            .list_visited_chat_rooms("viewer-two")
             .await
             .expect("imported viewer rooms");
         assert_eq!(imported.rooms.len(), 1);
         assert_eq!(imported.total_unread, 0);
         let event_count = {
             let conn = store.conn.lock().await;
-            conn.query_row("SELECT COUNT(*) FROM client_chat_email_events", [], |row| {
+            conn.query_row("SELECT COUNT(*) FROM chat_email_events", [], |row| {
                 row.get::<_, i64>(0)
             })
             .expect("count chat events")
@@ -38045,7 +39677,7 @@ mod tests {
             .expect("second room A message");
 
         let rooms = store
-            .lookup_client_chat_rooms(
+            .lookup_chat_rooms(
                 vec!["chat-client-unread-a".into()],
                 BTreeMap::from([("chat-client-unread-a".into(), first_a.seq)]),
                 None,
@@ -38099,13 +39731,13 @@ mod tests {
         {
             let conn = store.conn.lock().await;
             let events = conn
-                .query_row("SELECT COUNT(*) FROM client_chat_email_events", [], |row| {
+                .query_row("SELECT COUNT(*) FROM chat_email_events", [], |row| {
                     row.get::<_, i64>(0)
                 })
                 .expect("count email events");
             assert_eq!(events, 2, "owner message must not create an email event");
             conn.execute(
-                "UPDATE client_chat_email_events SET window_ends_at = ?1",
+                "UPDATE chat_email_events SET window_ends_at = ?1",
                 params![(Utc::now() - Duration::seconds(1)).to_rfc3339()],
             )
             .expect("close email window");
@@ -38149,7 +39781,7 @@ mod tests {
         {
             let conn = store.conn.lock().await;
             conn.execute(
-                "UPDATE client_chat_email_events SET window_ends_at = ?1 WHERE room_id = ?2",
+                "UPDATE chat_email_events SET window_ends_at = ?1 WHERE room_id = ?2",
                 params![(Utc::now() - Duration::seconds(1)).to_rfc3339(), room_id],
             )
             .expect("close old owner window");
@@ -38189,7 +39821,7 @@ mod tests {
             .expect("sync chat owner");
             let recipient = conn
                 .query_row(
-                    "SELECT recipient FROM client_chat_email_events WHERE room_id = ?1",
+                    "SELECT recipient FROM chat_email_events WHERE room_id = ?1",
                     params![room_id],
                     |row| row.get::<_, String>(0),
                 )
@@ -38197,14 +39829,14 @@ mod tests {
             assert_eq!(recipient, "next-owner@example.com");
             let old_status = conn
                 .query_row(
-                    "SELECT status FROM client_chat_email_deliveries WHERE id = ?1",
+                    "SELECT status FROM chat_email_deliveries WHERE id = ?1",
                     params![old_owner_delivery.id],
                     |row| row.get::<_, String>(0),
                 )
                 .expect("read stale delivery status");
             assert_eq!(old_status, "cancelled_owner_changed");
             conn.execute(
-                "UPDATE client_chat_email_events SET window_ends_at = ?1 WHERE room_id = ?2 AND status = 'pending'",
+                "UPDATE chat_email_events SET window_ends_at = ?1 WHERE room_id = ?2 AND status = 'pending'",
                 params![
                     (Utc::now() - Duration::seconds(1)).to_rfc3339(),
                     room_id
@@ -38280,7 +39912,7 @@ mod tests {
         {
             let conn = store.conn.lock().await;
             conn.execute(
-                "UPDATE client_chat_email_events SET window_ends_at = ?1",
+                "UPDATE chat_email_events SET window_ends_at = ?1",
                 params![(Utc::now() - Duration::seconds(1)).to_rfc3339()],
             )
             .expect("close chat email window");

@@ -22,8 +22,9 @@
 | `installation` | 一个运行中的 Server 实例,Router 注册的基本单位 |
 | `client tunnel` | Server 属主自己的管理端点隧道 |
 | `share tunnel` | 对外提供额度共享的隧道,每个启用的 share 一条 |
-| `share descriptor` | Server 同步给 Router 的 share 配置与运行时快照 |
+| `share descriptor` | Server 同步给 Router 的 share 配置与运行时快照;一个 descriptor 可绑定 Claude/Codex/Gemini 中的 1 到 3 个 app |
 | `account` | 绑定在 Upstream Provider 上的凭据(OAuth token 或 API key),存于 Server |
+| `capacity pool` | 同一物理账号或 API key 的匿名容量标识;可跨多个独立 Share URL 复用，在凭据源变化时重派生 |
 | `control_secret` | 注册时下发的对称 HMAC 密钥,用于 Router → Server 方向认证 |
 | `ingress context` | Router 注入转发请求的签名身份上下文 |
 | `pending share edit` | Router 侧排队的 share 变更,由 Server 拉取并 ack |
@@ -61,7 +62,7 @@ cc-switch-router 是 TokenSwitch 的**公共汇聚层**。它为 `cc-switch-serv
 
 ## 2. 三个交易面
 
-三个交易面共用同一套隧道与 Share descriptor 内核,但商品、结算和权限模型彼此独立。
+三个交易面共用同一套隧道与 Share descriptor 内核。Token Market 保持按 Token 用量结算；Share Market 与 Client Market 商品形态不同,但共用统一供应商准入、买家授信与账户级后付费账务。
 
 ### ① Token Market —— 按量 Token 交易
 
@@ -75,7 +76,7 @@ for_sale_official_price_percent_by_app: BTreeMap<String, u16>
 
 配套机制:
 
-- `token_limit` / `parallel_limit` —— 每个 Share 的额度与并发上限
+- `token_limit` / `parallel_limit` —— 一个多 app Share 共享额度与并发上限;多个独立 URL 若使用同一 `capacityPoolId`,Market 调度也只计算一次物理容量与故障转移槽位
 - `share_request_logs`、`llm_request_metrics` —— 逐请求计量(模型、Token 数、延迟、估算成本)
 - `share_model_health_state` —— 滚动健康度,支撑 Share 间自动 failover
 - `free_share_ip_parallel_limit` —— 免费档按真实用户 IP 限并发
@@ -84,15 +85,19 @@ for_sale_official_price_percent_by_app: BTreeMap<String, u16>
 
 ### ② Share Market —— 固定拼车位租用
 
-Share Market 内建于 Router,不注册为外部 `router_markets`。Share owner 只能从 Router 的 Share Market 页面通过「添加 Share」选择自己当前 active、尚未挂售的 Share,并创建最多 20 个拼车位。每个拼车位独立配置用户 Token/并发限制以及可选价格和账单周期。
+Share Market 内建于 Router,不注册为外部 `router_markets`。Share owner 只能从 Router 的 Share Market 页面通过「添加 Share」选择自己当前 active、尚未挂售的 Share,并创建最多 20 个拼车位。每个拼车位独立配置用户 Token/并发限制以及每日价格。
 
-- 价格、币种和账单周期全部为空时为免费拼车位；任意登录用户可租用,不生成账单且长期有效。
-- 付费拼车位先授予 72 小时体验权限并生成首张账单。租客根据 owner 的收款资料私下付款后声明已付款；续费到期同样保留 72 小时声明窗口,超时自动回收。
+- 每日价格留空时是免费拼车位；仍须通过供应商准入,但不要求信用额度、不进入账务系统且长期有效。
+- 付费拼车位先授权服务,前 12 小时不计费。体验期结束后,Router 只按实际健康服务区间累计费用,未知或不可用时间不计费。
+- 付费 Share 与 Client Host 共用按「买家 + 供应商 + 币种」聚合的赊账账户。有限信用额度使用达到 80% 时向买卖双方预警,用满、任一方主动清账或最后一个服务结束时生成合并账单并暂停相关服务；无限额度只接受主动清账。
+- 用户按供应商收款资料线下付款并声明,供应商确认后恢复仍有效的服务；逾期会限制用户继续使用市场赊账。争议由 Router 管理员裁决,账单也可由管理员作废。
+- 出账时会把供应商当时的收款方式和联系方式冻结到该账单,避免后续资料修改改变未结账单的付款依据或争议证据。
+- 供应商可随时永久关闭某个买方的赊账关系；即使已有待处理账单,关闭意图也会立即锁定并终止服务,清账或作废后不会恢复,未来也禁止双方再次建立付费租约。
 - 租用后,Router 才通过 pending Share edit 在 Server 上创建 `routerShareMarket` 管理的 `shareto` entitlement。普通 Share 编辑不能修改或删除这类 entitlement。
-- Owner 可强制回收、回收并拉黑租客、解除拉黑或停止挂售。停止挂售只关闭空闲拼车位,不打断现有租约。
+- Owner 可强制回收、回收并拒绝该买家后续 Share 租用,或停止挂售。停止挂售只关闭空闲拼车位,不打断现有租约。
 - **重新挂售**:停止挂售且该 Share 上已无活跃租约后,可再次通过「添加 Share」新建 listing。若仍有进行中的租约,「添加 Share」不可选中该 Share；也可在 Mine 的 closed listing 上「添加拼车位」以重新打开同一 listing。
 
-状态与审计由 `share_market_listings`、`share_market_seats`、`share_market_subscriptions`、`share_market_invoices`、`share_control_operations` 和 `share_market_events` 持久化。
+市场状态与审计由 `share_market_listings`、`share_market_seats`、`share_market_subscriptions`、`share_control_operations` 和 `share_market_events` 持久化；统一准入由 `market_supplier_access_policies`、`market_counterparties`、产品规则、私有/公共授信及事件表持久化；统一账务由 `market_credit_accounts`、`market_service_contracts`、`market_service_intervals`、`market_accrual_entries`、`market_invoices`、`market_invoice_lines` 及付款、争议、限制、事件表持久化。
 
 ### ③ Client Market —— 主机供给
 
@@ -116,7 +121,7 @@ idle ──► locked ──► allocated ──► draining ──► idle
 | `unreachable` 超 5 分钟 | SSH 探测;确认无安装痕迹则清除 DB 记录并复位为 idle |
 | 进程重启导致 job 中断 | 启动时 `reconcile_interrupted_jobs` 以最多 4 并发重跑 |
 
-**支付为链下荣誉制**:租客调用 `declare-paid` 自报已付,Host Provider 线下核验。Router 存储支付方式二维码资产与声明记录,**不经手资金流**。
+**准入与支付均和 Share Market 共用统一机制**:免费 Host 也必须通过供应商准入；付费 Host 还要求买家获得对应币种的私有额度,或在黑名单模式下使用有限公共额度。付费 Host 以固定每日价格提供,先享受 12 小时健康服务时长试用,之后只按 Router 观测到的健康区间累计费用。同一买家、Host Provider 和币种下的 Host 与 Share 共用余额,按买家额度出账。Router 只记录链下付款声明,供应商独立核验到账后确认；只有确认到账或管理员作废账单才会解除对应逾期限制。Provider 租用自己的付费 Host 时按免费处理,不会形成自债务。
 
 ### Router 联邦 —— 横向扩展
 
@@ -197,7 +202,7 @@ routes: Arc<RwLock<HashMap<String, LogicalRoute>>>
 
 ## 5. 数据层
 
-主库与 metrics 库分离,共 78 张表。
+主库与 metrics 库分离,当前共 96 张表。
 
 **连接模型**:单个 `Arc<Mutex<Connection>>`,WAL 模式、外键开启、`busy_timeout = 5000ms`(`store.rs:1241-1246`)。
 
@@ -210,10 +215,11 @@ routes: Arc<RwLock<HashMap<String, LogicalRoute>>>
 | 身份与隧道 | `installations`、`leases`、`tunnel_route_heads`、`shares`、`installation_client_tunnels` |
 | 计量 | `share_request_logs`、`market_request_logs`、`llm_request_metrics`、`image_generation_*` |
 | 健康 | `share_health_checks`、`installation_health_checks`、`share_model_health_state` |
-| 主机市场 | `router_ssh_hosts`、`client_market_subscriptions`、`client_market_invoices`、`account_payment_*` |
+| 统一市场账务 | `supplier_billing_profiles`、`market_credit_accounts`、`market_service_contracts`、`market_service_intervals`、`market_accrual_entries`、`market_invoices`、`market_invoice_lines`、`market_payment_*`、`market_billing_*`、`market_credit_restrictions` |
+| 主机市场 | `router_ssh_hosts`、`client_market_subscriptions`、`account_payment_*` |
 | 联邦与市场 | `router_markets`、`router_gateways`、`share_market_listings`、`share_market_seats`、`share_market_subscriptions` |
 | 通知 | `client_notification_events`、`email_delivery_batches` 等 9 张 |
-| 聊天 | `client_chat_rooms`、`client_chat_messages` 等 7 张(`store/client_chat.rs`) |
+| 聊天 | `chat_rooms`、`chat_messages`、`chat_visits`、`share_presence_state`、`client_chat_system_outbox`、`chat_public_payment_assets`、`chat_rate_limit`、`chat_email_events`、`chat_email_deliveries`、`chat_email_delivery_items` |
 | 认证 | `users`、`user_sessions`、`user_api_tokens`、`email_login_challenges`、`user_profiles` |
 | 遗留 | `board_*`(接口已返回 410 Gone,数据保留) |
 
@@ -231,6 +237,14 @@ routes: Arc<RwLock<HashMap<String, LogicalRoute>>>
 - **单连接全局锁**:所有 store 方法(含只读)都要 `self.conn.lock().await`。WAL 对跨进程并发读有效,但不缓解进程内这把 tokio Mutex 的串行化。这是当前最确定的扩展性瓶颈。
 - **`user_api_tokens.token_plaintext`**:默认 token 以明文存储,以支持在 UI 中重复展示 API key(`store.rs:12756, 23472`)。同表已有 `token_hash`。DB 泄露即等于活跃 token 泄露。
 - 健康检查类表使用 AUTOINCREMENT 追加,依赖 `cleanup_expired_data` 清理而非 schema 层 TTL。
+
+### Client 公开聊天室与市场事件
+
+聊天室身份只使用 `installation.id`。每个已验证 Owner 的 installation 最多有一个 active 房间,该 Client 下所有 Share、Share Market 租约、Client Market 租约和统一账务事件都写入同一房间；系统不创建 Share 房间或 Share 成员期。
+
+业务事务先在同一 SQLite 事务内写入 `client_chat_system_outbox`,后台再物化为 `author_kind=system`、`message_kind=market_event` 的不可删除消息。`source_kind + source_event_id + installation_id` 提供幂等键；失败事件指数退避,达到上限进入 dead-letter,不会阻塞后续事件。Owner、Provider、租客和事件 actor 会自动写入 `chat_visits`,因此可在各自入口看到房间与未读数。
+
+市场系统消息公开完整交易上下文,包括双方邮箱、金额、收款资料、付款凭证、reference/note、争议或回收原因和不含凭据的原始错误。物化系统消息时,仅当同源收款图片属于 payload 中的 Owner/Provider/Supplier,才写入 `chat_public_payment_assets`；该映射随消息级联删除并阻止资料更新提前清理图片。后端禁止 API Key、OAuth/Session token、Cookie、Authorization、密码、secret、私钥、SSH/lease 凭据和带凭据 query/fragment 的 URL 进入 outbox；仅 `kind=crypto` 的 `USDT`/`USDC` 收款资产符号可使用 `token` 字段。前端渲染前再次过滤。系统消息不创建 `chat_email_events`,只有真人访客消息可触发 Owner 聊天提醒邮件。
 
 ---
 
@@ -261,7 +275,8 @@ Router 从不改写 Server 返回的 descriptor,只做校验;若客户端只部�
 | `metrics_task` | — | 指标采集 |
 | `notification_task` | 5s | 离线/恢复邮件 outbox |
 | `chat_notification_task` | — | 聊天邮件投递 |
-| `client_market_trade_task` | — | 交易结算 |
+| `client_market_trade_task` | — | Client Market 报价、释放与清理状态对账 |
+| `market_billing_task` | 5s | 健康时长计费、阈值出账、最终账单、逾期限制和控制动作重试 |
 | `ip_blacklist_log_task` | 600s | 黑名单统计落日志 |
 
 **关停**:收到 SIGTERM 后先停 HTTP 接入并排空最多 30 秒,再关 SSH listener(5 秒)。

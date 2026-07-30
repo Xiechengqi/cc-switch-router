@@ -113,17 +113,18 @@ export function buildShareEditDraft(
   share: ShareView,
   publicMarketEmails: ReadonlySet<string>,
 ): ShareEditDraft {
+  const activeShareApps = shareAccessApps(share);
   const pendingPricing =
     share.activeEdit?.status === "rejected"
       ? share.activeEdit.patch.forSaleOfficialPricePercentByApp || {}
       : {};
   const sharePricing = share.forSaleOfficialPricePercentByApp || {};
   const priceInputs: Record<PriceApp, string> = { claude: "", codex: "", gemini: "" };
-  for (const app of PRICE_APPS) {
-    const pending = pendingPricing[app.key];
-    const fallback = sharePricing[app.key];
-    const value = typeof pending === "number" ? pending : fallback;
-    priceInputs[app.key] = typeof value === "number" && value > 0 ? String(value) : "";
+  const sharedPrice = activeShareApps
+    .map((app) => pendingPricing[app] ?? sharePricing[app])
+    .find((value) => typeof value === "number" && value > 0);
+  for (const app of activeShareApps) {
+    priceInputs[app] = typeof sharedPrice === "number" ? String(sharedPrice) : "";
   }
 
   const initialMode = (share.marketAccessMode as "selected" | "all") || "selected";
@@ -155,6 +156,7 @@ export function buildShareEditDraft(
     Object.values(accessByApp)
       .flatMap((access) => access?.sharedWithEmails || []),
   );
+  const directShareToEmails = accessEmails.filter((email) => !publicMarketEmails.has(email));
   for (const email of userGrantsSupported ? accessEmails : []) {
     if (!userGrants[email]) {
       userGrants[email] = {
@@ -179,15 +181,9 @@ export function buildShareEditDraft(
           )
         : [],
     shareToEmailsByApp: {
-      claude: splitEmails((accessByApp.claude?.sharedWithEmails || []).join("\n")).filter(
-        (email) => !publicMarketEmails.has(email),
-      ),
-      codex: splitEmails((accessByApp.codex?.sharedWithEmails || []).join("\n")).filter(
-        (email) => !publicMarketEmails.has(email),
-      ),
-      gemini: splitEmails((accessByApp.gemini?.sharedWithEmails || []).join("\n")).filter(
-        (email) => !publicMarketEmails.has(email),
-      ),
+      claude: activeShareApps.includes("claude") ? directShareToEmails : [],
+      codex: activeShareApps.includes("codex") ? directShareToEmails : [],
+      gemini: activeShareApps.includes("gemini") ? directShareToEmails : [],
     },
     tokenLimitInput: tokenLimitUnlimited ? String(UNLIMITED_TOKEN_LIMIT) : String(tokenLimit),
     tokenLimitUnlimited,
@@ -206,14 +202,12 @@ export function buildShareEditDraft(
   return draft;
 }
 
-function buildShareEditPricingPayload(draft: ShareEditDraft, share?: ShareView | null) {
+function buildShareEditPricingPayload(draft: ShareEditDraft, activeShareApps: PriceApp[]) {
   if (draft.forSale !== "Yes") return {};
+  const raw = activeShareApps.map((app) => draft.priceInputs[app]).find((value) => value.trim());
+  if (!raw || !/^(?:[1-9]|[1-9][0-9]|100)$/.test(raw)) return {};
   const result: Record<string, number> = {};
-  for (const app of shareAccessApps(share ?? null)) {
-    if (!share?.support?.[app]) continue;
-    const raw = draft.priceInputs[app];
-    if (!raw || !raw.trim()) continue;
-    if (!/^(?:[1-9]|[1-9][0-9]|100)$/.test(raw)) continue;
+  for (const app of activeShareApps) {
     result[app] = Number(raw);
   }
   return result;
@@ -298,7 +292,7 @@ export function buildShareEditPatch(
     appSettings,
     tokenLimit,
     parallelLimit,
-    forSaleOfficialPricePercentByApp: buildShareEditPricingPayload(draft, share),
+    forSaleOfficialPricePercentByApp: buildShareEditPricingPayload(draft, activeShareApps),
   };
   if (draft.userGrantsSupported) patch.userGrants = userGrants;
   if (expiresIso) patch.expiresAt = expiresIso;

@@ -274,7 +274,7 @@ function Topbar({ active }: { active: DashboardShellActive }) {
       */}
       <div className="sticky top-0 z-40 bg-background/85 backdrop-blur-md">
         <header className="mx-auto w-[calc(100%-2rem)] max-w-7xl py-3.5">
-        <div className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-3 gap-y-2 md:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]">
+        <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-2 md:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]">
           <div className="flex min-w-0 items-center gap-2.5 justify-self-start">
             <Link href={DASHBOARD_CLIENTS_PATH} className="flex shrink-0 items-center" aria-label="CC-Switch Router">
               <Image src="/router-logo.svg" alt="" width={32} height={32} className="h-8 w-8 shrink-0" priority />
@@ -283,14 +283,14 @@ function Topbar({ active }: { active: DashboardShellActive }) {
           </div>
 
           {showDashboardNav ? (
-            <div className="min-w-0 max-w-full justify-self-stretch overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] md:justify-self-center [&::-webkit-scrollbar]:hidden">
+            <div className="col-span-2 row-start-2 min-w-0 max-w-full justify-self-stretch overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] md:col-span-1 md:col-start-2 md:row-start-1 md:justify-self-center [&::-webkit-scrollbar]:hidden">
               <DashboardNav active={active} authed={showAuthedChrome} />
             </div>
           ) : (
             <div />
           )}
 
-          <div className="flex flex-nowrap items-center justify-end gap-2 justify-self-end">
+          <div className="col-start-2 row-start-1 flex flex-nowrap items-center justify-end gap-2 justify-self-end md:col-start-3">
             <LanguageSwitcher />
             {showAuthedChrome ? (
               <Dropdown>

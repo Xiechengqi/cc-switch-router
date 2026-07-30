@@ -138,7 +138,7 @@ export function recentThroughputTokensPerSec(logs?: ShareRequestLog[], limit = 1
     .slice(0, limit)
     .filter((log) => {
       const latency = Number(log.latencyMs || 0);
-      return Number.isFinite(latency) && latency > 0;
+      return hasObservedShareUsage(log) && Number.isFinite(latency) && latency > 0;
     });
   if (!samples.length) return null;
   let tokenSum = 0;
@@ -311,11 +311,19 @@ export function tokenCount(value?: string | number | null) {
   return Number.isFinite(count) && count > 0 ? count : 0;
 }
 
+export function hasObservedShareUsage(
+  log?: Partial<ShareRequestLog | MarketRequestLog>,
+) {
+  return !log?.usageState || log.usageState === "observed";
+}
+
 export function usageBucketTotalTokens(log?: Partial<ShareRequestLog | MarketRequestLog>) {
+  if (!hasObservedShareUsage(log)) return 0;
   return tokenCount(log?.inputTokens) + tokenCount(log?.outputTokens) + tokenCount(log?.cacheReadTokens) + tokenCount(log?.cacheCreationTokens);
 }
 
 export function cacheHitRate(log?: Partial<ShareRequestLog | MarketRequestLog>) {
+  if (!hasObservedShareUsage(log)) return 0;
   const input = tokenCount(log?.inputTokens);
   const cacheRead = tokenCount(log?.cacheReadTokens);
   const denominator = input + cacheRead;

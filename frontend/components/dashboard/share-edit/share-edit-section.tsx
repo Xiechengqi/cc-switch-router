@@ -3,7 +3,7 @@
 import * as React from "react";
 import { Alert } from "@heroui/react";
 import type { TFn } from "@/components/dashboard/share-dashboard-utils";
-import type { ShareView } from "@/lib/types";
+import type { ShareEditView, ShareView } from "@/lib/types";
 
 export function ReadOnlyField({
   label,
@@ -41,13 +41,23 @@ export function forSaleOptionLabel(forSale: "Yes" | "No" | "Free", t: TFn) {
   return t("dashboard.no");
 }
 
+export function shareEditPendingLabel(edit: ShareEditView, t: TFn) {
+  if (edit.patch.managedGrant?.action === "upsert") {
+    return t("dashboard.shareMarketGrantPending");
+  }
+  if (edit.patch.managedGrant?.action === "revoke") {
+    return t("dashboard.shareMarketRevokePending");
+  }
+  return t("dashboard.pendingApply");
+}
+
 export function ShareEditStatusBanner({ share, t }: { share: ShareView; t: TFn }) {
   const edit = share.activeEdit;
   if (!share.canManage || !edit) return null;
   if (edit.status === "pending") {
     return (
       <Alert status="warning" className="!text-slate-900">
-        {t("dashboard.pendingApply")}
+        {shareEditPendingLabel(edit, t)}
       </Alert>
     );
   }

@@ -3,7 +3,7 @@
 import * as React from "react";
 import { toast } from "@heroui/react";
 import {
-  cleanupClientMarketClientWithReason,
+  cleanupClientMarketProviderRental,
   deleteClientMarketHost,
   getClientMarketJob,
   reverifyClientMarketHost,
@@ -228,9 +228,9 @@ export function useBatchOperations({
           return;
         }
         try {
-          const { jobId } = await cleanupClientMarketClientWithReason(host.installationId, {
+          const { jobId } = await cleanupClientMarketProviderRental(host.installationId, {
             reason: cleanupReasonForHost(host),
-            blockClientForProvider: false,
+            denyClientAccess: false,
           });
           const result = await pollCleanupJobQuiet(jobId);
           if (result.ok) patch(host.id, { status: "succeeded" });

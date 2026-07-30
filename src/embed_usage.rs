@@ -197,16 +197,8 @@ fn period_links(opts: &EmbedRenderOptions) -> String {
     let mut x = if opts.compact { 540.0_f64 } else { 520.0_f64 };
     for period in ["24h", "7d", "30d"] {
         let active = period == current;
-        let bg = if active {
-            p.chip_active_bg
-        } else {
-            p.chip_bg
-        };
-        let fg = if active {
-            p.chip_active_text
-        } else {
-            p.muted
-        };
+        let bg = if active { p.chip_active_bg } else { p.chip_bg };
+        let fg = if active { p.chip_active_text } else { p.muted };
         out.push_str(&format!(
             r#"<a href="?period={period}&amp;{suffix}"><rect x="{x:.1}" y="18" width="{chip_w:.0}" height="{chip_h:.0}" rx="6" fill="{bg}"/><text x="{label_x:.1}" y="{label_y:.1}" text-anchor="middle" font-family="ui-sans-serif,system-ui,sans-serif" font-size="{font}" font-weight="600" fill="{fg}">{period}</text></a>"#,
             label_x = x + chip_w / 2.0,
@@ -246,7 +238,10 @@ fn model_rows_svg(
     for row in rows {
         let ratio = row.total_tokens as f64 / max_total as f64;
         let bar_w = (ratio * 280.0).max(2.0);
-        let model = escape_xml(&truncate_label(&row.model, if opts.compact { 24 } else { 28 }));
+        let model = escape_xml(&truncate_label(
+            &row.model,
+            if opts.compact { 24 } else { 28 },
+        ));
         let total = escape_xml(&format_number(row.total_tokens, opts.format));
         out.push_str(&format!(
             r#"<text x="24" y="{y:.1}" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="{font}" fill="{text}">{model}</text>
@@ -489,7 +484,10 @@ mod tests {
 
     #[test]
     fn full_number_formatting() {
-        assert_eq!(format_number(1_234_567, EmbedNumberFormat::Full), "1,234,567");
+        assert_eq!(
+            format_number(1_234_567, EmbedNumberFormat::Full),
+            "1,234,567"
+        );
     }
 
     #[test]

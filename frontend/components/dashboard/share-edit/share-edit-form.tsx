@@ -30,6 +30,7 @@ import { ShareUserGrantsEditor } from "./share-user-grants-editor";
 export type ShareEditFormApi = {
   draft: ShareEditDraft;
   shareApp?: PriceApp;
+  activeShareApps: PriceApp[];
   busy: boolean;
   error: string;
   notice: string;
@@ -358,6 +359,7 @@ export function useShareEditForm({
   return {
     draft,
     shareApp,
+    activeShareApps,
     busy,
     error,
     notice,
@@ -400,7 +402,7 @@ export function ShareEditFormBody({
   t: TFn;
   form: ShareEditFormApi;
 }) {
-  const { draft, shareApp } = form;
+  const { activeShareApps, draft, shareApp } = form;
 
   if (!shareApp) {
     return <EmptyBlock>{t("dashboard.shareEditNoAppType")}</EmptyBlock>;
@@ -423,7 +425,7 @@ export function ShareEditFormBody({
       <ShareEditMarketFields
         t={t}
         share={share}
-        shareApp={shareApp}
+        activeShareApps={activeShareApps}
         draft={draft}
         tokenMarkets={form.tokenMarkets}
         marketSelectKey={form.marketSelectKey}
@@ -445,10 +447,12 @@ export function ShareEditFormBody({
               onChange={(emails) =>
                 form.onDraftChange((current) => ({
                   ...current,
-                  shareToEmailsByApp: {
-                    ...current.shareToEmailsByApp,
-                    [shareApp]: emails,
-                  },
+                  shareToEmailsByApp: Object.fromEntries(
+                    (["claude", "codex", "gemini"] as const).map((app) => [
+                      app,
+                      activeShareApps.includes(app) ? emails : current.shareToEmailsByApp[app],
+                    ]),
+                  ) as ShareEditDraft["shareToEmailsByApp"],
                 }))
               }
               onPromote={(email) => form.setTransferTargetEmail(email)}
@@ -559,7 +563,7 @@ export function ShareEditFormBody({
         {draft.userGrantsSupported ? (
           <ShareUserGrantsEditor
             draft={draft}
-            shareApp={shareApp}
+            activeShareApps={activeShareApps}
             ownerEmail={share.ownerEmail || ""}
             defaultPolicy={defaultUserPolicy}
             supportedPeriods={share.supportedUserTokenPeriods}

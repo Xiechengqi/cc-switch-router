@@ -17,6 +17,8 @@ mod geo;
 mod ingress_context;
 mod ip_blacklist_stats;
 mod ip_iq;
+mod market_access;
+mod market_billing;
 mod metrics;
 mod models;
 mod namespace;
@@ -181,6 +183,7 @@ async fn main() -> Result<()> {
         client_market_terminal: Arc::new(Mutex::new(
             crate::client_market_terminal::TerminalSessionManager::default(),
         )),
+        market_billing_controls: Arc::new(Mutex::new(())),
         recent_traffic: RecentTraffic::new(),
         abuse: Arc::new(AbuseTracker::new()),
         ip_blacklist_stats: Arc::new(IpBlacklistStats::new()),
@@ -260,6 +263,7 @@ async fn main() -> Result<()> {
     let chat_notification_config = config.clone();
     let client_market_trade_state = state.clone();
     let share_market_state = state.clone();
+    let market_billing_state = state.clone();
 
     let http_listener = TcpListener::bind(config.api_addr).await?;
     let ssh_listener = TcpListener::bind(config.ssh_addr).await?;
@@ -443,6 +447,13 @@ async fn main() -> Result<()> {
         }
         result
     });
+    let market_billing_task = tokio::spawn(async move {
+        let result = crate::market_billing::run_service(market_billing_state).await;
+        if let Err(error) = &result {
+            tracing::error!(error = %error, "Market billing service stopped");
+        }
+        result
+    });
     let (http_shutdown_tx, http_shutdown_rx) = watch::channel(false);
     let (ssh_shutdown_tx, ssh_shutdown_rx) = watch::channel(false);
     let mut ssh_task = tokio::spawn(async move {
@@ -508,6 +519,7 @@ async fn main() -> Result<()> {
     chat_notification_task.abort();
     client_market_trade_task.abort();
     share_market_task.abort();
+    market_billing_task.abort();
     service_result
 }
 

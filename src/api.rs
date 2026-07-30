@@ -46,8 +46,8 @@ use crate::models::{
     DashboardMarketRequestLogView, DashboardPresenceRequest, DashboardPresenceResponse,
     DashboardResponse, DashboardTickerShare, DashboardUxEventRequest, DashboardUxEventResponse,
     GatewayRegistryRecord, GetInstallationOwnerEmailQuery, GetInstallationOwnerEmailResponse,
-    HealthResponse, ImageGenerationRequestLogEntry,
-    InstallationHeartbeatRequest, InstallationHeartbeatResponse, InstallationSetupCompletedRequest,
+    HealthResponse, ImageGenerationRequestLogEntry, InstallationHeartbeatRequest,
+    InstallationHeartbeatResponse, InstallationSetupCompletedRequest,
     InstallationSetupCompletedResponse, IssueLeaseRequest, IssueLeaseResponse, MapDisplaySettings,
     MapDisplaySettingsUpdate, MarketDisabledSharesUpdateRequest,
     MarketDisabledSharesUpdateResponse, MarketMaintenanceUpdateRequest,
@@ -217,7 +217,7 @@ pub fn router(state: ServerState) -> Router {
         )
         .route(
             "/v1/chat/rooms/:room_id/messages",
-            get(list_client_chat_messages).post(post_client_chat_message),
+            get(list_chat_messages).post(post_client_chat_message),
         )
         .route(
             "/v1/chat/rooms/:room_id/stream",
@@ -232,6 +232,8 @@ pub fn router(state: ServerState) -> Router {
         .merge(crate::client_market_trade::router())
         .merge(crate::client_market_terminal::router())
         .merge(crate::share_market::router())
+        .merge(crate::market_access::router())
+        .merge(crate::market_billing::router())
         .route("/", any(root_handler))
         .route("/install-client.sh", get(install_client_script))
         .route("/favicon.ico", get(favicon))
@@ -352,7 +354,10 @@ pub fn router(state: ServerState) -> Router {
         )
         .route("/v1/me/api-token", get(get_default_api_token))
         .route("/v1/me/api-token/reset", post(reset_default_api_token))
-        .route("/v1/me/profile", get(get_my_profile).patch(update_my_profile))
+        .route(
+            "/v1/me/profile",
+            get(get_my_profile).patch(update_my_profile),
+        )
         .route("/v1/me/usage/consumer", get(my_usage_consumer))
         .route("/v1/me/usage/provider", get(my_usage_provider))
         .route("/v1/me/shares", get(my_shares))
@@ -415,14 +420,14 @@ pub fn router(state: ServerState) -> Router {
         )
         .route("/v1/board/messages/:id", delete(delete_board_message))
         .route("/v1/board/meta", get(board_meta))
-        .route("/v1/chat/rooms/lookup", post(lookup_client_chat_rooms))
-        .route("/v1/chat/rooms", get(list_visited_client_chat_rooms))
+        .route("/v1/chat/rooms/lookup", post(lookup_chat_rooms))
+        .route("/v1/chat/rooms", get(list_visited_chat_rooms))
         .route("/v1/chat/meta", get(client_chat_meta))
         .route(
             "/v1/chat/rooms/:room_id/visit",
             put(record_client_chat_visit).delete(remove_client_chat_visit),
         )
-        .route("/v1/chat/visits/import", post(import_client_chat_visits))
+        .route("/v1/chat/visits/import", post(import_chat_visits))
         .route("/v1/chat/rooms/:room_id/read", put(mark_client_chat_read))
         .route(
             "/v1/admin/chat/messages/:message_id",
@@ -1139,7 +1144,8 @@ async fn upgrade_installation(
     // Client's `verify_router_ingress` middleware; going through the public URL
     // also fails for Market Clients because the edge proxy will not re-inject
     // Router session identity.
-    let target = client_upgrade_target(&state, &tunnel_url, &installation_id, &session_email).await?;
+    let target =
+        client_upgrade_target(&state, &tunnel_url, &installation_id, &session_email).await?;
     let response = state
         .proxy_http
         .post(format!(
@@ -1196,7 +1202,8 @@ async fn upgrade_installation_status(
         .store
         .prepare_installation_upgrade_status(&state.config, &installation_id, &session_email)
         .await?;
-    let target = client_upgrade_target(&state, &tunnel_url, &installation_id, &session_email).await?;
+    let target =
+        client_upgrade_target(&state, &tunnel_url, &installation_id, &session_email).await?;
     let response = state
         .proxy_http
         .get(format!(
@@ -1902,12 +1909,8 @@ fn merge_persisted_ticker_event(target: &mut RecentRequestEvent, mut source: Rec
     if option_string_is_blank(&source.user_email) {
         source.user_email = target.user_email.clone();
     }
-    if source.total_tokens.unwrap_or(0) == 0 {
-        source.input_tokens = target.input_tokens;
-        source.output_tokens = target.output_tokens;
-        source.cache_read_tokens = target.cache_read_tokens;
-        source.cache_creation_tokens = target.cache_creation_tokens;
-        source.total_tokens = target.total_tokens;
+    if !should_replace_ticker_usage(target, &source) {
+        copy_ticker_usage(&mut source, target);
     }
     if source.request_agent.is_none() {
         source.request_agent = target.request_agent.clone();
@@ -2025,24 +2028,8 @@ fn merge_ticker_event_country(target: &mut RecentRequestEvent, source: &RecentRe
 }
 
 fn merge_ticker_event_usage(target: &mut RecentRequestEvent, source: &RecentRequestEvent) {
-    let source_total = source.total_tokens.unwrap_or_else(|| {
-        u64::from(source.input_tokens.unwrap_or(0))
-            + u64::from(source.output_tokens.unwrap_or(0))
-            + u64::from(source.cache_read_tokens.unwrap_or(0))
-            + u64::from(source.cache_creation_tokens.unwrap_or(0))
-    });
-    let target_total = target.total_tokens.unwrap_or_else(|| {
-        u64::from(target.input_tokens.unwrap_or(0))
-            + u64::from(target.output_tokens.unwrap_or(0))
-            + u64::from(target.cache_read_tokens.unwrap_or(0))
-            + u64::from(target.cache_creation_tokens.unwrap_or(0))
-    });
-    if source_total > target_total {
-        target.input_tokens = source.input_tokens;
-        target.output_tokens = source.output_tokens;
-        target.cache_read_tokens = source.cache_read_tokens;
-        target.cache_creation_tokens = source.cache_creation_tokens;
-        target.total_tokens = Some(source_total);
+    if should_replace_ticker_usage(target, source) {
+        copy_ticker_usage(target, source);
     }
     if target.request_agent.is_none() {
         target.request_agent = source.request_agent.clone();
@@ -2062,6 +2049,79 @@ fn merge_ticker_event_usage(target: &mut RecentRequestEvent, source: &RecentRequ
     if target.status_code.unwrap_or(0) == 0 {
         target.status_code = source.status_code;
     }
+}
+
+fn should_replace_ticker_usage(target: &RecentRequestEvent, source: &RecentRequestEvent) -> bool {
+    if !has_ticker_usage(source) {
+        return false;
+    }
+    if !has_ticker_usage(target) {
+        return true;
+    }
+    match source
+        .usage_revision
+        .unwrap_or(0)
+        .cmp(&target.usage_revision.unwrap_or(0))
+    {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => {
+            let source_rank = ticker_usage_state_rank(source.usage_state.as_deref());
+            let target_rank = ticker_usage_state_rank(target.usage_state.as_deref());
+            let source_has_richer_usage =
+                match (ticker_usage_total(source), ticker_usage_total(target)) {
+                    (Some(source_total), Some(target_total)) => source_total > target_total,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+            source_rank > target_rank || (source_rank == target_rank && source_has_richer_usage)
+        }
+    }
+}
+
+fn has_ticker_usage(event: &RecentRequestEvent) -> bool {
+    event.usage_state.is_some()
+        || event.usage_revision.is_some()
+        || event.input_tokens.is_some()
+        || event.output_tokens.is_some()
+        || event.cache_read_tokens.is_some()
+        || event.cache_creation_tokens.is_some()
+        || event.total_tokens.is_some()
+}
+
+fn ticker_usage_state_rank(state: Option<&str>) -> u8 {
+    match state {
+        Some("observed") => 3,
+        Some("missing" | "parse_error" | "interrupted") => 2,
+        Some(_) => 1,
+        None => 0,
+    }
+}
+
+fn ticker_usage_total(event: &RecentRequestEvent) -> Option<u64> {
+    event.total_tokens.or_else(|| {
+        (event.input_tokens.is_some()
+            || event.output_tokens.is_some()
+            || event.cache_read_tokens.is_some()
+            || event.cache_creation_tokens.is_some())
+        .then(|| {
+            u64::from(event.input_tokens.unwrap_or(0))
+                + u64::from(event.output_tokens.unwrap_or(0))
+                + u64::from(event.cache_read_tokens.unwrap_or(0))
+                + u64::from(event.cache_creation_tokens.unwrap_or(0))
+        })
+    })
+}
+
+fn copy_ticker_usage(target: &mut RecentRequestEvent, source: &RecentRequestEvent) {
+    target.input_tokens = source.input_tokens;
+    target.output_tokens = source.output_tokens;
+    target.cache_read_tokens = source.cache_read_tokens;
+    target.cache_creation_tokens = source.cache_creation_tokens;
+    target.total_tokens = source.total_tokens;
+    target.usage_state = source.usage_state.clone();
+    target.stream_status = source.stream_status.clone();
+    target.usage_revision = source.usage_revision;
 }
 
 fn persisted_ticker_request_events(
@@ -2097,6 +2157,7 @@ fn share_log_to_ticker_event(
     share: &DashboardTickerShare,
     log: &ShareRequestLogEntry,
 ) -> RecentRequestEvent {
+    let usage_observed = log.usage_state == "observed";
     RecentRequestEvent {
         request_id: log.request_id.clone(),
         share_id: log.share_id.clone(),
@@ -2109,11 +2170,14 @@ fn share_log_to_ticker_event(
         user_country: log.user_country.clone(),
         user_country_iso3: log.user_country_iso3.clone(),
         user_email: log.user_email.clone(),
-        input_tokens: Some(log.input_tokens),
-        output_tokens: Some(log.output_tokens),
-        cache_read_tokens: Some(log.cache_read_tokens),
-        cache_creation_tokens: Some(log.cache_creation_tokens),
-        total_tokens: Some(share_log_total_tokens(log)),
+        input_tokens: usage_observed.then_some(log.input_tokens),
+        output_tokens: usage_observed.then_some(log.output_tokens),
+        cache_read_tokens: usage_observed.then_some(log.cache_read_tokens),
+        cache_creation_tokens: usage_observed.then_some(log.cache_creation_tokens),
+        total_tokens: usage_observed.then(|| share_log_total_tokens(log)),
+        usage_state: Some(log.usage_state.clone()),
+        stream_status: log.stream_status.clone(),
+        usage_revision: Some(log.usage_revision),
         request_agent: (!log.request_agent.is_empty()).then(|| log.request_agent.clone()),
         requested_model: (!log.requested_model.is_empty()).then(|| log.requested_model.clone()),
         actual_model: (!log.actual_model.is_empty()).then(|| log.actual_model.clone()),
@@ -2143,6 +2207,12 @@ fn share_log_to_ticker_event(
 }
 
 fn market_log_to_ticker_event(log: &DashboardMarketRequestLogView) -> RecentRequestEvent {
+    let usage_state = if log.status == "streaming" {
+        "pending"
+    } else {
+        "observed"
+    };
+    let usage_observed = usage_state == "observed";
     RecentRequestEvent {
         request_id: log.request_id.clone(),
         share_id: log.share_id.clone().unwrap_or_default(),
@@ -2151,11 +2221,14 @@ fn market_log_to_ticker_event(log: &DashboardMarketRequestLogView) -> RecentRequ
         user_country: log.user_country.clone(),
         user_country_iso3: log.user_country_iso3.clone(),
         user_email: log.user_email.clone(),
-        input_tokens: Some(log.input_tokens),
-        output_tokens: Some(log.output_tokens),
-        cache_read_tokens: Some(log.cache_read_tokens),
-        cache_creation_tokens: Some(log.cache_creation_tokens),
-        total_tokens: Some(market_log_total_tokens(log)),
+        input_tokens: usage_observed.then_some(log.input_tokens),
+        output_tokens: usage_observed.then_some(log.output_tokens),
+        cache_read_tokens: usage_observed.then_some(log.cache_read_tokens),
+        cache_creation_tokens: usage_observed.then_some(log.cache_creation_tokens),
+        total_tokens: usage_observed.then(|| market_log_total_tokens(log)),
+        usage_state: Some(usage_state.to_string()),
+        stream_status: Some(log.status.clone()),
+        usage_revision: Some(0),
         request_agent: (!log.request_agent.is_empty()).then(|| log.request_agent.clone()),
         requested_model: (!log.requested_model.is_empty()).then(|| log.requested_model.clone()),
         actual_model: (!log.actual_model.is_empty()).then(|| log.actual_model.clone()),
@@ -2215,10 +2288,7 @@ async fn public_network_stats(
 fn svg_usage_response(svg: String) -> Response {
     Response::builder()
         .status(StatusCode::OK)
-        .header(
-            header::CONTENT_TYPE,
-            "image/svg+xml; charset=utf-8",
-        )
+        .header(header::CONTENT_TYPE, "image/svg+xml; charset=utf-8")
         .header(
             header::CACHE_CONTROL,
             "public, max-age=0, s-maxage=60, stale-while-revalidate=300",
@@ -2231,7 +2301,10 @@ fn embed_models_limit(models: Option<usize>) -> usize {
     models.unwrap_or(8).clamp(1, 16)
 }
 
-fn embed_render_options(query: &EmbedUsageQuery, period_fallback: &str) -> crate::embed_usage::EmbedRenderOptions {
+fn embed_render_options(
+    query: &EmbedUsageQuery,
+    period_fallback: &str,
+) -> crate::embed_usage::EmbedRenderOptions {
     crate::embed_usage::EmbedRenderOptions::from_query(
         query.period.as_deref().or(Some(period_fallback)),
         query.theme.as_deref(),
@@ -2662,6 +2735,14 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[test]
+    fn share_edit_event_stream_requests_initial_resync() {
+        assert_eq!(
+            initial_share_edit_stream_events(),
+            [("ready", "{}"), ("resync", "{}")]
+        );
+    }
+
     async fn counted_json_handler(
         State(calls): State<Arc<AtomicUsize>>,
         Json(_value): Json<serde_json::Value>,
@@ -2934,6 +3015,61 @@ mod tests {
         assert_eq!(json["totalTokens"], 37);
         assert_eq!(json["actualModel"], "gpt-5");
         assert_eq!(json["latencyMs"], 1);
+    }
+
+    #[test]
+    fn share_log_ticker_event_distinguishes_pending_from_observed_zero() {
+        let mut pending = share_log("req-share-pending", 1);
+        pending.usage_state = "pending".into();
+        pending.stream_status = Some("streaming".into());
+        pending.usage_revision = 1;
+        let pending_event = share_log_to_ticker_event(&ticker_share(Vec::new()), &pending);
+
+        assert_eq!(pending_event.usage_state.as_deref(), Some("pending"));
+        assert_eq!(pending_event.stream_status.as_deref(), Some("streaming"));
+        assert_eq!(pending_event.usage_revision, Some(1));
+        assert_eq!(pending_event.input_tokens, None);
+        assert_eq!(pending_event.total_tokens, None);
+        let pending_json = serde_json::to_value(pending_event).unwrap();
+        assert!(pending_json.get("inputTokens").is_none());
+        assert!(pending_json.get("totalTokens").is_none());
+
+        let observed = share_log("req-share-zero", 2);
+        let observed_event = share_log_to_ticker_event(&ticker_share(Vec::new()), &observed);
+        assert_eq!(observed_event.usage_state.as_deref(), Some("observed"));
+        assert_eq!(observed_event.input_tokens, Some(0));
+        assert_eq!(observed_event.total_tokens, Some(0));
+        let observed_json = serde_json::to_value(observed_event).unwrap();
+        assert_eq!(observed_json["inputTokens"], 0);
+        assert_eq!(observed_json["totalTokens"], 0);
+    }
+
+    #[test]
+    fn ticker_usage_merge_keeps_highest_revision_terminal_state() {
+        let mut pending = share_log("req-share-revision", 1);
+        pending.usage_state = "pending".into();
+        pending.stream_status = Some("streaming".into());
+        pending.usage_revision = 1;
+        let mut event = share_log_to_ticker_event(&ticker_share(Vec::new()), &pending);
+
+        let mut observed = pending.clone();
+        observed.usage_state = "observed".into();
+        observed.stream_status = Some("completed".into());
+        observed.usage_revision = 2;
+        let observed_event = share_log_to_ticker_event(&ticker_share(Vec::new()), &observed);
+        merge_persisted_ticker_event(&mut event, observed_event);
+
+        assert_eq!(event.usage_state.as_deref(), Some("observed"));
+        assert_eq!(event.stream_status.as_deref(), Some("completed"));
+        assert_eq!(event.usage_revision, Some(2));
+        assert_eq!(event.total_tokens, Some(0));
+
+        let stale_event = share_log_to_ticker_event(&ticker_share(Vec::new()), &pending);
+        merge_persisted_ticker_event(&mut event, stale_event);
+        assert_eq!(event.usage_state.as_deref(), Some("observed"));
+        assert_eq!(event.stream_status.as_deref(), Some("completed"));
+        assert_eq!(event.usage_revision, Some(2));
+        assert_eq!(event.total_tokens, Some(0));
     }
 
     #[test]
@@ -3447,6 +3583,14 @@ mod tests {
             requested_model: "gpt-5".into(),
             actual_model: "gpt-5".into(),
             actual_model_source: "official".into(),
+            requested_reasoning_effort: None,
+            effective_reasoning_effort: None,
+            client_service_tier: None,
+            effective_service_tier: None,
+            service_tier_decision: None,
+            usage_state: "observed".into(),
+            stream_status: None,
+            usage_revision: 0,
             status_code: 200,
             latency_ms: 1,
             first_token_ms: None,
@@ -4108,7 +4252,9 @@ async fn share_edit_events(
     let installation_id = query.installation_id;
     let mut rx = state.share_edit_events.subscribe();
     let stream = async_stream::stream! {
-        yield Ok(Event::default().event("ready").data("{}"));
+        for (event_name, data) in initial_share_edit_stream_events() {
+            yield Ok(Event::default().event(event_name).data(data));
+        }
         loop {
             match rx.recv().await {
                 Ok(event) if event.installation_id == installation_id => {
@@ -4124,6 +4270,10 @@ async fn share_edit_events(
         }
     };
     Ok(Sse::new(stream))
+}
+
+fn initial_share_edit_stream_events() -> [(&'static str, &'static str); 2] {
+    [("ready", "{}"), ("resync", "{}")]
 }
 
 async fn batch_sync_share_request_logs(
@@ -4635,7 +4785,7 @@ async fn client_chat_room(
     Ok((public_chat_headers(), Json(ClientChatRoomResponse { room })))
 }
 
-async fn lookup_client_chat_rooms(
+async fn lookup_chat_rooms(
     State(state): State<ServerState>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -4652,7 +4802,7 @@ async fn lookup_client_chat_rooms(
         Json(
             state
                 .store
-                .lookup_client_chat_rooms(
+                .lookup_chat_rooms(
                     input.installation_ids,
                     input.last_read_seq_by_installation,
                     session.as_ref().map(|session| session.user_id.as_str()),
@@ -4662,7 +4812,7 @@ async fn lookup_client_chat_rooms(
     ))
 }
 
-async fn list_visited_client_chat_rooms(
+async fn list_visited_chat_rooms(
     State(state): State<ServerState>,
     headers: HeaderMap,
 ) -> Result<Json<ClientChatRoomListResponse>, AppError> {
@@ -4670,7 +4820,7 @@ async fn list_visited_client_chat_rooms(
     Ok(Json(
         state
             .store
-            .list_visited_client_chat_rooms(&session.user_id)
+            .list_visited_chat_rooms(&session.user_id)
             .await?,
     ))
 }
@@ -4682,7 +4832,7 @@ async fn client_chat_meta(
     let session = require_client_chat_session(&state, &headers).await?;
     let rooms = state
         .store
-        .list_visited_client_chat_rooms(&session.user_id)
+        .list_visited_chat_rooms(&session.user_id)
         .await?;
     Ok(Json(serde_json::json!({
         "totalUnread": rooms.total_unread,
@@ -4715,7 +4865,7 @@ async fn remove_client_chat_visit(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn import_client_chat_visits(
+async fn import_chat_visits(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Json(input): Json<ClientChatVisitImportRequest>,
@@ -4723,7 +4873,7 @@ async fn import_client_chat_visits(
     let session = require_client_chat_session(&state, &headers).await?;
     let imported = state
         .store
-        .import_client_chat_visits(&session.user_id, input.visits)
+        .import_chat_visits(&session.user_id, input.visits)
         .await?;
     Ok(Json(ClientChatVisitImportResponse { imported }))
 }
@@ -4748,13 +4898,19 @@ async fn client_chat_room_stream(
         .enforce_client_chat_public_read_rate(metadata.ip.as_deref())
         .await?;
     let room_id = room_id.trim().to_string();
+    let session = resolve_router_session(&state, &headers).await?;
+    let viewer_user_id = session.as_ref().map(|value| value.user_id.clone());
+    state
+        .store
+        .get_chat_room_latest_seq(&room_id, viewer_user_id.as_deref())
+        .await?;
     let mut cursor = query.after_seq.unwrap_or(0).max(0);
     let store = state.store.clone();
     let stream = async_stream::stream! {
         yield Ok(axum::response::sse::Event::default().event("ready").data("{}"));
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
-            match store.get_client_chat_room_latest_seq(&room_id).await {
+            match store.get_chat_room_latest_seq(&room_id, viewer_user_id.as_deref()).await {
                 Ok(latest_seq) if latest_seq > cursor => {
                     cursor = latest_seq;
                     let payload = serde_json::json!({ "latestSeq": latest_seq }).to_string();
@@ -4772,7 +4928,7 @@ async fn client_chat_room_stream(
     ))
 }
 
-async fn list_client_chat_messages(
+async fn list_chat_messages(
     State(state): State<ServerState>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -4790,7 +4946,7 @@ async fn list_client_chat_messages(
         Json(
             state
                 .store
-                .list_client_chat_messages(
+                .list_chat_messages(
                     &room_id,
                     session.as_ref().map(|session| session.user_id.as_str()),
                     query.before_seq,
@@ -6251,10 +6407,11 @@ async fn test_share_connection(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("text");
-    let probe = app_probe_for_kind(&input.app, probe_kind).ok_or_else(|| {
+    let app = input.app.trim().to_ascii_lowercase();
+    let probe = app_probe_for_kind(&app, probe_kind).ok_or_else(|| {
         AppError::BadRequest(format!(
             "unsupported app probe: app={} kind={probe_kind}",
-            input.app
+            app
         ))
     })?;
 
@@ -6277,19 +6434,19 @@ async fn test_share_connection(
             "only the share owner, invited users, or admins can test this share".into(),
         ));
     }
+    if !share.bindings.contains_key(&app) {
+        return Err(AppError::BadRequest(format!(
+            "share does not have a {app} binding"
+        )));
+    }
 
-    if input.app == "codex"
-        && probe_kind == "image"
-        && !share_codex_image_generation_enabled(&share)
-    {
+    if app == "codex" && probe_kind == "image" && !share_codex_image_generation_enabled(&share) {
         return Err(AppError::BadRequest(
             "codex image generation is not enabled for the bound provider".into(),
         ));
     }
 
-    if input.app == "claude"
-        && probe_kind == "tools"
-        && !share_claude_cursor_tools_probe_enabled(&share)
+    if app == "claude" && probe_kind == "tools" && !share_claude_cursor_tools_probe_enabled(&share)
     {
         return Err(AppError::BadRequest(
             "claude tools probe is only available for cursor_oauth / cursor_apikey shares".into(),
@@ -6363,7 +6520,7 @@ async fn test_share_connection(
             tracing::info!(
                 tag = "test-connection",
                 share_id = %share_id,
-                app = %input.app,
+                app = %app,
                 error = %err,
                 duration_ms,
                 "test-connection network error"
@@ -6384,7 +6541,7 @@ async fn test_share_connection(
                 .iter()
                 .map(|(k, v)| [k.as_str().to_string(), v.to_str().unwrap_or("").to_string()])
                 .collect();
-            let body_bytes = if input.app == "codex" && matches!(probe_kind, "image" | "text") {
+            let body_bytes = if app == "codex" && matches!(probe_kind, "image" | "text") {
                 let mut stream = resp.bytes_stream();
                 match tokio::time::timeout(std::time::Duration::from_secs(5), stream.next()).await {
                     Ok(Some(Ok(bytes))) => bytes,
@@ -6402,7 +6559,7 @@ async fn test_share_connection(
             tracing::info!(
                 tag = "test-connection",
                 share_id = %share_id,
-                app = %input.app,
+                app = %app,
                 status = status_code,
                 duration_ms,
                 "test-connection completed"
@@ -6410,13 +6567,13 @@ async fn test_share_connection(
             let scheduling_recovery = if status_code == 200 {
                 let recovery = state
                     .store
-                    .recover_share_app_scheduling_after_successful_test(&share_id, &input.app)
+                    .recover_share_app_scheduling_after_successful_test(&share_id, &app)
                     .await?;
                 if recovery.changed() {
                     tracing::info!(
                         tag = "test-connection",
                         share_id = %share_id,
-                        app = %input.app,
+                        app = %app,
                         share_model_health_deleted = recovery.share_model_health_deleted,
                         market_model_failures_deleted = recovery.market_model_failures_deleted,
                         market_runtime_states_deleted = recovery.market_runtime_states_deleted,

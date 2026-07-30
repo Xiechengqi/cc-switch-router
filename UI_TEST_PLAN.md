@@ -18,7 +18,7 @@
 
 **判断要不要更新本文件的最快方法**:`grep` 你改动的文件名,§18 会告诉你哪些用例受影响。
 
-现状:仓库**没有前端自动化测试**(无 jest/vitest/playwright),后端有 473 个 Rust 内联测试。所以前端行为的唯一防线就是这份手动清单。
+现状:仓库**没有前端自动化测试**(无 jest/vitest/playwright),后端有 Rust 内联测试和静态契约审计。浏览器交互仍以这份手动清单为验收依据。
 
 ---
 
@@ -67,6 +67,7 @@ cd frontend && npm run dev     # /v1/* 代理到 CC_SWITCH_ROUTER_DEV_API_TARGET
 | `/markets` | ✅ 只读 | ✅ | ✅ | ✅ | ✅ 可编辑 |
 | `/share-market` | ✅ 只读 catalog | ✅ 租用/挂售 | ✅ | ✅ | ✅ 无特权 |
 | `/account/share` | ❌ | ✅ 只读监控 | ✅ | ✅ | ✅ 无特权 |
+| `/account/billing` | ❌ | ✅ 应付/策略 | ✅ 应收/策略 | ✅ 应付 | ✅ 含争议裁决 |
 | `/client-market` 主机表 | ✅ 只读 | ✅ 空表 | ✅ 全功能 | ✅ 空表 | ✅ 无特权 |
 | `/rentals` | ❌ 提示登录 | ✅ 空 | ✅ 空 | ✅ 有数据 | ✅ |
 | `/account` | ❌ | ✅ | ✅ | ✅ | ✅ |
@@ -205,17 +206,17 @@ location.reload();
 | SM-01 | 任意 | 打开 `/share-market` | 顶部顺序为 Token Market / Share Market / Client Market；空 catalog 正常显示 |
 | SM-02 | 未登录 | 点租用或添加 Share | 打开登录弹窗,不提交写请求 |
 | SM-03 | 已登录且拥有 active Share | 点添加 Share | 只列出未挂售 Share；可一次添加 1-20 个拼车位 |
-| SM-04 | 添加拼车位 | 保持价格模式为免费 | 请求中价格、币种和账单周期均为空 |
-| SM-05 | 添加付费拼车位 | 输入三位以上小数、非三字母币种或非法周期 | 内联报错,不提交 |
-| SM-06 | 有可用拼车位 | 租用 | 座位进入 pending/occupied；同一用户不能重复租同一 Share；租用按钮对已拉黑/已有 direct grant 的用户不显示 |
-| SM-07 | 付费租约 | 查看付款详情并确认已付款 | 显示 owner 当前收款资料；无收款方式时声明按钮 disabled |
-| SM-08 | owner 查看已租座位 | 强制回收 / 回收并拉黑 | 二次确认后进入回收状态；拉黑用户不能再次租用该 owner 的座位(按钮不出现) |
-| SM-09 | owner 的 Mine tab | 解除拉黑 | 即使无 listing 也能看到拉黑列表；解除后用户可再次租用 |
+| SM-04 | 添加拼车位 | 保持价格模式为免费 | 请求中日费率和币种均为空 |
+| SM-05 | 添加付费拼车位 | 输入三位以上小数、非 CNY/USD 币种,或未配置对应币种收款资料/付款宽限 | 内联报错或阻止发布,不提交 |
+| SM-06 | 有可用拼车位 | 可信买家租用 | 座位进入 pending/occupied；同一用户不能重复租同一 Share；租用按钮对准入拒绝或已有 direct grant 的用户不显示 |
+| SM-07 | 付费租约 | 查看商品与租约 | 只显示收款方式种类和联系方式；不显示账号、地址、二维码或单商品付款按钮 |
+| SM-08 | owner 查看已租座位 | 强制回收 / 回收并拒绝后续访问 | 二次确认后进入回收状态；拒绝后该买家不能新租该 owner 的 Share 座位 |
+| SM-09 | owner 打开市场准入 | 将该买家的 Share 规则改回允许 | 保存后买家可再次新租 Share；Client Host 规则不受影响 |
 | SM-10 | listing 有活跃租约 | 停止挂售 | 空闲座位关闭,活跃租约继续显示且可正常使用；「添加 Share」仍不可选该 Share |
 | SM-11 | 已释放的座位 | 删除座位 | 座位从 catalog 消失,历史订阅和账单仍保留 |
 | SM-12 | 窄屏 | 检查导航、弹窗和座位表 | 导航和表格可横向滚动；弹窗纵向滚动；文字和操作不重叠 |
 | SM-13 | 停止挂售且无活跃租约 | 点添加 Share | 该 Share 重新出现在候选列表；可新建 listing |
-| SM-14 | 离线 Share 的可用座位 | 点租用 | toast 提示离线后仍提交租用；权限待 Server 上线后生效 |
+| SM-14 | 离线 Share 的可用座位 | 观察并直接调用租用接口 | 已登录用户不显示租用按钮；直接请求返回离线冲突,不创建订阅或账务合约 |
 | SM-15 | 租约非终态 | My rentals / owner 嵌套订阅 | 有 subdomain 时显示「打开 Share」并可跳转 |
 
 ### 6.1.1 Share Market ↔ Server 联调(SM-E2E)
@@ -228,7 +229,9 @@ location.reload();
 | SM-E2E-02 | renter 租用 | Router 订阅 `grant_pending` → pending edit → Server ack 后出现 `routerShareMarket` shareto |
 | SM-E2E-03 | renter 打开 Share 并鉴权调用 | 请求成功；用量计入该 grant 限额 |
 | SM-E2E-04 | owner 强制回收 | revoke pending edit → grant 移除 → renter 再请求被拒；座位回到可租 |
-| SM-E2E-05 | 付费座位:体验期内声明付款 / 超时 | 声明后 `active_paid`；超时未声明则自动回收 |
+| SM-E2E-05 | 付费座位完成 grant | 订阅进入 `active_postpaid`；前 12 小时健康服务时长不累计费用 |
+| SM-E2E-06 | 超过试用且保持在线 | 按健康秒数累计到 owner+renter+币种的赊账账户；不生成单商品账单 |
+| SM-E2E-07 | 同一 renter 租用该 owner 的多个 Share/Client Host 并达到阈值 | 生成一张含多个服务明细的聚合账单并暂停相关服务；完整收款资料只在该账单中出现 |
 
 ---
 
@@ -298,21 +301,21 @@ location.reload();
 | H-44 | 状态 unreachable/disabled/abnormal | Reverify | 执行重新校验 |
 | H-45 | 有 installation 且 allocated/unreachable/draining | Cleanup | 二次确认(danger)→ 进度弹窗显示阶段与日志 |
 | H-46 | 状态 unreachable/draining | 观察 Cleanup 文案 | 显示为「重试清理」 |
-| H-47 | allocated 且非自己租用 | 未付款清理 | 红色项;二次确认警告会封禁该租客 |
+| H-47 | allocated 且非自己租用 | Cleanup 并勾选拒绝后续访问 | 普通 Provider 可同时把该买家的 Client Host 产品规则设为拒绝；不撤销整段关系,也不写入欠款事实 |
 | H-48 | 无 installation 且 idle/disabled/abnormal | Delete | 二次确认(danger)后删除 |
 | H-49 | 清理进行中 | 尝试关闭进度弹窗 | 关闭按钮 disabled;任务成功或失败后才可关 |
 | H-50 | 有备注的主机 | 观察 | 备注以子行展示;**无备注则不出现空子行** |
 
 **操作可用性矩阵**(行=主机状态,列=菜单项;均需 host owner):
 
-| 状态 | Edit Offer | Reverify | Cleanup | 未付款清理 | Delete |
-|---|:--:|:--:|:--:|:--:|:--:|
-| idle | ✅ | — | — | — | ✅ |
-| allocated | ✅ | — | ✅ | ✅ | — |
-| draining | ✅ | — | ✅(重试) | — | — |
-| unreachable | ✅ | ✅ | ✅(重试) | — | — |
-| abnormal | ✅ | ✅ | — | — | ✅ |
-| disabled | ✅ | ✅ | — | — | ✅ |
+| 状态 | Edit Offer | Reverify | Cleanup | Delete |
+|---|:--:|:--:|:--:|:--:|
+| idle | ✅ | — | — | ✅ |
+| allocated | ✅ | — | ✅ | — |
+| draining | ✅ | — | ✅(重试) | — |
+| unreachable | ✅ | ✅ | ✅(重试) | — |
+| abnormal | ✅ | ✅ | — | ✅ |
+| disabled | ✅ | ✅ | — | ✅ |
 
 ### 7.6 选择模式与批量
 
@@ -345,32 +348,32 @@ location.reload();
 
 ## 8. 我的租用(R)
 
-覆盖 `client-market/rentals-page.tsx`、`my-rentals-panel.tsx`、`client-market-billing-banner.tsx`、`client-market/release-rental-action.tsx`
+覆盖 `client-market/rentals-page.tsx`、`my-rentals-panel.tsx`、`client-market-rental-banner.tsx`、`client-market/release-rental-action.tsx`
 
-### 8.1 列表与账单
+### 8.1 租用列表
 
 | ID | 前置 | 步骤 | 预期 |
 |---|---|---|---|
 | R-01 | 未登录 | 打开 `/rentals` | 提示登录,不发数据请求 |
 | R-02 | 登录但无租用 | 打开 | 虚线空态卡片 |
-| R-03 | 有租用 | 打开 | 每条租用一张卡:国旗、子域名、主机状态、供给方邮箱、**释放入口** + 账单区 |
+| R-03 | 有租用 | 打开 | 每条租用一张卡:国旗、子域名、主机状态、供给方邮箱与释放入口 |
 | R-04 | **既出租又租用** | 打开 | **只显示自己租的**,自己出租给别人的不出现 |
-| R-05 | 账单 payment_due | 观察 | 显示紧急度 chip 与「支付」按钮 |
-| R-06 | 承 R-05 | 点支付 | 弹窗显示供给方收款方式、二维码、金额、截止时间与倒计时 |
-| R-07 | 承 R-06 | 点「我已支付」 | 二次确认(warning)→ 成功 toast → 弹窗关闭 |
-| R-11 | 供给方中途改价 | 尝试支付 | 被拒绝并提示重新确认价格(金额回显校验) |
-| R-12 | 任意 | 保持 20 秒 | 自动刷新;`/client-market` 页**不再请求账单接口** |
+| R-05 | 付费租用 | 观察 | 只显示跳转统一 Market Billing 的入口；无单商品金额、付款倒计时或付款声明按钮 |
+| R-06 | 承 R-05 | 点 Market Billing | 跳转 `/account/billing/`；尚未出账时只显示供应商赊账账户，不显示完整收款账号/二维码 |
+| R-07 | 已生成聚合账单 | 在 Account Billing 打开当前账单 | 显示冻结的收款方式、二维码、总金额、截止时间及多个服务明细 |
+| R-11 | 供给方中途改价 | 刷新租用与账务 | 既有服务合约仍按租用时快照费率计费；新报价只影响后续租用 |
+| R-12 | 任意 | 保持 20 秒 | 自动刷新 `/v1/client-market/my-rentals`；不请求任何旧 Client 商品账单接口 |
 
 ### 8.2 释放(任何状态均可发起)
 
-释放入口常驻卡片,**不依赖账单紧急度**。此前它只存在于付款弹窗内,而付款弹窗又只在 `billingUrgencyTier` 为 urgent 时可达 —— 已付费且距到期尚远、以及免费租用(`priceCents` 为空,tier 返回 `null`)两种情况下,租客根本无法归还主机。
+释放入口常驻卡片,**不依赖是否已出聚合账单**。释放只终止后续计费并清理 Client；已产生但尚未出账的余额会进入最终聚合账单。
 
 | ID | 前置 | 步骤 | 预期 |
 |---|---|---|---|
-| R-20 | **已付款、距到期尚远**(tier=silent) | 打开 `/rentals` | 卡片上**有释放入口**(此前完全没有) |
+| R-20 | 付费租用仍处于试用或累计阶段 | 打开 `/rentals` | 卡片上有释放入口 |
 | R-21 | **免费租用**(无价格) | 打开 | 同样有释放入口 |
-| R-22 | 账单 payment_due | 打开 | 释放入口与「支付」按钮并存 |
-| R-23 | 任一可释放状态 | 点释放 | 二次确认(danger),文案**明确写出:不退款、剩余时间作废、数据永久删除、不可撤销** |
+| R-22 | 已存在聚合账单 | 打开 | 释放入口与 Market Billing 跳转并存；释放不改写已生成账单 |
+| R-23 | 任一可释放状态 | 点释放 | 二次确认(danger),明确隧道立即停用、远程安装被清理且数据可能永久丢失 |
 | R-24 | 承 R-23 | 点取消 | 无任何请求发出 |
 | R-25 | 承 R-23 | 点确认 | 进入**清理进度弹窗**,显示阶段 chip + 实时作业日志 |
 | R-26 | 承 R-25 | 观察阶段推进 | 依次经过 stop → wipe → purge,阶段 chip 随之更新 |
@@ -382,9 +385,7 @@ location.reload();
 | R-32 | 状态 releasing | 观察 | 显示释放中;**卡片不再显示释放入口**(已有作业在跑) |
 | R-33 | 清理超时(>3.6 分钟无终态) | 观察 | 超时 toast,不无限转圈 |
 | R-34 | 释放进行中 | 直接刷新页面 | 不崩溃;后台作业继续,状态由轮询反映 |
-| R-35 | 付款弹窗内 | 点释放 | 与卡片入口走**同一套**确认与进度弹窗 |
-
-> **R-23 的文案是本次改动的重点**,应逐项核对中英文都包含:不退款 / 剩余时间作废 / 数据永久删除 / 不可撤销。
+| R-35 | Account Billing 中查看该服务明细 | 释放 Client | 只能返回租用页发起释放；账单对话框不提供商品生命周期操作 |
 
 ---
 
@@ -394,7 +395,7 @@ location.reload();
 
 | ID | 前置 | 步骤 | 预期 |
 |---|---|---|---|
-| AC-01 | 已登录 | 打开 `/account` | 显示收款资料区与封禁列表区 |
+| AC-01 | 已登录 | 打开 `/account` | 显示收款资料；市场准入与授信由独立导航进入 `/account/market-access` |
 | AC-02 | 未配置 | 观察 | 空态;Client Market 发布付费报价时会被此状态阻止(见 H-26) |
 | AC-03 | 任意 | 添加支付宝 | 填账号 → 保存 → 重新加载后仍在 |
 | AC-04 | 任意 | 添加微信 | 同上 |
@@ -408,10 +409,10 @@ location.reload();
 | AC-12 | 承 AC-10 | 上传非图片文件 | 拒绝 |
 | AC-13 | 已配置多种 | 删除其中一种 | 该方式消失;其余保留;二维码资产同步清理 |
 | AC-14 | 已配置 | 保存后立刻去 Client Market 发布付费报价 | 不再被阻止(与 H-26 呼应) |
-| AC-15 | 有封禁记录 | 观察列表 | 显示被封禁的租客与时间 |
-| AC-16 | 承 AC-15 | 点解除 | 该租客解除;解除后其可再次租用本人主机 |
-| AC-17 | 无封禁 | 观察 | 空态文案 |
-| AC-18 | 修改收款资料后 | 让租客侧刷新账单 | 租客支付时因 `paymentProfileUpdatedAt` 变化被要求重新确认(与 R-11 呼应) |
+| AC-15 | 仍有付费报价、活跃服务、余额或未结账单 | 尝试清空全部收款方式 | 后端拒绝并说明必须先清理市场账务依赖 |
+| AC-16 | 已移除付费报价且所有账务依赖结清 | 清空全部收款方式 | 保存成功；免费商品和市场准入关系不受影响 |
+| AC-17 | 无收款方式 | 观察 | 显示收款资料空态；市场准入关系仍在 `/account/market-access` 管理 |
+| AC-18 | 修改收款资料后 | 分别查看修改前后生成的账单 | 已生成账单继续显示原冻结快照且无需重新确认；后续新账单使用新资料与新的 `paymentProfileUpdatedAt` |
 
 ### 9.1 账户 Share 只读监控(AS)
 
@@ -427,6 +428,51 @@ location.reload();
 | AS-06 | 有 subdomain | 点「打开 Share」 | 新标签打开 Share 子域 |
 | AS-07 | 空态 | User / Provider 无数据 | 空态 + 「打开 Share Market」链接 |
 | AS-08 | 未登录 | 打开 `/account/share` | 提示登录(账户区本身通常需登录) |
+
+### 9.2 市场准入与授信(MA)
+
+覆盖 `account-market-access-page.tsx`。Share 与 Client Host 默认白名单；免费商品也必须通过准入,付费商品还必须获得信用额度。
+
+| ID | 前置 | 步骤 | 预期 |
+|---|---|---|---|
+| MA-01 | 新供应商账户 | 打开 `/account/market-access` | Share / Client Host 均显示白名单模式,未知用户不能新租免费或付费商品 |
+| MA-02 | 买家尚未注册 | 按邮箱添加可信买家并允许 Share | 关系保存为邮箱预授权；买家注册并首次租用时绑定其用户 ID |
+| MA-03 | 可信买家无信用额度 | 分别租免费与付费商品 | 免费商品可租；付费商品拒绝并提示需供应商授信 |
+| MA-04 | 供应商给买家有限额度 | 保存后再更新额度 | CNY / USD 独立保存,revision 递增；后续账户使用新额度协调状态 |
+| MA-05 | 供应商选择无限额度 | 未确认/确认风险分别保存 | 未确认被前后端拒绝；确认后保存为无限且不要求金额 |
+| MA-06 | 买家有免费与付费服务 | 撤销整个买家关系 | 新租全部拒绝；现有付费服务终止且历史账单付款后不恢复,现有免费服务不被策略更新直接中断 |
+| MA-07 | 买家同时获准两个产品 | 将 Share 规则改为拒绝 | 只阻止后续 Share 租用,Client Host 与现有服务不受影响 |
+| MA-08 | 当前白名单 | 切换黑名单但不勾选风险确认,再勾选 | 未确认不能提交；确认后切换成功,页面持续显示未知用户风险提示 |
+| MA-09 | 黑名单且无公共额度 | 未知买家分别租免费与付费商品 | 免费商品可租；付费商品被拒绝 |
+| MA-10 | 黑名单 | 开启有限公共额度/尝试无限公共额度 | 有限额度需风险确认后可用；API 不提供无限公共额度且非法请求被拒绝 |
+| MA-11 | 已有进行中服务 | 切换默认模式或修改产品规则 | 只影响新租用,不会隐式中断现有服务 |
+| MA-12 | 外部系统持用户 API Token | 分别用 read/write scope 调准入接口,再提交旧 revision | 权限按 scope 隔离；过期 revision 返回冲突且不覆盖新设置 |
+
+### 9.3 统一市场账务(MB)
+
+覆盖 `account-billing-page.tsx`。Share 与 Client Host 按「买方 + 供应商 + 币种」共用赊账账户；商品页不承担付款交互。
+
+| ID | 前置 | 步骤 | 预期 |
+|---|---|---|---|
+| MB-01 | 未登录 | 打开 `/account/billing` | 提示登录,不显示任何账户或收款快照 |
+| MB-02 | 供应商 | 配置 CNY/USD 付款宽限时间 | 1-720 整数小时可保存；非法值被前端阻止 |
+| MB-03 | 仅有收款资料或仅有付款宽限 | 发布对应币种付费 Share/Host | 均被阻止；两项都配置后才可发布 |
+| MB-04 | 同供应商有多个付费 Share/Host | 查看应付账户 | 只出现一个同币种账户，列出多个服务、每日费率、健康时长试用与累计余额 |
+| MB-05 | 尚未出账 | 查看账户及各商品页 | 不显示完整账号、地址或二维码；只显示付款方式种类和联系方式 |
+| MB-06 | 有未出账余额 | 买方点「主动清账」并确认 | 生成一张聚合账单，关联服务暂停；账单金额和服务明细固定 |
+| MB-07 | 有限额度累计用满 | 等待后台 reconcile | 自动生成一张多服务聚合账单并暂停相关服务，不生成单商品账单 |
+| MB-08 | 最后一个服务结束且仍有余额 | 归还/回收/释放最后一个服务 | 生成最终聚合账单；停止时刻之后不再计费 |
+| MB-09 | 买方有 open/overdue 账单 | 点「声明已付款」 | 弹窗显示冻结收款资料，可提交方式、参考号、凭证链接与备注；声明后仍待供应商确认 |
+| MB-10 | 供应商看到付款声明 | 点拒绝并填写原因 | 账单恢复待付款；已过截止时间时全局赊账限制继续存在 |
+| MB-11 | 供应商独立核实到账 | 点确认到账 | 账单结清、限制解除；仍有效且未永久关闭的服务恢复 |
+| MB-12 | 账单超过截止时间 | 再租任意供应商的付费 Share/Host | 全局付费赊账被阻止；通过准入的免费商品仍可租用；仅声明或争议不解除限制 |
+| MB-13 | 买方对账单有异议 | 发起争议,管理员分别测试维持/作废 | 每张账单只能有一个进行中争议；维持不解封，作废清除余额并恢复符合条件的服务 |
+| MB-14 | 供应商决定停止关系 | 点「永久关闭赊账关系」 | 所有关联服务立即终止并生成/保留最终账单；结清或作废后不恢复，也不能再次建立付费租约 |
+| MB-15 | 有多张历史账单 | 展开历史并加载更多 | 按 sequence 倒序分页；历史行保留各自服务明细、声明、争议和付款快照 |
+| MB-16 | 买方/供应商/普通第三方/管理员 | 分别尝试付款、确认、拒绝、争议与裁决 | 买方只可声明/争议，供应商只可确认/拒绝/关闭，管理员只在裁决区有特权，第三方全部拒绝 |
+| MB-17 | 账单快照含二维码资产，随后同 URL 换图 | 以资料所有者、账单买方、仅浏览商品的用户读取 | 旧账单继续返回旧图；仅资料所有者和该账单买方可读，挂牌、报价或活跃租约本身不授权资产 |
+| MB-18 | 有限额度余额首次达到 80% | 运行 reconcile 并检查邮箱 | 买家和供应商各收到一次额度预警；同一周期不重复轰炸,结清后新周期可再次提醒 |
+| MB-19 | 无限额度已有余额 | 多次运行 reconcile,再由供应商点「要求清账」 | 不自动出账；供应商请求后生成聚合账单、暂停服务并通知买家 |
 
 ---
 
@@ -555,6 +601,13 @@ location.reload();
 | CH-10 | 多个房间 | 切换房间 | 各房间未读独立;已读游标独立 |
 | CH-11 | 打开中 | 断网再恢复 | SSE 断开有提示;恢复后补齐消息 |
 | CH-12 | client 被清理后 | 打开原房间 | 只读归档态(保留 60 天) |
+| CH-13 | 同一 Client 有多个 Share | 分别从 Share Market 行点群聊 | 均打开该 Client 的同一个公开房间,不创建 Share 房间 |
+| CH-14 | Client Market Provider 与租客 | 分别从 Host 行/我的租用点群聊 | 双方进入同一 Client 房间;各自未读角标正确 |
+| CH-15 | 完成租用、付款、争议、回收或清理 | 打开事件详情 | 显示完整双方邮箱、金额、收款资料、reference/note、凭证 URL、原因和安全原始错误 |
+| CH-16 | 测试事件含 API Key/OAuth token/Cookie/Authorization/密码/secret/私钥或签名 URL | 查询 DB/API 并打开 UI | 凭据字段被拒绝,错误文本显示固定占位,危险 URL 不可见且不可点击 |
+| CH-17 | 仅产生 Market/Billing 系统事件 | 等待超过聊天邮件聚合窗口 | Owner 不收到真人聊天提醒邮件;验证码、安全/Client 生命周期邮件不受影响 |
+| CH-18 | outbox 中同时有失败事件与正常事件 | 运行 worker 并重试至上限 | 正常事件不被阻塞;失败事件最终 dead-letter;重复 source 只物化一次 |
+| CH-19 | 系统消息包含同源收款图片 | 未登录打开图片;随后 Provider 更新收款资料 | 已发布图片可匿名读取且历史链接不失效;未发布图片仍返回未授权 |
 
 ---
 
@@ -705,7 +758,7 @@ location.reload();
 | `dashboard/share-card.tsx` | C-17~C-20 |
 | `dashboard/drawer-panels.tsx` | C-13, C-18, M-05, M-09 |
 | `dashboard/markets-table.tsx` | M-01~M-15 |
-| `dashboard/share-market-page.tsx` | SM-01~SM-15, SM-E2E-01~SM-E2E-05 |
+| `dashboard/share-market-page.tsx` | SM-01~SM-15, SM-E2E-01~SM-E2E-07 |
 | `dashboard/account-share-page.tsx` | AS-01~AS-08 |
 | `dashboard/account-client-page.tsx` | 账户 Client 只读监控(镜像 AS) |
 | `dashboard/client-market-page.tsx` | H-01~H-18(归属/筛选/排序/分页), H-60~H-71(选择与批量), H-80~H-84(导入导出) |
@@ -717,7 +770,7 @@ location.reload();
 | `client-market/use-batch-operations.ts` | H-60~H-71 |
 | `client-market/rentals-page.tsx` | R-01~R-04, R-12, R-34 |
 | `client-market/my-rentals-panel.tsx` | R-03, R-04, R-20~R-22, R-32 |
-| `client-market-billing-banner.tsx` | R-05~R-07, R-11, R-30, R-35 |
+| `dashboard/client-market-rental-banner.tsx` | R-05~R-07, R-11, R-30, R-35 |
 | `client-market/release-rental-action.tsx` | R-23~R-35 |
 | `dashboard/create-client-dialog.tsx` | C-19, H-40, 见 §17 |
 | `dashboard/web-terminal/*` | T-01~T-19 |
@@ -725,6 +778,7 @@ location.reload();
 | `dashboard/share-edit-dialog.tsx`, `share-edit/*` | S-08~S-25 |
 | `dashboard/share-connect-dialog.tsx` | S-01~S-07 |
 | `dashboard/account-page.tsx` | AC-01~AC-18 |
+| `dashboard/account-billing-page.tsx` | MB-01~MB-17 |
 | `dashboard/operation-verification.tsx` | S-24, D-06, D-07 |
 | `dashboard/provision-job-log.tsx` | H-45, D-10, Q-13 |
 | `dashboard/client-upgrade-button.tsx` | C-21, D-08, D-09 |
@@ -736,15 +790,14 @@ location.reload();
 | `settings/map-display-panel.tsx` | X-21, X-22, X-35, X-36 |
 | `settings/client-notification-deliveries-panel.tsx` | X-23, X-24, X-37, X-38 |
 | `metrics/*` | N-01~N-14 |
-| `chat/*` | CH-01~CH-12 |
+| `chat/*` | CH-01~CH-19 |
 | `common/confirm-alert-dialog.tsx` | G-05, G-08, G-09 |
 | `common/compact-region-multi-select.tsx` | C-09, H-07, H-14, H-15 |
 | `common/copyable-code-field.tsx` | H-24, X-08 |
-| `common/authenticated-image.tsx` | S-34, R-06 |
-| `common/payment-method-icons.tsx` | AC-03~AC-09, R-06 |
+| `common/authenticated-image.tsx` | S-34, MB-09, MB-17 |
+| `common/payment-method-icons.tsx` | AC-03~AC-09, R-06, MB-05, MB-09 |
 | `common/country-flag.tsx` | C-03, H-14, R-03 |
 | `lib/client-market-refresh.ts` | H-23(数据刷新不丢状态), C-22, R-12 |
-| `lib/billing-urgency.ts` | R-05, R-11 |
 | `lib/i18n.ts` | G-01, G-10 + 改动键所属界面 |
 | `lib/dashboard-nav.ts` | A-20 |
 | `lib/use-persistent-state.ts` | §3 全部持久化用例, G-12 |
@@ -754,29 +807,31 @@ location.reload();
 
 ## 19. 覆盖核对:API → 用例
 
-`lib/api.ts` 当前导出 **76 个端点函数**(另有 `parseJson` 为跨模块辅助函数),**全部有组件调用**。改 `lib/api.ts` 时更新此表。
+`lib/api.ts` 按域导出端点函数(`parseJson` 为跨模块辅助函数)。改端点名、路径或调用方时更新此表；不维护易失真的总数。
 
-| 域 | 端点数 | 覆盖用例 |
-|---|---:|---|
-| Admin(设置/版本/日志/公告/地图/通知/市场管理) | 20 | X-02~X-08, X-10~X-13, X-17, X-19, X-20, X-21, X-23, X-24, M-10~M-14 |
-| Client Market(主机/作业/报价/终端/子域名) | 20 | H-20~H-29, H-43~H-48, H-80~H-84, T-01, Q-02, Q-06, Q-11, Q-12 |
-| 聊天 | 10 | CH-01~CH-12 |
-| 指标 | 7 | N-02~N-14 |
-| Shares | 6 | S-05, S-06, S-08~S-25, S-34, S-35 |
-| 账户(收款资料/封禁) | 4 | AC-03~AC-16 |
-| Dashboard | 2 | C-01, C-22 |
-| Installations 升级 | 2 | C-21, D-08, D-09 |
-| 用户 API Token | 2 | A-10, A-11 |
-| Markets 优先级 | 1 | M-09 |
-| Share Market | 见 `getShareMarket*` / `*ShareMarket*` | SM-01~SM-15, SM-E2E-01~SM-E2E-05 |
-| 其他(regions / 公告读取) | 2 | A-14, A-16 |
-| 账单(`getMyClientMarketBilling` / `declareClientMarketPayment`) | 2 | R-05~R-11 |
+| 域 | 代表 API 函数 | 覆盖用例 |
+|---|---|---|
+| Admin(设置/版本/日志/公告/地图/通知/市场管理) | `getSettings*`、`saveSettings`、`updateMarket*` | X-02~X-08, X-10~X-13, X-17, X-19~X-24, M-10~M-14 |
+| Client Market(主机/作业/报价/终端/子域名) | `getClientMarketHosts`、`createClientMarketQuote`、`commitClientMarketQuote` | H-20~H-29, H-43~H-48, H-80~H-84, T-01, Q-02, Q-06, Q-11, Q-12 |
+| Client 租用生命周期 | `getMyClientMarketRentals`、`releaseClientMarketRental`、`cleanupClientMarketProviderRental` | R-01~R-35, H-44~H-48 |
+| 市场准入与授信 | `getMarketAccessDashboard`、`updateMarketAccessPolicy`、`upsertMarketCounterparty`、`updateMarketCounterpartyCredit`、`updateMarketPublicCredit` | MA-01~MA-12 |
+| 统一市场账务 | `getMarketBillingDashboard`、`settleMarketBillingAccount`、`requestMarketBillingSettlement`、`declareMarketBillingPayment`、`confirmMarketBillingPayment`、争议/作废端点 | MB-01~MB-19 |
+| 聊天 | `getClientChat*`、`postClientChatMessage` | CH-01~CH-19 |
+| 指标 | `getMetrics*`、`getLlmMetrics*` | N-02~N-14 |
+| Shares | `updateShareSettings`、`getShareUsageByEmail`、`refreshShareUsage` | S-05, S-06, S-08~S-25, S-34, S-35 |
+| 账户收款资料 | `getAccountPaymentProfile`、`updateAccountPaymentProfile` | AC-03~AC-16, MB-03, MB-17 |
+| Dashboard | `getDashboard`、`getMapDisplay` | C-01, C-22 |
+| Installations 升级 | `upgradeClientInstallation`、`getClientInstallationUpgradeStatus` | C-21, D-08, D-09 |
+| 用户 API Token | `getUserApiToken`、`resetUserApiToken` | A-10, A-11 |
+| Markets 优先级 | `getMarketSharePriority` | M-09 |
+| Share Market | `getShareMarket*`、`*ShareMarket*` | SM-01~SM-15, SM-E2E-01~SM-E2E-07 |
+| 其他(regions / 公告读取) | `getRegions`、`getAnnouncement` | A-14, A-16 |
 
 认证相关在 `lib/auth.ts`(非 `api.ts`):`requestEmailCode` / `verifyEmailCode` / `refreshAccessToken` / `sessionStatus` / `logoutSession` / `ensureInstallationIdentity` → 用例 A-02~A-06, A-12。
 
 ### 覆盖缺口
 
-**当前无 UI 不可达的后端能力。** 此前存在的 12 个无调用方函数(留言板整套 7 个、`getMetricsHostStatus`、`getLlmMetricsSnapshot`、`getClientMarketSupplySummary`、单实例 `getClientMarketBilling`、无 reason 版 `cleanupClientMarketClient`)已随对应的 66 个 `board.*` i18n 键与 3 个 board 类型一并删除。
+**当前无已知 UI 不可达的市场准入或账务能力。** 准入与授信端点由 `/account/market-access` 调用,统一账务端点由 `/account/billing` 调用；两者也支持 scoped 用户 API Token。静态审计会阻止旧单商品支付、旧独立封禁和供应商全局额度契约重新进入代码库。
 
 > 若后续再出现"接口写好了但没有 UI 入口"的情况,应在此处登记,并说明由后端测试还是手工调接口验证 —— 手动 UI 清单对它们无能为力。
 
@@ -784,7 +839,7 @@ location.reload();
 
 ## 20. 一轮完整回归的建议顺序
 
-共 **321 条用例**。单人跑完约需 4–5 小时。按角色分轮次,减少环境切换:
+共 **374 条用例**。单人跑完约需 5–6 小时。按角色分轮次,减少环境切换:
 
 | 轮次 | 环境 | 用例 | 约计 |
 |---|---|---|---|
@@ -797,7 +852,7 @@ location.reload();
 
 **冒烟子集**(每次提交前跑,约 15 分钟):
 
-`A-04`(登录)· `C-01`(总览渲染)· `H-01`(默认只看自己 + 故障优先排序)· `H-11`(严重度序)· `H-40`(新建入口)· `H-60`(选择模式)· `R-03`(租用列表)· `R-23`(释放不退款提示)· `Q-05`(报价倒计时)· `Q-10`(过期保留草稿)· `X-02`(设置表单)· `G-01`(中英文)
+`A-04`(登录)· `C-01`(总览渲染)· `H-01`(默认只看自己 + 故障优先排序)· `H-11`(严重度序)· `H-40`(新建入口)· `H-60`(选择模式)· `R-03`(租用列表)· `R-23`(释放与数据丢失确认)· `MB-04`(聚合账户)· `MB-09`(付款声明)· `Q-05`(报价倒计时)· `Q-10`(过期保留草稿)· `X-02`(设置表单)· `G-01`(中英文)
 
 **建议按轮次记录结果**,而不是逐条打勾——失败项记 用例 ID + 实际现象 + 截图,便于回归定位。
 
@@ -810,4 +865,6 @@ location.reload();
 | 日期 | 变更 |
 |---|---|
 | 2026-07-26 | 首版。309 条用例,覆盖 8 条路由 / 84 个组件 / 76 个 API 端点。同步删除 12 个无调用方的 API 函数与 66 个 `board.*` i18n 键。 |
-| 2026-07-27 | 租用释放改造:释放入口从付款弹窗内移到租用卡片常驻,新增不退款说明与清理进度弹窗。R 组 12 → 25 条,总数 322。 |
+| 2026-07-27 | 租用释放改造:释放入口从付款弹窗内移到租用卡片常驻,新增账单不回滚说明与清理进度弹窗。R 组 12 → 25 条,总数 322。 |
+| 2026-07-30 | Share/Client Market 改为供应商级统一后付费；删除单商品预付、续费和退款交互，新增 MB-01~MB-17、支付快照权限及旧契约静态审计。 |
+| 2026-07-30 | Share/Client Host 免费与付费租用统一改为默认白名单；新增邮箱预授权、产品规则、买家级有限/无限授信、风险确认的黑名单模式与有限公共额度,扩展 MA-01~MA-12、MB-18~MB-19。 |

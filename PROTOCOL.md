@@ -83,6 +83,13 @@ Router 不接受长效 SSH 凭据。每次建链前 Server 申请一次性 lease
 | `expiresAt` | 过期时间 |
 | `share` | share 隧道携带 `ShareDescriptor`,client 隧道为 `null` |
 
+`ShareDescriptor` 面向全新部署时必须满足以下约束:
+
+- `capacityPoolId` 是非空匿名标识。同一 Router 下复用相同物理账号或 API key 的不同 Share URL 使用同一值,用于容量与故障域去重；该值在凭据源不变期间稳定，账号绑定或 API key 改变时必须重新派生并同步。
+- `bindings` 必须包含 1 到 3 个不同 app 的 `{ app: providerId }` 绑定,app 仅允许 `claude`、`codex`、`gemini`;顶层 `appType` / `providerId` 必须对应其中一个绑定。
+- `support`、`appRuntimes`、`appProviders`、`appSettings` 和分 app 价格只可声明已绑定 app。多 app Share 的远程 ACL、限额、到期时间、描述、子域名和价格百分比必须一致。
+- 调用 app 只由 URL 协议路径判定,客户端提供的 app header 不参与授权。未绑定 app 的直连、Market 和 Gateway 请求均被拒绝。
+
 已连接的 Server 使用签名续期 API 在**原 SSH 连接上**续期,不按 lease TTL 周期重建连接。
 
 ---
@@ -171,25 +178,85 @@ Server 要求:
 1. 普通 `share/settings` 入口拒绝带 `managedGrant` 的补丁。
 2. pending-edit 应用路径接受 managed grant,写入/移除 `routerShareMarket` grant。
 3. 普通用户编辑不得修改或删除 `manager=routerShareMarket` 的 grant。
-4. edit-ack(`POST /v1/shares/edit-ack`)成功后,Router 将订阅从 `grant_pending` 推进到 `active_free` 或 `trial_payment_due`,或完成 revoke 后释放座位。
+4. edit-ack(`POST /v1/shares/edit-ack`)成功后,Router 将订阅从 `grant_pending` 推进到 `active_free` 或 `active_postpaid`,或完成 revoke 后释放座位。
 
 浏览器侧 HTTP 契约(用户 Session):
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
-| `GET` | `/v1/share-market/listings` | 公开 catalog(含 `canRent`、owner blocks) |
+| `GET` | `/v1/share-market/listings` | 公开 catalog(含统一准入与授信计算后的 `canRent`) |
 | `POST` | `/v1/share-market/listings` | 添加 Share 挂牌(1–20 座位) |
 | `DELETE` | `/v1/share-market/listings/:id` | 停止挂售 |
 | `GET` | `/v1/share-market/owned-shares` | 「添加 Share」候选(`alreadyListed`) |
 | `POST` | `/v1/share-market/listings/:id/seats` | 添加拼车位(可 reopen closed listing) |
 | `PATCH`/`DELETE` | `/v1/share-market/seats/:id` | 编辑/删除空闲座位 |
 | `POST` | `/v1/share-market/seats/:id/rent` | 租用 |
-| `POST` | `/v1/share-market/subscriptions/:id/declare-paid` | 声明已付款 |
 | `POST` | `/v1/share-market/subscriptions/:id/release` | 租客归还 |
-| `POST` | `/v1/share-market/subscriptions/:id/force-revoke` | Owner 强制回收(可选拉黑) |
-| `GET`/`DELETE` | `/v1/share-market/blocks`… | Owner 拉黑列表 / 解除 |
+| `POST` | `/v1/share-market/subscriptions/:id/force-revoke` | Owner 强制回收,可同时拒绝该买家后续 Share 租用 |
 
 `alreadyListed` 为 true 当且仅当:当前 owner 对该 Share 有 `active` listing,或该 Share 上仍有非终态订阅。停止挂售且租约全部结束后可再次 `POST /listings`。
+
+### 7.2 Share / Client Market 统一准入与授信
+
+Share 与 Client Host 的免费、付费商品在新租用时都执行同一套供应商准入规则。两个产品的默认模式均为 `whitelist`：供应商先按规范化邮箱添加可信买家,买家尚未注册时可预授权；首次租用时 Router 按已验证邮箱绑定 `buyer_user_id`。每个关系可对 `share` / `client_host` 分别设置 `inherit`、`allow` 或 `deny`。
+
+- 白名单模式下,只有有效关系且产品决策允许的买家可新租；黑名单模式下,未被明确拒绝的买家可新租免费商品。
+- 付费租用还要求同一买家、供应商和币种存在 `limited` 或 `unlimited` 私有授信。有限额度是账户自动出账边界；无限额度不自动出账,由任一方发起清账。
+- 黑名单模式必须提交风险确认。供应商可另行开启有限公共额度供未知买家租用付费商品,但公共额度不能设为无限。
+- 模式切换和产品规则更新只影响新租用。撤销整个买家关系会把该买家的账户信用设为 `none` 并终止现有付费服务；以后确认历史账单也不会恢复这些服务。现有免费服务不因单独修改策略而中断,Owner 可另行强制回收。
+- 所有更新操作使用 revision 做乐观并发控制；下列 `PUT` 请求必须提交当前资源的 `expectedRevision`，新资源提交 `0`。浏览器可用用户 Session；外部系统可用用户 API Token,读取和写入分别要求 `market:access:read`、`market:access:write` scope。
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| `GET` | `/v1/market-access/dashboard` | 读取产品模式、可信买家、授信与当前风险敞口 |
+| `PUT` | `/v1/market-access/policies/:product_kind` | 切换 Share / Client Host 白名单或黑名单模式 |
+| `POST` | `/v1/market-access/counterparties` | 按邮箱创建或重新启用可信买家关系 |
+| `PUT` | `/v1/market-access/counterparties/:id` | 更新产品规则或撤销关系 |
+| `PUT` | `/v1/market-access/counterparties/:id/credit-lines/:currency` | 更新买家 CNY / USD 私有信用额度 |
+| `PUT` | `/v1/market-access/public-credit-lines/:currency` | 更新黑名单模式的有限公共额度 |
+
+写入请求使用 camelCase JSON，未知字段会被拒绝：
+
+| 路径 | 关键请求字段 |
+|---|---|
+| `PUT /policies/:product_kind` | `mode`、切换黑名单时的 `riskAcknowledged: true`、`expectedRevision` |
+| `POST /counterparties` | `email`、`accessRules[] { productKind, decision }`，可选初始 `creditLines[] { currency, kind, limitMinor?, riskAcknowledged? }` |
+| `PUT /counterparties/:id` | 本次变更的 `accessRules[]`、可选 `status`、`expectedRevision` |
+| `PUT /counterparties/:id/credit-lines/:currency` | `kind`(`none` / `limited` / `unlimited`)、有限额度的 `limitMinor`、无限额度的 `riskAcknowledged: true`、`expectedRevision` |
+| `PUT /public-credit-lines/:currency` | `enabled`、启用时的有限 `limitMinor` 与 `riskAcknowledged: true`、`expectedRevision` |
+
+`limitMinor` 使用币种最小单位且范围为 `1..=100000000`；路径币种仅接受 `CNY` / `USD`。私有无限额度和任何公共额度都必须显式确认风险，公共额度始终只能是有限额度。
+
+### 7.3 Share / Client Market 统一后付费
+
+付费 Share 与 Client Host 不再按单个商品预付或续费。Router 按「买家 + 供应商 + 币种」维护赊账账户；每个服务独立享受 12 小时健康时长试用,之后按固定每日价格和实际健康秒数累计。有限额度使用达到 80% 时向买卖双方各发送一次预警,用满后自动生成聚合账单。买家主动清账、供应商要求清账、供应商永久关闭赊账账户或最后一个服务结束时也会生成聚合账单。
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| `GET` | `/v1/market-billing/dashboard` | 买方应付、供应商应收、当前账单与赊账限制 |
+| `PUT` | `/v1/market-billing/supplier-profiles/:currency` | 设置账单付款宽限时间 |
+| `POST` | `/v1/market-billing/accounts/:id/settle` | 买方主动生成当前聚合账单 |
+| `POST` | `/v1/market-billing/accounts/:id/request-settlement` | 供应商要求买家结清当前余额,包括无限额度账户 |
+| `POST` | `/v1/market-billing/accounts/:id/close` | 供应商永久终止关系；无账单时生成最终账单，已有账单时锁定关闭意图 |
+| `GET` | `/v1/market-billing/accounts/:id/invoices` | 按 sequence 游标分页读取已结账单 |
+| `POST` | `/v1/market-billing/invoices/:id/declare-payment` | 买方提交链下付款声明 |
+| `POST` | `/v1/market-billing/invoices/:id/confirm` | 供应商核验并确认到账 |
+| `POST` | `/v1/market-billing/invoices/:id/reject` | 供应商拒绝付款声明 |
+| `POST` | `/v1/market-billing/invoices/:id/disputes` | 买方发起一次账单争议 |
+| `GET`/`POST` | `/v1/admin/market-billing/disputes…` | 管理员查看并裁决争议 |
+| `POST` | `/v1/admin/market-billing/invoices/:id/void` | 管理员强制作废账单 |
+
+每张账单在生成时冻结供应商当时的收款方式、联系方式和资料更新时间；后续修改供应商收款资料不会改写历史或未结账单。付款声明和发起争议都不代表债务已解除。账单到达截止时间后,即使处于 `payment_declared` 或 `disputed` 状态也会保留全局市场赊账限制；只有供应商确认到账或管理员作废账单才解除该账单对应的限制。服务暂停期间不计费。
+
+供应商可在账户已有待付、待确认、逾期或争议账单时继续执行永久关闭。关闭意图一经锁定即终止全部关联服务；后续确认到账或管理员作废账单只结清债务,不会恢复服务,双方也不能再次建立付费租约。
+
+### 7.4 Market 系统事件与 Client 公开聊天室
+
+Share Market、Client Market 和统一账务不创建商品级聊天室。Router 只按 `installation.id` 建立唯一 Client 公开房间；Share Market 表格和 Client Market Provider/租客入口均解析到对应 `GET /v1/chat/clients/:installation_id/room`。同一 Client 的多个 Share 必须返回同一个 room ID。
+
+关键业务事件与原业务写入处于同一 SQLite 事务,先进入 `client_chat_system_outbox`,再由后台幂等物化为系统消息。Share 服务启停、到期、供应商变更、离线/恢复；挂牌、拼车位、租用、授权、回收；Client 开通、清理开始/成功/失败、强制释放；额度预警、出账、付款声明/确认/拒绝、逾期、争议和裁决均属于该事件流。系统消息自动关注 Owner、Provider、租客和 actor,产生未读,但不触发真人聊天提醒邮件。
+
+事件 payload 是公开数据。Router 原样公开完整邮箱、账单金额、收款方式/联系方式、付款 reference/note、凭证 URL、争议/回收原因和安全的原始错误。系统消息中由 Owner/Provider/Supplier 发布的 `/v1/account/payment-assets/:id` 收款图片也允许匿名读取；未被系统消息引用的资产继续要求 Owner 或对应账单买方 Session。以下内容是唯一保密例外,不得出现在 DB、API、日志或 UI：API Key、OAuth/Session token、Cookie、Authorization、密码、secret、私钥以及 SSH/lease 凭据。`PaymentMethod.token` 仅在 `kind=crypto` 且值为 `USDT`/`USDC` 时作为公开资产符号放行,其他 `token` 字段均按凭据拒绝。后端入 outbox 前拒绝敏感字段和带凭据 query/userinfo/fragment 的 URL,错误文本命中凭据片段时整体替换为固定占位；Web UI 还会独立执行字段、文本和 URL 二次过滤。
 
 ---
 
@@ -205,6 +272,21 @@ Router 经隧道拉取 share 侧运行时数据。Server 需实现:
 | `POST /_share-router/model-health` | 对绑定的上游供应商做实时健康探测 |
 
 校验方式与第 7 节相同(同一 HMAC 契约),另需 `x-cc-switch-share-id` 头标识目标 share。
+
+### 8.1 Share 请求日志 usage 生命周期
+
+Server 通过签名接口 `POST /v1/share-request-logs/batch-sync` 上送同一 `requestId` 的创建和终态记录。Token 数字字段为兼容字段，是否已经观测到真实 usage 必须由以下字段判定：
+
+| 字段 | 语义 |
+|---|---|
+| `usageState` | `pending`、`observed`、`missing`、`parse_error` 或 `interrupted` |
+| `streamStatus` | 上游流终态或失败原因，例如 `completed`、`client_cancelled`、`timeout` |
+| `usageRevision` | 同一请求内单调递增的 revision |
+
+- `observed` 允许所有 token 字段都为 `0`；这表示上游明确返回零，不能等同于 unknown。
+- `pending`、`missing`、`parse_error` 和 `interrupted` 的数字兼容字段即使为 `0`，Dashboard、ticker、吞吐量和统计采样也不得当作真实零 usage。
+- `share_request_logs` upsert 只接受 `excluded.usage_revision >= share_request_logs.usage_revision`，因此迟到或重放的低 revision pending 不能覆盖更高 revision 终态。
+- 旧 Server 未发送这些字段时，Router 按 `usageState=observed`、`usageRevision=0` 兼容；新 Server 必须发送明确状态。
 
 **该命名空间对公网封闭**:`/_share-router/*` 的入站 GET 必须携带合法控制签名,否则返回 404(`src/proxy.rs:4032-4043`)。`/_ctl/*` 在所有公网入口点一律 404,不经路由(`src/proxy.rs:1459, 1845, 2165`)。
 

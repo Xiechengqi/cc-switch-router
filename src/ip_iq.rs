@@ -35,7 +35,9 @@ fn cache_get(ip: &str) -> Option<HostIpIntel> {
 }
 
 fn cache_put(ip: &str, intel: &HostIpIntel) {
-    let Ok(mut guard) = cache().lock() else { return };
+    let Ok(mut guard) = cache().lock() else {
+        return;
+    };
     if guard.len() >= IQ_CACHE_MAX_ENTRIES {
         // Cheap bound: drop everything already past its TTL, and if that frees
         // nothing, clear outright rather than grow without limit.
@@ -147,10 +149,7 @@ struct IqClassification {
     tor: Option<bool>,
 }
 
-pub async fn lookup_host_ip_intel(
-    endpoints: &[String],
-    ip: &str,
-) -> Result<HostIpIntel, AppError> {
+pub async fn lookup_host_ip_intel(endpoints: &[String], ip: &str) -> Result<HostIpIntel, AppError> {
     let trimmed = ip.trim();
     if trimmed.is_empty() {
         return Err(AppError::BadRequest("ip is required".into()));

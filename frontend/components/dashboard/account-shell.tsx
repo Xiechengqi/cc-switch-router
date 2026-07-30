@@ -2,13 +2,15 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { Activity, BarChart3, KeyRound, Receipt, Share2, WalletCards } from "lucide-react";
+import { Activity, BarChart3, HandCoins, KeyRound, Receipt, Share2, ShieldCheck, WalletCards } from "lucide-react";
 import * as React from "react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   accountNavHrefFromPathname,
   DASHBOARD_ACCOUNT_API_KEYS_PATH,
   DASHBOARD_ACCOUNT_CLIENT_PATH,
+  DASHBOARD_ACCOUNT_BILLING_PATH,
+  DASHBOARD_ACCOUNT_MARKET_ACCESS_PATH,
   DASHBOARD_ACCOUNT_CONSUMER_USAGE_PATH,
   DASHBOARD_ACCOUNT_PATH,
   DASHBOARD_ACCOUNT_PAYMENTS_PATH,
@@ -27,6 +29,8 @@ const NAV_ITEMS: {
     | "account.nav.apiKeys"
     | "account.nav.providerUsage"
     | "account.nav.consumerUsage"
+    | "account.nav.billing"
+    | "account.nav.marketAccess"
     | "account.nav.payments"
     | "account.nav.share"
     | "account.nav.client";
@@ -54,6 +58,20 @@ const NAV_ITEMS: {
     labelKey: "account.nav.consumerUsage",
     icon: Activity,
     match: (pathname: string) => pathname.startsWith("/account/consumer-usage"),
+  },
+  {
+    id: "billing",
+    href: DASHBOARD_ACCOUNT_BILLING_PATH,
+    labelKey: "account.nav.billing",
+    icon: HandCoins,
+    match: (pathname: string) => pathname.startsWith("/account/billing"),
+  },
+  {
+    id: "market-access",
+    href: DASHBOARD_ACCOUNT_MARKET_ACCESS_PATH,
+    labelKey: "account.nav.marketAccess",
+    icon: ShieldCheck,
+    match: (pathname: string) => pathname.startsWith("/account/market-access"),
   },
   {
     id: "payments",

@@ -1,9 +1,10 @@
 "use client";
 
-import { Avatar, ScrollShadow, Tabs } from "@heroui/react";
+import { Avatar, ScrollShadow } from "@heroui/react";
 import { ChevronDown, ChevronUp, Loader2, MessageCircle, X } from "lucide-react";
 import Link from "next/link";
 import * as React from "react";
+import { chatMessageAuthorLabel, chatSystemEventText } from "@/components/chat/chat-system-event";
 import { initialsForLabel } from "@/components/chat/client-chat-helpers";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import type { MessageKey } from "@/lib/i18n";
@@ -24,7 +25,8 @@ function RoomListRow({
   onSelect: () => void;
   onRemove?: () => void;
 }) {
-  const author = room.lastMessage?.authorLabel || "?";
+  const author = room.lastMessage ? chatMessageAuthorLabel(room.lastMessage, t) : "?";
+  const preview = room.lastMessage ? chatSystemEventText(room.lastMessage, t, locale) : t("chat.noMessages");
   return (
     <div className="group relative">
       <button
@@ -46,7 +48,7 @@ function RoomListRow({
             ) : null}
           </span>
           <span className="mt-1 block truncate text-xs text-slate-500">
-            {room.lastMessage ? `${author}: ${room.lastMessage.body || t("chat.deleted")}` : t("chat.noMessages")}
+            {room.lastMessage ? `${author}: ${preview || t("chat.deleted")}` : preview}
           </span>
         </span>
         <span className="flex min-w-10 flex-col items-end gap-1 text-[10px] text-slate-400">
@@ -83,7 +85,7 @@ function EmptyChatState({ t }: { t: (key: MessageKey, values?: Record<string, st
   return (
     <div className="flex min-h-72 flex-col items-center justify-center gap-3 px-8 text-center text-slate-500">
       <MessageCircle className="h-7 w-7 text-slate-300" />
-      <p className="text-sm font-medium text-slate-700">{t("chat.empty")}</p>
+      <p className="text-sm font-medium text-slate-700">{t("chat.emptyClients")}</p>
       <p className="text-xs leading-5 text-slate-500">{t("chat.emptyHint")}</p>
       <Link
         href={DASHBOARD_CLIENTS_PATH}
@@ -113,7 +115,6 @@ export function ClientChatRoomList({
   onRemoveRecent?: (room: ClientChatRoom) => void;
 }) {
   const { t, locale } = useLocaleText();
-  const [tab, setTab] = React.useState<"recent" | "all">("recent");
   const [showArchived, setShowArchived] = React.useState(false);
 
   const chatClients = React.useMemo(
@@ -132,11 +133,10 @@ export function ClientChatRoomList({
   const activeRooms = rooms.filter((room) => room.status !== "archived");
   const archivedRooms = rooms.filter((room) => room.status === "archived");
   const visibleRooms = showArchived ? rooms : activeRooms;
+  const roomInstallations = new Set(rooms.map((room) => room.installationId));
+  const unvisitedClients = chatClients.filter((client) => !roomInstallations.has(client.installationId));
 
-  const tabClass =
-    "rounded-md border border-transparent px-2 py-1.5 text-xs font-medium text-slate-500 transition-colors hover:text-slate-700 data-[selected=true]:border-primary/30 data-[selected=true]:bg-primary/10 data-[selected=true]:text-primary";
-
-  if (loading && !rooms.length && tab === "recent") {
+  if (loading && !rooms.length) {
     return (
       <div className="flex flex-1 items-center justify-center">
         <Loader2 className="h-5 w-5 animate-spin text-slate-400" />
@@ -146,54 +146,21 @@ export function ClientChatRoomList({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <Tabs selectedKey={tab} onSelectionChange={(key) => setTab(key as "recent" | "all")} className="px-3 pt-2 text-foreground">
-        <Tabs.ListContainer>
-          <Tabs.List aria-label={t("chat.title")} className="text-foreground">
-            <Tabs.Tab id="recent" className={tabClass}>
-              {t("chat.tabRecent")}
-            </Tabs.Tab>
-            <Tabs.Tab id="all" className={tabClass}>
-              {t("chat.tabAll")}
-            </Tabs.Tab>
-          </Tabs.List>
-        </Tabs.ListContainer>
-      </Tabs>
       <ScrollShadow className="min-h-0 flex-1">
         {error ? <div className="m-3 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</div> : null}
-        {tab === "recent" ? (
-          <>
-            {visibleRooms.length ? (
-              <div className="divide-y divide-slate-100">
-                {visibleRooms.map((room) => (
-                  <RoomListRow
-                    key={room.id}
-                    room={room}
-                    locale={locale}
-                    t={t}
-                    onSelect={() => onSelectRoom(room)}
-                    onRemove={onRemoveRecent ? () => onRemoveRecent(room) : undefined}
-                  />
-                ))}
-              </div>
-            ) : (
-              <EmptyChatState t={t} />
-            )}
-            {archivedRooms.length ? (
-              <div className="border-t border-slate-100 px-4 py-2">
-                <button
-                  type="button"
-                  className="inline-flex items-center gap-1 text-xs font-medium text-slate-500 hover:text-slate-700"
-                  onClick={() => setShowArchived((value) => !value)}
-                >
-                  {showArchived ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
-                  {showArchived ? t("chat.hideArchived") : t("chat.showArchived", { count: archivedRooms.length })}
-                </button>
-              </div>
-            ) : null}
-          </>
-        ) : (
+        {visibleRooms.length || unvisitedClients.length ? (
           <div className="divide-y divide-slate-100">
-            {chatClients.map((client) => (
+            {visibleRooms.map((room) => (
+              <RoomListRow
+                key={room.id}
+                room={room}
+                locale={locale}
+                t={t}
+                onSelect={() => onSelectRoom(room)}
+                onRemove={onRemoveRecent ? () => onRemoveRecent(room) : undefined}
+              />
+            ))}
+            {unvisitedClients.map((client) => (
               <button
                 key={client.installationId}
                 type="button"
@@ -209,9 +176,22 @@ export function ClientChatRoomList({
                 </span>
               </button>
             ))}
-            {!chatClients.length ? <EmptyChatState t={t} /> : null}
           </div>
+        ) : (
+          <EmptyChatState t={t} />
         )}
+        {archivedRooms.length ? (
+          <div className="border-t border-slate-100 px-4 py-2">
+            <button
+              type="button"
+              className="inline-flex items-center gap-1 text-xs font-medium text-slate-500 hover:text-slate-700"
+              onClick={() => setShowArchived((value) => !value)}
+            >
+              {showArchived ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+              {showArchived ? t("chat.hideArchived") : t("chat.showArchived", { count: archivedRooms.length })}
+            </button>
+          </div>
+        ) : null}
       </ScrollShadow>
     </div>
   );

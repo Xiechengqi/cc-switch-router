@@ -5,10 +5,10 @@ import { Loader2 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { MyRentalsPanel } from "@/components/dashboard/client-market/my-rentals-panel";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { getClientMarketHosts, getMyClientMarketBilling } from "@/lib/api";
-import { mergeBillingMap, mergeHosts } from "@/lib/client-market-refresh";
+import { getClientMarketHosts, getMyClientMarketRentals } from "@/lib/api";
+import { mergeHosts, mergeRentalMap } from "@/lib/client-market-refresh";
 import { CLIENT_MARKET_POLL_MS } from "@/components/dashboard/client-market/host-utils";
-import type { ClientMarketBilling, ClientMarketHost } from "@/lib/types";
+import type { ClientMarketHost, ClientMarketRental } from "@/lib/types";
 
 /**
  * Renter surface for Account → Client 租用.
@@ -20,8 +20,8 @@ export function RentalsPage() {
   const authed = !!session?.authenticated;
 
   const [hosts, setHosts] = React.useState<ClientMarketHost[]>([]);
-  const [billingByInstallation, setBillingByInstallation] = React.useState<
-    Map<string, ClientMarketBilling>
+  const [rentalByInstallation, setRentalByInstallation] = React.useState<
+    Map<string, ClientMarketRental>
   >(new Map());
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState("");
@@ -38,13 +38,13 @@ export function RentalsPage() {
       setError("");
     }
     try {
-      const [nextHosts, billing] = await Promise.all([
+      const [nextHosts, rentals] = await Promise.all([
         getClientMarketHosts(undefined, controller.signal),
-        getMyClientMarketBilling(controller.signal),
+        getMyClientMarketRentals(controller.signal),
       ]);
       if (controller.signal.aborted) return;
       setHosts((prev) => mergeHosts(prev, nextHosts));
-      setBillingByInstallation((prev) => mergeBillingMap(prev, billing));
+      setRentalByInstallation((prev) => mergeRentalMap(prev, rentals));
     } catch (err) {
       if (controller.signal.aborted) return;
       if (!silent) setError(err instanceof Error ? err.message : String(err));
@@ -72,17 +72,17 @@ export function RentalsPage() {
 
   const myRentals = React.useMemo(
     () =>
-      Array.from(billingByInstallation.values()).filter(
-        (billing) => billing.isClientOwner && billing.status !== "released",
+      Array.from(rentalByInstallation.values()).filter(
+        (rental) => rental.isClientOwner && rental.status !== "released",
       ),
-    [billingByInstallation],
+    [rentalByInstallation],
   );
 
   /** Badge counts only in-rent subscriptions; releasing / release_failed stay visible in the list. */
   const activeRentalCount = React.useMemo(
     () =>
       myRentals.filter(
-        (billing) => billing.status === "active" || billing.status === "payment_due",
+        (rental) => rental.status === "active" || rental.status === "billing_suspended",
       ).length,
     [myRentals],
   );
@@ -125,7 +125,7 @@ export function RentalsPage() {
         ) : null}
       </div>
       <MyRentalsPanel
-        billings={myRentals}
+        rentals={myRentals}
         hostsByInstallation={hostsByInstallation}
         onChanged={silentRefresh}
       />

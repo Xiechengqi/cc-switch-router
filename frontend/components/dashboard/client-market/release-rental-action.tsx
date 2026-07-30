@@ -6,12 +6,12 @@ import { Loader2 } from "lucide-react";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { ProvisionJobLog } from "@/components/dashboard/provision-job-log";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { cleanupClientMarketClientWithReason, getClientMarketJob } from "@/lib/api";
+import { getClientMarketJob, releaseClientMarketRental } from "@/lib/api";
 import {
   cleanupFailureGuidanceKey,
   cleanupPhaseLabelKey,
 } from "@/components/dashboard/client-market/host-utils";
-import type { ClientMarketBilling, ProvisioningJob } from "@/lib/types";
+import type { ClientMarketRental, ProvisioningJob } from "@/lib/types";
 
 const POLL_INTERVAL_MS = 1200;
 const POLL_MAX_ATTEMPTS = 180;
@@ -21,32 +21,13 @@ function resumeStorageKey(installationId: string) {
   return `${RESUME_STORAGE_PREFIX}${installationId}`;
 }
 
-/**
- * Renter-initiated release of a rented Client.
- *
- * Three things this fixes over the previous behaviour:
- *
- * 1. **Always reachable.** Release used to live only inside the payment modal,
- *    which is itself gated on `billingUrgencyTier` being urgent. A paid rental with
- *    time left — and any free rental, where the tier is `null` — rendered no banner
- *    at all, so the renter had no way to give the Host back.
- * 2. **States the refund policy.** Releasing early does not refund the current
- *    period; the confirm dialog now says so instead of leaving the renter to guess.
- * 3. **Shows the teardown.** Release kicks off a remote cleanup job. Previously the
- *    renter only got a fire-and-forget toast; now the job's phases and log stream
- *    into a progress dialog, the same view the Host owner already gets.
- *
- * After confirm, refresh is safe: cleanup runs on the server (`tokio::spawn`). This
- * component reattaches via `billing.activeCleanupJobId` (and a sessionStorage hint)
- * so progress continues after a full page reload.
- */
 export function ReleaseRentalAction({
-  billing,
+  rental,
   onChanged,
   label,
   className,
 }: {
-  billing: ClientMarketBilling;
+  rental: ClientMarketRental;
   onChanged: () => Promise<void> | void;
   /** Overrides the button text, e.g. "Retry release" on a failed release. */
   label?: string;
@@ -83,23 +64,23 @@ export function ReleaseRentalAction({
         setJob(latest);
         if (latest.status === "succeeded") {
           try {
-            sessionStorage.removeItem(resumeStorageKey(billing.installationId));
+            sessionStorage.removeItem(resumeStorageKey(rental.installationId));
           } catch {
             /* ignore */
           }
-          toast.success(t("billing.releaseSucceeded"));
+          toast.success(t("clientMarket.release.succeeded"));
           await onChanged();
           return;
         }
         if (latest.status === "failed") {
           try {
-            sessionStorage.removeItem(resumeStorageKey(billing.installationId));
+            sessionStorage.removeItem(resumeStorageKey(rental.installationId));
           } catch {
             /* ignore */
           }
           const detail = latest.failureCode || latest.log.split("\n").filter(Boolean).at(-1) || "";
           toast.danger(
-            detail ? `${t("billing.releaseFailedToast")}: ${detail}` : t("billing.releaseFailedToast"),
+            detail ? `${t("clientMarket.release.failedToast")}: ${detail}` : t("clientMarket.release.failedToast"),
           );
           await onChanged();
           return;
@@ -108,7 +89,7 @@ export function ReleaseRentalAction({
       toast.danger(t("clientMarket.cleanupTimedOut"));
       await onChanged();
     },
-    [billing.installationId, onChanged, t],
+    [rental.installationId, onChanged, t],
   );
 
   const attachToJob = React.useCallback(
@@ -123,17 +104,17 @@ export function ReleaseRentalAction({
           setJob(latest);
           if (latest.status === "succeeded") {
             try {
-              sessionStorage.removeItem(resumeStorageKey(billing.installationId));
+              sessionStorage.removeItem(resumeStorageKey(rental.installationId));
             } catch {
               /* ignore */
             }
-            toast.success(t("billing.releaseSucceeded"));
+            toast.success(t("clientMarket.release.succeeded"));
             await onChanged();
             return;
           }
           if (latest.status === "failed") {
             try {
-              sessionStorage.removeItem(resumeStorageKey(billing.installationId));
+              sessionStorage.removeItem(resumeStorageKey(rental.installationId));
             } catch {
               /* ignore */
             }
@@ -141,8 +122,8 @@ export function ReleaseRentalAction({
               latest.failureCode || latest.log.split("\n").filter(Boolean).at(-1) || "";
             toast.danger(
               detail
-                ? `${t("billing.releaseFailedToast")}: ${detail}`
-                : t("billing.releaseFailedToast"),
+                ? `${t("clientMarket.release.failedToast")}: ${detail}`
+                : t("clientMarket.release.failedToast"),
             );
             await onChanged();
             return;
@@ -155,42 +136,39 @@ export function ReleaseRentalAction({
         if (trackingJobIdRef.current === jobId) setBusy(false);
       }
     },
-    [billing.installationId, onChanged, pollJob, t],
+    [rental.installationId, onChanged, pollJob, t],
   );
 
-  // Reattach after refresh: billing.activeCleanupJobId is authoritative; sessionStorage
-  // covers the brief window before the next billing poll returns the job id.
+  // Reattach after refresh: the rental record is authoritative; sessionStorage
+  // covers the brief window before the next rental poll returns the job id.
   React.useEffect(() => {
     if (cancelledRef.current) return;
     let stored: string | null = null;
     try {
-      stored = sessionStorage.getItem(resumeStorageKey(billing.installationId));
+      stored = sessionStorage.getItem(resumeStorageKey(rental.installationId));
     } catch {
       stored = null;
     }
     const jobId =
-      billing.activeCleanupJobId ||
-      (billing.status === "releasing" ? stored : null) ||
+      rental.activeCleanupJobId ||
+      (rental.status === "releasing" ? stored : null) ||
       null;
     if (!jobId) return;
     if (trackingJobIdRef.current === jobId) return;
     void attachToJob(jobId);
   }, [
     attachToJob,
-    billing.activeCleanupJobId,
-    billing.installationId,
-    billing.status,
+    rental.activeCleanupJobId,
+    rental.installationId,
+    rental.status,
   ]);
 
   const release = React.useCallback(async () => {
     setBusy(true);
     try {
-      const { jobId } = await cleanupClientMarketClientWithReason(billing.installationId, {
-        reason: "client_release",
-        blockClientForProvider: false,
-      });
+      const { jobId } = await releaseClientMarketRental(rental.installationId);
       try {
-        sessionStorage.setItem(resumeStorageKey(billing.installationId), jobId);
+        sessionStorage.setItem(resumeStorageKey(rental.installationId), jobId);
       } catch {
         /* ignore quota / private mode */
       }
@@ -208,12 +186,12 @@ export function ReleaseRentalAction({
     } finally {
       setBusy(false);
     }
-  }, [billing.installationId, onChanged, pollJob]);
+  }, [rental.installationId, onChanged, pollJob]);
 
   const jobPhase: "running" | "failed" | "success" =
     job?.status === "failed" ? "failed" : job?.status === "succeeded" ? "success" : "running";
   const settled = job?.status === "failed" || job?.status === "succeeded";
-  const showReleaseButton = billing.canRelease && billing.status !== "releasing";
+  const showReleaseButton = rental.canRelease && rental.status !== "releasing";
 
   return (
     <>
@@ -225,19 +203,23 @@ export function ReleaseRentalAction({
           isDisabled={busy}
           onClick={() => setConfirmOpen(true)}
         >
-          {label ?? t("billing.releaseClient")}
+          {label ?? t("clientMarket.release.action")}
         </Button>
       ) : null}
 
       <ConfirmAlertDialog
         open={confirmOpen}
-        title={t("billing.releaseTitle")}
-        // Deliberately spells out that an early release forfeits the paid period.
-        description={t("billing.releaseNoRefundDescription")}
-        confirmLabel={t("billing.releaseClient")}
+        title={t("clientMarket.release.confirmTitle")}
+        description={t("clientMarket.release.confirmDescription")}
+        confirmLabel={t("clientMarket.release.action")}
         cancelLabel={t("common.cancel")}
         busy={busy}
         tone="danger"
+        extra={
+          <p className="rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-xs leading-5 text-sky-900">
+            {t("chat.marketPublicNotice")}
+          </p>
+        }
         onConfirm={() => void release()}
         onOpenChange={(next) => !busy && setConfirmOpen(next)}
       />
@@ -252,7 +234,7 @@ export function ReleaseRentalAction({
         <Modal.Container placement="center">
           <Modal.Dialog className="light w-[min(640px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
             <Modal.Header>
-              <Modal.Heading>{t("billing.releaseProgressTitle")}</Modal.Heading>
+              <Modal.Heading>{t("clientMarket.release.progressTitle")}</Modal.Heading>
             </Modal.Header>
             <Modal.Body className="grid max-h-[70vh] grid-cols-[minmax(0,1fr)] gap-3 overflow-y-auto">
               <div className="flex flex-wrap items-center gap-2">
@@ -267,7 +249,7 @@ export function ReleaseRentalAction({
                         : undefined
                   }
                 >
-                  {job ? t(cleanupPhaseLabelKey(job.phase || "")) : t("billing.releaseStarting")}
+                  {job ? t(cleanupPhaseLabelKey(job.phase || "")) : t("clientMarket.release.starting")}
                 </Chip>
                 {job?.status ? (
                   <span className="text-xs text-muted-foreground">{job.status}</span>
@@ -283,7 +265,7 @@ export function ReleaseRentalAction({
                 </p>
               ) : null}
               {job?.status === "succeeded" ? (
-                <p className="text-xs leading-5 text-emerald-700">{t("billing.releaseSucceeded")}</p>
+                <p className="text-xs leading-5 text-emerald-700">{t("clientMarket.release.succeeded")}</p>
               ) : null}
             </Modal.Body>
             <Modal.Footer>

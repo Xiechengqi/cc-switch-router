@@ -1525,16 +1525,20 @@ pub async fn market_proxy_handler(
         _ => return simple_response(StatusCode::NOT_FOUND, "missing-share-id"),
     };
     let path_and_query = format!("{forwarded_path}{query}");
+    let Some(request_app) = infer_share_request_app(&path_and_query) else {
+        return simple_response(StatusCode::BAD_REQUEST, "unsupported-share-api-path");
+    };
 
     let active_subdomains = state.proxy.active_subdomains().await.into_iter().collect();
     let inflight_by_share = state.proxy.inflight_by_share().await;
     let authorized = match state
         .store
-        .list_market_shares(
+        .list_market_shares_for_app(
             &market_email,
             "main",
             &active_subdomains,
             &inflight_by_share,
+            &request_app,
         )
         .await
     {
@@ -1581,12 +1585,11 @@ pub async fn market_proxy_handler(
     builder = builder.header(SHARE_DATA_SOURCE_HEADER, "market");
 
     let log_share_id = mask_token(&share_id);
-    let request_app = infer_share_request_app(&path_and_query, &parts.headers);
     let share_permit = match state
         .proxy
         .try_acquire_share_permit(
             &share_id,
-            request_app.as_deref(),
+            Some(&request_app),
             route.parallel_limit,
             Some(market_email.as_str()),
         )
@@ -1905,12 +1908,21 @@ pub async fn gateway_proxy_handler(
         _ => return simple_response(StatusCode::NOT_FOUND, "missing-share-id"),
     };
     let path_and_query = format!("{forwarded_path}{query}");
+    let Some(request_app) = infer_share_request_app(&path_and_query) else {
+        return simple_response(StatusCode::BAD_REQUEST, "unsupported-share-api-path");
+    };
 
     let active_subdomains = state.proxy.active_subdomains().await.into_iter().collect();
     let inflight_by_share = state.proxy.inflight_by_share().await;
     let authorized = match state
         .store
-        .list_gateway_shares(&gateway, "main", &active_subdomains, &inflight_by_share)
+        .list_gateway_shares_for_app(
+            &gateway,
+            "main",
+            &active_subdomains,
+            &inflight_by_share,
+            &request_app,
+        )
         .await
     {
         Ok(shares) => shares.into_iter().any(|share| share.share_id == share_id),
@@ -1931,15 +1943,9 @@ pub async fn gateway_proxy_handler(
     let target = format!("http://{backend}{path_and_query}");
 
     let metrics_permit = state.metrics.proxy_request_started();
-    let request_app = infer_share_request_app(&path_and_query, &parts.headers);
     let share_permit = match state
         .proxy
-        .try_acquire_share_permit(
-            &share_id,
-            request_app.as_deref(),
-            route.parallel_limit,
-            None,
-        )
+        .try_acquire_share_permit(&share_id, Some(&request_app), route.parallel_limit, None)
         .await
     {
         Some(permit) => permit,
@@ -2494,7 +2500,7 @@ pub async fn proxy_handler(
                 .user_can_invoke_share(
                     &principal.email,
                     share_id,
-                    infer_share_request_app(&path, &parts.headers).as_deref(),
+                    infer_share_request_app(&path).as_deref(),
                 )
                 .await
             {
@@ -2637,7 +2643,7 @@ pub async fn proxy_handler(
     let share_permit = if skips_share_edge_auth {
         None
     } else if let Some(share_id) = route.share_id.as_deref() {
-        let request_app = infer_share_request_app(&path, &parts.headers);
+        let request_app = infer_share_request_app(&path);
         match state
             .proxy
             .try_acquire_share_permit(
@@ -2844,7 +2850,7 @@ pub async fn proxy_handler(
         request_id: id.clone(),
     });
     let share_proxy_started = Instant::now();
-    let share_request_app = infer_share_request_app(&path, &parts.headers);
+    let share_request_app = infer_share_request_app(&path);
 
     let upstream = match builder.body(body).send().await {
         Ok(response) => response,
@@ -3857,24 +3863,13 @@ fn json_error_response(status: StatusCode, message: &str) -> Response {
     response
 }
 
-fn infer_share_request_app(path: &str, headers: &HeaderMap) -> Option<String> {
-    for name in [
-        "x-cc-switch-app",
-        "x-cc-switch-app-type",
-        "x-request-agent",
-        "x-share-app",
-    ] {
-        if let Some(value) = headers
-            .get(name)
-            .and_then(|value| value.to_str().ok())
-            .map(|value| value.trim().to_ascii_lowercase())
-            .filter(|value| matches!(value.as_str(), "claude" | "codex" | "gemini"))
-        {
-            return Some(value);
-        }
-    }
+fn infer_share_request_app(path: &str) -> Option<String> {
     let path = path.trim_start_matches('/').to_ascii_lowercase();
-    if path.starts_with("gemini/") || path.starts_with("v1beta/") {
+    if path.starts_with("gemini/")
+        || path.starts_with("v1beta/")
+        || (path.starts_with("v1/models/")
+            && (path.contains(":generatecontent") || path.contains(":streamgeneratecontent")))
+    {
         return Some("gemini".to_string());
     }
     if path.starts_with("anthropic/") || path.starts_with("v1/messages") {
@@ -4596,6 +4591,7 @@ mod tests {
             client_market_terminal: Arc::new(Mutex::new(
                 crate::client_market_terminal::TerminalSessionManager::default(),
             )),
+            market_billing_controls: Arc::new(Mutex::new(())),
             recent_traffic: RecentTraffic::new(),
             abuse: Arc::new(crate::abuse::AbuseTracker::new()),
             ip_blacklist_stats: Arc::new(crate::ip_blacklist_stats::IpBlacklistStats::new()),
@@ -4791,16 +4787,36 @@ mod tests {
 
     #[test]
     fn image_generation_paths_infer_codex_app() {
-        let headers = HeaderMap::new();
+        assert_eq!(
+            infer_share_request_app("/v1/images/generations").as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            infer_share_request_app("/images/generations").as_deref(),
+            Some("codex")
+        );
+    }
 
-        assert_eq!(
-            infer_share_request_app("/v1/images/generations", &headers).as_deref(),
-            Some("codex")
-        );
-        assert_eq!(
-            infer_share_request_app("/images/generations", &headers).as_deref(),
-            Some("codex")
-        );
+    #[test]
+    fn request_app_is_inferred_only_from_protocol_path() {
+        for path in ["/v1/messages", "/anthropic/v1/messages"] {
+            assert_eq!(infer_share_request_app(path).as_deref(), Some("claude"));
+        }
+        for path in [
+            "/v1/chat/completions",
+            "/v1/responses",
+            "/openai/v1/responses",
+        ] {
+            assert_eq!(infer_share_request_app(path).as_deref(), Some("codex"));
+        }
+        for path in [
+            "/v1beta/models/gemini-2.5-flash:generateContent",
+            "/gemini/v1beta/models/gemini-2.5-flash:streamGenerateContent",
+            "/v1/models/gemini-2.5-flash:generateContent",
+        ] {
+            assert_eq!(infer_share_request_app(path).as_deref(), Some("gemini"));
+        }
+        assert_eq!(infer_share_request_app("/v1/models").as_deref(), None);
     }
 
     #[test]

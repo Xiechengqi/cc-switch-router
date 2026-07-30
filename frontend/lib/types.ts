@@ -254,6 +254,7 @@ export type ShareUserGrantMap = Record<string, ShareUserGrant>;
 export type ShareView = {
   routerId?: string;
   shareId: string;
+  capacityPoolId: string;
   shareName: string;
   ownerEmail?: string;
   sharedWithEmails?: string[];
@@ -272,7 +273,7 @@ export type ShareView = {
   activeEdit?: ShareEditView;
   appType: string;
   providerId?: string;
-  /** 唯一 app/provider binding（{app: provider_id}）。 */
+  /** 全部 app/provider bindings（{app: provider_id}）。 */
   bindings?: Record<string, string>;
   tokenLimit: number;
   parallelLimit: number;
@@ -339,6 +340,15 @@ export type ShareSettingsPatch = {
   expiresAt?: string;
   autoStart?: boolean;
   userGrants?: ShareUserGrantMap;
+  managedGrant?: {
+    operationId: string;
+    entitlementId: string;
+    shareSequence: number;
+    expectedConfigRevision: number;
+    action: "upsert" | "revoke";
+    email: string;
+    policy?: ShareUserPolicy;
+  };
 };
 
 export type ShareApiAuthResponse = {
@@ -623,6 +633,14 @@ export type ShareRequestLog = {
   requestedModel?: string;
   actualModel?: string;
   actualModelSource?: string;
+  requestedReasoningEffort?: string;
+  effectiveReasoningEffort?: string;
+  clientServiceTier?: string;
+  effectiveServiceTier?: string;
+  serviceTierDecision?: string;
+  usageState?: "pending" | "observed" | "missing" | "parse_error" | "interrupted" | string;
+  streamStatus?: string;
+  usageRevision?: number;
   statusCode: number;
   latencyMs: number;
   firstTokenMs?: number;
@@ -672,7 +690,7 @@ export type ShareUsageDailyBucket = {
 
 export type ShareUsageEmailRow = {
   email: string;
-  role: "owner" | "shareto" | "market" | string;
+  role: "owner" | "shareto" | "market" | "deprecated" | string;
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
@@ -750,6 +768,9 @@ export type MarketRequestLog = {
   requestedModel: string;
   actualModel: string;
   actualModelSource?: string;
+  usageState?: "pending" | "observed" | "missing" | "parse_error" | "interrupted" | string;
+  streamStatus?: string;
+  usageRevision?: number;
   status: string;
   statusCode?: number;
   errorMessage?: string;
@@ -789,6 +810,9 @@ export type RecentRequestEvent = {
   cacheReadTokens?: number;
   cacheCreationTokens?: number;
   totalTokens?: number;
+  usageState?: "pending" | "observed" | "missing" | "parse_error" | "interrupted" | string;
+  streamStatus?: string;
+  usageRevision?: number;
   isHealthCheck?: boolean;
   healthStatus?: string;
   healthAppType?: string;
@@ -1209,6 +1233,10 @@ export type ClientChatMessage = {
   seq: number;
   body: string;
   authorLabel: string;
+  authorKind: "user" | "system" | string;
+  messageKind: "text" | "market_event" | string;
+  eventType?: string;
+  eventPayload?: Record<string, unknown>;
   isMine: boolean;
   status: "visible" | "deleted" | string;
   createdAt: string;
@@ -1218,6 +1246,10 @@ export type ClientChatMessagePreview = {
   seq: number;
   body: string;
   authorLabel: string;
+  authorKind: "user" | "system" | string;
+  messageKind: "text" | "market_event" | string;
+  eventType?: string;
+  eventPayload?: Record<string, unknown>;
   createdAt: string;
 };
 
@@ -1226,6 +1258,8 @@ export type ClientChatRoom = {
   installationId: string;
   clientLabel: string;
   status: "active" | "archived" | string;
+  canPost: boolean;
+  readOnly: boolean;
   latestSeq: number;
   unreadCount: number;
   lastMessageAt?: string | null;
@@ -1340,12 +1374,10 @@ export type ClientMarketHost = {
   ip?: string;
   port?: number;
   hostOwnerEmail: string;
-  priceCents?: number;
-  rentalPeriodDays?: number;
+  dailyRateMinor?: number;
   currency?: string;
   offerRevision: number;
   paymentMethodKinds: string[];
-  paymentMethods?: ClientMarketPaymentMethod[];
   contacts?: PaymentContact[];
   countryCode?: string;
   hostname?: string;
@@ -1427,11 +1459,194 @@ export type AccountPaymentProfile = {
   updatedAt: string;
 };
 
-export type ClientMarketProviderBlock = {
-  clientUserId: string;
-  clientOwnerEmail: string;
+export type MarketBillingSupplierProfile = {
+  currency: "CNY" | "USD" | string;
+  settlementGraceHours: number;
+  revision: number;
+  updatedAt: string;
+};
+
+export type MarketBillingService = {
+  id: string;
+  productKind: "share" | "client_host" | string;
+  productRef: string;
+  serviceRef: string;
+  serviceLabel: string;
+  status: string;
+  healthState: string;
+  dailyRateMinor: number;
+  offerRevision: number;
+  trialSecondsRemaining: number;
+  activatedAt: string;
+  suspendedAt?: string;
+  terminatedAt?: string;
+};
+
+export type MarketBillingInvoiceLine = {
+  id: string;
+  contractId: string;
+  productKind: string;
+  productRef: string;
+  serviceRef: string;
+  serviceLabel: string;
+  dailyRateMinor: number;
+  billableSeconds: number;
+  amountMinor: number;
+  serviceStartedAt: string;
+  serviceEndedAt: string;
+  evidence: Record<string, unknown>;
+};
+
+export type MarketBillingPaymentDeclaration = {
+  id: string;
+  status: string;
+  paymentMethodKind?: string;
+  paymentReference?: string;
+  note?: string;
+  evidenceUrl?: string;
+  declaredAt: string;
+  rejectedAt?: string;
+  rejectionReason?: string;
+};
+
+export type MarketBillingDispute = {
+  id: string;
+  reason: string;
+  status: string;
+  resolution?: string;
+  createdAt: string;
+  resolvedAt?: string;
+};
+
+export type MarketBillingInvoice = {
+  id: string;
+  sequence: number;
+  status: string;
+  amountMinor: number;
+  currency: string;
+  dueAt: string;
+  deadlineAt: string;
+  openedAt: string;
+  declaredAt?: string;
+  paidAt?: string;
+  paymentMethods: ClientMarketPaymentMethod[];
+  contacts: PaymentContact[];
+  paymentProfileUpdatedAt: string;
+  lines: MarketBillingInvoiceLine[];
+  declaration?: MarketBillingPaymentDeclaration;
+  dispute?: MarketBillingDispute;
+};
+
+export type MarketBillingInvoiceHistory = {
+  invoices: MarketBillingInvoice[];
+  nextBeforeSequence?: number | null;
+};
+
+export type MarketCreditAccount = {
+  id: string;
+  buyerUserId: string;
+  buyerEmail: string;
+  supplierUserId: string;
+  supplierEmail: string;
+  currency: string;
+  status: string;
+  balanceMinor: number;
+  creditKind: "none" | "limited" | "unlimited" | string;
+  creditLimitMinor?: number;
+  utilizationBps?: number;
+  dailyRateMinor: number;
+  estimatedSettlementAt?: string;
+  isBuyer: boolean;
+  isSupplier: boolean;
+  canSettle: boolean;
+  canClose: boolean;
+  closeRequested: boolean;
+  services: MarketBillingService[];
+  openInvoice?: MarketBillingInvoice;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type MarketCreditRestriction = {
+  id: string;
+  invoiceId: string;
   reason: string;
   createdAt: string;
+};
+
+export type MarketBillingDashboard = {
+  accounts: MarketCreditAccount[];
+  supplierProfiles: MarketBillingSupplierProfile[];
+  restrictions: MarketCreditRestriction[];
+  trialHours: number;
+};
+
+export type AdminMarketBillingDispute = {
+  dispute: MarketBillingDispute;
+  accountId: string;
+  buyerEmail: string;
+  supplierEmail: string;
+  invoice: MarketBillingInvoice;
+};
+
+export type MarketAccessProductKind = "share" | "client_host";
+export type MarketAccessMode = "whitelist" | "blacklist";
+export type MarketAccessDecision = "inherit" | "allow" | "deny";
+export type MarketCreditKind = "none" | "limited" | "unlimited";
+
+export type MarketAccessPolicy = {
+  productKind: MarketAccessProductKind;
+  mode: MarketAccessMode;
+  revision: number;
+  riskAcknowledgedAt?: string;
+  updatedAt: string;
+};
+
+export type MarketCounterpartyAccessRule = {
+  productKind: MarketAccessProductKind;
+  decision: MarketAccessDecision;
+};
+
+export type MarketCreditLine = {
+  currency: "CNY" | "USD" | string;
+  kind: MarketCreditKind;
+  limitMinor?: number;
+  revision: number;
+  updatedAt: string;
+};
+
+export type MarketCounterpartyExposure = {
+  currency: string;
+  balanceMinor: number;
+  status: string;
+  activeServiceCount: number;
+};
+
+export type MarketCounterparty = {
+  id: string;
+  buyerEmail: string;
+  buyerUserId?: string;
+  status: "active" | "revoked" | string;
+  revision: number;
+  accessRules: MarketCounterpartyAccessRule[];
+  creditLines: MarketCreditLine[];
+  exposures: MarketCounterpartyExposure[];
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type MarketPublicCreditLine = {
+  currency: "CNY" | "USD" | string;
+  limitMinor?: number;
+  enabled: boolean;
+  revision: number;
+  updatedAt: string;
+};
+
+export type MarketAccessDashboard = {
+  policies: MarketAccessPolicy[];
+  counterparties: MarketCounterparty[];
+  publicCreditLines: MarketPublicCreditLine[];
 };
 
 export type ClientMarketProviderCountry = {
@@ -1461,10 +1676,8 @@ export type ClientMarketProvider = {
   externalClientsOver30Days: number;
   onlineRate30d?: number;
   anomalousHostRate: number;
-  minPriceCents?: number;
-  maxPriceCents?: number;
-  minRentalPeriodDays?: number;
-  maxRentalPeriodDays?: number;
+  minDailyRateMinor?: number;
+  maxDailyRateMinor?: number;
   successfulAllocations: number;
   paymentMethodKinds: string[];
   countries: ClientMarketProviderCountry[];
@@ -1484,8 +1697,8 @@ export type ClientMarketQuoteItem = {
   countryCode?: string;
   hostname?: string;
   ip?: string;
-  priceCents?: number;
-  rentalPeriodDays?: number;
+  dailyRateMinor?: number;
+  currency?: string;
   offerRevision: number;
 };
 
@@ -1501,25 +1714,19 @@ export type ClientMarketCommitQuoteResponse = {
   jobIds: string[];
 };
 
-export type ClientMarketBilling = {
+export type ClientMarketRental = {
   installationId: string;
   hostId: string;
   providerId: string;
   hostOwnerEmail: string;
   clientOwnerEmail: string;
-  status: "active" | "payment_due" | "releasing" | "release_failed" | "released" | string;
-  priceCents?: number;
-  rentalPeriodDays?: number;
+  status: "active" | "billing_suspended" | "releasing" | "release_failed" | "released" | string;
+  dailyRateMinor?: number;
+  currency?: string;
   offerRevision: number;
-  currentPeriodEnd?: string;
-  paymentDeadline?: string;
-  openInvoiceId?: string;
-  paymentMethods?: ClientMarketPaymentMethod[];
   paymentMethodKinds: string[];
   contacts?: PaymentContact[];
-  paymentProfileUpdatedAt?: string;
   isClientOwner: boolean;
-  canDeclarePaid: boolean;
   canRelease: boolean;
   /** Pending/running cleanup job — used to resume progress UI after refresh. */
   activeCleanupJobId?: string;
@@ -1533,8 +1740,8 @@ export type ClientMarketHostTransferDocument = {
     ip: string;
     port: number;
     note?: string;
-    priceCents?: number;
-    rentalPeriodDays?: number;
+    dailyRateMinor?: number;
+    currency?: string;
     expectedFingerprint?: string;
     informationalStatus?: string;
   }>;
@@ -1573,23 +1780,8 @@ export type ShareMarketSeatInput = {
   parallelLimit?: number;
   tokenLimit?: number;
   tokenPeriod: ShareTokenPeriod;
-  priceMinor?: number;
+  dailyRateMinor?: number;
   currency?: string;
-  periodUnit?: "day" | "week" | "month";
-  periodCount?: number;
-};
-
-export type ShareMarketInvoice = {
-  id: string;
-  sequence: number;
-  amountMinor: number;
-  currency: string;
-  periodUnit: string;
-  periodCount: number;
-  status: string;
-  dueAt: string;
-  deadlineAt: string;
-  openedAt: string;
 };
 
 export type ShareMarketSubscription = {
@@ -1597,6 +1789,7 @@ export type ShareMarketSubscription = {
   seatId: string;
   listingId: string;
   shareId: string;
+  installationId: string;
   shareName: string;
   appType: string;
   subdomain?: string;
@@ -1604,19 +1797,11 @@ export type ShareMarketSubscription = {
   ownerEmail: string;
   renterEmail: string;
   status: string;
-  priceMinor?: number;
+  dailyRateMinor?: number;
   currency?: string;
-  periodUnit?: string;
-  periodCount?: number;
   offerRevision: number;
-  trialEndsAt?: string;
-  currentPeriodEnd?: string;
-  paymentDeadline?: string;
-  openInvoice?: ShareMarketInvoice;
-  paymentMethods?: ClientMarketPaymentMethod[];
+  paymentMethodKinds: string[];
   contacts?: PaymentContact[];
-  paymentProfileUpdatedAt?: string;
-  canDeclarePaid: boolean;
   canRelease: boolean;
   canForceRevoke: boolean;
   releaseReason?: string;
@@ -1640,6 +1825,7 @@ export type ShareMarketSeat = ShareMarketSeatInput & {
 export type ShareMarketListing = {
   id: string;
   shareId: string;
+  installationId: string;
   shareName: string;
   appType: string;
   ownerEmail: string;
@@ -1649,7 +1835,7 @@ export type ShareMarketListing = {
   shareOnline: boolean;
   isOwner: boolean;
   contacts?: PaymentContact[];
-  paymentMethods?: ClientMarketPaymentMethod[];
+  paymentMethodKinds: string[];
   upstreamProvider?: ShareUpstreamProvider;
   tokenLimit?: number;
   parallelLimit?: number;
@@ -1660,19 +1846,10 @@ export type ShareMarketListing = {
   updatedAt: string;
 };
 
-export type ShareMarketOwnerBlock = {
-  blockedUserId: string;
-  blockedEmail: string;
-  reason: string;
-  createdAt: string;
-};
-
 export type ShareMarketCatalog = {
   listings: ShareMarketListing[];
   mySubscriptions: ShareMarketSubscription[];
-  ownerBlocks: ShareMarketOwnerBlock[];
   trialHours: number;
-  renewalGraceHours: number;
 };
 
 export type ShareMarketOwnedShare = {

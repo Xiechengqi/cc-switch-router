@@ -21,16 +21,10 @@ use uuid::Uuid;
 use crate::ServerState;
 use crate::error::AppError;
 use crate::models::AuthSession;
-use crate::notifications::{
-    FrozenEmailEnvelope, NotificationTemplateContext, RenderedNotificationEmail,
-    render_transactional_card_email, retry_delay_secs, sanitize_delivery_error,
-    send_resend_frozen_email,
-};
 use crate::store::AppStore;
 
 pub const HOST_STATUS_RESERVED: &str = "reserved";
 const QUOTE_TTL_SECS: i64 = 120;
-const PAYMENT_WINDOW_HOURS: i64 = 72;
 const MAX_CREATE_COUNT: usize = 2;
 const MAX_PAYMENT_METHODS: usize = 20;
 const MAX_CUSTOM_PAYMENT_CHARS: usize = 2_000;
@@ -38,16 +32,9 @@ const MAX_QR_SOURCE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_QR_PIXELS: u64 = 4_000_000;
 const MAX_QR_DIMENSION: u32 = 4_096;
 const MAX_QR_STORED_BYTES: usize = 4 * 1024 * 1024;
-const EMAIL_CYCLE_SECS: u64 = 5;
-const BILLING_CYCLE_SECS: u64 = 20;
-const MAX_EMAIL_ATTEMPTS: u32 = 12;
-/// Soft per-recipient cap for Client Market mail (aligned with notification lanes).
-const MARKET_EMAIL_RECIPIENT_HOURLY_LIMIT: i64 = 12;
-const MARKET_EMAIL_RATE_DEFER_SECS: i64 = 300;
-const MARKET_EMAIL_FOOTER: &str = "Payment declarations are self-reported. TokenSwitch Router does not process or verify transfers between Client owners and Host Providers.";
+const TRADE_RECONCILE_CYCLE_SECS: u64 = 20;
 
 const SUBSCRIPTION_ACTIVE: &str = "active";
-const SUBSCRIPTION_PAYMENT_DUE: &str = "payment_due";
 const SUBSCRIPTION_RELEASING: &str = "releasing";
 const SUBSCRIPTION_RELEASE_FAILED: &str = "release_failed";
 const SUBSCRIPTION_RELEASED: &str = "released";
@@ -92,23 +79,6 @@ pub struct PaymentProfileView {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProviderClientBlockView {
-    pub client_user_id: String,
-    pub client_owner_email: String,
-    pub reason: String,
-    pub created_at: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateProviderBlockRequest {
-    pub email: String,
-    #[serde(default)]
-    pub reason: Option<String>,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdatePaymentProfileRequest {
@@ -140,10 +110,8 @@ pub struct ProviderSummary {
     pub external_clients_over_30_days: i64,
     pub online_rate_30d: Option<f64>,
     pub anomalous_host_rate: f64,
-    pub min_price_cents: Option<i64>,
-    pub max_price_cents: Option<i64>,
-    pub min_rental_period_days: Option<i64>,
-    pub max_rental_period_days: Option<i64>,
+    pub min_daily_rate_minor: Option<i64>,
+    pub max_daily_rate_minor: Option<i64>,
     pub successful_allocations: i64,
     pub payment_method_kinds: Vec<String>,
     pub countries: Vec<ProviderCountrySummary>,
@@ -170,8 +138,7 @@ pub struct ProviderSupplyResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateHostOfferRequest {
-    pub price_cents: Option<i64>,
-    pub rental_period_days: Option<i64>,
+    pub daily_rate_minor: Option<i64>,
     #[serde(default)]
     pub currency: Option<String>,
 }
@@ -180,8 +147,7 @@ pub struct UpdateHostOfferRequest {
 #[serde(rename_all = "camelCase")]
 pub struct HostOfferView {
     pub host_id: String,
-    pub price_cents: Option<i64>,
-    pub rental_period_days: Option<i64>,
+    pub daily_rate_minor: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub currency: Option<String>,
     pub offer_revision: i64,
@@ -208,8 +174,9 @@ pub struct QuoteItemView {
     pub country_code: Option<String>,
     pub hostname: Option<String>,
     pub ip: Option<String>,
-    pub price_cents: Option<i64>,
-    pub rental_period_days: Option<i64>,
+    pub daily_rate_minor: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
     pub offer_revision: i64,
 }
 
@@ -253,81 +220,26 @@ pub struct CommitQuoteResponse {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct BillingView {
+pub struct RentalView {
     pub installation_id: String,
     pub host_id: String,
     pub provider_id: String,
     pub host_owner_email: String,
     pub client_owner_email: String,
     pub status: String,
-    pub price_cents: Option<i64>,
-    pub rental_period_days: Option<i64>,
+    pub daily_rate_minor: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
     pub offer_revision: i64,
-    pub current_period_end: Option<String>,
-    pub payment_deadline: Option<String>,
-    pub open_invoice_id: Option<String>,
-    pub payment_methods: Option<Vec<PaymentMethod>>,
     pub payment_method_kinds: Vec<String>,
     #[serde(default)]
     pub contacts: Vec<PaymentContact>,
-    pub payment_profile_updated_at: Option<String>,
     pub is_client_owner: bool,
-    pub can_declare_paid: bool,
     pub can_release: bool,
     /// Latest pending/running cleanup job for this installation (page-refresh resume).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_cleanup_job_id: Option<String>,
     pub updated_at: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeclarePaidRequest {
-    pub invoice_id: String,
-    pub offer_revision: i64,
-    pub payment_profile_updated_at: Option<String>,
-    /// Amount the client actually rendered to the user. `offer_revision` already
-    /// proves the client re-fetched after a price change, but not that a human saw
-    /// the new number — a UI that silently refreshes and resubmits would pass that
-    /// check alone. Echoing the displayed amount closes that gap. Optional for
-    /// backward compatibility; when present it must match the invoice exactly.
-    pub amount_cents_confirmed: Option<i64>,
-    #[serde(default)]
-    pub confirmed: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeclareInvoicePaidRequest {
-    pub offer_revision: i64,
-    pub payment_profile_updated_at: Option<String>,
-    /// See `DeclarePaidRequest::amount_cents_confirmed`.
-    pub amount_cents_confirmed: Option<i64>,
-    #[serde(default)]
-    pub confirmed: bool,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DeclarePaidResponse {
-    billing: BillingView,
-}
-
-#[derive(Debug, Clone)]
-pub struct MarketEmailClaim {
-    id: String,
-    recipient: String,
-    subject: String,
-    html: String,
-    text: String,
-    idempotency_key: String,
-    attempts: u32,
-}
-
-#[derive(Debug, Clone)]
-pub struct ExpiredBillingClient {
-    pub installation_id: String,
-    pub subdomain: Option<String>,
 }
 
 pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -337,15 +249,6 @@ pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             owner_email TEXT NOT NULL UNIQUE,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS host_provider_client_blocks (
-            provider_id TEXT NOT NULL,
-            client_user_id TEXT NOT NULL,
-            client_owner_email TEXT NOT NULL,
-            reason TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            lifted_at TEXT,
-            PRIMARY KEY (provider_id, client_user_id)
         );
         CREATE TABLE IF NOT EXISTS host_provider_daily_stats (
             provider_id TEXT NOT NULL,
@@ -386,7 +289,7 @@ pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             content BLOB NOT NULL,
             sha256 TEXT NOT NULL,
             created_at TEXT NOT NULL,
-            UNIQUE(user_id, source_url)
+            UNIQUE(user_id, source_url, sha256)
         );
         CREATE TABLE IF NOT EXISTS client_market_allocation_quotes (
             id TEXT PRIMARY KEY,
@@ -407,8 +310,8 @@ pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             host_owner_email TEXT NOT NULL,
             country_code TEXT,
             hostname TEXT,
-            price_cents INTEGER,
-            rental_period_days INTEGER,
+            daily_rate_minor INTEGER,
+            currency TEXT,
             offer_revision INTEGER NOT NULL,
             UNIQUE(quote_id, position),
             UNIQUE(quote_id, host_id)
@@ -430,43 +333,15 @@ pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             client_user_id TEXT NOT NULL,
             client_owner_email TEXT NOT NULL,
             status TEXT NOT NULL,
-            price_cents INTEGER,
-            rental_period_days INTEGER,
+            daily_rate_minor INTEGER,
+            currency TEXT,
             offer_revision INTEGER NOT NULL,
-            last_declared_at TEXT,
-            current_period_end TEXT,
-            payment_deadline TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             released_at TEXT
         );
-        CREATE TABLE IF NOT EXISTS client_market_invoices (
-            id TEXT PRIMARY KEY,
-            installation_id TEXT NOT NULL,
-            sequence INTEGER NOT NULL,
-            amount_cents INTEGER NOT NULL,
-            rental_period_days INTEGER NOT NULL,
-            offer_revision INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            due_at TEXT,
-            deadline_at TEXT NOT NULL,
-            opened_at TEXT NOT NULL,
-            declared_at TEXT,
-            canceled_at TEXT,
-            UNIQUE(installation_id, sequence)
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_client_market_open_invoice
-            ON client_market_invoices(installation_id) WHERE status = 'open';
         CREATE UNIQUE INDEX IF NOT EXISTS idx_client_market_active_subscription_host
             ON client_market_subscriptions(host_id) WHERE status != 'released';
-        CREATE TABLE IF NOT EXISTS client_market_payment_declarations (
-            id TEXT PRIMARY KEY,
-            invoice_id TEXT NOT NULL UNIQUE,
-            installation_id TEXT NOT NULL,
-            client_user_id TEXT NOT NULL,
-            client_owner_email TEXT NOT NULL,
-            declared_at TEXT NOT NULL
-        );
         CREATE TABLE IF NOT EXISTS client_market_audit_events (
             id TEXT PRIMARY KEY,
             installation_id TEXT,
@@ -497,56 +372,20 @@ pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             detail_json TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS client_market_email_events (
-            id TEXT PRIMARY KEY,
-            kind TEXT NOT NULL,
-            recipient TEXT NOT NULL,
-            subject TEXT NOT NULL,
-            html_body TEXT NOT NULL,
-            text_body TEXT NOT NULL,
-            idempotency_key TEXT NOT NULL UNIQUE,
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS client_market_email_deliveries (
-            id TEXT PRIMARY KEY,
-            event_id TEXT,
-            kind TEXT NOT NULL,
-            recipient TEXT NOT NULL,
-            subject TEXT NOT NULL,
-            html_body TEXT NOT NULL,
-            text_body TEXT NOT NULL,
-            idempotency_key TEXT NOT NULL UNIQUE,
-            status TEXT NOT NULL,
-            attempts INTEGER NOT NULL DEFAULT 0,
-            next_attempt_at TEXT NOT NULL,
-            claim_owner TEXT,
-            claim_expires_at TEXT,
-            provider_message_id TEXT,
-            error_message TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            sent_at TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_market_email_claim
-            ON client_market_email_deliveries(status, next_attempt_at, claim_expires_at);
         CREATE INDEX IF NOT EXISTS idx_market_payment_methods_profile
             ON account_payment_methods(profile_user_id, enabled, position);
         CREATE INDEX IF NOT EXISTS idx_market_subscription_events_installation
             ON client_market_subscription_events(installation_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_market_quotes_owner
             ON client_market_allocation_quotes(client_user_id, status, expires_at);
-        CREATE INDEX IF NOT EXISTS idx_market_subscriptions_billing
-            ON client_market_subscriptions(status, payment_deadline, current_period_end);
         CREATE INDEX IF NOT EXISTS idx_market_subscriptions_client
             ON client_market_subscriptions(client_user_id, status);
         CREATE INDEX IF NOT EXISTS idx_market_subscriptions_provider
             ON client_market_subscriptions(provider_id, status);
-        CREATE INDEX IF NOT EXISTS idx_market_blocks_client
-            ON host_provider_client_blocks(client_user_id, lifted_at);",
+        ",
     )?;
     add_column(conn, "router_ssh_hosts", "provider_id", "TEXT")?;
-    add_column(conn, "router_ssh_hosts", "price_cents", "INTEGER")?;
-    add_column(conn, "router_ssh_hosts", "rental_period_days", "INTEGER")?;
+    add_column(conn, "router_ssh_hosts", "daily_rate_minor", "INTEGER")?;
     add_column(conn, "router_ssh_hosts", "currency", "TEXT")?;
     add_column(
         conn,
@@ -558,7 +397,13 @@ pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     add_column(conn, "provisioning_jobs", "quote_id", "TEXT")?;
     add_column(conn, "provisioning_jobs", "client_owner_user_id", "TEXT")?;
     add_column(conn, "provisioning_jobs", "cleanup_reason", "TEXT")?;
-    add_column(conn, "client_market_email_deliveries", "event_id", "TEXT")?;
+    add_column(
+        conn,
+        "client_market_allocation_quote_items",
+        "currency",
+        "TEXT",
+    )?;
+    add_column(conn, "client_market_subscriptions", "currency", "TEXT")?;
     add_column(
         conn,
         "account_payment_profiles",
@@ -597,22 +442,6 @@ pub fn router() -> Router<ServerState> {
             get(get_payment_profile).put(update_payment_profile),
         )
         .route("/v1/account/payment-assets/:id", get(get_payment_asset))
-        .route(
-            "/v1/account/provider-blocks",
-            get(list_provider_blocks).post(create_provider_block),
-        )
-        .route(
-            "/v1/account/provider-blocks/:client_user_id",
-            delete(lift_provider_block),
-        )
-        .route(
-            "/v1/client-market/provider-blocks",
-            get(list_provider_blocks).post(create_provider_block),
-        )
-        .route(
-            "/v1/client-market/provider-blocks/:client_user_id",
-            delete(lift_provider_block),
-        )
         .route("/v1/client-market/providers", get(get_provider_supply))
         .route("/v1/client-market/providers/:id", get(get_provider))
         .route(
@@ -635,20 +464,11 @@ pub fn router() -> Router<ServerState> {
         )
         .route("/v1/client-market/quotes/:id/cancel", post(cancel_quote))
         .route("/v1/client-market/quotes/:id/commit", post(commit_quote))
-        .route("/v1/client-market/my-billing", get(list_my_billing))
-        .route("/v1/client-market/billing", get(list_my_billing))
+        .route("/v1/client-market/my-rentals", get(list_my_rentals))
         .route("/v1/client-market/clients", post(commit_client_batch))
         .route(
-            "/v1/client-market/clients/:installation_id/billing",
-            get(get_client_billing),
-        )
-        .route(
-            "/v1/client-market/clients/:installation_id/declare-paid",
-            post(declare_client_paid),
-        )
-        .route(
-            "/v1/client-market/invoices/:invoice_id/declare-paid",
-            post(declare_invoice_paid),
+            "/v1/client-market/clients/:installation_id/rental",
+            get(get_client_rental),
         )
         .route(
             "/v1/admin/client-market/subscriptions/:installation_id/force-release",
@@ -663,8 +483,8 @@ pub fn router() -> Router<ServerState> {
 /// block. A single failed remote cleanup — a Host rebooting mid-teardown is enough
 /// — therefore locks the renter out of creating any future Client, permanently.
 ///
-/// This deliberately touches only the subscription and its open invoice. Host
-/// disposition is left to the existing reverify / auto-heal path, because forcing
+/// This deliberately touches only the subscription. Billing termination already
+/// happens when cleanup starts. Host disposition is left to the existing reverify / auto-heal path, because forcing
 /// a Host back to `idle` here could hand a renter a box that still has a live
 /// `cc-switch-server` on it.
 async fn admin_force_release_subscription(
@@ -675,7 +495,11 @@ async fn admin_force_release_subscription(
     let session = crate::api::require_admin_session(&state, &headers).await?;
     let outcome = state
         .store
-        .client_market_force_release_subscription(&installation_id, &session.user_id, &session.email)
+        .client_market_force_release_subscription(
+            &installation_id,
+            &session.user_id,
+            &session.email,
+        )
         .await?;
     Ok(Json(outcome))
 }
@@ -686,7 +510,6 @@ pub struct ForceReleaseResponse {
     pub installation_id: String,
     pub previous_status: String,
     pub status: String,
-    pub canceled_invoices: usize,
     /// Present when the Host still carries this installation, so the operator
     /// knows a reverify is still required before it re-enters the pool.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -707,35 +530,30 @@ async fn require_session(
 pub(crate) const PAYMENT_PROFILE_REQUIRED_FOR_OFFER: &str =
     "configure payment details on the Account page before setting a Host offer";
 
-pub(crate) fn validate_offer(
-    price_cents: Option<i64>,
-    rental_period_days: Option<i64>,
-) -> Result<(Option<i64>, Option<i64>), AppError> {
-    match (price_cents, rental_period_days) {
-        (None, None) | (Some(0), None) | (Some(0), Some(0)) => Ok((None, None)),
-        (Some(price), Some(days)) if (1..=100_000_000).contains(&price) && (4..=3_650).contains(&days) => {
-            Ok((Some(price), Some(days)))
+pub(crate) fn validate_offer(daily_rate_minor: Option<i64>) -> Result<Option<i64>, AppError> {
+    match daily_rate_minor {
+        None | Some(0) => Ok(None),
+        Some(rate) if (1..=crate::market_billing::MAX_DAILY_RATE_MINOR).contains(&rate) => {
+            Ok(Some(rate))
         }
         _ => Err(AppError::BadRequest(
-            "paid hosts require priceCents between 1 and 100000000 and rentalPeriodDays between 4 and 3650; omit both for free forever".into(),
+            "paid Hosts require dailyRateMinor between 1 and 100000000; omit it or use zero for free forever".into(),
         )),
     }
 }
 
 pub(crate) fn normalize_offer_currency(
-    price_cents: Option<i64>,
+    daily_rate_minor: Option<i64>,
     currency: Option<String>,
 ) -> Result<Option<String>, AppError> {
     let normalized = currency
         .map(|value| value.trim().to_ascii_uppercase())
         .filter(|value| !value.is_empty());
-    match (price_cents, normalized.as_deref()) {
+    match (daily_rate_minor, normalized.as_deref()) {
         (None, _) => Ok(None),
         (Some(_), None) => Ok(Some("USD".into())),
         (Some(_), Some("CNY" | "USD")) => Ok(normalized),
-        (Some(_), Some(_)) => Err(AppError::BadRequest(
-            "currency must be CNY or USD".into(),
-        )),
+        (Some(_), Some(_)) => Err(AppError::BadRequest("currency must be CNY or USD".into())),
     }
 }
 
@@ -747,7 +565,9 @@ fn payment_profile_has_methods(conn: &Connection, provider_id: &str) -> Result<b
             |row| row.get(0),
         )
         .optional()
-        .map_err(|error| AppError::Internal(format!("read payment profile for offer failed: {error}")))?;
+        .map_err(|error| {
+            AppError::Internal(format!("read payment profile for offer failed: {error}"))
+        })?;
     let Some(methods_json) = methods_json else {
         return Ok(false);
     };
@@ -762,7 +582,57 @@ pub(crate) fn require_payment_profile_for_offer(
     if payment_profile_has_methods(conn, provider_id)? {
         return Ok(());
     }
-    Err(AppError::BadRequest(PAYMENT_PROFILE_REQUIRED_FOR_OFFER.into()))
+    Err(AppError::BadRequest(
+        PAYMENT_PROFILE_REQUIRED_FOR_OFFER.into(),
+    ))
+}
+
+fn ensure_payment_profile_can_be_cleared(
+    conn: &Connection,
+    supplier_user_id: &str,
+) -> Result<(), AppError> {
+    let has_dependency =
+        conn.query_row(
+            "SELECT
+                EXISTS(
+                    SELECT 1 FROM router_ssh_hosts
+                    WHERE provider_id = ?1 AND daily_rate_minor IS NOT NULL
+                ) OR EXISTS(
+                    SELECT 1
+                    FROM share_market_seats seat
+                    JOIN share_market_listings listing ON listing.id = seat.listing_id
+                    WHERE listing.owner_user_id = ?1
+                      AND listing.status = 'active' AND listing.deleted_at IS NULL
+                      AND seat.daily_rate_minor IS NOT NULL AND seat.retired_at IS NULL
+                      AND seat.status != 'deleted'
+                ) OR EXISTS(
+                    SELECT 1 FROM market_service_contracts
+                    WHERE supplier_user_id = ?1 AND status != 'terminated'
+                ) OR EXISTS(
+                    SELECT 1 FROM market_credit_accounts
+                    WHERE supplier_user_id = ?1 AND balance_units > 0
+                ) OR EXISTS(
+                    SELECT 1
+                    FROM market_invoices invoice
+                    JOIN market_credit_accounts account ON account.id = invoice.account_id
+                    WHERE account.supplier_user_id = ?1
+                      AND invoice.status IN ('open', 'payment_declared', 'overdue', 'disputed')
+                )",
+            params![supplier_user_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "check payment profile market dependencies failed: {error}"
+            ))
+        })? != 0;
+    if has_dependency {
+        return Err(AppError::Conflict(
+            "payment methods are required while paid offers, service contracts, accrued balances, or unsettled bills exist"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Reattach hosts that belong to this owner email onto the canonical provider id.
@@ -853,7 +723,9 @@ fn ensure_provider_profiles_for_orphan_hosts_tx(
                )",
         )
         .map_err(|error| {
-            AppError::Internal(format!("prepare orphan Host Provider emails failed: {error}"))
+            AppError::Internal(format!(
+                "prepare orphan Host Provider emails failed: {error}"
+            ))
         })?;
     let emails = statement
         .query_map([], |row| row.get::<_, String>(0))
@@ -886,7 +758,9 @@ fn ensure_provider_profiles_for_orphan_hosts_tx(
             )
             .optional()
             .map_err(|error| {
-                AppError::Internal(format!("lookup orphan Provider id collision failed: {error}"))
+                AppError::Internal(format!(
+                    "lookup orphan Provider id collision failed: {error}"
+                ))
             })?
         {
             if existing_email != email {
@@ -902,7 +776,9 @@ fn ensure_provider_profiles_for_orphan_hosts_tx(
             params![provider_id, email, now],
         )
         .map_err(|error| {
-            AppError::Internal(format!("ensure orphan Host Provider profile failed: {error}"))
+            AppError::Internal(format!(
+                "ensure orphan Host Provider profile failed: {error}"
+            ))
         })?;
     }
     Ok(())
@@ -993,10 +869,7 @@ fn normalize_payment_method(mut method: PaymentMethod) -> Result<PaymentMethod, 
 fn normalize_payment_contact(mut contact: PaymentContact) -> Result<PaymentContact, AppError> {
     contact.channel = contact.channel.trim().to_ascii_lowercase();
     contact.handle = contact.handle.trim().to_string();
-    if !matches!(
-        contact.channel.as_str(),
-        "wechat" | "telegram" | "custom"
-    ) {
+    if !matches!(contact.channel.as_str(), "wechat" | "telegram" | "custom") {
         return Err(AppError::BadRequest(
             "contact channel must be wechat, telegram, or custom".into(),
         ));
@@ -1009,7 +882,9 @@ fn normalize_payment_contact(mut contact: PaymentContact) -> Result<PaymentConta
     Ok(contact)
 }
 
-fn normalize_payment_contacts(contacts: Vec<PaymentContact>) -> Result<Vec<PaymentContact>, AppError> {
+fn normalize_payment_contacts(
+    contacts: Vec<PaymentContact>,
+) -> Result<Vec<PaymentContact>, AppError> {
     if contacts.len() > MAX_PAYMENT_CONTACTS {
         return Err(AppError::BadRequest(
             "at most 10 contact entries are allowed".into(),
@@ -1097,46 +972,6 @@ async fn get_payment_profile(
             .client_market_payment_profile(&session.user_id, &session.email)
             .await?,
     ))
-}
-
-async fn list_provider_blocks(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-) -> Result<Json<Vec<ProviderClientBlockView>>, AppError> {
-    let session = require_session(&state, &headers).await?;
-    Ok(Json(
-        state
-            .store
-            .client_market_provider_blocks(&session.user_id)
-            .await?,
-    ))
-}
-
-async fn create_provider_block(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Json(input): Json<CreateProviderBlockRequest>,
-) -> Result<Json<ProviderClientBlockView>, AppError> {
-    let session = require_session(&state, &headers).await?;
-    Ok(Json(
-        state
-            .store
-            .client_market_create_provider_block(&session, &input.email, input.reason.as_deref())
-            .await?,
-    ))
-}
-
-async fn lift_provider_block(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    AxumPath(client_user_id): AxumPath<String>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let session = require_session(&state, &headers).await?;
-    state
-        .store
-        .client_market_lift_provider_block(&session, &client_user_id)
-        .await?;
-    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 async fn update_payment_profile(
@@ -1356,10 +1191,10 @@ async fn get_payment_asset(
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Response, AppError> {
-    let session = require_session(&state, &headers).await?;
+    let session = crate::api::resolve_router_session(&state, &headers).await?;
     let bytes = state
         .store
-        .client_market_payment_asset_for_viewer(&id, &session)
+        .client_market_payment_asset_for_viewer(&id, session.as_ref())
         .await?;
     let mut response = Response::new(Body::from(bytes));
     response
@@ -1422,12 +1257,12 @@ async fn update_host_offer(
     Json(input): Json<UpdateHostOfferRequest>,
 ) -> Result<Json<HostOfferView>, AppError> {
     let session = require_session(&state, &headers).await?;
-    let (price, period) = validate_offer(input.price_cents, input.rental_period_days)?;
-    let currency = normalize_offer_currency(price, input.currency)?;
+    let daily_rate_minor = validate_offer(input.daily_rate_minor)?;
+    let currency = normalize_offer_currency(daily_rate_minor, input.currency)?;
     Ok(Json(
         state
             .store
-            .client_market_update_host_offer(&id, &session, price, period, currency)
+            .client_market_update_host_offer(&id, &session, daily_rate_minor, currency)
             .await?,
     ))
 }
@@ -1546,95 +1381,31 @@ fn validate_client_password(password: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-async fn list_my_billing(
+async fn list_my_rentals(
     State(state): State<ServerState>,
     headers: HeaderMap,
-) -> Result<Json<Vec<BillingView>>, AppError> {
+) -> Result<Json<Vec<RentalView>>, AppError> {
     let session = require_session(&state, &headers).await?;
     Ok(Json(
         state
             .store
-            .client_market_list_billing_for_viewer(&session)
+            .client_market_list_rentals_for_viewer(&session)
             .await?,
     ))
 }
 
-async fn get_client_billing(
+async fn get_client_rental(
     State(state): State<ServerState>,
     headers: HeaderMap,
     AxumPath(installation_id): AxumPath<String>,
-) -> Result<Json<BillingView>, AppError> {
+) -> Result<Json<RentalView>, AppError> {
     let session = require_session(&state, &headers).await?;
     Ok(Json(
         state
             .store
-            .client_market_billing_for_viewer(&installation_id, &session)
+            .client_market_rental_for_viewer(&installation_id, &session)
             .await?,
     ))
-}
-
-async fn declare_client_paid(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    AxumPath(installation_id): AxumPath<String>,
-    Json(input): Json<DeclarePaidRequest>,
-) -> Result<Json<DeclarePaidResponse>, AppError> {
-    if !input.confirmed {
-        return Err(AppError::BadRequest(
-            "payment declaration requires explicit confirmation".into(),
-        ));
-    }
-    let session = require_session(&state, &headers).await?;
-    state
-        .store
-        .client_market_declare_paid(
-            &installation_id,
-            &input.invoice_id,
-            input.offer_revision,
-            input.payment_profile_updated_at.as_deref(),
-            input.amount_cents_confirmed,
-            &session,
-        )
-        .await?;
-    let billing = state
-        .store
-        .client_market_billing_for_viewer(&installation_id, &session)
-        .await?;
-    Ok(Json(DeclarePaidResponse { billing }))
-}
-
-async fn declare_invoice_paid(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    AxumPath(invoice_id): AxumPath<String>,
-    Json(input): Json<DeclareInvoicePaidRequest>,
-) -> Result<Json<DeclarePaidResponse>, AppError> {
-    if !input.confirmed {
-        return Err(AppError::BadRequest(
-            "payment declaration requires explicit confirmation".into(),
-        ));
-    }
-    let session = require_session(&state, &headers).await?;
-    let installation_id = state
-        .store
-        .client_market_installation_for_invoice(&invoice_id)
-        .await?;
-    state
-        .store
-        .client_market_declare_paid(
-            &installation_id,
-            &invoice_id,
-            input.offer_revision,
-            input.payment_profile_updated_at.as_deref(),
-            input.amount_cents_confirmed,
-            &session,
-        )
-        .await?;
-    let billing = state
-        .store
-        .client_market_billing_for_viewer(&installation_id, &session)
-        .await?;
-    Ok(Json(DeclarePaidResponse { billing }))
 }
 
 impl AppStore {
@@ -1693,7 +1464,8 @@ impl AppStore {
             .map_err(|error| AppError::Internal(format!("load subscription failed: {error}")))?
             .ok_or_else(|| AppError::NotFound("subscription not found".into()))?;
 
-        if previous_status != SUBSCRIPTION_RELEASE_FAILED && previous_status != SUBSCRIPTION_RELEASING
+        if previous_status != SUBSCRIPTION_RELEASE_FAILED
+            && previous_status != SUBSCRIPTION_RELEASING
         {
             return Err(AppError::Conflict(format!(
                 "subscription is {previous_status}; only releasing or release_failed can be force released"
@@ -1705,7 +1477,7 @@ impl AppStore {
         let changed = tx
             .execute(
                 "UPDATE client_market_subscriptions
-                 SET status = ?2, payment_deadline = NULL, released_at = ?3, updated_at = ?3
+                 SET status = ?2, released_at = ?3, updated_at = ?3
                  WHERE installation_id = ?1 AND status = ?4",
                 params![
                     installation_id,
@@ -1721,17 +1493,6 @@ impl AppStore {
             ));
         }
 
-        // An open invoice would keep the renter blocked on the billing surface even
-        // after the subscription is released.
-        let canceled_invoices = tx
-            .execute(
-                "UPDATE client_market_invoices
-                 SET status = 'canceled', canceled_at = ?2
-                 WHERE installation_id = ?1 AND status = 'open'",
-                params![installation_id, now.to_rfc3339()],
-            )
-            .map_err(|error| AppError::Internal(format!("cancel open invoice failed: {error}")))?;
-
         let host_status: Option<String> = match host_id.as_deref() {
             Some(host) => tx
                 .query_row(
@@ -1744,34 +1505,6 @@ impl AppStore {
             None => None,
         };
 
-        if let Some((client_email, provider_email, label)) =
-            cleanup_parties_tx(&tx, installation_id)?
-        {
-            for (kind, recipient) in [
-                ("client_force_released", client_email),
-                ("provider_force_released", provider_email),
-            ] {
-                let rows = [
-                    ("Client", label.as_str()),
-                    ("Previous status", previous_status.as_str()),
-                ];
-                enqueue_market_card_email_tx(
-                    &tx,
-                    kind,
-                    &recipient,
-                    &format!("[Client Market] {label} released by an administrator"),
-                    "Client force-released",
-                    "This Client was stuck and has been released by an administrator. Creating new Clients is no longer blocked for this account. The Host may still need reverification by its owner before it returns to the pool.",
-                    &rows,
-                    None,
-                    None,
-                    None,
-                    &format!("force-release:{installation_id}:{kind}"),
-                    now,
-                )?;
-            }
-        }
-
         insert_audit_tx(
             &tx,
             Some(installation_id),
@@ -1781,7 +1514,6 @@ impl AppStore {
             "subscription_force_released",
             serde_json::json!({
                 "previousStatus": previous_status,
-                "canceledInvoices": canceled_invoices,
                 "hostStatus": host_status,
             }),
             now,
@@ -1794,25 +1526,9 @@ impl AppStore {
             installation_id: installation_id.to_string(),
             previous_status,
             status: SUBSCRIPTION_RELEASED.to_string(),
-            canceled_invoices,
             host_id,
             host_status,
         })
-    }
-
-    pub async fn client_market_installation_for_invoice(
-        &self,
-        invoice_id: &str,
-    ) -> Result<String, AppError> {
-        let conn = self.conn.lock().await;
-        conn.query_row(
-            "SELECT installation_id FROM client_market_invoices WHERE id = ?1",
-            params![invoice_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| AppError::Internal(format!("lookup invoice failed: {error}")))?
-        .ok_or_else(|| AppError::NotFound("invoice not found".into()))
     }
 
     pub async fn client_market_assert_creation_allowed(
@@ -1910,7 +1626,9 @@ impl AppStore {
                         params![existing_id],
                     )
                     .map_err(|error| {
-                        AppError::Internal(format!("remove legacy Provider profile failed: {error}"))
+                        AppError::Internal(format!(
+                            "remove legacy Provider profile failed: {error}"
+                        ))
                     })?;
                 } else {
                     tx.execute(
@@ -1938,9 +1656,7 @@ impl AppStore {
                         params![user_id, email, now, existing_id],
                     )
                     .map_err(|error| {
-                        AppError::Internal(format!(
-                            "re-key subscription Provider failed: {error}"
-                        ))
+                        AppError::Internal(format!("re-key subscription Provider failed: {error}"))
                     })?;
                 }
             } else {
@@ -2040,6 +1756,9 @@ impl AppStore {
         let tx = conn.transaction().map_err(|error| {
             AppError::Internal(format!("begin payment profile update failed: {error}"))
         })?;
+        if methods.is_empty() {
+            ensure_payment_profile_can_be_cleared(&tx, &session.user_id)?;
+        }
         let existing_contacts_json: String = tx
             .query_row(
                 "SELECT COALESCE(contacts_json, '[]') FROM account_payment_profiles WHERE user_id = ?1",
@@ -2068,7 +1787,27 @@ impl AppStore {
         .map_err(|error| AppError::Internal(format!("save payment profile failed: {error}")))?;
         tx.execute(
             "DELETE FROM account_payment_assets
-             WHERE user_id = ?1 AND INSTR(?2, id) = 0",
+             WHERE user_id = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM json_each(?2) method
+                   WHERE json_extract(method.value, '$.assetUrl') =
+                         '/v1/account/payment-assets/' || account_payment_assets.id
+               )
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM market_invoices invoice
+                   JOIN market_credit_accounts account ON account.id = invoice.account_id
+                   WHERE account.supplier_user_id = ?1
+                     AND EXISTS (
+                         SELECT 1 FROM json_each(invoice.payment_methods_json) method
+                         WHERE json_extract(method.value, '$.assetUrl') =
+                               '/v1/account/payment-assets/' || account_payment_assets.id
+                     )
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM chat_public_payment_assets published
+                   WHERE published.asset_id = account_payment_assets.id
+               )",
             params![session.user_id, methods_json],
         )
         .map_err(|error| {
@@ -2133,200 +1872,6 @@ impl AppStore {
         })
     }
 
-    pub async fn client_market_provider_blocks(
-        &self,
-        provider_id: &str,
-    ) -> Result<Vec<ProviderClientBlockView>, AppError> {
-        let conn = self.conn.lock().await;
-        let mut statement = conn
-            .prepare(
-                "SELECT client_user_id, client_owner_email, reason, created_at
-                 FROM host_provider_client_blocks
-                 WHERE provider_id = ?1 AND lifted_at IS NULL
-                 ORDER BY created_at DESC, client_owner_email",
-            )
-            .map_err(|error| {
-                AppError::Internal(format!("prepare Provider block list failed: {error}"))
-            })?;
-        statement
-            .query_map(params![provider_id], |row| {
-                Ok(ProviderClientBlockView {
-                    client_user_id: row.get(0)?,
-                    client_owner_email: row.get(1)?,
-                    reason: row.get(2)?,
-                    created_at: row.get(3)?,
-                })
-            })
-            .map_err(|error| {
-                AppError::Internal(format!("query Provider block list failed: {error}"))
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| {
-                AppError::Internal(format!("read Provider block list failed: {error}"))
-            })
-    }
-
-    pub async fn client_market_create_provider_block(
-        &self,
-        session: &AuthSession,
-        email: &str,
-        reason: Option<&str>,
-    ) -> Result<ProviderClientBlockView, AppError> {
-        let email = normalize_email(email)?;
-        if email.eq_ignore_ascii_case(session.email.trim()) {
-            return Err(AppError::BadRequest(
-                "cannot block your own account from your Hosts".into(),
-            ));
-        }
-        let reason = reason
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("manual");
-        if reason.len() > 64
-            || !reason
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-        {
-            return Err(AppError::BadRequest(
-                "block reason must be a short ascii token".into(),
-            ));
-        }
-        let now = Utc::now();
-        let mut conn = self.conn.lock().await;
-        let client_user_id: String = conn
-            .query_row(
-                "SELECT id FROM users WHERE email_normalized = ?1",
-                params![email],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| AppError::Internal(format!("lookup blocked user failed: {error}")))?
-            .ok_or_else(|| {
-                AppError::NotFound("no Router account found for that email".into())
-            })?;
-        if client_user_id == session.user_id {
-            return Err(AppError::BadRequest(
-                "cannot block your own account from your Hosts".into(),
-            ));
-        }
-        let tx = conn.transaction().map_err(|error| {
-            AppError::Internal(format!("begin Provider block create failed: {error}"))
-        })?;
-        tx.execute(
-            "INSERT INTO host_provider_client_blocks
-                (provider_id, client_user_id, client_owner_email, reason, created_at, lifted_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL)
-             ON CONFLICT(provider_id, client_user_id) DO UPDATE SET
-                client_owner_email = excluded.client_owner_email,
-                reason = excluded.reason,
-                created_at = excluded.created_at,
-                lifted_at = NULL",
-            params![
-                session.user_id,
-                client_user_id,
-                email,
-                reason,
-                now.to_rfc3339()
-            ],
-        )
-        .map_err(|error| AppError::Internal(format!("insert Provider block failed: {error}")))?;
-        insert_audit_tx(
-            &tx,
-            None,
-            None,
-            Some(&session.user_id),
-            Some(&session.email),
-            "provider_client_block_created",
-            serde_json::json!({
-                "clientUserId": client_user_id,
-                "clientOwnerEmail": email,
-                "reason": reason,
-            }),
-            now,
-        )?;
-        tx.commit().map_err(|error| {
-            AppError::Internal(format!("commit Provider block create failed: {error}"))
-        })?;
-        Ok(ProviderClientBlockView {
-            client_user_id,
-            client_owner_email: email,
-            reason: reason.to_string(),
-            created_at: now.to_rfc3339(),
-        })
-    }
-
-    pub async fn client_market_lift_provider_block(
-        &self,
-        session: &AuthSession,
-        client_user_id: &str,
-    ) -> Result<(), AppError> {
-        let client_user_id = client_user_id.trim();
-        if client_user_id.is_empty() || client_user_id.len() > 200 {
-            return Err(AppError::BadRequest(
-                "invalid blocked Client identity".into(),
-            ));
-        }
-        let now = Utc::now();
-        let mut conn = self.conn.lock().await;
-        let tx = conn.transaction().map_err(|error| {
-            AppError::Internal(format!("begin Provider unblock failed: {error}"))
-        })?;
-        let changed = tx
-            .execute(
-                "UPDATE host_provider_client_blocks SET lifted_at = ?3
-                 WHERE provider_id = ?1 AND client_user_id = ?2 AND lifted_at IS NULL",
-                params![session.user_id, client_user_id, now.to_rfc3339()],
-            )
-            .map_err(|error| AppError::Internal(format!("lift Provider block failed: {error}")))?;
-        if changed == 0 {
-            let exists: i64 = tx
-                .query_row(
-                    "SELECT COUNT(*) FROM host_provider_client_blocks
-                     WHERE provider_id = ?1 AND client_user_id = ?2",
-                    params![session.user_id, client_user_id],
-                    |row| row.get(0),
-                )
-                .map_err(|error| {
-                    AppError::Internal(format!("check Provider block failed: {error}"))
-                })?;
-            if exists == 0 {
-                return Err(AppError::NotFound(
-                    "blocked Client account not found".into(),
-                ));
-            }
-        } else {
-            insert_audit_tx(
-                &tx,
-                None,
-                None,
-                Some(&session.user_id),
-                Some(&session.email),
-                "provider_client_block_lifted",
-                serde_json::json!({ "clientUserId": client_user_id }),
-                now,
-            )?;
-        }
-        tx.commit().map_err(|error| {
-            AppError::Internal(format!("commit Provider unblock failed: {error}"))
-        })?;
-        Ok(())
-    }
-
-    pub async fn client_market_payment_asset_id(
-        &self,
-        user_id: &str,
-        source_url: &str,
-    ) -> Result<Option<String>, AppError> {
-        let conn = self.conn.lock().await;
-        conn.query_row(
-            "SELECT id FROM account_payment_assets WHERE user_id = ?1 AND source_url = ?2",
-            params![user_id, source_url],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| AppError::Internal(format!("lookup payment asset failed: {error}")))
-    }
-
     pub async fn client_market_store_payment_asset(
         &self,
         user_id: &str,
@@ -2341,14 +1886,21 @@ impl AppStore {
             "INSERT INTO account_payment_assets
                 (id, user_id, source_url, media_type, content, sha256, created_at)
              VALUES (?1, ?2, ?3, 'image/png', ?4, ?5, ?6)
-             ON CONFLICT(user_id, source_url) DO UPDATE SET
-                content = excluded.content, sha256 = excluded.sha256, created_at = excluded.created_at",
-            params![id, user_id, source_url, png, digest, Utc::now().to_rfc3339()],
+             ON CONFLICT(user_id, source_url, sha256) DO NOTHING",
+            params![
+                id,
+                user_id,
+                source_url,
+                png,
+                digest,
+                Utc::now().to_rfc3339()
+            ],
         )
         .map_err(|error| AppError::Internal(format!("store payment asset failed: {error}")))?;
         conn.query_row(
-            "SELECT id FROM account_payment_assets WHERE user_id = ?1 AND source_url = ?2",
-            params![user_id, source_url],
+            "SELECT id FROM account_payment_assets
+             WHERE user_id = ?1 AND source_url = ?2 AND sha256 = ?3",
+            params![user_id, source_url, digest],
             |row| row.get(0),
         )
         .map_err(|error| AppError::Internal(format!("read stored payment asset failed: {error}")))
@@ -2357,7 +1909,7 @@ impl AppStore {
     pub async fn client_market_payment_asset_for_viewer(
         &self,
         id: &str,
-        viewer: &AuthSession,
+        viewer: Option<&AuthSession>,
     ) -> Result<Vec<u8>, AppError> {
         let conn = self.conn.lock().await;
         let asset: Option<(String, Vec<u8>)> = conn
@@ -2370,47 +1922,44 @@ impl AppStore {
             .map_err(|error| AppError::Internal(format!("read payment asset failed: {error}")))?;
         let (owner_user_id, content) =
             asset.ok_or_else(|| AppError::NotFound("payment asset not found".into()))?;
-        let allowed = owner_user_id == viewer.user_id
-            || conn
-                .query_row(
-                    "SELECT 1 FROM client_market_subscriptions
-                     WHERE provider_id = ?1 AND client_user_id = ?2
-                       AND status != 'released' LIMIT 1",
-                    params![owner_user_id, viewer.user_id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()
-                .map_err(|error| {
-                    AppError::Internal(format!("authorize payment asset failed: {error}"))
-                })?
-                .is_some()
-            || conn
-                .query_row(
-                    "SELECT 1
-                     WHERE EXISTS (
-                         SELECT 1 FROM share_market_listings listing
-                         JOIN shares share ON share.share_id = listing.share_id
-                         WHERE listing.owner_user_id = ?1
-                           AND listing.status = 'active'
-                           AND listing.deleted_at IS NULL
-                           AND lower(share.owner_email) = lower(listing.owner_email)
-                     ) OR EXISTS (
-                         SELECT 1 FROM share_market_subscriptions subscription
-                         WHERE subscription.owner_user_id = ?1
-                           AND subscription.renter_user_id = ?2
-                     ) OR EXISTS (
-                         SELECT 1 FROM router_ssh_hosts host
-                         WHERE host.provider_id = ?1
-                     )
+        let publicly_published = conn
+            .query_row(
+                "SELECT 1 FROM chat_public_payment_assets WHERE asset_id = ?1 LIMIT 1",
+                params![id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!("authorize public payment asset failed: {error}"))
+            })?
+            .is_some();
+        let invoiced_for_viewer = if let Some(viewer) = viewer {
+            conn.query_row(
+                "SELECT 1
+                     FROM market_invoices invoice
+                     JOIN market_credit_accounts account ON account.id = invoice.account_id
+                     WHERE account.supplier_user_id = ?1
+                       AND account.buyer_user_id = ?2
+                       AND EXISTS (
+                           SELECT 1 FROM json_each(invoice.payment_methods_json) method
+                           WHERE json_extract(method.value, '$.assetUrl') =
+                                 '/v1/account/payment-assets/' || ?3
+                       )
                      LIMIT 1",
-                    params![owner_user_id, viewer.user_id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()
-                .map_err(|error| {
-                    AppError::Internal(format!("authorize marketed payment asset failed: {error}"))
-                })?
-                .is_some();
+                params![owner_user_id, viewer.user_id, id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::Internal(format!("authorize invoiced payment asset failed: {error}"))
+            })?
+            .is_some()
+        } else {
+            false
+        };
+        let allowed = publicly_published
+            || viewer.is_some_and(|viewer| owner_user_id == viewer.user_id)
+            || invoiced_for_viewer;
         if !allowed {
             return Err(AppError::Forbidden(
                 "not allowed to view this payment asset".into(),
@@ -2442,13 +1991,12 @@ impl AppStore {
                         COUNT(h.id) AS host_total,
                         COALESCE(SUM(CASE WHEN h.status = 'idle' THEN 1 ELSE 0 END), 0) AS idle_total,
                         COALESCE(SUM(CASE WHEN h.status = 'allocated' THEN 1 ELSE 0 END), 0) AS allocated_total,
-                        COALESCE(SUM(CASE WHEN h.id IS NOT NULL AND h.price_cents IS NULL THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN h.id IS NOT NULL AND h.price_cents IS NULL AND h.status = 'allocated' THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN h.id IS NOT NULL AND h.price_cents IS NOT NULL THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN h.id IS NOT NULL AND h.price_cents IS NOT NULL AND h.status = 'allocated' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN h.id IS NOT NULL AND h.daily_rate_minor IS NULL THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN h.id IS NOT NULL AND h.daily_rate_minor IS NULL AND h.status = 'allocated' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN h.id IS NOT NULL AND h.daily_rate_minor IS NOT NULL THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN h.id IS NOT NULL AND h.daily_rate_minor IS NOT NULL AND h.status = 'allocated' THEN 1 ELSE 0 END), 0),
                         COALESCE(SUM(CASE WHEN h.last_error IS NOT NULL AND TRIM(h.last_error) != '' THEN 1 ELSE 0 END), 0),
-                        MIN(h.price_cents), MAX(h.price_cents),
-                        MIN(h.rental_period_days), MAX(h.rental_period_days),
+                        MIN(h.daily_rate_minor), MAX(h.daily_rate_minor),
                         (SELECT COUNT(*) FROM provisioning_jobs j
                          WHERE j.host_id IN (SELECT id FROM router_ssh_hosts WHERE provider_id = p.provider_id)
                            AND j.type = 'create' AND j.status = 'succeeded') AS successful_allocations,
@@ -2481,11 +2029,9 @@ impl AppStore {
                     row.get::<_, i64>(10)?,
                     row.get::<_, Option<i64>>(11)?,
                     row.get::<_, Option<i64>>(12)?,
-                    row.get::<_, Option<i64>>(13)?,
-                    row.get::<_, Option<i64>>(14)?,
-                    row.get::<_, i64>(15)?,
-                    row.get::<_, String>(16)?,
-                    row.get::<_, String>(17)?,
+                    row.get::<_, i64>(13)?,
+                    row.get::<_, String>(14)?,
+                    row.get::<_, String>(15)?,
                 ))
             })
             .map_err(|error| {
@@ -2505,10 +2051,8 @@ impl AppStore {
                 paid_host_total,
                 paid_allocated_total,
                 anomalous_host_total,
-                min_price_cents,
-                max_price_cents,
-                min_period_days,
-                max_period_days,
+                min_daily_rate_minor,
+                max_daily_rate_minor,
                 successful,
                 methods_json,
                 offer_stable_since,
@@ -2528,8 +2072,8 @@ impl AppStore {
                     "SELECT country_code,
                             SUM(CASE WHEN status = 'idle' THEN 1 ELSE 0 END),
                             COUNT(*),
-                            SUM(CASE WHEN status = 'idle' AND price_cents IS NULL THEN 1 ELSE 0 END),
-                            SUM(CASE WHEN price_cents IS NULL THEN 1 ELSE 0 END)
+                            SUM(CASE WHEN status = 'idle' AND daily_rate_minor IS NULL THEN 1 ELSE 0 END),
+                            SUM(CASE WHEN daily_rate_minor IS NULL THEN 1 ELSE 0 END)
                      FROM router_ssh_hosts
                      WHERE provider_id = ?1 AND country_code IS NOT NULL
                      GROUP BY country_code ORDER BY country_code",
@@ -2615,10 +2159,8 @@ impl AppStore {
                 online_rate_30d: (observed_samples > 0)
                     .then(|| ratio(online_samples, observed_samples)),
                 anomalous_host_rate: ratio(anomalous_host_total, host_total),
-                min_price_cents,
-                max_price_cents,
-                min_rental_period_days: min_period_days,
-                max_rental_period_days: max_period_days,
+                min_daily_rate_minor,
+                max_daily_rate_minor,
                 successful_allocations: successful,
                 payment_method_kinds,
                 countries,
@@ -2708,10 +2250,11 @@ impl AppStore {
         &self,
         host_id: &str,
         session: &AuthSession,
-        price_cents: Option<i64>,
-        rental_period_days: Option<i64>,
+        daily_rate_minor: Option<i64>,
         currency: Option<String>,
     ) -> Result<HostOfferView, AppError> {
+        let daily_rate_minor = validate_offer(daily_rate_minor)?;
+        let currency = normalize_offer_currency(daily_rate_minor, currency)?;
         let mut conn = self.conn.lock().await;
         let tx = conn
             .transaction()
@@ -2720,14 +2263,13 @@ impl AppStore {
             Option<String>,
             String,
             Option<i64>,
-            Option<i64>,
             Option<String>,
             i64,
             String,
         )> = tx
             .query_row(
-                "SELECT provider_id, host_owner_email, price_cents, rental_period_days,
-                        currency, offer_revision, status
+                "SELECT provider_id, host_owner_email, daily_rate_minor, currency,
+                        offer_revision, status
                  FROM router_ssh_hosts WHERE id = ?1",
                 params![host_id],
                 |row| {
@@ -2738,21 +2280,13 @@ impl AppStore {
                         row.get(3)?,
                         row.get(4)?,
                         row.get(5)?,
-                        row.get(6)?,
                     ))
                 },
             )
             .optional()
             .map_err(|error| AppError::Internal(format!("read host offer failed: {error}")))?;
-        let (
-            provider_id,
-            host_owner_email,
-            old_price,
-            old_period,
-            old_currency,
-            old_revision,
-            host_status,
-        ) = host.ok_or_else(|| AppError::NotFound("host not found".into()))?;
+        let (provider_id, host_owner_email, old_price, old_currency, old_revision, host_status) =
+            host.ok_or_else(|| AppError::NotFound("host not found".into()))?;
         if !crate::client_market::session_is_host_owner(
             session,
             provider_id.as_deref(),
@@ -2782,12 +2316,7 @@ impl AppStore {
                     "UPDATE router_ssh_hosts
                      SET provider_id = ?2, host_owner_email = ?3, updated_at = ?4
                      WHERE id = ?1",
-                    params![
-                        host_id,
-                        session.user_id,
-                        email,
-                        Utc::now().to_rfc3339()
-                    ],
+                    params![host_id, session.user_id, email, Utc::now().to_rfc3339()],
                 )
                 .map_err(|error| {
                     AppError::Internal(format!("heal Host provider identity failed: {error}"))
@@ -2799,17 +2328,13 @@ impl AppStore {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|value| value.to_ascii_uppercase());
-        if old_price == price_cents
-            && old_period == rental_period_days
-            && old_currency_norm == currency
-        {
+        if old_price == daily_rate_minor && old_currency_norm == currency {
             tx.commit().map_err(|error| {
                 AppError::Internal(format!("commit unchanged Host offer failed: {error}"))
             })?;
             return Ok(HostOfferView {
                 host_id: host_id.to_string(),
-                price_cents,
-                rental_period_days,
+                daily_rate_minor,
                 currency,
                 offer_revision: old_revision,
             });
@@ -2822,33 +2347,31 @@ impl AppStore {
         }
         // Paid offers require the Host owner's Account payment details so renters
         // have a way to pay. Free forever does not require a payment profile.
-        if price_cents.is_some() {
+        if daily_rate_minor.is_some() {
             require_payment_profile_for_offer(&tx, &session.user_id)?;
+            crate::market_billing::require_supplier_profile_tx(
+                &tx,
+                &session.user_id,
+                currency
+                    .as_deref()
+                    .ok_or_else(|| AppError::Internal("paid Host currency is missing".into()))?,
+            )?;
         }
         let revision = old_revision + 1;
         tx.execute(
             "UPDATE router_ssh_hosts
-             SET price_cents = ?2, rental_period_days = ?3, currency = ?4,
-                 offer_revision = ?5, updated_at = ?6
+             SET daily_rate_minor = ?2, currency = ?3,
+                 offer_revision = ?4, updated_at = ?5
              WHERE id = ?1",
             params![
                 host_id,
-                price_cents,
-                rental_period_days,
+                daily_rate_minor,
                 currency,
                 revision,
                 Utc::now().to_rfc3339()
             ],
         )
         .map_err(|error| AppError::Internal(format!("update Host offer failed: {error}")))?;
-        apply_offer_to_subscriptions_tx(
-            &tx,
-            host_id,
-            price_cents,
-            rental_period_days,
-            revision,
-            Utc::now(),
-        )?;
         insert_audit_tx(
             &tx,
             None,
@@ -2857,11 +2380,9 @@ impl AppStore {
             Some(&session.email),
             "host_offer_updated",
             serde_json::json!({
-                "oldPriceCents": old_price,
-                "oldRentalPeriodDays": old_period,
+                "oldDailyRateMinor": old_price,
                 "oldCurrency": old_currency,
-                "priceCents": price_cents,
-                "rentalPeriodDays": rental_period_days,
+                "dailyRateMinor": daily_rate_minor,
                 "currency": currency,
                 "offerRevision": revision,
             }),
@@ -2871,8 +2392,7 @@ impl AppStore {
             .map_err(|error| AppError::Internal(format!("commit Host offer failed: {error}")))?;
         Ok(HostOfferView {
             host_id: host_id.to_string(),
-            price_cents,
-            rental_period_days,
+            daily_rate_minor,
             currency,
             offer_revision: revision,
         })
@@ -2950,20 +2470,18 @@ impl AppStore {
             ));
         }
         // Providers may allocate their own Hosts (self-host then self-use is a
-        // supported workflow). Still honour Provider→client blocks.
-        let candidates = if let Some(host_id) = input.host_id.as_deref() {
+        // supported workflow). Unified access policy is checked below.
+        let mut candidates = if let Some(host_id) = input.host_id.as_deref() {
             let candidate = tx
                 .query_row(
                     "SELECT h.id, h.provider_id, h.host_owner_email, h.country_code, h.hostname,
-                            h.ip, h.price_cents, h.rental_period_days, h.offer_revision
+                            h.ip, h.daily_rate_minor,
+                            CASE WHEN h.daily_rate_minor IS NULL THEN NULL
+                                 ELSE COALESCE(NULLIF(TRIM(h.currency), ''), 'USD') END,
+                            h.offer_revision
                      FROM router_ssh_hosts h
-                     WHERE h.id = ?1 AND h.status = 'idle' AND h.provider_id IS NOT NULL
-                       AND NOT EXISTS (
-                           SELECT 1 FROM host_provider_client_blocks b
-                           WHERE b.provider_id = h.provider_id AND b.client_user_id = ?2
-                             AND b.lifted_at IS NULL
-                       )",
-                    params![host_id, session.user_id],
+                     WHERE h.id = ?1 AND h.status = 'idle' AND h.provider_id IS NOT NULL",
+                    params![host_id],
                     map_quote_candidate,
                 )
                 .optional()
@@ -2982,21 +2500,18 @@ impl AppStore {
             // Host on live Routers; application-side sampling is explicit and testable.
             let sql = format!(
                 "SELECT h.id, h.provider_id, h.host_owner_email, h.country_code, h.hostname,
-                        h.ip, h.price_cents, h.rental_period_days, h.offer_revision
+                        h.ip, h.daily_rate_minor,
+                        CASE WHEN h.daily_rate_minor IS NULL THEN NULL
+                             ELSE COALESCE(NULLIF(TRIM(h.currency), ''), 'USD') END,
+                        h.offer_revision
                  FROM router_ssh_hosts h
                  WHERE h.status = 'idle'
-                   AND h.price_cents IS NULL
+                   AND h.daily_rate_minor IS NULL
                    AND h.provider_id IN ({provider_vars})
-                   AND h.country_code IN ({country_vars})
-                   AND NOT EXISTS (
-                       SELECT 1 FROM host_provider_client_blocks b
-                       WHERE b.provider_id = h.provider_id AND b.client_user_id = ?
-                         AND b.lifted_at IS NULL
-                   )"
+                   AND h.country_code IN ({country_vars})"
             );
             let mut values = provider_ids.clone();
             values.extend(countries.clone());
-            values.push(session.user_id.clone());
             let mut statement = tx.prepare(&sql).map_err(|error| {
                 AppError::Internal(format!("prepare random Host quote failed: {error}"))
             })?;
@@ -3005,9 +2520,26 @@ impl AppStore {
                 .map_err(|error| {
                     AppError::Internal(format!("query random Host quote failed: {error}"))
                 })?;
-            let mut pool = rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+            let pool = rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
                 AppError::Internal(format!("read random Host quote failed: {error}"))
             })?;
+            drop(statement);
+            let mut pool = pool
+                .into_iter()
+                .filter_map(|candidate| {
+                    match crate::market_access::product_access_allowed_tx(
+                        &tx,
+                        &candidate.provider_id,
+                        &session.user_id,
+                        &session.email,
+                        crate::market_access::PRODUCT_CLIENT_HOST,
+                    ) {
+                        Ok(true) => Some(Ok(candidate)),
+                        Ok(false) => None,
+                        Err(error) => Some(Err(error)),
+                    }
+                })
+                .collect::<Result<Vec<_>, AppError>>()?;
             if pool.len() < input.count {
                 return Err(AppError::ServiceUnavailable(
                     "not enough idle free Hosts match the selected Providers and regions".into(),
@@ -3021,6 +2553,31 @@ impl AppStore {
             return Err(AppError::ServiceUnavailable(
                 "not enough idle free Hosts match the selected Providers and regions".into(),
             ));
+        }
+        for candidate in &mut candidates {
+            if candidate.provider_id == session.user_id {
+                candidate.daily_rate_minor = None;
+                candidate.currency = None;
+            }
+            crate::market_access::ensure_product_access_tx(
+                &tx,
+                &candidate.provider_id,
+                &session.user_id,
+                &session.email,
+                crate::market_access::PRODUCT_CLIENT_HOST,
+            )?;
+            if candidate.daily_rate_minor.is_some() {
+                crate::market_billing::ensure_credit_allowed_tx(
+                    &tx,
+                    &session.user_id,
+                    &session.email,
+                    &candidate.provider_id,
+                    crate::market_access::PRODUCT_CLIENT_HOST,
+                    candidate.currency.as_deref().ok_or_else(|| {
+                        AppError::Internal("paid quoted Host currency is missing".into())
+                    })?,
+                )?;
+            }
         }
         let quote_id = Uuid::new_v4().to_string();
         let expires_at = now + Duration::seconds(QUOTE_TTL_SECS);
@@ -3060,7 +2617,8 @@ impl AppStore {
             tx.execute(
                 "INSERT INTO client_market_allocation_quote_items
                     (id, quote_id, position, host_id, provider_id, host_owner_email,
-                     country_code, hostname, price_cents, rental_period_days, offer_revision)
+                     country_code, hostname, daily_rate_minor, currency,
+                     offer_revision)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     item_id,
@@ -3071,8 +2629,8 @@ impl AppStore {
                     candidate.host_owner_email,
                     candidate.country_code,
                     candidate.hostname,
-                    candidate.price_cents,
-                    candidate.rental_period_days,
+                    candidate.daily_rate_minor,
+                    candidate.currency,
                     candidate.offer_revision,
                 ],
             )
@@ -3085,8 +2643,8 @@ impl AppStore {
                 country_code: candidate.country_code,
                 hostname: candidate.hostname,
                 ip: candidate.ip,
-                price_cents: candidate.price_cents,
-                rental_period_days: candidate.rental_period_days,
+                daily_rate_minor: candidate.daily_rate_minor,
+                currency: candidate.currency,
                 offer_revision: candidate.offer_revision,
             });
         }
@@ -3145,29 +2703,6 @@ impl AppStore {
             ));
         }
         ensure_creation_allowed_tx(&tx, &session.user_id, &session.email)?;
-        let blocked_provider: Option<String> = tx
-            .query_row(
-                "SELECT qi.provider_id
-                 FROM client_market_allocation_quote_items qi
-                 JOIN host_provider_client_blocks b
-                   ON b.provider_id = qi.provider_id
-                  AND b.client_user_id = ?2
-                  AND b.lifted_at IS NULL
-                 WHERE qi.quote_id = ?1
-                 LIMIT 1",
-                params![quote_id, session.user_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| {
-                AppError::Internal(format!("recheck quoted Provider block failed: {error}"))
-            })?;
-        if blocked_provider.is_some() {
-            return Err(AppError::Conflict(
-                "a quoted Provider no longer accepts this account; cancel this quote and select another Host"
-                    .into(),
-            ));
-        }
         let item_count: i64 = tx
             .query_row(
                 "SELECT COUNT(*) FROM client_market_allocation_quote_items WHERE quote_id = ?1",
@@ -3223,7 +2758,8 @@ impl AppStore {
         for (item_id, subdomain, _, confirmed_revision) in prepared {
             let item = tx
                 .query_row(
-                    "SELECT host_id, provider_id, host_owner_email, country_code, offer_revision
+                    "SELECT host_id, provider_id, host_owner_email, country_code,
+                            daily_rate_minor, currency, offer_revision
                      FROM client_market_allocation_quote_items
                      WHERE id = ?1 AND quote_id = ?2",
                     params![item_id, quote_id],
@@ -3233,7 +2769,9 @@ impl AppStore {
                             row.get::<_, String>(1)?,
                             row.get::<_, String>(2)?,
                             row.get::<_, Option<String>>(3)?,
-                            row.get::<_, i64>(4)?,
+                            row.get::<_, Option<i64>>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                            row.get::<_, i64>(6)?,
                         ))
                     },
                 )
@@ -3242,17 +2780,36 @@ impl AppStore {
                 .ok_or_else(|| {
                     AppError::BadRequest("quote item does not belong to this quote".into())
                 })?;
-            if *confirmed_revision != item.4 {
+            if *confirmed_revision != item.6 {
                 return Err(AppError::Conflict(
                     "the confirmed Host offer revision does not match the allocation quote; review the current offer"
                         .into(),
                 ));
             }
+            crate::market_access::ensure_product_access_tx(
+                &tx,
+                &item.1,
+                &session.user_id,
+                &session.email,
+                crate::market_access::PRODUCT_CLIENT_HOST,
+            )?;
+            if item.4.is_some() {
+                crate::market_billing::ensure_credit_allowed_tx(
+                    &tx,
+                    &session.user_id,
+                    &session.email,
+                    &item.1,
+                    crate::market_access::PRODUCT_CLIENT_HOST,
+                    item.5.as_deref().ok_or_else(|| {
+                        AppError::Internal("paid quote item currency is missing".into())
+                    })?,
+                )?;
+            }
             let changed = tx
                 .execute(
                     "UPDATE router_ssh_hosts SET status = 'locked', updated_at = ?2
                      WHERE id = ?1 AND status = ?3 AND offer_revision = ?4",
-                    params![item.0, now.to_rfc3339(), HOST_STATUS_RESERVED, item.4],
+                    params![item.0, now.to_rfc3339(), HOST_STATUS_RESERVED, item.6],
                 )
                 .map_err(|error| AppError::Internal(format!("lock quoted Host failed: {error}")))?;
             if changed != 1 {
@@ -3454,529 +3011,42 @@ impl AppStore {
         Ok(())
     }
 
-    pub async fn client_market_list_billing_for_viewer(
+    pub async fn client_market_list_rentals_for_viewer(
         &self,
         session: &AuthSession,
-    ) -> Result<Vec<BillingView>, AppError> {
+    ) -> Result<Vec<RentalView>, AppError> {
         let conn = self.conn.lock().await;
-        load_billing_views(&conn, None, session)
+        load_rental_views(&conn, None, session)
     }
 
-    pub async fn client_market_billing_for_viewer(
+    pub async fn client_market_rental_for_viewer(
         &self,
         installation_id: &str,
         session: &AuthSession,
-    ) -> Result<BillingView, AppError> {
+    ) -> Result<RentalView, AppError> {
         let conn = self.conn.lock().await;
-        load_billing_views(&conn, Some(installation_id), session)?
+        load_rental_views(&conn, Some(installation_id), session)?
             .into_iter()
             .next()
-            .ok_or_else(|| AppError::NotFound("Client Market billing record not found".into()))
-    }
-
-    pub async fn client_market_declare_paid(
-        &self,
-        installation_id: &str,
-        invoice_id: &str,
-        expected_offer_revision: i64,
-        expected_payment_profile_updated_at: Option<&str>,
-        expected_amount_cents: Option<i64>,
-        session: &AuthSession,
-    ) -> Result<(), AppError> {
-        let now = Utc::now();
-        let mut conn = self.conn.lock().await;
-        let tx = conn.transaction().map_err(|error| {
-            AppError::Internal(format!("begin payment declaration failed: {error}"))
-        })?;
-        struct DeclarationSubscription {
-            client_user_id: String,
-            provider_id: String,
-            provider_email: String,
-            current_period_end: Option<String>,
-            status: String,
-            payment_profile_updated_at: Option<String>,
-        }
-        let subscription: Option<DeclarationSubscription> = tx
-            .query_row(
-                "SELECT s.client_user_id, s.provider_id,
-                        COALESCE(p.owner_email, s.host_owner_email),
-                        s.current_period_end, s.status, payment.updated_at
-                 FROM client_market_subscriptions s
-                 LEFT JOIN host_provider_profiles p ON p.provider_id = s.provider_id
-                 LEFT JOIN account_payment_profiles payment ON payment.user_id = s.provider_id
-                 WHERE s.installation_id = ?1",
-                params![installation_id],
-                |row| {
-                    Ok(DeclarationSubscription {
-                        client_user_id: row.get(0)?,
-                        provider_id: row.get(1)?,
-                        provider_email: row.get(2)?,
-                        current_period_end: row.get(3)?,
-                        status: row.get(4)?,
-                        payment_profile_updated_at: row.get(5)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(|error| AppError::Internal(format!("read subscription failed: {error}")))?;
-        let DeclarationSubscription {
-            client_user_id,
-            provider_id,
-            provider_email,
-            current_period_end: old_end,
-            status,
-            payment_profile_updated_at,
-        } = subscription
-            .ok_or_else(|| AppError::NotFound("Client Market subscription not found".into()))?;
-        if client_user_id != session.user_id {
-            return Err(AppError::Forbidden(
-                "only the Client owner may declare payment".into(),
-            ));
-        }
-        let invoice: Option<(String, i64, i64, i64, String, Option<String>)> = tx
-            .query_row(
-                "SELECT i.status, i.amount_cents, i.rental_period_days, i.offer_revision,
-                        i.deadline_at, d.client_user_id
-                 FROM client_market_invoices i
-                 LEFT JOIN client_market_payment_declarations d ON d.invoice_id = i.id
-                 WHERE i.id = ?1 AND i.installation_id = ?2",
-                params![invoice_id, installation_id],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(|error| AppError::Internal(format!("read invoice failed: {error}")))?;
-        let (invoice_status, price, period, invoice_revision, deadline_at, declared_by) =
-            invoice.ok_or_else(|| AppError::NotFound("open invoice not found".into()))?;
-        if invoice_status == "declared" && declared_by.as_deref() == Some(session.user_id.as_str())
-        {
-            tx.commit().map_err(|error| {
-                AppError::Internal(format!(
-                    "commit idempotent payment declaration failed: {error}"
-                ))
-            })?;
-            return Ok(());
-        }
-        if invoice_status != "open" {
-            return Err(AppError::Conflict("invoice was already resolved".into()));
-        }
-        if invoice_revision != expected_offer_revision {
-            return Err(AppError::Conflict(
-                "the Host offer changed; review the current price before confirming payment".into(),
-            ));
-        }
-        if let Some(expected_amount) = expected_amount_cents
-            && expected_amount != price
-        {
-            return Err(AppError::Conflict(
-                "the invoice amount changed; review the current price before confirming payment"
-                    .into(),
-            ));
-        }
-        if payment_profile_updated_at.as_deref() != expected_payment_profile_updated_at {
-            return Err(AppError::Conflict(
-                "the Provider payment details changed; review the current payment details before confirming payment"
-                    .into(),
-            ));
-        }
-        if parse_time(&deadline_at)? <= now {
-            return Err(AppError::Gone(
-                "the payment deadline has passed and this Client is being released".into(),
-            ));
-        }
-        if status != SUBSCRIPTION_PAYMENT_DUE {
-            return Err(AppError::Conflict(
-                "this Client does not currently have an open payment".into(),
-            ));
-        }
-        let base = old_end
-            .as_deref()
-            .map(parse_time)
-            .transpose()?
-            .filter(|end| *end > now)
-            .unwrap_or(now);
-        let next_end = base + Duration::days(period);
-        let current_client_email = normalize_email(&session.email)?;
-        let changed = tx
-            .execute(
-                "UPDATE client_market_invoices
-                 SET status = 'declared', declared_at = ?3
-                 WHERE id = ?1 AND installation_id = ?2 AND status = 'open'",
-                params![invoice_id, installation_id, now.to_rfc3339()],
-            )
-            .map_err(|error| AppError::Internal(format!("declare invoice paid failed: {error}")))?;
-        if changed != 1 {
-            return Err(AppError::Conflict(
-                "payment declaration raced with another action".into(),
-            ));
-        }
-        tx.execute(
-            "INSERT INTO client_market_payment_declarations
-                (id, invoice_id, installation_id, client_user_id, client_owner_email, declared_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                Uuid::new_v4().to_string(),
-                invoice_id,
-                installation_id,
-                session.user_id,
-                current_client_email,
-                now.to_rfc3339(),
-            ],
-        )
-        .map_err(|error| {
-            AppError::Internal(format!("insert payment declaration failed: {error}"))
-        })?;
-        tx.execute(
-            "UPDATE client_market_subscriptions
-             SET status = ?2, price_cents = ?3, rental_period_days = ?4,
-                 offer_revision = ?5, client_owner_email = ?6,
-                 last_declared_at = ?7, current_period_end = ?8,
-                 payment_deadline = NULL, updated_at = ?7
-             WHERE installation_id = ?1",
-            params![
-                installation_id,
-                SUBSCRIPTION_ACTIVE,
-                price,
-                period,
-                invoice_revision,
-                current_client_email,
-                now.to_rfc3339(),
-                next_end.to_rfc3339(),
-            ],
-        )
-        .map_err(|error| AppError::Internal(format!("advance subscription failed: {error}")))?;
-        let client_label = client_label_tx(&tx, installation_id)?;
-        let amount = format_offer_dollars(price);
-        let rows = [
-            ("Client", client_label.as_str()),
-            ("Declared by", session.email.as_str()),
-            ("Amount", amount.as_str()),
-        ];
-        enqueue_market_card_email_tx(
-            &tx,
-            "payment_declared",
-            &provider_email,
-            &format!("[Client Market] Payment declared for {client_label}"),
-            "Payment declared",
-            "The Client owner declared that payment was completed. Router has not verified receipt. Please check your own account; if payment is missing, you may release the Client from your Host.",
-            &rows,
-            None,
-            None,
-            None,
-            &format!("payment-declared:{invoice_id}:{provider_id}"),
-            now,
-        )?;
-        insert_audit_tx(
-            &tx,
-            Some(installation_id),
-            None,
-            Some(&session.user_id),
-            Some(&session.email),
-            "payment_declared",
-            serde_json::json!({
-                "invoiceId": invoice_id,
-                "amountCents": price,
-                "nextPeriodEnd": next_end.to_rfc3339(),
-                "routerVerified": false,
-            }),
-            now,
-        )?;
-        tx.commit().map_err(|error| {
-            AppError::Internal(format!("commit payment declaration failed: {error}"))
-        })?;
-        Ok(())
+            .ok_or_else(|| AppError::NotFound("Client Market rental not found".into()))
     }
 
     pub async fn client_market_reconcile_trade_state(
         &self,
         now: DateTime<Utc>,
-    ) -> Result<Vec<ExpiredBillingClient>, AppError> {
+    ) -> Result<(), AppError> {
         let mut conn = self.conn.lock().await;
         let tx = conn.transaction().map_err(|error| {
-            AppError::Internal(format!("begin billing reconcile failed: {error}"))
+            AppError::Internal(format!(
+                "begin Client Market quote reconcile failed: {error}"
+            ))
         })?;
         expire_quotes_tx(&tx, now)?;
-        let renewals = {
-            let mut statement = tx
-                .prepare(
-                    "SELECT installation_id, price_cents, rental_period_days, offer_revision,
-                            current_period_end, client_owner_email
-                     FROM client_market_subscriptions s
-                     WHERE status = 'active' AND price_cents IS NOT NULL
-                       AND rental_period_days IS NOT NULL AND current_period_end IS NOT NULL
-                       AND current_period_end <= ?1
-                       AND NOT EXISTS (
-                           SELECT 1 FROM client_market_invoices i
-                           WHERE i.installation_id = s.installation_id AND i.status = 'open'
-                       )",
-                )
-                .map_err(|error| {
-                    AppError::Internal(format!("prepare renewal reconcile failed: {error}"))
-                })?;
-            statement
-                .query_map(
-                    params![(now + Duration::hours(PAYMENT_WINDOW_HOURS)).to_rfc3339()],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, i64>(2)?,
-                            row.get::<_, i64>(3)?,
-                            row.get::<_, String>(4)?,
-                            row.get::<_, String>(5)?,
-                        ))
-                    },
-                )
-                .map_err(|error| AppError::Internal(format!("query renewals failed: {error}")))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| AppError::Internal(format!("read renewals failed: {error}")))?
-        };
-        for (installation_id, price, period, revision, due_at, client_email) in renewals {
-            let due = parse_time(&due_at)?;
-            open_invoice_tx(
-                &tx,
-                &installation_id,
-                price,
-                period,
-                revision,
-                Some(due),
-                due,
-                now,
-            )?;
-            let label = client_label_tx(&tx, &installation_id)?;
-            let due_text = due.to_rfc3339();
-            let rows = [
-                ("Client", label.as_str()),
-                ("Due by", due_text.as_str()),
-            ];
-            enqueue_market_card_email_tx(
-                &tx,
-                "renewal_due",
-                &client_email,
-                &format!("[Client Market] Payment due for {label}"),
-                "Payment due",
-                "The next payment for this Client is due. Please pay the Host Provider and declare payment in Router before the countdown reaches zero. The Client is released automatically after the deadline.",
-                &rows,
-                None,
-                None,
-                None,
-                &format!("renewal-due:{installation_id}:{}", due.timestamp()),
-                now,
-            )?;
-        }
-        let expired = {
-            let mut statement = tx
-                .prepare(
-                    "SELECT s.installation_id, t.subdomain
-                     FROM client_market_subscriptions s
-                     LEFT JOIN installation_client_tunnels t ON t.installation_id = s.installation_id
-                     WHERE s.status = 'payment_due' AND s.payment_deadline <= ?1",
-                )
-                .map_err(|error| AppError::Internal(format!("prepare overdue billing failed: {error}")))?;
-            statement
-                .query_map(params![now.to_rfc3339()], |row| {
-                    Ok(ExpiredBillingClient {
-                        installation_id: row.get(0)?,
-                        subdomain: row.get(1)?,
-                    })
-                })
-                .map_err(|error| {
-                    AppError::Internal(format!("query overdue billing failed: {error}"))
-                })?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| {
-                    AppError::Internal(format!("read overdue billing failed: {error}"))
-                })?
-        };
         tx.commit().map_err(|error| {
-            AppError::Internal(format!("commit billing reconcile failed: {error}"))
+            AppError::Internal(format!(
+                "commit Client Market quote reconcile failed: {error}"
+            ))
         })?;
-        Ok(expired)
-    }
-
-    pub async fn client_market_claim_email(
-        &self,
-        worker_id: &str,
-        now: DateTime<Utc>,
-        delivery_enabled: bool,
-    ) -> Result<Option<MarketEmailClaim>, AppError> {
-        if !delivery_enabled {
-            return Ok(None);
-        }
-        let mut conn = self.conn.lock().await;
-        let tx = conn.transaction().map_err(|error| {
-            AppError::Internal(format!("begin market email claim failed: {error}"))
-        })?;
-        tx.execute(
-            "UPDATE client_market_email_deliveries
-             SET status = 'retry', claim_owner = NULL, claim_expires_at = NULL, updated_at = ?1
-             WHERE status = 'claimed' AND claim_expires_at <= ?1",
-            params![now.to_rfc3339()],
-        )
-        .map_err(|error| AppError::Internal(format!("recover market emails failed: {error}")))?;
-        let id: Option<String> = tx
-            .query_row(
-                "SELECT id FROM client_market_email_deliveries
-                 WHERE status IN ('pending', 'retry') AND next_attempt_at <= ?1
-                 ORDER BY created_at, id LIMIT 1",
-                params![now.to_rfc3339()],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| AppError::Internal(format!("select market email failed: {error}")))?;
-        let Some(id) = id else {
-            tx.commit().map_err(|error| {
-                AppError::Internal(format!("commit empty email claim failed: {error}"))
-            })?;
-            return Ok(None);
-        };
-        let recipient: String = tx
-            .query_row(
-                "SELECT recipient FROM client_market_email_deliveries WHERE id = ?1",
-                params![id],
-                |row| row.get(0),
-            )
-            .map_err(|error| {
-                AppError::Internal(format!("read market email recipient failed: {error}"))
-            })?;
-        let hour_cutoff = (now - Duration::hours(1)).to_rfc3339();
-        let recent_sent: i64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM client_market_email_deliveries
-                 WHERE lower(recipient) = lower(?1)
-                   AND status = 'sent'
-                   AND updated_at >= ?2",
-                params![recipient, hour_cutoff],
-                |row| row.get(0),
-            )
-            .map_err(|error| {
-                AppError::Internal(format!("count market email recipient rate failed: {error}"))
-            })?;
-        if recent_sent >= MARKET_EMAIL_RECIPIENT_HOURLY_LIMIT {
-            tx.execute(
-                "UPDATE client_market_email_deliveries
-                 SET status = 'retry', next_attempt_at = ?2, claim_owner = NULL,
-                     claim_expires_at = NULL, updated_at = ?3
-                 WHERE id = ?1",
-                params![
-                    id,
-                    (now + Duration::seconds(MARKET_EMAIL_RATE_DEFER_SECS)).to_rfc3339(),
-                    now.to_rfc3339(),
-                ],
-            )
-            .map_err(|error| {
-                AppError::Internal(format!("defer rate-limited market email failed: {error}"))
-            })?;
-            tx.commit().map_err(|error| {
-                AppError::Internal(format!("commit rate-limited email defer failed: {error}"))
-            })?;
-            return Ok(None);
-        }
-        let changed = tx
-            .execute(
-                "UPDATE client_market_email_deliveries
-                 SET status = 'claimed', attempts = attempts + 1, claim_owner = ?2,
-                     claim_expires_at = ?3, updated_at = ?4
-                 WHERE id = ?1 AND status IN ('pending', 'retry')",
-                params![
-                    id,
-                    worker_id,
-                    (now + Duration::seconds(90)).to_rfc3339(),
-                    now.to_rfc3339(),
-                ],
-            )
-            .map_err(|error| AppError::Internal(format!("claim market email failed: {error}")))?;
-        if changed != 1 {
-            return Err(AppError::Conflict("market email claim raced".into()));
-        }
-        let claim = tx
-            .query_row(
-                "SELECT id, recipient, subject, html_body, text_body, idempotency_key, attempts
-                 FROM client_market_email_deliveries WHERE id = ?1 AND claim_owner = ?2",
-                params![id, worker_id],
-                |row| {
-                    Ok(MarketEmailClaim {
-                        id: row.get(0)?,
-                        recipient: row.get(1)?,
-                        subject: row.get(2)?,
-                        html: row.get(3)?,
-                        text: row.get(4)?,
-                        idempotency_key: row.get(5)?,
-                        attempts: row.get::<_, i64>(6)? as u32,
-                    })
-                },
-            )
-            .map_err(|error| {
-                AppError::Internal(format!("read claimed market email failed: {error}"))
-            })?;
-        tx.commit().map_err(|error| {
-            AppError::Internal(format!("commit market email claim failed: {error}"))
-        })?;
-        Ok(Some(claim))
-    }
-
-    pub async fn client_market_finish_email(
-        &self,
-        id: &str,
-        worker_id: &str,
-        provider_message_id: Option<&str>,
-        error_message: Option<&str>,
-        retry_at: Option<DateTime<Utc>>,
-    ) -> Result<(), AppError> {
-        let conn = self.conn.lock().await;
-        let now = Utc::now().to_rfc3339();
-        let (status, next_attempt, sent_at) = if provider_message_id.is_some() {
-            ("sent", None, Some(now.clone()))
-        } else if let Some(retry_at) = retry_at {
-            ("retry", Some(retry_at.to_rfc3339()), None)
-        } else {
-            ("failed", None, None)
-        };
-        let changed = conn
-            .execute(
-                "UPDATE client_market_email_deliveries
-                 SET status = ?3, provider_message_id = ?4, error_message = ?5,
-                     next_attempt_at = COALESCE(?6, next_attempt_at), claim_owner = NULL,
-                     claim_expires_at = NULL, sent_at = ?7, updated_at = ?8
-                 WHERE id = ?1 AND claim_owner = ?2 AND status = 'claimed'",
-                params![
-                    id,
-                    worker_id,
-                    status,
-                    provider_message_id,
-                    error_message,
-                    next_attempt,
-                    sent_at,
-                    now
-                ],
-            )
-            .map_err(|error| AppError::Internal(format!("finish market email failed: {error}")))?;
-        if changed != 1 {
-            return Err(AppError::Conflict("market email claim was lost".into()));
-        }
-        if status == "sent" {
-            conn.execute(
-                "INSERT OR IGNORE INTO email_send_logs (
-                    id, email_type, to_email, provider_message_id, status,
-                    error_message, created_at
-                 )
-                 SELECT id, 'client_market', recipient, provider_message_id,
-                        'sent', NULL, ?2
-                 FROM client_market_email_deliveries WHERE id = ?1",
-                params![id, now],
-            )
-            .map_err(|error| {
-                AppError::Internal(format!("record sent Client Market email failed: {error}"))
-            })?;
-        }
         Ok(())
     }
 }
@@ -3989,8 +3059,8 @@ struct QuoteCandidate {
     country_code: Option<String>,
     hostname: Option<String>,
     ip: Option<String>,
-    price_cents: Option<i64>,
-    rental_period_days: Option<i64>,
+    daily_rate_minor: Option<i64>,
+    currency: Option<String>,
     offer_revision: i64,
 }
 
@@ -4002,8 +3072,8 @@ fn map_quote_candidate(row: &rusqlite::Row<'_>) -> rusqlite::Result<QuoteCandida
         country_code: row.get(3)?,
         hostname: row.get(4)?,
         ip: row.get(5)?,
-        price_cents: row.get(6)?,
-        rental_period_days: row.get(7)?,
+        daily_rate_minor: row.get(6)?,
+        currency: row.get(7)?,
         offer_revision: row.get(8)?,
     })
 }
@@ -4072,14 +3142,16 @@ fn ensure_creation_allowed_tx(
         .query_row(
             "SELECT COUNT(*) FROM client_market_subscriptions
              WHERE client_user_id = ?1
-               AND status IN ('payment_due', 'releasing', 'release_failed')",
+               AND status IN ('releasing', 'release_failed')",
             params![user_id],
             |row| row.get(0),
         )
-        .map_err(|error| AppError::Internal(format!("check unpaid Client gate failed: {error}")))?;
+        .map_err(|error| {
+            AppError::Internal(format!("check Client cleanup gate failed: {error}"))
+        })?;
     if blocked_subscription > 0 {
         return Err(AppError::Conflict(
-            "resolve the current unpaid or releasing Client before creating another".into(),
+            "finish the current Client cleanup before creating another".into(),
         ));
     }
     let active_jobs: i64 = tx
@@ -4101,343 +3173,8 @@ fn ensure_creation_allowed_tx(
     Ok(())
 }
 
-fn apply_offer_to_subscriptions_tx(
-    tx: &Transaction<'_>,
-    host_id: &str,
-    price: Option<i64>,
-    period: Option<i64>,
-    revision: i64,
-    now: DateTime<Utc>,
-) -> Result<(), AppError> {
-    let subscriptions = {
-        let mut statement = tx
-            .prepare(
-                "SELECT installation_id, status, current_period_end, client_owner_email
-                 FROM client_market_subscriptions
-                 WHERE host_id = ?1 AND status != 'released'",
-            )
-            .map_err(|error| {
-                AppError::Internal(format!("prepare Host subscriptions failed: {error}"))
-            })?;
-        statement
-            .query_map(params![host_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })
-            .map_err(|error| {
-                AppError::Internal(format!("query Host subscriptions failed: {error}"))
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| {
-                AppError::Internal(format!("read Host subscriptions failed: {error}"))
-            })?
-    };
-    for (installation_id, status, current_period_end, client_owner_email) in subscriptions {
-        if price.is_none() || period.is_none() {
-            tx.execute(
-                "UPDATE client_market_invoices SET status = 'canceled', canceled_at = ?2
-                 WHERE installation_id = ?1 AND status = 'open'",
-                params![installation_id, now.to_rfc3339()],
-            )
-            .map_err(|error| {
-                AppError::Internal(format!("cancel free Host invoice failed: {error}"))
-            })?;
-            tx.execute(
-                "UPDATE client_market_subscriptions
-                 SET status = 'active', price_cents = NULL, rental_period_days = NULL,
-                     offer_revision = ?2, current_period_end = NULL, payment_deadline = NULL,
-                     updated_at = ?3
-                 WHERE installation_id = ?1",
-                params![installation_id, revision, now.to_rfc3339()],
-            )
-            .map_err(|error| {
-                AppError::Internal(format!("make subscription free failed: {error}"))
-            })?;
-            enqueue_offer_changed_email_tx(
-                tx,
-                &installation_id,
-                &client_owner_email,
-                price,
-                period,
-                revision,
-                now,
-            )?;
-            continue;
-        }
-        let price = price.unwrap_or_default();
-        let period = period.unwrap_or_default();
-        if status == SUBSCRIPTION_PAYMENT_DUE {
-            let changed = tx
-                .execute(
-                    "UPDATE client_market_invoices
-                 SET amount_cents = ?2, rental_period_days = ?3, offer_revision = ?4
-                 WHERE installation_id = ?1 AND status = 'open'",
-                    params![installation_id, price, period, revision],
-                )
-                .map_err(|error| {
-                    AppError::Internal(format!("update open invoice offer failed: {error}"))
-                })?;
-            if changed != 1 {
-                return Err(AppError::Internal(
-                    "payment-due subscription has no open invoice".into(),
-                ));
-            }
-            tx.execute(
-                "UPDATE client_market_subscriptions
-                 SET price_cents = ?2, rental_period_days = ?3, offer_revision = ?4, updated_at = ?5
-                 WHERE installation_id = ?1",
-                params![installation_id, price, period, revision, now.to_rfc3339()],
-            )
-            .map_err(|error| {
-                AppError::Internal(format!("update pending subscription offer failed: {error}"))
-            })?;
-            enqueue_offer_changed_email_tx(
-                tx,
-                &installation_id,
-                &client_owner_email,
-                Some(price),
-                Some(period),
-                revision,
-                now,
-            )?;
-            continue;
-        }
-        if matches!(
-            status.as_str(),
-            SUBSCRIPTION_RELEASING | SUBSCRIPTION_RELEASE_FAILED
-        ) {
-            tx.execute(
-                "UPDATE client_market_subscriptions
-                 SET price_cents = ?2, rental_period_days = ?3, offer_revision = ?4, updated_at = ?5
-                 WHERE installation_id = ?1",
-                params![installation_id, price, period, revision, now.to_rfc3339()],
-            )
-            .map_err(|error| {
-                AppError::Internal(format!(
-                    "update releasing subscription offer failed: {error}"
-                ))
-            })?;
-            continue;
-        }
-        let Some(current_period_end) = current_period_end else {
-            let deadline = now + Duration::hours(PAYMENT_WINDOW_HOURS);
-            open_invoice_tx(
-                tx,
-                &installation_id,
-                price,
-                period,
-                revision,
-                None,
-                deadline,
-                now,
-            )?;
-            enqueue_offer_changed_email_tx(
-                tx,
-                &installation_id,
-                &client_owner_email,
-                Some(price),
-                Some(period),
-                revision,
-                now,
-            )?;
-            continue;
-        };
-        let frozen_end = parse_time(&current_period_end)?;
-        let should_open = frozen_end <= now + Duration::hours(PAYMENT_WINDOW_HOURS);
-        if should_open {
-            let deadline = if frozen_end <= now {
-                now + Duration::hours(PAYMENT_WINDOW_HOURS)
-            } else {
-                frozen_end
-            };
-            open_invoice_tx(
-                tx,
-                &installation_id,
-                price,
-                period,
-                revision,
-                Some(frozen_end),
-                deadline,
-                now,
-            )?;
-        } else {
-            tx.execute(
-                "UPDATE client_market_subscriptions
-                 SET price_cents = ?2, rental_period_days = ?3, offer_revision = ?4,
-                     updated_at = ?5
-                 WHERE installation_id = ?1",
-                params![installation_id, price, period, revision, now.to_rfc3339(),],
-            )
-            .map_err(|error| {
-                AppError::Internal(format!("update next subscription offer failed: {error}"))
-            })?;
-        }
-        enqueue_offer_changed_email_tx(
-            tx,
-            &installation_id,
-            &client_owner_email,
-            Some(price),
-            Some(period),
-            revision,
-            now,
-        )?;
-    }
-    Ok(())
-}
-
-fn enqueue_offer_changed_email_tx(
-    tx: &Transaction<'_>,
-    installation_id: &str,
-    recipient: &str,
-    price: Option<i64>,
-    period: Option<i64>,
-    revision: i64,
-    now: DateTime<Utc>,
-) -> Result<(), AppError> {
-    let label = client_label_tx(tx, installation_id)?;
-    let offer_text = match (price, period) {
-        (Some(price), Some(period)) => format!("{} / {period} days", format_offer_dollars(price)),
-        _ => "Free forever".to_string(),
-    };
-    let (intro, note) = match (price, period) {
-        (Some(_), Some(_)) => (
-            "The Host Provider changed the offer for this Client. The new offer applies immediately to an unpaid invoice and to the next billing period. Any current paid period keeps its existing end date. If this Client did not yet have a paid period, a three-day payment window has started.",
-            Some("Open Router Clients to review the deadline or release the Client."),
-        ),
-        _ => (
-            "The Host Provider changed the offer for this Client to free forever. Any open invoice and payment countdown for this Client have been canceled.",
-            None,
-        ),
-    };
-    let rows = [("Client", label.as_str()), ("New offer", offer_text.as_str())];
-    enqueue_market_card_email_tx(
-        tx,
-        "host_offer_changed",
-        recipient,
-        &format!("[Client Market] Host offer changed for {label}"),
-        "Host offer changed",
-        intro,
-        &rows,
-        None,
-        None,
-        note,
-        &format!("host-offer-changed:{installation_id}:{revision}"),
-        now,
-    )
-}
-
-fn open_invoice_tx(
-    tx: &Transaction<'_>,
-    installation_id: &str,
-    price: i64,
-    period: i64,
-    revision: i64,
-    due_at: Option<DateTime<Utc>>,
-    deadline: DateTime<Utc>,
-    now: DateTime<Utc>,
-) -> Result<String, AppError> {
-    let existing: Option<String> = tx
-        .query_row(
-            "SELECT id FROM client_market_invoices
-             WHERE installation_id = ?1 AND status = 'open'",
-            params![installation_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| AppError::Internal(format!("check open invoice failed: {error}")))?;
-    if let Some(id) = existing {
-        tx.execute(
-            "UPDATE client_market_invoices
-             SET amount_cents = ?2, rental_period_days = ?3, offer_revision = ?4,
-                 due_at = ?5, deadline_at = ?6
-             WHERE id = ?1 AND status = 'open'",
-            params![
-                id,
-                price,
-                period,
-                revision,
-                due_at.map(|value| value.to_rfc3339()),
-                deadline.to_rfc3339()
-            ],
-        )
-        .map_err(|error| AppError::Internal(format!("refresh open invoice failed: {error}")))?;
-        tx.execute(
-            "UPDATE client_market_subscriptions
-             SET status = ?2, price_cents = ?3, rental_period_days = ?4,
-                 offer_revision = ?5, current_period_end = COALESCE(?6, current_period_end),
-                 payment_deadline = ?7, updated_at = ?8
-             WHERE installation_id = ?1",
-            params![
-                installation_id,
-                SUBSCRIPTION_PAYMENT_DUE,
-                price,
-                period,
-                revision,
-                due_at.map(|value| value.to_rfc3339()),
-                deadline.to_rfc3339(),
-                now.to_rfc3339(),
-            ],
-        )
-        .map_err(|error| {
-            AppError::Internal(format!("refresh payment due subscription failed: {error}"))
-        })?;
-        return Ok(id);
-    }
-    let sequence: i64 = tx
-        .query_row(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM client_market_invoices WHERE installation_id = ?1",
-            params![installation_id],
-            |row| row.get(0),
-        )
-        .map_err(|error| AppError::Internal(format!("allocate invoice sequence failed: {error}")))?;
-    let id = Uuid::new_v4().to_string();
-    tx.execute(
-        "INSERT INTO client_market_invoices
-            (id, installation_id, sequence, amount_cents, rental_period_days,
-             offer_revision, status, due_at, deadline_at, opened_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, ?9)",
-        params![
-            id,
-            installation_id,
-            sequence,
-            price,
-            period,
-            revision,
-            due_at.map(|value| value.to_rfc3339()),
-            deadline.to_rfc3339(),
-            now.to_rfc3339(),
-        ],
-    )
-    .map_err(|error| AppError::Internal(format!("insert invoice failed: {error}")))?;
-    tx.execute(
-        "UPDATE client_market_subscriptions
-         SET status = ?2, price_cents = ?3, rental_period_days = ?4,
-             offer_revision = ?5, current_period_end = COALESCE(?6, current_period_end),
-             payment_deadline = ?7, updated_at = ?8
-         WHERE installation_id = ?1",
-        params![
-            installation_id,
-            SUBSCRIPTION_PAYMENT_DUE,
-            price,
-            period,
-            revision,
-            due_at.map(|value| value.to_rfc3339()),
-            deadline.to_rfc3339(),
-            now.to_rfc3339(),
-        ],
-    )
-    .map_err(|error| {
-        AppError::Internal(format!("mark subscription payment due failed: {error}"))
-    })?;
-    Ok(id)
-}
-
 #[derive(Debug)]
-struct BillingRow {
+struct RentalRow {
     installation_id: String,
     host_id: String,
     provider_id: String,
@@ -4445,36 +3182,27 @@ struct BillingRow {
     client_user_id: String,
     client_owner_email: String,
     status: String,
-    price_cents: Option<i64>,
-    rental_period_days: Option<i64>,
+    daily_rate_minor: Option<i64>,
+    currency: Option<String>,
     offer_revision: i64,
-    current_period_end: Option<String>,
-    payment_deadline: Option<String>,
-    open_invoice_id: Option<String>,
     methods_json: String,
     contacts_json: String,
-    payment_profile_updated_at: Option<String>,
     active_cleanup_job_id: Option<String>,
     updated_at: String,
 }
 
-fn load_billing_views(
+fn load_rental_views(
     conn: &Connection,
     installation_id: Option<&str>,
     session: &AuthSession,
-) -> Result<Vec<BillingView>, AppError> {
+) -> Result<Vec<RentalView>, AppError> {
     let mut sql = "SELECT s.installation_id, s.host_id, s.provider_id, s.host_owner_email,
-                s.client_user_id, s.client_owner_email, s.status, s.price_cents,
-                s.rental_period_days, s.offer_revision, s.current_period_end,
-                s.payment_deadline,
-                (SELECT id FROM client_market_invoices i
-                 WHERE i.installation_id = s.installation_id AND i.status = 'open' LIMIT 1),
+                s.client_user_id, s.client_owner_email, s.status, s.daily_rate_minor,
+                s.currency, s.offer_revision,
                 COALESCE((SELECT methods_json FROM account_payment_profiles p
                           WHERE p.user_id = s.provider_id), '[]'),
                 COALESCE((SELECT contacts_json FROM account_payment_profiles p
                           WHERE p.user_id = s.provider_id), '[]'),
-                (SELECT updated_at FROM account_payment_profiles p
-                 WHERE p.user_id = s.provider_id),
                 (SELECT j.id FROM provisioning_jobs j
                  WHERE j.installation_id = s.installation_id
                    AND j.type = 'cleanup'
@@ -4490,9 +3218,9 @@ fn load_billing_views(
     sql.push_str(" ORDER BY s.updated_at DESC, s.installation_id");
     let mut statement = conn
         .prepare(&sql)
-        .map_err(|error| AppError::Internal(format!("prepare billing list failed: {error}")))?;
+        .map_err(|error| AppError::Internal(format!("prepare rental list failed: {error}")))?;
     let mapper = |row: &rusqlite::Row<'_>| {
-        Ok(BillingRow {
+        Ok(RentalRow {
             installation_id: row.get(0)?,
             host_id: row.get(1)?,
             provider_id: row.get(2)?,
@@ -4500,31 +3228,27 @@ fn load_billing_views(
             client_user_id: row.get(4)?,
             client_owner_email: row.get(5)?,
             status: row.get(6)?,
-            price_cents: row.get(7)?,
-            rental_period_days: row.get(8)?,
+            daily_rate_minor: row.get(7)?,
+            currency: row.get(8)?,
             offer_revision: row.get(9)?,
-            current_period_end: row.get(10)?,
-            payment_deadline: row.get(11)?,
-            open_invoice_id: row.get(12)?,
-            methods_json: row.get(13)?,
-            contacts_json: row.get(14)?,
-            payment_profile_updated_at: row.get(15)?,
-            active_cleanup_job_id: row.get(16)?,
-            updated_at: row.get(17)?,
+            methods_json: row.get(10)?,
+            contacts_json: row.get(11)?,
+            active_cleanup_job_id: row.get(12)?,
+            updated_at: row.get(13)?,
         })
     };
     let rows = if let Some(installation_id) = installation_id {
         statement
             .query_map(params![installation_id], mapper)
-            .map_err(|error| AppError::Internal(format!("query billing record failed: {error}")))?
+            .map_err(|error| AppError::Internal(format!("query rental failed: {error}")))?
             .collect::<Result<Vec<_>, _>>()
     } else {
         statement
             .query_map([], mapper)
-            .map_err(|error| AppError::Internal(format!("query billing list failed: {error}")))?
+            .map_err(|error| AppError::Internal(format!("query rental list failed: {error}")))?
             .collect::<Result<Vec<_>, _>>()
     }
-    .map_err(|error| AppError::Internal(format!("read billing rows failed: {error}")))?;
+    .map_err(|error| AppError::Internal(format!("read rental rows failed: {error}")))?;
     let mut output = Vec::new();
     for row in rows {
         let client_role = row.client_user_id == session.user_id;
@@ -4532,40 +3256,27 @@ fn load_billing_views(
         if !client_role && !provider_role {
             continue;
         }
-        let mut methods: Vec<PaymentMethod> =
+        let methods: Vec<PaymentMethod> =
             serde_json::from_str(&row.methods_json).unwrap_or_default();
-        for method in &mut methods {
-            // Renters use the authenticated, Router-cached asset only. The
-            // Provider's source URL may contain private query parameters.
-            method.qr_image_url = None;
-        }
         let mut kinds = methods
             .iter()
             .map(|method| method.kind.clone())
             .collect::<Vec<_>>();
         kinds.sort();
         kinds.dedup();
-        output.push(BillingView {
+        output.push(RentalView {
             installation_id: row.installation_id,
             host_id: row.host_id,
             provider_id: row.provider_id,
             host_owner_email: row.host_owner_email,
             client_owner_email: row.client_owner_email,
             status: row.status.clone(),
-            price_cents: row.price_cents,
-            rental_period_days: row.rental_period_days,
+            daily_rate_minor: row.daily_rate_minor,
+            currency: row.currency,
             offer_revision: row.offer_revision,
-            current_period_end: row.current_period_end,
-            payment_deadline: row.payment_deadline,
-            open_invoice_id: row.open_invoice_id,
-            payment_methods: Some(methods),
             payment_method_kinds: kinds,
             contacts: serde_json::from_str(&row.contacts_json).unwrap_or_default(),
-            payment_profile_updated_at: row.payment_profile_updated_at,
             is_client_owner: client_role,
-            can_declare_paid: client_role
-                && row.status == SUBSCRIPTION_PAYMENT_DUE
-                && row.price_cents.is_some(),
             can_release: (client_role || provider_role)
                 && row.status != SUBSCRIPTION_RELEASED
                 && row.status != SUBSCRIPTION_RELEASING,
@@ -4574,6 +3285,245 @@ fn load_billing_views(
         });
     }
     Ok(output)
+}
+
+fn client_market_event_is_chat_visible(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "client_provisioned"
+            | "cleanup_started"
+            | "cleanup_finished"
+            | "cleanup_failed"
+            | "subscription_force_released"
+    )
+}
+
+type ClientMarketChatContext = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<i64>,
+    Option<String>,
+    i64,
+    String,
+    Option<String>,
+);
+
+fn client_market_event_fallback_status(event_type: &str) -> &'static str {
+    match event_type {
+        "client_provisioned" => SUBSCRIPTION_ACTIVE,
+        "cleanup_started" => SUBSCRIPTION_RELEASING,
+        "cleanup_finished" | "subscription_force_released" => SUBSCRIPTION_RELEASED,
+        "cleanup_failed" => SUBSCRIPTION_RELEASE_FAILED,
+        _ => "unknown",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enqueue_client_market_chat_event_tx(
+    tx: &Transaction<'_>,
+    source_event_id: &str,
+    installation_id: &str,
+    host_id: Option<&str>,
+    actor_user_id: Option<&str>,
+    actor_email: Option<&str>,
+    event_type: &str,
+    detail: &serde_json::Value,
+    now: &str,
+) -> Result<(), AppError> {
+    if !client_market_event_is_chat_visible(event_type) {
+        return Ok(());
+    }
+    let context: Option<ClientMarketChatContext> = tx
+        .query_row(
+            "SELECT COALESCE(NULLIF(t.subdomain, ''), s.installation_id),
+                    s.client_user_id, s.client_owner_email, s.provider_id,
+                    COALESCE(p.owner_email, s.host_owner_email),
+                    s.daily_rate_minor, s.currency, s.offer_revision, s.status,
+                    h.hostname
+             FROM client_market_subscriptions s
+             LEFT JOIN installation_client_tunnels t ON t.installation_id = s.installation_id
+             LEFT JOIN host_provider_profiles p ON p.provider_id = s.provider_id
+             LEFT JOIN router_ssh_hosts h ON h.id = s.host_id
+             WHERE s.installation_id = ?1",
+            params![installation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| {
+            AppError::Internal(format!("read Client Market chat context failed: {error}"))
+        })?;
+    let context = if context.is_some() {
+        context
+    } else {
+        tx.query_row(
+            "SELECT COALESCE(NULLIF(t.subdomain, ''), i.id),
+                    COALESCE(
+                        (SELECT u.id FROM users u
+                         WHERE u.email_normalized = lower(trim(COALESCE(NULLIF(i.owner_email, ''), t.owner_email)))),
+                        'email:' || lower(trim(COALESCE(NULLIF(i.owner_email, ''), t.owner_email)))
+                    ),
+                    COALESCE(NULLIF(i.owner_email, ''), t.owner_email),
+                    COALESCE(
+                        NULLIF(h.provider_id, ''),
+                        (SELECT profile.provider_id FROM host_provider_profiles profile
+                         WHERE lower(profile.owner_email) = lower(h.host_owner_email)
+                         ORDER BY CASE WHEN profile.provider_id LIKE 'email:%' THEN 1 ELSE 0 END,
+                                  profile.created_at
+                         LIMIT 1),
+                        (SELECT u.id FROM users u
+                         WHERE u.email_normalized = lower(trim(h.host_owner_email))),
+                        'email:' || lower(trim(h.host_owner_email))
+                    ),
+                    COALESCE(p.owner_email, h.host_owner_email),
+                    h.daily_rate_minor,
+                    CASE WHEN h.daily_rate_minor IS NULL THEN NULL
+                         ELSE COALESCE(NULLIF(trim(h.currency), ''), 'USD') END,
+                    COALESCE(h.offer_revision, 1), ?3, h.hostname
+             FROM installations i
+             LEFT JOIN installation_client_tunnels t ON t.installation_id = i.id
+             LEFT JOIN router_ssh_hosts h ON h.id = COALESCE(?2, i.provision_host_id)
+             LEFT JOIN host_provider_profiles p ON p.provider_id = h.provider_id
+             WHERE i.id = ?1
+               AND h.id IS NOT NULL
+               AND COALESCE(NULLIF(i.owner_email, ''), NULLIF(t.owner_email, '')) IS NOT NULL
+               AND NULLIF(h.host_owner_email, '') IS NOT NULL",
+            params![
+                installation_id,
+                host_id,
+                client_market_event_fallback_status(event_type)
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "read fallback Client Market chat context failed: {error}"
+            ))
+        })?
+    };
+    let Some((
+        client_label,
+        client_user_id,
+        client_owner_email,
+        provider_user_id,
+        provider_email,
+        daily_rate_minor,
+        currency,
+        offer_revision,
+        status,
+        hostname,
+    )) = context
+    else {
+        return Ok(());
+    };
+    let summary = format!("{client_label}: {}", event_type.replace('_', " "));
+    let mut payload = serde_json::json!({
+        "summary": summary,
+        "marketKind": "client",
+        "installationId": installation_id,
+        "clientLabel": client_label,
+        "clientUserId": client_user_id,
+        "clientOwnerEmail": client_owner_email,
+        "providerUserId": provider_user_id,
+        "providerEmail": provider_email,
+        "hostId": host_id,
+        "hostname": hostname,
+        "status": status,
+        "dailyRateMinor": daily_rate_minor,
+        "currency": currency,
+        "offerRevision": offer_revision,
+        "actorUserId": actor_user_id,
+        "actorEmail": actor_email,
+    });
+    let output = payload
+        .as_object_mut()
+        .expect("Client Market chat payload is an object");
+    for field in [
+        "previousStatus",
+        "hostStatus",
+        "reason",
+        "failureCode",
+        "providerDeniedClientAccess",
+        "trialHours",
+    ] {
+        if let Some(value) = detail.get(field) {
+            output.insert(field.into(), value.clone());
+        }
+    }
+    if let Some((methods_json, contacts_json)) = tx
+        .query_row(
+            "SELECT methods_json, COALESCE(contacts_json, '[]')
+             FROM account_payment_profiles WHERE user_id = ?1",
+            params![provider_user_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "read Client Market chat payment profile failed: {error}"
+            ))
+        })?
+    {
+        output.insert(
+            "paymentMethods".into(),
+            serde_json::from_str(&methods_json).map_err(|error| {
+                AppError::Internal(format!(
+                    "parse Client Market chat payment methods failed: {error}"
+                ))
+            })?,
+        );
+        output.insert(
+            "paymentContacts".into(),
+            serde_json::from_str(&contacts_json).map_err(|error| {
+                AppError::Internal(format!(
+                    "parse Client Market chat payment contacts failed: {error}"
+                ))
+            })?,
+        );
+    }
+    let mut followers = vec![client_user_id, provider_user_id];
+    if let Some(actor_user_id) = actor_user_id {
+        followers.push(actor_user_id.to_string());
+    }
+    crate::store::client_chat::enqueue_client_system_event_tx(
+        tx,
+        installation_id,
+        "client_market",
+        source_event_id,
+        event_type,
+        payload,
+        &followers,
+        now,
+    )
 }
 
 fn insert_audit_tx(
@@ -4586,6 +3536,7 @@ fn insert_audit_tx(
     detail: serde_json::Value,
     now: DateTime<Utc>,
 ) -> Result<(), AppError> {
+    let detail = crate::store::client_chat::sanitize_system_event_payload(detail)?;
     let event_id = Uuid::new_v4().to_string();
     let detail_json = detail.to_string();
     let created_at = now.to_rfc3339();
@@ -4654,131 +3605,19 @@ fn insert_audit_tx(
                 "insert Client Market subscription event failed: {error}"
             ))
         })?;
+        enqueue_client_market_chat_event_tx(
+            tx,
+            &event_id,
+            installation_id,
+            host_id,
+            actor_user_id,
+            actor_email,
+            event_type,
+            &detail,
+            &created_at,
+        )?;
     }
     Ok(())
-}
-
-fn market_clients_url(dashboard_url: &str) -> String {
-    format!("{}/clients/", dashboard_url.trim_end_matches('/'))
-}
-
-fn market_client_public_url(dashboard_url: &str, subdomain: &str) -> Option<String> {
-    let subdomain = subdomain.trim();
-    if subdomain.is_empty() {
-        return None;
-    }
-    let url = Url::parse(dashboard_url).ok()?;
-    let host = url.host_str()?;
-    if host.contains(':') {
-        return None;
-    }
-    let port = url
-        .port()
-        .map(|value| format!(":{value}"))
-        .unwrap_or_default();
-    Some(format!(
-        "{}://{subdomain}.{host}{port}/",
-        url.scheme()
-    ))
-}
-
-fn format_offer_dollars(price_cents: i64) -> String {
-    format!("${:.2}", price_cents as f64 / 100.0)
-}
-
-fn enqueue_rendered_email_tx(
-    tx: &Transaction<'_>,
-    kind: &str,
-    recipient: &str,
-    rendered: &RenderedNotificationEmail,
-    idempotency_key: &str,
-    now: DateTime<Utc>,
-) -> Result<(), AppError> {
-    let event_id = Uuid::new_v4().to_string();
-    tx.execute(
-        "INSERT INTO client_market_email_events
-            (id, kind, recipient, subject, html_body, text_body, idempotency_key, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-         ON CONFLICT(idempotency_key) DO NOTHING",
-        params![
-            event_id,
-            kind,
-            recipient,
-            rendered.subject,
-            rendered.html,
-            rendered.text,
-            idempotency_key,
-            now.to_rfc3339(),
-        ],
-    )
-    .map_err(|error| {
-        AppError::Internal(format!("enqueue Client Market email event failed: {error}"))
-    })?;
-    let event_id: String = tx
-        .query_row(
-            "SELECT id FROM client_market_email_events WHERE idempotency_key = ?1",
-            params![idempotency_key],
-            |row| row.get(0),
-        )
-        .map_err(|error| {
-            AppError::Internal(format!("read Client Market email event failed: {error}"))
-        })?;
-    tx.execute(
-        "INSERT INTO client_market_email_deliveries
-            (id, event_id, kind, recipient, subject, html_body, text_body, idempotency_key,
-             status, attempts, next_attempt_at, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', 0, ?9, ?9, ?9)
-         ON CONFLICT(idempotency_key) DO NOTHING",
-        params![
-            Uuid::new_v4().to_string(),
-            event_id,
-            kind,
-            recipient,
-            rendered.subject,
-            rendered.html,
-            rendered.text,
-            idempotency_key,
-            now.to_rfc3339(),
-        ],
-    )
-    .map_err(|error| AppError::Internal(format!("enqueue Client Market email failed: {error}")))?;
-    Ok(())
-}
-
-fn enqueue_market_card_email_tx(
-    tx: &Transaction<'_>,
-    kind: &str,
-    recipient: &str,
-    subject: &str,
-    title: &str,
-    introduction: &str,
-    rows: &[(&str, &str)],
-    action_label: Option<&str>,
-    action_url: Option<&str>,
-    note: Option<&str>,
-    idempotency_key: &str,
-    now: DateTime<Utc>,
-) -> Result<(), AppError> {
-    let rendered = render_transactional_card_email(
-        subject,
-        title,
-        subject,
-        introduction,
-        rows,
-        action_label,
-        action_url,
-        note,
-        MARKET_EMAIL_FOOTER,
-    );
-    enqueue_rendered_email_tx(tx, kind, recipient, &rendered, idempotency_key, now)
-}
-
-/// High-risk cleanup reasons still notify both parties when cleanup starts.
-fn cleanup_started_email_worthy(reason: &str) -> bool {
-    matches!(
-        reason,
-        "payment_not_received" | "payment_deadline_expired"
-    )
 }
 
 fn client_label_tx(tx: &Transaction<'_>, installation_id: &str) -> Result<String, AppError> {
@@ -4793,26 +3632,12 @@ fn client_label_tx(tx: &Transaction<'_>, installation_id: &str) -> Result<String
         .unwrap_or_else(|| installation_id.to_string()))
 }
 
-fn setup_password_hint_tx(
-    tx: &Transaction<'_>,
-    installation_id: &str,
-) -> Result<Option<String>, AppError> {
-    tx.query_row(
-        "SELECT password_hint FROM installation_setup_completions WHERE installation_id = ?1",
-        params![installation_id],
-        |row| row.get::<_, Option<String>>(0),
-    )
-    .optional()
-    .map_err(|error| AppError::Internal(format!("read setup password hint failed: {error}")))
-    .map(|value| value.flatten().filter(|hint| !hint.trim().is_empty()))
-}
-
 pub(crate) fn complete_provisioning_tx(
     tx: &Transaction<'_>,
     job_id: &str,
     host_id: &str,
     installation_id: &str,
-    dashboard_url: &str,
+    _dashboard_url: &str,
     now: DateTime<Utc>,
 ) -> Result<(), AppError> {
     let context: Option<(
@@ -4821,16 +3646,18 @@ pub(crate) fn complete_provisioning_tx(
         String,
         String,
         Option<i64>,
-        Option<i64>,
-        i64,
         Option<String>,
+        i64,
     )> = tx
         .query_row(
             "SELECT h.provider_id, h.host_owner_email, j.client_owner_email,
                     COALESCE(j.client_owner_user_id,
                              (SELECT u.id FROM users u WHERE u.email_normalized = LOWER(j.client_owner_email)),
                              'email:' || LOWER(j.client_owner_email)),
-                    h.price_cents, h.rental_period_days, h.offer_revision, h.hostname
+                    h.daily_rate_minor,
+                    CASE WHEN h.daily_rate_minor IS NULL THEN NULL
+                         ELSE COALESCE(NULLIF(TRIM(h.currency), ''), 'USD') END,
+                    h.offer_revision
              FROM provisioning_jobs j
              JOIN router_ssh_hosts h ON h.id = j.host_id
              WHERE j.id = ?1 AND h.id = ?2 AND h.provider_id IS NOT NULL",
@@ -4838,40 +3665,32 @@ pub(crate) fn complete_provisioning_tx(
             |row| {
                 Ok((
                     row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
-                    row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?,
+                    row.get(4)?, row.get(5)?, row.get(6)?,
                 ))
             },
         )
         .optional()
         .map_err(|error| AppError::Internal(format!("read completed provisioning billing context failed: {error}")))?;
-    let Some((
-        provider_id,
-        host_email,
-        client_email,
-        client_user_id,
-        price,
-        period,
-        revision,
-        hostname,
-    )) = context
+    let Some((provider_id, host_email, client_email, client_user_id, price, currency, revision)) =
+        context
     else {
         return Err(AppError::Internal(
             "provisioned Host has no stable Provider identity".into(),
         ));
     };
-    let paid = price.is_some() && period.is_some();
-    let status = if paid {
-        SUBSCRIPTION_PAYMENT_DUE
+    let (price, currency) = if provider_id == client_user_id {
+        (None, None)
     } else {
-        SUBSCRIPTION_ACTIVE
+        (price, currency)
     };
-    let deadline = paid.then(|| now + Duration::hours(PAYMENT_WINDOW_HOURS));
+    let status = SUBSCRIPTION_ACTIVE;
     tx.execute(
         "INSERT INTO client_market_subscriptions
             (installation_id, host_id, provider_id, host_owner_email,
-             client_user_id, client_owner_email, status, price_cents,
-             rental_period_days, offer_revision, payment_deadline, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
+             client_user_id, client_owner_email, status, daily_rate_minor,
+             currency, offer_revision,
+             created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
         params![
             installation_id,
             host_id,
@@ -4881,122 +3700,38 @@ pub(crate) fn complete_provisioning_tx(
             client_email,
             status,
             price,
-            period,
+            currency,
             revision,
-            deadline.map(|value| value.to_rfc3339()),
             now.to_rfc3339(),
         ],
     )
     .map_err(|error| {
         AppError::Internal(format!("create Client Market subscription failed: {error}"))
     })?;
-    if let (Some(price), Some(period), Some(deadline)) = (price, period, deadline) {
-        open_invoice_tx(
+    let label = client_label_tx(tx, installation_id)?;
+    if let Some(daily_rate_minor) = price {
+        let currency = currency
+            .as_deref()
+            .ok_or_else(|| AppError::Internal("paid Client Host currency is missing".into()))?;
+        crate::market_billing::activate_contract_tx(
             tx,
-            installation_id,
-            price,
-            period,
-            revision,
-            None,
-            deadline,
-            now,
+            crate::market_billing::ActivateContractInput {
+                product_kind: "client_host",
+                product_ref: installation_id,
+                service_ref: installation_id,
+                service_label: &label,
+                buyer_user_id: &client_user_id,
+                buyer_email: &client_email,
+                supplier_user_id: &provider_id,
+                supplier_email: &host_email,
+                currency,
+                daily_rate_minor,
+                offer_revision: revision,
+                replacement_of: None,
+            },
+            &now.to_rfc3339(),
         )?;
     }
-    let label = client_label_tx(tx, installation_id)?;
-    let clients_url = market_clients_url(dashboard_url);
-    let client_url = market_client_public_url(dashboard_url, &label);
-    let password_hint = setup_password_hint_tx(tx, installation_id)?;
-    let deadline_text = deadline.map(|value| value.to_rfc3339());
-    let price_text = price.map(format_offer_dollars);
-    let period_text = period.map(|value| format!("{value} days"));
-    let mut owner_rows: Vec<(&str, String)> = vec![
-        ("Client", label.clone()),
-        ("Owner", client_email.clone()),
-    ];
-    if let Some(url) = client_url.as_deref() {
-        owner_rows.push(("Client URL", url.to_string()));
-    }
-    if let Some(hint) = password_hint.as_deref() {
-        owner_rows.push(("Web password hint", hint.to_string()));
-    }
-    match (price_text.as_deref(), period_text.as_deref()) {
-        (Some(price), Some(period)) => {
-            owner_rows.push(("Offer", format!("{price} / {period}")));
-        }
-        _ => owner_rows.push(("Offer", "Free forever".into())),
-    }
-    if let Some(deadline) = deadline_text.as_deref() {
-        owner_rows.push(("Payment deadline", deadline.to_string()));
-    }
-    let owner_intro = if deadline.is_some() {
-        "Your Client Market Client is ready. You may evaluate it free for three days. If it suits your needs, pay the Host Provider and declare payment in Router before the deadline. If you do not want it, use Release now — after the deadline the Router disables and removes the Client automatically."
-    } else {
-        "Your Client Market Client is ready under a free-forever Host offer. No payment declaration is required. The Host Provider may change the offer or release the Client later."
-    };
-    let owner_note = password_hint.as_ref().map(|_| {
-        "This is not the complete password. Use the full Web password configured during setup; the Router never receives or emails the complete password."
-    });
-    let owner_row_refs: Vec<(&str, &str)> = owner_rows
-        .iter()
-        .map(|(label, value)| (*label, value.as_str()))
-        .collect();
-    enqueue_market_card_email_tx(
-        tx,
-        "client_allocated_owner",
-        &client_email,
-        &format!("[Client Market] {label} is ready"),
-        "Your Client is ready",
-        owner_intro,
-        &owner_row_refs,
-        Some(if client_url.is_some() {
-            "Open Client Web"
-        } else {
-            "Open Router Clients"
-        }),
-        Some(client_url.as_deref().unwrap_or(clients_url.as_str())),
-        owner_note,
-        &format!("client-ready:{installation_id}:{client_email}"),
-        now,
-    )?;
-    let host_label = hostname.unwrap_or_else(|| host_id.to_string());
-    let mut provider_rows = vec![
-        ("Host", host_label.clone()),
-        ("Client", label.clone()),
-        ("Client owner", client_email.clone()),
-    ];
-    if paid {
-        if let (Some(price), Some(period)) = (price_text.as_deref(), period_text.as_deref()) {
-            provider_rows.push(("Offer", format!("{price} / {period}")));
-        }
-        if let Some(deadline) = deadline_text.as_deref() {
-            provider_rows.push(("Client payment window", deadline.to_string()));
-        }
-    } else {
-        provider_rows.push(("Offer", "Free forever".into()));
-    }
-    let provider_intro = if paid {
-        "Your Host was allocated on Client Market. Keep the server stable. The Client owner has a three-day evaluation/payment window. Watch your configured payment accounts — Router records declarations but does not verify receipt."
-    } else {
-        "Your Host was allocated under your free-forever offer. Keep the server stable. You may update the offer or release the Client from Client Market."
-    };
-    let provider_row_refs: Vec<(&str, &str)> = provider_rows
-        .iter()
-        .map(|(label, value)| (*label, value.as_str()))
-        .collect();
-    enqueue_market_card_email_tx(
-        tx,
-        "client_allocated_provider",
-        &host_email,
-        &format!("[Client Market] Host {host_label} was allocated"),
-        "Host allocated",
-        provider_intro,
-        &provider_row_refs,
-        Some("Open Client Market"),
-        Some(&clients_url),
-        None,
-        &format!("host-allocated:{installation_id}:{provider_id}"),
-        now,
-    )?;
     insert_audit_tx(
         tx,
         Some(installation_id),
@@ -5007,10 +3742,10 @@ pub(crate) fn complete_provisioning_tx(
         serde_json::json!({
             "providerId": provider_id,
             "hostOwnerEmail": host_email,
-            "priceCents": price,
-            "rentalPeriodDays": period,
+            "dailyRateMinor": price,
+            "currency": currency,
             "offerRevision": revision,
-            "paymentDeadline": deadline.map(|value| value.to_rfc3339()),
+            "trialHours": crate::market_billing::TRIAL_SECONDS / 3_600,
         }),
         now,
     )?;
@@ -5024,7 +3759,7 @@ pub(crate) fn cleanup_started_tx(
     actor_user_id: Option<&str>,
     actor_email: Option<&str>,
     reason: &str,
-    block_client_for_provider: bool,
+    deny_client_access: bool,
     now: DateTime<Utc>,
 ) -> Result<(), AppError> {
     let subscription: Option<(String, String, String, String)> = tx
@@ -5042,6 +3777,13 @@ pub(crate) fn cleanup_started_tx(
             AppError::Internal(format!("read cleanup subscription failed: {error}"))
         })?;
     if let Some((provider_id, client_user_id, client_owner_email, provider_email)) = subscription {
+        crate::market_billing::terminate_contract_tx(
+            tx,
+            "client_host",
+            installation_id,
+            reason,
+            &now.to_rfc3339(),
+        )?;
         tx.execute(
             "UPDATE client_market_subscriptions
              SET status = ?2, updated_at = ?3 WHERE installation_id = ?1 AND status != 'released'",
@@ -5050,77 +3792,17 @@ pub(crate) fn cleanup_started_tx(
         .map_err(|error| {
             AppError::Internal(format!("mark subscription releasing failed: {error}"))
         })?;
-        tx.execute(
-            "UPDATE client_market_invoices SET status = 'canceled', canceled_at = ?2
-             WHERE installation_id = ?1 AND status = 'open'",
-            params![installation_id, now.to_rfc3339()],
-        )
-        .map_err(|error| AppError::Internal(format!("cancel releasing invoice failed: {error}")))?;
-        if block_client_for_provider {
-            tx.execute(
-                "INSERT INTO host_provider_client_blocks
-                    (provider_id, client_user_id, client_owner_email, reason, created_at, lifted_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, NULL)
-                 ON CONFLICT(provider_id, client_user_id) DO UPDATE SET
-                    client_owner_email = excluded.client_owner_email,
-                    reason = excluded.reason, created_at = excluded.created_at, lifted_at = NULL",
-                params![
-                    provider_id,
-                    client_user_id,
-                    client_owner_email,
-                    reason,
-                    now.to_rfc3339()
-                ],
-            )
-            .map_err(|error| {
-                AppError::Internal(format!("block Client from Provider failed: {error}"))
-            })?;
-        }
-        let label = client_label_tx(tx, installation_id)?;
-        if cleanup_started_email_worthy(reason) {
-            let (client_intro, client_title) = match reason {
-                "payment_not_received" => (
-                    "The Host Provider started removing this Client because payment was not received. Router does not verify payment receipt or arbitrate this decision. The tunnel is disabled immediately and remote data may be permanently deleted.",
-                    "Cleanup started — payment not received",
-                ),
-                "payment_deadline_expired" => (
-                    "This Client passed its three-day payment declaration deadline. Router disabled the tunnel and started remote cleanup. Data may be permanently deleted.",
-                    "Cleanup started — payment deadline expired",
-                ),
-                _ => (
-                    "Cleanup started for this Client. The tunnel is disabled immediately and remote data may be permanently deleted.",
-                    "Cleanup started",
-                ),
-            };
-            let reason_row = [("Client", label.as_str()), ("Reason", reason)];
-            enqueue_market_card_email_tx(
+        if deny_client_access {
+            crate::market_access::set_product_access_decision_tx(
                 tx,
-                "client_cleanup_started",
-                &client_owner_email,
-                &format!("[Client Market] Cleanup started for {label}"),
-                client_title,
-                client_intro,
-                &reason_row,
-                None,
-                None,
-                None,
-                &format!("cleanup-started:{installation_id}:{reason}:client"),
-                now,
-            )?;
-            let provider_rows = [("Client", label.as_str()), ("Reason", reason)];
-            enqueue_market_card_email_tx(
-                tx,
-                "provider_cleanup_started",
+                &provider_id,
                 &provider_email,
-                &format!("[Client Market] Cleanup started for {label}"),
-                "Cleanup started on your Host",
-                "Cleanup started for a Client on your Host. Router has disabled the tunnel and will report the final SSH cleanup result. Router does not verify payment receipt.",
-                &provider_rows,
-                None,
-                None,
-                None,
-                &format!("cleanup-started:{installation_id}:{reason}:provider"),
-                now,
+                &client_user_id,
+                &client_owner_email,
+                crate::market_access::PRODUCT_CLIENT_HOST,
+                crate::market_access::DECISION_DENY,
+                actor_user_id.unwrap_or(&provider_id),
+                &now.to_rfc3339(),
             )?;
         }
     }
@@ -5139,7 +3821,10 @@ pub(crate) fn cleanup_started_tx(
         actor_user_id,
         actor_email,
         "cleanup_started",
-        serde_json::json!({ "reason": reason, "providerBlockedClient": block_client_for_provider }),
+        serde_json::json!({
+            "reason": reason,
+            "providerDeniedClientAccess": deny_client_access,
+        }),
         now,
     )?;
     Ok(())
@@ -5151,36 +3836,13 @@ pub(crate) fn cleanup_finished_tx(
     host_id: &str,
     now: DateTime<Utc>,
 ) -> Result<(), AppError> {
-    let parties = cleanup_parties_tx(tx, installation_id)?;
     tx.execute(
         "UPDATE client_market_subscriptions
-         SET status = ?2, payment_deadline = NULL, released_at = ?3, updated_at = ?3
+         SET status = ?2, released_at = ?3, updated_at = ?3
          WHERE installation_id = ?1",
         params![installation_id, SUBSCRIPTION_RELEASED, now.to_rfc3339()],
     )
     .map_err(|error| AppError::Internal(format!("finish subscription release failed: {error}")))?;
-    if let Some((client_email, provider_email, label)) = parties {
-        for (kind, recipient, role) in [
-            ("client_cleanup_finished", client_email, "Client owner"),
-            ("provider_cleanup_finished", provider_email, "Host Provider"),
-        ] {
-            let rows = [("Client", label.as_str()), ("Recorded for", role)];
-            enqueue_market_card_email_tx(
-                tx,
-                kind,
-                &recipient,
-                &format!("[Client Market] Cleanup completed for {label}"),
-                "Cleanup completed",
-                "Remote cleanup completed. The Host is idle and available for allocation again.",
-                &rows,
-                None,
-                None,
-                None,
-                &format!("cleanup-finished:{installation_id}:{kind}"),
-                now,
-            )?;
-        }
-    }
     insert_audit_tx(
         tx,
         Some(installation_id),
@@ -5201,7 +3863,6 @@ pub(crate) fn cleanup_failed_tx(
     failure_code: &str,
     now: DateTime<Utc>,
 ) -> Result<(), AppError> {
-    let parties = cleanup_parties_tx(tx, installation_id)?;
     tx.execute(
         "UPDATE client_market_subscriptions
          SET status = ?2, updated_at = ?3 WHERE installation_id = ?1 AND status != 'released'",
@@ -5212,31 +3873,6 @@ pub(crate) fn cleanup_failed_tx(
         ],
     )
     .map_err(|error| AppError::Internal(format!("mark subscription release failed: {error}")))?;
-    if let Some((client_email, provider_email, label)) = parties {
-        for (kind, recipient) in [
-            ("client_cleanup_failed", client_email),
-            ("provider_cleanup_failed", provider_email),
-        ] {
-            let rows = [
-                ("Client", label.as_str()),
-                ("Failure", failure_code),
-            ];
-            enqueue_market_card_email_tx(
-                tx,
-                kind,
-                &recipient,
-                &format!("[Client Market] Cleanup failed for {label}"),
-                "Cleanup failed",
-                "Remote cleanup failed. The Client stays in release_failed, its tunnel stays disabled, and creating new Clients remains blocked for the Client owner. This state does not clear on its own — contact the Router administrator to force release it.",
-                &rows,
-                None,
-                None,
-                None,
-                &format!("cleanup-failed:{installation_id}:{failure_code}:{kind}"),
-                now,
-            )?;
-        }
-    }
     insert_audit_tx(
         tx,
         Some(installation_id),
@@ -5244,189 +3880,38 @@ pub(crate) fn cleanup_failed_tx(
         None,
         None,
         "cleanup_failed",
-        serde_json::json!({ "failureCode": failure_code }),
+        serde_json::json!({
+            "failureCode": failure_code.split(':').next().unwrap_or(failure_code),
+            "rawError": failure_code,
+        }),
         now,
     )?;
     Ok(())
 }
 
-fn cleanup_parties_tx(
-    tx: &Transaction<'_>,
-    installation_id: &str,
-) -> Result<Option<(String, String, String)>, AppError> {
-    tx.query_row(
-        "SELECT s.client_owner_email, COALESCE(p.owner_email, s.host_owner_email),
-                COALESCE(t.subdomain, s.installation_id)
-         FROM client_market_subscriptions s
-         LEFT JOIN host_provider_profiles p ON p.provider_id = s.provider_id
-         LEFT JOIN installation_client_tunnels t ON t.installation_id = s.installation_id
-         WHERE s.installation_id = ?1",
-        params![installation_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )
-    .optional()
-    .map_err(|error| {
-        AppError::Internal(format!("read cleanup notification parties failed: {error}"))
-    })
-}
-
 pub async fn run_trade_service(state: ServerState) -> anyhow::Result<()> {
     crate::client_market::reconcile_interrupted_host_import_jobs(state.clone()).await?;
-    let email_state = state.clone();
-    let billing_state = state;
-    tokio::try_join!(
-        run_market_email_worker(email_state),
-        run_billing_worker(billing_state),
-    )?;
-    Ok(())
+    run_trade_reconcile_worker(state).await
 }
 
-async fn run_market_email_worker(state: ServerState) -> anyhow::Result<()> {
-    let worker_id = format!("client-market-email-{}", Uuid::new_v4());
-    let http = reqwest::Client::builder()
-        .user_agent("cc-switch-router/0.1 client-market-email")
-        .connect_timeout(StdDuration::from_secs(10))
-        .timeout(StdDuration::from_secs(20))
-        .build()?;
-    let template = NotificationTemplateContext::from_config(&state.config);
-    let credentials = state
-        .config
-        .resend_api_key
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .zip(template.sender.as_deref());
-    if credentials.is_none() {
-        tracing::warn!(
-            "Client Market email delivery is not configured; queued messages will remain pending"
-        );
-    }
-    let mut interval = tokio::time::interval(StdDuration::from_secs(EMAIL_CYCLE_SECS));
+async fn run_trade_reconcile_worker(state: ServerState) -> anyhow::Result<()> {
+    let mut interval = tokio::time::interval(StdDuration::from_secs(TRADE_RECONCILE_CYCLE_SECS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
-        for _ in 0..25 {
-            let claim = match state
-                .store
-                .client_market_claim_email(&worker_id, Utc::now(), credentials.is_some())
-                .await
-            {
-                Ok(Some(claim)) => claim,
-                Ok(None) => break,
-                Err(error) => {
-                    tracing::warn!(error = %error, "Client Market email claim failed");
-                    break;
-                }
-            };
-            let Some((api_key, sender)) = credentials else {
-                tracing::error!("Client Market email was claimed without delivery credentials");
-                break;
-            };
-            let envelope = FrozenEmailEnvelope {
-                from: sender,
-                recipient: &claim.recipient,
-                subject: &claim.subject,
-                html: &claim.html,
-                text: &claim.text,
-                reply_to: template.reply_to.as_deref(),
-                idempotency_key: &claim.idempotency_key,
-            };
-            match send_resend_frozen_email(&http, api_key, envelope).await {
-                Ok(provider_id) => {
-                    if let Err(error) = state
-                        .store
-                        .client_market_finish_email(
-                            &claim.id,
-                            &worker_id,
-                            Some(&provider_id),
-                            None,
-                            None,
-                        )
-                        .await
-                    {
-                        tracing::warn!(email_id = %claim.id, error = %error, "Client Market email completion failed");
-                        break;
-                    }
-                }
-                Err(failure) => {
-                    let message = sanitize_delivery_error(&failure.message);
-                    let retry = failure.retryable && claim.attempts < MAX_EMAIL_ATTEMPTS;
-                    let retry_at = retry.then(|| {
-                        failure.retry_at.unwrap_or_else(|| {
-                            Utc::now()
-                                + Duration::seconds(retry_delay_secs(claim.attempts, &claim.id))
-                        })
-                    });
-                    if let Err(error) = state
-                        .store
-                        .client_market_finish_email(
-                            &claim.id,
-                            &worker_id,
-                            None,
-                            Some(&message),
-                            retry_at,
-                        )
-                        .await
-                    {
-                        tracing::warn!(email_id = %claim.id, error = %error, "Client Market email retry update failed");
-                        break;
-                    }
-                }
-            }
-        }
-    }
-}
-
-async fn run_billing_worker(state: ServerState) -> anyhow::Result<()> {
-    let mut interval = tokio::time::interval(StdDuration::from_secs(BILLING_CYCLE_SECS));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        interval.tick().await;
-        let expired = match state
+        if let Err(error) = state
             .store
             .client_market_reconcile_trade_state(Utc::now())
             .await
         {
-            Ok(expired) => expired,
-            Err(error) => {
-                tracing::warn!(error = %error, "Client Market billing reconcile failed");
-                continue;
-            }
-        };
+            tracing::warn!(error = %error, "Client Market quote reconcile failed");
+        }
         if let Err(error) = state
             .store
             .client_market_record_provider_daily_stats(Utc::now(), state.config.client_stale_secs)
             .await
         {
             tracing::warn!(error = %error, "Client Market Provider observation snapshot failed");
-        }
-        for client in expired {
-            match state
-                .store
-                .client_market_begin_system_cleanup_job(
-                    &client.installation_id,
-                    "payment_deadline_expired",
-                )
-                .await
-            {
-                Ok(job_id) => {
-                    if let Some(subdomain) = client.subdomain.as_deref() {
-                        state.proxy.remove_route(subdomain).await;
-                    }
-                    let runner_state = state.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) =
-                            crate::client_market::run_cleanup_job(runner_state, job_id.clone())
-                                .await
-                        {
-                            tracing::error!(job_id = %job_id, error = %error, "automatic Client Market release failed");
-                        }
-                    });
-                }
-                Err(AppError::Conflict(_)) | Err(AppError::NotFound(_)) => {}
-                Err(error) => {
-                    tracing::warn!(installation_id = %client.installation_id, error = %error, "could not start automatic Client Market release");
-                }
-            }
         }
     }
 }
@@ -5436,6 +3921,66 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use super::*;
+
+    fn session(user_id: &str, email: &str) -> AuthSession {
+        let now = Utc::now();
+        AuthSession {
+            session_id: format!("session-{user_id}"),
+            user_id: user_id.into(),
+            email: email.into(),
+            installation_id: format!("browser-{user_id}"),
+            access_token_hash: format!("access-{user_id}"),
+            refresh_token_hash: format!("refresh-{user_id}"),
+            access_expires_at: now + Duration::hours(1),
+            refresh_expires_at: now + Duration::days(30),
+            created_at: now,
+            last_used_at: now,
+        }
+    }
+
+    fn custom_payment_method() -> PaymentMethod {
+        PaymentMethod {
+            kind: "custom".into(),
+            account: None,
+            qr_image_url: None,
+            asset_url: None,
+            token: None,
+            chain: None,
+            address: None,
+            instructions: Some("Wire transfer details".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn client_market_audit_redacts_credential_fragments_before_persistence() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let mut conn = store.conn.lock().await;
+        let tx = conn
+            .transaction()
+            .expect("begin audit redaction transaction");
+        insert_audit_tx(
+            &tx,
+            None,
+            None,
+            None,
+            None,
+            "safety_audit",
+            serde_json::json!({ "rawError": "Authorization: Bearer fake-audit-secret" }),
+            Utc::now(),
+        )
+        .expect("insert sanitized Client Market audit");
+        tx.commit().expect("commit sanitized Client Market audit");
+        let detail: String = conn
+            .query_row(
+                "SELECT detail_json FROM client_market_audit_events
+                 WHERE event_type = 'safety_audit'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read sanitized Client Market audit");
+        assert!(!detail.contains("fake-audit-secret"));
+        assert!(detail.contains("[credential omitted]"));
+    }
 
     #[test]
     fn payment_asset_network_policy_rejects_reserved_addresses() {
@@ -5524,6 +4069,250 @@ mod tests {
                 instructions: Some("unsafe\0text".into()),
             })
             .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn payment_methods_cannot_be_cleared_with_market_dependencies() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let supplier = session(
+            "supplier-profile-guard",
+            "supplier-profile-guard@example.com",
+        );
+        let buyer = session("buyer-profile-guard", "buyer-profile-guard@example.com");
+        store
+            .client_market_update_payment_profile(&supplier, &[custom_payment_method()], None)
+            .await
+            .expect("configure guarded payment profile");
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            crate::market_access::configure_open_test_policy(
+                &conn,
+                &supplier,
+                "USD",
+                50_000,
+                &now.to_rfc3339(),
+            );
+            conn.execute(
+                "INSERT INTO router_ssh_hosts (
+                    id, ip, port, host_owner_email, status, created_at, updated_at,
+                    provider_id, daily_rate_minor, currency, offer_revision
+                 ) VALUES ('guarded-host', '203.0.113.10', 22, ?1, 'idle', ?2, ?2,
+                           ?3, 500, 'USD', 1)",
+                params![supplier.email, now.to_rfc3339(), supplier.user_id],
+            )
+            .expect("insert paid Host offer");
+        }
+        assert!(matches!(
+            store
+                .client_market_update_payment_profile(&supplier, &[], None)
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE router_ssh_hosts SET daily_rate_minor = NULL, currency = NULL
+                 WHERE id = 'guarded-host'",
+                [],
+            )
+            .expect("withdraw paid Host offer");
+        store
+            .market_billing_update_supplier_profile(&supplier, "USD", 24)
+            .await
+            .expect("configure supplier credit profile");
+        store
+            .market_billing_activate_contract(
+                crate::market_billing::ActivateContractInput {
+                    product_kind: "client_host",
+                    product_ref: "guarded-client",
+                    service_ref: "guarded-client",
+                    service_label: "Guarded Client",
+                    buyer_user_id: &buyer.user_id,
+                    buyer_email: &buyer.email,
+                    supplier_user_id: &supplier.user_id,
+                    supplier_email: &supplier.email,
+                    currency: "USD",
+                    daily_rate_minor: 500,
+                    offer_revision: 1,
+                    replacement_of: None,
+                },
+                now,
+            )
+            .await
+            .expect("activate guarded contract");
+        assert!(matches!(
+            store
+                .client_market_update_payment_profile(&supplier, &[], None)
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        store
+            .market_billing_terminate_contract(
+                "client_host",
+                "guarded-client",
+                "test_cleanup",
+                now + Duration::seconds(1),
+            )
+            .await
+            .expect("terminate guarded contract");
+        let account_id: String = store
+            .conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT id FROM market_credit_accounts
+                 WHERE buyer_user_id = ?1 AND supplier_user_id = ?2",
+                params![buyer.user_id, supplier.user_id],
+                |row| row.get(0),
+            )
+            .expect("read guarded credit account");
+        store
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE market_credit_accounts SET balance_units = 86400 WHERE id = ?1",
+                params![account_id],
+            )
+            .expect("seed guarded accrued balance");
+        assert!(matches!(
+            store
+                .client_market_update_payment_profile(&supplier, &[], None)
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        {
+            let conn = store.conn.lock().await;
+            let timestamp = (now + Duration::seconds(2)).to_rfc3339();
+            conn.execute(
+                "INSERT INTO market_invoices (
+                    id, account_id, sequence, amount_minor, amount_units, currency,
+                    payment_methods_json, payment_contacts_json, payment_profile_updated_at,
+                    status, due_at, deadline_at, opened_at
+                 ) VALUES ('guarded-invoice', ?1, 1, 500, 500000, 'USD',
+                           '[]', '[]', ?2, 'open', ?2, ?2, ?2)",
+                params![account_id, timestamp],
+            )
+            .expect("insert unsettled guarded invoice");
+        }
+        assert!(matches!(
+            store
+                .client_market_update_payment_profile(&supplier, &[], None)
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn invoice_snapshots_retain_and_authorize_their_payment_assets() {
+        let store = AppStore::new_in_memory_for_tests().expect("test store");
+        let supplier = session("supplier-asset-snapshot", "supplier@example.com");
+        let buyer = session("buyer-asset-snapshot", "buyer@example.com");
+        let now = Utc::now().to_rfc3339();
+        let source_url = "https://example.com/qr.png";
+        let snapshot_asset_id = store
+            .client_market_store_payment_asset(&supplier.user_id, source_url, &[1, 2, 3])
+            .await
+            .expect("store snapshotted payment asset");
+        let snapshot_method = PaymentMethod {
+            kind: "custom".into(),
+            account: None,
+            qr_image_url: None,
+            asset_url: Some(format!("/v1/account/payment-assets/{snapshot_asset_id}")),
+            token: None,
+            chain: None,
+            address: None,
+            instructions: Some("Snapshot instructions".into()),
+        };
+        store
+            .client_market_update_payment_profile(
+                &supplier,
+                std::slice::from_ref(&snapshot_method),
+                None,
+            )
+            .await
+            .expect("configure snapshotted payment asset");
+        store
+            .market_billing_update_supplier_profile(&supplier, "USD", 24)
+            .await
+            .expect("configure snapshot supplier credit profile");
+        {
+            let conn = store.conn.lock().await;
+            crate::market_access::configure_open_test_policy(&conn, &supplier, "USD", 50_000, &now);
+        }
+        store
+            .market_billing_activate_contract(
+                crate::market_billing::ActivateContractInput {
+                    product_kind: "client_host",
+                    product_ref: "asset-snapshot-client",
+                    service_ref: "asset-snapshot-client",
+                    service_label: "Asset Snapshot Client",
+                    buyer_user_id: &buyer.user_id,
+                    buyer_email: &buyer.email,
+                    supplier_user_id: &supplier.user_id,
+                    supplier_email: &supplier.email,
+                    currency: "USD",
+                    daily_rate_minor: 500,
+                    offer_revision: 1,
+                    replacement_of: None,
+                },
+                Utc::now(),
+            )
+            .await
+            .expect("activate snapshot billing contract");
+        let snapshot_json =
+            serde_json::to_string(&[snapshot_method]).expect("encode snapshotted payment method");
+        {
+            let conn = store.conn.lock().await;
+            let account_id: String = conn
+                .query_row(
+                    "SELECT id FROM market_credit_accounts
+                     WHERE buyer_user_id = ?1 AND supplier_user_id = ?2",
+                    params![buyer.user_id, supplier.user_id],
+                    |row| row.get(0),
+                )
+                .expect("read snapshot credit account");
+            conn.execute(
+                "INSERT INTO market_invoices (
+                    id, account_id, sequence, amount_minor, amount_units, currency,
+                    payment_methods_json, payment_contacts_json, payment_profile_updated_at,
+                    status, due_at, deadline_at, opened_at
+                 ) VALUES ('asset-snapshot-invoice', ?1, 1, 500, 500000, 'USD',
+                           ?2, '[]', ?3, 'open', ?3, ?3, ?3)",
+                params![account_id, snapshot_json, now],
+            )
+            .expect("insert payment asset invoice snapshot");
+        }
+
+        let replacement_asset_id = store
+            .client_market_store_payment_asset(&supplier.user_id, source_url, &[4, 5, 6])
+            .await
+            .expect("store replacement payment asset");
+        assert_ne!(snapshot_asset_id, replacement_asset_id);
+        let mut replacement_method = custom_payment_method();
+        replacement_method.asset_url =
+            Some(format!("/v1/account/payment-assets/{replacement_asset_id}"));
+        store
+            .client_market_update_payment_profile(&supplier, &[replacement_method], None)
+            .await
+            .expect("replace live payment profile");
+        assert_eq!(
+            store
+                .client_market_payment_asset_for_viewer(&snapshot_asset_id, Some(&buyer))
+                .await
+                .expect("invoice buyer reads snapshotted payment asset"),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            store
+                .client_market_payment_asset_for_viewer(&replacement_asset_id, Some(&supplier))
+                .await
+                .expect("supplier reads replacement payment asset"),
+            vec![4, 5, 6]
         );
     }
 }

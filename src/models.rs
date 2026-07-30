@@ -1122,6 +1122,22 @@ pub struct ShareRequestLogEntry {
     pub requested_model: String,
     pub actual_model: String,
     pub actual_model_source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_service_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_service_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier_decision: Option<String>,
+    #[serde(default = "default_observed_usage_state")]
+    pub usage_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_status: Option<String>,
+    #[serde(default)]
+    pub usage_revision: u64,
     pub status_code: u16,
     pub latency_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1144,6 +1160,10 @@ pub struct ShareRequestLogEntry {
     pub created_at: i64,
     #[serde(default)]
     pub is_health_check: bool,
+}
+
+fn default_observed_usage_state() -> String {
+    "observed".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1670,6 +1690,7 @@ pub struct MarketShareAppView {
 pub struct MarketShareView {
     pub router_id: String,
     pub share_id: String,
+    pub capacity_pool_id: String,
     pub subdomain: String,
     pub installation_id: String,
     pub share_name: String,
@@ -1679,6 +1700,8 @@ pub struct MarketShareView {
     pub installation_owner_email: Option<String>,
     pub app_type: String,
     pub for_sale: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub for_sale_official_price_percent_by_app: BTreeMap<String, u16>,
     #[serde(default = "default_market_access_mode")]
     pub market_access_mode: String,
     pub share_status: String,
@@ -2144,6 +2167,7 @@ pub struct ShareRuntimeSnapshotResponse {
 #[serde(rename_all = "camelCase")]
 pub struct ShareDescriptor {
     pub share_id: String,
+    pub capacity_pool_id: String,
     pub share_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_email: Option<String>,
@@ -2165,8 +2189,8 @@ pub struct ShareDescriptor {
     pub app_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
-    /// Share 的唯一 app/provider binding。写入时必须恰好一项，且与
-    /// `app_type` / `provider_id` 一致。
+    /// Share 的 app/provider bindings。写入时必须包含 1..=3 项，每个
+    /// app 最多一项，且 `app_type` / `provider_id` 必须指向其中一项。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub bindings: BTreeMap<String, String>,
     pub token_limit: i64,
@@ -2920,6 +2944,7 @@ pub struct MarketLinkView {
 pub struct ShareView {
     pub router_id: String,
     pub share_id: String,
+    pub capacity_pool_id: String,
     pub share_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_email: Option<String>,
@@ -2949,7 +2974,7 @@ pub struct ShareView {
     pub app_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
-    /// Share 的唯一 app/provider binding，供卡片和详情展示。
+    /// Share 的全部 app/provider bindings，供卡片和详情展示。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub bindings: BTreeMap<String, String>,
     pub token_limit: i64,
@@ -3100,6 +3125,12 @@ pub struct ClientChatMessageView {
     pub seq: i64,
     pub body: String,
     pub author_label: String,
+    pub author_kind: String,
+    pub message_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_payload: Option<serde_json::Value>,
     pub is_mine: bool,
     pub status: String,
     pub created_at: DateTime<Utc>,
@@ -3111,6 +3142,12 @@ pub struct ClientChatMessagePreview {
     pub seq: i64,
     pub body: String,
     pub author_label: String,
+    pub author_kind: String,
+    pub message_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_payload: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -3121,6 +3158,8 @@ pub struct ClientChatRoomView {
     pub installation_id: String,
     pub client_label: String,
     pub status: String,
+    pub can_post: bool,
+    pub read_only: bool,
     pub latest_seq: i64,
     pub unread_count: usize,
     pub last_message_at: Option<DateTime<Utc>>,

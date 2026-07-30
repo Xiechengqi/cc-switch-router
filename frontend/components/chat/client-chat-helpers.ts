@@ -67,7 +67,9 @@ export function clearChatDraft(roomId: string) {
   }
 }
 
-export function clearRecentChatLocalCache(room: Pick<ClientChatRoom, "id" | "installationId">) {
+export function clearRecentChatLocalCache(
+  room: Pick<ClientChatRoom, "id" | "installationId">,
+) {
   removeAnonymousVisit(room.installationId);
   clearChatDraft(room.id);
 }
@@ -100,7 +102,9 @@ export function sortRooms(rooms: ClientChatRoom[]) {
 
 export function unreadByInstallationMap(rooms: ClientChatRoom[]) {
   const map = new Map<string, number>();
-  for (const room of rooms) map.set(room.installationId, room.unreadCount);
+  for (const room of rooms) {
+    map.set(room.installationId, room.unreadCount);
+  }
   return map;
 }
 
@@ -135,10 +139,10 @@ export function mergeMessages(current: LocalChatMessage[], incoming: ClientChatM
   return [...byId.values()].sort((left, right) => left.seq - right.seq);
 }
 
-export function chatRoomUrl(installationId: string) {
+export function chatRoomUrl(room: Pick<ClientChatRoom, "installationId">) {
   const url = new URL(window.location.href);
-  url.pathname = "/clients/";
   url.search = "";
-  url.searchParams.set("chat", installationId);
+  url.pathname = "/clients/";
+  url.searchParams.set("chat", room.installationId);
   return url.toString();
 }

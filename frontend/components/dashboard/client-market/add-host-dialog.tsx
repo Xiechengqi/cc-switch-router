@@ -8,11 +8,12 @@ import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   createClientMarketHost,
   getAccountPaymentProfile,
+  getMarketBillingDashboard,
   getProvisionSshKey,
   lookupClientMarketHostIpInfo,
   testClientMarketHostSsh,
 } from "@/lib/api";
-import { DASHBOARD_ACCOUNT_PATH } from "@/lib/dashboard-nav";
+import { DASHBOARD_ACCOUNT_BILLING_PATH, DASHBOARD_ACCOUNT_PAYMENTS_PATH } from "@/lib/dashboard-nav";
 import type { HostIpIntel, ProvisionSshKey } from "@/lib/types";
 import { usePersistentState } from "@/lib/use-persistent-state";
 import {
@@ -50,7 +51,6 @@ export function AddHostDialog({
   const [note, setNote] = React.useState("");
   const [priceUsd, setPriceUsd] = React.useState("");
   const [currency, setCurrency] = React.useState<"CNY" | "USD">("USD");
-  const [rentalPeriodDays, setRentalPeriodDays] = React.useState("");
   const [busy, setBusy] = React.useState(false);
   const [testing, setTesting] = React.useState(false);
   const [error, setError] = React.useState("");
@@ -58,6 +58,7 @@ export function AddHostDialog({
   const [stepStatus, setStepStatus] = React.useState<StepStatusMap>(IDLE_STEP_STATUS);
   const [ipIntel, setIpIntel] = React.useState<HostIpIntel | null>(null);
   const [paymentReady, setPaymentReady] = React.useState<boolean | null>(null);
+  const [billingCurrencies, setBillingCurrencies] = React.useState<string[] | null>(null);
 
   React.useEffect(() => {
     if (!open) return;
@@ -68,6 +69,7 @@ export function AddHostDialog({
     setStepStatus(IDLE_STEP_STATUS);
     setIpIntel(null);
     setPaymentReady(null);
+    setBillingCurrencies(null);
     let cancelled = false;
     void getAccountPaymentProfile()
       .then((profile) => {
@@ -75,6 +77,13 @@ export function AddHostDialog({
       })
       .catch(() => {
         if (!cancelled) setPaymentReady(false);
+      });
+    void getMarketBillingDashboard()
+      .then((billing) => {
+        if (!cancelled) setBillingCurrencies(billing.supplierProfiles.map((item) => item.currency));
+      })
+      .catch(() => {
+        if (!cancelled) setBillingCurrencies([]);
       });
     setSshKeyLoading(true);
     void getProvisionSshKey()
@@ -150,13 +159,13 @@ export function AddHostDialog({
     if (parsedPort == null) return;
     let offer: ReturnType<typeof parseHostOffer>;
     try {
-      offer = parseHostOffer(priceUsd, rentalPeriodDays, t, currency);
+      offer = parseHostOffer(priceUsd, t, currency);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
       return;
     }
-    if (offer.priceCents && paymentReady === false) {
-      setError(t("clientMarket.offerRequiresPayment"));
+    if (offer.dailyRateMinor && (paymentReady === false || !billingCurrencies?.includes(currency))) {
+      setError(t("clientMarket.offerRequiresBilling"));
       return;
     }
     if (note.length > 500) {
@@ -254,7 +263,6 @@ export function AddHostDialog({
       setRootPassword("");
       setNote("");
       setPriceUsd("");
-      setRentalPeriodDays("");
       setPhase("form");
       setError("");
       setIpIntel(null);
@@ -425,9 +433,9 @@ export function AddHostDialog({
                     <span className="text-xs text-muted-foreground">{t("clientMarket.rootPasswordHint")}</span>
                   </label>
                 ) : null}
-                <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_7rem_minmax(0,1fr)]">
+                <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_7rem]">
                   <label className="grid gap-1 text-sm">
-                    <span className="text-muted-foreground">{t("clientMarket.rentalPrice")}</span>
+                    <span className="text-muted-foreground">{t("clientMarket.dailyPrice")}</span>
                     <input
                       value={priceUsd}
                       onChange={(event) => setPriceUsd(event.target.value)}
@@ -447,27 +455,15 @@ export function AddHostDialog({
                       <option value="USD">USD</option>
                     </select>
                   </label>
-                  <label className="grid gap-1 text-sm">
-                    <span className="text-muted-foreground">{t("clientMarket.rentalPeriod")}</span>
-                    <input
-                      value={rentalPeriodDays}
-                      onChange={(event) => setRentalPeriodDays(event.target.value)}
-                      placeholder={t("clientMarket.forever")}
-                      inputMode="numeric"
-                      className="h-11 rounded-lg border border-border bg-white px-3 text-slate-900 outline-none focus:ring-2 focus:ring-primary/30"
-                    />
-                  </label>
                 </div>
                 <p className="text-xs text-muted-foreground">{t("clientMarket.offerHint")}</p>
-                {paymentReady === false ? (
+                {paymentReady === false || (billingCurrencies && !billingCurrencies.includes(currency)) ? (
                   <div className="grid gap-1.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-950">
-                    <span>{t("clientMarket.offerRequiresPayment")}</span>
-                    <a
-                      href={DASHBOARD_ACCOUNT_PATH}
-                      className="font-medium text-foreground underline underline-offset-2"
-                    >
-                      {t("clientMarket.goToAccountPayment")}
-                    </a>
+                    <span>{t("clientMarket.offerRequiresBilling")}</span>
+                    <div className="flex flex-wrap gap-3">
+                      <a href={DASHBOARD_ACCOUNT_BILLING_PATH} className="font-medium text-foreground underline underline-offset-2">{t("clientMarket.goToBilling")}</a>
+                      <a href={DASHBOARD_ACCOUNT_PAYMENTS_PATH} className="font-medium text-foreground underline underline-offset-2">{t("clientMarket.goToAccountPayment")}</a>
+                    </div>
                   </div>
                 ) : null}
                 <label className="grid gap-1 text-sm">

@@ -13,9 +13,7 @@ pub const MIN_REQUEST_LOG_RETENTION_DAYS: u32 = 1;
 pub const MAX_REQUEST_LOG_RETENTION_DAYS: u32 = 365;
 /// Historical hardcoded IP-intelligence origins. Kept as the default so existing
 /// deployments keep working; override with `CC_SWITCH_ROUTER_IP_INTEL_ENDPOINTS`.
-const DEFAULT_IP_INTEL_ENDPOINTS: &[&str] =
-    &["http://3.0.3.0", "http://3.0.2.1", "http://3.0.2.9"];
-
+const DEFAULT_IP_INTEL_ENDPOINTS: &[&str] = &["http://3.0.3.0", "http://3.0.2.1", "http://3.0.2.9"];
 
 #[derive(Debug, Clone)]
 pub struct MetricsConfig {

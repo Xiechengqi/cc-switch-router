@@ -57,14 +57,19 @@ import type {
   ClientMarketProviderSupply,
   ClientMarketAllocationQuote,
   ClientMarketCommitQuoteResponse,
-  ClientMarketBilling,
+  ClientMarketRental,
   ClientMarketHostTransferDocument,
   ClientMarketHostImportResponse,
-  ClientMarketProviderBlock,
   ShareMarketCatalog,
   ShareMarketOwnedShare,
-  ShareMarketOwnerBlock,
   ShareMarketSeatInput,
+  AdminMarketBillingDispute,
+  MarketBillingDashboard,
+  MarketBillingInvoiceHistory,
+  MarketAccessDashboard,
+  MarketAccessDecision,
+  MarketAccessProductKind,
+  MarketCreditKind,
 } from "@/lib/types";
 
 
@@ -625,8 +630,7 @@ export async function createClientMarketHost(body: {
   port?: number;
   note?: string;
   rootPassword?: string;
-  priceCents?: number;
-  rentalPeriodDays?: number;
+  dailyRateMinor?: number;
   currency?: string;
 }) {
   return parseJson<ClientMarketHost>(
@@ -690,24 +694,30 @@ export async function getClientMarketJob(id: string) {
   );
 }
 
-export async function cleanupClientMarketClientWithReason(
+export async function cleanupClientMarketProviderRental(
   installationId: string,
   body: {
     reason:
-      | "client_release"
       | "provider_release"
-      | "payment_not_received"
       | "host_maintenance"
       | "service_terminated"
       | "other";
-    blockClientForProvider?: boolean;
+    denyClientAccess?: boolean;
   },
 ) {
   return parseJson<CreateClientMarketClientResponse>(
-    await authFetch(`/v1/client-market/clients/${encodeURIComponent(installationId)}/cleanup`, {
+    await authFetch(`/v1/client-market/clients/${encodeURIComponent(installationId)}/provider-cleanup`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function releaseClientMarketRental(installationId: string) {
+  return parseJson<CreateClientMarketClientResponse>(
+    await authFetch(`/v1/client-market/clients/${encodeURIComponent(installationId)}/release`, {
+      method: "POST",
     }),
   );
 }
@@ -731,15 +741,74 @@ export async function updateAccountPaymentProfile(
   );
 }
 
-export async function getClientMarketProviderBlocks() {
-  return parseJson<ClientMarketProviderBlock[]>(
-    await authFetch("/v1/client-market/provider-blocks", { cache: "no-store" }),
+export async function getMarketBillingDashboard(signal?: AbortSignal) {
+  return parseJson<MarketBillingDashboard>(
+    await authFetch("/v1/market-billing/dashboard", { cache: "no-store", signal }),
   );
 }
 
-export async function createClientMarketProviderBlock(body: { email: string; reason?: string }) {
-  return parseJson<ClientMarketProviderBlock>(
-    await authFetch("/v1/client-market/provider-blocks", {
+export async function updateMarketBillingSupplierProfile(
+  currency: "CNY" | "USD",
+  settlementGraceHours: number,
+) {
+  return parseJson<MarketBillingDashboard>(
+    await authFetch(`/v1/market-billing/supplier-profiles/${currency}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ settlementGraceHours }),
+    }),
+  );
+}
+
+export async function settleMarketBillingAccount(accountId: string) {
+  return parseJson<MarketBillingDashboard>(
+    await authFetch(`/v1/market-billing/accounts/${encodeURIComponent(accountId)}/settle`, {
+      method: "POST",
+    }),
+  );
+}
+
+export async function requestMarketBillingSettlement(accountId: string) {
+  return parseJson<{ ok: true }>(
+    await authFetch(`/v1/market-billing/accounts/${encodeURIComponent(accountId)}/request-settlement`, {
+      method: "POST",
+    }),
+  );
+}
+
+export async function closeMarketBillingAccount(accountId: string) {
+  return parseJson<MarketBillingDashboard>(
+    await authFetch(`/v1/market-billing/accounts/${encodeURIComponent(accountId)}/close`, {
+      method: "POST",
+    }),
+  );
+}
+
+export async function getMarketBillingInvoiceHistory(
+  accountId: string,
+  beforeSequence?: number,
+) {
+  const query = new URLSearchParams({ limit: "20" });
+  if (beforeSequence != null) query.set("beforeSequence", String(beforeSequence));
+  return parseJson<MarketBillingInvoiceHistory>(
+    await authFetch(
+      `/v1/market-billing/accounts/${encodeURIComponent(accountId)}/invoices?${query.toString()}`,
+      { cache: "no-store" },
+    ),
+  );
+}
+
+export async function declareMarketBillingPayment(
+  invoiceId: string,
+  body: {
+    paymentMethodKind?: string;
+    paymentReference?: string;
+    note?: string;
+    evidenceUrl?: string;
+  },
+) {
+  return parseJson<MarketBillingDashboard>(
+    await authFetch(`/v1/market-billing/invoices/${encodeURIComponent(invoiceId)}/declare-payment`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -747,10 +816,147 @@ export async function createClientMarketProviderBlock(body: { email: string; rea
   );
 }
 
-export async function liftClientMarketProviderBlock(clientUserId: string) {
-  return parseJson<{ ok: boolean }>(
-    await authFetch(`/v1/client-market/provider-blocks/${encodeURIComponent(clientUserId)}`, {
-      method: "DELETE",
+export async function confirmMarketBillingPayment(invoiceId: string) {
+  return parseJson<MarketBillingDashboard>(
+    await authFetch(`/v1/market-billing/invoices/${encodeURIComponent(invoiceId)}/confirm`, {
+      method: "POST",
+    }),
+  );
+}
+
+export async function rejectMarketBillingPayment(invoiceId: string, reason: string) {
+  return parseJson<MarketBillingDashboard>(
+    await authFetch(`/v1/market-billing/invoices/${encodeURIComponent(invoiceId)}/reject`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason }),
+    }),
+  );
+}
+
+export async function disputeMarketBillingInvoice(invoiceId: string, reason: string) {
+  return parseJson<MarketBillingDashboard>(
+    await authFetch(`/v1/market-billing/invoices/${encodeURIComponent(invoiceId)}/disputes`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason }),
+    }),
+  );
+}
+
+export async function getAdminMarketBillingDisputes(signal?: AbortSignal) {
+  return parseJson<AdminMarketBillingDispute[]>(
+    await authFetch("/v1/admin/market-billing/disputes", { cache: "no-store", signal }),
+  );
+}
+
+export async function resolveAdminMarketBillingDispute(
+  disputeId: string,
+  resolution: "uphold" | "void",
+  note?: string,
+) {
+  return parseJson<{ ok: true }>(
+    await authFetch(`/v1/admin/market-billing/disputes/${encodeURIComponent(disputeId)}/resolve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ resolution, note }),
+    }),
+  );
+}
+
+export async function voidAdminMarketBillingInvoice(invoiceId: string, reason: string) {
+  return parseJson<{ ok: true }>(
+    await authFetch(`/v1/admin/market-billing/invoices/${encodeURIComponent(invoiceId)}/void`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason }),
+    }),
+  );
+}
+
+export async function getMarketAccessDashboard(signal?: AbortSignal) {
+  return parseJson<MarketAccessDashboard>(
+    await authFetch("/v1/market-access/dashboard", { cache: "no-store", signal }),
+  );
+}
+
+export async function updateMarketAccessPolicy(
+  productKind: MarketAccessProductKind,
+  body: { mode: "whitelist" | "blacklist"; riskAcknowledged?: boolean; expectedRevision: number },
+) {
+  return parseJson<MarketAccessDashboard>(
+    await authFetch(`/v1/market-access/policies/${productKind}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function upsertMarketCounterparty(body: {
+  email: string;
+  accessRules: Array<{ productKind: MarketAccessProductKind; decision: MarketAccessDecision }>;
+  creditLines?: Array<{
+    currency: "CNY" | "USD";
+    kind: MarketCreditKind;
+    limitMinor?: number;
+    riskAcknowledged?: boolean;
+  }>;
+}) {
+  return parseJson<unknown>(
+    await authFetch("/v1/market-access/counterparties", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function updateMarketCounterparty(
+  id: string,
+  body: {
+    accessRules: Array<{ productKind: MarketAccessProductKind; decision: MarketAccessDecision }>;
+    status?: "active" | "revoked";
+    expectedRevision: number;
+  },
+) {
+  return parseJson<unknown>(
+    await authFetch(`/v1/market-access/counterparties/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function updateMarketCounterpartyCredit(
+  id: string,
+  currency: "CNY" | "USD",
+  body: {
+    kind: MarketCreditKind;
+    limitMinor?: number;
+    riskAcknowledged?: boolean;
+    expectedRevision: number;
+  },
+) {
+  return parseJson<unknown>(
+    await authFetch(`/v1/market-access/counterparties/${encodeURIComponent(id)}/credit-lines/${currency}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function updateMarketPublicCredit(
+  currency: "CNY" | "USD",
+  body: { enabled: boolean; limitMinor?: number; riskAcknowledged?: boolean; expectedRevision: number },
+) {
+  return parseJson<MarketAccessDashboard>(
+    await authFetch(`/v1/market-access/public-credit-lines/${currency}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
     }),
   );
 }
@@ -763,12 +969,11 @@ export async function getClientMarketProviderSupply() {
 
 export async function updateClientMarketHostOffer(
   hostId: string,
-  body: { priceCents?: number; rentalPeriodDays?: number; currency?: string },
+  body: { dailyRateMinor?: number; currency?: string },
 ) {
   return parseJson<{
     hostId: string;
-    priceCents?: number;
-    rentalPeriodDays?: number;
+    dailyRateMinor?: number;
     currency?: string;
     offerRevision: number;
   }>(
@@ -816,34 +1021,9 @@ export async function cancelClientMarketQuote(quoteId: string) {
   );
 }
 
-export async function getMyClientMarketBilling(signal?: AbortSignal) {
-  return parseJson<ClientMarketBilling[]>(
-    await authFetch("/v1/client-market/my-billing", { cache: "no-store", signal }),
-  );
-}
-
-export async function declareClientMarketPayment(
-  installationId: string,
-  invoiceId: string,
-  offerRevision: number,
-  paymentProfileUpdatedAt?: string,
-  /** The amount actually shown to the user. The Router rejects the declaration if
-   *  this disagrees with the invoice, so a silent price change cannot be paid
-   *  through by a UI that refreshed without the user re-reading the number. */
-  amountCentsConfirmed?: number,
-) {
-  return parseJson<{ billing: ClientMarketBilling }>(
-    await authFetch(`/v1/client-market/clients/${encodeURIComponent(installationId)}/declare-paid`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        invoiceId,
-        offerRevision,
-        paymentProfileUpdatedAt,
-        amountCentsConfirmed,
-        confirmed: true,
-      }),
-    }),
+export async function getMyClientMarketRentals(signal?: AbortSignal) {
+  return parseJson<ClientMarketRental[]>(
+    await authFetch("/v1/client-market/my-rentals", { cache: "no-store", signal }),
   );
 }
 
@@ -947,24 +1127,6 @@ export async function rentShareMarketSeat(seatId: string, offerRevision: number)
   );
 }
 
-export async function declareShareMarketPaid(
-  subscriptionId: string,
-  input: {
-    invoiceId: string;
-    offerRevision: number;
-    amountMinorConfirmed: number;
-    paymentProfileUpdatedAt: string;
-  },
-) {
-  return parseJson<{ ok: true }>(
-    await authFetch(`/v1/share-market/subscriptions/${encodeURIComponent(subscriptionId)}/declare-paid`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ...input, confirmed: true }),
-    }),
-  );
-}
-
 export async function releaseShareMarketSubscription(subscriptionId: string) {
   return parseJson<{ ok: true }>(
     await authFetch(`/v1/share-market/subscriptions/${encodeURIComponent(subscriptionId)}/release`, {
@@ -975,7 +1137,7 @@ export async function releaseShareMarketSubscription(subscriptionId: string) {
 
 export async function forceRevokeShareMarketSubscription(
   subscriptionId: string,
-  input: { blockUser: boolean; reason?: string },
+  input: { denyFutureAccess: boolean },
 ) {
   return parseJson<{ ok: true }>(
     await authFetch(`/v1/share-market/subscriptions/${encodeURIComponent(subscriptionId)}/force-revoke`, {
@@ -983,21 +1145,5 @@ export async function forceRevokeShareMarketSubscription(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(input),
     }),
-  );
-}
-
-export async function createShareMarketBlock(body: { email: string; reason?: string }) {
-  return parseJson<ShareMarketOwnerBlock>(
-    await authFetch("/v1/share-market/blocks", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }),
-  );
-}
-
-export async function liftShareMarketBlock(userId: string) {
-  return parseJson<{ ok: true }>(
-    await authFetch(`/v1/share-market/blocks/${encodeURIComponent(userId)}`, { method: "DELETE" }),
   );
 }

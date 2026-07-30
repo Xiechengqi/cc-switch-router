@@ -1,8 +1,9 @@
 "use client";
 
 import * as React from "react";
+import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { Button, Checkbox, Dropdown, Modal, toast } from "@heroui/react";
+import { Button, Dropdown, Modal, toast } from "@heroui/react";
 import {
   Ban,
   ChevronDown,
@@ -10,6 +11,7 @@ import {
   Copy,
   ExternalLink,
   Loader2,
+  MessagesSquare,
   MoreHorizontal,
   Pencil,
   Plus,
@@ -22,15 +24,14 @@ import {
   X,
 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
+import { useClientChat } from "@/components/chat/client-chat";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { CompactSelect } from "@/components/common/compact-select";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
+import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
 import {
   ProviderContactButton,
-  ProviderContactsList,
-  ProviderPaymentMethodsList,
 } from "@/components/common/provider-contacts";
-import { UserBlacklistPanel } from "@/components/common/user-blacklist-panel";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import { SeatSortHeader } from "@/components/dashboard/share-market/seat-sort-header";
 import {
@@ -47,20 +48,16 @@ import {
   addShareMarketSeat,
   closeShareMarketListing,
   createShareMarketListing,
-  declareShareMarketPaid,
   deleteShareMarketListing,
   deleteShareMarketSeat,
   forceRevokeShareMarketSubscription,
   getShareMarketCatalog,
   getShareMarketOwnedShares,
-  createShareMarketBlock,
-  liftShareMarketBlock,
   releaseShareMarketSubscription,
   rentShareMarketSeat,
   updateShareMarketSeat,
 } from "@/lib/api";
-import type { ShareMarketTabParam } from "@/lib/dashboard-nav";
-import { formatBillingCountdown } from "@/lib/billing-urgency";
+import { DASHBOARD_ACCOUNT_BILLING_PATH, type ShareMarketTabParam } from "@/lib/dashboard-nav";
 import { usePersistentState } from "@/lib/use-persistent-state";
 import type {
   ShareMarketCatalog,
@@ -92,8 +89,6 @@ type SeatDraft = {
   paid: boolean;
   price: string;
   currency: string;
-  periodUnit: "day" | "week" | "month";
-  periodCount: string;
 };
 
 const TOKEN_PERIODS: ShareTokenPeriod[] = [
@@ -117,26 +112,6 @@ function replaceMarketQuery(tab: MarketTab, focusShareId: string) {
   window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
 }
 
-function canOpenSharePayment(subscription: ShareMarketSubscription) {
-  return subscription.canDeclarePaid
-    || (
-      subscription.canRelease
-      && subscription.status === "grant_pending"
-      && subscription.priceMinor != null
-    );
-}
-
-function sharePaymentDeadline(subscription: ShareMarketSubscription, trialHours: number) {
-  const authoritative = subscription.paymentDeadline || subscription.openInvoice?.deadlineAt;
-  if (authoritative || subscription.status !== "grant_pending" || subscription.priceMinor == null) {
-    return authoritative;
-  }
-  if (!Number.isFinite(trialHours) || trialHours <= 0) return undefined;
-  const createdAt = Date.parse(subscription.createdAt);
-  if (!Number.isFinite(createdAt)) return undefined;
-  return new Date(createdAt + trialHours * 60 * 60 * 1_000).toISOString();
-}
-
 function emptySeat(supportedPeriods: ShareTokenPeriod[] = TOKEN_PERIODS): SeatDraft {
   return {
     parallelLimit: "",
@@ -145,8 +120,6 @@ function emptySeat(supportedPeriods: ShareTokenPeriod[] = TOKEN_PERIODS): SeatDr
     paid: false,
     price: "",
     currency: "CNY",
-    periodUnit: "month",
-    periodCount: "1",
   };
 }
 
@@ -156,10 +129,8 @@ function draftFromSeat(seat: ShareMarketSeat): SeatDraft {
     tokenLimit: seat.tokenLimit == null ? "" : String(seat.tokenLimit),
     tokenPeriod: seat.tokenPeriod,
     paid: !seat.isFree,
-    price: seat.priceMinor == null ? "" : (seat.priceMinor / 100).toFixed(2),
+    price: seat.dailyRateMinor == null ? "" : (seat.dailyRateMinor / 100).toFixed(2),
     currency: seat.currency || "CNY",
-    periodUnit: (seat.periodUnit as SeatDraft["periodUnit"]) || "month",
-    periodCount: String(seat.periodCount || 1),
   };
 }
 
@@ -178,13 +149,9 @@ function seatInput(draft: SeatDraft, t: TFn): ShareMarketSeatInput {
   if (!draft.paid) return { parallelLimit, tokenLimit, tokenPeriod: draft.tokenPeriod };
   const price = draft.price.trim();
   const amount = Number(price);
-  const periodCount = Number(draft.periodCount);
-  const priceMinor = Math.round(amount * 100);
-  if (!/^\d+(?:\.\d{1,2})?$/.test(price) || amount <= 0 || !Number.isSafeInteger(priceMinor)) {
+  const dailyRateMinor = Math.round(amount * 100);
+  if (!/^\d+(?:\.\d{1,2})?$/.test(price) || amount <= 0 || !Number.isSafeInteger(dailyRateMinor)) {
     throw new Error(t("shareMarket.error.price"));
-  }
-  if (!Number.isSafeInteger(periodCount) || periodCount < 1 || periodCount > 365) {
-    throw new Error(t("shareMarket.error.billingPeriod"));
   }
   const currency = draft.currency.trim().toUpperCase();
   if (currency !== "CNY" && currency !== "USD") {
@@ -194,10 +161,8 @@ function seatInput(draft: SeatDraft, t: TFn): ShareMarketSeatInput {
     parallelLimit,
     tokenLimit,
     tokenPeriod: draft.tokenPeriod,
-    priceMinor,
+    dailyRateMinor,
     currency,
-    periodUnit: draft.periodUnit,
-    periodCount,
   };
 }
 
@@ -290,30 +255,6 @@ function SeatFields({
               ]}
               onChange={(value) => patch({ currency: value })}
               ariaLabel={t("shareMarket.dialog.currency")}
-              className="w-full"
-              triggerClassName={selectTrigger}
-            />
-          </label>
-          <label className="grid gap-1 text-xs text-slate-500">
-            {t("shareMarket.dialog.billingCount")}
-            <input
-              className={fieldClass()}
-              inputMode="numeric"
-              value={draft.periodCount}
-              onChange={(event) => patch({ periodCount: event.target.value })}
-            />
-          </label>
-          <label className="grid gap-1 text-xs text-slate-500">
-            {t("shareMarket.dialog.billingUnit")}
-            <CompactSelect
-              value={draft.periodUnit}
-              options={[
-                { value: "day", label: t("shareMarket.dialog.day") },
-                { value: "week", label: t("shareMarket.dialog.week") },
-                { value: "month", label: t("shareMarket.dialog.month") },
-              ]}
-              onChange={(value) => patch({ periodUnit: value as SeatDraft["periodUnit"] })}
-              ariaLabel={t("shareMarket.dialog.billingUnit")}
               className="w-full"
               triggerClassName={selectTrigger}
             />
@@ -625,10 +566,14 @@ function formatShareLimit(value?: number | null) {
   return compactTokens(value);
 }
 
-function formatPrice(seat: Pick<ShareMarketSeat, "isFree" | "priceMinor" | "currency" | "periodUnit" | "periodCount">, free: string) {
-  if (seat.isFree || seat.priceMinor == null) return free;
-  const amount = new Intl.NumberFormat(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(seat.priceMinor / 100);
-  return `${amount} ${seat.currency || ""} / ${seat.periodCount || 1} ${seat.periodUnit || ""}`;
+function formatPrice(
+  seat: Pick<ShareMarketSeat, "isFree" | "dailyRateMinor" | "currency">,
+  free: string,
+  day: string,
+) {
+  if (seat.isFree || seat.dailyRateMinor == null) return free;
+  const amount = new Intl.NumberFormat(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(seat.dailyRateMinor / 100);
+  return `${amount} ${seat.currency || ""} / ${day}`;
 }
 
 function statusLabel(status: string, t: ReturnType<typeof useLocaleText>["t"]) {
@@ -653,9 +598,11 @@ function subscriptionStatusLabel(status: string, t: TFn) {
   const keys = {
     grant_pending: "shareMarket.subscription.grantPending",
     active_free: "shareMarket.subscription.activeFree",
-    trial_payment_due: "shareMarket.subscription.trialPaymentDue",
-    active_paid: "shareMarket.subscription.activePaid",
-    renewal_due: "shareMarket.subscription.renewalDue",
+    active_postpaid: "shareMarket.subscription.activePostpaid",
+    billing_suspend_pending: "shareMarket.subscription.billingSuspendPending",
+    billing_suspended: "shareMarket.subscription.billingSuspended",
+    billing_resume_pending: "shareMarket.subscription.billingResumePending",
+    billing_control_failed: "shareMarket.subscription.billingControlRetry",
     revoke_pending: "shareMarket.subscription.revokePending",
     revoke_failed: "shareMarket.subscription.revokeFailed",
     grant_failed: "shareMarket.subscription.grantFailed",
@@ -708,9 +655,6 @@ function seatRentAction(
   if (listing.status !== "active" || seat.status !== "available") return null;
   if (seat.canRent) return "rent";
   if (!authed && guestCanSeeAvailable(listing, seat)) return "login";
-  // canRent can lag false while the seat is clearly open; still offer rent/login
-  // and let the API enforce block / already-renting / direct-grant rules.
-  if (listing.shareStatus === "active") return authed ? "rent" : "login";
   return null;
 }
 
@@ -734,6 +678,7 @@ function buildSeatRows(
         ({
           id: subscription.listingId,
           shareId: subscription.shareId,
+          installationId: subscription.installationId,
           shareName: subscription.shareName,
           appType: subscription.appType,
           ownerEmail: subscription.ownerEmail,
@@ -743,7 +688,7 @@ function buildSeatRows(
           shareOnline: !!subscription.shareOnline,
           isOwner: false,
           contacts: subscription.contacts,
-          paymentMethods: subscription.paymentMethods,
+          paymentMethodKinds: subscription.paymentMethodKinds,
           supportedUserTokenPeriods: [],
           seats: [],
           createdAt: subscription.createdAt,
@@ -756,22 +701,15 @@ function buildSeatRows(
           position: 0,
           status: isTerminalSubscription(subscription.status) ? "retired" : "occupied",
           offerRevision: subscription.offerRevision,
-          isFree: subscription.priceMinor == null,
+          isFree: subscription.dailyRateMinor == null,
           canRent: false,
           readOnly: isTerminalSubscription(subscription.status),
           retiredAt: subscription.releasedAt,
           parallelLimit: undefined,
           tokenLimit: undefined,
           tokenPeriod: "lifetime" as const,
-          priceMinor: subscription.priceMinor,
+          dailyRateMinor: subscription.dailyRateMinor,
           currency: subscription.currency,
-          periodUnit:
-            subscription.periodUnit === "day" ||
-            subscription.periodUnit === "week" ||
-            subscription.periodUnit === "month"
-              ? subscription.periodUnit
-              : undefined,
-          periodCount: subscription.periodCount,
           subscription,
         } satisfies ShareMarketSeat);
       return {
@@ -868,7 +806,8 @@ function ProviderExpandPanel({
         <div className="min-w-0 col-span-2">
           <div className="flex items-center gap-0.5 text-slate-500">
             <span>{t("shareMarket.owner")}</span>
-            <ProviderContactButton contacts={listing.contacts} paymentMethods={listing.paymentMethods} />
+            <PaymentMethodIcons kinds={listing.paymentMethodKinds} />
+            <ProviderContactButton contacts={listing.contacts} />
           </div>
           <span className="block truncate text-slate-600" title={listing.ownerEmail}>{listing.ownerEmail}</span>
         </div>
@@ -877,137 +816,10 @@ function ProviderExpandPanel({
   );
 }
 
-function PaymentDialog({
-  subscription,
-  onClose,
-  onPaid,
-}: {
-  subscription: ShareMarketSubscription | null;
-  onClose: () => void;
-  onPaid: () => void;
-}) {
-  const { t } = useLocaleText();
-  const [confirmed, setConfirmed] = React.useState(false);
-  const [busy, setBusy] = React.useState(false);
-  const [error, setError] = React.useState("");
-  const invoice = subscription?.openInvoice;
-  const paymentMethods = subscription?.paymentMethods || [];
-  const hasPaymentMethods = paymentMethods.length > 0;
-  const confirmationRevision = [
-    subscription?.id,
-    invoice?.id,
-    invoice?.amountMinor,
-    subscription?.offerRevision,
-    subscription?.paymentProfileUpdatedAt,
-  ].join(":");
-  React.useEffect(() => {
-    setConfirmed(false);
-    setError("");
-  }, [confirmationRevision]);
-  const submit = async () => {
-    if (!subscription || !invoice || !subscription.paymentProfileUpdatedAt) return;
-    setBusy(true);
-    setError("");
-    try {
-      await declareShareMarketPaid(subscription.id, {
-        invoiceId: invoice.id,
-        offerRevision: subscription.offerRevision,
-        amountMinorConfirmed: invoice.amountMinor,
-        paymentProfileUpdatedAt: subscription.paymentProfileUpdatedAt,
-      });
-      onClose();
-      onPaid();
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setBusy(false);
-    }
-  };
-  return (
-    <Modal.Backdrop isOpen={!!subscription} onOpenChange={(next) => !next && !busy && onClose()}>
-      <Modal.Container placement="center">
-        <Modal.Dialog className="light w-[min(620px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
-          <Modal.Header><Modal.Heading>{t("shareMarket.paymentDetails")}</Modal.Heading></Modal.Header>
-          <Modal.Body className="grid max-h-[70vh] gap-4 overflow-y-auto">
-            {invoice ? (
-              <div className="flex items-baseline justify-between gap-3 border-b border-slate-200 pb-3">
-                <span className="text-sm text-slate-500">{subscription?.shareName}</span>
-                <strong className="text-lg">{(invoice.amountMinor / 100).toFixed(2)} {invoice.currency}</strong>
-              </div>
-            ) : null}
-            {subscription && !invoice ? (
-              <div className="flex items-center gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
-                <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
-                <span>{t("shareMarket.paymentPreparing")}</span>
-              </div>
-            ) : null}
-            <div className="grid gap-3">
-              <ProviderContactsList contacts={subscription?.contacts} />
-              <ProviderPaymentMethodsList paymentMethods={paymentMethods} />
-              {!hasPaymentMethods ? <p className="text-sm text-slate-500">{t("shareMarket.noPaymentMethods")}</p> : null}
-            </div>
-            <Checkbox isDisabled={!invoice} isSelected={confirmed} onChange={setConfirmed}>
-              <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
-              <Checkbox.Content><span className="text-sm text-slate-700">{t("shareMarket.confirmPaid")}</span></Checkbox.Content>
-            </Checkbox>
-            {error ? <p className="text-sm text-red-600">{error}</p> : null}
-          </Modal.Body>
-          <Modal.Footer>
-            <Button variant="outline" isDisabled={busy} onClick={onClose}>{t("common.cancel")}</Button>
-            <Button variant="primary" isDisabled={!confirmed || !invoice || !hasPaymentMethods || busy || !subscription?.paymentProfileUpdatedAt} onClick={() => void submit()}>
-              {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <CircleDollarSign className="h-4 w-4" />}{t("shareMarket.declarePaid")}
-            </Button>
-          </Modal.Footer>
-        </Modal.Dialog>
-      </Modal.Container>
-    </Modal.Backdrop>
-  );
-}
-
-function SharePaymentAction({
-  subscription,
-  trialHours,
-  onPay,
-}: {
-  subscription: ShareMarketSubscription;
-  trialHours: number;
-  onPay: () => void;
-}) {
-  const { locale, t } = useLocaleText();
-  const [, refreshCountdown] = React.useState(0);
-  const countdownId = React.useId();
-  const deadline = sharePaymentDeadline(subscription, trialHours);
-
-  React.useEffect(() => {
-    if (!deadline) return;
-    const timer = window.setInterval(() => refreshCountdown((value) => value + 1), 30_000);
-    return () => window.clearInterval(timer);
-  }, [deadline]);
-
-  const countdown = formatBillingCountdown(deadline, locale);
-  return (
-    <div className="grid justify-items-center gap-0.5">
-      <Button
-        size="sm"
-        variant="primary"
-        aria-describedby={countdown ? countdownId : undefined}
-        onClick={onPay}
-      >
-        <CircleDollarSign className="h-4 w-4" />
-        {t("shareMarket.goPay")}
-      </Button>
-      {countdown ? (
-        <span id={countdownId} className="max-w-28 text-center text-[10px] leading-4 text-amber-700">
-          {t("shareMarket.paymentCountdown", { countdown })}
-        </span>
-      ) : null}
-    </div>
-  );
-}
-
 export function ShareMarketPage() {
   const { t, locale } = useLocaleText();
   const { session, loading: authLoading } = useAuth();
+  const { openChat, unreadByInstallation } = useClientChat();
   const searchParams = useSearchParams();
   const authed = !!session?.authenticated;
   const [catalog, setCatalog] = React.useState<ShareMarketCatalog | null>(null);
@@ -1025,7 +837,6 @@ export function ShareMarketPage() {
   const [sortPrefs, setSortPrefs] = usePersistentState<SeatSortPrefs>(SORT_PREFS_KEY, CLEARED_SEAT_SORT);
   const [addOpen, setAddOpen] = React.useState(false);
   const [seatDialog, setSeatDialog] = React.useState<{ listingId: string; seat?: ShareMarketSeat; supportedPeriods?: ShareTokenPeriod[] } | null>(null);
-  const [paymentSubscriptionId, setPaymentSubscriptionId] = React.useState("");
   const [confirmAction, setConfirmAction] = React.useState<ConfirmAction | null>(null);
   const [busyId, setBusyId] = React.useState("");
   const focusedRef = React.useRef<string>("");
@@ -1081,27 +892,14 @@ export function ShareMarketPage() {
   }, []);
 
   React.useEffect(() => { void load(); }, [load, session?.user?.id]);
-  const paymentSubscription = React.useMemo(
-    () => catalog?.mySubscriptions.find((subscription) => subscription.id === paymentSubscriptionId) || null,
-    [catalog, paymentSubscriptionId],
-  );
   React.useEffect(() => {
-    if (!paymentSubscriptionId || !catalog) return;
-    if (!paymentSubscription || !canOpenSharePayment(paymentSubscription)) {
-      setPaymentSubscriptionId("");
-    }
-  }, [catalog, paymentSubscription, paymentSubscriptionId]);
-  React.useEffect(() => {
-    const waitingForPayment = !!paymentSubscription
-      && paymentSubscription.status === "grant_pending"
-      && !paymentSubscription.openInvoice;
     const timer = window.setInterval(() => {
-      if (waitingForPayment || (!addOpen && !seatDialog && !paymentSubscriptionId && !confirmAction && !busyId)) {
+      if (!addOpen && !seatDialog && !confirmAction && !busyId) {
         void load(true);
       }
-    }, waitingForPayment ? 1_000 : 5_000);
+    }, 5_000);
     return () => window.clearInterval(timer);
-  }, [addOpen, busyId, confirmAction, load, paymentSubscription, paymentSubscriptionId, seatDialog]);
+  }, [addOpen, busyId, confirmAction, load, seatDialog]);
 
   const act = async (id: string, action: () => Promise<unknown>) => {
     if (busyId) return;
@@ -1249,8 +1047,31 @@ export function ShareMarketPage() {
     setOwnerFilters([]);
   }, [setOnlineFilters, setOwnerFilters, setShareFilters, setStatusFilters]);
 
-  const date = (value?: string) => value ? new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value)) : "";
   const tokenPeriod = (period: ShareTokenPeriod) => t(`shareMarket.period.${period}`);
+
+  const renderGroupChat = (installationId: string | undefined) => {
+    if (!installationId) return <span className="text-slate-400">—</span>;
+    const unread = unreadByInstallation.get(installationId) || 0;
+    return (
+      <span className="relative inline-flex" title={t("shareMarket.openGroupChat")}>
+        <Button
+          isIconOnly
+          size="sm"
+          variant="ghost"
+          className="h-8 w-8 min-w-8"
+          aria-label={t("shareMarket.openGroupChat")}
+          onClick={() => void openChat(installationId)}
+        >
+          <MessagesSquare className="h-4 w-4" />
+        </Button>
+        {unread > 0 ? (
+          <span className="pointer-events-none absolute -right-1 -top-1 min-w-4 rounded-full bg-red-600 px-1 text-center text-[9px] font-semibold leading-4 text-white">
+            {unread > 99 ? "99+" : unread}
+          </span>
+        ) : null}
+      </span>
+    );
+  };
 
   React.useEffect(() => {
     if (!focusShareId || !catalog || layout !== "shares" || focusedRef.current === focusShareId) return;
@@ -1293,32 +1114,35 @@ export function ShareMarketPage() {
         </div>
         <div className="mt-1 flex min-w-0 items-center gap-0.5">
           <p className="min-w-0 truncate text-xs text-slate-500">{ownerView ? subscription.renterEmail : subscription.ownerEmail}</p>
-          {!ownerView ? <ProviderContactButton contacts={subscription.contacts} paymentMethods={subscription.paymentMethods} /> : null}
-        </div>
-        <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-600">
-          {subscription.trialEndsAt && subscription.status === "trial_payment_due" ? <span>{t("shareMarket.trialEnds", { time: date(subscription.trialEndsAt) })}</span> : null}
-          {subscription.paymentDeadline ? <span>{t("shareMarket.paymentDeadline", { time: date(subscription.paymentDeadline) })}</span> : null}
-          {subscription.currentPeriodEnd ? <span>{t("shareMarket.periodEnds", { time: date(subscription.currentPeriodEnd) })}</span> : null}
+          {!ownerView ? (
+            <>
+              <PaymentMethodIcons kinds={subscription.paymentMethodKinds} />
+              <ProviderContactButton contacts={subscription.contacts} />
+            </>
+          ) : null}
         </div>
       </div>
       <div className="flex flex-wrap items-start justify-start gap-2 sm:justify-end">
+        {renderGroupChat(subscription.installationId)}
         {openUrl ? (
           <Button size="sm" variant="outline" onClick={() => window.open(openUrl, "_blank", "noopener,noreferrer")}>
             <ExternalLink className="h-4 w-4" />{t("shareMarket.openShare")}
           </Button>
         ) : null}
-        {!ownerView && canOpenSharePayment(subscription) ? (
-          <SharePaymentAction
-            subscription={subscription}
-            trialHours={catalog?.trialHours || 0}
-            onPay={() => setPaymentSubscriptionId(subscription.id)}
-          />
+        {subscription.dailyRateMinor != null ? (
+          <Link
+            href={DASHBOARD_ACCOUNT_BILLING_PATH}
+            className="inline-flex h-8 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-3 text-sm font-medium text-slate-700 transition-colors hover:bg-slate-50"
+          >
+            <CircleDollarSign className="h-4 w-4" />
+            {t("marketBilling.open")}
+          </Link>
         ) : null}
         {!ownerView && subscription.canRelease ? <Button size="sm" variant="outline" isDisabled={!!busyId} onClick={() => setConfirmAction({ id: subscription.id, title: t("shareMarket.confirm.releaseTitle"), description: t("shareMarket.confirm.releaseDescription", { share: subscription.shareName }), confirmLabel: t("shareMarket.release"), tone: "warning", run: () => releaseShareMarketSubscription(subscription.id) })}><RotateCcw className="h-4 w-4" />{t("shareMarket.release")}</Button> : null}
         {ownerView && subscription.canForceRevoke ? (
           <>
-            <Button size="sm" variant="outline" isDisabled={!!busyId} onClick={() => setConfirmAction({ id: subscription.id, title: t("shareMarket.confirm.revokeTitle"), description: t("shareMarket.confirm.revokeDescription", { email: subscription.renterEmail }), confirmLabel: t("shareMarket.forceRevoke"), tone: "warning", run: () => forceRevokeShareMarketSubscription(subscription.id, { blockUser: false }) })}>{t("shareMarket.forceRevoke")}</Button>
-            <Button size="sm" variant="danger" isDisabled={!!busyId} onClick={() => setConfirmAction({ id: subscription.id, title: t("shareMarket.confirm.blockTitle"), description: t("shareMarket.confirm.blockDescription", { email: subscription.renterEmail }), confirmLabel: t("shareMarket.blockAndRevoke"), tone: "danger", run: () => forceRevokeShareMarketSubscription(subscription.id, { blockUser: true }) })}><UserRoundX className="h-4 w-4" />{t("shareMarket.blockAndRevoke")}</Button>
+            <Button size="sm" variant="outline" isDisabled={!!busyId} onClick={() => setConfirmAction({ id: subscription.id, title: t("shareMarket.confirm.revokeTitle"), description: t("shareMarket.confirm.revokeDescription", { email: subscription.renterEmail }), confirmLabel: t("shareMarket.forceRevoke"), tone: "warning", run: () => forceRevokeShareMarketSubscription(subscription.id, { denyFutureAccess: false }) })}>{t("shareMarket.forceRevoke")}</Button>
+            <Button size="sm" variant="danger" isDisabled={!!busyId} onClick={() => setConfirmAction({ id: subscription.id, title: t("shareMarket.confirm.denyTitle"), description: t("shareMarket.confirm.denyDescription", { email: subscription.renterEmail }), confirmLabel: t("shareMarket.denyAndRevoke"), tone: "danger", run: () => forceRevokeShareMarketSubscription(subscription.id, { denyFutureAccess: true }) })}><UserRoundX className="h-4 w-4" />{t("shareMarket.denyAndRevoke")}</Button>
           </>
         ) : null}
       </div>
@@ -1357,12 +1181,14 @@ export function ShareMarketPage() {
             {t("nav.login")}
           </Button>
         ) : null}
-        {subscription && canOpenSharePayment(subscription) ? (
-          <SharePaymentAction
-            subscription={subscription}
-            trialHours={catalog?.trialHours || 0}
-            onPay={() => setPaymentSubscriptionId(subscription.id)}
-          />
+        {subscription?.dailyRateMinor != null ? (
+          <Link
+            href={DASHBOARD_ACCOUNT_BILLING_PATH}
+            className="inline-flex h-8 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-3 text-sm font-medium text-slate-700 transition-colors hover:bg-slate-50"
+          >
+            <CircleDollarSign className="h-4 w-4" />
+            {t("marketBilling.open")}
+          </Link>
         ) : null}
         {subscription?.canRelease ? (
           <Button
@@ -1428,7 +1254,7 @@ export function ShareMarketPage() {
                       description: t("shareMarket.confirm.revokeDescription", { email: subscription.renterEmail }),
                       confirmLabel: t("shareMarket.forceRevoke"),
                       tone: "warning",
-                      run: () => forceRevokeShareMarketSubscription(subscription.id, { blockUser: false }),
+                      run: () => forceRevokeShareMarketSubscription(subscription.id, { denyFutureAccess: false }),
                     })}
                   >
                     <RotateCcw className="h-4 w-4" />
@@ -1441,15 +1267,15 @@ export function ShareMarketPage() {
                     className="text-destructive"
                     onAction={() => setConfirmAction({
                       id: subscription.id,
-                      title: t("shareMarket.confirm.blockTitle"),
-                      description: t("shareMarket.confirm.blockDescription", { email: subscription.renterEmail }),
-                      confirmLabel: t("shareMarket.blockAndRevoke"),
+                      title: t("shareMarket.confirm.denyTitle"),
+                      description: t("shareMarket.confirm.denyDescription", { email: subscription.renterEmail }),
+                      confirmLabel: t("shareMarket.denyAndRevoke"),
                       tone: "danger",
-                      run: () => forceRevokeShareMarketSubscription(subscription.id, { blockUser: true }),
+                      run: () => forceRevokeShareMarketSubscription(subscription.id, { denyFutureAccess: true }),
                     })}
                   >
                     <UserRoundX className="h-4 w-4" />
-                    {t("shareMarket.blockAndRevoke")}
+                    {t("shareMarket.denyAndRevoke")}
                   </Dropdown.Item>
                 ) : null}
                 <Dropdown.Item id={`manage-${seat.id}`} onAction={() => openShareManage(listing.shareId)}>
@@ -1537,7 +1363,8 @@ export function ShareMarketPage() {
             <div className="flex min-w-0 items-center gap-1 text-xs text-slate-500">
               <span className="shrink-0">{t("shareMarket.owner")}:</span>
               <span className="max-w-[16rem] truncate text-slate-700" title={listing.ownerEmail}>{listing.ownerEmail}</span>
-              <ProviderContactButton contacts={listing.contacts} paymentMethods={listing.paymentMethods} />
+              <PaymentMethodIcons kinds={listing.paymentMethodKinds} />
+              <ProviderContactButton contacts={listing.contacts} />
             </div>
             <span className={`rounded-sm px-1.5 py-0.5 text-[10px] font-medium ${statusTone}`}>{listingStatus}</span>
           </div>
@@ -1547,7 +1374,8 @@ export function ShareMarketPage() {
           ) : null}
         </div>
         {listing.isOwner ? (
-          <div className="flex flex-wrap gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            {renderGroupChat(listing.installationId)}
             <Button size="sm" variant="outline" onClick={() => setSeatDialog({ listingId: listing.id, supportedPeriods: listing.supportedUserTokenPeriods })}><Plus className="h-4 w-4" />{t("shareMarket.addSeat")}</Button>
             {listing.status === "active" ? <Button size="sm" variant="outline" isDisabled={!!busyId} onClick={() => setConfirmAction({ id: listing.id, title: t("shareMarket.confirm.closeTitle"), description: t("shareMarket.confirm.closeDescription", { share: listing.shareName }), confirmLabel: t("shareMarket.closeListing"), tone: "warning", run: () => closeShareMarketListing(listing.id) })}><Ban className="h-4 w-4" />{t("shareMarket.closeListing")}</Button> : null}
             {listing.status === "closed" && !hasRentalHistory ? (
@@ -1571,7 +1399,9 @@ export function ShareMarketPage() {
               </Button>
             ) : null}
           </div>
-        ) : null}
+        ) : (
+          renderGroupChat(listing.installationId)
+        )}
       </header>
       <div className="overflow-x-auto">
         <table className="w-full min-w-[860px] text-left text-sm">
@@ -1582,7 +1412,7 @@ export function ShareMarketPage() {
                   <td className="px-4 py-3 font-medium tabular-nums">{seat.position}</td>
                   <td className="px-3 py-3 text-slate-600">{seat.parallelLimit ?? t("common.unlimited")}</td>
                   <td className="px-3 py-3 text-slate-600">{seat.tokenLimit?.toLocaleString() ?? t("common.unlimited")} · {tokenPeriod(seat.tokenPeriod)}</td>
-                  <td className="px-3 py-3 font-medium">{formatPrice(seat, t("shareMarket.free"))}</td>
+                  <td className="px-3 py-3 font-medium">{formatPrice(seat, t("shareMarket.free"), t("marketBilling.day"))}</td>
                   <td className="max-w-[14rem] px-3 py-3"><span className="block truncate text-slate-600" title={seat.subscription?.renterEmail}>{seat.subscription?.renterEmail || "—"}</span></td>
                   <td className="px-3 py-3"><span className="rounded-sm bg-slate-100 px-1.5 py-0.5 text-xs text-slate-600">{seatStatusLabel(seat, seat.subscription, t)}</span></td>
                   <td className="px-4 py-3">{renderSeatActions(listing, seat, seat.subscription)}</td>
@@ -1598,7 +1428,7 @@ export function ShareMarketPage() {
   const renderSeatFirstTable = () => (
     <section className="rounded-md border border-slate-200 bg-white">
       <div className="overflow-x-auto">
-        <table className="w-full min-w-[1120px] text-left text-sm">
+        <table className="w-full min-w-[1180px] text-left text-sm">
           <thead className="bg-slate-50 text-xs font-medium text-slate-500">
             <tr>
               <th className="sticky top-0 z-10 w-10 border-b border-slate-200 bg-slate-50 px-2 py-2" />
@@ -1685,6 +1515,9 @@ export function ShareMarketPage() {
                   />
                 }
               />
+              <th className="sticky top-0 z-10 border-b border-slate-200 bg-slate-50 px-3 py-2 text-center text-xs font-medium text-slate-500">
+                {t("shareMarket.groupChat")}
+              </th>
               <th
                 scope="col"
                 className="sticky top-0 z-10 border-b border-slate-200 bg-slate-50 px-4 py-2 text-right text-xs font-medium text-slate-500"
@@ -1750,7 +1583,7 @@ export function ShareMarketPage() {
                       {seat.tokenLimit?.toLocaleString() ?? t("common.unlimited")}
                       {seat.tokenPeriod ? ` · ${tokenPeriod(seat.tokenPeriod)}` : ""}
                     </td>
-                    <td className="px-3 py-3 font-medium">{formatPrice(seat, t("shareMarket.free"))}</td>
+                    <td className="px-3 py-3 font-medium">{formatPrice(seat, t("shareMarket.free"), t("marketBilling.day"))}</td>
                     <td className="max-w-[14rem] px-3 py-3">
                       <span className="block truncate text-xs text-slate-600" title={subscription?.renterEmail}>
                         {subscription?.renterEmail || "—"}
@@ -1764,14 +1597,18 @@ export function ShareMarketPage() {
                         <span className="min-w-0 truncate text-xs text-slate-600" title={listing.ownerEmail}>
                           {listing.ownerEmail}
                         </span>
-                        <ProviderContactButton contacts={listing.contacts} paymentMethods={listing.paymentMethods} />
+                        <PaymentMethodIcons kinds={listing.paymentMethodKinds} />
+                        <ProviderContactButton contacts={listing.contacts} />
                       </div>
+                    </td>
+                    <td className="px-3 py-3 text-center">
+                      {renderGroupChat(listing.installationId || subscription?.installationId)}
                     </td>
                     <td className="px-4 py-3">{renderSeatActions(listing, seat, subscription)}</td>
                   </tr>
                   {expanded ? (
                     <tr className="border-t border-slate-100 bg-slate-50/70">
-                      <td colSpan={11} className="px-4 py-3">
+                      <td colSpan={12} className="px-4 py-3">
                         <ProviderExpandPanel listing={listing} locale={locale} t={t} />
                       </td>
                     </tr>
@@ -1834,6 +1671,15 @@ export function ShareMarketPage() {
           </label>
         </div>
         <div className="flex gap-2">
+          {authed ? (
+            <Link
+              href={DASHBOARD_ACCOUNT_BILLING_PATH}
+              className="inline-flex h-8 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-3 text-sm font-medium text-slate-700 transition-colors hover:bg-slate-50"
+            >
+              <CircleDollarSign className="h-4 w-4" />
+              {t("marketBilling.open")}
+            </Link>
+          ) : null}
           <Button isIconOnly variant="ghost" aria-label={t("common.reload")} isDisabled={loading} onClick={() => void load()}><RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} /></Button>
           <Button variant="primary" size="sm" className="h-8" isDisabled={authLoading} onClick={() => authed ? setAddOpen(true) : window.dispatchEvent(new Event("router-open-login"))}>
             <Plus className="h-4 w-4" />
@@ -1860,49 +1706,8 @@ export function ShareMarketPage() {
         </section>
       ) : null}
 
-      <UserBlacklistPanel
-        enabled={authed}
-        hosting={(catalog?.listings || []).some((listing) => listing.isOwner)}
-        entries={(catalog?.ownerBlocks || []).map((block) => ({
-          id: block.blockedUserId,
-          email: block.blockedEmail,
-          reason: block.reason,
-          createdAt: block.createdAt,
-        }))}
-        hint={t("shareMarket.blocksHint")}
-        empty={t("shareMarket.noBlocks")}
-        reasonLabel={(reason) =>
-          reason === "owner_force_revoke" || reason === "manual"
-            ? reason === "manual"
-              ? t("clientMarket.blockReason.manual")
-              : t("shareMarket.ownerRevokeReason")
-            : reason.replaceAll("_", " ")
-        }
-        onAdd={async (emails) => {
-          for (const email of emails) {
-            await createShareMarketBlock({ email, reason: "manual" });
-          }
-          if (emails.length === 1) {
-            toast.success(t("shareMarket.blockedAddedToast", { email: emails[0] }));
-          } else {
-            toast.success(t("shareMarket.blockedAddedCountToast", { count: emails.length }));
-          }
-          await load(true);
-        }}
-        onLift={async (id) => {
-          const target = (catalog?.ownerBlocks || []).find((block) => block.blockedUserId === id);
-          await liftShareMarketBlock(id);
-          if (target) toast.success(t("shareMarket.unblockedToast", { email: target.blockedEmail }));
-          await load(true);
-        }}
-      />
       <AddListingDialog open={addOpen} onOpenChange={setAddOpen} onSaved={() => void load(true)} />
       <SeatDialog open={!!seatDialog} listingId={seatDialog?.listingId || ""} seat={seatDialog?.seat} supportedPeriods={seatDialog?.supportedPeriods} onOpenChange={(next) => !next && setSeatDialog(null)} onSaved={() => void load(true)} />
-      <PaymentDialog
-        subscription={paymentSubscription}
-        onClose={() => setPaymentSubscriptionId("")}
-        onPaid={() => void load(true)}
-      />
       <ConfirmAlertDialog
         open={!!confirmAction}
         title={confirmAction?.title || ""}
@@ -1911,6 +1716,11 @@ export function ShareMarketPage() {
         cancelLabel={t("common.cancel")}
         tone={confirmAction?.tone || "warning"}
         busy={!!busyId}
+        extra={
+          <p className="rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-xs leading-5 text-sky-900">
+            {t("chat.marketPublicNotice")}
+          </p>
+        }
         onConfirm={() => void runConfirmedAction()}
         onOpenChange={(next) => !next && !busyId && setConfirmAction(null)}
       />
