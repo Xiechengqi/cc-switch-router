@@ -274,7 +274,7 @@ listener。日志使用 append 模式;生产环境应由 `logrotate` 或 journal
 **协议与功能**
 
 - 仅实现 HTTP/WebSocket tunnel,不支持任意 TCP 转发
-- 邮件验证码登录是基于服务端持久化 session 的 bearer token,不是 JWT
+- 邮件验证码登录是基于服务端持久化 session 的 bearer token,不是 JWT。验证码按邮箱、installation 和用途隔离；同一邮箱的多设备验证码可并存，校验必须使用发码时的 installation 身份
 - Resend 用量展示依赖官方响应头 `x-resend-daily-quota`;该 header 通常只对 free plan 返回,不返回时页脚不会显示用量
 
 **Share 数据一致性**

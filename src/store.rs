@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
 use std::net::IpAddr;
 use std::path::{Component, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use base64::Engine;
@@ -917,6 +917,7 @@ fn build_dashboard_country_aggregation(
 pub struct AppStore {
     pub(crate) conn: Arc<Mutex<Connection>>,
     share_log_recovery_attempts: Arc<Mutex<HashMap<String, i64>>>,
+    auth_email_send_locks: Arc<Mutex<HashMap<(String, String), Weak<Mutex<()>>>>>,
     ip_hash_salt: Arc<String>,
     geo_lookup_base_url: Arc<String>,
 }
@@ -1260,6 +1261,7 @@ impl AppStore {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             share_log_recovery_attempts: Arc::new(Mutex::new(HashMap::new())),
+            auth_email_send_locks: Arc::new(Mutex::new(HashMap::new())),
             ip_hash_salt: Arc::new(salt),
             geo_lookup_base_url: Arc::new("https://ip.im".to_string()),
         })
@@ -1279,6 +1281,7 @@ impl AppStore {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             share_log_recovery_attempts: Arc::new(Mutex::new(HashMap::new())),
+            auth_email_send_locks: Arc::new(Mutex::new(HashMap::new())),
             ip_hash_salt: Arc::new(salt),
             geo_lookup_base_url: Arc::new("https://ip.im".to_string()),
         })
@@ -3766,7 +3769,11 @@ impl AppStore {
         metadata: ClientMetadata,
     ) -> Result<RequestEmailCodeResponse, AppError> {
         let email = normalize_email(&input.email)?;
-        let now = Utc::now();
+        let send_lock = self
+            .auth_email_send_lock(&email, &input.installation_id)
+            .await;
+        let _send_guard = send_lock.lock().await;
+        let request_at = Utc::now();
         {
             let conn = self.conn.lock().await;
             let installation = get_installation(&conn, &input.installation_id)?
@@ -3785,7 +3792,7 @@ impl AppStore {
                 &input.installation_id,
                 "auth_request_code",
                 &input.nonce,
-                now,
+                request_at,
             )?;
             enforce_auth_send_limits(
                 &conn,
@@ -3793,7 +3800,7 @@ impl AppStore {
                 &email,
                 &input.installation_id,
                 &metadata,
-                now,
+                request_at,
             )?;
         }
 
@@ -3802,57 +3809,37 @@ impl AppStore {
         let provider_message_id =
             send_login_code_email(resend, config, &email, &code, config.auth_code_ttl_secs).await?;
 
-        let expires_at = now + Duration::seconds(config.auth_code_ttl_secs);
-        let resend_available_at = now + Duration::seconds(config.auth_code_cooldown_secs);
+        let issued_at = Utc::now();
         let code_hash = hash_token(&format!("{email}:{code}"));
-        let conn = self.conn.lock().await;
-        conn.execute(
-            "UPDATE email_login_challenges
-             SET consumed_at = ?2
-             WHERE email_normalized = ?1
-               AND purpose = ?3
-               AND consumed_at IS NULL",
-            params![email, now.to_rfc3339(), AUTH_PURPOSE_LOGIN],
-        )
-        .map_err(|e| AppError::Internal(format!("expire old auth challenges failed: {e}")))?;
-        conn.execute(
-            "INSERT INTO email_login_challenges (
-                id, email_normalized, installation_id, purpose, code_hash, expires_at,
-                consumed_at, attempt_count, resend_available_at, created_ip, created_user_agent, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 0, ?7, ?8, NULL, ?9)",
-            params![
-                Uuid::new_v4().to_string(),
-                email,
-                input.installation_id,
-                AUTH_PURPOSE_LOGIN,
-                code_hash,
-                expires_at.to_rfc3339(),
-                resend_available_at.to_rfc3339(),
-                metadata.ip,
-                now.to_rfc3339(),
-            ],
-        )
-        .map_err(|e| AppError::Internal(format!("insert auth challenge failed: {e}")))?;
-        conn.execute(
-            "INSERT INTO email_send_logs (
-                id, email_type, to_email, provider_message_id, status, error_message, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
-            params![
-                Uuid::new_v4().to_string(),
-                "login_code",
-                email,
-                provider_message_id,
-                "sent",
-                now.to_rfc3339(),
-            ],
-        )
-        .map_err(|e| AppError::Internal(format!("insert email send log failed: {e}")))?;
+        let mut conn = self.conn.lock().await;
+        persist_sent_login_challenge(
+            &mut conn,
+            config,
+            &email,
+            &input.installation_id,
+            &code_hash,
+            provider_message_id.as_deref(),
+            &metadata,
+            issued_at,
+        )?;
 
         Ok(RequestEmailCodeResponse {
             ok: true,
             cooldown_secs: config.auth_code_cooldown_secs,
             masked_destination: mask_email(&email),
         })
+    }
+
+    async fn auth_email_send_lock(&self, email: &str, installation_id: &str) -> Arc<Mutex<()>> {
+        let key = (email.to_string(), installation_id.to_string());
+        let mut locks = self.auth_email_send_locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
     }
 
     pub async fn verify_email_code(
@@ -3863,24 +3850,46 @@ impl AppStore {
         let email = normalize_email(&input.email)?;
         let code = input.code.trim();
         if code.len() != AUTH_CODE_DIGITS || !code.chars().all(|ch| ch.is_ascii_digit()) {
+            log_email_verification_rejection(EmailVerificationRejectionReason::InvalidCode);
             return Err(AppError::Unauthorized("invalid verification code".into()));
         }
 
         let now = Utc::now();
-        let conn = self.conn.lock().await;
-        let installation = get_installation(&conn, &input.installation_id)?
-            .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| AppError::Internal(format!("begin email verification failed: {e}")))?;
+        let installation = match get_installation(&tx, &input.installation_id)? {
+            Some(installation) => installation,
+            None => {
+                log_email_verification_rejection(EmailVerificationRejectionReason::NotFound);
+                return Err(AppError::Unauthorized("installation not found".into()));
+            }
+        };
 
         let challenge = get_latest_active_email_challenge(
-            &conn,
+            &tx,
             &email,
             &input.installation_id,
             AUTH_PURPOSE_LOGIN,
             now,
-        )?
-        .ok_or_else(|| AppError::Unauthorized("verification code expired or not found".into()))?;
+        )?;
+        let Some(challenge) = challenge else {
+            let reason = classify_missing_email_challenge(
+                &tx,
+                &email,
+                &input.installation_id,
+                AUTH_PURPOSE_LOGIN,
+                now,
+            )?;
+            log_email_verification_rejection(reason);
+            return Err(AppError::Unauthorized(
+                "verification code expired or not found".into(),
+            ));
+        };
 
         if challenge.attempt_count >= config.auth_max_verify_attempts {
+            log_email_verification_rejection(EmailVerificationRejectionReason::AttemptLimit);
             return Err(AppError::TooManyRequests(
                 "too many invalid verification attempts".into(),
             ));
@@ -3888,23 +3897,43 @@ impl AppStore {
 
         let expected_hash = hash_token(&format!("{email}:{code}"));
         if expected_hash != challenge.code_hash {
-            conn.execute(
+            tx.execute(
                 "UPDATE email_login_challenges
                  SET attempt_count = attempt_count + 1
                  WHERE id = ?1",
                 params![challenge.id],
             )
             .map_err(|e| AppError::Internal(format!("update auth attempts failed: {e}")))?;
+            tx.commit().map_err(|e| {
+                AppError::Internal(format!("commit auth attempt update failed: {e}"))
+            })?;
+            log_email_verification_rejection(EmailVerificationRejectionReason::InvalidCode);
             return Err(AppError::Unauthorized("invalid verification code".into()));
         }
 
-        conn.execute(
-            "UPDATE email_login_challenges SET consumed_at = ?2 WHERE id = ?1",
-            params![challenge.id, now.to_rfc3339()],
-        )
-        .map_err(|e| AppError::Internal(format!("consume auth challenge failed: {e}")))?;
+        let consumed = tx
+            .execute(
+                "UPDATE email_login_challenges
+             SET consumed_at = ?2
+             WHERE id = ?1 AND consumed_at IS NULL AND expires_at >= ?2",
+                params![challenge.id, now.to_rfc3339()],
+            )
+            .map_err(|e| AppError::Internal(format!("consume auth challenge failed: {e}")))?;
+        if consumed != 1 {
+            let reason = classify_missing_email_challenge(
+                &tx,
+                &email,
+                &input.installation_id,
+                AUTH_PURPOSE_LOGIN,
+                now,
+            )?;
+            log_email_verification_rejection(reason);
+            return Err(AppError::Unauthorized(
+                "verification code expired or not found".into(),
+            ));
+        }
 
-        let user = upsert_user_by_email(&conn, &email, now)?;
+        let user = upsert_user_by_email(&tx, &email, now)?;
         let access_token = generate_secret(48);
         let refresh_token = generate_secret(64);
         let access_expires_at = now + Duration::seconds(config.auth_session_ttl_secs);
@@ -3921,8 +3950,10 @@ impl AppStore {
             created_at: now,
             last_used_at: now,
         };
-        persist_session(&conn, &session)?;
-        let (api_token, api_token_status) = ensure_default_user_api_token(&conn, &user.id, now)?;
+        persist_session(&tx, &session)?;
+        let (api_token, api_token_status) = ensure_default_user_api_token(&tx, &user.id, now)?;
+        tx.commit()
+            .map_err(|e| AppError::Internal(format!("commit email verification failed: {e}")))?;
 
         Ok(VerifyEmailCodeResponse {
             user,
@@ -22536,6 +22567,36 @@ struct EmailLoginChallenge {
     attempt_count: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmailVerificationRejectionReason {
+    Expired,
+    Consumed,
+    InstallationMismatch,
+    NotFound,
+    InvalidCode,
+    AttemptLimit,
+}
+
+impl EmailVerificationRejectionReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Expired => "expired",
+            Self::Consumed => "consumed",
+            Self::InstallationMismatch => "installation_mismatch",
+            Self::NotFound => "not_found",
+            Self::InvalidCode => "invalid_code",
+            Self::AttemptLimit => "attempt_limit",
+        }
+    }
+}
+
+fn log_email_verification_rejection(reason: EmailVerificationRejectionReason) {
+    tracing::warn!(
+        reason = reason.as_str(),
+        "email verification challenge rejected"
+    );
+}
+
 fn normalize_email(value: &str) -> Result<String, AppError> {
     let email = value.trim().to_ascii_lowercase();
     let Some((local, domain)) = email.split_once('@') else {
@@ -23096,6 +23157,123 @@ fn latest_challenge_cooldown(
         parse_dt_sql(&value).map_err(|e| AppError::Internal(format!("parse cooldown failed: {e}")))
     })
     .transpose()
+}
+
+fn persist_sent_login_challenge(
+    conn: &mut Connection,
+    config: &Config,
+    email: &str,
+    installation_id: &str,
+    code_hash: &str,
+    provider_message_id: Option<&str>,
+    metadata: &ClientMetadata,
+    issued_at: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let issued_at_text = issued_at.to_rfc3339();
+    let expires_at = issued_at + Duration::seconds(config.auth_code_ttl_secs);
+    let resend_available_at = issued_at + Duration::seconds(config.auth_code_cooldown_secs);
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| AppError::Internal(format!("begin auth challenge persistence failed: {e}")))?;
+    tx.execute(
+        "UPDATE email_login_challenges
+         SET consumed_at = ?4
+         WHERE email_normalized = ?1
+           AND installation_id = ?2
+           AND purpose = ?3
+           AND consumed_at IS NULL",
+        params![email, installation_id, AUTH_PURPOSE_LOGIN, issued_at_text,],
+    )
+    .map_err(|e| AppError::Internal(format!("expire old auth challenges failed: {e}")))?;
+    tx.execute(
+        "INSERT INTO email_login_challenges (
+            id, email_normalized, installation_id, purpose, code_hash, expires_at,
+            consumed_at, attempt_count, resend_available_at, created_ip, created_user_agent, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 0, ?7, ?8, NULL, ?9)",
+        params![
+            Uuid::new_v4().to_string(),
+            email,
+            installation_id,
+            AUTH_PURPOSE_LOGIN,
+            code_hash,
+            expires_at.to_rfc3339(),
+            resend_available_at.to_rfc3339(),
+            metadata.ip.as_deref(),
+            issued_at_text,
+        ],
+    )
+    .map_err(|e| AppError::Internal(format!("insert auth challenge failed: {e}")))?;
+    tx.execute(
+        "INSERT INTO email_send_logs (
+            id, email_type, to_email, provider_message_id, status, error_message, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
+        params![
+            Uuid::new_v4().to_string(),
+            "login_code",
+            email,
+            provider_message_id,
+            "sent",
+            issued_at_text,
+        ],
+    )
+    .map_err(|e| AppError::Internal(format!("insert email send log failed: {e}")))?;
+    tx.commit().map_err(|e| {
+        AppError::Internal(format!("commit auth challenge persistence failed: {e}"))
+    })?;
+    Ok(())
+}
+
+fn classify_missing_email_challenge(
+    conn: &Connection,
+    email: &str,
+    installation_id: &str,
+    purpose: &str,
+    now: DateTime<Utc>,
+) -> Result<EmailVerificationRejectionReason, AppError> {
+    let exact_status = conn
+        .query_row(
+            "SELECT consumed_at IS NOT NULL, expires_at < ?4
+             FROM email_login_challenges
+             WHERE email_normalized = ?1
+               AND installation_id = ?2
+               AND purpose = ?3
+             ORDER BY created_at DESC
+             LIMIT 1",
+            params![email, installation_id, purpose, now.to_rfc3339()],
+            |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
+        )
+        .optional()
+        .map_err(|e| AppError::Internal(format!("classify auth challenge failed: {e}")))?;
+    if let Some((consumed, expired)) = exact_status {
+        if consumed {
+            return Ok(EmailVerificationRejectionReason::Consumed);
+        }
+        if expired {
+            return Ok(EmailVerificationRejectionReason::Expired);
+        }
+    }
+
+    let installation_mismatch: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM email_login_challenges
+                WHERE email_normalized = ?1
+                  AND installation_id <> ?2
+                  AND purpose = ?3
+                  AND consumed_at IS NULL
+                  AND expires_at >= ?4
+             )",
+            params![email, installation_id, purpose, now.to_rfc3339()],
+            |row| row.get(0),
+        )
+        .map_err(|e| {
+            AppError::Internal(format!("classify auth installation mismatch failed: {e}"))
+        })?;
+    if installation_mismatch {
+        return Ok(EmailVerificationRejectionReason::InstallationMismatch);
+    }
+    Ok(EmailVerificationRejectionReason::NotFound)
 }
 
 fn get_latest_active_email_challenge(
@@ -23662,6 +23840,396 @@ mod tests {
         assert!(html.contains("<span translate=\"no\">TokenSwitch</span> router notification"));
     }
 
+    #[tokio::test]
+    async fn auth_challenges_for_different_installations_remain_active() {
+        let (store, config) = setup_store("auth-challenge-installation-isolation").await;
+        insert_installation(&store, "auth-installation-a").await;
+        insert_installation(&store, "auth-installation-b").await;
+        let email = "buyer@example.com";
+        let issued_at = Utc::now();
+
+        insert_test_login_challenge(
+            &store,
+            &config,
+            email,
+            "auth-installation-a",
+            "111111",
+            issued_at,
+        )
+        .await;
+        insert_test_login_challenge(
+            &store,
+            &config,
+            email,
+            "auth-installation-b",
+            "222222",
+            issued_at + Duration::seconds(1),
+        )
+        .await;
+
+        let conn = store.conn.lock().await;
+        let active_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM email_login_challenges
+                 WHERE email_normalized = ?1 AND consumed_at IS NULL",
+                params![email],
+                |row| row.get(0),
+            )
+            .expect("count active installation challenges");
+        assert_eq!(active_count, 2);
+        assert_eq!(
+            get_latest_active_email_challenge(
+                &conn,
+                email,
+                "auth-installation-a",
+                AUTH_PURPOSE_LOGIN,
+                issued_at,
+            )
+            .expect("read installation a challenge")
+            .expect("installation a challenge")
+            .code_hash,
+            hash_token(&format!("{email}:111111"))
+        );
+        assert_eq!(
+            get_latest_active_email_challenge(
+                &conn,
+                email,
+                "auth-installation-b",
+                AUTH_PURPOSE_LOGIN,
+                issued_at,
+            )
+            .expect("read installation b challenge")
+            .expect("installation b challenge")
+            .code_hash,
+            hash_token(&format!("{email}:222222"))
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn auth_email_send_lock_serializes_only_the_same_challenge_scope() {
+        let (store, config) = setup_store("auth-email-send-lock-scope").await;
+        let first = store
+            .auth_email_send_lock("buyer@example.com", "installation-a")
+            .await;
+        let same_scope = store
+            .auth_email_send_lock("buyer@example.com", "installation-a")
+            .await;
+        let other_scope = store
+            .auth_email_send_lock("buyer@example.com", "installation-b")
+            .await;
+        assert!(Arc::ptr_eq(&first, &same_scope));
+        assert!(!Arc::ptr_eq(&first, &other_scope));
+
+        let held = first.lock().await;
+        let waiter = tokio::spawn(async move {
+            let _guard = same_scope.lock().await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        let other_guard = other_scope
+            .try_lock()
+            .expect("different challenge scope should not block");
+        drop(other_guard);
+        drop(held);
+        waiter.await.expect("same-scope lock waiter");
+
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn auth_challenge_resend_only_consumes_same_installation() {
+        let (store, config) = setup_store("auth-challenge-resend-isolation").await;
+        insert_installation(&store, "auth-resend-a").await;
+        insert_installation(&store, "auth-resend-b").await;
+        let email = "resend@example.com";
+        let issued_at = Utc::now();
+
+        insert_test_login_challenge(&store, &config, email, "auth-resend-a", "111111", issued_at)
+            .await;
+        insert_test_login_challenge(
+            &store,
+            &config,
+            email,
+            "auth-resend-b",
+            "222222",
+            issued_at + Duration::seconds(1),
+        )
+        .await;
+        insert_test_login_challenge(
+            &store,
+            &config,
+            email,
+            "auth-resend-a",
+            "333333",
+            issued_at + Duration::seconds(2),
+        )
+        .await;
+
+        let conn = store.conn.lock().await;
+        let installation_a_counts: (i64, i64) = conn
+            .query_row(
+                "SELECT
+                    SUM(CASE WHEN consumed_at IS NULL THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN consumed_at IS NOT NULL THEN 1 ELSE 0 END)
+                 FROM email_login_challenges
+                 WHERE email_normalized = ?1 AND installation_id = 'auth-resend-a'",
+                params![email],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("count installation a resend challenges");
+        assert_eq!(installation_a_counts, (1, 1));
+        let installation_b_active: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM email_login_challenges
+                 WHERE email_normalized = ?1
+                   AND installation_id = 'auth-resend-b'
+                   AND consumed_at IS NULL",
+                params![email],
+                |row| row.get(0),
+            )
+            .expect("count installation b active challenge");
+        assert_eq!(installation_b_active, 1);
+        let latest_a = get_latest_active_email_challenge(
+            &conn,
+            email,
+            "auth-resend-a",
+            AUTH_PURPOSE_LOGIN,
+            issued_at,
+        )
+        .expect("read resent challenge")
+        .expect("resent challenge");
+        assert_eq!(latest_a.code_hash, hash_token(&format!("{email}:333333")));
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn auth_challenge_missing_reason_distinguishes_failure_modes() {
+        let (store, config) = setup_store("auth-challenge-missing-reasons").await;
+        insert_installation(&store, "auth-reason-a").await;
+        insert_installation(&store, "auth-reason-b").await;
+        let now = Utc::now();
+
+        insert_test_login_challenge(
+            &store,
+            &config,
+            "mismatch@example.com",
+            "auth-reason-b",
+            "111111",
+            now,
+        )
+        .await;
+        insert_test_login_challenge(
+            &store,
+            &config,
+            "expired@example.com",
+            "auth-reason-a",
+            "222222",
+            now - Duration::seconds(config.auth_code_ttl_secs + 1),
+        )
+        .await;
+        insert_test_login_challenge(
+            &store,
+            &config,
+            "consumed@example.com",
+            "auth-reason-a",
+            "333333",
+            now,
+        )
+        .await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE email_login_challenges
+                 SET consumed_at = ?2
+                 WHERE email_normalized = ?1",
+                params!["consumed@example.com", now.to_rfc3339()],
+            )
+            .expect("consume reason challenge");
+        }
+
+        let conn = store.conn.lock().await;
+        assert_eq!(
+            classify_missing_email_challenge(
+                &conn,
+                "mismatch@example.com",
+                "auth-reason-a",
+                AUTH_PURPOSE_LOGIN,
+                now,
+            )
+            .expect("classify installation mismatch"),
+            EmailVerificationRejectionReason::InstallationMismatch
+        );
+        assert_eq!(
+            classify_missing_email_challenge(
+                &conn,
+                "expired@example.com",
+                "auth-reason-a",
+                AUTH_PURPOSE_LOGIN,
+                now,
+            )
+            .expect("classify expired challenge"),
+            EmailVerificationRejectionReason::Expired
+        );
+        assert_eq!(
+            classify_missing_email_challenge(
+                &conn,
+                "consumed@example.com",
+                "auth-reason-a",
+                AUTH_PURPOSE_LOGIN,
+                now,
+            )
+            .expect("classify consumed challenge"),
+            EmailVerificationRejectionReason::Consumed
+        );
+        assert_eq!(
+            classify_missing_email_challenge(
+                &conn,
+                "missing@example.com",
+                "auth-reason-a",
+                AUTH_PURPOSE_LOGIN,
+                now,
+            )
+            .expect("classify missing challenge"),
+            EmailVerificationRejectionReason::NotFound
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn auth_code_verification_atomically_creates_session_and_consumes_challenge() {
+        let (store, config) = setup_store("auth-verification-atomic-success").await;
+        let installation_id = "auth-atomic-success";
+        let email = "atomic-success@example.com";
+        let code = "123456";
+        insert_installation(&store, installation_id).await;
+        insert_test_login_challenge(&store, &config, email, installation_id, code, Utc::now())
+            .await;
+
+        let response = store
+            .verify_email_code(
+                &config,
+                VerifyEmailCodeRequest {
+                    email: email.into(),
+                    code: code.into(),
+                    installation_id: installation_id.into(),
+                },
+            )
+            .await
+            .expect("verify email challenge");
+        assert_eq!(response.user.email, email);
+
+        let conn = store.conn.lock().await;
+        let persisted: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM email_login_challenges WHERE consumed_at IS NOT NULL),
+                    (SELECT COUNT(*) FROM users WHERE email_normalized = ?1),
+                    (SELECT COUNT(*) FROM user_sessions WHERE installation_id = ?2),
+                    (SELECT COUNT(*) FROM user_api_tokens WHERE user_id = ?3)",
+                params![email, installation_id, response.user.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read atomic verification records");
+        assert_eq!(persisted, (1, 1, 1, 1));
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn auth_code_verification_rolls_back_consumption_when_session_creation_fails() {
+        let (store, config) = setup_store("auth-verification-atomic-rollback").await;
+        let installation_id = "auth-atomic-rollback";
+        let email = "atomic-rollback@example.com";
+        let code = "654321";
+        insert_installation(&store, installation_id).await;
+        insert_test_login_challenge(&store, &config, email, installation_id, code, Utc::now())
+            .await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute_batch(
+                "CREATE TRIGGER fail_auth_session_insert
+                 BEFORE INSERT ON user_sessions
+                 BEGIN
+                   SELECT RAISE(ABORT, 'forced auth session failure');
+                 END;",
+            )
+            .expect("create failing session trigger");
+        }
+
+        let result = store
+            .verify_email_code(
+                &config,
+                VerifyEmailCodeRequest {
+                    email: email.into(),
+                    code: code.into(),
+                    installation_id: installation_id.into(),
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(AppError::Internal(_))));
+
+        let conn = store.conn.lock().await;
+        let persisted: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM email_login_challenges WHERE consumed_at IS NOT NULL),
+                    (SELECT COUNT(*) FROM users WHERE email_normalized = ?1),
+                    (SELECT COUNT(*) FROM user_sessions WHERE installation_id = ?2)",
+                params![email, installation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read rolled back verification records");
+        assert_eq!(persisted, (0, 0, 0));
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn invalid_auth_code_attempt_is_committed() {
+        let (store, config) = setup_store("auth-verification-attempt-commit").await;
+        let installation_id = "auth-attempt-commit";
+        let email = "attempt@example.com";
+        insert_installation(&store, installation_id).await;
+        insert_test_login_challenge(
+            &store,
+            &config,
+            email,
+            installation_id,
+            "123456",
+            Utc::now(),
+        )
+        .await;
+
+        let result = store
+            .verify_email_code(
+                &config,
+                VerifyEmailCodeRequest {
+                    email: email.into(),
+                    code: "000000".into(),
+                    installation_id: installation_id.into(),
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(AppError::Unauthorized(_))));
+
+        let conn = store.conn.lock().await;
+        let attempt_count: i64 = conn
+            .query_row(
+                "SELECT attempt_count FROM email_login_challenges
+                 WHERE email_normalized = ?1 AND installation_id = ?2",
+                params![email, installation_id],
+                |row| row.get(0),
+            )
+            .expect("read committed auth attempt count");
+        assert_eq!(attempt_count, 1);
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
     #[test]
     fn token_market_pricing_accepts_single_bound_app() {
         let pricing = BTreeMap::from([("codex".to_string(), 80)]);
@@ -23871,6 +24439,31 @@ mod tests {
         let config = test_config(name);
         let store = AppStore::new(&config).expect("create store");
         (store, config)
+    }
+
+    async fn insert_test_login_challenge(
+        store: &AppStore,
+        config: &Config,
+        email: &str,
+        installation_id: &str,
+        code: &str,
+        issued_at: DateTime<Utc>,
+    ) {
+        let mut conn = store.conn.lock().await;
+        persist_sent_login_challenge(
+            &mut conn,
+            config,
+            email,
+            installation_id,
+            &hash_token(&format!("{email}:{code}")),
+            Some("test-provider-message"),
+            &ClientMetadata {
+                ip: Some("127.0.0.1".into()),
+                country_code: None,
+            },
+            issued_at,
+        )
+        .expect("insert test login challenge");
     }
 
     fn enabled_notification_config(name: &str) -> Config {

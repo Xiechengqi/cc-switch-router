@@ -63,6 +63,19 @@ Server 首次启动时生成 Ed25519 密钥对,公钥随注册请求上送。请
 - 签名为 Ed25519 签名的标准 base64
 - `nonce` 由 Router 侧 `request_nonces` 表做重放拦截
 
+### 3.1 Dashboard 邮箱登录 challenge
+
+Dashboard 浏览器同样通过 `POST /v1/installations/register` 建立 Ed25519 installation 身份。该身份是验证码 challenge、Session 和 refresh token 的设备边界，必须满足以下约束：
+
+- 同一浏览器 profile 的并发初始化必须收敛到同一组 `installationId`、公钥和私钥。单标签页使用 single-flight；支持 Web Locks API 时，跨标签页以 `cc-switch-router-installation-identity-v1` 锁串行初始化，并在持锁后重新读取持久化身份。
+- `POST /v1/auth/email/request-code` 使用 action `auth_request_code` 和 `{ email, purpose: "login" }` 签名。前端必须保存该次请求实际使用的完整 installation 身份快照。
+- challenge 的逻辑作用域是 `email_normalized + installation_id + purpose`。同一邮箱可在多个 installation 上同时持有有效 challenge；重发只消费同一作用域的旧 challenge，不得影响其他设备。
+- 同一邮箱和 installation 的并发发码在 Router 进程内串行执行，后到请求必须在前一请求落盘后重新经过冷却检查；等待邮件供应商时不得持有 SQLite 连接锁。
+- challenge 的 `created_at`、过期时间和重发冷却从邮件供应商确认发送成功后开始计算，发信耗时不占用验证码有效期。
+- `POST /v1/auth/email/verify-code` 必须提交发送 challenge 时保存的 `installationId`，不得在校验时重新解析可能已变化的浏览器身份。
+- 正确验证码的消费、用户 upsert、Session 创建和默认 API Token 创建位于同一个 SQLite `IMMEDIATE` 事务；任一写入失败时全部回滚。错误验证码的 `attempt_count` 独立提交。
+- 客户端只接收通用安全错误。Router 日志仅记录 `expired`、`consumed`、`installation_mismatch`、`not_found`、`invalid_code` 或 `attempt_limit` 原因码，不记录邮箱、验证码或验证码 hash。
+
 ---
 
 ## 4. Lease:一次性 SSH 凭证

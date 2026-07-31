@@ -4,6 +4,7 @@ import * as React from "react";
 import { Alert, Button, Form, Input, InputOTP, Modal, REGEXP_ONLY_DIGITS } from "@heroui/react";
 import { Loader2, Mail } from "lucide-react";
 import { requestEmailCode, resetInstallationIdentityState, shouldResetInstallationIdentity, verifyEmailCode } from "@/lib/auth";
+import type { InstallationIdentity } from "@/lib/auth";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 
@@ -26,13 +27,17 @@ export function LoginDialog({ open, onOpenChange }: { open: boolean; onOpenChang
   const [busy, setBusy] = React.useState(false);
   const [resending, setResending] = React.useState(false);
   const [maskedDestination, setMaskedDestination] = React.useState("");
+  const [challengeIdentity, setChallengeIdentity] = React.useState<InstallationIdentity | null>(null);
   const [error, setError] = React.useState("");
+  const sendingRef = React.useRef(false);
+  const verifyingRef = React.useRef(false);
 
   React.useEffect(() => {
     if (open) {
       setStep("email");
       setCode("");
       setMaskedDestination("");
+      setChallengeIdentity(null);
       setError("");
     }
   }, [open]);
@@ -40,7 +45,8 @@ export function LoginDialog({ open, onOpenChange }: { open: boolean; onOpenChang
   async function sendCode(options?: { resend?: boolean }) {
     const isResend = !!options?.resend;
     const source = isResend ? email : email.trim().toLowerCase();
-    if (!source) return;
+    if (!source || sendingRef.current) return;
+    sendingRef.current = true;
     if (isResend) setResending(true);
     else setBusy(true);
     setError("");
@@ -56,27 +62,32 @@ export function LoginDialog({ open, onOpenChange }: { open: boolean; onOpenChang
       }
       setEmail(source);
       setMaskedDestination(data.maskedDestination || fallbackMask(source));
+      setChallengeIdentity(data.identity);
       setStep("code");
       if (isResend) setCode("");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
+      sendingRef.current = false;
       if (isResend) setResending(false);
       else setBusy(false);
     }
   }
 
-  async function verify() {
-    if (!email.trim() || code.trim().length < 6) return;
+  async function verify(candidateCode: string) {
+    const submittedCode = candidateCode.trim();
+    if (!email.trim() || submittedCode.length < 6 || !challengeIdentity || verifyingRef.current) return;
+    verifyingRef.current = true;
     setBusy(true);
     setError("");
     try {
-      await verifyEmailCode(email.trim().toLowerCase(), code.trim());
+      await verifyEmailCode(email.trim().toLowerCase(), submittedCode, challengeIdentity);
       await refresh();
       onOpenChange(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
+      verifyingRef.current = false;
       setBusy(false);
     }
   }
@@ -105,7 +116,7 @@ export function LoginDialog({ open, onOpenChange }: { open: boolean; onOpenChang
                 if (!isCodeStep) {
                   if (!busy && email.trim()) sendCode().catch(console.error);
                 } else if (!busy && code.trim().length >= 6) {
-                  verify().catch(console.error);
+                  verify(code).catch(console.error);
                 }
               }}
             >
@@ -116,7 +127,7 @@ export function LoginDialog({ open, onOpenChange }: { open: boolean; onOpenChang
                       value={code}
                       onChange={(value) => {
                         setCode(value);
-                        if (value.length === 6 && !busy) verify().catch(console.error);
+                        if (value.length === 6 && !busy) verify(value).catch(console.error);
                       }}
                       maxLength={6}
                       pattern={REGEXP_ONLY_DIGITS}
@@ -143,6 +154,7 @@ export function LoginDialog({ open, onOpenChange }: { open: boolean; onOpenChang
                       onClick={() => {
                         setStep("email");
                         setCode("");
+                        setChallengeIdentity(null);
                         setError("");
                       }}
                       disabled={busy || resending}

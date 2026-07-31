@@ -136,6 +136,12 @@ location.reload();
 | A-18 | 承 A-16 | 点「不再提示」 | 关闭;刷新不再弹 |
 | A-19 | 承 A-16 | 点弹窗 X | 关闭但**不写忽略状态**,刷新后仍弹 |
 | A-20 | 任意 | 逐个点 5 个导航 tab | 分别到 clients / markets / client-market / rentals / account,选中态正确 |
+| A-21 | 清空 `cc_switch_router_auth_v1`;拦截 Network | 同一标签页同时触发 AuthProvider 初始化和发送验证码 | `/v1/installations/register` 只发送 1 次;后续 request-code 与 localStorage 使用同一 `installationId` |
+| A-22 | 清空认证 localStorage;浏览器支持 Web Locks | 同时打开两个 Dashboard 标签页 | 两页最终持有相同完整 installation 身份;总计只注册 1 个 installation;任一页发码后均不覆盖身份 |
+| A-23 | 承 A-02;拦截 verify-code | 快速输入或粘贴完整 6 位验证码 | 只发送 1 次 verify-code;body 使用最新 6 位值和 request-code 时的 `installationId` |
+| A-24 | 两个独立浏览器 profile/设备,同一邮箱 | 设备 A 请求验证码;设备 B 随后请求验证码;分别输入各自邮件中的验证码 | 两个 challenge 均有效;设备 B 的请求不使设备 A 报 `expired or not found` |
+| A-25 | 同一设备和邮箱 | 请求验证码后点「重新发送」;先输入旧码再输入新码 | 旧码失败且新码成功;其他设备的有效验证码不受影响 |
+| A-26 | 清空认证状态;拦截 request-code | 快速双击发送或在同一浏览器两个标签页同时为同一邮箱发码 | 前端单标签页只发 1 次;跨标签页后到请求命中冷却且不再发送第二封邮件 |
 
 ---
 
@@ -753,7 +759,7 @@ location.reload();
 | 文件 | 用例 |
 |---|---|
 | `layout/app-shell.tsx` | A-01, A-07~A-15, A-20 |
-| `auth/login-dialog.tsx`, `auth-provider.tsx` | A-02~A-06, A-12 |
+| `auth/login-dialog.tsx`, `auth-provider.tsx` | A-02~A-06, A-12, A-21~A-26 |
 | `announcement/*` | A-16~A-19 |
 | `dashboard/live-map.tsx` | C-02~C-06 |
 | `dashboard/client-board.tsx` | C-07~C-16, C-22 |

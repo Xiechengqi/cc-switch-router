@@ -6,9 +6,11 @@ const AUTH_KEY = "cc_switch_router_auth_v1";
 const PROTOCOL_EPOCH = "namespace-flat-1";
 const ACCESS_TOKEN_REFRESH_SKEW_MS = 10_000;
 const AUTH_REFRESH_LOCK_NAME = "cc-switch-router-auth-refresh-v1";
+const INSTALLATION_IDENTITY_LOCK_NAME = "cc-switch-router-installation-identity-v1";
 const FALLBACK_REFRESH_RECHECK_MS = 200;
 
 let accessTokenRefresh: Promise<boolean> | null = null;
+let installationIdentityInitialization: Promise<InstallationIdentity> | null = null;
 
 export type AuthState = {
   installationId?: string | null;
@@ -19,6 +21,12 @@ export type AuthState = {
   refreshToken?: string | null;
   expiresAt?: string | null;
   refreshExpiresAt?: string | null;
+};
+
+export type InstallationIdentity = {
+  installationId: string;
+  publicKey: string;
+  privateKey: string;
 };
 
 function isBrowser() {
@@ -140,8 +148,7 @@ async function registerInstallationIdentity(publicKey: string, privateKey: strin
   return data.installationId as string;
 }
 
-export async function ensureInstallationIdentity() {
-  const state = readAuthState();
+function installationIdentityFromState(state: AuthState): InstallationIdentity | null {
   if (state.installationId && state.publicKey && state.privateKey) {
     return {
       installationId: state.installationId,
@@ -149,14 +156,55 @@ export async function ensureInstallationIdentity() {
       privateKey: state.privateKey,
     };
   }
+  return null;
+}
+
+async function createInstallationIdentityIfMissing(): Promise<InstallationIdentity> {
+  const existing = installationIdentityFromState(readAuthState());
+  if (existing) return existing;
+
   const keys = await generateInstallationKeys();
   const installationId = await registerInstallationIdentity(keys.publicKey, keys.privateKey);
+
+  const identityCreatedElsewhere = installationIdentityFromState(readAuthState());
+  if (identityCreatedElsewhere) return identityCreatedElsewhere;
+
   const next = mergeAuthState({ installationId, publicKey: keys.publicKey, privateKey: keys.privateKey });
   return {
     installationId,
     publicKey: next.publicKey!,
     privateKey: next.privateKey!,
   };
+}
+
+async function initializeInstallationIdentity(): Promise<InstallationIdentity> {
+  const lockManager = typeof navigator !== "undefined" ? navigator.locks : undefined;
+  if (!lockManager) return createInstallationIdentityIfMissing();
+
+  let lockCallbackStarted = false;
+  try {
+    return await lockManager.request(INSTALLATION_IDENTITY_LOCK_NAME, async () => {
+      lockCallbackStarted = true;
+      return createInstallationIdentityIfMissing();
+    });
+  } catch (error) {
+    if (lockCallbackStarted) throw error;
+    return createInstallationIdentityIfMissing();
+  }
+}
+
+export async function ensureInstallationIdentity(): Promise<InstallationIdentity> {
+  const existing = installationIdentityFromState(readAuthState());
+  if (existing) return existing;
+  if (installationIdentityInitialization) return installationIdentityInitialization;
+
+  const pending = initializeInstallationIdentity();
+  installationIdentityInitialization = pending;
+  try {
+    return await pending;
+  } finally {
+    if (installationIdentityInitialization === pending) installationIdentityInitialization = null;
+  }
 }
 
 export function shouldResetInstallationIdentity(message: string) {
@@ -173,8 +221,11 @@ export function resetInstallationIdentityState() {
   });
 }
 
-export async function signAuthPayload(action: string, payload: Record<string, unknown>) {
-  const identity = await ensureInstallationIdentity();
+async function signAuthPayloadWithIdentity(
+  identity: InstallationIdentity,
+  action: string,
+  payload: Record<string, unknown>,
+) {
   const timestampMs = Date.now();
   const nonce = crypto.randomUUID ? crypto.randomUUID() : `${timestampMs}-${Math.random()}`;
   const payloadJson = JSON.stringify(payload);
@@ -192,6 +243,11 @@ export async function signAuthPayload(action: string, payload: Record<string, un
     nonce,
     signature,
   };
+}
+
+export async function signAuthPayload(action: string, payload: Record<string, unknown>) {
+  const identity = await ensureInstallationIdentity();
+  return signAuthPayloadWithIdentity(identity, action, payload);
 }
 
 export function authBearerHeaders() {
@@ -366,7 +422,8 @@ export async function logoutSession() {
 }
 
 export async function requestEmailCode(email: string) {
-  const signed = await signAuthPayload("auth_request_code", { email, purpose: "login" });
+  const identity = await ensureInstallationIdentity();
+  const signed = await signAuthPayloadWithIdentity(identity, "auth_request_code", { email, purpose: "login" });
   const response = await fetch("/v1/auth/email/request-code", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -374,11 +431,13 @@ export async function requestEmailCode(email: string) {
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data?.message || `request code failed (${response.status})`);
-  return data as { maskedDestination: string };
+  return {
+    ...(data as { maskedDestination: string }),
+    identity,
+  };
 }
 
-export async function verifyEmailCode(email: string, code: string) {
-  const identity = await ensureInstallationIdentity();
+export async function verifyEmailCode(email: string, code: string, identity: InstallationIdentity) {
   const response = await fetch("/v1/auth/email/verify-code", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -387,6 +446,9 @@ export async function verifyEmailCode(email: string, code: string) {
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data?.message || `verify failed (${response.status})`);
   mergeAuthState({
+    installationId: identity.installationId,
+    publicKey: identity.publicKey,
+    privateKey: identity.privateKey,
     email: data.user?.email || email,
     accessToken: data.accessToken,
     refreshToken: data.refreshToken,
