@@ -202,8 +202,24 @@ function main() {
   }
 
   const invoiceType = extractTypeBlock(typeSource, "MarketBillingInvoice");
-  for (const required of ["paymentMethods", "paymentProfileUpdatedAt", "lines"]) {
+  for (const required of [
+    "amountUsdMinor",
+    "amountCnyMinor",
+    "paymentMethods",
+    "paymentProfileUpdatedAt",
+    "lines",
+  ]) {
     if (!invoiceType.includes(required)) errors.push(`MarketBillingInvoice is missing ${required}`);
+  }
+  const invoiceLineType = extractTypeBlock(typeSource, "MarketBillingInvoiceLine");
+  for (const required of ["amountUsdMinor", "amountCnyMinor"]) {
+    if (!invoiceLineType.includes(required)) {
+      errors.push(`MarketBillingInvoiceLine is missing ${required}`);
+    }
+  }
+
+  for (const required of ["MARKET_CURRENCY", "USD_CNY_RATE", "amount_usd_minor", "amount_cny_minor"]) {
+    if (!billingSource.includes(required)) errors.push(`market billing is missing ${required}`);
   }
 
   for (const [label, block] of [

@@ -607,9 +607,9 @@ pub(crate) fn normalize_offer_currency(
         .filter(|value| !value.is_empty());
     match (daily_rate_minor, normalized.as_deref()) {
         (None, _) => Ok(None),
-        (Some(_), None) => Ok(Some("USD".into())),
-        (Some(_), Some("CNY" | "USD")) => Ok(normalized),
-        (Some(_), Some(_)) => Err(AppError::BadRequest("currency must be CNY or USD".into())),
+        (Some(_), None) => Ok(Some(crate::market_billing::MARKET_CURRENCY.into())),
+        (Some(_), Some(crate::market_billing::MARKET_CURRENCY)) => Ok(normalized),
+        (Some(_), Some(_)) => Err(AppError::BadRequest("currency must be USD".into())),
     }
 }
 
@@ -4283,6 +4283,20 @@ mod tests {
                 "reserved address was accepted: {address}"
             );
         }
+    }
+
+    #[test]
+    fn paid_host_offer_defaults_to_usd_and_rejects_other_currencies() {
+        assert_eq!(
+            normalize_offer_currency(Some(500), None).expect("default paid Host currency"),
+            Some("USD".into())
+        );
+        assert_eq!(
+            normalize_offer_currency(Some(500), Some(" usd ".into()))
+                .expect("normalize USD paid Host currency"),
+            Some("USD".into())
+        );
+        assert!(normalize_offer_currency(Some(500), Some("CNY".into())).is_err());
     }
 
     #[test]

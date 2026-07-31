@@ -15,6 +15,7 @@ import {
   testClientMarketHostSsh,
 } from "@/lib/api";
 import { DASHBOARD_ACCOUNT_BILLING_PATH, DASHBOARD_ACCOUNT_PAYMENTS_PATH } from "@/lib/dashboard-nav";
+import { MARKET_CURRENCY } from "@/lib/market-money";
 import type { HostIpIntel, ProvisionSshKey } from "@/lib/types";
 import { usePersistentState } from "@/lib/use-persistent-state";
 import {
@@ -53,7 +54,6 @@ export function AddHostDialog({
   const [note, setNote] = React.useState("");
   const [pricing, setPricing] = React.useState<"free" | "paid">("free");
   const [priceUsd, setPriceUsd] = React.useState("");
-  const [currency, setCurrency] = React.useState<"CNY" | "USD">("USD");
   const [freeDurationMode, setFreeDurationMode] = React.useState<"fixed" | "permanent">("fixed");
   const [freeDurationDays, setFreeDurationDays] = React.useState("1");
   const [busy, setBusy] = React.useState(false);
@@ -169,7 +169,7 @@ export function AddHostDialog({
     };
     try {
       offer = pricing === "paid"
-        ? parseHostOffer(priceUsd, t, currency)
+        ? parseHostOffer(priceUsd, t)
         : {
             freeDurationDays:
               freeDurationMode === "fixed"
@@ -180,7 +180,7 @@ export function AddHostDialog({
       setError(reason instanceof Error ? reason.message : String(reason));
       return;
     }
-    if (pricing === "paid" && (!offer.dailyRateMinor || paymentReady === false || !billingCurrencies?.includes(currency))) {
+    if (pricing === "paid" && (!offer.dailyRateMinor || paymentReady === false || !billingCurrencies?.includes(MARKET_CURRENCY))) {
       if (!offer.dailyRateMinor) {
         setError(t("clientMarket.offerInvalid"));
         return;
@@ -465,9 +465,7 @@ export function AddHostDialog({
                     </label>
                     <label className="grid gap-1 text-sm">
                       <span className="text-muted-foreground">{t("clientMarket.rentalCurrency")}</span>
-                      <select value={currency} onChange={(event) => setCurrency(event.target.value === "CNY" ? "CNY" : "USD")} className="h-11 rounded-lg border border-border bg-white px-2 text-slate-900 outline-none focus:ring-2 focus:ring-primary/30">
-                        <option value="CNY">CNY</option><option value="USD">USD</option>
-                      </select>
+                      <span className="flex h-11 items-center rounded-lg border border-border bg-slate-50 px-3 font-medium text-slate-900">{MARKET_CURRENCY}</span>
                     </label>
                   </div>
                 ) : (
@@ -492,7 +490,7 @@ export function AddHostDialog({
                   </div>
                 )}
                 <p className="text-xs text-muted-foreground">{pricing === "paid" ? t("clientMarket.offerHint") : t("clientMarket.freeDuration.hint")}</p>
-                {pricing === "paid" && (paymentReady === false || (billingCurrencies && !billingCurrencies.includes(currency))) ? (
+                {pricing === "paid" && (paymentReady === false || (billingCurrencies && !billingCurrencies.includes(MARKET_CURRENCY))) ? (
                   <div className="grid gap-1.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-950">
                     <span>{t("clientMarket.offerRequiresBilling")}</span>
                     <div className="flex flex-wrap gap-3">

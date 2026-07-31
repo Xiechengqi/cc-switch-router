@@ -48,8 +48,9 @@ import type {
   MarketBillingPaymentDeclaration,
   MarketCreditAccount,
 } from "@/lib/types";
+import { formatUsdCnyMoney, MARKET_CURRENCY } from "@/lib/market-money";
 
-type Currency = "CNY" | "USD";
+type Currency = typeof MARKET_CURRENCY;
 type ProfileDraft = { graceHours: string };
 type Action =
   | { kind: "settle" | "request-settlement" | "close"; account: MarketCreditAccount }
@@ -58,13 +59,6 @@ type Action =
   | { kind: "admin-invoice-void"; dispute: AdminMarketBillingDispute };
 
 const EMPTY_PROFILE: ProfileDraft = { graceHours: "24" };
-
-function formatMoney(value: number, currency: string, locale: string) {
-  return new Intl.NumberFormat(locale, {
-    style: "currency",
-    currency: currency === "CNY" ? "CNY" : "USD",
-  }).format(value / 100);
-}
 
 function formatDate(value: string | undefined, locale: string) {
   if (!value) return "-";
@@ -150,7 +144,7 @@ function InvoiceLines({ invoice, locale }: { invoice: MarketBillingInvoice; loca
                 {formatDuration(line.billableSeconds)}
               </td>
               <td className="px-3 py-2.5 text-right font-medium tabular-nums">
-                {formatMoney(line.amountMinor, invoice.currency, locale)}
+                {formatUsdCnyMoney(line.amountUsdMinor, locale, line.amountCnyMinor)}
               </td>
             </tr>
           ))}
@@ -273,7 +267,9 @@ function CreditAccountPanel({
           </div>
           <div className="text-right">
             <strong className="block text-lg tabular-nums text-foreground">
-              {formatMoney(invoice?.amountMinor ?? account.balanceMinor, account.currency, locale)}
+              {invoice
+                ? formatUsdCnyMoney(invoice.amountUsdMinor, locale, invoice.amountCnyMinor)
+                : formatUsdCnyMoney(account.balanceMinor, locale)}
             </strong>
             <span className="text-xs text-muted-foreground">
               {invoice ? t("marketBilling.invoice.total") : t("marketBilling.unbilledBalance")}
@@ -288,14 +284,14 @@ function CreditAccountPanel({
               {account.creditKind === "unlimited"
                 ? t("marketBilling.creditUnlimited")
                 : account.creditLimitMinor != null
-                  ? formatMoney(account.creditLimitMinor, account.currency, locale)
+                  ? formatUsdCnyMoney(account.creditLimitMinor, locale)
                   : t("marketBilling.creditNone")}
             </strong>
           </div>
           <div>
             <span className="text-xs text-muted-foreground">{t("marketBilling.dailyExposure")}</span>
             <strong className="mt-0.5 block text-sm tabular-nums">
-              {formatMoney(account.dailyRateMinor, account.currency, locale)}
+              {formatUsdCnyMoney(account.dailyRateMinor, locale)}
             </strong>
           </div>
           <div>
@@ -339,7 +335,7 @@ function CreditAccountPanel({
               <Server className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
               <span className="min-w-0 flex-1 truncate font-medium" title={service.serviceLabel}>{service.serviceLabel}</span>
               <span className="text-xs text-muted-foreground">{productLabel(service.productKind, t)}</span>
-              <span className="text-xs tabular-nums">{formatMoney(service.dailyRateMinor, account.currency, locale)} / {t("marketBilling.day")}</span>
+              <span className="text-xs tabular-nums">{formatUsdCnyMoney(service.dailyRateMinor, locale)} / {t("marketBilling.day")}</span>
               <Chip size="sm" variant="soft">{serviceStatusLabel(service.status, t)}</Chip>
               {service.trialSecondsRemaining > 0 ? (
                 <span className="w-full pl-5 text-xs text-muted-foreground">
@@ -437,7 +433,7 @@ function CreditAccountPanel({
                         </Chip>
                       </span>
                       <span className="text-right">
-                        <strong className="block text-sm tabular-nums">{formatMoney(item.amountMinor, item.currency, locale)}</strong>
+                        <strong className="block text-sm tabular-nums">{formatUsdCnyMoney(item.amountUsdMinor, locale, item.amountCnyMinor)}</strong>
                         <span className="text-xs text-muted-foreground">{formatDate(item.paidAt || item.openedAt, locale)}</span>
                       </span>
                     </summary>
@@ -513,11 +509,9 @@ export function AccountBillingPage() {
   const [evidenceUrl, setEvidenceUrl] = React.useState("");
   const [paymentKind, setPaymentKind] = React.useState("");
   const [profiles, setProfiles] = React.useState<Record<Currency, ProfileDraft>>({
-    CNY: { ...EMPTY_PROFILE },
     USD: { ...EMPTY_PROFILE },
   });
   const [profileDirty, setProfileDirty] = React.useState<Record<Currency, boolean>>({
-    CNY: false,
     USD: false,
   });
 
@@ -553,8 +547,8 @@ export function AccountBillingPage() {
   React.useEffect(() => {
     if (!dashboard) return;
     setProfiles((current) => {
-      const next = { CNY: { ...current.CNY }, USD: { ...current.USD } };
-      for (const currency of ["CNY", "USD"] as const) {
+      const next = { USD: { ...current.USD } };
+      for (const currency of [MARKET_CURRENCY] as const) {
         if (profileDirty[currency]) continue;
         const profile = dashboard.supplierProfiles.find((item) => item.currency === currency);
         if (profile) {
@@ -676,6 +670,7 @@ export function AccountBillingPage() {
             <h2 className="text-lg font-semibold text-foreground">{t("marketBilling.title")}</h2>
           </div>
           <p className="mt-1 max-w-3xl text-sm text-muted-foreground">{t("marketBilling.subtitle", { hours: dashboard?.trialHours || 12 })}</p>
+          <p className="mt-1 max-w-3xl text-xs font-medium text-amber-700">{t("market.currencyNotice")}</p>
         </div>
         <Button isIconOnly variant="outline" aria-label={t("common.reload")} isDisabled={refreshing} onClick={() => void load(true)}>
           <RefreshCw className={`h-4 w-4 ${refreshing ? "animate-spin" : ""}`} />
@@ -700,8 +695,8 @@ export function AccountBillingPage() {
             <p className="mt-0.5 text-xs text-muted-foreground">{t("marketBilling.profile.hint")}</p>
           </div>
         </div>
-        <div className="grid gap-3 xl:grid-cols-2">
-          {(["CNY", "USD"] as const).map((currency) => {
+        <div className="grid max-w-2xl gap-3">
+          {([MARKET_CURRENCY] as const).map((currency) => {
             const profile = dashboard?.supplierProfiles.find((item) => item.currency === currency);
             const draft = profiles[currency];
             return (
@@ -765,7 +760,7 @@ export function AccountBillingPage() {
             <div key={item.dispute.id} className="grid gap-3 rounded-lg border border-sky-200 bg-sky-50/60 p-4">
               <div className="flex flex-wrap items-start justify-between gap-3">
                 <div>
-                  <strong className="text-sm">{formatMoney(item.invoice.amountMinor, item.invoice.currency, locale)}</strong>
+                  <strong className="text-sm">{formatUsdCnyMoney(item.invoice.amountUsdMinor, locale, item.invoice.amountCnyMinor)}</strong>
                   <p className="mt-1 break-all text-xs text-muted-foreground">{item.buyerEmail} → {item.supplierEmail}</p>
                 </div>
                 <span className="text-xs text-muted-foreground">{formatDate(item.dispute.createdAt, locale)}</span>
@@ -802,7 +797,7 @@ export function AccountBillingPage() {
               {actionInvoice ? (
                 <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-slate-50 p-3 text-sm">
                   <span className="text-muted-foreground">{t("marketBilling.invoice.total")}</span>
-                  <strong>{formatMoney(actionInvoice.amountMinor, actionInvoice.currency, locale)}</strong>
+                  <strong>{formatUsdCnyMoney(actionInvoice.amountUsdMinor, locale, actionInvoice.amountCnyMinor)}</strong>
                 </div>
               ) : null}
               {actionInvoice?.declaration ? (

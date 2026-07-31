@@ -282,7 +282,7 @@ function HostRowImpl({
               className="block whitespace-nowrap text-xs font-semibold text-foreground"
               title={t("clientMarket.currentOffer")}
             >
-              {formatHostOffer(host.dailyRateMinor, locale, host.currency, host.freeDurationDays)}
+              {formatHostOffer(host.dailyRateMinor, locale, host.freeDurationDays)}
             </span>
             {showRenterRental && rental ? (
               <div className="mt-0.5 min-w-0">

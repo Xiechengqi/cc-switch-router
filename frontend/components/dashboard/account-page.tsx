@@ -246,6 +246,7 @@ export function AccountPaymentsPanel() {
               <h2 className="text-base font-semibold">{t("account.paymentDetails")}</h2>
             </div>
             <p className="mt-1 text-sm text-muted-foreground">{t("account.visibilityHint")}</p>
+            <p className="mt-1 text-xs font-medium text-amber-700">{t("market.currencyNotice")}</p>
           </div>
           <Button variant="primary" isDisabled={!dirty || saving} onClick={() => void save()}>
             {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}

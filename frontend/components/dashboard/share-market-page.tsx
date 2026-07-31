@@ -63,6 +63,7 @@ import {
   updateShareMarketSeat,
 } from "@/lib/api";
 import { DASHBOARD_ACCOUNT_BILLING_PATH, type ShareMarketTabParam } from "@/lib/dashboard-nav";
+import { formatUsdMoney, MARKET_CURRENCY } from "@/lib/market-money";
 import { usePersistentState } from "@/lib/use-persistent-state";
 import type {
   ShareMarketCatalog,
@@ -94,7 +95,6 @@ type SeatDraft = {
   tokenPeriod: ShareTokenPeriod;
   paid: boolean;
   price: string;
-  currency: string;
   freeDurationMode: "fixed" | "permanent";
   freeDurationDays: string;
 };
@@ -127,7 +127,6 @@ function emptySeat(supportedPeriods: ShareTokenPeriod[] = TOKEN_PERIODS): SeatDr
     tokenPeriod: supportedPeriods.includes("lifetime") ? "lifetime" : supportedPeriods[0] || "lifetime",
     paid: false,
     price: "",
-    currency: "CNY",
     freeDurationMode: "fixed",
     freeDurationDays: "1",
   };
@@ -140,7 +139,6 @@ function draftFromSeat(seat: ShareMarketSeat): SeatDraft {
     tokenPeriod: seat.tokenPeriod,
     paid: !seat.isFree,
     price: seat.dailyRateMinor == null ? "" : (seat.dailyRateMinor / 100).toFixed(2),
-    currency: seat.currency || "CNY",
     freeDurationMode: seat.freeDurationDays == null ? "permanent" : "fixed",
     freeDurationDays: String(seat.freeDurationDays ?? 1),
   };
@@ -180,16 +178,12 @@ function seatInput(draft: SeatDraft, t: TFn): ShareMarketSeatInput {
   if (!/^\d+(?:\.\d{1,2})?$/.test(price) || amount <= 0 || !Number.isSafeInteger(dailyRateMinor)) {
     throw new Error(t("shareMarket.error.price"));
   }
-  const currency = draft.currency.trim().toUpperCase();
-  if (currency !== "CNY" && currency !== "USD") {
-    throw new Error(t("shareMarket.error.currency"));
-  }
   return {
     parallelLimit,
     tokenLimit,
     tokenPeriod: draft.tokenPeriod,
     dailyRateMinor,
-    currency,
+    currency: MARKET_CURRENCY,
   };
 }
 
@@ -267,20 +261,12 @@ function SeatFields({
               onChange={(event) => patch({ price: event.target.value })}
             />
           </label>
-          <label className="grid gap-1 text-xs text-slate-500">
+          <div className="grid gap-1 text-xs text-slate-500">
             {t("shareMarket.dialog.currency")}
-            <CompactSelect
-              value={draft.currency === "USD" ? "USD" : "CNY"}
-              options={[
-                { value: "CNY", label: "CNY" },
-                { value: "USD", label: "USD" },
-              ]}
-              onChange={(value) => patch({ currency: value })}
-              ariaLabel={t("shareMarket.dialog.currency")}
-              className="w-full"
-              triggerClassName={selectTrigger}
-            />
-          </label>
+            <div className="flex h-10 items-center rounded-md border border-slate-200 bg-slate-50 px-3 text-sm font-medium text-slate-900">
+              {MARKET_CURRENCY}
+            </div>
+          </div>
         </div>
       ) : (
         <div className="grid min-w-0 gap-3">
@@ -569,6 +555,7 @@ function formatShareLimit(value?: number | null) {
 
 function formatPrice(
   seat: Pick<ShareMarketSeat, "isFree" | "dailyRateMinor" | "currency" | "freeDurationDays">,
+  locale: string,
   free: string,
   day: string,
   permanent: string,
@@ -578,8 +565,7 @@ function formatPrice(
       ? `${free} · ${permanent}`
       : `${free} · ${seat.freeDurationDays} ${day}`;
   }
-  const amount = new Intl.NumberFormat(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(seat.dailyRateMinor / 100);
-  return `${amount} ${seat.currency || ""} / ${day}`;
+  return `${formatUsdMoney(seat.dailyRateMinor, locale)} / ${day}`;
 }
 
 function freePeriodTiming(
@@ -1477,7 +1463,7 @@ export function ShareMarketPage() {
                   <td className="px-4 py-3 font-medium tabular-nums">{seat.position}</td>
                   <td className="px-3 py-3 text-slate-600">{seat.parallelLimit ?? t("common.unlimited")}</td>
                   <td className="px-3 py-3 text-slate-600">{seat.tokenLimit?.toLocaleString() ?? t("common.unlimited")} · {tokenPeriod(seat.tokenPeriod)}</td>
-                  <td className="px-3 py-3 font-medium">{formatPrice(seat, t("shareMarket.free"), t("marketBilling.day"), t("shareMarket.permanent"))}</td>
+                  <td className="px-3 py-3 font-medium">{formatPrice(seat, locale, t("shareMarket.free"), t("marketBilling.day"), t("shareMarket.permanent"))}</td>
                   <td className="max-w-[14rem] px-3 py-3"><span className="block truncate text-slate-600" title={seat.subscription?.renterEmail}>{seat.subscription?.renterEmail || "—"}</span></td>
                   <td className="px-3 py-3"><span className="rounded-sm bg-slate-100 px-1.5 py-0.5 text-xs text-slate-600">{seatStatusLabel(seat, seat.subscription, t)}</span></td>
                   <td className="px-4 py-3">{renderSeatActions(listing, seat, seat.subscription)}</td>
@@ -1648,7 +1634,7 @@ export function ShareMarketPage() {
                       {seat.tokenLimit?.toLocaleString() ?? t("common.unlimited")}
                       {seat.tokenPeriod ? ` · ${tokenPeriod(seat.tokenPeriod)}` : ""}
                     </td>
-                    <td className="px-3 py-3 font-medium">{formatPrice(seat, t("shareMarket.free"), t("marketBilling.day"), t("shareMarket.permanent"))}</td>
+                    <td className="px-3 py-3 font-medium">{formatPrice(seat, locale, t("shareMarket.free"), t("marketBilling.day"), t("shareMarket.permanent"))}</td>
                     <td className="max-w-[14rem] px-3 py-3">
                       <span className="block truncate text-xs text-slate-600" title={subscription?.renterEmail}>
                         {subscription?.renterEmail || "—"}

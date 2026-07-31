@@ -28,6 +28,7 @@ import type {
   CreateClientSelectionPersist,
   ProvisioningJob,
 } from "@/lib/types";
+import { formatUsdMoney } from "@/lib/market-money";
 import { usePersistentState } from "@/lib/use-persistent-state";
 
 const PROVIDERS_KEY = "cc_switch_router_create_client_providers_v2";
@@ -89,7 +90,7 @@ function normalizeRegionPersist(value: unknown): CreateClientRegionsPersist {
 function formatOffer(
   dailyRateMinor: number | undefined,
   locale: string,
-  currency = "USD",
+  _currency = "USD",
   freeDurationDays?: number,
 ) {
   if (dailyRateMinor == null) {
@@ -100,10 +101,7 @@ function formatOffer(
     }
     return locale.startsWith("zh") ? "免费 · 永久" : "Free · permanent";
   }
-  const amount = new Intl.NumberFormat(locale, {
-    style: "currency",
-    currency: currency === "CNY" ? "CNY" : "USD",
-  }).format(dailyRateMinor / 100);
+  const amount = formatUsdMoney(dailyRateMinor, locale);
   return locale.startsWith("zh") ? `${amount} / 天` : `${amount} / day`;
 }
 

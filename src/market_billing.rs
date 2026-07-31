@@ -17,6 +17,8 @@ use crate::models::AuthSession;
 use crate::store::AppStore;
 
 pub const TRIAL_SECONDS: i64 = 12 * 60 * 60;
+pub(crate) const MARKET_CURRENCY: &str = "USD";
+pub(crate) const USD_CNY_RATE: i64 = 7;
 const MONEY_UNITS_PER_MINOR: i64 = 86_400;
 const NEAR_CREDIT_LIMIT_BPS: i64 = 8_000;
 const DEFAULT_SETTLEMENT_GRACE_HOURS: i64 = 24;
@@ -126,6 +128,8 @@ pub struct BillingInvoiceLineView {
     pub daily_rate_minor: i64,
     pub billable_seconds: i64,
     pub amount_minor: i64,
+    pub amount_usd_minor: i64,
+    pub amount_cny_minor: i64,
     pub service_started_at: String,
     pub service_ended_at: String,
     pub evidence: serde_json::Value,
@@ -152,6 +156,8 @@ pub struct BillingInvoiceView {
     pub sequence: i64,
     pub status: String,
     pub amount_minor: i64,
+    pub amount_usd_minor: i64,
+    pub amount_cny_minor: i64,
     pub currency: String,
     pub due_at: String,
     pub deadline_at: String,
@@ -597,10 +603,10 @@ pub fn router() -> Router<ServerState> {
 
 fn normalize_currency(currency: &str) -> Result<String, AppError> {
     let currency = currency.trim().to_ascii_uppercase();
-    if matches!(currency.as_str(), "CNY" | "USD") {
+    if currency == MARKET_CURRENCY {
         Ok(currency)
     } else {
-        Err(AppError::BadRequest("currency must be CNY or USD".into()))
+        Err(AppError::BadRequest("currency must be USD".into()))
     }
 }
 
@@ -624,6 +630,10 @@ fn ceil_minor(amount_units: i64) -> i64 {
     } else {
         amount_units / MONEY_UNITS_PER_MINOR + i64::from(amount_units % MONEY_UNITS_PER_MINOR != 0)
     }
+}
+
+fn usd_minor_to_cny_minor(amount_usd_minor: i64) -> i64 {
+    amount_usd_minor.saturating_mul(USD_CNY_RATE)
 }
 
 fn parse_time(value: &str) -> Result<DateTime<Utc>, AppError> {
@@ -1263,13 +1273,16 @@ fn billing_chat_invoice_payload_tx(
              FROM market_invoices WHERE id = ?1",
             params![invoice_id],
             |row| {
+                let amount_usd_minor = row.get::<_, i64>(0)?;
                 let methods = serde_json::from_str::<serde_json::Value>(&row.get::<_, String>(5)?)
                     .unwrap_or_else(|_| serde_json::json!([]));
                 let contacts = serde_json::from_str::<serde_json::Value>(&row.get::<_, String>(6)?)
                     .unwrap_or_else(|_| serde_json::json!([]));
                 Ok(serde_json::json!({
                     "invoiceId": invoice_id,
-                    "amountMinor": row.get::<_, i64>(0)?,
+                    "amountMinor": amount_usd_minor,
+                    "amountUsdMinor": amount_usd_minor,
+                    "amountCnyMinor": usd_minor_to_cny_minor(amount_usd_minor),
                     "currency": row.get::<_, String>(1)?,
                     "invoiceStatus": row.get::<_, String>(2)?,
                     "dueAt": row.get::<_, String>(3)?,
@@ -2160,6 +2173,7 @@ fn invoice_view(
             statement
                 .query_map(params![invoice_id], |row| {
                     let evidence: String = row.get(11)?;
+                    let amount_minor = row.get(8)?;
                     Ok(BillingInvoiceLineView {
                         id: row.get(0)?,
                         contract_id: row.get(1)?,
@@ -2169,7 +2183,9 @@ fn invoice_view(
                         service_label: row.get(5)?,
                         daily_rate_minor: row.get(6)?,
                         billable_seconds: row.get(7)?,
-                        amount_minor: row.get(8)?,
+                        amount_minor,
+                        amount_usd_minor: amount_minor,
+                        amount_cny_minor: usd_minor_to_cny_minor(amount_minor),
                         service_started_at: row.get(9)?,
                         service_ended_at: row.get(10)?,
                         evidence: serde_json::from_str(&evidence)
@@ -2179,12 +2195,15 @@ fn invoice_view(
                 .collect::<Result<Vec<_>, _>>()
         })
         .map_err(map_db("read billing dashboard invoice lines"))?;
+    let currency = normalize_currency(&header.4)?;
     Ok(Some(BillingInvoiceView {
         id: header.0,
         sequence: header.1,
         status: header.2,
         amount_minor: header.3,
-        currency: header.4,
+        amount_usd_minor: header.3,
+        amount_cny_minor: usd_minor_to_cny_minor(header.3),
+        currency,
         due_at: header.5,
         deadline_at: header.6,
         opened_at: header.7,
@@ -2220,7 +2239,8 @@ impl AppStore {
                  JOIN supplier_billing_profiles profile
                    ON profile.supplier_user_id = account.supplier_user_id
                   AND profile.currency = account.currency
-                 WHERE account.buyer_user_id = ?1 OR account.supplier_user_id = ?1
+                 WHERE (account.buyer_user_id = ?1 OR account.supplier_user_id = ?1)
+                   AND account.currency = 'USD'
                  ORDER BY account.updated_at DESC, account.id",
             )
             .and_then(|mut statement| {
@@ -2319,7 +2339,8 @@ impl AppStore {
         let supplier_profiles = conn
             .prepare(
                 "SELECT currency, settlement_grace_hours, revision, updated_at
-                 FROM supplier_billing_profiles WHERE supplier_user_id = ?1
+                 FROM supplier_billing_profiles
+                 WHERE supplier_user_id = ?1 AND currency = 'USD'
                  ORDER BY currency",
             )
             .and_then(|mut statement| {
@@ -3879,6 +3900,8 @@ fn open_invoice_tx(
         event_type,
         serde_json::json!({
             "amountMinor": amount_minor,
+            "amountUsdMinor": amount_minor,
+            "amountCnyMinor": usd_minor_to_cny_minor(amount_minor),
             "currency": account.currency,
             "deadlineAt": deadline_at,
         }),
@@ -4553,6 +4576,8 @@ mod tests {
                 serde_json::from_str(&payload).expect("parse billing payload");
             assert_eq!(payload["invoiceId"], "billing-chat-invoice");
             assert_eq!(payload["amountMinor"], 1234);
+            assert_eq!(payload["amountUsdMinor"], 1234);
+            assert_eq!(payload["amountCnyMinor"], 8638);
             assert_eq!(payload["currency"], "USD");
             assert_eq!(payload["billingEventType"], "payment_declared");
             assert_eq!(payload["buyerEmail"], "renter@example.com");
@@ -4775,6 +4800,8 @@ mod tests {
             .as_ref()
             .expect("remaining balance invoice");
         assert_eq!(invoice.amount_minor, 1);
+        assert_eq!(invoice.amount_usd_minor, 1);
+        assert_eq!(invoice.amount_cny_minor, 7);
         assert_eq!(invoice.lines.len(), 1);
         assert_eq!(invoice.lines[0].product_ref, "client-final");
     }
@@ -5229,7 +5256,13 @@ mod tests {
         assert_eq!(account.status, ACCOUNT_SETTLEMENT_DUE);
         let invoice = account.open_invoice.as_ref().expect("combined invoice");
         assert_eq!(invoice.amount_minor, 2);
+        assert_eq!(invoice.amount_usd_minor, 2);
+        assert_eq!(invoice.amount_cny_minor, 14);
         assert_eq!(invoice.lines.len(), 2);
+        assert!(invoice.lines.iter().all(|line| {
+            line.amount_usd_minor == line.amount_minor
+                && line.amount_cny_minor == line.amount_minor * USD_CNY_RATE
+        }));
         assert_eq!(
             invoice
                 .lines

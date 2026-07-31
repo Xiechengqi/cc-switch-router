@@ -39,9 +39,10 @@ import type {
   MarketCreditLine,
   MarketPublicCreditLine,
 } from "@/lib/types";
+import { formatUsdCnyMoney, MARKET_CURRENCY } from "@/lib/market-money";
 import { cn } from "@/lib/utils";
 
-type Currency = "CNY" | "USD";
+type Currency = typeof MARKET_CURRENCY;
 type ScopeKey = `${MarketAccessProductKind}:${MarketAccessPricingKind}`;
 
 type CreditDraft = {
@@ -83,19 +84,12 @@ const ACCESS_SCOPES: ReadonlyArray<{
   { productKind: "client_host", pricingKind: "paid" },
 ];
 
-const CURRENCIES: Currency[] = ["CNY", "USD"];
+const CURRENCIES: Currency[] = [MARKET_CURRENCY];
 
 function parseLimitMinor(value: string) {
   if (!/^\d+(?:\.\d{1,2})?$/.test(value.trim())) return null;
   const minor = Math.round(Number(value) * 100);
   return Number.isSafeInteger(minor) && minor >= 1 && minor <= 100_000_000 ? minor : null;
-}
-
-function formatMoney(value: number, currency: string, locale: string) {
-  return new Intl.NumberFormat(locale, {
-    style: "currency",
-    currency: currency === "CNY" ? "CNY" : "USD",
-  }).format(value / 100);
 }
 
 function scopeKey(
@@ -139,7 +133,6 @@ function buildCounterpartyDraft(counterparty: MarketCounterparty): CounterpartyD
       "client_host:paid": counterpartyDecision(counterparty, "client_host", "paid"),
     },
     credits: {
-      CNY: creditDraft(counterpartyCreditLine(counterparty, "CNY")),
       USD: creditDraft(counterpartyCreditLine(counterparty, "USD")),
     },
   };
@@ -869,7 +862,7 @@ export function AccountMarketAccessPage() {
             <h3 className="text-sm font-semibold">{t("marketAccess.publicCreditTitle")}</h3>
             <p className="mt-1 text-xs text-muted-foreground">{t("marketAccess.publicCreditHint")}</p>
           </div>
-          {(["CNY", "USD"] as const).map((currency) => (
+          {CURRENCIES.map((currency) => (
             <PublicCreditEditor
               key={currency}
               currency={currency}
@@ -980,12 +973,11 @@ export function AccountMarketAccessPage() {
 
           <div className="overflow-hidden rounded-lg border border-border bg-white">
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[1700px] table-fixed border-collapse text-sm">
+              <table className="w-full min-w-[1470px] table-fixed border-collapse text-sm">
                 <colgroup>
                   <col className="w-[220px]" />
                   <col className="w-[120px]" />
                   <col className="w-[250px]" />
-                  <col className="w-[230px]" />
                   <col className="w-[230px]" />
                   <col className="w-[230px]" />
                   <col className="w-[230px]" />
@@ -998,7 +990,6 @@ export function AccountMarketAccessPage() {
                     <th className="px-3 py-2.5">{t("marketAccess.table.application")}</th>
                     <th className="px-3 py-2.5">{t("marketAccess.product.share")}</th>
                     <th className="px-3 py-2.5">{t("marketAccess.product.clientHost")}</th>
-                    <th className="px-3 py-2.5">CNY {t("marketAccess.creditType")}</th>
                     <th className="px-3 py-2.5">USD {t("marketAccess.creditType")}</th>
                     <th className="px-3 py-2.5">{t("marketAccess.table.exposure")}</th>
                   </tr>
@@ -1022,7 +1013,7 @@ export function AccountMarketAccessPage() {
                         </Chip>
                       </td>
                       <td className="px-3 py-3">{renderAccessRequests(group.requests, false)}</td>
-                      <td colSpan={5} className="px-3 py-3 text-center text-muted-foreground">-</td>
+                      <td colSpan={4} className="px-3 py-3 text-center text-muted-foreground">-</td>
                     </tr>
                   ))}
                   {visibleCounterparties.map((counterparty) => {
@@ -1151,7 +1142,7 @@ export function AccountMarketAccessPage() {
                               {counterparty.exposures.map((exposure) => (
                                 <div key={exposure.currency}>
                                   <strong className="block text-xs tabular-nums">
-                                    {formatMoney(exposure.balanceMinor, exposure.currency, locale)}
+                                    {formatUsdCnyMoney(exposure.balanceMinor, locale)}
                                   </strong>
                                   <span className="text-[11px] text-muted-foreground">
                                     {t("marketAccess.activeServices", {
@@ -1170,7 +1161,7 @@ export function AccountMarketAccessPage() {
                   })}
                   {visibleCounterparties.length === 0 && visibleOrphanRequestGroups.length === 0 ? (
                     <tr>
-                      <td colSpan={8} className="px-4 py-12 text-center text-sm text-muted-foreground">
+                      <td colSpan={7} className="px-4 py-12 text-center text-sm text-muted-foreground">
                         {(dashboard?.counterparties.length || dashboard?.accessRequests.length)
                           ? t("marketAccess.noMatches")
                           : t("marketAccess.empty")}

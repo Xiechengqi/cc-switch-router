@@ -18,6 +18,7 @@ import {
   shareMarketHref,
 } from "@/lib/dashboard-nav";
 import type { MessageKey } from "@/lib/i18n";
+import { formatUsdMoney } from "@/lib/market-money";
 import type {
   ShareMarketCatalog,
   ShareMarketListing,
@@ -111,9 +112,8 @@ function offerLabel(
       ? `${freeLabel} · ${permanentLabel}`
       : `${freeLabel} · ${subscription.freeDurationDays} ${dayLabel}`;
   }
-  const amount = (subscription.dailyRateMinor / 100).toFixed(2);
-  const currency = subscription.currency || "CNY";
-  return locale.startsWith("zh") ? `${currency} ${amount} / 天` : `${currency} ${amount} / day`;
+  const amount = formatUsdMoney(subscription.dailyRateMinor, locale);
+  return locale.startsWith("zh") ? `${amount} / 天` : `${amount} / day`;
 }
 
 function formatDate(value: string | undefined, locale: string) {

@@ -403,10 +403,9 @@ fn normalize_seat(input: SeatInput) -> Result<NormalizedSeat, AppError> {
             "paid seat daily price is outside the supported range".into(),
         ));
     }
-    let currency =
-        currency.ok_or_else(|| AppError::BadRequest("paid seat currency is required".into()))?;
-    if currency != "CNY" && currency != "USD" {
-        return Err(AppError::BadRequest("currency must be CNY or USD".into()));
+    let currency = currency.unwrap_or_else(|| crate::market_billing::MARKET_CURRENCY.into());
+    if currency != crate::market_billing::MARKET_CURRENCY {
+        return Err(AppError::BadRequest("currency must be USD".into()));
     }
     Ok(NormalizedSeat {
         parallel_limit: input.parallel_limit,
@@ -4513,7 +4512,7 @@ mod tests {
     fn paid_seat() -> SeatInput {
         SeatInput {
             daily_rate_minor: Some(1_200),
-            currency: Some("CNY".into()),
+            currency: Some("USD".into()),
             free_duration_days: None,
             ..free_seat()
         }
@@ -4583,7 +4582,7 @@ mod tests {
             "INSERT INTO supplier_billing_profiles (
                 supplier_user_id, supplier_email, currency,
                 settlement_grace_hours, revision, created_at, updated_at
-             ) VALUES (?1, ?2, 'CNY', 24, 1, ?3, ?3)
+             ) VALUES (?1, ?2, 'USD', 24, 1, ?3, ?3)
              ON CONFLICT(supplier_user_id, currency) DO UPDATE SET
                 supplier_email = excluded.supplier_email,
                 settlement_grace_hours = excluded.settlement_grace_hours,
@@ -4591,7 +4590,7 @@ mod tests {
                 updated_at = excluded.updated_at",
             params![owner.user_id, owner.email, updated_at],
         )
-        .expect("configure CNY payment grace");
+        .expect("configure USD payment grace");
     }
 
     async fn create_listing(
@@ -4603,7 +4602,7 @@ mod tests {
         let now = Utc::now().to_rfc3339();
         {
             let conn = store.conn.lock().await;
-            crate::market_access::configure_open_test_policy(&conn, owner, "CNY", 50_000, &now);
+            crate::market_access::configure_open_test_policy(&conn, owner, "USD", 50_000, &now);
         }
         let listing_id = store
             .share_market_create_listing(
@@ -4924,17 +4923,34 @@ mod tests {
     #[test]
     fn partial_or_zero_pricing_is_rejected() {
         let mut input = free_seat();
-        input.daily_rate_minor = Some(100);
+        input.currency = Some("USD".into());
         assert!(normalize_seat(input).is_err());
 
         let mut input = free_seat();
         input.daily_rate_minor = Some(0);
-        input.currency = Some("CNY".into());
+        input.currency = Some("USD".into());
         assert!(normalize_seat(input).is_err());
 
         let mut input = free_seat();
         input.token_limit = Some(i64::MAX as u64 + 1);
         assert!(normalize_seat(input).is_err());
+    }
+
+    #[test]
+    fn paid_seat_defaults_to_usd_and_rejects_other_currencies() {
+        let mut defaulted = paid_seat();
+        defaulted.currency = None;
+        assert_eq!(
+            normalize_seat(defaulted)
+                .expect("default paid seat currency")
+                .currency
+                .as_deref(),
+            Some("USD")
+        );
+
+        let mut cny = paid_seat();
+        cny.currency = Some("CNY".into());
+        assert!(normalize_seat(cny).is_err());
     }
 
     #[tokio::test]
@@ -5163,7 +5179,7 @@ mod tests {
             crate::market_access::configure_open_test_policy(
                 &conn,
                 &owner,
-                "CNY",
+                "USD",
                 50_000,
                 &Utc::now().to_rfc3339(),
             );
@@ -5944,7 +5960,7 @@ mod tests {
             assert_eq!(payload["tokenLimit"], 10_000);
             assert_eq!(payload["tokenPeriod"], "day");
             assert_eq!(payload["dailyRateMinor"], 1_200);
-            assert_eq!(payload["currency"], "CNY");
+            assert_eq!(payload["currency"], "USD");
             assert_eq!(payload["paymentMethods"][0]["account"], "account-v1");
         }
         assert_eq!(
@@ -6005,7 +6021,7 @@ mod tests {
         assert_eq!(contract.2, "trial");
         assert_eq!(contract.3, crate::market_billing::TRIAL_SECONDS);
         assert_eq!(contract.4, 1_200);
-        assert_eq!(contract.5, "CNY");
+        assert_eq!(contract.5, "USD");
     }
 
     #[tokio::test]
@@ -7263,7 +7279,7 @@ mod tests {
             conn.execute(
                 "UPDATE market_public_credit_policies
                  SET enabled = 0, revision = revision + 1, updated_at = ?2
-                 WHERE supplier_user_id = ?1 AND currency = 'CNY'",
+                 WHERE supplier_user_id = ?1 AND currency = 'USD'",
                 params![owner.user_id, now],
             )
             .expect("remove paid credit");
@@ -7291,7 +7307,7 @@ mod tests {
                 "UPDATE market_public_credit_policies
                  SET enabled = 1, limit_minor = 50000, revision = revision + 1,
                      updated_at = ?2
-                 WHERE supplier_user_id = ?1 AND currency = 'CNY'",
+                 WHERE supplier_user_id = ?1 AND currency = 'USD'",
                 params![owner.user_id, now],
             )
             .expect("restore paid credit");
@@ -7332,14 +7348,14 @@ mod tests {
             conn.execute(
                 "UPDATE market_public_credit_policies
                  SET limit_minor = 100, revision = revision + 1, updated_at = ?2
-                 WHERE supplier_user_id = ?1 AND currency = 'CNY'",
+                 WHERE supplier_user_id = ?1 AND currency = 'USD'",
                 params![owner.user_id, now],
             )
             .expect("lower paid credit");
             conn.execute(
                 "UPDATE market_credit_accounts
                  SET status = 'active', balance_units = 8640000, updated_at = ?3
-                 WHERE buyer_user_id = ?1 AND supplier_user_id = ?2 AND currency = 'CNY'",
+                 WHERE buyer_user_id = ?1 AND supplier_user_id = ?2 AND currency = 'USD'",
                 params![renter.user_id, owner.user_id, now],
             )
             .expect("raise accrued balance to lowered limit");

@@ -14,6 +14,7 @@ import { getClientMarketHosts, getMyClientMarketRentals } from "@/lib/api";
 import { mergeHosts, mergeRentalMap } from "@/lib/client-market-refresh";
 import { clientMarketMineHref, DASHBOARD_ACCOUNT_BILLING_PATH, DASHBOARD_ACCOUNT_CLIENT_PATH } from "@/lib/dashboard-nav";
 import type { MessageKey } from "@/lib/i18n";
+import { formatUsdMoney } from "@/lib/market-money";
 import type { ClientMarketHost, ClientMarketRental } from "@/lib/types";
 
 type ClientMonitorTab = "user" | "provider";
@@ -34,7 +35,7 @@ function offerLabel(
   dailyRateMinor: number | undefined,
   freeDurationDays: number | undefined,
   locale: string,
-  currency = "USD",
+  _currency = "USD",
 ) {
   if (isFreeOffer(dailyRateMinor)) {
     if (freeDurationDays != null) {
@@ -44,9 +45,7 @@ function offerLabel(
     }
     return locale.startsWith("zh") ? "免费 / 永久" : "Free / permanent";
   }
-  const amount = new Intl.NumberFormat(locale, { style: "currency", currency: currency === "CNY" ? "CNY" : "USD" }).format(
-    (dailyRateMinor as number) / 100,
-  );
+  const amount = formatUsdMoney(dailyRateMinor as number, locale);
   return locale.startsWith("zh") ? `${amount} / 天` : `${amount} / day`;
 }
 

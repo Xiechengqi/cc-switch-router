@@ -216,7 +216,7 @@ Server 要求:
 Share 与 Client Host 的新租用都执行供应商准入，但策略按「产品 + 价格类型」拆成四个独立作用域：`share/free`、`share/paid`、`client_host/free`、`client_host/paid`。免费作用域隐式默认 `blacklist`，便于未知用户先体验；付费作用域隐式默认 `whitelist`，必须先建立信任和授信。供应商可按规范化邮箱添加买家，买家尚未注册时可预授权；首次租用时 Router 按已验证邮箱绑定 `buyer_user_id`。每个关系可对四个作用域分别设置 `inherit`、`allow` 或 `deny`。
 
 - 白名单模式下，只有有效关系且对应作用域明确 `allow` 的买家可新租；黑名单模式下，除对应作用域明确 `deny` 外均可新租。免费或付费、Share 或 Host 的规则互不隐式继承。
-- 付费租用还要求同一买家、供应商和币种存在 `limited` 或 `unlimited` 私有授信。有限额度是账户自动出账边界；无限额度不自动出账,由任一方发起清账。
+- 付费租用还要求同一买家和供应商存在 USD `limited` 或 `unlimited` 私有授信。有限额度是账户自动出账边界；无限额度不自动出账,由任一方发起清账。
 - 只有从白名单实际切换到黑名单时必须提交风险确认；重复保存黑名单不重复要求确认。供应商可另行开启有限公共额度供付费黑名单作用域中的未知买家使用，但公共额度不能设为无限。
 - `GET /v1/share-market/listings` 的座位与 `GET /v1/client-market/hosts` 的 Host 都返回 `sellerApprovalRequired`。该字段只面向已登录的非 Owner,表示当前供应商准入不允许该买家；前端据此保留「租用」/「新建」入口并引导联系 Owner,不得把服务端英文拒绝消息直接展示为红色错误。Share 引导到对应 Client 聊天室；Client Host 展示 Owner 邮箱及其公开联系方式。
 - 模式切换和产品规则更新只影响新租用。撤销整个买家关系会把该买家的账户信用设为 `none` 并终止现有付费服务；以后确认历史账单也不会恢复这些服务。现有免费服务不因单独修改策略而中断,Owner 可另行强制回收。
@@ -228,7 +228,7 @@ Share 与 Client Host 的新租用都执行供应商准入，但策略按「产�
 | `PUT` | `/v1/market-access/policies/:product_kind/:pricing_kind` | 独立切换四个作用域的白名单或黑名单模式 |
 | `POST` | `/v1/market-access/counterparties` | 按邮箱创建或重新启用可信买家关系 |
 | `PUT` | `/v1/market-access/counterparties/:id` | 更新产品规则或撤销关系 |
-| `PUT` | `/v1/market-access/counterparties/:id/credit-lines/:currency` | 更新买家 CNY / USD 私有信用额度 |
+| `PUT` | `/v1/market-access/counterparties/:id/credit-lines/:currency` | 更新买家 USD 私有信用额度 |
 | `PUT` | `/v1/market-access/public-credit-lines/:currency` | 更新黑名单模式的有限公共额度 |
 
 写入请求使用 camelCase JSON，未知字段会被拒绝：
@@ -241,13 +241,15 @@ Share 与 Client Host 的新租用都执行供应商准入，但策略按「产�
 | `PUT /counterparties/:id/credit-lines/:currency` | `kind`(`none` / `limited` / `unlimited`)、有限额度的 `limitMinor`、无限额度的 `riskAcknowledged: true`、`expectedRevision` |
 | `PUT /public-credit-lines/:currency` | `enabled`、启用时的有限 `limitMinor` 与 `riskAcknowledged: true`、`expectedRevision` |
 
-`limitMinor` 使用币种最小单位且范围为 `1..=100000000`；路径币种仅接受 `CNY` / `USD`。私有无限额度和任何公共额度都必须显式确认风险，公共额度始终只能是有限额度。
+`limitMinor` 使用 USD 最小单位（美分）且范围为 `1..=100000000`；路径币种仅接受 `USD`。私有无限额度和任何公共额度都必须显式确认风险，公共额度始终只能是有限额度。
 
 免费 Client Host 使用与免费 Share 相同的期限契约：Host 创建、编辑与导入接口接受 `freeDurationDays=1..365` 或 `null`（永久），付费 Host 拒绝该字段。Allocation Quote 冻结期限和 `offerRevision`；倒计时从 Client provisioning 成功、订阅写入 `activatedAt` 时开始。到期前 24 小时只产生一次临期事件，到期后 Router 以 `free_period_expired` 调用现有安全 cleanup。清理失败时租约保持 `release_failed` 且 Host 继续隔离，不会错误回到 `idle`。
 
 ### 7.3 Share / Client Market 统一后付费
 
-付费 Share 与 Client Host 不再按单个商品预付或续费。Router 按「买家 + 供应商 + 币种」维护赊账账户；每个服务独立享受 12 小时健康时长试用,之后按固定每日价格和实际健康秒数累计。有限额度使用达到 80% 时向买卖双方各发送一次预警,用满后自动生成聚合账单。买家主动清账、供应商要求清账、供应商永久关闭赊账账户或最后一个服务结束时也会生成聚合账单。
+付费 Share 与 Client Host 不再按单个商品预付或续费。Router 按「买家 + 供应商」维护唯一 USD 赊账账户；每个服务独立享受 12 小时健康时长试用,之后按固定 USD 每日价格和实际健康秒数累计。有限额度使用达到 80% 时向买卖双方各发送一次预警,用满后自动生成聚合账单。买家主动清账、供应商要求清账、供应商永久关闭赊账账户或最后一个服务结束时也会生成聚合账单。
+
+USD 是唯一报价、授信、记账和结算币种。账单总额与每条账单明细同时返回 `amountUsdMinor` 和 `amountCnyMinor`，其中 `amountMinor` 继续作为 USD 兼容字段；人民币金额固定按 `1 USD = 7 CNY` 计算，仅用于展示。`/v1/market-billing/supplier-profiles/:currency` 的路径参数也只接受 `USD`。
 
 | 方法 | 路径 | 用途 |
 |---|---|---|

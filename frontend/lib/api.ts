@@ -776,7 +776,7 @@ export async function getMarketBillingDashboard(signal?: AbortSignal) {
 }
 
 export async function updateMarketBillingSupplierProfile(
-  currency: "CNY" | "USD",
+  currency: "USD",
   settlementGraceHours: number,
 ) {
   return parseJson<MarketBillingDashboard>(
@@ -930,7 +930,7 @@ export async function upsertMarketCounterparty(body: {
     decision: MarketAccessDecision;
   }>;
   creditLines?: Array<{
-    currency: "CNY" | "USD";
+    currency: "USD";
     kind: MarketCreditKind;
     limitMinor?: number;
     riskAcknowledged?: boolean;
@@ -968,7 +968,7 @@ export async function updateMarketCounterparty(
 
 export async function updateMarketCounterpartyCredit(
   id: string,
-  currency: "CNY" | "USD",
+  currency: "USD",
   body: {
     kind: MarketCreditKind;
     limitMinor?: number;
@@ -986,7 +986,7 @@ export async function updateMarketCounterpartyCredit(
 }
 
 export async function updateMarketPublicCredit(
-  currency: "CNY" | "USD",
+  currency: "USD",
   body: { enabled: boolean; limitMinor?: number; riskAcknowledged?: boolean; expectedRevision: number },
 ) {
   return parseJson<MarketAccessDashboard>(

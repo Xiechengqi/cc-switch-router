@@ -1375,7 +1375,7 @@ export type ClientMarketHost = {
   port?: number;
   hostOwnerEmail: string;
   dailyRateMinor?: number;
-  currency?: string;
+  currency?: "USD";
   freeDurationDays?: number;
   offerRevision: number;
   paymentMethodKinds: string[];
@@ -1463,7 +1463,7 @@ export type AccountPaymentProfile = {
 };
 
 export type MarketBillingSupplierProfile = {
-  currency: "CNY" | "USD" | string;
+  currency: "USD";
   settlementGraceHours: number;
   revision: number;
   updatedAt: string;
@@ -1495,6 +1495,8 @@ export type MarketBillingInvoiceLine = {
   dailyRateMinor: number;
   billableSeconds: number;
   amountMinor: number;
+  amountUsdMinor: number;
+  amountCnyMinor: number;
   serviceStartedAt: string;
   serviceEndedAt: string;
   evidence: Record<string, unknown>;
@@ -1526,7 +1528,9 @@ export type MarketBillingInvoice = {
   sequence: number;
   status: string;
   amountMinor: number;
-  currency: string;
+  amountUsdMinor: number;
+  amountCnyMinor: number;
+  currency: "USD";
   dueAt: string;
   deadlineAt: string;
   openedAt: string;
@@ -1551,7 +1555,7 @@ export type MarketCreditAccount = {
   buyerEmail: string;
   supplierUserId: string;
   supplierEmail: string;
-  currency: string;
+  currency: "USD";
   status: string;
   balanceMinor: number;
   creditKind: "none" | "limited" | "unlimited" | string;
@@ -1637,7 +1641,7 @@ export type MarketCounterpartyAccessRule = {
 };
 
 export type MarketCreditLine = {
-  currency: "CNY" | "USD" | string;
+  currency: "USD";
   kind: MarketCreditKind;
   limitMinor?: number;
   revision: number;
@@ -1645,7 +1649,7 @@ export type MarketCreditLine = {
 };
 
 export type MarketCounterpartyExposure = {
-  currency: string;
+  currency: "USD";
   balanceMinor: number;
   status: string;
   activeServiceCount: number;
@@ -1675,7 +1679,7 @@ export type MarketAccessRequest = {
   targetKind: "share_seat" | "client_host" | string;
   targetId: string;
   targetLabel: string;
-  currency?: string;
+  currency?: "USD";
   status: "requested" | "approved" | "rejected" | "cancelled" | string;
   revision: number;
   requestedAt: string;
@@ -1685,7 +1689,7 @@ export type MarketAccessRequest = {
 };
 
 export type MarketPublicCreditLine = {
-  currency: "CNY" | "USD" | string;
+  currency: "USD";
   limitMinor?: number;
   enabled: boolean;
   revision: number;
@@ -1773,7 +1777,7 @@ export type ClientMarketRental = {
   clientOwnerEmail: string;
   status: "active" | "billing_suspended" | "releasing" | "release_failed" | "released" | string;
   dailyRateMinor?: number;
-  currency?: string;
+  currency?: "USD";
   freeDurationDays?: number;
   offerRevision: number;
   activatedAt?: string;
@@ -1795,7 +1799,7 @@ export type ClientMarketHostTransferDocument = {
     port: number;
     note?: string;
     dailyRateMinor?: number;
-    currency?: string;
+    currency?: "USD";
     freeDurationDays?: number;
     expectedFingerprint?: string;
     informationalStatus?: string;
@@ -1836,7 +1840,7 @@ export type ShareMarketSeatInput = {
   tokenLimit?: number;
   tokenPeriod: ShareTokenPeriod;
   dailyRateMinor?: number;
-  currency?: string;
+  currency?: "USD";
   freeDurationDays?: number;
 };
 
@@ -1854,7 +1858,7 @@ export type ShareMarketSubscription = {
   renterEmail: string;
   status: string;
   dailyRateMinor?: number;
-  currency?: string;
+  currency?: "USD";
   freeDurationDays?: number;
   offerRevision: number;
   activatedAt?: string;

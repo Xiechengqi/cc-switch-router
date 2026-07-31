@@ -1,5 +1,6 @@
 import type { ClientMarketHost, ClientMarketHostTransferDocument, HostIpIntel } from "@/lib/types";
 import type { MessageKey } from "@/lib/i18n";
+import { formatUsdMoney, MARKET_CURRENCY } from "@/lib/market-money";
 
 /**
  * Pure helpers, constants and types shared by the Client Market surfaces.
@@ -145,7 +146,7 @@ export function hostExportKey(host: { ip?: string | null; port?: number | null }
   return formatHostEndpoint(host.ip, host.port);
 }
 
-/** Fixed line format: ip:port|note|dailyPriceMinor|currency|freeDurationDays|fingerprint */
+/** Fixed line format: ip:port|note|dailyPriceMinor|USD|freeDurationDays|fingerprint */
 export type HostTransferLineEntry = ClientMarketHostTransferDocument["hosts"][number];
 
 export function formatHostEndpoint(ip: string, port: number) {
@@ -219,7 +220,7 @@ export function parseHostTransferLines(text: string): { document?: ClientMarketH
       }
     }
     const currency = currencyRaw ? currencyRaw.toUpperCase() : undefined;
-    if (currency && currency !== "CNY" && currency !== "USD") return { errorLine: trimmed };
+    if (currency && currency !== MARKET_CURRENCY) return { errorLine: trimmed };
     let freeDurationDays: number | undefined;
     if (freeDurationRaw) {
       freeDurationDays = Number(freeDurationRaw);
@@ -233,7 +234,7 @@ export function parseHostTransferLines(text: string): { document?: ClientMarketH
       port: endpoint.port,
       note: note || undefined,
       dailyRateMinor,
-      currency,
+      currency: currency ? MARKET_CURRENCY : undefined,
       freeDurationDays,
       expectedFingerprint: fingerprint || undefined,
     });
@@ -420,7 +421,6 @@ export type Translate = (key: MessageKey, values?: Record<string, string | numbe
 export function formatHostOffer(
   dailyRateMinor: number | undefined,
   locale: string,
-  currency = "USD",
   freeDurationDays?: number,
 ) {
   if (!dailyRateMinor) {
@@ -431,10 +431,7 @@ export function formatHostOffer(
     }
     return locale.startsWith("zh") ? "免费 · 永久" : "Free · permanent";
   }
-  const amount = new Intl.NumberFormat(locale, {
-    style: "currency",
-    currency: currency === "CNY" ? "CNY" : "USD",
-  }).format(dailyRateMinor / 100);
+  const amount = formatUsdMoney(dailyRateMinor, locale);
   return locale.startsWith("zh") ? `${amount} / 天` : `${amount} / day`;
 }
 
@@ -449,9 +446,8 @@ export function parseFreeDurationDays(value: string, t: Translate) {
   return days;
 }
 
-export function parseHostOffer(priceValue: string, t: Translate, currency = "USD") {
+export function parseHostOffer(priceValue: string, t: Translate) {
   const price = priceValue.trim();
-  const normalizedCurrency = currency.trim().toUpperCase() === "CNY" ? "CNY" : "USD";
   if (!price) return { dailyRateMinor: undefined, currency: undefined as string | undefined };
   if (!/^\d{1,7}(?:\.\d{1,2})?$/.test(price)) {
     throw new Error(t("clientMarket.offerInvalid"));
@@ -461,7 +457,7 @@ export function parseHostOffer(priceValue: string, t: Translate, currency = "USD
   if (dailyRateMinor < 1 || dailyRateMinor > 100_000_000) {
     throw new Error(t("clientMarket.offerRange"));
   }
-  return { dailyRateMinor, currency: normalizedCurrency };
+  return { dailyRateMinor, currency: MARKET_CURRENCY };
 }
 
 export function isPaymentProfileRequiredError(message: string) {

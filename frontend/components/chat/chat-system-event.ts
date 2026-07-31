@@ -1,4 +1,5 @@
 import type { MessageKey } from "@/lib/i18n";
+import { formatUsdCnyMoney, usdMinorToCnyMinor } from "@/lib/market-money";
 import type { ClientChatMessage, ClientChatMessagePreview } from "@/lib/types";
 
 type TFn = (key: MessageKey, values?: Record<string, string | number>) => string;
@@ -344,6 +345,11 @@ function detailScalar(
   if (typeof value === "boolean") return value ? "Yes" : "No";
   if (typeof value === "number") {
     if (key.endsWith("Minor")) {
+      if (key === "amountMinor") {
+        const amountUsdMinor = typeof root.amountUsdMinor === "number" ? root.amountUsdMinor : value;
+        const amountCnyMinor = typeof root.amountCnyMinor === "number" ? root.amountCnyMinor : undefined;
+        return formatUsdCnyMoney(amountUsdMinor, locale, amountCnyMinor);
+      }
       const currency = typeof root.currency === "string" ? root.currency : "";
       return `${new Intl.NumberFormat(locale, {
         minimumFractionDigits: 2,
@@ -459,13 +465,18 @@ function payloadTime(payload: Record<string, unknown>, key: string, locale: stri
   }).format(date);
 }
 
-function payloadAmount(payload: Record<string, unknown>) {
-  const amountMinor = payloadNumber(payload, "amountMinor");
-  const currency = payloadString(payload, "currency", "");
-  return `${new Intl.NumberFormat(undefined, {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  }).format(amountMinor / 100)} ${currency}`.trim();
+function payloadAmount(payload: Record<string, unknown>, locale: string) {
+  const amountUsdMinor = payloadNumber(
+    payload,
+    "amountUsdMinor",
+    payloadNumber(payload, "amountMinor"),
+  );
+  const amountCnyMinor = payloadNumber(
+    payload,
+    "amountCnyMinor",
+    usdMinorToCnyMinor(amountUsdMinor),
+  );
+  return formatUsdCnyMoney(amountUsdMinor, locale, amountCnyMinor);
 }
 
 function payloadPercent(payload: Record<string, unknown>, key: string, locale: string) {
@@ -504,26 +515,26 @@ export function chatSystemEventText(message: StructuredChatMessage, t: TFn, loca
       return t("chat.event.entitlementFailed", { seat, renter });
     case "payment_due":
       return t("chat.event.paymentDue", {
-        amount: payloadAmount(payload),
+        amount: payloadAmount(payload, locale),
         time: payloadTime(payload, "deadlineAt", locale),
       });
     case "payment_declared":
-      return t("chat.event.paymentDeclared", { amount: payloadAmount(payload) });
+      return t("chat.event.paymentDeclared", { amount: payloadAmount(payload, locale) });
     case "billing_payment_confirmed":
-      return t("chat.event.billingPaymentConfirmed", { amount: payloadAmount(payload) });
+      return t("chat.event.billingPaymentConfirmed", { amount: payloadAmount(payload, locale) });
     case "billing_payment_rejected":
       return t("chat.event.billingPaymentRejected", {
-        amount: payloadAmount(payload),
+        amount: payloadAmount(payload, locale),
         reason: payloadString(payload, "reason"),
       });
     case "billing_payment_overdue":
       return t("chat.event.billingPaymentOverdue", {
-        amount: payloadAmount(payload),
+        amount: payloadAmount(payload, locale),
         time: payloadTime(payload, "deadlineAt", locale),
       });
     case "billing_invoice_disputed":
       return t("chat.event.billingInvoiceDisputed", {
-        amount: payloadAmount(payload),
+        amount: payloadAmount(payload, locale),
         reason: payloadString(payload, "reason"),
       });
     case "billing_dispute_resolved":
@@ -531,11 +542,11 @@ export function chatSystemEventText(message: StructuredChatMessage, t: TFn, loca
         payloadString(payload, "resolution", "uphold") === "void"
           ? "chat.event.billingDisputeResolvedVoid"
           : "chat.event.billingDisputeResolvedUpheld",
-        { amount: payloadAmount(payload) },
+        { amount: payloadAmount(payload, locale) },
       );
     case "billing_invoice_voided":
       return t("chat.event.billingInvoiceVoided", {
-        amount: payloadAmount(payload),
+        amount: payloadAmount(payload, locale),
         reason: payloadString(payload, "reason"),
       });
     case "billing_credit_limit_warning":

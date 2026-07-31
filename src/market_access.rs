@@ -616,10 +616,10 @@ fn normalize_decision(value: &str) -> Result<String, AppError> {
 
 pub(crate) fn normalize_currency(value: &str) -> Result<String, AppError> {
     let currency = value.trim().to_ascii_uppercase();
-    if matches!(currency.as_str(), "CNY" | "USD") {
+    if currency == crate::market_billing::MARKET_CURRENCY {
         Ok(currency)
     } else {
-        Err(AppError::BadRequest("currency must be CNY or USD".into()))
+        Err(AppError::BadRequest("currency must be USD".into()))
     }
 }
 
@@ -859,7 +859,9 @@ fn counterparty_view_tx(conn: &Connection, id: &str) -> Result<CounterpartyView,
     view.credit_lines = conn
         .prepare(
             "SELECT currency, kind, limit_minor, revision, updated_at
-             FROM market_credit_grants WHERE counterparty_id = ?1 ORDER BY currency",
+             FROM market_credit_grants
+             WHERE counterparty_id = ?1 AND currency = 'USD'
+             ORDER BY currency",
         )
         .and_then(|mut statement| {
             statement
@@ -887,6 +889,7 @@ fn counterparty_view_tx(conn: &Connection, id: &str) -> Result<CounterpartyView,
                  FROM market_credit_accounts account
                  JOIN market_counterparties counterparty ON counterparty.supplier_user_id = account.supplier_user_id
                  WHERE counterparty.id = ?1 AND account.buyer_user_id = ?2
+                   AND account.currency = 'USD'
                  ORDER BY account.currency",
             )
             .and_then(|mut statement| {
@@ -1022,7 +1025,8 @@ impl AppStore {
         let mut public_credit_lines = conn
             .prepare(
                 "SELECT currency, enabled, limit_minor, revision, updated_at
-                 FROM market_public_credit_policies WHERE supplier_user_id = ?1
+                 FROM market_public_credit_policies
+                 WHERE supplier_user_id = ?1 AND currency = 'USD'
                  ORDER BY currency",
             )
             .and_then(|mut statement| {
@@ -1039,7 +1043,7 @@ impl AppStore {
                     .collect::<Result<Vec<_>, _>>()
             })
             .map_err(map_db("list public credit policies"))?;
-        for currency in ["CNY", "USD"] {
+        for currency in [crate::market_billing::MARKET_CURRENCY] {
             if !public_credit_lines
                 .iter()
                 .any(|line| line.currency == currency)
@@ -3346,6 +3350,12 @@ mod tests {
     }
 
     #[test]
+    fn market_credit_accepts_only_usd() {
+        assert_eq!(normalize_currency(" usd ").expect("normalize USD"), "USD");
+        assert!(normalize_currency("CNY").is_err());
+    }
+
+    #[test]
     fn product_decision_update_does_not_reactivate_a_revoked_relationship() {
         let conn = access_connection();
         let now = Utc::now().to_rfc3339();
@@ -3457,7 +3467,7 @@ mod tests {
             "INSERT INTO market_public_credit_policies (
                 supplier_user_id, supplier_email, currency, enabled, limit_minor,
                 revision, risk_acknowledged_at, created_at, updated_at
-             ) VALUES ('public-supplier', 'public@example.com', 'CNY', 1, 5000,
+             ) VALUES ('public-supplier', 'public@example.com', 'USD', 1, 5000,
                        1, ?1, ?1, ?1)",
             params![now],
         )
@@ -3468,7 +3478,7 @@ mod tests {
             "unknown-buyer",
             "unknown@example.com",
             PRODUCT_SHARE,
-            "CNY",
+            "USD",
         )
         .expect("resolve finite public credit");
         assert_eq!(public_grant.kind, CREDIT_LIMITED);

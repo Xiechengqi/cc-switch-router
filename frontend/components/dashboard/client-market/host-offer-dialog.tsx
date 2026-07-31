@@ -7,6 +7,7 @@ import { SegmentedControl } from "@/components/common/segmented-control";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getAccountPaymentProfile, getMarketBillingDashboard, updateClientMarketHostOffer } from "@/lib/api";
 import { DASHBOARD_ACCOUNT_BILLING_PATH, DASHBOARD_ACCOUNT_PAYMENTS_PATH } from "@/lib/dashboard-nav";
+import { MARKET_CURRENCY } from "@/lib/market-money";
 import type { ClientMarketHost } from "@/lib/types";
 import {
   isPaymentProfileRequiredError,
@@ -30,7 +31,6 @@ export function HostOfferDialog({
     host.dailyRateMinor ? "paid" : "free",
   );
   const [price, setPrice] = React.useState(host.dailyRateMinor ? (host.dailyRateMinor / 100).toFixed(2) : "");
-  const [currency, setCurrency] = React.useState<"CNY" | "USD">(host.currency === "CNY" ? "CNY" : "USD");
   const [freeDurationMode, setFreeDurationMode] = React.useState<"fixed" | "permanent">(
     host.freeDurationDays == null ? "permanent" : "fixed",
   );
@@ -46,7 +46,6 @@ export function HostOfferDialog({
     if (!open) return;
     setPricing(host.dailyRateMinor ? "paid" : "free");
     setPrice(host.dailyRateMinor ? (host.dailyRateMinor / 100).toFixed(2) : "");
-    setCurrency(host.currency === "CNY" ? "CNY" : "USD");
     setFreeDurationMode(host.freeDurationDays == null ? "permanent" : "fixed");
     setFreeDurationDays(String(host.freeDurationDays ?? 1));
     setError("");
@@ -69,7 +68,7 @@ export function HostOfferDialog({
     return () => {
       cancelled = true;
     };
-  }, [host.currency, host.dailyRateMinor, host.freeDurationDays, open]);
+  }, [host.dailyRateMinor, host.freeDurationDays, open]);
 
   const save = async () => {
     let offer: {
@@ -79,7 +78,7 @@ export function HostOfferDialog({
     };
     try {
       offer = pricing === "paid"
-        ? parseHostOffer(price, t, currency)
+        ? parseHostOffer(price, t)
         : {
             freeDurationDays:
               freeDurationMode === "fixed"
@@ -90,7 +89,7 @@ export function HostOfferDialog({
       setError(reason instanceof Error ? reason.message : String(reason));
       return;
     }
-    if (pricing === "paid" && (!offer.dailyRateMinor || paymentReady === false || !billingCurrencies?.includes(currency))) {
+    if (pricing === "paid" && (!offer.dailyRateMinor || paymentReady === false || !billingCurrencies?.includes(MARKET_CURRENCY))) {
       if (!offer.dailyRateMinor) {
         setError(t("clientMarket.offerInvalid"));
         return;
@@ -120,7 +119,7 @@ export function HostOfferDialog({
           <Modal.Header><Modal.Heading>{t("clientMarket.editOffer")}</Modal.Heading></Modal.Header>
           <Modal.Body className="grid gap-4">
             <p className="text-sm text-muted-foreground">{t("clientMarket.editOfferHint")}</p>
-            {pricing === "paid" && (paymentReady === false || (billingCurrencies && !billingCurrencies.includes(currency))) ? (
+            {pricing === "paid" && (paymentReady === false || (billingCurrencies && !billingCurrencies.includes(MARKET_CURRENCY))) ? (
               <div className="grid gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-3 text-sm text-amber-950">
                 <p>{t("clientMarket.offerRequiresBilling")}</p>
                 <div className="flex flex-wrap gap-3">
@@ -148,9 +147,7 @@ export function HostOfferDialog({
                 </label>
                 <label className="grid gap-1 text-sm">
                   <span className="text-muted-foreground">{t("clientMarket.currency")}</span>
-                  <select value={currency} onChange={(event) => setCurrency(event.target.value === "CNY" ? "CNY" : "USD")} className="h-10 rounded-md border px-2">
-                    <option value="CNY">CNY</option><option value="USD">USD</option>
-                  </select>
+                  <span className="flex h-10 items-center rounded-md border bg-slate-50 px-3 font-medium">{MARKET_CURRENCY}</span>
                 </label>
               </div>
             ) : (
