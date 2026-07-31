@@ -274,7 +274,7 @@ function HostRowImpl({
         </td>
         <td className="max-w-[9rem] whitespace-nowrap px-2 py-2 align-middle">
           <span className="block text-xs font-semibold text-foreground" title={t("clientMarket.currentOffer")}>
-            {formatHostOffer(host.dailyRateMinor, locale, host.currency)}
+            {formatHostOffer(host.dailyRateMinor, locale, host.currency, host.freeDurationDays)}
           </span>
         </td>
         <td className="max-w-[12rem] px-2 py-2 align-middle">

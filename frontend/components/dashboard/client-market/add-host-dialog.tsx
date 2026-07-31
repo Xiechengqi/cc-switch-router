@@ -1,9 +1,10 @@
 "use client";
 
 import * as React from "react";
-import { Button, Modal, Tabs, toast } from "@heroui/react";
+import { Button, Modal, toast } from "@heroui/react";
 import { Check, ChevronDown, Circle, Loader2, X } from "lucide-react";
 import { CopyableCodeField } from "@/components/common/copyable-code-field";
+import { SegmentedControl } from "@/components/common/segmented-control";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   createClientMarketHost,
@@ -28,6 +29,7 @@ import {
   formatHostIpIntelSecondary,
   formatHostIpLocation,
   isPaymentProfileRequiredError,
+  parseFreeDurationDays,
   parseHostOffer,
 } from "@/components/dashboard/client-market/host-utils";
 
@@ -49,8 +51,11 @@ export function AddHostDialog({
   const [port, setPort] = React.useState("22");
   const [rootPassword, setRootPassword] = React.useState("");
   const [note, setNote] = React.useState("");
+  const [pricing, setPricing] = React.useState<"free" | "paid">("free");
   const [priceUsd, setPriceUsd] = React.useState("");
   const [currency, setCurrency] = React.useState<"CNY" | "USD">("USD");
+  const [freeDurationMode, setFreeDurationMode] = React.useState<"fixed" | "permanent">("fixed");
+  const [freeDurationDays, setFreeDurationDays] = React.useState("1");
   const [busy, setBusy] = React.useState(false);
   const [testing, setTesting] = React.useState(false);
   const [error, setError] = React.useState("");
@@ -157,14 +162,29 @@ export function AddHostDialog({
   const submit = async () => {
     const parsedPort = parsePort();
     if (parsedPort == null) return;
-    let offer: ReturnType<typeof parseHostOffer>;
+    let offer: {
+      dailyRateMinor?: number;
+      currency?: string;
+      freeDurationDays?: number;
+    };
     try {
-      offer = parseHostOffer(priceUsd, t, currency);
+      offer = pricing === "paid"
+        ? parseHostOffer(priceUsd, t, currency)
+        : {
+            freeDurationDays:
+              freeDurationMode === "fixed"
+                ? parseFreeDurationDays(freeDurationDays, t)
+                : undefined,
+          };
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
       return;
     }
-    if (offer.dailyRateMinor && (paymentReady === false || !billingCurrencies?.includes(currency))) {
+    if (pricing === "paid" && (!offer.dailyRateMinor || paymentReady === false || !billingCurrencies?.includes(currency))) {
+      if (!offer.dailyRateMinor) {
+        setError(t("clientMarket.offerInvalid"));
+        return;
+      }
       setError(t("clientMarket.offerRequiresBilling"));
       return;
     }
@@ -262,7 +282,10 @@ export function AddHostDialog({
       setPort("22");
       setRootPassword("");
       setNote("");
+      setPricing("free");
       setPriceUsd("");
+      setFreeDurationMode("fixed");
+      setFreeDurationDays("1");
       setPhase("form");
       setError("");
       setIpIntel(null);
@@ -340,27 +363,17 @@ export function AddHostDialog({
           {phase === "form" ? (
             <>
               <Modal.Body className="grid gap-3 text-slate-900">
-                <Tabs
-                  selectedKey={mode}
-                  onSelectionChange={(key: React.Key) => setMode(String(key) as AddHostMode)}
-                  variant="secondary"
-                  className="text-foreground"
-                >
-                  <Tabs.List className="grid w-full grid-cols-2 text-foreground">
-                    <Tabs.Tab
-                      id="password"
-                      className="rounded-md border border-transparent px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors data-[selected=true]:border-primary/30 data-[selected=true]:bg-primary/10 data-[selected=true]:text-primary"
-                    >
-                      {t("clientMarket.tabPassword")}
-                    </Tabs.Tab>
-                    <Tabs.Tab
-                      id="manual"
-                      className="rounded-md border border-transparent px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors data-[selected=true]:border-primary/30 data-[selected=true]:bg-primary/10 data-[selected=true]:text-primary"
-                    >
-                      {t("clientMarket.tabManual")}
-                    </Tabs.Tab>
-                  </Tabs.List>
-                </Tabs>
+                <SegmentedControl
+                  value={mode}
+                  onChange={setMode}
+                  ariaLabel={t("clientMarket.addHostTitle")}
+                  size="md"
+                  fullWidth
+                  items={[
+                    { id: "password", label: t("clientMarket.tabPassword") },
+                    { id: "manual", label: t("clientMarket.tabManual") },
+                  ]}
+                />
 
                 {mode === "manual" ? (
                   <div className="overflow-hidden rounded-xl border border-border">
@@ -433,31 +446,53 @@ export function AddHostDialog({
                     <span className="text-xs text-muted-foreground">{t("clientMarket.rootPasswordHint")}</span>
                   </label>
                 ) : null}
-                <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_7rem]">
-                  <label className="grid gap-1 text-sm">
-                    <span className="text-muted-foreground">{t("clientMarket.dailyPrice")}</span>
-                    <input
-                      value={priceUsd}
-                      onChange={(event) => setPriceUsd(event.target.value)}
-                      placeholder={t("clientMarket.free")}
-                      inputMode="decimal"
-                      className="h-11 rounded-lg border border-border bg-white px-3 text-slate-900 outline-none focus:ring-2 focus:ring-primary/30"
+                <SegmentedControl
+                  value={pricing}
+                  onChange={setPricing}
+                  ariaLabel={t("clientMarket.currentOffer")}
+                  size="md"
+                  fullWidth
+                  items={[
+                    { id: "free", label: t("clientMarket.free") },
+                    { id: "paid", label: t("clientMarket.paid") },
+                  ]}
+                />
+                {pricing === "paid" ? (
+                  <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_7rem]">
+                    <label className="grid gap-1 text-sm">
+                      <span className="text-muted-foreground">{t("clientMarket.dailyPrice")}</span>
+                      <input value={priceUsd} onChange={(event) => setPriceUsd(event.target.value)} inputMode="decimal" className="h-11 rounded-lg border border-border bg-white px-3 text-slate-900 outline-none focus:ring-2 focus:ring-primary/30" />
+                    </label>
+                    <label className="grid gap-1 text-sm">
+                      <span className="text-muted-foreground">{t("clientMarket.rentalCurrency")}</span>
+                      <select value={currency} onChange={(event) => setCurrency(event.target.value === "CNY" ? "CNY" : "USD")} className="h-11 rounded-lg border border-border bg-white px-2 text-slate-900 outline-none focus:ring-2 focus:ring-primary/30">
+                        <option value="CNY">CNY</option><option value="USD">USD</option>
+                      </select>
+                    </label>
+                  </div>
+                ) : (
+                  <div className="grid gap-3">
+                    <SegmentedControl
+                      value={freeDurationMode}
+                      onChange={setFreeDurationMode}
+                      ariaLabel={t("clientMarket.freeDuration.days")}
+                      size="md"
+                      fullWidth
+                      items={[
+                        { id: "fixed", label: t("clientMarket.freeDuration.fixed") },
+                        { id: "permanent", label: t("clientMarket.freeDuration.permanent") },
+                      ]}
                     />
-                  </label>
-                  <label className="grid gap-1 text-sm">
-                    <span className="text-muted-foreground">{t("clientMarket.rentalCurrency")}</span>
-                    <select
-                      value={currency}
-                      onChange={(event) => setCurrency(event.target.value === "CNY" ? "CNY" : "USD")}
-                      className="h-11 rounded-lg border border-border bg-white px-2 text-slate-900 outline-none focus:ring-2 focus:ring-primary/30"
-                    >
-                      <option value="CNY">CNY</option>
-                      <option value="USD">USD</option>
-                    </select>
-                  </label>
-                </div>
-                <p className="text-xs text-muted-foreground">{t("clientMarket.offerHint")}</p>
-                {paymentReady === false || (billingCurrencies && !billingCurrencies.includes(currency)) ? (
+                    {freeDurationMode === "fixed" ? (
+                      <label className="grid gap-1 text-sm">
+                        <span className="text-muted-foreground">{t("clientMarket.freeDuration.days")}</span>
+                        <input type="number" min={1} max={365} step={1} value={freeDurationDays} onChange={(event) => setFreeDurationDays(event.target.value)} className="h-11 rounded-lg border border-border bg-white px-3 text-slate-900 outline-none focus:ring-2 focus:ring-primary/30" />
+                      </label>
+                    ) : null}
+                  </div>
+                )}
+                <p className="text-xs text-muted-foreground">{pricing === "paid" ? t("clientMarket.offerHint") : t("clientMarket.freeDuration.hint")}</p>
+                {pricing === "paid" && (paymentReady === false || (billingCurrencies && !billingCurrencies.includes(currency))) ? (
                   <div className="grid gap-1.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-950">
                     <span>{t("clientMarket.offerRequiresBilling")}</span>
                     <div className="flex flex-wrap gap-3">

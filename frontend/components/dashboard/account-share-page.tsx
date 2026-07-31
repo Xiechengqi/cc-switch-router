@@ -3,9 +3,10 @@
 import * as React from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Chip, Tabs } from "@heroui/react";
+import { Chip } from "@heroui/react";
 import { ArrowUpRight, ExternalLink, Loader2 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
+import { SegmentedControl } from "@/components/common/segmented-control";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
 import { subdomainTunnelUrl } from "@/components/dashboard/share-dashboard-utils";
 import { CLIENT_MARKET_POLL_MS } from "@/components/dashboard/client-market/host-utils";
@@ -98,8 +99,18 @@ function sortSubscriptions(left: ShareMarketSubscription, right: ShareMarketSubs
   );
 }
 
-function offerLabel(subscription: ShareMarketSubscription, locale: string, freeLabel: string) {
-  if (subscription.dailyRateMinor == null) return freeLabel;
+function offerLabel(
+  subscription: ShareMarketSubscription,
+  locale: string,
+  freeLabel: string,
+  permanentLabel: string,
+  dayLabel: string,
+) {
+  if (subscription.dailyRateMinor == null) {
+    return subscription.freeDurationDays == null
+      ? `${freeLabel} · ${permanentLabel}`
+      : `${freeLabel} · ${subscription.freeDurationDays} ${dayLabel}`;
+  }
   const amount = (subscription.dailyRateMinor / 100).toFixed(2);
   const currency = subscription.currency || "CNY";
   return locale.startsWith("zh") ? `${currency} ${amount} / 天` : `${currency} ${amount} / day`;
@@ -117,6 +128,21 @@ function shareOpenUrl(subdomain?: string | null) {
   return subdomainTunnelUrl(subdomain);
 }
 
+function freePeriodTiming(
+  subscription: ShareMarketSubscription,
+  locale: string,
+  t: ReturnType<typeof useLocaleText>["t"],
+) {
+  if (subscription.dailyRateMinor != null) return null;
+  if (!subscription.activatedAt) return t("shareMarket.freeDuration.pendingActivation");
+  const activated = formatDate(subscription.activatedAt, locale);
+  if (!subscription.expiresAt) {
+    return `${t("shareMarket.freeDuration.activated")}: ${activated} · ${t("shareMarket.permanent")}`;
+  }
+  const expires = formatDate(subscription.expiresAt, locale);
+  return `${t("shareMarket.freeDuration.activated")}: ${activated} · ${t("shareMarket.freeDuration.expires")}: ${expires}`;
+}
+
 function SubscriptionMonitorCard({
   subscription,
   perspective,
@@ -131,6 +157,7 @@ function SubscriptionMonitorCard({
     perspective === "provider"
       ? shareMarketHref({ tab: "mine", shareId: subscription.shareId })
       : shareMarketHref({ tab: "rentals", shareId: subscription.shareId });
+  const freeTiming = freePeriodTiming(subscription, locale, t);
 
   return (
     <section
@@ -166,7 +193,16 @@ function SubscriptionMonitorCard({
       <dl className="grid gap-2 text-sm sm:grid-cols-2">
         <div className="grid gap-0.5">
           <dt className="text-xs text-muted-foreground">{t("account.share.offer")}</dt>
-          <dd className="font-medium">{offerLabel(subscription, locale, t("shareMarket.free"))}</dd>
+          <dd className="font-medium">
+            {offerLabel(
+              subscription,
+              locale,
+              t("shareMarket.free"),
+              t("shareMarket.permanent"),
+              t("marketBilling.day"),
+            )}
+          </dd>
+          {freeTiming ? <dd className="text-xs text-muted-foreground">{freeTiming}</dd> : null}
         </div>
         <div className="grid gap-0.5">
           <dt className="text-xs text-muted-foreground">{t("account.share.updated")}</dt>
@@ -392,23 +428,18 @@ export function AccountSharePage() {
         <p className="mt-0.5 text-sm text-muted-foreground">{t("account.shareHint")}</p>
       </div>
 
-      <Tabs
-        selectedKey={tab}
-        onSelectionChange={(key) => {
-          if (key === "user" || key === "provider") setTab(key);
-        }}
-        variant="secondary"
-        className="min-w-0 text-foreground"
-      >
-        <Tabs.List className="grid w-full max-w-sm grid-cols-2 text-foreground">
-          <Tabs.Tab id="user" className="px-3 py-2 text-sm font-medium !text-slate-900 data-[selected=true]:!text-slate-900">
-            {t("account.share.tab.user")}
-          </Tabs.Tab>
-          <Tabs.Tab id="provider" className="px-3 py-2 text-sm font-medium !text-slate-900 data-[selected=true]:!text-slate-900">
-            {t("account.share.tab.provider")}
-          </Tabs.Tab>
-        </Tabs.List>
-      </Tabs>
+      <SegmentedControl
+        value={tab}
+        onChange={setTab}
+        ariaLabel={t("account.nav.share")}
+        size="md"
+        className="w-full max-w-sm"
+        fullWidth
+        items={[
+          { id: "user", label: t("account.share.tab.user") },
+          { id: "provider", label: t("account.share.tab.provider") },
+        ]}
+      />
 
       {tab === "user" ? (
         userSubscriptions.length ? (

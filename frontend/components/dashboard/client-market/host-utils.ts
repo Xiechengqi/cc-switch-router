@@ -145,7 +145,7 @@ export function hostExportKey(host: { ip?: string | null; port?: number | null }
   return formatHostEndpoint(host.ip, host.port);
 }
 
-/** Fixed line format: ip:port|note|dailyPriceMinor|currency|fingerprint */
+/** Fixed line format: ip:port|note|dailyPriceMinor|currency|freeDurationDays|fingerprint */
 export type HostTransferLineEntry = ClientMarketHostTransferDocument["hosts"][number];
 
 export function formatHostEndpoint(ip: string, port: number) {
@@ -176,9 +176,10 @@ export function encodeHostTransferLine(entry: HostTransferLineEntry): string {
   const note = entry.note?.trim() || "";
   const price = entry.dailyRateMinor != null ? String(entry.dailyRateMinor) : "";
   const currency = entry.currency?.trim().toUpperCase() || "";
+  const freeDurationDays = entry.freeDurationDays != null ? String(entry.freeDurationDays) : "";
   const fingerprint = entry.expectedFingerprint?.trim() || "";
   const status = entry.informationalStatus?.trim();
-  const line = `${endpoint}|${note}|${price}|${currency}|${fingerprint}`;
+  const line = `${endpoint}|${note}|${price}|${currency}|${freeDurationDays}|${fingerprint}`;
   return status ? `${line} # ${status}` : line;
 }
 
@@ -194,7 +195,14 @@ export function parseHostTransferLines(text: string): { document?: ClientMarketH
     if (!trimmed || trimmed.startsWith("#")) continue;
     const line = trimmed.replace(/\s+#.*$/, "").trim();
     if (!line) continue;
-    const [endpointPart, note = "", priceRaw = "", currencyRaw = "", fingerprint = ""] = line
+    const [
+      endpointPart,
+      note = "",
+      priceRaw = "",
+      currencyRaw = "",
+      freeDurationRaw = "",
+      fingerprint = "",
+    ] = line
       .split("|")
       .map((part) => part.trim());
     const endpoint = splitHostEndpoint(endpointPart);
@@ -206,15 +214,27 @@ export function parseHostTransferLines(text: string): { document?: ClientMarketH
     if (priceRaw) {
       if (!/^\d+$/.test(priceRaw)) return { errorLine: trimmed };
       dailyRateMinor = Number(priceRaw);
+      if (!Number.isSafeInteger(dailyRateMinor) || dailyRateMinor > 100_000_000) {
+        return { errorLine: trimmed };
+      }
     }
     const currency = currencyRaw ? currencyRaw.toUpperCase() : undefined;
     if (currency && currency !== "CNY" && currency !== "USD") return { errorLine: trimmed };
+    let freeDurationDays: number | undefined;
+    if (freeDurationRaw) {
+      freeDurationDays = Number(freeDurationRaw);
+      if (!Number.isInteger(freeDurationDays) || freeDurationDays < 1 || freeDurationDays > 365) {
+        return { errorLine: trimmed };
+      }
+    }
+    if (dailyRateMinor && freeDurationDays != null) return { errorLine: trimmed };
     hosts.push({
       ip: endpoint.ip,
       port: endpoint.port,
       note: note || undefined,
       dailyRateMinor,
       currency,
+      freeDurationDays,
       expectedFingerprint: fingerprint || undefined,
     });
   }
@@ -401,13 +421,32 @@ export function formatHostOffer(
   dailyRateMinor: number | undefined,
   locale: string,
   currency = "USD",
+  freeDurationDays?: number,
 ) {
-  if (!dailyRateMinor) return locale.startsWith("zh") ? "免费 · 永久" : "Free · forever";
+  if (!dailyRateMinor) {
+    if (freeDurationDays != null) {
+      return locale.startsWith("zh")
+        ? `免费 · ${freeDurationDays} 天`
+        : `Free · ${freeDurationDays} ${freeDurationDays === 1 ? "day" : "days"}`;
+    }
+    return locale.startsWith("zh") ? "免费 · 永久" : "Free · permanent";
+  }
   const amount = new Intl.NumberFormat(locale, {
     style: "currency",
     currency: currency === "CNY" ? "CNY" : "USD",
   }).format(dailyRateMinor / 100);
   return locale.startsWith("zh") ? `${amount} / 天` : `${amount} / day`;
+}
+
+export function parseFreeDurationDays(value: string, t: Translate) {
+  if (!/^\d+$/.test(value.trim())) {
+    throw new Error(t("clientMarket.freeDurationInvalid"));
+  }
+  const days = Number(value);
+  if (!Number.isInteger(days) || days < 1 || days > 365) {
+    throw new Error(t("clientMarket.freeDurationInvalid"));
+  }
+  return days;
 }
 
 export function parseHostOffer(priceValue: string, t: Translate, currency = "USD") {

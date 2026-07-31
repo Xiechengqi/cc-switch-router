@@ -821,6 +821,8 @@ struct RouterSshHostView {
     daily_rate_minor: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     currency: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    free_duration_days: Option<u32>,
     offer_revision: i64,
     #[serde(default)]
     payment_method_kinds: Vec<String>,
@@ -865,13 +867,19 @@ fn host_seller_approval_required(
     is_host_owner: bool,
     is_idle: bool,
     provider_id: Option<&str>,
-    access_by_provider: &HashMap<String, bool>,
+    daily_rate_minor: Option<i64>,
+    access_by_scope: &HashMap<(String, String), bool>,
 ) -> bool {
     has_viewer
         && !is_host_owner
         && is_idle
-        && provider_id
-            .is_some_and(|provider_id| access_by_provider.get(provider_id) == Some(&false))
+        && provider_id.is_some_and(|provider_id| {
+            let key = (
+                provider_id.to_string(),
+                crate::market_access::pricing_kind_for_rate(daily_rate_minor).to_string(),
+            );
+            access_by_scope.get(&key) == Some(&false)
+        })
 }
 
 async fn list_hosts(
@@ -888,15 +896,16 @@ async fn list_hosts(
             query.status.as_deref(),
         )
         .await?;
-    let mut access_by_provider = HashMap::new();
+    let mut access_by_scope = HashMap::new();
     if let Some(session) = viewer.as_ref() {
         let conn = state.store.conn.lock().await;
-        for provider_id in hosts
-            .iter()
-            .filter(|host| host.status == HOST_STATUS_IDLE)
-            .filter_map(|host| host.provider_id.as_deref())
-        {
-            if access_by_provider.contains_key(provider_id) {
+        for host in hosts.iter().filter(|host| host.status == HOST_STATUS_IDLE) {
+            let Some(provider_id) = host.provider_id.as_deref() else {
+                continue;
+            };
+            let pricing_kind = crate::market_access::pricing_kind_for_rate(host.daily_rate_minor);
+            let key = (provider_id.to_string(), pricing_kind.to_string());
+            if access_by_scope.contains_key(&key) {
                 continue;
             }
             let allowed = crate::market_access::product_access_allowed_tx(
@@ -905,8 +914,9 @@ async fn list_hosts(
                 &session.user_id,
                 &session.email,
                 crate::market_access::PRODUCT_CLIENT_HOST,
+                pricing_kind,
             )?;
-            access_by_provider.insert(provider_id.to_string(), allowed);
+            access_by_scope.insert(key, allowed);
         }
     }
     let views = hosts
@@ -929,7 +939,8 @@ async fn list_hosts(
                 is_host_owner,
                 host.status == HOST_STATUS_IDLE,
                 host.provider_id.as_deref(),
-                &access_by_provider,
+                host.daily_rate_minor,
+                &access_by_scope,
             );
             let ip_intel = host_ip_intel_for_viewer(
                 host.ip_intel_json.as_deref(),
@@ -948,6 +959,7 @@ async fn list_hosts(
                     .currency
                     .clone()
                     .or_else(|| host.daily_rate_minor.map(|_| "USD".into())),
+                free_duration_days: host.free_duration_days,
                 offer_revision: host.offer_revision,
                 payment_method_kinds: host.payment_method_kinds,
                 contacts: host.contacts,
@@ -1007,6 +1019,8 @@ struct CreateHostRequest {
     daily_rate_minor: Option<i64>,
     #[serde(default)]
     currency: Option<String>,
+    #[serde(default)]
+    free_duration_days: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1020,6 +1034,8 @@ struct HostTransferEntry {
     daily_rate_minor: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     currency: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    free_duration_days: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expected_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1204,6 +1220,10 @@ async fn create_host(
     let daily_rate_minor = crate::client_market_trade::validate_offer(input.daily_rate_minor)?;
     let currency =
         crate::client_market_trade::normalize_offer_currency(daily_rate_minor, input.currency)?;
+    let free_duration_days = crate::client_market_trade::validate_free_duration_days(
+        daily_rate_minor,
+        input.free_duration_days,
+    )?;
     if daily_rate_minor.is_some() {
         let conn = state.store.conn.lock().await;
         crate::client_market_trade::require_payment_profile_for_offer(&conn, &session.user_id)?;
@@ -1226,6 +1246,7 @@ async fn create_host(
             Some(&intel_json),
             daily_rate_minor,
             currency.as_deref(),
+            free_duration_days,
         )
         .await?;
     Ok(Json(host_to_view(host, true)))
@@ -1255,6 +1276,7 @@ async fn export_hosts(
             note: host.note,
             daily_rate_minor: host.daily_rate_minor,
             currency: host.currency,
+            free_duration_days: host.free_duration_days,
             expected_fingerprint: host.ssh_host_key_fingerprint,
             informational_status: Some(host.status),
         })
@@ -1394,6 +1416,10 @@ async fn import_one_host(
         let daily_rate_minor = crate::client_market_trade::validate_offer(entry.daily_rate_minor)?;
         let currency =
             crate::client_market_trade::normalize_offer_currency(daily_rate_minor, entry.currency)?;
+        let free_duration_days = crate::client_market_trade::validate_free_duration_days(
+            daily_rate_minor,
+            entry.free_duration_days,
+        )?;
         if daily_rate_minor.is_some() {
             let conn = state.store.conn.lock().await;
             crate::client_market_trade::require_payment_profile_for_offer(&conn, &provider_id)?;
@@ -1455,6 +1481,7 @@ async fn import_one_host(
                 Some(&intel_json),
                 daily_rate_minor,
                 currency.as_deref(),
+                free_duration_days,
             )
             .await?;
         Ok(Some(host.id))
@@ -3970,6 +3997,7 @@ fn host_to_view(host: RouterSshHostRecord, reveal: bool) -> RouterSshHostView {
         host_owner_email: host.host_owner_email,
         daily_rate_minor: host.daily_rate_minor,
         currency: host.currency,
+        free_duration_days: host.free_duration_days,
         offer_revision: host.offer_revision,
         payment_method_kinds: host.payment_method_kinds,
         contacts: host.contacts,
@@ -4029,6 +4057,7 @@ pub struct RouterSshHostRecord {
     pub host_owner_email: String,
     pub daily_rate_minor: Option<i64>,
     pub currency: Option<String>,
+    pub free_duration_days: Option<u32>,
     pub offer_revision: i64,
     pub payment_method_kinds: Vec<String>,
     pub contacts: Vec<crate::client_market_trade::PaymentContact>,
@@ -4416,7 +4445,7 @@ impl AppStore {
                               WHERE p.user_id = h.provider_id), '[]'),
                     COALESCE((SELECT contacts_json FROM account_payment_profiles p
                               WHERE p.user_id = h.provider_id), '[]'),
-                    NULLIF(TRIM(h.currency), '')
+                    NULLIF(TRIM(h.currency), ''), h.free_duration_days
              FROM router_ssh_hosts h
              LEFT JOIN installation_client_tunnels t ON t.installation_id = h.installation_id
              LEFT JOIN installations i ON i.id = h.installation_id
@@ -4515,6 +4544,7 @@ impl AppStore {
             ip_intel_json,
             None,
             None,
+            None,
         )
         .await
     }
@@ -4533,8 +4563,14 @@ impl AppStore {
         ip_intel_json: Option<&str>,
         daily_rate_minor: Option<i64>,
         currency: Option<&str>,
+        free_duration_days: Option<u32>,
     ) -> Result<RouterSshHostRecord, AppError> {
         let owner = normalize_market_email(owner_email)?;
+        let daily_rate_minor = crate::client_market_trade::validate_offer(daily_rate_minor)?;
+        let free_duration_days = crate::client_market_trade::validate_free_duration_days(
+            daily_rate_minor,
+            free_duration_days,
+        )?;
         let now = Utc::now().to_rfc3339();
         let id = Uuid::new_v4().to_string();
         let conn = self.conn.lock().await;
@@ -4557,9 +4593,9 @@ impl AppStore {
             "INSERT INTO router_ssh_hosts (
                 id, provider_id, ip, port, host_owner_email, country_code, hostname, ssh_host_key_fingerprint,
                 status, installation_id, last_verified_at, last_error, note, ip_intel_json,
-                daily_rate_minor, currency, offer_revision, created_at, updated_at
+                daily_rate_minor, currency, free_duration_days, offer_revision, created_at, updated_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, NULL, ?11, ?12,
-                       ?13, ?14, 1, ?10, ?10)",
+                       ?13, ?14, ?15, 1, ?10, ?10)",
             params![
                 id,
                 provider_id,
@@ -4575,6 +4611,7 @@ impl AppStore {
                 ip_intel_json,
                 daily_rate_minor,
                 currency,
+                free_duration_days.map(i64::from),
             ],
         )
         .map_err(|e| {
@@ -5120,6 +5157,7 @@ impl AppStore {
         let sql = format!(
             "SELECT id, provider_id FROM router_ssh_hosts
              WHERE status = '{HOST_STATUS_IDLE}'
+               AND daily_rate_minor IS NULL
                AND host_owner_email IN ({owner_placeholders})
                AND country_code IN ({region_placeholders})
              ORDER BY RANDOM()"
@@ -5153,6 +5191,7 @@ impl AppStore {
                 &client_user_id,
                 &client_identity.1,
                 crate::market_access::PRODUCT_CLIENT_HOST,
+                crate::market_access::PRICING_FREE,
             )? {
                 host_id = Some(candidate_id);
                 break;
@@ -5232,7 +5271,7 @@ impl AppStore {
                                   WHERE p.user_id = h.provider_id), '[]'),
                         COALESCE((SELECT contacts_json FROM account_payment_profiles p
                                   WHERE p.user_id = h.provider_id), '[]'),
-                        NULLIF(TRIM(h.currency), '')
+                        NULLIF(TRIM(h.currency), ''), h.free_duration_days
                  FROM router_ssh_hosts h
                  LEFT JOIN installation_client_tunnels t ON t.installation_id = h.installation_id
                  LEFT JOIN installations i ON i.id = h.installation_id
@@ -6290,7 +6329,7 @@ fn get_router_ssh_host(
                           WHERE p.user_id = h.provider_id), '[]'),
                 COALESCE((SELECT contacts_json FROM account_payment_profiles p
                           WHERE p.user_id = h.provider_id), '[]'),
-                NULLIF(TRIM(h.currency), '')
+                NULLIF(TRIM(h.currency), ''), h.free_duration_days
          FROM router_ssh_hosts h
          LEFT JOIN installation_client_tunnels t ON t.installation_id = h.installation_id
          LEFT JOIN installations i ON i.id = h.installation_id
@@ -6323,6 +6362,9 @@ fn map_router_ssh_host_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouterSs
     let methods_json: String = row.get(21)?;
     let contacts_json: String = row.get(22)?;
     let currency: Option<String> = row.get(23)?;
+    let free_duration_days = row
+        .get::<_, Option<i64>>(24)?
+        .and_then(|value| u32::try_from(value).ok());
     let payment_methods =
         serde_json::from_str::<Vec<crate::client_market_trade::PaymentMethod>>(&methods_json)
             .unwrap_or_default();
@@ -6359,6 +6401,7 @@ fn map_router_ssh_host_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouterSs
         payment_method_kinds,
         contacts,
         currency,
+        free_duration_days,
     })
 }
 
@@ -6633,6 +6676,7 @@ mod tests {
                 None,
                 daily_rate_minor,
                 daily_rate_minor.map(|_| "USD"),
+                None,
             )
             .await
             .expect("insert Provider Host")
@@ -6765,6 +6809,7 @@ mod tests {
                 note: Some("first".into()),
                 daily_rate_minor: None,
                 currency: None,
+                free_duration_days: Some(1),
                 expected_fingerprint: Some("SHA256:first".into()),
                 informational_status: Some("idle".into()),
             },
@@ -6774,6 +6819,7 @@ mod tests {
                 note: Some("second".into()),
                 daily_rate_minor: Some(500),
                 currency: Some("USD".into()),
+                free_duration_days: None,
                 expected_fingerprint: Some("SHA256:second".into()),
                 informational_status: Some("allocated".into()),
             },
@@ -7610,14 +7656,15 @@ mod tests {
     #[test]
     fn host_approval_flag_only_marks_authenticated_non_owners_without_access() {
         let access = HashMap::from([
-            ("allowed-provider".to_string(), true),
-            ("blocked-provider".to_string(), false),
+            (("allowed-provider".to_string(), "free".to_string()), true),
+            (("blocked-provider".to_string(), "free".to_string()), false),
         ]);
         assert!(host_seller_approval_required(
             true,
             false,
             true,
             Some("blocked-provider"),
+            None,
             &access,
         ));
         assert!(!host_seller_approval_required(
@@ -7625,6 +7672,7 @@ mod tests {
             false,
             true,
             Some("blocked-provider"),
+            None,
             &access,
         ));
         assert!(!host_seller_approval_required(
@@ -7632,6 +7680,7 @@ mod tests {
             true,
             true,
             Some("blocked-provider"),
+            None,
             &access,
         ));
         assert!(!host_seller_approval_required(
@@ -7639,6 +7688,7 @@ mod tests {
             false,
             true,
             Some("allowed-provider"),
+            None,
             &access,
         ));
         assert!(!host_seller_approval_required(
@@ -7646,10 +7696,11 @@ mod tests {
             false,
             false,
             Some("blocked-provider"),
+            None,
             &access,
         ));
         assert!(!host_seller_approval_required(
-            true, false, true, None, &access,
+            true, false, true, None, None, &access,
         ));
     }
 
@@ -7663,6 +7714,7 @@ mod tests {
             host_owner_email: "host@example.com".into(),
             daily_rate_minor: Some(500),
             currency: Some("USD".into()),
+            free_duration_days: None,
             offer_revision: 1,
             payment_method_kinds: vec!["alipay".into()],
             contacts: vec![],
@@ -7826,7 +7878,13 @@ mod tests {
             .await
             .expect("configure Provider payment grace");
         let changed_offer = store
-            .client_market_update_host_offer(&first.id, &provider, Some(900), Some("USD".into()))
+            .client_market_update_host_offer(
+                &first.id,
+                &provider,
+                Some(900),
+                Some("USD".into()),
+                None,
+            )
             .await
             .expect("Provider may change an offer while a quote is reserved");
         assert_eq!(changed_offer.offer_revision, 2);
@@ -7993,6 +8051,7 @@ mod tests {
                 &client.user_id,
                 &client.email,
                 crate::market_access::PRODUCT_CLIENT_HOST,
+                crate::market_access::PRICING_PAID,
                 crate::market_access::DECISION_DENY,
                 "provider-blocked-quote",
                 &Utc::now().to_rfc3339(),
@@ -8068,13 +8127,25 @@ mod tests {
 
         let provider = market_session("provider-stable", "provider-old@example.com");
         let updated = store
-            .client_market_update_host_offer(&host.id, &provider, Some(900), Some("USD".into()))
+            .client_market_update_host_offer(
+                &host.id,
+                &provider,
+                Some(900),
+                Some("USD".into()),
+                None,
+            )
             .await
             .expect("update daily Host rate");
         assert_eq!(updated.offer_revision, 2);
         assert_eq!(updated.daily_rate_minor, Some(900));
         let unchanged = store
-            .client_market_update_host_offer(&host.id, &provider, Some(900), Some("USD".into()))
+            .client_market_update_host_offer(
+                &host.id,
+                &provider,
+                Some(900),
+                Some("USD".into()),
+                None,
+            )
             .await
             .expect("save unchanged daily Host rate");
         assert_eq!(unchanged.offer_revision, 2);
@@ -8248,7 +8319,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_supply_counts_drifted_free_forever_hosts_as_idle() {
+    async fn provider_supply_counts_drifted_permanent_free_hosts_as_idle() {
         let (store, _config, root) = test_store("provider-supply-drifted-free-idle");
         store
             .client_market_ensure_provider("provider-stable", "provider@example.com")
@@ -8315,7 +8386,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_supply_counts_null_provider_id_free_forever_hosts_as_idle() {
+    async fn provider_supply_counts_null_provider_id_permanent_free_hosts_as_idle() {
         let (store, _config, root) = test_store("provider-supply-null-provider-free-idle");
         store
             .client_market_ensure_provider("provider-stable", "provider@example.com")
@@ -8628,6 +8699,230 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn free_host_duration_is_bounded_and_paid_offers_reject_it() {
+        assert_eq!(
+            crate::client_market_trade::validate_free_duration_days(None, Some(1)).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            crate::client_market_trade::validate_free_duration_days(None, None).unwrap(),
+            None
+        );
+        assert!(matches!(
+            crate::client_market_trade::validate_free_duration_days(None, Some(0)),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(matches!(
+            crate::client_market_trade::validate_free_duration_days(
+                None,
+                Some(crate::client_market_trade::MAX_FREE_DURATION_DAYS + 1),
+            ),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(matches!(
+            crate::client_market_trade::validate_free_duration_days(Some(500), Some(1)),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn free_host_duration_is_frozen_in_quote_and_starts_at_activation() {
+        use crate::client_market_trade::CreateQuoteRequest;
+
+        let (store, _config, root) = test_store("free-duration-quote-snapshot");
+        let host = add_provider_host(
+            &store,
+            "provider-free-duration",
+            "provider@example.com",
+            "198.18.52.1",
+            "US",
+            None,
+        )
+        .await;
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE router_ssh_hosts SET free_duration_days = 7 WHERE id = ?1",
+                params![host.id],
+            )
+            .unwrap();
+        }
+        let client = market_session("client-free-duration", "client@example.com");
+        let quote = store
+            .client_market_create_quote(
+                &client,
+                CreateQuoteRequest {
+                    provider_ids: Vec::new(),
+                    country_codes: Vec::new(),
+                    count: 1,
+                    host_id: Some(host.id.clone()),
+                },
+            )
+            .await
+            .expect("create fixed-duration free Host quote");
+        assert_eq!(quote.items[0].free_duration_days, Some(7));
+        let committed = store
+            .client_market_commit_quote(
+                &quote.id,
+                &client,
+                &[(
+                    quote.items[0].id.clone(),
+                    "duration-snapshot".into(),
+                    "secret".into(),
+                    quote.items[0].offer_revision,
+                )],
+            )
+            .await
+            .expect("commit fixed-duration free Host quote");
+        let activated_at = Utc::now();
+        {
+            let mut conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE router_ssh_hosts SET free_duration_days = 30 WHERE id = ?1",
+                params![host.id],
+            )
+            .unwrap();
+            let tx = conn.transaction().unwrap();
+            crate::client_market_trade::complete_provisioning_tx(
+                &tx,
+                &committed.job_ids[0],
+                &host.id,
+                "duration-snapshot-installation",
+                "https://client.example.test",
+                activated_at,
+            )
+            .expect("activate quoted free Host subscription");
+            tx.commit().unwrap();
+        }
+        let conn = store.conn.lock().await;
+        let (free_duration_days, stored_activated_at, expires_at): (i64, String, String) = conn
+            .query_row(
+                "SELECT free_duration_days, activated_at, expires_at
+                 FROM client_market_subscriptions
+                 WHERE installation_id = 'duration-snapshot-installation'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(free_duration_days, 7);
+        assert_eq!(
+            chrono::DateTime::parse_from_rfc3339(&stored_activated_at)
+                .unwrap()
+                .with_timezone(&Utc),
+            activated_at
+        );
+        assert_eq!(
+            chrono::DateTime::parse_from_rfc3339(&expires_at)
+                .unwrap()
+                .with_timezone(&Utc),
+            activated_at + chrono::Duration::days(7)
+        );
+        drop(conn);
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn free_host_expiry_is_retryable_once_and_permanent_access_does_not_expire() {
+        let (store, _config, root) = test_store("free-duration-expiry");
+        let expiring_host = add_provider_host(
+            &store,
+            "provider-expiring",
+            "provider@example.com",
+            "198.18.53.1",
+            "US",
+            None,
+        )
+        .await;
+        let permanent_host = add_provider_host(
+            &store,
+            "provider-permanent",
+            "permanent@example.com",
+            "198.18.53.2",
+            "US",
+            None,
+        )
+        .await;
+        let now = Utc::now();
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO client_market_subscriptions
+                    (installation_id, host_id, provider_id, host_owner_email,
+                     client_user_id, client_owner_email, status, daily_rate_minor,
+                     currency, free_duration_days, offer_revision, activated_at, expires_at,
+                     created_at, updated_at)
+                 VALUES ('expired-free-client', ?1, 'provider-expiring', 'provider@example.com',
+                         'client-expiring', 'client@example.com', 'active', NULL, NULL, 1, 1,
+                         ?2, ?3, ?2, ?2),
+                        ('permanent-free-client', ?4, 'provider-permanent', 'permanent@example.com',
+                         'client-permanent', 'client2@example.com', 'active', NULL, NULL, NULL, 1,
+                         ?2, NULL, ?2, ?2)",
+                params![
+                    expiring_host.id,
+                    now.to_rfc3339(),
+                    (now - chrono::Duration::seconds(1)).to_rfc3339(),
+                    permanent_host.id,
+                ],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            store
+                .client_market_reconcile_trade_state(now)
+                .await
+                .unwrap(),
+            vec!["expired-free-client".to_string()]
+        );
+        {
+            let mut conn = store.conn.lock().await;
+            let tx = conn.transaction().unwrap();
+            crate::client_market_trade::cleanup_started_tx(
+                &tx,
+                "expired-free-client",
+                &expiring_host.id,
+                None,
+                None,
+                "free_period_expired",
+                false,
+                now,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        assert!(
+            store
+                .client_market_reconcile_trade_state(now + chrono::Duration::days(400))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let conn = store.conn.lock().await;
+        let expired_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM client_market_subscription_events
+                 WHERE installation_id = 'expired-free-client'
+                   AND event_type = 'free_period_expired'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(expired_events, 1);
+        let permanent_status: String = conn
+            .query_row(
+                "SELECT status FROM client_market_subscriptions
+                 WHERE installation_id = 'permanent-free-client'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(permanent_status, "active");
+        drop(conn);
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn provider_cleanup_and_blocking_use_stable_identity() {
         let (store, _config, root) = test_store("trade-provider-block");
@@ -8703,6 +8998,7 @@ mod tests {
                     "client-block",
                     "client-old@example.com",
                     crate::market_access::PRODUCT_CLIENT_HOST,
+                    crate::market_access::PRICING_PAID,
                 )
                 .expect("read denied Client access")
             );
@@ -8713,6 +9009,7 @@ mod tests {
                 "client-block",
                 "client-old@example.com",
                 crate::market_access::PRODUCT_CLIENT_HOST,
+                crate::market_access::PRICING_PAID,
                 crate::market_access::DECISION_ALLOW,
                 "provider-block",
                 &Utc::now().to_rfc3339(),
@@ -8821,6 +9118,7 @@ mod tests {
                     "renter",
                     "renter@example.com",
                     crate::market_access::PRODUCT_CLIENT_HOST,
+                    crate::market_access::PRICING_PAID,
                 )
                 .expect("ordinary release preserves Client access")
             );
@@ -8846,6 +9144,7 @@ mod tests {
                     provider_id,
                     provider_email,
                     crate::market_access::PRODUCT_CLIENT_HOST,
+                    crate::market_access::PRICING_PAID,
                 )
                 .expect("self-rental access remains allowed")
             );

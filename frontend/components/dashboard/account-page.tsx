@@ -253,7 +253,7 @@ export function AccountPaymentsPanel() {
           </Button>
         </div>
 
-        <div className="grid gap-3 border-b border-border pb-6">
+        <div className="grid gap-3">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <h3 className="text-sm font-semibold">{t("account.contact.title")}</h3>
@@ -357,7 +357,38 @@ export function AccountPaymentsPanel() {
           )}
         </div>
 
-        <div className="grid gap-4 border-b border-border pb-6">
+        <div className="grid gap-4">
+          <div className="grid gap-1">
+            <div className="flex items-center gap-2">
+              <PaymentMethodIcons kinds={["binance"]} />
+              <h3 className="text-sm font-semibold">{t("billing.payment.binance")}</h3>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {t("account.binanceRecommend")}
+              <a
+                href="https://www.bsmkweb.cc/register?ref=310371521"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="font-medium text-accent hover:underline"
+              >
+                {t("account.binanceRegister")}
+              </a>
+            </p>
+          </div>
+          <div className="grid gap-4 md:grid-cols-2">
+            <label className="grid gap-1.5 text-sm">
+              <span className="text-muted-foreground">{t("account.binanceUserId")}</span>
+              <input
+                value={draft.binanceAccount}
+                onChange={(event) => patchDraft({ binanceAccount: event.target.value })}
+                className="h-10 rounded-md border bg-white px-3 outline-none focus:ring-2 focus:ring-primary/20"
+              />
+            </label>
+            {qrField("binance", draft.binanceQr, (value) => patchDraft({ binanceQr: value }), t("account.qrImageUrl"))}
+          </div>
+        </div>
+
+        <div className="grid gap-4">
           <div className="flex items-center gap-2">
             <PaymentMethodIcons kinds={["alipay"]} />
             <h3 className="text-sm font-semibold">{t("billing.payment.alipay")}</h3>
@@ -375,7 +406,7 @@ export function AccountPaymentsPanel() {
           </div>
         </div>
 
-        <div className="grid gap-4 border-b border-border pb-6">
+        <div className="grid gap-4">
           <div className="flex items-center gap-2">
             <PaymentMethodIcons kinds={["wechat"]} />
             <h3 className="text-sm font-semibold">{t("billing.payment.wechat")}</h3>
@@ -385,25 +416,7 @@ export function AccountPaymentsPanel() {
           </div>
         </div>
 
-        <div className="grid gap-4 border-b border-border pb-6">
-          <div className="flex items-center gap-2">
-            <PaymentMethodIcons kinds={["binance"]} />
-            <h3 className="text-sm font-semibold">{t("billing.payment.binance")}</h3>
-          </div>
-          <div className="grid gap-4 md:grid-cols-2">
-            <label className="grid gap-1.5 text-sm">
-              <span className="text-muted-foreground">{t("account.binanceUserId")}</span>
-              <input
-                value={draft.binanceAccount}
-                onChange={(event) => patchDraft({ binanceAccount: event.target.value })}
-                className="h-10 rounded-md border bg-white px-3 outline-none focus:ring-2 focus:ring-primary/20"
-              />
-            </label>
-            {qrField("binance", draft.binanceQr, (value) => patchDraft({ binanceQr: value }), t("account.qrImageUrl"))}
-          </div>
-        </div>
-
-        <div className="grid gap-4 border-b border-border pb-6">
+        <div className="grid gap-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-2">
               <PaymentMethodIcons kinds={["crypto"]} />

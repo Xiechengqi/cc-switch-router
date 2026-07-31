@@ -233,7 +233,7 @@ function main() {
     "/v1/client-market/my-rentals",
     "/v1/client-market/clients/:installation_id/rental",
     "/v1/market-access/dashboard",
-    "/v1/market-access/policies/:product_kind",
+    "/v1/market-access/policies/:product_kind/:pricing_kind",
     "/v1/market-access/counterparties",
     "/v1/market-access/counterparties/:id",
     "/v1/market-access/counterparties/:id/credit-lines/:currency",

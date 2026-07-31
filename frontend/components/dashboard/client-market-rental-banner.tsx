@@ -1,6 +1,6 @@
 "use client";
 
-import { HandCoins, Loader2 } from "lucide-react";
+import { Clock3, HandCoins, Loader2 } from "lucide-react";
 import { ReleaseRentalAction } from "@/components/dashboard/client-market/release-rental-action";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { DASHBOARD_ACCOUNT_BILLING_PATH } from "@/lib/dashboard-nav";
@@ -22,7 +22,7 @@ export function ClientMarketRentalBanner({
   readOnly?: boolean;
   manageHref?: string;
 }) {
-  const { t } = useLocaleText();
+  const { locale, t } = useLocaleText();
   if (!rental || !rental.isClientOwner || rental.status === "released") return null;
 
   if (rental.status === "releasing") {
@@ -48,7 +48,34 @@ export function ClientMarketRentalBanner({
     );
   }
 
-  if (!rental.dailyRateMinor) return null;
+  if (!rental.dailyRateMinor) {
+    const activated = rental.activatedAt
+      ? new Date(rental.activatedAt).toLocaleString(locale)
+      : null;
+    const expires = rental.expiresAt ? new Date(rental.expiresAt) : null;
+    const remainingMs = expires ? expires.getTime() - Date.now() : null;
+    const remaining = remainingMs == null
+      ? t("clientMarket.freeDuration.permanent")
+      : remainingMs <= 0
+        ? t("clientMarket.freeDuration.expired")
+        : remainingMs < 48 * 60 * 60 * 1000
+          ? t("clientMarket.freeDuration.remainingHours", { count: Math.ceil(remainingMs / 3_600_000) })
+          : t("clientMarket.freeDuration.remainingDays", { count: Math.ceil(remainingMs / 86_400_000) });
+    const detail = activated
+      ? expires
+        ? `${t("clientMarket.freeDuration.activated")}: ${activated} · ${t("clientMarket.freeDuration.expires")}: ${expires.toLocaleString(locale)} · ${remaining}`
+        : `${t("clientMarket.freeDuration.activated")}: ${activated} · ${remaining}`
+      : t("clientMarket.freeDuration.pendingActivation");
+    return (
+      <span
+        className={`inline-flex items-center gap-1 text-muted-foreground ${compact ? "text-[11px]" : "text-xs"}`}
+        title={detail}
+      >
+        <Clock3 className="h-3 w-3" />
+        {compact ? `${t("clientMarket.free")} · ${remaining}` : detail}
+      </span>
+    );
+  }
   return (
     <a
       href={DASHBOARD_ACCOUNT_BILLING_PATH}

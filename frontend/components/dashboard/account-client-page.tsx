@@ -3,10 +3,11 @@
 import * as React from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Chip, Tabs } from "@heroui/react";
+import { Chip } from "@heroui/react";
 import { ArrowUpRight, Loader2 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CountryFlag } from "@/components/common/country-flag";
+import { SegmentedControl } from "@/components/common/segmented-control";
 import { CLIENT_MARKET_POLL_MS } from "@/components/dashboard/client-market/host-utils";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getClientMarketHosts, getMyClientMarketRentals } from "@/lib/api";
@@ -25,22 +26,45 @@ type MonitorEntry = {
 
 const RECENT_RELEASED_MS = 30 * 24 * 60 * 60 * 1000;
 
-function isFreeForeverOffer(dailyRateMinor?: number | null) {
+function isFreeOffer(dailyRateMinor?: number | null) {
   return !dailyRateMinor;
 }
 
 function offerLabel(
   dailyRateMinor: number | undefined,
+  freeDurationDays: number | undefined,
   locale: string,
   currency = "USD",
 ) {
-  if (isFreeForeverOffer(dailyRateMinor)) {
-    return locale.startsWith("zh") ? "免费 / 永久" : "Free / forever";
+  if (isFreeOffer(dailyRateMinor)) {
+    if (freeDurationDays != null) {
+      return locale.startsWith("zh")
+        ? `免费 / ${freeDurationDays} 天`
+        : `Free / ${freeDurationDays} ${freeDurationDays === 1 ? "day" : "days"}`;
+    }
+    return locale.startsWith("zh") ? "免费 / 永久" : "Free / permanent";
   }
   const amount = new Intl.NumberFormat(locale, { style: "currency", currency: currency === "CNY" ? "CNY" : "USD" }).format(
     (dailyRateMinor as number) / 100,
   );
   return locale.startsWith("zh") ? `${amount} / 天` : `${amount} / day`;
+}
+
+function freePeriodTiming(
+  rental: ClientMarketRental | undefined,
+  locale: string,
+  t: ReturnType<typeof useLocaleText>["t"],
+) {
+  if (!rental || !isFreeOffer(rental.dailyRateMinor)) return null;
+  if (!rental.activatedAt) {
+    return rental.status === "idle" ? null : t("clientMarket.freeDuration.pendingActivation");
+  }
+  const activated = formatDate(rental.activatedAt, locale);
+  if (!rental.expiresAt) {
+    return `${t("clientMarket.freeDuration.activated")}: ${activated} · ${t("clientMarket.freeDuration.permanent")}`;
+  }
+  const expires = formatDate(rental.expiresAt, locale);
+  return `${t("clientMarket.freeDuration.activated")}: ${activated} · ${t("clientMarket.freeDuration.expires")}: ${expires}`;
 }
 
 function formatDate(value: string | undefined, locale: string) {
@@ -96,6 +120,7 @@ function synthesizeRentalFromHost(
     status: host.installationId ? "active" : "idle",
     dailyRateMinor: host.dailyRateMinor,
     currency: host.currency,
+    freeDurationDays: host.freeDurationDays,
     offerRevision: host.offerRevision ?? 0,
     paymentMethodKinds: host.paymentMethodKinds || [],
     isClientOwner,
@@ -125,6 +150,7 @@ function MonitorCard({
   const host = entry.host;
   const status = rental?.status || host?.status || "unknown";
   const dailyRateMinor = rental?.dailyRateMinor ?? host?.dailyRateMinor;
+  const freeDurationDays = rental?.freeDurationDays ?? host?.freeDurationDays;
   const currency = rental?.currency || host?.currency || "USD";
   const subdomain = host?.clientSubdomain;
   const title =
@@ -145,6 +171,7 @@ function MonitorCard({
       ? clientMarketMineHref(rental.installationId)
       : clientMarketMineHref();
   const updatedAt = rental?.updatedAt || host?.updatedAt || host?.createdAt;
+  const freeTiming = freePeriodTiming(rental, locale, t);
 
   return (
     <section
@@ -177,7 +204,8 @@ function MonitorCard({
       <dl className="grid gap-2 text-sm sm:grid-cols-2">
         <div className="grid gap-0.5">
           <dt className="text-xs text-muted-foreground">{t("account.client.offer")}</dt>
-          <dd className="font-medium">{offerLabel(dailyRateMinor, locale, currency)}</dd>
+          <dd className="font-medium">{offerLabel(dailyRateMinor, freeDurationDays, locale, currency)}</dd>
+          {freeTiming ? <dd className="text-xs text-muted-foreground">{freeTiming}</dd> : null}
         </div>
         <div className="grid gap-0.5">
           <dt className="text-xs text-muted-foreground">{t("account.nav.billing")}</dt>
@@ -238,7 +266,7 @@ function MonitorList({
 
 /**
  * Account → Client Market: read-only Provider / User monitor.
- * Includes free-forever Hosts (rental + host fallback). Actions stay on Client Market.
+ * Includes free Hosts (rental + host fallback). Actions stay on Client Market.
  */
 export function AccountClientPage() {
   const { t } = useLocaleText();
@@ -396,10 +424,10 @@ export function AccountClientPage() {
         continue;
       }
 
-      // Idle free-forever Hosts: still show under Provider monitor.
+      // Idle free Hosts: still show under Provider monitor.
       if (
         !host.installationId &&
-        isFreeForeverOffer(host.dailyRateMinor) &&
+        isFreeOffer(host.dailyRateMinor) &&
         !seenHosts.has(host.id)
       ) {
         seenHosts.add(host.id);
@@ -447,23 +475,18 @@ export function AccountClientPage() {
         <p className="mt-0.5 text-sm text-muted-foreground">{t("account.clientHint")}</p>
       </div>
 
-      <Tabs
-        selectedKey={tab}
-        onSelectionChange={(key) => {
-          if (key === "user" || key === "provider") setTab(key);
-        }}
-        variant="secondary"
-        className="min-w-0 text-foreground"
-      >
-        <Tabs.List className="grid w-full max-w-sm grid-cols-2 text-foreground">
-          <Tabs.Tab id="user" className="px-3 py-2 text-sm font-medium !text-slate-900 data-[selected=true]:!text-slate-900">
-            {t("account.client.tab.user")}
-          </Tabs.Tab>
-          <Tabs.Tab id="provider" className="px-3 py-2 text-sm font-medium !text-slate-900 data-[selected=true]:!text-slate-900">
-            {t("account.client.tab.provider")}
-          </Tabs.Tab>
-        </Tabs.List>
-      </Tabs>
+      <SegmentedControl
+        value={tab}
+        onChange={setTab}
+        ariaLabel={t("account.nav.client")}
+        size="md"
+        className="w-full max-w-sm"
+        fullWidth
+        items={[
+          { id: "user", label: t("account.client.tab.user") },
+          { id: "provider", label: t("account.client.tab.provider") },
+        ]}
+      />
 
       {tab === "user" ? (
         <MonitorList

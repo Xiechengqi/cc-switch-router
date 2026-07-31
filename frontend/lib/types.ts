@@ -1376,6 +1376,7 @@ export type ClientMarketHost = {
   hostOwnerEmail: string;
   dailyRateMinor?: number;
   currency?: string;
+  freeDurationDays?: number;
   offerRevision: number;
   paymentMethodKinds: string[];
   contacts?: PaymentContact[];
@@ -1591,12 +1592,14 @@ export type AdminMarketBillingDispute = {
 };
 
 export type MarketAccessProductKind = "share" | "client_host";
+export type MarketAccessPricingKind = "free" | "paid";
 export type MarketAccessMode = "whitelist" | "blacklist";
 export type MarketAccessDecision = "inherit" | "allow" | "deny";
 export type MarketCreditKind = "none" | "limited" | "unlimited";
 
 export type MarketAccessPolicy = {
   productKind: MarketAccessProductKind;
+  pricingKind: MarketAccessPricingKind;
   mode: MarketAccessMode;
   revision: number;
   riskAcknowledgedAt?: string;
@@ -1605,6 +1608,7 @@ export type MarketAccessPolicy = {
 
 export type MarketCounterpartyAccessRule = {
   productKind: MarketAccessProductKind;
+  pricingKind: MarketAccessPricingKind;
   decision: MarketAccessDecision;
 };
 
@@ -1700,6 +1704,7 @@ export type ClientMarketQuoteItem = {
   ip?: string;
   dailyRateMinor?: number;
   currency?: string;
+  freeDurationDays?: number;
   offerRevision: number;
 };
 
@@ -1724,7 +1729,10 @@ export type ClientMarketRental = {
   status: "active" | "billing_suspended" | "releasing" | "release_failed" | "released" | string;
   dailyRateMinor?: number;
   currency?: string;
+  freeDurationDays?: number;
   offerRevision: number;
+  activatedAt?: string;
+  expiresAt?: string;
   paymentMethodKinds: string[];
   contacts?: PaymentContact[];
   isClientOwner: boolean;
@@ -1743,6 +1751,7 @@ export type ClientMarketHostTransferDocument = {
     note?: string;
     dailyRateMinor?: number;
     currency?: string;
+    freeDurationDays?: number;
     expectedFingerprint?: string;
     informationalStatus?: string;
   }>;
@@ -1783,6 +1792,7 @@ export type ShareMarketSeatInput = {
   tokenPeriod: ShareTokenPeriod;
   dailyRateMinor?: number;
   currency?: string;
+  freeDurationDays?: number;
 };
 
 export type ShareMarketSubscription = {
@@ -1800,7 +1810,10 @@ export type ShareMarketSubscription = {
   status: string;
   dailyRateMinor?: number;
   currency?: string;
+  freeDurationDays?: number;
   offerRevision: number;
+  activatedAt?: string;
+  expiresAt?: string;
   paymentMethodKinds: string[];
   contacts?: PaymentContact[];
   canRelease: boolean;

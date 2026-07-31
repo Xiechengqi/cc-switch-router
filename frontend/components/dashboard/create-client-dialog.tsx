@@ -1,13 +1,13 @@
 "use client";
 
 import * as React from "react";
-import { Button, Chip, Modal, Tabs } from "@heroui/react";
+import { Button, Chip, Modal } from "@heroui/react";
 import { Check, Copy, Dices, Loader2, LogIn, Minus, Plus, RotateCcw, Server } from "lucide-react";
-import Link from "next/link";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { CountryFlag } from "@/components/common/country-flag";
 import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
+import { SegmentedControl } from "@/components/common/segmented-control";
 import { isSellerApprovalRequiredError } from "@/components/common/seller-approval-dialog";
 import { buildClientInstallCommand } from "@/components/dashboard/install-guide-dialog";
 import { ProvisionJobLog } from "@/components/dashboard/provision-job-log";
@@ -20,7 +20,6 @@ import {
   getClientMarketJob,
   getClientMarketProviderSupply,
 } from "@/lib/api";
-import { DASHBOARD_CLIENT_MARKET_PATH } from "@/lib/dashboard-nav";
 import type {
   ClientMarketAllocationQuote,
   ClientMarketHost,
@@ -87,8 +86,20 @@ function normalizeRegionPersist(value: unknown): CreateClientRegionsPersist {
   };
 }
 
-function formatOffer(dailyRateMinor: number | undefined, locale: string, currency = "USD") {
-  if (dailyRateMinor == null) return locale.startsWith("zh") ? "免费 · 永久" : "Free · permanent";
+function formatOffer(
+  dailyRateMinor: number | undefined,
+  locale: string,
+  currency = "USD",
+  freeDurationDays?: number,
+) {
+  if (dailyRateMinor == null) {
+    if (freeDurationDays != null) {
+      return locale.startsWith("zh")
+        ? `免费 · ${freeDurationDays} 天`
+        : `Free · ${freeDurationDays} ${freeDurationDays === 1 ? "day" : "days"}`;
+    }
+    return locale.startsWith("zh") ? "免费 · 永久" : "Free · permanent";
+  }
   const amount = new Intl.NumberFormat(locale, {
     style: "currency",
     currency: currency === "CNY" ? "CNY" : "USD",
@@ -149,7 +160,7 @@ export function CreateClientDialog({
 
   const safeProviders = React.useMemo(() => normalizeProviderPersist(providerPersist), [providerPersist]);
   const safeRegions = React.useMemo(() => normalizeRegionPersist(regionPersist), [regionPersist]);
-  /** Clients-page pool create only allocates free forever Hosts; Client Market fixed Host may be paid. */
+  /** Clients-page pool create only allocates free Hosts; Client Market fixed Host may be paid. */
   const freeOnly = !fixedHost;
   const availableProviderIds = React.useMemo(() => new Set(providers.map((provider) => provider.providerId)), [providers]);
   const selectedProviderIds = React.useMemo(() => {
@@ -578,8 +589,6 @@ export function CreateClientDialog({
   const jobList = Object.values(jobs);
   const successes = jobList.filter((job) => job.status === "succeeded").length;
   const failures = jobList.filter((job) => job.status === "failed").length;
-  const createModeTabClass =
-    "inline-flex h-9 items-center justify-center rounded-md px-3 text-sm font-medium !text-slate-900 transition-colors data-[selected=true]:bg-white data-[selected=true]:font-semibold data-[selected=true]:shadow-sm";
   const showOfficialCapacityHint =
     providerSupplyLoaded &&
     !loading &&
@@ -594,21 +603,17 @@ export function CreateClientDialog({
           <Modal.Header><Modal.Heading>{fixedHost ? t("createClient.fixedTitle", { host: fixedHost.hostname || fixedHost.ip || fixedHost.id.slice(0, 8) }) : t("createClient.title")}</Modal.Heading></Modal.Header>
           <Modal.Body className="grid min-w-0 max-h-[min(76vh,680px)] grid-cols-[minmax(0,1fr)] gap-4 overflow-y-auto">
             {phase === "form" && !fixedHost ? (
-              <Tabs
-                selectedKey={mode}
-                aria-label={t("createClient.title")}
-                className="text-slate-900"
-                onSelectionChange={(key: React.Key) => setMode(String(key) as CreateMode)}
-              >
-                <Tabs.List className="grid w-full grid-cols-2 gap-0.5 rounded-lg bg-slate-100 p-1 ring-1 ring-inset ring-slate-200/80">
-                  <Tabs.Tab id="online" className={createModeTabClass}>
-                    {t("createClient.tabOnline")}
-                  </Tabs.Tab>
-                  <Tabs.Tab id="manual" className={createModeTabClass}>
-                    {t("createClient.tabManual")}
-                  </Tabs.Tab>
-                </Tabs.List>
-              </Tabs>
+              <SegmentedControl
+                value={mode}
+                onChange={setMode}
+                ariaLabel={t("createClient.title")}
+                size="md"
+                fullWidth
+                items={[
+                  { id: "online", label: t("createClient.tabOnline") },
+                  { id: "manual", label: t("createClient.tabManual") },
+                ]}
+              />
             ) : null}
 
             {phase === "form" && mode === "manual" && !fixedHost ? (
@@ -620,53 +625,68 @@ export function CreateClientDialog({
                 {loading ? <div className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />{t("createClient.loadingSupply")}</div> : null}
                 {freeOnly ? (
                   <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-900">
-                    {t("createClient.freeOnlyHint")}{" "}
-                    <Link
-                      href={DASHBOARD_CLIENT_MARKET_PATH}
-                      className="font-medium text-primary underline-offset-2 hover:underline"
-                      onClick={() => onOpenChange(false)}
-                    >
-                      {t("createClient.freeOnlyHintLink")}
-                    </Link>
+                    {t("createClient.freeOnlyHint")}
                   </p>
                 ) : null}
                 {fixedHost ? (
                   <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-2 rounded-md border p-3">
                     <div className="flex flex-wrap items-center gap-2"><Server className="h-4 w-4" /><strong className="text-sm">{fixedHost.hostname || fixedHost.ip}</strong><Chip size="sm" variant="soft">{fixedHost.countryCode || "-"}</Chip></div>
-                    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-2 text-xs text-muted-foreground"><span className="min-w-0 truncate" title={fixedHost.hostOwnerEmail}>{fixedHost.hostOwnerEmail}</span><span className="font-medium text-foreground">{formatOffer(fixedHost.dailyRateMinor, locale, fixedHost.currency)}</span><PaymentMethodIcons kinds={fixedHost.paymentMethodKinds || []} className="col-span-2" /></div>
+                    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-2 text-xs text-muted-foreground"><span className="min-w-0 truncate" title={fixedHost.hostOwnerEmail}>{fixedHost.hostOwnerEmail}</span><span className="font-medium text-foreground">{formatOffer(fixedHost.dailyRateMinor, locale, fixedHost.currency, fixedHost.freeDurationDays)}</span><PaymentMethodIcons kinds={fixedHost.paymentMethodKinds || []} className="col-span-2" /></div>
                   </section>
                 ) : (
                   <>
-                    <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-2">
-                      <span className="text-sm font-medium">{t("createClient.hostProvider")}</span>
-                      <CompactRegionMultiSelect
-                        values={providerFilterValues}
-                        onChange={setSelectedProviders}
-                        options={providerOptions}
-                        allLabel={t("createClient.hostOwnersAll")}
-                        moreLabel={(count) => t("createClient.hostOwnersMore", { count })}
-                        clearLabel={t("createClient.clearOwners")}
-                        ariaLabel={t("createClient.filterHostOwners")}
-                        className="w-full max-w-md"
-                      />
-                      {showOfficialCapacityHint ? (
-                        <p className="text-xs text-amber-800">
-                          {officialProviderId
-                            ? t("createClient.officialUnavailable")
-                            : t("createClient.officialNotConfigured")}
-                        </p>
-                      ) : null}
-                    </section>
-                    <section className="grid gap-2"><span className="text-sm font-medium">{t("createClient.regions")}</span><div className="grid max-h-40 gap-1 overflow-y-auto rounded-md border p-2">
-                      {regionOptions.map((region) => {
-                        const checked = selectedCountryCodes.includes(region.code);
-                        return <label key={region.code} className="flex cursor-pointer items-center gap-2 rounded px-1 py-1.5 text-sm hover:bg-slate-50"><input type="checkbox" checked={checked} onChange={() => {
-                          const current = new Set(selectedCountryCodes);
-                          if (current.has(region.code)) current.delete(region.code); else current.add(region.code);
-                          setRegionPersist({ mode: "subset", codes: Array.from(current) });
-                        }} /><CountryFlag code={region.code} className="h-3.5 w-5 rounded-sm object-cover" /><span className="min-w-0 flex-1 truncate">{regionNames.of(region.code) || region.code}</span><span className="font-mono text-xs text-muted-foreground">{region.idle}/{region.total}</span></label>;
-                      })}
-                    </div></section>
+                    <div className="grid min-w-0 gap-5 sm:grid-cols-2">
+                      <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-2">
+                        <span className="text-sm font-medium">{t("createClient.hostProvider")}</span>
+                        <CompactRegionMultiSelect
+                          values={providerFilterValues}
+                          onChange={setSelectedProviders}
+                          options={providerOptions}
+                          allLabel={t("createClient.hostOwnersAll")}
+                          moreLabel={(count) => t("createClient.hostOwnersMore", { count })}
+                          clearLabel={t("createClient.clearOwners")}
+                          ariaLabel={t("createClient.filterHostOwners")}
+                          className="w-full"
+                        />
+                        {showOfficialCapacityHint ? (
+                          <p className="text-xs text-amber-800">
+                            {officialProviderId
+                              ? t("createClient.officialUnavailable")
+                              : t("createClient.officialNotConfigured")}
+                          </p>
+                        ) : null}
+                      </section>
+                      <section className="grid min-w-0 gap-2">
+                        <span className="text-sm font-medium">{t("createClient.regions")}</span>
+                        <div className="grid max-h-40 gap-1 overflow-y-auto rounded-md border p-2">
+                          {regionOptions.map((region) => {
+                            const checked = selectedCountryCodes.includes(region.code);
+                            return (
+                              <label
+                                key={region.code}
+                                className="flex cursor-pointer items-center gap-2 rounded px-1 py-1.5 text-sm hover:bg-slate-50"
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={checked}
+                                  onChange={() => {
+                                    const current = new Set(selectedCountryCodes);
+                                    if (current.has(region.code)) current.delete(region.code);
+                                    else current.add(region.code);
+                                    setRegionPersist({ mode: "subset", codes: Array.from(current) });
+                                  }}
+                                />
+                                <CountryFlag code={region.code} className="h-3.5 w-5 rounded-sm object-cover" />
+                                <span className="min-w-0 flex-1 truncate">{regionNames.of(region.code) || region.code}</span>
+                                <span className="font-mono text-xs text-muted-foreground">
+                                  {region.idle}/{region.total}
+                                </span>
+                              </label>
+                            );
+                          })}
+                        </div>
+                      </section>
+                    </div>
                     <section className="flex flex-wrap items-center justify-between gap-3"><div><div className="text-sm font-medium">{t("createClient.quantity")}</div><div className="text-xs text-muted-foreground">{t(freeOnly ? "createClient.capacityFree" : "createClient.capacity", { idle: capacity })}</div></div><div className="inline-flex items-center gap-2"><Button isIconOnly size="sm" variant="outline" aria-label={t("createClient.decreaseQuantity")} isDisabled={quantity <= 1} onClick={() => setQuantity(1)}><Minus className="h-4 w-4" /></Button><span className="w-8 text-center font-mono">{quantity}</span><Button isIconOnly size="sm" variant="outline" aria-label={t("createClient.increaseQuantity")} isDisabled={quantity >= 2 || quantity >= capacity} onClick={() => setQuantity(2)}><Plus className="h-4 w-4" /></Button></div></section>
                   </>
                 )}
@@ -693,7 +713,7 @@ export function CreateClientDialog({
                   const draft = drafts[item.id] || { subdomain: "", password: "" };
                   const subdomainValue = normalizeDraftSubdomain(draft.subdomain);
                   const subdomainCheck = subdomainChecks[item.id]?.value === subdomainValue ? subdomainChecks[item.id] : undefined;
-                  return <section key={item.id} className="grid gap-3 rounded-md border p-3"><div className="flex flex-wrap items-center gap-2"><span className="font-mono text-xs text-muted-foreground">#{index + 1}</span><strong className="font-mono text-sm">{item.ip || "—"}</strong>{item.countryCode ? <CountryFlag code={item.countryCode} className="h-3.5 w-5 rounded-sm object-cover" /> : null}<span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{item.hostOwnerEmail}</span><span className="text-sm font-semibold">{formatOffer(item.dailyRateMinor, locale, item.currency)}</span></div><label className="grid gap-1 text-sm"><span className="text-muted-foreground">{t("createClient.subdomain")}</span><div className="flex gap-2"><input value={draft.subdomain} onChange={(event) => setDrafts((current) => ({ ...current, [item.id]: { ...draft, subdomain: event.target.value } }))} className={`h-10 min-w-0 flex-1 rounded-md border px-3 font-mono ${subdomainCheck?.status === "unavailable" ? "border-rose-400" : subdomainCheck?.status === "available" ? "border-emerald-400" : ""}`} /><Button isIconOnly variant="outline" aria-label={t("createClient.randomSubdomain")} onClick={() => setDrafts((current) => ({ ...current, [item.id]: { ...draft, subdomain: randomSubdomain() } }))}><Dices className="h-4 w-4" /></Button></div>{subdomainCheck ? <span className={`flex items-center gap-1 text-xs ${subdomainCheck.status === "available" ? "text-emerald-700" : subdomainCheck.status === "unavailable" ? "text-rose-600" : "text-muted-foreground"}`}>{subdomainCheck.status === "checking" ? <Loader2 className="h-3 w-3 animate-spin" /> : subdomainCheck.status === "available" ? <Check className="h-3 w-3" /> : null}{subdomainCheck.status === "checking" ? t("createClient.subdomainChecking") : subdomainCheck.status === "available" ? t("createClient.subdomainAvailable") : subdomainCheck.message}</span> : null}</label><label className="grid gap-1 text-sm"><span className="text-muted-foreground">{t("createClient.password")}</span><input type="password" value={draft.password} onChange={(event) => setDrafts((current) => ({ ...current, [item.id]: { ...draft, password: event.target.value } }))} autoComplete="new-password" className="h-10 rounded-md border px-3" /></label></section>;
+                  return <section key={item.id} className="grid gap-3 rounded-md border p-3"><div className="flex flex-wrap items-center gap-2"><span className="font-mono text-xs text-muted-foreground">#{index + 1}</span><strong className="font-mono text-sm">{item.ip || "—"}</strong>{item.countryCode ? <CountryFlag code={item.countryCode} className="h-3.5 w-5 rounded-sm object-cover" /> : null}<span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{item.hostOwnerEmail}</span><span className="text-sm font-semibold">{formatOffer(item.dailyRateMinor, locale, item.currency, item.freeDurationDays)}</span></div><label className="grid gap-1 text-sm"><span className="text-muted-foreground">{t("createClient.subdomain")}</span><div className="flex gap-2"><input value={draft.subdomain} onChange={(event) => setDrafts((current) => ({ ...current, [item.id]: { ...draft, subdomain: event.target.value } }))} className={`h-10 min-w-0 flex-1 rounded-md border px-3 font-mono ${subdomainCheck?.status === "unavailable" ? "border-rose-400" : subdomainCheck?.status === "available" ? "border-emerald-400" : ""}`} /><Button isIconOnly variant="outline" aria-label={t("createClient.randomSubdomain")} onClick={() => setDrafts((current) => ({ ...current, [item.id]: { ...draft, subdomain: randomSubdomain() } }))}><Dices className="h-4 w-4" /></Button></div>{subdomainCheck ? <span className={`flex items-center gap-1 text-xs ${subdomainCheck.status === "available" ? "text-emerald-700" : subdomainCheck.status === "unavailable" ? "text-rose-600" : "text-muted-foreground"}`}>{subdomainCheck.status === "checking" ? <Loader2 className="h-3 w-3 animate-spin" /> : subdomainCheck.status === "available" ? <Check className="h-3 w-3" /> : null}{subdomainCheck.status === "checking" ? t("createClient.subdomainChecking") : subdomainCheck.status === "available" ? t("createClient.subdomainAvailable") : subdomainCheck.message}</span> : null}</label><label className="grid gap-1 text-sm"><span className="text-muted-foreground">{t("createClient.password")}</span><input type="password" value={draft.password} onChange={(event) => setDrafts((current) => ({ ...current, [item.id]: { ...draft, password: event.target.value } }))} autoComplete="new-password" className="h-10 rounded-md border px-3" /></label></section>;
                 })}
               </div>
             ) : null}

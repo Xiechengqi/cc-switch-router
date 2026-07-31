@@ -6,6 +6,7 @@ import { CheckSquare, ChevronLeft, ChevronRight, Download, Loader2, Plus, Refres
 import { useAuth } from "@/components/auth/auth-provider";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
+import { SegmentedControl } from "@/components/common/segmented-control";
 import { SellerApprovalDialog } from "@/components/common/seller-approval-dialog";
 import { CreateClientDialog } from "@/components/dashboard/create-client-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
@@ -453,20 +454,23 @@ export function ClientMarketPage() {
     <div className="mx-auto grid min-w-0 w-[calc(100%-2rem)] max-w-7xl grid-cols-[minmax(0,1fr)] gap-5 pb-10">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
-          <div className="inline-flex max-w-full overflow-x-auto rounded-lg bg-slate-100 p-1 text-[11px]">
-            {statusTabs.map((tab) => (
-              <button
-                key={tab.value}
-                type="button"
-                title={tab.hint}
-                aria-label={`${tab.label}. ${tab.hint}`}
-                onClick={() => setListTab(tab.value)}
-                className={`rounded-md px-2.5 py-1.5 transition-colors ${hostStatusTabTone(tab.value, listTab === tab.value)}`}
-              >
-                {tab.label} · {tab.count}
-              </button>
-            ))}
-          </div>
+          <SegmentedControl
+            value={listTab}
+            onChange={setListTab}
+            ariaLabel={t("clientMarket.title")}
+            size="sm"
+            items={statusTabs.map((tab) => ({
+              id: tab.value,
+              label: (
+                <>
+                  {tab.label} · {tab.count}
+                </>
+              ),
+              title: tab.hint,
+              ariaLabel: `${tab.label}. ${tab.hint}`,
+              className: hostStatusTabTone(tab.value, false),
+            }))}
+          />
         </div>
         <div className="flex flex-wrap items-center gap-2">
           {authed ? (

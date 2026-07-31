@@ -13,6 +13,7 @@ import {
   UserRoundX,
 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
+import { SegmentedControl } from "@/components/common/segmented-control";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   getMarketAccessDashboard,
@@ -26,6 +27,7 @@ import type {
   MarketAccessDashboard,
   MarketAccessDecision,
   MarketAccessPolicy,
+  MarketAccessPricingKind,
   MarketAccessProductKind,
   MarketCounterparty,
   MarketCreditKind,
@@ -47,39 +49,6 @@ function formatMoney(value: number, currency: string, locale: string) {
     style: "currency",
     currency: currency === "CNY" ? "CNY" : "USD",
   }).format(value / 100);
-}
-
-function SegmentedControl<T extends string>({
-  value,
-  options,
-  disabled,
-  onChange,
-}: {
-  value: T;
-  options: Array<{ value: T; label: string }>;
-  disabled?: boolean;
-  onChange: (value: T) => void;
-}) {
-  return (
-    <div className="inline-grid min-h-9 grid-flow-col overflow-hidden rounded-md border border-border bg-slate-50 p-0.5">
-      {options.map((option) => (
-        <button
-          key={option.value}
-          type="button"
-          disabled={disabled}
-          onClick={() => onChange(option.value)}
-          className={cn(
-            "min-w-20 rounded px-2 py-1 text-xs font-medium transition-colors disabled:opacity-50",
-            value === option.value
-              ? "bg-white text-foreground shadow-sm"
-              : "text-muted-foreground hover:text-foreground",
-          )}
-        >
-          {option.label}
-        </button>
-      ))}
-    </div>
-  );
 }
 
 function CreditEditor({
@@ -265,8 +234,12 @@ export function AccountMarketAccessPage() {
   const [refreshing, setRefreshing] = React.useState(false);
   const [busy, setBusy] = React.useState("");
   const [email, setEmail] = React.useState("");
-  const [allowShare, setAllowShare] = React.useState(true);
-  const [allowClient, setAllowClient] = React.useState(true);
+  const [allowedScopes, setAllowedScopes] = React.useState<Record<string, boolean>>({
+    "share:free": true,
+    "share:paid": true,
+    "client_host:free": true,
+    "client_host:paid": true,
+  });
   const [blacklistPolicy, setBlacklistPolicy] = React.useState<MarketAccessPolicy | null>(null);
   const [riskAcknowledged, setRiskAcknowledged] = React.useState(false);
 
@@ -291,13 +264,20 @@ export function AccountMarketAccessPage() {
     void load();
   }, [load]);
 
-  const policyFor = (kind: MarketAccessProductKind) => dashboard?.policies.find((item) => item.productKind === kind);
+  const policyFor = (kind: MarketAccessProductKind, pricingKind: MarketAccessPricingKind) =>
+    dashboard?.policies.find(
+      (item) => item.productKind === kind && item.pricingKind === pricingKind,
+    );
   const blackMode = dashboard?.policies.some((policy) => policy.mode === "blacklist") || false;
+  const paidBlackMode =
+    dashboard?.policies.some(
+      (policy) => policy.pricingKind === "paid" && policy.mode === "blacklist",
+    ) || false;
 
   const applyPolicy = async (policy: MarketAccessPolicy, mode: "whitelist" | "blacklist", acknowledged = false) => {
-    setBusy(`policy:${policy.productKind}`);
+    setBusy(`policy:${policy.productKind}:${policy.pricingKind}`);
     try {
-      setDashboard(await updateMarketAccessPolicy(policy.productKind, {
+      setDashboard(await updateMarketAccessPolicy(policy.productKind, policy.pricingKind, {
         mode,
         riskAcknowledged: acknowledged,
         expectedRevision: policy.revision,
@@ -328,7 +308,7 @@ export function AccountMarketAccessPage() {
       toast.danger(t("marketAccess.invalidEmail"));
       return;
     }
-    if (!allowShare && !allowClient) {
+    if (!Object.values(allowedScopes).some(Boolean)) {
       toast.danger(t("marketAccess.productRequired"));
       return;
     }
@@ -336,10 +316,11 @@ export function AccountMarketAccessPage() {
     try {
       await upsertMarketCounterparty({
         email: normalizedEmail,
-        accessRules: [
-          ...(allowShare ? [{ productKind: "share" as const, decision: "allow" as const }] : []),
-          ...(allowClient ? [{ productKind: "client_host" as const, decision: "allow" as const }] : []),
-        ],
+        accessRules: (["share", "client_host"] as const).flatMap((productKind) =>
+          (["free", "paid"] as const)
+            .filter((pricingKind) => allowedScopes[`${productKind}:${pricingKind}`])
+            .map((pricingKind) => ({ productKind, pricingKind, decision: "allow" as const })),
+        ),
       });
       setEmail("");
       await load(true);
@@ -354,12 +335,13 @@ export function AccountMarketAccessPage() {
   const updateDecision = async (
     counterparty: MarketCounterparty,
     productKind: MarketAccessProductKind,
+    pricingKind: MarketAccessPricingKind,
     decision: MarketAccessDecision,
   ) => {
-    setBusy(`access:${counterparty.id}:${productKind}`);
+    setBusy(`access:${counterparty.id}:${productKind}:${pricingKind}`);
     try {
       await updateMarketCounterparty(counterparty.id, {
-        accessRules: [{ productKind, decision }],
+        accessRules: [{ productKind, pricingKind, decision }],
         status: counterparty.status === "revoked" ? "revoked" : "active",
         expectedRevision: counterparty.revision,
       });
@@ -414,30 +396,56 @@ export function AccountMarketAccessPage() {
         </section>
       ) : null}
 
-      <section className="grid gap-4 border-y border-border py-5">
+      <section className="grid gap-4">
         <h3 className="text-sm font-semibold">{t("marketAccess.policyTitle")}</h3>
-        <div className="grid gap-4 sm:grid-cols-2">
-          {(["share", "client_host"] as const).map((kind) => {
-            const policy = policyFor(kind) || { productKind: kind, mode: "whitelist", revision: 0, updatedAt: "" };
-            return (
-              <div key={kind} className="flex flex-wrap items-center justify-between gap-3 border-b border-border pb-4 sm:border-b-0 sm:pb-0">
-                <strong className="text-sm">{kind === "share" ? t("marketAccess.product.share") : t("marketAccess.product.clientHost")}</strong>
-                <SegmentedControl
-                  value={policy.mode}
-                  disabled={!!busy}
-                  options={[
-                    { value: "whitelist", label: t("marketAccess.mode.whitelist") },
-                    { value: "blacklist", label: t("marketAccess.mode.blacklist") },
-                  ]}
-                  onChange={(mode) => changePolicy(policy, mode)}
-                />
-              </div>
-            );
-          })}
+        <div className="grid gap-3 sm:grid-cols-2">
+          {(["share", "client_host"] as const).flatMap((kind) =>
+            (["free", "paid"] as const).map((pricingKind) => {
+              const policy = policyFor(kind, pricingKind) || {
+                productKind: kind,
+                pricingKind,
+                mode: pricingKind === "free" ? ("blacklist" as const) : ("whitelist" as const),
+                revision: 0,
+                updatedAt: "",
+              };
+              const productLabel =
+                kind === "share"
+                  ? t("marketAccess.product.share")
+                  : t("marketAccess.product.clientHost");
+              const pricingLabel =
+                pricingKind === "free"
+                  ? t("marketAccess.pricing.free")
+                  : t("marketAccess.pricing.paid");
+              const title = `${productLabel} · ${pricingLabel}`;
+              const blacklisted = policy.mode === "blacklist";
+              return (
+                <div
+                  key={`${kind}:${pricingKind}`}
+                  className={cn(
+                    "grid gap-3 rounded-lg border bg-card p-3",
+                    blacklisted ? "border-amber-300 bg-amber-50/40" : "border-border",
+                  )}
+                >
+                  <strong className="text-sm text-foreground">{title}</strong>
+                  <SegmentedControl
+                    value={policy.mode}
+                    disabled={!!busy}
+                    ariaLabel={title}
+                    fullWidth
+                    items={[
+                      { id: "whitelist", label: t("marketAccess.mode.whitelist") },
+                      { id: "blacklist", label: t("marketAccess.mode.blacklist") },
+                    ]}
+                    onChange={(mode) => changePolicy(policy, mode)}
+                  />
+                </div>
+              );
+            }),
+          )}
         </div>
       </section>
 
-      {blackMode ? (
+      {paidBlackMode ? (
         <section className="grid gap-4 border-b border-border pb-5">
           <div>
             <h3 className="text-sm font-semibold">{t("marketAccess.publicCreditTitle")}</h3>
@@ -457,7 +465,7 @@ export function AccountMarketAccessPage() {
       <section className="grid gap-4">
         <div>
           <h3 className="text-sm font-semibold">{t("marketAccess.addTitle")}</h3>
-          <div className="mt-3 grid gap-3 sm:grid-cols-[minmax(12rem,1fr)_auto_auto_auto] sm:items-end">
+          <div className="mt-3 grid gap-3 sm:grid-cols-[minmax(12rem,1fr)_minmax(16rem,2fr)_auto] sm:items-end">
             <label className="grid gap-1 text-xs text-muted-foreground">
               {t("marketAccess.email")}
               <input
@@ -467,14 +475,32 @@ export function AccountMarketAccessPage() {
                 className="h-10 min-w-0 rounded-md border border-border bg-white px-3 text-sm text-foreground"
               />
             </label>
-            <Checkbox isSelected={allowShare} onChange={setAllowShare} className="pb-2 text-sm">
-              <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
-              {t("marketAccess.product.share")}
-            </Checkbox>
-            <Checkbox isSelected={allowClient} onChange={setAllowClient} className="pb-2 text-sm">
-              <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
-              {t("marketAccess.product.clientHost")}
-            </Checkbox>
+            <div className="grid grid-cols-2 gap-x-4 gap-y-2 pb-1">
+              {(["share", "client_host"] as const).flatMap((productKind) =>
+                (["free", "paid"] as const).map((pricingKind) => {
+                  const key = `${productKind}:${pricingKind}`;
+                  return (
+                    <Checkbox
+                      key={key}
+                      isSelected={allowedScopes[key] !== false}
+                      onChange={(selected) =>
+                        setAllowedScopes((current) => ({ ...current, [key]: selected }))
+                      }
+                      className="text-sm"
+                    >
+                      <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
+                      {productKind === "share"
+                        ? t("marketAccess.product.share")
+                        : t("marketAccess.product.clientHost")}
+                      {" · "}
+                      {pricingKind === "free"
+                        ? t("marketAccess.pricing.free")
+                        : t("marketAccess.pricing.paid")}
+                    </Checkbox>
+                  );
+                }),
+              )}
+            </div>
             <Button variant="primary" isDisabled={busy === "add"} onClick={() => void addCounterparty()}>
               {busy === "add" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
               {t("common.add")}
@@ -484,8 +510,13 @@ export function AccountMarketAccessPage() {
 
         <div className="grid gap-3">
           {(dashboard?.counterparties || []).map((counterparty) => {
-            const decisionFor = (kind: MarketAccessProductKind) =>
-              counterparty.accessRules.find((rule) => rule.productKind === kind)?.decision || "inherit";
+            const decisionFor = (
+              kind: MarketAccessProductKind,
+              pricingKind: MarketAccessPricingKind,
+            ) =>
+              counterparty.accessRules.find(
+                (rule) => rule.productKind === kind && rule.pricingKind === pricingKind,
+              )?.decision || "inherit";
             return (
               <article key={counterparty.id} className="overflow-hidden rounded-lg border border-border bg-card">
                 <div className="flex flex-wrap items-start justify-between gap-3 border-b border-border px-4 py-3">
@@ -513,22 +544,37 @@ export function AccountMarketAccessPage() {
                   </Button>
                 </div>
                 <div className="grid gap-4 px-4 py-4">
-                  <div className="grid gap-3 sm:grid-cols-2">
-                    {(["share", "client_host"] as const).map((kind) => (
-                      <div key={kind} className="flex flex-wrap items-center justify-between gap-2">
-                        <span className="text-sm">{kind === "share" ? t("marketAccess.product.share") : t("marketAccess.product.clientHost")}</span>
-                        <SegmentedControl
-                          value={decisionFor(kind)}
-                          disabled={counterparty.status !== "active" || !!busy}
-                          options={[
-                            { value: "inherit", label: t("marketAccess.decision.inherit") },
-                            { value: "allow", label: t("marketAccess.decision.allow") },
-                            { value: "deny", label: t("marketAccess.decision.deny") },
-                          ]}
-                          onChange={(decision) => void updateDecision(counterparty, kind, decision)}
-                        />
-                      </div>
-                    ))}
+                  <div className="grid gap-3">
+                    {(["share", "client_host"] as const).flatMap((kind) =>
+                      (["free", "paid"] as const).map((pricingKind) => (
+                        <div key={`${kind}:${pricingKind}`} className="flex flex-wrap items-center justify-between gap-2">
+                          <span className="text-sm">
+                            {kind === "share"
+                              ? t("marketAccess.product.share")
+                              : t("marketAccess.product.clientHost")}
+                            {" · "}
+                            {pricingKind === "free"
+                              ? t("marketAccess.pricing.free")
+                              : t("marketAccess.pricing.paid")}
+                          </span>
+                          <SegmentedControl
+                            value={decisionFor(kind, pricingKind)}
+                            disabled={counterparty.status !== "active" || !!busy}
+                            ariaLabel={`${kind === "share" ? t("marketAccess.product.share") : t("marketAccess.product.clientHost")} · ${pricingKind === "free" ? t("marketAccess.pricing.free") : t("marketAccess.pricing.paid")}`}
+                            fullWidth
+                            className="w-60"
+                            items={[
+                              { id: "inherit", label: t("marketAccess.decision.inherit") },
+                              { id: "allow", label: t("marketAccess.decision.allow") },
+                              { id: "deny", label: t("marketAccess.decision.deny") },
+                            ]}
+                            onChange={(decision) =>
+                              void updateDecision(counterparty, kind, pricingKind, decision)
+                            }
+                          />
+                        </div>
+                      )),
+                    )}
                   </div>
                   <div className="grid gap-3">
                     {(["CNY", "USD"] as const).map((currency) => (

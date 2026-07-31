@@ -68,6 +68,7 @@ import type {
   MarketBillingInvoiceHistory,
   MarketAccessDashboard,
   MarketAccessDecision,
+  MarketAccessPricingKind,
   MarketAccessProductKind,
   MarketCreditKind,
 } from "@/lib/types";
@@ -632,6 +633,7 @@ export async function createClientMarketHost(body: {
   rootPassword?: string;
   dailyRateMinor?: number;
   currency?: string;
+  freeDurationDays?: number;
 }) {
   return parseJson<ClientMarketHost>(
     await authFetch("/v1/client-market/hosts", {
@@ -882,10 +884,11 @@ export async function getMarketAccessDashboard(signal?: AbortSignal) {
 
 export async function updateMarketAccessPolicy(
   productKind: MarketAccessProductKind,
+  pricingKind: MarketAccessPricingKind,
   body: { mode: "whitelist" | "blacklist"; riskAcknowledged?: boolean; expectedRevision: number },
 ) {
   return parseJson<MarketAccessDashboard>(
-    await authFetch(`/v1/market-access/policies/${productKind}`, {
+    await authFetch(`/v1/market-access/policies/${productKind}/${pricingKind}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -895,7 +898,11 @@ export async function updateMarketAccessPolicy(
 
 export async function upsertMarketCounterparty(body: {
   email: string;
-  accessRules: Array<{ productKind: MarketAccessProductKind; decision: MarketAccessDecision }>;
+  accessRules: Array<{
+    productKind: MarketAccessProductKind;
+    pricingKind: MarketAccessPricingKind;
+    decision: MarketAccessDecision;
+  }>;
   creditLines?: Array<{
     currency: "CNY" | "USD";
     kind: MarketCreditKind;
@@ -915,7 +922,11 @@ export async function upsertMarketCounterparty(body: {
 export async function updateMarketCounterparty(
   id: string,
   body: {
-    accessRules: Array<{ productKind: MarketAccessProductKind; decision: MarketAccessDecision }>;
+    accessRules: Array<{
+      productKind: MarketAccessProductKind;
+      pricingKind: MarketAccessPricingKind;
+      decision: MarketAccessDecision;
+    }>;
     status?: "active" | "revoked";
     expectedRevision: number;
   },
@@ -969,12 +980,13 @@ export async function getClientMarketProviderSupply() {
 
 export async function updateClientMarketHostOffer(
   hostId: string,
-  body: { dailyRateMinor?: number; currency?: string },
+  body: { dailyRateMinor?: number; currency?: string; freeDurationDays?: number },
 ) {
   return parseJson<{
     hostId: string;
     dailyRateMinor?: number;
     currency?: string;
+    freeDurationDays?: number;
     offerRevision: number;
   }>(
     await authFetch(`/v1/client-market/hosts/${encodeURIComponent(hostId)}/offer`, {

@@ -1454,6 +1454,7 @@ pub(crate) fn ensure_credit_allowed_tx(
         buyer_user_id,
         buyer_email,
         product_kind,
+        crate::market_access::PRICING_PAID,
     )?;
     resolve_credit_grant_tx(
         tx,
@@ -1481,6 +1482,7 @@ pub(crate) fn credit_allowed_tx(
             buyer_user_id,
             buyer_email,
             product_kind,
+            crate::market_access::PRICING_PAID,
         )? {
             return Err(AppError::Forbidden(
                 "seller approval is required before renting this market service".into(),

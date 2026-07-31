@@ -15,6 +15,8 @@ use crate::store::AppStore;
 
 pub const PRODUCT_SHARE: &str = "share";
 pub const PRODUCT_CLIENT_HOST: &str = "client_host";
+pub const PRICING_FREE: &str = "free";
+pub const PRICING_PAID: &str = "paid";
 pub const MODE_WHITELIST: &str = "whitelist";
 pub const MODE_BLACKLIST: &str = "blacklist";
 pub const DECISION_INHERIT: &str = "inherit";
@@ -44,6 +46,7 @@ pub struct EffectiveCreditGrant {
 #[serde(rename_all = "camelCase")]
 pub struct AccessPolicyView {
     pub product_kind: String,
+    pub pricing_kind: String,
     pub mode: String,
     pub revision: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -55,6 +58,7 @@ pub struct AccessPolicyView {
 #[serde(rename_all = "camelCase")]
 pub struct CounterpartyAccessRuleView {
     pub product_kind: String,
+    pub pricing_kind: String,
     pub decision: String,
 }
 
@@ -126,6 +130,7 @@ struct UpdatePolicyRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AccessRuleInput {
     pub product_kind: String,
+    pub pricing_kind: String,
     pub decision: String,
 }
 
@@ -188,12 +193,13 @@ pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             supplier_user_id TEXT NOT NULL,
             supplier_email TEXT NOT NULL,
             product_kind TEXT NOT NULL CHECK (product_kind IN ('share', 'client_host')),
+            pricing_kind TEXT NOT NULL CHECK (pricing_kind IN ('free', 'paid')),
             mode TEXT NOT NULL CHECK (mode IN ('whitelist', 'blacklist')),
             revision INTEGER NOT NULL DEFAULT 1,
             risk_acknowledged_at TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
-            PRIMARY KEY (supplier_user_id, product_kind)
+            PRIMARY KEY (supplier_user_id, product_kind, pricing_kind)
         );
         CREATE TABLE IF NOT EXISTS market_counterparties (
             id TEXT PRIMARY KEY,
@@ -214,10 +220,11 @@ pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         CREATE TABLE IF NOT EXISTS market_counterparty_access_rules (
             counterparty_id TEXT NOT NULL,
             product_kind TEXT NOT NULL CHECK (product_kind IN ('share', 'client_host')),
+            pricing_kind TEXT NOT NULL CHECK (pricing_kind IN ('free', 'paid')),
             decision TEXT NOT NULL CHECK (decision IN ('inherit', 'allow', 'deny')),
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
-            PRIMARY KEY (counterparty_id, product_kind)
+            PRIMARY KEY (counterparty_id, product_kind, pricing_kind)
         );
         CREATE TABLE IF NOT EXISTS market_credit_grants (
             counterparty_id TEXT NOT NULL,
@@ -262,7 +269,7 @@ pub fn router() -> Router<ServerState> {
     Router::new()
         .route("/v1/market-access/dashboard", get(get_dashboard))
         .route(
-            "/v1/market-access/policies/:product_kind",
+            "/v1/market-access/policies/:product_kind/:pricing_kind",
             put(update_policy),
         )
         .route(
@@ -297,6 +304,32 @@ fn normalize_product_kind(value: &str) -> Result<String, AppError> {
     }
 }
 
+fn normalize_pricing_kind(value: &str) -> Result<String, AppError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        PRICING_FREE => Ok(PRICING_FREE.into()),
+        PRICING_PAID => Ok(PRICING_PAID.into()),
+        _ => Err(AppError::BadRequest(
+            "pricingKind must be free or paid".into(),
+        )),
+    }
+}
+
+fn default_access_mode(pricing_kind: &str) -> &'static str {
+    if pricing_kind == PRICING_FREE {
+        MODE_BLACKLIST
+    } else {
+        MODE_WHITELIST
+    }
+}
+
+pub(crate) fn pricing_kind_for_rate(daily_rate_minor: Option<i64>) -> &'static str {
+    if daily_rate_minor.is_some() {
+        PRICING_PAID
+    } else {
+        PRICING_FREE
+    }
+}
+
 fn normalize_mode(value: &str) -> Result<String, AppError> {
     match value.trim().to_ascii_lowercase().as_str() {
         MODE_WHITELIST => Ok(MODE_WHITELIST.into()),
@@ -307,14 +340,17 @@ fn normalize_mode(value: &str) -> Result<String, AppError> {
     }
 }
 
-fn validate_policy_mode(value: &str, risk_acknowledged: bool) -> Result<String, AppError> {
-    let mode = normalize_mode(value)?;
-    if mode == MODE_BLACKLIST && !risk_acknowledged {
+fn validate_policy_transition(
+    current_mode: &str,
+    requested_mode: &str,
+    risk_acknowledged: bool,
+) -> Result<(), AppError> {
+    if current_mode != requested_mode && requested_mode == MODE_BLACKLIST && !risk_acknowledged {
         return Err(AppError::BadRequest(
-            "blacklist mode requires riskAcknowledged=true".into(),
+            "switching to blacklist mode requires riskAcknowledged=true".into(),
         ));
     }
-    Ok(mode)
+    Ok(())
 }
 
 fn normalize_decision(value: &str) -> Result<String, AppError> {
@@ -456,15 +492,17 @@ fn policy_view_tx(
     conn: &Connection,
     supplier_user_id: &str,
     product_kind: &str,
+    pricing_kind: &str,
 ) -> Result<AccessPolicyView, AppError> {
     conn.query_row(
         "SELECT mode, revision, risk_acknowledged_at, updated_at
          FROM market_supplier_access_policies
-         WHERE supplier_user_id = ?1 AND product_kind = ?2",
-        params![supplier_user_id, product_kind],
+         WHERE supplier_user_id = ?1 AND product_kind = ?2 AND pricing_kind = ?3",
+        params![supplier_user_id, product_kind, pricing_kind],
         |row| {
             Ok(AccessPolicyView {
                 product_kind: product_kind.to_string(),
+                pricing_kind: pricing_kind.to_string(),
                 mode: row.get(0)?,
                 revision: row.get(1)?,
                 risk_acknowledged_at: row.get(2)?,
@@ -478,7 +516,8 @@ fn policy_view_tx(
     .unwrap_or_else(|| {
         Ok(AccessPolicyView {
             product_kind: product_kind.to_string(),
-            mode: MODE_WHITELIST.into(),
+            pricing_kind: pricing_kind.to_string(),
+            mode: default_access_mode(pricing_kind).into(),
             revision: 0,
             risk_acknowledged_at: None,
             updated_at: String::new(),
@@ -512,15 +551,16 @@ fn counterparty_view_tx(conn: &Connection, id: &str) -> Result<CounterpartyView,
         .ok_or_else(|| AppError::NotFound("market counterparty not found".into()))?;
     view.access_rules = conn
         .prepare(
-            "SELECT product_kind, decision FROM market_counterparty_access_rules
-             WHERE counterparty_id = ?1 ORDER BY product_kind",
+            "SELECT product_kind, pricing_kind, decision FROM market_counterparty_access_rules
+             WHERE counterparty_id = ?1 ORDER BY product_kind, pricing_kind",
         )
         .and_then(|mut statement| {
             statement
                 .query_map(params![id], |row| {
                     Ok(CounterpartyAccessRuleView {
                         product_kind: row.get(0)?,
-                        decision: row.get(1)?,
+                        pricing_kind: row.get(1)?,
+                        decision: row.get(2)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()
@@ -584,7 +624,14 @@ impl AppStore {
         let conn = self.conn.lock().await;
         let policies = [PRODUCT_SHARE, PRODUCT_CLIENT_HOST]
             .into_iter()
-            .map(|kind| policy_view_tx(&conn, &actor.user_id, kind))
+            .flat_map(|product_kind| {
+                [PRICING_FREE, PRICING_PAID]
+                    .into_iter()
+                    .map(move |pricing_kind| (product_kind, pricing_kind))
+            })
+            .map(|(product_kind, pricing_kind)| {
+                policy_view_tx(&conn, &actor.user_id, product_kind, pricing_kind)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let ids = conn
             .prepare(
@@ -655,58 +702,67 @@ async fn get_dashboard(
 async fn update_policy(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    Path(product_kind): Path<String>,
+    Path((product_kind, pricing_kind)): Path<(String, String)>,
     Json(input): Json<UpdatePolicyRequest>,
 ) -> Result<Json<MarketAccessDashboardView>, AppError> {
     let actor = require_actor(&state, &headers, "market:access:write").await?;
     let product_kind = normalize_product_kind(&product_kind)?;
-    let mode = validate_policy_mode(&input.mode, input.risk_acknowledged)?;
+    let pricing_kind = normalize_pricing_kind(&pricing_kind)?;
+    let mode = normalize_mode(&input.mode)?;
     {
         let now = Utc::now().to_rfc3339();
         let mut conn = state.store.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin access policy update"))?;
-        let current = policy_view_tx(&tx, &actor.user_id, &product_kind)?;
+        let current = policy_view_tx(&tx, &actor.user_id, &product_kind, &pricing_kind)?;
         if input.expected_revision != current.revision {
             return Err(AppError::Conflict(
                 "market access policy revision changed; reload before saving".into(),
             ));
         }
-        tx.execute(
-            "INSERT INTO market_supplier_access_policies (
-            supplier_user_id, supplier_email, product_kind, mode, revision,
+        if current.mode != mode {
+            validate_policy_transition(&current.mode, &mode, input.risk_acknowledged)?;
+            tx.execute(
+                "INSERT INTO market_supplier_access_policies (
+            supplier_user_id, supplier_email, product_kind, pricing_kind, mode, revision,
             risk_acknowledged_at, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?6)
-         ON CONFLICT(supplier_user_id, product_kind) DO UPDATE SET
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?7)
+         ON CONFLICT(supplier_user_id, product_kind, pricing_kind) DO UPDATE SET
             supplier_email = excluded.supplier_email,
             mode = excluded.mode,
             revision = market_supplier_access_policies.revision + 1,
             risk_acknowledged_at = excluded.risk_acknowledged_at,
             updated_at = excluded.updated_at",
-            params![
-                actor.user_id,
-                actor.email,
-                product_kind,
-                mode,
-                if mode == MODE_BLACKLIST {
-                    Some(now.as_str())
-                } else {
-                    None
-                },
-                now,
-            ],
-        )
-        .map_err(map_db("upsert market access policy"))?;
-        record_event_tx(
-            &tx,
-            &actor.user_id,
-            None,
-            &actor.user_id,
-            "access_policy_updated",
-            serde_json::json!({ "productKind": product_kind, "mode": mode }),
-            &now,
-        )?;
+                params![
+                    actor.user_id,
+                    actor.email,
+                    product_kind,
+                    pricing_kind,
+                    mode,
+                    if mode == MODE_BLACKLIST {
+                        Some(now.as_str())
+                    } else {
+                        None
+                    },
+                    now,
+                ],
+            )
+            .map_err(map_db("upsert market access policy"))?;
+            record_event_tx(
+                &tx,
+                &actor.user_id,
+                None,
+                &actor.user_id,
+                "access_policy_updated",
+                serde_json::json!({
+                    "productKind": product_kind,
+                    "pricingKind": pricing_kind,
+                    "mode": mode,
+                }),
+                &now,
+            )?;
+        }
         tx.commit().map_err(map_db("commit access policy update"))?;
     }
     Ok(Json(state.store.market_access_dashboard(&actor).await?))
@@ -719,14 +775,15 @@ fn upsert_access_rule_tx(
     now: &str,
 ) -> Result<(), AppError> {
     let product_kind = normalize_product_kind(&input.product_kind)?;
+    let pricing_kind = normalize_pricing_kind(&input.pricing_kind)?;
     let decision = normalize_decision(&input.decision)?;
     tx.execute(
         "INSERT INTO market_counterparty_access_rules (
-            counterparty_id, product_kind, decision, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?4)
-         ON CONFLICT(counterparty_id, product_kind) DO UPDATE SET
+            counterparty_id, product_kind, pricing_kind, decision, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+         ON CONFLICT(counterparty_id, product_kind, pricing_kind) DO UPDATE SET
             decision = excluded.decision, updated_at = excluded.updated_at",
-        params![counterparty_id, product_kind, decision, now],
+        params![counterparty_id, product_kind, pricing_kind, decision, now],
     )
     .map_err(map_db("upsert counterparty access rule"))?;
     Ok(())
@@ -1177,15 +1234,16 @@ fn access_mode_tx(
     conn: &Connection,
     supplier_user_id: &str,
     product_kind: &str,
+    pricing_kind: &str,
 ) -> Result<String, AppError> {
     conn.query_row(
         "SELECT mode FROM market_supplier_access_policies
-         WHERE supplier_user_id = ?1 AND product_kind = ?2",
-        params![supplier_user_id, product_kind],
+         WHERE supplier_user_id = ?1 AND product_kind = ?2 AND pricing_kind = ?3",
+        params![supplier_user_id, product_kind, pricing_kind],
         |row| row.get::<_, String>(0),
     )
     .optional()
-    .map(|value| value.unwrap_or_else(|| MODE_WHITELIST.into()))
+    .map(|value| value.unwrap_or_else(|| default_access_mode(pricing_kind).into()))
     .map_err(map_db("read supplier access mode"))
 }
 
@@ -1195,13 +1253,15 @@ pub(crate) fn product_access_allowed_tx(
     buyer_user_id: &str,
     buyer_email: &str,
     product_kind: &str,
+    pricing_kind: &str,
 ) -> Result<bool, AppError> {
     let product_kind = normalize_product_kind(product_kind)?;
+    let pricing_kind = normalize_pricing_kind(pricing_kind)?;
     if supplier_user_id == buyer_user_id && product_kind == PRODUCT_CLIENT_HOST {
         return Ok(true);
     }
     let buyer_email = normalize_email(buyer_email)?;
-    let mode = access_mode_tx(conn, supplier_user_id, &product_kind)?;
+    let mode = access_mode_tx(conn, supplier_user_id, &product_kind, &pricing_kind)?;
     let relationship =
         relationship_for_buyer_tx(conn, supplier_user_id, buyer_user_id, &buyer_email)?;
     let Some((relationship_id, _, status)) = relationship else {
@@ -1213,8 +1273,8 @@ pub(crate) fn product_access_allowed_tx(
     let decision = conn
         .query_row(
             "SELECT decision FROM market_counterparty_access_rules
-             WHERE counterparty_id = ?1 AND product_kind = ?2",
-            params![relationship_id, product_kind],
+             WHERE counterparty_id = ?1 AND product_kind = ?2 AND pricing_kind = ?3",
+            params![relationship_id, product_kind, pricing_kind],
             |row| row.get::<_, String>(0),
         )
         .optional()
@@ -1233,6 +1293,7 @@ pub(crate) fn ensure_product_access_tx(
     buyer_user_id: &str,
     buyer_email: &str,
     product_kind: &str,
+    pricing_kind: &str,
 ) -> Result<(), AppError> {
     if !product_access_allowed_tx(
         tx,
@@ -1240,6 +1301,7 @@ pub(crate) fn ensure_product_access_tx(
         buyer_user_id,
         buyer_email,
         product_kind,
+        pricing_kind,
     )? {
         return Err(AppError::Forbidden(
             "seller approval is required before renting this market service".into(),
@@ -1276,6 +1338,7 @@ pub(crate) fn set_product_access_decision_tx(
     buyer_user_id: &str,
     buyer_email: &str,
     product_kind: &str,
+    pricing_kind: &str,
     decision: &str,
     actor_user_id: &str,
     now: &str,
@@ -1286,6 +1349,7 @@ pub(crate) fn set_product_access_decision_tx(
         ));
     }
     let product_kind = normalize_product_kind(product_kind)?;
+    let pricing_kind = normalize_pricing_kind(pricing_kind)?;
     let decision = normalize_decision(decision)?;
     if decision == DECISION_INHERIT {
         return Err(AppError::BadRequest(
@@ -1336,6 +1400,7 @@ pub(crate) fn set_product_access_decision_tx(
         &relationship_id,
         &AccessRuleInput {
             product_kind: product_kind.clone(),
+            pricing_kind: pricing_kind.clone(),
             decision: decision.clone(),
         },
         now,
@@ -1348,6 +1413,7 @@ pub(crate) fn set_product_access_decision_tx(
         "product_access_decision_updated",
         serde_json::json!({
             "productKind": product_kind,
+            "pricingKind": pricing_kind,
             "decision": decision,
             "buyerEmail": buyer_email,
         }),
@@ -1367,7 +1433,7 @@ pub(crate) fn effective_credit_grant_tx(
     let product_kind = normalize_product_kind(product_kind)?;
     let currency = normalize_currency(currency)?;
     let buyer_email = normalize_email(buyer_email)?;
-    let mode = access_mode_tx(conn, supplier_user_id, &product_kind)?;
+    let mode = access_mode_tx(conn, supplier_user_id, &product_kind, PRICING_PAID)?;
     if let Some((relationship_id, _, status)) =
         relationship_for_buyer_tx(conn, supplier_user_id, buyer_user_id, &buyer_email)?
     {
@@ -1438,15 +1504,24 @@ pub(crate) fn configure_open_test_policy(
     now: &str,
 ) {
     for product_kind in [PRODUCT_SHARE, PRODUCT_CLIENT_HOST] {
-        conn.execute(
-            "INSERT INTO market_supplier_access_policies (
-                supplier_user_id, supplier_email, product_kind, mode, revision,
-                risk_acknowledged_at, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, 'blacklist', 1, ?4, ?4, ?4)
-             ON CONFLICT(supplier_user_id, product_kind) DO UPDATE SET mode = 'blacklist'",
-            params![supplier.user_id, supplier.email, product_kind, now],
-        )
-        .expect("configure open test access policy");
+        for pricing_kind in [PRICING_FREE, PRICING_PAID] {
+            conn.execute(
+                "INSERT INTO market_supplier_access_policies (
+                    supplier_user_id, supplier_email, product_kind, pricing_kind, mode, revision,
+                    risk_acknowledged_at, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, 'blacklist', 1, ?5, ?5, ?5)
+                 ON CONFLICT(supplier_user_id, product_kind, pricing_kind)
+                 DO UPDATE SET mode = 'blacklist'",
+                params![
+                    supplier.user_id,
+                    supplier.email,
+                    product_kind,
+                    pricing_kind,
+                    now
+                ],
+            )
+            .expect("configure open test access policy");
+        }
     }
     conn.execute(
         "INSERT INTO market_public_credit_policies (
@@ -1471,9 +1546,20 @@ mod tests {
     }
 
     #[test]
-    fn access_defaults_to_whitelist_and_binds_preapproved_email() {
+    fn access_defaults_are_split_and_preapproved_email_binds_per_scope() {
         let mut conn = access_connection();
         let now = Utc::now().to_rfc3339();
+        assert!(
+            product_access_allowed_tx(
+                &conn,
+                "supplier",
+                "buyer",
+                "buyer@example.com",
+                PRODUCT_SHARE,
+                PRICING_FREE,
+            )
+            .expect("check default free Share access")
+        );
         assert!(
             !product_access_allowed_tx(
                 &conn,
@@ -1481,8 +1567,9 @@ mod tests {
                 "buyer",
                 "buyer@example.com",
                 PRODUCT_SHARE,
+                PRICING_PAID,
             )
-            .expect("check default Share access")
+            .expect("check default paid Share access")
         );
         conn.execute(
             "INSERT INTO market_counterparties (
@@ -1498,6 +1585,7 @@ mod tests {
             "relationship",
             &AccessRuleInput {
                 product_kind: PRODUCT_SHARE.into(),
+                pricing_kind: PRICING_PAID.into(),
                 decision: DECISION_ALLOW.into(),
             },
             &now,
@@ -1510,13 +1598,21 @@ mod tests {
                 "buyer",
                 "BUYER@example.com",
                 PRODUCT_SHARE,
+                PRICING_PAID,
             )
             .expect("check preapproved Share access")
         );
 
         let tx = conn.transaction().expect("begin account binding");
-        ensure_product_access_tx(&tx, "supplier", "buyer", "buyer@example.com", PRODUCT_SHARE)
-            .expect("bind preapproved account");
+        ensure_product_access_tx(
+            &tx,
+            "supplier",
+            "buyer",
+            "buyer@example.com",
+            PRODUCT_SHARE,
+            PRICING_PAID,
+        )
+        .expect("bind preapproved account");
         tx.commit().expect("commit account binding");
         let bound_user_id: String = conn
             .query_row(
@@ -1530,15 +1626,13 @@ mod tests {
 
     #[test]
     fn risky_open_policies_require_explicit_acknowledgement() {
-        assert!(validate_policy_mode(MODE_BLACKLIST, false).is_err());
-        assert_eq!(
-            validate_policy_mode(MODE_BLACKLIST, true).expect("acknowledge blacklist mode"),
-            MODE_BLACKLIST
-        );
-        assert_eq!(
-            validate_policy_mode(MODE_WHITELIST, false).expect("whitelist is the safe default"),
-            MODE_WHITELIST
-        );
+        assert_eq!(default_access_mode(PRICING_FREE), MODE_BLACKLIST);
+        assert_eq!(default_access_mode(PRICING_PAID), MODE_WHITELIST);
+        assert!(validate_policy_transition(MODE_WHITELIST, MODE_BLACKLIST, false).is_err());
+        validate_policy_transition(MODE_WHITELIST, MODE_BLACKLIST, true)
+            .expect("acknowledge blacklist transition");
+        validate_policy_transition(MODE_BLACKLIST, MODE_BLACKLIST, false)
+            .expect("implicit free blacklist needs no acknowledgement");
         assert!(validate_public_credit_line(true, Some(10_000), false).is_err());
         assert!(validate_public_credit_line(true, None, true).is_err());
         assert_eq!(
@@ -1574,6 +1668,7 @@ mod tests {
             "buyer",
             "buyer@example.com",
             PRODUCT_SHARE,
+            PRICING_FREE,
             DECISION_DENY,
             "supplier",
             &now,
@@ -1596,6 +1691,7 @@ mod tests {
                 "buyer",
                 "buyer@example.com",
                 PRODUCT_SHARE,
+                PRICING_FREE,
             )
             .expect("keep revoked Share access denied")
         );
@@ -1612,6 +1708,7 @@ mod tests {
             "buyer",
             "buyer@example.com",
             PRODUCT_CLIENT_HOST,
+            PRICING_PAID,
             DECISION_ALLOW,
             "supplier",
             &now,
@@ -1651,9 +1748,9 @@ mod tests {
 
         conn.execute(
             "INSERT INTO market_supplier_access_policies (
-                supplier_user_id, supplier_email, product_kind, mode, revision,
+                supplier_user_id, supplier_email, product_kind, pricing_kind, mode, revision,
                 risk_acknowledged_at, created_at, updated_at
-             ) VALUES ('public-supplier', 'public@example.com', 'share', 'blacklist',
+             ) VALUES ('public-supplier', 'public@example.com', 'share', 'paid', 'blacklist',
                        1, ?1, ?1, ?1)",
             params![now],
         )

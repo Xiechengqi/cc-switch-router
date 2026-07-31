@@ -3,11 +3,16 @@
 import * as React from "react";
 import { Button, Modal, toast } from "@heroui/react";
 import { Loader2 } from "lucide-react";
+import { SegmentedControl } from "@/components/common/segmented-control";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { getAccountPaymentProfile, getMarketBillingDashboard, updateClientMarketHostOffer } from "@/lib/api";
 import { DASHBOARD_ACCOUNT_BILLING_PATH, DASHBOARD_ACCOUNT_PAYMENTS_PATH } from "@/lib/dashboard-nav";
 import type { ClientMarketHost } from "@/lib/types";
-import { isPaymentProfileRequiredError, parseHostOffer } from "@/components/dashboard/client-market/host-utils";
+import {
+  isPaymentProfileRequiredError,
+  parseFreeDurationDays,
+  parseHostOffer,
+} from "@/components/dashboard/client-market/host-utils";
 
 export function HostOfferDialog({
   host,
@@ -21,8 +26,17 @@ export function HostOfferDialog({
   onSaved: () => void;
 }) {
   const { t } = useLocaleText();
+  const [pricing, setPricing] = React.useState<"free" | "paid">(
+    host.dailyRateMinor ? "paid" : "free",
+  );
   const [price, setPrice] = React.useState(host.dailyRateMinor ? (host.dailyRateMinor / 100).toFixed(2) : "");
   const [currency, setCurrency] = React.useState<"CNY" | "USD">(host.currency === "CNY" ? "CNY" : "USD");
+  const [freeDurationMode, setFreeDurationMode] = React.useState<"fixed" | "permanent">(
+    host.freeDurationDays == null ? "permanent" : "fixed",
+  );
+  const [freeDurationDays, setFreeDurationDays] = React.useState(
+    String(host.freeDurationDays ?? 1),
+  );
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
   const [paymentReady, setPaymentReady] = React.useState<boolean | null>(null);
@@ -30,8 +44,11 @@ export function HostOfferDialog({
 
   React.useEffect(() => {
     if (!open) return;
+    setPricing(host.dailyRateMinor ? "paid" : "free");
     setPrice(host.dailyRateMinor ? (host.dailyRateMinor / 100).toFixed(2) : "");
     setCurrency(host.currency === "CNY" ? "CNY" : "USD");
+    setFreeDurationMode(host.freeDurationDays == null ? "permanent" : "fixed");
+    setFreeDurationDays(String(host.freeDurationDays ?? 1));
     setError("");
     setPaymentReady(null);
     setBillingCurrencies(null);
@@ -52,17 +69,32 @@ export function HostOfferDialog({
     return () => {
       cancelled = true;
     };
-  }, [host.currency, host.dailyRateMinor, open]);
+  }, [host.currency, host.dailyRateMinor, host.freeDurationDays, open]);
 
   const save = async () => {
-    let offer: ReturnType<typeof parseHostOffer>;
+    let offer: {
+      dailyRateMinor?: number;
+      currency?: string;
+      freeDurationDays?: number;
+    };
     try {
-      offer = parseHostOffer(price, t, currency);
+      offer = pricing === "paid"
+        ? parseHostOffer(price, t, currency)
+        : {
+            freeDurationDays:
+              freeDurationMode === "fixed"
+                ? parseFreeDurationDays(freeDurationDays, t)
+                : undefined,
+          };
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
       return;
     }
-    if (offer.dailyRateMinor && (paymentReady === false || !billingCurrencies?.includes(currency))) {
+    if (pricing === "paid" && (!offer.dailyRateMinor || paymentReady === false || !billingCurrencies?.includes(currency))) {
+      if (!offer.dailyRateMinor) {
+        setError(t("clientMarket.offerInvalid"));
+        return;
+      }
       setError(t("clientMarket.offerRequiresBilling"));
       return;
     }
@@ -88,7 +120,7 @@ export function HostOfferDialog({
           <Modal.Header><Modal.Heading>{t("clientMarket.editOffer")}</Modal.Heading></Modal.Header>
           <Modal.Body className="grid gap-4">
             <p className="text-sm text-muted-foreground">{t("clientMarket.editOfferHint")}</p>
-            {paymentReady === false || (billingCurrencies && !billingCurrencies.includes(currency)) ? (
+            {pricing === "paid" && (paymentReady === false || (billingCurrencies && !billingCurrencies.includes(currency))) ? (
               <div className="grid gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-3 text-sm text-amber-950">
                 <p>{t("clientMarket.offerRequiresBilling")}</p>
                 <div className="flex flex-wrap gap-3">
@@ -97,35 +129,56 @@ export function HostOfferDialog({
                 </div>
               </div>
             ) : null}
-            <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_7rem]">
-              <label className="grid gap-1 text-sm">
-                <span className="text-muted-foreground">{t("clientMarket.dailyPrice")}</span>
-                <input
-                  value={price}
-                  onChange={(event) => setPrice(event.target.value)}
-                  placeholder={t("clientMarket.free")}
-                  inputMode="decimal"
-                  className="h-10 rounded-md border px-3"
+            <SegmentedControl
+              value={pricing}
+              onChange={setPricing}
+              ariaLabel={t("clientMarket.currentOffer")}
+              size="md"
+              fullWidth
+              items={[
+                { id: "free", label: t("clientMarket.free") },
+                { id: "paid", label: t("clientMarket.paid") },
+              ]}
+            />
+            {pricing === "paid" ? (
+              <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_7rem]">
+                <label className="grid gap-1 text-sm">
+                  <span className="text-muted-foreground">{t("clientMarket.dailyPrice")}</span>
+                  <input value={price} onChange={(event) => setPrice(event.target.value)} inputMode="decimal" className="h-10 rounded-md border px-3" />
+                </label>
+                <label className="grid gap-1 text-sm">
+                  <span className="text-muted-foreground">{t("clientMarket.currency")}</span>
+                  <select value={currency} onChange={(event) => setCurrency(event.target.value === "CNY" ? "CNY" : "USD")} className="h-10 rounded-md border px-2">
+                    <option value="CNY">CNY</option><option value="USD">USD</option>
+                  </select>
+                </label>
+              </div>
+            ) : (
+              <div className="grid gap-3">
+                <SegmentedControl
+                  value={freeDurationMode}
+                  onChange={setFreeDurationMode}
+                  ariaLabel={t("clientMarket.freeDuration.days")}
+                  size="md"
+                  fullWidth
+                  items={[
+                    { id: "fixed", label: t("clientMarket.freeDuration.fixed") },
+                    { id: "permanent", label: t("clientMarket.freeDuration.permanent") },
+                  ]}
                 />
-              </label>
-              <label className="grid gap-1 text-sm">
-                <span className="text-muted-foreground">{t("clientMarket.currency")}</span>
-                <select
-                  value={currency}
-                  onChange={(event) => setCurrency(event.target.value === "CNY" ? "CNY" : "USD")}
-                  className="h-10 rounded-md border px-2"
-                >
-                  <option value="CNY">CNY</option>
-                  <option value="USD">USD</option>
-                </select>
-              </label>
-            </div>
-            <p className="text-xs text-muted-foreground">{t("clientMarket.makeFreeHint")}</p>
+                {freeDurationMode === "fixed" ? (
+                  <label className="grid gap-1 text-sm">
+                    <span className="text-muted-foreground">{t("clientMarket.freeDuration.days")}</span>
+                    <input type="number" min={1} max={365} step={1} value={freeDurationDays} onChange={(event) => setFreeDurationDays(event.target.value)} className="h-10 rounded-md border px-3" />
+                  </label>
+                ) : null}
+              </div>
+            )}
             {error ? <p className="text-sm text-rose-600">{error}</p> : null}
           </Modal.Body>
           <Modal.Footer>
             <Button variant="ghost" isDisabled={busy} onClick={() => onOpenChange(false)}>{t("common.cancel")}</Button>
-            <Button variant="primary" isDisabled={busy || paymentReady === null || billingCurrencies === null} onClick={() => void save()}>
+            <Button variant="primary" isDisabled={busy || (pricing === "paid" && (paymentReady === null || billingCurrencies === null))} onClick={() => void save()}>
               {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
               {t("common.save")}
             </Button>

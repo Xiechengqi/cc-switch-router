@@ -33,6 +33,7 @@ const MAX_QR_PIXELS: u64 = 4_000_000;
 const MAX_QR_DIMENSION: u32 = 4_096;
 const MAX_QR_STORED_BYTES: usize = 4 * 1024 * 1024;
 const TRADE_RECONCILE_CYCLE_SECS: u64 = 20;
+pub(crate) const MAX_FREE_DURATION_DAYS: u32 = 365;
 
 const SUBSCRIPTION_ACTIVE: &str = "active";
 const SUBSCRIPTION_RELEASING: &str = "releasing";
@@ -141,6 +142,8 @@ pub struct UpdateHostOfferRequest {
     pub daily_rate_minor: Option<i64>,
     #[serde(default)]
     pub currency: Option<String>,
+    #[serde(default)]
+    pub free_duration_days: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -150,6 +153,8 @@ pub struct HostOfferView {
     pub daily_rate_minor: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub currency: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub free_duration_days: Option<u32>,
     pub offer_revision: i64,
 }
 
@@ -177,6 +182,8 @@ pub struct QuoteItemView {
     pub daily_rate_minor: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub currency: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub free_duration_days: Option<u32>,
     pub offer_revision: i64,
 }
 
@@ -230,7 +237,13 @@ pub struct RentalView {
     pub daily_rate_minor: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub currency: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub free_duration_days: Option<u32>,
     pub offer_revision: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activated_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
     pub payment_method_kinds: Vec<String>,
     #[serde(default)]
     pub contacts: Vec<PaymentContact>,
@@ -312,6 +325,7 @@ pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             hostname TEXT,
             daily_rate_minor INTEGER,
             currency TEXT,
+            free_duration_days INTEGER,
             offer_revision INTEGER NOT NULL,
             UNIQUE(quote_id, position),
             UNIQUE(quote_id, host_id)
@@ -335,7 +349,10 @@ pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             status TEXT NOT NULL,
             daily_rate_minor INTEGER,
             currency TEXT,
+            free_duration_days INTEGER,
             offer_revision INTEGER NOT NULL,
+            activated_at TEXT,
+            expires_at TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             released_at TEXT
@@ -387,6 +404,7 @@ pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     add_column(conn, "router_ssh_hosts", "provider_id", "TEXT")?;
     add_column(conn, "router_ssh_hosts", "daily_rate_minor", "INTEGER")?;
     add_column(conn, "router_ssh_hosts", "currency", "TEXT")?;
+    add_column(conn, "router_ssh_hosts", "free_duration_days", "INTEGER")?;
     add_column(
         conn,
         "router_ssh_hosts",
@@ -403,7 +421,21 @@ pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         "currency",
         "TEXT",
     )?;
+    add_column(
+        conn,
+        "client_market_allocation_quote_items",
+        "free_duration_days",
+        "INTEGER",
+    )?;
     add_column(conn, "client_market_subscriptions", "currency", "TEXT")?;
+    add_column(
+        conn,
+        "client_market_subscriptions",
+        "free_duration_days",
+        "INTEGER",
+    )?;
+    add_column(conn, "client_market_subscriptions", "activated_at", "TEXT")?;
+    add_column(conn, "client_market_subscriptions", "expires_at", "TEXT")?;
     add_column(
         conn,
         "account_payment_profiles",
@@ -412,7 +444,10 @@ pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     )?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_router_ssh_hosts_provider_supply
-            ON router_ssh_hosts(provider_id, status, country_code);",
+            ON router_ssh_hosts(provider_id, status, country_code);
+         CREATE INDEX IF NOT EXISTS idx_client_market_free_expiry
+            ON client_market_subscriptions(status, expires_at)
+            WHERE daily_rate_minor IS NULL AND expires_at IS NOT NULL;",
     )?;
     Ok(())
 }
@@ -537,8 +572,29 @@ pub(crate) fn validate_offer(daily_rate_minor: Option<i64>) -> Result<Option<i64
             Ok(Some(rate))
         }
         _ => Err(AppError::BadRequest(
-            "paid Hosts require dailyRateMinor between 1 and 100000000; omit it or use zero for free forever".into(),
+            "paid Hosts require dailyRateMinor between 1 and 100000000; omit it or use zero for free".into(),
         )),
+    }
+}
+
+pub(crate) fn validate_free_duration_days(
+    daily_rate_minor: Option<i64>,
+    free_duration_days: Option<u32>,
+) -> Result<Option<u32>, AppError> {
+    if daily_rate_minor.is_some() {
+        if free_duration_days.is_some() {
+            return Err(AppError::BadRequest(
+                "paid Hosts cannot set freeDurationDays".into(),
+            ));
+        }
+        return Ok(None);
+    }
+    match free_duration_days {
+        None => Ok(None),
+        Some(days) if (1..=MAX_FREE_DURATION_DAYS).contains(&days) => Ok(Some(days)),
+        Some(_) => Err(AppError::BadRequest(format!(
+            "freeDurationDays must be between 1 and {MAX_FREE_DURATION_DAYS}, or null for permanent access"
+        ))),
     }
 }
 
@@ -636,7 +692,7 @@ fn ensure_payment_profile_can_be_cleared(
 }
 
 /// Reattach hosts that belong to this owner email onto the canonical provider id.
-/// Free/forever hosts often keep a drifted `provider_id` because offer edits (which
+/// Free hosts often keep a drifted `provider_id` because offer edits (which
 /// heal identity) are never applied to them.
 fn heal_hosts_onto_provider_tx(
     tx: &Transaction<'_>,
@@ -663,7 +719,7 @@ fn heal_all_provider_host_bindings_tx(tx: &Transaction<'_>, now: &str) -> Result
     // `provider_id IS NULL` must be handled explicitly: SQLite treats
     // `NULL != '<id>'` as unknown, so a bare inequality skips every legacy Host
     // whose provider_id column was added nullable and never backfilled. Those
-    // free/forever idle Hosts then disappear from Create Client supply even
+    // free idle Hosts then disappear from Create Client supply even
     // though their owner_email already matches a Provider profile.
     tx.execute(
         "UPDATE router_ssh_hosts
@@ -1259,10 +1315,18 @@ async fn update_host_offer(
     let session = require_session(&state, &headers).await?;
     let daily_rate_minor = validate_offer(input.daily_rate_minor)?;
     let currency = normalize_offer_currency(daily_rate_minor, input.currency)?;
+    let free_duration_days =
+        validate_free_duration_days(daily_rate_minor, input.free_duration_days)?;
     Ok(Json(
         state
             .store
-            .client_market_update_host_offer(&id, &session, daily_rate_minor, currency)
+            .client_market_update_host_offer(
+                &id,
+                &session,
+                daily_rate_minor,
+                currency,
+                free_duration_days,
+            )
             .await?,
     ))
 }
@@ -1689,7 +1753,7 @@ impl AppStore {
                 }
             })?;
         }
-        // Pull free/forever hosts (and any other drifted rows) whose owner email
+        // Pull free hosts (and any other drifted rows) whose owner email
         // matches this Provider back onto the stable provider_id. Paid hosts are
         // often healed via offer edits; free hosts otherwise stay orphaned and
         // disappear from Create Client idle capacity.
@@ -2252,9 +2316,11 @@ impl AppStore {
         session: &AuthSession,
         daily_rate_minor: Option<i64>,
         currency: Option<String>,
+        free_duration_days: Option<u32>,
     ) -> Result<HostOfferView, AppError> {
         let daily_rate_minor = validate_offer(daily_rate_minor)?;
         let currency = normalize_offer_currency(daily_rate_minor, currency)?;
+        let free_duration_days = validate_free_duration_days(daily_rate_minor, free_duration_days)?;
         let mut conn = self.conn.lock().await;
         let tx = conn
             .transaction()
@@ -2264,12 +2330,13 @@ impl AppStore {
             String,
             Option<i64>,
             Option<String>,
+            Option<i64>,
             i64,
             String,
         )> = tx
             .query_row(
                 "SELECT provider_id, host_owner_email, daily_rate_minor, currency,
-                        offer_revision, status
+                        free_duration_days, offer_revision, status
                  FROM router_ssh_hosts WHERE id = ?1",
                 params![host_id],
                 |row| {
@@ -2280,13 +2347,21 @@ impl AppStore {
                         row.get(3)?,
                         row.get(4)?,
                         row.get(5)?,
+                        row.get(6)?,
                     ))
                 },
             )
             .optional()
             .map_err(|error| AppError::Internal(format!("read host offer failed: {error}")))?;
-        let (provider_id, host_owner_email, old_price, old_currency, old_revision, host_status) =
-            host.ok_or_else(|| AppError::NotFound("host not found".into()))?;
+        let (
+            provider_id,
+            host_owner_email,
+            old_price,
+            old_currency,
+            old_free_duration_days,
+            old_revision,
+            host_status,
+        ) = host.ok_or_else(|| AppError::NotFound("host not found".into()))?;
         if !crate::client_market::session_is_host_owner(
             session,
             provider_id.as_deref(),
@@ -2328,7 +2403,10 @@ impl AppStore {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|value| value.to_ascii_uppercase());
-        if old_price == daily_rate_minor && old_currency_norm == currency {
+        if old_price == daily_rate_minor
+            && old_currency_norm == currency
+            && old_free_duration_days == free_duration_days.map(i64::from)
+        {
             tx.commit().map_err(|error| {
                 AppError::Internal(format!("commit unchanged Host offer failed: {error}"))
             })?;
@@ -2336,6 +2414,7 @@ impl AppStore {
                 host_id: host_id.to_string(),
                 daily_rate_minor,
                 currency,
+                free_duration_days,
                 offer_revision: old_revision,
             });
         }
@@ -2346,7 +2425,7 @@ impl AppStore {
             ));
         }
         // Paid offers require the Host owner's Account payment details so renters
-        // have a way to pay. Free forever does not require a payment profile.
+        // have a way to pay. Free offers do not require a payment profile.
         if daily_rate_minor.is_some() {
             require_payment_profile_for_offer(&tx, &session.user_id)?;
             crate::market_billing::require_supplier_profile_tx(
@@ -2361,12 +2440,13 @@ impl AppStore {
         tx.execute(
             "UPDATE router_ssh_hosts
              SET daily_rate_minor = ?2, currency = ?3,
-                 offer_revision = ?4, updated_at = ?5
+                 free_duration_days = ?4, offer_revision = ?5, updated_at = ?6
              WHERE id = ?1",
             params![
                 host_id,
                 daily_rate_minor,
                 currency,
+                free_duration_days.map(i64::from),
                 revision,
                 Utc::now().to_rfc3339()
             ],
@@ -2382,8 +2462,10 @@ impl AppStore {
             serde_json::json!({
                 "oldDailyRateMinor": old_price,
                 "oldCurrency": old_currency,
+                "oldFreeDurationDays": old_free_duration_days,
                 "dailyRateMinor": daily_rate_minor,
                 "currency": currency,
+                "freeDurationDays": free_duration_days,
                 "offerRevision": revision,
             }),
             Utc::now(),
@@ -2394,6 +2476,7 @@ impl AppStore {
             host_id: host_id.to_string(),
             daily_rate_minor,
             currency,
+            free_duration_days,
             offer_revision: revision,
         })
     }
@@ -2478,7 +2561,7 @@ impl AppStore {
                             h.ip, h.daily_rate_minor,
                             CASE WHEN h.daily_rate_minor IS NULL THEN NULL
                                  ELSE COALESCE(NULLIF(TRIM(h.currency), ''), 'USD') END,
-                            h.offer_revision
+                            h.free_duration_days, h.offer_revision
                      FROM router_ssh_hosts h
                      WHERE h.id = ?1 AND h.status = 'idle' AND h.provider_id IS NOT NULL",
                     params![host_id],
@@ -2503,7 +2586,7 @@ impl AppStore {
                         h.ip, h.daily_rate_minor,
                         CASE WHEN h.daily_rate_minor IS NULL THEN NULL
                              ELSE COALESCE(NULLIF(TRIM(h.currency), ''), 'USD') END,
-                        h.offer_revision
+                        h.free_duration_days, h.offer_revision
                  FROM router_ssh_hosts h
                  WHERE h.status = 'idle'
                    AND h.daily_rate_minor IS NULL
@@ -2533,6 +2616,7 @@ impl AppStore {
                         &session.user_id,
                         &session.email,
                         crate::market_access::PRODUCT_CLIENT_HOST,
+                        crate::market_access::PRICING_FREE,
                     ) {
                         Ok(true) => Some(Ok(candidate)),
                         Ok(false) => None,
@@ -2555,9 +2639,12 @@ impl AppStore {
             ));
         }
         for candidate in &mut candidates {
+            let pricing_kind =
+                crate::market_access::pricing_kind_for_rate(candidate.daily_rate_minor);
             if candidate.provider_id == session.user_id {
                 candidate.daily_rate_minor = None;
                 candidate.currency = None;
+                candidate.free_duration_days = None;
             }
             crate::market_access::ensure_product_access_tx(
                 &tx,
@@ -2565,6 +2652,7 @@ impl AppStore {
                 &session.user_id,
                 &session.email,
                 crate::market_access::PRODUCT_CLIENT_HOST,
+                pricing_kind,
             )?;
             if candidate.daily_rate_minor.is_some() {
                 crate::market_billing::ensure_credit_allowed_tx(
@@ -2618,8 +2706,8 @@ impl AppStore {
                 "INSERT INTO client_market_allocation_quote_items
                     (id, quote_id, position, host_id, provider_id, host_owner_email,
                      country_code, hostname, daily_rate_minor, currency,
-                     offer_revision)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                     free_duration_days, offer_revision)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     item_id,
                     quote_id,
@@ -2631,6 +2719,7 @@ impl AppStore {
                     candidate.hostname,
                     candidate.daily_rate_minor,
                     candidate.currency,
+                    candidate.free_duration_days.map(i64::from),
                     candidate.offer_revision,
                 ],
             )
@@ -2645,6 +2734,7 @@ impl AppStore {
                 ip: candidate.ip,
                 daily_rate_minor: candidate.daily_rate_minor,
                 currency: candidate.currency,
+                free_duration_days: candidate.free_duration_days,
                 offer_revision: candidate.offer_revision,
             });
         }
@@ -2792,6 +2882,7 @@ impl AppStore {
                 &session.user_id,
                 &session.email,
                 crate::market_access::PRODUCT_CLIENT_HOST,
+                crate::market_access::pricing_kind_for_rate(item.4),
             )?;
             if item.4.is_some() {
                 crate::market_billing::ensure_credit_allowed_tx(
@@ -3034,7 +3125,7 @@ impl AppStore {
     pub async fn client_market_reconcile_trade_state(
         &self,
         now: DateTime<Utc>,
-    ) -> Result<(), AppError> {
+    ) -> Result<Vec<String>, AppError> {
         let mut conn = self.conn.lock().await;
         let tx = conn.transaction().map_err(|error| {
             AppError::Internal(format!(
@@ -3042,12 +3133,93 @@ impl AppStore {
             ))
         })?;
         expire_quotes_tx(&tx, now)?;
+        let expiring = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT s.installation_id, s.host_id, s.expires_at
+                     FROM client_market_subscriptions s
+                     WHERE s.status = 'active' AND s.daily_rate_minor IS NULL
+                       AND s.expires_at > ?1 AND s.expires_at <= ?2
+                       AND NOT EXISTS (
+                           SELECT 1 FROM client_market_subscription_events e
+                           WHERE e.installation_id = s.installation_id
+                             AND e.event_type = 'free_period_expiring'
+                       )",
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "prepare expiring free Client subscriptions failed: {error}"
+                    ))
+                })?;
+            statement
+                .query_map(
+                    params![now.to_rfc3339(), (now + Duration::hours(24)).to_rfc3339()],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "query expiring free Client subscriptions failed: {error}"
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "read expiring free Client subscriptions failed: {error}"
+                    ))
+                })?
+        };
+        for (installation_id, host_id, expires_at) in expiring {
+            insert_audit_tx(
+                &tx,
+                Some(&installation_id),
+                Some(&host_id),
+                None,
+                None,
+                "free_period_expiring",
+                serde_json::json!({ "expiresAt": expires_at }),
+                now,
+            )?;
+        }
+        let expired_installations = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT installation_id
+                     FROM client_market_subscriptions
+                     WHERE status = 'active' AND daily_rate_minor IS NULL
+                       AND expires_at IS NOT NULL AND expires_at <= ?1
+                     ORDER BY expires_at, installation_id",
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "prepare expired free Client subscriptions failed: {error}"
+                    ))
+                })?;
+            statement
+                .query_map(params![now.to_rfc3339()], |row| row.get(0))
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "query expired free Client subscriptions failed: {error}"
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "read expired free Client subscriptions failed: {error}"
+                    ))
+                })?
+        };
         tx.commit().map_err(|error| {
             AppError::Internal(format!(
                 "commit Client Market quote reconcile failed: {error}"
             ))
         })?;
-        Ok(())
+        Ok(expired_installations)
     }
 }
 
@@ -3061,6 +3233,7 @@ struct QuoteCandidate {
     ip: Option<String>,
     daily_rate_minor: Option<i64>,
     currency: Option<String>,
+    free_duration_days: Option<u32>,
     offer_revision: i64,
 }
 
@@ -3074,7 +3247,10 @@ fn map_quote_candidate(row: &rusqlite::Row<'_>) -> rusqlite::Result<QuoteCandida
         ip: row.get(5)?,
         daily_rate_minor: row.get(6)?,
         currency: row.get(7)?,
-        offer_revision: row.get(8)?,
+        free_duration_days: row
+            .get::<_, Option<i64>>(8)?
+            .and_then(|value| u32::try_from(value).ok()),
+        offer_revision: row.get(9)?,
     })
 }
 
@@ -3184,7 +3360,10 @@ struct RentalRow {
     status: String,
     daily_rate_minor: Option<i64>,
     currency: Option<String>,
+    free_duration_days: Option<u32>,
     offer_revision: i64,
+    activated_at: Option<String>,
+    expires_at: Option<String>,
     methods_json: String,
     contacts_json: String,
     active_cleanup_job_id: Option<String>,
@@ -3198,7 +3377,8 @@ fn load_rental_views(
 ) -> Result<Vec<RentalView>, AppError> {
     let mut sql = "SELECT s.installation_id, s.host_id, s.provider_id, s.host_owner_email,
                 s.client_user_id, s.client_owner_email, s.status, s.daily_rate_minor,
-                s.currency, s.offer_revision,
+                s.currency, s.free_duration_days, s.offer_revision,
+                s.activated_at, s.expires_at,
                 COALESCE((SELECT methods_json FROM account_payment_profiles p
                           WHERE p.user_id = s.provider_id), '[]'),
                 COALESCE((SELECT contacts_json FROM account_payment_profiles p
@@ -3230,11 +3410,16 @@ fn load_rental_views(
             status: row.get(6)?,
             daily_rate_minor: row.get(7)?,
             currency: row.get(8)?,
-            offer_revision: row.get(9)?,
-            methods_json: row.get(10)?,
-            contacts_json: row.get(11)?,
-            active_cleanup_job_id: row.get(12)?,
-            updated_at: row.get(13)?,
+            free_duration_days: row
+                .get::<_, Option<i64>>(9)?
+                .and_then(|value| u32::try_from(value).ok()),
+            offer_revision: row.get(10)?,
+            activated_at: row.get(11)?,
+            expires_at: row.get(12)?,
+            methods_json: row.get(13)?,
+            contacts_json: row.get(14)?,
+            active_cleanup_job_id: row.get(15)?,
+            updated_at: row.get(16)?,
         })
     };
     let rows = if let Some(installation_id) = installation_id {
@@ -3273,7 +3458,10 @@ fn load_rental_views(
             status: row.status.clone(),
             daily_rate_minor: row.daily_rate_minor,
             currency: row.currency,
+            free_duration_days: row.free_duration_days,
             offer_revision: row.offer_revision,
+            activated_at: row.activated_at,
+            expires_at: row.expires_at,
             payment_method_kinds: kinds,
             contacts: serde_json::from_str(&row.contacts_json).unwrap_or_default(),
             is_client_owner: client_role,
@@ -3291,6 +3479,8 @@ fn client_market_event_is_chat_visible(event_type: &str) -> bool {
     matches!(
         event_type,
         "client_provisioned"
+            | "free_period_expiring"
+            | "free_period_expired"
             | "cleanup_started"
             | "cleanup_finished"
             | "cleanup_failed"
@@ -3314,6 +3504,8 @@ type ClientMarketChatContext = (
 fn client_market_event_fallback_status(event_type: &str) -> &'static str {
     match event_type {
         "client_provisioned" => SUBSCRIPTION_ACTIVE,
+        "free_period_expiring" => SUBSCRIPTION_ACTIVE,
+        "free_period_expired" => SUBSCRIPTION_RELEASING,
         "cleanup_started" => SUBSCRIPTION_RELEASING,
         "cleanup_finished" | "subscription_force_released" => SUBSCRIPTION_RELEASED,
         "cleanup_failed" => SUBSCRIPTION_RELEASE_FAILED,
@@ -3474,6 +3666,9 @@ fn enqueue_client_market_chat_event_tx(
         "failureCode",
         "providerDeniedClientAccess",
         "trialHours",
+        "freeDurationDays",
+        "activatedAt",
+        "expiresAt",
     ] {
         if let Some(value) = detail.get(field) {
             output.insert(field.into(), value.clone());
@@ -3647,6 +3842,7 @@ pub(crate) fn complete_provisioning_tx(
         String,
         Option<i64>,
         Option<String>,
+        Option<i64>,
         i64,
     )> = tx
         .query_row(
@@ -3654,43 +3850,64 @@ pub(crate) fn complete_provisioning_tx(
                     COALESCE(j.client_owner_user_id,
                              (SELECT u.id FROM users u WHERE u.email_normalized = LOWER(j.client_owner_email)),
                              'email:' || LOWER(j.client_owner_email)),
-                    h.daily_rate_minor,
-                    CASE WHEN h.daily_rate_minor IS NULL THEN NULL
+                    CASE WHEN j.quote_id IS NOT NULL THEN qi.daily_rate_minor
+                         ELSE h.daily_rate_minor END,
+                    CASE WHEN j.quote_id IS NOT NULL THEN qi.currency
+                         WHEN h.daily_rate_minor IS NULL THEN NULL
                          ELSE COALESCE(NULLIF(TRIM(h.currency), ''), 'USD') END,
-                    h.offer_revision
+                    CASE WHEN j.quote_id IS NOT NULL THEN qi.free_duration_days
+                         ELSE h.free_duration_days END,
+                    CASE WHEN j.quote_id IS NOT NULL THEN qi.offer_revision
+                         ELSE h.offer_revision END
              FROM provisioning_jobs j
              JOIN router_ssh_hosts h ON h.id = j.host_id
-             WHERE j.id = ?1 AND h.id = ?2 AND h.provider_id IS NOT NULL",
+             LEFT JOIN client_market_allocation_quote_items qi
+               ON qi.quote_id = j.quote_id AND qi.host_id = j.host_id
+             WHERE j.id = ?1 AND h.id = ?2 AND h.provider_id IS NOT NULL
+               AND (j.quote_id IS NULL OR qi.id IS NOT NULL)",
             params![job_id, host_id],
             |row| {
                 Ok((
                     row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
-                    row.get(4)?, row.get(5)?, row.get(6)?,
+                    row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?,
                 ))
             },
         )
         .optional()
         .map_err(|error| AppError::Internal(format!("read completed provisioning billing context failed: {error}")))?;
-    let Some((provider_id, host_email, client_email, client_user_id, price, currency, revision)) =
-        context
+    let Some((
+        provider_id,
+        host_email,
+        client_email,
+        client_user_id,
+        price,
+        currency,
+        free_duration_days,
+        revision,
+    )) = context
     else {
         return Err(AppError::Internal(
             "provisioned Host has no stable Provider identity".into(),
         ));
     };
-    let (price, currency) = if provider_id == client_user_id {
-        (None, None)
+    let (price, currency, free_duration_days) = if provider_id == client_user_id {
+        (None, None, None)
     } else {
-        (price, currency)
+        (price, currency, free_duration_days)
+    };
+    let expires_at = if price.is_none() {
+        free_duration_days.map(|days| now + Duration::days(days))
+    } else {
+        None
     };
     let status = SUBSCRIPTION_ACTIVE;
     tx.execute(
         "INSERT INTO client_market_subscriptions
             (installation_id, host_id, provider_id, host_owner_email,
              client_user_id, client_owner_email, status, daily_rate_minor,
-             currency, offer_revision,
+             currency, free_duration_days, offer_revision, activated_at, expires_at,
              created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?12, ?12)",
         params![
             installation_id,
             host_id,
@@ -3701,8 +3918,10 @@ pub(crate) fn complete_provisioning_tx(
             status,
             price,
             currency,
+            free_duration_days,
             revision,
             now.to_rfc3339(),
+            expires_at.map(|value| value.to_rfc3339()),
         ],
     )
     .map_err(|error| {
@@ -3744,7 +3963,10 @@ pub(crate) fn complete_provisioning_tx(
             "hostOwnerEmail": host_email,
             "dailyRateMinor": price,
             "currency": currency,
+            "freeDurationDays": free_duration_days,
             "offerRevision": revision,
+            "activatedAt": now.to_rfc3339(),
+            "expiresAt": expires_at.map(|value| value.to_rfc3339()),
             "trialHours": crate::market_billing::TRIAL_SECONDS / 3_600,
         }),
         now,
@@ -3762,21 +3984,39 @@ pub(crate) fn cleanup_started_tx(
     deny_client_access: bool,
     now: DateTime<Utc>,
 ) -> Result<(), AppError> {
-    let subscription: Option<(String, String, String, String)> = tx
+    let subscription: Option<(String, String, String, String, Option<i64>, Option<String>)> = tx
         .query_row(
             "SELECT s.provider_id, s.client_user_id, s.client_owner_email,
-                    COALESCE(p.owner_email, s.host_owner_email)
+                    COALESCE(p.owner_email, s.host_owner_email), s.daily_rate_minor,
+                    s.expires_at
              FROM client_market_subscriptions s
              LEFT JOIN host_provider_profiles p ON p.provider_id = s.provider_id
              WHERE s.installation_id = ?1",
             params![installation_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
         )
         .optional()
         .map_err(|error| {
             AppError::Internal(format!("read cleanup subscription failed: {error}"))
         })?;
-    if let Some((provider_id, client_user_id, client_owner_email, provider_email)) = subscription {
+    if let Some((
+        provider_id,
+        client_user_id,
+        client_owner_email,
+        provider_email,
+        daily_rate_minor,
+        expires_at,
+    )) = subscription
+    {
         crate::market_billing::terminate_contract_tx(
             tx,
             "client_host",
@@ -3792,6 +4032,18 @@ pub(crate) fn cleanup_started_tx(
         .map_err(|error| {
             AppError::Internal(format!("mark subscription releasing failed: {error}"))
         })?;
+        if reason == "free_period_expired" {
+            insert_audit_tx(
+                tx,
+                Some(installation_id),
+                Some(host_id),
+                None,
+                None,
+                "free_period_expired",
+                serde_json::json!({ "expiresAt": expires_at }),
+                now,
+            )?;
+        }
         if deny_client_access {
             crate::market_access::set_product_access_decision_tx(
                 tx,
@@ -3800,6 +4052,7 @@ pub(crate) fn cleanup_started_tx(
                 &client_user_id,
                 &client_owner_email,
                 crate::market_access::PRODUCT_CLIENT_HOST,
+                crate::market_access::pricing_kind_for_rate(daily_rate_minor),
                 crate::market_access::DECISION_DENY,
                 actor_user_id.unwrap_or(&provider_id),
                 &now.to_rfc3339(),
@@ -3899,12 +4152,31 @@ async fn run_trade_reconcile_worker(state: ServerState) -> anyhow::Result<()> {
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
-        if let Err(error) = state
+        let expired_installations = match state
             .store
             .client_market_reconcile_trade_state(Utc::now())
             .await
         {
-            tracing::warn!(error = %error, "Client Market quote reconcile failed");
+            Ok(installations) => installations,
+            Err(error) => {
+                tracing::warn!(error = %error, "Client Market trade reconcile failed");
+                Vec::new()
+            }
+        };
+        for installation_id in expired_installations {
+            if let Err(error) = crate::client_market::terminate_for_billing(
+                &state,
+                &installation_id,
+                "free_period_expired",
+            )
+            .await
+            {
+                tracing::warn!(
+                    installation_id,
+                    error = %error,
+                    "expired free Client cleanup could not start"
+                );
+            }
         }
         if let Err(error) = state
             .store

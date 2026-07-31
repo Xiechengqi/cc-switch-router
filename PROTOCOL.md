@@ -209,13 +209,15 @@ Server 要求:
 
 `alreadyListed` 为 true 当且仅当:当前 owner 对该 Share 有 `active` listing,或该 Share 上仍有非终态订阅。停止挂售且租约全部结束后可再次 `POST /listings`。
 
+免费拼车位可通过 `freeDurationDays` 设置 `1..=365` 天固定期限；省略或传 `null` 表示永久。付费拼车位不得携带该字段。报价参数在租用时冻结到订阅，但期限只从 managed grant 被 Server 实际应用、订阅进入 `active_free` 时开始计算。Router 在到期前 24 小时写入一次临期事件；到期后自动进入现有 revoke 流程，回收失败时保持失败状态并继续重试，不会把座位提前恢复为可租。
+
 ### 7.2 Share / Client Market 统一准入与授信
 
-Share 与 Client Host 的免费、付费商品在新租用时都执行同一套供应商准入规则。两个产品的默认模式均为 `whitelist`：供应商先按规范化邮箱添加可信买家,买家尚未注册时可预授权；首次租用时 Router 按已验证邮箱绑定 `buyer_user_id`。每个关系可对 `share` / `client_host` 分别设置 `inherit`、`allow` 或 `deny`。
+Share 与 Client Host 的新租用都执行供应商准入，但策略按「产品 + 价格类型」拆成四个独立作用域：`share/free`、`share/paid`、`client_host/free`、`client_host/paid`。免费作用域隐式默认 `blacklist`，便于未知用户先体验；付费作用域隐式默认 `whitelist`，必须先建立信任和授信。供应商可按规范化邮箱添加买家，买家尚未注册时可预授权；首次租用时 Router 按已验证邮箱绑定 `buyer_user_id`。每个关系可对四个作用域分别设置 `inherit`、`allow` 或 `deny`。
 
-- 白名单模式下,只有有效关系且产品决策允许的买家可新租；黑名单模式下,未被明确拒绝的买家可新租免费商品。
+- 白名单模式下，只有有效关系且对应作用域明确 `allow` 的买家可新租；黑名单模式下，除对应作用域明确 `deny` 外均可新租。免费或付费、Share 或 Host 的规则互不隐式继承。
 - 付费租用还要求同一买家、供应商和币种存在 `limited` 或 `unlimited` 私有授信。有限额度是账户自动出账边界；无限额度不自动出账,由任一方发起清账。
-- 黑名单模式必须提交风险确认。供应商可另行开启有限公共额度供未知买家租用付费商品,但公共额度不能设为无限。
+- 只有从白名单实际切换到黑名单时必须提交风险确认；重复保存黑名单不重复要求确认。供应商可另行开启有限公共额度供付费黑名单作用域中的未知买家使用，但公共额度不能设为无限。
 - `GET /v1/share-market/listings` 的座位与 `GET /v1/client-market/hosts` 的 Host 都返回 `sellerApprovalRequired`。该字段只面向已登录的非 Owner,表示当前供应商准入不允许该买家；前端据此保留「租用」/「新建」入口并引导联系 Owner,不得把服务端英文拒绝消息直接展示为红色错误。Share 引导到对应 Client 聊天室；Client Host 展示 Owner 邮箱及其公开联系方式。
 - 模式切换和产品规则更新只影响新租用。撤销整个买家关系会把该买家的账户信用设为 `none` 并终止现有付费服务；以后确认历史账单也不会恢复这些服务。现有免费服务不因单独修改策略而中断,Owner 可另行强制回收。
 - 所有更新操作使用 revision 做乐观并发控制；下列 `PUT` 请求必须提交当前资源的 `expectedRevision`，新资源提交 `0`。浏览器可用用户 Session；外部系统可用用户 API Token,读取和写入分别要求 `market:access:read`、`market:access:write` scope。
@@ -223,7 +225,7 @@ Share 与 Client Host 的免费、付费商品在新租用时都执行同一套�
 | 方法 | 路径 | 用途 |
 |---|---|---|
 | `GET` | `/v1/market-access/dashboard` | 读取产品模式、可信买家、授信与当前风险敞口 |
-| `PUT` | `/v1/market-access/policies/:product_kind` | 切换 Share / Client Host 白名单或黑名单模式 |
+| `PUT` | `/v1/market-access/policies/:product_kind/:pricing_kind` | 独立切换四个作用域的白名单或黑名单模式 |
 | `POST` | `/v1/market-access/counterparties` | 按邮箱创建或重新启用可信买家关系 |
 | `PUT` | `/v1/market-access/counterparties/:id` | 更新产品规则或撤销关系 |
 | `PUT` | `/v1/market-access/counterparties/:id/credit-lines/:currency` | 更新买家 CNY / USD 私有信用额度 |
@@ -233,13 +235,15 @@ Share 与 Client Host 的免费、付费商品在新租用时都执行同一套�
 
 | 路径 | 关键请求字段 |
 |---|---|
-| `PUT /policies/:product_kind` | `mode`、切换黑名单时的 `riskAcknowledged: true`、`expectedRevision` |
-| `POST /counterparties` | `email`、`accessRules[] { productKind, decision }`，可选初始 `creditLines[] { currency, kind, limitMinor?, riskAcknowledged? }` |
-| `PUT /counterparties/:id` | 本次变更的 `accessRules[]`、可选 `status`、`expectedRevision` |
+| `PUT /policies/:product_kind/:pricing_kind` | `mode`、从白名单切换到黑名单时的 `riskAcknowledged: true`、`expectedRevision` |
+| `POST /counterparties` | `email`、`accessRules[] { productKind, pricingKind, decision }`，可选初始 `creditLines[] { currency, kind, limitMinor?, riskAcknowledged? }` |
+| `PUT /counterparties/:id` | 本次变更的 `accessRules[] { productKind, pricingKind, decision }`、可选 `status`、`expectedRevision` |
 | `PUT /counterparties/:id/credit-lines/:currency` | `kind`(`none` / `limited` / `unlimited`)、有限额度的 `limitMinor`、无限额度的 `riskAcknowledged: true`、`expectedRevision` |
 | `PUT /public-credit-lines/:currency` | `enabled`、启用时的有限 `limitMinor` 与 `riskAcknowledged: true`、`expectedRevision` |
 
 `limitMinor` 使用币种最小单位且范围为 `1..=100000000`；路径币种仅接受 `CNY` / `USD`。私有无限额度和任何公共额度都必须显式确认风险，公共额度始终只能是有限额度。
+
+免费 Client Host 使用与免费 Share 相同的期限契约：Host 创建、编辑与导入接口接受 `freeDurationDays=1..365` 或 `null`（永久），付费 Host 拒绝该字段。Allocation Quote 冻结期限和 `offerRevision`；倒计时从 Client provisioning 成功、订阅写入 `activatedAt` 时开始。到期前 24 小时只产生一次临期事件，到期后 Router 以 `free_period_expired` 调用现有安全 cleanup。清理失败时租约保持 `release_failed` 且 Host 继续隔离，不会错误回到 `idle`。
 
 ### 7.3 Share / Client Market 统一后付费
 

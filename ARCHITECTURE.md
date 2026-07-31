@@ -87,7 +87,8 @@ for_sale_official_price_percent_by_app: BTreeMap<String, u16>
 
 Share Market 内建于 Router,不注册为外部 `router_markets`。Share owner 只能从 Router 的 Share Market 页面通过「添加 Share」选择自己当前 active、尚未挂售的 Share,并创建最多 20 个拼车位。每个拼车位独立配置用户 Token/并发限制以及每日价格。
 
-- 每日价格留空时是免费拼车位；仍须通过供应商准入,但不要求信用额度、不进入账务系统且长期有效。
+- 每日价格留空时是免费拼车位；不要求信用额度、不进入账务系统。Owner 可设置 1–365 天固定期限或永久，固定期限从 managed grant 实际生效时开始，到期自动走 revoke 回收。
+- 准入按 `share/free`、`share/paid`、`client_host/free`、`client_host/paid` 四个作用域独立配置。免费默认黑名单，未知用户可先体验；付费默认白名单，需 Owner 明确允许并授予信用额度。
 - 付费拼车位先授权服务,前 12 小时不计费。体验期结束后,Router 只按实际健康服务区间累计费用,未知或不可用时间不计费。
 - 付费 Share 与 Client Host 共用按「买家 + 供应商 + 币种」聚合的赊账账户。有限信用额度使用达到 80% 时向买卖双方预警,用满、任一方主动清账或最后一个服务结束时生成合并账单并暂停相关服务；无限额度只接受主动清账。
 - 用户按供应商收款资料线下付款并声明,供应商确认后恢复仍有效的服务；逾期会限制用户继续使用市场赊账。争议由 Router 管理员裁决,账单也可由管理员作废。
@@ -97,7 +98,7 @@ Share Market 内建于 Router,不注册为外部 `router_markets`。Share owner 
 - Owner 可强制回收、回收并拒绝该买家后续 Share 租用,或停止挂售。停止挂售只关闭空闲拼车位,不打断现有租约。
 - **重新挂售**:停止挂售且该 Share 上已无活跃租约后,可再次通过「添加 Share」新建 listing。若仍有进行中的租约,「添加 Share」不可选中该 Share；也可在 Mine 的 closed listing 上「添加拼车位」以重新打开同一 listing。
 
-市场状态与审计由 `share_market_listings`、`share_market_seats`、`share_market_subscriptions`、`share_control_operations` 和 `share_market_events` 持久化；统一准入由 `market_supplier_access_policies`、`market_counterparties`、产品规则、私有/公共授信及事件表持久化；统一账务由 `market_credit_accounts`、`market_service_contracts`、`market_service_intervals`、`market_accrual_entries`、`market_invoices`、`market_invoice_lines` 及付款、争议、限制、事件表持久化。
+市场状态与审计由 `share_market_listings`、`share_market_seats`、`share_market_subscriptions`、`share_control_operations` 和 `share_market_events` 持久化；Seat 与 Subscription 都冻结 `free_duration_days`，Subscription 另存 `activated_at` / `expires_at`。统一准入由 `market_supplier_access_policies`、`market_counterparties`、产品规则、私有/公共授信及事件表持久化，其中策略和规则主键均包含 `pricing_kind`。统一账务由 `market_credit_accounts`、`market_service_contracts`、`market_service_intervals`、`market_accrual_entries`、`market_invoices`、`market_invoice_lines` 及付款、争议、限制、事件表持久化。
 
 ### ③ Client Market —— 主机供给
 
@@ -121,7 +122,7 @@ idle ──► locked ──► allocated ──► draining ──► idle
 | `unreachable` 超 5 分钟 | SSH 探测;确认无安装痕迹则清除 DB 记录并复位为 idle |
 | 进程重启导致 job 中断 | 启动时 `reconcile_interrupted_jobs` 以最多 4 并发重跑 |
 
-**准入与支付均和 Share Market 共用统一机制**:免费 Host 也必须通过供应商准入；付费 Host 还要求买家获得对应币种的私有额度,或在黑名单模式下使用有限公共额度。付费 Host 以固定每日价格提供,先享受 12 小时健康服务时长试用,之后只按 Router 观测到的健康区间累计费用。同一买家、Host Provider 和币种下的 Host 与 Share 共用余额,按买家额度出账。Router 只记录链下付款声明,供应商独立核验到账后确认；只有确认到账或管理员作废账单才会解除对应逾期限制。Provider 租用自己的付费 Host 时按免费处理,不会形成自债务。
+**准入与支付均和 Share Market 共用统一机制**:免费 Host 使用独立的 `client_host/free` 作用域，默认黑名单；可配置 1–365 天固定期限或永久，期限在 Client provisioning 成功后才开始，到期复用安全 cleanup。付费 Host 使用默认白名单的 `client_host/paid` 作用域，还要求买家获得对应币种的私有额度，或在该付费作用域切为黑名单后使用有限公共额度。付费 Host 以固定每日价格提供,先享受 12 小时健康服务时长试用,之后只按 Router 观测到的健康区间累计费用。同一买家、Host Provider 和币种下的 Host 与 Share 共用余额,按买家额度出账。Router 只记录链下付款声明,供应商独立核验到账后确认；只有确认到账或管理员作废账单才会解除对应逾期限制。Provider 租用自己的付费 Host 时按免费处理,不会形成自债务。
 
 ### Router 联邦 —— 横向扩展
 
@@ -275,7 +276,8 @@ Router 从不改写 Server 返回的 descriptor,只做校验;若客户端只部�
 | `metrics_task` | — | 指标采集 |
 | `notification_task` | 5s | 离线/恢复邮件 outbox |
 | `chat_notification_task` | — | 聊天邮件投递 |
-| `client_market_trade_task` | — | Client Market 报价、释放与清理状态对账 |
+| `client_market_trade_task` | 20s | Client Market 报价、免费期限、释放与清理状态对账 |
+| `share_market_task` | 5s | managed grant、免费期限与 Share 租约状态对账 |
 | `market_billing_task` | 5s | 健康时长计费、阈值出账、最终账单、逾期限制和控制动作重试 |
 | `ip_blacklist_log_task` | 600s | 黑名单统计落日志 |
 

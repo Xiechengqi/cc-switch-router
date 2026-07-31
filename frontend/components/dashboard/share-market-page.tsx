@@ -29,6 +29,7 @@ import { CompactRegionMultiSelect } from "@/components/common/compact-region-mul
 import { CompactSelect } from "@/components/common/compact-select";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
+import { SegmentedControl } from "@/components/common/segmented-control";
 import {
   isSellerApprovalRequiredError,
   SellerApprovalDialog,
@@ -93,6 +94,8 @@ type SeatDraft = {
   paid: boolean;
   price: string;
   currency: string;
+  freeDurationMode: "fixed" | "permanent";
+  freeDurationDays: string;
 };
 
 const TOKEN_PERIODS: ShareTokenPeriod[] = [
@@ -124,6 +127,8 @@ function emptySeat(supportedPeriods: ShareTokenPeriod[] = TOKEN_PERIODS): SeatDr
     paid: false,
     price: "",
     currency: "CNY",
+    freeDurationMode: "fixed",
+    freeDurationDays: "1",
   };
 }
 
@@ -135,6 +140,8 @@ function draftFromSeat(seat: ShareMarketSeat): SeatDraft {
     paid: !seat.isFree,
     price: seat.dailyRateMinor == null ? "" : (seat.dailyRateMinor / 100).toFixed(2),
     currency: seat.currency || "CNY",
+    freeDurationMode: seat.freeDurationDays == null ? "permanent" : "fixed",
+    freeDurationDays: String(seat.freeDurationDays ?? 1),
   };
 }
 
@@ -150,7 +157,22 @@ function parsePositiveOptional(value: string, label: string, t: TFn) {
 function seatInput(draft: SeatDraft, t: TFn): ShareMarketSeatInput {
   const parallelLimit = parsePositiveOptional(draft.parallelLimit, t("shareMarket.parallel"), t);
   const tokenLimit = parsePositiveOptional(draft.tokenLimit, t("shareMarket.tokens"), t);
-  if (!draft.paid) return { parallelLimit, tokenLimit, tokenPeriod: draft.tokenPeriod };
+  if (!draft.paid) {
+    let freeDurationDays: number | undefined;
+    if (draft.freeDurationMode === "fixed") {
+      const parsed = Number(draft.freeDurationDays);
+      if (!/^\d+$/.test(draft.freeDurationDays.trim()) || !Number.isInteger(parsed) || parsed < 1 || parsed > 365) {
+        throw new Error(t("shareMarket.error.freeDuration"));
+      }
+      freeDurationDays = parsed;
+    }
+    return {
+      parallelLimit,
+      tokenLimit,
+      tokenPeriod: draft.tokenPeriod,
+      freeDurationDays,
+    };
+  }
   const price = draft.price.trim();
   const amount = Number(price);
   const dailyRateMinor = Math.round(amount * 100);
@@ -211,33 +233,28 @@ function SeatFields({
           />
         </label>
         <label className="grid gap-1 text-xs text-slate-500">
-          {t("shareMarket.period")}
+          {t("shareMarket.tokenPeriod")}
           <CompactSelect
             value={draft.tokenPeriod}
             options={periods.map((period) => ({ value: period, label: t(`shareMarket.period.${period}`) }))}
             onChange={(value) => patch({ tokenPeriod: value as ShareTokenPeriod })}
-            ariaLabel={t("shareMarket.period")}
+            ariaLabel={t("shareMarket.tokenPeriod")}
             className="w-full"
             triggerClassName={selectTrigger}
           />
         </label>
       </div>
-      <div className="grid grid-cols-2 gap-1 rounded-md bg-slate-100 p-1">
-        <button
-          type="button"
-          className={`h-9 rounded-md text-sm font-medium ${!draft.paid ? "bg-white text-slate-900 shadow-sm" : "text-slate-500"}`}
-          onClick={() => patch({ paid: false })}
-        >
-          {t("shareMarket.dialog.freeMode")}
-        </button>
-        <button
-          type="button"
-          className={`h-9 rounded-md text-sm font-medium ${draft.paid ? "bg-white text-slate-900 shadow-sm" : "text-slate-500"}`}
-          onClick={() => patch({ paid: true })}
-        >
-          {t("shareMarket.dialog.paidMode")}
-        </button>
-      </div>
+      <SegmentedControl
+        value={draft.paid ? "paid" : "free"}
+        onChange={(value) => patch({ paid: value === "paid" })}
+        ariaLabel={t("shareMarket.dialog.amount")}
+        size="md"
+        fullWidth
+        items={[
+          { id: "free", label: t("shareMarket.dialog.freeMode") },
+          { id: "paid", label: t("shareMarket.dialog.paidMode") },
+        ]}
+      />
       {draft.paid ? (
         <div className="grid min-w-0 gap-3 sm:grid-cols-2">
           <label className="grid gap-1 text-xs text-slate-500">
@@ -264,7 +281,35 @@ function SeatFields({
             />
           </label>
         </div>
-      ) : null}
+      ) : (
+        <div className="grid min-w-0 gap-3">
+          <SegmentedControl
+            value={draft.freeDurationMode}
+            onChange={(value) => patch({ freeDurationMode: value })}
+            ariaLabel={t("shareMarket.freeDuration.days")}
+            size="md"
+            fullWidth
+            items={[
+              { id: "fixed", label: t("shareMarket.freeDuration.fixed") },
+              { id: "permanent", label: t("shareMarket.freeDuration.permanent") },
+            ]}
+          />
+          {draft.freeDurationMode === "fixed" ? (
+            <label className="grid gap-1 text-xs text-slate-500">
+              {t("shareMarket.freeDuration.days")}
+              <input
+                type="number"
+                min={1}
+                max={365}
+                step={1}
+                className={fieldClass()}
+                value={draft.freeDurationDays}
+                onChange={(event) => patch({ freeDurationDays: event.target.value })}
+              />
+            </label>
+          ) : null}
+        </div>
+      )}
     </div>
   );
 }
@@ -515,55 +560,6 @@ function listingProviderTitle(provider: ShareUpstreamProvider | undefined, unava
   return `${identity} · ${strategy}`;
 }
 
-function shareMarketTabTone(active: boolean) {
-  return active ? "bg-white font-medium text-foreground shadow-sm" : "text-slate-700";
-}
-
-function LayoutModeToggle({
-  layout,
-  onChange,
-  seatsLabel,
-  sharesLabel,
-  ariaLabel,
-}: {
-  layout: MarketLayout;
-  onChange: (next: MarketLayout) => void;
-  seatsLabel: string;
-  sharesLabel: string;
-  ariaLabel: string;
-}) {
-  return (
-    <div
-      role="group"
-      aria-label={ariaLabel}
-      className="inline-flex shrink-0 overflow-hidden rounded-lg border border-slate-200 bg-slate-100 p-0.5 text-[11px]"
-    >
-      <button
-        type="button"
-        onClick={() => onChange("seats")}
-        className={cn(
-          "rounded-md px-2.5 py-1.5 transition-colors",
-          layout === "seats" ? "bg-white font-semibold text-foreground shadow-sm" : "font-medium text-slate-500 hover:text-slate-700",
-        )}
-        aria-pressed={layout === "seats"}
-      >
-        {seatsLabel}
-      </button>
-      <button
-        type="button"
-        onClick={() => onChange("shares")}
-        className={cn(
-          "rounded-md px-2.5 py-1.5 transition-colors",
-          layout === "shares" ? "bg-white font-semibold text-foreground shadow-sm" : "font-medium text-slate-500 hover:text-slate-700",
-        )}
-        aria-pressed={layout === "shares"}
-      >
-        {sharesLabel}
-      </button>
-    </div>
-  );
-}
-
 function formatShareLimit(value?: number | null) {
   if (value == null) return "—";
   if (Number(value) < 0) return "∞";
@@ -571,13 +567,39 @@ function formatShareLimit(value?: number | null) {
 }
 
 function formatPrice(
-  seat: Pick<ShareMarketSeat, "isFree" | "dailyRateMinor" | "currency">,
+  seat: Pick<ShareMarketSeat, "isFree" | "dailyRateMinor" | "currency" | "freeDurationDays">,
   free: string,
   day: string,
+  permanent: string,
 ) {
-  if (seat.isFree || seat.dailyRateMinor == null) return free;
+  if (seat.isFree || seat.dailyRateMinor == null) {
+    return seat.freeDurationDays == null
+      ? `${free} · ${permanent}`
+      : `${free} · ${seat.freeDurationDays} ${day}`;
+  }
   const amount = new Intl.NumberFormat(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(seat.dailyRateMinor / 100);
   return `${amount} ${seat.currency || ""} / ${day}`;
+}
+
+function freePeriodTiming(
+  subscription: ShareMarketSubscription,
+  locale: AppLocale,
+  t: TFn,
+) {
+  if (subscription.dailyRateMinor != null) return null;
+  if (!subscription.activatedAt) return t("shareMarket.freeDuration.pendingActivation");
+  const activated = new Date(subscription.activatedAt).toLocaleString(locale);
+  if (!subscription.expiresAt) {
+    return `${t("shareMarket.freeDuration.activated")}: ${activated} · ${t("shareMarket.permanent")}`;
+  }
+  const expires = new Date(subscription.expiresAt);
+  const remainingMs = expires.getTime() - Date.now();
+  const remaining = remainingMs <= 0
+    ? t("shareMarket.freeDuration.expired")
+    : remainingMs < 48 * 60 * 60 * 1000
+      ? t("shareMarket.freeDuration.remainingHours", { count: Math.ceil(remainingMs / 3_600_000) })
+      : t("shareMarket.freeDuration.remainingDays", { count: Math.ceil(remainingMs / 86_400_000) });
+  return `${t("shareMarket.freeDuration.activated")}: ${activated} · ${t("shareMarket.freeDuration.expires")}: ${expires.toLocaleString(locale)} · ${remaining}`;
 }
 
 function statusLabel(status: string, t: ReturnType<typeof useLocaleText>["t"]) {
@@ -716,6 +738,7 @@ function buildSeatRows(
           tokenPeriod: "lifetime" as const,
           dailyRateMinor: subscription.dailyRateMinor,
           currency: subscription.currency,
+          freeDurationDays: subscription.freeDurationDays,
           subscription,
         } satisfies ShareMarketSeat);
       return {
@@ -1110,6 +1133,7 @@ export function ShareMarketPage() {
 
   const renderSubscription = (subscription: ShareMarketSubscription, ownerView = false) => {
     const openUrl = shareOpenUrl(subscription.subdomain);
+    const timing = freePeriodTiming(subscription, locale, t);
     return (
     <div
       key={subscription.id}
@@ -1136,6 +1160,7 @@ export function ShareMarketPage() {
             </>
           ) : null}
         </div>
+        {timing ? <p className="mt-1 text-xs text-slate-500">{timing}</p> : null}
       </div>
       <div className="flex flex-wrap items-start justify-start gap-2 sm:justify-end">
         {renderGroupChat(subscription.installationId)}
@@ -1441,7 +1466,7 @@ export function ShareMarketPage() {
                   <td className="px-4 py-3 font-medium tabular-nums">{seat.position}</td>
                   <td className="px-3 py-3 text-slate-600">{seat.parallelLimit ?? t("common.unlimited")}</td>
                   <td className="px-3 py-3 text-slate-600">{seat.tokenLimit?.toLocaleString() ?? t("common.unlimited")} · {tokenPeriod(seat.tokenPeriod)}</td>
-                  <td className="px-3 py-3 font-medium">{formatPrice(seat, t("shareMarket.free"), t("marketBilling.day"))}</td>
+                  <td className="px-3 py-3 font-medium">{formatPrice(seat, t("shareMarket.free"), t("marketBilling.day"), t("shareMarket.permanent"))}</td>
                   <td className="max-w-[14rem] px-3 py-3"><span className="block truncate text-slate-600" title={seat.subscription?.renterEmail}>{seat.subscription?.renterEmail || "—"}</span></td>
                   <td className="px-3 py-3"><span className="rounded-sm bg-slate-100 px-1.5 py-0.5 text-xs text-slate-600">{seatStatusLabel(seat, seat.subscription, t)}</span></td>
                   <td className="px-4 py-3">{renderSeatActions(listing, seat, seat.subscription)}</td>
@@ -1612,7 +1637,7 @@ export function ShareMarketPage() {
                       {seat.tokenLimit?.toLocaleString() ?? t("common.unlimited")}
                       {seat.tokenPeriod ? ` · ${tokenPeriod(seat.tokenPeriod)}` : ""}
                     </td>
-                    <td className="px-3 py-3 font-medium">{formatPrice(seat, t("shareMarket.free"), t("marketBilling.day"))}</td>
+                    <td className="px-3 py-3 font-medium">{formatPrice(seat, t("shareMarket.free"), t("marketBilling.day"), t("shareMarket.permanent"))}</td>
                     <td className="max-w-[14rem] px-3 py-3">
                       <span className="block truncate text-xs text-slate-600" title={subscription?.renterEmail}>
                         {subscription?.renterEmail || "—"}
@@ -1664,25 +1689,27 @@ export function ShareMarketPage() {
     <div className="mx-auto grid w-full max-w-7xl gap-5 px-1 pb-10">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
-          <LayoutModeToggle
-            layout={layout}
+          <SegmentedControl
+            value={layout}
             onChange={setLayout}
-            seatsLabel={t("shareMarket.layout.seats")}
-            sharesLabel={t("shareMarket.layout.shares")}
             ariaLabel={t("shareMarket.layoutToggle")}
+            size="sm"
+            items={[
+              { id: "seats", label: t("shareMarket.layout.seats") },
+              { id: "shares", label: t("shareMarket.layout.shares") },
+            ]}
           />
-          <div className="inline-flex max-w-full overflow-x-auto rounded-lg bg-slate-100 p-1 text-[11px]">
-            {marketTabs.map((item) => (
-              <button
-                key={item.id}
-                type="button"
-                onClick={() => setTab(item.id)}
-                className={`rounded-md px-2.5 py-1.5 transition-colors ${shareMarketTabTone(tab === item.id)}`}
-              >
-                {item.label}
-              </button>
-            ))}
-          </div>
+          <SegmentedControl
+            value={tab}
+            onChange={setTab}
+            ariaLabel={t("shareMarket.title")}
+            size="sm"
+            items={marketTabs.map((item) => ({
+              id: item.id,
+              label: item.label,
+              className: "text-slate-700",
+            }))}
+          />
           <label className="flex min-w-[12rem] max-w-sm flex-1 items-center gap-2 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-sm shadow-sm">
             <Search className="h-4 w-4 shrink-0 text-slate-400" aria-hidden />
             <input
