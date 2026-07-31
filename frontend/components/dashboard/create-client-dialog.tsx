@@ -8,6 +8,7 @@ import { useAuth } from "@/components/auth/auth-provider";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { CountryFlag } from "@/components/common/country-flag";
 import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
+import { isSellerApprovalRequiredError } from "@/components/common/seller-approval-dialog";
 import { buildClientInstallCommand } from "@/components/dashboard/install-guide-dialog";
 import { ProvisionJobLog } from "@/components/dashboard/provision-job-log";
 import { useLocaleText } from "@/components/i18n/locale-provider";
@@ -105,11 +106,13 @@ export function CreateClientDialog({
   onOpenChange,
   fixedHost,
   onCreated,
+  onSellerApprovalRequired,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   fixedHost?: ClientMarketHost | null;
   onCreated?: () => void;
+  onSellerApprovalRequired?: (host: ClientMarketHost) => void;
 }) {
   const { locale, t } = useLocaleText();
   const { session, loading: authLoading } = useAuth();
@@ -401,9 +404,24 @@ export function CreateClientDialog({
     return () => window.clearTimeout(timer);
   }, [drafts, open, phase, quote, t]);
 
+  const routeSellerApprovalError = (reason: unknown) => {
+    if (!fixedHost || !onSellerApprovalRequired || !isSellerApprovalRequiredError(reason)) {
+      return false;
+    }
+    if (quote) void cancelClientMarketQuote(quote.id).catch(() => undefined);
+    onOpenChange(false);
+    onSellerApprovalRequired(fixedHost);
+    return true;
+  };
+
   const requestQuote = async () => {
     if (!authed) {
       window.dispatchEvent(new Event("router-open-login"));
+      return;
+    }
+    if (fixedHost?.sellerApprovalRequired === true) {
+      onOpenChange(false);
+      onSellerApprovalRequired?.(fixedHost);
       return;
     }
     if ((!fixedHost && (!selectedProviderIds.length || !selectedCountryCodes.length)) || capacity < quantity) {
@@ -432,7 +450,9 @@ export function CreateClientDialog({
       setSubdomainChecks({});
       setPhase("quote");
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      if (!routeSellerApprovalError(reason)) {
+        setError(reason instanceof Error ? reason.message : String(reason));
+      }
     } finally {
       setLoading(false);
     }
@@ -516,7 +536,9 @@ export function CreateClientDialog({
       const generation = pollGeneration.current;
       void pollJobs(response.jobIds, generation);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      if (!routeSellerApprovalError(reason)) {
+        setError(reason instanceof Error ? reason.message : String(reason));
+      }
     } finally {
       setLoading(false);
     }

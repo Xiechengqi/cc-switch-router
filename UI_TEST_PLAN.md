@@ -208,7 +208,7 @@ location.reload();
 | SM-03 | 已登录且拥有 active Share | 点添加 Share | 只列出未挂售 Share；可一次添加 1-20 个拼车位 |
 | SM-04 | 添加拼车位 | 保持价格模式为免费 | 请求中日费率和币种均为空 |
 | SM-05 | 添加付费拼车位 | 输入三位以上小数、非 CNY/USD 币种,或未配置对应币种收款资料/付款宽限 | 内联报错或阻止发布,不提交 |
-| SM-06 | 有可用拼车位 | 可信买家租用 | 座位进入 pending/occupied；同一用户不能重复租同一 Share；租用按钮对准入拒绝或已有 direct grant 的用户不显示 |
+| SM-06 | 有可用拼车位 | 可信买家租用 | 座位进入 pending/occupied；同一用户不能重复租同一 Share；已有 direct grant 的用户不显示租用按钮 |
 | SM-07 | 付费租约 | 查看商品与租约 | 只显示收款方式种类和联系方式；不显示账号、地址、二维码或单商品付款按钮 |
 | SM-08 | owner 查看已租座位 | 强制回收 / 回收并拒绝后续访问 | 二次确认后进入回收状态；拒绝后该买家不能新租该 owner 的 Share 座位 |
 | SM-09 | owner 打开市场准入 | 将该买家的 Share 规则改回允许 | 保存后买家可再次新租 Share；Client Host 规则不受影响 |
@@ -218,6 +218,7 @@ location.reload();
 | SM-13 | 停止挂售且无活跃租约 | 点添加 Share | 该 Share 重新出现在候选列表；可新建 listing |
 | SM-14 | 离线 Share 的可用座位 | 观察并直接调用租用接口 | 已登录用户不显示租用按钮；直接请求返回离线冲突,不创建订阅或账务合约 |
 | SM-15 | 租约非终态 | My rentals / owner 嵌套订阅 | 有 subdomain 时显示「打开 Share」并可跳转 |
+| SM-16 | 已登录买家不在 owner 白名单,Share 在线且座位可用 | 点「租用」 | 保留租用按钮；弹出中性授权引导而非红色英文错误，明确只有白名单用户可租用并显示当前登录邮箱；点主操作打开该 Share 对应的 Client 聊天室 |
 
 ### 6.1.1 Share Market ↔ Server 联调(SM-E2E)
 
@@ -305,6 +306,7 @@ location.reload();
 | H-48 | 无 installation 且 idle/disabled/abnormal | Delete | 二次确认(danger)后删除 |
 | H-49 | 清理进行中 | 尝试关闭进度弹窗 | 关闭按钮 disabled;任务成功或失败后才可关 |
 | H-50 | 有备注的主机 | 观察 | 备注以子行展示;**无备注则不出现空子行** |
+| H-51 | 已登录买家不在 Host owner 白名单,主机 idle | 点「新建」 | 弹出中性授权引导而非红色英文错误，明确只有白名单用户可使用；显示 owner 邮箱及其 WeChat/Telegram/自定义联系方式，邮件按钮打开 `mailto:`；quote 或 commit 阶段撤销准入也回到同一弹窗 |
 
 **操作可用性矩阵**(行=主机状态,列=菜单项;均需 host owner):
 
@@ -758,12 +760,12 @@ location.reload();
 | `dashboard/share-card.tsx` | C-17~C-20 |
 | `dashboard/drawer-panels.tsx` | C-13, C-18, M-05, M-09 |
 | `dashboard/markets-table.tsx` | M-01~M-15 |
-| `dashboard/share-market-page.tsx` | SM-01~SM-15, SM-E2E-01~SM-E2E-07 |
+| `dashboard/share-market-page.tsx` | SM-01~SM-16, SM-E2E-01~SM-E2E-07 |
 | `dashboard/account-share-page.tsx` | AS-01~AS-08 |
 | `dashboard/account-client-page.tsx` | 账户 Client 只读监控(镜像 AS) |
 | `dashboard/client-market-page.tsx` | H-01~H-18(归属/筛选/排序/分页), H-60~H-71(选择与批量), H-80~H-84(导入导出) |
 | `client-market/host-utils.ts` | H-10~H-13, H-42(矩阵), H-64 |
-| `client-market/host-row.tsx` | H-40~H-50, T-01~T-03 |
+| `client-market/host-row.tsx` | H-40~H-51, T-01~T-03 |
 | `client-market/add-host-dialog.tsx` | H-20~H-29 |
 | `client-market/host-offer-dialog.tsx` | H-43, H-26 |
 | `client-market/host-sort-header.tsx` | H-12~H-15 |
@@ -824,7 +826,7 @@ location.reload();
 | Installations 升级 | `upgradeClientInstallation`、`getClientInstallationUpgradeStatus` | C-21, D-08, D-09 |
 | 用户 API Token | `getUserApiToken`、`resetUserApiToken` | A-10, A-11 |
 | Markets 优先级 | `getMarketSharePriority` | M-09 |
-| Share Market | `getShareMarket*`、`*ShareMarket*` | SM-01~SM-15, SM-E2E-01~SM-E2E-07 |
+| Share Market | `getShareMarket*`、`*ShareMarket*` | SM-01~SM-16, SM-E2E-01~SM-E2E-07 |
 | 其他(regions / 公告读取) | `getRegions`、`getAnnouncement` | A-14, A-16 |
 
 认证相关在 `lib/auth.ts`(非 `api.ts`):`requestEmailCode` / `verifyEmailCode` / `refreshAccessToken` / `sessionStatus` / `logoutSession` / `ensureInstallationIdentity` → 用例 A-02~A-06, A-12。
@@ -839,12 +841,12 @@ location.reload();
 
 ## 20. 一轮完整回归的建议顺序
 
-共 **374 条用例**。单人跑完约需 5–6 小时。按角色分轮次,减少环境切换:
+共 **376 条用例**。单人跑完约需 5–6 小时。按角色分轮次,减少环境切换:
 
 | 轮次 | 环境 | 用例 | 约计 |
 |---|---|---|---|
 | 1. 匿名 | `DEV_AUTH_BYPASS=0`,不登录 | A-01, C-01~C-06, M-01~M-08, H-06, H-32, S-40, S-41, S-46, CH-02, N-01, X-01 | 25 分钟 |
-| 2. 普通用户 | 登录,名下无主机无租用 | A-02~A-20, AC-01~AC-18, H-01, H-02, R-01, R-02, C-07~C-23 | 60 分钟 |
+| 2. 普通用户 | 登录,名下无主机无租用 | A-02~A-20, AC-01~AC-18, H-01, H-02, H-51, SM-16, R-01, R-02, C-07~C-23 | 60 分钟 |
 | 3. 供给方 | 名下有多状态主机 | H-03~H-05, H-07, H-10~H-18, H-20~H-29, H-40~H-50, H-60~H-84, T-01, T-04~T-19, T-30~T-36, Q-01~Q-14, D-10 | 120 分钟 |
 | 4. 租客 | 有租用中 Client | R-03~R-12, R-20~R-35, T-02, H-30, S-42~S-45, D-01~D-04 | 55 分钟 |
 | 5. 管理员 | 邮箱在 `ADMIN_EMAILS` | X-02~X-38, N-02~N-14, M-09~M-15, CH-07, H-31, T-03, D-05~D-09, S-08~S-35 | 90 分钟 |
@@ -852,7 +854,7 @@ location.reload();
 
 **冒烟子集**(每次提交前跑,约 15 分钟):
 
-`A-04`(登录)· `C-01`(总览渲染)· `H-01`(默认只看自己 + 故障优先排序)· `H-11`(严重度序)· `H-40`(新建入口)· `H-60`(选择模式)· `R-03`(租用列表)· `R-23`(释放与数据丢失确认)· `MB-04`(聚合账户)· `MB-09`(付款声明)· `Q-05`(报价倒计时)· `Q-10`(过期保留草稿)· `X-02`(设置表单)· `G-01`(中英文)
+`A-04`(登录)· `C-01`(总览渲染)· `H-01`(默认只看自己 + 故障优先排序)· `H-11`(严重度序)· `H-51`(白名单引导)· `SM-16`(聊天室引导)· `H-60`(选择模式)· `R-03`(租用列表)· `R-23`(释放与数据丢失确认)· `MB-04`(聚合账户)· `MB-09`(付款声明)· `Q-05`(报价倒计时)· `Q-10`(过期保留草稿)· `X-02`(设置表单)· `G-01`(中英文)
 
 **建议按轮次记录结果**,而不是逐条打勾——失败项记 用例 ID + 实际现象 + 截图,便于回归定位。
 
@@ -868,3 +870,4 @@ location.reload();
 | 2026-07-27 | 租用释放改造:释放入口从付款弹窗内移到租用卡片常驻,新增账单不回滚说明与清理进度弹窗。R 组 12 → 25 条,总数 322。 |
 | 2026-07-30 | Share/Client Market 改为供应商级统一后付费；删除单商品预付、续费和退款交互，新增 MB-01~MB-17、支付快照权限及旧契约静态审计。 |
 | 2026-07-30 | Share/Client Host 免费与付费租用统一改为默认白名单；新增邮箱预授权、产品规则、买家级有限/无限授信、风险确认的黑名单模式与有限公共额度,扩展 MA-01~MA-12、MB-18~MB-19。 |
+| 2026-07-30 | 未获供应商准入时保留 Share「租用」/Client Host「新建」入口并改为联系 Owner 的授权引导弹窗；Share 跳转 Client 聊天室,Host 展示邮件与公开联系方式,新增 SM-16、H-51。 |

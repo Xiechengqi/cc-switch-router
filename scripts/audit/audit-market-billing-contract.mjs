@@ -206,6 +206,17 @@ function main() {
     if (!invoiceType.includes(required)) errors.push(`MarketBillingInvoice is missing ${required}`);
   }
 
+  for (const [label, block] of [
+    ["RouterSshHostView", extractRustBlock(clientSource, "struct RouterSshHostView")],
+    ["Share SeatView", extractRustBlock(shareSource, "pub struct SeatView")],
+    ["ClientMarketHost", extractTypeBlock(typeSource, "ClientMarketHost")],
+    ["ShareMarketSeat", extractTypeBlock(typeSource, "ShareMarketSeat")],
+  ]) {
+    if (!block.includes("seller_approval_required") && !block.includes("sellerApprovalRequired")) {
+      errors.push(`${label} is missing sellerApprovalRequired`);
+    }
+  }
+
   for (const requestType of [
     "UpdatePolicyRequest",
     "UpdateCounterpartyRequest",

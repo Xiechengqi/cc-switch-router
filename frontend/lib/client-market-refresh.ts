@@ -33,6 +33,7 @@ const HOST_SCALAR_KEYS = [
   "clientSubdomain",
   "clientOwnerEmail",
   "installationId",
+  "sellerApprovalRequired",
   "canWebTerminal",
   "isHostOwner",
   "isClientOwner",

@@ -98,6 +98,7 @@ pub struct SeatView {
     pub offer_revision: i64,
     pub is_free: bool,
     pub can_rent: bool,
+    pub seller_approval_required: bool,
     pub read_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retired_at: Option<String>,
@@ -1419,7 +1420,7 @@ impl AppStore {
                         .transpose()?,
                     None => None,
                 };
-                let base_can_rent = viewer.is_some_and(|session| {
+                let base_rent_prerequisites = viewer.is_some_and(|session| {
                     status == "active"
                         && share_status == "active"
                         && share_online
@@ -1427,10 +1428,11 @@ impl AppStore {
                         && seat_status == SEAT_AVAILABLE
                         && retired_at.is_none()
                         && session.user_id != owner_user_id
-                        && viewer_has_access
                         && !viewer_already_renting
                         && !viewer_has_direct_grant
                 });
+                let seller_approval_required = base_rent_prerequisites && !viewer_has_access;
+                let base_can_rent = base_rent_prerequisites && viewer_has_access;
                 let paid_credit_allowed = if daily_rate_minor.is_none() {
                     true
                 } else if !base_can_rent {
@@ -1473,6 +1475,7 @@ impl AppStore {
                     offer_revision,
                     is_free: daily_rate_minor.is_none(),
                     can_rent,
+                    seller_approval_required,
                     read_only,
                     retired_at,
                     subscription,
@@ -6883,6 +6886,15 @@ mod tests {
                 .seats[0]
                 .can_rent
         );
+        assert!(
+            blocked_catalog
+                .listings
+                .iter()
+                .find(|listing| listing.share_id == "share-canrent-b")
+                .expect("listing b for blocked approval state")
+                .seats[0]
+                .seller_approval_required
+        );
 
         let granted_catalog = store
             .share_market_catalog(
@@ -6902,6 +6914,15 @@ mod tests {
                 .expect("listing b for granted")
                 .seats[0]
                 .can_rent
+        );
+        assert!(
+            !granted_catalog
+                .listings
+                .iter()
+                .find(|listing| listing.share_id == "share-canrent-b")
+                .expect("listing b for direct grant approval state")
+                .seats[0]
+                .seller_approval_required
         );
     }
 

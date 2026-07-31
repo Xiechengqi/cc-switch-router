@@ -1379,6 +1379,7 @@ export type ClientMarketHost = {
   offerRevision: number;
   paymentMethodKinds: string[];
   contacts?: PaymentContact[];
+  sellerApprovalRequired?: boolean;
   countryCode?: string;
   hostname?: string;
   sshHostKeyFingerprint?: string;
@@ -1817,6 +1818,7 @@ export type ShareMarketSeat = ShareMarketSeatInput & {
   offerRevision: number;
   isFree: boolean;
   canRent: boolean;
+  sellerApprovalRequired: boolean;
   readOnly: boolean;
   retiredAt?: string;
   subscription?: ShareMarketSubscription;

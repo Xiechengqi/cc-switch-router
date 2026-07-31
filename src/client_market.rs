@@ -826,6 +826,8 @@ struct RouterSshHostView {
     payment_method_kinds: Vec<String>,
     #[serde(default)]
     contacts: Vec<crate::client_market_trade::PaymentContact>,
+    #[serde(default)]
+    seller_approval_required: bool,
     country_code: Option<String>,
     hostname: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -858,6 +860,20 @@ struct RouterSshHostView {
     updated_at: Option<String>,
 }
 
+fn host_seller_approval_required(
+    has_viewer: bool,
+    is_host_owner: bool,
+    is_idle: bool,
+    provider_id: Option<&str>,
+    access_by_provider: &HashMap<String, bool>,
+) -> bool {
+    has_viewer
+        && !is_host_owner
+        && is_idle
+        && provider_id
+            .is_some_and(|provider_id| access_by_provider.get(provider_id) == Some(&false))
+}
+
 async fn list_hosts(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -872,6 +888,27 @@ async fn list_hosts(
             query.status.as_deref(),
         )
         .await?;
+    let mut access_by_provider = HashMap::new();
+    if let Some(session) = viewer.as_ref() {
+        let conn = state.store.conn.lock().await;
+        for provider_id in hosts
+            .iter()
+            .filter(|host| host.status == HOST_STATUS_IDLE)
+            .filter_map(|host| host.provider_id.as_deref())
+        {
+            if access_by_provider.contains_key(provider_id) {
+                continue;
+            }
+            let allowed = crate::market_access::product_access_allowed_tx(
+                &conn,
+                provider_id,
+                &session.user_id,
+                &session.email,
+                crate::market_access::PRODUCT_CLIENT_HOST,
+            )?;
+            access_by_provider.insert(provider_id.to_string(), allowed);
+        }
+    }
     let views = hosts
         .into_iter()
         .map(|host| {
@@ -887,6 +924,13 @@ async fn list_hosts(
             let reveal_installation = reveal_operations || is_client_owner;
             // Web Terminal is host-owner only — not admins or client owners.
             let can_web_terminal = is_host_owner;
+            let seller_approval_required = host_seller_approval_required(
+                viewer.is_some(),
+                is_host_owner,
+                host.status == HOST_STATUS_IDLE,
+                host.provider_id.as_deref(),
+                &access_by_provider,
+            );
             let ip_intel = host_ip_intel_for_viewer(
                 host.ip_intel_json.as_deref(),
                 &host.ip,
@@ -907,6 +951,7 @@ async fn list_hosts(
                 offer_revision: host.offer_revision,
                 payment_method_kinds: host.payment_method_kinds,
                 contacts: host.contacts,
+                seller_approval_required,
                 country_code: host.country_code,
                 hostname: host.hostname,
                 ssh_host_key_fingerprint: reveal_operations
@@ -3935,6 +3980,7 @@ fn host_to_view(host: RouterSshHostRecord, reveal: bool) -> RouterSshHostView {
         offer_revision: host.offer_revision,
         payment_method_kinds: host.payment_method_kinds,
         contacts: host.contacts,
+        seller_approval_required: false,
         country_code: host.country_code,
         hostname: host.hostname,
         ssh_host_key_fingerprint: reveal.then_some(host.ssh_host_key_fingerprint).flatten(),
@@ -7569,6 +7615,52 @@ mod tests {
     }
 
     #[test]
+    fn host_approval_flag_only_marks_authenticated_non_owners_without_access() {
+        let access = HashMap::from([
+            ("allowed-provider".to_string(), true),
+            ("blocked-provider".to_string(), false),
+        ]);
+        assert!(host_seller_approval_required(
+            true,
+            false,
+            true,
+            Some("blocked-provider"),
+            &access,
+        ));
+        assert!(!host_seller_approval_required(
+            false,
+            false,
+            true,
+            Some("blocked-provider"),
+            &access,
+        ));
+        assert!(!host_seller_approval_required(
+            true,
+            true,
+            true,
+            Some("blocked-provider"),
+            &access,
+        ));
+        assert!(!host_seller_approval_required(
+            true,
+            false,
+            true,
+            Some("allowed-provider"),
+            &access,
+        ));
+        assert!(!host_seller_approval_required(
+            true,
+            false,
+            false,
+            Some("blocked-provider"),
+            &access,
+        ));
+        assert!(!host_seller_approval_required(
+            true, false, true, None, &access,
+        ));
+    }
+
+    #[test]
     fn public_host_views_hide_operational_and_owner_details() {
         let host = RouterSshHostRecord {
             id: "host-id".into(),
@@ -7647,6 +7739,12 @@ mod tests {
             Some("public-client")
         );
         assert!(public.get("paymentMethods").is_none());
+        assert_eq!(
+            public
+                .get("sellerApprovalRequired")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
         let private = serde_json::to_value(host_to_view(host, true)).unwrap();
         assert_eq!(
             private.get("ip").and_then(|value| value.as_str()),

@@ -6,6 +6,7 @@ import { CheckSquare, ChevronLeft, ChevronRight, Download, Loader2, Plus, Refres
 import { useAuth } from "@/components/auth/auth-provider";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
+import { SellerApprovalDialog } from "@/components/common/seller-approval-dialog";
 import { CreateClientDialog } from "@/components/dashboard/create-client-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
@@ -96,6 +97,7 @@ export function ClientMarketPage() {
   const [page, setPage] = React.useState(1);
   const [error, setError] = React.useState("");
   const [fixedHost, setFixedHost] = React.useState<ClientMarketHost | null>(null);
+  const [approvalHost, setApprovalHost] = React.useState<ClientMarketHost | null>(null);
   const [transferBusy, setTransferBusy] = React.useState(false);
   const [importOpen, setImportOpen] = React.useState(false);
   const [exportOpen, setExportOpen] = React.useState(false);
@@ -116,6 +118,13 @@ export function ClientMarketPage() {
     if (ids.size !== before) setRowUiBusyCount(ids.size);
   }, []);
 
+  const openCreateForHost = React.useCallback((host: ClientMarketHost) => {
+    if (host.sellerApprovalRequired === true) {
+      setApprovalHost(host);
+      return;
+    }
+    setFixedHost(host);
+  }, []);
 
   const load = React.useCallback(
     async (options?: { silent?: boolean }) => {
@@ -286,6 +295,7 @@ export function ClientMarketPage() {
     importOpen ||
     exportOpen ||
     !!fixedHost ||
+    !!approvalHost ||
     rowUiBusyCount > 0;
 
   React.useEffect(() => {
@@ -778,7 +788,7 @@ export function ClientMarketPage() {
                     onSelectedChange={batch.setHostSelected}
                     selectionDisabled={batch.batchBusy}
                     onChanged={silentRefresh}
-                    onCreate={setFixedHost}
+                    onCreate={openCreateForHost}
                     onUiBusyChange={setRowUiBusy}
                   />
                 ))}
@@ -851,6 +861,15 @@ export function ClientMarketPage() {
         onOpenChange={(next) => { if (!next) setFixedHost(null); }}
         fixedHost={fixedHost}
         onCreated={() => void silentRefresh()}
+        onSellerApprovalRequired={setApprovalHost}
+      />
+      <SellerApprovalDialog
+        open={!!approvalHost}
+        product="clientHost"
+        ownerEmail={approvalHost?.hostOwnerEmail || ""}
+        buyerEmail={viewerEmail || ""}
+        contacts={approvalHost?.contacts}
+        onOpenChange={(next) => { if (!next) setApprovalHost(null); }}
       />
       <Modal.Backdrop
         isOpen={importOpen}

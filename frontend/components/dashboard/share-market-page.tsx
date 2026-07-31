@@ -30,6 +30,10 @@ import { CompactSelect } from "@/components/common/compact-select";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
 import {
+  isSellerApprovalRequiredError,
+  SellerApprovalDialog,
+} from "@/components/common/seller-approval-dialog";
+import {
   ProviderContactButton,
 } from "@/components/common/provider-contacts";
 import { ShareAppLogo } from "@/components/dashboard/share-app-logo";
@@ -650,10 +654,11 @@ function seatRentAction(
   listing: ShareMarketListing,
   seat: ShareMarketSeat,
   authed: boolean,
-): "rent" | "login" | null {
+): "rent" | "approval" | "login" | null {
   if (listing.isOwner) return null;
   if (listing.status !== "active" || seat.status !== "available") return null;
   if (seat.canRent) return "rent";
+  if (authed && seat.sellerApprovalRequired) return "approval";
   if (!authed && guestCanSeeAvailable(listing, seat)) return "login";
   return null;
 }
@@ -703,6 +708,7 @@ function buildSeatRows(
           offerRevision: subscription.offerRevision,
           isFree: subscription.dailyRateMinor == null,
           canRent: false,
+          sellerApprovalRequired: false,
           readOnly: isTerminalSubscription(subscription.status),
           retiredAt: subscription.releasedAt,
           parallelLimit: undefined,
@@ -838,6 +844,7 @@ export function ShareMarketPage() {
   const [addOpen, setAddOpen] = React.useState(false);
   const [seatDialog, setSeatDialog] = React.useState<{ listingId: string; seat?: ShareMarketSeat; supportedPeriods?: ShareTokenPeriod[] } | null>(null);
   const [confirmAction, setConfirmAction] = React.useState<ConfirmAction | null>(null);
+  const [approvalListing, setApprovalListing] = React.useState<ShareMarketListing | null>(null);
   const [busyId, setBusyId] = React.useState("");
   const focusedRef = React.useRef<string>("");
 
@@ -894,21 +901,29 @@ export function ShareMarketPage() {
   React.useEffect(() => { void load(); }, [load, session?.user?.id]);
   React.useEffect(() => {
     const timer = window.setInterval(() => {
-      if (!addOpen && !seatDialog && !confirmAction && !busyId) {
+      if (!addOpen && !seatDialog && !confirmAction && !approvalListing && !busyId) {
         void load(true);
       }
     }, 5_000);
     return () => window.clearInterval(timer);
-  }, [addOpen, busyId, confirmAction, load, seatDialog]);
+  }, [addOpen, approvalListing, busyId, confirmAction, load, seatDialog]);
 
-  const act = async (id: string, action: () => Promise<unknown>) => {
+  const act = async (
+    id: string,
+    action: () => Promise<unknown>,
+    approvalFallback?: ShareMarketListing,
+  ) => {
     if (busyId) return;
     setBusyId(id);
     try {
       await action();
       await load(true);
     } catch (reason) {
-      toast.danger(reason instanceof Error ? reason.message : String(reason));
+      if (approvalFallback && isSellerApprovalRequiredError(reason)) {
+        setApprovalListing(approvalFallback);
+      } else {
+        toast.danger(reason instanceof Error ? reason.message : String(reason));
+      }
     } finally {
       setBusyId("");
     }
@@ -1169,10 +1184,24 @@ export function ShareMarketPage() {
             isDisabled={!!busyId}
             onClick={() => {
               if (!listing.shareOnline) toast.info(t("shareMarket.rentOfflineHint"));
-              void act(seat.id, () => rentShareMarketSeat(seat.id, seat.offerRevision));
+              void act(
+                seat.id,
+                () => rentShareMarketSeat(seat.id, seat.offerRevision),
+                listing,
+              );
             }}
           >
             {busyId === seat.id ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+            {t("shareMarket.rent")}
+          </Button>
+        ) : null}
+        {rentAction === "approval" ? (
+          <Button
+            size="sm"
+            variant="outline"
+            isDisabled={!!busyId}
+            onClick={() => setApprovalListing(listing)}
+          >
             {t("shareMarket.rent")}
           </Button>
         ) : null}
@@ -1708,6 +1737,15 @@ export function ShareMarketPage() {
 
       <AddListingDialog open={addOpen} onOpenChange={setAddOpen} onSaved={() => void load(true)} />
       <SeatDialog open={!!seatDialog} listingId={seatDialog?.listingId || ""} seat={seatDialog?.seat} supportedPeriods={seatDialog?.supportedPeriods} onOpenChange={(next) => !next && setSeatDialog(null)} onSaved={() => void load(true)} />
+      <SellerApprovalDialog
+        open={!!approvalListing}
+        product="share"
+        ownerEmail={approvalListing?.ownerEmail || ""}
+        buyerEmail={session?.user?.email || ""}
+        contacts={approvalListing?.contacts}
+        onOpenChange={(next) => { if (!next) setApprovalListing(null); }}
+        onOpenChat={() => approvalListing ? openChat(approvalListing.installationId) : undefined}
+      />
       <ConfirmAlertDialog
         open={!!confirmAction}
         title={confirmAction?.title || ""}
