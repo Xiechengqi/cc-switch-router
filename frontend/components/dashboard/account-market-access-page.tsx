@@ -18,7 +18,9 @@ import { useAuth } from "@/components/auth/auth-provider";
 import { SegmentedControl } from "@/components/common/segmented-control";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
+  approveMarketAccessRequest,
   getMarketAccessDashboard,
+  rejectMarketAccessRequest,
   updateMarketAccessPolicy,
   updateMarketCounterparty,
   updateMarketCounterpartyCredit,
@@ -27,6 +29,7 @@ import {
 } from "@/lib/api";
 import type {
   MarketAccessDashboard,
+  MarketAccessRequest,
   MarketAccessDecision,
   MarketAccessPolicy,
   MarketAccessPricingKind,
@@ -61,6 +64,13 @@ type CounterpartyChange = {
     decision: MarketAccessDecision;
   }>;
   creditCurrencies: Currency[];
+};
+
+type AccessRequestGroup = {
+  key: string;
+  buyerEmail: string;
+  buyerUserId: string;
+  requests: MarketAccessRequest[];
 };
 
 const ACCESS_SCOPES: ReadonlyArray<{
@@ -139,6 +149,36 @@ function buildCounterpartyDrafts(counterparties: MarketCounterparty[]) {
   return Object.fromEntries(
     counterparties.map((counterparty) => [counterparty.id, buildCounterpartyDraft(counterparty)]),
   ) as Record<string, CounterpartyDraft>;
+}
+
+function sameBuyer(
+  leftUserId: string | undefined,
+  leftEmail: string,
+  rightUserId: string | undefined,
+  rightEmail: string,
+) {
+  return (!!leftUserId && !!rightUserId && leftUserId === rightUserId)
+    || leftEmail.trim().toLowerCase() === rightEmail.trim().toLowerCase();
+}
+
+function groupAccessRequests(requests: MarketAccessRequest[]): AccessRequestGroup[] {
+  const groups = new Map<string, AccessRequestGroup>();
+  for (const request of requests) {
+    const key = request.buyerUserId || request.buyerEmail.trim().toLowerCase();
+    const group = groups.get(key) || {
+      key,
+      buyerEmail: request.buyerEmail,
+      buyerUserId: request.buyerUserId,
+      requests: [],
+    };
+    group.requests.push(request);
+    groups.set(key, group);
+  }
+  return Array.from(groups.values()).sort((left, right) => {
+    const leftTime = left.requests[0]?.requestedAt || "";
+    const rightTime = right.requests[0]?.requestedAt || "";
+    return rightTime.localeCompare(leftTime) || left.buyerEmail.localeCompare(right.buyerEmail);
+  });
 }
 
 function creditChanged(line: MarketCreditLine | undefined, draft: CreditDraft) {
@@ -381,16 +421,76 @@ export function AccountMarketAccessPage() {
     () => counterpartyChanges.filter(({ change }) => hasCounterpartyChange(change)),
     [counterpartyChanges],
   );
+  const requestGroups = React.useMemo(
+    () => groupAccessRequests(dashboard?.accessRequests || []),
+    [dashboard?.accessRequests],
+  );
+  const requestsByCounterparty = React.useMemo(
+    () => new Map((dashboard?.counterparties || []).map((counterparty) => [
+      counterparty.id,
+      (dashboard?.accessRequests || []).filter((request) => sameBuyer(
+        counterparty.buyerUserId,
+        counterparty.buyerEmail,
+        request.buyerUserId,
+        request.buyerEmail,
+      )),
+    ])),
+    [dashboard?.accessRequests, dashboard?.counterparties],
+  );
+  const orphanRequestGroups = React.useMemo(
+    () => requestGroups.filter((group) => !(dashboard?.counterparties || []).some(
+      (counterparty) => sameBuyer(
+        counterparty.buyerUserId,
+        counterparty.buyerEmail,
+        group.buyerUserId,
+        group.buyerEmail,
+      ),
+    )),
+    [dashboard?.counterparties, requestGroups],
+  );
+  const dirtyCounterpartyIds = React.useMemo(
+    () => new Set(changedCounterparties.map(({ counterparty }) => counterparty.id)),
+    [changedCounterparties],
+  );
   const normalizedBuyerQuery = buyerQuery.trim().toLowerCase();
   const visibleCounterparties = React.useMemo(() => {
     if (!normalizedBuyerQuery) return dashboard?.counterparties || [];
-    return (dashboard?.counterparties || []).filter((counterparty) =>
-      [counterparty.buyerEmail, counterparty.buyerUserId || "", counterparty.status]
+    return (dashboard?.counterparties || []).filter((counterparty) => {
+      const requests = requestsByCounterparty.get(counterparty.id) || [];
+      return [
+        counterparty.buyerEmail,
+        counterparty.buyerUserId || "",
+        counterparty.status,
+        ...requests.flatMap((request) => [
+          request.productKind,
+          request.pricingKind,
+          request.currency || "",
+          "requested",
+        ]),
+      ]
+        .join(" ")
+        .toLowerCase()
+        .includes(normalizedBuyerQuery);
+    });
+  }, [dashboard?.counterparties, normalizedBuyerQuery, requestsByCounterparty]);
+  const visibleOrphanRequestGroups = React.useMemo(() => {
+    if (!normalizedBuyerQuery) return orphanRequestGroups;
+    return orphanRequestGroups.filter((group) =>
+      [
+        group.buyerEmail,
+        group.buyerUserId,
+        ...group.requests.flatMap((request) => [
+          request.productKind,
+          request.pricingKind,
+          request.currency || "",
+          "requested",
+        ]),
+      ]
         .join(" ")
         .toLowerCase()
         .includes(normalizedBuyerQuery),
     );
-  }, [dashboard?.counterparties, normalizedBuyerQuery]);
+  }, [normalizedBuyerQuery, orphanRequestGroups]);
 
   const updateCounterpartyDraft = React.useCallback(
     (id: string, update: (draft: CounterpartyDraft) => CounterpartyDraft) => {
@@ -405,18 +505,50 @@ export function AccountMarketAccessPage() {
 
   const updateDashboardPreservingDrafts = React.useCallback(
     (nextDashboard: MarketAccessDashboard) => {
+      const previousById = new Map(
+        (dashboard?.counterparties || []).map((counterparty) => [counterparty.id, counterparty]),
+      );
       setDashboard(nextDashboard);
       setCounterpartyDrafts((current) =>
         Object.fromEntries(
-          nextDashboard.counterparties.map((counterparty) => [
-            counterparty.id,
-            current[counterparty.id] || buildCounterpartyDraft(counterparty),
-          ]),
+          nextDashboard.counterparties.map((counterparty) => {
+            const previous = previousById.get(counterparty.id);
+            const draft = current[counterparty.id];
+            const preserve = !!previous && !!draft && hasCounterpartyChange(counterpartyChange(previous, draft));
+            return [
+              counterparty.id,
+              preserve ? draft : buildCounterpartyDraft(counterparty),
+            ];
+          }),
         ) as Record<string, CounterpartyDraft>,
       );
     },
-    [],
+    [dashboard?.counterparties],
   );
+
+  React.useEffect(() => {
+    if (!authed) return;
+    let active = true;
+    const timer = window.setInterval(() => {
+      if (busy) return;
+      void getMarketAccessDashboard()
+        .then((nextDashboard) => {
+          if (!active) return;
+          if (changedCounterparties.length > 0) {
+            setDashboard((current) => current
+              ? { ...current, accessRequests: nextDashboard.accessRequests }
+              : nextDashboard);
+            return;
+          }
+          updateDashboardPreservingDrafts(nextDashboard);
+        })
+        .catch(() => undefined);
+    }, 15_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [authed, busy, changedCounterparties.length, updateDashboardPreservingDrafts]);
 
   const applyPolicy = async (policy: MarketAccessPolicy, mode: "whitelist" | "blacklist", acknowledged = false) => {
     setBusy(`policy:${policy.productKind}:${policy.pricingKind}`);
@@ -491,6 +623,84 @@ export function AccountMarketAccessPage() {
       setBusy("");
     }
   };
+
+  const resolveAccessRequest = async (
+    request: MarketAccessRequest,
+    action: "approve" | "reject",
+  ) => {
+    const buyerHasUnsavedChanges = changedCounterparties.some(({ counterparty }) => sameBuyer(
+      counterparty.buyerUserId,
+      counterparty.buyerEmail,
+      request.buyerUserId,
+      request.buyerEmail,
+    ));
+    if (buyerHasUnsavedChanges) {
+      toast.info(t("marketAccess.requestSaveDraftFirst"));
+      return;
+    }
+    setBusy(`request:${action}:${request.id}`);
+    try {
+      const nextDashboard = action === "approve"
+        ? await approveMarketAccessRequest(request.id, request.revision)
+        : await rejectMarketAccessRequest(request.id, request.revision);
+      updateDashboardPreservingDrafts(nextDashboard);
+      toast.success(
+        t(action === "approve" ? "marketAccess.requestApproved" : "marketAccess.requestRejected", {
+          email: request.buyerEmail,
+        }),
+      );
+    } catch (error) {
+      toast.danger(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const renderAccessRequests = (requests: MarketAccessRequest[], buyerHasUnsavedChanges: boolean) => (
+    <div className="grid gap-2">
+      {requests.map((request) => {
+        const actionBusy = busy.endsWith(`:${request.id}`);
+        const disabled = !!busy || buyerHasUnsavedChanges;
+        return (
+          <div key={request.id} className="grid gap-1.5 rounded-md border border-sky-200 bg-sky-50 px-2.5 py-2">
+            <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-[11px] text-sky-900">
+              <Chip size="sm" variant="soft" className="bg-sky-100 text-sky-800">
+                {t("marketAccess.status.requested")}
+              </Chip>
+              <span>
+                {t(request.productKind === "share" ? "marketAccess.product.share" : "marketAccess.product.clientHost")}
+                {" · "}
+                {t(request.pricingKind === "free" ? "marketAccess.pricing.free" : "marketAccess.pricing.paid")}
+                {request.currency ? ` · ${request.currency}` : ""}
+              </span>
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              <Button
+                size="sm"
+                variant="primary"
+                className="h-7 px-2 text-xs"
+                isDisabled={disabled}
+                onClick={() => void resolveAccessRequest(request, "approve")}
+              >
+                {actionBusy && busy.includes(":approve:") ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Check className="h-3.5 w-3.5" />}
+                {t("marketAccess.approve")}
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 px-2 text-xs"
+                isDisabled={disabled}
+                onClick={() => void resolveAccessRequest(request, "reject")}
+              >
+                {actionBusy && busy.includes(":reject:") ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <X className="h-3.5 w-3.5" />}
+                {t("marketAccess.reject")}
+              </Button>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
 
   const resetCounterpartyChanges = () => {
     setCounterpartyDrafts(buildCounterpartyDrafts(dashboard?.counterparties || []));
@@ -770,10 +980,11 @@ export function AccountMarketAccessPage() {
 
           <div className="overflow-hidden rounded-lg border border-border bg-white">
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[1460px] table-fixed border-collapse text-sm">
+              <table className="w-full min-w-[1700px] table-fixed border-collapse text-sm">
                 <colgroup>
-                  <col className="w-[230px]" />
+                  <col className="w-[220px]" />
                   <col className="w-[120px]" />
+                  <col className="w-[250px]" />
                   <col className="w-[230px]" />
                   <col className="w-[230px]" />
                   <col className="w-[230px]" />
@@ -784,6 +995,7 @@ export function AccountMarketAccessPage() {
                   <tr>
                     <th className="px-3 py-2.5">{t("marketAccess.table.buyer")}</th>
                     <th className="px-3 py-2.5">{t("marketAccess.table.status")}</th>
+                    <th className="px-3 py-2.5">{t("marketAccess.table.application")}</th>
                     <th className="px-3 py-2.5">{t("marketAccess.product.share")}</th>
                     <th className="px-3 py-2.5">{t("marketAccess.product.clientHost")}</th>
                     <th className="px-3 py-2.5">CNY {t("marketAccess.creditType")}</th>
@@ -792,12 +1004,34 @@ export function AccountMarketAccessPage() {
                   </tr>
                 </thead>
                 <tbody>
+                  {visibleOrphanRequestGroups.map((group) => (
+                    <tr key={`request:${group.key}`} className="border-t border-sky-200 bg-sky-50/30 align-top">
+                      <td className="px-3 py-3">
+                        <strong className="block break-all text-sm font-medium text-foreground">
+                          {group.buyerEmail}
+                        </strong>
+                        {group.buyerUserId ? (
+                          <span className="mt-1 block truncate font-mono text-[10px] text-muted-foreground" title={group.buyerUserId}>
+                            {group.buyerUserId}
+                          </span>
+                        ) : null}
+                      </td>
+                      <td className="px-3 py-3">
+                        <Chip size="sm" variant="soft" className="bg-sky-100 text-sky-800">
+                          {t("marketAccess.status.requested")}
+                        </Chip>
+                      </td>
+                      <td className="px-3 py-3">{renderAccessRequests(group.requests, false)}</td>
+                      <td colSpan={5} className="px-3 py-3 text-center text-muted-foreground">-</td>
+                    </tr>
+                  ))}
                   {visibleCounterparties.map((counterparty) => {
                     const draft =
                       counterpartyDrafts[counterparty.id] || buildCounterpartyDraft(counterparty);
                     const change = counterpartyChange(counterparty, draft);
                     const rowChanged = hasCounterpartyChange(change);
                     const editorDisabled = draft.status === "revoked" || !!busy;
+                    const accessRequests = requestsByCounterparty.get(counterparty.id) || [];
                     return (
                       <tr
                         key={counterparty.id}
@@ -850,6 +1084,13 @@ export function AccountMarketAccessPage() {
                                 : t("marketAccess.status.revoked")}
                             </Chip>
                           </div>
+                        </td>
+                        <td className="px-3 py-3">
+                          {accessRequests.length ? (
+                            renderAccessRequests(accessRequests, dirtyCounterpartyIds.has(counterparty.id))
+                          ) : (
+                            <span className="text-muted-foreground">-</span>
+                          )}
                         </td>
                         {(["share", "client_host"] as const).map((productKind) => (
                           <td key={productKind} className="px-3 py-3">
@@ -927,10 +1168,10 @@ export function AccountMarketAccessPage() {
                       </tr>
                     );
                   })}
-                  {visibleCounterparties.length === 0 ? (
+                  {visibleCounterparties.length === 0 && visibleOrphanRequestGroups.length === 0 ? (
                     <tr>
-                      <td colSpan={7} className="px-4 py-12 text-center text-sm text-muted-foreground">
-                        {dashboard?.counterparties.length
+                      <td colSpan={8} className="px-4 py-12 text-center text-sm text-muted-foreground">
+                        {(dashboard?.counterparties.length || dashboard?.accessRequests.length)
                           ? t("marketAccess.noMatches")
                           : t("marketAccess.empty")}
                       </td>

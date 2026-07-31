@@ -8,7 +8,7 @@ import { CompactRegionMultiSelect } from "@/components/common/compact-region-mul
 import { CountryFlag } from "@/components/common/country-flag";
 import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
 import { SegmentedControl } from "@/components/common/segmented-control";
-import { isSellerApprovalRequiredError } from "@/components/common/seller-approval-dialog";
+import { marketEligibilityFromError } from "@/components/common/seller-approval-dialog";
 import { buildClientInstallCommand } from "@/components/dashboard/install-guide-dialog";
 import { ProvisionJobLog } from "@/components/dashboard/provision-job-log";
 import { useLocaleText } from "@/components/i18n/locale-provider";
@@ -117,13 +117,13 @@ export function CreateClientDialog({
   onOpenChange,
   fixedHost,
   onCreated,
-  onSellerApprovalRequired,
+  onMarketEligibilityRequired,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   fixedHost?: ClientMarketHost | null;
   onCreated?: () => void;
-  onSellerApprovalRequired?: (host: ClientMarketHost) => void;
+  onMarketEligibilityRequired?: (host: ClientMarketHost, eligibility: ClientMarketHost["eligibility"]) => void;
 }) {
   const { locale, t } = useLocaleText();
   const { session, loading: authLoading } = useAuth();
@@ -415,13 +415,14 @@ export function CreateClientDialog({
     return () => window.clearTimeout(timer);
   }, [drafts, open, phase, quote, t]);
 
-  const routeSellerApprovalError = (reason: unknown) => {
-    if (!fixedHost || !onSellerApprovalRequired || !isSellerApprovalRequiredError(reason)) {
+  const routeMarketEligibilityError = (reason: unknown) => {
+    const eligibility = marketEligibilityFromError(reason);
+    if (!fixedHost || !onMarketEligibilityRequired || !eligibility) {
       return false;
     }
     if (quote) void cancelClientMarketQuote(quote.id).catch(() => undefined);
     onOpenChange(false);
-    onSellerApprovalRequired(fixedHost);
+    onMarketEligibilityRequired(fixedHost, eligibility);
     return true;
   };
 
@@ -430,9 +431,9 @@ export function CreateClientDialog({
       window.dispatchEvent(new Event("router-open-login"));
       return;
     }
-    if (fixedHost?.sellerApprovalRequired === true) {
+    if (fixedHost && !fixedHost.eligibility.allowed) {
       onOpenChange(false);
-      onSellerApprovalRequired?.(fixedHost);
+      onMarketEligibilityRequired?.(fixedHost, fixedHost.eligibility);
       return;
     }
     if ((!fixedHost && (!selectedProviderIds.length || !selectedCountryCodes.length)) || capacity < quantity) {
@@ -461,7 +462,7 @@ export function CreateClientDialog({
       setSubdomainChecks({});
       setPhase("quote");
     } catch (reason) {
-      if (!routeSellerApprovalError(reason)) {
+      if (!routeMarketEligibilityError(reason)) {
         setError(reason instanceof Error ? reason.message : String(reason));
       }
     } finally {
@@ -547,7 +548,7 @@ export function CreateClientDialog({
       const generation = pollGeneration.current;
       void pollJobs(response.jobIds, generation);
     } catch (reason) {
-      if (!routeSellerApprovalError(reason)) {
+      if (!routeMarketEligibilityError(reason)) {
         setError(reason instanceof Error ? reason.message : String(reason));
       }
     } finally {

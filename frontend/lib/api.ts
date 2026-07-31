@@ -67,6 +67,7 @@ import type {
   MarketBillingDashboard,
   MarketBillingInvoiceHistory,
   MarketAccessDashboard,
+  MarketAccessRequest,
   MarketCounterparty,
   MarketAccessDecision,
   MarketAccessPricingKind,
@@ -75,10 +76,34 @@ import type {
 } from "@/lib/types";
 
 
+export class ApiError extends Error {
+  readonly status: number;
+  readonly code?: string;
+  readonly details?: Record<string, unknown>;
+
+  constructor(
+    status: number,
+    message: string,
+    code?: string,
+    details?: Record<string, unknown>,
+  ) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.code = code;
+    this.details = details;
+  }
+}
+
 export async function parseJson<T>(response: Response): Promise<T> {
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(data?.message || `HTTP ${response.status}`);
+    throw new ApiError(
+      response.status,
+      data?.message || `HTTP ${response.status}`,
+      typeof data?.code === "string" ? data.code : undefined,
+      data?.details && typeof data.details === "object" ? data.details : undefined,
+    );
   }
   return data as T;
 }
@@ -969,6 +994,49 @@ export async function updateMarketPublicCredit(
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function createMarketAccessRequest(body: {
+  targetKind: "share_seat" | "client_host";
+  targetId: string;
+}) {
+  return parseJson<MarketAccessRequest>(
+    await authFetch("/v1/market-access/requests", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function approveMarketAccessRequest(id: string, expectedRevision: number) {
+  return parseJson<MarketAccessDashboard>(
+    await authFetch(`/v1/market-access/requests/${encodeURIComponent(id)}/approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedRevision }),
+    }),
+  );
+}
+
+export async function rejectMarketAccessRequest(id: string, expectedRevision: number) {
+  return parseJson<MarketAccessDashboard>(
+    await authFetch(`/v1/market-access/requests/${encodeURIComponent(id)}/reject`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedRevision }),
+    }),
+  );
+}
+
+export async function cancelMarketAccessRequest(id: string, expectedRevision: number) {
+  return parseJson<MarketAccessRequest>(
+    await authFetch(`/v1/market-access/requests/${encodeURIComponent(id)}/cancel`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedRevision }),
     }),
   );
 }

@@ -31,8 +31,8 @@ import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
 import { SegmentedControl } from "@/components/common/segmented-control";
 import {
-  isSellerApprovalRequiredError,
-  SellerApprovalDialog,
+  MarketAccessDialog,
+  marketEligibilityFromError,
 } from "@/components/common/seller-approval-dialog";
 import {
   ProviderContactButton,
@@ -73,6 +73,7 @@ import type {
   ShareMarketSubscription,
   ShareTokenPeriod,
   ShareUpstreamProvider,
+  MarketEligibility,
 } from "@/lib/types";
 import type { AppLocale } from "@/lib/i18n";
 import { cn, compactTokens } from "@/lib/utils";
@@ -668,7 +669,10 @@ function isTerminalSubscription(status: string) {
 }
 
 function guestCanSeeAvailable(listing: ShareMarketListing, seat: ShareMarketSeat) {
-  return listing.status === "active" && listing.shareStatus === "active" && seat.status === "available";
+  return listing.status === "active"
+    && listing.shareStatus === "active"
+    && listing.shareOnline
+    && seat.status === "available";
 }
 
 /** Rent/login CTA for non-owners on available seats (same rules in seats + Share layouts). */
@@ -680,7 +684,7 @@ function seatRentAction(
   if (listing.isOwner) return null;
   if (listing.status !== "active" || seat.status !== "available") return null;
   if (seat.canRent) return "rent";
-  if (authed && seat.sellerApprovalRequired) return "approval";
+  if (authed && seat.rentPrerequisitesMet && !seat.eligibility.allowed) return "approval";
   if (!authed && guestCanSeeAvailable(listing, seat)) return "login";
   return null;
 }
@@ -730,7 +734,9 @@ function buildSeatRows(
           offerRevision: subscription.offerRevision,
           isFree: subscription.dailyRateMinor == null,
           canRent: false,
+          rentPrerequisitesMet: false,
           sellerApprovalRequired: false,
+          eligibility: { allowed: true, status: "allowed" },
           readOnly: isTerminalSubscription(subscription.status),
           retiredAt: subscription.releasedAt,
           parallelLimit: undefined,
@@ -867,7 +873,11 @@ export function ShareMarketPage() {
   const [addOpen, setAddOpen] = React.useState(false);
   const [seatDialog, setSeatDialog] = React.useState<{ listingId: string; seat?: ShareMarketSeat; supportedPeriods?: ShareTokenPeriod[] } | null>(null);
   const [confirmAction, setConfirmAction] = React.useState<ConfirmAction | null>(null);
-  const [approvalListing, setApprovalListing] = React.useState<ShareMarketListing | null>(null);
+  const [accessDialog, setAccessDialog] = React.useState<{
+    listing: ShareMarketListing;
+    seat: ShareMarketSeat;
+    eligibility: MarketEligibility;
+  } | null>(null);
   const [busyId, setBusyId] = React.useState("");
   const focusedRef = React.useRef<string>("");
 
@@ -924,17 +934,17 @@ export function ShareMarketPage() {
   React.useEffect(() => { void load(); }, [load, session?.user?.id]);
   React.useEffect(() => {
     const timer = window.setInterval(() => {
-      if (!addOpen && !seatDialog && !confirmAction && !approvalListing && !busyId) {
+      if (!addOpen && !seatDialog && !confirmAction && !accessDialog && !busyId) {
         void load(true);
       }
     }, 5_000);
     return () => window.clearInterval(timer);
-  }, [addOpen, approvalListing, busyId, confirmAction, load, seatDialog]);
+  }, [accessDialog, addOpen, busyId, confirmAction, load, seatDialog]);
 
   const act = async (
     id: string,
     action: () => Promise<unknown>,
-    approvalFallback?: ShareMarketListing,
+    accessFallback?: { listing: ShareMarketListing; seat: ShareMarketSeat },
   ) => {
     if (busyId) return;
     setBusyId(id);
@@ -942,8 +952,9 @@ export function ShareMarketPage() {
       await action();
       await load(true);
     } catch (reason) {
-      if (approvalFallback && isSellerApprovalRequiredError(reason)) {
-        setApprovalListing(approvalFallback);
+      const eligibility = marketEligibilityFromError(reason);
+      if (accessFallback && eligibility) {
+        setAccessDialog({ ...accessFallback, eligibility });
       } else {
         toast.danger(reason instanceof Error ? reason.message : String(reason));
       }
@@ -1212,7 +1223,7 @@ export function ShareMarketPage() {
               void act(
                 seat.id,
                 () => rentShareMarketSeat(seat.id, seat.offerRevision),
-                listing,
+                { listing, seat },
               );
             }}
           >
@@ -1225,7 +1236,7 @@ export function ShareMarketPage() {
             size="sm"
             variant="outline"
             isDisabled={!!busyId}
-            onClick={() => setApprovalListing(listing)}
+            onClick={() => setAccessDialog({ listing, seat, eligibility: seat.eligibility })}
           >
             {t("shareMarket.rent")}
           </Button>
@@ -1764,14 +1775,19 @@ export function ShareMarketPage() {
 
       <AddListingDialog open={addOpen} onOpenChange={setAddOpen} onSaved={() => void load(true)} />
       <SeatDialog open={!!seatDialog} listingId={seatDialog?.listingId || ""} seat={seatDialog?.seat} supportedPeriods={seatDialog?.supportedPeriods} onOpenChange={(next) => !next && setSeatDialog(null)} onSaved={() => void load(true)} />
-      <SellerApprovalDialog
-        open={!!approvalListing}
+      <MarketAccessDialog
+        open={!!accessDialog}
         product="share"
-        ownerEmail={approvalListing?.ownerEmail || ""}
+        ownerEmail={accessDialog?.listing.ownerEmail || ""}
         buyerEmail={session?.user?.email || ""}
-        contacts={approvalListing?.contacts}
-        onOpenChange={(next) => { if (!next) setApprovalListing(null); }}
-        onOpenChat={() => approvalListing ? openChat(approvalListing.installationId) : undefined}
+        contacts={accessDialog?.listing.contacts}
+        targetKind="share_seat"
+        targetId={accessDialog?.seat.id || ""}
+        currency={accessDialog?.seat.currency}
+        eligibility={accessDialog?.eligibility || { allowed: false, status: "access_required" }}
+        onOpenChange={(next) => { if (!next) setAccessDialog(null); }}
+        onOpenChat={() => accessDialog ? openChat(accessDialog.listing.installationId) : undefined}
+        onRequested={() => void load(true)}
       />
       <ConfirmAlertDialog
         open={!!confirmAction}

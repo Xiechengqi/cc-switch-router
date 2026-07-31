@@ -100,7 +100,9 @@ pub struct SeatView {
     pub offer_revision: i64,
     pub is_free: bool,
     pub can_rent: bool,
+    pub rent_prerequisites_met: bool,
     pub seller_approval_required: bool,
+    pub eligibility: crate::market_access::MarketEligibilityView,
     pub read_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retired_at: Option<String>,
@@ -1362,7 +1364,6 @@ impl AppStore {
         drop(listings_statement);
 
         let mut listings = Vec::with_capacity(listing_rows.len());
-        let mut paid_credit_allowed_by_supplier_currency = BTreeMap::new();
         for (
             id,
             share_id,
@@ -1459,17 +1460,20 @@ impl AppStore {
                 retired_at,
             ) in seat_rows
             {
-                let viewer_has_access = if let Some(session) = viewer {
-                    crate::market_access::product_access_allowed_tx(
+                let eligibility = match viewer {
+                    Some(session) if session.user_id == owner_user_id => {
+                        crate::market_access::MarketEligibilityView::allowed()
+                    }
+                    Some(session) => crate::market_access::market_eligibility_tx(
                         &conn,
                         &owner_user_id,
                         &session.user_id,
                         &session.email,
                         crate::market_access::PRODUCT_SHARE,
-                        crate::market_access::pricing_kind_for_rate(daily_rate_minor),
-                    )?
-                } else {
-                    false
+                        daily_rate_minor,
+                        currency.as_deref(),
+                    )?,
+                    None => crate::market_access::MarketEligibilityView::login_required(),
                 };
                 let subscription = match current_subscription_id.or(retired_subscription_id) {
                     Some(subscription_id) => subscription_record(&conn, &subscription_id)?
@@ -1488,32 +1492,9 @@ impl AppStore {
                         && !viewer_already_renting
                         && !viewer_has_direct_grant
                 });
-                let seller_approval_required = base_rent_prerequisites && !viewer_has_access;
-                let base_can_rent = base_rent_prerequisites && viewer_has_access;
-                let paid_credit_allowed = if daily_rate_minor.is_none() {
-                    true
-                } else if !base_can_rent {
-                    false
-                } else if let (Some(session), Some(currency)) = (viewer, currency.as_deref()) {
-                    let key = (owner_user_id.clone(), currency.to_string());
-                    if let Some(allowed) = paid_credit_allowed_by_supplier_currency.get(&key) {
-                        *allowed
-                    } else {
-                        let allowed = crate::market_billing::credit_allowed_tx(
-                            &conn,
-                            &session.user_id,
-                            &session.email,
-                            &owner_user_id,
-                            crate::market_access::PRODUCT_SHARE,
-                            currency,
-                        )?;
-                        paid_credit_allowed_by_supplier_currency.insert(key, allowed);
-                        allowed
-                    }
-                } else {
-                    false
-                };
-                let can_rent = base_can_rent && paid_credit_allowed;
+                let seller_approval_required =
+                    base_rent_prerequisites && eligibility.status == "access_required";
+                let can_rent = base_rent_prerequisites && eligibility.allowed;
                 let read_only = retired_at.is_some();
                 seats.push(SeatView {
                     id: seat_id,
@@ -1534,7 +1515,9 @@ impl AppStore {
                     offer_revision,
                     is_free: daily_rate_minor.is_none(),
                     can_rent,
+                    rent_prerequisites_met: base_rent_prerequisites,
                     seller_approval_required,
+                    eligibility,
                     read_only,
                     retired_at,
                     subscription,
@@ -6274,12 +6257,14 @@ mod tests {
             .share_market_request_release(&owner, &subscription_id, true, true)
             .await
             .expect("force revoke and deny future access");
-        assert!(matches!(
-            store
-                .share_market_rent_seat(&renter, &seat_b, RentSeatRequest { offer_revision: 1 })
-                .await,
-            Err(AppError::Forbidden(_))
-        ));
+        let error = store
+            .share_market_rent_seat(&renter, &seat_b, RentSeatRequest { offer_revision: 1 })
+            .await
+            .expect_err("deny another Share rental after future access is revoked");
+        assert_eq!(
+            error.code(),
+            Some(crate::market_access::ERROR_MARKET_ACCESS_REQUIRED)
+        );
         {
             let conn = store.conn.lock().await;
             assert!(
@@ -7154,6 +7139,26 @@ mod tests {
                 .seats[0]
                 .seller_approval_required
         );
+        assert!(
+            blocked_catalog
+                .listings
+                .iter()
+                .find(|listing| listing.share_id == "share-canrent-b")
+                .expect("listing b for blocked prerequisites")
+                .seats[0]
+                .rent_prerequisites_met
+        );
+        assert_eq!(
+            blocked_catalog
+                .listings
+                .iter()
+                .find(|listing| listing.share_id == "share-canrent-b")
+                .expect("listing b for blocked eligibility")
+                .seats[0]
+                .eligibility
+                .status,
+            "access_required"
+        );
 
         let granted_catalog = store
             .share_market_catalog(
@@ -7182,6 +7187,26 @@ mod tests {
                 .expect("listing b for direct grant approval state")
                 .seats[0]
                 .seller_approval_required
+        );
+        assert!(
+            !granted_catalog
+                .listings
+                .iter()
+                .find(|listing| listing.share_id == "share-canrent-b")
+                .expect("listing b for direct grant prerequisites")
+                .seats[0]
+                .rent_prerequisites_met
+        );
+        assert_eq!(
+            granted_catalog
+                .listings
+                .iter()
+                .find(|listing| listing.share_id == "share-canrent-b")
+                .expect("listing b for direct grant eligibility")
+                .seats[0]
+                .eligibility
+                .status,
+            "allowed"
         );
     }
 
@@ -7221,6 +7246,17 @@ mod tests {
             .await
             .expect("catalog with available credit");
         assert!(can_rent_second(&catalog));
+        assert_eq!(
+            catalog
+                .listings
+                .iter()
+                .find(|listing| listing.share_id == "share-paid-canrent-b")
+                .expect("eligible second paid listing")
+                .seats[0]
+                .eligibility
+                .status,
+            "allowed"
+        );
 
         {
             let conn = store.conn.lock().await;
@@ -7237,6 +7273,17 @@ mod tests {
             .await
             .expect("catalog without credit");
         assert!(!can_rent_second(&catalog));
+        assert_eq!(
+            catalog
+                .listings
+                .iter()
+                .find(|listing| listing.share_id == "share-paid-canrent-b")
+                .expect("second paid listing without credit")
+                .seats[0]
+                .eligibility
+                .status,
+            "credit_required"
+        );
 
         {
             let conn = store.conn.lock().await;
@@ -7262,6 +7309,17 @@ mod tests {
             .await
             .expect("catalog for overdue buyer");
         assert!(!can_rent_second(&catalog));
+        assert_eq!(
+            catalog
+                .listings
+                .iter()
+                .find(|listing| listing.share_id == "share-paid-canrent-b")
+                .expect("second paid listing for overdue buyer")
+                .seats[0]
+                .eligibility
+                .status,
+            "buyer_restricted"
+        );
 
         {
             let conn = store.conn.lock().await;
@@ -7291,5 +7349,16 @@ mod tests {
             .await
             .expect("catalog after credit reduction");
         assert!(!can_rent_second(&catalog));
+        assert_eq!(
+            catalog
+                .listings
+                .iter()
+                .find(|listing| listing.share_id == "share-paid-canrent-b")
+                .expect("second paid listing at credit limit")
+                .seats[0]
+                .eligibility
+                .status,
+            "credit_limit_reached"
+        );
     }
 }

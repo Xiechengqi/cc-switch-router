@@ -2,7 +2,7 @@ use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -25,8 +25,21 @@ pub const DECISION_DENY: &str = "deny";
 pub const CREDIT_NONE: &str = "none";
 pub const CREDIT_LIMITED: &str = "limited";
 pub const CREDIT_UNLIMITED: &str = "unlimited";
+pub const ACCESS_REQUEST_REQUESTED: &str = "requested";
+pub const ACCESS_REQUEST_APPROVED: &str = "approved";
+pub const ACCESS_REQUEST_REJECTED: &str = "rejected";
+pub const ACCESS_REQUEST_CANCELLED: &str = "cancelled";
+pub const TARGET_SHARE_SEAT: &str = "share_seat";
+pub const TARGET_CLIENT_HOST: &str = "client_host";
+pub const ERROR_MARKET_ACCESS_REQUIRED: &str = "MARKET_ACCESS_REQUIRED";
+pub const ERROR_MARKET_CREDIT_REQUIRED: &str = "MARKET_CREDIT_REQUIRED";
+pub const ERROR_MARKET_BUYER_RESTRICTED: &str = "MARKET_BUYER_RESTRICTED";
+pub const ERROR_MARKET_SETTLEMENT_REQUIRED: &str = "MARKET_SETTLEMENT_REQUIRED";
+pub const ERROR_MARKET_CREDIT_LIMIT_REACHED: &str = "MARKET_CREDIT_LIMIT_REACHED";
+pub const ERROR_MARKET_RELATIONSHIP_CLOSED: &str = "MARKET_RELATIONSHIP_CLOSED";
 
 const MAX_CREDIT_LIMIT_MINOR: i64 = 100_000_000;
+const ACCESS_REQUEST_REAPPLY_COOLDOWN_HOURS: i64 = 24;
 
 const CREATE_SUPPLIER_ACCESS_POLICIES_TABLE: &str =
     "CREATE TABLE IF NOT EXISTS market_supplier_access_policies (
@@ -125,6 +138,67 @@ pub struct CounterpartyView {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AccessRequestView {
+    pub id: String,
+    pub supplier_user_id: String,
+    pub supplier_email: String,
+    pub buyer_user_id: String,
+    pub buyer_email: String,
+    pub product_kind: String,
+    pub pricing_kind: String,
+    pub target_kind: String,
+    pub target_id: String,
+    pub target_label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    pub status: String,
+    pub revision: i64,
+    pub requested_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_by_user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccessRequestSummaryView {
+    pub id: String,
+    pub status: String,
+    pub requested_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketEligibilityView {
+    pub allowed: bool,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request: Option<AccessRequestSummaryView>,
+}
+
+impl MarketEligibilityView {
+    pub(crate) fn allowed() -> Self {
+        Self {
+            allowed: true,
+            status: "allowed".into(),
+            request: None,
+        }
+    }
+
+    pub(crate) fn login_required() -> Self {
+        Self {
+            allowed: false,
+            status: "login_required".into(),
+            request: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PublicCreditLineView {
     pub currency: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -139,7 +213,21 @@ pub struct PublicCreditLineView {
 pub struct MarketAccessDashboardView {
     pub policies: Vec<AccessPolicyView>,
     pub counterparties: Vec<CounterpartyView>,
+    pub access_requests: Vec<AccessRequestView>,
     pub public_credit_lines: Vec<PublicCreditLineView>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateAccessRequest {
+    target_kind: String,
+    target_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ResolveAccessRequest {
+    expected_revision: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -382,7 +470,34 @@ pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         CREATE INDEX IF NOT EXISTS idx_market_counterparties_supplier_status
             ON market_counterparties(supplier_user_id, status, updated_at);
         CREATE INDEX IF NOT EXISTS idx_market_access_events_supplier
-            ON market_access_events(supplier_user_id, created_at);",
+            ON market_access_events(supplier_user_id, created_at);
+        CREATE TABLE IF NOT EXISTS market_access_requests (
+            id TEXT PRIMARY KEY,
+            supplier_user_id TEXT NOT NULL,
+            supplier_email TEXT NOT NULL,
+            buyer_user_id TEXT NOT NULL,
+            buyer_email TEXT NOT NULL,
+            product_kind TEXT NOT NULL CHECK (product_kind IN ('share', 'client_host')),
+            pricing_kind TEXT NOT NULL CHECK (pricing_kind IN ('free', 'paid')),
+            target_kind TEXT NOT NULL CHECK (target_kind IN ('share_seat', 'client_host')),
+            target_id TEXT NOT NULL,
+            target_label TEXT NOT NULL,
+            currency TEXT,
+            status TEXT NOT NULL CHECK (status IN ('requested', 'approved', 'rejected', 'cancelled')),
+            revision INTEGER NOT NULL DEFAULT 1,
+            requested_at TEXT NOT NULL,
+            resolved_at TEXT,
+            resolved_by_user_id TEXT,
+            resolution_reason TEXT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_market_access_request_requested
+            ON market_access_requests(
+                supplier_user_id, buyer_user_id, product_kind, pricing_kind
+            ) WHERE status = 'requested';
+        CREATE INDEX IF NOT EXISTS idx_market_access_requests_supplier
+            ON market_access_requests(supplier_user_id, status, requested_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_market_access_requests_buyer
+            ON market_access_requests(buyer_user_id, status, requested_at DESC);",
     )?;
     Ok(())
 }
@@ -409,6 +524,19 @@ pub fn router() -> Router<ServerState> {
         .route(
             "/v1/market-access/public-credit-lines/:currency",
             put(update_public_credit_line),
+        )
+        .route("/v1/market-access/requests", post(create_access_request))
+        .route(
+            "/v1/market-access/requests/:id/approve",
+            post(approve_access_request),
+        )
+        .route(
+            "/v1/market-access/requests/:id/reject",
+            post(reject_access_request),
+        )
+        .route(
+            "/v1/market-access/requests/:id/cancel",
+            post(cancel_access_request),
         )
 }
 
@@ -610,6 +738,46 @@ fn record_event_tx(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn resolve_matching_access_requests_tx(
+    tx: &Connection,
+    supplier_user_id: &str,
+    buyer_user_id: Option<&str>,
+    buyer_email: &str,
+    product_kind: &str,
+    pricing_kind: &str,
+    status: &str,
+    actor_user_id: &str,
+    reason: &str,
+    now: &str,
+) -> Result<usize, AppError> {
+    if !matches!(status, ACCESS_REQUEST_APPROVED | ACCESS_REQUEST_CANCELLED) {
+        return Err(AppError::Internal(
+            "unsupported automatic market access request resolution".into(),
+        ));
+    }
+    tx.execute(
+        "UPDATE market_access_requests
+         SET status = ?6, revision = revision + 1, resolved_at = ?7,
+             resolved_by_user_id = ?8, resolution_reason = ?9
+         WHERE supplier_user_id = ?1 AND status = 'requested'
+           AND product_kind = ?4 AND pricing_kind = ?5
+           AND ((?2 IS NOT NULL AND buyer_user_id = ?2) OR buyer_email = ?3)",
+        params![
+            supplier_user_id,
+            buyer_user_id,
+            normalize_email(buyer_email)?,
+            normalize_product_kind(product_kind)?,
+            normalize_pricing_kind(pricing_kind)?,
+            status,
+            now,
+            actor_user_id,
+            reason,
+        ],
+    )
+    .map_err(map_db("resolve matching market access requests"))
+}
+
 fn policy_view_tx(
     conn: &Connection,
     supplier_user_id: &str,
@@ -738,6 +906,71 @@ fn counterparty_view_tx(conn: &Connection, id: &str) -> Result<CounterpartyView,
     Ok(view)
 }
 
+fn access_request_view_tx(conn: &Connection, id: &str) -> Result<AccessRequestView, AppError> {
+    conn.query_row(
+        "SELECT id, supplier_user_id, supplier_email, buyer_user_id, buyer_email,
+                product_kind, pricing_kind, target_kind, target_id, target_label,
+                currency, status, revision, requested_at, resolved_at,
+                resolved_by_user_id, resolution_reason
+         FROM market_access_requests WHERE id = ?1",
+        params![id],
+        |row| {
+            Ok(AccessRequestView {
+                id: row.get(0)?,
+                supplier_user_id: row.get(1)?,
+                supplier_email: row.get(2)?,
+                buyer_user_id: row.get(3)?,
+                buyer_email: row.get(4)?,
+                product_kind: row.get(5)?,
+                pricing_kind: row.get(6)?,
+                target_kind: row.get(7)?,
+                target_id: row.get(8)?,
+                target_label: row.get(9)?,
+                currency: row.get(10)?,
+                status: row.get(11)?,
+                revision: row.get(12)?,
+                requested_at: row.get(13)?,
+                resolved_at: row.get(14)?,
+                resolved_by_user_id: row.get(15)?,
+                resolution_reason: row.get(16)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(map_db("read market access request"))?
+    .ok_or_else(|| AppError::NotFound("market access request not found".into()))
+}
+
+pub(crate) fn requested_access_request_tx(
+    conn: &Connection,
+    supplier_user_id: &str,
+    buyer_user_id: &str,
+    product_kind: &str,
+    pricing_kind: &str,
+) -> Result<Option<AccessRequestSummaryView>, AppError> {
+    conn.query_row(
+        "SELECT id, status, requested_at FROM market_access_requests
+         WHERE supplier_user_id = ?1 AND buyer_user_id = ?2
+           AND product_kind = ?3 AND pricing_kind = ?4 AND status = 'requested'
+         ORDER BY requested_at DESC LIMIT 1",
+        params![
+            supplier_user_id,
+            buyer_user_id,
+            normalize_product_kind(product_kind)?,
+            normalize_pricing_kind(pricing_kind)?,
+        ],
+        |row| {
+            Ok(AccessRequestSummaryView {
+                id: row.get(0)?,
+                status: row.get(1)?,
+                requested_at: row.get(2)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(map_db("read requested market access application"))
+}
+
 impl AppStore {
     pub async fn market_access_dashboard(
         &self,
@@ -769,6 +1002,22 @@ impl AppStore {
         let counterparties = ids
             .iter()
             .map(|id| counterparty_view_tx(&conn, id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let request_ids = conn
+            .prepare(
+                "SELECT id FROM market_access_requests
+                 WHERE supplier_user_id = ?1 AND status = 'requested'
+                 ORDER BY requested_at DESC, id",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map(params![actor.user_id], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(map_db("list market access requests"))?;
+        let access_requests = request_ids
+            .iter()
+            .map(|id| access_request_view_tx(&conn, id))
             .collect::<Result<Vec<_>, _>>()?;
         let mut public_credit_lines = conn
             .prepare(
@@ -808,6 +1057,7 @@ impl AppStore {
         Ok(MarketAccessDashboardView {
             policies,
             counterparties,
+            access_requests,
             public_credit_lines,
         })
     }
@@ -819,6 +1069,572 @@ async fn get_dashboard(
 ) -> Result<Json<MarketAccessDashboardView>, AppError> {
     let actor = require_actor(&state, &headers, "market:access:read").await?;
     Ok(Json(state.store.market_access_dashboard(&actor).await?))
+}
+
+#[derive(Debug)]
+struct ResolvedAccessTarget {
+    supplier_user_id: String,
+    supplier_email: String,
+    product_kind: String,
+    pricing_kind: String,
+    target_kind: String,
+    target_id: String,
+    target_label: String,
+    currency: Option<String>,
+}
+
+fn resolve_access_target_tx(
+    conn: &Connection,
+    target_kind: &str,
+    target_id: &str,
+) -> Result<ResolvedAccessTarget, AppError> {
+    let target_kind = target_kind.trim().to_ascii_lowercase();
+    let target_id = target_id.trim();
+    if target_id.is_empty() {
+        return Err(AppError::BadRequest("targetId is required".into()));
+    }
+    match target_kind.as_str() {
+        TARGET_SHARE_SEAT => conn
+            .query_row(
+                "SELECT listing.owner_user_id, listing.owner_email, listing.share_id,
+                        seat.daily_rate_minor,
+                        CASE WHEN seat.daily_rate_minor IS NULL THEN NULL
+                             ELSE COALESCE(NULLIF(TRIM(seat.currency), ''), 'USD') END
+                 FROM share_market_seats seat
+                 JOIN share_market_listings listing ON listing.id = seat.listing_id
+                 WHERE seat.id = ?1 AND listing.deleted_at IS NULL
+                   AND listing.status = 'active' AND seat.status = 'available'",
+                params![target_id],
+                |row| {
+                    let daily_rate_minor = row.get::<_, Option<i64>>(3)?;
+                    Ok(ResolvedAccessTarget {
+                        supplier_user_id: row.get(0)?,
+                        supplier_email: row.get(1)?,
+                        product_kind: PRODUCT_SHARE.into(),
+                        pricing_kind: pricing_kind_for_rate(daily_rate_minor).into(),
+                        target_kind: TARGET_SHARE_SEAT.into(),
+                        target_id: target_id.into(),
+                        target_label: row.get(2)?,
+                        currency: row
+                            .get::<_, Option<String>>(4)?
+                            .map(|value| value.to_ascii_uppercase()),
+                    })
+                },
+            )
+            .optional()
+            .map_err(map_db("resolve Share seat access target"))?
+            .ok_or_else(|| AppError::NotFound("Share seat not found".into())),
+        TARGET_CLIENT_HOST => {
+            let target = conn
+                .query_row(
+                    "SELECT host.provider_id, host.host_owner_email,
+                            COALESCE(NULLIF(TRIM(host.hostname), ''), host.ip),
+                            host.daily_rate_minor,
+                            CASE WHEN host.daily_rate_minor IS NULL THEN NULL
+                                 ELSE COALESCE(NULLIF(TRIM(host.currency), ''), 'USD') END
+                     FROM router_ssh_hosts host WHERE host.id = ?1 AND host.status = 'idle'",
+                    params![target_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<i64>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(map_db("resolve Client Host access target"))?
+                .ok_or_else(|| AppError::NotFound("Client Host not found".into()))?;
+            let supplier_user_id = target.0.ok_or_else(|| {
+                AppError::Conflict("Client Host is not attached to a market Provider".into())
+            })?;
+            Ok(ResolvedAccessTarget {
+                supplier_user_id,
+                supplier_email: target.1,
+                product_kind: PRODUCT_CLIENT_HOST.into(),
+                pricing_kind: pricing_kind_for_rate(target.3).into(),
+                target_kind: TARGET_CLIENT_HOST.into(),
+                target_id: target_id.into(),
+                target_label: target.2,
+                currency: target.4.map(|value| value.to_ascii_uppercase()),
+            })
+        }
+        _ => Err(AppError::BadRequest(
+            "targetKind must be share_seat or client_host".into(),
+        )),
+    }
+}
+
+fn create_access_request_tx(
+    tx: &Connection,
+    actor: &MarketAccessActor,
+    input: &CreateAccessRequest,
+    now: chrono::DateTime<Utc>,
+) -> Result<AccessRequestView, AppError> {
+    let target = resolve_access_target_tx(tx, &input.target_kind, &input.target_id)?;
+    if target.supplier_user_id == actor.user_id {
+        return Err(AppError::BadRequest(
+            "cannot request access to your own market service".into(),
+        ));
+    }
+    if product_access_allowed_tx(
+        tx,
+        &target.supplier_user_id,
+        &actor.user_id,
+        &actor.email,
+        &target.product_kind,
+        &target.pricing_kind,
+    )? {
+        return Err(AppError::Conflict(
+            "this account already has access to the requested market scope".into(),
+        ));
+    }
+    if let Some(existing_id) = tx
+        .query_row(
+            "SELECT id FROM market_access_requests
+             WHERE supplier_user_id = ?1 AND buyer_user_id = ?2
+               AND product_kind = ?3 AND pricing_kind = ?4 AND status = 'requested'
+             ORDER BY requested_at DESC LIMIT 1",
+            params![
+                target.supplier_user_id,
+                actor.user_id,
+                target.product_kind,
+                target.pricing_kind,
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(map_db("read duplicate market access application"))?
+    {
+        return access_request_view_tx(tx, &existing_id);
+    }
+    if let Some(resolved_at) = tx
+        .query_row(
+            "SELECT resolved_at FROM market_access_requests
+             WHERE supplier_user_id = ?1 AND buyer_user_id = ?2
+               AND product_kind = ?3 AND pricing_kind = ?4 AND status = 'rejected'
+               AND resolved_at IS NOT NULL
+             ORDER BY resolved_at DESC LIMIT 1",
+            params![
+                target.supplier_user_id,
+                actor.user_id,
+                target.product_kind,
+                target.pricing_kind,
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(map_db("read rejected market access application"))?
+        && let Ok(resolved_at) = chrono::DateTime::parse_from_rfc3339(&resolved_at)
+    {
+        let available_at = resolved_at.with_timezone(&Utc)
+            + Duration::hours(ACCESS_REQUEST_REAPPLY_COOLDOWN_HOURS);
+        if available_at > now {
+            return Err(AppError::RateLimited {
+                message: "wait before submitting another access application to this supplier"
+                    .into(),
+                retry_after_secs: (available_at - now).num_seconds().max(1) as u64,
+            });
+        }
+    }
+    let id = Uuid::new_v4().to_string();
+    let requested_at = now.to_rfc3339();
+    tx.execute(
+        "INSERT INTO market_access_requests (
+            id, supplier_user_id, supplier_email, buyer_user_id, buyer_email,
+            product_kind, pricing_kind, target_kind, target_id, target_label,
+            currency, status, revision, requested_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'requested', 1, ?12)",
+        params![
+            id,
+            target.supplier_user_id,
+            normalize_email(&target.supplier_email)?,
+            actor.user_id,
+            normalize_email(&actor.email)?,
+            target.product_kind,
+            target.pricing_kind,
+            target.target_kind,
+            target.target_id,
+            target.target_label,
+            target.currency,
+            requested_at,
+        ],
+    )
+    .map_err(map_db("create market access application"))?;
+    record_event_tx(
+        tx,
+        &target.supplier_user_id,
+        None,
+        &actor.user_id,
+        "access_requested",
+        serde_json::json!({
+            "requestId": id,
+            "buyerEmail": actor.email,
+            "productKind": target.product_kind,
+            "pricingKind": target.pricing_kind,
+            "targetKind": target.target_kind,
+            "targetId": target.target_id,
+        }),
+        &requested_at,
+    )?;
+    access_request_view_tx(tx, &id)
+}
+
+async fn create_access_request(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<CreateAccessRequest>,
+) -> Result<Json<AccessRequestView>, AppError> {
+    let actor = require_actor(&state, &headers, "market:access:write").await?;
+    let mut conn = state.store.conn.lock().await;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(map_db("begin market access application"))?;
+    let view = create_access_request_tx(&tx, &actor, &input, Utc::now())?;
+    tx.commit()
+        .map_err(map_db("commit market access application"))?;
+    Ok(Json(view))
+}
+
+fn approve_access_request_tx(
+    tx: &Connection,
+    actor: &MarketAccessActor,
+    request: &AccessRequestView,
+    now: &str,
+) -> Result<String, AppError> {
+    let existing = relationship_for_buyer_tx(
+        tx,
+        &request.supplier_user_id,
+        &request.buyer_user_id,
+        &request.buyer_email,
+    )?;
+    let relationship_id = existing
+        .as_ref()
+        .map(|relationship| relationship.0.clone())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    if let Some((_, bound_user_id, status)) = existing {
+        if bound_user_id.is_some_and(|bound| bound != request.buyer_user_id) {
+            return Err(AppError::Conflict(
+                "this buyer email is bound to another Router account".into(),
+            ));
+        }
+        if status == "revoked" {
+            tx.execute(
+                "DELETE FROM market_counterparty_access_rules WHERE counterparty_id = ?1",
+                params![relationship_id],
+            )
+            .map_err(map_db("clear revoked market access rules"))?;
+            tx.execute(
+                "UPDATE market_credit_grants
+                 SET kind = 'none', limit_minor = NULL, revision = revision + 1, updated_at = ?2
+                 WHERE counterparty_id = ?1",
+                params![relationship_id, now],
+            )
+            .map_err(map_db("clear revoked market credit grants"))?;
+            revoke_counterparty_credit_accounts_tx(
+                tx,
+                &request.supplier_user_id,
+                &relationship_id,
+                now,
+            )?;
+        }
+        tx.execute(
+            "UPDATE market_counterparties
+             SET supplier_email = ?2, buyer_user_id = ?3, buyer_email = ?4,
+                 status = 'active', revision = revision + 1, updated_at = ?5, revoked_at = NULL
+             WHERE id = ?1",
+            params![
+                relationship_id,
+                actor.email,
+                request.buyer_user_id,
+                request.buyer_email,
+                now,
+            ],
+        )
+        .map_err(map_db("activate requested market counterparty"))?;
+    } else {
+        tx.execute(
+            "INSERT INTO market_counterparties (
+                id, supplier_user_id, supplier_email, buyer_user_id, buyer_email,
+                status, revision, created_at, updated_at, revoked_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'active', 1, ?6, ?6, NULL)",
+            params![
+                relationship_id,
+                actor.user_id,
+                actor.email,
+                request.buyer_user_id,
+                request.buyer_email,
+                now,
+            ],
+        )
+        .map_err(map_db("create requested market counterparty"))?;
+    }
+    upsert_access_rule_tx(
+        tx,
+        &relationship_id,
+        &AccessRuleInput {
+            product_kind: request.product_kind.clone(),
+            pricing_kind: request.pricing_kind.clone(),
+            decision: DECISION_ALLOW.into(),
+        },
+        now,
+    )?;
+    record_event_tx(
+        tx,
+        &actor.user_id,
+        Some(&relationship_id),
+        &actor.user_id,
+        "access_request_approved",
+        serde_json::json!({
+            "requestId": request.id,
+            "buyerEmail": request.buyer_email,
+            "productKind": request.product_kind,
+            "pricingKind": request.pricing_kind,
+        }),
+        now,
+    )?;
+    Ok(relationship_id)
+}
+
+fn approve_access_request_for_actor_tx(
+    tx: &Connection,
+    actor: &MarketAccessActor,
+    id: &str,
+    expected_revision: i64,
+    now: &str,
+) -> Result<(), AppError> {
+    let request = access_request_view_tx(tx, id)?;
+    if request.supplier_user_id != actor.user_id {
+        return Err(AppError::Forbidden(
+            "market access request belongs to another supplier".into(),
+        ));
+    }
+    if request.status == ACCESS_REQUEST_APPROVED {
+        return Ok(());
+    }
+    if request.status != ACCESS_REQUEST_REQUESTED {
+        return Err(AppError::Conflict(format!(
+            "market access request is {} and cannot be approved",
+            request.status
+        )));
+    }
+    if request.revision != expected_revision {
+        return Err(AppError::Conflict(
+            "market access request revision changed; reload before approving".into(),
+        ));
+    }
+    approve_access_request_tx(tx, actor, &request, now)?;
+    let changed = tx
+        .execute(
+            "UPDATE market_access_requests
+             SET status = 'approved', revision = revision + 1, resolved_at = ?2,
+                 resolved_by_user_id = ?3, resolution_reason = 'supplier_approved'
+             WHERE id = ?1 AND status = 'requested' AND revision = ?4",
+            params![id, now, actor.user_id, expected_revision],
+        )
+        .map_err(map_db("approve market access request"))?;
+    if changed != 1 {
+        return Err(AppError::Conflict(
+            "market access request changed; reload before approving".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn approve_access_request(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<ResolveAccessRequest>,
+) -> Result<Json<MarketAccessDashboardView>, AppError> {
+    let actor = require_actor(&state, &headers, "market:access:write").await?;
+    {
+        let now = Utc::now().to_rfc3339();
+        let mut conn = state.store.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_db("begin market access approval"))?;
+        approve_access_request_for_actor_tx(&tx, &actor, &id, input.expected_revision, &now)?;
+        tx.commit()
+            .map_err(map_db("commit market access approval"))?;
+    }
+    Ok(Json(state.store.market_access_dashboard(&actor).await?))
+}
+
+fn reject_access_request_for_actor_tx(
+    tx: &Connection,
+    actor: &MarketAccessActor,
+    id: &str,
+    expected_revision: i64,
+    now: &str,
+) -> Result<(), AppError> {
+    let request = access_request_view_tx(tx, id)?;
+    if request.supplier_user_id != actor.user_id {
+        return Err(AppError::Forbidden(
+            "market access request belongs to another supplier".into(),
+        ));
+    }
+    if request.status == ACCESS_REQUEST_REJECTED {
+        return Ok(());
+    }
+    if request.status != ACCESS_REQUEST_REQUESTED {
+        return Err(AppError::Conflict(format!(
+            "market access request is {} and cannot be rejected",
+            request.status
+        )));
+    }
+    if request.revision != expected_revision {
+        return Err(AppError::Conflict(
+            "market access request revision changed; reload before rejecting".into(),
+        ));
+    }
+    let changed = tx
+        .execute(
+            "UPDATE market_access_requests
+             SET status = 'rejected', revision = revision + 1, resolved_at = ?2,
+                 resolved_by_user_id = ?3, resolution_reason = 'supplier_rejected'
+             WHERE id = ?1 AND status = 'requested' AND revision = ?4",
+            params![id, now, actor.user_id, expected_revision],
+        )
+        .map_err(map_db("reject market access request"))?;
+    if changed != 1 {
+        return Err(AppError::Conflict(
+            "market access request changed; reload before rejecting".into(),
+        ));
+    }
+    record_event_tx(
+        tx,
+        &actor.user_id,
+        None,
+        &actor.user_id,
+        "access_request_rejected",
+        serde_json::json!({
+            "requestId": request.id,
+            "buyerEmail": request.buyer_email,
+            "productKind": request.product_kind,
+            "pricingKind": request.pricing_kind,
+        }),
+        now,
+    )?;
+    Ok(())
+}
+
+async fn reject_access_request(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<ResolveAccessRequest>,
+) -> Result<Json<MarketAccessDashboardView>, AppError> {
+    let actor = require_actor(&state, &headers, "market:access:write").await?;
+    {
+        let now = Utc::now().to_rfc3339();
+        let mut conn = state.store.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_db("begin market access rejection"))?;
+        reject_access_request_for_actor_tx(&tx, &actor, &id, input.expected_revision, &now)?;
+        tx.commit()
+            .map_err(map_db("commit market access rejection"))?;
+    }
+    Ok(Json(state.store.market_access_dashboard(&actor).await?))
+}
+
+fn cancel_access_request_for_actor_tx(
+    tx: &Connection,
+    actor: &MarketAccessActor,
+    id: &str,
+    expected_revision: i64,
+    now: &str,
+) -> Result<AccessRequestView, AppError> {
+    let request = access_request_view_tx(tx, id)?;
+    if request.buyer_user_id != actor.user_id {
+        return Err(AppError::Forbidden(
+            "market access request belongs to another buyer".into(),
+        ));
+    }
+    if request.status == ACCESS_REQUEST_CANCELLED {
+        return Ok(request);
+    }
+    if request.status != ACCESS_REQUEST_REQUESTED {
+        return Err(AppError::Conflict(format!(
+            "market access request is {} and cannot be cancelled",
+            request.status
+        )));
+    }
+    if request.revision != expected_revision {
+        return Err(AppError::Conflict(
+            "market access request revision changed; reload before cancelling".into(),
+        ));
+    }
+    let changed = tx
+        .execute(
+            "UPDATE market_access_requests
+             SET status = 'cancelled', revision = revision + 1, resolved_at = ?2,
+                 resolved_by_user_id = ?3, resolution_reason = 'buyer_cancelled'
+             WHERE id = ?1 AND status = 'requested' AND revision = ?4",
+            params![id, now, actor.user_id, expected_revision],
+        )
+        .map_err(map_db("cancel market access request"))?;
+    if changed != 1 {
+        return Err(AppError::Conflict(
+            "market access request changed; reload before cancelling".into(),
+        ));
+    }
+    record_event_tx(
+        tx,
+        &request.supplier_user_id,
+        None,
+        &actor.user_id,
+        "access_request_cancelled",
+        serde_json::json!({ "requestId": request.id }),
+        now,
+    )?;
+    access_request_view_tx(tx, id)
+}
+
+async fn cancel_access_request(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<ResolveAccessRequest>,
+) -> Result<Json<AccessRequestView>, AppError> {
+    let actor = require_actor(&state, &headers, "market:access:write").await?;
+    let now = Utc::now().to_rfc3339();
+    let mut conn = state.store.conn.lock().await;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(map_db("begin market access cancellation"))?;
+    let view = cancel_access_request_for_actor_tx(&tx, &actor, &id, input.expected_revision, &now)?;
+    tx.commit()
+        .map_err(map_db("commit market access cancellation"))?;
+    Ok(Json(view))
+}
+
+fn cancel_access_requests_for_scope_tx(
+    tx: &Connection,
+    supplier_user_id: &str,
+    product_kind: &str,
+    pricing_kind: &str,
+    actor_user_id: &str,
+    now: &str,
+) -> Result<usize, AppError> {
+    tx.execute(
+        "UPDATE market_access_requests
+         SET status = 'cancelled', revision = revision + 1, resolved_at = ?5,
+             resolved_by_user_id = ?4, resolution_reason = 'access_policy_opened'
+         WHERE supplier_user_id = ?1 AND product_kind = ?2 AND pricing_kind = ?3
+           AND status = 'requested'",
+        params![
+            supplier_user_id,
+            normalize_product_kind(product_kind)?,
+            normalize_pricing_kind(pricing_kind)?,
+            actor_user_id,
+            now,
+        ],
+    )
+    .map_err(map_db("cancel applications after opening access policy"))
 }
 
 async fn update_policy(
@@ -884,6 +1700,16 @@ async fn update_policy(
                 }),
                 &now,
             )?;
+            if mode == MODE_BLACKLIST {
+                cancel_access_requests_for_scope_tx(
+                    &tx,
+                    &actor.user_id,
+                    &product_kind,
+                    &pricing_kind,
+                    &actor.user_id,
+                    &now,
+                )?;
+            }
         }
         tx.commit().map_err(map_db("commit access policy update"))?;
     }
@@ -1062,6 +1888,20 @@ async fn upsert_counterparty(
         .map_err(map_db("upsert market counterparty"))?;
         for rule in &input.access_rules {
             upsert_access_rule_tx(&tx, &id, rule, &now)?;
+            if rule.decision.trim().eq_ignore_ascii_case(DECISION_ALLOW) {
+                resolve_matching_access_requests_tx(
+                    &tx,
+                    &actor.user_id,
+                    buyer_user_id.as_deref(),
+                    &email,
+                    &rule.product_kind,
+                    &rule.pricing_kind,
+                    ACCESS_REQUEST_APPROVED,
+                    &actor.user_id,
+                    "supplier_allowed_scope",
+                    &now,
+                )?;
+            }
         }
         for line in &input.credit_lines {
             upsert_credit_line_tx(&tx, &id, line, None, &now)?;
@@ -1106,12 +1946,20 @@ async fn update_counterparty(
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_db("begin counterparty update"))?;
-        let current: (String, i64, String) = tx
+        let current: (String, i64, String, Option<String>, String) = tx
             .query_row(
-                "SELECT supplier_user_id, revision, status
+                "SELECT supplier_user_id, revision, status, buyer_user_id, buyer_email
              FROM market_counterparties WHERE id = ?1",
                 params![id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()
             .map_err(map_db("read counterparty owner"))?
@@ -1150,6 +1998,20 @@ async fn update_counterparty(
         }
         for rule in &input.access_rules {
             upsert_access_rule_tx(&tx, &id, rule, &now)?;
+            if status == "active" && rule.decision.trim().eq_ignore_ascii_case(DECISION_ALLOW) {
+                resolve_matching_access_requests_tx(
+                    &tx,
+                    &actor.user_id,
+                    current.3.as_deref(),
+                    &current.4,
+                    &rule.product_kind,
+                    &rule.pricing_kind,
+                    ACCESS_REQUEST_APPROVED,
+                    &actor.user_id,
+                    "supplier_allowed_scope",
+                    &now,
+                )?;
+            }
         }
         record_event_tx(
             &tx,
@@ -1409,6 +2271,79 @@ pub(crate) fn product_access_allowed_tx(
     })
 }
 
+pub(crate) fn market_eligibility_tx(
+    conn: &Connection,
+    supplier_user_id: &str,
+    buyer_user_id: &str,
+    buyer_email: &str,
+    product_kind: &str,
+    daily_rate_minor: Option<i64>,
+    currency: Option<&str>,
+) -> Result<MarketEligibilityView, AppError> {
+    let pricing_kind = pricing_kind_for_rate(daily_rate_minor);
+    if !product_access_allowed_tx(
+        conn,
+        supplier_user_id,
+        buyer_user_id,
+        buyer_email,
+        product_kind,
+        pricing_kind,
+    )? {
+        return Ok(MarketEligibilityView {
+            allowed: false,
+            status: "access_required".into(),
+            request: requested_access_request_tx(
+                conn,
+                supplier_user_id,
+                buyer_user_id,
+                product_kind,
+                pricing_kind,
+            )?,
+        });
+    }
+    if daily_rate_minor.is_none() {
+        return Ok(MarketEligibilityView::allowed());
+    }
+    let currency = currency
+        .ok_or_else(|| AppError::Internal("paid market service currency is missing".into()))?;
+    match crate::market_billing::credit_eligibility_tx(
+        conn,
+        buyer_user_id,
+        buyer_email,
+        supplier_user_id,
+        product_kind,
+        currency,
+    ) {
+        Ok(_) => Ok(MarketEligibilityView::allowed()),
+        Err(error) => {
+            let status = match error.code() {
+                Some(ERROR_MARKET_ACCESS_REQUIRED) => "access_required",
+                Some(ERROR_MARKET_CREDIT_REQUIRED) => "credit_required",
+                Some(ERROR_MARKET_BUYER_RESTRICTED) => "buyer_restricted",
+                Some(ERROR_MARKET_SETTLEMENT_REQUIRED) => "settlement_required",
+                Some(ERROR_MARKET_CREDIT_LIMIT_REACHED) => "credit_limit_reached",
+                Some(ERROR_MARKET_RELATIONSHIP_CLOSED) => "relationship_closed",
+                _ => return Err(error),
+            };
+            Ok(MarketEligibilityView {
+                allowed: false,
+                status: status.into(),
+                request: if status == "access_required" {
+                    requested_access_request_tx(
+                        conn,
+                        supplier_user_id,
+                        buyer_user_id,
+                        product_kind,
+                        pricing_kind,
+                    )?
+                } else {
+                    None
+                },
+            })
+        }
+    }
+}
+
 pub(crate) fn ensure_product_access_tx(
     tx: &Transaction<'_>,
     supplier_user_id: &str,
@@ -1425,8 +2360,14 @@ pub(crate) fn ensure_product_access_tx(
         product_kind,
         pricing_kind,
     )? {
-        return Err(AppError::Forbidden(
-            "seller approval is required before renting this market service".into(),
+        return Err(AppError::coded_forbidden(
+            ERROR_MARKET_ACCESS_REQUIRED,
+            "seller approval is required before renting this market service",
+            serde_json::json!({
+                "supplierUserId": supplier_user_id,
+                "productKind": product_kind,
+                "pricingKind": pricing_kind,
+            }),
         ));
     }
     let buyer_email = normalize_email(buyer_email)?;
@@ -1481,6 +2422,9 @@ pub(crate) fn set_product_access_decision_tx(
     let supplier_email = normalize_email(supplier_email)?;
     let buyer_email = normalize_email(buyer_email)?;
     let existing = relationship_for_buyer_tx(tx, supplier_user_id, buyer_user_id, &buyer_email)?;
+    let relationship_active = existing
+        .as_ref()
+        .is_none_or(|relationship| relationship.2 == "active");
     let relationship_id = existing
         .as_ref()
         .map(|relationship| relationship.0.clone())
@@ -1527,6 +2471,20 @@ pub(crate) fn set_product_access_decision_tx(
         },
         now,
     )?;
+    if decision == DECISION_ALLOW && relationship_active {
+        resolve_matching_access_requests_tx(
+            tx,
+            supplier_user_id,
+            Some(buyer_user_id),
+            &buyer_email,
+            &product_kind,
+            &pricing_kind,
+            ACCESS_REQUEST_APPROVED,
+            actor_user_id,
+            "supplier_allowed_scope",
+            now,
+        )?;
+    }
     record_event_tx(
         tx,
         supplier_user_id,
@@ -1581,8 +2539,14 @@ pub(crate) fn effective_credit_grant_tx(
             .map_err(map_db("read counterparty credit grant"))?
         {
             if kind == CREDIT_NONE {
-                return Err(AppError::Forbidden(
-                    "seller has not granted paid market credit in this currency".into(),
+                return Err(AppError::coded_forbidden(
+                    ERROR_MARKET_CREDIT_REQUIRED,
+                    "seller has not granted paid market credit in this currency",
+                    serde_json::json!({
+                        "supplierUserId": supplier_user_id,
+                        "productKind": product_kind,
+                        "currency": currency,
+                    }),
                 ));
             }
             return Ok(EffectiveCreditGrant {
@@ -1593,8 +2557,8 @@ pub(crate) fn effective_credit_grant_tx(
             });
         }
     }
-    if mode == MODE_BLACKLIST {
-        if let Some((limit_minor, revision)) = conn
+    if mode == MODE_BLACKLIST
+        && let Some((limit_minor, revision)) = conn
             .query_row(
                 "SELECT limit_minor, revision FROM market_public_credit_policies
                  WHERE supplier_user_id = ?1 AND currency = ?2 AND enabled = 1",
@@ -1603,17 +2567,22 @@ pub(crate) fn effective_credit_grant_tx(
             )
             .optional()
             .map_err(map_db("read public credit policy"))?
-        {
-            return Ok(EffectiveCreditGrant {
-                kind: CREDIT_LIMITED.into(),
-                limit_minor: Some(limit_minor),
-                source: "public".into(),
-                revision,
-            });
-        }
+    {
+        return Ok(EffectiveCreditGrant {
+            kind: CREDIT_LIMITED.into(),
+            limit_minor: Some(limit_minor),
+            source: "public".into(),
+            revision,
+        });
     }
-    Err(AppError::Forbidden(
-        "seller has not granted paid market credit in this currency".into(),
+    Err(AppError::coded_forbidden(
+        ERROR_MARKET_CREDIT_REQUIRED,
+        "seller has not granted paid market credit in this currency",
+        serde_json::json!({
+            "supplierUserId": supplier_user_id,
+            "productKind": product_kind,
+            "currency": currency,
+        }),
     ))
 }
 
@@ -1665,6 +2634,469 @@ mod tests {
         let conn = Connection::open_in_memory().expect("open in-memory database");
         init_schema(&conn).expect("initialize market access schema");
         conn
+    }
+
+    fn access_request_connection() -> Connection {
+        let conn = access_connection();
+        crate::share_market::init_schema(&conn).expect("initialize Share market schema");
+        conn
+    }
+
+    fn test_actor(user_id: &str, email: &str) -> MarketAccessActor {
+        MarketAccessActor {
+            user_id: user_id.into(),
+            email: email.into(),
+        }
+    }
+
+    fn test_request_time() -> chrono::DateTime<Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .expect("parse request test time")
+            .with_timezone(&Utc)
+    }
+
+    fn insert_paid_share_target(conn: &Connection, seat_id: &str) {
+        let listing_id = format!("listing-{seat_id}");
+        let share_id = format!("share-{seat_id}");
+        let now = test_request_time().to_rfc3339();
+        conn.execute(
+            "INSERT OR IGNORE INTO supplier_billing_profiles (
+                supplier_user_id, supplier_email, currency, settlement_grace_hours,
+                revision, created_at, updated_at
+             ) VALUES ('supplier', 'supplier@example.com', 'USD', 24, 1, ?1, ?1)",
+            params![now],
+        )
+        .expect("insert supplier billing profile");
+        conn.execute(
+            "INSERT INTO share_market_listings (
+                id, share_id, installation_id, owner_user_id, owner_email,
+                status, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, 'supplier', 'supplier@example.com',
+                       'active', ?4, ?4)",
+            params![listing_id, share_id, format!("installation-{seat_id}"), now],
+        )
+        .expect("insert access request listing");
+        conn.execute(
+            "INSERT INTO share_market_seats (
+                id, listing_id, position, status, token_period_json,
+                daily_rate_minor, currency, offer_revision, created_at, updated_at
+             ) VALUES (?1, ?2, 1, 'available', 'null', 1000, 'USD', 1, ?3, ?3)",
+            params![seat_id, listing_id, now],
+        )
+        .expect("insert access request seat");
+    }
+
+    fn share_request_input(seat_id: &str) -> CreateAccessRequest {
+        CreateAccessRequest {
+            target_kind: TARGET_SHARE_SEAT.into(),
+            target_id: seat_id.into(),
+        }
+    }
+
+    #[test]
+    fn access_request_is_idempotent_and_rejection_enforces_cooldown() {
+        let conn = access_request_connection();
+        insert_paid_share_target(&conn, "seat-idempotent");
+        let buyer = test_actor("buyer", "buyer@example.com");
+        let supplier = test_actor("supplier", "supplier@example.com");
+        let input = share_request_input("seat-idempotent");
+        let now = test_request_time();
+
+        let first = create_access_request_tx(&conn, &buyer, &input, now)
+            .expect("create first access request");
+        let duplicate = create_access_request_tx(&conn, &buyer, &input, now + Duration::minutes(1))
+            .expect("return existing access request");
+        assert_eq!(duplicate.id, first.id);
+        assert_eq!(duplicate.revision, first.revision);
+
+        reject_access_request_for_actor_tx(
+            &conn,
+            &supplier,
+            &first.id,
+            first.revision,
+            &(now + Duration::minutes(2)).to_rfc3339(),
+        )
+        .expect("reject access request");
+        assert_eq!(
+            access_request_view_tx(&conn, &first.id)
+                .expect("read rejected access request")
+                .status,
+            ACCESS_REQUEST_REJECTED
+        );
+
+        let retry = create_access_request_tx(&conn, &buyer, &input, now + Duration::hours(1))
+            .expect_err("enforce rejected request cooldown");
+        assert!(matches!(
+            retry,
+            AppError::RateLimited {
+                retry_after_secs,
+                ..
+            } if retry_after_secs > 0
+        ));
+
+        let reapplied = create_access_request_tx(&conn, &buyer, &input, now + Duration::hours(25))
+            .expect("allow request after cooldown");
+        assert_ne!(reapplied.id, first.id);
+        assert_eq!(reapplied.status, ACCESS_REQUEST_REQUESTED);
+    }
+
+    #[test]
+    fn access_request_resolution_rejects_wrong_actors_and_stale_revisions() {
+        let conn = access_request_connection();
+        insert_paid_share_target(&conn, "seat-authorization");
+        let buyer = test_actor("buyer", "buyer@example.com");
+        let supplier = test_actor("supplier", "supplier@example.com");
+        let other = test_actor("other", "other@example.com");
+        let now = test_request_time();
+        let request = create_access_request_tx(
+            &conn,
+            &buyer,
+            &share_request_input("seat-authorization"),
+            now,
+        )
+        .expect("create authorization request");
+
+        assert!(matches!(
+            approve_access_request_for_actor_tx(
+                &conn,
+                &other,
+                &request.id,
+                request.revision,
+                &now.to_rfc3339(),
+            ),
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(matches!(
+            reject_access_request_for_actor_tx(
+                &conn,
+                &other,
+                &request.id,
+                request.revision,
+                &now.to_rfc3339(),
+            ),
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(matches!(
+            approve_access_request_for_actor_tx(
+                &conn,
+                &supplier,
+                &request.id,
+                0,
+                &now.to_rfc3339(),
+            ),
+            Err(AppError::Conflict(_))
+        ));
+        assert!(matches!(
+            cancel_access_request_for_actor_tx(
+                &conn,
+                &other,
+                &request.id,
+                request.revision,
+                &now.to_rfc3339(),
+            ),
+            Err(AppError::Forbidden(_))
+        ));
+
+        let cancelled = cancel_access_request_for_actor_tx(
+            &conn,
+            &buyer,
+            &request.id,
+            request.revision,
+            &now.to_rfc3339(),
+        )
+        .expect("cancel own request");
+        assert_eq!(cancelled.status, ACCESS_REQUEST_CANCELLED);
+        assert_eq!(cancelled.revision, 2);
+        assert_eq!(
+            cancel_access_request_for_actor_tx(
+                &conn,
+                &buyer,
+                &request.id,
+                request.revision,
+                &now.to_rfc3339(),
+            )
+            .expect("repeat request cancellation")
+            .status,
+            ACCESS_REQUEST_CANCELLED
+        );
+    }
+
+    #[test]
+    fn approving_request_grants_only_requested_scope_without_credit() {
+        let conn = access_request_connection();
+        insert_paid_share_target(&conn, "seat-approval");
+        let buyer = test_actor("buyer", "buyer@example.com");
+        let supplier = test_actor("supplier", "supplier@example.com");
+        let now = test_request_time();
+        let request =
+            create_access_request_tx(&conn, &buyer, &share_request_input("seat-approval"), now)
+                .expect("create approval request");
+        let before = market_eligibility_tx(
+            &conn,
+            &supplier.user_id,
+            &buyer.user_id,
+            &buyer.email,
+            PRODUCT_SHARE,
+            Some(1000),
+            Some("USD"),
+        )
+        .expect("read eligibility before approval");
+        assert_eq!(before.status, "access_required");
+        assert_eq!(before.request.expect("requested summary").id, request.id);
+
+        approve_access_request_for_actor_tx(
+            &conn,
+            &supplier,
+            &request.id,
+            request.revision,
+            &(now + Duration::minutes(1)).to_rfc3339(),
+        )
+        .expect("approve access request");
+        approve_access_request_for_actor_tx(
+            &conn,
+            &supplier,
+            &request.id,
+            request.revision,
+            &(now + Duration::minutes(2)).to_rfc3339(),
+        )
+        .expect("repeat access approval idempotently");
+
+        let approved = access_request_view_tx(&conn, &request.id).expect("read approved request");
+        assert_eq!(approved.status, ACCESS_REQUEST_APPROVED);
+        assert_eq!(approved.revision, 2);
+        let relationship =
+            relationship_for_buyer_tx(&conn, &supplier.user_id, &buyer.user_id, &buyer.email)
+                .expect("read approved relationship")
+                .expect("approved relationship exists");
+        assert_eq!(relationship.2, "active");
+        let rules: Vec<(String, String, String)> = conn
+            .prepare(
+                "SELECT product_kind, pricing_kind, decision
+                 FROM market_counterparty_access_rules WHERE counterparty_id = ?1",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map(params![relationship.0], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })?
+                    .collect()
+            })
+            .expect("read approved rules");
+        assert_eq!(
+            rules,
+            vec![(
+                PRODUCT_SHARE.into(),
+                PRICING_PAID.into(),
+                DECISION_ALLOW.into(),
+            )]
+        );
+        let credit_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM market_credit_grants WHERE counterparty_id = ?1",
+                params![relationship.0],
+                |row| row.get(0),
+            )
+            .expect("count approval credit grants");
+        assert_eq!(credit_count, 0);
+        let after = market_eligibility_tx(
+            &conn,
+            &supplier.user_id,
+            &buyer.user_id,
+            &buyer.email,
+            PRODUCT_SHARE,
+            Some(1000),
+            Some("USD"),
+        )
+        .expect("read eligibility after approval");
+        assert_eq!(after.status, "credit_required");
+        assert!(!after.allowed);
+        assert!(after.request.is_none());
+    }
+
+    #[test]
+    fn approving_revoked_relationship_clears_old_scopes_and_credit() {
+        let conn = access_request_connection();
+        insert_paid_share_target(&conn, "seat-reactivation");
+        let buyer = test_actor("buyer", "buyer@example.com");
+        let supplier = test_actor("supplier", "supplier@example.com");
+        let now = test_request_time();
+        let now_text = now.to_rfc3339();
+        conn.execute(
+            "INSERT INTO market_counterparties (
+                id, supplier_user_id, supplier_email, buyer_user_id, buyer_email,
+                status, revision, created_at, updated_at, revoked_at
+             ) VALUES ('revoked-relationship', 'supplier', 'supplier@example.com',
+                       'buyer', 'buyer@example.com', 'revoked', 4, ?1, ?1, ?1)",
+            params![now_text],
+        )
+        .expect("insert revoked relationship");
+        for (product_kind, pricing_kind) in [
+            (PRODUCT_SHARE, PRICING_FREE),
+            (PRODUCT_CLIENT_HOST, PRICING_PAID),
+        ] {
+            upsert_access_rule_tx(
+                &conn,
+                "revoked-relationship",
+                &AccessRuleInput {
+                    product_kind: product_kind.into(),
+                    pricing_kind: pricing_kind.into(),
+                    decision: DECISION_ALLOW.into(),
+                },
+                &now_text,
+            )
+            .expect("insert stale access rule");
+        }
+        upsert_credit_line_tx(
+            &conn,
+            "revoked-relationship",
+            &CreditLineInput {
+                currency: "USD".into(),
+                kind: CREDIT_LIMITED.into(),
+                limit_minor: Some(50_000),
+                risk_acknowledged: false,
+            },
+            Some(0),
+            &now_text,
+        )
+        .expect("insert stale credit grant");
+        conn.execute(
+            "INSERT INTO market_credit_accounts (
+                id, buyer_user_id, buyer_email, supplier_user_id, supplier_email,
+                currency, status, balance_units, credit_kind, credit_limit_minor,
+                credit_source, credit_revision, version, created_at, updated_at
+             ) VALUES ('stale-account', 'buyer', 'buyer@example.com', 'supplier',
+                       'supplier@example.com', 'USD', 'active', 0, 'limited', 50000,
+                       'counterparty', 1, 1, ?1, ?1)",
+            params![now_text],
+        )
+        .expect("insert stale credit account");
+
+        let request = create_access_request_tx(
+            &conn,
+            &buyer,
+            &share_request_input("seat-reactivation"),
+            now,
+        )
+        .expect("create reactivation request");
+        approve_access_request_for_actor_tx(
+            &conn,
+            &supplier,
+            &request.id,
+            request.revision,
+            &(now + Duration::minutes(1)).to_rfc3339(),
+        )
+        .expect("approve reactivation request");
+
+        let relationship: (String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT status, revision, revoked_at FROM market_counterparties
+                 WHERE id = 'revoked-relationship'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read reactivated relationship");
+        assert_eq!(relationship, ("active".into(), 5, None));
+        let rules: Vec<(String, String, String)> = conn
+            .prepare(
+                "SELECT product_kind, pricing_kind, decision
+                 FROM market_counterparty_access_rules
+                 WHERE counterparty_id = 'revoked-relationship'",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                    .collect()
+            })
+            .expect("read reset access rules");
+        assert_eq!(
+            rules,
+            vec![(
+                PRODUCT_SHARE.into(),
+                PRICING_PAID.into(),
+                DECISION_ALLOW.into(),
+            )]
+        );
+        let credit: (String, Option<i64>, i64) = conn
+            .query_row(
+                "SELECT kind, limit_minor, revision FROM market_credit_grants
+                 WHERE counterparty_id = 'revoked-relationship' AND currency = 'USD'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read reset credit grant");
+        assert_eq!(credit, (CREDIT_NONE.into(), None, 2));
+        let account_credit: (String, Option<i64>) = conn
+            .query_row(
+                "SELECT credit_kind, credit_limit_minor FROM market_credit_accounts
+                 WHERE id = 'stale-account'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read reset account credit");
+        assert_eq!(account_credit, (CREDIT_NONE.into(), None));
+    }
+
+    #[test]
+    fn manual_allow_approves_request_and_open_policy_cancels_pending_scope() {
+        let conn = access_request_connection();
+        insert_paid_share_target(&conn, "seat-manual-resolution");
+        let now = test_request_time();
+        let first_buyer = test_actor("first-buyer", "first@example.com");
+        let second_buyer = test_actor("second-buyer", "second@example.com");
+        let first_request = create_access_request_tx(
+            &conn,
+            &first_buyer,
+            &share_request_input("seat-manual-resolution"),
+            now,
+        )
+        .expect("create manually approved request");
+        set_product_access_decision_tx(
+            &conn,
+            "supplier",
+            "supplier@example.com",
+            &first_buyer.user_id,
+            &first_buyer.email,
+            PRODUCT_SHARE,
+            PRICING_PAID,
+            DECISION_ALLOW,
+            "supplier",
+            &(now + Duration::minutes(1)).to_rfc3339(),
+        )
+        .expect("manually allow requested scope");
+        let manually_approved =
+            access_request_view_tx(&conn, &first_request.id).expect("read manual approval");
+        assert_eq!(manually_approved.status, ACCESS_REQUEST_APPROVED);
+        assert_eq!(
+            manually_approved.resolution_reason.as_deref(),
+            Some("supplier_allowed_scope")
+        );
+
+        let second_request = create_access_request_tx(
+            &conn,
+            &second_buyer,
+            &share_request_input("seat-manual-resolution"),
+            now + Duration::minutes(2),
+        )
+        .expect("create request before opening policy");
+        assert_eq!(
+            cancel_access_requests_for_scope_tx(
+                &conn,
+                "supplier",
+                PRODUCT_SHARE,
+                PRICING_PAID,
+                "supplier",
+                &(now + Duration::minutes(3)).to_rfc3339(),
+            )
+            .expect("cancel scope requests"),
+            1
+        );
+        let cancelled =
+            access_request_view_tx(&conn, &second_request.id).expect("read policy cancellation");
+        assert_eq!(cancelled.status, ACCESS_REQUEST_CANCELLED);
+        assert_eq!(
+            cancelled.resolution_reason.as_deref(),
+            Some("access_policy_opened")
+        );
     }
 
     #[test]

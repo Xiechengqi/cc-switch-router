@@ -25,6 +25,7 @@ const HOST_SCALAR_KEYS = [
   "hostOwnerEmail",
   "dailyRateMinor",
   "currency",
+  "freeDurationDays",
   "offerRevision",
   "countryCode",
   "hostname",
@@ -58,6 +59,7 @@ function sameHost(left: ClientMarketHost, right: ClientMarketHost): boolean {
   }
   if (!sameStringList(left.paymentMethodKinds, right.paymentMethodKinds)) return false;
   if (JSON.stringify(left.contacts ?? []) !== JSON.stringify(right.contacts ?? [])) return false;
+  if (JSON.stringify(left.eligibility) !== JSON.stringify(right.eligibility)) return false;
   // ipIntel is a nested object refreshed rarely; only pay for it once the cheap
   // scalar pass has found no difference.
   return JSON.stringify(left.ipIntel ?? null) === JSON.stringify(right.ipIntel ?? null);

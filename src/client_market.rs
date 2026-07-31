@@ -830,6 +830,7 @@ struct RouterSshHostView {
     contacts: Vec<crate::client_market_trade::PaymentContact>,
     #[serde(default)]
     seller_approval_required: bool,
+    eligibility: crate::market_access::MarketEligibilityView,
     country_code: Option<String>,
     hostname: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -897,6 +898,7 @@ async fn list_hosts(
         )
         .await?;
     let mut access_by_scope = HashMap::new();
+    let mut eligibility_by_scope = HashMap::new();
     if let Some(session) = viewer.as_ref() {
         let conn = state.store.conn.lock().await;
         for host in hosts.iter().filter(|host| host.status == HOST_STATUS_IDLE) {
@@ -904,19 +906,32 @@ async fn list_hosts(
                 continue;
             };
             let pricing_kind = crate::market_access::pricing_kind_for_rate(host.daily_rate_minor);
-            let key = (provider_id.to_string(), pricing_kind.to_string());
-            if access_by_scope.contains_key(&key) {
+            let access_key = (provider_id.to_string(), pricing_kind.to_string());
+            let eligibility_key = (
+                provider_id.to_string(),
+                pricing_kind.to_string(),
+                host.currency
+                    .clone()
+                    .map(|value| value.to_ascii_uppercase()),
+            );
+            if eligibility_by_scope.contains_key(&eligibility_key) {
                 continue;
             }
-            let allowed = crate::market_access::product_access_allowed_tx(
+            let eligibility = crate::market_access::market_eligibility_tx(
                 &conn,
                 provider_id,
                 &session.user_id,
                 &session.email,
                 crate::market_access::PRODUCT_CLIENT_HOST,
-                pricing_kind,
+                host.daily_rate_minor,
+                host.currency
+                    .as_deref()
+                    .or_else(|| host.daily_rate_minor.map(|_| "USD")),
             )?;
-            access_by_scope.insert(key, allowed);
+            access_by_scope
+                .entry(access_key)
+                .or_insert(eligibility.status != "access_required");
+            eligibility_by_scope.insert(eligibility_key, eligibility);
         }
     }
     let views = hosts
@@ -942,6 +957,25 @@ async fn list_hosts(
                 host.daily_rate_minor,
                 &access_by_scope,
             );
+            let eligibility = if viewer.is_none() {
+                crate::market_access::MarketEligibilityView::login_required()
+            } else if is_host_owner || host.status != HOST_STATUS_IDLE {
+                crate::market_access::MarketEligibilityView::allowed()
+            } else if let Some(provider_id) = host.provider_id.as_deref() {
+                eligibility_by_scope
+                    .get(&(
+                        provider_id.to_string(),
+                        crate::market_access::pricing_kind_for_rate(host.daily_rate_minor)
+                            .to_string(),
+                        host.currency
+                            .clone()
+                            .map(|value| value.to_ascii_uppercase()),
+                    ))
+                    .cloned()
+                    .unwrap_or_else(crate::market_access::MarketEligibilityView::allowed)
+            } else {
+                crate::market_access::MarketEligibilityView::allowed()
+            };
             let ip_intel = host_ip_intel_for_viewer(
                 host.ip_intel_json.as_deref(),
                 &host.ip,
@@ -964,6 +998,7 @@ async fn list_hosts(
                 payment_method_kinds: host.payment_method_kinds,
                 contacts: host.contacts,
                 seller_approval_required,
+                eligibility,
                 country_code: host.country_code,
                 hostname: host.hostname,
                 ssh_host_key_fingerprint: reveal_operations
@@ -4002,6 +4037,7 @@ fn host_to_view(host: RouterSshHostRecord, reveal: bool) -> RouterSshHostView {
         payment_method_kinds: host.payment_method_kinds,
         contacts: host.contacts,
         seller_approval_required: false,
+        eligibility: crate::market_access::MarketEligibilityView::allowed(),
         country_code: host.country_code,
         hostname: host.hostname,
         ssh_host_key_fingerprint: reveal.then_some(host.ssh_host_key_fingerprint).flatten(),
@@ -7790,6 +7826,20 @@ mod tests {
                 .and_then(|value| value.as_bool()),
             Some(false)
         );
+        assert_eq!(
+            public
+                .get("eligibility")
+                .and_then(|value| value.get("status"))
+                .and_then(|value| value.as_str()),
+            Some("allowed")
+        );
+        assert_eq!(
+            public
+                .get("eligibility")
+                .and_then(|value| value.get("allowed"))
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
         let private = serde_json::to_value(host_to_view(host, true)).unwrap();
         assert_eq!(
             private.get("ip").and_then(|value| value.as_str()),
@@ -8064,12 +8114,14 @@ mod tests {
             "secret".into(),
             quote.items[0].offer_revision,
         )];
-        assert!(matches!(
-            store
-                .client_market_commit_quote(&quote.id, &client, &prepared)
-                .await,
-            Err(AppError::Forbidden(_))
-        ));
+        let error = store
+            .client_market_commit_quote(&quote.id, &client, &prepared)
+            .await
+            .expect_err("recheck Provider access before committing quote");
+        assert_eq!(
+            error.code(),
+            Some(crate::market_access::ERROR_MARKET_ACCESS_REQUIRED)
+        );
         assert_eq!(
             store
                 .client_market_get_host(&host.id)

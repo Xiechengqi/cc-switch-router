@@ -7,7 +7,7 @@ import { useAuth } from "@/components/auth/auth-provider";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
 import { SegmentedControl } from "@/components/common/segmented-control";
-import { SellerApprovalDialog } from "@/components/common/seller-approval-dialog";
+import { MarketAccessDialog } from "@/components/common/seller-approval-dialog";
 import { CreateClientDialog } from "@/components/dashboard/create-client-dialog";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
@@ -20,7 +20,7 @@ import {
   reverifyClientMarketHost,
 } from "@/lib/api";
 import { mergeHosts } from "@/lib/client-market-refresh";
-import type { ClientMarketHost, ClientMarketHostImportResponse, ClientMarketRental } from "@/lib/types";
+import type { ClientMarketHost, ClientMarketHostImportResponse, ClientMarketRental, MarketEligibility } from "@/lib/types";
 import { usePersistentState } from "@/lib/use-persistent-state";
 import { useBatchOperations } from "@/components/dashboard/client-market/use-batch-operations";
 import { AddHostDialog } from "@/components/dashboard/client-market/add-host-dialog";
@@ -98,7 +98,10 @@ export function ClientMarketPage() {
   const [page, setPage] = React.useState(1);
   const [error, setError] = React.useState("");
   const [fixedHost, setFixedHost] = React.useState<ClientMarketHost | null>(null);
-  const [approvalHost, setApprovalHost] = React.useState<ClientMarketHost | null>(null);
+  const [accessDialog, setAccessDialog] = React.useState<{
+    host: ClientMarketHost;
+    eligibility: MarketEligibility;
+  } | null>(null);
   const [transferBusy, setTransferBusy] = React.useState(false);
   const [importOpen, setImportOpen] = React.useState(false);
   const [exportOpen, setExportOpen] = React.useState(false);
@@ -120,12 +123,16 @@ export function ClientMarketPage() {
   }, []);
 
   const openCreateForHost = React.useCallback((host: ClientMarketHost) => {
-    if (host.sellerApprovalRequired === true) {
-      setApprovalHost(host);
+    if (!authed) {
+      window.dispatchEvent(new Event(ROUTER_OPEN_LOGIN_EVENT));
+      return;
+    }
+    if (!host.eligibility.allowed) {
+      setAccessDialog({ host, eligibility: host.eligibility });
       return;
     }
     setFixedHost(host);
-  }, []);
+  }, [authed]);
 
   const load = React.useCallback(
     async (options?: { silent?: boolean }) => {
@@ -296,7 +303,7 @@ export function ClientMarketPage() {
     importOpen ||
     exportOpen ||
     !!fixedHost ||
-    !!approvalHost ||
+    !!accessDialog ||
     rowUiBusyCount > 0;
 
   React.useEffect(() => {
@@ -865,15 +872,20 @@ export function ClientMarketPage() {
         onOpenChange={(next) => { if (!next) setFixedHost(null); }}
         fixedHost={fixedHost}
         onCreated={() => void silentRefresh()}
-        onSellerApprovalRequired={setApprovalHost}
+        onMarketEligibilityRequired={(host, eligibility) => setAccessDialog({ host, eligibility })}
       />
-      <SellerApprovalDialog
-        open={!!approvalHost}
+      <MarketAccessDialog
+        open={!!accessDialog}
         product="clientHost"
-        ownerEmail={approvalHost?.hostOwnerEmail || ""}
+        ownerEmail={accessDialog?.host.hostOwnerEmail || ""}
         buyerEmail={viewerEmail || ""}
-        contacts={approvalHost?.contacts}
-        onOpenChange={(next) => { if (!next) setApprovalHost(null); }}
+        contacts={accessDialog?.host.contacts}
+        targetKind="client_host"
+        targetId={accessDialog?.host.id || ""}
+        currency={accessDialog?.host.currency}
+        eligibility={accessDialog?.eligibility || { allowed: false, status: "access_required" }}
+        onOpenChange={(next) => { if (!next) setAccessDialog(null); }}
+        onRequested={() => void silentRefresh()}
       />
       <Modal.Backdrop
         isOpen={importOpen}

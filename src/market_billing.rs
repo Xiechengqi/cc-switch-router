@@ -1375,8 +1375,10 @@ fn ensure_credit_preconditions_tx(
         .map_err(map_db("check market credit restriction"))?
         .is_some();
     if restricted {
-        return Err(AppError::Forbidden(
-            "new market credit is blocked until overdue bills are resolved".into(),
+        return Err(AppError::coded_forbidden(
+            crate::market_access::ERROR_MARKET_BUYER_RESTRICTED,
+            "new market credit is blocked until overdue bills are resolved",
+            serde_json::json!({ "buyerUserId": buyer_user_id, "currency": currency }),
         ));
     }
     Ok(())
@@ -1409,16 +1411,27 @@ fn resolve_credit_grant_tx(
         .map_err(map_db("read market credit account status"))?;
     if let Some((status, balance_units)) = account_state {
         if status == ACCOUNT_CLOSED {
-            return Err(AppError::Conflict(
-                "the supplier permanently closed this credit relationship; future paid rentals with this supplier are disabled".into(),
+            return Err(AppError::coded_conflict(
+                crate::market_access::ERROR_MARKET_RELATIONSHIP_CLOSED,
+                "the supplier permanently closed this credit relationship; future paid rentals with this supplier are disabled",
+                serde_json::json!({
+                    "supplierUserId": supplier_user_id,
+                    "currency": currency,
+                }),
             ));
         }
         if matches!(
             status.as_str(),
             ACCOUNT_SETTLEMENT_DUE | ACCOUNT_PAYMENT_DECLARED | ACCOUNT_OVERDUE | ACCOUNT_DISPUTED
         ) {
-            return Err(AppError::Conflict(
-                "settle the supplier credit account before renting another service".into(),
+            return Err(AppError::coded_conflict(
+                crate::market_access::ERROR_MARKET_SETTLEMENT_REQUIRED,
+                "settle the supplier credit account before renting another service",
+                serde_json::json!({
+                    "supplierUserId": supplier_user_id,
+                    "currency": currency,
+                    "accountStatus": status,
+                }),
             ));
         }
         if grant.kind == crate::market_access::CREDIT_LIMITED {
@@ -1430,13 +1443,56 @@ fn resolve_credit_grant_tx(
                 .checked_mul(MONEY_UNITS_PER_MINOR)
                 .ok_or_else(|| AppError::Internal("market credit limit overflowed".into()))?;
             if balance_units >= limit_units {
-                return Err(AppError::Conflict(
-                    "the supplier credit limit has been reached; settle the account before renting another service".into(),
+                return Err(AppError::coded_conflict(
+                    crate::market_access::ERROR_MARKET_CREDIT_LIMIT_REACHED,
+                    "the supplier credit limit has been reached; settle the account before renting another service",
+                    serde_json::json!({
+                        "supplierUserId": supplier_user_id,
+                        "currency": currency,
+                        "limitMinor": grant.limit_minor,
+                    }),
                 ));
             }
         }
     }
     Ok(grant)
+}
+
+pub(crate) fn credit_eligibility_tx(
+    tx: &Connection,
+    buyer_user_id: &str,
+    buyer_email: &str,
+    supplier_user_id: &str,
+    product_kind: &str,
+    currency: &str,
+) -> Result<crate::market_access::EffectiveCreditGrant, AppError> {
+    ensure_credit_preconditions_tx(tx, buyer_user_id, supplier_user_id, currency)?;
+    if !crate::market_access::product_access_allowed_tx(
+        tx,
+        supplier_user_id,
+        buyer_user_id,
+        buyer_email,
+        product_kind,
+        crate::market_access::PRICING_PAID,
+    )? {
+        return Err(AppError::coded_forbidden(
+            crate::market_access::ERROR_MARKET_ACCESS_REQUIRED,
+            "seller approval is required before renting this market service",
+            serde_json::json!({
+                "supplierUserId": supplier_user_id,
+                "productKind": product_kind,
+                "pricingKind": crate::market_access::PRICING_PAID,
+            }),
+        ));
+    }
+    resolve_credit_grant_tx(
+        tx,
+        buyer_user_id,
+        buyer_email,
+        supplier_user_id,
+        product_kind,
+        currency,
+    )
 }
 
 pub(crate) fn ensure_credit_allowed_tx(
@@ -1464,44 +1520,6 @@ pub(crate) fn ensure_credit_allowed_tx(
         product_kind,
         currency,
     )
-}
-
-pub(crate) fn credit_allowed_tx(
-    tx: &Connection,
-    buyer_user_id: &str,
-    buyer_email: &str,
-    supplier_user_id: &str,
-    product_kind: &str,
-    currency: &str,
-) -> Result<bool, AppError> {
-    let check = || {
-        ensure_credit_preconditions_tx(tx, buyer_user_id, supplier_user_id, currency)?;
-        if !crate::market_access::product_access_allowed_tx(
-            tx,
-            supplier_user_id,
-            buyer_user_id,
-            buyer_email,
-            product_kind,
-            crate::market_access::PRICING_PAID,
-        )? {
-            return Err(AppError::Forbidden(
-                "seller approval is required before renting this market service".into(),
-            ));
-        }
-        resolve_credit_grant_tx(
-            tx,
-            buyer_user_id,
-            buyer_email,
-            supplier_user_id,
-            product_kind,
-            currency,
-        )
-    };
-    match check() {
-        Ok(_) => Ok(true),
-        Err(AppError::Forbidden(_) | AppError::Conflict(_)) => Ok(false),
-        Err(error) => Err(error),
-    }
 }
 
 pub(crate) fn activate_contract_tx(
@@ -5285,18 +5303,20 @@ mod tests {
             .await
             .expect("restrict overdue declared payment");
         assert!(overdue_actions.is_empty());
-        assert!(matches!(
-            store
-                .market_billing_check_credit_allowed(
-                    &buyer.user_id,
-                    &buyer.email,
-                    &supplier.user_id,
-                    crate::market_access::PRODUCT_CLIENT_HOST,
-                    "USD",
-                )
-                .await,
-            Err(AppError::Forbidden(_))
-        ));
+        let error = store
+            .market_billing_check_credit_allowed(
+                &buyer.user_id,
+                &buyer.email,
+                &supplier.user_id,
+                crate::market_access::PRODUCT_CLIENT_HOST,
+                "USD",
+            )
+            .await
+            .expect_err("block overdue buyer credit");
+        assert_eq!(
+            error.code(),
+            Some(crate::market_access::ERROR_MARKET_BUYER_RESTRICTED)
+        );
         let declared_dashboard = store
             .market_billing_dashboard(&buyer)
             .await
@@ -5556,7 +5576,10 @@ mod tests {
             )
             .await
             .expect_err("block a new rental at the lowered credit limit");
-        assert!(matches!(error, AppError::Conflict(_)));
+        assert_eq!(
+            error.code(),
+            Some(crate::market_access::ERROR_MARKET_CREDIT_LIMIT_REACHED)
+        );
     }
 
     #[tokio::test]
@@ -5853,7 +5876,10 @@ mod tests {
             )
             .await
             .expect_err("closed relationship must reject future paid rentals");
-        assert!(matches!(error, AppError::Conflict(_)));
+        assert_eq!(
+            error.code(),
+            Some(crate::market_access::ERROR_MARKET_RELATIONSHIP_CLOSED)
+        );
         assert!(error.to_string().contains("permanently closed"));
     }
 
@@ -5901,35 +5927,39 @@ mod tests {
             .market_billing_reconcile(overdue_at)
             .await
             .expect("mark invoice overdue");
-        assert!(matches!(
-            store
-                .market_billing_check_credit_allowed(
-                    &buyer.user_id,
-                    &buyer.email,
-                    &supplier.user_id,
-                    crate::market_access::PRODUCT_CLIENT_HOST,
-                    "USD",
-                )
-                .await,
-            Err(AppError::Forbidden(_))
-        ));
+        let error = store
+            .market_billing_check_credit_allowed(
+                &buyer.user_id,
+                &buyer.email,
+                &supplier.user_id,
+                crate::market_access::PRODUCT_CLIENT_HOST,
+                "USD",
+            )
+            .await
+            .expect_err("block credit after invoice becomes overdue");
+        assert_eq!(
+            error.code(),
+            Some(crate::market_access::ERROR_MARKET_BUYER_RESTRICTED)
+        );
 
         store
             .market_billing_open_dispute(&buyer, &invoice_id, "service evidence is incorrect")
             .await
             .expect("open first billing dispute");
-        assert!(matches!(
-            store
-                .market_billing_check_credit_allowed(
-                    &buyer.user_id,
-                    &buyer.email,
-                    &supplier.user_id,
-                    crate::market_access::PRODUCT_CLIENT_HOST,
-                    "USD",
-                )
-                .await,
-            Err(AppError::Forbidden(_))
-        ));
+        let error = store
+            .market_billing_check_credit_allowed(
+                &buyer.user_id,
+                &buyer.email,
+                &supplier.user_id,
+                crate::market_access::PRODUCT_CLIENT_HOST,
+                "USD",
+            )
+            .await
+            .expect_err("keep disputed overdue buyer restricted");
+        assert_eq!(
+            error.code(),
+            Some(crate::market_access::ERROR_MARKET_BUYER_RESTRICTED)
+        );
         let disputed_dashboard = store
             .market_billing_dashboard(&buyer)
             .await
@@ -6033,18 +6063,20 @@ mod tests {
             .market_billing_reconcile(overdue_at)
             .await
             .expect("restrict overdue disputed invoice");
-        assert!(matches!(
-            store
-                .market_billing_check_credit_allowed(
-                    &buyer.user_id,
-                    &buyer.email,
-                    &supplier.user_id,
-                    crate::market_access::PRODUCT_CLIENT_HOST,
-                    "USD",
-                )
-                .await,
-            Err(AppError::Forbidden(_))
-        ));
+        let error = store
+            .market_billing_check_credit_allowed(
+                &buyer.user_id,
+                &buyer.email,
+                &supplier.user_id,
+                crate::market_access::PRODUCT_CLIENT_HOST,
+                "USD",
+            )
+            .await
+            .expect_err("restrict overdue disputed invoice");
+        assert_eq!(
+            error.code(),
+            Some(crate::market_access::ERROR_MARKET_BUYER_RESTRICTED)
+        );
         let disputed_dashboard = store
             .market_billing_dashboard(&buyer)
             .await

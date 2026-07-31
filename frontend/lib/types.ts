@@ -1381,6 +1381,7 @@ export type ClientMarketHost = {
   paymentMethodKinds: string[];
   contacts?: PaymentContact[];
   sellerApprovalRequired?: boolean;
+  eligibility: MarketEligibility;
   countryCode?: string;
   hostname?: string;
   sshHostKeyFingerprint?: string;
@@ -1597,6 +1598,29 @@ export type MarketAccessMode = "whitelist" | "blacklist";
 export type MarketAccessDecision = "inherit" | "allow" | "deny";
 export type MarketCreditKind = "none" | "limited" | "unlimited";
 
+export type MarketEligibilityStatus =
+  | "allowed"
+  | "login_required"
+  | "access_required"
+  | "credit_required"
+  | "buyer_restricted"
+  | "settlement_required"
+  | "credit_limit_reached"
+  | "relationship_closed"
+  | string;
+
+export type MarketAccessRequestSummary = {
+  id: string;
+  status: "requested" | string;
+  requestedAt: string;
+};
+
+export type MarketEligibility = {
+  allowed: boolean;
+  status: MarketEligibilityStatus;
+  request?: MarketAccessRequestSummary;
+};
+
 export type MarketAccessPolicy = {
   productKind: MarketAccessProductKind;
   pricingKind: MarketAccessPricingKind;
@@ -1640,6 +1664,26 @@ export type MarketCounterparty = {
   updatedAt: string;
 };
 
+export type MarketAccessRequest = {
+  id: string;
+  supplierUserId: string;
+  supplierEmail: string;
+  buyerUserId: string;
+  buyerEmail: string;
+  productKind: MarketAccessProductKind;
+  pricingKind: MarketAccessPricingKind;
+  targetKind: "share_seat" | "client_host" | string;
+  targetId: string;
+  targetLabel: string;
+  currency?: string;
+  status: "requested" | "approved" | "rejected" | "cancelled" | string;
+  revision: number;
+  requestedAt: string;
+  resolvedAt?: string;
+  resolvedByUserId?: string;
+  resolutionReason?: string;
+};
+
 export type MarketPublicCreditLine = {
   currency: "CNY" | "USD" | string;
   limitMinor?: number;
@@ -1651,6 +1695,7 @@ export type MarketPublicCreditLine = {
 export type MarketAccessDashboard = {
   policies: MarketAccessPolicy[];
   counterparties: MarketCounterparty[];
+  accessRequests: MarketAccessRequest[];
   publicCreditLines: MarketPublicCreditLine[];
 };
 
@@ -1831,7 +1876,9 @@ export type ShareMarketSeat = ShareMarketSeatInput & {
   offerRevision: number;
   isFree: boolean;
   canRent: boolean;
+  rentPrerequisitesMet: boolean;
   sellerApprovalRequired: boolean;
+  eligibility: MarketEligibility;
   readOnly: boolean;
   retiredAt?: string;
   subscription?: ShareMarketSubscription;
