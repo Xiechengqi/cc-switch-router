@@ -3190,21 +3190,14 @@ async fn ssh_verify_host(
                 .into(),
         ));
     }
-    // Registering a host must not silently wipe an existing install.
+    // Leftover install files are fine: install-client.sh backs up $HOME/.cc-switch-server
+    // and reinstalls the binary when the host is later claimed for provisioning.
     let output = ssh_run_remote_with_input(
         &state.provision_ssh_key_path,
         known_hosts,
         ip,
         port,
-        &format!(
-            "{helpers}\
-             set -eu; \
-             home=\"$(cc_switch_server_home)\"; \
-             if cc_switch_server_has_install_files; then \
-             echo \"host already contains a cc-switch-server installation under $home\" >&2; exit 42; fi; \
-             uname -n",
-            helpers = REMOTE_CC_SWITCH_SERVER_HELPERS,
-        ),
+        "set -eu; uname -n",
         None,
         SSH_VERIFY_TIMEOUT,
         SshHostKeyPolicy::AcceptNew,
