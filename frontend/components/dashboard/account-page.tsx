@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { Button, Chip, ListBox, Select, toast } from "@heroui/react";
-import { Loader2, Plus, Save, Trash2, WalletCards } from "lucide-react";
+import { ExternalLink, Loader2, Plus, Save, Trash2, WalletCards } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
 import { AuthenticatedImage } from "@/components/common/authenticated-image";
@@ -369,9 +369,10 @@ export function AccountPaymentsPanel() {
                 href="https://www.bsmkweb.cc/register?ref=310371521"
                 target="_blank"
                 rel="noopener noreferrer"
-                className="font-medium text-accent hover:underline"
+                className="inline-flex items-center gap-0.5 font-medium text-primary hover:underline"
               >
                 {t("account.binanceRegister")}
+                <ExternalLink className="h-3 w-3 shrink-0" aria-hidden />
               </a>
             </p>
           </div>

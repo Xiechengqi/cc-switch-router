@@ -28,6 +28,31 @@ pub const CREDIT_UNLIMITED: &str = "unlimited";
 
 const MAX_CREDIT_LIMIT_MINOR: i64 = 100_000_000;
 
+const CREATE_SUPPLIER_ACCESS_POLICIES_TABLE: &str =
+    "CREATE TABLE IF NOT EXISTS market_supplier_access_policies (
+        supplier_user_id TEXT NOT NULL,
+        supplier_email TEXT NOT NULL,
+        product_kind TEXT NOT NULL CHECK (product_kind IN ('share', 'client_host')),
+        pricing_kind TEXT NOT NULL CHECK (pricing_kind IN ('free', 'paid')),
+        mode TEXT NOT NULL CHECK (mode IN ('whitelist', 'blacklist')),
+        revision INTEGER NOT NULL DEFAULT 1,
+        risk_acknowledged_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (supplier_user_id, product_kind, pricing_kind)
+    );";
+
+const CREATE_COUNTERPARTY_ACCESS_RULES_TABLE: &str =
+    "CREATE TABLE IF NOT EXISTS market_counterparty_access_rules (
+        counterparty_id TEXT NOT NULL,
+        product_kind TEXT NOT NULL CHECK (product_kind IN ('share', 'client_host')),
+        pricing_kind TEXT NOT NULL CHECK (pricing_kind IN ('free', 'paid')),
+        decision TEXT NOT NULL CHECK (decision IN ('inherit', 'allow', 'deny')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (counterparty_id, product_kind, pricing_kind)
+    );";
+
 #[derive(Debug, Clone)]
 pub struct MarketAccessActor {
     pub user_id: String,
@@ -187,21 +212,127 @@ struct UpdatePublicCreditLineRequest {
     expected_revision: i64,
 }
 
+fn pricing_scope_rebuild_source(
+    conn: &Connection,
+    table: &str,
+    expected_primary_key: &[&str],
+) -> Result<Option<bool>, rusqlite::Error> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let schema = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if schema.is_empty() {
+        return Ok(None);
+    }
+
+    let has_pricing_kind = schema.iter().any(|(name, _)| name == "pricing_kind");
+    let mut primary_key = schema
+        .iter()
+        .filter(|(_, position)| *position > 0)
+        .map(|(name, position)| (*position, name.as_str()))
+        .collect::<Vec<_>>();
+    primary_key.sort_unstable_by_key(|(position, _)| *position);
+    let primary_key = primary_key
+        .into_iter()
+        .map(|(_, name)| name)
+        .collect::<Vec<_>>();
+
+    Ok((!has_pricing_kind || primary_key != expected_primary_key).then_some(has_pricing_kind))
+}
+
+fn migrate_pricing_scoped_access_tables(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let supplier_policy_source = pricing_scope_rebuild_source(
+        conn,
+        "market_supplier_access_policies",
+        &["supplier_user_id", "product_kind", "pricing_kind"],
+    )?;
+    let counterparty_rule_source = pricing_scope_rebuild_source(
+        conn,
+        "market_counterparty_access_rules",
+        &["counterparty_id", "product_kind", "pricing_kind"],
+    )?;
+    if supplier_policy_source.is_none() && counterparty_rule_source.is_none() {
+        return Ok(());
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    if let Some(source_has_pricing_kind) = supplier_policy_source {
+        tx.execute_batch(
+            "ALTER TABLE market_supplier_access_policies
+                 RENAME TO market_supplier_access_policies_legacy_pricing_scope;",
+        )?;
+        tx.execute_batch(CREATE_SUPPLIER_ACCESS_POLICIES_TABLE)?;
+        if source_has_pricing_kind {
+            tx.execute_batch(
+                "INSERT INTO market_supplier_access_policies (
+                    supplier_user_id, supplier_email, product_kind, pricing_kind, mode,
+                    revision, risk_acknowledged_at, created_at, updated_at
+                 )
+                 SELECT supplier_user_id, supplier_email, product_kind, pricing_kind, mode,
+                        revision, risk_acknowledged_at, created_at, updated_at
+                 FROM market_supplier_access_policies_legacy_pricing_scope;",
+            )?;
+        } else {
+            tx.execute_batch(
+                "INSERT INTO market_supplier_access_policies (
+                    supplier_user_id, supplier_email, product_kind, pricing_kind, mode,
+                    revision, risk_acknowledged_at, created_at, updated_at
+                 )
+                 SELECT legacy.supplier_user_id, legacy.supplier_email, legacy.product_kind,
+                        scope.pricing_kind, legacy.mode, legacy.revision,
+                        legacy.risk_acknowledged_at, legacy.created_at, legacy.updated_at
+                 FROM market_supplier_access_policies_legacy_pricing_scope AS legacy
+                 CROSS JOIN (
+                    SELECT 'free' AS pricing_kind
+                    UNION ALL SELECT 'paid'
+                 ) AS scope;",
+            )?;
+        }
+        tx.execute_batch("DROP TABLE market_supplier_access_policies_legacy_pricing_scope;")?;
+    }
+
+    if let Some(source_has_pricing_kind) = counterparty_rule_source {
+        tx.execute_batch(
+            "ALTER TABLE market_counterparty_access_rules
+                 RENAME TO market_counterparty_access_rules_legacy_pricing_scope;",
+        )?;
+        tx.execute_batch(CREATE_COUNTERPARTY_ACCESS_RULES_TABLE)?;
+        if source_has_pricing_kind {
+            tx.execute_batch(
+                "INSERT INTO market_counterparty_access_rules (
+                    counterparty_id, product_kind, pricing_kind, decision, created_at, updated_at
+                 )
+                 SELECT counterparty_id, product_kind, pricing_kind, decision,
+                        created_at, updated_at
+                 FROM market_counterparty_access_rules_legacy_pricing_scope;",
+            )?;
+        } else {
+            tx.execute_batch(
+                "INSERT INTO market_counterparty_access_rules (
+                    counterparty_id, product_kind, pricing_kind, decision, created_at, updated_at
+                 )
+                 SELECT legacy.counterparty_id, legacy.product_kind, scope.pricing_kind,
+                        legacy.decision, legacy.created_at, legacy.updated_at
+                 FROM market_counterparty_access_rules_legacy_pricing_scope AS legacy
+                 CROSS JOIN (
+                    SELECT 'free' AS pricing_kind
+                    UNION ALL SELECT 'paid'
+                 ) AS scope;",
+            )?;
+        }
+        tx.execute_batch("DROP TABLE market_counterparty_access_rules_legacy_pricing_scope;")?;
+    }
+    tx.commit()
+}
+
 pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
+    migrate_pricing_scoped_access_tables(conn)?;
+    conn.execute_batch(CREATE_SUPPLIER_ACCESS_POLICIES_TABLE)?;
+    conn.execute_batch(CREATE_COUNTERPARTY_ACCESS_RULES_TABLE)?;
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS market_supplier_access_policies (
-            supplier_user_id TEXT NOT NULL,
-            supplier_email TEXT NOT NULL,
-            product_kind TEXT NOT NULL CHECK (product_kind IN ('share', 'client_host')),
-            pricing_kind TEXT NOT NULL CHECK (pricing_kind IN ('free', 'paid')),
-            mode TEXT NOT NULL CHECK (mode IN ('whitelist', 'blacklist')),
-            revision INTEGER NOT NULL DEFAULT 1,
-            risk_acknowledged_at TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (supplier_user_id, product_kind, pricing_kind)
-        );
-        CREATE TABLE IF NOT EXISTS market_counterparties (
+        "CREATE TABLE IF NOT EXISTS market_counterparties (
             id TEXT PRIMARY KEY,
             supplier_user_id TEXT NOT NULL,
             supplier_email TEXT NOT NULL,
@@ -217,15 +348,6 @@ pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         CREATE UNIQUE INDEX IF NOT EXISTS uq_market_counterparty_bound_user
             ON market_counterparties(supplier_user_id, buyer_user_id)
             WHERE buyer_user_id IS NOT NULL;
-        CREATE TABLE IF NOT EXISTS market_counterparty_access_rules (
-            counterparty_id TEXT NOT NULL,
-            product_kind TEXT NOT NULL CHECK (product_kind IN ('share', 'client_host')),
-            pricing_kind TEXT NOT NULL CHECK (pricing_kind IN ('free', 'paid')),
-            decision TEXT NOT NULL CHECK (decision IN ('inherit', 'allow', 'deny')),
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (counterparty_id, product_kind, pricing_kind)
-        );
         CREATE TABLE IF NOT EXISTS market_credit_grants (
             counterparty_id TEXT NOT NULL,
             currency TEXT NOT NULL,
@@ -1543,6 +1665,150 @@ mod tests {
         let conn = Connection::open_in_memory().expect("open in-memory database");
         init_schema(&conn).expect("initialize market access schema");
         conn
+    }
+
+    #[test]
+    fn legacy_unscoped_access_tables_migrate_to_both_pricing_scopes() {
+        let conn = Connection::open_in_memory().expect("open legacy in-memory database");
+        conn.execute_batch(
+            "CREATE TABLE market_supplier_access_policies (
+                supplier_user_id TEXT NOT NULL,
+                supplier_email TEXT NOT NULL,
+                product_kind TEXT NOT NULL CHECK (product_kind IN ('share', 'client_host')),
+                mode TEXT NOT NULL CHECK (mode IN ('whitelist', 'blacklist')),
+                revision INTEGER NOT NULL DEFAULT 1,
+                risk_acknowledged_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (supplier_user_id, product_kind)
+            );
+            CREATE TABLE market_counterparty_access_rules (
+                counterparty_id TEXT NOT NULL,
+                product_kind TEXT NOT NULL CHECK (product_kind IN ('share', 'client_host')),
+                decision TEXT NOT NULL CHECK (decision IN ('inherit', 'allow', 'deny')),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (counterparty_id, product_kind)
+            );
+            INSERT INTO market_supplier_access_policies (
+                supplier_user_id, supplier_email, product_kind, mode, revision,
+                risk_acknowledged_at, created_at, updated_at
+            ) VALUES
+                ('supplier', 'supplier@example.com', 'share', 'whitelist', 7,
+                 NULL, '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z'),
+                ('supplier', 'supplier@example.com', 'client_host', 'blacklist', 3,
+                 '2026-01-03T00:00:00Z', '2026-01-01T00:00:00Z', '2026-01-03T00:00:00Z');
+            INSERT INTO market_counterparty_access_rules (
+                counterparty_id, product_kind, decision, created_at, updated_at
+            ) VALUES
+                ('counterparty', 'share', 'allow',
+                 '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z'),
+                ('counterparty', 'client_host', 'deny',
+                 '2026-01-01T00:00:00Z', '2026-01-03T00:00:00Z');",
+        )
+        .expect("initialize legacy access schema");
+
+        init_schema(&conn).expect("migrate legacy access schema");
+
+        let policy_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM market_supplier_access_policies",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count migrated policies");
+        assert_eq!(policy_count, 4);
+        for pricing_kind in [PRICING_FREE, PRICING_PAID] {
+            let share_policy: (String, i64, Option<String>, String, String) = conn
+                .query_row(
+                    "SELECT mode, revision, risk_acknowledged_at, created_at, updated_at
+                     FROM market_supplier_access_policies
+                     WHERE supplier_user_id = 'supplier' AND product_kind = 'share'
+                       AND pricing_kind = ?1",
+                    params![pricing_kind],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .expect("read migrated Share policy");
+            assert_eq!(
+                share_policy,
+                (
+                    MODE_WHITELIST.into(),
+                    7,
+                    None,
+                    "2026-01-01T00:00:00Z".into(),
+                    "2026-01-02T00:00:00Z".into(),
+                )
+            );
+
+            let client_host_rule: String = conn
+                .query_row(
+                    "SELECT decision FROM market_counterparty_access_rules
+                     WHERE counterparty_id = 'counterparty' AND product_kind = 'client_host'
+                       AND pricing_kind = ?1",
+                    params![pricing_kind],
+                    |row| row.get(0),
+                )
+                .expect("read migrated Client Host rule");
+            assert_eq!(client_host_rule, DECISION_DENY);
+        }
+
+        assert_eq!(
+            pricing_scope_rebuild_source(
+                &conn,
+                "market_supplier_access_policies",
+                &["supplier_user_id", "product_kind", "pricing_kind"],
+            )
+            .expect("inspect migrated policy schema"),
+            None
+        );
+        assert_eq!(
+            pricing_scope_rebuild_source(
+                &conn,
+                "market_counterparty_access_rules",
+                &["counterparty_id", "product_kind", "pricing_kind"],
+            )
+            .expect("inspect migrated rule schema"),
+            None
+        );
+
+        init_schema(&conn).expect("rerun migrated access schema initialization");
+        let policy_count_after_rerun: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM market_supplier_access_policies",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count policies after rerun");
+        assert_eq!(policy_count_after_rerun, 4);
+        conn.execute(
+            "INSERT INTO market_supplier_access_policies (
+                supplier_user_id, supplier_email, product_kind, pricing_kind, mode,
+                revision, created_at, updated_at
+             ) VALUES ('supplier', 'supplier@example.com', 'share', 'free',
+                       'whitelist', 8, '2026-01-01T00:00:00Z', '2026-01-04T00:00:00Z')
+             ON CONFLICT(supplier_user_id, product_kind, pricing_kind)
+             DO UPDATE SET revision = excluded.revision, updated_at = excluded.updated_at",
+            [],
+        )
+        .expect("upsert migrated pricing-scoped policy");
+        let revision: i64 = conn
+            .query_row(
+                "SELECT revision FROM market_supplier_access_policies
+                 WHERE supplier_user_id = 'supplier' AND product_kind = 'share'
+                   AND pricing_kind = 'free'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read updated migrated policy");
+        assert_eq!(revision, 8);
     }
 
     #[test]
