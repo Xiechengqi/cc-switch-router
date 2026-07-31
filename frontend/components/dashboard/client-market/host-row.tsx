@@ -13,7 +13,10 @@ import { WebTerminalGlyph } from "@/components/dashboard/web-terminal/web-termin
 import { useWebTerminal } from "@/components/dashboard/web-terminal";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { HostOfferDialog } from "@/components/dashboard/client-market/host-offer-dialog";
-import { ClientMarketRentalBanner } from "@/components/dashboard/client-market-rental-banner";
+import {
+  ClientMarketRentalBanner,
+  clientMarketRentalHasBanner,
+} from "@/components/dashboard/client-market-rental-banner";
 import { ProviderContactButton } from "@/components/common/provider-contacts";
 import { ReleaseRentalAction } from "@/components/dashboard/client-market/release-rental-action";
 import {
@@ -89,7 +92,7 @@ function HostRowImpl({
   const isClientOwner = host.isClientOwner === true;
   const canCleanup = hostCanCleanup(host, viewerEmail);
   const canClientRelease = hostCanClientRelease(host, rental);
-  const showRenterRental = isClientOwner && !!rental && rental.status !== "released";
+  const showRenterRental = clientMarketRentalHasBanner(rental);
   const isRetryCleanup =
     canCleanup && (host.status === "unreachable" || host.status === "draining");
   const canReverify = hostCanReverify(host, viewerEmail);
@@ -208,7 +211,8 @@ function HostRowImpl({
   const chatUnread = host.installationId
     ? unreadByInstallation.get(host.installationId) || 0
     : 0;
-  const showSubrow = !!noteText || showRenterRental;
+  /** Notes only — rental lifecycle lives under the offer cell to avoid interstitial table rows. */
+  const showSubrow = !!noteText;
   const ipIntelSubtitle = secondaryIntelParts.length ? secondaryIntelParts.join(" · ") : "";
   const statusGuidanceKey = hostStatusGuidanceKey(host.status, host.lastError);
   const statusGuidanceSubtitle = statusGuidanceKey ? t(statusGuidanceKey) : "";
@@ -272,10 +276,25 @@ function HostRowImpl({
             <ProviderContactButton contacts={host.contacts} />
           </div>
         </td>
-        <td className="max-w-[9rem] whitespace-nowrap px-2 py-2 align-middle">
-          <span className="block text-xs font-semibold text-foreground" title={t("clientMarket.currentOffer")}>
-            {formatHostOffer(host.dailyRateMinor, locale, host.currency, host.freeDurationDays)}
-          </span>
+        <td className="max-w-[9rem] px-2 py-2 align-middle">
+          <div className="min-w-0">
+            <span
+              className="block whitespace-nowrap text-xs font-semibold text-foreground"
+              title={t("clientMarket.currentOffer")}
+            >
+              {formatHostOffer(host.dailyRateMinor, locale, host.currency, host.freeDurationDays)}
+            </span>
+            {showRenterRental && rental ? (
+              <div className="mt-0.5 min-w-0">
+                <ClientMarketRentalBanner
+                  rental={rental}
+                  onChanged={onChanged}
+                  compact
+                  resumeRelease
+                />
+              </div>
+            ) : null}
+          </div>
         </td>
         <td className="max-w-[12rem] px-2 py-2 align-middle">
           <div
@@ -412,21 +431,12 @@ function HostRowImpl({
       {showSubrow ? (
         <tr className="border-b border-border/60 bg-muted/20">
           <td colSpan={colSpan} className="px-2 py-1.5 align-middle">
-            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] leading-4 text-muted-foreground">
-              {noteText ? (
-                <span className="min-w-0 whitespace-normal break-words" title={noteText}>
-                  {noteText}
-                </span>
-              ) : null}
-              {showRenterRental && rental ? (
-                <ClientMarketRentalBanner
-                  rental={rental}
-                  onChanged={onChanged}
-                  compact
-                  resumeRelease
-                />
-              ) : null}
-            </div>
+            <span
+              className="min-w-0 whitespace-normal break-words text-[11px] leading-4 text-muted-foreground"
+              title={noteText}
+            >
+              {noteText}
+            </span>
           </td>
         </tr>
       ) : null}

@@ -1,7 +1,7 @@
 "use client";
 
 import { Button, ScrollShadow, TextArea } from "@heroui/react";
-import { Info, Loader2, Send, Trash2 } from "lucide-react";
+import { Loader2, Send, Trash2 } from "lucide-react";
 import * as React from "react";
 import { chatSystemEventDetails, chatSystemEventText } from "@/components/chat/chat-system-event";
 import {
@@ -51,6 +51,64 @@ function renderBodyNodes(body: string, mine: boolean) {
   return nodes;
 }
 
+function SystemEventBubble({
+  message,
+  locale,
+  t,
+}: {
+  message: LocalChatMessage;
+  locale: string;
+  t: (key: MessageKey, values?: Record<string, string | number>) => string;
+}) {
+  const [expanded, setExpanded] = React.useState(false);
+  const details = chatSystemEventDetails(message, t, locale);
+  return (
+    <article className="flex justify-center py-0.5">
+      <div className="w-full max-w-[min(22rem,85%)] px-1 text-center text-[11px] leading-5 text-slate-500">
+        <p className="break-words text-slate-600">{chatSystemEventText(message, t, locale)}</p>
+        <div className="mt-0.5 flex flex-wrap items-center justify-center gap-x-2 gap-y-0.5">
+          <span className="text-[10px] text-slate-400" title={formatDateTime(message.createdAt)}>
+            {formatRelativeTime(message.createdAt, locale)}
+          </span>
+          {details.length ? (
+            <button
+              type="button"
+              className="text-[10px] font-medium text-primary hover:underline"
+              aria-expanded={expanded}
+              onClick={() => setExpanded((value) => !value)}
+            >
+              {expanded ? t("chat.hideDetails") : t("chat.showDetails")}
+            </button>
+          ) : null}
+        </div>
+        {expanded && details.length ? (
+          <dl className="mt-1.5 grid grid-cols-[minmax(5rem,auto)_minmax(0,1fr)] gap-x-2 gap-y-1 rounded-md bg-slate-50 px-2.5 py-2 text-left text-[11px]">
+            {details.map((detail) => (
+              <React.Fragment key={detail.key}>
+                <dt className="break-words text-slate-400">{detail.label}</dt>
+                <dd className="min-w-0 whitespace-pre-wrap break-all text-slate-600">
+                  {detail.href ? (
+                    <a
+                      href={detail.href}
+                      target="_blank"
+                      rel="noopener noreferrer nofollow"
+                      className="text-primary underline underline-offset-2"
+                    >
+                      {detail.value}
+                    </a>
+                  ) : (
+                    detail.value
+                  )}
+                </dd>
+              </React.Fragment>
+            ))}
+          </dl>
+        ) : null}
+      </div>
+    </article>
+  );
+}
+
 function MessageBubble({
   message,
   locale,
@@ -68,81 +126,64 @@ function MessageBubble({
 }) {
   const mine = message.isMine;
   if (message.authorKind === "system" || message.messageKind === "market_event") {
-    const details = chatSystemEventDetails(message, t, locale);
-    return (
-      <article className="flex justify-center py-0.5">
-        <div className="flex w-[94%] max-w-[94%] items-start gap-2 rounded-md bg-slate-100 px-3 py-2 text-xs leading-5 text-slate-600">
-          <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-slate-400" />
-          <div className="min-w-0">
-            <p className="break-words font-medium text-slate-700">{chatSystemEventText(message, t, locale)}</p>
-            {details.length ? (
-              <dl className="mt-2 grid grid-cols-[minmax(6rem,auto)_minmax(0,1fr)] gap-x-3 gap-y-1 border-t border-slate-200 pt-2">
-                {details.map((detail) => (
-                  <React.Fragment key={detail.key}>
-                    <dt className="break-words text-slate-400">{detail.label}</dt>
-                    <dd className="min-w-0 whitespace-pre-wrap break-all text-slate-600">
-                      {detail.href ? (
-                        <a
-                          href={detail.href}
-                          target="_blank"
-                          rel="noopener noreferrer nofollow"
-                          className="text-primary underline underline-offset-2"
-                        >
-                          {detail.value}
-                        </a>
-                      ) : detail.value}
-                    </dd>
-                  </React.Fragment>
-                ))}
-              </dl>
-            ) : null}
-            <p className="mt-0.5 text-[10px] text-slate-400" title={formatDateTime(message.createdAt)}>
-              {t("chat.systemMessage")} · {formatRelativeTime(message.createdAt, locale)}
-            </p>
-          </div>
-        </div>
-      </article>
-    );
+    return <SystemEventBubble message={message} locale={locale} t={t} />;
   }
   return (
     <article className={cn("group flex min-w-0", mine ? "justify-end" : "justify-start")}>
-      <div className={cn("max-w-[88%]", mine ? "items-end" : "items-start")}>
-        <div
-          className={cn(
-            "mb-1 flex items-center gap-2 text-[10px] text-slate-400",
-            mine ? "justify-end" : "justify-start",
-          )}
-        >
-          <span title={formatDateTime(message.createdAt)}>{formatRelativeTime(message.createdAt, locale)}</span>
-          <span className="font-medium text-slate-500">{mine ? t("chat.you") : message.authorLabel}</span>
-          {canDelete ? (
+      <div className={cn("flex max-w-[88%] flex-col", mine ? "items-end" : "items-start")}>
+        {!mine ? (
+          <div className="mb-0.5 flex items-center gap-1.5 px-0.5 text-[10px] text-slate-500">
+            <span className="font-medium">{message.authorLabel}</span>
+            {canDelete ? (
+              <button
+                type="button"
+                onClick={onDelete}
+                className="rounded p-0.5 text-slate-400 opacity-0 transition hover:bg-red-50 hover:text-red-600 group-hover:opacity-100 focus:opacity-100"
+                title={t("common.delete")}
+                aria-label={t("common.delete")}
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </button>
+            ) : null}
+          </div>
+        ) : null}
+        <div className="relative">
+          {mine && canDelete ? (
             <button
               type="button"
               onClick={onDelete}
-              className="rounded p-1 text-slate-400 opacity-0 transition hover:bg-red-50 hover:text-red-600 group-hover:opacity-100 focus:opacity-100"
+              className="absolute -left-8 top-1 rounded p-0.5 text-slate-400 opacity-0 transition hover:bg-red-50 hover:text-red-600 group-hover:opacity-100 focus:opacity-100"
               title={t("common.delete")}
               aria-label={t("common.delete")}
             >
               <Trash2 className="h-3.5 w-3.5" />
             </button>
           ) : null}
+          {message.status === "deleted" ? (
+            <p className="text-sm italic text-slate-400">{t("chat.deleted")}</p>
+          ) : (
+            <div
+              className={cn(
+                "rounded-2xl px-3 py-2 text-sm leading-6 shadow-sm",
+                mine
+                  ? "rounded-br-md bg-primary text-primary-foreground"
+                  : "rounded-bl-md border border-slate-200 bg-white text-slate-800",
+                message.__failed && "border border-red-200 bg-red-50 text-red-800",
+                message.__pending && "opacity-70",
+              )}
+            >
+              <p className="whitespace-pre-wrap break-words">{renderBodyNodes(message.body, mine)}</p>
+            </div>
+          )}
         </div>
-        {message.status === "deleted" ? (
-          <p className="text-sm italic text-slate-400">{t("chat.deleted")}</p>
-        ) : (
-          <div
-            className={cn(
-              "rounded-2xl px-3 py-2 text-sm leading-6 shadow-sm",
-              mine ? "rounded-br-md bg-primary text-primary-foreground" : "rounded-bl-md border border-slate-200 bg-white text-slate-800",
-              message.__failed && "border border-red-200 bg-red-50 text-red-800",
-              message.__pending && "opacity-70",
-            )}
-          >
-            <p className="whitespace-pre-wrap break-words">{renderBodyNodes(message.body, mine)}</p>
-          </div>
-        )}
+        <span
+          className={cn("mt-0.5 px-0.5 text-[10px] text-slate-400", mine ? "text-right" : "text-left")}
+          title={formatDateTime(message.createdAt)}
+        >
+          {formatRelativeTime(message.createdAt, locale)}
+        </span>
         {message.__failed ? (
-          <button type="button" className="mt-1 text-xs font-medium text-red-600 hover:underline" onClick={onRetry}>
+          <button type="button" className="mt-0.5 text-xs font-medium text-red-600 hover:underline" onClick={onRetry}>
             {t("chat.pendingFailed")}
           </button>
         ) : null}
@@ -429,9 +470,9 @@ export function ClientChatRoomPanel({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <ScrollShadow ref={scrollRef as React.Ref<HTMLDivElement>} className="min-h-0 flex-1 px-3 py-3">
+      <ScrollShadow ref={scrollRef as React.Ref<HTMLDivElement>} className="min-h-0 flex-1 px-3 py-2.5">
         {hasMore ? (
-          <div className="mb-3 flex justify-center">
+          <div className="mb-2 flex justify-center">
             <Button size="sm" variant="ghost" onClick={() => void loadOlder()} isDisabled={loadingOlder}>
               {loadingOlder ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
               {t("chat.loadOlder")}
@@ -443,7 +484,7 @@ export function ClientChatRoomPanel({
             <Loader2 className="h-5 w-5 animate-spin text-slate-400" />
           </div>
         ) : null}
-        <div className="grid gap-3">
+        <div className="grid gap-2">
           {messageList.map((message) => (
             <MessageBubble
               key={message.id}
@@ -465,19 +506,19 @@ export function ClientChatRoomPanel({
           ) : null}
         </div>
       </ScrollShadow>
-      <div className="shrink-0 border-t border-slate-200 bg-slate-50/70 p-3">
-        {error ? <p className="mb-2 break-words text-xs text-red-600">{error}</p> : null}
+      <div className="shrink-0 border-t border-slate-200 bg-slate-50/70 px-3 py-2">
+        {error ? <p className="mb-1.5 break-words text-xs text-red-600">{error}</p> : null}
         {room.status === "archived" || room.readOnly ? (
-          <p className="py-2 text-center text-xs text-slate-500">{t("chat.archivedReadOnly")}</p>
+          <p className="py-1.5 text-center text-xs text-slate-500">{t("chat.archivedReadOnly")}</p>
         ) : !session?.authenticated ? (
-          <div className="grid gap-2">
+          <div className="grid gap-1.5">
             <p className="text-center text-xs leading-5 text-slate-500">{t("chat.loginHint")}</p>
             <Button className="w-full" variant="primary" onClick={() => window.dispatchEvent(new CustomEvent("router-open-login"))}>
               {t("chat.loginToSend")}
             </Button>
           </div>
         ) : (
-          <div className="grid gap-2">
+          <div className="grid gap-1.5">
             <TextArea
               ref={textareaRef as React.Ref<HTMLTextAreaElement>}
               value={body}
@@ -489,7 +530,7 @@ export function ClientChatRoomPanel({
                 }
               }}
               placeholder={t("chat.write")}
-              className="min-h-20"
+              className="min-h-14"
             />
             <div className="flex items-center justify-between gap-3">
               <span className={cn("text-xs tabular-nums", bodyLength > MAX_BODY_LENGTH ? "text-red-600" : "text-slate-400")}>

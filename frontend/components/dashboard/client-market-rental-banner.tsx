@@ -6,6 +6,18 @@ import { useLocaleText } from "@/components/i18n/locale-provider";
 import { DASHBOARD_ACCOUNT_BILLING_PATH } from "@/lib/dashboard-nav";
 import type { ClientMarketRental } from "@/lib/types";
 
+/** True when the banner would show non-redundant lifecycle info (not just "Free · permanent"). */
+export function clientMarketRentalHasBanner(rental?: ClientMarketRental | null): boolean {
+  if (!rental || !rental.isClientOwner || rental.status === "released") return false;
+  if (rental.status === "releasing" || rental.status === "release_failed") return true;
+  if (!rental.dailyRateMinor) {
+    if (!rental.activatedAt) return true;
+    if (rental.expiresAt) return true;
+    return false;
+  }
+  return true;
+}
+
 /** Client lifecycle status plus a single link to supplier-level postpaid billing. */
 export function ClientMarketRentalBanner({
   rental,
@@ -23,7 +35,8 @@ export function ClientMarketRentalBanner({
   manageHref?: string;
 }) {
   const { locale, t } = useLocaleText();
-  if (!rental || !rental.isClientOwner || rental.status === "released") return null;
+  if (!clientMarketRentalHasBanner(rental)) return null;
+  if (!rental) return null;
 
   if (rental.status === "releasing") {
     return (
@@ -72,7 +85,11 @@ export function ClientMarketRentalBanner({
         title={detail}
       >
         <Clock3 className="h-3 w-3" />
-        {compact ? `${t("clientMarket.free")} · ${remaining}` : detail}
+        {compact
+          ? activated
+            ? remaining
+            : t("clientMarket.freeDuration.pendingActivation")
+          : detail}
       </span>
     );
   }

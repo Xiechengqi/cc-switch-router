@@ -67,6 +67,7 @@ import type {
   MarketBillingDashboard,
   MarketBillingInvoiceHistory,
   MarketAccessDashboard,
+  MarketCounterparty,
   MarketAccessDecision,
   MarketAccessPricingKind,
   MarketAccessProductKind,
@@ -910,7 +911,7 @@ export async function upsertMarketCounterparty(body: {
     riskAcknowledged?: boolean;
   }>;
 }) {
-  return parseJson<unknown>(
+  return parseJson<MarketCounterparty>(
     await authFetch("/v1/market-access/counterparties", {
       method: "POST",
       headers: { "Content-Type": "application/json" },

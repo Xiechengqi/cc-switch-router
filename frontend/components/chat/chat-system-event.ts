@@ -15,22 +15,15 @@ export type ChatSystemEventDetail = {
 };
 
 const DETAIL_LABELS: Record<string, MessageKey> = {
-  accountId: "chat.detail.accountId",
-  accountStatus: "chat.detail.accountStatus",
-  actorEmail: "chat.detail.actorEmail",
-  actorUserId: "chat.detail.actorUserId",
+  activatedAt: "chat.detail.activatedAt",
   address: "chat.detail.address",
   amountMinor: "chat.detail.amount",
   appType: "chat.detail.appType",
   assetUrl: "chat.detail.assetUrl",
   balanceMinor: "chat.detail.balance",
-  billingEventType: "chat.detail.billingEventType",
   buyerEmail: "chat.detail.buyerEmail",
-  buyerUserId: "chat.detail.buyerUserId",
   chain: "chat.detail.chain",
-  clientLabel: "chat.detail.clientLabel",
   clientOwnerEmail: "chat.detail.clientOwnerEmail",
-  clientUserId: "chat.detail.clientUserId",
   contact: "chat.detail.contact",
   createdAt: "chat.detail.createdAt",
   creditKind: "chat.detail.creditKind",
@@ -38,65 +31,42 @@ const DETAIL_LABELS: Record<string, MessageKey> = {
   currency: "chat.detail.currency",
   dailyRateMinor: "chat.detail.dailyRate",
   deadlineAt: "chat.detail.deadlineAt",
-  declarationId: "chat.detail.declarationId",
   declaredAt: "chat.detail.declaredAt",
   dispute: "chat.detail.dispute",
   dueAt: "chat.detail.dueAt",
   error: "chat.detail.error",
   evidenceUrl: "chat.detail.evidenceUrl",
+  expiresAt: "chat.detail.expiresAt",
   failureCode: "chat.detail.failureCode",
   free: "chat.detail.free",
+  freeDurationDays: "chat.detail.freeDurationDays",
   futureAccessDenied: "chat.detail.futureAccessDenied",
-  hostId: "chat.detail.hostId",
   hostname: "chat.detail.hostname",
-  hostStatus: "chat.detail.hostStatus",
-  id: "chat.detail.id",
-  installationId: "chat.detail.installationId",
   instructions: "chat.detail.instructions",
-  invoiceId: "chat.detail.invoiceId",
   invoiceStatus: "chat.detail.invoiceStatus",
   kind: "chat.detail.kind",
-  listingId: "chat.detail.listingId",
-  marketKind: "chat.detail.marketKind",
   method: "chat.detail.method",
   note: "chat.detail.note",
-  offerRevision: "chat.detail.offerRevision",
   ownerEmail: "chat.detail.ownerEmail",
-  ownerUserId: "chat.detail.ownerUserId",
   paymentContacts: "chat.detail.paymentContacts",
   paymentDeclaration: "chat.detail.paymentDeclaration",
   paymentMethodKind: "chat.detail.paymentMethodKind",
   paymentMethods: "chat.detail.paymentMethods",
   paymentReference: "chat.detail.paymentReference",
-  previousStatus: "chat.detail.previousStatus",
-  productKind: "chat.detail.productKind",
-  productRef: "chat.detail.productRef",
   providerDeniedClientAccess: "chat.detail.providerDeniedClientAccess",
   providerEmail: "chat.detail.providerEmail",
   qrImageUrl: "chat.detail.qrImageUrl",
   reason: "chat.detail.reason",
-  rawError: "chat.detail.rawError",
-  rejectedAt: "chat.detail.rejectedAt",
   rejectionReason: "chat.detail.rejectionReason",
   renterEmail: "chat.detail.renterEmail",
-  renterUserId: "chat.detail.renterUserId",
   resolution: "chat.detail.resolution",
   resolvedAt: "chat.detail.resolvedAt",
   seatCount: "chat.detail.seatCount",
-  seatId: "chat.detail.seatId",
   seatPosition: "chat.detail.seatPosition",
   seatStatus: "chat.detail.seatStatus",
-  serviceLabel: "chat.detail.serviceLabel",
-  serviceRef: "chat.detail.serviceRef",
-  services: "chat.detail.services",
-  shareId: "chat.detail.shareId",
-  shareName: "chat.detail.shareName",
-  status: "chat.detail.status",
   subdomain: "chat.detail.subdomain",
-  subscriptionId: "chat.detail.subscriptionId",
   subscriptionStatus: "chat.detail.subscriptionStatus",
   supplierEmail: "chat.detail.supplierEmail",
-  supplierUserId: "chat.detail.supplierUserId",
   token: "chat.detail.token",
   tokenLimit: "chat.detail.tokenLimit",
   tokenPeriod: "chat.detail.tokenPeriod",
@@ -107,6 +77,146 @@ const DETAIL_LABELS: Record<string, MessageKey> = {
   trialHours: "chat.detail.trialHours",
   utilizationBps: "chat.detail.utilization",
 };
+
+/**
+ * User-facing detail keys per market event. Empty = summary only.
+ * Technical IDs / internal bookkeeping fields are intentionally omitted.
+ */
+const DETAIL_FIELDS_BY_EVENT: Record<string, readonly string[]> = {
+  client_provisioned: [
+    "providerEmail",
+    "hostname",
+    "dailyRateMinor",
+    "currency",
+    "trialHours",
+    "freeDurationDays",
+    "activatedAt",
+    "expiresAt",
+  ],
+  free_period_expiring: ["expiresAt", "freeDurationDays", "hostname", "providerEmail"],
+  free_period_expired: ["expiresAt", "hostname", "providerEmail"],
+  cleanup_started: ["reason", "hostname", "providerEmail"],
+  cleanup_finished: ["hostname", "providerEmail", "providerDeniedClientAccess"],
+  subscription_force_released: [
+    "hostname",
+    "providerEmail",
+    "providerDeniedClientAccess",
+    "reason",
+  ],
+  cleanup_failed: ["failureCode", "reason", "hostname", "providerEmail"],
+
+  listing_created: ["seatCount", "dailyRateMinor", "currency"],
+  listing_relisted: [],
+  listing_closed: [],
+  listing_deleted: [],
+  seat_added: ["seatPosition", "dailyRateMinor", "currency"],
+  seat_updated: [
+    "seatPosition",
+    "dailyRateMinor",
+    "currency",
+    "tokenLimit",
+    "tokenPeriod",
+    "parallelLimit",
+  ],
+  seat_deleted: ["seatPosition"],
+  seat_rented: ["seatPosition", "renterEmail", "dailyRateMinor", "currency", "trialHours"],
+  seat_retired: ["seatPosition"],
+  entitlement_activated: ["seatPosition", "renterEmail"],
+  entitlement_failed: ["seatPosition", "renterEmail", "error", "failureCode"],
+  renter_release_requested: ["seatPosition", "renterEmail"],
+  owner_revoke_requested: ["seatPosition", "renterEmail"],
+  entitlement_revoke_requested: ["seatPosition", "renterEmail"],
+  subscription_released: ["seatPosition", "renterEmail"],
+  revoke_failed: ["seatPosition", "renterEmail", "error", "failureCode"],
+  billing_suspension_requested: ["seatPosition", "renterEmail"],
+  billing_suspended: ["seatPosition", "renterEmail"],
+  billing_suspension_failed: ["seatPosition", "renterEmail", "error", "failureCode"],
+  billing_resume_requested: ["seatPosition", "renterEmail"],
+  billing_resumed: ["seatPosition", "renterEmail"],
+  billing_resume_failed: ["seatPosition", "renterEmail", "error", "failureCode"],
+  share_enabled: [],
+  share_disabled: [],
+  share_expiration_changed: ["expiresAt"],
+  share_expired: ["expiresAt"],
+  share_provider_changed: [],
+  service_offline: [],
+  service_recovered: [],
+
+  payment_due: [
+    "amountMinor",
+    "currency",
+    "dueAt",
+    "deadlineAt",
+    "supplierEmail",
+    "paymentMethods",
+    "paymentContacts",
+  ],
+  payment_declared: [
+    "amountMinor",
+    "currency",
+    "buyerEmail",
+    "paymentReference",
+    "evidenceUrl",
+    "assetUrl",
+    "method",
+    "note",
+  ],
+  billing_payment_confirmed: ["amountMinor", "currency", "supplierEmail"],
+  billing_payment_rejected: ["amountMinor", "currency", "reason", "rejectionReason"],
+  billing_payment_overdue: ["amountMinor", "currency", "deadlineAt"],
+  billing_invoice_disputed: ["amountMinor", "currency", "reason"],
+  billing_dispute_resolved: ["amountMinor", "currency", "resolution"],
+  billing_invoice_voided: ["amountMinor", "currency", "reason"],
+  billing_credit_limit_warning: [
+    "utilizationBps",
+    "balanceMinor",
+    "creditLimitMinor",
+    "currency",
+  ],
+  billing_account_closing: ["supplierEmail", "reason"],
+};
+
+/** Conservative fallback for unknown event types — never dump IDs. */
+const FALLBACK_DETAIL_FIELDS = [
+  "amountMinor",
+  "currency",
+  "reason",
+  "error",
+  "failureCode",
+  "deadlineAt",
+  "dueAt",
+  "expiresAt",
+  "activatedAt",
+  "renterEmail",
+  "ownerEmail",
+  "providerEmail",
+  "supplierEmail",
+  "buyerEmail",
+  "seatPosition",
+  "hostname",
+] as const;
+
+function looksLikeUuid(value: string) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    value.trim(),
+  );
+}
+
+function payloadHasMoneyAmount(payload: Record<string, unknown>) {
+  return ["amountMinor", "dailyRateMinor", "balanceMinor", "creditLimitMinor"].some(
+    (key) => typeof payload[key] === "number" && Number.isFinite(payload[key] as number),
+  );
+}
+
+function shouldIncludeDetailKey(key: string, payload: Record<string, unknown>) {
+  if (!(key in payload) || payload[key] == null) return false;
+  if (key === "currency" && !payloadHasMoneyAmount(payload)) return false;
+  if (key === "hostname" || key === "clientLabel" || key === "shareName") {
+    const value = payload[key];
+    return typeof value === "string" && value.trim().length > 0 && !looksLikeUuid(value);
+  }
+  return true;
+}
 
 const SENSITIVE_DETAIL_FIELDS = [
   "apikey",
@@ -316,12 +426,16 @@ export function chatSystemEventDetails(
 ) {
   if (message.messageKind !== "market_event" || !message.eventPayload) return [];
   const payload = message.eventPayload;
+  const eventType = message.eventType || "";
+  const allowed = Object.prototype.hasOwnProperty.call(DETAIL_FIELDS_BY_EVENT, eventType)
+    ? DETAIL_FIELDS_BY_EVENT[eventType]
+    : FALLBACK_DETAIL_FIELDS;
+  if (!allowed.length) return [];
   const output: ChatSystemEventDetail[] = [];
-  Object.entries(payload).forEach(([key, value]) => {
-    if (key !== "summary" && !isSensitiveDetailField(key)) {
-      flattenEventDetails(value, [key], payload, locale, t, output);
-    }
-  });
+  for (const key of allowed) {
+    if (!shouldIncludeDetailKey(key, payload) || isSensitiveDetailField(key)) continue;
+    flattenEventDetails(payload[key], [key], payload, locale, t, output);
+  }
   return output;
 }
 
@@ -432,6 +546,15 @@ export function chatSystemEventText(message: StructuredChatMessage, t: TFn, loca
       return t("chat.event.billingAccountClosing");
     case "client_provisioned":
       return t("chat.event.clientProvisioned", {
+        client: payloadString(payload, "clientLabel"),
+      });
+    case "free_period_expiring":
+      return t("chat.event.freePeriodExpiring", {
+        client: payloadString(payload, "clientLabel"),
+        time: payloadTime(payload, "expiresAt", locale),
+      });
+    case "free_period_expired":
+      return t("chat.event.freePeriodExpired", {
         client: payloadString(payload, "clientLabel"),
       });
     case "cleanup_started":

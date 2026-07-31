@@ -465,6 +465,8 @@ location.reload();
 | MA-11 | 已有进行中服务 | 切换默认模式或修改产品规则 | 只影响新租用,不会隐式中断现有服务 |
 | MA-12 | 外部系统持用户 API Token | 分别用 read/write scope 调准入接口,再提交旧 revision | 权限按 scope 隔离；过期 revision 返回冲突且不覆盖新设置 |
 | MA-13 | 四个作用域配置不同模式与买家规则 | 逐一租用 Share / Host 的免费与付费报价 | 每次只读取匹配的 `(productKind, pricingKind)`，不存在跨作用域继承或串扰 |
+| MA-14 | 已有多名可信买家 | 在买家表格搜索邮箱或用户 ID，再清空搜索 | 只过滤匹配行；未保存的其他行草稿不丢失，空结果显示搜索空态 |
+| MA-15 | 同时修改多名买家的状态、准入或 CNY/USD 授信 | 观察全局按钮，先重置再重新修改并保存 | 无语义变更时「保存」和「重置」禁用；重置恢复服务端快照；保存一次提交全部脏行并刷新 revision；无限额度仍需逐项确认风险 |
 
 ### 9.3 统一市场账务(MB)
 
@@ -832,7 +834,7 @@ location.reload();
 | Admin(设置/版本/日志/公告/地图/通知/市场管理) | `getSettings*`、`saveSettings`、`updateMarket*` | X-02~X-08, X-10~X-13, X-17, X-19~X-24, M-10~M-14 |
 | Client Market(主机/作业/报价/终端/子域名) | `getClientMarketHosts`、`createClientMarketQuote`、`commitClientMarketQuote` | H-20~H-29, H-43~H-48, H-80~H-84, T-01, Q-02, Q-06, Q-11, Q-12 |
 | Client 租用生命周期 | `getMyClientMarketRentals`、`releaseClientMarketRental`、`cleanupClientMarketProviderRental` | R-01~R-35, H-44~H-48 |
-| 市场准入与授信 | `getMarketAccessDashboard`、`updateMarketAccessPolicy`、`upsertMarketCounterparty`、`updateMarketCounterpartyCredit`、`updateMarketPublicCredit` | MA-01~MA-12 |
+| 市场准入与授信 | `getMarketAccessDashboard`、`updateMarketAccessPolicy`、`upsertMarketCounterparty`、`updateMarketCounterparty`、`updateMarketCounterpartyCredit`、`updateMarketPublicCredit` | MA-01~MA-15 |
 | 统一市场账务 | `getMarketBillingDashboard`、`settleMarketBillingAccount`、`requestMarketBillingSettlement`、`declareMarketBillingPayment`、`confirmMarketBillingPayment`、争议/作废端点 | MB-01~MB-19 |
 | 聊天 | `getClientChat*`、`postClientChatMessage` | CH-01~CH-19 |
 | 指标 | `getMetrics*`、`getLlmMetrics*` | N-02~N-14 |
@@ -888,3 +890,4 @@ location.reload();
 | 2026-07-30 | Share/Client Host 免费与付费租用统一改为默认白名单；新增邮箱预授权、产品规则、买家级有限/无限授信、风险确认的黑名单模式与有限公共额度,扩展 MA-01~MA-12、MB-18~MB-19。 |
 | 2026-07-30 | 未获供应商准入时保留 Share「租用」/Client Host「新建」入口并改为联系 Owner 的授权引导弹窗；Share 跳转 Client 聊天室,Host 展示邮件与公开联系方式,新增 SM-16、H-51。 |
 | 2026-07-31 | 免费与付费准入拆为四个独立作用域，免费默认黑名单、付费默认白名单；免费 Share/Host 新增 1–365 天或永久期限、报价快照、临期事件和到期安全回收，扩展 SM/H/AS/MA 回归用例。 |
+| 2026-07-31 | 可信买家管理改为可搜索表格和统一草稿保存；新增全局重置/保存门控以及多买家批量编辑回归用例 MA-14~MA-15。 |

@@ -8,9 +8,11 @@ import {
   Loader2,
   Plus,
   RefreshCw,
+  RotateCcw,
+  Save,
+  Search,
   ShieldCheck,
-  UserRoundCheck,
-  UserRoundX,
+  X,
 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { SegmentedControl } from "@/components/common/segmented-control";
@@ -37,6 +39,41 @@ import type {
 import { cn } from "@/lib/utils";
 
 type Currency = "CNY" | "USD";
+type ScopeKey = `${MarketAccessProductKind}:${MarketAccessPricingKind}`;
+
+type CreditDraft = {
+  kind: MarketCreditKind;
+  limit: string;
+  unlimitedAcknowledged: boolean;
+};
+
+type CounterpartyDraft = {
+  status: "active" | "revoked";
+  decisions: Record<ScopeKey, MarketAccessDecision>;
+  credits: Record<Currency, CreditDraft>;
+};
+
+type CounterpartyChange = {
+  statusChanged: boolean;
+  accessRules: Array<{
+    productKind: MarketAccessProductKind;
+    pricingKind: MarketAccessPricingKind;
+    decision: MarketAccessDecision;
+  }>;
+  creditCurrencies: Currency[];
+};
+
+const ACCESS_SCOPES: ReadonlyArray<{
+  productKind: MarketAccessProductKind;
+  pricingKind: MarketAccessPricingKind;
+}> = [
+  { productKind: "share", pricingKind: "free" },
+  { productKind: "share", pricingKind: "paid" },
+  { productKind: "client_host", pricingKind: "free" },
+  { productKind: "client_host", pricingKind: "paid" },
+];
+
+const CURRENCIES: Currency[] = ["CNY", "USD"];
 
 function parseLimitMinor(value: string) {
   if (!/^\d+(?:\.\d{1,2})?$/.test(value.trim())) return null;
@@ -51,100 +88,152 @@ function formatMoney(value: number, currency: string, locale: string) {
   }).format(value / 100);
 }
 
-function CreditEditor({
-  counterpartyId,
-  currency,
+function scopeKey(
+  productKind: MarketAccessProductKind,
+  pricingKind: MarketAccessPricingKind,
+): ScopeKey {
+  return `${productKind}:${pricingKind}`;
+}
+
+function counterpartyDecision(
+  counterparty: MarketCounterparty,
+  productKind: MarketAccessProductKind,
+  pricingKind: MarketAccessPricingKind,
+) {
+  return (
+    counterparty.accessRules.find(
+      (rule) => rule.productKind === productKind && rule.pricingKind === pricingKind,
+    )?.decision || "inherit"
+  );
+}
+
+function counterpartyCreditLine(counterparty: MarketCounterparty, currency: Currency) {
+  return counterparty.creditLines.find((line) => line.currency === currency);
+}
+
+function creditDraft(line?: MarketCreditLine): CreditDraft {
+  return {
+    kind: line?.kind || "none",
+    limit: line?.limitMinor != null ? (line.limitMinor / 100).toFixed(2) : "",
+    unlimitedAcknowledged: false,
+  };
+}
+
+function buildCounterpartyDraft(counterparty: MarketCounterparty): CounterpartyDraft {
+  return {
+    status: counterparty.status === "revoked" ? "revoked" : "active",
+    decisions: {
+      "share:free": counterpartyDecision(counterparty, "share", "free"),
+      "share:paid": counterpartyDecision(counterparty, "share", "paid"),
+      "client_host:free": counterpartyDecision(counterparty, "client_host", "free"),
+      "client_host:paid": counterpartyDecision(counterparty, "client_host", "paid"),
+    },
+    credits: {
+      CNY: creditDraft(counterpartyCreditLine(counterparty, "CNY")),
+      USD: creditDraft(counterpartyCreditLine(counterparty, "USD")),
+    },
+  };
+}
+
+function buildCounterpartyDrafts(counterparties: MarketCounterparty[]) {
+  return Object.fromEntries(
+    counterparties.map((counterparty) => [counterparty.id, buildCounterpartyDraft(counterparty)]),
+  ) as Record<string, CounterpartyDraft>;
+}
+
+function creditChanged(line: MarketCreditLine | undefined, draft: CreditDraft) {
+  const currentKind = line?.kind || "none";
+  if (draft.kind !== currentKind) return true;
+  if (draft.kind !== "limited") return false;
+  return parseLimitMinor(draft.limit) !== line?.limitMinor;
+}
+
+function counterpartyChange(
+  counterparty: MarketCounterparty,
+  draft?: CounterpartyDraft,
+): CounterpartyChange {
+  if (!draft) {
+    return { statusChanged: false, accessRules: [], creditCurrencies: [] };
+  }
+  return {
+    statusChanged:
+      draft.status !== (counterparty.status === "revoked" ? "revoked" : "active"),
+    accessRules: ACCESS_SCOPES.filter(
+      ({ productKind, pricingKind }) =>
+        draft.decisions[scopeKey(productKind, pricingKind)] !==
+        counterpartyDecision(counterparty, productKind, pricingKind),
+    ).map(({ productKind, pricingKind }) => ({
+      productKind,
+      pricingKind,
+      decision: draft.decisions[scopeKey(productKind, pricingKind)],
+    })),
+    creditCurrencies: CURRENCIES.filter((currency) =>
+      creditChanged(counterpartyCreditLine(counterparty, currency), draft.credits[currency]),
+    ),
+  };
+}
+
+function hasCounterpartyChange(change: CounterpartyChange) {
+  return change.statusChanged || change.accessRules.length > 0 || change.creditCurrencies.length > 0;
+}
+
+function CounterpartyCreditCell({
   line,
+  currency,
+  draft,
   disabled,
-  onSaved,
+  onChange,
 }: {
-  counterpartyId: string;
-  currency: Currency;
   line?: MarketCreditLine;
+  currency: Currency;
+  draft: CreditDraft;
   disabled?: boolean;
-  onSaved: () => Promise<void>;
+  onChange: (draft: CreditDraft) => void;
 }) {
   const { t } = useLocaleText();
-  const [kind, setKind] = React.useState<MarketCreditKind>(line?.kind || "none");
-  const [limit, setLimit] = React.useState(line?.limitMinor ? (line.limitMinor / 100).toFixed(2) : "");
-  const [unlimitedAcknowledged, setUnlimitedAcknowledged] = React.useState(false);
-  const [busy, setBusy] = React.useState(false);
-
-  React.useEffect(() => {
-    setKind(line?.kind || "none");
-    setLimit(line?.limitMinor ? (line.limitMinor / 100).toFixed(2) : "");
-    setUnlimitedAcknowledged(false);
-  }, [line?.kind, line?.limitMinor, line?.revision]);
-
-  const save = async () => {
-    const limitMinor = kind === "limited" ? parseLimitMinor(limit) : undefined;
-    if (kind === "limited" && limitMinor == null) {
-      toast.danger(t("marketAccess.invalidLimit"));
-      return;
-    }
-    if (kind === "unlimited" && !unlimitedAcknowledged) {
-      toast.danger(t("marketAccess.unlimitedConfirmRequired"));
-      return;
-    }
-    setBusy(true);
-    try {
-      await updateMarketCounterpartyCredit(counterpartyId, currency, {
-        kind,
-        limitMinor: limitMinor ?? undefined,
-        riskAcknowledged: kind === "unlimited" && unlimitedAcknowledged,
-        expectedRevision: line?.revision || 0,
-      });
-      await onSaved();
-      toast.success(t("marketAccess.creditSaved", { currency }));
-    } catch (error) {
-      toast.danger(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(false);
-    }
-  };
+  const needsUnlimitedAcknowledgement =
+    draft.kind === "unlimited" && (line?.kind || "none") !== "unlimited";
 
   return (
-    <div className="grid gap-2 border-t border-border pt-3 first:border-t-0 first:pt-0 sm:grid-cols-[4rem_8rem_minmax(7rem,1fr)_auto] sm:items-end">
-      <strong className="text-sm">{currency}</strong>
-      <label className="grid gap-1 text-xs text-muted-foreground">
-        {t("marketAccess.creditType")}
-        <select
-          value={kind}
-          disabled={disabled || busy}
-          onChange={(event) => setKind(event.target.value as MarketCreditKind)}
-          className="h-9 rounded-md border border-border bg-white px-2 text-sm text-foreground"
-        >
-          <option value="none">{t("marketAccess.credit.none")}</option>
-          <option value="limited">{t("marketAccess.credit.limited")}</option>
-          <option value="unlimited">{t("marketAccess.credit.unlimited")}</option>
-        </select>
-      </label>
-      {kind === "limited" ? (
-        <label className="grid gap-1 text-xs text-muted-foreground">
-          {t("marketAccess.limitMajor")}
-          <input
-            value={limit}
-            disabled={disabled || busy}
-            inputMode="decimal"
-            onChange={(event) => setLimit(event.target.value)}
-            className="h-9 min-w-0 rounded-md border border-border bg-white px-3 text-sm text-foreground"
-          />
-        </label>
-      ) : kind === "unlimited" ? (
+    <div className="grid min-w-52 gap-2">
+      <select
+        value={draft.kind}
+        disabled={disabled}
+        aria-label={`${currency} ${t("marketAccess.creditType")}`}
+        onChange={(event) =>
+          onChange({
+            ...draft,
+            kind: event.target.value as MarketCreditKind,
+            unlimitedAcknowledged: false,
+          })
+        }
+        className="h-9 w-full rounded-md border border-border bg-white px-2 text-xs text-foreground disabled:bg-slate-50"
+      >
+        <option value="none">{t("marketAccess.credit.none")}</option>
+        <option value="limited">{t("marketAccess.credit.limited")}</option>
+        <option value="unlimited">{t("marketAccess.credit.unlimited")}</option>
+      </select>
+      {draft.kind === "limited" ? (
+        <input
+          value={draft.limit}
+          disabled={disabled}
+          inputMode="decimal"
+          aria-label={`${currency} ${t("marketAccess.limitMajor")}`}
+          placeholder={t("marketAccess.limitMajor")}
+          onChange={(event) => onChange({ ...draft, limit: event.target.value })}
+          className="h-9 w-full rounded-md border border-border bg-white px-2 text-xs text-foreground disabled:bg-slate-50"
+        />
+      ) : needsUnlimitedAcknowledgement ? (
         <Checkbox
-          isSelected={unlimitedAcknowledged}
-          onChange={setUnlimitedAcknowledged}
-          isDisabled={disabled || busy}
-          className="self-center text-xs"
+          isSelected={draft.unlimitedAcknowledged}
+          onChange={(selected) => onChange({ ...draft, unlimitedAcknowledged: selected })}
+          isDisabled={disabled}
+          className="text-[11px] leading-4"
         >
           <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
           {t("marketAccess.unlimitedConfirm")}
         </Checkbox>
-      ) : <div />}
-      <Button size="sm" variant="outline" isDisabled={disabled || busy} onClick={() => void save()}>
-        {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
-        {t("common.save")}
-      </Button>
+      ) : null}
     </div>
   );
 }
@@ -230,10 +319,14 @@ export function AccountMarketAccessPage() {
   const { session, loading: authLoading } = useAuth();
   const authed = !!session?.authenticated;
   const [dashboard, setDashboard] = React.useState<MarketAccessDashboard | null>(null);
+  const [counterpartyDrafts, setCounterpartyDrafts] = React.useState<
+    Record<string, CounterpartyDraft>
+  >({});
   const [loading, setLoading] = React.useState(true);
   const [refreshing, setRefreshing] = React.useState(false);
   const [busy, setBusy] = React.useState("");
   const [email, setEmail] = React.useState("");
+  const [buyerQuery, setBuyerQuery] = React.useState("");
   const [allowedScopes, setAllowedScopes] = React.useState<Record<string, boolean>>({
     "share:free": true,
     "share:paid": true,
@@ -251,7 +344,9 @@ export function AccountMarketAccessPage() {
     if (silent) setRefreshing(true);
     else setLoading(true);
     try {
-      setDashboard(await getMarketAccessDashboard());
+      const nextDashboard = await getMarketAccessDashboard();
+      setDashboard(nextDashboard);
+      setCounterpartyDrafts(buildCounterpartyDrafts(nextDashboard.counterparties));
     } catch (error) {
       toast.danger(error instanceof Error ? error.message : String(error));
     } finally {
@@ -273,15 +368,66 @@ export function AccountMarketAccessPage() {
     dashboard?.policies.some(
       (policy) => policy.pricingKind === "paid" && policy.mode === "blacklist",
     ) || false;
+  const counterpartyChanges = React.useMemo(
+    () =>
+      (dashboard?.counterparties || []).map((counterparty) => ({
+        counterparty,
+        draft: counterpartyDrafts[counterparty.id],
+        change: counterpartyChange(counterparty, counterpartyDrafts[counterparty.id]),
+      })),
+    [counterpartyDrafts, dashboard?.counterparties],
+  );
+  const changedCounterparties = React.useMemo(
+    () => counterpartyChanges.filter(({ change }) => hasCounterpartyChange(change)),
+    [counterpartyChanges],
+  );
+  const normalizedBuyerQuery = buyerQuery.trim().toLowerCase();
+  const visibleCounterparties = React.useMemo(() => {
+    if (!normalizedBuyerQuery) return dashboard?.counterparties || [];
+    return (dashboard?.counterparties || []).filter((counterparty) =>
+      [counterparty.buyerEmail, counterparty.buyerUserId || "", counterparty.status]
+        .join(" ")
+        .toLowerCase()
+        .includes(normalizedBuyerQuery),
+    );
+  }, [dashboard?.counterparties, normalizedBuyerQuery]);
+
+  const updateCounterpartyDraft = React.useCallback(
+    (id: string, update: (draft: CounterpartyDraft) => CounterpartyDraft) => {
+      setCounterpartyDrafts((current) => {
+        const draft = current[id];
+        if (!draft) return current;
+        return { ...current, [id]: update(draft) };
+      });
+    },
+    [],
+  );
+
+  const updateDashboardPreservingDrafts = React.useCallback(
+    (nextDashboard: MarketAccessDashboard) => {
+      setDashboard(nextDashboard);
+      setCounterpartyDrafts((current) =>
+        Object.fromEntries(
+          nextDashboard.counterparties.map((counterparty) => [
+            counterparty.id,
+            current[counterparty.id] || buildCounterpartyDraft(counterparty),
+          ]),
+        ) as Record<string, CounterpartyDraft>,
+      );
+    },
+    [],
+  );
 
   const applyPolicy = async (policy: MarketAccessPolicy, mode: "whitelist" | "blacklist", acknowledged = false) => {
     setBusy(`policy:${policy.productKind}:${policy.pricingKind}`);
     try {
-      setDashboard(await updateMarketAccessPolicy(policy.productKind, policy.pricingKind, {
-        mode,
-        riskAcknowledged: acknowledged,
-        expectedRevision: policy.revision,
-      }));
+      updateDashboardPreservingDrafts(
+        await updateMarketAccessPolicy(policy.productKind, policy.pricingKind, {
+          mode,
+          riskAcknowledged: acknowledged,
+          expectedRevision: policy.revision,
+        }),
+      );
       toast.success(t("marketAccess.policySaved"));
       return true;
     } catch (error) {
@@ -314,7 +460,7 @@ export function AccountMarketAccessPage() {
     }
     setBusy("add");
     try {
-      await upsertMarketCounterparty({
+      const savedCounterparty = await upsertMarketCounterparty({
         email: normalizedEmail,
         accessRules: (["share", "client_host"] as const).flatMap((productKind) =>
           (["free", "paid"] as const)
@@ -323,7 +469,21 @@ export function AccountMarketAccessPage() {
         ),
       });
       setEmail("");
-      await load(true);
+      setDashboard((current) =>
+        current
+          ? {
+              ...current,
+              counterparties: [
+                ...current.counterparties.filter((item) => item.id !== savedCounterparty.id),
+                savedCounterparty,
+              ].sort((left, right) => left.buyerEmail.localeCompare(right.buyerEmail)),
+            }
+          : current,
+      );
+      setCounterpartyDrafts((current) => ({
+        ...current,
+        [savedCounterparty.id]: buildCounterpartyDraft(savedCounterparty),
+      }));
       toast.success(t("marketAccess.counterpartyAdded", { email: normalizedEmail }));
     } catch (error) {
       toast.danger(error instanceof Error ? error.message : String(error));
@@ -332,37 +492,79 @@ export function AccountMarketAccessPage() {
     }
   };
 
-  const updateDecision = async (
-    counterparty: MarketCounterparty,
-    productKind: MarketAccessProductKind,
-    pricingKind: MarketAccessPricingKind,
-    decision: MarketAccessDecision,
-  ) => {
-    setBusy(`access:${counterparty.id}:${productKind}:${pricingKind}`);
-    try {
-      await updateMarketCounterparty(counterparty.id, {
-        accessRules: [{ productKind, pricingKind, decision }],
-        status: counterparty.status === "revoked" ? "revoked" : "active",
-        expectedRevision: counterparty.revision,
-      });
-      await load(true);
-    } catch (error) {
-      toast.danger(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy("");
-    }
+  const resetCounterpartyChanges = () => {
+    setCounterpartyDrafts(buildCounterpartyDrafts(dashboard?.counterparties || []));
   };
 
-  const toggleCounterparty = async (counterparty: MarketCounterparty) => {
-    setBusy(`status:${counterparty.id}`);
+  const saveCounterpartyChanges = async () => {
+    if (!dashboard || changedCounterparties.length === 0) return;
+    for (const { counterparty, draft, change } of changedCounterparties) {
+      if (!draft) continue;
+      for (const currency of change.creditCurrencies) {
+        const credit = draft.credits[currency];
+        if (credit.kind === "limited" && parseLimitMinor(credit.limit) == null) {
+          toast.danger(
+            t("marketAccess.buyerCreditError", {
+              email: counterparty.buyerEmail,
+              currency,
+              message: t("marketAccess.invalidLimit"),
+            }),
+          );
+          return;
+        }
+        if (credit.kind === "unlimited" && !credit.unlimitedAcknowledged) {
+          toast.danger(
+            t("marketAccess.buyerCreditError", {
+              email: counterparty.buyerEmail,
+              currency,
+              message: t("marketAccess.unlimitedConfirmRequired"),
+            }),
+          );
+          return;
+        }
+      }
+    }
+
+    setBusy("save-counterparties");
     try {
-      await updateMarketCounterparty(counterparty.id, {
-        accessRules: [],
-        status: counterparty.status === "active" ? "revoked" : "active",
-        expectedRevision: counterparty.revision,
-      });
+      for (const { counterparty, draft, change } of changedCounterparties) {
+        if (!draft) continue;
+        const saveRelationship = async () => {
+          if (!change.statusChanged && change.accessRules.length === 0) return;
+          await updateMarketCounterparty(counterparty.id, {
+            accessRules: change.accessRules,
+            status: draft.status,
+            expectedRevision: counterparty.revision,
+          });
+        };
+        const saveCredits = async () => {
+          for (const currency of change.creditCurrencies) {
+            const credit = draft.credits[currency];
+            const line = counterpartyCreditLine(counterparty, currency);
+            await updateMarketCounterpartyCredit(counterparty.id, currency, {
+              kind: credit.kind,
+              limitMinor:
+                credit.kind === "limited" ? parseLimitMinor(credit.limit) ?? undefined : undefined,
+              riskAcknowledged:
+                credit.kind === "unlimited" && credit.unlimitedAcknowledged,
+              expectedRevision: line?.revision || 0,
+            });
+          }
+        };
+        if (change.statusChanged && draft.status === "revoked") {
+          await saveCredits();
+          await saveRelationship();
+        } else {
+          await saveRelationship();
+          await saveCredits();
+        }
+      }
       await load(true);
+      toast.success(
+        t("marketAccess.buyersSaved", { count: changedCounterparties.length }),
+      );
     } catch (error) {
+      await load(true);
       toast.danger(error instanceof Error ? error.message : String(error));
     } finally {
       setBusy("");
@@ -381,7 +583,13 @@ export function AccountMarketAccessPage() {
           <ShieldCheck className="h-5 w-5 text-muted-foreground" />
           <h2 className="text-lg font-semibold">{t("marketAccess.title")}</h2>
         </div>
-        <Button isIconOnly variant="outline" aria-label={t("common.reload")} isDisabled={refreshing} onClick={() => void load(true)}>
+        <Button
+          isIconOnly
+          variant="outline"
+          aria-label={t("common.reload")}
+          isDisabled={refreshing || !!busy || changedCounterparties.length > 0}
+          onClick={() => void load(true)}
+        >
           <RefreshCw className={cn("h-4 w-4", refreshing && "animate-spin")} />
         </Button>
       </div>
@@ -456,7 +664,7 @@ export function AccountMarketAccessPage() {
               key={currency}
               currency={currency}
               line={dashboard?.publicCreditLines.find((line) => line.currency === currency)}
-              onSaved={setDashboard}
+              onSaved={updateDashboardPreservingDrafts}
             />
           ))}
         </section>
@@ -501,100 +709,237 @@ export function AccountMarketAccessPage() {
                 }),
               )}
             </div>
-            <Button variant="primary" isDisabled={busy === "add"} onClick={() => void addCounterparty()}>
+            <Button variant="primary" isDisabled={!!busy} onClick={() => void addCounterparty()}>
               {busy === "add" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
               {t("common.add")}
             </Button>
           </div>
         </div>
 
-        <div className="grid gap-3">
-          {(dashboard?.counterparties || []).map((counterparty) => {
-            const decisionFor = (
-              kind: MarketAccessProductKind,
-              pricingKind: MarketAccessPricingKind,
-            ) =>
-              counterparty.accessRules.find(
-                (rule) => rule.productKind === kind && rule.pricingKind === pricingKind,
-              )?.decision || "inherit";
-            return (
-              <article key={counterparty.id} className="overflow-hidden rounded-lg border border-border bg-card">
-                <div className="flex flex-wrap items-start justify-between gap-3 border-b border-border px-4 py-3">
-                  <div className="min-w-0">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <strong className="break-all text-sm">{counterparty.buyerEmail}</strong>
-                      <Chip size="sm" variant="soft" className={counterparty.status === "active" ? "bg-emerald-100 text-emerald-700" : "bg-slate-100 text-slate-600"}>
-                        {counterparty.status === "active" ? t("marketAccess.status.active") : t("marketAccess.status.revoked")}
-                      </Chip>
-                    </div>
-                    {counterparty.exposures.length ? (
-                      <p className="mt-1 text-xs text-muted-foreground">
-                        {counterparty.exposures.map((exposure) => `${exposure.currency} ${formatMoney(exposure.balanceMinor, exposure.currency, locale)} · ${exposure.activeServiceCount}`).join(" | ")}
-                      </p>
-                    ) : null}
-                  </div>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    isDisabled={!!busy}
-                    onClick={() => void toggleCounterparty(counterparty)}
+        <div className="grid gap-3 border-t border-border pt-4">
+          <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
+            <h3 className="text-sm font-semibold">{t("marketAccess.buyersTitle")}</h3>
+            <div className="flex w-full min-w-0 flex-wrap items-center gap-2 sm:w-auto">
+              <label className="flex h-9 min-w-0 flex-1 items-center gap-2 rounded-md border border-border bg-white px-3 text-sm focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-primary/10 sm:min-w-64">
+                <Search className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
+                <input
+                  type="search"
+                  value={buyerQuery}
+                  onChange={(event) => setBuyerQuery(event.target.value)}
+                  className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground"
+                  placeholder={t("marketAccess.searchBuyers")}
+                  aria-label={t("marketAccess.searchBuyers")}
+                />
+                {buyerQuery ? (
+                  <button
+                    type="button"
+                    className="rounded p-0.5 text-muted-foreground hover:bg-slate-100 hover:text-foreground"
+                    aria-label={t("common.close")}
+                    onClick={() => setBuyerQuery("")}
                   >
-                    {counterparty.status === "active" ? <UserRoundX className="h-4 w-4" /> : <UserRoundCheck className="h-4 w-4" />}
-                    {counterparty.status === "active" ? t("marketAccess.revoke") : t("marketAccess.reactivate")}
-                  </Button>
-                </div>
-                <div className="grid gap-4 px-4 py-4">
-                  <div className="grid gap-3">
-                    {(["share", "client_host"] as const).flatMap((kind) =>
-                      (["free", "paid"] as const).map((pricingKind) => (
-                        <div key={`${kind}:${pricingKind}`} className="flex flex-wrap items-center justify-between gap-2">
-                          <span className="text-sm">
-                            {kind === "share"
-                              ? t("marketAccess.product.share")
-                              : t("marketAccess.product.clientHost")}
-                            {" · "}
-                            {pricingKind === "free"
-                              ? t("marketAccess.pricing.free")
-                              : t("marketAccess.pricing.paid")}
-                          </span>
-                          <SegmentedControl
-                            value={decisionFor(kind, pricingKind)}
-                            disabled={counterparty.status !== "active" || !!busy}
-                            ariaLabel={`${kind === "share" ? t("marketAccess.product.share") : t("marketAccess.product.clientHost")} · ${pricingKind === "free" ? t("marketAccess.pricing.free") : t("marketAccess.pricing.paid")}`}
-                            fullWidth
-                            className="w-60"
-                            items={[
-                              { id: "inherit", label: t("marketAccess.decision.inherit") },
-                              { id: "allow", label: t("marketAccess.decision.allow") },
-                              { id: "deny", label: t("marketAccess.decision.deny") },
-                            ]}
-                            onChange={(decision) =>
-                              void updateDecision(counterparty, kind, pricingKind, decision)
-                            }
-                          />
-                        </div>
-                      )),
-                    )}
-                  </div>
-                  <div className="grid gap-3">
-                    {(["CNY", "USD"] as const).map((currency) => (
-                      <CreditEditor
-                        key={currency}
-                        counterpartyId={counterparty.id}
-                        currency={currency}
-                        line={counterparty.creditLines.find((line) => line.currency === currency)}
-                        disabled={counterparty.status !== "active"}
-                        onSaved={() => load(true)}
-                      />
-                    ))}
-                  </div>
-                </div>
-              </article>
-            );
-          })}
-          {dashboard?.counterparties.length === 0 ? (
-            <p className="border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">{t("marketAccess.empty")}</p>
-          ) : null}
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                ) : null}
+              </label>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-9"
+                isDisabled={changedCounterparties.length === 0 || !!busy}
+                onClick={resetCounterpartyChanges}
+              >
+                <RotateCcw className="h-4 w-4" />
+                {t("common.reset")}
+              </Button>
+              <Button
+                size="sm"
+                variant="primary"
+                className="h-9"
+                isDisabled={changedCounterparties.length === 0 || !!busy}
+                onClick={() => void saveCounterpartyChanges()}
+              >
+                {busy === "save-counterparties" ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Save className="h-4 w-4" />
+                )}
+                {t("common.save")}
+              </Button>
+            </div>
+          </div>
+
+          <div className="overflow-hidden rounded-lg border border-border bg-white">
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[1460px] table-fixed border-collapse text-sm">
+                <colgroup>
+                  <col className="w-[230px]" />
+                  <col className="w-[120px]" />
+                  <col className="w-[230px]" />
+                  <col className="w-[230px]" />
+                  <col className="w-[230px]" />
+                  <col className="w-[230px]" />
+                  <col className="w-[190px]" />
+                </colgroup>
+                <thead className="bg-slate-50 text-left text-[11px] font-semibold uppercase text-muted-foreground">
+                  <tr>
+                    <th className="px-3 py-2.5">{t("marketAccess.table.buyer")}</th>
+                    <th className="px-3 py-2.5">{t("marketAccess.table.status")}</th>
+                    <th className="px-3 py-2.5">{t("marketAccess.product.share")}</th>
+                    <th className="px-3 py-2.5">{t("marketAccess.product.clientHost")}</th>
+                    <th className="px-3 py-2.5">CNY {t("marketAccess.creditType")}</th>
+                    <th className="px-3 py-2.5">USD {t("marketAccess.creditType")}</th>
+                    <th className="px-3 py-2.5">{t("marketAccess.table.exposure")}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {visibleCounterparties.map((counterparty) => {
+                    const draft =
+                      counterpartyDrafts[counterparty.id] || buildCounterpartyDraft(counterparty);
+                    const change = counterpartyChange(counterparty, draft);
+                    const rowChanged = hasCounterpartyChange(change);
+                    const editorDisabled = draft.status === "revoked" || !!busy;
+                    return (
+                      <tr
+                        key={counterparty.id}
+                        className={cn(
+                          "border-t border-border align-top",
+                          rowChanged && "bg-primary/[0.025] shadow-[inset_3px_0_0_var(--primary)]",
+                        )}
+                      >
+                        <td className="px-3 py-3">
+                          <strong className="block break-all text-sm font-medium text-foreground">
+                            {counterparty.buyerEmail}
+                          </strong>
+                          {counterparty.buyerUserId ? (
+                            <span className="mt-1 block truncate font-mono text-[10px] text-muted-foreground" title={counterparty.buyerUserId}>
+                              {counterparty.buyerUserId}
+                            </span>
+                          ) : null}
+                          {rowChanged ? (
+                            <Chip size="sm" variant="soft" className="mt-2 bg-blue-50 text-blue-700">
+                              {t("marketAccess.unsaved")}
+                            </Chip>
+                          ) : null}
+                        </td>
+                        <td className="px-3 py-3">
+                          <div className="flex items-center gap-2">
+                            <Checkbox
+                              aria-label={t("marketAccess.status.active")}
+                              isSelected={draft.status === "active"}
+                              isDisabled={!!busy}
+                              onChange={(selected) =>
+                                updateCounterpartyDraft(counterparty.id, (current) => ({
+                                  ...current,
+                                  status: selected ? "active" : "revoked",
+                                }))
+                              }
+                            >
+                              <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
+                            </Checkbox>
+                            <Chip
+                              size="sm"
+                              variant="soft"
+                              className={
+                                draft.status === "active"
+                                  ? "bg-emerald-100 text-emerald-700"
+                                  : "bg-slate-100 text-slate-600"
+                              }
+                            >
+                              {draft.status === "active"
+                                ? t("marketAccess.status.active")
+                                : t("marketAccess.status.revoked")}
+                            </Chip>
+                          </div>
+                        </td>
+                        {(["share", "client_host"] as const).map((productKind) => (
+                          <td key={productKind} className="px-3 py-3">
+                            <div className="grid gap-2">
+                              {(["free", "paid"] as const).map((pricingKind) => {
+                                const key = scopeKey(productKind, pricingKind);
+                                const label =
+                                  pricingKind === "free"
+                                    ? t("marketAccess.pricing.free")
+                                    : t("marketAccess.pricing.paid");
+                                return (
+                                  <label key={pricingKind} className="grid grid-cols-[3rem_minmax(0,1fr)] items-center gap-2 text-xs text-muted-foreground">
+                                    <span>{label}</span>
+                                    <select
+                                      value={draft.decisions[key]}
+                                      disabled={editorDisabled}
+                                      aria-label={`${productKind === "share" ? t("marketAccess.product.share") : t("marketAccess.product.clientHost")} · ${label}`}
+                                      onChange={(event) =>
+                                        updateCounterpartyDraft(counterparty.id, (current) => ({
+                                          ...current,
+                                          decisions: {
+                                            ...current.decisions,
+                                            [key]: event.target.value as MarketAccessDecision,
+                                          },
+                                        }))
+                                      }
+                                      className="h-9 min-w-0 rounded-md border border-border bg-white px-2 text-xs text-foreground disabled:bg-slate-50"
+                                    >
+                                      <option value="inherit">{t("marketAccess.decision.inherit")}</option>
+                                      <option value="allow">{t("marketAccess.decision.allow")}</option>
+                                      <option value="deny">{t("marketAccess.decision.deny")}</option>
+                                    </select>
+                                  </label>
+                                );
+                              })}
+                            </div>
+                          </td>
+                        ))}
+                        {CURRENCIES.map((currency) => (
+                          <td key={currency} className="px-3 py-3">
+                            <CounterpartyCreditCell
+                              currency={currency}
+                              line={counterpartyCreditLine(counterparty, currency)}
+                              draft={draft.credits[currency]}
+                              disabled={editorDisabled}
+                              onChange={(credit) =>
+                                updateCounterpartyDraft(counterparty.id, (current) => ({
+                                  ...current,
+                                  credits: { ...current.credits, [currency]: credit },
+                                }))
+                              }
+                            />
+                          </td>
+                        ))}
+                        <td className="px-3 py-3">
+                          {counterparty.exposures.length ? (
+                            <div className="grid gap-2">
+                              {counterparty.exposures.map((exposure) => (
+                                <div key={exposure.currency}>
+                                  <strong className="block text-xs tabular-nums">
+                                    {formatMoney(exposure.balanceMinor, exposure.currency, locale)}
+                                  </strong>
+                                  <span className="text-[11px] text-muted-foreground">
+                                    {t("marketAccess.activeServices", {
+                                      count: exposure.activeServiceCount,
+                                    })}
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+                          ) : (
+                            <span className="text-muted-foreground">-</span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                  {visibleCounterparties.length === 0 ? (
+                    <tr>
+                      <td colSpan={7} className="px-4 py-12 text-center text-sm text-muted-foreground">
+                        {dashboard?.counterparties.length
+                          ? t("marketAccess.noMatches")
+                          : t("marketAccess.empty")}
+                      </td>
+                    </tr>
+                  ) : null}
+                </tbody>
+              </table>
+            </div>
+          </div>
         </div>
       </section>
 
