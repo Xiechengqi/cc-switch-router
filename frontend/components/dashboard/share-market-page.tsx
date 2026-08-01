@@ -8,6 +8,7 @@ import {
   Ban,
   ChevronDown,
   CircleDollarSign,
+  Clock3,
   Copy,
   ExternalLink,
   Loader2,
@@ -19,6 +20,7 @@ import {
   RotateCcw,
   Search,
   Settings,
+  ShieldCheck,
   Trash2,
   UserRoundX,
   X,
@@ -859,6 +861,11 @@ export function ShareMarketPage() {
   const [addOpen, setAddOpen] = React.useState(false);
   const [seatDialog, setSeatDialog] = React.useState<{ listingId: string; seat?: ShareMarketSeat; supportedPeriods?: ShareTokenPeriod[] } | null>(null);
   const [confirmAction, setConfirmAction] = React.useState<ConfirmAction | null>(null);
+  const [rentDialog, setRentDialog] = React.useState<{
+    listing: ShareMarketListing;
+    seat: ShareMarketSeat;
+  } | null>(null);
+  const [rentError, setRentError] = React.useState("");
   const [accessDialog, setAccessDialog] = React.useState<{
     listing: ShareMarketListing;
     seat: ShareMarketSeat;
@@ -920,12 +927,12 @@ export function ShareMarketPage() {
   React.useEffect(() => { void load(); }, [load, session?.user?.id]);
   React.useEffect(() => {
     const timer = window.setInterval(() => {
-      if (!addOpen && !seatDialog && !confirmAction && !accessDialog && !busyId) {
+      if (!addOpen && !seatDialog && !confirmAction && !accessDialog && !rentDialog && !busyId) {
         void load(true);
       }
     }, 5_000);
     return () => window.clearInterval(timer);
-  }, [accessDialog, addOpen, busyId, confirmAction, load, seatDialog]);
+  }, [accessDialog, addOpen, busyId, confirmAction, load, rentDialog, seatDialog]);
 
   const act = async (
     id: string,
@@ -953,6 +960,28 @@ export function ShareMarketPage() {
     if (!confirmAction) return;
     await act(confirmAction.id, confirmAction.run);
     setConfirmAction(null);
+  };
+
+  const confirmRent = async () => {
+    if (!rentDialog || busyId) return;
+    const target = rentDialog;
+    setBusyId(target.seat.id);
+    setRentError("");
+    try {
+      await rentShareMarketSeat(target.seat.id, target.seat.offerRevision);
+      await load(true);
+      setRentDialog(null);
+    } catch (reason) {
+      const eligibility = marketEligibilityFromError(reason);
+      if (eligibility) {
+        setRentDialog(null);
+        setAccessDialog({ ...target, eligibility });
+      } else {
+        setRentError(reason instanceof Error ? reason.message : String(reason));
+      }
+    } finally {
+      setBusyId("");
+    }
   };
 
   const listings = React.useMemo(() => {
@@ -1205,12 +1234,8 @@ export function ShareMarketPage() {
             variant="primary"
             isDisabled={!!busyId}
             onClick={() => {
-              if (!listing.shareOnline) toast.info(t("shareMarket.rentOfflineHint"));
-              void act(
-                seat.id,
-                () => rentShareMarketSeat(seat.id, seat.offerRevision),
-                { listing, seat },
-              );
+              setRentError("");
+              setRentDialog({ listing, seat });
             }}
           >
             {busyId === seat.id ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
@@ -1761,6 +1786,86 @@ export function ShareMarketPage() {
 
       <AddListingDialog open={addOpen} onOpenChange={setAddOpen} onSaved={() => void load(true)} />
       <SeatDialog open={!!seatDialog} listingId={seatDialog?.listingId || ""} seat={seatDialog?.seat} supportedPeriods={seatDialog?.supportedPeriods} onOpenChange={(next) => !next && setSeatDialog(null)} onSaved={() => void load(true)} />
+      <Modal.Backdrop
+        isOpen={!!rentDialog}
+        onOpenChange={(next) => {
+          if (!next && !busyId) {
+            setRentDialog(null);
+            setRentError("");
+          }
+        }}
+      >
+        <Modal.Container placement="center">
+          <Modal.Dialog className="light w-[min(560px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
+            <Modal.Header>
+              <Modal.Heading>{t("shareMarket.rentConfirm.title")}</Modal.Heading>
+            </Modal.Header>
+            <Modal.Body className="grid gap-4">
+              {rentDialog ? (
+                <>
+                  <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2 rounded-md border border-slate-200 bg-slate-50 p-3 text-sm">
+                    <dt className="text-slate-500">{t("shareMarket.col.share")}</dt>
+                    <dd className="min-w-0 truncate font-medium" title={rentDialog.listing.shareName}>
+                      {rentDialog.listing.shareName} · #{rentDialog.seat.position}
+                    </dd>
+                    <dt className="text-slate-500">{t("shareMarket.owner")}</dt>
+                    <dd className="flex min-w-0 items-center gap-1">
+                      <span className="min-w-0 truncate" title={rentDialog.listing.ownerEmail}>{rentDialog.listing.ownerEmail}</span>
+                      <ProviderContactButton contacts={rentDialog.listing.contacts} />
+                    </dd>
+                    <dt className="text-slate-500">{t("shareMarket.status")}</dt>
+                    <dd className={rentDialog.listing.shareOnline ? "font-medium text-emerald-700" : "font-medium text-rose-700"}>
+                      {rentDialog.listing.shareOnline ? t("shareMarket.online") : t("shareMarket.offline")}
+                    </dd>
+                    <dt className="text-slate-500">{t("shareMarket.dialog.amount")}</dt>
+                    <dd className="font-medium">
+                      {formatPrice(
+                        rentDialog.seat,
+                        locale,
+                        t("shareMarket.free"),
+                        t("marketBilling.day"),
+                        t("shareMarket.permanent"),
+                      )}
+                    </dd>
+                  </dl>
+                  {rentDialog.seat.dailyRateMinor != null ? (
+                    <div className="flex gap-3 rounded-md border border-sky-200 bg-sky-50 p-3 text-sm leading-6 text-sky-950">
+                      <Clock3 className="mt-1 h-4 w-4 shrink-0" />
+                      <p>{t("shareMarket.rentConfirm.postpaid", { hours: catalog?.trialHours || 12 })}</p>
+                    </div>
+                  ) : (
+                    <div className="flex gap-3 rounded-md border border-emerald-200 bg-emerald-50 p-3 text-sm leading-6 text-emerald-950">
+                      <ShieldCheck className="mt-1 h-4 w-4 shrink-0" />
+                      <p>{rentDialog.seat.freeDurationDays == null
+                        ? t("shareMarket.rentConfirm.freePermanent")
+                        : t("shareMarket.rentConfirm.freeFixed", { days: rentDialog.seat.freeDurationDays })}</p>
+                    </div>
+                  )}
+                  {!rentDialog.listing.shareOnline ? (
+                    <p className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-800">
+                      {t("shareMarket.rentConfirm.offline")}
+                    </p>
+                  ) : null}
+                  {rentError ? (
+                    <p className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">{rentError}</p>
+                  ) : null}
+                </>
+              ) : null}
+            </Modal.Body>
+            <Modal.Footer>
+              <Button variant="ghost" isDisabled={!!busyId} onClick={() => setRentDialog(null)}>{t("common.cancel")}</Button>
+              <Button
+                variant="primary"
+                isDisabled={!!busyId || !rentDialog?.listing.shareOnline}
+                onClick={() => void confirmRent()}
+              >
+                {busyId === rentDialog?.seat.id ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                {t("shareMarket.rentConfirm.confirm")}
+              </Button>
+            </Modal.Footer>
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
       <MarketAccessDialog
         open={!!accessDialog}
         product="share"
@@ -1773,7 +1878,7 @@ export function ShareMarketPage() {
         eligibility={accessDialog?.eligibility || { allowed: false, status: "access_required" }}
         onOpenChange={(next) => { if (!next) setAccessDialog(null); }}
         onOpenChat={() => accessDialog ? openChat(accessDialog.listing.installationId) : undefined}
-        onRequested={() => void load(true)}
+        onRequestChanged={() => load(true)}
       />
       <ConfirmAlertDialog
         open={!!confirmAction}

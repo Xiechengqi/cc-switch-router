@@ -5,6 +5,8 @@ import { Button, Checkbox, Chip, Modal, toast } from "@heroui/react";
 import {
   AlertTriangle,
   Check,
+  ChevronDown,
+  Clock3,
   Loader2,
   Plus,
   RefreshCw,
@@ -20,10 +22,10 @@ import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   approveMarketAccessRequest,
   getMarketAccessDashboard,
+  getMarketBillingConfig,
   rejectMarketAccessRequest,
   updateMarketAccessPolicy,
-  updateMarketCounterparty,
-  updateMarketCounterpartyCredit,
+  updateMarketCounterpartiesBatch,
   updateMarketPublicCredit,
   upsertMarketCounterparty,
 } from "@/lib/api";
@@ -39,7 +41,12 @@ import type {
   MarketCreditLine,
   MarketPublicCreditLine,
 } from "@/lib/types";
-import { formatUsdCnyMoney, MARKET_CURRENCY } from "@/lib/market-money";
+import {
+  DEFAULT_USD_CNY_RATE_MICROS,
+  formatUsdCnyMoney,
+  MARKET_CURRENCY,
+  usdMinorToCnyMinor,
+} from "@/lib/market-money";
 import { cn } from "@/lib/utils";
 
 type Currency = typeof MARKET_CURRENCY;
@@ -72,6 +79,11 @@ type AccessRequestGroup = {
   buyerEmail: string;
   buyerUserId: string;
   requests: MarketAccessRequest[];
+};
+
+type RequestAction = {
+  kind: "approve" | "reject";
+  request: MarketAccessRequest;
 };
 
 const ACCESS_SCOPES: ReadonlyArray<{
@@ -210,17 +222,26 @@ function hasCounterpartyChange(change: CounterpartyChange) {
   return change.statusChanged || change.accessRules.length > 0 || change.creditCurrencies.length > 0;
 }
 
+function formatRequestTime(value: string, locale: string) {
+  const date = new Date(value);
+  return Number.isFinite(date.getTime())
+    ? new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(date)
+    : value;
+}
+
 function CounterpartyCreditCell({
   line,
   currency,
   draft,
   disabled,
+  allowNone = true,
   onChange,
 }: {
   line?: MarketCreditLine;
   currency: Currency;
   draft: CreditDraft;
   disabled?: boolean;
+  allowNone?: boolean;
   onChange: (draft: CreditDraft) => void;
 }) {
   const { t } = useLocaleText();
@@ -228,7 +249,7 @@ function CounterpartyCreditCell({
     draft.kind === "unlimited" && (line?.kind || "none") !== "unlimited";
 
   return (
-    <div className="grid min-w-52 gap-2">
+    <div className="grid min-w-0 gap-2">
       <select
         value={draft.kind}
         disabled={disabled}
@@ -242,7 +263,7 @@ function CounterpartyCreditCell({
         }
         className="h-9 w-full rounded-md border border-border bg-white px-2 text-xs text-foreground disabled:bg-slate-50"
       >
-        <option value="none">{t("marketAccess.credit.none")}</option>
+        {allowNone ? <option value="none">{t("marketAccess.credit.none")}</option> : null}
         <option value="limited">{t("marketAccess.credit.limited")}</option>
         <option value="unlimited">{t("marketAccess.credit.unlimited")}</option>
       </select>
@@ -352,6 +373,9 @@ export function AccountMarketAccessPage() {
   const { session, loading: authLoading } = useAuth();
   const authed = !!session?.authenticated;
   const [dashboard, setDashboard] = React.useState<MarketAccessDashboard | null>(null);
+  const [usdCnyRateMicros, setUsdCnyRateMicros] = React.useState(
+    DEFAULT_USD_CNY_RATE_MICROS,
+  );
   const [counterpartyDrafts, setCounterpartyDrafts] = React.useState<
     Record<string, CounterpartyDraft>
   >({});
@@ -361,13 +385,26 @@ export function AccountMarketAccessPage() {
   const [email, setEmail] = React.useState("");
   const [buyerQuery, setBuyerQuery] = React.useState("");
   const [allowedScopes, setAllowedScopes] = React.useState<Record<string, boolean>>({
-    "share:free": true,
-    "share:paid": true,
-    "client_host:free": true,
-    "client_host:paid": true,
+    "share:free": false,
+    "share:paid": false,
+    "client_host:free": false,
+    "client_host:paid": false,
+  });
+  const [newBuyerCredit, setNewBuyerCredit] = React.useState<CreditDraft>({
+    kind: "limited",
+    limit: "",
+    unlimitedAcknowledged: false,
   });
   const [blacklistPolicy, setBlacklistPolicy] = React.useState<MarketAccessPolicy | null>(null);
   const [riskAcknowledged, setRiskAcknowledged] = React.useState(false);
+  const [requestAction, setRequestAction] = React.useState<RequestAction | null>(null);
+  const [approvalCredit, setApprovalCredit] = React.useState<CreditDraft>({
+    kind: "limited",
+    limit: "",
+    unlimitedAcknowledged: false,
+  });
+  const [rejectionReason, setRejectionReason] = React.useState("");
+  const [revokeConfirmationOpen, setRevokeConfirmationOpen] = React.useState(false);
 
   const load = React.useCallback(async (silent = false) => {
     if (!authed) {
@@ -377,8 +414,12 @@ export function AccountMarketAccessPage() {
     if (silent) setRefreshing(true);
     else setLoading(true);
     try {
-      const nextDashboard = await getMarketAccessDashboard();
+      const [nextDashboard, billingConfig] = await Promise.all([
+        getMarketAccessDashboard(),
+        getMarketBillingConfig(),
+      ]);
       setDashboard(nextDashboard);
+      setUsdCnyRateMicros(billingConfig.usdCnyRateMicros);
       setCounterpartyDrafts(buildCounterpartyDrafts(nextDashboard.counterparties));
     } catch (error) {
       toast.danger(error instanceof Error ? error.message : String(error));
@@ -396,11 +437,11 @@ export function AccountMarketAccessPage() {
     dashboard?.policies.find(
       (item) => item.productKind === kind && item.pricingKind === pricingKind,
     );
-  const blackMode = dashboard?.policies.some((policy) => policy.mode === "blacklist") || false;
   const paidBlackMode =
     dashboard?.policies.some(
       (policy) => policy.pricingKind === "paid" && policy.mode === "blacklist",
     ) || false;
+  const publicCreditEnabled = dashboard?.publicCreditLines.some((line) => line.enabled) || false;
   const counterpartyChanges = React.useMemo(
     () =>
       (dashboard?.counterparties || []).map((counterparty) => ({
@@ -413,6 +454,11 @@ export function AccountMarketAccessPage() {
   const changedCounterparties = React.useMemo(
     () => counterpartyChanges.filter(({ change }) => hasCounterpartyChange(change)),
     [counterpartyChanges],
+  );
+  const revokedCounterparties = React.useMemo(
+    () => changedCounterparties.filter(({ draft, change }) =>
+      change.statusChanged && draft?.status === "revoked"),
+    [changedCounterparties],
   );
   const requestGroups = React.useMemo(
     () => groupAccessRequests(dashboard?.accessRequests || []),
@@ -523,7 +569,7 @@ export function AccountMarketAccessPage() {
     if (!authed) return;
     let active = true;
     const timer = window.setInterval(() => {
-      if (busy) return;
+      if (busy || requestAction) return;
       void getMarketAccessDashboard()
         .then((nextDashboard) => {
           if (!active) return;
@@ -541,7 +587,31 @@ export function AccountMarketAccessPage() {
       active = false;
       window.clearInterval(timer);
     };
-  }, [authed, busy, changedCounterparties.length, updateDashboardPreservingDrafts]);
+  }, [authed, busy, changedCounterparties.length, requestAction, updateDashboardPreservingDrafts]);
+
+  React.useEffect(() => {
+    if (changedCounterparties.length === 0) return;
+    const message = t("marketAccess.leaveConfirm");
+    const beforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    const captureNavigation = (event: MouseEvent) => {
+      if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      const target = event.target instanceof Element ? event.target.closest("a[href]") : null;
+      if (!(target instanceof HTMLAnchorElement) || target.target === "_blank" || target.href === window.location.href) return;
+      if (!window.confirm(message)) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    };
+    window.addEventListener("beforeunload", beforeUnload);
+    document.addEventListener("click", captureNavigation, true);
+    return () => {
+      window.removeEventListener("beforeunload", beforeUnload);
+      document.removeEventListener("click", captureNavigation, true);
+    };
+  }, [changedCounterparties.length, t]);
 
   const applyPolicy = async (policy: MarketAccessPolicy, mode: "whitelist" | "blacklist", acknowledged = false) => {
     setBusy(`policy:${policy.productKind}:${policy.pricingKind}`);
@@ -575,12 +645,28 @@ export function AccountMarketAccessPage() {
 
   const addCounterparty = async () => {
     const normalizedEmail = email.trim().toLowerCase();
+    const paidScopeSelected = allowedScopes["share:paid"] || allowedScopes["client_host:paid"];
     if (!normalizedEmail.includes("@")) {
       toast.danger(t("marketAccess.invalidEmail"));
       return;
     }
     if (!Object.values(allowedScopes).some(Boolean)) {
       toast.danger(t("marketAccess.productRequired"));
+      return;
+    }
+    const creditLimitMinor = newBuyerCredit.kind === "limited"
+      ? parseLimitMinor(newBuyerCredit.limit)
+      : undefined;
+    if (paidScopeSelected && newBuyerCredit.kind === "none") {
+      toast.danger(t("marketAccess.addCreditRequired"));
+      return;
+    }
+    if (paidScopeSelected && newBuyerCredit.kind === "limited" && creditLimitMinor == null) {
+      toast.danger(t("marketAccess.invalidLimit"));
+      return;
+    }
+    if (paidScopeSelected && newBuyerCredit.kind === "unlimited" && !newBuyerCredit.unlimitedAcknowledged) {
+      toast.danger(t("marketAccess.unlimitedConfirmRequired"));
       return;
     }
     setBusy("add");
@@ -592,12 +678,35 @@ export function AccountMarketAccessPage() {
             .filter((pricingKind) => allowedScopes[`${productKind}:${pricingKind}`])
             .map((pricingKind) => ({ productKind, pricingKind, decision: "allow" as const })),
         ),
+        creditLines: paidScopeSelected ? [{
+          currency: MARKET_CURRENCY,
+          kind: newBuyerCredit.kind,
+          limitMinor: creditLimitMinor ?? undefined,
+          riskAcknowledged:
+            newBuyerCredit.kind === "unlimited" && newBuyerCredit.unlimitedAcknowledged,
+        }] : undefined,
       });
       setEmail("");
+      setAllowedScopes({
+        "share:free": false,
+        "share:paid": false,
+        "client_host:free": false,
+        "client_host:paid": false,
+      });
+      setNewBuyerCredit({ kind: "limited", limit: "", unlimitedAcknowledged: false });
       setDashboard((current) =>
         current
           ? {
               ...current,
+              accessRequests: current.accessRequests.filter(
+                (request) =>
+                  !sameBuyer(
+                    savedCounterparty.buyerUserId,
+                    savedCounterparty.buyerEmail,
+                    request.buyerUserId,
+                    request.buyerEmail,
+                  ) || !allowedScopes[scopeKey(request.productKind, request.pricingKind)],
+              ),
               counterparties: [
                 ...current.counterparties.filter((item) => item.id !== savedCounterparty.id),
                 savedCounterparty,
@@ -617,10 +726,7 @@ export function AccountMarketAccessPage() {
     }
   };
 
-  const resolveAccessRequest = async (
-    request: MarketAccessRequest,
-    action: "approve" | "reject",
-  ) => {
+  const openRequestAction = (request: MarketAccessRequest, kind: "approve" | "reject") => {
     const buyerHasUnsavedChanges = changedCounterparties.some(({ counterparty }) => sameBuyer(
       counterparty.buyerUserId,
       counterparty.buyerEmail,
@@ -631,14 +737,90 @@ export function AccountMarketAccessPage() {
       toast.info(t("marketAccess.requestSaveDraftFirst"));
       return;
     }
-    setBusy(`request:${action}:${request.id}`);
+    const counterparty = dashboard?.counterparties.find((item) => sameBuyer(
+      item.buyerUserId,
+      item.buyerEmail,
+      request.buyerUserId,
+      request.buyerEmail,
+    ));
+    const existingCredit = counterparty && counterpartyCreditLine(counterparty, MARKET_CURRENCY);
+    const suggestedMinor = request.dailyRateMinor ? request.dailyRateMinor * 7 : 5_000;
+    setApprovalCredit({
+      kind: existingCredit && existingCredit.kind !== "none" ? existingCredit.kind : "limited",
+      limit: existingCredit?.limitMinor != null
+        ? (existingCredit.limitMinor / 100).toFixed(2)
+        : (suggestedMinor / 100).toFixed(2),
+      unlimitedAcknowledged: false,
+    });
+    setRejectionReason("");
+    setRequestAction({ kind, request });
+  };
+
+  const requestCounterparty = requestAction
+    ? dashboard?.counterparties.find((counterparty) => sameBuyer(
+        counterparty.buyerUserId,
+        counterparty.buyerEmail,
+        requestAction.request.buyerUserId,
+        requestAction.request.buyerEmail,
+      ))
+    : undefined;
+  const requestCreditLine = requestCounterparty
+    ? counterpartyCreditLine(requestCounterparty, MARKET_CURRENCY)
+    : undefined;
+
+  const resolveAccessRequest = async () => {
+    if (!requestAction) return;
+    const { request, kind } = requestAction;
+    let creditLine: {
+      currency: Currency;
+      kind: MarketCreditKind;
+      limitMinor?: number;
+      riskAcknowledged?: boolean;
+      expectedRevision: number;
+    } | undefined;
+    if (kind === "approve" && request.pricingKind === "paid") {
+      const limitMinor = approvalCredit.kind === "limited" ? parseLimitMinor(approvalCredit.limit) : undefined;
+      if (approvalCredit.kind === "none" || (approvalCredit.kind === "limited" && limitMinor == null)) {
+        toast.danger(t("marketAccess.invalidLimit"));
+        return;
+      }
+      const existingUnlimitedCredit = requestCreditLine?.kind === "unlimited";
+      if (
+        approvalCredit.kind === "unlimited"
+        && !existingUnlimitedCredit
+        && !approvalCredit.unlimitedAcknowledged
+      ) {
+        toast.danger(t("marketAccess.unlimitedConfirmRequired"));
+        return;
+      }
+      if (requestCounterparty?.status === "revoked" || creditChanged(requestCreditLine, approvalCredit)) {
+        creditLine = {
+          currency: MARKET_CURRENCY,
+          kind: approvalCredit.kind,
+          limitMinor: limitMinor ?? undefined,
+          riskAcknowledged:
+            approvalCredit.kind === "unlimited"
+            && (existingUnlimitedCredit || approvalCredit.unlimitedAcknowledged),
+          expectedRevision: requestCreditLine?.revision || 0,
+        };
+      }
+    }
+    if (kind === "reject" && !rejectionReason.trim()) {
+      toast.danger(t("marketAccess.rejectionReasonRequired"));
+      return;
+    }
+    setBusy(`request:${kind}:${request.id}`);
     try {
-      const nextDashboard = action === "approve"
-        ? await approveMarketAccessRequest(request.id, request.revision)
-        : await rejectMarketAccessRequest(request.id, request.revision);
+      const nextDashboard = kind === "approve"
+        ? await approveMarketAccessRequest(request.id, {
+            expectedRevision: request.revision,
+            creditLine,
+          })
+        : await rejectMarketAccessRequest(request.id, request.revision, rejectionReason.trim());
       updateDashboardPreservingDrafts(nextDashboard);
+      setRequestAction(null);
       toast.success(
-        t(action === "approve" ? "marketAccess.requestApproved" : "marketAccess.requestRejected", {
+        t(kind === "approve" ? "marketAccess.requestApproved" : "marketAccess.requestRejected", {
           email: request.buyerEmail,
         }),
       );
@@ -652,7 +834,6 @@ export function AccountMarketAccessPage() {
   const renderAccessRequests = (requests: MarketAccessRequest[], buyerHasUnsavedChanges: boolean) => (
     <div className="grid gap-2">
       {requests.map((request) => {
-        const actionBusy = busy.endsWith(`:${request.id}`);
         const disabled = !!busy || buyerHasUnsavedChanges;
         return (
           <div key={request.id} className="grid gap-1.5 rounded-md border border-sky-200 bg-sky-50 px-2.5 py-2">
@@ -667,15 +848,26 @@ export function AccountMarketAccessPage() {
                 {request.currency ? ` · ${request.currency}` : ""}
               </span>
             </div>
+            <strong className="break-words text-xs font-medium text-sky-950">{request.targetLabel}</strong>
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-sky-800/80">
+              <span className="inline-flex items-center gap-1"><Clock3 className="h-3 w-3" />{formatRequestTime(request.requestedAt, locale)}</span>
+              {request.dailyRateMinor != null ? (
+                <span>{formatUsdCnyMoney(
+                  request.dailyRateMinor,
+                  locale,
+                  usdMinorToCnyMinor(request.dailyRateMinor, usdCnyRateMicros),
+                )} / {t("marketBilling.day")}</span>
+              ) : null}
+            </div>
             <div className="flex flex-wrap gap-1.5">
               <Button
                 size="sm"
                 variant="primary"
                 className="h-7 px-2 text-xs"
                 isDisabled={disabled}
-                onClick={() => void resolveAccessRequest(request, "approve")}
+                onClick={() => openRequestAction(request, "approve")}
               >
-                {actionBusy && busy.includes(":approve:") ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Check className="h-3.5 w-3.5" />}
+                <Check className="h-3.5 w-3.5" />
                 {t("marketAccess.approve")}
               </Button>
               <Button
@@ -683,9 +875,9 @@ export function AccountMarketAccessPage() {
                 variant="outline"
                 className="h-7 px-2 text-xs"
                 isDisabled={disabled}
-                onClick={() => void resolveAccessRequest(request, "reject")}
+                onClick={() => openRequestAction(request, "reject")}
               >
-                {actionBusy && busy.includes(":reject:") ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <X className="h-3.5 w-3.5" />}
+                <X className="h-3.5 w-3.5" />
                 {t("marketAccess.reject")}
               </Button>
             </div>
@@ -699,7 +891,7 @@ export function AccountMarketAccessPage() {
     setCounterpartyDrafts(buildCounterpartyDrafts(dashboard?.counterparties || []));
   };
 
-  const saveCounterpartyChanges = async () => {
+  const saveCounterpartyChanges = async (revokeConfirmed = false) => {
     if (!dashboard || changedCounterparties.length === 0) return;
     for (const { counterparty, draft, change } of changedCounterparties) {
       if (!draft) continue;
@@ -728,46 +920,39 @@ export function AccountMarketAccessPage() {
       }
     }
 
+    if (revokedCounterparties.length > 0 && !revokeConfirmed) {
+      setRevokeConfirmationOpen(true);
+      return;
+    }
+
     setBusy("save-counterparties");
     try {
-      for (const { counterparty, draft, change } of changedCounterparties) {
-        if (!draft) continue;
-        const saveRelationship = async () => {
-          if (!change.statusChanged && change.accessRules.length === 0) return;
-          await updateMarketCounterparty(counterparty.id, {
-            accessRules: change.accessRules,
-            status: draft.status,
-            expectedRevision: counterparty.revision,
-          });
-        };
-        const saveCredits = async () => {
-          for (const currency of change.creditCurrencies) {
+      const nextDashboard = await updateMarketCounterpartiesBatch({
+        updates: changedCounterparties.flatMap(({ counterparty, draft, change }) => draft ? [{
+          id: counterparty.id,
+          expectedRevision: counterparty.revision,
+          accessRules: change.accessRules,
+          status: change.statusChanged ? draft.status : undefined,
+          creditLines: change.creditCurrencies.map((currency) => {
             const credit = draft.credits[currency];
             const line = counterpartyCreditLine(counterparty, currency);
-            await updateMarketCounterpartyCredit(counterparty.id, currency, {
+            return {
+              currency,
               kind: credit.kind,
-              limitMinor:
-                credit.kind === "limited" ? parseLimitMinor(credit.limit) ?? undefined : undefined,
-              riskAcknowledged:
-                credit.kind === "unlimited" && credit.unlimitedAcknowledged,
+              limitMinor: credit.kind === "limited" ? parseLimitMinor(credit.limit) ?? undefined : undefined,
+              riskAcknowledged: credit.kind === "unlimited" && credit.unlimitedAcknowledged,
               expectedRevision: line?.revision || 0,
-            });
-          }
-        };
-        if (change.statusChanged && draft.status === "revoked") {
-          await saveCredits();
-          await saveRelationship();
-        } else {
-          await saveRelationship();
-          await saveCredits();
-        }
-      }
-      await load(true);
+            };
+          }),
+        }] : []),
+      });
+      setDashboard(nextDashboard);
+      setCounterpartyDrafts(buildCounterpartyDrafts(nextDashboard.counterparties));
+      setRevokeConfirmationOpen(false);
       toast.success(
         t("marketAccess.buyersSaved", { count: changedCounterparties.length }),
       );
     } catch (error) {
-      await load(true);
       toast.danger(error instanceof Error ? error.message : String(error));
     } finally {
       setBusy("");
@@ -778,6 +963,9 @@ export function AccountMarketAccessPage() {
     return <div className="flex items-center gap-2 py-8 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />{t("common.loading")}</div>;
   }
   if (!authed) return <p className="py-8 text-sm text-muted-foreground">{t("account.signInRequired")}</p>;
+
+  const requestExposure = requestCounterparty?.exposures.find((exposure) => exposure.currency === MARKET_CURRENCY);
+  const paidScopeSelected = allowedScopes["share:paid"] || allowedScopes["client_host:paid"];
 
   return (
     <div className="grid min-w-0 gap-6">
@@ -797,7 +985,7 @@ export function AccountMarketAccessPage() {
         </Button>
       </div>
 
-      {blackMode ? (
+      {paidBlackMode || publicCreditEnabled ? (
         <section className="flex gap-3 border-y border-amber-300 bg-amber-50 px-4 py-3 text-amber-950">
           <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" />
           <div>
@@ -829,12 +1017,13 @@ export function AccountMarketAccessPage() {
                   : t("marketAccess.pricing.paid");
               const title = `${productLabel} · ${pricingLabel}`;
               const blacklisted = policy.mode === "blacklist";
+              const riskyOpenAccess = blacklisted && pricingKind === "paid";
               return (
                 <div
                   key={`${kind}:${pricingKind}`}
                   className={cn(
                     "grid gap-3 rounded-lg border bg-card p-3",
-                    blacklisted ? "border-amber-300 bg-amber-50/40" : "border-border",
+                    riskyOpenAccess ? "border-amber-300 bg-amber-50/40" : "border-border",
                   )}
                 >
                   <strong className="text-sm text-foreground">{title}</strong>
@@ -849,6 +1038,9 @@ export function AccountMarketAccessPage() {
                     ]}
                     onChange={(mode) => changePolicy(policy, mode)}
                   />
+                  <p className="text-xs leading-5 text-muted-foreground">
+                    {t(blacklisted ? "marketAccess.mode.openHint" : "marketAccess.mode.trustedHint")}
+                  </p>
                 </div>
               );
             }),
@@ -856,7 +1048,7 @@ export function AccountMarketAccessPage() {
         </div>
       </section>
 
-      {paidBlackMode ? (
+      {paidBlackMode || publicCreditEnabled ? (
         <section className="grid gap-4 border-b border-border pb-5">
           <div>
             <h3 className="text-sm font-semibold">{t("marketAccess.publicCreditTitle")}</h3>
@@ -916,6 +1108,21 @@ export function AccountMarketAccessPage() {
               {busy === "add" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
               {t("common.add")}
             </Button>
+            {paidScopeSelected ? (
+              <section className="grid gap-3 rounded-md border border-sky-200 bg-sky-50/40 p-3 sm:col-span-3 sm:grid-cols-[minmax(12rem,1fr)_minmax(14rem,2fr)] sm:items-start">
+                <div>
+                  <strong className="text-sm text-foreground">{t("marketAccess.addCreditTitle")}</strong>
+                  <p className="mt-1 text-xs leading-5 text-muted-foreground">{t("marketAccess.addCreditHint")}</p>
+                </div>
+                <CounterpartyCreditCell
+                  currency={MARKET_CURRENCY}
+                  draft={newBuyerCredit}
+                  disabled={!!busy}
+                  allowNone={false}
+                  onChange={setNewBuyerCredit}
+                />
+              </section>
+            ) : null}
           </div>
         </div>
 
@@ -971,209 +1178,245 @@ export function AccountMarketAccessPage() {
             </div>
           </div>
 
-          <div className="overflow-hidden rounded-lg border border-border bg-white">
-            <div className="overflow-x-auto">
-              <table className="w-full min-w-[1470px] table-fixed border-collapse text-sm">
-                <colgroup>
-                  <col className="w-[220px]" />
-                  <col className="w-[120px]" />
-                  <col className="w-[250px]" />
-                  <col className="w-[230px]" />
-                  <col className="w-[230px]" />
-                  <col className="w-[230px]" />
-                  <col className="w-[190px]" />
-                </colgroup>
-                <thead className="bg-slate-50 text-left text-[11px] font-semibold uppercase text-muted-foreground">
-                  <tr>
-                    <th className="px-3 py-2.5">{t("marketAccess.table.buyer")}</th>
-                    <th className="px-3 py-2.5">{t("marketAccess.table.status")}</th>
-                    <th className="px-3 py-2.5">{t("marketAccess.table.application")}</th>
-                    <th className="px-3 py-2.5">{t("marketAccess.product.share")}</th>
-                    <th className="px-3 py-2.5">{t("marketAccess.product.clientHost")}</th>
-                    <th className="px-3 py-2.5">USD {t("marketAccess.creditType")}</th>
-                    <th className="px-3 py-2.5">{t("marketAccess.table.exposure")}</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {visibleOrphanRequestGroups.map((group) => (
-                    <tr key={`request:${group.key}`} className="border-t border-sky-200 bg-sky-50/30 align-top">
-                      <td className="px-3 py-3">
-                        <strong className="block break-all text-sm font-medium text-foreground">
-                          {group.buyerEmail}
-                        </strong>
-                        {group.buyerUserId ? (
-                          <span className="mt-1 block truncate font-mono text-[10px] text-muted-foreground" title={group.buyerUserId}>
-                            {group.buyerUserId}
-                          </span>
-                        ) : null}
-                      </td>
-                      <td className="px-3 py-3">
-                        <Chip size="sm" variant="soft" className="bg-sky-100 text-sky-800">
-                          {t("marketAccess.status.requested")}
+          <div className="grid gap-2">
+            {visibleOrphanRequestGroups.map((group) => (
+              <section key={`request:${group.key}`} className="grid gap-3 rounded-lg border border-sky-200 bg-sky-50/30 p-4">
+                <div className="flex min-w-0 flex-wrap items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <strong className="block break-all text-sm font-medium text-foreground">{group.buyerEmail}</strong>
+                    {group.buyerUserId ? <span className="mt-1 block truncate font-mono text-[10px] text-muted-foreground" title={group.buyerUserId}>{group.buyerUserId}</span> : null}
+                  </div>
+                  <Chip size="sm" variant="soft" className="bg-sky-100 text-sky-800">{t("marketAccess.status.requested")}</Chip>
+                </div>
+                {renderAccessRequests(group.requests, false)}
+              </section>
+            ))}
+            {visibleCounterparties.map((counterparty) => {
+              const draft = counterpartyDrafts[counterparty.id] || buildCounterpartyDraft(counterparty);
+              const change = counterpartyChange(counterparty, draft);
+              const rowChanged = hasCounterpartyChange(change);
+              const editorDisabled = draft.status === "revoked" || !!busy;
+              const accessRequests = requestsByCounterparty.get(counterparty.id) || [];
+              const credit = counterpartyCreditLine(counterparty, MARKET_CURRENCY);
+              return (
+                <details
+                  key={counterparty.id}
+                  className={cn(
+                    "group overflow-hidden rounded-lg border border-border bg-white",
+                    rowChanged && "border-primary/40 shadow-[inset_3px_0_0_var(--primary)]",
+                  )}
+                >
+                  <summary className="flex cursor-pointer list-none items-center gap-3 px-4 py-3 hover:bg-slate-50">
+                    <div className="min-w-0 flex-1">
+                      <div className="flex min-w-0 flex-wrap items-center gap-2">
+                        <strong className="min-w-0 break-all text-sm font-medium text-foreground">{counterparty.buyerEmail}</strong>
+                        <Chip size="sm" variant="soft" className={draft.status === "active" ? "bg-emerald-100 text-emerald-700" : "bg-slate-100 text-slate-600"}>
+                          {draft.status === "active" ? t("marketAccess.status.active") : t("marketAccess.status.revoked")}
                         </Chip>
-                      </td>
-                      <td className="px-3 py-3">{renderAccessRequests(group.requests, false)}</td>
-                      <td colSpan={4} className="px-3 py-3 text-center text-muted-foreground">-</td>
-                    </tr>
-                  ))}
-                  {visibleCounterparties.map((counterparty) => {
-                    const draft =
-                      counterpartyDrafts[counterparty.id] || buildCounterpartyDraft(counterparty);
-                    const change = counterpartyChange(counterparty, draft);
-                    const rowChanged = hasCounterpartyChange(change);
-                    const editorDisabled = draft.status === "revoked" || !!busy;
-                    const accessRequests = requestsByCounterparty.get(counterparty.id) || [];
-                    return (
-                      <tr
-                        key={counterparty.id}
-                        className={cn(
-                          "border-t border-border align-top",
-                          rowChanged && "bg-primary/[0.025] shadow-[inset_3px_0_0_var(--primary)]",
-                        )}
+                        {accessRequests.length ? <Chip size="sm" variant="soft" className="bg-sky-100 text-sky-800">{t("marketAccess.requestCount", { count: accessRequests.length })}</Chip> : null}
+                        {rowChanged ? <Chip size="sm" variant="soft" className="bg-blue-50 text-blue-700">{t("marketAccess.unsaved")}</Chip> : null}
+                      </div>
+                      <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                        <span>{t("marketAccess.creditSummary", { value: credit?.kind === "limited" && credit.limitMinor != null ? formatUsdCnyMoney(credit.limitMinor, locale, usdMinorToCnyMinor(credit.limitMinor, usdCnyRateMicros)) : credit?.kind === "unlimited" ? t("marketBilling.creditUnlimited") : t("marketBilling.creditNone") })}</span>
+                        {counterparty.exposures.map((exposure) => <span key={exposure.currency}>{t("marketAccess.exposureSummary", { amount: formatUsdCnyMoney(exposure.balanceMinor, locale, usdMinorToCnyMinor(exposure.balanceMinor, usdCnyRateMicros)), count: exposure.activeServiceCount })}</span>)}
+                      </div>
+                    </div>
+                    <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" />
+                  </summary>
+                  <div className="grid gap-5 border-t border-border p-4">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <strong className="text-sm">{t("marketAccess.relationshipStatus")}</strong>
+                        <p className="mt-0.5 text-xs text-muted-foreground">{t("marketAccess.relationshipStatusHint")}</p>
+                      </div>
+                      <Checkbox
+                        aria-label={t("marketAccess.status.active")}
+                        isSelected={draft.status === "active"}
+                        isDisabled={!!busy}
+                        onChange={(selected) => updateCounterpartyDraft(counterparty.id, (current) => ({ ...current, status: selected ? "active" : "revoked" }))}
                       >
-                        <td className="px-3 py-3">
-                          <strong className="block break-all text-sm font-medium text-foreground">
-                            {counterparty.buyerEmail}
-                          </strong>
-                          {counterparty.buyerUserId ? (
-                            <span className="mt-1 block truncate font-mono text-[10px] text-muted-foreground" title={counterparty.buyerUserId}>
-                              {counterparty.buyerUserId}
-                            </span>
-                          ) : null}
-                          {rowChanged ? (
-                            <Chip size="sm" variant="soft" className="mt-2 bg-blue-50 text-blue-700">
-                              {t("marketAccess.unsaved")}
-                            </Chip>
-                          ) : null}
-                        </td>
-                        <td className="px-3 py-3">
-                          <div className="flex items-center gap-2">
-                            <Checkbox
-                              aria-label={t("marketAccess.status.active")}
-                              isSelected={draft.status === "active"}
-                              isDisabled={!!busy}
-                              onChange={(selected) =>
-                                updateCounterpartyDraft(counterparty.id, (current) => ({
-                                  ...current,
-                                  status: selected ? "active" : "revoked",
-                                }))
-                              }
-                            >
-                              <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
-                            </Checkbox>
-                            <Chip
-                              size="sm"
-                              variant="soft"
-                              className={
-                                draft.status === "active"
-                                  ? "bg-emerald-100 text-emerald-700"
-                                  : "bg-slate-100 text-slate-600"
-                              }
-                            >
-                              {draft.status === "active"
-                                ? t("marketAccess.status.active")
-                                : t("marketAccess.status.revoked")}
-                            </Chip>
+                        <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
+                        {draft.status === "active" ? t("marketAccess.status.active") : t("marketAccess.status.revoked")}
+                      </Checkbox>
+                    </div>
+
+                    {accessRequests.length ? (
+                      <section className="grid gap-2 border-t border-border pt-4">
+                        <strong className="text-sm">{t("marketAccess.table.application")}</strong>
+                        {renderAccessRequests(accessRequests, dirtyCounterpartyIds.has(counterparty.id))}
+                      </section>
+                    ) : null}
+
+                    <div className="grid gap-4 border-t border-border pt-4 lg:grid-cols-2">
+                      {(["share", "client_host"] as const).map((productKind) => (
+                        <section key={productKind} className="grid gap-3">
+                          <strong className="text-sm">{productKind === "share" ? t("marketAccess.product.share") : t("marketAccess.product.clientHost")}</strong>
+                          {(["free", "paid"] as const).map((pricingKind) => {
+                            const key = scopeKey(productKind, pricingKind);
+                            const label = pricingKind === "free" ? t("marketAccess.pricing.free") : t("marketAccess.pricing.paid");
+                            return (
+                              <label key={pricingKind} className="grid gap-1 text-xs text-muted-foreground sm:grid-cols-[5rem_minmax(0,1fr)] sm:items-center">
+                                <span>{label}</span>
+                                <select
+                                  value={draft.decisions[key]}
+                                  disabled={editorDisabled}
+                                  aria-label={`${productKind === "share" ? t("marketAccess.product.share") : t("marketAccess.product.clientHost")} · ${label}`}
+                                  onChange={(event) => updateCounterpartyDraft(counterparty.id, (current) => ({ ...current, decisions: { ...current.decisions, [key]: event.target.value as MarketAccessDecision } }))}
+                                  className="h-9 min-w-0 rounded-md border border-border bg-white px-2 text-xs text-foreground disabled:bg-slate-50"
+                                >
+                                  <option value="inherit">{t("marketAccess.decision.inherit")}</option>
+                                  <option value="allow">{t("marketAccess.decision.allow")}</option>
+                                  <option value="deny">{t("marketAccess.decision.deny")}</option>
+                                </select>
+                              </label>
+                            );
+                          })}
+                        </section>
+                      ))}
+                    </div>
+
+                    <div className="grid gap-4 border-t border-border pt-4 md:grid-cols-2">
+                      <section className="grid gap-2">
+                        <strong className="text-sm">USD {t("marketAccess.creditType")}</strong>
+                        <CounterpartyCreditCell
+                          currency={MARKET_CURRENCY}
+                          line={credit}
+                          draft={draft.credits[MARKET_CURRENCY]}
+                          disabled={editorDisabled}
+                          onChange={(nextCredit) => updateCounterpartyDraft(counterparty.id, (current) => ({ ...current, credits: { ...current.credits, [MARKET_CURRENCY]: nextCredit } }))}
+                        />
+                      </section>
+                      <section className="grid content-start gap-2">
+                        <strong className="text-sm">{t("marketAccess.table.exposure")}</strong>
+                        {counterparty.exposures.length ? counterparty.exposures.map((exposure) => (
+                          <div key={exposure.currency} className="text-sm">
+                            <strong className="block tabular-nums">{formatUsdCnyMoney(exposure.balanceMinor, locale, usdMinorToCnyMinor(exposure.balanceMinor, usdCnyRateMicros))}</strong>
+                            <span className="text-xs text-muted-foreground">{t("marketAccess.activeServices", { count: exposure.activeServiceCount })}</span>
                           </div>
-                        </td>
-                        <td className="px-3 py-3">
-                          {accessRequests.length ? (
-                            renderAccessRequests(accessRequests, dirtyCounterpartyIds.has(counterparty.id))
-                          ) : (
-                            <span className="text-muted-foreground">-</span>
-                          )}
-                        </td>
-                        {(["share", "client_host"] as const).map((productKind) => (
-                          <td key={productKind} className="px-3 py-3">
-                            <div className="grid gap-2">
-                              {(["free", "paid"] as const).map((pricingKind) => {
-                                const key = scopeKey(productKind, pricingKind);
-                                const label =
-                                  pricingKind === "free"
-                                    ? t("marketAccess.pricing.free")
-                                    : t("marketAccess.pricing.paid");
-                                return (
-                                  <label key={pricingKind} className="grid grid-cols-[3rem_minmax(0,1fr)] items-center gap-2 text-xs text-muted-foreground">
-                                    <span>{label}</span>
-                                    <select
-                                      value={draft.decisions[key]}
-                                      disabled={editorDisabled}
-                                      aria-label={`${productKind === "share" ? t("marketAccess.product.share") : t("marketAccess.product.clientHost")} · ${label}`}
-                                      onChange={(event) =>
-                                        updateCounterpartyDraft(counterparty.id, (current) => ({
-                                          ...current,
-                                          decisions: {
-                                            ...current.decisions,
-                                            [key]: event.target.value as MarketAccessDecision,
-                                          },
-                                        }))
-                                      }
-                                      className="h-9 min-w-0 rounded-md border border-border bg-white px-2 text-xs text-foreground disabled:bg-slate-50"
-                                    >
-                                      <option value="inherit">{t("marketAccess.decision.inherit")}</option>
-                                      <option value="allow">{t("marketAccess.decision.allow")}</option>
-                                      <option value="deny">{t("marketAccess.decision.deny")}</option>
-                                    </select>
-                                  </label>
-                                );
-                              })}
-                            </div>
-                          </td>
-                        ))}
-                        {CURRENCIES.map((currency) => (
-                          <td key={currency} className="px-3 py-3">
-                            <CounterpartyCreditCell
-                              currency={currency}
-                              line={counterpartyCreditLine(counterparty, currency)}
-                              draft={draft.credits[currency]}
-                              disabled={editorDisabled}
-                              onChange={(credit) =>
-                                updateCounterpartyDraft(counterparty.id, (current) => ({
-                                  ...current,
-                                  credits: { ...current.credits, [currency]: credit },
-                                }))
-                              }
-                            />
-                          </td>
-                        ))}
-                        <td className="px-3 py-3">
-                          {counterparty.exposures.length ? (
-                            <div className="grid gap-2">
-                              {counterparty.exposures.map((exposure) => (
-                                <div key={exposure.currency}>
-                                  <strong className="block text-xs tabular-nums">
-                                    {formatUsdCnyMoney(exposure.balanceMinor, locale)}
-                                  </strong>
-                                  <span className="text-[11px] text-muted-foreground">
-                                    {t("marketAccess.activeServices", {
-                                      count: exposure.activeServiceCount,
-                                    })}
-                                  </span>
-                                </div>
-                              ))}
-                            </div>
-                          ) : (
-                            <span className="text-muted-foreground">-</span>
-                          )}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                  {visibleCounterparties.length === 0 && visibleOrphanRequestGroups.length === 0 ? (
-                    <tr>
-                      <td colSpan={7} className="px-4 py-12 text-center text-sm text-muted-foreground">
-                        {(dashboard?.counterparties.length || dashboard?.accessRequests.length)
-                          ? t("marketAccess.noMatches")
-                          : t("marketAccess.empty")}
-                      </td>
-                    </tr>
-                  ) : null}
-                </tbody>
-              </table>
-            </div>
+                        )) : <span className="text-sm text-muted-foreground">-</span>}
+                      </section>
+                    </div>
+                  </div>
+                </details>
+              );
+            })}
+            {visibleCounterparties.length === 0 && visibleOrphanRequestGroups.length === 0 ? (
+              <p className="rounded-lg border border-dashed border-border px-4 py-12 text-center text-sm text-muted-foreground">
+                {(dashboard?.counterparties.length || dashboard?.accessRequests.length) ? t("marketAccess.noMatches") : t("marketAccess.empty")}
+              </p>
+            ) : null}
           </div>
         </div>
       </section>
+
+      <Modal.Backdrop isOpen={!!requestAction} onOpenChange={(open) => !open && !busy && setRequestAction(null)}>
+        <Modal.Container placement="center">
+          <Modal.Dialog className="light w-[min(600px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
+            <Modal.Header>
+              <Modal.Heading>{t(requestAction?.kind === "reject" ? "marketAccess.rejectTitle" : "marketAccess.approveTitle")}</Modal.Heading>
+            </Modal.Header>
+            <Modal.Body className="grid max-h-[70vh] gap-4 overflow-y-auto">
+              {requestAction ? (
+                <div className="grid gap-2 rounded-md border border-border bg-slate-50 p-3 text-sm">
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <strong className="break-all">{requestAction.request.buyerEmail}</strong>
+                    <span className="text-xs text-muted-foreground">{formatRequestTime(requestAction.request.requestedAt, locale)}</span>
+                  </div>
+                  <span>{requestAction.request.targetLabel}</span>
+                  <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                    <span>{t(requestAction.request.productKind === "share" ? "marketAccess.product.share" : "marketAccess.product.clientHost")}</span>
+                    <span>{t(requestAction.request.pricingKind === "free" ? "marketAccess.pricing.free" : "marketAccess.pricing.paid")}</span>
+                    {requestAction.request.dailyRateMinor != null ? (
+                      <span>{formatUsdCnyMoney(requestAction.request.dailyRateMinor, locale, usdMinorToCnyMinor(requestAction.request.dailyRateMinor, usdCnyRateMicros))} / {t("marketBilling.day")}</span>
+                    ) : null}
+                  </div>
+                </div>
+              ) : null}
+
+              {requestAction?.kind === "approve" && requestAction.request.pricingKind === "paid" ? (
+                <section className="grid gap-3">
+                  <div>
+                    <strong className="text-sm">{t("marketAccess.approvalCreditTitle")}</strong>
+                    <p className="mt-1 text-xs leading-5 text-muted-foreground">{t("marketAccess.approvalCreditHint")}</p>
+                  </div>
+                  {requestExposure ? (
+                    <div className="grid grid-cols-2 gap-3 rounded-md border border-border px-3 py-2 text-xs">
+                      <span className="text-muted-foreground">{t("marketAccess.currentExposure")}</span>
+                      <strong className="text-right tabular-nums">{formatUsdCnyMoney(requestExposure.balanceMinor, locale, usdMinorToCnyMinor(requestExposure.balanceMinor, usdCnyRateMicros))}</strong>
+                      <span className="text-muted-foreground">{t("marketAccess.activeServicesLabel")}</span>
+                      <strong className="text-right tabular-nums">{requestExposure.activeServiceCount}</strong>
+                    </div>
+                  ) : null}
+                  <CounterpartyCreditCell
+                    currency={MARKET_CURRENCY}
+                    line={requestCreditLine}
+                    draft={approvalCredit}
+                    disabled={!!busy}
+                    allowNone={false}
+                    onChange={setApprovalCredit}
+                  />
+                </section>
+              ) : null}
+
+              {requestAction?.kind === "approve" && requestAction.request.pricingKind === "free" ? (
+                <p className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm leading-6 text-emerald-900">{t("marketAccess.approveFreeHint")}</p>
+              ) : null}
+
+              {requestAction?.kind === "reject" ? (
+                <>
+                  <label className="grid gap-1 text-sm">
+                    <span className="text-muted-foreground">{t("marketAccess.rejectionReason")}</span>
+                    <textarea value={rejectionReason} onChange={(event) => setRejectionReason(event.target.value)} maxLength={2000} rows={4} autoFocus className="rounded-md border border-border p-3" />
+                  </label>
+                  <p className="flex gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-950">
+                    <Clock3 className="mt-0.5 h-4 w-4 shrink-0" />
+                    {t("marketAccess.rejectionCooldown")}
+                  </p>
+                </>
+              ) : null}
+            </Modal.Body>
+            <Modal.Footer>
+              <Button variant="ghost" isDisabled={!!busy} onClick={() => setRequestAction(null)}>{t("common.cancel")}</Button>
+              <Button variant={requestAction?.kind === "reject" ? "danger" : "primary"} isDisabled={!!busy} onClick={() => void resolveAccessRequest()}>
+                {busy.startsWith("request:") ? <Loader2 className="h-4 w-4 animate-spin" /> : requestAction?.kind === "reject" ? <X className="h-4 w-4" /> : <Check className="h-4 w-4" />}
+                {t(requestAction?.kind === "reject" ? "marketAccess.rejectConfirm" : "marketAccess.approveConfirm")}
+              </Button>
+            </Modal.Footer>
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
+
+      <Modal.Backdrop isOpen={revokeConfirmationOpen} onOpenChange={(open) => !open && !busy && setRevokeConfirmationOpen(false)}>
+        <Modal.Container placement="center">
+          <Modal.Dialog className="light w-[min(560px,calc(100vw-2rem))] max-w-none !bg-white !text-slate-900">
+            <Modal.Header><Modal.Heading>{t("marketAccess.revokeConfirmTitle")}</Modal.Heading></Modal.Header>
+            <Modal.Body className="grid gap-4">
+              <div className="flex gap-3 rounded-md border border-rose-200 bg-rose-50 p-3 text-sm leading-6 text-rose-900">
+                <AlertTriangle className="mt-1 h-4 w-4 shrink-0" />
+                <span>{t("marketAccess.revokeConfirmDescription")}</span>
+              </div>
+              <div className="grid max-h-60 gap-2 overflow-y-auto">
+                {revokedCounterparties.map(({ counterparty }) => {
+                  const exposure = counterparty.exposures.find((item) => item.currency === MARKET_CURRENCY);
+                  return (
+                    <div key={counterparty.id} className="flex flex-wrap items-center justify-between gap-2 border-b border-border py-2 text-sm last:border-b-0">
+                      <strong className="break-all">{counterparty.buyerEmail}</strong>
+                      <span className="text-xs text-muted-foreground">{exposure ? t("marketAccess.revokeImpact", { amount: formatUsdCnyMoney(exposure.balanceMinor, locale, usdMinorToCnyMinor(exposure.balanceMinor, usdCnyRateMicros)), count: exposure.activeServiceCount }) : t("marketAccess.revokeNoExposure")}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </Modal.Body>
+            <Modal.Footer>
+              <Button variant="ghost" isDisabled={!!busy} onClick={() => setRevokeConfirmationOpen(false)}>{t("common.cancel")}</Button>
+              <Button variant="danger" isDisabled={!!busy} onClick={() => void saveCounterpartyChanges(true)}>
+                {busy === "save-counterparties" ? <Loader2 className="h-4 w-4 animate-spin" /> : <AlertTriangle className="h-4 w-4" />}
+                {t("marketAccess.revokeConfirm")}
+              </Button>
+            </Modal.Footer>
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
 
       <Modal.Backdrop isOpen={!!blacklistPolicy} onOpenChange={(open) => !open && !busy && setBlacklistPolicy(null)}>
         <Modal.Container placement="center">

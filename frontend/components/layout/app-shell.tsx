@@ -21,6 +21,7 @@ import {
   DASHBOARD_CLIENT_MARKET_PATH,
   type DashboardShellActive,
 } from "@/lib/dashboard-nav";
+import { getMarketAccessInboxSummary } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 type RegionOption = {
@@ -151,9 +152,11 @@ function LanguageSwitcher() {
 function DashboardNav({
   active,
   authed,
+  pendingAccessRequests,
 }: {
   active: "clients" | "markets" | "share-market" | "client-market" | "account";
   authed: boolean;
+  pendingAccessRequests: number;
 }) {
   const { t } = useLocaleText();
   const pathname = usePathname() || DASHBOARD_CLIENTS_PATH;
@@ -184,7 +187,7 @@ function DashboardNav({
       label: t("nav.clientMarketTab"),
     },
     ...(authed
-      ? [{ id: "account" as const, href: DASHBOARD_ACCOUNT_PATH, icon: UserRound, label: t("nav.accountTab") }]
+      ? [{ id: "account" as const, href: DASHBOARD_ACCOUNT_PATH, icon: UserRound, label: t("nav.accountTab"), pending: pendingAccessRequests }]
       : []),
   ];
 
@@ -213,6 +216,11 @@ function DashboardNav({
               aria-hidden
             />
             <span className="whitespace-nowrap">{item.label}</span>
+            {("pending" in item ? item.pending || 0 : 0) > 0 ? (
+              <span className="inline-flex min-w-5 items-center justify-center rounded-full bg-rose-100 px-1.5 text-[10px] font-semibold text-rose-700">
+                {(item.pending || 0) > 99 ? "99+" : item.pending}
+              </span>
+            ) : null}
           </Link>
         );
       })}
@@ -226,6 +234,7 @@ function Topbar({ active }: { active: DashboardShellActive }) {
   const router = useRouter();
   const [loginOpen, setLoginOpen] = React.useState(false);
   const [clientRedirect, setClientRedirect] = React.useState<string | null>(null);
+  const [pendingAccessRequests, setPendingAccessRequests] = React.useState(0);
   const redirectStartedRef = React.useRef(false);
   const lastAuthedEmailRef = React.useRef<string | null>(null);
   if (session?.authenticated && session.user?.email) {
@@ -237,6 +246,23 @@ function Topbar({ active }: { active: DashboardShellActive }) {
   const showAuthedChrome = authed || (loading && !!lastAuthedEmailRef.current);
   const displayEmail = session?.user?.email || lastAuthedEmailRef.current || "";
   const showDashboardNav = active === "clients" || active === "markets" || active === "share-market" || active === "client-market" || active === "account";
+
+  React.useEffect(() => {
+    if (!authed || active === "account") {
+      setPendingAccessRequests(0);
+      return;
+    }
+    let activeRequest = true;
+    const loadPending = () => void getMarketAccessInboxSummary()
+      .then((summary) => { if (activeRequest) setPendingAccessRequests(summary.pendingRequests); })
+      .catch(() => undefined);
+    loadPending();
+    const timer = window.setInterval(loadPending, 30_000);
+    return () => {
+      activeRequest = false;
+      window.clearInterval(timer);
+    };
+  }, [active, authed]);
 
   React.useEffect(() => {
     setClientRedirect(sameRouterDomainClientRedirect(new URLSearchParams(window.location.search).get("clientRedirect")));
@@ -284,7 +310,7 @@ function Topbar({ active }: { active: DashboardShellActive }) {
 
           {showDashboardNav ? (
             <div className="col-span-2 row-start-2 min-w-0 max-w-full justify-self-stretch overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] md:col-span-1 md:col-start-2 md:row-start-1 md:justify-self-center [&::-webkit-scrollbar]:hidden">
-              <DashboardNav active={active} authed={showAuthedChrome} />
+              <DashboardNav active={active} authed={showAuthedChrome} pendingAccessRequests={pendingAccessRequests} />
             </div>
           ) : (
             <div />

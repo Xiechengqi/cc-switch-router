@@ -7,7 +7,15 @@ import { useAuth } from "@/components/auth/auth-provider";
 import { PaymentMethodIcons } from "@/components/common/payment-method-icons";
 import { AuthenticatedImage } from "@/components/common/authenticated-image";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { getAccountPaymentProfile, updateAccountPaymentProfile } from "@/lib/api";
+import {
+  getAccountPaymentProfile,
+  getMarketBillingConfig,
+  updateAccountPaymentProfile,
+} from "@/lib/api";
+import {
+  DEFAULT_USD_CNY_RATE_MICROS,
+  formatUsdCnyRate,
+} from "@/lib/market-money";
 import type { ClientMarketPaymentMethod, PaymentContact, PaymentContactChannel } from "@/lib/types";
 
 type CryptoDraft = { token: "USDT" | "USDC"; chain: "bsc" | "base" | "eth" | "tron"; address: string };
@@ -97,6 +105,9 @@ export function AccountPaymentsPanel() {
   const [draft, setDraft] = React.useState<PaymentDraft>(emptyPaymentDraft);
   const [baseline, setBaseline] = React.useState(() => serializePaymentDraft(emptyPaymentDraft()));
   const [previews, setPreviews] = React.useState<Record<string, string>>({});
+  const [usdCnyRateMicros, setUsdCnyRateMicros] = React.useState(
+    DEFAULT_USD_CNY_RATE_MICROS,
+  );
 
   const dirty = serializePaymentDraft(draft) !== baseline;
 
@@ -145,8 +156,11 @@ export function AccountPaymentsPanel() {
   React.useEffect(() => {
     if (!authed) return;
     setLoading(true);
-    getAccountPaymentProfile()
-      .then((profile) => applyProfile(profile.methods, profile.contacts || []))
+    Promise.all([getAccountPaymentProfile(), getMarketBillingConfig()])
+      .then(([profile, billingConfig]) => {
+        applyProfile(profile.methods, profile.contacts || []);
+        setUsdCnyRateMicros(billingConfig.usdCnyRateMicros);
+      })
       .catch((error) => toast.danger(error instanceof Error ? error.message : String(error)))
       .finally(() => setLoading(false));
   }, [applyProfile, authed]);
@@ -246,7 +260,9 @@ export function AccountPaymentsPanel() {
               <h2 className="text-base font-semibold">{t("account.paymentDetails")}</h2>
             </div>
             <p className="mt-1 text-sm text-muted-foreground">{t("account.visibilityHint")}</p>
-            <p className="mt-1 text-xs font-medium text-amber-700">{t("market.currencyNotice")}</p>
+            <p className="mt-1 text-xs font-medium text-amber-700">{t("market.currencyNotice", {
+              rate: formatUsdCnyRate(usdCnyRateMicros),
+            })}</p>
           </div>
           <Button variant="primary" isDisabled={!dirty || saving} onClick={() => void save()}>
             {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}

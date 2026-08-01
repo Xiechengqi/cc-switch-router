@@ -1,5 +1,9 @@
 import type { MessageKey } from "@/lib/i18n";
-import { formatUsdCnyMoney, usdMinorToCnyMinor } from "@/lib/market-money";
+import {
+  DEFAULT_USD_CNY_RATE_MICROS,
+  formatUsdCnyMoney,
+  usdMinorToCnyMinor,
+} from "@/lib/market-money";
 import type { ClientChatMessage, ClientChatMessagePreview } from "@/lib/types";
 
 type TFn = (key: MessageKey, values?: Record<string, string | number>) => string;
@@ -347,7 +351,12 @@ function detailScalar(
     if (key.endsWith("Minor")) {
       if (key === "amountMinor") {
         const amountUsdMinor = typeof root.amountUsdMinor === "number" ? root.amountUsdMinor : value;
-        const amountCnyMinor = typeof root.amountCnyMinor === "number" ? root.amountCnyMinor : undefined;
+        const usdCnyRateMicros = typeof root.usdCnyRateMicros === "number"
+          ? root.usdCnyRateMicros
+          : DEFAULT_USD_CNY_RATE_MICROS;
+        const amountCnyMinor = typeof root.amountCnyMinor === "number"
+          ? root.amountCnyMinor
+          : usdMinorToCnyMinor(amountUsdMinor, usdCnyRateMicros);
         return formatUsdCnyMoney(amountUsdMinor, locale, amountCnyMinor);
       }
       const currency = typeof root.currency === "string" ? root.currency : "";
@@ -474,7 +483,10 @@ function payloadAmount(payload: Record<string, unknown>, locale: string) {
   const amountCnyMinor = payloadNumber(
     payload,
     "amountCnyMinor",
-    usdMinorToCnyMinor(amountUsdMinor),
+    usdMinorToCnyMinor(
+      amountUsdMinor,
+      payloadNumber(payload, "usdCnyRateMicros", DEFAULT_USD_CNY_RATE_MICROS),
+    ),
   );
   return formatUsdCnyMoney(amountUsdMinor, locale, amountCnyMinor);
 }

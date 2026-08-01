@@ -11,7 +11,7 @@ import {
 } from "lucide-react";
 import { ProviderContactsList } from "@/components/common/provider-contacts";
 import { useLocaleText } from "@/components/i18n/locale-provider";
-import { ApiError, createMarketAccessRequest } from "@/lib/api";
+import { ApiError, cancelMarketAccessRequest, createMarketAccessRequest } from "@/lib/api";
 import { DASHBOARD_ACCOUNT_BILLING_PATH } from "@/lib/dashboard-nav";
 import type { MessageKey } from "@/lib/i18n";
 import type {
@@ -69,7 +69,7 @@ export function MarketAccessDialog({
   eligibility,
   onOpenChange,
   onOpenChat,
-  onRequested,
+  onRequestChanged,
 }: {
   open: boolean;
   product: "share" | "clientHost";
@@ -82,7 +82,7 @@ export function MarketAccessDialog({
   eligibility: MarketEligibility;
   onOpenChange: (open: boolean) => void;
   onOpenChat?: () => void | Promise<void>;
-  onRequested?: (request: MarketAccessRequest) => void;
+  onRequestChanged?: (request?: MarketAccessRequest) => void | Promise<void>;
 }) {
   const { t } = useLocaleText();
   const share = product === "share";
@@ -113,8 +113,23 @@ export function MarketAccessDialog({
     setError("");
     try {
       const created = await createMarketAccessRequest({ targetKind, targetId });
-      setRequest({ id: created.id, status: created.status, requestedAt: created.requestedAt });
-      onRequested?.(created);
+      setRequest({ id: created.id, status: created.status, revision: created.revision, requestedAt: created.requestedAt });
+      await onRequestChanged?.(created);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const cancelRequest = async () => {
+    if (!request || busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      await cancelMarketAccessRequest(request.id, request.revision);
+      setRequest(undefined);
+      await onRequestChanged?.();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -128,7 +143,7 @@ export function MarketAccessDialog({
     "credit_limit_reached",
   ].includes(eligibility.status);
   const canApply = eligibility.status === "access_required";
-  const canContact = canApply || eligibility.status === "credit_required" || eligibility.status === "relationship_closed";
+  const canContact = canApply || eligibility.status === "credit_required";
 
   return (
     <Modal.Backdrop isOpen={open} onOpenChange={onOpenChange}>
@@ -180,13 +195,18 @@ export function MarketAccessDialog({
                 {t(share ? "marketApproval.openChat" : "marketApproval.emailOwner")}
               </Button>
             ) : null}
+            {canApply && request ? (
+              <Button variant="outline" isDisabled={busy} onClick={() => void cancelRequest()}>
+                {t("marketApproval.cancelRequest")}
+              </Button>
+            ) : null}
             {needsBilling ? (
               <Button variant="primary" onClick={() => { window.location.href = DASHBOARD_ACCOUNT_BILLING_PATH; }}>
                 <CircleDollarSign className="h-4 w-4" />
                 {t("marketBilling.open")}
               </Button>
             ) : null}
-            {canApply ? (
+            {canApply && !request ? (
               <Button variant="primary" isDisabled={!!request || busy} onClick={() => void apply()}>
                 <Send className="h-4 w-4" />
                 {request ? t("marketApproval.requested") : t("marketApproval.apply")}

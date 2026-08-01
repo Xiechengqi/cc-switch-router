@@ -14,6 +14,7 @@ use crate::error::AppError;
 pub enum FieldType {
     Text,
     Int,
+    Decimal,
     Bool,
     Path,
     Url,
@@ -31,6 +32,7 @@ pub enum DynamicGroup {
     Telegram,
     Board,
     ClientNotifications,
+    MarketBilling,
 }
 
 #[derive(Debug, Clone)]
@@ -815,6 +817,19 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         placeholder: Some("1"),
         dynamic_group: None,
     },
+    // ── Market billing ──
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE",
+        label: "USD/CNY exchange rate",
+        group: "Market billing",
+        field_type: FieldType::Decimal,
+        required: false,
+        restart_required: false,
+        default: Some("7"),
+        description: "CNY received for 1 USD. Applies immediately to unbilled estimates and is frozen when each invoice opens (0.01-100, up to 6 decimal places).",
+        placeholder: Some("7"),
+        dynamic_group: Some(DynamicGroup::MarketBilling),
+    },
     // ── External verification ──
     SettingsField {
         key: "CC_SWITCH_ROUTER_VERIFICATION_SERVICE_BASE_URL",
@@ -1385,6 +1400,19 @@ fn normalize_value(field: &SettingsField, raw: &str) -> Result<Option<String>, A
             validate_registration_admission_integer(field.key, value)?;
             Ok(Some(trimmed.to_string()))
         }
+        FieldType::Decimal => {
+            if field.key != "CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE" {
+                return Err(AppError::Internal(format!(
+                    "unsupported decimal settings field: {}",
+                    field.key
+                )));
+            }
+            let rate_micros = crate::market_billing::parse_usd_cny_rate_micros(trimmed)
+                .map_err(|message| AppError::BadRequest(format!("{}: {message}", field.key)))?;
+            Ok(Some(crate::market_billing::format_usd_cny_rate(
+                rate_micros,
+            )))
+        }
         FieldType::Bool => match trimmed.to_ascii_lowercase().as_str() {
             "1" | "true" | "yes" | "on" => Ok(Some("true".to_string())),
             "0" | "false" | "no" | "off" => Ok(Some("false".to_string())),
@@ -1715,6 +1743,11 @@ pub fn apply_updates_to_dynamic(
                     .registration_global_hourly_limit =
                     value.and_then(|v| v.parse().ok()).unwrap_or(10);
             }
+            "CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE" => {
+                current.market_usd_cny_rate_micros = value
+                    .and_then(|value| crate::market_billing::parse_usd_cny_rate_micros(value).ok())
+                    .unwrap_or(crate::market_billing::DEFAULT_USD_CNY_RATE_MICROS);
+            }
             // Restart-required fields (paths, addresses, TTLs, Resend API
             // key, auth limits, verification URLs, email From/Reply-To):
             // these have already been written to the .env file by the
@@ -1765,6 +1798,31 @@ mod tests {
             normalize_value(field, " 1500 ").unwrap(),
             Some("1500".into())
         );
+    }
+
+    #[test]
+    fn market_exchange_rate_is_dynamic_and_canonical() {
+        let field = field_by_key("CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE").unwrap();
+        assert_eq!(
+            normalize_value(field, " 7.120000 ").unwrap(),
+            Some("7.12".into())
+        );
+        assert!(normalize_value(field, "0").is_err());
+        assert!(normalize_value(field, "7.1234567").is_err());
+        assert!(!field.restart_required);
+        assert!(matches!(
+            field.dynamic_group,
+            Some(DynamicGroup::MarketBilling)
+        ));
+
+        let config = test_static_config_with_board_overrides();
+        let mut dynamic = DynamicSettings::from_config(&config);
+        let updates = BTreeMap::from([(
+            "CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE".into(),
+            Some("7.25".into()),
+        )]);
+        apply_updates_to_dynamic(&mut dynamic, &updates, &config);
+        assert_eq!(dynamic.market_usd_cny_rate_micros, 7_250_000);
     }
 
     #[test]
@@ -2220,6 +2278,7 @@ mod tests {
             auth_installation_hourly_limit: 10,
             ip_blacklist: String::new(),
             free_share_ip_parallel_limit: 1,
+            market_usd_cny_rate_micros: crate::market_billing::DEFAULT_USD_CNY_RATE_MICROS,
             ip_intel_endpoints: Vec::new(),
             verification_service_base_url: "https://example.com".into(),
             verification_service_api_key: None,

@@ -205,6 +205,7 @@ function main() {
   for (const required of [
     "amountUsdMinor",
     "amountCnyMinor",
+    "usdCnyRateMicros",
     "paymentMethods",
     "paymentProfileUpdatedAt",
     "lines",
@@ -218,7 +219,13 @@ function main() {
     }
   }
 
-  for (const required of ["MARKET_CURRENCY", "USD_CNY_RATE", "amount_usd_minor", "amount_cny_minor"]) {
+  for (const required of [
+    "MARKET_CURRENCY",
+    "DEFAULT_USD_CNY_RATE_MICROS",
+    "usd_cny_rate_micros",
+    "amount_usd_minor",
+    "amount_cny_minor",
+  ]) {
     if (!billingSource.includes(required)) errors.push(`market billing is missing ${required}`);
   }
 
@@ -238,10 +245,39 @@ function main() {
     "UpdateCounterpartyRequest",
     "UpdateCreditLineRequest",
     "UpdatePublicCreditLineRequest",
+    "ApproveAccessRequest",
+    "RejectAccessRequest",
+    "ResolveAccessRequest",
+    "BatchCounterpartyUpdate",
   ]) {
     const block = extractRustBlock(accessSource, `struct ${requestType}`);
     if (!block.includes("expected_revision: i64")) {
       errors.push(`${requestType} must require expectedRevision`);
+    }
+  }
+  const approvalRequest = extractRustBlock(accessSource, "struct ApproveAccessRequest");
+  if (!approvalRequest.includes("credit_line: Option<ApprovalCreditLineInput>")) {
+    errors.push("ApproveAccessRequest must support atomic paid credit approval");
+  }
+  const approvalCredit = extractRustBlock(accessSource, "struct ApprovalCreditLineInput");
+  if (!approvalCredit.includes("expected_revision: i64")) {
+    errors.push("ApprovalCreditLineInput must require expectedRevision");
+  }
+  const approvalTransaction = extractRustBlock(accessSource, "fn approve_access_request_tx(");
+  if (!approvalTransaction.includes("ensure_credit_line_revision_tx")) {
+    errors.push("paid access approval must enforce credit revision before mutation");
+  }
+  const rejectionRequest = extractRustBlock(accessSource, "struct RejectAccessRequest");
+  if (!rejectionRequest.includes("reason: String")) {
+    errors.push("RejectAccessRequest must require a supplier reason");
+  }
+  for (const [label, declaration] of [
+    ["market access approval", "async fn approve_access_request("],
+    ["market counterparty batch update", "async fn update_counterparties_batch("],
+  ]) {
+    const block = extractRustBlock(accessSource, declaration);
+    if (!block.includes("TransactionBehavior::Immediate") || !block.includes("tx.commit()")) {
+      errors.push(`${label} must use one committed SQLite Immediate transaction`);
     }
   }
 
@@ -249,12 +285,19 @@ function main() {
     "/v1/client-market/my-rentals",
     "/v1/client-market/clients/:installation_id/rental",
     "/v1/market-access/dashboard",
+    "/v1/market-access/inbox-summary",
     "/v1/market-access/policies/:product_kind/:pricing_kind",
     "/v1/market-access/counterparties",
+    "/v1/market-access/counterparties/batch",
     "/v1/market-access/counterparties/:id",
     "/v1/market-access/counterparties/:id/credit-lines/:currency",
     "/v1/market-access/public-credit-lines/:currency",
+    "/v1/market-access/requests",
+    "/v1/market-access/requests/:id/approve",
+    "/v1/market-access/requests/:id/reject",
+    "/v1/market-access/requests/:id/cancel",
     "/v1/market-billing/dashboard",
+    "/v1/market-billing/config",
     "/v1/market-billing/accounts/:account_id/request-settlement",
   ]) {
     if (!files.some((relativePath) => {
@@ -340,6 +383,34 @@ function main() {
       "frontend/components/dashboard/account-billing-page.tsx",
     ].includes(relativePath)) {
       errors.push(`${relativePath} renders full payment methods outside Account Billing`);
+    }
+  }
+
+  for (const [relativePath, requiredMarkers] of [
+    [
+      "frontend/components/dashboard/share-market-page.tsx",
+      ["setRentDialog({ listing, seat })", "shareMarket.rentConfirm.postpaid", "seat.offerRevision"],
+    ],
+    [
+      "frontend/components/dashboard/create-client-dialog.tsx",
+      ["createClient.quoteTerms.postpaid", "createClient.quoteTerms.free", "offerRevision: item.offerRevision"],
+    ],
+    [
+      "frontend/components/dashboard/account-billing-page.tsx",
+      ["marketBilling.tabs.todo", "marketBilling.tabs.payables", "actionSubmitLabel"],
+    ],
+    [
+      "frontend/components/dashboard/account-market-readiness-page.tsx",
+      ["getAccountPaymentProfile", "getMarketAccessDashboard", "getMarketBillingDashboard"],
+    ],
+    [
+      "frontend/lib/api.ts",
+      ["/v1/market-access/counterparties/batch", "/v1/market-access/inbox-summary"],
+    ],
+  ]) {
+    const source = fs.readFileSync(path.join(root, relativePath), "utf8");
+    for (const marker of requiredMarkers) {
+      if (!source.includes(marker)) errors.push(`${relativePath} is missing ${marker}`);
     }
   }
 

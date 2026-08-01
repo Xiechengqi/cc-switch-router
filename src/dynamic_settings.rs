@@ -16,6 +16,7 @@ pub struct DynamicSettings {
     pub telegram: TelegramSettings,
     pub board: BoardSettings,
     pub client_notifications: ClientNotificationSettings,
+    pub market_usd_cny_rate_micros: i64,
     pub footer_telegram_url: String,
 }
 
@@ -70,6 +71,7 @@ impl DynamicSettings {
                 guest_self_delete_secs: config.board_guest_self_delete_secs,
             },
             client_notifications: config.client_notifications.clone(),
+            market_usd_cny_rate_micros: config.market_usd_cny_rate_micros,
             footer_telegram_url: config.footer_telegram_url.clone(),
         }
     }

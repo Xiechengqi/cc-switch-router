@@ -18,7 +18,10 @@ use crate::store::AppStore;
 
 pub const TRIAL_SECONDS: i64 = 12 * 60 * 60;
 pub(crate) const MARKET_CURRENCY: &str = "USD";
-pub(crate) const USD_CNY_RATE: i64 = 7;
+pub(crate) const USD_CNY_RATE_SCALE: i64 = 1_000_000;
+pub(crate) const DEFAULT_USD_CNY_RATE_MICROS: i64 = 7 * USD_CNY_RATE_SCALE;
+const MIN_USD_CNY_RATE_MICROS: i64 = USD_CNY_RATE_SCALE / 100;
+const MAX_USD_CNY_RATE_MICROS: i64 = 100 * USD_CNY_RATE_SCALE;
 const MONEY_UNITS_PER_MINOR: i64 = 86_400;
 const NEAR_CREDIT_LIMIT_BPS: i64 = 8_000;
 const DEFAULT_SETTLEMENT_GRACE_HOURS: i64 = 24;
@@ -158,6 +161,7 @@ pub struct BillingInvoiceView {
     pub amount_minor: i64,
     pub amount_usd_minor: i64,
     pub amount_cny_minor: i64,
+    pub usd_cny_rate_micros: i64,
     pub currency: String,
     pub due_at: String,
     pub deadline_at: String,
@@ -226,6 +230,14 @@ pub struct BillingDashboardView {
     pub supplier_profiles: Vec<SupplierBillingProfileView>,
     pub restrictions: Vec<CreditRestrictionView>,
     pub trial_hours: i64,
+    pub usd_cny_rate_micros: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketBillingConfigView {
+    pub currency: &'static str,
+    pub usd_cny_rate_micros: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -447,6 +459,8 @@ pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             account_id TEXT NOT NULL,
             sequence INTEGER NOT NULL,
             amount_minor INTEGER NOT NULL,
+            amount_cny_minor INTEGER NOT NULL,
+            usd_cny_rate_micros INTEGER NOT NULL,
             amount_units INTEGER NOT NULL,
             currency TEXT NOT NULL,
             payment_methods_json TEXT NOT NULL,
@@ -477,6 +491,7 @@ pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             daily_rate_minor INTEGER NOT NULL,
             billable_seconds INTEGER NOT NULL,
             amount_minor INTEGER NOT NULL,
+            amount_cny_minor INTEGER NOT NULL,
             amount_units INTEGER NOT NULL,
             service_started_at TEXT NOT NULL,
             service_ended_at TEXT NOT NULL,
@@ -550,6 +565,7 @@ pub fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
 
 pub fn router() -> Router<ServerState> {
     Router::new()
+        .route("/v1/market-billing/config", get(get_billing_config))
         .route("/v1/market-billing/dashboard", get(get_dashboard))
         .route(
             "/v1/market-billing/supplier-profiles/:currency",
@@ -632,8 +648,61 @@ fn ceil_minor(amount_units: i64) -> i64 {
     }
 }
 
-fn usd_minor_to_cny_minor(amount_usd_minor: i64) -> i64 {
-    amount_usd_minor.saturating_mul(USD_CNY_RATE)
+pub(crate) fn parse_usd_cny_rate_micros(value: &str) -> Result<i64, String> {
+    let trimmed = value.trim();
+    let (whole, fraction) = trimmed
+        .split_once('.')
+        .map(|(whole, fraction)| (whole, Some(fraction)))
+        .unwrap_or((trimmed, None));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction.is_some_and(|fraction| {
+            fraction.is_empty()
+                || fraction.len() > 6
+                || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
+        return Err("USD/CNY rate must be a decimal with at most 6 fractional digits".into());
+    }
+    let whole = whole
+        .parse::<i64>()
+        .map_err(|_| "USD/CNY rate is too large".to_string())?;
+    let fraction = fraction.unwrap_or_default();
+    let fractional_micros = if fraction.is_empty() {
+        0
+    } else {
+        let value = fraction
+            .parse::<i64>()
+            .map_err(|_| "USD/CNY rate fraction is invalid".to_string())?;
+        value * 10_i64.pow(u32::try_from(6 - fraction.len()).unwrap_or_default())
+    };
+    let rate_micros = whole
+        .checked_mul(USD_CNY_RATE_SCALE)
+        .and_then(|value| value.checked_add(fractional_micros))
+        .ok_or_else(|| "USD/CNY rate is too large".to_string())?;
+    if !(MIN_USD_CNY_RATE_MICROS..=MAX_USD_CNY_RATE_MICROS).contains(&rate_micros) {
+        return Err("USD/CNY rate must be between 0.01 and 100".into());
+    }
+    Ok(rate_micros)
+}
+
+pub(crate) fn format_usd_cny_rate(rate_micros: i64) -> String {
+    let whole = rate_micros / USD_CNY_RATE_SCALE;
+    let fraction = rate_micros % USD_CNY_RATE_SCALE;
+    if fraction == 0 {
+        return whole.to_string();
+    }
+    format!("{whole}.{fraction:06}")
+        .trim_end_matches('0')
+        .to_string()
+}
+
+fn usd_minor_to_cny_minor(amount_usd_minor: i64, rate_micros: i64) -> i64 {
+    let converted = i128::from(amount_usd_minor)
+        .saturating_mul(i128::from(rate_micros))
+        .saturating_add(i128::from(USD_CNY_RATE_SCALE / 2))
+        / i128::from(USD_CNY_RATE_SCALE);
+    i64::try_from(converted).unwrap_or(i64::MAX)
 }
 
 fn parse_time(value: &str) -> Result<DateTime<Utc>, AppError> {
@@ -679,6 +748,13 @@ async fn get_dashboard(
 ) -> Result<Json<BillingDashboardView>, AppError> {
     let session = require_session(&state, &headers).await?;
     Ok(Json(state.store.market_billing_dashboard(&session).await?))
+}
+
+async fn get_billing_config(State(state): State<ServerState>) -> Json<MarketBillingConfigView> {
+    Json(MarketBillingConfigView {
+        currency: MARKET_CURRENCY,
+        usd_cny_rate_micros: state.store.market_usd_cny_rate_micros(),
+    })
 }
 
 async fn update_supplier_profile(
@@ -1268,25 +1344,27 @@ fn billing_chat_invoice_payload_tx(
 ) -> Result<serde_json::Value, AppError> {
     let mut payload = tx
         .query_row(
-            "SELECT amount_minor, currency, status, due_at, deadline_at,
+            "SELECT amount_minor, amount_cny_minor, usd_cny_rate_micros,
+                    currency, status, due_at, deadline_at,
                     payment_methods_json, payment_contacts_json
              FROM market_invoices WHERE id = ?1",
             params![invoice_id],
             |row| {
                 let amount_usd_minor = row.get::<_, i64>(0)?;
-                let methods = serde_json::from_str::<serde_json::Value>(&row.get::<_, String>(5)?)
+                let methods = serde_json::from_str::<serde_json::Value>(&row.get::<_, String>(7)?)
                     .unwrap_or_else(|_| serde_json::json!([]));
-                let contacts = serde_json::from_str::<serde_json::Value>(&row.get::<_, String>(6)?)
+                let contacts = serde_json::from_str::<serde_json::Value>(&row.get::<_, String>(8)?)
                     .unwrap_or_else(|_| serde_json::json!([]));
                 Ok(serde_json::json!({
                     "invoiceId": invoice_id,
                     "amountMinor": amount_usd_minor,
                     "amountUsdMinor": amount_usd_minor,
-                    "amountCnyMinor": usd_minor_to_cny_minor(amount_usd_minor),
-                    "currency": row.get::<_, String>(1)?,
-                    "invoiceStatus": row.get::<_, String>(2)?,
-                    "dueAt": row.get::<_, String>(3)?,
-                    "deadlineAt": row.get::<_, String>(4)?,
+                    "amountCnyMinor": row.get::<_, i64>(1)?,
+                    "usdCnyRateMicros": row.get::<_, i64>(2)?,
+                    "currency": row.get::<_, String>(3)?,
+                    "invoiceStatus": row.get::<_, String>(4)?,
+                    "dueAt": row.get::<_, String>(5)?,
+                    "deadlineAt": row.get::<_, String>(6)?,
                     "paymentMethods": methods,
                     "paymentContacts": contacts,
                 }))
@@ -2132,8 +2210,9 @@ fn invoice_view(
 ) -> Result<Option<BillingInvoiceView>, AppError> {
     let header = conn
         .query_row(
-            "SELECT id, sequence, status, amount_minor, currency, due_at,
-                    deadline_at, opened_at, declared_at, paid_at,
+            "SELECT id, sequence, status, amount_minor, amount_cny_minor,
+                    usd_cny_rate_micros, currency, due_at, deadline_at,
+                    opened_at, declared_at, paid_at,
                     payment_methods_json, payment_contacts_json,
                     payment_profile_updated_at
              FROM market_invoices WHERE id = ?1",
@@ -2144,15 +2223,17 @@ fn invoice_view(
                     row.get::<_, i64>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
                     row.get::<_, String>(6)?,
                     row.get::<_, String>(7)?,
-                    row.get::<_, Option<String>>(8)?,
-                    row.get::<_, Option<String>>(9)?,
-                    row.get::<_, String>(10)?,
-                    row.get::<_, String>(11)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
                     row.get::<_, String>(12)?,
+                    row.get::<_, String>(13)?,
+                    row.get::<_, String>(14)?,
                 ))
             },
         )
@@ -2165,14 +2246,14 @@ fn invoice_view(
         .prepare(
             "SELECT id, contract_id, product_kind, product_ref, service_ref,
                     service_label, daily_rate_minor, billable_seconds, amount_minor,
-                    service_started_at, service_ended_at, evidence_json
+                    amount_cny_minor, service_started_at, service_ended_at, evidence_json
              FROM market_invoice_lines WHERE invoice_id = ?1
              ORDER BY service_started_at, id",
         )
         .and_then(|mut statement| {
             statement
                 .query_map(params![invoice_id], |row| {
-                    let evidence: String = row.get(11)?;
+                    let evidence: String = row.get(12)?;
                     let amount_minor = row.get(8)?;
                     Ok(BillingInvoiceLineView {
                         id: row.get(0)?,
@@ -2185,9 +2266,9 @@ fn invoice_view(
                         billable_seconds: row.get(7)?,
                         amount_minor,
                         amount_usd_minor: amount_minor,
-                        amount_cny_minor: usd_minor_to_cny_minor(amount_minor),
-                        service_started_at: row.get(9)?,
-                        service_ended_at: row.get(10)?,
+                        amount_cny_minor: row.get(9)?,
+                        service_started_at: row.get(10)?,
+                        service_ended_at: row.get(11)?,
                         evidence: serde_json::from_str(&evidence)
                             .unwrap_or_else(|_| serde_json::json!({})),
                     })
@@ -2195,26 +2276,27 @@ fn invoice_view(
                 .collect::<Result<Vec<_>, _>>()
         })
         .map_err(map_db("read billing dashboard invoice lines"))?;
-    let currency = normalize_currency(&header.4)?;
+    let currency = normalize_currency(&header.6)?;
     Ok(Some(BillingInvoiceView {
         id: header.0,
         sequence: header.1,
         status: header.2,
         amount_minor: header.3,
         amount_usd_minor: header.3,
-        amount_cny_minor: usd_minor_to_cny_minor(header.3),
+        amount_cny_minor: header.4,
+        usd_cny_rate_micros: header.5,
         currency,
-        due_at: header.5,
-        deadline_at: header.6,
-        opened_at: header.7,
-        declared_at: header.8,
-        paid_at: header.9,
-        payment_methods: serde_json::from_str(&header.10)
+        due_at: header.7,
+        deadline_at: header.8,
+        opened_at: header.9,
+        declared_at: header.10,
+        paid_at: header.11,
+        payment_methods: serde_json::from_str(&header.12)
             .map_err(|_| AppError::Internal("stored invoice payment methods are invalid".into()))?,
-        contacts: serde_json::from_str(&header.11).map_err(|_| {
+        contacts: serde_json::from_str(&header.13).map_err(|_| {
             AppError::Internal("stored invoice payment contacts are invalid".into())
         })?,
-        payment_profile_updated_at: header.12,
+        payment_profile_updated_at: header.14,
         declaration: declaration_view_for_invoice(conn, invoice_id)?,
         dispute: dispute_view_for_invoice(conn, invoice_id)?,
         lines,
@@ -2381,6 +2463,7 @@ impl AppStore {
             supplier_profiles,
             restrictions,
             trial_hours: TRIAL_SECONDS / 3_600,
+            usd_cny_rate_micros: self.market_usd_cny_rate_micros(),
         })
     }
 
@@ -2497,6 +2580,7 @@ impl AppStore {
     ) -> Result<Vec<BillingAction>, AppError> {
         let now = Utc::now();
         let now_text = now.to_rfc3339();
+        let usd_cny_rate_micros = self.market_usd_cny_rate_micros();
         let mut conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -2621,6 +2705,7 @@ impl AppStore {
                     "voluntary_settlement_requested"
                 },
                 Some(actor_user_id),
+                usd_cny_rate_micros,
             )?;
             if close_requested {
                 tx.execute(
@@ -3678,6 +3763,7 @@ struct InvoiceLineDraft {
     billable_seconds: i64,
     amount_units: i64,
     amount_minor: i64,
+    amount_cny_minor: i64,
     started_at: String,
     ended_at: String,
 }
@@ -3688,6 +3774,7 @@ fn open_invoice_tx(
     now: DateTime<Utc>,
     event_type: &str,
     actor_user_id: Option<&str>,
+    usd_cny_rate_micros: i64,
 ) -> Result<String, AppError> {
     if tx
         .query_row(
@@ -3731,6 +3818,7 @@ fn open_invoice_tx(
                         billable_seconds: row.get(6)?,
                         amount_units: row.get(7)?,
                         amount_minor: 0,
+                        amount_cny_minor: 0,
                         started_at: row.get(8)?,
                         ended_at: row.get(9)?,
                     })
@@ -3766,6 +3854,27 @@ fn open_invoice_tx(
         }
         drafts[index].amount_minor += 1;
         minor_remaining -= 1;
+    }
+    let amount_cny_minor = usd_minor_to_cny_minor(amount_minor, usd_cny_rate_micros);
+    let mut assigned_cny_minor = 0_i64;
+    let mut cny_remainders = Vec::with_capacity(drafts.len());
+    for (index, line) in drafts.iter_mut().enumerate() {
+        let scaled = i128::from(line.amount_minor) * i128::from(usd_cny_rate_micros);
+        line.amount_cny_minor = i64::try_from(scaled / i128::from(USD_CNY_RATE_SCALE))
+            .map_err(|_| AppError::Internal("market CNY allocation overflowed".into()))?;
+        assigned_cny_minor = assigned_cny_minor
+            .checked_add(line.amount_cny_minor)
+            .ok_or_else(|| AppError::Internal("market CNY allocation overflowed".into()))?;
+        cny_remainders.push((scaled % i128::from(USD_CNY_RATE_SCALE), index));
+    }
+    cny_remainders.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    let mut cny_minor_remaining = amount_cny_minor - assigned_cny_minor;
+    for (_, index) in cny_remainders {
+        if cny_minor_remaining == 0 {
+            break;
+        }
+        drafts[index].amount_cny_minor += 1;
+        cny_minor_remaining -= 1;
     }
     let sequence = tx
         .query_row(
@@ -3808,15 +3917,18 @@ fn open_invoice_tx(
     }
     tx.execute(
         "INSERT INTO market_invoices (
-            id, account_id, sequence, amount_minor, amount_units, currency,
+            id, account_id, sequence, amount_minor, amount_cny_minor,
+            usd_cny_rate_micros, amount_units, currency,
             payment_methods_json, payment_contacts_json, payment_profile_updated_at,
             status, due_at, deadline_at, opened_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'open', ?10, ?11, ?10)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'open', ?12, ?13, ?12)",
         params![
             invoice_id,
             account.id,
             sequence,
             amount_minor,
+            amount_cny_minor,
+            usd_cny_rate_micros,
             amount_units,
             account.currency,
             payment_profile.0,
@@ -3832,8 +3944,9 @@ fn open_invoice_tx(
             "INSERT INTO market_invoice_lines (
                 id, invoice_id, contract_id, product_kind, product_ref, service_ref,
                 service_label, daily_rate_minor, billable_seconds, amount_minor,
-                amount_units, service_started_at, service_ended_at, evidence_json, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                amount_cny_minor, amount_units, service_started_at, service_ended_at,
+                evidence_json, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 Uuid::new_v4().to_string(),
                 invoice_id,
@@ -3845,6 +3958,7 @@ fn open_invoice_tx(
                 line.daily_rate_minor,
                 line.billable_seconds,
                 line.amount_minor,
+                line.amount_cny_minor,
                 line.amount_units,
                 line.started_at,
                 line.ended_at,
@@ -3901,7 +4015,8 @@ fn open_invoice_tx(
         serde_json::json!({
             "amountMinor": amount_minor,
             "amountUsdMinor": amount_minor,
-            "amountCnyMinor": usd_minor_to_cny_minor(amount_minor),
+            "amountCnyMinor": amount_cny_minor,
+            "usdCnyRateMicros": usd_cny_rate_micros,
             "currency": account.currency,
             "deadlineAt": deadline_at,
         }),
@@ -4008,7 +4123,11 @@ fn mark_overdue_invoices_tx(tx: &Transaction<'_>, now: &str) -> Result<(), AppEr
     Ok(())
 }
 
-fn open_final_invoices_tx(tx: &Transaction<'_>, now: DateTime<Utc>) -> Result<(), AppError> {
+fn open_final_invoices_tx(
+    tx: &Transaction<'_>,
+    now: DateTime<Utc>,
+    usd_cny_rate_micros: i64,
+) -> Result<(), AppError> {
     let account_ids = tx
         .prepare(
             "SELECT account.id
@@ -4030,7 +4149,14 @@ fn open_final_invoices_tx(tx: &Transaction<'_>, now: DateTime<Utc>) -> Result<()
         .map_err(map_db("load final market settlements"))?;
     for account_id in account_ids {
         let account = load_account_row_tx(tx, &account_id)?;
-        open_invoice_tx(tx, &account, now, "final_service_ended", None)?;
+        open_invoice_tx(
+            tx,
+            &account,
+            now,
+            "final_service_ended",
+            None,
+            usd_cny_rate_micros,
+        )?;
     }
     Ok(())
 }
@@ -4040,6 +4166,7 @@ impl AppStore {
         &self,
         now: DateTime<Utc>,
     ) -> Result<Vec<BillingAction>, AppError> {
+        let usd_cny_rate_micros = self.market_usd_cny_rate_micros();
         let mut conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -4148,7 +4275,14 @@ impl AppStore {
                     balance_units: next_balance,
                     ..account
                 };
-                open_invoice_tx(&tx, &settled_account, now, "credit_limit_reached", None)?;
+                open_invoice_tx(
+                    &tx,
+                    &settled_account,
+                    now,
+                    "credit_limit_reached",
+                    None,
+                    usd_cny_rate_micros,
+                )?;
             } else {
                 let utilization_bps = limit_units.map(|limit_units| {
                     i64::try_from(i128::from(next_balance) * 10_000_i128 / i128::from(limit_units))
@@ -4201,7 +4335,7 @@ impl AppStore {
             params![now_text],
         )
         .map_err(map_db("terminate services with revoked market credit"))?;
-        open_final_invoices_tx(&tx, now)?;
+        open_final_invoices_tx(&tx, now, usd_cny_rate_micros)?;
         mark_overdue_invoices_tx(&tx, &now_text)?;
         let actions = pending_control_actions_tx(&tx)?;
         tx.commit()
@@ -4213,6 +4347,16 @@ impl AppStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usd_cny_rate_parser_is_exact_and_bounded() {
+        assert_eq!(parse_usd_cny_rate_micros("7").unwrap(), 7_000_000);
+        assert_eq!(parse_usd_cny_rate_micros(" 7.123456 ").unwrap(), 7_123_456);
+        assert_eq!(format_usd_cny_rate(7_120_000), "7.12");
+        assert!(parse_usd_cny_rate_micros("7.1234567").is_err());
+        assert!(parse_usd_cny_rate_micros("0").is_err());
+        assert!(parse_usd_cny_rate_micros("100.01").is_err());
+    }
 
     fn session(user_id: &str, email: &str) -> AuthSession {
         let now = Utc::now();
@@ -4458,10 +4602,11 @@ mod tests {
             let invoice_id = "billing-chat-invoice";
             conn.execute(
                 "INSERT INTO market_invoices (
-                    id, account_id, sequence, amount_minor, amount_units, currency,
+                    id, account_id, sequence, amount_minor, amount_cny_minor,
+                    usd_cny_rate_micros, amount_units, currency,
                     payment_methods_json, payment_contacts_json, payment_profile_updated_at,
                     status, due_at, deadline_at, opened_at
-                 ) VALUES (?1, 'billing-chat-account', 1, 1234, 1234, 'USD',
+                 ) VALUES (?1, 'billing-chat-account', 1, 1234, 8638, 7000000, 1234, 'USD',
                            '[{\"kind\":\"custom\",\"instructions\":\"Wire to account 001\"}]',
                            '[{\"channel\":\"telegram\",\"handle\":\"@provider\"}]',
                            ?2, 'open', ?2, ?3, ?2)",
@@ -4484,10 +4629,11 @@ mod tests {
                     "INSERT INTO market_invoice_lines (
                         id, invoice_id, contract_id, product_kind, product_ref,
                         service_ref, service_label, daily_rate_minor, billable_seconds,
-                        amount_minor, amount_units, service_started_at, service_ended_at,
+                        amount_minor, amount_cny_minor, amount_units,
+                        service_started_at, service_ended_at,
                         evidence_json, created_at
                      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 100, 60,
-                               617, 617, ?8, ?8, '{}', ?8)",
+                               617, 4319, 617, ?8, ?8, '{}', ?8)",
                     params![
                         line_id,
                         invoice_id,
@@ -4578,6 +4724,7 @@ mod tests {
             assert_eq!(payload["amountMinor"], 1234);
             assert_eq!(payload["amountUsdMinor"], 1234);
             assert_eq!(payload["amountCnyMinor"], 8638);
+            assert_eq!(payload["usdCnyRateMicros"], 7_000_000);
             assert_eq!(payload["currency"], "USD");
             assert_eq!(payload["billingEventType"], "payment_declared");
             assert_eq!(payload["buyerEmail"], "renter@example.com");
@@ -5233,6 +5380,7 @@ mod tests {
         let observed_at = started_at + Duration::seconds(1);
         record_client_health(&store, "client-combined-a", observed_at, "healthy").await;
         record_client_health(&store, "client-combined-b", observed_at, "healthy").await;
+        store.set_market_usd_cny_rate_micros(7_500_000);
 
         let suspend_actions = store
             .market_billing_reconcile(observed_at)
@@ -5257,12 +5405,16 @@ mod tests {
         let invoice = account.open_invoice.as_ref().expect("combined invoice");
         assert_eq!(invoice.amount_minor, 2);
         assert_eq!(invoice.amount_usd_minor, 2);
-        assert_eq!(invoice.amount_cny_minor, 14);
+        assert_eq!(dashboard.usd_cny_rate_micros, 7_500_000);
+        assert_eq!(invoice.amount_cny_minor, 15);
+        assert_eq!(invoice.usd_cny_rate_micros, 7_500_000);
         assert_eq!(invoice.lines.len(), 2);
-        assert!(invoice.lines.iter().all(|line| {
-            line.amount_usd_minor == line.amount_minor
-                && line.amount_cny_minor == line.amount_minor * USD_CNY_RATE
-        }));
+        assert!(
+            invoice
+                .lines
+                .iter()
+                .all(|line| line.amount_usd_minor == line.amount_minor)
+        );
         assert_eq!(
             invoice
                 .lines
@@ -5271,7 +5423,27 @@ mod tests {
                 .sum::<i64>(),
             2
         );
+        assert_eq!(
+            invoice
+                .lines
+                .iter()
+                .map(|line| line.amount_cny_minor)
+                .sum::<i64>(),
+            invoice.amount_cny_minor
+        );
         assert!(invoice.lines.iter().all(|line| line.billable_seconds == 1));
+        store.set_market_usd_cny_rate_micros(8_000_000);
+        let refreshed = store
+            .market_billing_dashboard(&buyer)
+            .await
+            .expect("reload invoice after exchange-rate update");
+        assert_eq!(refreshed.usd_cny_rate_micros, 8_000_000);
+        let frozen_invoice = refreshed.accounts[0]
+            .open_invoice
+            .as_ref()
+            .expect("frozen combined invoice");
+        assert_eq!(frozen_invoice.usd_cny_rate_micros, 7_500_000);
+        assert_eq!(frozen_invoice.amount_cny_minor, 15);
         let mut product_refs = invoice
             .lines
             .iter()

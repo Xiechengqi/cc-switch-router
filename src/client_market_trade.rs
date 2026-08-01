@@ -4476,10 +4476,11 @@ mod tests {
             let timestamp = (now + Duration::seconds(2)).to_rfc3339();
             conn.execute(
                 "INSERT INTO market_invoices (
-                    id, account_id, sequence, amount_minor, amount_units, currency,
+                    id, account_id, sequence, amount_minor, amount_cny_minor,
+                    usd_cny_rate_micros, amount_units, currency,
                     payment_methods_json, payment_contacts_json, payment_profile_updated_at,
                     status, due_at, deadline_at, opened_at
-                 ) VALUES ('guarded-invoice', ?1, 1, 500, 500000, 'USD',
+                 ) VALUES ('guarded-invoice', ?1, 1, 500, 3500, 7000000, 500000, 'USD',
                            '[]', '[]', ?2, 'open', ?2, ?2, ?2)",
                 params![account_id, timestamp],
             )
@@ -4564,10 +4565,11 @@ mod tests {
                 .expect("read snapshot credit account");
             conn.execute(
                 "INSERT INTO market_invoices (
-                    id, account_id, sequence, amount_minor, amount_units, currency,
+                    id, account_id, sequence, amount_minor, amount_cny_minor,
+                    usd_cny_rate_micros, amount_units, currency,
                     payment_methods_json, payment_contacts_json, payment_profile_updated_at,
                     status, due_at, deadline_at, opened_at
-                 ) VALUES ('asset-snapshot-invoice', ?1, 1, 500, 500000, 'USD',
+                 ) VALUES ('asset-snapshot-invoice', ?1, 1, 500, 3500, 7000000, 500000, 'USD',
                            ?2, '[]', ?3, 'open', ?3, ?3, ?3)",
                 params![account_id, snapshot_json, now],
             )

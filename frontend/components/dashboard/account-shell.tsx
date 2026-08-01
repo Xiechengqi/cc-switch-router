@@ -2,15 +2,18 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { Activity, BarChart3, HandCoins, KeyRound, Receipt, Share2, ShieldCheck, WalletCards } from "lucide-react";
+import { Activity, BarChart3, ClipboardCheck, HandCoins, KeyRound, Receipt, Share2, ShieldCheck, WalletCards } from "lucide-react";
 import * as React from "react";
+import { useAuth } from "@/components/auth/auth-provider";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import { getMarketAccessInboxSummary } from "@/lib/api";
 import {
   accountNavHrefFromPathname,
   DASHBOARD_ACCOUNT_API_KEYS_PATH,
   DASHBOARD_ACCOUNT_CLIENT_PATH,
   DASHBOARD_ACCOUNT_BILLING_PATH,
   DASHBOARD_ACCOUNT_MARKET_ACCESS_PATH,
+  DASHBOARD_ACCOUNT_MARKET_READINESS_PATH,
   DASHBOARD_ACCOUNT_CONSUMER_USAGE_PATH,
   DASHBOARD_ACCOUNT_PATH,
   DASHBOARD_ACCOUNT_PAYMENTS_PATH,
@@ -30,6 +33,7 @@ const NAV_ITEMS: {
     | "account.nav.providerUsage"
     | "account.nav.consumerUsage"
     | "account.nav.billing"
+    | "account.nav.marketReadiness"
     | "account.nav.marketAccess"
     | "account.nav.payments"
     | "account.nav.share"
@@ -58,6 +62,13 @@ const NAV_ITEMS: {
     labelKey: "account.nav.consumerUsage",
     icon: Activity,
     match: (pathname: string) => pathname.startsWith("/account/consumer-usage"),
+  },
+  {
+    id: "market-readiness",
+    href: DASHBOARD_ACCOUNT_MARKET_READINESS_PATH,
+    labelKey: "account.nav.marketReadiness",
+    icon: ClipboardCheck,
+    match: (pathname: string) => pathname.startsWith("/account/market-readiness"),
   },
   {
     id: "billing",
@@ -103,8 +114,11 @@ function isAccountIndexPath(pathname: string) {
 
 export function AccountShell({ children }: { children: React.ReactNode }) {
   const { t } = useLocaleText();
+  const { session } = useAuth();
   const pathname = usePathname() || DASHBOARD_ACCOUNT_API_KEYS_PATH;
   const router = useRouter();
+  const [pendingAccessRequests, setPendingAccessRequests] = React.useState(0);
+  const authed = !!session?.authenticated;
 
   React.useEffect(() => {
     if (isAccountIndexPath(pathname)) {
@@ -114,6 +128,23 @@ export function AccountShell({ children }: { children: React.ReactNode }) {
     const href = accountNavHrefFromPathname(pathname);
     if (href) writeStoredAccountNavHref(href);
   }, [pathname, router]);
+
+  React.useEffect(() => {
+    if (!authed) {
+      setPendingAccessRequests(0);
+      return;
+    }
+    let active = true;
+    const loadPending = () => void getMarketAccessInboxSummary()
+      .then((summary) => { if (active) setPendingAccessRequests(summary.pendingRequests); })
+      .catch(() => undefined);
+    loadPending();
+    const timer = window.setInterval(loadPending, 30_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [authed, pathname]);
 
   return (
     <main className="mx-auto grid min-w-0 w-[calc(100%-2rem)] max-w-6xl grid-cols-[minmax(0,1fr)] gap-6 pb-12 pt-2 md:grid-cols-[13rem_minmax(0,1fr)] md:gap-8">
@@ -140,6 +171,11 @@ export function AccountShell({ children }: { children: React.ReactNode }) {
               >
                 <Icon className="h-4 w-4 shrink-0" aria-hidden />
                 <span className="whitespace-nowrap">{t(item.labelKey)}</span>
+                {(item.id === "market-readiness" || item.id === "market-access") && pendingAccessRequests > 0 ? (
+                  <span className="inline-flex min-w-5 items-center justify-center rounded-full bg-rose-100 px-1.5 text-[10px] font-semibold text-rose-700">
+                    {pendingAccessRequests > 99 ? "99+" : pendingAccessRequests}
+                  </span>
+                ) : null}
               </Link>
             );
           })}

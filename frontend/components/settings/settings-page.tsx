@@ -338,7 +338,8 @@ function SettingsFieldRow({
         ) : (
           <Input
             id={field.key}
-            type={field.fieldType === "secret" ? "password" : field.fieldType === "int" ? "number" : field.fieldType === "url" ? "url" : field.fieldType === "email" ? "email" : "text"}
+            type={field.fieldType === "secret" ? "password" : field.fieldType === "int" || field.fieldType === "decimal" ? "number" : field.fieldType === "url" ? "url" : field.fieldType === "email" ? "email" : "text"}
+            step={field.fieldType === "decimal" ? "0.000001" : undefined}
             value={String(value ?? "")}
             onChange={(event) => onChange(event.target.value)}
             placeholder={field.fieldType === "secret" && entry?.hasValue

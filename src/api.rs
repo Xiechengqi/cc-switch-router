@@ -5237,6 +5237,9 @@ async fn admin_settings_apply(
             return Err(sync_error);
         }
     }
+    state
+        .store
+        .set_market_usd_cny_rate_micros(next_dynamic.market_usd_cny_rate_micros);
     *dynamic_guard = next_dynamic.clone();
     drop(dynamic_guard);
 

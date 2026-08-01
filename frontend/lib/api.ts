@@ -65,8 +65,10 @@ import type {
   ShareMarketSeatInput,
   AdminMarketBillingDispute,
   MarketBillingDashboard,
+  MarketBillingConfig,
   MarketBillingInvoiceHistory,
   MarketAccessDashboard,
+  MarketAccessInboxSummary,
   MarketAccessRequest,
   MarketCounterparty,
   MarketAccessDecision,
@@ -775,6 +777,12 @@ export async function getMarketBillingDashboard(signal?: AbortSignal) {
   );
 }
 
+export async function getMarketBillingConfig(signal?: AbortSignal) {
+  return parseJson<MarketBillingConfig>(
+    await authFetch("/v1/market-billing/config", { cache: "no-store", signal }),
+  );
+}
+
 export async function updateMarketBillingSupplierProfile(
   currency: "USD",
   settlementGraceHours: number,
@@ -908,6 +916,12 @@ export async function getMarketAccessDashboard(signal?: AbortSignal) {
   );
 }
 
+export async function getMarketAccessInboxSummary(signal?: AbortSignal) {
+  return parseJson<MarketAccessInboxSummary>(
+    await authFetch("/v1/market-access/inbox-summary", { cache: "no-store", signal }),
+  );
+}
+
 export async function updateMarketAccessPolicy(
   productKind: MarketAccessProductKind,
   pricingKind: MarketAccessPricingKind,
@@ -985,6 +999,34 @@ export async function updateMarketCounterpartyCredit(
   );
 }
 
+export async function updateMarketCounterpartiesBatch(body: {
+  updates: Array<{
+    id: string;
+    expectedRevision: number;
+    accessRules: Array<{
+      productKind: MarketAccessProductKind;
+      pricingKind: MarketAccessPricingKind;
+      decision: MarketAccessDecision;
+    }>;
+    status?: "active" | "revoked";
+    creditLines: Array<{
+      currency: "USD";
+      kind: MarketCreditKind;
+      limitMinor?: number;
+      riskAcknowledged?: boolean;
+      expectedRevision: number;
+    }>;
+  }>;
+}) {
+  return parseJson<MarketAccessDashboard>(
+    await authFetch("/v1/market-access/counterparties/batch", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
 export async function updateMarketPublicCredit(
   currency: "USD",
   body: { enabled: boolean; limitMinor?: number; riskAcknowledged?: boolean; expectedRevision: number },
@@ -1011,22 +1053,38 @@ export async function createMarketAccessRequest(body: {
   );
 }
 
-export async function approveMarketAccessRequest(id: string, expectedRevision: number) {
+export async function approveMarketAccessRequest(
+  id: string,
+  body: {
+    expectedRevision: number;
+    creditLine?: {
+      currency: "USD";
+      kind: MarketCreditKind;
+      limitMinor?: number;
+      riskAcknowledged?: boolean;
+      expectedRevision: number;
+    };
+  },
+) {
   return parseJson<MarketAccessDashboard>(
     await authFetch(`/v1/market-access/requests/${encodeURIComponent(id)}/approve`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ expectedRevision }),
+      body: JSON.stringify(body),
     }),
   );
 }
 
-export async function rejectMarketAccessRequest(id: string, expectedRevision: number) {
+export async function rejectMarketAccessRequest(
+  id: string,
+  expectedRevision: number,
+  reason: string,
+) {
   return parseJson<MarketAccessDashboard>(
     await authFetch(`/v1/market-access/requests/${encodeURIComponent(id)}/reject`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ expectedRevision }),
+      body: JSON.stringify({ expectedRevision, reason }),
     }),
   );
 }

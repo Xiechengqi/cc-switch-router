@@ -885,7 +885,7 @@ export function ClientMarketPage() {
         currency={accessDialog?.host.currency}
         eligibility={accessDialog?.eligibility || { allowed: false, status: "access_required" }}
         onOpenChange={(next) => { if (!next) setAccessDialog(null); }}
-        onRequested={() => void silentRefresh()}
+        onRequestChanged={silentRefresh}
       />
       <Modal.Backdrop
         isOpen={importOpen}

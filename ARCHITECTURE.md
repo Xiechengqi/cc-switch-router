@@ -90,15 +90,18 @@ Share Market 内建于 Router,不注册为外部 `router_markets`。Share owner 
 - 每日价格留空时是免费拼车位；不要求信用额度、不进入账务系统。Owner 可设置 1–365 天固定期限或永久，固定期限从 managed grant 实际生效时开始，到期自动走 revoke 回收。
 - 准入按 `share/free`、`share/paid`、`client_host/free`、`client_host/paid` 四个作用域独立配置。免费默认黑名单，未知用户可先体验；付费默认白名单，需 Owner 明确允许并授予信用额度。
 - 付费拼车位先授权服务,前 12 小时不计费。体验期结束后,Router 只按实际健康服务区间累计费用,未知或不可用时间不计费。
-- 付费 Share 与 Client Host 共用按「买家 + 供应商」聚合的 USD 赊账账户。有限信用额度使用达到 80% 时向买卖双方预警,用满、任一方主动清账或最后一个服务结束时生成合并账单并暂停相关服务；无限额度只接受主动清账。账单按固定 `1 USD = 7 CNY` 提供双币金额,CNY 不参与记账。
+- 付费 Share 与 Client Host 共用按「买家 + 供应商」聚合的 USD 赊账账户。有限信用额度使用达到 80% 时向买卖双方预警,用满、任一方主动清账或最后一个服务结束时生成合并账单并暂停相关服务；无限额度只接受主动清账。美元兑人民币汇率由动态 Settings 管理并默认 `1:7`；未出账估算使用当前汇率，账单冻结出账时的汇率、人民币总额和明细，CNY 不参与记账。
 - 用户按供应商收款资料线下付款并声明,供应商确认后恢复仍有效的服务；逾期会限制用户继续使用市场赊账。争议由 Router 管理员裁决,账单也可由管理员作废。
 - 出账时会把供应商当时的收款方式和联系方式冻结到该账单,避免后续资料修改改变未结账单的付款依据或争议证据。
 - 供应商可随时永久关闭某个买方的赊账关系；即使已有待处理账单,关闭意图也会立即锁定并终止服务,清账或作废后不会恢复,未来也禁止双方再次建立付费租约。
+- 买家点击租用先经过交易确认，确认内容固定展示 Owner、服务、在线状态、免费期限或 USD 日费，以及付费服务的 12 小时健康时长试用和按供应商聚合账单语义；提交继续携带 `offerRevision` 防止确认后报价被替换。
 - 租用后,Router 才通过 pending Share edit 在 Server 上创建 `routerShareMarket` 管理的 `shareto` entitlement。普通 Share 编辑不能修改或删除这类 entitlement。
 - Owner 可强制回收、回收并拒绝该买家后续 Share 租用,或停止挂售。停止挂售只关闭空闲拼车位,不打断现有租约。
 - **重新挂售**:停止挂售且该 Share 上已无活跃租约后,可再次通过「添加 Share」新建 listing。若仍有进行中的租约,「添加 Share」不可选中该 Share；也可在 Mine 的 closed listing 上「添加拼车位」以重新打开同一 listing。
 
-市场状态与审计由 `share_market_listings`、`share_market_seats`、`share_market_subscriptions`、`share_control_operations` 和 `share_market_events` 持久化；Seat 与 Subscription 都冻结 `free_duration_days`，Subscription 另存 `activated_at` / `expires_at`。统一准入由 `market_supplier_access_policies`、`market_counterparties`、产品规则、私有/公共授信及事件表持久化，其中策略和规则主键均包含 `pricing_kind`。统一账务由 `market_credit_accounts`、`market_service_contracts`、`market_service_intervals`、`market_accrual_entries`、`market_invoices`、`market_invoice_lines` 及付款、争议、限制、事件表持久化。
+市场状态与审计由 `share_market_listings`、`share_market_seats`、`share_market_subscriptions`、`share_control_operations` 和 `share_market_events` 持久化；Seat 与 Subscription 都冻结 `free_duration_days`，Subscription 另存 `activated_at` / `expires_at`。统一准入由 `market_supplier_access_policies`、`market_counterparties`、产品规则、`market_access_requests`、私有/公共授信及事件表持久化，其中策略和规则主键均包含 `pricing_kind`。准入申请批准及管理页批量保存都使用 SQLite Immediate 事务，避免出现“已允许但未授信”或只保存部分买家的状态。统一账务由 `market_credit_accounts`、`market_service_contracts`、`market_service_intervals`、`market_accrual_entries`、`market_invoices`、`market_invoice_lines` 及付款、争议、限制、事件表持久化。
+
+账户 UI 以 `/account/market-readiness` 作为供应商运营摘要，聚合收款资料、待准入数量、账务待办与四项准入策略；实际写操作仍分别归属收款信息、市场准入和市场账务页面。账务页以待处理、应付、应收、历史和管理员争议分区，不引入独立的前端账务状态。
 
 ### ③ Client Market —— 主机供给
 

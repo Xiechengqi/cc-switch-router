@@ -951,7 +951,7 @@ export type SettingsField = {
   key: string;
   label: string;
   group: string;
-  fieldType: "text" | "int" | "bool" | "path" | "url" | "email" | "email_list" | "ip_list" | "secret";
+  fieldType: "text" | "int" | "decimal" | "bool" | "path" | "url" | "email" | "email_list" | "ip_list" | "secret";
   required: boolean;
   restartRequired: boolean;
   default?: string | null;
@@ -1530,6 +1530,7 @@ export type MarketBillingInvoice = {
   amountMinor: number;
   amountUsdMinor: number;
   amountCnyMinor: number;
+  usdCnyRateMicros: number;
   currency: "USD";
   dueAt: string;
   deadlineAt: string;
@@ -1586,6 +1587,12 @@ export type MarketBillingDashboard = {
   supplierProfiles: MarketBillingSupplierProfile[];
   restrictions: MarketCreditRestriction[];
   trialHours: number;
+  usdCnyRateMicros: number;
+};
+
+export type MarketBillingConfig = {
+  currency: "USD";
+  usdCnyRateMicros: number;
 };
 
 export type AdminMarketBillingDispute = {
@@ -1616,6 +1623,7 @@ export type MarketEligibilityStatus =
 export type MarketAccessRequestSummary = {
   id: string;
   status: "requested" | string;
+  revision: number;
   requestedAt: string;
 };
 
@@ -1679,6 +1687,7 @@ export type MarketAccessRequest = {
   targetKind: "share_seat" | "client_host" | string;
   targetId: string;
   targetLabel: string;
+  dailyRateMinor?: number;
   currency?: "USD";
   status: "requested" | "approved" | "rejected" | "cancelled" | string;
   revision: number;
@@ -1686,6 +1695,7 @@ export type MarketAccessRequest = {
   resolvedAt?: string;
   resolvedByUserId?: string;
   resolutionReason?: string;
+  resolutionNote?: string;
 };
 
 export type MarketPublicCreditLine = {
@@ -1701,6 +1711,10 @@ export type MarketAccessDashboard = {
   counterparties: MarketCounterparty[];
   accessRequests: MarketAccessRequest[];
   publicCreditLines: MarketPublicCreditLine[];
+};
+
+export type MarketAccessInboxSummary = {
+  pendingRequests: number;
 };
 
 export type ClientMarketProviderCountry = {

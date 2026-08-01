@@ -221,15 +221,23 @@ Share 与 Client Host 的新租用都执行供应商准入，但策略按「产�
 - `GET /v1/share-market/listings` 的座位与 `GET /v1/client-market/hosts` 的 Host 都返回 `sellerApprovalRequired`。该字段只面向已登录的非 Owner,表示当前供应商准入不允许该买家；前端据此保留「租用」/「新建」入口并引导联系 Owner,不得把服务端英文拒绝消息直接展示为红色错误。Share 引导到对应 Client 聊天室；Client Host 展示 Owner 邮箱及其公开联系方式。
 - 模式切换和产品规则更新只影响新租用。撤销整个买家关系会把该买家的账户信用设为 `none` 并终止现有付费服务；以后确认历史账单也不会恢复这些服务。现有免费服务不因单独修改策略而中断,Owner 可另行强制回收。
 - 所有更新操作使用 revision 做乐观并发控制；下列 `PUT` 请求必须提交当前资源的 `expectedRevision`，新资源提交 `0`。浏览器可用用户 Session；外部系统可用用户 API Token,读取和写入分别要求 `market:access:read`、`market:access:write` scope。
+- 白名单买家可从具体 Share seat 或 Client Host 发起「申请准入」。同一买家、供应商、产品和价格作用域只保留一个待处理申请；拒绝后 24 小时内不能重复申请。申请记录目标名称、当时的日费和币种供供应商判断，供应商的「市场准备」与「市场准入」入口显示待处理数量；最终租用仍校验商品当前 `offerRevision`。
+- 免费申请批准只允许对应免费作用域。付费申请必须在同一 SQLite Immediate 事务中同时允许对应付费作用域并授予有效 USD 有限或无限额度；任一步失败时关系、规则、额度和申请状态全部回滚。供应商拒绝必须提交原因，买家可用申请 revision 取消仍在等待的申请。
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
 | `GET` | `/v1/market-access/dashboard` | 读取产品模式、可信买家、授信与当前风险敞口 |
+| `GET` | `/v1/market-access/inbox-summary` | 读取供应商待处理准入申请数量，用于导航角标 |
 | `PUT` | `/v1/market-access/policies/:product_kind/:pricing_kind` | 独立切换四个作用域的白名单或黑名单模式 |
 | `POST` | `/v1/market-access/counterparties` | 按邮箱创建或重新启用可信买家关系 |
+| `PUT` | `/v1/market-access/counterparties/batch` | 原子保存多个买家关系、四作用域规则和 USD 授信 |
 | `PUT` | `/v1/market-access/counterparties/:id` | 更新产品规则或撤销关系 |
 | `PUT` | `/v1/market-access/counterparties/:id/credit-lines/:currency` | 更新买家 USD 私有信用额度 |
 | `PUT` | `/v1/market-access/public-credit-lines/:currency` | 更新黑名单模式的有限公共额度 |
+| `POST` | `/v1/market-access/requests` | 买家按 `targetKind + targetId` 申请对应供应商作用域 |
+| `POST` | `/v1/market-access/requests/:id/approve` | 供应商批准；付费申请可原子携带信用额度 |
+| `POST` | `/v1/market-access/requests/:id/reject` | 供应商填写原因并拒绝申请 |
+| `POST` | `/v1/market-access/requests/:id/cancel` | 买家取消自己的待处理申请 |
 
 写入请求使用 camelCase JSON，未知字段会被拒绝：
 
@@ -237,9 +245,14 @@ Share 与 Client Host 的新租用都执行供应商准入，但策略按「产�
 |---|---|
 | `PUT /policies/:product_kind/:pricing_kind` | `mode`、从白名单切换到黑名单时的 `riskAcknowledged: true`、`expectedRevision` |
 | `POST /counterparties` | `email`、`accessRules[] { productKind, pricingKind, decision }`，可选初始 `creditLines[] { currency, kind, limitMinor?, riskAcknowledged? }` |
+| `PUT /counterparties/batch` | `updates[] { id, expectedRevision, status?, accessRules[], creditLines[] }`；每条 `creditLines[]` 还携带自己的 `expectedRevision` |
 | `PUT /counterparties/:id` | 本次变更的 `accessRules[] { productKind, pricingKind, decision }`、可选 `status`、`expectedRevision` |
 | `PUT /counterparties/:id/credit-lines/:currency` | `kind`(`none` / `limited` / `unlimited`)、有限额度的 `limitMinor`、无限额度的 `riskAcknowledged: true`、`expectedRevision` |
 | `PUT /public-credit-lines/:currency` | `enabled`、启用时的有限 `limitMinor` 与 `riskAcknowledged: true`、`expectedRevision` |
+| `POST /requests` | `targetKind`(`share_seat` / `client_host`)、`targetId` |
+| `POST /requests/:id/approve` | `expectedRevision`；付费申请在新增或修改授信时携带 `creditLine { currency: "USD", kind, limitMinor?, riskAcknowledged?, expectedRevision }`，沿用既有有效授信时可省略，免费申请不得携带 |
+| `POST /requests/:id/reject` | `expectedRevision`、必填 `reason` |
+| `POST /requests/:id/cancel` | `expectedRevision` |
 
 `limitMinor` 使用 USD 最小单位（美分）且范围为 `1..=100000000`；路径币种仅接受 `USD`。私有无限额度和任何公共额度都必须显式确认风险，公共额度始终只能是有限额度。
 
@@ -249,10 +262,11 @@ Share 与 Client Host 的新租用都执行供应商准入，但策略按「产�
 
 付费 Share 与 Client Host 不再按单个商品预付或续费。Router 按「买家 + 供应商」维护唯一 USD 赊账账户；每个服务独立享受 12 小时健康时长试用,之后按固定 USD 每日价格和实际健康秒数累计。有限额度使用达到 80% 时向买卖双方各发送一次预警,用满后自动生成聚合账单。买家主动清账、供应商要求清账、供应商永久关闭赊账账户或最后一个服务结束时也会生成聚合账单。
 
-USD 是唯一报价、授信、记账和结算币种。账单总额与每条账单明细同时返回 `amountUsdMinor` 和 `amountCnyMinor`，其中 `amountMinor` 继续作为 USD 兼容字段；人民币金额固定按 `1 USD = 7 CNY` 计算，仅用于展示。`/v1/market-billing/supplier-profiles/:currency` 的路径参数也只接受 `USD`。
+USD 是唯一报价、授信、记账和结算币种。账单总额与每条账单明细同时返回 `amountUsdMinor` 和 `amountCnyMinor`，其中 `amountMinor` 继续作为 USD 兼容字段。美元兑人民币汇率由 `CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE` 控制，默认 `1:7`，可在 Settings 热更新；未出账估算使用当前汇率，账单通过 `usdCnyRateMicros`（百万分之一精度）冻结出账汇率及人民币金额，后续设置变更不影响历史账单。人民币金额四舍五入到分且仅用于展示。`/v1/market-billing/supplier-profiles/:currency` 的路径参数只接受 `USD`。
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
+| `GET` | `/v1/market-billing/config` | 当前 USD 记账币种及美元兑人民币展示汇率 |
 | `GET` | `/v1/market-billing/dashboard` | 买方应付、供应商应收、当前账单与赊账限制 |
 | `PUT` | `/v1/market-billing/supplier-profiles/:currency` | 设置账单付款宽限时间 |
 | `POST` | `/v1/market-billing/accounts/:id/settle` | 买方主动生成当前聚合账单 |

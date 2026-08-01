@@ -25,6 +25,7 @@ import {
   ProviderContactsList,
   ProviderPaymentMethodsList,
 } from "@/components/common/provider-contacts";
+import { SegmentedControl } from "@/components/common/segmented-control";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import {
   closeMarketBillingAccount,
@@ -48,9 +49,16 @@ import type {
   MarketBillingPaymentDeclaration,
   MarketCreditAccount,
 } from "@/lib/types";
-import { formatUsdCnyMoney, MARKET_CURRENCY } from "@/lib/market-money";
+import {
+  DEFAULT_USD_CNY_RATE_MICROS,
+  formatUsdCnyMoney,
+  formatUsdCnyRate,
+  MARKET_CURRENCY,
+  usdMinorToCnyMinor,
+} from "@/lib/market-money";
 
 type Currency = typeof MARKET_CURRENCY;
+type BillingTab = "todo" | "payables" | "receivables" | "history" | "admin";
 type ProfileDraft = { graceHours: string };
 type Action =
   | { kind: "settle" | "request-settlement" | "close"; account: MarketCreditAccount }
@@ -109,6 +117,25 @@ function serviceStatusLabel(status: string, t: ReturnType<typeof useLocaleText>[
     case "terminated": return t("marketBilling.service.terminated");
     default: return status.replaceAll("_", " ");
   }
+}
+
+function actionSubmitLabel(action: Action, t: ReturnType<typeof useLocaleText>["t"]) {
+  switch (action.kind) {
+    case "settle": return t("marketBilling.action.settle");
+    case "request-settlement": return t("marketBilling.action.requestSettlement");
+    case "close": return t("marketBilling.action.closeAccount");
+    case "declare": return t("marketBilling.action.declare");
+    case "confirm": return t("marketBilling.action.confirm");
+    case "reject": return t("marketBilling.action.reject");
+    case "dispute": return t("marketBilling.action.dispute");
+    case "admin-uphold": return t("marketBilling.admin.uphold");
+    case "admin-void": return t("marketBilling.admin.voidDispute");
+    case "admin-invoice-void": return t("marketBilling.admin.voidInvoice");
+  }
+}
+
+function actionIsDangerous(action: Action) {
+  return ["close", "reject", "dispute", "admin-void", "admin-invoice-void"].includes(action.kind);
 }
 
 function trialTime(seconds: number, t: ReturnType<typeof useLocaleText>["t"]) {
@@ -206,10 +233,14 @@ function CreditAccountPanel({
   account,
   perspective,
   onAction,
+  usdCnyRateMicros,
+  mode = "full",
 }: {
   account: MarketCreditAccount;
   perspective: "buyer" | "supplier";
   onAction: (action: Action) => void;
+  usdCnyRateMicros: number;
+  mode?: "full" | "history";
 }) {
   const { locale, t } = useLocaleText();
   const invoice = account.openInvoice;
@@ -228,7 +259,7 @@ function CreditAccountPanel({
     setHistoryOpen(false);
     setHistory(null);
     setHistoryCursor(undefined);
-  }, [account.openInvoice?.id]);
+  }, [account.id, account.openInvoice?.id, mode]);
 
   async function loadHistory(beforeSequence?: number) {
     setHistoryLoading(true);
@@ -250,7 +281,7 @@ function CreditAccountPanel({
   }
 
   return (
-    <section className="overflow-hidden rounded-lg border border-border bg-card">
+    <section id={`billing-account-${account.id}`} className="scroll-mt-24 overflow-hidden rounded-lg border border-border bg-card">
       <div className="grid gap-4 p-4 sm:p-5">
         <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">
           <div className="min-w-0">
@@ -265,33 +296,45 @@ function CreditAccountPanel({
               {perspective === "buyer" ? t("marketBilling.supplier") : t("marketBilling.buyer")} · {account.currency}
             </p>
           </div>
-          <div className="text-right">
+          {mode === "full" ? <div className="text-right">
             <strong className="block text-lg tabular-nums text-foreground">
               {invoice
                 ? formatUsdCnyMoney(invoice.amountUsdMinor, locale, invoice.amountCnyMinor)
-                : formatUsdCnyMoney(account.balanceMinor, locale)}
+                : formatUsdCnyMoney(
+                    account.balanceMinor,
+                    locale,
+                    usdMinorToCnyMinor(account.balanceMinor, usdCnyRateMicros),
+                  )}
             </strong>
             <span className="text-xs text-muted-foreground">
               {invoice ? t("marketBilling.invoice.total") : t("marketBilling.unbilledBalance")}
             </span>
-          </div>
+          </div> : null}
         </div>
 
-        <div className="grid gap-3 sm:grid-cols-3">
+        {mode === "full" ? <><div className="grid gap-3 sm:grid-cols-3">
           <div>
             <span className="text-xs text-muted-foreground">{t("marketBilling.creditLimit")}</span>
             <strong className="mt-0.5 block text-sm tabular-nums">
               {account.creditKind === "unlimited"
                 ? t("marketBilling.creditUnlimited")
                 : account.creditLimitMinor != null
-                  ? formatUsdCnyMoney(account.creditLimitMinor, locale)
+                  ? formatUsdCnyMoney(
+                      account.creditLimitMinor,
+                      locale,
+                      usdMinorToCnyMinor(account.creditLimitMinor, usdCnyRateMicros),
+                    )
                   : t("marketBilling.creditNone")}
             </strong>
           </div>
           <div>
             <span className="text-xs text-muted-foreground">{t("marketBilling.dailyExposure")}</span>
             <strong className="mt-0.5 block text-sm tabular-nums">
-              {formatUsdCnyMoney(account.dailyRateMinor, locale)}
+              {formatUsdCnyMoney(
+                account.dailyRateMinor,
+                locale,
+                usdMinorToCnyMinor(account.dailyRateMinor, usdCnyRateMicros),
+              )}
             </strong>
           </div>
           <div>
@@ -335,7 +378,11 @@ function CreditAccountPanel({
               <Server className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
               <span className="min-w-0 flex-1 truncate font-medium" title={service.serviceLabel}>{service.serviceLabel}</span>
               <span className="text-xs text-muted-foreground">{productLabel(service.productKind, t)}</span>
-              <span className="text-xs tabular-nums">{formatUsdCnyMoney(service.dailyRateMinor, locale)} / {t("marketBilling.day")}</span>
+              <span className="text-xs tabular-nums">{formatUsdCnyMoney(
+                service.dailyRateMinor,
+                locale,
+                usdMinorToCnyMinor(service.dailyRateMinor, usdCnyRateMicros),
+              )} / {t("marketBilling.day")}</span>
               <Chip size="sm" variant="soft">{serviceStatusLabel(service.status, t)}</Chip>
               {service.trialSecondsRemaining > 0 ? (
                 <span className="w-full pl-5 text-xs text-muted-foreground">
@@ -344,10 +391,10 @@ function CreditAccountPanel({
               ) : null}
             </div>
           )) : <p className="text-sm text-muted-foreground">{t("marketBilling.noServices")}</p>}
-        </div>
+        </div></> : null}
       </div>
 
-      {invoice ? (
+      {mode === "full" && invoice ? (
         <div className="border-t border-border bg-slate-50/70">
           <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 sm:px-5">
             <div>
@@ -360,6 +407,9 @@ function CreditAccountPanel({
               </div>
               <p className="mt-1 text-xs text-muted-foreground">
                 {t("marketBilling.invoice.deadline", { date: formatDate(invoice.deadlineAt, locale) })}
+                {" · "}{t("marketBilling.invoice.exchangeRate", {
+                  rate: formatUsdCnyRate(invoice.usdCnyRateMicros),
+                })}
               </p>
             </div>
             <div className="flex flex-wrap gap-2">
@@ -406,7 +456,7 @@ function CreditAccountPanel({
       <div className="border-t border-border">
         <button
           type="button"
-          className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left text-sm font-medium hover:bg-slate-50 sm:px-5"
+          className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left text-sm font-medium hover:bg-slate-50 disabled:cursor-default disabled:hover:bg-transparent sm:px-5"
           aria-expanded={historyOpen}
           onClick={toggleHistory}
         >
@@ -434,7 +484,11 @@ function CreditAccountPanel({
                       </span>
                       <span className="text-right">
                         <strong className="block text-sm tabular-nums">{formatUsdCnyMoney(item.amountUsdMinor, locale, item.amountCnyMinor)}</strong>
-                        <span className="text-xs text-muted-foreground">{formatDate(item.paidAt || item.openedAt, locale)}</span>
+                        <span className="text-xs text-muted-foreground">
+                          {formatDate(item.paidAt || item.openedAt, locale)} · {t("marketBilling.invoice.exchangeRate", {
+                            rate: formatUsdCnyRate(item.usdCnyRateMicros),
+                          })}
+                        </span>
                       </span>
                     </summary>
                     <InvoiceLines invoice={item} locale={locale} />
@@ -466,7 +520,7 @@ function CreditAccountPanel({
         ) : null}
       </div>
 
-      {(!invoice && account.canSettle) || (!invoice && perspective === "supplier" && account.balanceMinor > 0 && ["active", "near_credit_limit"].includes(account.status)) || account.canClose ? (
+      {mode === "full" && ((!invoice && account.canSettle) || (!invoice && perspective === "supplier" && account.balanceMinor > 0 && ["active", "near_credit_limit"].includes(account.status)) || account.canClose) ? (
         <div className="flex flex-wrap justify-end gap-2 border-t border-border px-4 py-3 sm:px-5">
           {!invoice && account.canSettle ? (
             <Button size="sm" variant="outline" onClick={() => onAction({ kind: "settle", account })}>
@@ -502,6 +556,7 @@ export function AccountBillingPage() {
   const [loading, setLoading] = React.useState(true);
   const [refreshing, setRefreshing] = React.useState(false);
   const [busy, setBusy] = React.useState("");
+  const [tab, setTab] = React.useState<BillingTab>("todo");
   const [action, setAction] = React.useState<Action | null>(null);
   const [reason, setReason] = React.useState("");
   const [reference, setReference] = React.useState("");
@@ -656,6 +711,38 @@ export function AccountBillingPage() {
   const buyerAccounts = dashboard?.accounts.filter((account) => account.isBuyer) || [];
   const supplierAccounts = dashboard?.accounts.filter((account) => account.isSupplier) || [];
   const restrictions = dashboard?.restrictions || [];
+  const todoEntries = [
+    ...buyerAccounts
+      .filter((account) => {
+        const status = account.openInvoice?.status;
+        return (status != null && ["open", "overdue"].includes(status))
+          || (!account.openInvoice && account.canSettle && account.balanceMinor > 0);
+      })
+      .map((account) => ({ account, perspective: "buyer" as const })),
+    ...supplierAccounts
+      .filter((account) => account.openInvoice?.status === "payment_declared"
+        || (!account.openInvoice
+          && account.balanceMinor > 0
+          && ["near_credit_limit", "settlement_due"].includes(account.status)))
+      .map((account) => ({ account, perspective: "supplier" as const })),
+  ];
+  const historyEntries = [
+    ...buyerAccounts.map((account) => ({ account, perspective: "buyer" as const })),
+    ...supplierAccounts.map((account) => ({ account, perspective: "supplier" as const })),
+  ];
+  const payableInvoiceCount = buyerAccounts.filter((account) => ["open", "overdue"].includes(account.openInvoice?.status || "")).length;
+  const receiptReviewCount = supplierAccounts.filter((account) => account.openInvoice?.status === "payment_declared").length;
+  const overdueCount = dashboard?.accounts.filter((account) => account.openInvoice?.status === "overdue").length || 0;
+  const disputeCount = dashboard?.accounts.filter((account) => account.openInvoice?.status === "disputed").length || 0;
+
+  const focusRestrictedInvoice = (invoiceId: string) => {
+    const account = dashboard?.accounts.find((item) => item.openInvoice?.id === invoiceId);
+    setTab("todo");
+    if (!account) return;
+    window.setTimeout(() => {
+      document.getElementById(`billing-account-${account.id}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 0);
+  };
 
   const actionInvoice = action && "invoice" in action ? action.invoice : action && "dispute" in action ? action.dispute.invoice : undefined;
   const needsReason = action && ["reject", "dispute", "admin-invoice-void"].includes(action.kind);
@@ -670,7 +757,11 @@ export function AccountBillingPage() {
             <h2 className="text-lg font-semibold text-foreground">{t("marketBilling.title")}</h2>
           </div>
           <p className="mt-1 max-w-3xl text-sm text-muted-foreground">{t("marketBilling.subtitle", { hours: dashboard?.trialHours || 12 })}</p>
-          <p className="mt-1 max-w-3xl text-xs font-medium text-amber-700">{t("market.currencyNotice")}</p>
+          <p className="mt-1 max-w-3xl text-xs font-medium text-amber-700">{t("market.currencyNotice", {
+            rate: formatUsdCnyRate(
+              dashboard?.usdCnyRateMicros || DEFAULT_USD_CNY_RATE_MICROS,
+            ),
+          })}</p>
         </div>
         <Button isIconOnly variant="outline" aria-label={t("common.reload")} isDisabled={refreshing} onClick={() => void load(true)}>
           <RefreshCw className={`h-4 w-4 ${refreshing ? "animate-spin" : ""}`} />
@@ -680,14 +771,55 @@ export function AccountBillingPage() {
       {restrictions.length ? (
         <section className="flex gap-3 rounded-lg border border-rose-200 bg-rose-50 p-4 text-rose-900">
           <ShieldAlert className="mt-0.5 h-5 w-5 shrink-0" />
-          <div>
+          <div className="min-w-0 flex-1">
             <strong className="text-sm">{t("marketBilling.restricted.title")}</strong>
             <p className="mt-1 text-sm leading-6">{t("marketBilling.restricted.description")}</p>
+            <div className="mt-3 flex flex-wrap gap-2">
+              {restrictions.map((restriction) => {
+                const account = dashboard?.accounts.find((item) => item.openInvoice?.id === restriction.invoiceId);
+                return (
+                  <Button key={restriction.id} size="sm" variant="outline" onClick={() => focusRestrictedInvoice(restriction.invoiceId)}>
+                    <ReceiptText className="h-4 w-4" />
+                    {account?.openInvoice
+                      ? t("marketBilling.restricted.openInvoice", { sequence: account.openInvoice.sequence })
+                      : t("marketBilling.restricted.open")}
+                  </Button>
+                );
+              })}
+            </div>
           </div>
         </section>
       ) : null}
 
-      <section className="grid gap-4 border-y border-border py-5">
+      <section className="grid grid-cols-2 gap-x-5 gap-y-4 border-y border-border py-4 sm:grid-cols-4">
+        {[
+          [t("marketBilling.summary.payable"), payableInvoiceCount],
+          [t("marketBilling.summary.review"), receiptReviewCount],
+          [t("marketBilling.summary.overdue"), overdueCount],
+          [t("marketBilling.summary.disputes"), disputeCount],
+        ].map(([label, value]) => (
+          <div key={String(label)} className="min-w-0">
+            <span className="block truncate text-xs text-muted-foreground">{label}</span>
+            <strong className="mt-0.5 block text-xl tabular-nums">{value}</strong>
+          </div>
+        ))}
+      </section>
+
+      <SegmentedControl
+        value={tab}
+        onChange={setTab}
+        ariaLabel={t("marketBilling.tabs.label")}
+        size="md"
+        items={[
+          { id: "todo", label: <span className="inline-flex items-center gap-1.5">{t("marketBilling.tabs.todo")}<span className="tabular-nums text-muted-foreground">{todoEntries.length}</span></span> },
+          { id: "payables", label: <span className="inline-flex items-center gap-1.5">{t("marketBilling.tabs.payables")}<span className="tabular-nums text-muted-foreground">{buyerAccounts.length}</span></span> },
+          { id: "receivables", label: <span className="inline-flex items-center gap-1.5">{t("marketBilling.tabs.receivables")}<span className="tabular-nums text-muted-foreground">{supplierAccounts.length}</span></span> },
+          { id: "history", label: t("marketBilling.tabs.history") },
+          ...(isAdmin ? [{ id: "admin" as const, label: <span className="inline-flex items-center gap-1.5">{t("marketBilling.tabs.admin")}<span className="tabular-nums text-muted-foreground">{adminDisputes.length}</span></span> }] : []),
+        ]}
+      />
+
+      {tab === "receivables" ? <section className="grid gap-4 border-y border-border py-5">
         <div className="flex items-start gap-2">
           <Settings2 className="mt-0.5 h-4 w-4 text-muted-foreground" />
           <div>
@@ -725,29 +857,49 @@ export function AccountBillingPage() {
             );
           })}
         </div>
-      </section>
+      </section> : null}
 
-      <section className="grid gap-3">
+      {tab === "todo" ? <section className="grid gap-3">
+        <div>
+          <h3 className="text-base font-semibold">{t("marketBilling.todo.title")}</h3>
+          <p className="mt-0.5 text-sm text-muted-foreground">{t("marketBilling.todo.hint")}</p>
+        </div>
+        {todoEntries.length ? todoEntries.map(({ account, perspective }) => (
+          <CreditAccountPanel key={`todo:${perspective}:${account.id}`} account={account} perspective={perspective} onAction={openAction} usdCnyRateMicros={dashboard?.usdCnyRateMicros || 0} />
+        )) : <p className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">{t("marketBilling.todo.empty")}</p>}
+      </section> : null}
+
+      {tab === "payables" ? <section className="grid gap-3">
         <div>
           <h3 className="text-base font-semibold">{t("marketBilling.payables.title")}</h3>
           <p className="mt-0.5 text-sm text-muted-foreground">{t("marketBilling.payables.hint")}</p>
         </div>
         {buyerAccounts.length ? buyerAccounts.map((account) => (
-          <CreditAccountPanel key={`buyer:${account.id}`} account={account} perspective="buyer" onAction={openAction} />
+          <CreditAccountPanel key={`buyer:${account.id}`} account={account} perspective="buyer" onAction={openAction} usdCnyRateMicros={dashboard?.usdCnyRateMicros || 0} />
         )) : <p className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">{t("marketBilling.payables.empty")}</p>}
-      </section>
+      </section> : null}
 
-      <section className="grid gap-3">
+      {tab === "receivables" ? <section className="grid gap-3">
         <div>
           <h3 className="text-base font-semibold">{t("marketBilling.receivables.title")}</h3>
           <p className="mt-0.5 text-sm text-muted-foreground">{t("marketBilling.receivables.hint")}</p>
         </div>
         {supplierAccounts.length ? supplierAccounts.map((account) => (
-          <CreditAccountPanel key={`supplier:${account.id}`} account={account} perspective="supplier" onAction={openAction} />
+          <CreditAccountPanel key={`supplier:${account.id}`} account={account} perspective="supplier" onAction={openAction} usdCnyRateMicros={dashboard?.usdCnyRateMicros || 0} />
         )) : <p className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">{t("marketBilling.receivables.empty")}</p>}
-      </section>
+      </section> : null}
 
-      {isAdmin ? (
+      {tab === "history" ? <section className="grid gap-3">
+        <div>
+          <h3 className="text-base font-semibold">{t("marketBilling.history.title")}</h3>
+          <p className="mt-0.5 text-sm text-muted-foreground">{t("marketBilling.history.hint")}</p>
+        </div>
+        {historyEntries.length ? historyEntries.map(({ account, perspective }) => (
+          <CreditAccountPanel key={`history:${perspective}:${account.id}`} account={account} perspective={perspective} mode="history" onAction={openAction} usdCnyRateMicros={dashboard?.usdCnyRateMicros || 0} />
+        )) : <p className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">{t("marketBilling.history.empty")}</p>}
+      </section> : null}
+
+      {isAdmin && tab === "admin" ? (
         <section className="grid gap-3 border-t border-border pt-6">
           <div className="flex items-start gap-2">
             <Scale className="mt-0.5 h-4 w-4 text-muted-foreground" />
@@ -855,9 +1007,13 @@ export function AccountBillingPage() {
             </Modal.Body>
             <Modal.Footer>
               <Button variant="ghost" isDisabled={!!busy} onClick={() => setAction(null)}>{t("common.cancel")}</Button>
-              <Button variant="primary" isDisabled={!!busy} onClick={() => void submitAction()}>
+              <Button
+                variant={action && actionIsDangerous(action) ? "danger" : "primary"}
+                isDisabled={!!busy || !!(needsReason && !reason.trim())}
+                onClick={() => void submitAction()}
+              >
                 {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                {t("common.verify")}
+                {action ? actionSubmitLabel(action, t) : ""}
               </Button>
             </Modal.Footer>
           </Modal.Dialog>

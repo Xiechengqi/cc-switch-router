@@ -66,8 +66,8 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 | `/v1/chat/*` | 9 | 公开读 / Session 写 | `clients/:installation_id/room`、`rooms/:room_id/messages`、`rooms/:room_id/stream`；不存在 Share 独立房间 |
 | `/v1/market/*`、`/v1/markets/*` | 11 | 公开读 / 用户 Session / 市场 bearer token | `shares`、`shares/headroom`、`request-logs/batch`、`share-states`、`tunnel/lease` |
 | `/v1/share-market/*` | 9 | 公开 catalog / 用户 Session | `listings`、`owned-shares`、`seats/:id/rent`、`subscriptions/:id/release`、`force-revoke`；停止挂售后无活跃租约可再次 `POST listings` |
-| `/v1/market-access/*` | 6 | 用户 Session / scoped API Token | `dashboard`、`policies/:product_kind`、`counterparties`、买家授信、黑名单模式公共额度 |
-| `/v1/market-billing/*` | 10 | 用户 Session | `dashboard`、`supplier-profiles`、`accounts/:id/settle`、`request-settlement`、`accounts/:id/invoices`、付款声明/确认/拒绝与争议 |
+| `/v1/market-access/*` | 12 | 用户 Session / scoped API Token | `dashboard`、`inbox-summary`、`policies`、`counterparties/batch`、准入申请批准/拒绝/取消、买家授信与公共额度 |
+| `/v1/market-billing/*` | 11 | 公开 `config` / 用户 Session | `config`、`dashboard`、`supplier-profiles`、`accounts/:id/settle`、`request-settlement`、`accounts/:id/invoices`、付款声明/确认/拒绝与争议 |
 | `/v1/gateway/*`、`/v1/gateways/*` | 5 | HMAC 签名(`x-cc-gateway-*`) | `register`、`shares`、`shares/feedback`、`request-logs/batch` |
 | `/v1/auth/*` | 5 | 公开 / Session | `email/request-code`、`email/verify-code`、`session/refresh`、`session/me`、`session/logout` |
 | `/v1/tunnels/*` | 4 | Ed25519 签名 | `lease`、`lease/renew`、`activate`、`state` |
@@ -155,6 +155,7 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_AUTH_IP_HOURLY_LIMIT` | `20` | 单 IP 每小时最大发送次数 |
 | `CC_SWITCH_ROUTER_AUTH_INSTALLATION_HOURLY_LIMIT` | `10` | 单 installation 每小时最大发送次数 |
 | `CC_SWITCH_ROUTER_FREE_SHARE_IP_PARALLEL_LIMIT` | `1` | 所有 `for_sale = Free` share 共用的单真实用户 IP 并发上限;设为 `0` 可关闭 |
+| `CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE` | `7` | 市场账务美元兑人民币汇率（1 USD 对应的 CNY，范围 0.01-100，最多 6 位小数）；可在 Settings 热更新 |
 | `CC_SWITCH_ROUTER_IP_INTEL_ENDPOINTS` | 内置三个 `http://` 源站 | Client Market 主机 IP 情报服务,逗号分隔的 base URL,按顺序尝试。**每台登记主机的 IP 都会发送到这些端点**,应由 Router 运维方自建或交给可信任全量主机清单的一方。缺少 scheme 时按 `https://` 处理;仍使用 `http://` 时启动会打印告警。结果缓存 6 小时 |
 
 注册准入先使用内存中的来源、全局和公钥尝试计数器削平瞬时流量,再对真正创建的新 installation 身份执行 SQLite 持久化的来源/全局 10 分钟、小时和每日额度。进程重启会重置内存尝试计数器,但不会重置持久化的新身份额度。达到任一限制时接口返回 HTTP `429` 并携带 `Retry-After`;使用已有公钥恢复已注册 installation 仍受尝试速率保护,但不消耗新身份额度,也不受未绑定 installation 水位线阻断。
@@ -175,9 +176,9 @@ EOF
 
 Client 生命周期通知使用持久化 outbox、固定 Resend 幂等键和离线 episode 去重,注册与离线邮件都只发送至对应 Client 当前已验证的 Owner 邮箱。关闭总开关时,Router 会推进在线状态 baseline 并抑制待发记录;以后重新启用不会补发停用期间的历史通知。多 Client 在窗口内集中注册或离线时会按 Owner 合并为 digest。Offline lane 使用独立的单收件人/全局 `10/50` 小时额度,registration lane 使用独立的 `3/10` 小时额度,两者互不占用。未完成的 outbox 会持续保留,已发送、dead-letter、取消和抑制记录保留 30 天供审计。
 
-Share Market 与 Client Market 对免费和付费商品统一采用供应商准入策略,默认均为白名单。供应商先按买家邮箱建立信任关系,再按产品允许访问；付费商品还必须按买家和供应商授予 USD 有限或无限信用额度。切换到黑名单模式必须显式确认风险,未知买家只能使用免费商品,或在供应商另行开启有限公共额度后租用付费商品；公共额度不能设为无限。
+Share Market 与 Client Market 按产品和价格类型使用四项独立供应商准入策略：免费商品默认黑名单模式（默认开放），付费商品默认白名单模式（仅可信买家）。供应商可预先按买家邮箱建立信任，也可处理买家从具体商品发起的准入申请；批准付费申请时必须原子授予 USD 有限或无限信用额度。切换付费作用域到黑名单模式必须显式确认风险，且未知买家只有在供应商另行开启有限公共额度后才能租用付费商品；公共额度不能设为无限。
 
-付费商品共用账户级后付费赊账：每项服务先享受 12 小时健康时长试用,之后只按 Router 观测到的健康服务秒数累计固定 USD 每日费用。同一买家和供应商共用一个 USD 余额；有限额度使用达到 80% 时向相关 Client 公开聊天室写入系统预警,用满后生成聚合账单并暂停相关服务。账单按固定 `1 USD = 7 CNY` 同时提供美元与人民币金额,CNY 只用于展示而不形成独立账户。无限额度不自动出账,供应商可主动要求清账；买家也可主动清账,最后一项服务结束时剩余余额会自动出账。Router 不经手资金,付款声明仍需供应商确认到账；逾期声明或争议不会自行解除市场赊账限制。
+付费商品共用账户级后付费赊账：每项服务先享受 12 小时健康时长试用,之后只按 Router 观测到的健康服务秒数累计固定 USD 每日费用。同一买家和供应商共用一个 USD 余额；有限额度使用达到 80% 时向相关 Client 公开聊天室写入系统预警,用满后生成聚合账单并暂停相关服务。账单按 Settings 中的美元兑人民币汇率同时提供双币金额，默认 `1 USD = 7 CNY`；出账时冻结汇率和人民币金额，后续设置变更不改写历史账单，CNY 不形成独立账户。无限额度不自动出账,供应商可主动要求清账；买家也可主动清账,最后一项服务结束时剩余余额会自动出账。Router 不经手资金,付款声明仍需供应商确认到账；逾期声明或争议不会自行解除市场赊账限制。
 
 Client 公开聊天室与 `installation.id` 一一对应,只为已验证 Owner 的 Client 建立；同一 Client 下的所有 Share 共用这一房间,不存在 Share 独立聊天室。历史消息公开可读,发送真人消息必须使用 Router 登录 Session;普通用户 API Token 不能发送。匿名访客的最近聊天室和已读游标只保存在当前浏览器,登录后会一次性合并到服务端用户记录。非 Owner 真人消息在同一聊天室内从第一条消息开始使用固定 60 秒窗口聚合,窗口内每条消息都完整写入同一封 Owner 邮件;Owner 自己的消息和系统消息不会触发聊天邮件。消息与邮件事件在同一 SQLite 事务落库,后台使用固定 Resend 幂等键、claim lease、重试和 dead-letter。Client 被清理后聊天室转为公开只读归档并保留 60 天,同一 Client 在期限内恢复时沿用原房间。
 

@@ -2,7 +2,10 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
 use std::net::IpAddr;
 use std::path::{Component, PathBuf};
-use std::sync::{Arc, Weak};
+use std::sync::{
+    Arc, Weak,
+    atomic::{AtomicI64, Ordering as AtomicOrdering},
+};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use base64::Engine;
@@ -920,6 +923,7 @@ pub struct AppStore {
     auth_email_send_locks: Arc<Mutex<HashMap<(String, String), Weak<Mutex<()>>>>>,
     ip_hash_salt: Arc<String>,
     geo_lookup_base_url: Arc<String>,
+    market_usd_cny_rate_micros: Arc<AtomicI64>,
 }
 
 /// P18: 测试接続で必要な share の基本情報。
@@ -1264,6 +1268,7 @@ impl AppStore {
             auth_email_send_locks: Arc::new(Mutex::new(HashMap::new())),
             ip_hash_salt: Arc::new(salt),
             geo_lookup_base_url: Arc::new("https://ip.im".to_string()),
+            market_usd_cny_rate_micros: Arc::new(AtomicI64::new(config.market_usd_cny_rate_micros)),
         })
     }
 
@@ -1284,7 +1289,20 @@ impl AppStore {
             auth_email_send_locks: Arc::new(Mutex::new(HashMap::new())),
             ip_hash_salt: Arc::new(salt),
             geo_lookup_base_url: Arc::new("https://ip.im".to_string()),
+            market_usd_cny_rate_micros: Arc::new(AtomicI64::new(
+                crate::market_billing::DEFAULT_USD_CNY_RATE_MICROS,
+            )),
         })
+    }
+
+    pub(crate) fn market_usd_cny_rate_micros(&self) -> i64 {
+        self.market_usd_cny_rate_micros
+            .load(AtomicOrdering::Acquire)
+    }
+
+    pub(crate) fn set_market_usd_cny_rate_micros(&self, rate_micros: i64) {
+        self.market_usd_cny_rate_micros
+            .store(rate_micros, AtomicOrdering::Release);
     }
 
     pub async fn lookup_geo_country_code_for_ip(&self, ip: &str) -> Option<String> {
@@ -24405,6 +24423,7 @@ mod tests {
             auth_installation_hourly_limit: 15,
             ip_blacklist: String::new(),
             free_share_ip_parallel_limit: 1,
+            market_usd_cny_rate_micros: crate::market_billing::DEFAULT_USD_CNY_RATE_MICROS,
             ip_intel_endpoints: Vec::new(),
             verification_service_base_url: "https://tokenswitch.org".into(),
             verification_service_api_key: None,

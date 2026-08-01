@@ -95,6 +95,7 @@ pub struct Config {
     pub auth_installation_hourly_limit: i64,
     pub ip_blacklist: String,
     pub free_share_ip_parallel_limit: i64,
+    pub market_usd_cny_rate_micros: i64,
     /// Base URLs of the IP-intelligence service, tried in order. Every registered
     /// Client Market Host IP is sent to these endpoints, so they should be operated
     /// by the Router operator or a party trusted with the full Host inventory.
@@ -263,6 +264,9 @@ impl Config {
             free_share_ip_parallel_limit: env_var("CC_SWITCH_ROUTER_FREE_SHARE_IP_PARALLEL_LIMIT")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1),
+            market_usd_cny_rate_micros: env_var("CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE")
+                .and_then(|value| crate::market_billing::parse_usd_cny_rate_micros(&value).ok())
+                .unwrap_or(crate::market_billing::DEFAULT_USD_CNY_RATE_MICROS),
             ip_intel_endpoints: parse_ip_intel_endpoints(
                 env_var("CC_SWITCH_ROUTER_IP_INTEL_ENDPOINTS").as_deref(),
             ),
@@ -497,6 +501,7 @@ CC_SWITCH_ROUTER_AUTH_IP_HOURLY_LIMIT=20
 CC_SWITCH_ROUTER_AUTH_INSTALLATION_HOURLY_LIMIT=10
 CC_SWITCH_ROUTER_IP_BLACKLIST=
 CC_SWITCH_ROUTER_FREE_SHARE_IP_PARALLEL_LIMIT=1
+CC_SWITCH_ROUTER_MARKET_USD_CNY_RATE=7
 CC_SWITCH_ROUTER_RESEND_API_KEY=
 # CC_SWITCH_ROUTER_RESEND_FROM defaults to noreply@[CC_SWITCH_ROUTER_TUNNEL_DOMAIN]
 CC_SWITCH_ROUTER_RESEND_FROM=
@@ -725,6 +730,7 @@ mod tests {
             auth_installation_hourly_limit: 5,
             ip_blacklist: String::new(),
             free_share_ip_parallel_limit: 1,
+            market_usd_cny_rate_micros: crate::market_billing::DEFAULT_USD_CNY_RATE_MICROS,
             ip_intel_endpoints: Vec::new(),
             verification_service_base_url: "https://example.com".into(),
             verification_service_api_key: None,

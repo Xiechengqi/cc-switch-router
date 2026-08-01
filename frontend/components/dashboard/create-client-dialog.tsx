@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { Button, Chip, Modal } from "@heroui/react";
-import { Check, Copy, Dices, Loader2, LogIn, Minus, Plus, RotateCcw, Server } from "lucide-react";
+import { Check, Clock3, Copy, Dices, Loader2, LogIn, Minus, Plus, RotateCcw, Server, ShieldCheck } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { CompactRegionMultiSelect } from "@/components/common/compact-region-multi-select";
 import { CountryFlag } from "@/components/common/country-flag";
@@ -580,6 +580,13 @@ export function CreateClientDialog({
     [ownerEmail, t],
   );
   const quoteSeconds = secondsRemaining(quote?.expiresAt);
+  const paidQuoteCount = quote?.items.filter((item) => item.dailyRateMinor != null).length || 0;
+  const freeQuoteCount = (quote?.items.length || 0) - paidQuoteCount;
+  const quoteSupplierCount = new Set(
+    quote?.items
+      .filter((item) => item.dailyRateMinor != null)
+      .map((item) => item.providerId) || [],
+  ).size;
   const subdomainsCanCommit = !!quote && quote.items.every((item) => {
     const value = normalizeDraftSubdomain(drafts[item.id]?.subdomain || "");
     const check = subdomainChecks[item.id];
@@ -708,6 +715,25 @@ export function CreateClientDialog({
                 >
                   {t("createClient.quoteCountdown", { seconds: quoteSeconds })}
                 </Chip></div>
+                {paidQuoteCount ? (
+                  <div className="flex gap-3 rounded-md border border-sky-200 bg-sky-50 p-3 text-sm leading-6 text-sky-950">
+                    <Clock3 className="mt-1 h-4 w-4 shrink-0" />
+                    <div>
+                      <strong>{t("createClient.quoteTerms.postpaidTitle")}</strong>
+                      <p>{t("createClient.quoteTerms.postpaid", {
+                        count: paidQuoteCount,
+                        suppliers: quoteSupplierCount,
+                        hours: 12,
+                      })}</p>
+                    </div>
+                  </div>
+                ) : null}
+                {freeQuoteCount ? (
+                  <div className="flex gap-3 rounded-md border border-emerald-200 bg-emerald-50 p-3 text-sm leading-6 text-emerald-950">
+                    <ShieldCheck className="mt-1 h-4 w-4 shrink-0" />
+                    <p>{t("createClient.quoteTerms.free", { count: freeQuoteCount })}</p>
+                  </div>
+                ) : null}
                 {quote.items.map((item, index) => {
                   const draft = drafts[item.id] || { subdomain: "", password: "" };
                   const subdomainValue = normalizeDraftSubdomain(draft.subdomain);
