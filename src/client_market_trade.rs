@@ -3721,7 +3721,7 @@ fn enqueue_client_market_chat_event_tx(
     )
 }
 
-fn insert_audit_tx(
+pub(crate) fn insert_audit_tx(
     tx: &Transaction<'_>,
     installation_id: Option<&str>,
     host_id: Option<&str>,

@@ -45,6 +45,8 @@ import type {
   ClientChatRoomListResponse,
   ClientChatVisit,
   ClientMarketHost,
+  ClientMarketSshHostKeyInspection,
+  ClientMarketSshHostKeyRotationResponse,
   HostIpIntel,
   SupplySummaryEntry,
   ProvisionSshKey,
@@ -706,6 +708,33 @@ export async function reverifyClientMarketHost(id: string) {
   return parseJson<ClientMarketHost>(
     await authFetch(`/v1/client-market/hosts/${encodeURIComponent(id)}/reverify`, {
       method: "POST",
+    }),
+  );
+}
+
+export async function scanClientMarketHostSshKey(id: string, signal?: AbortSignal) {
+  return parseJson<ClientMarketSshHostKeyInspection>(
+    await authFetch(`/v1/client-market/hosts/${encodeURIComponent(id)}/ssh-host-key/scan`, {
+      method: "POST",
+      cache: "no-store",
+      signal,
+    }),
+  );
+}
+
+export async function rotateClientMarketHostSshKey(
+  id: string,
+  body: {
+    expectedCurrentFingerprint?: string;
+    confirmedFingerprint: string;
+    verifiedFromHostConsole: boolean;
+  },
+) {
+  return parseJson<ClientMarketSshHostKeyRotationResponse>(
+    await authFetch(`/v1/client-market/hosts/${encodeURIComponent(id)}/ssh-host-key/rotate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
     }),
   );
 }

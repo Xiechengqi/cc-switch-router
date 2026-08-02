@@ -143,6 +143,8 @@ async fn create_terminal_session(
         .await?
         .ok_or_else(|| AppError::NotFound("host not found".into()))?;
     authorize_web_terminal(&host, &session)?;
+    let host = crate::client_market::prepare_web_terminal_host(&state, &host).await?;
+    authorize_web_terminal(&host, &session)?;
 
     let mut manager = state.client_market_terminal.lock().await;
     let ticket = manager.issue_ticket(TerminalTicket {

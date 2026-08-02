@@ -1400,6 +1400,21 @@ export type ClientMarketHost = {
   updatedAt?: string;
 };
 
+export type ClientMarketSshHostKeyInspection = {
+  hostId: string;
+  endpoint: string;
+  storedFingerprint?: string;
+  observedFingerprint: string;
+  observedKeyType: string;
+  changed: boolean;
+  confirmationRequired: boolean;
+};
+
+export type ClientMarketSshHostKeyRotationResponse = {
+  host: ClientMarketHost;
+  inspection: ClientMarketSshHostKeyInspection;
+};
+
 export type SupplySummaryEntry = {
   hostOwnerEmail: string;
   countryCode?: string;

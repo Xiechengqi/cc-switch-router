@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Write as _;
 use std::net::{IpAddr, SocketAddr};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -94,6 +95,8 @@ const PROVISION_POLL_INTERVAL: Duration = Duration::from_secs(15);
 const PROVISION_SECRET_TTL: Duration = Duration::from_secs(15 * 60);
 const PROVISION_REDEEM_RETRY_TTL: Duration = Duration::from_secs(2 * 60);
 const SSH_VERIFY_TIMEOUT: Duration = Duration::from_secs(180);
+const SSH_HOST_KEY_SCAN_TIMEOUT: Duration = Duration::from_secs(12);
+const SSH_HOST_KEY_SCAN_CONNECT_TIMEOUT_SECS: &str = "5";
 const SSH_INSTALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const SSH_CLEANUP_TIMEOUT: Duration = Duration::from_secs(90);
 const SSH_OUTPUT_LIMIT: usize = 64 * 1024;
@@ -767,6 +770,14 @@ pub fn router() -> Router<ServerState> {
         .route("/v1/client-market/supply-summary", get(supply_summary))
         .route("/v1/client-market/hosts/:id", delete(delete_host))
         .route("/v1/client-market/hosts/:id/reverify", post(reverify_host))
+        .route(
+            "/v1/client-market/hosts/:id/ssh-host-key/scan",
+            post(scan_host_ssh_key),
+        )
+        .route(
+            "/v1/client-market/hosts/:id/ssh-host-key/rotate",
+            post(rotate_host_ssh_key),
+        )
         .route("/v1/client-market/jobs/:id", get(get_job))
         .route(
             "/v1/client-market/clients/:installation_id/release",
@@ -1134,6 +1145,52 @@ struct TestHostSshRequest {
 #[serde(rename_all = "camelCase")]
 struct TestHostSshResponse {
     ok: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SshHostKeyInspection {
+    host_id: String,
+    endpoint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stored_fingerprint: Option<String>,
+    observed_fingerprint: String,
+    observed_key_type: String,
+    changed: bool,
+    confirmation_required: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RotateHostSshKeyRequest {
+    #[serde(default)]
+    expected_current_fingerprint: Option<String>,
+    confirmed_fingerprint: String,
+    #[serde(default)]
+    verified_from_host_console: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RotateHostSshKeyResponse {
+    host: RouterSshHostView,
+    inspection: SshHostKeyInspection,
+}
+
+#[derive(Debug, Clone)]
+struct ObservedSshHostKey {
+    target: String,
+    key_type: String,
+    encoded_key: String,
+    fingerprint: String,
+}
+
+struct HostFingerprintRotation<'a> {
+    expected_fingerprint: Option<&'a str>,
+    fingerprint: &'a str,
+    key_type: &'a str,
+    actor_user_id: &'a str,
+    actor_email: &'a str,
 }
 
 async fn test_host_ssh(
@@ -1618,6 +1675,125 @@ async fn reverify_host(
         .client_market_complete_host_reverify(&id, hostname.as_deref(), fingerprint.as_deref())
         .await?;
     Ok(Json(host_to_view(updated, true)))
+}
+
+async fn scan_host_ssh_key(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<SshHostKeyInspection>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let _known_hosts_guard = PROVISION_KNOWN_HOSTS_LOCK.lock().await;
+    let host = state
+        .store
+        .client_market_get_host_for_operator(&id, &session)
+        .await?;
+    let observed = ssh_scan_host_key(
+        &host.ip,
+        host.port,
+        host.ssh_host_key_fingerprint.as_deref(),
+    )
+    .await?;
+    let inspection = ssh_host_key_inspection(&host, &observed);
+    if !inspection.confirmation_required {
+        ensure_strict_known_host_entry(&state.config, &host, &observed).await?;
+    }
+    Ok(Json(inspection))
+}
+
+async fn rotate_host_ssh_key(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(input): Json<RotateHostSshKeyRequest>,
+) -> Result<Json<RotateHostSshKeyResponse>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let expected_current =
+        normalized_optional_fingerprint(input.expected_current_fingerprint.as_deref());
+    let confirmed = normalize_confirmed_ssh_fingerprint(&input.confirmed_fingerprint)?;
+    if !input.verified_from_host_console {
+        return Err(AppError::BadRequest(
+            "confirm that the fingerprint was verified from the Host console".into(),
+        ));
+    }
+    let initial_host = state
+        .store
+        .client_market_get_host_for_operator(&id, &session)
+        .await?;
+    require_host_key_rotation_idle(&state, &initial_host).await?;
+    require_expected_host_fingerprint(&initial_host, expected_current.as_deref())?;
+
+    let _known_hosts_guard = PROVISION_KNOWN_HOSTS_LOCK.lock().await;
+    let host = state
+        .store
+        .client_market_get_host_for_operator(&id, &session)
+        .await?;
+    require_host_key_rotation_idle(&state, &host).await?;
+    require_expected_host_fingerprint(&host, expected_current.as_deref())?;
+
+    let observed = ssh_scan_host_key(
+        &host.ip,
+        host.port,
+        host.ssh_host_key_fingerprint.as_deref(),
+    )
+    .await?;
+    let inspection = ssh_host_key_inspection(&host, &observed);
+    if observed.fingerprint != confirmed {
+        return Err(AppError::coded_conflict(
+            "SSH_HOST_KEY_CHANGED_DURING_CONFIRMATION",
+            "the observed SSH host fingerprint does not match the confirmed fingerprint",
+            serde_json::to_value(&inspection).unwrap_or_else(|_| serde_json::json!({})),
+        ));
+    }
+
+    if normalized_optional_fingerprint(host.ssh_host_key_fingerprint.as_deref()).as_deref()
+        == Some(confirmed.as_str())
+    {
+        ensure_strict_known_host_entry(&state.config, &host, &observed).await?;
+        return Ok(Json(RotateHostSshKeyResponse {
+            host: host_to_view(host, true),
+            inspection,
+        }));
+    }
+
+    let known_hosts = known_hosts_path(&state.config);
+    let snapshot = install_known_host_entry(&known_hosts, &observed).await?;
+    let updated = match state
+        .store
+        .client_market_rotate_host_fingerprint(
+            &host.id,
+            HostFingerprintRotation {
+                expected_fingerprint: host.ssh_host_key_fingerprint.as_deref(),
+                fingerprint: &observed.fingerprint,
+                key_type: &observed.key_type,
+                actor_user_id: &session.user_id,
+                actor_email: &session.email,
+            },
+        )
+        .await
+    {
+        Ok(updated) => updated,
+        Err(error) => {
+            if let Err(rollback_error) = restore_known_hosts_snapshot(&known_hosts, &snapshot) {
+                return Err(AppError::Internal(format!(
+                    "rotate SSH host fingerprint failed ({error}); restoring known_hosts also failed: {rollback_error}"
+                )));
+            }
+            return Err(error);
+        }
+    };
+    let updated_inspection = ssh_host_key_inspection(&updated, &observed);
+    info!(
+        host_id = %updated.id,
+        endpoint = %observed.target,
+        old_fingerprint = ?host.ssh_host_key_fingerprint,
+        new_fingerprint = %observed.fingerprint,
+        "client market SSH host fingerprint rotated"
+    );
+    Ok(Json(RotateHostSshKeyResponse {
+        host: host_to_view(updated, true),
+        inspection: updated_inspection,
+    }))
 }
 
 async fn delete_host(
@@ -3593,6 +3769,435 @@ async fn claim_idle_host_without_running_server(
     ))
 }
 
+fn normalized_optional_fingerprint(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn normalize_confirmed_ssh_fingerprint(value: &str) -> Result<String, AppError> {
+    let value = value.trim();
+    let encoded = value.strip_prefix("SHA256:").ok_or_else(|| {
+        AppError::BadRequest("confirmed fingerprint must use the SHA256:<base64> format".into())
+    })?;
+    let digest = base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(encoded)
+        .map_err(|_| AppError::BadRequest("confirmed SSH fingerprint is invalid".into()))?;
+    if digest.len() != 32 {
+        return Err(AppError::BadRequest(
+            "confirmed SSH fingerprint is invalid".into(),
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn ssh_known_hosts_target(ip: &str, port: u16) -> String {
+    if port == 22 {
+        ip.to_string()
+    } else {
+        format!("[{ip}]:{port}")
+    }
+}
+
+fn ssh_host_key_inspection(
+    host: &RouterSshHostRecord,
+    observed: &ObservedSshHostKey,
+) -> SshHostKeyInspection {
+    let stored_fingerprint =
+        normalized_optional_fingerprint(host.ssh_host_key_fingerprint.as_deref());
+    let confirmation_required =
+        stored_fingerprint.as_deref() != Some(observed.fingerprint.as_str());
+    SshHostKeyInspection {
+        host_id: host.id.clone(),
+        endpoint: observed.target.clone(),
+        changed: stored_fingerprint.is_some() && confirmation_required,
+        confirmation_required,
+        stored_fingerprint,
+        observed_fingerprint: observed.fingerprint.clone(),
+        observed_key_type: observed.key_type.clone(),
+    }
+}
+
+fn require_expected_host_fingerprint(
+    host: &RouterSshHostRecord,
+    expected: Option<&str>,
+) -> Result<(), AppError> {
+    let current = normalized_optional_fingerprint(host.ssh_host_key_fingerprint.as_deref());
+    if current.as_deref() != expected {
+        return Err(AppError::coded_conflict(
+            "SSH_HOST_KEY_STATE_CHANGED",
+            "the stored SSH host fingerprint changed; scan the host again",
+            serde_json::json!({ "storedFingerprint": current }),
+        ));
+    }
+    Ok(())
+}
+
+async fn require_host_key_rotation_idle(
+    state: &ServerState,
+    host: &RouterSshHostRecord,
+) -> Result<(), AppError> {
+    if host_key_rotation_status_is_busy(&host.status)
+        || state
+            .store
+            .client_market_host_has_active_job(&host.id)
+            .await?
+    {
+        return Err(AppError::Conflict(
+            "SSH host fingerprint cannot be changed while a Host operation is active".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn host_key_rotation_status_is_busy(status: &str) -> bool {
+    matches!(
+        status,
+        "reserved" | HOST_STATUS_LOCKED | HOST_STATUS_DRAINING
+    )
+}
+
+pub(crate) async fn prepare_web_terminal_host(
+    state: &ServerState,
+    authorized_host: &RouterSshHostRecord,
+) -> Result<RouterSshHostRecord, AppError> {
+    let _known_hosts_guard = PROVISION_KNOWN_HOSTS_LOCK.lock().await;
+    let host = state
+        .store
+        .client_market_get_host(&authorized_host.id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("host not found".into()))?;
+    let observed = ssh_scan_host_key(
+        &host.ip,
+        host.port,
+        host.ssh_host_key_fingerprint.as_deref(),
+    )
+    .await?;
+    let inspection = ssh_host_key_inspection(&host, &observed);
+    if inspection.confirmation_required {
+        return Err(AppError::coded_conflict(
+            "SSH_HOST_KEY_CONFIRMATION_REQUIRED",
+            "SSH host identity confirmation is required before opening Web Terminal",
+            serde_json::to_value(&inspection).unwrap_or_else(|_| serde_json::json!({})),
+        ));
+    }
+    ensure_strict_known_host_entry(&state.config, &host, &observed).await?;
+    Ok(host)
+}
+
+async fn ssh_scan_host_key(
+    ip: &str,
+    port: u16,
+    stored_fingerprint: Option<&str>,
+) -> Result<ObservedSshHostKey, AppError> {
+    let mut command = Command::new("ssh-keyscan");
+    command
+        .arg("-T")
+        .arg(SSH_HOST_KEY_SCAN_CONNECT_TIMEOUT_SECS)
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-t")
+        .arg("ed25519,ecdsa,rsa")
+        .arg(ip)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(SSH_HOST_KEY_SCAN_TIMEOUT, command.output())
+        .await
+        .map_err(|_| AppError::ServiceUnavailable("SSH host key scan timed out".into()))?
+        .map_err(|error| {
+            AppError::ServiceUnavailable(format!("start SSH host key scan failed: {error}"))
+        })?;
+    if output.stdout.len() > 64 * 1024 || output.stderr.len() > 64 * 1024 {
+        return Err(AppError::ServiceUnavailable(
+            "SSH host key scan returned too much data".into(),
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout).map_err(|_| {
+        AppError::ServiceUnavailable("SSH host key scan returned invalid text".into())
+    })?;
+    let target = ssh_known_hosts_target(ip, port);
+    parse_ssh_keyscan_output(&stdout, &target, stored_fingerprint).ok_or_else(|| {
+        warn!(
+            exit_status = ?output.status.code(),
+            stderr_bytes = output.stderr.len(),
+            "SSH host key scan returned no supported key"
+        );
+        AppError::ServiceUnavailable(
+            "SSH host key scan failed: the host returned no supported key".into(),
+        )
+    })
+}
+
+fn parse_ssh_keyscan_output(
+    output: &str,
+    target: &str,
+    stored_fingerprint: Option<&str>,
+) -> Option<ObservedSshHostKey> {
+    let mut candidates = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let Some(scanned_target) = fields.next() else {
+            continue;
+        };
+        if !scanned_target
+            .split(',')
+            .any(|candidate| candidate == target)
+        {
+            continue;
+        }
+        let Some(key_type) = fields.next() else {
+            continue;
+        };
+        let Some(encoded_key) = fields.next() else {
+            continue;
+        };
+        if fields.next().is_some() {
+            continue;
+        }
+        let priority = match key_type {
+            "ssh-ed25519" => 0,
+            value if value.starts_with("ecdsa-sha2-") => 1,
+            "ssh-rsa" => 2,
+            _ => continue,
+        };
+        let Ok(key_blob) = base64::engine::general_purpose::STANDARD.decode(encoded_key) else {
+            continue;
+        };
+        if key_blob.is_empty() || key_blob.len() > 16 * 1024 {
+            continue;
+        }
+        let digest = Sha256::digest(key_blob);
+        let fingerprint = format!(
+            "SHA256:{}",
+            base64::engine::general_purpose::STANDARD_NO_PAD.encode(digest)
+        );
+        candidates.push((
+            priority,
+            ObservedSshHostKey {
+                target: target.to_string(),
+                key_type: key_type.to_string(),
+                encoded_key: encoded_key.to_string(),
+                fingerprint,
+            },
+        ));
+    }
+    if let Some(stored_fingerprint) = normalized_optional_fingerprint(stored_fingerprint)
+        && let Some((_, matching)) = candidates
+            .iter()
+            .find(|(_, candidate)| candidate.fingerprint == stored_fingerprint)
+    {
+        return Some(matching.clone());
+    }
+    candidates.sort_by_key(|(priority, _)| *priority);
+    candidates.into_iter().next().map(|(_, key)| key)
+}
+
+#[derive(Debug)]
+struct KnownHostsSnapshot {
+    existed: bool,
+    bytes: Vec<u8>,
+}
+
+fn read_known_hosts_snapshot(path: &Path) -> Result<KnownHostsSnapshot, AppError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                return Err(AppError::Internal(
+                    "Client Market known_hosts path is not a regular file".into(),
+                ));
+            }
+            Ok(KnownHostsSnapshot {
+                existed: true,
+                bytes: fs::read(path).map_err(|error| {
+                    AppError::Internal(format!("read Client Market known_hosts failed: {error}"))
+                })?,
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(KnownHostsSnapshot {
+            existed: false,
+            bytes: Vec::new(),
+        }),
+        Err(error) => Err(AppError::Internal(format!(
+            "inspect Client Market known_hosts failed: {error}"
+        ))),
+    }
+}
+
+fn atomic_write_known_hosts(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
+    let parent = path.parent().ok_or_else(|| {
+        AppError::Internal("Client Market known_hosts path has no parent directory".into())
+    })?;
+    fs::create_dir_all(parent).map_err(|error| {
+        AppError::Internal(format!(
+            "create Client Market known_hosts directory failed: {error}"
+        ))
+    })?;
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("known_hosts");
+    let temporary = parent.join(format!(".{name}.{}.tmp", Uuid::new_v4()));
+    let result = (|| -> Result<(), AppError> {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(|error| {
+                AppError::Internal(format!("create known_hosts temporary file failed: {error}"))
+            })?;
+        file.write_all(bytes).map_err(|error| {
+            AppError::Internal(format!("write known_hosts temporary file failed: {error}"))
+        })?;
+        file.sync_all().map_err(|error| {
+            AppError::Internal(format!("sync known_hosts temporary file failed: {error}"))
+        })?;
+        drop(file);
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600)).map_err(|error| {
+            AppError::Internal(format!("secure known_hosts temporary file failed: {error}"))
+        })?;
+        fs::rename(&temporary, path).map_err(|error| {
+            AppError::Internal(format!("replace Client Market known_hosts failed: {error}"))
+        })?;
+        if let Err(error) = fs::File::open(parent).and_then(|directory| directory.sync_all()) {
+            warn!(%error, "failed to sync Client Market known_hosts directory");
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn ssh_keygen_backup_path(path: &Path) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(".old");
+    PathBuf::from(value)
+}
+
+struct TemporaryKnownHostsPath {
+    path: PathBuf,
+}
+
+impl TemporaryKnownHostsPath {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TemporaryKnownHostsPath {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+        let _ = fs::remove_file(ssh_keygen_backup_path(&self.path));
+    }
+}
+
+async fn install_known_host_entry(
+    path: &Path,
+    observed: &ObservedSshHostKey,
+) -> Result<KnownHostsSnapshot, AppError> {
+    let snapshot = read_known_hosts_snapshot(path)?;
+    let parent = path.parent().ok_or_else(|| {
+        AppError::Internal("Client Market known_hosts path has no parent directory".into())
+    })?;
+    fs::create_dir_all(parent).map_err(|error| {
+        AppError::Internal(format!(
+            "create Client Market known_hosts directory failed: {error}"
+        ))
+    })?;
+    let candidate = TemporaryKnownHostsPath::new(
+        parent.join(format!(".known_hosts.rotate.{}.tmp", Uuid::new_v4())),
+    );
+    atomic_write_known_hosts(candidate.path(), &snapshot.bytes)?;
+    let output = Command::new("ssh-keygen")
+        .arg("-R")
+        .arg(&observed.target)
+        .arg("-f")
+        .arg(candidate.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|error| AppError::Internal(format!("start ssh-keygen failed: {error}")))?;
+    if !output.status.success() {
+        return Err(AppError::Internal(format!(
+            "remove stale known_hosts entry failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let mut next = fs::read(candidate.path()).map_err(|error| {
+        AppError::Internal(format!(
+            "read rotated known_hosts candidate failed: {error}"
+        ))
+    })?;
+    if !next.is_empty() && !next.ends_with(b"\n") {
+        next.push(b'\n');
+    }
+    next.extend_from_slice(
+        format!(
+            "{} {} {}\n",
+            observed.target, observed.key_type, observed.encoded_key
+        )
+        .as_bytes(),
+    );
+    atomic_write_known_hosts(path, &next)?;
+    Ok(snapshot)
+}
+
+fn restore_known_hosts_snapshot(
+    path: &Path,
+    snapshot: &KnownHostsSnapshot,
+) -> Result<(), AppError> {
+    if snapshot.existed {
+        return atomic_write_known_hosts(path, &snapshot.bytes);
+    }
+    match fs::remove_file(path) {
+        Ok(()) => {
+            if let Some(parent) = path.parent()
+                && let Err(error) =
+                    fs::File::open(parent).and_then(|directory| directory.sync_all())
+            {
+                warn!(%error, "failed to sync restored Client Market known_hosts directory");
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(AppError::Internal(format!(
+            "remove newly-created Client Market known_hosts failed: {error}"
+        ))),
+    }
+}
+
+async fn ensure_strict_known_host_entry(
+    config: &Config,
+    host: &RouterSshHostRecord,
+    observed: &ObservedSshHostKey,
+) -> Result<(), AppError> {
+    let known_hosts = known_hosts_path(config);
+    if ssh_fetch_host_fingerprint(&host.ip, host.port, &known_hosts)
+        .await
+        .is_ok_and(|fingerprint| fingerprint == observed.fingerprint)
+    {
+        return Ok(());
+    }
+    install_known_host_entry(&known_hosts, observed).await?;
+    Ok(())
+}
+
 async fn ssh_fetch_host_fingerprint(
     ip: &str,
     port: u16,
@@ -5398,6 +6003,89 @@ impl AppStore {
         Ok(host)
     }
 
+    async fn client_market_rotate_host_fingerprint(
+        &self,
+        id: &str,
+        rotation: HostFingerprintRotation<'_>,
+    ) -> Result<RouterSshHostRecord, AppError> {
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction().map_err(|error| {
+            AppError::Internal(format!(
+                "begin SSH host fingerprint rotation failed: {error}"
+            ))
+        })?;
+        let host = get_router_ssh_host(&tx, id)?
+            .ok_or_else(|| AppError::NotFound("host not found".into()))?;
+        if host.ssh_host_key_fingerprint.as_deref() != rotation.expected_fingerprint {
+            return Err(AppError::Conflict(
+                "the stored SSH host fingerprint changed; scan the host again".into(),
+            ));
+        }
+        let active_jobs: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM provisioning_jobs
+                 WHERE host_id = ?1 AND status IN ('pending', 'running')",
+                params![id],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "check active jobs before SSH host fingerprint rotation failed: {error}"
+                ))
+            })?;
+        if host_key_rotation_status_is_busy(&host.status) || active_jobs > 0 {
+            return Err(AppError::Conflict(
+                "SSH host fingerprint cannot be changed while a Host operation is active".into(),
+            ));
+        }
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let changed = tx
+            .execute(
+                "UPDATE router_ssh_hosts
+                 SET ssh_host_key_fingerprint = ?3, last_verified_at = ?4, updated_at = ?4
+                 WHERE id = ?1
+                   AND ((ssh_host_key_fingerprint IS NULL AND ?2 IS NULL)
+                        OR ssh_host_key_fingerprint = ?2)",
+                params![
+                    id,
+                    rotation.expected_fingerprint,
+                    rotation.fingerprint,
+                    now_text
+                ],
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("update SSH host fingerprint failed: {error}"))
+            })?;
+        if changed != 1 {
+            return Err(AppError::Conflict(
+                "the stored SSH host fingerprint changed; scan the host again".into(),
+            ));
+        }
+        crate::client_market_trade::insert_audit_tx(
+            &tx,
+            host.installation_id.as_deref(),
+            Some(id),
+            Some(rotation.actor_user_id),
+            Some(rotation.actor_email),
+            "host_ssh_fingerprint_rotated",
+            serde_json::json!({
+                "endpoint": ssh_known_hosts_target(&host.ip, host.port),
+                "keyType": rotation.key_type,
+                "oldFingerprint": host.ssh_host_key_fingerprint,
+                "newFingerprint": rotation.fingerprint,
+            }),
+            now,
+        )?;
+        tx.commit().map_err(|error| {
+            AppError::Internal(format!(
+                "commit SSH host fingerprint rotation failed: {error}"
+            ))
+        })?;
+        get_router_ssh_host(&conn, id)?
+            .ok_or_else(|| AppError::Internal("rotated Host disappeared".into()))
+    }
+
     pub async fn client_market_complete_host_reverify(
         &self,
         id: &str,
@@ -6492,6 +7180,13 @@ mod tests {
         get_by_label as get_public_host,
     };
 
+    const TEST_ED25519_KEY_OLD: &str =
+        "AAAAC3NzaC1lZDI1NTE5AAAAIGjWI8jfRRbxMZjdFDfgRlaHpRZPf7qs4odSbL41WQ1m";
+    const TEST_ED25519_KEY_NEW: &str =
+        "AAAAC3NzaC1lZDI1NTE5AAAAIGjWI8jfRRbxMZjdFDfgRlaHpRZPf7qs4odSbL41WQ1n";
+    const TEST_ED25519_KEY_OTHER: &str =
+        "AAAAC3NzaC1lZDI1NTE5AAAAIGjWI8jfRRbxMZjdFDfgRlaHpRZPf7qs4odSbL41WQ1o";
+
     fn test_config(name: &str) -> (Config, PathBuf) {
         let root = std::env::temp_dir().join(format!(
             "cc-switch-router-client-market-{name}-{}",
@@ -6563,6 +7258,312 @@ mod tests {
         let (config, root) = test_config(name);
         let store = AppStore::new(&config).expect("create client market test store");
         (store, config, root)
+    }
+
+    fn test_ssh_fingerprint(encoded_key: &str) -> String {
+        let blob = base64::engine::general_purpose::STANDARD
+            .decode(encoded_key)
+            .expect("decode test SSH key");
+        format!(
+            "SHA256:{}",
+            base64::engine::general_purpose::STANDARD_NO_PAD.encode(Sha256::digest(blob))
+        )
+    }
+
+    #[test]
+    fn ssh_keyscan_parser_prefers_ed25519_and_preserves_a_pinned_algorithm() {
+        let target = "[203.0.113.10]:22222";
+        let rsa_key = base64::engine::general_purpose::STANDARD.encode(b"test-rsa-key");
+        let ecdsa_key = base64::engine::general_purpose::STANDARD.encode(b"test-ecdsa-key");
+        let output = format!(
+            "# ssh-keyscan comment\n\
+             {target} ssh-rsa {rsa_key}\n\
+             wrong.example ssh-ed25519 {TEST_ED25519_KEY_OTHER}\n\
+             {target} ecdsa-sha2-nistp256 {ecdsa_key}\n\
+             {target} ssh-ed25519 {TEST_ED25519_KEY_NEW}\n"
+        );
+
+        let preferred = parse_ssh_keyscan_output(&output, target, None)
+            .expect("select the preferred SSH host key");
+        assert_eq!(preferred.target, target);
+        assert_eq!(preferred.key_type, "ssh-ed25519");
+        assert_eq!(preferred.encoded_key, TEST_ED25519_KEY_NEW);
+
+        let rsa_fingerprint = test_ssh_fingerprint(&rsa_key);
+        let pinned_rsa = parse_ssh_keyscan_output(&output, target, Some(&rsa_fingerprint))
+            .expect("retain a pinned RSA host key");
+        assert_eq!(pinned_rsa.key_type, "ssh-rsa");
+        assert_eq!(pinned_rsa.fingerprint, rsa_fingerprint);
+
+        let ecdsa_fingerprint = test_ssh_fingerprint(&ecdsa_key);
+        let pinned_ecdsa = parse_ssh_keyscan_output(&output, target, Some(&ecdsa_fingerprint))
+            .expect("retain a pinned ECDSA host key");
+        assert_eq!(pinned_ecdsa.key_type, "ecdsa-sha2-nistp256");
+        assert_eq!(pinned_ecdsa.fingerprint, ecdsa_fingerprint);
+
+        assert!(
+            parse_ssh_keyscan_output(
+                &format!("wrong.example ssh-ed25519 {TEST_ED25519_KEY_NEW}\n"),
+                target,
+                None,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn confirmed_ssh_fingerprint_requires_an_openssh_sha256_digest() {
+        let valid = format!(
+            "SHA256:{}",
+            base64::engine::general_purpose::STANDARD_NO_PAD.encode([7_u8; 32])
+        );
+        assert_eq!(
+            normalize_confirmed_ssh_fingerprint(&format!("  {valid}  ")).unwrap(),
+            valid
+        );
+
+        for invalid in [
+            "",
+            "MD5:00:11:22",
+            "SHA256:not-base64!",
+            "SHA256:c2hvcnQ",
+            "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        ] {
+            assert!(
+                matches!(
+                    normalize_confirmed_ssh_fingerprint(invalid),
+                    Err(AppError::BadRequest(_))
+                ),
+                "fingerprint should be rejected: {invalid}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn known_hosts_rotation_replaces_hashed_entry_and_restores_snapshots() {
+        let (_config, root) = test_config("known-hosts-rotation");
+        let path = root.join("known_hosts");
+        let target = "[203.0.113.10]:22222";
+        let original = format!(
+            "{target} ssh-ed25519 {TEST_ED25519_KEY_OLD}\n\
+             other.example ssh-ed25519 {TEST_ED25519_KEY_OTHER}\n"
+        );
+        atomic_write_known_hosts(&path, original.as_bytes()).expect("write known_hosts fixture");
+        let hashed = std::process::Command::new("ssh-keygen")
+            .arg("-H")
+            .arg("-f")
+            .arg(&path)
+            .output()
+            .expect("start ssh-keygen hash");
+        assert!(
+            hashed.status.success(),
+            "hash known_hosts fixture: {}",
+            String::from_utf8_lossy(&hashed.stderr)
+        );
+        let _ = fs::remove_file(ssh_keygen_backup_path(&path));
+        let original_hashed = fs::read(&path).expect("read hashed known_hosts fixture");
+        assert!(!String::from_utf8_lossy(&original_hashed).contains(target));
+
+        let observed = ObservedSshHostKey {
+            target: target.into(),
+            key_type: "ssh-ed25519".into(),
+            encoded_key: TEST_ED25519_KEY_NEW.into(),
+            fingerprint: test_ssh_fingerprint(TEST_ED25519_KEY_NEW),
+        };
+        let snapshot = install_known_host_entry(&path, &observed)
+            .await
+            .expect("rotate known_hosts entry");
+        assert!(snapshot.existed);
+        assert_eq!(snapshot.bytes, original_hashed);
+
+        let rotated = fs::read_to_string(&path).expect("read rotated known_hosts");
+        assert!(rotated.contains(TEST_ED25519_KEY_NEW));
+        assert!(rotated.contains(TEST_ED25519_KEY_OTHER));
+        assert!(!rotated.contains(TEST_ED25519_KEY_OLD));
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let lookup = std::process::Command::new("ssh-keygen")
+            .arg("-F")
+            .arg(target)
+            .arg("-f")
+            .arg(&path)
+            .output()
+            .expect("look up rotated Host");
+        assert!(lookup.status.success());
+        assert!(String::from_utf8_lossy(&lookup.stdout).contains(TEST_ED25519_KEY_NEW));
+
+        restore_known_hosts_snapshot(&path, &snapshot).expect("restore known_hosts snapshot");
+        assert_eq!(fs::read(&path).unwrap(), original_hashed);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let new_path = root.join("new_known_hosts");
+        let new_snapshot = install_known_host_entry(&new_path, &observed)
+            .await
+            .expect("install first known_hosts entry");
+        assert!(!new_snapshot.existed);
+        assert!(new_path.exists());
+        restore_known_hosts_snapshot(&new_path, &new_snapshot)
+            .expect("remove known_hosts created after snapshot");
+        assert!(!new_path.exists());
+
+        let leftovers = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("known_hosts.rotate") || name.ends_with(".old"))
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "temporary files remain: {leftovers:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn host_fingerprint_rotation_is_cas_audited_and_rejects_busy_hosts() {
+        let (store, _config, root) = test_store("host-key-cas");
+        let host = add_provider_host(
+            &store,
+            "provider-host-key",
+            "provider@example.com",
+            "198.18.44.1",
+            "US",
+            None,
+        )
+        .await;
+        let old_fingerprint = host.ssh_host_key_fingerprint.clone().unwrap();
+        let new_fingerprint = test_ssh_fingerprint(TEST_ED25519_KEY_NEW);
+
+        let updated = store
+            .client_market_rotate_host_fingerprint(
+                &host.id,
+                HostFingerprintRotation {
+                    expected_fingerprint: Some(&old_fingerprint),
+                    fingerprint: &new_fingerprint,
+                    key_type: "ssh-ed25519",
+                    actor_user_id: "provider-host-key",
+                    actor_email: "provider@example.com",
+                },
+            )
+            .await
+            .expect("rotate pinned Host fingerprint");
+        assert_eq!(
+            updated.ssh_host_key_fingerprint.as_deref(),
+            Some(new_fingerprint.as_str())
+        );
+        assert!(updated.last_verified_at.is_some());
+
+        assert!(matches!(
+            store
+                .client_market_rotate_host_fingerprint(
+                    &host.id,
+                    HostFingerprintRotation {
+                        expected_fingerprint: Some(&old_fingerprint),
+                        fingerprint: &test_ssh_fingerprint(TEST_ED25519_KEY_OTHER),
+                        key_type: "ssh-ed25519",
+                        actor_user_id: "stale-actor",
+                        actor_email: "stale@example.com",
+                    },
+                )
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "UPDATE router_ssh_hosts SET status = 'reserved' WHERE id = ?1",
+                params![host.id],
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            store
+                .client_market_rotate_host_fingerprint(
+                    &host.id,
+                    HostFingerprintRotation {
+                        expected_fingerprint: Some(&new_fingerprint),
+                        fingerprint: &test_ssh_fingerprint(TEST_ED25519_KEY_OTHER),
+                        key_type: "ssh-ed25519",
+                        actor_user_id: "provider-host-key",
+                        actor_email: "provider@example.com",
+                    },
+                )
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+
+        {
+            let conn = store.conn.lock().await;
+            let now = Utc::now().to_rfc3339();
+            conn.execute(
+                "UPDATE router_ssh_hosts SET status = 'idle' WHERE id = ?1",
+                params![host.id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO provisioning_jobs
+                    (id, type, host_id, status, phase, log_blob, created_at, updated_at)
+                 VALUES ('host-key-job', 'create', ?1, 'running', 'locked', '', ?2, ?2)",
+                params![host.id, now],
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            store
+                .client_market_rotate_host_fingerprint(
+                    &host.id,
+                    HostFingerprintRotation {
+                        expected_fingerprint: Some(&new_fingerprint),
+                        fingerprint: &test_ssh_fingerprint(TEST_ED25519_KEY_OTHER),
+                        key_type: "ssh-ed25519",
+                        actor_user_id: "provider-host-key",
+                        actor_email: "provider@example.com",
+                    },
+                )
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+
+        {
+            let conn = store.conn.lock().await;
+            let (count, actor_user_id, actor_email, detail_json): (
+                i64,
+                Option<String>,
+                Option<String>,
+                String,
+            ) = conn
+                .query_row(
+                    "SELECT COUNT(*), actor_user_id, actor_email, detail_json
+                     FROM client_market_audit_events
+                     WHERE host_id = ?1 AND event_type = 'host_ssh_fingerprint_rotated'",
+                    params![host.id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+            assert_eq!(actor_user_id.as_deref(), Some("provider-host-key"));
+            assert_eq!(actor_email.as_deref(), Some("provider@example.com"));
+            let detail: serde_json::Value = serde_json::from_str(&detail_json).unwrap();
+            assert_eq!(detail["endpoint"], "198.18.44.1");
+            assert_eq!(detail["keyType"], "ssh-ed25519");
+            assert_eq!(detail["oldFingerprint"], old_fingerprint);
+            assert_eq!(detail["newFingerprint"], new_fingerprint);
+            let stored: String = conn
+                .query_row(
+                    "SELECT ssh_host_key_fingerprint FROM router_ssh_hosts WHERE id = ?1",
+                    params![host.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, new_fingerprint);
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

@@ -274,7 +274,7 @@ function WebTerminalWindowShell({
 
       <div className="relative min-h-0 flex-1 bg-slate-50 p-3">
         <div className="h-full overflow-hidden rounded-xl border border-slate-200/80 bg-white shadow-[inset_0_1px_0_rgba(255,255,255,0.7)]">
-          <WebTerminalSession hostId={window.hostId} active={!minimized} />
+          <WebTerminalSession hostId={window.hostId} hostLabel={window.title} active={!minimized} />
         </div>
         {!maximized ? (
           <button

@@ -3,7 +3,7 @@
 import * as React from "react";
 import { createPortal } from "react-dom";
 import { Button, Checkbox, Chip, Dropdown, Modal, toast } from "@heroui/react";
-import { Loader2, MessageCircle, MoreHorizontal, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { Fingerprint, Loader2, MessageCircle, MoreHorizontal, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useClientChat } from "@/components/chat/client-chat";
 import { ConfirmAlertDialog } from "@/components/common/confirm-alert-dialog";
@@ -13,6 +13,7 @@ import { WebTerminalGlyph } from "@/components/dashboard/web-terminal/web-termin
 import { useWebTerminal } from "@/components/dashboard/web-terminal";
 import { useLocaleText } from "@/components/i18n/locale-provider";
 import { HostOfferDialog } from "@/components/dashboard/client-market/host-offer-dialog";
+import { HostKeyRotationDialog } from "@/components/dashboard/client-market/host-key-rotation-dialog";
 import {
   ClientMarketRentalBanner,
   clientMarketRentalHasBanner,
@@ -81,12 +82,13 @@ function HostRowImpl({
   const [cleanupJob, setCleanupJob] = React.useState<ProvisioningJob | null>(null);
   const [cleanupOpen, setCleanupOpen] = React.useState(false);
   const [offerOpen, setOfferOpen] = React.useState(false);
+  const [hostKeyOpen, setHostKeyOpen] = React.useState(false);
 
   React.useEffect(() => {
-    const locked = offerOpen || cleanupOpen || confirmAction != null || busy;
+    const locked = offerOpen || hostKeyOpen || cleanupOpen || confirmAction != null || busy;
     onUiBusyChange?.(host.id, locked);
     return () => onUiBusyChange?.(host.id, false);
-  }, [busy, cleanupOpen, confirmAction, host.id, offerOpen, onUiBusyChange]);
+  }, [busy, cleanupOpen, confirmAction, host.id, hostKeyOpen, offerOpen, onUiBusyChange]);
   const canManageHost = hostCanManage(host, viewerEmail);
   const canDelete = hostCanDelete(host, viewerEmail);
   const isClientOwner = host.isClientOwner === true;
@@ -400,6 +402,12 @@ function HostRowImpl({
                         {t("clientMarket.editOfferAction")}
                       </Dropdown.Item>
                     ) : null}
+                    {canManageHost ? (
+                      <Dropdown.Item id="ssh-host-key" onAction={() => setHostKeyOpen(true)}>
+                        <Fingerprint className="h-4 w-4" />
+                        {t("clientMarket.sshHostKey.action")}
+                      </Dropdown.Item>
+                    ) : null}
                     {canReverify ? (
                       <Dropdown.Item id="reverify" onAction={() => void onReverify()}>
                         <RefreshCw className="h-4 w-4" />
@@ -546,6 +554,13 @@ function HostRowImpl({
                 </Modal.Container>
               </Modal.Backdrop>
               <HostOfferDialog host={host} open={offerOpen} onOpenChange={setOfferOpen} onSaved={onChanged} />
+              <HostKeyRotationDialog
+                hostId={host.id}
+                hostLabel={hostLabel}
+                open={hostKeyOpen}
+                onOpenChange={setHostKeyOpen}
+                onUpdated={() => onChanged()}
+              />
             </>,
             document.body,
           )

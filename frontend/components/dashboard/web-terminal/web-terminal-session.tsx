@@ -1,11 +1,17 @@
 "use client";
 
 import * as React from "react";
+import { Button } from "@heroui/react";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import { Loader2 } from "lucide-react";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import {
+  HostKeyRotationDialog,
+  sshHostKeyInspectionFromError,
+} from "@/components/dashboard/client-market/host-key-rotation-dialog";
 import { createClientMarketTerminalSession } from "@/lib/api";
+import type { ClientMarketSshHostKeyInspection } from "@/lib/types";
 import "@xterm/xterm/css/xterm.css";
 
 const MSG_INPUT = "1";
@@ -49,9 +55,11 @@ function adaptiveFontSize(container: HTMLElement): number {
 
 export function WebTerminalSession({
   hostId,
+  hostLabel = hostId,
   active,
 }: {
   hostId: string;
+  hostLabel?: string;
   /** When false (minimized / off-route), keep session but skip fit churn. */
   active: boolean;
 }) {
@@ -63,6 +71,10 @@ export function WebTerminalSession({
   const pingTimerRef = React.useRef<ReturnType<typeof setInterval> | null>(null);
   const [status, setStatus] = React.useState<"connecting" | "connected" | "error">("connecting");
   const [error, setError] = React.useState("");
+  const [hostKeyInspection, setHostKeyInspection] =
+    React.useState<ClientMarketSshHostKeyInspection | null>(null);
+  const [hostKeyDialogOpen, setHostKeyDialogOpen] = React.useState(false);
+  const [retryGeneration, setRetryGeneration] = React.useState(0);
 
   const sendResize = React.useCallback(() => {
     const term = termRef.current;
@@ -94,6 +106,7 @@ export function WebTerminalSession({
     let cancelled = false;
     setStatus("connecting");
     setError("");
+    setHostKeyInspection(null);
 
     const connect = async () => {
       try {
@@ -204,7 +217,13 @@ export function WebTerminalSession({
       } catch (err) {
         if (cancelled) return;
         setStatus("error");
-        setError(err instanceof Error ? err.message : String(err));
+        const inspection = sshHostKeyInspectionFromError(err);
+        if (inspection) {
+          setHostKeyInspection(inspection);
+          setError(t("clientMarket.sshHostKey.reviewRequired"));
+        } else {
+          setError(err instanceof Error ? err.message : String(err));
+        }
       }
     };
 
@@ -239,7 +258,7 @@ export function WebTerminalSession({
       }
       fitRef.current = null;
     };
-  }, [fitTerminal, hostId, t]);
+  }, [fitTerminal, hostId, retryGeneration, t]);
 
   React.useEffect(() => {
     if (!active) return;
@@ -256,11 +275,32 @@ export function WebTerminalSession({
         </div>
       ) : null}
       {status === "error" && error ? (
-        <div className="absolute inset-x-0 top-0 z-10 border-b border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
-          {error}
+        <div className="absolute inset-x-0 top-0 z-10 flex flex-wrap items-center justify-between gap-2 border-b border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+          <span>{error}</span>
+          {hostKeyInspection ? (
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 border-rose-300 bg-white px-2.5 text-xs text-rose-700"
+              onClick={() => setHostKeyDialogOpen(true)}
+            >
+              {t("clientMarket.sshHostKey.review")}
+            </Button>
+          ) : null}
         </div>
       ) : null}
       <div ref={containerRef} className="h-full w-full p-1" />
+      <HostKeyRotationDialog
+        hostId={hostId}
+        hostLabel={hostLabel}
+        open={hostKeyDialogOpen}
+        initialInspection={hostKeyInspection}
+        onOpenChange={setHostKeyDialogOpen}
+        onUpdated={() => {
+          setHostKeyDialogOpen(false);
+          setRetryGeneration((value) => value + 1);
+        }}
+      />
     </div>
   );
 }
