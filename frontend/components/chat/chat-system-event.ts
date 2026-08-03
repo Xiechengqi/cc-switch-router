@@ -29,6 +29,7 @@ const DETAIL_LABELS: Record<string, MessageKey> = {
   buyerEmail: "chat.detail.buyerEmail",
   chain: "chat.detail.chain",
   clientOwnerEmail: "chat.detail.clientOwnerEmail",
+  confirmedOfflineAt: "chat.detail.confirmedOfflineAt",
   contact: "chat.detail.contact",
   createdAt: "chat.detail.createdAt",
   creditKind: "chat.detail.creditKind",
@@ -50,6 +51,7 @@ const DETAIL_LABELS: Record<string, MessageKey> = {
   instructions: "chat.detail.instructions",
   invoiceStatus: "chat.detail.invoiceStatus",
   kind: "chat.detail.kind",
+  lastAuthenticatedSeenAt: "chat.detail.lastAuthenticatedSeenAt",
   method: "chat.detail.method",
   note: "chat.detail.note",
   ownerEmail: "chat.detail.ownerEmail",
@@ -88,6 +90,7 @@ const DETAIL_LABELS: Record<string, MessageKey> = {
  * Technical IDs / internal bookkeeping fields are intentionally omitted.
  */
 const DETAIL_FIELDS_BY_EVENT: Record<string, readonly string[]> = {
+  client_offline: ["lastAuthenticatedSeenAt", "confirmedOfflineAt"],
   client_provisioned: [
     "providerEmail",
     "hostname",
@@ -570,6 +573,11 @@ export function chatSystemEventText(message: StructuredChatMessage, t: TFn, loca
     case "client_provisioned":
       return t("chat.event.clientProvisioned", {
         client: payloadString(payload, "clientLabel"),
+      });
+    case "client_offline":
+      return t("chat.event.clientOffline", {
+        client: payloadString(payload, "clientLabel"),
+        time: payloadTime(payload, "lastAuthenticatedSeenAt", locale),
       });
     case "free_period_expiring":
       return t("chat.event.freePeriodExpiring", {

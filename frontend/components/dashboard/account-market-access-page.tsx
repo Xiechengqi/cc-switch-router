@@ -1133,12 +1133,13 @@ export function AccountMarketAccessPage() {
               <label className="flex h-9 min-w-0 flex-1 items-center gap-2 rounded-md border border-border bg-white px-3 text-sm focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-primary/10 sm:min-w-64">
                 <Search className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
                 <input
-                  type="search"
+                  type="text"
                   value={buyerQuery}
                   onChange={(event) => setBuyerQuery(event.target.value)}
                   className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground"
                   placeholder={t("marketAccess.searchBuyers")}
                   aria-label={t("marketAccess.searchBuyers")}
+                  autoComplete="off"
                 />
                 {buyerQuery ? (
                   <button

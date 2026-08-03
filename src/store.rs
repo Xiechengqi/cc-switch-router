@@ -2205,6 +2205,19 @@ impl AppStore {
                     .map_err(|error| {
                         AppError::Internal(format!("confirm client offline failed: {error}"))
                     })?;
+                    let last_seen_timestamp = last_seen.to_rfc3339();
+                    let verified_owner_email = state
+                        .owner_verified_at
+                        .as_ref()
+                        .and_then(|_| state.owner_email.as_deref());
+                    enqueue_client_offline_chat_event_tx(
+                        &tx,
+                        &state.installation_id,
+                        verified_owner_email,
+                        episode,
+                        &last_seen_timestamp,
+                        &now,
+                    )?;
                     let snapshot = serde_json::json!({
                         "installationId": state.installation_id,
                         "platform": state.platform,
@@ -15459,6 +15472,19 @@ fn materialize_offline_events_before_cleanup_tx(
         .map_err(|error| {
             AppError::Internal(format!("materialize cleanup offline state failed: {error}"))
         })?;
+        if let Some(last_authenticated_seen_at) = last_authenticated_seen_at.as_deref() {
+            let verified_owner_email = owner_verified_at
+                .as_ref()
+                .and_then(|_| owner_email.as_deref());
+            enqueue_client_offline_chat_event_tx(
+                conn,
+                &installation_id,
+                verified_owner_email,
+                episode,
+                last_authenticated_seen_at,
+                &now,
+            )?;
+        }
         let status = if should_notify {
             "pending"
         } else if notifications_enabled {
@@ -15506,6 +15532,55 @@ fn materialize_offline_events_before_cleanup_tx(
         })?;
     }
     Ok(())
+}
+
+fn enqueue_client_offline_chat_event_tx(
+    conn: &Connection,
+    installation_id: &str,
+    verified_owner_email: Option<&str>,
+    episode: i64,
+    last_authenticated_seen_at: &str,
+    confirmed_offline_at: &DateTime<Utc>,
+) -> Result<(), AppError> {
+    let Some(owner_email) = verified_owner_email
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    let room_id = client_chat::ensure_room_for_verified_owner_tx(
+        conn,
+        installation_id,
+        owner_email,
+        confirmed_offline_at.to_owned(),
+    )?;
+    let client_label = conn
+        .query_row(
+            "SELECT client_label_snapshot FROM chat_rooms WHERE id = ?1",
+            params![room_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("read Client offline chat label failed: {error}"))
+        })?;
+    let source_event_id = format!("offline:{installation_id}:{episode}");
+    let summary = format!("Client {client_label} is confirmed offline.");
+    let confirmed_offline_at = confirmed_offline_at.to_rfc3339();
+    client_chat::enqueue_client_system_event_tx(
+        conn,
+        installation_id,
+        "client_presence",
+        &source_event_id,
+        "client_offline",
+        serde_json::json!({
+            "summary": summary,
+            "clientLabel": client_label,
+            "lastAuthenticatedSeenAt": last_authenticated_seen_at,
+            "confirmedOfflineAt": confirmed_offline_at,
+        }),
+        &[],
+        &confirmed_offline_at,
+    )
 }
 
 fn add_column_if_missing(
@@ -30929,6 +31004,7 @@ mod tests {
         let config = enabled_notification_config("offline-presence-episodes");
         let store = AppStore::new(&config).expect("create store");
         let signing_key = insert_signed_installation(&store, "inst-presence").await;
+        insert_setup_client_tunnel(&store, "inst-presence", "presence-client").await;
         let payload = crate::models::InstallationHeartbeatPayload {
             protocol_version: 1,
             boot_id: "boot-presence".into(),
@@ -30968,19 +31044,57 @@ mod tests {
             .expect("repeat offline scan");
         {
             let conn = store.conn.lock().await;
-            let state: (String, i64, i64) = conn
+            let state: (String, i64, i64, i64) = conn
                 .query_row(
                     "SELECT ns.presence_state, ns.offline_episode,
                             (SELECT COUNT(*) FROM client_notification_events e
                              WHERE e.installation_id = ns.installation_id
-                               AND e.kind = 'client_offline')
+                               AND e.kind = 'client_offline'),
+                            (SELECT COUNT(*) FROM client_chat_system_outbox o
+                             WHERE o.installation_id = ns.installation_id
+                               AND o.event_type = 'client_offline')
                      FROM installation_notification_state ns
                      WHERE ns.installation_id = 'inst-presence'",
                     [],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .expect("read first offline episode");
-            assert_eq!(state, ("offline".into(), 1, 1));
+            assert_eq!(state, ("offline".into(), 1, 1, 1));
+            let (source_kind, source_event_id, event_type, payload_json): (
+                String,
+                String,
+                String,
+                String,
+            ) = conn
+                .query_row(
+                    "SELECT source_kind, source_event_id, event_type, payload_json
+                     FROM client_chat_system_outbox
+                     WHERE installation_id = 'inst-presence'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("read first offline chat event");
+            assert_eq!(source_kind, "client_presence");
+            assert_eq!(source_event_id, "offline:inst-presence:1");
+            assert_eq!(event_type, "client_offline");
+            let event_payload: serde_json::Value =
+                serde_json::from_str(&payload_json).expect("parse offline chat payload");
+            assert_eq!(event_payload["clientLabel"], "presence-client");
+            assert_eq!(
+                event_payload["confirmedOfflineAt"],
+                offline_now.to_rfc3339()
+            );
+            let stored_last_seen: String = conn
+                .query_row(
+                    "SELECT last_authenticated_seen_at
+                     FROM installation_notification_state
+                     WHERE installation_id = 'inst-presence'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read trusted heartbeat timestamp");
+            assert_eq!(event_payload["lastAuthenticatedSeenAt"], stored_last_seen);
+            assert_eq!(event_payload.as_object().map(|value| value.len()), Some(4));
             conn.execute(
                 "UPDATE installation_notification_state
                  SET presence_state = 'recovering', recovery_candidate_since = ?2,
@@ -31008,6 +31122,133 @@ mod tests {
             )
             .expect("read recovered presence");
         assert_eq!(presence, "online");
+        drop(conn);
+
+        let recovered_last_seen = offline_now + Duration::seconds(100);
+        let second_offline_now =
+            recovered_last_seen + Duration::seconds(policy.offline_alert_secs + 1);
+        store
+            .reconcile_client_notification_events(&policy, second_offline_now)
+            .await
+            .expect("confirm second offline episode inside email cooldown");
+        {
+            let conn = store.conn.lock().await;
+            let outbox_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM client_chat_system_outbox
+                     WHERE installation_id = 'inst-presence'
+                       AND event_type = 'client_offline'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count offline chat episodes");
+            assert_eq!(outbox_count, 2);
+            let second_notification_status: String = conn
+                .query_row(
+                    "SELECT status FROM client_notification_events
+                     WHERE installation_id = 'inst-presence'
+                       AND kind = 'client_offline' AND episode = 2",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read cooldown-suppressed notification");
+            assert_eq!(second_notification_status, "suppressed_cooldown");
+        }
+        assert_eq!(
+            store
+                .process_client_chat_system_outbox(100)
+                .await
+                .expect("materialize offline chat episodes"),
+            2
+        );
+        let conn = store.conn.lock().await;
+        let message_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chat_messages
+                 WHERE event_type = 'client_offline'
+                   AND source_event_id LIKE 'client_presence:offline:inst-presence:%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count offline chat messages");
+        let chat_email_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chat_email_events", [], |row| {
+                row.get(0)
+            })
+            .expect("count chat email events");
+        assert_eq!(message_count, 2);
+        assert_eq!(chat_email_count, 0);
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
+    async fn offline_chat_event_is_independent_from_disabled_email_notifications() {
+        let mut config = test_config("offline-chat-with-notifications-disabled");
+        config.client_notifications.enabled = false;
+        let store = AppStore::new(&config).expect("create store");
+        insert_signed_installation(&store, "inst-disabled-offline-chat").await;
+        insert_setup_client_tunnel(
+            &store,
+            "inst-disabled-offline-chat",
+            "disabled-offline-client",
+        )
+        .await;
+        let policy = notification_policy(&config);
+        assert!(!policy.enabled);
+        let last_seen = Utc::now() - Duration::seconds(policy.offline_alert_secs + 1);
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO installation_notification_state (
+                    installation_id, registration_state, registration_verified_at,
+                    monitoring_enabled, presence_state, last_authenticated_seen_at,
+                    offline_episode, created_at, updated_at
+                 ) VALUES (?1, 'verified', ?2, 1, 'online', ?2, 0, ?2, ?2)",
+                params!["inst-disabled-offline-chat", last_seen.to_rfc3339()],
+            )
+            .expect("insert disabled notification presence state");
+        }
+        store
+            .reconcile_client_notification_events(&policy, Utc::now())
+            .await
+            .expect("confirm offline while email notifications are disabled");
+        {
+            let conn = store.conn.lock().await;
+            let (notification_status, outbox_count): (String, i64) = conn
+                .query_row(
+                    "SELECT e.status,
+                            (SELECT COUNT(*) FROM client_chat_system_outbox o
+                             WHERE o.installation_id = e.installation_id
+                               AND o.event_type = 'client_offline')
+                     FROM client_notification_events e
+                     WHERE e.installation_id = 'inst-disabled-offline-chat'
+                       AND e.kind = 'client_offline'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read disabled notification offline event");
+            assert_eq!(notification_status, "suppressed_disabled");
+            assert_eq!(outbox_count, 1);
+        }
+        assert_eq!(
+            store
+                .process_client_chat_system_outbox(100)
+                .await
+                .expect("materialize disabled-notification chat event"),
+            1
+        );
+        let conn = store.conn.lock().await;
+        let (message_count, email_count): (i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM chat_messages WHERE event_type = 'client_offline'),
+                    (SELECT COUNT(*) FROM chat_email_events)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("count disabled-notification chat outputs");
+        assert_eq!((message_count, email_count), (1, 0));
         drop(conn);
         let _ = std::fs::remove_file(PathBuf::from(config.db_path));
     }
@@ -38183,6 +38424,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_offline_fallback_materializes_into_archived_client_chat() {
+        let mut config = test_config("cleanup-offline-archived-client-chat");
+        config.client_notifications.enabled = false;
+        let store = AppStore::new(&config).expect("create store");
+        let installation_id = "inst-cleanup-offline-chat";
+        let _signing_key = insert_signed_installation(&store, installation_id).await;
+        insert_setup_client_tunnel(&store, installation_id, "cleanup-offline-client").await;
+        let stale = Utc::now()
+            - Duration::seconds(
+                config
+                    .client_installation_retention_secs
+                    .max(config.client_stale_secs)
+                    + 60,
+            );
+        {
+            let conn = store.conn.lock().await;
+            let room_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM chat_rooms WHERE installation_id = ?1",
+                    params![installation_id],
+                    |row| row.get(0),
+                )
+                .expect("count pre-cleanup Client rooms");
+            assert_eq!(room_count, 0);
+            conn.execute(
+                "UPDATE installations SET last_seen_at = ?2 WHERE id = ?1",
+                params![installation_id, stale.to_rfc3339()],
+            )
+            .expect("backdate cleanup chat installation");
+            conn.execute(
+                "INSERT INTO installation_notification_state (
+                    installation_id, registration_state, registration_verified_at,
+                    monitoring_enabled, presence_state, last_authenticated_seen_at,
+                    offline_episode, created_at, updated_at
+                 ) VALUES (?1, 'verified', ?2, 1, 'online', ?2, 0, ?2, ?2)",
+                params![installation_id, stale.to_rfc3339()],
+            )
+            .expect("insert cleanup chat presence state");
+        }
+
+        let result = store
+            .cleanup_expired_data(&config, &ProxyRegistry::default())
+            .await
+            .expect("cleanup offline Client with chat event");
+        assert_eq!(result.deleted_installations, 1);
+        {
+            let conn = store.conn.lock().await;
+            let installation_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM installations WHERE id = ?1",
+                    params![installation_id],
+                    |row| row.get(0),
+                )
+                .expect("count cleaned installation");
+            let (room_status, outbox_count): (String, i64) = conn
+                .query_row(
+                    "SELECT r.status,
+                            (SELECT COUNT(*) FROM client_chat_system_outbox o
+                             WHERE o.installation_id = r.installation_id
+                               AND o.event_type = 'client_offline')
+                     FROM chat_rooms r WHERE r.installation_id = ?1",
+                    params![installation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read archived Client room and offline outbox");
+            assert_eq!(installation_count, 0);
+            assert_eq!(room_status, "archived");
+            assert_eq!(outbox_count, 1);
+        }
+        assert_eq!(
+            store
+                .process_client_chat_system_outbox(100)
+                .await
+                .expect("materialize cleanup offline event into archived room"),
+            1
+        );
+        let conn = store.conn.lock().await;
+        let (room_status, message_count, chat_email_count): (String, i64, i64) = conn
+            .query_row(
+                "SELECT r.status,
+                        (SELECT COUNT(*) FROM chat_messages m
+                         WHERE m.room_id = r.id AND m.event_type = 'client_offline'),
+                        (SELECT COUNT(*) FROM chat_email_events)
+                 FROM chat_rooms r WHERE r.installation_id = ?1",
+                params![installation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read materialized archived offline event");
+        assert_eq!(room_status, "archived");
+        assert_eq!(message_count, 1);
+        assert_eq!(chat_email_count, 0);
+        drop(conn);
+        let _ = std::fs::remove_file(PathBuf::from(config.db_path));
+    }
+
+    #[tokio::test]
     async fn cleanup_retains_installation_until_offline_notification_is_terminal() {
         let mut config = enabled_notification_config("cleanup-pending-offline-event");
         config.cleanup_interval_secs = 60;
@@ -38238,8 +38575,17 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("read pending offline event");
+        let chat_outbox_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM client_chat_system_outbox
+                 WHERE installation_id = 'inst-pending-offline'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count unverified Owner chat outbox events");
         assert_eq!(retained, 1);
         assert_eq!(event_status, "pending");
+        assert_eq!(chat_outbox_count, 0);
         drop(conn);
 
         let policy = notification_policy(&config);
