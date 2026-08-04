@@ -784,24 +784,30 @@ pub(crate) async fn dispatch_actions(state: &ServerState, actions: Vec<BillingAc
                 )
                 .await
             }
-            (BillingActionKind::Suspend, "client_host") => match state
-                .store
-                .client_market_set_billing_suspended(&action.service_ref, true)
-                .await
-            {
-                Ok(subdomain) => {
-                    if let Some(subdomain) = subdomain {
-                        state.proxy.remove_route(&subdomain).await;
+            (BillingActionKind::Suspend, "client_host") => {
+                let _recovery_guard = state.client_market_recovery.lock(&action.service_ref).await;
+                match state
+                    .store
+                    .client_market_set_billing_suspended(&action.service_ref, true)
+                    .await
+                {
+                    Ok(subdomain) => {
+                        if let Some(subdomain) = subdomain {
+                            state.proxy.remove_route(&subdomain).await;
+                        }
+                        Ok(())
                     }
-                    Ok(())
+                    Err(error) => Err(error),
                 }
-                Err(error) => Err(error),
-            },
-            (BillingActionKind::Resume, "client_host") => state
-                .store
-                .client_market_set_billing_suspended(&action.service_ref, false)
-                .await
-                .map(|_| ()),
+            }
+            (BillingActionKind::Resume, "client_host") => {
+                let _recovery_guard = state.client_market_recovery.lock(&action.service_ref).await;
+                state
+                    .store
+                    .client_market_set_billing_suspended(&action.service_ref, false)
+                    .await
+                    .map(|_| ())
+            }
             (BillingActionKind::Terminate, "client_host") => {
                 crate::client_market::terminate_for_billing(
                     state,
@@ -1897,6 +1903,24 @@ impl AppStore {
             ],
         )
         .map_err(map_db("update Client subscription billing suspension"))?;
+        if suspended {
+            tx.execute(
+                "UPDATE provisioning_jobs
+                 SET status = 'failed', phase = 'complete',
+                     failure_code = 'recovery_suspended_for_billing',
+                     log_blob = substr(COALESCE(log_blob, '') || 'recovery cancelled by billing suspension\n', -131072),
+                     updated_at = ?2
+                 WHERE installation_id = ?1 AND type = 'recover'
+                   AND status IN ('pending', 'running')",
+                params![installation_id, now],
+            )
+            .map_err(map_db("cancel Client recovery for billing suspension"))?;
+            tx.execute(
+                "DELETE FROM client_market_recovery_state WHERE installation_id = ?1",
+                params![installation_id],
+            )
+            .map_err(map_db("clear Client recovery for billing suspension"))?;
+        }
         tx.commit()
             .map_err(map_db("commit Client billing suspension"))?;
         Ok(tunnel.0)

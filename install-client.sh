@@ -75,6 +75,92 @@ disable_web_terminal() {
   fi
 }
 
+install_systemd_service() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+  [ -d /run/systemd/system ] || return 1
+  INFO "Installing systemd service for cc-switch-server"
+  local service_file="/etc/systemd/system/cc-switch-server.service"
+  local service_tmp
+  service_tmp=$(mktemp) || ERROR "Unable to create systemd service temporary file"
+  cat > "${service_tmp}" <<'EOF'
+[Unit]
+Description=cc-switch-server
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=root
+Environment=HOME=/root
+WorkingDirectory=/root
+ExecStart=/usr/local/bin/cc-switch-server
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  install -m 0644 "${service_tmp}" "${service_file}" \
+    || { rm -f "${service_tmp}"; ERROR "Unable to install systemd service"; }
+  rm -f "${service_tmp}"
+  systemctl daemon-reload || ERROR "Unable to reload systemd"
+  systemctl enable cc-switch-server.service || ERROR "Unable to enable cc-switch-server"
+  systemctl reset-failed cc-switch-server.service >/dev/null 2>&1 || true
+  systemctl start cc-switch-server.service || ERROR "Unable to start cc-switch-server"
+  SERVICE_MANAGER="systemd"
+  return 0
+}
+
+install_openrc_service() {
+  command -v rc-service >/dev/null 2>&1 || return 1
+  command -v rc-update >/dev/null 2>&1 || return 1
+  [ -d /etc/init.d ] || return 1
+  INFO "Installing OpenRC service for cc-switch-server"
+  local service_file="/etc/init.d/cc-switch-server"
+  local service_tmp
+  service_tmp=$(mktemp) || ERROR "Unable to create OpenRC service temporary file"
+  cat > "${service_tmp}" <<'EOF'
+#!/sbin/openrc-run
+
+name="cc-switch-server"
+description="cc-switch-server"
+command="/usr/local/bin/cc-switch-server"
+command_user="root:root"
+directory="/root"
+supervisor="supervise-daemon"
+respawn_delay=30
+respawn_max=3
+respawn_period=600
+
+depend() {
+  need net
+  after firewall
+}
+EOF
+  install -m 0755 "${service_tmp}" "${service_file}" \
+    || { rm -f "${service_tmp}"; ERROR "Unable to install OpenRC service"; }
+  rm -f "${service_tmp}"
+  rc-update add cc-switch-server default >/dev/null \
+    || ERROR "Unable to enable cc-switch-server OpenRC service"
+  rc-service cc-switch-server start || ERROR "Unable to start cc-switch-server OpenRC service"
+  SERVICE_MANAGER="openrc"
+  return 0
+}
+
+start_cc_switch_server() {
+  SERVICE_MANAGER="nohup"
+  if install_systemd_service; then
+    return 0
+  fi
+  if install_openrc_service; then
+    return 0
+  fi
+  YELLOW "No supported service manager found; using nohup fallback"
+  EXEC "nohup /usr/local/bin/${binary} </dev/null &> /dev/null &"
+}
+
 main() {
 
 # check location
@@ -153,8 +239,9 @@ else
 fi
 unset PASSWORD PASSWORD_ARG
 [ "${DISABLE_WEB_TERMINAL}" -eq 1 ] && disable_web_terminal
-EXEC "nohup /usr/local/bin/${binary} &> /dev/null &"
+start_cc_switch_server
 EXEC "sleep 3"
+INFO "Client process manager: ${SERVICE_MANAGER}"
 SUBDOMAIN=$(grep tunnelSubdomain $HOME/.cc-switch-server/server.json  | awk -F '"' '{print $(NF-1)}')
 SUBDOMAIN_URL=$(echo ${ROUTER} | sed "s/:\/\//:\/\/${SUBDOMAIN}\./")
 

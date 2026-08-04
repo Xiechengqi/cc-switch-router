@@ -2492,6 +2492,7 @@ mod tests {
             client_stale_secs: 60 * 60,
             client_installation_retention_secs: 6 * 60 * 60,
             paused_share_stale_secs: 60 * 60,
+            client_market_recovery_enabled: true,
             resend_api_key: None,
             resend_from: None,
             resend_from_name: None,

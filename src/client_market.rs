@@ -199,7 +199,19 @@ cc_switch_server_is_running() {
   pids=$(cc_switch_server_list_pids)
   [ -n "$pids" ]
 }
+cc_switch_server_stop_supervisor() {
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    systemctl disable --now cc-switch-server.service >/dev/null 2>&1 || true
+  fi
+  if command -v rc-service >/dev/null 2>&1; then
+    rc-service cc-switch-server stop >/dev/null 2>&1 || true
+  fi
+  if command -v rc-update >/dev/null 2>&1; then
+    rc-update del cc-switch-server default >/dev/null 2>&1 || true
+  fi
+}
 cc_switch_server_stop() {
+  cc_switch_server_stop_supervisor
   if ! cc_switch_server_is_running; then
     return 0
   fi
@@ -229,6 +241,13 @@ cc_switch_server_home() {
 }
 cc_switch_server_wipe_files() {
   home="$(cc_switch_server_home)"
+  cc_switch_server_stop_supervisor
+  rm -f /etc/systemd/system/cc-switch-server.service
+  rm -f /etc/init.d/cc-switch-server
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl reset-failed cc-switch-server.service >/dev/null 2>&1 || true
+  fi
   rm -f /usr/local/bin/cc-switch-server
   rm -rf "${home}/.cc-switch-server"
   # Unmatched globs must not abort under `set -e`.
@@ -633,6 +652,18 @@ pub fn router() -> Router<ServerState> {
             "/v1/client-market/hosts/:id/ssh-host-key/rotate",
             post(rotate_host_ssh_key),
         )
+        .route(
+            "/v1/client-market/hosts/:id/recovery/pause",
+            post(pause_host_recovery),
+        )
+        .route(
+            "/v1/client-market/hosts/:id/recovery/resume",
+            post(resume_host_recovery),
+        )
+        .route(
+            "/v1/client-market/hosts/:id/recovery/retry",
+            post(retry_host_recovery),
+        )
         .route("/v1/client-market/jobs/:id", get(get_job))
         .route(
             "/v1/client-market/clients/:installation_id/release",
@@ -715,6 +746,10 @@ struct RouterSshHostView {
     is_host_owner: bool,
     #[serde(default)]
     is_client_owner: bool,
+    #[serde(default)]
+    can_control_recovery: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery: Option<crate::client_market_recovery::ClientMarketRecoveryView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_verified_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -755,6 +790,11 @@ async fn list_hosts(
     Query(query): Query<ListHostsQuery>,
 ) -> Result<Json<Vec<RouterSshHostView>>, AppError> {
     let viewer = extract_optional_session(&state, &headers).await?;
+    let viewer_is_admin = if let Some(session) = viewer.as_ref() {
+        state.dynamic.read().await.is_admin(&session.email)
+    } else {
+        false
+    };
     let hosts = state
         .store
         .client_market_list_hosts(
@@ -762,6 +802,33 @@ async fn list_hosts(
             query.country.as_deref(),
             query.status.as_deref(),
         )
+        .await?;
+    let recovery_host_ids = if state.config.client_market_recovery_enabled {
+        viewer
+            .as_ref()
+            .map(|session| {
+                hosts
+                    .iter()
+                    .filter(|host| {
+                        viewer_is_admin
+                            || session_is_host_owner(
+                                session,
+                                host.provider_id.as_deref(),
+                                &host.host_owner_email,
+                            )
+                            || host.client_owner_user_id.as_deref()
+                                == Some(session.user_id.as_str())
+                    })
+                    .map(|host| host.id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let recovery_by_host = state
+        .store
+        .client_market_recovery_views_for_hosts(&recovery_host_ids)
         .await?;
     let mut access_by_scope = HashMap::new();
     let mut eligibility_by_scope = HashMap::new();
@@ -813,6 +880,19 @@ async fn list_hosts(
             });
             let reveal_operations = is_host_owner;
             let reveal_installation = reveal_operations || is_client_owner;
+            let reveal_recovery_detail = is_host_owner || viewer_is_admin;
+            let can_control_recovery =
+                state.config.client_market_recovery_enabled && reveal_recovery_detail;
+            let recovery = if reveal_installation || viewer_is_admin {
+                recovery_by_host.get(&host.id).cloned().map(|mut recovery| {
+                    if !reveal_recovery_detail {
+                        recovery.blocked_reason = None;
+                    }
+                    recovery
+                })
+            } else {
+                None
+            };
             // Web Terminal is host-owner only — not admins or client owners.
             let can_web_terminal = is_host_owner;
             let seller_approval_required = host_seller_approval_required(
@@ -881,6 +961,8 @@ async fn list_hosts(
                 can_web_terminal,
                 is_host_owner,
                 is_client_owner,
+                can_control_recovery,
+                recovery,
                 last_verified_at: reveal_operations.then_some(host.last_verified_at).flatten(),
                 last_error: reveal_operations.then_some(host.last_error).flatten(),
                 note: reveal_operations.then_some(host.note).flatten(),
@@ -1532,6 +1614,61 @@ async fn reverify_host(
     Ok(Json(host_to_view(updated, true)))
 }
 
+async fn pause_host_recovery(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<crate::client_market_recovery::ClientMarketRecoveryView>, AppError> {
+    control_host_recovery(
+        &state,
+        &headers,
+        &id,
+        crate::client_market_recovery::RecoveryControlAction::Pause,
+    )
+    .await
+    .map(Json)
+}
+
+async fn resume_host_recovery(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<crate::client_market_recovery::ClientMarketRecoveryView>, AppError> {
+    control_host_recovery(
+        &state,
+        &headers,
+        &id,
+        crate::client_market_recovery::RecoveryControlAction::Resume,
+    )
+    .await
+    .map(Json)
+}
+
+async fn retry_host_recovery(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<crate::client_market_recovery::ClientMarketRecoveryView>, AppError> {
+    control_host_recovery(
+        &state,
+        &headers,
+        &id,
+        crate::client_market_recovery::RecoveryControlAction::Retry,
+    )
+    .await
+    .map(Json)
+}
+
+async fn control_host_recovery(
+    state: &ServerState,
+    headers: &HeaderMap,
+    host_id: &str,
+    action: crate::client_market_recovery::RecoveryControlAction,
+) -> Result<crate::client_market_recovery::ClientMarketRecoveryView, AppError> {
+    let session = require_session(state, headers).await?;
+    crate::client_market_recovery::control_recovery(state, &session, host_id, action).await
+}
+
 async fn scan_host_ssh_key(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -1769,18 +1906,21 @@ async fn start_client_cleanup(
         .client_market_subdomain_for_installation(&installation_id)
         .await?;
     // Session admins are not elevated: only the Host owner or Client owner may cleanup.
-    let job_id = state
-        .store
-        .client_market_begin_cleanup_job_with_context(
-            &installation_id,
-            Some(&session.user_id),
-            &viewer,
-            false,
-            Some(required_role),
-            reason,
-            Some(deny_client_access),
-        )
-        .await?;
+    let job_id = {
+        let _recovery_guard = state.client_market_recovery.lock(&installation_id).await;
+        state
+            .store
+            .client_market_begin_cleanup_job_with_context(
+                &installation_id,
+                Some(&session.user_id),
+                &viewer,
+                false,
+                Some(required_role),
+                reason,
+                Some(deny_client_access),
+            )
+            .await?
+    };
     if let Some(subdomain) = subdomain.as_deref() {
         state.proxy.remove_route(subdomain).await;
     }
@@ -1824,11 +1964,14 @@ pub(crate) async fn terminate_for_billing(
         .store
         .client_market_subdomain_for_installation(installation_id)
         .await?;
-    let job_id = match state
-        .store
-        .client_market_begin_system_cleanup_job(installation_id, reason)
-        .await
-    {
+    let begin_cleanup = {
+        let _recovery_guard = state.client_market_recovery.lock(installation_id).await;
+        state
+            .store
+            .client_market_begin_system_cleanup_job(installation_id, reason)
+            .await
+    };
+    let job_id = match begin_cleanup {
         Ok(job_id) => job_id,
         Err(AppError::Conflict(_)) => {
             let conn = state.store.conn.lock().await;
@@ -1972,6 +2115,9 @@ pub async fn reconcile_interrupted_jobs(state: ServerState) -> Result<(), AppErr
                         handle_cleanup_job_failure(&runner_state, &job_id, error).await;
                     }
                 }
+                crate::client_market_recovery::JOB_TYPE_RECOVER => {
+                    crate::client_market_recovery::resume_interrupted_job(runner_state, job).await;
+                }
                 _ => {
                     let _ = runner_state
                         .store
@@ -2075,11 +2221,14 @@ pub async fn reconcile_stale_market_hosts(state: ServerState) -> Result<(), AppE
             installation_id = %installation_id,
             "spawning cleanup for stale draining host"
         );
-        match state
-            .store
-            .client_market_begin_system_cleanup_job(&installation_id, "stale_draining_recovery")
-            .await
-        {
+        let begin_cleanup = {
+            let _recovery_guard = state.client_market_recovery.lock(&installation_id).await;
+            state
+                .store
+                .client_market_begin_system_cleanup_job(&installation_id, "stale_draining_recovery")
+                .await
+        };
+        match begin_cleanup {
             Ok(job_id) => {
                 let runner_state = state.clone();
                 tokio::spawn(async move {
@@ -3465,6 +3614,114 @@ async fn ssh_wipe_cc_switch_files(
     .await
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClientRecoveryRemoteOutcome {
+    AlreadyRunning,
+    Started { method: String },
+    MissingBinary,
+    MissingConfig,
+    StartFailed { method: String },
+}
+
+/// Check and, only when absent, start the Client Market process. The command is
+/// idempotent and keeps strict SSH host verification enabled for unattended recovery.
+pub(crate) async fn ssh_recover_market_client_process(
+    state: &ServerState,
+    host: &RouterSshHostRecord,
+) -> Result<ClientRecoveryRemoteOutcome, AppError> {
+    let known_hosts = known_hosts_path(&state.config);
+    require_pinned_host_fingerprint(host, &known_hosts).await?;
+    let command = format!(
+        "{helpers}\
+         set +e; \
+         if cc_switch_server_is_running; then \
+           echo 'CC_SWITCH_RECOVERY=already_running'; exit 0; \
+         fi; \
+         if [ ! -x /usr/local/bin/cc-switch-server ]; then \
+           echo 'CC_SWITCH_RECOVERY=missing_binary'; exit 0; \
+         fi; \
+         home=$(cc_switch_server_home); \
+         if [ ! -r \"$home/.cc-switch-server/server.json\" ]; then \
+           echo 'CC_SWITCH_RECOVERY=missing_config'; exit 0; \
+         fi; \
+         method=nohup; started=0; \
+         if command -v systemctl >/dev/null 2>&1 \
+              && [ -d /run/systemd/system ] \
+              && systemctl cat cc-switch-server.service >/dev/null 2>&1; then \
+           method=systemd; \
+           systemctl start cc-switch-server.service >/dev/null 2>&1 && started=1; \
+         elif command -v rc-service >/dev/null 2>&1 \
+              && [ -x /etc/init.d/cc-switch-server ]; then \
+           method=openrc; \
+           rc-service cc-switch-server start >/dev/null 2>&1 && started=1; \
+         else \
+           cd \"$home\" >/dev/null 2>&1 \
+             && nohup /usr/local/bin/cc-switch-server </dev/null >/dev/null 2>&1 & \
+           started=1; \
+         fi; \
+         if [ \"$started\" -ne 1 ]; then \
+           echo \"CC_SWITCH_RECOVERY=start_failed:$method\"; exit 0; \
+         fi; \
+         sleep 2; \
+         if cc_switch_server_is_running; then \
+           echo \"CC_SWITCH_RECOVERY=started:$method\"; \
+         else \
+           echo \"CC_SWITCH_RECOVERY=start_failed:$method\"; \
+         fi",
+        helpers = REMOTE_CC_SWITCH_SERVER_HELPERS,
+    );
+    let output = ssh_run_remote_with_input_connect_timeout(
+        &state.provision_ssh_key_path,
+        &known_hosts,
+        &host.ip,
+        host.port,
+        &command,
+        None,
+        Duration::from_secs(45),
+        SshHostKeyPolicy::RequireKnown,
+        10,
+    )
+    .await?;
+    parse_client_recovery_remote_outcome(&output)
+}
+
+fn parse_client_recovery_remote_outcome(
+    output: &str,
+) -> Result<ClientRecoveryRemoteOutcome, AppError> {
+    let marker = output
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("CC_SWITCH_RECOVERY="))
+        .ok_or_else(|| {
+            AppError::ServiceUnavailable(
+                "recovery command completed without a valid result marker".into(),
+            )
+        })?;
+    match marker {
+        "already_running" => Ok(ClientRecoveryRemoteOutcome::AlreadyRunning),
+        "missing_binary" => Ok(ClientRecoveryRemoteOutcome::MissingBinary),
+        "missing_config" => Ok(ClientRecoveryRemoteOutcome::MissingConfig),
+        value if value.starts_with("started:") => Ok(ClientRecoveryRemoteOutcome::Started {
+            method: recovery_method(value.trim_start_matches("started:"))?,
+        }),
+        value if value.starts_with("start_failed:") => {
+            Ok(ClientRecoveryRemoteOutcome::StartFailed {
+                method: recovery_method(value.trim_start_matches("start_failed:"))?,
+            })
+        }
+        _ => Err(AppError::ServiceUnavailable(
+            "recovery command returned an unknown result marker".into(),
+        )),
+    }
+}
+
+fn recovery_method(value: &str) -> Result<String, AppError> {
+    matches!(value, "systemd" | "openrc" | "nohup")
+        .then(|| value.to_string())
+        .ok_or_else(|| AppError::ServiceUnavailable("recovery method marker is invalid".into()))
+}
+
 /// True when the remote host has no running process and no install/backup files.
 async fn ssh_remote_is_market_clean(
     state: &ServerState,
@@ -4149,6 +4406,32 @@ async fn ssh_run_remote_with_input(
     timeout: Duration,
     host_key_policy: SshHostKeyPolicy,
 ) -> Result<String, AppError> {
+    ssh_run_remote_with_input_connect_timeout(
+        key_path,
+        known_hosts,
+        ip,
+        port,
+        remote_command,
+        stdin,
+        timeout,
+        host_key_policy,
+        30,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn ssh_run_remote_with_input_connect_timeout(
+    key_path: &Path,
+    known_hosts: &Path,
+    ip: &str,
+    port: u16,
+    remote_command: &str,
+    stdin: Option<Vec<u8>>,
+    timeout: Duration,
+    host_key_policy: SshHostKeyPolicy,
+    connect_timeout_secs: u64,
+) -> Result<String, AppError> {
     if let Some(parent) = known_hosts.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             AppError::Internal(format!(
@@ -4202,7 +4485,7 @@ async fn ssh_run_remote_with_input(
         .arg("-o")
         .arg("UpdateHostKeys=no")
         .arg("-o")
-        .arg("ConnectTimeout=30")
+        .arg(format!("ConnectTimeout={connect_timeout_secs}"))
         .arg("-o")
         .arg("ServerAliveInterval=10")
         .arg("-o")
@@ -4509,6 +4792,8 @@ fn host_to_view(host: RouterSshHostRecord, reveal: bool) -> RouterSshHostView {
         can_web_terminal: false,
         is_host_owner: false,
         is_client_owner: false,
+        can_control_recovery: false,
+        recovery: None,
         last_verified_at: reveal.then_some(host.last_verified_at).flatten(),
         last_error: reveal.then_some(host.last_error).flatten(),
         note: reveal.then_some(host.note).flatten(),
@@ -6558,6 +6843,29 @@ impl AppStore {
                 "client host is already being cleaned or is unavailable".into(),
             ));
         }
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE provisioning_jobs
+             SET status = 'failed', phase = 'complete', failure_code = 'recovery_cancelled',
+                 log_blob = substr(COALESCE(log_blob, '') || 'recovery cancelled by cleanup\n', -131072),
+                 updated_at = ?3
+             WHERE host_id = ?1 AND installation_id = ?2 AND type = 'recover'
+               AND status IN ('pending', 'running')",
+            params![host.0, installation_id, now],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("cancel recovery before cleanup failed: {error}"))
+        })?;
+        tx.execute(
+            "DELETE FROM client_market_recovery_state
+             WHERE installation_id = ?1 AND host_id = ?2",
+            params![installation_id, host.0],
+        )
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "clear recovery state before cleanup failed: {error}"
+            ))
+        })?;
         if host.3 == HOST_STATUS_DRAINING {
             let active: i64 = tx
                 .query_row(
@@ -6576,7 +6884,6 @@ impl AppStore {
             }
         }
         let job_id = Uuid::new_v4().to_string();
-        let now = Utc::now().to_rfc3339();
         let client_owner_email = subscription_owner
             .as_ref()
             .map(|owner| owner.1.as_str())
@@ -7066,6 +7373,7 @@ mod tests {
             client_stale_secs: 60 * 60,
             client_installation_retention_secs: 6 * 60 * 60,
             paused_share_stale_secs: 60 * 60,
+            client_market_recovery_enabled: true,
             resend_api_key: None,
             resend_from: None,
             resend_from_name: None,
@@ -10157,6 +10465,41 @@ mod tests {
             REMOTE_CC_SWITCH_SERVER_HELPERS.contains("kill -9"),
             "stop must escalate to SIGKILL when SIGTERM is ignored"
         );
+        assert!(
+            REMOTE_CC_SWITCH_SERVER_HELPERS
+                .contains("systemctl disable --now cc-switch-server.service"),
+            "cleanup must disable systemd before killing the process"
+        );
+        assert!(
+            REMOTE_CC_SWITCH_SERVER_HELPERS.contains("rc-update del cc-switch-server default"),
+            "cleanup must disable OpenRC before killing the process"
+        );
+    }
+
+    #[test]
+    fn recovery_remote_markers_are_strictly_parsed() {
+        assert_eq!(
+            parse_client_recovery_remote_outcome("noise\nCC_SWITCH_RECOVERY=already_running\n")
+                .unwrap(),
+            ClientRecoveryRemoteOutcome::AlreadyRunning
+        );
+        assert_eq!(
+            parse_client_recovery_remote_outcome("CC_SWITCH_RECOVERY=started:systemd\n").unwrap(),
+            ClientRecoveryRemoteOutcome::Started {
+                method: "systemd".into()
+            }
+        );
+        assert_eq!(
+            parse_client_recovery_remote_outcome("CC_SWITCH_RECOVERY=start_failed:openrc\n")
+                .unwrap(),
+            ClientRecoveryRemoteOutcome::StartFailed {
+                method: "openrc".into()
+            }
+        );
+        assert!(
+            parse_client_recovery_remote_outcome("CC_SWITCH_RECOVERY=started:unknown\n").is_err()
+        );
+        assert!(parse_client_recovery_remote_outcome("unstructured output").is_err());
     }
 
     #[test]

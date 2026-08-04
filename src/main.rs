@@ -5,6 +5,7 @@ mod board_telegram;
 mod cf;
 mod client_chat;
 mod client_market;
+mod client_market_recovery;
 mod client_market_terminal;
 mod client_market_trade;
 mod client_meta;
@@ -122,6 +123,7 @@ async fn main() -> Result<()> {
         client_stale_secs = config.client_stale_secs,
         client_installation_retention_secs = config.client_installation_retention_secs,
         paused_share_stale_secs = config.paused_share_stale_secs,
+        client_market_recovery_enabled = config.client_market_recovery_enabled,
         client_email_notifications_enabled = config.client_notifications.enabled,
         client_notification_recipient_mode = "owner_email",
         client_offline_alert_secs = config.client_notifications.offline_alert_secs,
@@ -192,6 +194,9 @@ async fn main() -> Result<()> {
         client_market_terminal: Arc::new(Mutex::new(
             crate::client_market_terminal::TerminalSessionManager::default(),
         )),
+        client_market_recovery: Arc::new(
+            crate::client_market_recovery::ClientMarketRecoveryCoordinator::default(),
+        ),
         market_billing_controls: Arc::new(Mutex::new(())),
         recent_traffic: RecentTraffic::new(),
         abuse: Arc::new(AbuseTracker::new()),
@@ -271,6 +276,7 @@ async fn main() -> Result<()> {
     let chat_notification_store = state.store.clone();
     let chat_notification_config = config.clone();
     let client_market_trade_state = state.clone();
+    let client_market_recovery_state = state.clone();
     let share_market_state = state.clone();
     let market_billing_state = state.clone();
     let database_sync_store = state.store.clone();
@@ -475,6 +481,13 @@ async fn main() -> Result<()> {
         }
         result
     });
+    let client_market_recovery_task = tokio::spawn(async move {
+        let result = crate::client_market_recovery::run_service(client_market_recovery_state).await;
+        if let Err(error) = &result {
+            tracing::error!(error = %error, "Client Market recovery service stopped");
+        }
+        result
+    });
     let share_market_task = tokio::spawn(async move {
         let result = crate::share_market::run_service(share_market_state).await;
         if let Err(error) = &result {
@@ -556,6 +569,7 @@ async fn main() -> Result<()> {
     notification_task.abort();
     chat_notification_task.abort();
     client_market_trade_task.abort();
+    client_market_recovery_task.abort();
     share_market_task.abort();
     market_billing_task.abort();
     service_result

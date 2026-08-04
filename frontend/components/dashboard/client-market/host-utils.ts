@@ -349,6 +349,27 @@ export function statusLabelKey(status: string): MessageKey {
   return (known[status as keyof typeof known] || "clientMarket.status.idle") as MessageKey;
 }
 
+export function recoveryStateLabelKey(state: string): MessageKey {
+  const known = {
+    online: "clientMarket.recovery.state.online",
+    offline: "clientMarket.recovery.state.offline",
+    stabilizing: "clientMarket.recovery.state.stabilizing",
+    blocked: "clientMarket.recovery.state.blocked",
+    paused: "clientMarket.recovery.state.paused",
+  } as const;
+  return (known[state as keyof typeof known] || "clientMarket.recovery.state.offline") as MessageKey;
+}
+
+export function recoveryBlockedReasonKey(reason?: string): MessageKey {
+  const known = {
+    missing_binary: "clientMarket.recovery.blocked.missingBinary",
+    missing_config: "clientMarket.recovery.blocked.missingConfig",
+    ssh_host_key_mismatch: "clientMarket.recovery.blocked.hostKey",
+    ssh_authentication_failed: "clientMarket.recovery.blocked.authentication",
+  } as const;
+  return (known[reason as keyof typeof known] || "clientMarket.recovery.blocked.other") as MessageKey;
+}
+
 export const HOST_STATUS_GROUPS = ["all", "idle", "in_use", "needs_attention"] as const;
 export type HostStatusFilter = (typeof HOST_STATUS_GROUPS)[number];
 /** Left-rail tabs: optional "mine" (authed only) + status groups. */

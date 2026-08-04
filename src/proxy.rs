@@ -4591,6 +4591,9 @@ mod tests {
             client_market_terminal: Arc::new(Mutex::new(
                 crate::client_market_terminal::TerminalSessionManager::default(),
             )),
+            client_market_recovery: Arc::new(
+                crate::client_market_recovery::ClientMarketRecoveryCoordinator::default(),
+            ),
             market_billing_controls: Arc::new(Mutex::new(())),
             recent_traffic: RecentTraffic::new(),
             abuse: Arc::new(crate::abuse::AbuseTracker::new()),
@@ -4643,6 +4646,7 @@ mod tests {
             client_stale_secs: 60 * 60,
             client_installation_retention_secs: 6 * 60 * 60,
             paused_share_stale_secs: 60 * 60,
+            client_market_recovery_enabled: true,
             resend_api_key: None,
             resend_from: None,
             resend_from_name: None,

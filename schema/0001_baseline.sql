@@ -347,6 +347,26 @@ CREATE INDEX idx_market_payment_methods_profile
             ON account_payment_methods(profile_user_id, enabled, position);
 CREATE INDEX idx_market_subscription_events_installation
             ON client_market_subscription_events(installation_id, created_at);
+CREATE TABLE client_market_recovery_state (
+            installation_id TEXT PRIMARY KEY,
+            host_id TEXT NOT NULL UNIQUE,
+            observed_state TEXT NOT NULL
+                CHECK (observed_state IN ('online', 'offline', 'stabilizing', 'blocked', 'paused')),
+            incident_started_at TEXT,
+            stable_since TEXT,
+            attempt_level INTEGER NOT NULL DEFAULT 0
+                CHECK (attempt_level >= 0 AND attempt_level <= 5),
+            next_attempt_at TEXT,
+            last_attempt_at TEXT,
+            last_outcome TEXT,
+            blocked_reason TEXT,
+            paused_at TEXT,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (installation_id) REFERENCES installations(id) ON DELETE CASCADE,
+            FOREIGN KEY (host_id) REFERENCES router_ssh_hosts(id) ON DELETE CASCADE
+        );
+CREATE INDEX idx_client_market_recovery_due
+            ON client_market_recovery_state(observed_state, next_attempt_at);
 CREATE INDEX idx_market_quotes_owner
             ON client_market_allocation_quotes(client_user_id, status, expires_at);
 CREATE INDEX idx_market_subscriptions_client

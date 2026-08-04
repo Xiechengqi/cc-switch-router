@@ -127,7 +127,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count baseline tables");
-        assert_eq!(table_count, 97);
+        assert_eq!(table_count, 98);
         let checksum = conn
             .query_row(
                 "SELECT checksum FROM schema_migrations WHERE version = 1",

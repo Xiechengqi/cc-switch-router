@@ -8,6 +8,7 @@ import { ClientMarketRentalBanner } from "@/components/dashboard/client-market-r
 import { CountryFlag } from "@/components/common/country-flag";
 import { ReleaseRentalAction } from "@/components/dashboard/client-market/release-rental-action";
 import { useLocaleText } from "@/components/i18n/locale-provider";
+import { recoveryStateLabelKey } from "@/components/dashboard/client-market/host-utils";
 import type { ClientMarketHost, ClientMarketRental } from "@/lib/types";
 
 /**
@@ -70,6 +71,11 @@ export function MyRentalsPanel({
               {host ? (
                 <Chip size="sm" variant="tertiary">
                   {host.status}
+                </Chip>
+              ) : null}
+              {host?.recovery ? (
+                <Chip size="sm" variant="soft">
+                  {t(recoveryStateLabelKey(host.recovery.state))}
                 </Chip>
               ) : null}
               <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">

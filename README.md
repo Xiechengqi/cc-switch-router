@@ -45,7 +45,9 @@ TokenSwitch 的公共汇聚层。为 `cc-switch-server` 实例提供公网子域
 
 早期的 `cc-switch` Tauri 桌面版已不再作为客户端,相关兼容代码已移除,详见 [MIGRATION.md](MIGRATION.md)。
 
-远程主机上的部署由仓库内 `install-client.sh` 负责,它会下载 `cc-switch-server` 二进制并完成初始化。Client Market 的主机开通流程会自动调用该脚本。
+远程主机上的部署由仓库内 `install-client.sh` 负责,它会下载 `cc-switch-server` 二进制并完成初始化。Client Market 的主机开通流程会自动调用该脚本；脚本优先安装带重启限速的 systemd/OpenRC 服务,没有受支持的服务管理器时才退回 `nohup`。
+
+Client Market Client 的 tunnel 连续离线 30 秒后,Router 才会使用 provision key 和已固定的 SSH Host 指纹检查远端进程。进程仍存在时不会 kill/restart；进程缺失时才执行幂等拉起。SSH 命令最长 45 秒,拉起后最长等待 tunnel 90 秒,单个 Router 最多并行 4 个恢复任务。每次介入完成后的重试退避依次为 10 分钟、30 分钟、1 小时、3 小时、6 小时并在 6 小时封顶,持续在线 10 分钟后清零。缺失 binary/config、SSH 身份变化或认证失效会阻断自动重试并等待 Provider 处理；Provider 和 Router 管理员可在 Host 操作菜单暂停、恢复或立即重试。Host 清理和账务释放会原子取消恢复任务。Turso 不可写时无法取得持久化 claim,因此不会执行 SSH。
 
 客户端与 Router 之间的注册、lease、建链、控制平面与身份注入契约,见 [PROTOCOL.md](PROTOCOL.md)。
 
@@ -59,7 +61,7 @@ API 路由按域分组概览如下,协议细节见 [PROTOCOL.md](PROTOCOL.md)。
 
 | 域 | 路径数 | 认证方式 | 代表端点 |
 |---|---:|---|---|
-| `/v1/client-market/*` | 28 | 用户 Session | `hosts`、`quotes`、`quotes/:id/commit`、`providers`、`my-rentals`、`terminal/ws` |
+| `/v1/client-market/*` | 33 | 用户 Session | `hosts`、`quotes`、`quotes/:id/commit`、`providers`、`my-rentals`、`terminal/ws` |
 | `/v1/admin/*` | 约 36 | Session + admin 判定 | `settings/values`、`version`、`upgrade`、`metrics/*`、`audit`、`logs/router/tail`、`market-billing/disputes` |
 | `/v1/shares/*` | 17 | installation bearer / Ed25519 签名 | `claim-subdomain`、`sync`、`batch-sync`、`descriptor-batch-sync`、`pending-edits`、`edit-ack`、`edit-events`、`runtime-refresh`、`heartbeat`、`prune` |
 | `/v1/installations/*` | 11 | Ed25519 签名 / bearer | `register`、`heartbeat`、`setup-completed`、`report-status`、`client-tunnel`、`client-tunnel/claim`、`bind-owner-email` |
@@ -119,6 +121,7 @@ wget https://github.com/xiechengqi/cc-switch-router/releases/download/latest/cc-
 | `CC_SWITCH_ROUTER_REQUEST_LOG_RETENTION_DAYS` | `30` | Share 请求记录和图片请求历史保留天数,范围 1-365;不影响累计 Token 用量 |
 | `CC_SWITCH_ROUTER_CLIENT_STALE_SECS` | `3600` | client 超过该时间未心跳时标记离线,并清理其 share、lease 与内存路由 |
 | `CC_SWITCH_ROUTER_CLIENT_INSTALLATION_RETENTION_SECS` | `21600` | 离线 client 的 installation 记录保留时长,超时后删除;必须 >= `CLIENT_STALE_SECS` |
+| `CC_SWITCH_ROUTER_CLIENT_MARKET_RECOVERY_ENABLED` | `true` | Client Market Client 自动恢复总开关；关闭后 Router 不再 SSH 介入,不影响 Host 本机 systemd/OpenRC 守护 |
 | `CC_SWITCH_ROUTER_REGISTRATION_SOURCE_RATE_PER_MINUTE` | `60` | 单可信来源每分钟持续注册尝试速率 |
 | `CC_SWITCH_ROUTER_REGISTRATION_SOURCE_BURST` | `20` | 单可信来源允许的短时注册尝试突发量 |
 | `CC_SWITCH_ROUTER_REGISTRATION_GLOBAL_RATE_PER_MINUTE` | `600` | Router 全局每分钟持续注册尝试速率 |
