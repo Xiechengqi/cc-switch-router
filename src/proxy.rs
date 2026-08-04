@@ -4574,6 +4574,11 @@ mod tests {
                 lon: None,
             },
             store: AppStore::new(config).unwrap(),
+            server_logs: Arc::new(crate::server_logs::ServerLogStore::disabled_for_tests(
+                config
+                    .data_dir
+                    .join(format!("server-logs-test-{}", Uuid::new_v4())),
+            )),
             proxy,
             proxy_http: reqwest::Client::new(),
             resend: None,

@@ -33,6 +33,7 @@ pub enum DynamicGroup {
     Telegram,
     Board,
     ClientNotifications,
+    ServerLogs,
     MarketBilling,
 }
 
@@ -334,6 +335,67 @@ pub const SETTINGS_FIELDS: &[SettingsField] = &[
         description: "Share and image request history is kept for this many days (1-365).",
         placeholder: Some("30"),
         dynamic_group: None,
+    },
+    // ── Uploaded Server logs ──
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_SERVER_LOG_INGEST_ENABLED",
+        label: "Server log collection",
+        group: "Server logs",
+        field_type: FieldType::Bool,
+        required: false,
+        restart_required: true,
+        default: Some("true"),
+        description: "Accept signed INFO, WARN, and ERROR log batches from registered cc-switch-server installations.",
+        placeholder: None,
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_SERVER_LOG_DATA_DIR",
+        label: "Server log directory",
+        group: "Server logs",
+        field_type: FieldType::Path,
+        required: false,
+        restart_required: true,
+        default: None,
+        description: "Router-owned file directory for uploaded Server JSONL and compressed log segments. Log bodies are never stored in the business database.",
+        placeholder: Some("/var/lib/cc-switch-router/server-logs"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_SERVER_LOG_RETENTION_DAYS",
+        label: "Server log retention (days)",
+        group: "Server logs",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("7"),
+        description: "Delete uploaded Server log segments older than this file retention window (1-90 days).",
+        placeholder: Some("7"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_SERVER_LOG_MAX_TOTAL_MIB",
+        label: "Server log storage limit (MiB)",
+        group: "Server logs",
+        field_type: FieldType::Int,
+        required: false,
+        restart_required: true,
+        default: Some("1024"),
+        description: "Maximum uploaded Server log file footprint. Oldest event files are removed first (16-1048576 MiB).",
+        placeholder: Some("1024"),
+        dynamic_group: None,
+    },
+    SettingsField {
+        key: "CC_SWITCH_ROUTER_SERVER_LOG_PUBLIC_ENABLED",
+        label: "Public Server logs",
+        group: "Server logs",
+        field_type: FieldType::Bool,
+        required: false,
+        restart_required: false,
+        default: Some("false"),
+        description: "Allow anonymous visitors to view a redacted projection of all Clients' logs received during the last five minutes.",
+        placeholder: None,
+        dynamic_group: Some(DynamicGroup::ServerLogs),
     },
     SettingsField {
         key: "CC_SWITCH_ROUTER_CLIENT_STALE_SECS",
@@ -1478,6 +1540,19 @@ fn normalize_value(field: &SettingsField, raw: &str) -> Result<Option<String>, A
                     field.key
                 )));
             }
+            let server_log_range = match field.key {
+                "CC_SWITCH_ROUTER_SERVER_LOG_RETENTION_DAYS" => Some((1, 90)),
+                "CC_SWITCH_ROUTER_SERVER_LOG_MAX_TOTAL_MIB" => Some((16, 1_048_576)),
+                _ => None,
+            };
+            if let Some((min, max)) = server_log_range {
+                if !(min..=max).contains(&value) {
+                    return Err(AppError::BadRequest(format!(
+                        "{} must be between {min} and {max}, got: {value}",
+                        field.key
+                    )));
+                }
+            }
             Ok(Some(trimmed.to_string()))
         }
         FieldType::Select => match field.key {
@@ -1889,6 +1964,9 @@ pub fn apply_updates_to_dynamic(
                 current.market_usd_cny_rate_micros = value
                     .and_then(|value| crate::market_billing::parse_usd_cny_rate_micros(value).ok())
                     .unwrap_or(crate::market_billing::DEFAULT_USD_CNY_RATE_MICROS);
+            }
+            "CC_SWITCH_ROUTER_SERVER_LOG_PUBLIC_ENABLED" => {
+                current.server_log_public_enabled = value.map(parse_bool_truthy).unwrap_or(false);
             }
             // Restart-required fields (paths, addresses, TTLs, Resend API
             // key, auth limits, verification URLs, email From/Reply-To):

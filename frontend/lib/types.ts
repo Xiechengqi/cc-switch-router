@@ -1969,3 +1969,45 @@ export type ShareMarketOwnedShare = {
   alreadyListed: boolean;
   supportedUserTokenPeriods: ShareTokenPeriod[];
 };
+
+export type ServerLogScope = "public" | "mine" | "all";
+
+export type ServerLogClient = {
+  installationId: string;
+  clientAlias: string;
+};
+
+export type ServerLogMeta = {
+  ingestEnabled: boolean;
+  publicEnabled: boolean;
+  authenticated: boolean;
+  isAdmin: boolean;
+  scopes: ServerLogScope[];
+  clients: ServerLogClient[];
+  retentionDays: number;
+  publicWindowSeconds: number;
+};
+
+export type ServerLogEvent = {
+  eventId: string;
+  clientAlias: string;
+  installationId?: string;
+  streamId?: string;
+  sequence?: number;
+  occurredAtMs: number;
+  receivedAtMs: number;
+  level: "info" | "warn" | "error" | string;
+  target: string;
+  message: string;
+  fields?: Record<string, unknown>;
+  file?: string;
+  line?: number;
+  serverVersion?: string;
+  commitId?: string;
+};
+
+export type ServerLogEventsResponse = {
+  events: ServerLogEvent[];
+  nextCursor?: string;
+  publicWindowSeconds?: number;
+};

@@ -19,6 +19,7 @@ use crate::proxy::ProxyRegistry;
 use crate::recent_traffic::RecentTraffic;
 use crate::registration_admission::RegistrationAdmissionLimiter;
 use crate::scheduling_signals::OverrideStore;
+use crate::server_logs::ServerLogStore;
 use crate::store::AppStore;
 
 #[derive(Clone)]
@@ -26,6 +27,8 @@ pub struct ServerState {
     pub config: Config,
     pub server_geo: ServerGeo,
     pub store: AppStore,
+    /// Router-owned file store for uploaded cc-switch-server process logs.
+    pub server_logs: Arc<ServerLogStore>,
     pub proxy: Arc<ProxyRegistry>,
     /// Shared HTTP client for proxied tunnel traffic. It keeps connection pools
     /// bounded and avoids allocating a new client for every request.

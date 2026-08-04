@@ -15,6 +15,7 @@ bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 futures-util = "0.3"
+flate2 = "1"
 hmac = "0.12"
 hex = "0.4"
 http = "1"

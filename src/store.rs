@@ -1320,6 +1320,77 @@ impl AppStore {
         })
     }
 
+    pub async fn authenticate_installation_log_batch(
+        &self,
+        input: &crate::server_logs::InstallationLogBatchRequest,
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().await;
+        let installation = get_installation(&conn, &input.installation_id)?
+            .ok_or_else(|| AppError::Unauthorized("installation not found".into()))?;
+        let skew = Utc::now().timestamp_millis().abs_diff(input.timestamp_ms);
+        if skew > SIGNED_REQUEST_MAX_SKEW_MS as u64 {
+            return Err(AppError::Unauthorized("stale signed request".into()));
+        }
+        // Sequence cursors make batch replay idempotent, so log authentication
+        // deliberately avoids nonce and presence writes on the business DB hot path.
+        verify_signed_payload(
+            &installation.public_key,
+            &input.installation_id,
+            crate::server_logs::INSTALLATION_LOG_BATCH_ACTION,
+            &input.payload,
+            input.timestamp_ms,
+            &input.nonce,
+            &input.signature,
+        )
+    }
+
+    pub async fn list_verified_installation_ids_for_owner(
+        &self,
+        owner_email: &str,
+    ) -> Result<Vec<String>, AppError> {
+        let owner_email = owner_email.trim().to_ascii_lowercase();
+        if owner_email.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().await;
+        let mut statement = conn
+            .prepare(
+                "SELECT id FROM installations
+                 WHERE owner_verified_at IS NOT NULL
+                   AND owner_email IS NOT NULL
+                   AND LOWER(TRIM(owner_email)) = ?1
+                 ORDER BY created_at DESC, id ASC",
+            )
+            .map_err(|error| {
+                AppError::Internal(format!("prepare owner installation query failed: {error}"))
+            })?;
+        let rows = statement
+            .query_map(params![owner_email], |row| row.get::<_, String>(0))
+            .map_err(|error| {
+                AppError::Internal(format!("query owner installations failed: {error}"))
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+            AppError::Internal(format!("read owner installation row failed: {error}"))
+        })
+    }
+
+    pub async fn list_all_installation_ids(&self) -> Result<Vec<String>, AppError> {
+        let conn = self.conn.lock().await;
+        let mut statement = conn
+            .prepare("SELECT id FROM installations ORDER BY created_at DESC, id ASC")
+            .map_err(|error| {
+                AppError::Internal(format!("prepare installation id query failed: {error}"))
+            })?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| {
+                AppError::Internal(format!("query installation ids failed: {error}"))
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+            AppError::Internal(format!("read installation id row failed: {error}"))
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn new_in_memory_for_tests() -> Result<Self, AppError> {
         let conn = Connection::open_in_memory().map_err(|error| {

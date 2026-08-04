@@ -77,6 +77,9 @@ import type {
   MarketAccessPricingKind,
   MarketAccessProductKind,
   MarketCreditKind,
+  ServerLogEventsResponse,
+  ServerLogMeta,
+  ServerLogScope,
 } from "@/lib/types";
 
 
@@ -1325,6 +1328,48 @@ export async function releaseShareMarketSubscription(subscriptionId: string) {
       method: "POST",
     }),
   );
+}
+
+export async function getServerLogMeta() {
+  return parseJson<ServerLogMeta>(
+    await authFetch("/v1/server-logs/meta", { cache: "no-store" }),
+  );
+}
+
+export async function getServerLogs(input: {
+  scope: ServerLogScope;
+  installationId?: string;
+  level?: string;
+  search?: string;
+  cursor?: string;
+  limit?: number;
+}) {
+  const params = new URLSearchParams({ scope: input.scope });
+  if (input.installationId) params.set("installationId", input.installationId);
+  if (input.level) params.set("level", input.level);
+  if (input.search) params.set("search", input.search);
+  if (input.cursor) params.set("cursor", input.cursor);
+  if (input.limit) params.set("limit", String(input.limit));
+  return parseJson<ServerLogEventsResponse>(
+    await authFetch(`/v1/server-logs/events?${params}`, { cache: "no-store" }),
+  );
+}
+
+export async function exportServerLogs(input: {
+  scope: Exclude<ServerLogScope, "public">;
+  installationId?: string;
+  level?: string;
+  search?: string;
+}) {
+  const params = new URLSearchParams({ scope: input.scope });
+  if (input.installationId) params.set("installationId", input.installationId);
+  if (input.level) params.set("level", input.level);
+  if (input.search) params.set("search", input.search);
+  const response = await authFetch(`/v1/server-logs/export?${params}`, {
+    cache: "no-store",
+  });
+  if (!response.ok) await parseJson(response);
+  return response.blob();
 }
 
 export async function forceRevokeShareMarketSubscription(
